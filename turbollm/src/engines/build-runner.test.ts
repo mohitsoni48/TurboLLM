@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine } from './build-runner'
+import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan } from './build-runner'
 import { join } from 'node:path'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -102,6 +102,169 @@ test('findPriorEngine: an unrelated repo never matches', () => {
   const engines = [{ id: '1', name: 'Other', binPath: '/x/other', sourceRepo: 'https://github.com/a/b' }]
   const prior = findPriorEngine(engines, { binPath: '/x/new', sourceRepo: 'https://github.com/c/d' })
   assert.equal(prior, undefined)
+})
+
+const IK_REPO = 'https://github.com/ikawrakow/ik_llama.cpp'
+const blankBranchEngine = {
+  id: '1',
+  name: 'ik_llama.cpp',
+  binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp\\build\\bin\\llama-server.exe',
+  sourceRepo: IK_REPO,
+  sourceCommit: '',
+}
+
+test('findPriorEngine: a blank branch matches a later build that names the repo default explicitly (live-reproduced regression)', () => {
+  // Reproduced live: "Add via git repo" leaves branch blank ("leave blank to build the repo's own
+  // default branch" — CustomBuildDialog.tsx) and registers with sourceBranch undefined, landing at
+  // the bare buildDirName (no branch suffix). The SAME engine's own "Rebuild" action later sends an
+  // EXPLICIT branch (EnginesScreen.tsx's selectedBranch, initialized from catalog.defaultBranch —
+  // "main" for ik_llama.cpp), which slugs to a DIFFERENT directory/binPath. Neither the binPath
+  // check nor an exact branch comparison sees these as the same target, so the stale registration
+  // is never replaced and blocks the rebuild's name with NameTakenError forever.
+  const prior = findPriorEngine([blankBranchEngine], {
+    binPath: 'C:\\...\\build\\ikawrakow-ik_llama.cpp-main\\build\\bin\\llama-server.exe',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'main',
+    sourceCommit: '',
+    defaultBranch: 'main',
+  })
+  assert.equal(prior?.id, '1')
+})
+
+test('findPriorEngine: a blank-branch registration is NOT replaced by a build of a DIFFERENT branch (Opus review, destructive)', () => {
+  // The first version of this fix bridged a blank branch to ANY named branch, so adding a second
+  // engine from another branch of the same repo silently deleted the first. "Blank" means the
+  // repo's DEFAULT branch — a build of any other branch is a distinct engine that must coexist.
+  const prior = findPriorEngine([blankBranchEngine], {
+    binPath: '/x/ikawrakow-ik_llama.cpp-sidestream/llama-server',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'sidestream',
+    sourceCommit: '',
+    defaultBranch: 'main',
+  })
+  assert.equal(prior, undefined)
+})
+
+test('findPriorEngine: a blank new build matches an engine already registered under the resolved default branch', () => {
+  const namedMain = { id: '2', name: 'ik', binPath: '/x/named-main', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '' }
+  const prior = findPriorEngine([namedMain], { binPath: '/x/new', sourceRepo: IK_REPO, sourceCommit: '', defaultBranch: 'main' })
+  assert.equal(prior?.id, '2')
+})
+
+test('findPriorEngine: never bridges blank to named when the default branch could not be resolved', () => {
+  // Fail closed: with no way to know that "main" is the default, treating the two as the same
+  // engine is a guess, and a wrong guess deletes a registration. Falls through to no match.
+  const prior = findPriorEngine([blankBranchEngine], {
+    binPath: '/x/new',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'main',
+    sourceCommit: '',
+  })
+  assert.equal(prior, undefined)
+})
+
+test('findPriorEngine: with several branches tracked, only the one matching the build\'s effective branch is replaced', () => {
+  const dev = { id: '3', name: 'fork-dev', binPath: '/x/dev', sourceRepo: IK_REPO, sourceBranch: 'dev', sourceCommit: '' }
+  const prior = findPriorEngine([dev, blankBranchEngine], {
+    binPath: '/x/new',
+    sourceRepo: IK_REPO,
+    sourceBranch: 'main',
+    sourceCommit: '',
+    defaultBranch: 'main',
+  })
+  assert.equal(prior?.id, '1')
+})
+
+test('findPriorEngine: a blank AND an explicitly-named-default registration — the exact branch match wins, whatever the registry order (Opus pass 2)', () => {
+  // Both resolve to "main", so both are candidates. Picking by array position left the other one
+  // holding the name, which then failed the registration with NameTakenError AND deleted an engine
+  // the build was not aimed at. An exact stored-branch match is the more specific claim.
+  const named = { id: '2', name: 'ik-named', binPath: '/x/named', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '' }
+  const build = { binPath: '/x/new', sourceRepo: IK_REPO, sourceBranch: 'main', sourceCommit: '', defaultBranch: 'main' }
+  assert.equal(findPriorEngine([blankBranchEngine, named], build)?.id, '2')
+  assert.equal(findPriorEngine([named, blankBranchEngine], build)?.id, '2')
+  const blankBuild = { binPath: '/x/new', sourceRepo: IK_REPO, sourceCommit: '', defaultBranch: 'main' }
+  assert.equal(findPriorEngine([named, blankBranchEngine], blankBuild)?.id, '1')
+})
+
+const PRISM_HOME = 'https://github.com/PrismML-Eng/llama.cpp'
+const prismCard = { homepage: PRISM_HOME, defaultBranch: 'prism' }
+const registered = (id: string, sourceBranch?: string, extra: Record<string, string> = {}) => ({
+  id,
+  name: id,
+  binPath: `/x/${id}`,
+  sourceRepo: PRISM_HOME,
+  sourceBranch,
+  sourceCommit: '',
+  ...extra,
+})
+
+test('findEngineForCatalogEntry: a card finds the engine it built on the default branch (live-reproduced orphan)', () => {
+  // Reproduced live after a real Prism build: the engine registered as sourceBranch "prism", but the
+  // catalog matched by EXACT recorded branch against a request that never carries one (''), so the
+  // Prism card reported sourceBuilt:false and could not manage its own engine.
+  assert.equal(findEngineForCatalogEntry([registered('built', 'prism')], prismCard)?.id, 'built')
+})
+
+test('findEngineForCatalogEntry: a blank-branch (legacy / Add via git repo) registration still belongs to the card', () => {
+  assert.equal(findEngineForCatalogEntry([registered('legacy')], prismCard)?.id, 'legacy')
+})
+
+test('findEngineForCatalogEntry: an engine on a DIFFERENT branch is not the default card\'s engine', () => {
+  assert.equal(findEngineForCatalogEntry([registered('other', 'sidestream')], prismCard), undefined)
+})
+
+test('findEngineForCatalogEntry: an exact recorded-branch match beats a blank one, whatever the registry order', () => {
+  const blank = registered('blank')
+  const named = registered('named', 'prism')
+  assert.equal(findEngineForCatalogEntry([blank, named], prismCard)?.id, 'named')
+  assert.equal(findEngineForCatalogEntry([named, blank], prismCard)?.id, 'named')
+})
+
+test('findEngineForCatalogEntry: an explicitly requested branch finds that branch\'s engine only', () => {
+  const engines = [registered('default', 'prism'), registered('dev', 'dev')]
+  assert.equal(findEngineForCatalogEntry(engines, prismCard, 'dev')?.id, 'dev')
+})
+
+test('findEngineForCatalogEntry: a pinned-commit entry ignores the recorded branch (the commit is the identity)', () => {
+  const pinnedCard = { homepage: PRISM_HOME, sourceCommit: '846e991ec3c7', patchUrl: 'https://x/p.diff' }
+  const guessed = registered('pinned', 'main', { sourceCommit: '846e991ec3c7', sourcePatchUrl: 'https://x/p.diff' })
+  assert.equal(findEngineForCatalogEntry([guessed], pinnedCard)?.id, 'pinned')
+})
+
+test('findEngineForCatalogEntry: a different repo, or a different pinned commit, never matches', () => {
+  assert.equal(findEngineForCatalogEntry([{ ...registered('x', 'prism'), sourceRepo: 'https://github.com/a/b' }], prismCard), undefined)
+  const pinnedCard = { homepage: PRISM_HOME, sourceCommit: 'aaaa1111', patchUrl: 'https://x/p.diff' }
+  assert.equal(findEngineForCatalogEntry([registered('old', undefined, { sourceCommit: 'bbbb2222', sourcePatchUrl: 'https://x/p.diff' })], pinnedCard), undefined)
+})
+
+test('catalogBranchesToScan: the default branch first, then the legacy blank dir', () => {
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }), ['prism', undefined])
+  assert.deepEqual(catalogBranchesToScan({}), [undefined])
+  assert.deepEqual(catalogBranchesToScan({ sourceCommit: 'abc' }), [undefined])
+})
+
+test('catalogBranchesToScan: a non-default branch never scans the default branch\'s (bare) directory (Opus review)', () => {
+  // The bare directory is the DEFAULT branch's legacy build. Scanning it for `dev` would mark the
+  // card installed from a different branch's binary, contradicting findEngineForCatalogEntry.
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'dev'), ['dev'])
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'prism'), ['prism', undefined])
+})
+
+test('findEngineForCatalogEntry: a stray space around the catalog default cannot break the match (Opus review)', () => {
+  assert.equal(findEngineForCatalogEntry([registered('built', 'prism')], { homepage: PRISM_HOME, defaultBranch: ' prism ' })?.id, 'built')
+})
+
+test('parseDefaultBranch: reads the branch out of `git ls-remote --symref <url> HEAD` output', () => {
+  const out = 'ref: refs/heads/main\tHEAD\n4c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d\tHEAD\n'
+  assert.equal(parseDefaultBranch(out), 'main')
+  assert.equal(parseDefaultBranch('ref: refs/heads/feature/x-y\tHEAD\nabc\tHEAD'), 'feature/x-y')
+})
+
+test('parseDefaultBranch: undefined when there is no symref line (empty repo, detached, garbage)', () => {
+  assert.equal(parseDefaultBranch(''), undefined)
+  assert.equal(parseDefaultBranch('4c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d\tHEAD\n'), undefined)
+  assert.equal(parseDefaultBranch('fatal: unable to access'), undefined)
 })
 
 test('normRepoUrl: strips scheme, github.com host, .git suffix, trailing slash, and case', () => {

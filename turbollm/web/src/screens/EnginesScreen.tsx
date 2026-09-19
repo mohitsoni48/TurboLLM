@@ -89,6 +89,7 @@ import {
 } from '../components/ui/alert-dialog'
 import { AddEngineDialog } from './engines/AddEngineDialog'
 import { BuildGuideDialog } from './engines/BuildGuideDialog'
+import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
@@ -415,12 +416,16 @@ function osLabel(platforms: string[]): string {
 /** Default engine name for a fresh build-from-source run. Official llama.cpp repos
  *  get the `Llama-<Branch>` convention; forks get `<EngineName>-<Branch>`. */
 function defaultBuildName(catalog: CatalogEngine | undefined, branch: string): string {
-  const b = (branch || 'main').trim()
+  const b = branch.trim()
   const officialLlama = ['llama.cpp', 'llama.cpp-cuda-linux', 'llama.cpp-android-source', 'llama.cpp-source'].includes(
     catalog?.id ?? '',
   )
-  return officialLlama ? `Llama-${b}` : `${catalog?.name ?? 'engine'}-${b}`
+  const base = officialLlama ? 'Llama' : (catalog?.name ?? 'engine')
+  return b ? `${base}-${b}` : base
 }
+
+/** A blank branch means "the repo's own default", which the user should see spelled out. */
+const branchLabel = (branch: string): string => branch || '(repo default)'
 
 /**
  * Engines screen. Three calm zones:
@@ -806,7 +811,7 @@ function EngineGallery({
   const install = useBackendInstall()
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
-  const [deleteTarget, setDeleteTarget] = useState<{ name: string; registryId: string } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
 
   const catalogById = useMemo(() => {
     const m = new Map<string, CatalogEngine>()
@@ -938,9 +943,9 @@ function EngineGallery({
   const requestDelete = (e: CatalogEngine) => {
     const registryId = registryEngineId(e)
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
-    setDeleteTarget({ name: e.name, registryId })
+    setDeleteTarget(deleteTargetFor(registryId, registry?.engines ?? [], e.name))
   }
-  const requestDeleteCustom = (eng: Engine) => setDeleteTarget({ name: eng.name, registryId: eng.id })
+  const requestDeleteCustom = (eng: Engine) => setDeleteTarget(deleteTargetFor(eng.id, [eng], eng.name))
   // Custom-engine parity (GitHub: "treated as an outsider... same UI as catalogue engines"):
   // Disable is just registry.remove keyed by the LIVE engine's own id — no registryEngineId
   // lookup needed, unlike a catalog engine (which has to be re-matched via binPath/sourceRepo
@@ -1125,6 +1130,7 @@ function EngineGallery({
             <AlertDialogTitle>Delete {deleteTarget?.name}?</AlertDialogTitle>
             <AlertDialogDescription>
               Files for this engine are removed from disk. Your models are not affected.
+              {deleteTarget?.binPath && <span className="mt-2 block break-all font-mono text-[11px]">{deleteTarget.binPath}</span>}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -1182,9 +1188,16 @@ function EngineCard({
   const [guideOpen, setGuideOpen] = useState(false)
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
-  // Branch selected by the user for build-from-source entries. Default: repo's default branch
-  // (catalog.defaultBranch), falling back to 'main' for unknown repos.
-  const [selectedBranch, setSelectedBranch] = useState(catalog?.defaultBranch ?? 'main')
+  // Only the user's OWN pick is state. The default is derived every render: this card can mount
+  // before its catalog entry arrives (the gallery waits on the recommendation, not the catalog),
+  // and a default captured once at mount froze on 'main' — so the dropdown showed the real branch
+  // while the build request sent 'main' ("Remote branch main not found" for Prism, master, etc.).
+  // The recommendation's own engine carries defaultBranch too, so it is known even before the catalog.
+  const [chosenBranch, setChosenBranch] = useState<string | undefined>(undefined)
+  // Unknown default = '' (no branch sent; git clones the repo's own default). Never guess 'main':
+  // a wrong guess is a hard "Remote branch main not found" for any repo whose default isn't main.
+  const defaultBranch = catalog?.defaultBranch ?? e.defaultBranch ?? ''
+  const selectedBranch = chosenBranch ?? defaultBranch
   const isLlama = e.id === 'llama.cpp'
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
@@ -1207,11 +1220,11 @@ function EngineCard({
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
   // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
-  // not a hardcoded 'main'. `selectedBranch` already initialises from catalog.defaultBranch, so a
-  // hardcoded ['main'] left the selected value absent from the option list — the <select> then
-  // rendered as 'main' for every engine, including the ones whose default is master/concedo/prism.
-  const fallbackBranch = catalog?.defaultBranch ?? 'main'
-  const allBranches = branchesQ.data?.branches ?? [fallbackBranch]
+  // not a hardcoded 'main'. The list must always contain `selectedBranch` (the default until the
+  // user picks something else): a <select> whose value matches no option DISPLAYS its first option
+  // while the state holds another, which is how a hardcoded ['main'] rendered as 'main' for every
+  // engine, and how a lookup failure after the user picked a branch would do the same.
+  const allBranches = branchesQ.data?.branches ?? [selectedBranch]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
   // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
@@ -1300,7 +1313,7 @@ function EngineCard({
                 onMouseDown={() => setBranchesWanted(true)}
                 onFocus={() => setBranchesWanted(true)}
                 onChange={(e) => {
-                  setSelectedBranch(e.target.value)
+                  setChosenBranch(e.target.value)
                   void _onRefetchCatalog()
                 }}
                 className="w-full rounded-md border border-border bg-panel-2 pl-2 pr-7 py-1 text-[12px] text-ink outline-none focus:border-accent font-mono appearance-none"
@@ -1309,7 +1322,7 @@ function EngineCard({
                   // Keep the CURRENT branch as the option while the list loads. The old markup
                   // swapped in a hardcoded value="main" placeholder, which made the <select>'s
                   // value disagree with selectedBranch for any engine whose default is not main.
-                  <option value={selectedBranch}>{selectedBranch} — loading branches…</option>
+                  <option value={selectedBranch}>{branchLabel(selectedBranch)} — loading branches…</option>
                 ) : filtered.length === 0 ? (
                   <option value={selectedBranch} disabled>
                     No matching branches
@@ -1317,7 +1330,7 @@ function EngineCard({
                 ) : (
                   filtered.map((b) => (
                     <option key={b} value={b}>
-                      {b}
+                      {branchLabel(b)}
                     </option>
                   ))
                 )}

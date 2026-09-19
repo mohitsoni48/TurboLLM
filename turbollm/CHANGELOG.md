@@ -25,6 +25,49 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.6] - 2026-09-19
+
+### Fixed
+
+- **Rebuilding an engine could still fail with "Name already in use."** v1.13.5 fixed one cause of
+  this, but not the one most people hit. An engine added through **Add via git repo** with the
+  branch left blank ("build the repo's own default branch") was registered with no branch on
+  record, while the **Rebuild** action on that same engine always sends the branch explicitly
+  (`main`, for example). The two never matched as the same engine, so the old entry was never
+  replaced and kept its name, which blocked the rebuild after a full, successful compile. A blank
+  branch is now resolved to the repo's real default branch before comparing, so rebuilding the
+  default branch finds the engine it should replace. A build of a different branch still gets its
+  own entry, and if the default branch can't be looked up, a blank branch is never treated as a
+  named one. (If a Rebuild targets a branch other than the repo's default, it is a different
+  engine and still needs its own name.)
+
+- **Building Prism (and other engines whose default branch isn't `main`) could fail with "Remote
+  branch main not found."** The branch dropdown showed the right branch (`prism`), but the build was
+  sent with `main`. The card picked its default branch once, when it first appeared on the Engines
+  page. If its catalog entry hadn't loaded yet at that moment, it locked in `main` and never updated,
+  while the dropdown kept showing the correct one. It only affected engines whose default isn't
+  `main` (Prism, the `master` ones, concedo), and only when the page loaded in that order. The
+  default is now worked out fresh each time, and only a branch you pick yourself is remembered.
+  If an engine has no known default branch, no branch is sent at all and git uses the repo's own
+  default, instead of a guessed `main`. Every engine in the catalog was checked against its real
+  repository, and each one's default branch is correct.
+- **An engine you built from its own card wasn't recognised by that card afterwards.** After a
+  successful build (Prism, or ik_llama.cpp after a Rebuild) the engine registered fine, but its card
+  kept offering "Build from source" and couldn't Rebuild, Disable or Delete it. The card only
+  recognised engines that had been recorded with no branch at all. Cards now recognise their engine
+  whether the branch was left blank or recorded as the default, and an engine on any other branch
+  stays its own entry. If you have two builds of the same repo, the card manages the one built on the
+  default branch and the other appears under your custom engines.
+
+### Discord
+
+- 🔧 **Engine rebuilds:** rebuilding an engine you added from a git repo could finish compiling and
+  then fail with "name already in use." That's fixed. Rebuild now replaces the old entry.
+- 🔧 **Prism and similar engines:** building some engines could fail instantly with "remote branch
+  main not found," even though the right branch was selected on screen. Fixed.
+- 🔧 **Engine cards:** an engine you built from its card (like Prism) is now recognised by that card,
+  so you can Rebuild, Disable or Delete it from there.
+
 ## [1.13.5] - 2026-09-18
 
 ### Fixed

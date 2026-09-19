@@ -49,7 +49,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, catalogBranchesToScan, chooseEngineName, findEngineForCatalogEntry, findPriorEngine, normRepoUrl, sameRepo, sourceBuildBinary, sourceBuildDirOf } from '../engines/build-runner'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
@@ -550,30 +550,24 @@ export function registerApi(app: Hono, d: Deps): void {
       // solar-open2 vs. the plain llama.cpp entry — both build ggml-org/llama.cpp): without also
       // requiring the SAME commit + patch, a plain unpatched llama.cpp build would falsely read
       // as "solar-open2 already installed" and hand out a binary with no solar_open2 support at
-      // all. Entries with no commit/patch pin (sourceCommit/patchUrl both '') still match each
-      // other exactly as before — UNLESS a branch is requested, in which case we scope the
-      // match to that branch so each branch gets its own installed/enabled state.
+      // all. Branch is compared as an EFFECTIVE branch (a blank recorded branch means the entry's
+      // `defaultBranch`), so an engine recorded as the default and one recorded blank both belong
+      // to the card, while one on any other branch stays a distinct custom engine. A pinned
+      // commit/patch entry ignores the branch entirely. See findEngineForCatalogEntry.
       // Skip entirely for `excludeFromSourceMatch` entries (ADR-388) — the backend-picker
       // `llama.cpp` card's installed state comes from LlamaCppBackendRows, not this. Without the
       // guard, a manually source-built plain `ggml-org/llama.cpp` (no commit/patch — the same
       // identity this card matches with) got its registry id silently claimed here, hiding it
       // from BOTH the custom-engine card list AND this card's own UI (which never reads
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
-      // An entry is "branch-capable" when it has no pinned commit or patch — the user can
-      // build any branch, so the match should be scoped to the requested branch.
-      const isBranchCapable = !e.sourceCommit && !e.patchUrl
-      const matchBranch = isBranchCapable ? (branchParam ?? '') : undefined
-      const srcEng = e.excludeFromSourceMatch
-        ? undefined
-        : regEngines.find(
-            (x) =>
-              sameRepo(x.sourceRepo, e.homepage) &&
-              (x.sourceCommit ?? '') === (e.sourceCommit ?? '') &&
-              (x.sourcePatchUrl ?? '') === (e.patchUrl ?? '') &&
-              (x.sourceBranch ?? '') === (matchBranch ?? ''),
-          )
+      const srcEng = e.excludeFromSourceMatch ? undefined : findEngineForCatalogEntry(regEngines, e, branchParam)
       let sourceBinPath: string | undefined = srcEng?.binPath
-      if (!srcEng && !e.excludeFromSourceMatch) sourceBinPath = sourceBuildBinary(enginesRoot, e.homepage, matchBranch, e.sourceCommit) ?? undefined
+      if (!srcEng && !e.excludeFromSourceMatch) {
+        sourceBinPath =
+          catalogBranchesToScan(e, branchParam)
+            .map((branch) => sourceBuildBinary(enginesRoot, e.homepage, branch, e.sourceCommit))
+            .find((bin) => bin !== null) ?? undefined
+      }
       const sourceBuilt = !!srcEng || !!sourceBinPath
       if (srcEng) {
         installed = true
@@ -764,6 +758,7 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceRepo: repoUrl,
           sourceBranch: branch,
           sourceCommit: commit,
+          defaultBranch: out.defaultBranch,
         })
         if (prior) {
           if (d.registry.active()?.id === prior.id) await d.manager.stopAndWait()

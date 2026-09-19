@@ -78,7 +78,9 @@ export interface CatalogEngine {
   /** Extra context shown under the card (support caveats, etc.). */
   note?: string
   /** Default branch for this repo (e.g. 'master' for llama.cpp, 'main' for most others).
-    *  Used to pre-select the branch in the dropdown — caller falls back to 'main'. */
+    *  Pre-selects the branch in the dropdown AND is what a blank recorded branch means when a
+    *  registered engine is matched to this card. Required for any unpinned build-from-source entry
+    *  (catalog.test.ts): with none, the card sends no branch rather than guessing 'main'. */
   defaultBranch?: string
   /** Pin the build-from-source to an exact commit SHA (7-40 hex). Set when the entry needs a
     *  specific historical commit — e.g. one that a `patchUrl` was authored against. */

@@ -113,6 +113,8 @@ export interface BuildIdentity {
   sourceRepo?: string
   sourceBranch?: string
   sourceCommit?: string
+  /** The repo's real default branch, when it could be resolved — what a blank `sourceBranch` means. */
+  defaultBranch?: string
 }
 
 /** The subset of a registered {@link Engine}'s fields needed to match it against a build. */
@@ -132,24 +134,106 @@ export interface RegisteredEngineIdentity {
  * slugs to the same build directory. Falls back to repo identity via {@link sameRepo} (never a
  * raw string comparison — two spellings of the same repo, e.g. a trailing `.git`/slash, or a
  * moved data dir (ADR-215) that changes the absolute `binPath` while the repo is unchanged, must
- * still match), requiring an EXACT branch+commit match so a commit-pinned build never collapses
- * onto a plain branch-tip build of the same repo, or vice versa.
+ * still match), requiring an EXACT commit match so a commit-pinned build never collapses onto a
+ * plain branch-tip build of the same repo, or vice versa.
  *
  * ADR-387 fixed `buildDirName`'s own repo comparison but explicitly flagged this exact class of
  * bug as unaddressed here: "registration still matches by binary path before checking repo
  * identity ... a future collision class would reopen the same failure shape." A raw `===` on
  * `sourceRepo` was that collision class — it left a stranded prior registration (and its name)
- * un-replaceable whenever `binPath` alone didn't match. */
+ * un-replaceable whenever `binPath` alone didn't match.
+ *
+ * Branches are compared as EFFECTIVE branches (ADR-428 follow-up): "Add via git repo" lets the
+ * branch be left blank to mean "the repo's own default branch" and registers with no
+ * `sourceBranch`, while a later "Rebuild" of that same engine sends the default branch by NAME —
+ * a different string, slugging to a different directory, for the same build target. A blank
+ * branch therefore resolves to `build.defaultBranch` before comparing. It is never resolved
+ * to "whatever is registered": a build of any OTHER branch is a distinct engine and must coexist
+ * with the blank one, not delete it. When the default could not be resolved, blank stays blank,
+ * so blank never bridges to a named branch — a wrong guess here removes a registration. */
 export function findPriorEngine(engines: RegisteredEngineIdentity[], build: BuildIdentity): RegisteredEngineIdentity | undefined {
-  return (
-    engines.find((e) => e.binPath === build.binPath) ??
-    engines.find(
-      (e) =>
-        sameRepo(e.sourceRepo, build.sourceRepo) &&
-        (e.sourceBranch ?? '') === (build.sourceBranch ?? '') &&
-        (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
-    )
+  const byBinPath = engines.find((e) => e.binPath === build.binPath)
+  if (byBinPath) return byBinPath
+
+  const sameTarget = engines.filter(
+    (e) => sameRepo(e.sourceRepo, build.sourceRepo) && (e.sourceCommit ?? '') === (build.sourceCommit ?? ''),
   )
+  // An exact stored-branch match is the more specific claim, so it wins over the resolved-default
+  // match: a blank registration and an explicitly-named-default one can both resolve to the same
+  // branch, and picking by registry order would delete the one this build wasn't aimed at.
+  const storedBranch = (build.sourceBranch ?? '').trim()
+  const wantedBranch = effectiveBranch(build.sourceBranch, build.defaultBranch)
+  return (
+    sameTarget.find((e) => (e.sourceBranch ?? '').trim() === storedBranch) ??
+    sameTarget.find((e) => effectiveBranch(e.sourceBranch, build.defaultBranch) === wantedBranch)
+  )
+}
+
+function effectiveBranch(branch: string | undefined, defaultBranch: string | undefined): string {
+  return (branch ?? '').trim() || (defaultBranch ?? '').trim()
+}
+
+/** The subset of a catalog entry needed to decide which registered engine is its build. */
+export interface CatalogEntryIdentity {
+  homepage: string
+  defaultBranch?: string
+  sourceCommit?: string
+  patchUrl?: string
+}
+
+export interface RegisteredSourceIdentity extends RegisteredEngineIdentity {
+  sourcePatchUrl?: string
+}
+
+/** A pinned commit / patch is the build's whole identity, so the branch it was recorded under is noise. */
+const isPinnedEntry = (entry: Pick<CatalogEntryIdentity, 'sourceCommit' | 'patchUrl'>): boolean => !!(entry.sourceCommit || entry.patchUrl)
+
+/** PURE: the registered engine a catalog card owns (so the card can Rebuild / Disable / Delete it).
+ *
+ * The catalog used to match on the EXACT recorded branch against a request that never carries one,
+ * so only blank-branch registrations were ever recognised: a Prism built from its own card
+ * (recorded `prism`) was orphaned from the Prism card. Branches are now compared as EFFECTIVE
+ * branches — blank means the entry's audited `defaultBranch`, same rule as {@link findPriorEngine} —
+ * so a blank registration and one recorded as the default both belong to the card, while an engine
+ * on any other branch stays a distinct (custom) engine. An exact recorded match wins over a blank
+ * one so the choice never depends on registry order. */
+export function findEngineForCatalogEntry(
+  engines: RegisteredSourceIdentity[],
+  entry: CatalogEntryIdentity,
+  requestedBranch?: string,
+): RegisteredSourceIdentity | undefined {
+  const sameBuild = engines.filter(
+    (e) =>
+      sameRepo(e.sourceRepo, entry.homepage) &&
+      (e.sourceCommit ?? '') === (entry.sourceCommit ?? '') &&
+      (e.sourcePatchUrl ?? '') === (entry.patchUrl ?? ''),
+  )
+  if (isPinnedEntry(entry)) return sameBuild[0]
+
+  const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
+  return (
+    sameBuild.find((e) => (e.sourceBranch ?? '').trim() === wanted) ??
+    sameBuild.find((e) => effectiveBranch(e.sourceBranch, entry.defaultBranch) === wanted)
+  )
+}
+
+/** PURE: the branch values whose build directory a catalog card should look in for a build that is
+ *  on disk but not registered (a Disabled engine). Cards build into the named-branch directory
+ *  (`…-prism`); "Add via git repo" with a blank branch built into the bare one, which is the DEFAULT
+ *  branch's legacy build — so the bare directory is scanned only when the wanted branch IS the default,
+ *  or a different branch's binary would mark the card installed. */
+export function catalogBranchesToScan(entry: Omit<CatalogEntryIdentity, 'homepage'>, requestedBranch?: string): Array<string | undefined> {
+  if (isPinnedEntry(entry)) return [undefined]
+  const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
+  if (!wanted) return [undefined]
+  return wanted === (entry.defaultBranch ?? '').trim() ? [wanted, undefined] : [wanted]
+}
+
+/** PURE: the repo's default branch from `git ls-remote --symref <url> HEAD`, whose first line is
+ *  `ref: refs/heads/<branch>\tHEAD`. Undefined when there is no symref line (an empty repo, an
+ *  unreadable remote, unexpected output) — callers treat that as "unknown", never as a branch. */
+export function parseDefaultBranch(lsRemoteOutput: string): string | undefined {
+  return /^ref:\s+refs\/heads\/(\S+)\s+HEAD\s*$/m.exec(lsRemoteOutput)?.[1]
 }
 
 export interface BuildHooks {
@@ -164,6 +248,8 @@ export interface BuildOutput {
   commit: string
   /** Directory the build lives in (so the caller can GC on failure if desired). */
   buildRoot: string
+  /** The repo's default branch, resolved best-effort from the remote; undefined when unknown. */
+  defaultBranch?: string
 }
 
 /** PURE: a filesystem-safe directory slug for a repo+branch, so a rebuild of the same
@@ -753,6 +839,19 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // Record the built commit (ADR-088 provenance / rebuild comparison).
   const commit = (await runStep('git', ['-C', srcDir, 'rev-parse', 'HEAD'], { env, signal, onLine: () => {} })).trim()
 
+  // What a blank branch means for this repo, so registration can tell a blank-branch engine and
+  // a named-default-branch rebuild are the same engine. Best-effort and fail-open: it only ever
+  // ADDS a match, so an unreachable remote just means blank and named stay distinct.
+  let defaultBranch: string | undefined
+  try {
+    // runStep has no timeout, so bound a stalled connection: abort when under 1 KB/s for 15 s.
+    const lsRemoteArgs = ['-c', 'http.lowSpeedLimit=1000', '-c', 'http.lowSpeedTime=15', 'ls-remote', '--symref', req.repoUrl, 'HEAD']
+    const lsRemote = await runStep('git', lsRemoteArgs, { env, signal, onLine: () => {} })
+    defaultBranch = parseDefaultBranch(lsRemote)
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') throw e
+  }
+
   // 1b) Apply a pinned, checksum-verified third-party patch on top of the checked-out commit,
   // when the catalog entry ships one — for an architecture not yet in the repo's mainline that
   // needs a patch to compile (e.g. solar_open2). OPT-IN: with no `patchUrl` the build below is
@@ -898,5 +997,5 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // neither has anything to bundle.
   if (isWindows) copyCudaRuntimeDlls(env, dirname(binPath), hooks.log)
   else if (!isMac && !isAndroid) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
-  return { binPath, commit, buildRoot }
+  return { binPath, commit, buildRoot, defaultBranch }
 }
