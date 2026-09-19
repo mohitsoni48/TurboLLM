@@ -53,9 +53,10 @@ _Nothing yet._
   dropdown display the first match while the build still used the previous selection. The branch the
   build will use is now always in the list and always the one shown, and the "N of M" count no longer
   counts it twice.
-- **Building from an unusual repository address is now safe.** A malformed repository address could
-  point a build at a folder outside its own build folder. Build folder names are now always a single,
-  real folder name.
+- **Unusual repository addresses and engine paths are now safe.** A malformed repository address could
+  point a build at a folder outside its own build folder, and an engine registered with an unusual
+  binary path could make "delete files" select a whole folder of builds instead of just its own.
+  Build folder names are now always a single, real folder name.
 - **vLLM and SGLang were still misdiagnosed on macOS and less common systems.** uvloop ships macOS
   builds, so a failed check on a Mac is a broken environment, not "cannot run on macOS," and the
   message now says so. Only Windows is reported as unable to run them. The message calls Linux a

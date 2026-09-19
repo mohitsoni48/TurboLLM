@@ -411,6 +411,17 @@ test('sourceBuildDirOf: null for a non-source-build binary path', () => {
   assert.equal(sourceBuildDirOf(join(root, 'turboquant', 'llama-server.exe'), root), null)
 })
 
+// A registered engine's binPath is stored exactly as typed (path.join would have collapsed the dot
+// segments, so these are raw strings). `?purge=1` deletes whatever this returns recursively:
+// "." made it the whole build/ directory (every source build), ".." the engines root itself.
+test('sourceBuildDirOf: a dot segment in the binPath never selects build/ itself or its parent', () => {
+  const root = join('C:', 'e', 'engines')
+  for (const step of ['.', '..', '...']) {
+    const bin = `C:/e/engines/build/${step}/prism/build/bin/llama-server.exe`
+    assert.equal(sourceBuildDirOf(bin, root), null, `"${step}" must not resolve to a directory to delete`)
+  }
+})
+
 // GitHub #61: exllamav3 (a pure-Python engine, no CMakeLists.txt) failed 1-click build with a
 // bare "cmake exited with code 1" and no explanation. notCmakeProjectError fails fast instead.
 test('notCmakeProjectError: null (no error) when CMakeLists.txt is present', () => {

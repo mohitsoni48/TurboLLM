@@ -373,7 +373,13 @@ export function buildDirName(repoUrl: string, branch?: string, commit?: string):
  *  `runBuild`'s clean-start `rmSync` would delete every installed engine. Those become "engine". */
 function asDirName(raw: string): string {
   const slug = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
-  return /^\.*$/.test(slug) ? 'engine' : slug
+  return isPathStep(slug) ? 'engine' : slug
+}
+
+/** PURE: a name made only of dots ("." / ".." / "...") is a path step, not a directory name — and
+ *  empty is no name at all. Joining one under a root selects that root or its parent. */
+function isPathStep(name: string): boolean {
+  return /^\.*$/.test(name)
 }
 
 /** PURE: loose equality of two repo identifiers (full URL or `owner/repo`), ignoring scheme,
@@ -411,10 +417,12 @@ export function sourceBuildBinary(enginesRoot: string, repoUrl: string, branch?:
 }
 
 /** PURE: given a built engine's binPath, the `engines/build/<slug>` dir it lives under (for
- *  purge), or null when the path isn't a source-build output. */
+ *  purge), or null when the path isn't a source-build output. A registered binPath is stored as
+ *  typed, so its slug can be "." or ".." — which would select build/ itself or the engines root,
+ *  and purge deletes the result recursively. */
 export function sourceBuildDirOf(binPath: string, enginesRoot: string): string | null {
   const m = binPath.replace(/\\/g, '/').match(/\/engines\/build\/([^/]+)(?:\/|$)/i)
-  if (!m) return null
+  if (!m || isPathStep(m[1])) return null
   return join(enginesRoot, 'build', m[1])
 }
 
