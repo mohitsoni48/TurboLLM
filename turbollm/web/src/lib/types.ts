@@ -343,6 +343,7 @@ export type CustomEngineSource = {
   sourceRepo?: string
   sourceBranch?: string
   sourceCommit?: string
+  sourcePatchUrl?: string
   addedAt: string
   /** Whether `binPath` still exists on disk — false means the user removed the build
    *  folder by hand; Enable can't work until it's rebuilt. */

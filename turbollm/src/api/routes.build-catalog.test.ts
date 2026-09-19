@@ -141,10 +141,14 @@ function seedBuild(enginesRoot: string, dirName: string): void {
 
 interface CatalogItem {
   id: string
+  homepage: string
   installed?: boolean
   sourceBuilt?: boolean
   sourceBranch?: string
   sourceBinPath?: string
+  sourceEngineId?: string
+  sourceCommit?: string
+  patchUrl?: string
 }
 
 async function catalogItem(h: Harness, id: string): Promise<CatalogItem> {
@@ -189,6 +193,33 @@ test('GET /engines/catalog: a Disabled Solar Open 2 build under the pre-ADR-387 
     const solar = await catalogItem(h, 'solar-open2')
     assert.equal(solar.installed, true)
     assert.match(solar.sourceBinPath ?? '', /llama\.cpp-846e991ec3c7/)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('POST /engines keeps the commit and patch of a pinned build, so its card recognises the engine it registered', async () => {
+  // A pinned card (Solar Open 2) matches on repo + commit + patch. Enable used to send only repo +
+  // branch, so the engine it registered belonged to no card and the card still read "not installed".
+  const h = harness()
+  try {
+    const card = await catalogItem(h, 'solar-open2')
+    assert.ok(card.sourceCommit && card.patchUrl, 'the Solar Open 2 entry is pinned to a commit and a patch')
+    assert.equal(card.sourceBuilt, false)
+
+    const res = await h.app.request('/api/v1/engines', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      // process.execPath stands in for a built server: probe() only needs something native it can run.
+      body: JSON.stringify({ name: 'Solar Open 2', binPath: process.execPath, sourceRepo: card.homepage, sourceCommit: card.sourceCommit, sourcePatchUrl: card.patchUrl }),
+    })
+    assert.equal(res.status, 201)
+    const registered = (await res.json()) as { id: string; sourcePatchUrl?: string }
+    assert.equal(registered.sourcePatchUrl, card.patchUrl)
+
+    const after = await catalogItem(h, 'solar-open2')
+    assert.equal(after.sourceBuilt, true)
+    assert.equal(after.sourceEngineId, registered.id)
   } finally {
     h.cleanup()
   }

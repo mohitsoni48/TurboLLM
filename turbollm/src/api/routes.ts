@@ -12,7 +12,7 @@ import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bo
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError, customSourceKey } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey, nameTakenMessage } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
@@ -705,7 +705,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // running engine's own files being replaced underneath it.
     const engines = d.registry.list().engines
     const conflict = findNameConflict(engines, name, { buildRoot, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
-    if (conflict) return err(c, 400, 'name_already_taken', new NameTakenError(conflict, { sourceRepo: repoUrl, sourceBranch: branch }).message)
+    if (conflict) return err(c, 400, 'name_already_taken', nameTakenMessage(conflict, { sourceRepo: repoUrl, sourceBranch: branch }))
     const running = d.registry.active()
     if (running && engineBusy(d) && isEngineInBuildDir(running.binPath, buildRoot))
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before rebuilding it — the rebuild replaces its files.`)
@@ -1057,19 +1057,20 @@ export function registerApi(app: Hono, d: Deps): void {
     // sessions already get for host execution.
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
-    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string }>(c)
+    const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
     try {
       const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, {
         sourceRepo: b.sourceRepo,
         sourceBranch: b.sourceBranch,
         sourceCommit: b.sourceCommit,
+        sourcePatchUrl: b.sourcePatchUrl,
       })
       // Same custom-source tracking as the 1-click build completion above — a manually
       // pointed-at binary (with or without a sourceRepo) is just as much a "custom engine"
       // as a self-service build, and deserves the same Disable-survives-as-Enable treatment.
       if (!isCatalogRepo(b.sourceRepo)) {
-        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit })
+        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl })
       }
       // `probe_no_version` is non-blocking (spec 03 §2): the engine is saved, but
       // the response carries a warning flag so the dialog can prompt the user.

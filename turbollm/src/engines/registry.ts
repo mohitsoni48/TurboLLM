@@ -31,7 +31,7 @@ interface IncomingSource {
   sourceBranch?: string
 }
 
-function nameTakenMessage(holder: Pick<Engine, 'name' | 'sourceRepo' | 'sourceBranch'> | undefined, incoming: IncomingSource | undefined): string {
+export function nameTakenMessage(holder: Pick<Engine, 'name' | 'sourceRepo' | 'sourceBranch'> | undefined, incoming: IncomingSource | undefined): string {
   if (!holder) return 'Name already in use — choose a different name.'
   const base = `Name already in use by "${holder.name}" — choose a different name.`
   const held = holder.sourceBranch?.trim()
