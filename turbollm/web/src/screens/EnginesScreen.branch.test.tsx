@@ -95,6 +95,14 @@ beforeEach(() => {
   )
 })
 
+/** Bodies of every POST /api/v1/build/run the screen has made. */
+function buildRequests(): Array<Record<string, unknown>> {
+  return vi
+    .mocked(fetch)
+    .mock.calls.filter(([input, init]) => String(input instanceof Request ? input.url : input).includes('/api/v1/build/run') && init?.method === 'POST')
+    .map(([, init]) => JSON.parse(String(init?.body)))
+}
+
 function renderEngines() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
@@ -115,9 +123,13 @@ describe('EnginesScreen source-build branch (Prism "Remote branch main not found
     releaseCatalog()
     fireEvent.click(await screen.findByRole('button', { name: /build from source/i }))
 
-    // The dialog title embeds the branch the request will actually send.
     const title = await screen.findByText(/Build .* from source/)
     await waitFor(() => expect(title.textContent).toContain('-prism'))
     expect(title.textContent).not.toContain('-main')
+
+    // The original bug was the screen and the REQUEST disagreeing, so assert the request itself.
+    fireEvent.click(await screen.findByRole('button', { name: /build it for me/i }))
+    await waitFor(() => expect(buildRequests()).toHaveLength(1))
+    expect(buildRequests()[0]).toMatchObject({ repoUrl: 'https://github.com/PrismML-Eng/llama.cpp', branch: 'prism' })
   })
 })

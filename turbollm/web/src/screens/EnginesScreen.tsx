@@ -1212,10 +1212,11 @@ function EngineCard({
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
   // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
-  // not a hardcoded 'main'. `selectedBranch` defaults to the same value, so a hardcoded ['main']
-  // left the selected value absent from the option list — the <select> then rendered as 'main'
-  // for every engine, including the ones whose default is master/concedo/prism.
-  const allBranches = branchesQ.data?.branches ?? [defaultBranch]
+  // not a hardcoded 'main'. The list must always contain `selectedBranch` (the default until the
+  // user picks something else): a <select> whose value matches no option DISPLAYS its first option
+  // while the state holds another, which is how a hardcoded ['main'] rendered as 'main' for every
+  // engine, and how a lookup failure after the user picked a branch would do the same.
+  const allBranches = branchesQ.data?.branches ?? [selectedBranch]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
   // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
