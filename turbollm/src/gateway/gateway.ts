@@ -18,6 +18,7 @@ import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
+import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
 import {
   extractSearchQuery,
@@ -752,6 +753,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // see GatewayV1Options.pathname. Defaults to the real one, so the public mount is unchanged.
   const pathname = opts.pathname ?? url.pathname
 
+  // POST /v1/classify and /v1/rerank (Jev models, ADR-434 (d)) live in their own module and are
+  // dispatched here rather than registered as Hono routes: the Turbo Link façade mounts this same
+  // handler, and a separately registered route is the registration-order bug class of ADR-421.
+  const jevEndpoint = jevEndpointFor(c.req.method, pathname)
+  if (jevEndpoint) return handleJevRequest(c, d, jevEndpoint, opts)
+
   // GET /v1/models: always synthesise the list from the WHOLE local library (not just
   // the loaded model), regardless of whether an engine is running — real key entries for
   // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
@@ -759,11 +766,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // strips back to the real key before routing) is only added when gateway.autoSwap is
   // on: picking a model from Claude Code's /model always requires a swap, so advertising
   // it while auto-swap is off would let the user pick a model that silently never loads.
+  // A Jev model is marked `kind: "jev"` and gets no alias: it never chats, so Claude Code can't use it.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
     const autoSwap = d.store.snapshot().gateway.autoSwap
     const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
-      { id: m.key, object: 'model', owned_by: 'turbollm' },
-      ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+      { id: m.key, object: 'model', owned_by: 'turbollm', ...(m.jev ? { kind: 'jev' } : {}) },
+      ...(autoSwap && !m.jev ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
     ])
     // Turbo Link (ADR-376 §1 decision 7): every model on every ONLINE linked host, under
     // its qualified `<machine>/<model>` id — the exact id ModelRouter.resolveRemote routes
