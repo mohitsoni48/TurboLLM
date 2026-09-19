@@ -170,7 +170,7 @@ export function findPriorEngine(engines: RegisteredEngineIdentity[], build: Buil
 }
 
 function effectiveBranch(branch: string | undefined, defaultBranch: string | undefined): string {
-  return (branch ?? '').trim() || (defaultBranch ?? '')
+  return (branch ?? '').trim() || (defaultBranch ?? '').trim()
 }
 
 /** The subset of a catalog entry needed to decide which registered engine is its build. */
@@ -186,7 +186,7 @@ export interface RegisteredSourceIdentity extends RegisteredEngineIdentity {
 }
 
 /** A pinned commit / patch is the build's whole identity, so the branch it was recorded under is noise. */
-const isPinnedEntry = (entry: CatalogEntryIdentity): boolean => !!(entry.sourceCommit || entry.patchUrl)
+const isPinnedEntry = (entry: Pick<CatalogEntryIdentity, 'sourceCommit' | 'patchUrl'>): boolean => !!(entry.sourceCommit || entry.patchUrl)
 
 /** PURE: the registered engine a catalog card owns (so the card can Rebuild / Disable / Delete it).
  *
@@ -219,11 +219,14 @@ export function findEngineForCatalogEntry(
 
 /** PURE: the branch values whose build directory a catalog card should look in for a build that is
  *  on disk but not registered (a Disabled engine). Cards build into the named-branch directory
- *  (`…-prism`); "Add via git repo" with a blank branch built into the bare one, so both are scanned. */
+ *  (`…-prism`); "Add via git repo" with a blank branch built into the bare one, which is the DEFAULT
+ *  branch's legacy build — so the bare directory is scanned only when the wanted branch IS the default,
+ *  or a different branch's binary would mark the card installed. */
 export function catalogBranchesToScan(entry: Omit<CatalogEntryIdentity, 'homepage'>, requestedBranch?: string): Array<string | undefined> {
-  if (isPinnedEntry(entry as CatalogEntryIdentity)) return [undefined]
+  if (isPinnedEntry(entry)) return [undefined]
   const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
-  return wanted ? [wanted, undefined] : [undefined]
+  if (!wanted) return [undefined]
+  return wanted === (entry.defaultBranch ?? '').trim() ? [wanted, undefined] : [wanted]
 }
 
 /** PURE: the repo's default branch from `git ls-remote --symref <url> HEAD`, whose first line is

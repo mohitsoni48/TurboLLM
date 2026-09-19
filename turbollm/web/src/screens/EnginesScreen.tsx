@@ -89,6 +89,7 @@ import {
 } from '../components/ui/alert-dialog'
 import { AddEngineDialog } from './engines/AddEngineDialog'
 import { BuildGuideDialog } from './engines/BuildGuideDialog'
+import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
@@ -810,7 +811,7 @@ function EngineGallery({
   const install = useBackendInstall()
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
-  const [deleteTarget, setDeleteTarget] = useState<{ name: string; registryId: string } | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
 
   const catalogById = useMemo(() => {
     const m = new Map<string, CatalogEngine>()
@@ -942,9 +943,9 @@ function EngineGallery({
   const requestDelete = (e: CatalogEngine) => {
     const registryId = registryEngineId(e)
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
-    setDeleteTarget({ name: e.name, registryId })
+    setDeleteTarget(deleteTargetFor(registryId, registry?.engines ?? [], e.name))
   }
-  const requestDeleteCustom = (eng: Engine) => setDeleteTarget({ name: eng.name, registryId: eng.id })
+  const requestDeleteCustom = (eng: Engine) => setDeleteTarget(deleteTargetFor(eng.id, [eng], eng.name))
   // Custom-engine parity (GitHub: "treated as an outsider... same UI as catalogue engines"):
   // Disable is just registry.remove keyed by the LIVE engine's own id — no registryEngineId
   // lookup needed, unlike a catalog engine (which has to be re-matched via binPath/sourceRepo
@@ -1129,6 +1130,7 @@ function EngineGallery({
             <AlertDialogTitle>Delete {deleteTarget?.name}?</AlertDialogTitle>
             <AlertDialogDescription>
               Files for this engine are removed from disk. Your models are not affected.
+              {deleteTarget?.binPath && <span className="mt-2 block break-all font-mono text-[11px]">{deleteTarget.binPath}</span>}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

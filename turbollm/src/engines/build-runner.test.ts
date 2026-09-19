@@ -240,9 +240,19 @@ test('findEngineForCatalogEntry: a different repo, or a different pinned commit,
 
 test('catalogBranchesToScan: the default branch first, then the legacy blank dir', () => {
   assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }), ['prism', undefined])
-  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'dev'), ['dev', undefined])
   assert.deepEqual(catalogBranchesToScan({}), [undefined])
   assert.deepEqual(catalogBranchesToScan({ sourceCommit: 'abc' }), [undefined])
+})
+
+test('catalogBranchesToScan: a non-default branch never scans the default branch\'s (bare) directory (Opus review)', () => {
+  // The bare directory is the DEFAULT branch's legacy build. Scanning it for `dev` would mark the
+  // card installed from a different branch's binary, contradicting findEngineForCatalogEntry.
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'dev'), ['dev'])
+  assert.deepEqual(catalogBranchesToScan({ defaultBranch: 'prism' }, 'prism'), ['prism', undefined])
+})
+
+test('findEngineForCatalogEntry: a stray space around the catalog default cannot break the match (Opus review)', () => {
+  assert.equal(findEngineForCatalogEntry([registered('built', 'prism')], { homepage: PRISM_HOME, defaultBranch: ' prism ' })?.id, 'built')
 })
 
 test('parseDefaultBranch: reads the branch out of `git ls-remote --symref <url> HEAD` output', () => {

@@ -550,17 +550,16 @@ export function registerApi(app: Hono, d: Deps): void {
       // solar-open2 vs. the plain llama.cpp entry — both build ggml-org/llama.cpp): without also
       // requiring the SAME commit + patch, a plain unpatched llama.cpp build would falsely read
       // as "solar-open2 already installed" and hand out a binary with no solar_open2 support at
-      // all. Entries with no commit/patch pin (sourceCommit/patchUrl both '') still match each
-      // other exactly as before — UNLESS a branch is requested, in which case we scope the
-      // match to that branch so each branch gets its own installed/enabled state.
+      // all. Branch is compared as an EFFECTIVE branch (a blank recorded branch means the entry's
+      // `defaultBranch`), so an engine recorded as the default and one recorded blank both belong
+      // to the card, while one on any other branch stays a distinct custom engine. A pinned
+      // commit/patch entry ignores the branch entirely. See findEngineForCatalogEntry.
       // Skip entirely for `excludeFromSourceMatch` entries (ADR-388) — the backend-picker
       // `llama.cpp` card's installed state comes from LlamaCppBackendRows, not this. Without the
       // guard, a manually source-built plain `ggml-org/llama.cpp` (no commit/patch — the same
       // identity this card matches with) got its registry id silently claimed here, hiding it
       // from BOTH the custom-engine card list AND this card's own UI (which never reads
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
-      // An entry is "branch-capable" when it has no pinned commit or patch — the user can
-      // build any branch, so the match should be scoped to the requested branch.
       const srcEng = e.excludeFromSourceMatch ? undefined : findEngineForCatalogEntry(regEngines, e, branchParam)
       let sourceBinPath: string | undefined = srcEng?.binPath
       if (!srcEng && !e.excludeFromSourceMatch) {

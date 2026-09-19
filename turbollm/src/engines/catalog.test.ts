@@ -8,7 +8,9 @@ import { catalogForPlatform } from './catalog'
 // from an unpinned branch has to declare the real one. Audited against each remote's HEAD
 // (`git ls-remote --symref`) when this guard was added; this test keeps new entries honest.
 test('every build-from-source catalog entry on an unpinned branch declares its default branch', () => {
-  const buildable = catalogForPlatform().filter(
+  // Explicit platform: on Android catalogForPlatform() drops every entry not runnable there, which
+  // would leave this guard checking a single entry. Every other platform returns the whole catalog.
+  const buildable = catalogForPlatform('linux').filter(
     (e) => !e.sourceCommit && !e.patchUrl && (e.variants ?? []).some((v) => v.hasPrebuilt === false),
   )
   assert.ok(buildable.length >= 4, `expected the source-build entries to be found, got ${buildable.length}`)
