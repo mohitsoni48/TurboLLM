@@ -23,7 +23,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **vLLM loads again under WSL.** Recent vLLM releases start with a new model runner that needs
+  pinned memory, which vLLM switches off under WSL. Every model failed before loading anything, with
+  `RuntimeError: UVA is not available`. On WSL, TurboLLM now starts vLLM with its previous model
+  runner, which works there. Native Linux is unchanged. If you set `VLLM_USE_V2_MODEL_RUNNER`
+  yourself, your setting is kept.
 
 ## [1.13.7] - 2026-09-19
 
