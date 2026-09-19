@@ -4,15 +4,22 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { DEFAULT_HYPOTHESIS_TEMPLATE, type JevInfo } from '../models/jev'
+import { DEFAULT_HYPOTHESIS_TEMPLATE, JevShapeError, type JevInfo } from '../models/jev'
 import {
+  callEngineClassify,
+  JevEndpointError,
   jevEndpointFor,
   jevErrorResponse,
   MAX_JEV_INPUTS,
   nliTemplateFor,
   parseClassifyBody,
   parseRerankBody,
+  toClassifyResponse,
+  toRerankResponse,
+  type ClassifyInput,
+  type EngineClassifyResult,
   type JevHttpError,
+  type RerankInput,
 } from './jev-endpoints'
 
 const MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
@@ -262,4 +269,283 @@ test('jevErrorResponse answers the OpenAI error envelope with the error\'s statu
   assert.deepEqual(await res.json(), {
     error: { message: "No local model matches 'nope'.", type: 'invalid_request_error', code: 'model_not_found' },
   })
+})
+
+const ENGINE_TARGET = 'http://engine.local'
+const OPENJEV = { key: MODEL_KEY, name: MODEL_NAME, jev: openJevInfo() }
+
+/** Fixture F2 — the engine's recorded /classify response for the three kitchen hypotheses. */
+const F2_KITCHEN = {
+  data: [
+    { index: 0, label: 'entailment', probs: [0.0, 0.957, 0.043], num_classes: 3 },
+    { index: 1, label: 'contradiction', probs: [1.0, 0.0, 0.0], num_classes: 3 },
+    { index: 2, label: 'neutral', probs: [0.001, 0.001, 0.998], num_classes: 3 },
+  ],
+  usage: { prompt_tokens: 69, total_tokens: 69 },
+}
+
+/** Fixture F3 — the engine's recorded /classify response for Berlin, Paris, Madrid. */
+const F3_FRANCE = {
+  data: [
+    { index: 0, label: 'contradiction', probs: [0.990, 0.008, 0.002], num_classes: 3 },
+    { index: 1, label: 'entailment', probs: [0.020, 0.941, 0.039], num_classes: 3 },
+    { index: 2, label: 'contradiction', probs: [0.980, 0.016, 0.004], num_classes: 3 },
+  ],
+  usage: { prompt_tokens: 51, total_tokens: 51 },
+}
+
+/** Fixture F7 — the gateway's expected /v1/classify body for F2. */
+const F7_CLASSIFY = {
+  model: MODEL_KEY,
+  results: [
+    {
+      hypothesis: 'Someone is preparing food.',
+      label: 'entailment',
+      probs: { contradiction: 0, entailment: 0.957, neutral: 0.043 },
+    },
+    {
+      hypothesis: 'The kitchen is empty and silent.',
+      label: 'contradiction',
+      probs: { contradiction: 1, entailment: 0, neutral: 0 },
+    },
+    {
+      hypothesis: 'The chef is wearing a blue apron.',
+      label: 'neutral',
+      probs: { contradiction: 0.001, entailment: 0.001, neutral: 0.998 },
+    },
+  ],
+  usage: { prompt_tokens: 69, total_tokens: 69 },
+}
+
+/** Fixture F7 — the gateway's expected /v1/rerank body for F3. */
+const F7_RERANK = {
+  model: MODEL_KEY,
+  results: [
+    { index: 1, document: { text: 'Paris' }, relevance_score: 0.941, label: 'entailment' },
+    { index: 2, document: { text: 'Madrid' }, relevance_score: 0.016, label: 'contradiction' },
+    { index: 0, document: { text: 'Berlin' }, relevance_score: 0.008, label: 'contradiction' },
+  ],
+  usage: { prompt_tokens: 51, total_tokens: 51 },
+}
+
+const KITCHEN_ENGINE_INPUT = KITCHEN_HYPOTHESES.map((h) => `Premise: ${KITCHEN_PREMISE}\nHypothesis: ${h}`)
+const KITCHEN_CLASSIFY: ClassifyInput = { model: MODEL_KEY, premise: KITCHEN_PREMISE, hypotheses: KITCHEN_HYPOTHESES }
+
+function franceRerank(topN: number | undefined = undefined): RerankInput {
+  return {
+    model: MODEL_KEY,
+    query: FRANCE_QUERY,
+    documents: CITIES,
+    topN,
+    hypothesisTemplate: DEFAULT_HYPOTHESIS_TEMPLATE,
+  }
+}
+
+interface EngineCall {
+  url: string
+  init: RequestInit
+}
+
+/** A fetch double that records every call and answers each with a fresh Response. No socket. */
+function recordingEngine(reply: () => Response): { fetchImpl: typeof fetch; calls: EngineCall[] } {
+  const calls: EngineCall[] = []
+  const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} })
+    return reply()
+  }) as typeof fetch
+  return { fetchImpl, calls }
+}
+
+function jsonReply(body: unknown, status = 200): () => Response {
+  return () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+}
+
+function throwingEngine(error: Error): typeof fetch {
+  return (async () => { throw error }) as typeof fetch
+}
+
+function classifyKitchen(fetchImpl: typeof fetch, signal = new AbortController().signal): Promise<EngineClassifyResult> {
+  return callEngineClassify(ENGINE_TARGET, KITCHEN_ENGINE_INPUT, signal, fetchImpl)
+}
+
+async function engineFailure(call: Promise<unknown>): Promise<JevHttpError> {
+  try {
+    await call
+  } catch (e) {
+    if (e instanceof JevEndpointError) return e.http
+    throw e
+  }
+  return assert.fail('expected the engine call to fail')
+}
+
+function withRows(rows: unknown): Record<string, unknown> {
+  return { ...structuredClone(F2_KITCHEN), data: rows }
+}
+
+function kitchenRowsWith(index: number, change: Record<string, unknown>): Array<Record<string, unknown> | null> {
+  const rows: Array<Record<string, unknown> | null> = structuredClone(F2_KITCHEN.data)
+  rows[index] = { ...rows[index], ...change }
+  return rows
+}
+
+function kitchenRowsWithNull(index: number): Array<Record<string, unknown> | null> {
+  const rows: Array<Record<string, unknown> | null> = structuredClone(F2_KITCHEN.data)
+  rows[index] = null
+  return rows
+}
+
+const BAD_ENGINE_RESPONSE: JevHttpError = {
+  status: 502,
+  code: 'engine_bad_response',
+  type: 'api_error',
+  message: 'The engine returned an unexpected /classify response.',
+}
+
+test('callEngineClassify: one POST to <target>/classify (no /v1) with the engine alias and every input', async () => {
+  const engine = recordingEngine(jsonReply(F2_KITCHEN))
+  const signal = new AbortController().signal
+
+  await classifyKitchen(engine.fetchImpl, signal)
+
+  assert.equal(engine.calls.length, 1)
+  const [{ url, init }] = engine.calls
+  assert.equal(url, 'http://engine.local/classify')
+  assert.equal(init.method, 'POST')
+  assert.equal(new Headers(init.headers).get('content-type'), 'application/json')
+  assert.deepEqual(JSON.parse(String(init.body)), { model: 'default_model', input: KITCHEN_ENGINE_INPUT })
+  assert.equal(init.signal, signal)
+})
+
+test('callEngineClassify: F2 → rows in index order with their probs, and the usage', async () => {
+  const result = await classifyKitchen(recordingEngine(jsonReply(F2_KITCHEN)).fetchImpl)
+  assert.deepEqual(result, {
+    rows: [
+      { index: 0, probs: [0.0, 0.957, 0.043] },
+      { index: 1, probs: [1.0, 0.0, 0.0] },
+      { index: 2, probs: [0.001, 0.001, 0.998] },
+    ],
+    usage: { prompt_tokens: 69, total_tokens: 69 },
+  })
+})
+
+test('callEngineClassify: rows the engine returns out of order are sorted by index', async () => {
+  const [first, second, third] = F2_KITCHEN.data
+  const shuffled = withRows([third, first, second])
+  const result = await classifyKitchen(recordingEngine(jsonReply(shuffled)).fetchImpl)
+  assert.deepEqual(result.rows.map((row) => row.index), [0, 1, 2])
+  assert.deepEqual(result.rows[2].probs, [0.001, 0.001, 0.998])
+})
+
+test('callEngineClassify: missing or non-numeric usage counts become 0', async () => {
+  const noUsage = { data: structuredClone(F2_KITCHEN.data) }
+  const oddUsage = { ...structuredClone(F2_KITCHEN), usage: { prompt_tokens: '69', total_tokens: null } }
+  for (const body of [noUsage, oddUsage]) {
+    const result = await classifyKitchen(recordingEngine(jsonReply(body)).fetchImpl)
+    assert.deepEqual(result.usage, { prompt_tokens: 0, total_tokens: 0 })
+  }
+})
+
+test('callEngineClassify: each malformed engine body (F5) → 502 engine_bad_response', async () => {
+  const malformed: Array<[string, () => Response]> = [
+    ['a row without index', jsonReply(withRows(kitchenRowsWith(1, { index: undefined })))],
+    ['two rows with index 0', jsonReply(withRows(kitchenRowsWith(1, { index: 0 })))],
+    ['a non-integer index', jsonReply(withRows(kitchenRowsWith(1, { index: 1.5 })))],
+    ['an index out of range', jsonReply(withRows(kitchenRowsWith(2, { index: 3 })))],
+    ['a row that is not an object', jsonReply(withRows(kitchenRowsWithNull(1)))],
+    ['data not an array', jsonReply(withRows({ 0: F2_KITCHEN.data[0] }))],
+    ['no data at all', jsonReply({ usage: F2_KITCHEN.usage })],
+    ['2 rows for 3 inputs', jsonReply(withRows(F2_KITCHEN.data.slice(0, 2)))],
+    ['a non-JSON body', () => new Response('<html>oops</html>', { status: 200 })],
+  ]
+  for (const [name, reply] of malformed) {
+    assert.deepEqual(await engineFailure(classifyKitchen(recordingEngine(reply).fetchImpl)), BAD_ENGINE_RESPONSE, name)
+  }
+})
+
+test('callEngineClassify: an engine 4xx → 400 engine_rejected with the engine\'s own message', async () => {
+  const engine = recordingEngine(jsonReply({ error: { message: 'bad' } }, 422))
+  assert.deepEqual(await engineFailure(classifyKitchen(engine.fetchImpl)), {
+    status: 400, code: 'engine_rejected', type: 'invalid_request_error', message: 'bad',
+  })
+})
+
+test('callEngineClassify: an engine 5xx → 502 engine_error', async () => {
+  const engine = recordingEngine(() => new Response('', { status: 500 }))
+  assert.deepEqual(await engineFailure(classifyKitchen(engine.fetchImpl)), {
+    status: 502, code: 'engine_error', type: 'api_error', message: 'Engine returned HTTP 500.',
+  })
+})
+
+test('callEngineClassify: a fetch that throws → 500 engine_unreachable', async () => {
+  const failure = await engineFailure(classifyKitchen(throwingEngine(new TypeError('fetch failed'))))
+  assert.deepEqual(failure, {
+    status: 500, code: 'engine_unreachable', type: 'api_error', message: 'Engine unreachable: fetch failed',
+  })
+})
+
+test('callEngineClassify: a client that already left → 500 engine_unreachable naming the disconnect', async () => {
+  const left = new AbortController()
+  left.abort()
+  const aborted = throwingEngine(new DOMException('This operation was aborted', 'AbortError'))
+  assert.deepEqual(await engineFailure(classifyKitchen(aborted, left.signal)), {
+    status: 500,
+    code: 'engine_unreachable',
+    type: 'api_error',
+    message: 'Client disconnected before the engine responded.',
+  })
+})
+
+test('toClassifyResponse: F2 → the F7 classify body, labels read from the model\'s own id2label', async () => {
+  const engine = await classifyKitchen(recordingEngine(jsonReply(F2_KITCHEN)).fetchImpl)
+  assert.deepEqual(toClassifyResponse(OPENJEV, KITCHEN_CLASSIFY, engine.rows, engine.usage), F7_CLASSIFY)
+})
+
+test('toClassifyResponse: the engine\'s own label strings are ignored (all "neutral" in, real labels out)', async () => {
+  const allNeutral = withRows(F2_KITCHEN.data.map((row) => ({ ...row, label: 'neutral' })))
+  const engine = await classifyKitchen(recordingEngine(jsonReply(allNeutral)).fetchImpl)
+  const response = toClassifyResponse(OPENJEV, KITCHEN_CLASSIFY, engine.rows, engine.usage)
+  assert.deepEqual(response.results.map((r) => r.label), ['entailment', 'contradiction', 'neutral'])
+})
+
+test('toClassifyResponse: a permuted id2label (F4) maps each probability to its own label', () => {
+  const permuted = { key: MODEL_KEY, jev: openJevInfo({ labels: ['entailment', 'neutral', 'contradiction'] }) }
+  const input: ClassifyInput = { model: MODEL_KEY, premise: KITCHEN_PREMISE, hypotheses: [KITCHEN_HYPOTHESES[0]] }
+  const response = toClassifyResponse(permuted, input, [{ index: 0, probs: [0.957, 0.043, 0.0] }], F2_KITCHEN.usage)
+  assert.deepEqual(response.results, [{
+    hypothesis: 'Someone is preparing food.',
+    label: 'entailment',
+    probs: { entailment: 0.957, neutral: 0.043, contradiction: 0 },
+  }])
+})
+
+test('toClassifyResponse: a probs row of the wrong shape (F5) throws JevShapeError', () => {
+  for (const probs of [[0.957, 0.043], ['x', 0, 0]]) {
+    const rows = [{ index: 0, probs }, ...F2_KITCHEN.data.slice(1)]
+    assert.throws(() => toClassifyResponse(OPENJEV, KITCHEN_CLASSIFY, rows, F2_KITCHEN.usage), JevShapeError)
+  }
+})
+
+test('toRerankResponse: F3 → Paris, Madrid, Berlin by P(entailment) with their original indices (F7)', async () => {
+  const engine = await classifyKitchen(recordingEngine(jsonReply(F3_FRANCE)).fetchImpl)
+  assert.deepEqual(toRerankResponse(OPENJEV, franceRerank(), engine.rows, engine.usage), F7_RERANK)
+})
+
+test('toRerankResponse: top_n 2 keeps the two best; top_n 10 is clamped to the 3 documents', () => {
+  const rows = F3_FRANCE.data
+  const top2 = toRerankResponse(OPENJEV, franceRerank(2), rows, F3_FRANCE.usage)
+  assert.deepEqual(top2.results.map((r) => r.document.text), ['Paris', 'Madrid'])
+  assert.equal(toRerankResponse(OPENJEV, franceRerank(10), rows, F3_FRANCE.usage).results.length, 3)
+})
+
+test('toRerankResponse: equal scores keep the documents\' input order', () => {
+  const [berlin, paris] = F3_FRANCE.data
+  const tied = [
+    { index: 0, probs: paris.probs },
+    { index: 1, probs: paris.probs },
+    { index: 2, probs: berlin.probs },
+  ]
+  for (const rows of [tied, [...tied].reverse()]) {
+    const response = toRerankResponse(OPENJEV, franceRerank(), rows, F3_FRANCE.usage)
+    assert.deepEqual(response.results.map((r) => r.index), [0, 1, 2])
+  }
 })

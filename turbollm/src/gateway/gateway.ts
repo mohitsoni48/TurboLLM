@@ -55,7 +55,7 @@ function resolveHarness(c: Context, d: Deps, protocol: 'anthropic' | 'openai'): 
  *  turn, hits ESC, times out, or closes). Wiring its signal into the upstream engine
  *  fetch is what stops abandoned requests from running to completion and clogging the
  *  engine's queue — the in-app chat path already does this; the gateway must too. */
-function clientAbort(c: { req: { raw: Request } }): AbortController {
+export function clientAbort(c: { req: { raw: Request } }): AbortController {
   const ac = new AbortController()
   const sig = c.req.raw.signal
   if (sig) {
@@ -69,7 +69,7 @@ function clientAbort(c: { req: { raw: Request } }): AbortController {
  *  response. These engines mirror the OpenAI `{error:{message,type}}` shape on failure; falls
  *  back to the raw body (truncated) when it isn't JSON-shaped, so a crash page or a plain-text
  *  panic still surfaces something readable instead of a blanket "Engine error." */
-async function describeEngineError(res: Response): Promise<{ message: string; type?: string }> {
+export async function describeEngineError(res: Response): Promise<{ message: string; type?: string }> {
   const raw = await res.text().catch(() => '')
   try {
     const parsed = JSON.parse(raw) as { error?: { message?: string; type?: string } }

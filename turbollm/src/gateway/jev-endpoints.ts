@@ -4,7 +4,15 @@
 // registration order (ADR-421, divergence row 7). User strings are validated, never trimmed.
 import type { Context } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
-import { DEFAULT_HYPOTHESIS_TEMPLATE, validateHypothesisTemplate, type JevInfo } from '../models/jev'
+import { ENGINE_MODEL_ALIAS } from '../engines/compat'
+import {
+  DEFAULT_HYPOTHESIS_TEMPLATE,
+  mapProbs,
+  validateHypothesisTemplate,
+  type JevInfo,
+  type JevLabel,
+} from '../models/jev'
+import { describeEngineError } from './gateway'
 
 export type JevEndpoint = 'classify' | 'rerank'
 
@@ -31,6 +39,54 @@ export interface JevHttpError {
   code: string
   type: 'invalid_request_error' | 'api_error'
   message: string
+}
+
+/** A failed engine call, carrying the refusal the gateway answers with. */
+export class JevEndpointError extends Error {
+  constructor(public http: JevHttpError) {
+    super(http.message)
+  }
+}
+
+/** One engine row: `index` is the input it answers, `probs` is still unchecked (mapProbs checks it). */
+export interface EngineClassifyRow {
+  index: number
+  probs: unknown
+}
+
+export interface ClassifyUsage {
+  prompt_tokens: number
+  total_tokens: number
+}
+
+export interface EngineClassifyResult {
+  rows: EngineClassifyRow[]
+  usage: ClassifyUsage
+}
+
+/** A local model already known to be a Jev model. */
+export interface JevModel {
+  key: string
+  jev: JevInfo
+}
+
+export interface ClassifyResponse {
+  model: string
+  results: Array<{ hypothesis: string; label: JevLabel; probs: Record<JevLabel, number> }>
+  usage: ClassifyUsage
+}
+
+export interface RerankResult {
+  index: number
+  document: { text: string }
+  relevance_score: number
+  label: JevLabel
+}
+
+export interface RerankResponse {
+  model: string
+  results: RerankResult[]
+  usage: ClassifyUsage
 }
 
 /** Which Jev endpoint a request is for: POST on the exact path only. */
@@ -81,6 +137,50 @@ export function nliTemplateFor(entry: { name: string; jev?: JevInfo }): string |
   }
 }
 
+/** The one engine call per request: a batched `POST <engine>/classify`. For a classification head
+ *  that is the only route vLLM serves, and it has no /v1 prefix (brief lines 21-25). Rows come back
+ *  sorted by index, exactly one per input; any other failure is thrown as a JevEndpointError. */
+export async function callEngineClassify(
+  target: string,
+  input: string[],
+  signal: AbortSignal,
+  fetchImpl: typeof fetch,
+): Promise<EngineClassifyResult> {
+  const res = await postToEngine(target, input, signal, fetchImpl)
+  if (!res.ok) throw new JevEndpointError(await engineRefusal(res))
+  const body = await engineJson(res)
+  return { rows: rowsInInputOrder(body, input.length), usage: usageOf(body) }
+}
+
+/** One result per hypothesis, in input order, labelled through the model's own id2label. */
+export function toClassifyResponse(
+  entry: JevModel,
+  input: ClassifyInput,
+  rows: EngineClassifyRow[],
+  usage: ClassifyUsage,
+): ClassifyResponse {
+  const results = rows.map((row) => ({
+    hypothesis: input.hypotheses[row.index],
+    ...mapProbs(entry.jev.labels, row.probs),
+  }))
+  return { model: entry.key, results, usage }
+}
+
+/** Documents ranked by P(entailment), best first (ties keep input order), cut to top_n. */
+export function toRerankResponse(
+  entry: JevModel,
+  input: RerankInput,
+  rows: EngineClassifyRow[],
+  usage: ClassifyUsage,
+): RerankResponse {
+  const ranked = rows.map((row): RerankResult => {
+    const { label, probs } = mapProbs(entry.jev.labels, row.probs)
+    return { index: row.index, document: { text: input.documents[row.index] }, relevance_score: probs.entailment, label }
+  })
+  ranked.sort(byRelevanceThenInputOrder)
+  return { model: entry.key, results: ranked.slice(0, input.topN ?? ranked.length), usage }
+}
+
 export function jevErrorResponse(c: Context, error: JevHttpError): Response {
   return c.json({ error: { message: error.message, type: error.type, code: error.code } }, error.status)
 }
@@ -108,6 +208,82 @@ function chosenHypothesisTemplate(requested: unknown): string | JevHttpError {
   const problem = validateHypothesisTemplate(requested)
   if (problem === null) return requested as string
   return { status: 400, code: 'invalid_hypothesis_template', type: 'invalid_request_error', message: problem }
+}
+
+const BAD_ENGINE_RESPONSE: JevHttpError = {
+  status: 502,
+  code: 'engine_bad_response',
+  type: 'api_error',
+  message: 'The engine returned an unexpected /classify response.',
+}
+
+async function postToEngine(
+  target: string,
+  input: string[],
+  signal: AbortSignal,
+  fetchImpl: typeof fetch,
+): Promise<Response> {
+  try {
+    return await fetchImpl(`${target}/classify`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: ENGINE_MODEL_ALIAS, input }),
+      signal,
+    })
+  } catch (e) {
+    throw new JevEndpointError(engineUnreachable(e as Error, signal))
+  }
+}
+
+function engineUnreachable(error: Error, signal: AbortSignal): JevHttpError {
+  const message = signal.aborted
+    ? 'Client disconnected before the engine responded.'
+    : `Engine unreachable: ${error.message}`
+  return { status: 500, code: 'engine_unreachable', type: 'api_error', message }
+}
+
+async function engineRefusal(res: Response): Promise<JevHttpError> {
+  const { message } = await describeEngineError(res)
+  return res.status >= 500
+    ? { status: 502, code: 'engine_error', type: 'api_error', message }
+    : { status: 400, code: 'engine_rejected', type: 'invalid_request_error', message }
+}
+
+async function engineJson(res: Response): Promise<unknown> {
+  try {
+    return await res.json()
+  } catch {
+    throw new JevEndpointError(BAD_ENGINE_RESPONSE)
+  }
+}
+
+/** Sorted by index, the rows must read 0..n-1 — one check that refuses a duplicate, a gap and an
+ *  out-of-range index alike, so every result lines up with the input it answers. */
+function rowsInInputOrder(body: unknown, inputCount: number): EngineClassifyRow[] {
+  const data = isJsonObject(body) ? body.data : undefined
+  if (!Array.isArray(data) || data.length !== inputCount || !data.every(isIndexedRow)) {
+    throw new JevEndpointError(BAD_ENGINE_RESPONSE)
+  }
+  const rows = data.map(({ index, probs }) => ({ index, probs })).sort((a, b) => a.index - b.index)
+  if (!rows.every((row, position) => row.index === position)) throw new JevEndpointError(BAD_ENGINE_RESPONSE)
+  return rows
+}
+
+function isIndexedRow(row: unknown): row is EngineClassifyRow {
+  return isJsonObject(row) && Number.isInteger(row.index)
+}
+
+function usageOf(body: unknown): ClassifyUsage {
+  const usage: Record<string, unknown> = isJsonObject(body) && isJsonObject(body.usage) ? body.usage : {}
+  return { prompt_tokens: tokenCount(usage.prompt_tokens), total_tokens: tokenCount(usage.total_tokens) }
+}
+
+function tokenCount(reported: unknown): number {
+  return typeof reported === 'number' && Number.isFinite(reported) ? reported : 0
+}
+
+function byRelevanceThenInputOrder(a: RerankResult, b: RerankResult): number {
+  return b.relevance_score - a.relevance_score || a.index - b.index
 }
 
 function isInputList<T>(value: unknown, isInput: (item: unknown) => item is T): value is T[] {
