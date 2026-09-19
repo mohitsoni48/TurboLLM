@@ -25,6 +25,27 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.13.6] - 2026-09-19
+
+### Fixed
+
+- **Rebuilding an engine could still fail with "Name already in use."** v1.13.5 fixed one cause of
+  this, but not the one most people hit. An engine added through **Add via git repo** with the
+  branch left blank ("build the repo's own default branch") was registered with no branch on
+  record, while the **Rebuild** action on that same engine always sends the branch explicitly
+  (`main`, for example). The two never matched as the same engine, so the old entry was never
+  replaced and kept its name, which blocked the rebuild after a full, successful compile. A blank
+  branch is now resolved to the repo's real default branch before comparing, so rebuilding the
+  default branch finds the engine it should replace. A build of a different branch still gets its
+  own entry, and if the default branch can't be looked up, a blank branch is never treated as a
+  named one. (If a Rebuild targets a branch other than the repo's default, it is a different
+  engine and still needs its own name.)
+
+### Discord
+
+- 🔧 **Engine rebuilds:** rebuilding an engine you added from a git repo could finish compiling and
+  then fail with "name already in use." That's fixed. Rebuild now replaces the old entry.
+
 ## [1.13.5] - 2026-09-18
 
 ### Fixed
