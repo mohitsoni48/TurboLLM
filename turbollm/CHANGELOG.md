@@ -41,10 +41,20 @@ _Nothing yet._
   named one. (If a Rebuild targets a branch other than the repo's default, it is a different
   engine and still needs its own name.)
 
+- **Building Prism (and other engines whose default branch isn't `main`) could fail with "Remote
+  branch main not found."** The branch dropdown showed the right branch (`prism`), but the build was
+  sent with `main`. The card picked its default branch once, when it first appeared on the Engines
+  page. If its catalog entry hadn't loaded yet at that moment, it locked in `main` and never updated,
+  while the dropdown kept showing the correct one. It only affected engines whose default isn't
+  `main` (Prism, the `master` ones, concedo), and only when the page loaded in that order. The
+  default is now worked out fresh each time, and only a branch you pick yourself is remembered.
+
 ### Discord
 
 - 🔧 **Engine rebuilds:** rebuilding an engine you added from a git repo could finish compiling and
   then fail with "name already in use." That's fixed. Rebuild now replaces the old entry.
+- 🔧 **Prism and similar engines:** building some engines could fail instantly with "remote branch
+  main not found," even though the right branch was selected on screen. Fixed.
 
 ## [1.13.5] - 2026-09-18
 

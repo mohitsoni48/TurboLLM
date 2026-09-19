@@ -1182,9 +1182,14 @@ function EngineCard({
   const [guideOpen, setGuideOpen] = useState(false)
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
-  // Branch selected by the user for build-from-source entries. Default: repo's default branch
-  // (catalog.defaultBranch), falling back to 'main' for unknown repos.
-  const [selectedBranch, setSelectedBranch] = useState(catalog?.defaultBranch ?? 'main')
+  // Only the user's OWN pick is state. The default is derived every render: this card can mount
+  // before its catalog entry arrives (the gallery waits on the recommendation, not the catalog),
+  // and a default captured once at mount froze on 'main' — so the dropdown showed the real branch
+  // while the build request sent 'main' ("Remote branch main not found" for Prism, master, etc.).
+  // The recommendation's own engine carries defaultBranch too, so it is known even before the catalog.
+  const [chosenBranch, setChosenBranch] = useState<string | undefined>(undefined)
+  const defaultBranch = catalog?.defaultBranch ?? e.defaultBranch ?? 'main'
+  const selectedBranch = chosenBranch ?? defaultBranch
   const isLlama = e.id === 'llama.cpp'
   const sourceBuilt = !!catalog?.sourceBuilt
   const incompatible = fit.compatible.length === 0
@@ -1207,11 +1212,10 @@ function EngineCard({
   const branchesQ = useGitBranches(catalog?.homepage, buildYourself && branchesWanted)
   const [searchQuery, setSearchQuery] = useState('')
   // Fallback list when the lookup fails (offline, rate-limited): the entry's OWN default branch,
-  // not a hardcoded 'main'. `selectedBranch` already initialises from catalog.defaultBranch, so a
-  // hardcoded ['main'] left the selected value absent from the option list — the <select> then
-  // rendered as 'main' for every engine, including the ones whose default is master/concedo/prism.
-  const fallbackBranch = catalog?.defaultBranch ?? 'main'
-  const allBranches = branchesQ.data?.branches ?? [fallbackBranch]
+  // not a hardcoded 'main'. `selectedBranch` defaults to the same value, so a hardcoded ['main']
+  // left the selected value absent from the option list — the <select> then rendered as 'main'
+  // for every engine, including the ones whose default is master/concedo/prism.
+  const allBranches = branchesQ.data?.branches ?? [defaultBranch]
   const totalBranches = branchesQ.data?.total ?? allBranches.length
   const branchError = branchesQ.error
   // Keyed off the daemon's error CODE, not a bare 403: a 403 is also a plain permission failure,
@@ -1300,7 +1304,7 @@ function EngineCard({
                 onMouseDown={() => setBranchesWanted(true)}
                 onFocus={() => setBranchesWanted(true)}
                 onChange={(e) => {
-                  setSelectedBranch(e.target.value)
+                  setChosenBranch(e.target.value)
                   void _onRefetchCatalog()
                 }}
                 className="w-full rounded-md border border-border bg-panel-2 pl-2 pr-7 py-1 text-[12px] text-ink outline-none focus:border-accent font-mono appearance-none"
