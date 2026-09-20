@@ -7,6 +7,7 @@ import { skillKeys, fetchSkills } from '../../lib/agent-api'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
+import { isChatModel } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
 import { compactCodeSession, execShellCommand, revertCodeSession, sendCodeQueuedTurnNow, startCodeRun, steerOutcomeMessage, stopCodeSession } from '../../lib/code-api'
 import type { CodeAgent, QueuedTurn, ShellRun, SteerKind } from '../../lib/code-types'
@@ -175,7 +176,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   const engineState = status?.engine.state
   const modelsQ = useModels()
   const modelActions = useModelActions()
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||

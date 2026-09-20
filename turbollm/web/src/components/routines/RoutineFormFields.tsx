@@ -4,6 +4,7 @@ import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
+import { isChatModel } from '../../lib/model-kind'
 
 // Labels say plainly which one runs in-process and which shell out — the distinction that the
 // value names encode with the `_cli` suffix (routine-types.ts).
@@ -71,7 +72,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   const [browserOpen, setBrowserOpen] = useState(false)
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
-  const models = modelsQ.data?.models ?? []
+  const models = (modelsQ.data?.models ?? []).filter(isChatModel)
   const agents = agentsQ.data ?? []
   // A controlled <select> whose value matches no <option> falls back to the first one — here the
   // placeholder — so the field would read as unset while the draft still holds a real value and

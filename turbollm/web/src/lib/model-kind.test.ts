@@ -1,0 +1,34 @@
+// ADR-434 (f): a Jev model labels premise/hypothesis pairs and can never chat, so every list
+// that says "pick a model to talk to" must leave it out. One predicate, so no picker can drift.
+import { describe, expect, it } from 'vitest'
+import { isChatModel } from './model-kind'
+import type { JevInfo, ModelEntry } from './types'
+
+const JEV_INFO: JevInfo = {
+  labels: ['contradiction', 'entailment', 'neutral'],
+  nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+  architecture: 'Qwen3_5ForSequenceClassification',
+  verified: true,
+}
+
+function model(fields: Partial<ModelEntry>): ModelEntry {
+  return fields as ModelEntry
+}
+
+describe('isChatModel', () => {
+  it('accepts an ordinary model, which carries no jev descriptor', () => {
+    expect(isChatModel(model({ key: 'qwen3-8b' }))).toBe(true)
+  })
+
+  it('rejects a Jev model', () => {
+    expect(isChatModel(model({ key: 'qwen3.5 4b nli v2', jev: JEV_INFO }))).toBe(false)
+  })
+
+  it('still rejects a Jev model that is not verified, since it can never chat either', () => {
+    expect(isChatModel(model({ jev: { ...JEV_INFO, verified: false } }))).toBe(false)
+  })
+
+  it('does not drop an embedding model: removing those from pickers is a different, undecided change', () => {
+    expect(isChatModel(model({ key: 'nomic-embed', embedding: true }))).toBe(true)
+  })
+})

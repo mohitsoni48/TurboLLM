@@ -8,9 +8,10 @@ import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../lib/api'
 import type { CodeSessionDetail } from '../../lib/code-api'
+import type { ModelEntry } from '../../lib/types'
 
 // jsdom's environment doesn't wire up a working localStorage (authHeaders() reads it on every
 // call) — same gap CodeComposer.test.tsx/CodeGitDialog.test.tsx/code-api.test.ts already work around.
@@ -58,12 +59,14 @@ vi.mock('../../lib/code-api', async (importOriginal) => {
 })
 
 // ── lib/queries.ts (useStatus/useModels/useModelActions) — this screen only reads status ──
+// The library is empty unless a test sets it, so the tests that don't care see what they always saw.
+let mockLibrary: Array<Partial<ModelEntry>> = []
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
   return {
     ...actual,
     useStatus: () => ({ data: { engine: { state: 'running' } } }),
-    useModels: () => ({ data: { models: [] } }),
+    useModels: () => ({ data: { models: mockLibrary } }),
     useModelActions: () => ({
       load: { mutate: vi.fn(), isPending: false },
       eject: { mutate: vi.fn(), isPending: false },
@@ -90,16 +93,33 @@ vi.mock('./CodeTranscript', () => ({
   CodeTranscriptSkeleton: () => null,
   TodoChecklist: () => null,
 }))
+let modelsOfferedByComposer: Array<Partial<ModelEntry>> = []
+let modelsOfferedByTerminalToolbar: Array<Partial<ModelEntry>> = []
 // A minimal, interactive stand-in for the real composer — exposes exactly the two triggers these
 // tests need (a plain send and a steer send) without depending on its own internal state machine.
 vi.mock('./CodeComposer', () => ({
-  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void }) => (
-    <div>
-      <textarea aria-label="composer" value={props.value} onChange={(e) => props.onValueChange(e.target.value)} />
-      <button onClick={() => props.onSubmit()}>Send</button>
-      <button onClick={() => props.onSubmit('steer')}>Steer</button>
-    </div>
-  ),
+  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void; models: Array<Partial<ModelEntry>> }) => {
+    modelsOfferedByComposer = props.models
+    return (
+      <div>
+        <textarea aria-label="composer" value={props.value} onChange={(e) => props.onValueChange(e.target.value)} />
+        <button onClick={() => props.onSubmit()}>Send</button>
+        <button onClick={() => props.onSubmit('steer')}>Steer</button>
+      </div>
+    )
+  },
+}))
+// A terminal-agent session (claude/pi/opencode) mounts these two instead of the composer; the real
+// TerminalView needs a canvas that jsdom does not have.
+vi.mock('./TerminalView', async () => {
+  const { forwardRef } = await import('react')
+  return { TerminalView: forwardRef(() => null) }
+})
+vi.mock('./TerminalToolbar', () => ({
+  TerminalToolbar: (props: { models: Array<Partial<ModelEntry>> }) => {
+    modelsOfferedByTerminalToolbar = props.models
+    return null
+  },
 }))
 
 const toastSuccess = vi.fn()
@@ -258,5 +278,42 @@ describe('CodeSessionScreen — toast-on-send', () => {
     await user.type(screen.getByLabelText('composer'), 'go')
     await user.click(screen.getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(connectSpy).toHaveBeenCalled())
+  })
+})
+
+// ADR-434 (f): a Jev model labels text and can never chat or run an agent, so the Code session's
+// model picker must not offer it — even under vLLM, where it is "compatible with the active engine".
+describe('CodeSessionScreen — model picker offers chat models only', () => {
+  const chatModel: Partial<ModelEntry> = { key: 'qwen3-8b', name: 'Qwen3 8B', compatibleWithActiveEngine: true }
+  const jevModel: Partial<ModelEntry> = {
+    key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', compatibleWithActiveEngine: true,
+    jev: { labels: ['contradiction', 'entailment', 'neutral'], nliTemplate: 'Premise: {premise} Hypothesis: {hypothesis}', architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+  }
+  const wrongEngineChatModel: Partial<ModelEntry> = { key: 'gguf-on-vllm', name: 'GGUF on vLLM', compatibleWithActiveEngine: false }
+
+  beforeEach(async () => {
+    mockLibrary = [chatModel, jevModel, wrongEngineChatModel]
+    modelsOfferedByComposer = []
+    modelsOfferedByTerminalToolbar = []
+    getCodeSessionMock.mockReset()
+    ScreenComp = await importScreen()
+  })
+
+  afterEach(() => { mockLibrary = [] })
+
+  it('the composer is offered the engine-compatible chat model and not the Jev model', async () => {
+    getCodeSessionMock.mockResolvedValue(detail())
+    renderScreen()
+    await screen.findByLabelText('composer')
+    expect(modelsOfferedByComposer.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+
+  it('the toolbar of a terminal-agent session is offered the same list', async () => {
+    const terminalSession = detail()
+    terminalSession.session.codeAgent = 'claude'
+    getCodeSessionMock.mockResolvedValue(terminalSession)
+    renderScreen()
+    await waitFor(() => expect(modelsOfferedByTerminalToolbar.length).toBeGreaterThan(0))
+    expect(modelsOfferedByTerminalToolbar.map((m) => m.key)).toEqual(['qwen3-8b'])
   })
 })
