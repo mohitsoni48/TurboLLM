@@ -9,7 +9,7 @@ import {
   CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL,
   type RoutineToolsStore,
 } from './routine-tools'
-import { CODE_GATE_MESSAGE } from './routine-routes'
+import { CODE_GATE_MESSAGE, JEV_ROUTINE_MODEL_MESSAGE } from './routine-routes'
 
 function freshStore(): ConversationStore {
   return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-tools-test-')))
@@ -815,4 +815,54 @@ test('the create_routine modelKey description warns off Jev models', () => {
 
   assert.match(modelKey.description, /kind: jev/)
   assert.match(modelKey.description, /cannot run a routine/)
+})
+
+// ── the model-callable tools refuse a Jev model too (QA gap G2) ──────────────────────────────
+// These executors write to the store directly, not through POST/PUT /api/v1/routines, so T25a's
+// route-level refusal does not cover them.
+
+const JEV_TOOL_KEY = 'jev-fake-v2'
+const isJev = (key: string) => key === JEV_TOOL_KEY
+
+test('execCreateRoutine: a Jev modelKey is refused and nothing is stored', async () => {
+  const store = freshStore()
+
+  const msg = await execCreateRoutine({
+    flavor: 'chat', prompt: 'Summarize my inbox', scheduleDisplay: 'Runs daily at 9:00 AM',
+    scheduleRule: { kind: 'daily', hour: 9, minute: 0 }, modelKey: JEV_TOOL_KEY, agentId: 'agent-1',
+  }, store, false, undefined, isJev)
+
+  assert.equal(msg, `Error: ${JEV_ROUTINE_MODEL_MESSAGE(JEV_TOOL_KEY)}`)
+  assert.equal(store.listRoutines().length, 0)
+})
+
+test('execCreateRoutine: without the predicate the same call is unchanged', async () => {
+  const store = freshStore()
+
+  const msg = await execCreateRoutine({
+    flavor: 'chat', prompt: 'Summarize my inbox', scheduleDisplay: 'Runs daily at 9:00 AM',
+    scheduleRule: { kind: 'daily', hour: 9, minute: 0 }, modelKey: JEV_TOOL_KEY, agentId: 'agent-1',
+  }, store)
+
+  assert.match(msg, /pending_confirmation/)
+  assert.equal(store.listRoutines().length, 1)
+})
+
+test('execUpdateRoutine: switching a routine to a Jev model is refused, even with confirm', async () => {
+  const store = freshStore()
+  const created = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+
+  const msg = execUpdateRoutine({ routineId: created.id, modelKey: JEV_TOOL_KEY, confirm: true }, store, false, isJev)
+
+  assert.equal(msg, `Error: ${JEV_ROUTINE_MODEL_MESSAGE(JEV_TOOL_KEY)}`)
+  assert.equal(store.getRoutine(created.id)?.modelKey, 'm')
+})
+
+test('execUpdateRoutine: without the predicate the same edit still applies', () => {
+  const store = freshStore()
+  const created = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+
+  execUpdateRoutine({ routineId: created.id, modelKey: JEV_TOOL_KEY, confirm: true }, store)
+
+  assert.equal(store.getRoutine(created.id)?.modelKey, JEV_TOOL_KEY)
 })
