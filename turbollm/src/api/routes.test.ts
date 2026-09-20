@@ -155,3 +155,20 @@ test('GET /api/v1/status reports the loaded Jev model', async () => {
     key: JEV_KEY, name: 'qwen3.5 4b nli v2', labels: OPENJEV.labels, state: 'running', slot: 'primary',
   })
 })
+
+// `GET /api/v1/activity` (ADR-434 (i)(3)) is registered by registerApi itself, synchronously, so it
+// can never fall behind the SPA fallback (ADR-421).
+test('registerApi registers GET /api/v1/activity', async () => {
+  const d = {
+    store: { snapshot: () => ({}) },
+    manager: { status: () => ({ state: 'stopped' }), sessionStats: () => ({ activeRequests: 0 }) },
+    db: { getConversation: () => null, getAgentRun: () => null, getRoutine: () => null },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const res = await app.request('/api/v1/activity')
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { items: [], engineGenerating: false })
+})

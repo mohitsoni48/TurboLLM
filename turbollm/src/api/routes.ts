@@ -74,6 +74,7 @@ import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } fr
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
+import { registerActivityRoutes } from './active-work'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -186,6 +187,11 @@ export function registerApi(app: Hono, d: Deps): void {
       features: enabledFeatures(),
     })
   })
+
+  // What a model load would interrupt (ADR-434 (i)(3)). Its own module so this 3,000-line hub
+  // does not grow another handler, registered HERE and synchronously so it can never end up
+  // behind the SPA fallback (ADR-421).
+  registerActivityRoutes(app, d)
 
   // ---- artifact screenshot (faithful export) ----
   // Pixel-perfect raster of an HTML artifact via a real headless Chrome (ADR-121 follow-up).

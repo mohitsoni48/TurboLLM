@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, codeAuth } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, codeAuth, requiredCapability } from './auth'
 import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
@@ -473,4 +473,13 @@ test('codeAuth: the same request with an ungranted legacy key still passes', asy
   await codeAuth(d)(c, async () => { called = true })
   assert.equal(called, true)
   assert.equal(jsonResult(), undefined)
+})
+
+// GET /api/v1/activity names running chats, Code turns and routines so a model load can ask first
+// (ADR-434 (i)(3)). Only a caller that may load models needs that, and routine names are not a
+// models:use read; the route is read-only, so a write has no capability at all (ADR-422).
+test('requiredCapability: reading /api/v1/activity needs models:load; nothing may write it', () => {
+  assert.equal(requiredCapability('GET', '/api/v1/activity'), 'models:load')
+  assert.equal(requiredCapability('HEAD', '/api/v1/activity'), 'models:load')
+  assert.equal(requiredCapability('POST', '/api/v1/activity'), null)
 })
