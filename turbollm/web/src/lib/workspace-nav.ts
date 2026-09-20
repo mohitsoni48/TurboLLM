@@ -12,6 +12,8 @@
 // session", not a durable cross-session preference like theme/fontSize (stores/ui.ts). A fresh
 // browser session starts clean on Chat, same as today.
 
+import { JEV_PATH } from './jev-mode'
+
 const KEY = 'tllm.workspace.lastPath'
 const DEFAULT_PATH = '/workspace/chat'
 
@@ -20,7 +22,7 @@ const DEFAULT_PATH = '/workspace/chat'
 export function getLastWorkspacePath(): string {
   try {
     const v = sessionStorage.getItem(KEY)
-    return v && v.startsWith('/workspace/') ? v : DEFAULT_PATH
+    return v && v.startsWith('/workspace/') && !isJevPlayground(v) ? v : DEFAULT_PATH
   } catch {
     return DEFAULT_PATH
   }
@@ -29,7 +31,7 @@ export function getLastWorkspacePath(): string {
 /** Call on every route change (Shell.tsx). No-op for anything outside /workspace — leaving
  *  Workspace for another section must not overwrite what was remembered there. */
 export function rememberWorkspacePath(pathname: string): void {
-  if (!pathname.startsWith('/workspace/')) return
+  if (!pathname.startsWith('/workspace/') || isJevPlayground(pathname)) return
   try {
     sessionStorage.setItem(KEY, pathname)
   } catch {
@@ -42,4 +44,12 @@ export function rememberWorkspacePath(pathname: string): void {
  *  Ctrl+1-9 shortcut, and the mobile nav bar (Shell.tsx, three separate render sites) can't drift. */
 export function resolveNavTarget(to: string): string {
   return to === '/workspace' ? getLastWorkspacePath() : to
+}
+
+/** ADR-434 (i)(2): the Jev Playground is a /workspace/* route, but it exists only while a Jev
+ *  model is loaded. Remembering it would trap the user — unloading the model would send them
+ *  back to a route that immediately redirects, instead of the chat or session they left. Both
+ *  the write and the read reject it, so a value stored by an older build is ignored too. */
+function isJevPlayground(pathname: string): boolean {
+  return pathname === JEV_PATH || pathname.startsWith(`${JEV_PATH}/`)
 }
