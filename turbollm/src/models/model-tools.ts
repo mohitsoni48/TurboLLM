@@ -10,7 +10,7 @@
  *  structurally (TypeScript structural typing, same idiom as RoutineToolsStore/AgentToolsStore)
  *  — cli.ts just passes `scanner`. Kept narrow so tests can stub it with a plain object. */
 export interface ModelToolsStore {
-  list(): { models: Array<{ key: string; name: string; quant: string; sizeLabel: string }> }
+  list(): { models: Array<{ key: string; name: string; quant: string; sizeLabel: string; jev?: unknown }> }
 }
 
 export const LIST_MODELS_TOOL = {
@@ -20,13 +20,22 @@ export const LIST_MODELS_TOOL = {
     description:
       'List every model in TurboLLM\'s local library, with the exact modelKey each one needs — a compound ' +
       'id (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"), never a generic name like "gpt-4" or "claude". ' +
-      'Use this BEFORE calling create_routine to get a real modelKey — never guess one.',
+      'Use this BEFORE calling create_routine to get a real modelKey — never guess one.' +
+      ' Models marked "kind: jev" label text and cannot chat — never use one as a routine modelKey.',
     parameters: { type: 'object', properties: {} },
   },
+}
+
+/** One catalog line. A Jev model stays listed — a caller that wants to classify needs its key —
+ *  but the line says what it is, because it can neither chat nor be a routine model
+ *  (ADR-434 (f)). Shared with the MCP bridge's own list_models so the two never drift. */
+export function formatModelLine(m: { key: string; name: string; quant: string; sizeLabel: string; jev?: unknown }): string {
+  const line = `- ${m.key} — ${m.name} (${m.quant}, ${m.sizeLabel})`
+  return m.jev ? `${line} — kind: jev (labels text; cannot chat or run a routine)` : line
 }
 
 export function execListModels(_args: Record<string, unknown>, store: ModelToolsStore): string {
   const { models } = store.list()
   if (models.length === 0) return 'No models in the library yet — add one in TurboLLM\'s Models screen first.'
-  return models.map((m) => `- ${m.key} — ${m.name} (${m.quant}, ${m.sizeLabel})`).join('\n')
+  return models.map(formatModelLine).join('\n')
 }

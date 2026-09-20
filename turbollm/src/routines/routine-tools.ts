@@ -154,7 +154,7 @@ export const CREATE_ROUTINE_TOOL = {
         prompt: { type: 'string', description: 'The task to run, in the same words a user would ask it.' },
         scheduleDisplay: { type: 'string', description: 'Human-readable schedule, e.g. "Runs weekdays at 9:00 AM". Must accurately describe scheduleRule.' },
         scheduleRule: SCHEDULE_RULE_SCHEMA,
-        modelKey: { type: 'string', description: 'One of TurboLLM\'s own model keys — a compound id (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"), never a generic name like "gpt-4" or "claude". Call list_models first if you don\'t already know a real one; never guess.' },
+        modelKey: { type: 'string', description: 'One of TurboLLM\'s own model keys — a compound id (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"), never a generic name like "gpt-4" or "claude". Call list_models first if you don\'t already know a real one; never guess. Never pick a model list_models marks "kind: jev" — it labels text and cannot run a routine.' },
         agentId: { type: 'string', description: 'Required when flavor is "chat": an existing Customize -> Agents persona id.' },
         workspacePath: { type: 'string', description: 'Required when flavor is "code": absolute path to the workspace directory.' },
         // Driven off schema.ts's list, not a second hand-maintained copy: this enum is what a MODEL

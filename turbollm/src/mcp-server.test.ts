@@ -315,3 +315,21 @@ test('list_models: formats the exact compound modelKey, not a generic display na
   const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
   assert.equal(text, '- gemma 4 26b a4b qat|Q4_0|14439362752 — Gemma 4 26B A4B QAT (Q4_0, 26B-A4B)')
 })
+
+// QA gap G2: the MCP bridge's own list_models renders the daemon's rows, so it must mark a Jev
+// model exactly as the in-app tool does — the two lists are what a model picks a routine's
+// modelKey from.
+test('list_models (MCP): a Jev row is marked kind: jev, a chat row is unchanged', async () => {
+  const f = fakeFetch([() => json({ models: [
+    { key: 'qwen3-8b', name: 'Qwen3 8B', quant: 'Q4_K_M', sizeLabel: '8B' },
+    { key: 'jev-fake-v2', name: 'jev fake v2', quant: 'mlx-fp16', sizeLabel: '4B', jev: { labels: ['contradiction', 'entailment', 'neutral'], architecture: 'Qwen3_5ForSequenceClassification', verified: true } },
+  ] })])
+
+  const res = await handleMcpRequest(toolCallReq('list_models', {}), BASE, '1.0.0', f)
+
+  const text = (res!.result as { content: Array<{ text: string }> }).content[0].text
+  assert.deepEqual(text.split('\n'), [
+    '- qwen3-8b — Qwen3 8B (Q4_K_M, 8B)',
+    '- jev-fake-v2 — jev fake v2 (mlx-fp16, 4B) — kind: jev (labels text; cannot chat or run a routine)',
+  ])
+})

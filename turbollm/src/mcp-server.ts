@@ -39,7 +39,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL } from './routines/routine-tools'
 import { validateCreate, type RoutineBody } from './routines/routine-routes'
 import { LIST_AGENTS_TOOL, CREATE_AGENT_TOOL } from './chat/chat-agent-tools'
-import { LIST_MODELS_TOOL } from './models/model-tools'
+import { LIST_MODELS_TOOL, formatModelLine } from './models/model-tools'
 import type { Routine } from './routines/schema'
 import type { CustomChatAgent } from './config/config'
 import type { ModelEntry } from './models/scanner'
@@ -231,7 +231,7 @@ async function listModelsText(baseUrl: string, fetchImpl: typeof fetch): Promise
   if (!res.ok) return `Error: ${await describeHttpError(res)}`
   const { models } = await res.json() as { models: ModelEntry[] }
   if (models.length === 0) return 'No models in the library yet — add one in TurboLLM\'s Models screen first.'
-  return models.map((m) => `- ${m.key} — ${m.name} (${m.quant}, ${m.sizeLabel})`).join('\n')
+  return models.map(formatModelLine).join('\n')
 }
 
 async function listRoutinesText(baseUrl: string, fetchImpl: typeof fetch): Promise<string> {

@@ -807,3 +807,12 @@ test('update_routine and delete_routine require routineId', () => {
   assert.deepEqual(DELETE_ROUTINE_TOOL.function.parameters.required, ['routineId'])
   assert.deepEqual(RUN_ROUTINE_NOW_TOOL.function.parameters.required, ['routineId'])
 })
+
+// QA gap G2: the tool that asks a model to pick a modelKey must steer it away from the models
+// list_models marks as Jev.
+test('the create_routine modelKey description warns off Jev models', () => {
+  const modelKey = (CREATE_ROUTINE_TOOL.function.parameters.properties as Record<string, { description: string }>).modelKey
+
+  assert.match(modelKey.description, /kind: jev/)
+  assert.match(modelKey.description, /cannot run a routine/)
+})
