@@ -262,4 +262,22 @@ describe('RoutineFormFields — model picker offers chat models only', () => {
     renderForm()
     expect(screen.getByRole('option', { name: /GGUF on vLLM/ })).toBeInTheDocument()
   })
+
+  // A routine saved before this release can name a model that is now detected as Jev. The model
+  // IS in the catalog, so calling it missing would be false; it just cannot run a routine.
+  it('says a stored Jev model is a Jev model, not that it is missing from the catalog', () => {
+    mockLibrary = [MODEL_A, jevModel]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: jevModel.key! }, vi.fn())
+    const select = screen.getByLabelText('Model') as HTMLSelectElement
+    expect(screen.getByRole('option', { name: /qwen3\.5 4b nli v2 \(a Jev model/ })).toBeInTheDocument()
+    expect(screen.queryByText(/not in the current catalog/)).not.toBeInTheDocument()
+    expect(select.value).toBe(jevModel.key)
+  })
+
+  it('still calls a stored key that is in no catalog entry at all missing, beside a Jev model', () => {
+    mockLibrary = [MODEL_A, jevModel]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: 'deleted-model' }, vi.fn())
+    expect(screen.getByRole('option', { name: /deleted-model \(not in the current catalog\)/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /a Jev model/ })).not.toBeInTheDocument()
+  })
 })
