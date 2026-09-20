@@ -17,13 +17,16 @@ import rehypeRaw from 'rehype-raw'
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize'
 import { ChevronDown, Download, ExternalLink, Lock, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
-import { useDownloadMutations, useHfRepo, useModelActions, useSettings, useStatus, useSysInfo } from '../../lib/queries'
+import { useModelLoader } from '../../lib/model-loader'
+import { useDownloadMutations, useHfRepo, useSettings, useStatus, useSysInfo } from '../../lib/queries'
 import { useLinks, useRemoteDownloadActions } from '../../lib/link-queries'
 import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
-import type { FitVerdict, HfRepoFile } from '../../lib/types'
+import type { FitVerdict, HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
 import { gpuBudgetMb } from '../../lib/vram'
+import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
+import { CheckpointPicker } from './CheckpointPicker'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '../../components/ui/dropdown-menu'
 import { Sheet, SheetContent } from '../../components/ui/sheet'
 import { toast } from '../../components/ui/sonner'
@@ -108,7 +111,7 @@ export function HfRepoContent({
   const detailQ = useHfRepo(repo)
   const sysQ = useSysInfo()
   const dlMut = useDownloadMutations()
-  const actions = useModelActions()
+  const loader = useModelLoader()
   // Host-gated and soft: no links (or a browser off-box) means the plain local button.
   const links = useLinks().data ?? []
   const remoteDl = useRemoteDownloadActions()
@@ -210,27 +213,51 @@ export function HfRepoContent({
     )
   }
 
+  const queueInto = (files: HfRepoFile[], subdir: string) => {
+    if (!detail) return
+    for (const f of files) {
+      dlMut.enqueue.mutate({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir })
+    }
+    toast.success(`Queued ${files.length} files for ${subdir}`)
+    onClose()
+  }
+
   // Safetensors repos (MLX / vLLM) download all component files into a subdirectory.
   const onDownloadSafetensors = () => {
     if (!detail?.safetensors || !detail.files.length) return
-    const subdir = detail.repo.split('/').pop() ?? detail.repo
-    let queued = 0
-    for (const f of detail.files) {
-      dlMut.enqueue.mutate({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir })
-      queued++
-    }
-    toast.success(`Queued ${queued} files for ${subdir}`)
-    onClose()
+    queueInto(detail.files, detail.repo.split('/').pop() ?? detail.repo)
+  }
+
+  /** One checkpoint folder lands in its own subdirectory; a root checkpoint keeps today's
+   *  plain repo folder, so a single-checkpoint repo downloads exactly where it always did. */
+  const onDownloadCheckpoint = (cp: HfCheckpoint) => {
+    if (!detail) return
+    const repoName = detail.repo.split('/').pop() ?? detail.repo
+    queueInto(cp.files, cp.dir ? `${repoName}/${cp.dir}` : repoName)
   }
 
   const onLoad = () => {
     const key = selectedFile?.localKey
     if (!key) return
-    actions.load.mutate(
-      { key },
+    loader.requestLoad(
+      { key, name: selectedFile?.name ?? '', isJev: false },
       {
         onSuccess: () => {
           toast.success(`Loading ${selectedFile?.quant ?? 'model'}`)
+          onClose()
+        },
+        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
+      },
+    )
+  }
+
+  const onLoadCheckpoint = (cp: HfCheckpoint) => {
+    if (!cp.localKey) return
+    loader.requestLoad(
+      { key: cp.localKey, name: cp.name, isJev: !!cp.jev },
+      {
+        onSuccess: () => {
+          toast.success(`Loading ${cp.name}`)
           onClose()
         },
         onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
@@ -264,14 +291,16 @@ export function HfRepoContent({
           onSearch={onSearch ? () => onSearch(repoSearchTerm(repo)) : undefined}
         />
       ) : isSafetensors ? (
-        <MlxRepoBody
+        <SafetensorsBody
           detail={detail}
           vramMb={vramMb}
           engineKind={engineKind}
           hfTokenSet={hfTokenSet}
           blockedByGate={blockedByGate}
-          onDownload={onDownloadSafetensors}
-          isPending={dlMut.enqueue.isPending}
+          enqueuePending={dlMut.enqueue.isPending}
+          onDownloadRepo={onDownloadSafetensors}
+          onDownloadCheckpoint={onDownloadCheckpoint}
+          onLoadCheckpoint={onLoadCheckpoint}
         />
       ) : !detail || ggufFiles.length === 0 ? (
         <div className="py-10 text-center text-[13px] text-muted">No GGUF files found in this repo.</div>
@@ -308,7 +337,7 @@ export function HfRepoContent({
           {/* Primary action */}
           <div className="flex items-center gap-2">
             {selectedIsLocal && selectedFile?.localKey ? (
-              <Button className="flex-1" onClick={() => { track('models', 'load_hf_quant'); onLoad() }} disabled={actions.load.isPending}>
+              <Button className="flex-1" onClick={() => { track('models', 'load_hf_quant'); onLoad() }} disabled={loader.isPending}>
                 <Zap size={14} />
                 Load
               </Button>
@@ -561,6 +590,90 @@ function GatedNotice({ repo, hfTokenSet }: { repo: string; hfTokenSet: boolean }
           Accept the license on {hfLink}, then add a Hugging Face token in Settings → Models.
         </p>
       )}
+    </div>
+  )
+}
+
+type SafetensorsBodyProps = {
+  detail: HfRepoDetail
+  vramMb: number | undefined
+  engineKind: string
+  hfTokenSet: boolean
+  blockedByGate: boolean
+  enqueuePending: boolean
+  onDownloadRepo: () => void
+  onDownloadCheckpoint: (cp: HfCheckpoint) => void
+  onLoadCheckpoint: (cp: HfCheckpoint) => void
+}
+
+/** Safetensors repos, split by how many model folders the daemon found (ADR-434 (h)).
+ *  No list at all means a daemon too old to look for them — that still downloads the root. */
+function SafetensorsBody(props: SafetensorsBodyProps) {
+  const checkpoints = props.detail.checkpoints
+  if (!checkpoints) return <WholeRepoBody {...props} />
+  if (checkpoints.length === 0) return <NoCheckpointNotice />
+  if (checkpoints.length === 1) return <OneCheckpointBody checkpoint={checkpoints[0]} {...props} />
+  return (
+    <CheckpointPicker
+      repo={props.detail.repo}
+      checkpoints={checkpoints}
+      vramMb={props.vramMb}
+      blockedByGate={props.blockedByGate}
+      enqueuePending={props.enqueuePending}
+      onDownload={props.onDownloadCheckpoint}
+      onLoad={props.onLoadCheckpoint}
+    />
+  )
+}
+
+function WholeRepoBody(props: SafetensorsBodyProps) {
+  return (
+    <MlxRepoBody
+      detail={props.detail}
+      vramMb={props.vramMb}
+      engineKind={props.engineKind}
+      hfTokenSet={props.hfTokenSet}
+      blockedByGate={props.blockedByGate}
+      onDownload={props.onDownloadRepo}
+      isPending={props.enqueuePending}
+    />
+  )
+}
+
+/** The repo IS the model, so it reads exactly as it did before checkpoints existed — only a
+ *  nested folder swaps in its own file list and its own download target. */
+function OneCheckpointBody({ checkpoint, ...props }: SafetensorsBodyProps & { checkpoint: HfCheckpoint }) {
+  const nested = checkpoint.dir !== ''
+  return (
+    <>
+      <CheckpointTags checkpoint={checkpoint} />
+      <MlxRepoBody
+        detail={nested ? { ...props.detail, files: checkpoint.files } : props.detail}
+        vramMb={props.vramMb}
+        engineKind={props.engineKind}
+        hfTokenSet={props.hfTokenSet}
+        blockedByGate={props.blockedByGate}
+        onDownload={nested ? () => props.onDownloadCheckpoint(checkpoint) : props.onDownloadRepo}
+        isPending={props.enqueuePending}
+      />
+    </>
+  )
+}
+
+function CheckpointTags({ checkpoint }: { checkpoint: HfCheckpoint }) {
+  if (!checkpoint.jev) return null
+  return (
+    <div className="mb-3 flex flex-wrap items-center gap-2">
+      <Badge variant="accent">Jev model</Badge>
+      {!checkpoint.jev.verified && <Badge>Not verified</Badge>}
+    </div>
+  )
+}
+
+function NoCheckpointNotice() {
+  return (
+    <div className="py-10 text-center text-[13px] text-muted">
+      No model checkpoint in this repo — it has weight files, but no folder with a config.json next to them.
     </div>
   )
 }
