@@ -37,6 +37,15 @@ test('buildSystemPrompt: blank agent still returns an empty system prompt (uncha
   assert.equal(buildSystemPrompt('blank', 'ignored', { assistantName: '', userName: '', customInstructions: '' }), '')
 })
 
+// ADR-434 (d): the in-app assistant describes TurboLLM's gateway from this text, so it has to name the
+// two Jev endpoints or it will tell a user there is no way to classify or rerank.
+test('the TurboLLM Expert persona lists /v1/classify and /v1/rerank in its Gateway section', () => {
+  const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
+  assert.ok(expert)
+  const gateway = expert!.systemPrompt.split('## Gateway')[1].split('\n## ')[0]
+  assert.match(gateway, /\*\*OpenAI-compatible\*\*: .*`POST \/v1\/embeddings`, `POST \/v1\/classify`, `POST \/v1\/rerank` \(Jev models\)/)
+})
+
 // getDefaultAgentId/getConvAgentId's isAndroid fallback (personas.ts) isn't covered here: both
 // read/write `localStorage`, which this suite's node:test runner (tsx --test, no
 // --localstorage-file) only stubs — setItem/removeItem are undefined, so any test touching them

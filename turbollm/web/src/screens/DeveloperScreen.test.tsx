@@ -7,6 +7,7 @@
 // automatically on page load with no click required. The real security boundary is server-side
 // (keys-network.test.ts); this only verifies the UI honestly reflects that same state.
 import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { QueryClientProvider, QueryClient } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NetworkInfo } from '../lib/api'
@@ -145,5 +146,29 @@ describe('DeveloperScreen — TurboLLM MCP section', () => {
     // this section must render fully regardless, since it has nothing sensitive to protect.
     expect(screen.getByText('TurboLLM MCP')).toBeInTheDocument()
     expect(screen.getByText(/"command": "npx"/)).toBeInTheDocument()
+  })
+})
+
+// ADR-434 (d), ADR-414: the in-app API reference is what a developer builds against, so it must
+// list the two Jev endpoints the gateway now serves, right after /v1/embeddings and ahead of the
+// models list, and leave every existing row where it was.
+describe('DeveloperScreen — API reference', () => {
+  async function renderApiReferenceOpen() {
+    const { ApiReferenceSection } = await import('./DeveloperScreen')
+    const user = userEvent.setup()
+    render(<ApiReferenceSection />)
+    await user.click(screen.getByText('API reference'))
+  }
+
+  it('lists /v1/classify and /v1/rerank straight after /v1/embeddings, with the existing rows unchanged', async () => {
+    await renderApiReferenceOpen()
+    const paths = screen.getAllByText(/^\/v1\//).map((el) => el.textContent)
+    expect(paths).toEqual(['/v1/chat/completions', '/v1/messages', '/v1/embeddings', '/v1/classify', '/v1/rerank', '/v1/models'])
+  })
+
+  it('describes the two Jev endpoints in the words the plan gives', async () => {
+    await renderApiReferenceOpen()
+    expect(screen.getByText('Jev: label premise/hypothesis pairs')).toBeInTheDocument()
+    expect(screen.getByText('Jev: rerank documents')).toBeInTheDocument()
   })
 })
