@@ -7,24 +7,44 @@
 // is not "nothing is running".
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useModelLoader } from './model-loader'
+import { useJevLoadedToast, useModelLoader } from './model-loader'
 import { useJevLoadStore } from '../stores/jev-load'
-import type { ActiveWork } from './types'
+import type { ActiveWork, JevStatus, Status } from './types'
 
 const h = vi.hoisted(() => ({
   loadMutate: vi.fn(),
   getActivity: vi.fn(),
   loadIsPending: false,
   loadVariables: undefined as { key: string } | undefined,
+  status: undefined as Status | undefined,
+  pathname: '/models',
+  navigate: vi.fn(),
+  toastSuccess: vi.fn(),
+  track: vi.fn(),
 }))
 
 vi.mock('./queries', () => ({
   useModelActions: () => ({
     load: { mutate: h.loadMutate, isPending: h.loadIsPending, variables: h.loadVariables },
   }),
+  useStatus: () => ({ data: h.status }),
 }))
 
 vi.mock('./jev-api', () => ({ getActivity: () => h.getActivity() }))
+
+vi.mock('./api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./api')>()
+  return { ...actual, track: (...a: unknown[]) => h.track(...a) }
+})
+
+vi.mock('../components/ui/sonner', () => ({
+  toast: { success: (...a: unknown[]) => h.toastSuccess(...a), error: vi.fn() },
+}))
+
+vi.mock('react-router-dom', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('react-router-dom')>()
+  return { ...actual, useNavigate: () => h.navigate, useLocation: () => ({ pathname: h.pathname }) }
+})
 
 const JEV = { key: 'jev-key', name: 'qwen3.5 4b nli v2', isJev: true }
 const CHAT = { key: 'chat-key', name: 'qwen3.8 30b', isJev: false }
@@ -36,8 +56,13 @@ const API_GENERATING: ActiveWork = { items: [], engineGenerating: true }
 beforeEach(() => {
   h.loadMutate.mockReset()
   h.getActivity.mockReset()
+  h.navigate.mockReset()
+  h.toastSuccess.mockReset()
+  h.track.mockReset()
   h.loadIsPending = false
   h.loadVariables = undefined
+  h.status = undefined
+  h.pathname = '/models'
   useJevLoadStore.setState({ confirm: null, pendingJevKey: null })
 })
 
@@ -176,5 +201,102 @@ describe('pending state', () => {
     const result = loader()
     expect(result.current.isPending).toBe(false)
     expect(result.current.pendingKey).toBeUndefined()
+  })
+})
+
+// ADR-434 (i)(3): success is announced, never acted on. The toast offers the playground; only
+// the user's click goes there. (i)(4): a load this browser did not start — a Routine's pinned
+// swap, an API client's auto-swap — gets no toast at all, which is what `pendingJevKey` decides.
+const READY: JevStatus = {
+  key: 'jev-key',
+  name: 'qwen3.5 4b nli v2',
+  labels: ['contradiction', 'entailment', 'neutral'],
+  state: 'running',
+  slot: 'primary',
+}
+
+function statusWith(jev: JevStatus | null): Status {
+  return { jev } as unknown as Status
+}
+
+function toastAction() {
+  return (h.toastSuccess.mock.calls[0][1] as { action: { label: string; onClick: () => void } }).action
+}
+
+describe('useJevLoadedToast', () => {
+  it('announces the model this browser asked for, once it is really running', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith(READY)
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).toHaveBeenCalledTimes(1)
+    expect(h.toastSuccess.mock.calls[0][0]).toBe('qwen3.5 4b nli v2 is ready')
+    expect(toastAction().label).toBe('Open Jev Playground')
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+
+  it('does not fire again on the next status poll', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith(READY)
+
+    const { rerender } = renderHook(() => useJevLoadedToast())
+    h.status = statusWith({ ...READY })
+    rerender()
+    rerender()
+
+    expect(h.toastSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  it('never navigates by itself — only the toast action does', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith(READY)
+
+    renderHook(() => useJevLoadedToast())
+    expect(h.navigate).not.toHaveBeenCalled()
+
+    act(() => { toastAction().onClick() })
+
+    expect(h.track).toHaveBeenCalledWith('models', 'open_jev_playground_toast')
+    expect(h.navigate).toHaveBeenCalledWith('/workspace/jev')
+  })
+
+  it('stays quiet on the playground itself, but still stops waiting', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith(READY)
+    h.pathname = '/workspace/jev'
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).not.toHaveBeenCalled()
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+
+  it('says nothing for a Jev model this browser did not load', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith({ ...READY, key: 'someone-elses-key', name: 'other' })
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).not.toHaveBeenCalled()
+    expect(useJevLoadStore.getState().pendingJevKey).toBe('jev-key')
+  })
+
+  it('waits for "running" — a starting engine is not ready', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'jev-key' })
+    h.status = statusWith({ ...READY, state: 'starting' })
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).not.toHaveBeenCalled()
+    expect(useJevLoadStore.getState().pendingJevKey).toBe('jev-key')
+  })
+
+  it('says nothing when this browser started no load at all', () => {
+    h.status = statusWith(READY)
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).not.toHaveBeenCalled()
   })
 })
