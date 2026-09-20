@@ -195,20 +195,24 @@ describe('HfRepoDialog — a repo with several checkpoints', () => {
     ])
   })
 
-  it('loads an already-downloaded row through the shared loader, flagged as Jev', async () => {
+  it('loads an already-downloaded row through the shared loader, with the checkpoint\'s own jev', async () => {
     const downloaded = checkpoint({ downloaded: true, localKey: 'v2-key' })
     renderContent(repoDetail({ files: [], checkpoints: [downloaded, V1, BIG] }))
     await userEvent.click(await screen.findByRole('button', { name: 'Load' }))
     const [target, opts] = requestLoad.mock.calls[0]
-    expect(target).toEqual({ key: 'v2-key', name: 'qwen3.5-4b-nli-v2', isJev: true })
+    expect(target).toEqual({
+      key: 'v2-key',
+      name: 'qwen3.5-4b-nli-v2',
+      jev: { architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+    })
     expect(typeof opts.onSuccess).toBe('function')
     expect(typeof opts.onError).toBe('function')
   })
 
-  it('does not flag a plain safetensors checkpoint as Jev', async () => {
+  it('gives the loader nothing to confirm for a plain safetensors checkpoint', async () => {
     const plain = checkpoint({ downloaded: true, localKey: 'plain-key', jev: null })
     renderContent(repoDetail({ files: [], checkpoints: [plain, V1, BIG] }))
     await userEvent.click(await screen.findByRole('button', { name: 'Load' }))
-    expect(requestLoad.mock.calls[0][0].isJev).toBe(false)
+    expect(requestLoad.mock.calls[0][0].jev).toBeNull()
   })
 })

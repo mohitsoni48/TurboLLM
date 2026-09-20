@@ -240,7 +240,7 @@ export function HfRepoContent({
     const key = selectedFile?.localKey
     if (!key) return
     loader.requestLoad(
-      { key, name: selectedFile?.name ?? '', isJev: false },
+      { key, name: selectedFile?.name ?? '' },
       {
         onSuccess: () => {
           toast.success(`Loading ${selectedFile?.quant ?? 'model'}`)
@@ -254,7 +254,7 @@ export function HfRepoContent({
   const onLoadCheckpoint = (cp: HfCheckpoint) => {
     if (!cp.localKey) return
     loader.requestLoad(
-      { key: cp.localKey, name: cp.name, isJev: !!cp.jev },
+      { key: cp.localKey, name: cp.name, jev: cp.jev },
       {
         onSuccess: () => {
           toast.success(`Loading ${cp.name}`)

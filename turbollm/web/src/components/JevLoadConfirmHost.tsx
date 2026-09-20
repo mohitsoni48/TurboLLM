@@ -14,9 +14,8 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from './ui/alert-dialog'
-import { toast } from './ui/sonner'
-import { ApiError, track } from '../lib/api'
-import { useModelActions } from '../lib/queries'
+import { track } from '../lib/api'
+import { useModelLoader } from '../lib/model-loader'
 import { useJevLoadStore } from '../stores/jev-load'
 import type { ActiveWork, ActiveWorkItem } from '../lib/types'
 
@@ -27,16 +26,16 @@ const API_GENERATION = 'a request an API client is generating'
 export function JevLoadConfirmHost() {
   const confirm = useJevLoadStore((s) => s.confirm)
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
-  const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
-  const actions = useModelActions()
+  const { confirmLoad } = useModelLoader()
 
   if (!confirm) return null
-  const { target, work, overrides } = confirm
+  const { target, work, opts } = confirm
 
+  // The load runs through the loader, not a mutation of this dialog's own: a second observer
+  // would keep its own pending state and forget the caller's callbacks (ADR-436 (6)).
   function loadAnyway() {
     track('models', 'confirm_jev_load')
-    setPendingJevKey(target.key)
-    actions.load.mutate({ key: target.key, overrides }, { onError: (e) => toast.error(loadFailureMessage(e)) })
+    confirmLoad(target, opts)
     setConfirm(null)
   }
 
@@ -88,8 +87,4 @@ function describeItem(item: ActiveWorkItem): string {
   if (item.kind === 'chat') return `a reply in "${item.label}"`
   if (item.kind === 'code') return `a Code turn in "${item.label}"`
   return `the routine "${item.label}"`
-}
-
-function loadFailureMessage(e: unknown): string {
-  return `Could not load model: ${e instanceof ApiError ? e.message : 'check the engine logs on the Engines screen.'}`
 }

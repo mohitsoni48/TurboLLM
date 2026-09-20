@@ -936,7 +936,7 @@ export function ModelDetailDialog({
                   // the engine and the model "never loads again" with no feedback.
                   const fireLoad = () =>
                     loader.requestLoad(
-                      { key: detail.key, name: detail.name, isJev: !!detail.jev },
+                      detail,
                       {
                         overrides: draft,
                         onError: (e) =>

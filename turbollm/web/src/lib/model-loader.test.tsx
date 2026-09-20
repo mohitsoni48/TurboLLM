@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   pathname: '/models',
   navigate: vi.fn(),
   toastSuccess: vi.fn(),
+  toastError: vi.fn(),
   track: vi.fn(),
 }))
 
@@ -38,7 +39,7 @@ vi.mock('./api', async (importOriginal) => {
 })
 
 vi.mock('../components/ui/sonner', () => ({
-  toast: { success: (...a: unknown[]) => h.toastSuccess(...a), error: vi.fn() },
+  toast: { success: (...a: unknown[]) => h.toastSuccess(...a), error: (...a: unknown[]) => h.toastError(...a) },
 }))
 
 vi.mock('react-router-dom', async (importOriginal) => {
@@ -46,8 +47,14 @@ vi.mock('react-router-dom', async (importOriginal) => {
   return { ...actual, useNavigate: () => h.navigate, useLocation: () => ({ pathname: h.pathname }) }
 })
 
-const JEV = { key: 'jev-key', name: 'qwen3.5 4b nli v2', isJev: true }
-const CHAT = { key: 'chat-key', name: 'qwen3.8 30b', isJev: false }
+// The caller hands over what it already has about the model; the model's own `jev` field is
+// what decides, so there is no `isJev` flag a call site can forget (§5 ruling 9).
+const JEV = {
+  key: 'jev-key',
+  name: 'qwen3.5 4b nli v2',
+  jev: { labels: [], nliTemplate: null, architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+}
+const CHAT = { key: 'chat-key', name: 'qwen3.8 30b' }
 
 const IDLE: ActiveWork = { items: [], engineGenerating: false }
 const CHATTING: ActiveWork = { items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], engineGenerating: false }
@@ -58,6 +65,7 @@ beforeEach(() => {
   h.getActivity.mockReset()
   h.navigate.mockReset()
   h.toastSuccess.mockReset()
+  h.toastError.mockReset()
   h.track.mockReset()
   h.loadIsPending = false
   h.loadVariables = undefined
@@ -130,8 +138,20 @@ describe('requestLoad — a Jev model while work is running', () => {
 
     await waitFor(() => expect(useJevLoadStore.getState().confirm).not.toBeNull())
     expect(h.loadMutate).not.toHaveBeenCalled()
-    expect(useJevLoadStore.getState().confirm).toEqual({ target: JEV, work: CHATTING, overrides: { ctx: 8192 } })
+    expect(useJevLoadStore.getState().confirm).toEqual({ target: JEV, work: CHATTING, opts: { overrides: { ctx: 8192 } } })
     expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+
+  it('carries the caller\'s own handlers into the confirmation, so confirming changes nothing else', async () => {
+    h.getActivity.mockResolvedValue(CHATTING)
+    const onError = vi.fn()
+    const onSuccess = vi.fn()
+    const result = loader()
+
+    await act(async () => { result.current.requestLoad(JEV, { onError, onSuccess }) })
+
+    await waitFor(() => expect(useJevLoadStore.getState().confirm).not.toBeNull())
+    expect(useJevLoadStore.getState().confirm?.opts).toEqual({ onError, onSuccess })
   })
 
   it('counts a generation with no item of its own — an API client mid-request', async () => {
@@ -151,7 +171,7 @@ describe('requestLoad — a Jev model while work is running', () => {
     await act(async () => { result.current.requestLoad(JEV, { overrides: { ctx: 8192 } }) })
 
     await waitFor(() => expect(useJevLoadStore.getState().confirm).not.toBeNull())
-    expect(useJevLoadStore.getState().confirm).toEqual({ target: JEV, work: null, overrides: { ctx: 8192 } })
+    expect(useJevLoadStore.getState().confirm).toEqual({ target: JEV, work: null, opts: { overrides: { ctx: 8192 } } })
     expect(h.loadMutate).not.toHaveBeenCalled()
   })
 })
@@ -183,6 +203,94 @@ describe('a Jev load that fails', () => {
 
     mutateCallbacks().onSuccess?.()
     expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+})
+
+// QA E17, E31(c): a refused load is never a silent no-op. The handler is the loader's, not the
+// call site's, so a surface that passes nothing still says something.
+describe('a load nobody asked to hear about', () => {
+  it('toasts the failure of a chat load', async () => {
+    const result = loader()
+    await act(async () => { result.current.requestLoad(CHAT) })
+
+    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
+
+    expect(h.toastError).toHaveBeenCalledWith('Could not load model: check the engine logs on the Engines screen.')
+  })
+
+  it('relays the daemon\'s own words when it gave a reason', async () => {
+    const { ApiError } = await import('./api')
+    const result = loader()
+    await act(async () => { result.current.requestLoad(CHAT) })
+
+    act(() => { mutateCallbacks().onError?.(new ApiError('engine_start_failed', 'vLLM is not installed.', 409)) })
+
+    expect(h.toastError).toHaveBeenCalledWith('Could not load model: vLLM is not installed.')
+  })
+
+  it('toasts a Jev load failure too', async () => {
+    h.getActivity.mockResolvedValue(IDLE)
+    const result = loader()
+    await act(async () => { result.current.requestLoad(JEV) })
+    await waitFor(() => expect(h.loadMutate).toHaveBeenCalledTimes(1))
+
+    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
+
+    expect(h.toastError).toHaveBeenCalledTimes(1)
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+
+  it('stays out of the way when the caller handles the failure itself', async () => {
+    const onError = vi.fn()
+    const result = loader()
+    await act(async () => { result.current.requestLoad(CHAT, { onError }) })
+
+    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
+
+    expect(onError).toHaveBeenCalledTimes(1)
+    expect(h.toastError).not.toHaveBeenCalled()
+  })
+})
+
+// ADR-434 (i)(3): answering the confirmation must not change what the load does — same pending
+// key, same failure surface, same caller callbacks as the load that was never interrupted.
+describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
+  it('claims the toast for this browser, exactly as an unasked Jev load does', () => {
+    const result = loader()
+
+    act(() => { result.current.confirmLoad(JEV, {}) })
+
+    expect(h.loadMutate).toHaveBeenCalledTimes(1)
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: undefined })
+    expect(useJevLoadStore.getState().pendingJevKey).toBe('jev-key')
+  })
+
+  it('gives the toast back and says so once when the load fails', () => {
+    const result = loader()
+    act(() => { result.current.confirmLoad(JEV, {}) })
+
+    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
+
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+    expect(h.toastError).toHaveBeenCalledTimes(1)
+  })
+
+  it('still calls the caller\'s onSuccess, so the surface that asked can close itself', () => {
+    const onSuccess = vi.fn()
+    const result = loader()
+
+    act(() => { result.current.confirmLoad(JEV, { onSuccess }) })
+    mutateCallbacks().onSuccess?.()
+
+    expect(onSuccess).toHaveBeenCalledTimes(1)
+  })
+
+  it('carries the overrides the caller asked for', () => {
+    const result = loader()
+
+    act(() => { result.current.confirmLoad(JEV, { overrides: { ctx: 8192 } }) })
+
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 } })
   })
 })
 

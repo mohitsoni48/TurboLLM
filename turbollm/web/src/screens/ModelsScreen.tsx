@@ -373,7 +373,7 @@ export function ModelsScreen() {
         <LibraryTab
           modelsQ={modelsQ}
           actions={actions}
-          onLoad={(m) => loader.requestLoad({ key: m.key, name: m.name, isJev: !!m.jev })}
+          onLoad={(m) => loader.requestLoad(m)}
           loadBusy={loadBusy}
           loadingKey={loadingKey}
           dirs={dirs}

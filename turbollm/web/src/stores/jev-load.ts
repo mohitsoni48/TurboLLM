@@ -7,13 +7,23 @@
 import { create } from 'zustand'
 import type { ActiveWork, LoadProfile } from '../lib/types'
 
-/** The model a load site asked for. `isJev` is what decides whether the activity probe runs. */
-export type LoadTarget = { key: string; name: string; isJev: boolean }
+/** The model a load site asked for — its own `jev` field, not a flag the caller has to
+ *  remember, is what decides whether the activity probe runs (§5 ruling 9). Structural, so a
+ *  `ModelEntry` and an `HfCheckpoint`'s narrower `jev` both fit. */
+export type LoadTarget = { key: string; name: string; jev?: { architecture: string } | null }
+
+/** What a load site asks for beyond the model itself. Carried through the confirmation, so a
+ *  confirmed load behaves exactly like one that was never interrupted (ADR-434 (i)(3)). */
+export type LoadOptions = {
+  overrides?: Partial<LoadProfile>
+  onError?: (e: unknown) => void
+  onSuccess?: () => void
+}
 
 interface JevLoadState {
   /** `work: null` means the activity probe could not be read — which is NOT "nothing is
    *  running", so it still asks, with an honest "couldn't check" line. */
-  confirm: { target: LoadTarget; work: ActiveWork | null; overrides?: Partial<LoadProfile> } | null
+  confirm: { target: LoadTarget; work: ActiveWork | null; opts: LoadOptions } | null
   /** The key of a Jev load THIS browser fired — the one thing that entitles it to a toast. */
   pendingJevKey: string | null
   setConfirm(c: JevLoadState['confirm']): void

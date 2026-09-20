@@ -119,16 +119,20 @@ describe('ModelsScreen — Jev models', () => {
     expect(screen.getByText('no chat template')).toBeTruthy()
   })
 
-  it('loads a Jev model through the loader, flagged as Jev', async () => {
+  // The loader reads the model's own `jev` field, so the row hands the entry over whole rather
+  // than computing a flag this call site could forget (§5 ruling 9).
+  it('loads a Jev model through the loader, jev field and all', async () => {
     state.models = [jevEntry()]
     renderScreen()
     await userEvent.click(screen.getByRole('button', { name: 'Load' }))
-    expect(requestLoad).toHaveBeenCalledWith({ key: 'jev-1', name: 'qwen3.5-4b-nli-v2', isJev: true })
+    expect(requestLoad).toHaveBeenCalledWith(jevEntry())
+    expect(requestLoad.mock.calls[0][0].jev).toEqual(JEV)
   })
 
-  it('loads a plain model through the same loader, not flagged as Jev', async () => {
+  it('loads a plain model through the same loader, with nothing to confirm', async () => {
     renderScreen()
     await userEvent.click(screen.getByRole('button', { name: 'Load' }))
-    expect(requestLoad).toHaveBeenCalledWith({ key: 'local-1', name: 'Local Llama', isJev: false })
+    expect(requestLoad).toHaveBeenCalledWith(entry())
+    expect(requestLoad.mock.calls[0][0].jev).toBeUndefined()
   })
 })

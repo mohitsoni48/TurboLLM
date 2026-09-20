@@ -278,7 +278,7 @@ describe('JevPlaygroundScreen', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Switch model' }))
     await userEvent.click(within(screen.getByRole('group', { name: 'Chat models' })).getByRole('button'))
 
-    await waitFor(() => expect(h.requestLoad).toHaveBeenCalledWith({ key: 'gemma-27b', name: 'Gemma 27B', isJev: false }))
+    await waitFor(() => expect(h.requestLoad).toHaveBeenCalledWith(chat))
     expect(h.stopEngine).toHaveBeenCalledWith(KEY)
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_switch_model')
   })

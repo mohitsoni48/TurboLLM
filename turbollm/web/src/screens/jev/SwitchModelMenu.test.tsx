@@ -7,12 +7,16 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { SwitchModelMenu, switchToModel } from './SwitchModelMenu'
 import type { JevStatus, ModelEntry } from '../../lib/types'
 
-const h = vi.hoisted(() => ({ track: vi.fn() }))
+const h = vi.hoisted(() => ({ track: vi.fn(), toastError: vi.fn() }))
 
 vi.mock('../../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/api')>()
   return { ...actual, track: (...a: unknown[]) => h.track(...a) }
 })
+
+vi.mock('../../components/ui/sonner', () => ({
+  toast: { error: (...a: unknown[]) => h.toastError(...a), success: vi.fn() },
+}))
 
 const CURRENT: JevStatus = {
   key: 'jev-loaded',
@@ -51,6 +55,7 @@ function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT) {
 
 beforeEach(() => {
   h.track.mockReset()
+  h.toastError.mockReset()
 })
 
 describe('SwitchModelMenu', () => {
@@ -108,26 +113,48 @@ describe('switchToModel', () => {
     await switchToModel({ ...CURRENT, slot: 'pool' }, CHAT, d)
     expect(d.stopEngine).toHaveBeenCalledWith(CURRENT.key)
     expect(d.order).toEqual(['stop', 'load'])
-    expect(d.requestLoad).toHaveBeenCalledWith({ key: 'gemma-27b', name: 'Gemma 27B', isJev: false })
+    expect(d.requestLoad).toHaveBeenCalledWith(CHAT)
   })
 
   it('leaves the primary slot alone — loading replaces it anyway', async () => {
     const d = deps()
     await switchToModel(CURRENT, CHAT, d)
     expect(d.stopEngine).not.toHaveBeenCalled()
-    expect(d.requestLoad).toHaveBeenCalledWith({ key: 'gemma-27b', name: 'Gemma 27B', isJev: false })
+    expect(d.requestLoad).toHaveBeenCalledWith(CHAT)
   })
 
   it('keeps the pool slot when the next model is another Jev model', async () => {
     const d = deps()
     await switchToModel({ ...CURRENT, slot: 'pool' }, OTHER_JEV, d)
     expect(d.stopEngine).not.toHaveBeenCalled()
-    expect(d.requestLoad).toHaveBeenCalledWith({ key: 'jev-other', name: 'Other NLI', isJev: true })
+    expect(d.requestLoad).toHaveBeenCalledWith(OTHER_JEV)
   })
 
   it('records the switch whichever model was picked', async () => {
     const d = deps()
     await switchToModel(CURRENT, CHAT, d)
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_switch_model')
+  })
+
+  // QA E17: never a silent no-op. A rejected eject used to escape as an unhandled rejection
+  // with the panel already closed, so the pick looked like it did nothing.
+  it('says why the switch stopped when the slot will not eject, and loads nothing on top of it', async () => {
+    const { ApiError } = await import('../../lib/api')
+    const d = deps()
+    d.stopEngine.mockRejectedValue(new ApiError('engine_busy', 'The engine is still generating.', 409))
+
+    await switchToModel({ ...CURRENT, slot: 'pool' }, CHAT, d)
+
+    expect(h.toastError).toHaveBeenCalledWith('Could not switch model: The engine is still generating.')
+    expect(d.requestLoad).not.toHaveBeenCalled()
+  })
+
+  it('points at the engine logs when the eject failed with no reason of its own', async () => {
+    const d = deps()
+    d.stopEngine.mockRejectedValue(new Error('network down'))
+
+    await switchToModel({ ...CURRENT, slot: 'pool' }, CHAT, d)
+
+    expect(h.toastError).toHaveBeenCalledWith('Could not switch model: check the engine logs on the Engines screen.')
   })
 })

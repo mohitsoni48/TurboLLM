@@ -4,13 +4,14 @@
 // answers the question the screen raises — "how do I get back to Chat?" — without a click to
 // discover it. Nothing here navigates; loading a chat model clears `status.jev`, and the
 // Workspace gate takes the user back on its own.
-import { track } from '../../lib/api'
-import type { useModelLoader } from '../../lib/model-loader'
+import { ApiError, track } from '../../lib/api'
+import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
+import { toast } from '../../components/ui/sonner'
 import type { JevStatus, ModelEntry } from '../../lib/types'
 
 type SwitchDeps = {
   stopEngine(key: string): Promise<unknown>
-  requestLoad: ReturnType<typeof useModelLoader>['requestLoad']
+  requestLoad(target: LoadTarget, opts?: LoadOptions): void
 }
 
 export function SwitchModelMenu({
@@ -33,11 +34,31 @@ export function SwitchModelMenu({
 }
 
 /** ADR-427: a Jev model in a POOL slot keeps its own engine, so a chat pick has to eject that
- *  slot — a primary swap already replaces what is running. */
+ *  slot — a primary swap already replaces what is running. A slot that refuses to eject stops
+ *  the switch and says so: loading on top of it would leave the playground open with no
+ *  explanation (QA E17, H19). */
 export async function switchToModel(current: JevStatus, m: ModelEntry, deps: SwitchDeps): Promise<void> {
   track('workspace', 'jev_switch_model')
-  if (!m.jev && current.slot === 'pool') await deps.stopEngine(current.key)
-  deps.requestLoad({ key: m.key, name: m.name, isJev: !!m.jev })
+  if (needsEject(current, m) && !(await ejected(current, deps))) return
+  deps.requestLoad(m)
+}
+
+function needsEject(current: JevStatus, m: ModelEntry): boolean {
+  return !m.jev && current.slot === 'pool'
+}
+
+async function ejected(current: JevStatus, deps: SwitchDeps): Promise<boolean> {
+  try {
+    await deps.stopEngine(current.key)
+    return true
+  } catch (e) {
+    toast.error(switchFailureMessage(e))
+    return false
+  }
+}
+
+function switchFailureMessage(e: unknown): string {
+  return `Could not switch model: ${e instanceof ApiError ? e.message : 'check the engine logs on the Engines screen.'}`
 }
 
 function ModelGroup({ title, models, onPick }: { title: string; models: ModelEntry[]; onPick: (m: ModelEntry) => void }) {

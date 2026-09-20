@@ -7,21 +7,18 @@
 import { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { toast } from '../components/ui/sonner'
-import { useJevLoadStore, type LoadTarget } from '../stores/jev-load'
-import { track } from './api'
+import { useJevLoadStore, type LoadOptions, type LoadTarget } from '../stores/jev-load'
+import { ApiError, track } from './api'
 import { getActivity } from './jev-api'
 import { JEV_PATH } from './jev-mode'
 import { useModelActions, useStatus } from './queries'
-import type { ActiveWork, LoadProfile } from './types'
+import type { ActiveWork } from './types'
 
-interface LoadOptions {
-  overrides?: Partial<LoadProfile>
-  onError?: (e: unknown) => void
-  onSuccess?: () => void
-}
+export type { LoadOptions, LoadTarget }
 
 export function useModelLoader(): {
   requestLoad(target: LoadTarget, opts?: LoadOptions): void
+  confirmLoad(target: LoadTarget, opts: LoadOptions): void
   isPending: boolean
   pendingKey: string | undefined
 } {
@@ -30,7 +27,10 @@ export function useModelLoader(): {
   const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
 
   function startLoad(target: LoadTarget, opts: LoadOptions): void {
-    actions.load.mutate({ key: target.key, overrides: opts.overrides }, { onError: opts.onError, onSuccess: opts.onSuccess })
+    actions.load.mutate({ key: target.key, overrides: opts.overrides }, {
+      onError: failureHandler(opts.onError),
+      onSuccess: opts.onSuccess,
+    })
   }
 
   /** Claims the toast for this browser first, and gives it back if the load fails. */
@@ -39,7 +39,7 @@ export function useModelLoader(): {
     actions.load.mutate({ key: target.key, overrides: opts.overrides }, {
       onError: (e) => {
         setPendingJevKey(null)
-        opts.onError?.(e)
+        failureHandler(opts.onError)(e)
       },
       onSuccess: opts.onSuccess,
     })
@@ -48,19 +48,32 @@ export function useModelLoader(): {
   async function askBeforeJevLoad(target: LoadTarget, opts: LoadOptions): Promise<void> {
     const work = await readActiveWork()
     if (work && !isBusy(work)) startJevLoad(target, opts)
-    else setConfirm({ target, work, overrides: opts.overrides })
+    else setConfirm({ target, work, opts })
   }
 
   function requestLoad(target: LoadTarget, opts: LoadOptions = {}): void {
-    if (target.isJev) void askBeforeJevLoad(target, opts)
+    if (target.jev) void askBeforeJevLoad(target, opts)
     else startLoad(target, opts)
   }
 
   return {
     requestLoad,
+    // "Load anyway" answers the (i)(3) question with the very load it interrupted: same
+    // pending key, same failure surface, same caller callbacks.
+    confirmLoad: startJevLoad,
     isPending: actions.load.isPending,
     pendingKey: actions.load.isPending ? actions.load.variables?.key : undefined,
   }
+}
+
+/** A refused load is never a silent no-op (QA E17, E31(c)): a caller that passes no handler
+ *  of its own still gets told. */
+function failureHandler(onError: LoadOptions['onError']): (e: unknown) => void {
+  return onError ?? ((e) => toast.error(loadFailureMessage(e)))
+}
+
+function loadFailureMessage(e: unknown): string {
+  return `Could not load model: ${e instanceof ApiError ? e.message : 'check the engine logs on the Engines screen.'}`
 }
 
 /** Announces a Jev load THIS browser started, once the model is really running (ADR-434 (i)(3)).

@@ -128,7 +128,7 @@ export function JevPlaygroundScreen() {
 
   function pickModel(m: ModelEntry) {
     setSwitchOpen(false)
-    void switchToModel(current, m, { stopEngine, requestLoad })
+    switchToModel(current, m, { stopEngine, requestLoad }).catch((e) => setProblem(failureMessage(e)))
   }
 
   const template = models?.find((m) => m.key === jev.key)?.jev?.nliTemplate ?? null

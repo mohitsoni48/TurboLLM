@@ -8,7 +8,11 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import { useJevLoadStore } from './jev-load'
 import type { ActiveWork } from '../lib/types'
 
-const TARGET = { key: 'jev-key', name: 'qwen3.5 4b nli v2', isJev: true }
+const TARGET = {
+  key: 'jev-key',
+  name: 'qwen3.5 4b nli v2',
+  jev: { labels: [], nliTemplate: null, architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+}
 
 const BUSY: ActiveWork = { items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], engineGenerating: false }
 
@@ -22,21 +26,24 @@ describe('useJevLoadStore', () => {
     expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
   })
 
-  it('holds the target, the work it would interrupt and the load overrides', () => {
-    useJevLoadStore.getState().setConfirm({ target: TARGET, work: BUSY, overrides: { ctx: 4096 } })
+  // The whole options object, not just the overrides: answering the question must not drop the
+  // callbacks the surface that asked for the load is waiting on (ADR-434 (i)(3)).
+  it('holds the target, the work it would interrupt and everything the caller asked for', () => {
+    const onSuccess = () => {}
+    useJevLoadStore.getState().setConfirm({ target: TARGET, work: BUSY, opts: { overrides: { ctx: 4096 }, onSuccess } })
     const { confirm } = useJevLoadStore.getState()
     expect(confirm?.target).toEqual(TARGET)
     expect(confirm?.work).toEqual(BUSY)
-    expect(confirm?.overrides).toEqual({ ctx: 4096 })
+    expect(confirm?.opts).toEqual({ overrides: { ctx: 4096 }, onSuccess })
   })
 
   it('holds a null work — the probe could not be read, which is not "nothing is running"', () => {
-    useJevLoadStore.getState().setConfirm({ target: TARGET, work: null })
+    useJevLoadStore.getState().setConfirm({ target: TARGET, work: null, opts: {} })
     expect(useJevLoadStore.getState().confirm?.work).toBeNull()
   })
 
   it('clears the confirmation', () => {
-    useJevLoadStore.getState().setConfirm({ target: TARGET, work: BUSY })
+    useJevLoadStore.getState().setConfirm({ target: TARGET, work: BUSY, opts: {} })
     useJevLoadStore.getState().setConfirm(null)
     expect(useJevLoadStore.getState().confirm).toBeNull()
   })

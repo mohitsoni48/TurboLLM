@@ -107,20 +107,21 @@ beforeEach(() => {
 })
 
 describe('ModelDetailDialog — loading through the shared loader', () => {
-  it('loads a Jev model through the loader, flagged as Jev, with the draft overrides', async () => {
+  it('loads a Jev model through the loader, jev field and all, with the draft overrides', async () => {
     renderDialog(VERIFIED)
     await userEvent.click(await screen.findByRole('button', { name: /load model/i }))
     expect(requestLoad).toHaveBeenCalledTimes(1)
     const [target, opts] = requestLoad.mock.calls[0]
-    expect(target).toEqual({ key: 'jev-1', name: 'qwen3.5-4b-nli-v2', isJev: true })
+    expect(target).toEqual(expect.objectContaining({ key: 'jev-1', name: 'qwen3.5-4b-nli-v2', jev: jev() }))
     expect(opts.overrides).toEqual(profile())
     expect(typeof opts.onError).toBe('function')
   })
 
-  it('loads a plain model through the same loader, not flagged as Jev', async () => {
+  it('loads a plain model through the same loader, with nothing to confirm', async () => {
     renderDialog(PLAIN)
     await userEvent.click(await screen.findByRole('button', { name: /load model/i }))
-    expect(requestLoad.mock.calls[0][0]).toEqual({ key: 'chat-1', name: 'Qwen3 8B', isJev: false })
+    expect(requestLoad.mock.calls[0][0]).toEqual(expect.objectContaining({ key: 'chat-1', name: 'Qwen3 8B' }))
+    expect(requestLoad.mock.calls[0][0].jev).toBeUndefined()
   })
 
   it('still saves before loading when "Remember these settings" is on', async () => {

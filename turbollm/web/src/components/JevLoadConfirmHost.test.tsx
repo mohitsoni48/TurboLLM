@@ -5,32 +5,36 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { JevLoadConfirmHost } from './JevLoadConfirmHost'
-import { useJevLoadStore } from '../stores/jev-load'
+import { useJevLoadStore, type LoadOptions } from '../stores/jev-load'
 import type { ActiveWork } from '../lib/types'
 
 const h = vi.hoisted(() => ({
-  loadMutate: vi.fn(),
+  confirmLoad: vi.fn(),
   track: vi.fn(),
-  toastError: vi.fn(),
 }))
 
-vi.mock('../lib/queries', () => ({ useModelActions: () => ({ load: { mutate: h.loadMutate, isPending: false } }) }))
+// The dialog runs no mutation of its own: "Load anyway" is the loader's load (ADR-436 (6)).
+vi.mock('../lib/model-loader', () => ({
+  useModelLoader: () => ({ requestLoad: vi.fn(), confirmLoad: h.confirmLoad, isPending: false, pendingKey: undefined }),
+}))
 vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>()
   return { ...actual, track: (...a: unknown[]) => h.track(...a) }
 })
-vi.mock('./ui/sonner', () => ({ toast: { error: (...a: unknown[]) => h.toastError(...a), success: vi.fn() } }))
 
-const TARGET = { key: 'jev-key', name: 'qwen3.5 4b nli v2', isJev: true }
+const TARGET = {
+  key: 'jev-key',
+  name: 'qwen3.5 4b nli v2',
+  jev: { labels: [], nliTemplate: null, architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+}
 
-function openConfirm(work: ActiveWork | null, overrides?: { ctx: number }) {
-  useJevLoadStore.setState({ confirm: { target: TARGET, work, overrides }, pendingJevKey: null })
+function openConfirm(work: ActiveWork | null, opts: LoadOptions = {}) {
+  useJevLoadStore.setState({ confirm: { target: TARGET, work, opts }, pendingJevKey: null })
 }
 
 beforeEach(() => {
-  h.loadMutate.mockReset()
+  h.confirmLoad.mockReset()
   h.track.mockReset()
-  h.toastError.mockReset()
   useJevLoadStore.setState({ confirm: null, pendingJevKey: null })
 })
 
@@ -80,16 +84,21 @@ describe('JevLoadConfirmHost', () => {
     expect(screen.getByText("TurboLLM couldn't check what is running right now — loading may interrupt it.")).toBeTruthy()
   })
 
-  it('loads anyway, claiming the toast first and carrying the overrides through', async () => {
-    openConfirm({ items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], engineGenerating: false }, { ctx: 8192 })
+  it('loads anyway through the loader, carrying everything the caller asked for', async () => {
+    const onSuccess = vi.fn()
+    const onError = vi.fn()
+    openConfirm({ items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], engineGenerating: false }, {
+      overrides: { ctx: 8192 },
+      onSuccess,
+      onError,
+    })
     render(<JevLoadConfirmHost />)
 
     await userEvent.click(screen.getByRole('button', { name: 'Load anyway' }))
 
     expect(h.track).toHaveBeenCalledWith('models', 'confirm_jev_load')
-    expect(h.loadMutate).toHaveBeenCalledTimes(1)
-    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 } })
-    expect(useJevLoadStore.getState().pendingJevKey).toBe('jev-key')
+    expect(h.confirmLoad).toHaveBeenCalledTimes(1)
+    expect(h.confirmLoad).toHaveBeenCalledWith(TARGET, { overrides: { ctx: 8192 }, onSuccess, onError })
     expect(useJevLoadStore.getState().confirm).toBeNull()
   })
 
@@ -124,31 +133,8 @@ describe('JevLoadConfirmHost', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
 
     expect(h.track).toHaveBeenCalledWith('models', 'cancel_jev_load')
-    expect(h.loadMutate).not.toHaveBeenCalled()
+    expect(h.confirmLoad).not.toHaveBeenCalled()
     expect(useJevLoadStore.getState().confirm).toBeNull()
     expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
-  })
-
-  it('surfaces a failed load, so a Jev load cannot fail silently', async () => {
-    openConfirm({ items: [], engineGenerating: true })
-    render(<JevLoadConfirmHost />)
-    await userEvent.click(screen.getByRole('button', { name: 'Load anyway' }))
-
-    const { onError } = h.loadMutate.mock.calls[0][1] as { onError: (e: unknown) => void }
-    onError(new Error('boom'))
-
-    expect(h.toastError).toHaveBeenCalledWith('Could not load model: check the engine logs on the Engines screen.')
-  })
-
-  it('relays the daemon\'s own words when it gave a reason', async () => {
-    const { ApiError } = await import('../lib/api')
-    openConfirm({ items: [], engineGenerating: true })
-    render(<JevLoadConfirmHost />)
-    await userEvent.click(screen.getByRole('button', { name: 'Load anyway' }))
-
-    const { onError } = h.loadMutate.mock.calls[0][1] as { onError: (e: unknown) => void }
-    onError(new ApiError('engine_start_failed', 'vLLM is not installed.', 409))
-
-    expect(h.toastError).toHaveBeenCalledWith('Could not load model: vLLM is not installed.')
   })
 })
