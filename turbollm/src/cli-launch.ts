@@ -303,6 +303,9 @@ export const CLAUDE_AUTOCOMPACT_PCT_OVERRIDE = '80'
 export interface ModelEntry {
   key: string
   name: string
+  /** Present when this is a Jev model: it labels text and cannot chat (ADR-434 (f)), so no
+   *  coding agent may be pointed at it. Shape irrelevant here — only presence matters. */
+  jev?: unknown
   /** The model's own maximum context from its GGUF metadata — a ceiling, not what it will load with. */
   nativeCtx?: number
   /** The context window this model would ACTUALLY be loaded with, from its saved profile/preset for
@@ -413,6 +416,12 @@ async function fetchStatus(base: string, _fetch: typeof fetch = fetch): Promise<
   } catch {
     return null
   }
+}
+
+/** The models a coding agent can actually talk to. A Jev model labels text and cannot hold a
+ *  conversation (ADR-434 (f)), so it is never a launch target. */
+function chatModels(models: ModelEntry[]): ModelEntry[] {
+  return models.filter((m) => !m.jev)
 }
 
 /** Fetch the model list. Returns [] on network error. */
@@ -1411,6 +1420,15 @@ export async function launchCli(
     const models = await fetchModels(base, _fetch)
     const resolvedKey = resolveModelKey(models, modelKey)
 
+    // Refused BEFORE any load: a Jev model would start an engine that cannot answer a single
+    // prompt, and the agent would fail on its first turn with an opaque error instead.
+    const resolvedEntry = models.find((m) => m.key === resolvedKey)
+    if (resolvedEntry?.jev) {
+      process.stderr.write(`'${resolvedEntry.name}' is a Jev model (it labels text) — coding agents need a chat model.
+`)
+      return 1
+    }
+
     // Turbo Link fallback, and deliberately a FALLBACK rather than a first check: a local
     // key can legitimately contain a slash (`unsloth/Qwen3-GGUF`), so it parses as
     // qualified while naming no machine at all. Local resolution therefore keeps first
@@ -1475,8 +1493,9 @@ export async function launchCli(
     // instead of pinning the CLI to a machine that cannot answer.
     remoteModel = status.selectedRemoteModel
   } else if (!alreadyRunning) {
-    // No --model and no model loaded: auto-load the last-used / first available model.
-    const models = await fetchModels(base, _fetch)
+    // No --model and no model loaded: auto-load the last-used / first available CHAT model —
+    // a library of nothing but Jev models falls into the empty-library message below, unchanged.
+    const models = chatModels(await fetchModels(base, _fetch))
     if (models.length === 0) {
       process.stderr.write(
         `TurboLLM is running, but no model is loaded and no models are in the library.\n` +
@@ -1540,7 +1559,7 @@ export async function launchCli(
   // config (see LaunchContext.models). Best-effort: `fetchModels` already returns [] on any network
   // error, and every consumer falls back to the loaded model alone, so a hiccup degrades the picker
   // rather than failing the launch. Cheap — it is one loopback request.
-  const libraryModels = spec.prepareConfig ? await fetchModels(base, _fetch) : []
+  const libraryModels = spec.prepareConfig ? chatModels(await fetchModels(base, _fetch)) : []
   // A config-file harness's picker can only offer what we write into its config, and a remote
   // model is not in the LOCAL library — so pinning `turbollm/<machine>/<model>` without adding
   // the row would point the harness at a model it does not know it has. `nativeCtx` is left
