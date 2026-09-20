@@ -37,6 +37,7 @@ export function CheckpointPicker({
         <CheckpointRow
           key={`${repo}/${cp.dir}`}
           checkpoint={cp}
+          shadowedBy={shadowingCheckpoint(cp, checkpoints)}
           vramMb={vramMb}
           blockedByGate={blockedByGate}
           enqueuePending={enqueuePending}
@@ -50,6 +51,7 @@ export function CheckpointPicker({
 
 function CheckpointRow({
   checkpoint,
+  shadowedBy,
   vramMb,
   blockedByGate,
   enqueuePending,
@@ -57,6 +59,7 @@ function CheckpointRow({
   onLoad,
 }: {
   checkpoint: HfCheckpoint
+  shadowedBy: HfCheckpoint | null
   vramMb: number | undefined
   blockedByGate: boolean
   enqueuePending: boolean
@@ -73,6 +76,7 @@ function CheckpointRow({
           <CheckpointTags checkpoint={checkpoint} />
         </div>
         <div className="mt-0.5 text-[12px] text-muted">{fmtSize(checkpoint.sizeBytes)}</div>
+        {shadowedBy && <ShadowedNote ancestorName={shadowedBy.name} />}
       </div>
       {localKey ? (
         <Button size="sm" onClick={() => { track('models', 'load_hf_checkpoint'); onLoad(checkpoint) }}>
@@ -89,6 +93,27 @@ function CheckpointRow({
           Download
         </Button>
       )}
+    </div>
+  )
+}
+
+/** The checkpoint this one would disappear behind once both are on disk, or null.
+ *  The scanner skips a model folder nested inside another model's folder, and the repo root
+ *  is an ancestor of every nested folder in it. */
+export function shadowingCheckpoint(cp: HfCheckpoint, all: HfCheckpoint[]): HfCheckpoint | null {
+  return all.find((other) => containsDir(other.dir, cp.dir)) ?? null
+}
+
+function containsDir(ancestor: string, dir: string): boolean {
+  if (dir === '') return false
+  if (ancestor === '') return true
+  return dir.startsWith(`${ancestor}/`)
+}
+
+function ShadowedNote({ ancestorName }: { ancestorName: string }) {
+  return (
+    <div className="mt-1 text-[12px]" style={{ color: 'var(--warn)' }}>
+      {`Won't show in your library if "${ancestorName}" is also downloaded — TurboLLM doesn't list a model folder inside another model's folder.`}
     </div>
   )
 }
