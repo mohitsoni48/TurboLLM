@@ -81,8 +81,19 @@ test('jevEndpointFor: POST on the exact classify and rerank paths', () => {
 test('jevEndpointFor: another method, a longer path or another endpoint is not a Jev endpoint', () => {
   assert.equal(jevEndpointFor('GET', '/v1/classify'), null)
   assert.equal(jevEndpointFor('POST', '/v1/classify/x'), null)
-  assert.equal(jevEndpointFor('POST', '/v1/rerank/'), null)
   assert.equal(jevEndpointFor('POST', '/v1/chat/completions'), null)
+})
+
+test('jevEndpointFor: one trailing slash still reaches the endpoint, as curl and several clients add it', () => {
+  assert.equal(jevEndpointFor('POST', '/v1/classify/'), 'classify')
+  assert.equal(jevEndpointFor('POST', '/v1/rerank/'), 'rerank')
+})
+
+test('jevEndpointFor: only ONE trailing slash is forgiven, and never on a longer path', () => {
+  assert.equal(jevEndpointFor('POST', '/v1/classify//'), null)
+  assert.equal(jevEndpointFor('POST', '/v1/classify/x/'), null)
+  assert.equal(jevEndpointFor('GET', '/v1/classify/'), null)
+  assert.equal(jevEndpointFor('POST', '/'), null)
 })
 
 test('MAX_JEV_INPUTS is 128', () => {

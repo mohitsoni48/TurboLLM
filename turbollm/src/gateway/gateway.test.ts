@@ -190,6 +190,18 @@ test('POST /v1/classify is served by the Jev handler: one engine /classify call,
   })
 })
 
+test('POST /v1/classify/ (trailing slash) is served by the Jev handler, not proxied to the primary engine', async () => {
+  await withEngine(F2_KITCHEN, async (calls) => {
+    const res = await postJson(gatewayApp(), '/v1/classify/', {
+      model: JEV_KEY, premise: KITCHEN_PREMISE, hypotheses: KITCHEN_HYPOTHESES,
+    })
+
+    assert.deepEqual(calls, [{ url: 'http://engine.local/classify', method: 'POST' }])
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), F7_CLASSIFY)
+  })
+})
+
 test('POST /v1/rerank is served by the Jev handler: one engine /classify call, the F7 body', async () => {
   await withEngine(F3_FRANCE, async (calls) => {
     const res = await postJson(gatewayApp(), '/v1/rerank', {
@@ -209,6 +221,22 @@ test('gatewayV1Handler behind the Turbo Link façade refuses /v1/classify (origi
 
   await withEngine(F2_KITCHEN, async (calls) => {
     const res = await postJson(app, '/api/link/v1/classify', {
+      model: JEV_KEY, premise: KITCHEN_PREMISE, hypotheses: KITCHEN_HYPOTHESES,
+    })
+
+    assert.equal(res.status, 400)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_classify_unsupported')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('a trailing slash does not let a Turbo Link peer past the /v1/classify refusal either', async () => {
+  const app = new Hono()
+  const d = jevGatewayDeps()
+  app.post('/api/link/v1/classify/', (c) => gatewayV1Handler(c, d, { origin: 'link', pathname: '/v1/classify/' }))
+
+  await withEngine(F2_KITCHEN, async (calls) => {
+    const res = await postJson(app, '/api/link/v1/classify/', {
       model: JEV_KEY, premise: KITCHEN_PREMISE, hypotheses: KITCHEN_HYPOTHESES,
     })
 

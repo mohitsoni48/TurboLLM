@@ -95,10 +95,12 @@ export interface RerankResponse {
   usage: ClassifyUsage
 }
 
-/** Which Jev endpoint a request is for: POST on the exact path only. */
+/** Which Jev endpoint a request is for: POST on the exact path, forgiving ONE trailing slash (curl
+ *  and several HTTP clients add it, and it would otherwise be proxied to the primary engine). */
 export function jevEndpointFor(method: string, pathname: string): JevEndpoint | null {
   if (method !== 'POST') return null
-  return Object.hasOwn(JEV_ENDPOINT_PATHS, pathname) ? JEV_ENDPOINT_PATHS[pathname] : null
+  const path = pathname.endsWith('/') ? pathname.slice(0, -1) : pathname
+  return Object.hasOwn(JEV_ENDPOINT_PATHS, path) ? JEV_ENDPOINT_PATHS[path] : null
 }
 
 /** One /v1/classify or /v1/rerank request: refuse a Turbo Link peer, validate, resolve exactly the
