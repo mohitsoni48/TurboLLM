@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
+import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
 import { Input } from '../../components/ui/input'
@@ -305,6 +306,7 @@ export function ModelDetailDialog({
   const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
   const detailQ = useModelDetail(modelKey, activeEngine?.id)
   const actions = useModelActions()
+  const loader = useModelLoader()
   const bench = useBenchActions()
   const benchState = useBenchState()
   const [pendingBenchKey, setPendingBenchKey] = useState<string | null>(null)
@@ -581,6 +583,14 @@ export function ModelDetailDialog({
                 MLX-VLM manages context and KV cache automatically — there are no context/GPU-layer/KV
                 knobs to set, and no launch-time sampling defaults either; sampling is set
                 <span className="text-ink"> per-conversation</span> in chat.
+              </div>
+            )}
+
+            {detail.jev && (
+              <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">
+                {detail.jev.verified
+                  ? `Jev model — launched as a classifier with verified settings for ${detail.jev.architecture}.`
+                  : "Jev model — Not verified: launched with plain --runner pooling; if vLLM can't load it, its own error is shown."}
               </div>
             )}
 
@@ -925,9 +935,10 @@ export function ModelDetailDialog({
                   // surfaces failures via toast — otherwise a bad param silently stops
                   // the engine and the model "never loads again" with no feedback.
                   const fireLoad = () =>
-                    actions.load.mutate(
-                      { key: detail.key, overrides: draft },
+                    loader.requestLoad(
+                      { key: detail.key, name: detail.name, isJev: !!detail.jev },
                       {
+                        overrides: draft,
                         onError: (e) =>
                           toast.error(
                             e instanceof ApiError
