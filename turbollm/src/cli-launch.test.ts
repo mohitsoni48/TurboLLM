@@ -29,10 +29,11 @@ interface FakeDaemon {
   loads: string[]
 }
 
-/** A daemon with both models in the library, nothing loaded, and `lastLoaded` as given. */
-function fakeDaemon(lastLoadedKey?: string): FakeDaemon {
+/** A daemon with both models in the library and `lastLoaded` as given. Nothing is loaded unless
+ *  `loadedKey` names the model that is already running when the launcher connects. */
+function fakeDaemon(lastLoadedKey?: string, loadedKey: string | null = null): FakeDaemon {
   const loads: string[] = []
-  let runningKey: string | null = null
+  let runningKey: string | null = loadedKey
   const fetchImpl = async (input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> => {
     const url = String(input)
     if (url.includes('/api/v1/status')) {
@@ -118,6 +119,40 @@ test('auto-load skips a Jev model even when it was the last one loaded', async (
 
   assert.equal(code, 0)
   assert.deepEqual(daemon.loads, ['qwen3-8b'], 'the chat model is loaded, never the Jev one')
+  assert.equal(spawn.calls, 1)
+})
+
+test('no --model, with a Jev model already loaded, refuses instead of pinning the agent to it', async () => {
+  const spawn = makeSpawn()
+  const daemon = fakeDaemon(undefined, 'jev-fake-v2')
+
+  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch, undefined, memFs()))
+
+  assert.equal(code, 1)
+  assert.equal(stderr, `'jev fake v2' is a Jev model (it labels text) — coding agents need a chat model.
+`)
+  assert.deepEqual(daemon.loads, [], 'nothing may be loaded')
+  assert.equal(spawn.calls, 0, 'the agent must not be launched')
+})
+
+test('a config-writing harness is not wired to an already-loaded Jev model either', async () => {
+  const fs = memFs()
+  const daemon = fakeDaemon(undefined, 'jev-fake-v2')
+
+  const { code } = await captured(() => launchCli('opencode', 6996, [], makeSpawn().fn, undefined, daemon.fetch, undefined, fs))
+
+  assert.equal(code, 1)
+  assert.equal(fs.files.size, 0, 'no harness config may be written for a Jev model')
+})
+
+test('no --model, with a chat model already loaded, still reuses it without loading anything', async () => {
+  const spawn = makeSpawn()
+  const daemon = fakeDaemon(undefined, 'qwen3-8b')
+
+  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch, undefined, memFs()))
+
+  assert.equal(code, 0)
+  assert.deepEqual(daemon.loads, [])
   assert.equal(spawn.calls, 1)
 })
 

@@ -424,6 +424,13 @@ function chatModels(models: ModelEntry[]): ModelEntry[] {
   return models.filter((m) => !m.jev)
 }
 
+/** A coding agent that is handed a Jev model fails on its first prompt with an opaque error, so
+ *  every path that would pick one says why here instead and exits 1. */
+function refuseJevModel(name: string): number {
+  process.stderr.write(`'${name}' is a Jev model (it labels text) — coding agents need a chat model.\n`)
+  return 1
+}
+
 /** Fetch the model list. Returns [] on network error. */
 async function fetchModels(base: string, _fetch: typeof fetch = fetch): Promise<ModelEntry[]> {
   try {
@@ -1423,11 +1430,7 @@ export async function launchCli(
     // Refused BEFORE any load: a Jev model would start an engine that cannot answer a single
     // prompt, and the agent would fail on its first turn with an opaque error instead.
     const resolvedEntry = models.find((m) => m.key === resolvedKey)
-    if (resolvedEntry?.jev) {
-      process.stderr.write(`'${resolvedEntry.name}' is a Jev model (it labels text) — coding agents need a chat model.
-`)
-      return 1
-    }
+    if (resolvedEntry?.jev) return refuseJevModel(resolvedEntry.name)
 
     // Turbo Link fallback, and deliberately a FALLBACK rather than a first check: a local
     // key can legitimately contain a slash (`unsloth/Qwen3-GGUF`), so it parses as
@@ -1517,6 +1520,12 @@ export async function launchCli(
       return 1
     }
     if (outcome.status) status = outcome.status
+  } else {
+    // No --model and no linked-machine pick, so the launch reuses whatever is already loaded. That
+    // has to be a chat model too: the two branches above never run for it, and it would otherwise be
+    // pinned into the harness below (a gateway auto-swap can leave a Jev model loaded).
+    const loaded = (await fetchModels(base, _fetch)).find((m) => m.key === status?.model?.key)
+    if (loaded?.jev) return refuseJevModel(loaded.name)
   }
 
   // At this point we expect a model to be loaded — UNLESS it is a remote one, in which
