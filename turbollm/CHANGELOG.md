@@ -23,6 +23,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+### Added
+
+- **Prompt cache RAM setting.** llama.cpp keeps finished prompts in RAM (up to 8 GB by default) so
+  returning to an earlier conversation skips re-processing. A new **Prompt cache RAM (MiB)** field in a
+  model's Advanced settings caps that (`--cache-ram`), and `0` turns it off to free the memory. It is
+  blank by default, so nothing changes until you set it. Shown only on engines that support the flag.
+
 ### Fixed
 
 - **vLLM loads again under WSL.** Recent vLLM releases start with a new model runner that needs

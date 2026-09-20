@@ -193,6 +193,12 @@ export interface LoadProfile {
    *  ROCm + AMD-unified-APU workaround (GitHub #85 / ADR-324), which fires on its own; when
    *  both would apply, {@link profileToArgs} still emits the flag exactly once. */
   noMmap?: boolean
+  /** llama.cpp --cache-ram: MiB of system RAM the server may spend keeping finished prompts so
+   *  returning to an earlier conversation skips re-processing. Absent → not emitted, so the
+   *  engine default (8192 MiB) applies and an untouched profile launches exactly as before.
+   *  0 disables the prompt cache and hands that RAM back. Whole MiB only: llama.cpp's -1
+   *  ("no limit") is deliberately not offered, being the opposite of what this control is for. */
+  cacheRam?: number
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
   tunedBy?: 'bench' | 'user'
@@ -771,6 +777,16 @@ function isRocmUnifiedApuLoad(m: ModelEntry, sys: SysInfo | undefined, binPath: 
   return sys.gpus.some((g) => g.vendor === 'amd' && g.unified)
 }
 
+/** llama.cpp stores `--cache-ram` in a 32-bit int, so a larger value fails the engine's startup. */
+export const CACHE_RAM_MAX_MIB = 2_147_483_647
+
+/** True for a usable `--cache-ram` size: whole MiB up to {@link CACHE_RAM_MAX_MIB}, with 0 meaning
+ *  "prompt cache off". Takes `unknown` because a stored profile is client- or hand-edited JSON the
+ *  compiler cannot vouch for. The ceiling also keeps `String(value)` free of exponent notation. */
+export function isCacheRamMib(value: unknown): value is number {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= CACHE_RAM_MAX_MIB
+}
+
 /** Map a profile to llama-server args (spec 05 §8). The manager injects
  *  -m/--host/--port/--metrics/--no-webui; this returns everything else.
  *  Flags absent from the engine's capabilities are skipped (graceful degrade).
@@ -852,6 +868,8 @@ export function profileToArgs(
   if (m.vision && p.useMmproj && !p.mmprojGpu && has('--no-mmproj-offload')) a.push('--no-mmproj-offload')
   if (p.imageMaxTokens > 0 && has('--image-max-tokens')) a.push('--image-max-tokens', String(p.imageMaxTokens))
   if (p.cacheReuse > 0 && has('--cache-reuse')) a.push('--cache-reuse', String(p.cacheReuse))
+  // 0 is a real value here (it turns the prompt cache off), so unlike the batch sizes this is not gated on > 0.
+  if (isCacheRamMib(p.cacheRam) && has('--cache-ram')) a.push('--cache-ram', String(p.cacheRam))
   if (p.useJinja && has('--jinja')) a.push('--jinja')
   if (p.chatTemplateFile && has('--chat-template-file')) a.push('--chat-template-file', p.chatTemplateFile)
   // Speculative decoding (spec 05 §8). TurboQuant forks expose `--spec-type`:

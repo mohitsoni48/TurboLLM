@@ -12,6 +12,8 @@
 // that omits `gpu`/`nCpuMoe` still writes cleanly. `requireCtx` is the one caller-dependent knob —
 // the profile route demands a usable ctx, a preset patch may legitimately omit it.
 
+import { CACHE_RAM_MAX_MIB, isCacheRamMib } from '../models/profile'
+
 /** Returns a human-readable reason the profile is invalid, or `null` when it is acceptable. */
 export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolean }): string | null {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return 'profile must be a JSON object.'
@@ -54,6 +56,10 @@ export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolea
     if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {
       return 'ngl must be a non-negative number.'
     }
+  }
+
+  if (prof.cacheRam !== undefined && !isCacheRamMib(prof.cacheRam)) {
+    return `cacheRam must be a non-negative whole number of MiB, at most ${CACHE_RAM_MAX_MIB} (0 disables the prompt cache).`
   }
 
   return null
