@@ -32,6 +32,14 @@ describe('JevHeader', () => {
     expect(screen.getByText('qwen3.5 4b nli v2 · vLLM 0.29 · stopping')).toBeTruthy()
   })
 
+  it('leaves out an engine it cannot name', () => {
+    // A remote-access token scoped to models:use cannot read /status (ADR-422, R8), so the
+    // screen knows which Jev model is loaded but not what is running it. Better a shorter
+    // chip than one with a gap where the engine should be.
+    render(<JevHeader jev={JEV} engine={{ name: '', kind: '' }} onSwitch={vi.fn()} />)
+    expect(screen.getByText('qwen3.5 4b nli v2 · running')).toBeTruthy()
+  })
+
   it("credits the model for its own labels", () => {
     render(<JevHeader jev={JEV} engine={ENGINE} onSwitch={vi.fn()} />)
     expect(screen.getByText('Labels read from the model: contradiction, entailment, neutral')).toBeTruthy()

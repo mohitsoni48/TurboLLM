@@ -27,7 +27,7 @@ export function JevHeader({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <span className="inline-flex items-center gap-2 rounded-md border border-border px-2.5 py-1 text-[13px] text-ink">
           <span className={`h-[7px] w-[7px] rounded-full ${STATE_DOT[jev.state]}`} />
-          {`${jev.name} · ${engine.name} · ${stateLabel(jev.state)}`}
+          {[jev.name, engine.name, stateLabel(jev.state)].filter(Boolean).join(' · ')}
         </span>
         <Button variant="outline" size="sm" onClick={onSwitch}>
           <ArrowLeftRight size={14} /> Switch model
