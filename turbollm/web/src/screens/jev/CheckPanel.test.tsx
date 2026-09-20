@@ -59,16 +59,28 @@ describe('CheckPanel', () => {
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_add_hypothesis')
   })
 
+  it('names each hypothesis row by its position, so a screen reader can tell them apart', () => {
+    renderPanel()
+    expect(screen.getByRole('textbox', { name: 'Hypothesis 1' })).toHaveValue(DRAFT.hypotheses[0])
+    expect(screen.getByRole('textbox', { name: 'Hypothesis 2' })).toHaveValue(DRAFT.hypotheses[1])
+  })
+
+  it('names each Remove button after the row it removes, and removes only that row', async () => {
+    const { onChange } = renderPanel()
+    await userEvent.click(screen.getByRole('button', { name: 'Remove hypothesis 2' }))
+    expect(onChange).toHaveBeenCalledWith({ ...DRAFT, hypotheses: [DRAFT.hypotheses[0]] })
+  })
+
   it('removes the row whose button was pressed', async () => {
     const { onChange } = renderPanel()
-    await userEvent.click(screen.getAllByLabelText('Remove')[0])
+    await userEvent.click(screen.getByRole('button', { name: 'Remove hypothesis 1' }))
     expect(onChange).toHaveBeenCalledWith({ ...DRAFT, hypotheses: [DRAFT.hypotheses[1]] })
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_remove_hypothesis')
   })
 
   it('keeps the last row, because a check needs a hypothesis', () => {
     renderPanel({ value: { premise: 'p', hypotheses: ['only one'] } })
-    expect(screen.getByLabelText('Remove')).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Remove hypothesis 1' })).toBeDisabled()
   })
 
   it('stops adding rows at the request limit', () => {

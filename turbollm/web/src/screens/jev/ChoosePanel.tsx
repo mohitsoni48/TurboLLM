@@ -62,6 +62,7 @@ export function ChoosePanel({
             <input
               className={inputCls}
               placeholder="An option"
+              aria-label={`Option ${i + 1}`}
               disabled={running}
               value={option}
               onChange={(e) => rewriteOption(i, e.target.value)}
@@ -69,7 +70,7 @@ export function ChoosePanel({
             <Button
               variant="ghost"
               size="iconSm"
-              aria-label="Remove"
+              aria-label={`Remove option ${i + 1}`}
               disabled={value.options.length < 2}
               onClick={() => removeOption(i)}
             >

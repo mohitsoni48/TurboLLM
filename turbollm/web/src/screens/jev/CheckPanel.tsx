@@ -63,6 +63,7 @@ export function CheckPanel({
             <input
               className={inputCls}
               placeholder="A hypothesis to check"
+              aria-label={`Hypothesis ${i + 1}`}
               disabled={running}
               value={hypothesis}
               onChange={(e) => rewriteHypothesis(i, e.target.value)}
@@ -70,7 +71,7 @@ export function CheckPanel({
             <Button
               variant="ghost"
               size="iconSm"
-              aria-label="Remove"
+              aria-label={`Remove hypothesis ${i + 1}`}
               disabled={value.hypotheses.length < 2}
               onClick={() => removeHypothesis(i)}
             >

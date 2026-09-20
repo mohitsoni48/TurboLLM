@@ -53,16 +53,28 @@ describe('ChoosePanel', () => {
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_add_option')
   })
 
+  it('names each option row by its position, so a screen reader can tell them apart', () => {
+    renderPanel()
+    expect(screen.getByRole('textbox', { name: 'Option 1' })).toHaveValue(DRAFT.options[0])
+    expect(screen.getByRole('textbox', { name: 'Option 2' })).toHaveValue(DRAFT.options[1])
+  })
+
+  it('names each Remove button after the row it removes, and removes only that row', async () => {
+    const { onChange } = renderPanel()
+    await userEvent.click(screen.getByRole('button', { name: 'Remove option 2' }))
+    expect(onChange).toHaveBeenCalledWith({ ...DRAFT, options: [DRAFT.options[0]] })
+  })
+
   it('removes the row whose button was pressed', async () => {
     const { onChange } = renderPanel()
-    await userEvent.click(screen.getAllByLabelText('Remove')[0])
+    await userEvent.click(screen.getByRole('button', { name: 'Remove option 1' }))
     expect(onChange).toHaveBeenCalledWith({ ...DRAFT, options: ['Paris'] })
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_remove_option')
   })
 
   it('keeps the last row', () => {
     renderPanel({ value: { question: 'q', options: ['only one'] } })
-    expect(screen.getByLabelText('Remove')).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Remove option 1' })).toBeDisabled()
   })
 
   it('stops adding rows at the request limit', () => {
