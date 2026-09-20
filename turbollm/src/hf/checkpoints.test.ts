@@ -3,8 +3,11 @@
 // Download button does nothing. Fixtures are the plan's F6 trees — no network.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES } from './checkpoints'
-import type { RawTreeEntry } from './hf'
+import { join } from 'node:path'
+import { annotateCheckpoint, findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES } from './checkpoints'
+import type { HfRepoFile, RawTreeEntry } from './hf'
+import type { ProvenanceEntry } from '../downloads/downloads'
+import type { ModelEntry } from '../models/scanner'
 
 const fileUrl = (path: string) => `https://huggingface.co/AlexWortega/openjev/resolve/main/${path}`
 
@@ -148,4 +151,91 @@ test('a deeper checkpoint keeps its full POSIX dir and is named by its last segm
 
 test('the config-fetch cap is 16', () => {
   assert.equal(MAX_CHECKPOINT_CONFIG_FETCHES, 16)
+})
+
+// ── annotateCheckpoint: is this checkpoint already on disk, and which local model is it? ──────
+// Provenance `filename` is a basename (downloads.ts:512), so the existing (repo, filename) file
+// match cannot tell two checkpoints' identical `model.safetensors` apart. The checkpoint match
+// therefore goes by sha256, or by the download's full destination path.
+
+const PRIMARY = join('D:', 'models')
+
+function checkpointOf(dir: string, sha: string): { dir: string; files: HfRepoFile[] } {
+  const prefix = dir ? `${dir}/` : ''
+  const component = (name: string, sha256?: string): HfRepoFile => ({
+    name: `${prefix}${name}`, quant: 'mlx', sizeBytes: 1, parts: 1, mmproj: false, safetensors: true, sha256,
+    url: fileUrl(`${prefix}${name}`),
+  })
+  return { dir, files: [component('config.json'), component('model.safetensors', sha), component('tokenizer.json')] }
+}
+
+function provenanceFor(repo: string, dest: string, sha256?: string): ProvenanceEntry {
+  return { repo, filename: 'model.safetensors', dest, at: '2026-09-19T00:00:00.000Z', ...(sha256 ? { sha256 } : {}) }
+}
+
+function scanned(path: string, key: string): ModelEntry {
+  return { key, name: key, path } as unknown as ModelEntry
+}
+
+const REPO = 'AlexWortega/openjev'
+const V2 = checkpointOf('qwen3.5-4b-nli-v2', 'sha-v2')
+const V1 = checkpointOf('qwen3.5-4b-nli-v1', 'sha-v1')
+const V2_DIR = join(PRIMARY, 'openjev', 'qwen3.5-4b-nli-v2')
+const V2_DEST = join(V2_DIR, 'model.safetensors')
+
+test('a downloaded checkpoint is matched by its weight sha, and its sibling is not', () => {
+  const prov = [provenanceFor(REPO, V2_DEST, 'sha-v2')]
+  const models = [scanned(V2_DIR, 'qwen3.5 4b nli v2|mlx-fp16|9012345678')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, models), { downloaded: true, localKey: 'qwen3.5 4b nli v2|mlx-fp16|9012345678' })
+  assert.deepEqual(annotateCheckpoint(REPO, V1, prov, models), { downloaded: false, localKey: null })
+})
+
+test('with no sha recorded, the download destination path decides — still only that checkpoint', () => {
+  const prov = [provenanceFor(REPO, V2_DEST)]
+  const models = [scanned(V2_DIR, 'v2-key')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, models), { downloaded: true, localKey: 'v2-key' })
+  assert.deepEqual(annotateCheckpoint(REPO, V1, prov, models), { downloaded: false, localKey: null })
+})
+
+test('a subfolder download never marks the ROOT checkpoint as downloaded', () => {
+  const root = checkpointOf('', 'sha-root')
+  const prov = [provenanceFor(REPO, V2_DEST)]
+  const models = [scanned(V2_DIR, 'v2-key')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, root, prov, models), { downloaded: false, localKey: null })
+})
+
+test('a provenance entry from a DIFFERENT repo does not match by path', () => {
+  const prov = [provenanceFor('someone/else', V2_DEST)]
+  const models = [scanned(V2_DIR, 'v2-key')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, models), { downloaded: false, localKey: null })
+})
+
+test('a matching download with no scanned model yet is not downloaded', () => {
+  const prov = [provenanceFor(REPO, V2_DEST, 'sha-v2')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, []), { downloaded: false, localKey: null })
+})
+
+test('a download whose folder is not in the library yet is not downloaded, even with other models scanned', () => {
+  const prov = [provenanceFor(REPO, V2_DEST, 'sha-v2')]
+  const unrelated = [scanned(join(PRIMARY, 'gemma-4-e4b'), 'gemma-key')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, unrelated), { downloaded: false, localKey: null })
+})
+
+test('a checkpoint nobody downloaded is not downloaded', () => {
+  assert.deepEqual(annotateCheckpoint(REPO, V2, [], [scanned(V2_DIR, 'v2-key')]), { downloaded: false, localKey: null })
+})
+
+// Only on Windows: a backslash destination is what this platform's own downloads write, and the
+// local-model lookup uses node:path `dirname`, which splits backslashes only here.
+test('a Windows-style destination with backslashes matches the same checkpoint', { skip: process.platform !== 'win32' }, () => {
+  const prov = [provenanceFor(REPO, 'D:\\models\\openjev\\qwen3.5-4b-nli-v2\\model.safetensors')]
+  const models = [scanned('D:\\models\\openjev\\qwen3.5-4b-nli-v2', 'v2-key')]
+
+  assert.deepEqual(annotateCheckpoint(REPO, V2, prov, models), { downloaded: true, localKey: 'v2-key' })
 })

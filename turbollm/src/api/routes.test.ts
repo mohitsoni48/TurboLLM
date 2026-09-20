@@ -3,6 +3,7 @@
 // The reason comes from the one shared `modelIncompatibility()` rule.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
@@ -171,4 +172,63 @@ test('registerApi registers GET /api/v1/activity', async () => {
 
   assert.equal(res.status, 200)
   assert.deepEqual(await res.json(), { items: [], engineGenerating: false })
+})
+
+// The HF repo-detail route overlays each checkpoint row with "is it already downloaded, and
+// which local model is it?" (ADR-434 (h)) — beside, never instead of, the existing `files`
+// overlay.
+function appWithRepoDetail(detail: unknown, provenance: unknown[], models: ModelEntry[]) {
+  const d = {
+    store: { snapshot: () => ({}) },
+    hf: { getRepo: async () => detail },
+    downloads: { provenance: () => provenance },
+    scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
+    hashes: { get: () => undefined, ensure: () => {} },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+  return app
+}
+
+test('GET /api/v1/hf/models/:owner/:name annotates every checkpoint, leaving files untouched', async () => {
+  const cp = (dir: string, sha: string) => ({
+    dir,
+    name: dir,
+    sizeBytes: 9,
+    jev: { architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+    files: [{ name: `${dir}/model.safetensors`, quant: 'mlx', sizeBytes: 9, parts: 1, mmproj: false, safetensors: true, sha256: sha, url: 'u' }],
+  })
+  const detail = {
+    repo: 'AlexWortega/openjev', gated: false, license: 'mit', downloads: 1, likes: 1, card: '',
+    files: [], safetensors: true,
+    checkpoints: [cp('qwen3.5-4b-nli-v1', 'sha-v1'), cp('qwen3.5-4b-nli-v2', 'sha-v2')],
+  }
+  const dir = join('D:', 'models', 'openjev', 'qwen3.5-4b-nli-v2')
+  const provenance = [{ repo: 'AlexWortega/openjev', filename: 'model.safetensors', sha256: 'sha-v2', dest: join(dir, 'model.safetensors'), at: '' }]
+  const models = [entry({ key: 'v2-key', path: dir })]
+
+  const res = await appWithRepoDetail(detail, provenance, models).request('/api/v1/hf/models/AlexWortega/openjev')
+
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { files: unknown[]; verifying: boolean; checkpoints: { dir: string; downloaded: boolean; localKey: string | null; jev: unknown }[] }
+  assert.deepEqual(body.checkpoints.map((c) => [c.dir, c.downloaded, c.localKey]), [
+    ['qwen3.5-4b-nli-v1', false, null],
+    ['qwen3.5-4b-nli-v2', true, 'v2-key'],
+  ])
+  assert.deepEqual(body.checkpoints[1].jev, { architecture: 'Qwen3_5ForSequenceClassification', verified: true })
+  assert.deepEqual(body.files, [])
+  assert.equal(body.verifying, false)
+})
+
+test('a GGUF repo detail (no checkpoints) comes back exactly as before', async () => {
+  const detail = {
+    repo: 'bartowski/Qwen3-8B-GGUF', gated: false, license: '', downloads: 0, likes: 0, card: '',
+    files: [{ name: 'qwen3-8b-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 4, parts: 1, mmproj: false, url: 'u' }],
+  }
+
+  const res = await appWithRepoDetail(detail, [], []).request('/api/v1/hf/models/bartowski/Qwen3-8B-GGUF')
+
+  const body = (await res.json()) as Record<string, unknown>
+  assert.equal('checkpoints' in body, false)
+  assert.deepEqual(body.files, [{ ...detail.files[0], downloaded: false, localKey: null }])
 })

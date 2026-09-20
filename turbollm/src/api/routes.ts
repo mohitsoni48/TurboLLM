@@ -74,6 +74,7 @@ import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } fr
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
+import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
@@ -2472,7 +2473,11 @@ export function registerApi(app: Hono, d: Deps): void {
         }
         return { ...f, downloaded: !!local, localKey: local?.key ?? null }
       })
-      return c.json({ ...detail, files, verifying })
+      // Checkpoint rows (ADR-434 (h)) are annotated the same way, but by sha or destination
+      // path: provenance `filename` is a basename, so two checkpoints' identical
+      // `model.safetensors` cannot be told apart by name.
+      const checkpoints = detail.checkpoints?.map((cp) => ({ ...cp, ...annotateCheckpoint(repo, cp, prov, models) }))
+      return c.json({ ...detail, files, ...(checkpoints ? { checkpoints } : {}), verifying })
     } catch (e) {
       return hfErr(c, e)
     }

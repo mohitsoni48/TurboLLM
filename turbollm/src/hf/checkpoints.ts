@@ -1,7 +1,10 @@
 // Which directories of a safetensors repo are downloadable models (ADR-434 (h)). A repo with
 // exactly one checkpoint behaves exactly as today; a repo like OpenJev, which keeps each
 // checkpoint in its own folder, gets one row per folder instead of a dead Download button.
+import { dirname } from 'node:path'
 import type { HfRepoFile, RawTreeEntry } from './hf'
+import type { ProvenanceEntry } from '../downloads/downloads'
+import type { ModelEntry } from '../models/scanner'
 
 /** A downloadable model directory in an HF repo. */
 export interface HfCheckpoint {
@@ -113,4 +116,41 @@ function dirOf(path: string): string {
 function baseOf(path: string): string {
   const cut = path.lastIndexOf('/')
   return cut === -1 ? path : path.slice(cut + 1)
+}
+
+/** Is this checkpoint already on disk, and which local model is it? Provenance `filename` is a
+ *  basename, so two checkpoints' identical `model.safetensors` are indistinguishable by name:
+ *  the match is by weight sha256 first, then by the download's own destination path. */
+export function annotateCheckpoint(
+  repo: string,
+  cp: CheckpointPlacement,
+  provenance: ProvenanceEntry[],
+  models: ModelEntry[],
+): { downloaded: boolean; localKey: string | null } {
+  const download = downloadOf(repo, cp, provenance)
+  const local = download ? models.find((m) => m.path === dirname(download.dest)) : undefined
+  return { downloaded: !!local, localKey: local?.key ?? null }
+}
+
+/** What `annotateCheckpoint` needs of a checkpoint: where it lives and what it ships. */
+type CheckpointPlacement = Pick<HfCheckpoint, 'dir' | 'files'>
+
+function downloadOf(repo: string, cp: CheckpointPlacement, provenance: ProvenanceEntry[]): ProvenanceEntry | undefined {
+  const weightShas = new Set(cp.files.filter((f) => WEIGHTS_RE.test(f.name)).map((f) => f.sha256))
+  return provenance.find((p) => !!p.sha256 && weightShas.has(p.sha256))
+    ?? provenance.find((p) => p.repo === repo && landedInCheckpoint(repo, cp, p.dest))
+}
+
+/** The repo's own name anchors the tail — the same anchor the download subdir uses. Without it
+ *  the ROOT checkpoint (dir '') would match every subfolder download of the repo. */
+function landedInCheckpoint(repo: string, cp: CheckpointPlacement, dest: string): boolean {
+  const destSegments = dest.replace(/\\/g, '/').split('/').filter(Boolean)
+  const dirSegments = cp.dir ? cp.dir.split('/') : []
+  return cp.files.some((f) => endsWith(destSegments, [baseOf(repo), ...dirSegments, baseOf(f.name)]))
+}
+
+function endsWith(segments: string[], tail: string[]): boolean {
+  if (tail.length > segments.length) return false
+  const from = segments.length - tail.length
+  return tail.every((segment, i) => segments[from + i] === segment)
 }
