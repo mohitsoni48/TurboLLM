@@ -739,3 +739,62 @@ test('#222: both new fields survive a resolveProfile round-trip from a saved pro
   assert.equal(args[args.indexOf('--load-mode') + 1], 'dio')
   assert.equal(args.includes('--no-mmap'), true)
 })
+
+// --cache-ram: llama.cpp keeps finished prompts in RAM (default 8192 MiB) so returning to an earlier
+// conversation skips re-processing. `cacheRam` follows the #222 shape (ADR-415): a curated, default-inert
+// control. Absent emits nothing, so an untouched profile still launches byte-identically (DEFAULT_ARGS).
+
+test('cache-ram: deriveDefault leaves cacheRam unset and a default profile never emits the flag', () => {
+  const p = base()
+  assert.equal(p.cacheRam, undefined)
+  assert.equal(profileToArgs(p, model(), caps).includes('--cache-ram'), false)
+})
+
+test('cache-ram: 0 is emitted, because 0 disables the prompt cache and is a real value, not "unset"', () => {
+  const args = profileToArgs({ ...base(), cacheRam: 0 }, model(), caps)
+  const at = args.indexOf('--cache-ram')
+  assert.deepEqual(args.slice(at, at + 2), ['--cache-ram', '0'])
+})
+
+test('cache-ram: a MiB limit is emitted verbatim', () => {
+  const args = profileToArgs({ ...base(), cacheRam: 2048 }, model(), caps)
+  assert.equal(args[args.indexOf('--cache-ram') + 1], '2048')
+})
+
+test('cache-ram: the largest value a 32-bit int holds, which llama.cpp parses, is still emitted', () => {
+  const args = profileToArgs({ ...base(), cacheRam: 2_147_483_647 }, model(), caps)
+  assert.equal(args[args.indexOf('--cache-ram') + 1], '2147483647')
+})
+
+test('cache-ram: emitted when the engine advertises the flag by name in a probed flag list', () => {
+  // `caps` above is the empty allow-all list, which would pass even if the gate's flag name were misspelled.
+  const probed = { kvTypes: [], flags: ['-c', '--cache-ram'] }
+  const args = profileToArgs({ ...base(), cacheRam: 0 }, model(), probed)
+  assert.equal(args[args.indexOf('--cache-ram') + 1], '0')
+})
+
+test('cache-ram: skipped when the engine does not advertise the flag', () => {
+  const noCacheRam = { kvTypes: [], flags: ['-c', '--parallel'] }
+  assert.equal(profileToArgs({ ...base(), cacheRam: 0 }, model(), noCacheRam).includes('--cache-ram'), false)
+})
+
+test('cache-ram: a stored value that is not a non-negative whole number is never emitted', () => {
+  // A hand-edited config.json or an older client must not turn into `--cache-ram null`.
+  for (const junk of [null, Number.NaN, -1, 1.5, '2048', 1e21, 2_147_483_648]) {
+    const p = { ...base(), cacheRam: junk } as unknown as LoadProfile
+    assert.equal(profileToArgs(p, model(), caps).includes('--cache-ram'), false, `cacheRam=${String(junk)}`)
+  }
+})
+
+test('cache-ram: a hand-typed --cache-ram in extraArgs comes last, so it wins', () => {
+  const p = { ...base(), cacheRam: 0, extraArgs: ['--cache-ram', '512'] }
+  const args = profileToArgs(p, model(), caps)
+  assert.equal(args.lastIndexOf('--cache-ram') > args.indexOf('--cache-ram'), true)
+  assert.equal(args[args.lastIndexOf('--cache-ram') + 1], '512')
+})
+
+test('cache-ram: 0 survives a resolveProfile round-trip from a saved profile', () => {
+  const m = model()
+  const args = profileToArgs(resolveProfile(m, sys(), { cacheRam: 0 }), m, caps)
+  assert.equal(args[args.indexOf('--cache-ram') + 1], '0')
+})

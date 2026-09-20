@@ -790,6 +790,9 @@ export type LoadProfile = {
   /** llama.cpp --no-mmap (GitHub #222). Read the file into memory instead of mapping it.
    *  Absent/false = engine default (mmap on). */
   noMmap?: boolean
+  /** llama.cpp --cache-ram: MiB of RAM the server may use to keep finished prompts. Absent =
+   *  not emitted, engine default (8192 MiB). 0 disables the prompt cache. Whole MiB only. */
+  cacheRam?: number
   tunedBy?: string
 }
 

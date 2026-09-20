@@ -874,6 +874,11 @@ export function ModelDetailDialog({
                     onChange={(v) => { track('models', 'set_model_no_mmap'); set('noMmap', v) }}
                   />
                 )}
+                {hasFlag('--cache-ram') && (
+                  <Row label="Prompt cache RAM (MiB)" hint="--cache-ram: RAM llama.cpp keeps finished prompts in, so returning to an earlier chat skips re-processing. Blank = engine default (8192). 0 turns it off and gives that RAM back.">
+                    <DefaultableNumberInput value={draft.cacheRam} placeholder="8192" min={0} max={1048576} step={256} onChange={(v) => set('cacheRam', v === undefined ? undefined : Math.round(v))} />
+                  </Row>
+                )}
               </Section>
             )}
             </>)}
