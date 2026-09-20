@@ -4,6 +4,8 @@
 // degradation. Network/auth failures surface as a typed HfError so routes can map
 // them to a stable error envelope.
 import { quantFromName } from '../gguf/gguf'
+import { detectJev } from '../models/jev'
+import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
 
 const BASE = 'https://huggingface.co'
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -101,6 +103,9 @@ export interface HfRepoDetail {
   files: HfRepoFile[]
   /** True when the repo is a safetensors model (no GGUFs — covers MLX and vLLM). */
   safetensors?: boolean
+  /** Every downloadable checkpoint folder of a safetensors repo (ADR-434 (h)), root first.
+   *  Present only for safetensors repos; `files` above is unchanged either way. */
+  checkpoints?: HfCheckpoint[]
 }
 
 /** One concrete file to fetch for a working GGUF model (spec 10 §3): a shard of a
@@ -178,6 +183,7 @@ export class HfClient {
 
     let files: HfRepoFile[]
     let safetensors: boolean | undefined
+    let checkpoints: HfCheckpoint[] | undefined
     if (isSafetensors) {
       safetensors = true
       // Collect all component files: safetensors weights + JSON config/tokenizer files +
@@ -202,6 +208,10 @@ export class HfClient {
         sha256: e.lfs?.oid,
         url: this.fileUrl(repo, e.path),
       }))
+      // ADR-434 (h): the list above is ROOT-ONLY by design — dropping that filter would
+      // flatten a multi-checkpoint repo into one folder and have its checkpoints overwrite
+      // each other. The checkpoint rows are additive, and each downloads only its own files.
+      checkpoints = await this.withJevBadges(repo, findCheckpoints(repo, tree, (path) => this.fileUrl(repo, path)))
     } else {
       files = groupFiles(repo, ggufEntries)
     }
@@ -220,6 +230,27 @@ export class HfClient {
       card: await this.getCard(repo),
       files,
       ...(safetensors ? { safetensors } : {}),
+      ...(checkpoints ? { checkpoints } : {}),
+    }
+  }
+
+  /** Marks the Jev checkpoints by reading each one's OWN config.json, in parallel and capped:
+   *  a repo of training checkpoints can hold hundreds, and the rows past the cap simply carry
+   *  no badge. An unreadable config is `jev: null` — never a failed repo view. */
+  private async withJevBadges(repo: string, cps: Omit<HfCheckpoint, 'jev'>[]): Promise<HfCheckpoint[]> {
+    const badges = await Promise.all(
+      cps.slice(0, MAX_CHECKPOINT_CONFIG_FETCHES).map((cp) => this.jevBadge(repo, cp.dir)),
+    )
+    return cps.map((cp, i) => ({ ...cp, jev: badges[i] ?? null }))
+  }
+
+  private async jevBadge(repo: string, dir: string): Promise<HfCheckpoint['jev']> {
+    try {
+      const cfg = await this.getJson<unknown>(`${BASE}/${repo}/resolve/main/${dir ? `${dir}/` : ''}config.json`)
+      const jev = detectJev(cfg)
+      return jev ? { architecture: jev.architecture, verified: jev.verified } : null
+    } catch {
+      return null
     }
   }
 
@@ -452,7 +483,9 @@ interface RawRepoInfo {
   cardData?: { license?: string; base_model?: string | string[] }
 }
 
-interface RawTreeEntry {
+/** One raw entry of HF's recursive tree listing. Exported for `checkpoints.ts`, which works on
+ *  the same tree `getRepo` fetches. */
+export interface RawTreeEntry {
   type?: string
   path: string
   size?: number
