@@ -29,6 +29,21 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   returning to an earlier conversation skips re-processing. A new **Prompt cache RAM (MiB)** field in a
   model's Advanced settings caps that (`--cache-ram`), and `0` turns it off to free the memory. It is
   blank by default, so nothing changes until you set it. Shown only on engines that support the flag.
+- **Jev models: classify and rerank with a local NLI model.** TurboLLM now recognises NLI
+  cross-encoders (such as OpenJev) and runs them through vLLM. While one is loaded, Workspace
+  becomes the **Jev Playground**: check a premise against up to 128 hypotheses, or rank options
+  against a question, with the model's own labels and probabilities and a copyable request for the
+  matching endpoint. On the API: `POST /v1/classify` and `POST /v1/rerank`. Downloading one is
+  easier too: a Hugging Face repo that keeps several checkpoints in subfolders now lists them one
+  per row, and each row downloads only its own files. Full guide: https://turbollm.dev/docs/jev
+
+### Changed
+
+- **`/v1/rerank` now belongs to Jev models.** TurboLLM serves it itself instead of passing it
+  through to the engine, so a llama.cpp reranker is no longer reachable on that path.
+- **An NLI cross-encoder already in your library is now treated as a Jev model.** It is no longer
+  listed as an embedding model and no longer answers `/v1/embeddings`, and loading it takes the
+  main model slot, as a chat model does, instead of loading beside your chat model.
 
 ### Fixed
 
