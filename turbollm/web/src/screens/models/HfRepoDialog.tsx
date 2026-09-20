@@ -31,7 +31,7 @@ import { toast } from '../../components/ui/sonner'
 /** Per-quant VRAM fit estimate. We only know the file size here (no GGUF block/head
  *  metadata), so this is a coarse weights-plus-overhead heuristic vs total VRAM —
  *  deliberately conservative. Unknown VRAM → 'unknown' (neutral styling, spec 10 §3). */
-function fileFit(sizeBytes: number, vramMb: number | undefined): FitVerdict {
+export function fileFit(sizeBytes: number, vramMb: number | undefined): FitVerdict {
   if (!vramMb) return 'unknown'
   const sizeMb = sizeBytes / 1e6
   // Reserve headroom for KV cache + runtime (~15% of file + 1GB baseline).
@@ -360,7 +360,7 @@ export function HfRepoContent({
 /** A small colored dot indicating VRAM fit — green/yellow/red (fits/tight/overflow),
  *  neutral otherwise. Used both standalone (VRAM verdict line) and inside the quant
  *  dropdown so every option's fit is visible without opening it further. */
-function FitDot({ fit, size = 8 }: { fit: FitVerdict; size?: number }) {
+export function FitDot({ fit, size = 8 }: { fit: FitVerdict; size?: number }) {
   return (
     <span
       className="shrink-0 rounded-full"
@@ -654,6 +654,6 @@ function repoSearchTerm(repo: string | null): string {
   return name.replace(/[-_]?gguf$/i, '').replace(/[-_]+/g, ' ').trim()
 }
 
-function fmtSize(b: number): string {
+export function fmtSize(b: number): string {
   return b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`
 }
