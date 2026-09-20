@@ -11,6 +11,7 @@ import { ApiError, track } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
 import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
+import { isChatModel } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
@@ -153,7 +154,7 @@ export function CodeHomeScreen() {
   // load (the engine auto-starts), exactly like Chat's own model picker.
   const modelsQ = useModels()
   const modelActions = useModelActions()
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||

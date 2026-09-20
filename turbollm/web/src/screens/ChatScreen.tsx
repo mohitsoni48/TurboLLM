@@ -34,6 +34,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { useLinks, useLinkStatus, useRemoteModels } from '../lib/link-queries'
 import { describeRemoteHost, findRemoteChoice, selectModel } from '../lib/remote-models'
+import { isChatModel } from '../lib/model-kind'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -326,7 +327,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Only offer models the active engine can actually load (ADR-044) — GGUFs under
   // llama.cpp, safetensors under MLX/vLLM. Keeps the chat model menu from listing
   // models that would 409 on load.
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine)
+  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
   // Turbo Link (ADR-376 §6.3): models living on other machines, grouped under their machine
   // in the picker below. Both queries fail soft (`?? []`) — a host-gated 403 or a daemon
   // with no links must leave the chat screen exactly as it was, not error it.
