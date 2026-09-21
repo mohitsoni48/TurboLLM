@@ -225,7 +225,7 @@ test('gatewayV1Handler behind the Turbo Link façade refuses /v1/classify (origi
     })
 
     assert.equal(res.status, 400)
-    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_classify_unsupported')
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_jev_unsupported')
     assert.deepEqual(calls, [])
   })
 })
@@ -241,7 +241,7 @@ test('a trailing slash does not let a Turbo Link peer past the /v1/classify refu
     })
 
     assert.equal(res.status, 400)
-    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_classify_unsupported')
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'link_jev_unsupported')
     assert.deepEqual(calls, [])
   })
 })

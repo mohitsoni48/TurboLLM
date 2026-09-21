@@ -638,18 +638,18 @@ function engineInputsSent(harness: Harness): string[] {
   return (JSON.parse(String(harness.engineCalls[0].init.body)) as { input: string[] }).input
 }
 
-const LINK_CLASSIFY_UNSUPPORTED: JevHttpError = {
+const LINK_JEV_UNSUPPORTED: JevHttpError = {
   status: 400,
-  code: 'link_classify_unsupported',
+  code: 'link_jev_unsupported',
   type: 'invalid_request_error',
-  message: 'Turbo Link does not carry /v1/classify or /v1/rerank — call the machine that has the model.',
+  message: 'Turbo Link does not carry the Jev endpoints — call the machine that has the model.',
 }
 
 test('handleJevRequest step 1: a Turbo Link peer is refused before anything is read or routed', async () => {
   resetLocalActivity()
   const harness = jevHarness({ origin: 'link' })
 
-  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), LINK_CLASSIFY_UNSUPPORTED)
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), LINK_JEV_UNSUPPORTED)
 
   assert.deepEqual(harness.resolvedLocally, [])
   assert.deepEqual(harness.routed, [])
@@ -670,9 +670,9 @@ test('handleJevRequest step 3: a body that fails validation → that exact error
   assert.deepEqual(harness.resolvedLocally, [])
 })
 
-test('handleJevRequest step 4: a Turbo Link model id → 400 link_classify_unsupported, never resolved locally', async () => {
+test('handleJevRequest step 4: a Turbo Link model id → 400 link_jev_unsupported, never resolved locally', async () => {
   const harness = jevHarness()
-  await assertRefused(await postJson(harness.app, '/v1/rerank', rerankBody({ model: LINKED_ID })), LINK_CLASSIFY_UNSUPPORTED)
+  await assertRefused(await postJson(harness.app, '/v1/rerank', rerankBody({ model: LINKED_ID })), LINK_JEV_UNSUPPORTED)
   assert.deepEqual(harness.resolvedLocally, [])
   assert.deepEqual(harness.routed, [])
 })

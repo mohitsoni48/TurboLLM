@@ -19,7 +19,7 @@ import {
   isJsonObject,
   jevErrorResponse,
   jsonBodyOf,
-  LINK_CLASSIFY_UNSUPPORTED,
+  LINK_JEV_UNSUPPORTED,
   MAX_JEV_INPUTS,
   refusalFor,
   resolveJevModel,
@@ -86,7 +86,7 @@ export async function handleJevRequest(
   opts: GatewayV1Options,
   fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
-  if (opts.origin === 'link') return jevErrorResponse(c, LINK_CLASSIFY_UNSUPPORTED)
+  if (opts.origin === 'link') return jevErrorResponse(c, LINK_JEV_UNSUPPORTED)
   return endpoint === 'classify'
     ? serveJevRequest(c, d, CLASSIFY_ENDPOINT, fetchImpl)
     : serveJevRequest(c, d, RERANK_ENDPOINT, fetchImpl)

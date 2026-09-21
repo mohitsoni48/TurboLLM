@@ -109,7 +109,7 @@ export interface ResolvedJevModel {
 /** Exactly the model the request names — a Turbo Link id is refused (ADR-427's embeddings stance)
  *  and nothing ever falls back to another local model. */
 export function resolveJevModel(d: Deps, requested: string): ResolvedJevModel {
-  if (d.modelRouter.resolveRemoteTarget(requested)) throw new JevEndpointError(LINK_CLASSIFY_UNSUPPORTED)
+  if (d.modelRouter.resolveRemoteTarget(requested)) throw new JevEndpointError(LINK_JEV_UNSUPPORTED)
   const entry = d.modelRouter.resolveLocal(requested)
   if (!entry) throw new JevEndpointError(modelNotFound(requested))
   if (!isJevModel(entry)) throw new JevEndpointError(notAJevModel(entry.name))
@@ -138,11 +138,11 @@ export function refusalFor(error: unknown): JevHttpError {
   throw error
 }
 
-export const LINK_CLASSIFY_UNSUPPORTED: JevHttpError = {
+export const LINK_JEV_UNSUPPORTED: JevHttpError = {
   status: 400,
-  code: 'link_classify_unsupported',
+  code: 'link_jev_unsupported',
   type: 'invalid_request_error',
-  message: 'Turbo Link does not carry /v1/classify or /v1/rerank — call the machine that has the model.',
+  message: 'Turbo Link does not carry the Jev endpoints — call the machine that has the model.',
 }
 
 function modelNotFound(requested: string): JevHttpError {
