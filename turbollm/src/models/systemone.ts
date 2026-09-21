@@ -132,3 +132,47 @@ function levelTextOf(level: Criterion): string {
   if (text === undefined) throw new TypeError('A score level has no text; validation refuses a null level.')
   return text
 }
+
+/** The probability-weighted level position, `sum i * p_i`. */
+export function weightedLevel(probabilities: readonly number[]): number {
+  return probabilities.reduce((sum, probability, level) => sum + level * probability, 0)
+}
+
+/** How much a choice answer can be trusted: `sqrt(fit x margin)`, where `fit` is the best raw entailment
+ *  and `margin` is the gap between the two most likely options. A message that fits no option has a
+ *  tiny `fit`, so its normalised margin cannot make it look routed. */
+export function choiceConfidence(raw: readonly number[], probabilities: readonly number[]): number {
+  requireComparableVectors(raw, probabilities)
+  return Math.sqrt(bestFitOf(raw) * topTwoGap(probabilities))
+}
+
+/** How much a score answer can be trusted: `sqrt(fit x concentration)`, where `concentration` falls from
+ *  1 (all mass on one level) to 0 (a spread of half the scale or more). */
+export function scoreConfidence(raw: readonly number[], probabilities: readonly number[]): number {
+  requireComparableVectors(raw, probabilities)
+  return Math.sqrt(bestFitOf(raw) * concentrationOf(probabilities))
+}
+
+function requireComparableVectors(raw: readonly number[], probabilities: readonly number[]): void {
+  if (raw.length !== probabilities.length) {
+    throw new RangeError(`raw has ${raw.length} values but probabilities has ${probabilities.length}.`)
+  }
+  if (raw.length < 2) {
+    throw new RangeError('A confidence needs at least two options or levels to compare.')
+  }
+}
+
+function bestFitOf(raw: readonly number[]): number {
+  return Math.max(...raw)
+}
+
+function topTwoGap(probabilities: readonly number[]): number {
+  const [first, second] = [...probabilities].sort((a, b) => b - a)
+  return first - second
+}
+
+function concentrationOf(probabilities: readonly number[]): number {
+  const mean = weightedLevel(probabilities)
+  const variance = probabilities.reduce((sum, probability, level) => sum + probability * (level - mean) ** 2, 0)
+  return Math.max(0, 1 - (2 * Math.sqrt(variance)) / (probabilities.length - 1))
+}

@@ -4,11 +4,14 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  choiceConfidence,
   criterionTextOf,
   instructionTextOf,
   normalise,
   planSystemOne,
+  scoreConfidence,
   serialiseState,
+  weightedLevel,
   type Criterion,
   type Instructions,
   type Question,
@@ -54,6 +57,18 @@ function planOf(questions: Record<string, Question>, state: StateValue = STATE_U
 
 function textsOf(plan: SystemOnePlan): string[] {
   return plan.hypotheses.map((hypothesis) => hypothesis.text)
+}
+
+function assertClose(actual: number, expected: number, tolerance = 1e-9): void {
+  assert.ok(Math.abs(actual - expected) <= tolerance, `expected ${actual} to be within ${tolerance} of ${expected}`)
+}
+
+function choiceConfidenceOf(raw: readonly number[]): number {
+  return choiceConfidence(raw, normalise(raw))
+}
+
+function scoreConfidenceOf(raw: readonly number[]): number {
+  return scoreConfidence(raw, normalise(raw))
 }
 
 test('serialiseState returns a string state byte for byte', () => {
@@ -294,4 +309,98 @@ test('planSystemOne throws a TypeError for a null score level and plans a state 
 
   assert.throws(() => planOf({ q: nullLevel }), TypeError)
   assert.equal(planOf({ q: Q_NOUL }, nested(32)).premise.length, 2048)
+})
+
+test('weightedLevel is the probability-weighted level position', () => {
+  assertClose(weightedLevel([0.086, 0.089, 0.551, 0.274]), 2.013)
+  assert.equal(weightedLevel([1, 0, 0]), 0)
+  assert.equal(weightedLevel([0, 0, 1]), 2)
+  assert.equal(weightedLevel([0.25, 0.25, 0.25, 0.25]), 1.5)
+})
+
+test('weightedLevel of no levels is 0 and does not throw', () => {
+  assert.equal(weightedLevel([]), 0)
+})
+
+test('choiceConfidence is the square root of the raw fit times the top-two margin', () => {
+  assertClose(choiceConfidenceOf([0.321, 0.515, 0.185, 0.005]), 0.31205475103149055)
+})
+
+test('choiceConfidence of a message that fits no option is 0.05205456194566272', () => {
+  assertClose(choiceConfidenceOf([0.008, 0.024, 0.013, 0.017]), 0.05205456194566272)
+})
+
+test('choiceConfidence separates a routed message from an unroutable one by a factor of at least five', () => {
+  const routed = choiceConfidenceOf([0.321, 0.515, 0.185, 0.005])
+  const unroutable = choiceConfidenceOf([0.008, 0.024, 0.013, 0.017])
+
+  assert.ok(routed / unroutable >= 5)
+})
+
+test('choiceConfidence is 0, never NaN, for all-zero raws and for a two-way tie', () => {
+  const noFit = choiceConfidenceOf([0, 0, 0, 0])
+
+  assert.equal(noFit, 0)
+  assert.equal(Number.isNaN(noFit), false)
+  assert.equal(choiceConfidenceOf([0.4, 0.4, 0.1]), 0)
+})
+
+test('scoreConfidence is the square root of the raw fit times the concentration', () => {
+  assertClose(scoreConfidenceOf([0.086, 0.089, 0.551, 0.274]), 0.49210868531804325)
+})
+
+test('scoreConfidence ranks a bimodal vector below a concentrated one', () => {
+  const bimodal = scoreConfidenceOf([0.29, 0.04, 0.19, 0.48])
+  const concentrated = scoreConfidenceOf([0.05, 0.06, 0.8, 0.09])
+
+  assertClose(bimodal, 0.26011376377111967)
+  assertClose(concentrated, 0.6976332844853927)
+  assert.ok(bimodal < concentrated)
+})
+
+test('scoreConfidence is 0 for all-zero raws and follows the formula for three levels', () => {
+  assert.equal(scoreConfidenceOf([0, 0, 0, 0]), 0)
+  assertClose(scoreConfidenceOf([0.9, 0.05, 0.05]), 0.686095736295143)
+})
+
+test('at two options the choice and score formulas agree only at the endpoints', () => {
+  // Only the endpoints coincide: at an interior split the margin and the concentration measure different things.
+  assertClose(choiceConfidenceOf([0.8, 0]), 0.8944271909999159)
+  assertClose(scoreConfidenceOf([0.8, 0]), 0.8944271909999159)
+  assert.equal(choiceConfidenceOf([0.5, 0.5]), 0)
+  assert.equal(scoreConfidenceOf([0.5, 0.5]), 0)
+})
+
+test('every confidence lies between 0 and 1', () => {
+  const vectors = [
+    [0.321, 0.515, 0.185, 0.005],
+    [0.008, 0.024, 0.013, 0.017],
+    [0.086, 0.089, 0.551, 0.274],
+    [0.29, 0.04, 0.19, 0.48],
+    [0.05, 0.06, 0.8, 0.09],
+    [0.9, 0.05, 0.05],
+    [0.8, 0],
+    [0, 0, 0, 0],
+  ]
+
+  for (const raw of vectors) {
+    for (const confidence of [choiceConfidenceOf(raw), scoreConfidenceOf(raw)]) {
+      assert.ok(confidence >= 0 && confidence <= 1, `${confidence} for ${raw.join(', ')}`)
+    }
+  }
+})
+
+test('both confidence functions throw a RangeError for a single option or mismatched lengths', () => {
+  assert.throws(() => choiceConfidence([0.9], [1]), RangeError)
+  assert.throws(() => scoreConfidence([0.9], [1]), RangeError)
+  assert.throws(() => choiceConfidence([0.5, 0.5, 0.1], [0.5, 0.5]), RangeError)
+  assert.throws(() => scoreConfidence([0.5, 0.5], [0.5, 0.25, 0.25]), RangeError)
+})
+
+test('scoreConfidence takes fit from the raw scores, not from the normalised vector', () => {
+  const halfScale = [0.043, 0.0445, 0.2755, 0.137]
+  const probabilities = normalise(halfScale)
+
+  assertClose(weightedLevel(probabilities), 2.013, 1e-12)
+  assertClose(scoreConfidence(halfScale, probabilities), 0.3479733884691852)
 })
