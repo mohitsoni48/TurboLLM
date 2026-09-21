@@ -7,7 +7,8 @@
 // people put in issues and blog posts.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
-import { MAX_JEV_INPUTS, buildCurl, classify, getActivity, rerank } from './jev-api'
+import { MAX_JEV_INPUTS, buildCurl, classify, getActivity, rerank, systemone } from './jev-api'
+import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
 import type { ActiveWork, ClassifyResponse, RerankResponse } from './types'
 
 const AUTH_KEY = 'tllm.authToken'
@@ -27,6 +28,18 @@ const FRANCE: RerankResponse = {
 }
 
 const IDLE: ActiveWork = { items: [], engineGenerating: false }
+
+const SYSTEMONE_REQUEST: SystemOneRequest = {
+  state: 'It is fine',
+  model: 'm',
+  questions: { q: { type: 'noul', instructions: 'i' } },
+}
+
+const SYSTEMONE_REPLY: SystemOneResponse = {
+  model: 'm',
+  answers: { q: { type: 'noul', noul: 0.945 } },
+  usage: { input_tokens: 42, output_tokens: 1 },
+}
 
 let storage: Map<string, string>
 
@@ -153,5 +166,68 @@ describe('buildCurl', () => {
   it('never carries the stored key, however loud the origin is', () => {
     storage.set(AUTH_KEY, 'secret-key')
     expect(buildCurl('http://192.168.1.5:6996', 'classify', body)).not.toContain('secret-key')
+  })
+})
+
+describe('systemone', () => {
+  it('posts the request to its own endpoint and returns the parsed answers', async () => {
+    const mock = stubFetch(SYSTEMONE_REPLY)
+    const res = await systemone(SYSTEMONE_REQUEST)
+    const { path, init, headers } = requestOf(mock)
+    expect(path).toBe('/v1/systemone')
+    expect(init.method).toBe('POST')
+    expect(headers['Content-Type']).toBe('application/json')
+    expect(init.body).toBe(JSON.stringify(SYSTEMONE_REQUEST))
+    expect(res).toEqual(SYSTEMONE_REPLY)
+  })
+
+  it('sends the stored key, so the playground works over the LAN too', async () => {
+    storage.set(AUTH_KEY, 'secret-key')
+    const mock = stubFetch(SYSTEMONE_REPLY)
+    await systemone(SYSTEMONE_REQUEST)
+    expect(requestOf(mock).headers['X-TurboLLM-Auth']).toBe('secret-key')
+  })
+
+  it('turns a 422 refusal into an ApiError that keeps the code and the message', async () => {
+    const message = 'questions.q.type must be one of noul, choice, score'
+    stubFetch({ error: { code: 'invalid_request', message, type: 'invalid_request_error' } }, 422)
+    const refused = systemone(SYSTEMONE_REQUEST)
+    await expect(refused).rejects.toMatchObject({ name: 'ApiError', code: 'invalid_request', message, status: 422 })
+    await expect(refused).rejects.toBeInstanceOf(ApiError)
+  })
+})
+
+describe('buildCurl for systemone', () => {
+  const SYSTEMONE_CURL = 'curl http://localhost:6996/v1/systemone \\\n'
+    + '  -H "content-type: application/json" \\\n'
+    + '  -d \'{"state":"It is fine","model":"m","questions":{"q":{"type":"noul","instructions":"i"}}}\''
+
+  const bodyOf = (curl: string) => curl.slice(curl.indexOf("-d '") + 4, -1).replaceAll("'\\''", "'")
+
+  it('is the same pasteable three-line command, aimed at /v1/systemone', () => {
+    expect(buildCurl('http://localhost:6996', 'systemone', SYSTEMONE_REQUEST)).toBe(SYSTEMONE_CURL)
+  })
+
+  it('leads with the auth hint from a LAN origin, where the daemon demands a key', () => {
+    const lines = buildCurl('http://192.168.1.5:6996', 'systemone', SYSTEMONE_REQUEST).split('\n')
+    expect(lines[0]).toBe('# add -H "X-TurboLLM-Auth: <your key>"')
+    expect(lines[1]).toBe('curl http://192.168.1.5:6996/v1/systemone \\')
+  })
+
+  it('escapes a single quote in the state so the paste sends the same body', () => {
+    const curl = buildCurl('http://localhost:6996', 'systemone', { ...SYSTEMONE_REQUEST, state: "it's fine" })
+    expect(curl).toContain('"state":"it\'\\\'\'s fine"')
+  })
+
+  it('round-trips: un-escaping the -d argument gives back exactly the request that was posted', () => {
+    const quoted = { ...SYSTEMONE_REQUEST, state: "it's fine" }
+    for (const request of [SYSTEMONE_REQUEST, quoted]) {
+      expect(JSON.parse(bodyOf(buildCurl('http://localhost:6996', 'systemone', request)))).toEqual(request)
+    }
+  })
+
+  it('never carries the stored key, even from a LAN origin', () => {
+    storage.set(AUTH_KEY, 'secret-key')
+    expect(buildCurl('http://192.168.1.5:6996', 'systemone', SYSTEMONE_REQUEST)).not.toContain('secret-key')
   })
 })

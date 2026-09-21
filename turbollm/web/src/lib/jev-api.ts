@@ -1,10 +1,12 @@
-// Jev (ADR-434 (c), (d)): the two gateway endpoints a Jev model answers, the daemon probe
-// for what a load would interrupt, and the curl the playground's API view hands the user.
+// Jev (ADR-434 (c), (d), ADR-439): the three gateway endpoints a Jev model answers (classify,
+// rerank and systemone), the daemon probe for what a load would interrupt, and the curl the
+// playground hands the user.
 //
 // `request()` in api.ts is module-private, so every sibling API module (link-api.ts,
 // code-api.ts, chat-api.ts, …) re-implements the same shape locally against the shared
 // ApiError/authHeaders — this follows that convention rather than exporting it.
 import { ApiError, authHeaders } from './api'
+import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
 import type { ActiveWork, ClassifyRequest, ClassifyResponse, RerankRequest, RerankResponse } from './types'
 
 /** Upper bound on hypotheses (check) or options (choose) in one request. Mirrors
@@ -20,6 +22,10 @@ export function rerank(req: RerankRequest): Promise<RerankResponse> {
   return request<RerankResponse>('/v1/rerank', { method: 'POST', json: req })
 }
 
+export function systemone(req: SystemOneRequest): Promise<SystemOneResponse> {
+  return request<SystemOneResponse>('/v1/systemone', { method: 'POST', json: req })
+}
+
 export function getActivity(): Promise<ActiveWork> {
   return request<ActiveWork>('/api/v1/activity')
 }
@@ -27,7 +33,7 @@ export function getActivity(): Promise<ActiveWork> {
 /** The exact command for this run, ready to paste. It NEVER contains the stored key:
  *  this is the view people screenshot. From a non-loopback origin, where the daemon
  *  does demand a key, it leads with a comment saying to add the header yourself. */
-export function buildCurl(origin: string, endpoint: 'classify' | 'rerank', body: object): string {
+export function buildCurl(origin: string, endpoint: 'classify' | 'rerank' | 'systemone', body: object): string {
   const command = [
     `curl ${origin}/v1/${endpoint} \\`,
     '  -H "content-type: application/json" \\',
