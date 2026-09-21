@@ -102,10 +102,14 @@ function jevModel(): ModelEntry {
   })
 }
 
+// The length is capped here, not passed through: vLLM's profile run on this model's native
+// 262,144 died with a CUDA illegal memory access (2026-09-21, vLLM 0.29.0) — see jev.ts.
 test('a Jev model on vLLM launches with the verified classifier flags after the profile flags', () => {
   const opts = resumeLoad(jevModel(), 'vllm')
 
-  assert.deepEqual(opts.extraArgs, ['--max-num-batched-tokens', '262144', ...OPENJEV_LAUNCH_TOKENS])
+  assert.deepEqual(opts.extraArgs, [
+    '--max-model-len', '8192', '--max-num-batched-tokens', '8192', ...OPENJEV_LAUNCH_TOKENS,
+  ])
 })
 
 test('a Jev model on MLX keeps the MLX sampling path, with no Jev flags', () => {

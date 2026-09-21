@@ -9,8 +9,10 @@ import {
   detectJev,
   fillHypothesisTemplate,
   flagName,
+  JEV_DEFAULT_MAX_MODEL_LEN,
   JEV_LAUNCH_TABLE,
   jevLaunchArgs,
+  jevMaxModelLen,
   JevShapeError,
   mapProbs,
   validateHypothesisTemplate,
@@ -179,6 +181,29 @@ test('an unverified architecture gets only vLLM\'s native --runner pooling', () 
 
 test('an unverified architecture whose user sets --runner gets nothing from the table', () => {
   assert.deepEqual(jevLaunchArgs(unverifiedJevInfo, ['--runner', 'generate']), [])
+})
+
+// Launch length. Live regression (2026-09-21, vLLM 0.29.0, RTX 5070 Ti): with no --max-model-len
+// vLLM derived OpenJev's own 262,144 and ran its torch.compile profile pass with a batch that
+// size, dying with `torch.AcceleratorError: CUDA error: an illegal memory access` — the default
+// load of the very model this feature exists for. At 8192 the model loads and classifies (a
+// 4,821-token premise labelled in 754 ms) and an over-long input gets a clean 400 instead.
+
+test('a Jev model launches at the verified cap, not at its own crashing native context', () => {
+  assert.equal(jevMaxModelLen(262_144, []), JEV_DEFAULT_MAX_MODEL_LEN)
+})
+
+test('a Jev model shorter than the cap keeps its own context, which vLLM refuses to exceed', () => {
+  assert.equal(jevMaxModelLen(512, []), 512)
+})
+
+test('an unknown native context still gets the cap', () => {
+  assert.equal(jevMaxModelLen(0, []), JEV_DEFAULT_MAX_MODEL_LEN)
+})
+
+test('a user --max-model-len, in either spelling, leaves the length entirely to them', () => {
+  assert.equal(jevMaxModelLen(262_144, ['--max-model-len', '3000']), 0)
+  assert.equal(jevMaxModelLen(262_144, ['--max_model_len=3000']), 0)
 })
 
 // NLI input and hypothesis templates — ADR-434 (d). Substitution is literal and single-pass:

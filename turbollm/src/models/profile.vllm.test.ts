@@ -5,7 +5,7 @@ import { test } from 'node:test'
 import { deriveDefault, defaultVllm, vllmProfileToArgs } from './profile'
 import type { LoadProfile, VllmProfile } from './profile'
 import type { ModelEntry } from './scanner'
-import type { JevInfo } from './jev'
+import { flagName, type JevInfo } from './jev'
 import type { SysInfo } from '../sysinfo/sysinfo'
 
 function model(over: Partial<ModelEntry> = {}): ModelEntry {
@@ -138,17 +138,25 @@ const OPENJEV_LAUNCH_TOKENS = [
   '--limit-mm-per-prompt', '{"image":0,"video":0}',
 ]
 
+// Live regression (2026-09-21, vLLM 0.29.0, RTX 5070 Ti): a fresh Jev profile emitted no
+// --max-model-len, so vLLM derived the model's own 262,144 and got --max-num-batched-tokens
+// 262144 to match — its torch.compile profile pass then died with `torch.AcceleratorError: CUDA
+// error: an illegal memory access`, failing the default load of the very model this feature
+// exists for. Capped at 8192 the same model loads and classifies a 4,821-token premise in 754 ms.
+const OPENJEV_NATIVE_CTX = 262_144
+
+/** What a Jev profile that has chosen no length of its own emits, for any native context
+ *  at or above the cap. */
+const CAPPED_JEV_LENGTH_FLAGS = ['--max-model-len', '8192', '--max-num-batched-tokens', '8192']
+
 function withExtraArgs(extraArgs: string[]): LoadProfile {
   return { ...deriveDefault(model(), sys), extraArgs }
 }
 
 test('a Jev model appends exactly the verified launch flags after the profile flags', () => {
-  const p = withExtraArgs([])
+  const args = vllmProfileToArgs(withExtraArgs([]), MODEL_NATIVE_CTX, OPENJEV)
 
-  const args = vllmProfileToArgs(p, MODEL_NATIVE_CTX, OPENJEV)
-
-  assert.deepEqual(args, [...vllmProfileToArgs(p, MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
-  assert.deepEqual(args, ['--max-num-batched-tokens', String(MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
+  assert.deepEqual(args, [...CAPPED_JEV_LENGTH_FLAGS, ...OPENJEV_LAUNCH_TOKENS])
 })
 
 test('a Jev flag the user set appears once, in the user position (last)', () => {
@@ -161,7 +169,49 @@ test('a Jev flag the user set appears once, in the user position (last)', () => 
 test('a user who set all four spike flags gets each exactly once, as typed', () => {
   const args = vllmProfileToArgs(withExtraArgs(OPENJEV_LAUNCH_TOKENS), MODEL_NATIVE_CTX, OPENJEV)
 
-  assert.deepEqual(args, ['--max-num-batched-tokens', String(MODEL_NATIVE_CTX), ...OPENJEV_LAUNCH_TOKENS])
+  assert.deepEqual(args, [...CAPPED_JEV_LENGTH_FLAGS, ...OPENJEV_LAUNCH_TOKENS])
+})
+
+test('a fresh Jev profile caps the launch length instead of passing the crashing native context', () => {
+  const args = vllmProfileToArgs(withExtraArgs([]), OPENJEV_NATIVE_CTX, OPENJEV)
+
+  assert.deepEqual(args, [...CAPPED_JEV_LENGTH_FLAGS, ...OPENJEV_LAUNCH_TOKENS])
+  assert.ok(!args.includes(String(OPENJEV_NATIVE_CTX)), 'the context that crashed vLLM must not reach it')
+})
+
+test('a Jev model shorter than the cap launches at its own context, with no batched-tokens flag', () => {
+  const args = vllmProfileToArgs(withExtraArgs([]), 512, OPENJEV)
+
+  assert.equal(valAfter(args, '--max-model-len'), '512')
+  assert.equal(valAfter(args, '--max-num-batched-tokens'), undefined)
+})
+
+test('a Jev model with an unknown native context still gets the capped length', () => {
+  assert.equal(valAfter(vllmProfileToArgs(withExtraArgs([]), 0, OPENJEV), '--max-model-len'), '8192')
+})
+
+test('an explicit profile maxModelLen wins over the Jev cap', () => {
+  const args = vllmProfileToArgs(withVllm({ maxModelLen: 4096 }), OPENJEV_NATIVE_CTX, OPENJEV)
+
+  assert.deepEqual(args.filter((token) => token === '--max-model-len'), ['--max-model-len'])
+  assert.equal(valAfter(args, '--max-model-len'), '4096')
+  assert.equal(valAfter(args, '--max-num-batched-tokens'), '4096')
+  assert.ok(!args.includes('8192'), 'the cap must not appear once the user has chosen a length')
+})
+
+for (const userLength of [['--max-model-len', '3000'], ['--max_model_len=3000']]) {
+  test(`a user ${userLength[0]} in extraArgs wins, and is the only one on the command line`, () => {
+    const args = vllmProfileToArgs(withExtraArgs(userLength), OPENJEV_NATIVE_CTX, OPENJEV)
+
+    assert.equal(args.filter((token) => flagName(token) === 'max-model-len').length, 1)
+    assert.deepEqual(args.slice(-userLength.length), userLength)
+  })
+}
+
+test('the cap is Jev-only: the same profile without a Jev descriptor is unchanged', () => {
+  assert.deepEqual(vllmProfileToArgs(withExtraArgs([]), OPENJEV_NATIVE_CTX, undefined), [
+    '--max-num-batched-tokens', String(OPENJEV_NATIVE_CTX),
+  ])
 })
 
 test('without a Jev descriptor the argv is unchanged for representative profiles', () => {

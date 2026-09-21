@@ -59,6 +59,20 @@ export function jevLaunchArgs(jev: JevInfo, userExtraArgs: readonly string[]): s
     .flatMap(([flag, value]) => (value === undefined ? [flag] : [flag, value]))
 }
 
+/** The context a Jev model launches with when nobody has chosen one. vLLM sizes its
+ *  torch.compile profile run from the effective max-model-len, and at OpenJev 4B v2's native
+ *  262,144 that pass dies with `CUDA error: an illegal memory access` (vLLM 0.29.0, verified
+ *  live 2026-09-21). 8192 is the largest length verified to load and classify on that box. */
+export const JEV_DEFAULT_MAX_MODEL_LEN = 8192
+
+/** The `--max-model-len` to launch a Jev model with, or 0 when the user's own extraArgs already
+ *  set the flag — the caller then emits none, so the user's stays the only one. Never above the
+ *  model's own context, which vLLM rejects outright. */
+export function jevMaxModelLen(nativeCtx: number, userExtraArgs: readonly string[]): number {
+  if (userExtraArgs.some((token) => flagName(token) === 'max-model-len')) return 0
+  return nativeCtx > 0 ? Math.min(nativeCtx, JEV_DEFAULT_MAX_MODEL_LEN) : JEV_DEFAULT_MAX_MODEL_LEN
+}
+
 /** '--hf_overrides=…' → 'hf-overrides'; '--Runner' → 'runner'; non '--' tokens → null.
  *  vLLM's FlexibleArgumentParser treats '_' and '-' alike, so the comparison must too. */
 export function flagName(token: string): string | null {
