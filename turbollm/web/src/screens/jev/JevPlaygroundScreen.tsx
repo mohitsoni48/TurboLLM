@@ -64,9 +64,12 @@ export function JevPlaygroundScreen() {
   const currentRun = useRef(0)
 
   async function runDraft(next: JevMode, check_: CheckDraft, choose_: ChooseDraft, key: string) {
+    // The run in flight is the reason nothing new starts, and it has nothing to say about the
+    // draft: only a run that was really refused gets to write the line under the panel.
+    if (inFlight.current) return
     const missing = next === 'check' ? checkDraftError(check_) : chooseDraftError(choose_)
     setProblem(missing)
-    if (missing || inFlight.current) return
+    if (missing) return
     const asked = ++currentRun.current
     track('workspace', RUN_ACTION[next])
     inFlight.current = true
@@ -123,6 +126,10 @@ export function JevPlaygroundScreen() {
   }
 
   function pickExample(id: string) {
+    // The picker is disabled while a run is in flight, but the first run starts from an effect
+    // that lands after the paint that would disable it. Picking in that frame would throw the
+    // answer on screen away to start a run this guard then refuses.
+    if (inFlight.current) return
     track('workspace', 'jev_load_example')
     setExampleId(id)
     const example = JEV_EXAMPLES.check.find((e) => e.id === id)
@@ -145,7 +152,9 @@ export function JevPlaygroundScreen() {
 
   function pickModel(m: ModelEntry) {
     setSwitchOpen(false)
-    switchToModel(current, m, { stopEngine, requestLoad }).catch((e) => setProblem(failureMessage(e)))
+    // Nothing to catch: a refused eject and a refused load both report themselves as a toast,
+    // and `problem` is the line under the panel, which belongs to a run.
+    void switchToModel(current, m, { stopEngine, requestLoad })
   }
 
   const template = models?.find((m) => m.key === jev.key)?.jev?.nliTemplate ?? null

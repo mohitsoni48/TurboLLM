@@ -7,6 +7,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { JevPlaygroundScreen } from './JevPlaygroundScreen'
+import { JEV_EXAMPLES } from './jev-examples'
 import { ApiError } from '../../lib/api'
 import type { ClassifyResponse, ModelEntry, RerankResponse, Status } from '../../lib/types'
 
@@ -158,6 +159,42 @@ describe('JevPlaygroundScreen', () => {
       await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
 
       expect(screen.getByRole('combobox')).toBeDisabled()
+    })
+
+    // The message under the panel belongs to a run that was really refused. A run that was
+    // ignored because another one is still in flight has nothing to say about the draft.
+    it('says nothing about the draft when it is the run in flight that stopped it', async () => {
+      renderScreen()
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
+      await userEvent.click(screen.getByRole('button', { name: 'Choose' }))
+      await userEvent.clear(screen.getByLabelText('Question'))
+      await userEvent.click(screen.getByRole('button', { name: 'Check' }))
+
+      const answer = slowClassify()
+      await userEvent.click(screen.getByRole('button', { name: 'Run' }))
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(2))
+      await userEvent.click(screen.getByRole('button', { name: 'Choose' }))
+      fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true })
+
+      expect(screen.queryByText('Enter a question first')).toBeNull()
+      expect(h.rerank).not.toHaveBeenCalled()
+      answer()
+    })
+
+    // The picker is disabled while a run is in flight, but the first run starts from an effect
+    // that lands after the paint that would disable it. Picking in that frame must not throw
+    // away the run on screen to start one it cannot start.
+    it('keeps the run it cannot replace when an example is picked mid-run', async () => {
+      const answer = slowClassify()
+      renderScreen()
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
+
+      fireEvent.change(screen.getByRole('combobox'), { target: { value: JEV_EXAMPLES.choose[0].id } })
+      answer()
+
+      expect(await screen.findByText('0.957')).toBeTruthy()
+      expect(h.rerank).not.toHaveBeenCalled()
+      expect(screen.getByLabelText('Premise')).toHaveValue('A chef is chopping onions in a busy restaurant kitchen.')
     })
 
     // The reviewer's own path (picking a Choose example mid-run) is unreachable now that the
