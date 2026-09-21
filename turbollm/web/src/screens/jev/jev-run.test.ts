@@ -3,7 +3,7 @@
 //
 // The body assertions are strict on purpose. The API view shows the user this exact request and
 // invites them to paste it into a shell, so an extra field here becomes an extra field in the
-// documentation people copy — and `hypothesis_template` in particular is API-only ((d): the
+// documentation people copy — and `hypothesis_template` in particular is API-only (ADR-434 (d): the
 // playground keeps the default).
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { checkDraftError, chooseDraftError, runCheck, runChoose } from './jev-run'

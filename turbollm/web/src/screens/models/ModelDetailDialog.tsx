@@ -290,7 +290,7 @@ function PresetsPanel({
 }
 
 /** The shared loader's last failure, and only when it is this model's: the dialog's own
- *  mutation observer never sees one, because it closes itself in the same click (C-7, C-8). */
+ *  mutation observer never sees one, because it closes itself in the same click. */
 function failureOf(failure: { key: string; message: string } | null, modelKey: string | undefined): string | null {
   return failure && failure.key === modelKey ? failure.message : null
 }

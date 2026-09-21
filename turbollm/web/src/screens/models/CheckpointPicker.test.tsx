@@ -2,7 +2,7 @@
 //
 // An OpenJev-style repo ships several model folders side by side. Each gets its own size, fit
 // dot and action, and an unverified architecture is TAGGED rather than hidden — the founder's
-// call in (h): the user decides whether to try it, the UI does not decide for them.
+// call in ADR-434 (h): the user decides whether to try it, the UI does not decide for them.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -137,7 +137,7 @@ describe('CheckpointPicker — actions', () => {
 
 // The scanner does not list a model folder that sits inside another model's folder, so a repo
 // with BOTH a root checkpoint and nested ones can be downloaded into a library that then shows
-// only one of them. Q2's approved default is to say so on the row, up front.
+// only one of them. The row says so, up front.
 const ROOT = checkpoint({ dir: '', name: 'openjev', sizeBytes: 1e9 })
 const OUTER = checkpoint({ dir: 'a', name: 'a', sizeBytes: 1e9 })
 const INNER = checkpoint({ dir: 'a/b', name: 'b', sizeBytes: 1e9 })

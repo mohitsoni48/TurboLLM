@@ -2,7 +2,7 @@
 //
 // A repo like AlexWortega/openjev holds several complete models side by side, so "download the
 // repo" is the wrong unit — the user picks a folder. An architecture TurboLLM has no verified
-// launch row for is tagged, never hidden: (h) leaves that judgement to the user.
+// launch row for is tagged, never hidden: ADR-434 (h) leaves that judgement to the user.
 //
 // `fileFit`, `FitDot` and `fmtSize` come from HfRepoDialog, which also renders this picker. The
 // resulting cycle is function-only and resolves at call time, exactly like the sibling bodies

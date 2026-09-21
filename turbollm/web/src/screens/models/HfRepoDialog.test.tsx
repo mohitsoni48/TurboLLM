@@ -1,6 +1,6 @@
 // The safetensors side of the HF repo dialog (ADR-434 (h)).
 //
-// A repo used to be one downloadable thing. It is now a list of checkpoint folders, and the
+// A repo is a list of checkpoint folders, not one downloadable thing, and the
 // three interesting cases are the edges: no checkpoint at all (say so, offer nothing), exactly
 // one (behave exactly as this dialog always has), and several (let the user pick one).
 //

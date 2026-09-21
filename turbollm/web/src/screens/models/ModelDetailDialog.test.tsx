@@ -84,7 +84,7 @@ vi.mock('../../lib/queries', () => ({
   useModels: () => ({ data: { models: [] } }),
 }))
 // The dialog reads the shared loader, not its own mutation observer: it closes itself in the
-// same click that fires a load, and a load started anywhere must busy this button (C-7, C-8).
+// same click that fires a load, and a load started anywhere must busy this button.
 let loaderState: { isPending: boolean; pendingKey?: string; loadError: { key: string; message: string } | null }
 vi.mock('../../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad, confirmLoad: vi.fn(), ...loaderState }),

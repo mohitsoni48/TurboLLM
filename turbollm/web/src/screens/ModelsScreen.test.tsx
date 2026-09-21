@@ -122,8 +122,8 @@ describe('ModelsScreen — Jev models', () => {
     expect(screen.getByText('Mistral MLX')).toBeTruthy()
   })
 
-  // Divergence row 3's own rationale is "no churn for other models": `incompatibleReason` is the
-  // short chip label, so serving it as the tooltip dropped the actionable half of the sentence.
+  // No churn for other models: `incompatibleReason` is the short chip label, so serving it as
+  // the tooltip would drop the actionable half of the sentence.
   it('keeps the full "switch to" tooltip for a model that is not a Jev model', async () => {
     state.models = [entry({ key: 'mlx-1', name: 'Mistral MLX', format: 'mlx', compatibleWithActiveEngine: false, incompatibleReason: 'needs MLX or vLLM' })]
     renderScreen()
@@ -153,7 +153,7 @@ describe('ModelsScreen — Jev models', () => {
   })
 
   // The loader reads the model's own `jev` field, so the row hands the entry over whole rather
-  // than computing a flag this call site could forget (§5 ruling 9).
+  // than computing a flag this call site could forget.
   it('loads a Jev model through the loader, jev field and all', async () => {
     state.models = [jevEntry()]
     renderScreen()

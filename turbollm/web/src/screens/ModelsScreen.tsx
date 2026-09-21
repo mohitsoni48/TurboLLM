@@ -717,8 +717,8 @@ function useDeleteModel() {
   })
 }
 
-/** Why the Load button is dead. Only a Jev model takes the daemon's own wording (divergence
- *  row 3): `incompatibleReason` is the short chip label, and serving it here for every model
+/** Why the Load button is dead. Only a Jev model takes the daemon's own wording:
+ *  `incompatibleReason` is the short chip label, and serving it here for every model
  *  would duplicate the chip beside it and drop the half that says what to do about it. */
 function cannotLoadTitle(m: ModelEntry, needsEngine: string): string {
   if (m.jev && m.incompatibleReason) return m.incompatibleReason

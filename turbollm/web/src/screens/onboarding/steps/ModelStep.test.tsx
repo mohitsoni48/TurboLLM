@@ -6,7 +6,7 @@ import ModelStep from './ModelStep'
 import type { OnboardingCtx } from '../../../lib/onboarding/types'
 import type { ModelEntry } from '../../../lib/types'
 
-// ADR-434 (f) + "Correction to (i)(4)", QA gap G1: the payoff of this step sends the user into
+// ADR-434 (f) and its correction to (i)(4): the payoff of this step sends the user into
 // Chat or Code, and a loaded Jev model would redirect both to the playground. So "Use a model I
 // already have" must never offer one. It reuses the chat-capable predicate the pickers use and
 // keeps loading straight through `loadModel` (a non-Jev load needs no confirm).

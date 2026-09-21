@@ -1,5 +1,5 @@
-// A load fired from the model detail dialog outlives the click that fired it (ADR-434 (i)(3),
-// QA E31(c) "a load that fails -> error toast").
+// A load fired from the model detail dialog outlives the click that fired it (ADR-434 (i)(3)),
+// and a load that fails still ends in an error toast.
 //
 // The dialog closes itself in the same click that starts a load. This drives the REAL dialog,
 // the REAL shared loader and the REAL mutations, mocking only the API underneath, and closes it
@@ -151,7 +151,7 @@ describe('ModelDetailDialog — a failed load, reported after the dialog closed'
     expect(onClose.mock.invocationCallOrder[0]).toBeLessThan(api.toastError.mock.invocationCallOrder[0])
   })
 
-  it('tells the user a Jev model failed to load (QA E31(c))', async () => {
+  it('tells the user a Jev model failed to load', async () => {
     api.loadModel.mockRejectedValue(engineRefusal())
     const onClose = await openDialogFor(JEV_MODEL)
     await turnRememberOff()

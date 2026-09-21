@@ -166,7 +166,7 @@ describe('DeveloperScreen — API reference', () => {
     expect(paths).toEqual(['/v1/chat/completions', '/v1/messages', '/v1/embeddings', '/v1/classify', '/v1/rerank', '/v1/models'])
   })
 
-  it('describes the two Jev endpoints in the words the plan gives', async () => {
+  it('describes the two Jev endpoints in one line each', async () => {
     await renderApiReferenceOpen()
     expect(screen.getByText('Jev: label premise/hypothesis pairs')).toBeInTheDocument()
     expect(screen.getByText('Jev: rerank documents')).toBeInTheDocument()
