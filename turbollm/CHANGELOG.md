@@ -33,7 +33,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   cross-encoders (such as OpenJev) and runs them through vLLM. While one is loaded, Workspace
   becomes the **Jev Playground**: check a premise against up to 128 hypotheses, or rank options
   against a question, with the model's own labels and probabilities and a copyable request for the
-  matching endpoint. On the API: `POST /v1/classify` and `POST /v1/rerank`. Downloading one is
+  matching endpoint. On the API: `POST /v1/classify` and `POST /v1/rerank`. A Jev model loads with
+  an 8,192-token limit per request by default (the model's **Max model length** setting); longer
+  input is refused with a clear 400. Downloading one is
   easier too: a Hugging Face repo that keeps several checkpoints in subfolders now lists them one
   per row, and each row downloads only its own files. Full guide: https://turbollm.dev/docs/jev
 
