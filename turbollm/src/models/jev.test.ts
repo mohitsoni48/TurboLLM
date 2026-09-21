@@ -18,7 +18,7 @@ import {
   type JevLabel,
 } from './jev'
 
-/** Fixture F1 — the OpenJev config.json fields that matter (plan Appendix). */
+/** The OpenJev config.json fields that matter. */
 function openJevConfig(): Record<string, unknown> {
   return {
     architectures: ['Qwen3_5ForSequenceClassification'],
@@ -41,7 +41,7 @@ function without(field: string): Record<string, unknown> {
   return cfg
 }
 
-test('OpenJev config (F1) is a verified Jev model with its labels in id2label order', () => {
+test('the OpenJev config is a verified Jev model with its labels in id2label order', () => {
   assert.deepEqual(detectJev(openJevConfig()), {
     labels: ['contradiction', 'entailment', 'neutral'],
     nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
@@ -50,7 +50,7 @@ test('OpenJev config (F1) is a verified Jev model with its labels in id2label or
   })
 })
 
-test('permuted id2label (F4) keeps the model\'s own class order', () => {
+test('a permuted id2label keeps the model\'s own class order', () => {
   const cfg = withField('id2label', { '0': 'entailment', '1': 'neutral', '2': 'contradiction' })
   assert.deepEqual(detectJev(cfg)?.labels, ['entailment', 'neutral', 'contradiction'])
 })
@@ -182,7 +182,7 @@ test('an unverified architecture whose user sets --runner gets nothing from the 
 })
 
 // NLI input and hypothesis templates — ADR-434 (d). Substitution is literal and single-pass:
-// user text is never re-expanded and never interpreted as a replacement pattern (QA E28).
+// user text is never re-expanded and never interpreted as a replacement pattern.
 
 const OPENJEV_NLI_TEMPLATE = 'Premise: {premise}\nHypothesis: {hypothesis}'
 
@@ -245,14 +245,14 @@ for (const [description, template, expected] of hypothesisTemplates) {
 const F1_LABELS: JevLabel[] = ['contradiction', 'entailment', 'neutral']
 const F4_LABELS: JevLabel[] = ['entailment', 'neutral', 'contradiction']
 
-test('F1 labels map an entailment row to entailment with every class probability', () => {
+test('the OpenJev labels map an entailment row to entailment with every class probability', () => {
   assert.deepEqual(mapProbs(F1_LABELS, [0, 0.957, 0.043]), {
     label: 'entailment',
     probs: { contradiction: 0, entailment: 0.957, neutral: 0.043 },
   })
 })
 
-test('F4 permuted labels map through the model\'s own order', () => {
+test('permuted labels map through the model\'s own order', () => {
   assert.deepEqual(mapProbs(F4_LABELS, [0.957, 0.043, 0]), {
     label: 'entailment',
     probs: { entailment: 0.957, neutral: 0.043, contradiction: 0 },

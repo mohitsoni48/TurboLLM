@@ -354,7 +354,7 @@ test('executeTool: list_models routes to the injected model store and returns th
   assert.match(out, /gemma 4 26b a4b qat\|Q4_0\|14439362752/)
 })
 
-// QA gap G2: the registry is what wires the predicate in, so a chat/Code tool call gets the same
+// The registry is what wires the predicate in, so a chat/Code tool call gets the same
 // refusal the REST route gives.
 function modelsStoreWithJev(): ModelToolsStore {
   return {

@@ -123,7 +123,7 @@ test('user extraArgs pass through last', () => {
 })
 
 // ADR-434 (g): a Jev model launches with the verified classifier flags, placed after the profile's
-// own flags and before the user's extra args, minus any flag the user already set (H2).
+// own flags and before the user's extra args, minus any flag the user already set.
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
   nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',

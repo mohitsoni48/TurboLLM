@@ -1,6 +1,6 @@
 // Discover must offer one row per DOWNLOADABLE checkpoint folder (ADR-434 (h)): OpenJev keeps
-// every checkpoint in its own subfolder, so today's root-only file list is empty and the
-// Download button does nothing. Fixtures are the plan's F6 trees — no network.
+// every checkpoint in its own subfolder, so a root-only file list is empty and the
+// Download button does nothing. The fixtures are in-memory trees — no network.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { join } from 'node:path'
@@ -15,7 +15,7 @@ function file(path: string, size?: number, oid?: string): RawTreeEntry {
   return { type: 'file', path, ...(oid ? { lfs: { oid, size } } : { size }) }
 }
 
-/** F6 "OpenJev-like": three checkpoint folders, a README, a video and a .py the picker must
+/** "OpenJev-like": three checkpoint folders, a README, a video and a .py the picker must
  *  never offer, plus the directory entries HF's recursive tree includes. */
 const OPENJEV_TREE: RawTreeEntry[] = [
   file('README.md', 5),
@@ -47,7 +47,7 @@ const SINGLE_ROOT_TREE: RawTreeEntry[] = [
   file('README.md', 5),
 ]
 
-/** F6 "Diffusers-like": weights in folders that hold no tokenizer, and a root with no
+/** "Diffusers-like": weights in folders that hold no tokenizer, and a root with no
  *  config.json — the library would refuse every one of them, so none may be offered. */
 const DIFFUSERS_TREE: RawTreeEntry[] = [
   file('model_index.json', 400),

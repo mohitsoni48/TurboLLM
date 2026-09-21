@@ -35,8 +35,8 @@ test('koboldcpp gets KoboldCpp flags, including --nogpu on a machine with no GPU
   assert.ok(!opts.extraArgs.includes('-c'))
 })
 
-// The gateway's own builder used to take KoboldCpp's backend from gpus[0], so an Intel iGPU
-// listed before an NVIDIA card picked Vulkan. The shared builder ranks vendors (R3).
+// KoboldCpp's backend comes from the primary vendor, not from gpus[0]: an Intel iGPU listed
+// before an NVIDIA card must not pick Vulkan. The shared builder ranks vendors.
 test('koboldcpp picks its GPU backend from the primary vendor, not the first GPU listed', () => {
   const igpuFirst: SysInfo = {
     ...NO_GPU_MACHINE,

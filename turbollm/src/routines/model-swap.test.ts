@@ -89,12 +89,12 @@ test('a genuine load failure (not ComfyUI) still reports skip-load-failed with t
 })
 
 // ── a Routine run RESTORES the loaded Jev model afterwards (ADR-434 "Correction to (i)(4)") ────
-// The ADR's (i)(4) originally said a Routine run unloads the Jev model for good. It does not:
-// routines swap the pinned model in, run, and then reload whatever was loaded before — so a
-// Routine firing while a Jev model is loaded briefly takes Workspace out of the playground and
-// then brings it back. That is settled Routines design (spec 20 §5, ADR-060), so this pins it
-// through THIS branch's new router code: the real ModelRouter, the shared StartOpts builder and
-// the Jev launch flags. Nothing is spawned and no port is used — the Manager is a double.
+// A Routine run does not unload the Jev model for good: routines swap the pinned model in, run,
+// and then reload whatever was loaded before — so a Routine firing while a Jev model is loaded
+// briefly takes Workspace out of the playground and then brings it back. That is settled
+// Routines design (spec 20 §5, ADR-060), so this pins it through the real ModelRouter, the
+// shared StartOpts builder and the Jev launch flags. Nothing is spawned and no port is used —
+// the Manager is a double.
 
 const JEV_MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
 const CHAT_MODEL_KEY = 'qwen3-8b|mlx-4bit|8000000000'

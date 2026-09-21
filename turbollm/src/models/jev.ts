@@ -21,7 +21,7 @@ export interface JevInfo {
 /** A launch flag: [name, value?]. JSON values are pre-serialised (no spaces), exactly as verified. */
 export type LaunchFlag = readonly [flag: string, value?: string]
 
-/** Verified launch rows keyed by architecture (rule (g)). Only verified rows go here. */
+/** Verified launch rows keyed by architecture (ADR-434 (g)). Only verified rows go here. */
 export const JEV_LAUNCH_TABLE: Readonly<Record<string, readonly LaunchFlag[]>> = {
   Qwen3_5ForSequenceClassification: [
     ['--runner', 'pooling'],
@@ -34,7 +34,7 @@ export const JEV_LAUNCH_TABLE: Readonly<Record<string, readonly LaunchFlag[]>> =
 /** Any other architecture: vLLM's native path; vLLM's own error surfaces if it can't load. */
 export const JEV_DEFAULT_LAUNCH: readonly LaunchFlag[] = [['--runner', 'pooling']]
 
-/** Rule (g). `cfg` is the parsed config.json (untrusted JSON). A Jev model needs a
+/** ADR-434 (g). `cfg` is the parsed config.json (untrusted JSON). A Jev model needs a
  *  sequence-classification head whose id2label is exactly the three NLI labels, in any order. */
 export function detectJev(cfg: unknown): JevInfo | undefined {
   if (!isRecord(cfg)) return undefined

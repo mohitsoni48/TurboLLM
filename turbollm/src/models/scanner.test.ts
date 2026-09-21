@@ -9,7 +9,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { mlxEntryFor } from './scanner'
 
-/** Fixture F1 — the OpenJev config.json fields that matter (plan Appendix). */
+/** The OpenJev config.json fields that matter. */
 function openJevConfig(): Record<string, unknown> {
   return {
     architectures: ['Qwen3_5ForSequenceClassification'],

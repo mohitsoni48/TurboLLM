@@ -316,7 +316,7 @@ test('list_models: formats the exact compound modelKey, not a generic display na
   assert.equal(text, '- gemma 4 26b a4b qat|Q4_0|14439362752 — Gemma 4 26B A4B QAT (Q4_0, 26B-A4B)')
 })
 
-// QA gap G2: the MCP bridge's own list_models renders the daemon's rows, so it must mark a Jev
+// The MCP bridge's own list_models renders the daemon's rows, so it must mark a Jev
 // model exactly as the in-app tool does — the two lists are what a model picks a routine's
 // modelKey from.
 test('list_models (MCP): a Jev row is marked kind: jev, a chat row is unchanged', async () => {

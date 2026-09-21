@@ -103,7 +103,7 @@ test('with no active engine every model is compatible, with no reason', async ()
   ])
 })
 
-// `GET /api/v1/status` carries a local-only `jev` field (architecture §2.8) so Workspace can
+// `GET /api/v1/status` carries a local-only `jev` field so Workspace can
 // follow a loaded Jev model. The double mirrors status-fail-reason.test.ts's status double.
 function appWithPrimary(primaryKey: string | null) {
   const cfg: Record<string, unknown> = {

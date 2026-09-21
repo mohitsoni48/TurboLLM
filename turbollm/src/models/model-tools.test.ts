@@ -25,7 +25,7 @@ test('execListModels: multiple models, one row each', () => {
   assert.equal(out, '- a — Model A (Q4_0, 8B)\n- b — Model B (Q6_K, 35B)')
 })
 
-// ── Jev models are marked, never hidden (ADR-434 (f) + QA gap G2) ─────────────────────────────
+// ── Jev models are marked, never hidden (ADR-434 (f)) ──────────────────────────────────────────
 // A Jev model labels text: it cannot chat and cannot be a routine's modelKey. It stays listed —
 // a model asked to classify needs its key — but the line says what it is.
 

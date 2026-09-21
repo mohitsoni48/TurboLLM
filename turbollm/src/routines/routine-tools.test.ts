@@ -808,7 +808,7 @@ test('update_routine and delete_routine require routineId', () => {
   assert.deepEqual(RUN_ROUTINE_NOW_TOOL.function.parameters.required, ['routineId'])
 })
 
-// QA gap G2: the tool that asks a model to pick a modelKey must steer it away from the models
+// The tool that asks a model to pick a modelKey must steer it away from the models
 // list_models marks as Jev.
 test('the create_routine modelKey description warns off Jev models', () => {
   const modelKey = (CREATE_ROUTINE_TOOL.function.parameters.properties as Record<string, { description: string }>).modelKey
@@ -817,8 +817,8 @@ test('the create_routine modelKey description warns off Jev models', () => {
   assert.match(modelKey.description, /cannot run a routine/)
 })
 
-// ── the model-callable tools refuse a Jev model too (QA gap G2) ──────────────────────────────
-// These executors write to the store directly, not through POST/PUT /api/v1/routines, so T25a's
+// ── the model-callable tools refuse a Jev model too ─────────────────────────────────────────
+// These executors write to the store directly, not through POST/PUT /api/v1/routines, so the
 // route-level refusal does not cover them.
 
 const JEV_TOOL_KEY = 'jev-fake-v2'
