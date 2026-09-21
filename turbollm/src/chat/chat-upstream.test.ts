@@ -1,4 +1,4 @@
-// resolveChatUpstream while a Jev model is the primary (ADR-434 (f), architecture §2.7). The in-app
+// resolveChatUpstream while a Jev model is the primary (ADR-434 (f)). The in-app
 // chat — the standalone /chat view and routine runs — gets a clear 409 instead of the engine's
 // opaque 404, because a Jev model labels premise/hypothesis pairs and cannot chat. Everything else
 // resolveChatUpstream decides stays exactly as it was.
@@ -12,7 +12,7 @@ const ENGINE = 'http://engine.invalid'
 const JEV_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
 const GGUF_KEY = 'qwen3-8b|Q4|123'
 
-/** Fixture F1's entry: the OpenJev checkpoint as the scanner lists it. */
+/** The OpenJev checkpoint as the scanner lists it. */
 const OPENJEV_ENTRY = {
   key: JEV_KEY,
   name: 'qwen3.5 4b nli v2',

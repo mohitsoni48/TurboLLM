@@ -109,7 +109,7 @@ export class ModelRouter {
     return this.withSwapLock(() => this.doLoad(entry))
   }
 
-  /** Route to exactly `entry` — never to a different model (ADR-434, architecture §2.4). Unlike
+  /** Route to exactly `entry` — never to a different model (ADR-434). Unlike
    *  route(), an entry that isn't alive is never answered by whatever the primary holds: with
    *  auto-swap on it is loaded (the same serialised doLoad route() uses); with it off, a 503. */
   async routeTo(entry: ModelEntry): Promise<RouteResult> {

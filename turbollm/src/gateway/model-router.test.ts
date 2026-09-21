@@ -313,9 +313,9 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
   assert.ok(loadedWith, 'expected Manager.load to be called even though autoSwap is disabled')
 })
 
-// ── doLoad: the shared modelIncompatibility() rule (ADR-434 (g), divergence row 2) ──
+// ── doLoad: the shared modelIncompatibility() rule (ADR-434 (g)) ──
 // An auto-swap to a model the active engine cannot load answers 503 with the same message the
-// manual load guard uses, before anything is evicted or loaded. The audio check is new here.
+// manual load guard uses, before anything is evicted or loaded. That includes the audio check.
 function recordingPrimary() {
   const loads: unknown[] = []
   const manager = {
@@ -384,7 +384,7 @@ test('loadExplicit reports 503 for an unknown model key without touching the man
   assert.equal(loadCalled, false)
 })
 
-// ── buildOpts: gateway loads build StartOpts through the one shared builder (divergence row 1) ──
+// ── buildOpts: gateway loads build StartOpts through the one shared builder ──
 // A source scan, as engine-lifecycle.shared-builder.test.ts does for startEngine: a re-introduced
 // inline copy produces correct StartOpts on the day it lands, and only drifts later.
 const MODEL_ROUTER_SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'model-router.ts'), 'utf8')
@@ -475,7 +475,7 @@ test('buildOpts: an incomplete model builds nothing', () => {
   assert.equal(opts, null)
 })
 
-// ── resolveLocal / targetEntry / routeTo / aliveSlots (architecture §2.4, ADR-060, ADR-376) ──
+// ── resolveLocal / targetEntry / routeTo / aliveSlots (ADR-060, ADR-376) ──
 // routeTo routes to exactly the entry it is given and never falls back to whatever the primary
 // holds; targetEntry answers "which local model would route() hit" without loading anything.
 // Targets are opaque strings here: nothing is ever contacted.

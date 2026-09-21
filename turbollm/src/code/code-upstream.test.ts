@@ -97,7 +97,7 @@ test('no requested model is the unchanged local path', () => {
 })
 
 test('a Jev model as the local primary fails the Code turn with the jev_model_loaded sentence, not model_not_loaded', () => {
-  // ADR-434 (f), QA gap G5: resolveChatUpstream's 409 reaches Code as its own message, so the
+  // ADR-434 (f): resolveChatUpstream's 409 reaches Code as its own message, so the
   // user sees why the turn can't run instead of an opaque engine error.
   const jevPrimary = {
     key: 'local-model',

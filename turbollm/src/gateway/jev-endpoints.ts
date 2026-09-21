@@ -1,7 +1,7 @@
 // /v1/classify and /v1/rerank — the gateway endpoints for Jev (NLI cross-encoder) models
-// (ADR-434 (d), architecture §2.5). They live in their own module, dispatched from the single
+// (ADR-434 (d)). They live in their own module, dispatched from the single
 // `/v1/*` handler, so the gateway hub doesn't grow and no new Hono route can be shadowed by
-// registration order (ADR-421, divergence row 7). User strings are validated, never trimmed.
+// registration order (ADR-421). User strings are validated, never trimmed.
 import type { Context } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { Deps } from '../deps'
@@ -39,7 +39,7 @@ export interface RerankInput {
   hypothesisTemplate: string
 }
 
-/** A refusal in the OpenAI error envelope's terms (architecture §3.2). */
+/** A refusal in the OpenAI error envelope's terms. */
 export interface JevHttpError {
   status: ContentfulStatusCode
   code: string
@@ -106,7 +106,7 @@ export function jevEndpointFor(method: string, pathname: string): JevEndpoint | 
 /** One /v1/classify or /v1/rerank request: refuse a Turbo Link peer, validate, resolve exactly the
  *  named local Jev model, route to it (auto-swap may load it), then one batched engine call. It never
  *  takes the generation gate (classification is not a generation) and writes no request-log or usage
- *  entry (divergence row 15). */
+ *  entry. */
 export async function handleJevRequest(
   c: Context,
   d: Deps,
@@ -147,7 +147,7 @@ export function parseRerankBody(raw: unknown): RerankInput | JevHttpError {
   }
 }
 
-/** The model's own premise/hypothesis template. Q1 default (architecture §5, ADR-436 (8)): with no
+/** The model's own premise/hypothesis template. ADR-436 (8): with no
  *  usable `nli_template` the model is refused rather than given a guessed prompt, because ADR-434 (d)
  *  says the template is read from the model and never hardcoded. */
 export function nliTemplateFor(entry: { name: string; jev?: JevInfo }): string | JevHttpError {
@@ -163,7 +163,7 @@ export function nliTemplateFor(entry: { name: string; jev?: JevInfo }): string |
 }
 
 /** The one engine call per request: a batched `POST <engine>/classify`. For a classification head
- *  that is the only route vLLM serves, and it has no /v1 prefix (brief lines 21-25). Rows come back
+ *  that is the only route vLLM serves, and it has no /v1 prefix. Rows come back
  *  sorted by index, exactly one per input; any other failure is thrown as a JevEndpointError. */
 export async function callEngineClassify(
   target: string,
@@ -295,7 +295,7 @@ function isJevModel(entry: ModelEntry): entry is ModelEntry & JevModel {
 }
 
 /** routeTo, never route(): a model that isn't alive is loaded (auto-swap on) or refused, never
- *  answered by whatever the primary holds (divergence row 6). */
+ *  answered by whatever the primary holds. */
 async function routeToJevModel(d: Deps, entry: ModelEntry): Promise<string> {
   const route = await d.modelRouter.routeTo(entry)
   if ('status' in route) {

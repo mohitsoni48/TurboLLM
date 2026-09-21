@@ -1,4 +1,4 @@
-// /v1/classify and /v1/rerank (ADR-434 (d), architecture §2.5 / §3.1 / §3.2). Request bodies are
+// /v1/classify and /v1/rerank (ADR-434 (d)). Request bodies are
 // validated into typed inputs or precise 400s before anything is resolved, routed or sent to an
 // engine. User strings are never trimmed or rewritten.
 import assert from 'node:assert/strict'
@@ -52,7 +52,7 @@ function rerankBody(overrides: Record<string, unknown> = {}): Record<string, unk
   return { model: MODEL_KEY, query: FRANCE_QUERY, documents: CITIES, ...overrides }
 }
 
-/** Fixture F1's Jev descriptor, as detectJev() reads it from the OpenJev config.json. */
+/** The OpenJev Jev descriptor, as detectJev() reads it from the OpenJev config.json. */
 function openJevInfo(overrides: Partial<JevInfo> = {}): JevInfo {
   return {
     labels: ['contradiction', 'entailment', 'neutral'],
@@ -263,7 +263,7 @@ test('nliTemplateFor: the model\'s own nli_template is returned as-is', () => {
   assert.equal(nliTemplateFor({ name: MODEL_NAME, jev: openJevInfo() }), OPENJEV_TEMPLATE)
 })
 
-test('nliTemplateFor (Q1 default): no usable nli_template → 400 jev_template_missing, no fallback', () => {
+test('nliTemplateFor: no usable nli_template → 400 jev_template_missing, no fallback', () => {
   assert.deepEqual(nliTemplateFor({ name: MODEL_NAME, jev: openJevInfo({ nliTemplate: null }) }), TEMPLATE_MISSING)
 })
 
@@ -291,7 +291,7 @@ test('jevErrorResponse answers the OpenAI error envelope with the error\'s statu
 const ENGINE_TARGET = 'http://engine.local'
 const OPENJEV = { key: MODEL_KEY, name: MODEL_NAME, jev: openJevInfo() }
 
-/** Fixture F2 — the engine's recorded /classify response for the three kitchen hypotheses. */
+/** The engine's recorded /classify response for the three kitchen hypotheses. */
 const F2_KITCHEN = {
   data: [
     { index: 0, label: 'entailment', probs: [0.0, 0.957, 0.043], num_classes: 3 },
@@ -301,7 +301,7 @@ const F2_KITCHEN = {
   usage: { prompt_tokens: 69, total_tokens: 69 },
 }
 
-/** Fixture F3 — the engine's recorded /classify response for Berlin, Paris, Madrid. */
+/** The engine's recorded /classify response for Berlin, Paris, Madrid. */
 const F3_FRANCE = {
   data: [
     { index: 0, label: 'contradiction', probs: [0.990, 0.008, 0.002], num_classes: 3 },
@@ -311,7 +311,7 @@ const F3_FRANCE = {
   usage: { prompt_tokens: 51, total_tokens: 51 },
 }
 
-/** Fixture F7 — the gateway's expected /v1/classify body for F2. */
+/** The gateway's expected /v1/classify body for the kitchen response. */
 const F7_CLASSIFY = {
   model: MODEL_KEY,
   results: [
@@ -334,7 +334,7 @@ const F7_CLASSIFY = {
   usage: { prompt_tokens: 69, total_tokens: 69 },
 }
 
-/** Fixture F7 — the gateway's expected /v1/rerank body for F3. */
+/** The gateway's expected /v1/rerank body for the France response. */
 const F7_RERANK = {
   model: MODEL_KEY,
   results: [
@@ -433,7 +433,7 @@ test('callEngineClassify: one POST to <target>/classify (no /v1) with the engine
   assert.equal(init.signal, signal)
 })
 
-test('callEngineClassify: F2 → rows in index order with their probs, and the usage', async () => {
+test('callEngineClassify: the kitchen response → rows in index order with their probs, and the usage', async () => {
   const result = await classifyKitchen(recordingEngine(jsonReply(F2_KITCHEN)).fetchImpl)
   assert.deepEqual(result, {
     rows: [
@@ -462,7 +462,7 @@ test('callEngineClassify: missing or non-numeric usage counts become 0', async (
   }
 })
 
-test('callEngineClassify: each malformed engine body (F5) → 502 engine_bad_response', async () => {
+test('callEngineClassify: each malformed engine body → 502 engine_bad_response', async () => {
   const malformed: Array<[string, () => Response]> = [
     ['a row without index', jsonReply(withRows(kitchenRowsWith(1, { index: undefined })))],
     ['two rows with index 0', jsonReply(withRows(kitchenRowsWith(1, { index: 0 })))],
@@ -512,7 +512,7 @@ test('callEngineClassify: a client that already left → 500 engine_unreachable 
   })
 })
 
-test('toClassifyResponse: F2 → the F7 classify body, labels read from the model\'s own id2label', async () => {
+test('toClassifyResponse: the kitchen response → the classify body, labels read from the model\'s own id2label', async () => {
   const engine = await classifyKitchen(recordingEngine(jsonReply(F2_KITCHEN)).fetchImpl)
   assert.deepEqual(toClassifyResponse(OPENJEV, KITCHEN_CLASSIFY, engine.rows, engine.usage), F7_CLASSIFY)
 })
@@ -524,7 +524,7 @@ test('toClassifyResponse: the engine\'s own label strings are ignored (all "neut
   assert.deepEqual(response.results.map((r) => r.label), ['entailment', 'contradiction', 'neutral'])
 })
 
-test('toClassifyResponse: a permuted id2label (F4) maps each probability to its own label', () => {
+test('toClassifyResponse: a permuted id2label maps each probability to its own label', () => {
   const permuted = { key: MODEL_KEY, jev: openJevInfo({ labels: ['entailment', 'neutral', 'contradiction'] }) }
   const input: ClassifyInput = { model: MODEL_KEY, premise: KITCHEN_PREMISE, hypotheses: [KITCHEN_HYPOTHESES[0]] }
   const response = toClassifyResponse(permuted, input, [{ index: 0, probs: [0.957, 0.043, 0.0] }], F2_KITCHEN.usage)
@@ -535,14 +535,14 @@ test('toClassifyResponse: a permuted id2label (F4) maps each probability to its 
   }])
 })
 
-test('toClassifyResponse: a probs row of the wrong shape (F5) throws JevShapeError', () => {
+test('toClassifyResponse: a probs row of the wrong shape throws JevShapeError', () => {
   for (const probs of [[0.957, 0.043], ['x', 0, 0]]) {
     const rows = [{ index: 0, probs }, ...F2_KITCHEN.data.slice(1)]
     assert.throws(() => toClassifyResponse(OPENJEV, KITCHEN_CLASSIFY, rows, F2_KITCHEN.usage), JevShapeError)
   }
 })
 
-test('toRerankResponse: F3 → Paris, Madrid, Berlin by P(entailment) with their original indices (F7)', async () => {
+test('toRerankResponse: the France response → Paris, Madrid, Berlin by P(entailment) with their original indices', async () => {
   const engine = await classifyKitchen(recordingEngine(jsonReply(F3_FRANCE)).fetchImpl)
   assert.deepEqual(toRerankResponse(OPENJEV, franceRerank(), engine.rows, engine.usage), F7_RERANK)
 })
@@ -728,7 +728,7 @@ test('handleJevRequest step 10: probs of the wrong shape (JevShapeError) → 502
   await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), BAD_ENGINE_RESPONSE)
 })
 
-test('handleJevRequest: classify on the F1 model + F2 → 200 with the F7 body, one batched engine call', async () => {
+test('handleJevRequest: classify on the OpenJev model + the kitchen response → 200 with the classify body, one batched engine call', async () => {
   resetLocalActivity()
   const harness = jevHarness()
 
@@ -747,7 +747,7 @@ test('handleJevRequest: classify on the F1 model + F2 → 200 with the F7 body, 
   assert.notEqual(lastLocalActivityMs(), null, 'a local classify counts as the owner using the machine')
 })
 
-test('handleJevRequest: rerank France + F3 → sorted F7 body, engine inputs built with the default template', async () => {
+test('handleJevRequest: rerank France + the France response → sorted rerank body, engine inputs built with the default template', async () => {
   const harness = jevHarness({ reply: jsonReply(F3_FRANCE) })
 
   const res = await postJson(harness.app, '/v1/rerank', rerankBody())

@@ -1,4 +1,4 @@
-// gateway.ts and Jev models (ADR-434 (d), architecture §2.6). describeEngineError and clientAbort
+// gateway.ts and Jev models (ADR-434 (d)). describeEngineError and clientAbort
 // are exported for /v1/classify with their bodies unchanged, so the first tests pin today's
 // behaviour through the new export. The rest drive the public /v1/* surface in-process (Hono's
 // app.request, a stubbed globalThis.fetch restored in `finally` — no port, no engine).
@@ -43,7 +43,7 @@ const ENGINE = 'http://engine.local'
 const JEV_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
 const GGUF_KEY = 'qwen3-8b|Q4|123'
 
-/** Fixture F1's entry: the OpenJev checkpoint as the scanner lists it. */
+/** The OpenJev checkpoint as the scanner lists it. */
 const OPENJEV_ENTRY = {
   key: JEV_KEY,
   name: 'qwen3.5 4b nli v2',
@@ -64,7 +64,7 @@ const KITCHEN_HYPOTHESES = [
   'The chef is wearing a blue apron.',
 ]
 
-/** Fixture F2 — the engine's recorded /classify response for the kitchen hypotheses. */
+/** The engine's recorded /classify response for the kitchen hypotheses. */
 const F2_KITCHEN = {
   data: [
     { index: 0, label: 'entailment', probs: [0.0, 0.957, 0.043], num_classes: 3 },
@@ -74,7 +74,7 @@ const F2_KITCHEN = {
   usage: { prompt_tokens: 69, total_tokens: 69 },
 }
 
-/** Fixture F3 — the engine's recorded /classify response for Berlin, Paris, Madrid. */
+/** The engine's recorded /classify response for Berlin, Paris, Madrid. */
 const F3_FRANCE = {
   data: [
     { index: 0, label: 'contradiction', probs: [0.990, 0.008, 0.002], num_classes: 3 },
@@ -84,7 +84,7 @@ const F3_FRANCE = {
   usage: { prompt_tokens: 51, total_tokens: 51 },
 }
 
-/** Fixture F7 — the expected /v1/classify and /v1/rerank bodies. */
+/** The expected /v1/classify and /v1/rerank bodies. */
 const F7_CLASSIFY = {
   model: JEV_KEY,
   results: [
@@ -178,7 +178,7 @@ function postJson(app: Hono, path: string, body: unknown): Promise<Response> {
   }))
 }
 
-test('POST /v1/classify is served by the Jev handler: one engine /classify call, the F7 body', async () => {
+test('POST /v1/classify is served by the Jev handler: one engine /classify call, the classify body', async () => {
   await withEngine(F2_KITCHEN, async (calls) => {
     const res = await postJson(gatewayApp(), '/v1/classify', {
       model: JEV_KEY, premise: KITCHEN_PREMISE, hypotheses: KITCHEN_HYPOTHESES,
@@ -202,7 +202,7 @@ test('POST /v1/classify/ (trailing slash) is served by the Jev handler, not prox
   })
 })
 
-test('POST /v1/rerank is served by the Jev handler: one engine /classify call, the F7 body', async () => {
+test('POST /v1/rerank is served by the Jev handler: one engine /classify call, the rerank body', async () => {
   await withEngine(F3_FRANCE, async (calls) => {
     const res = await postJson(gatewayApp(), '/v1/rerank', {
       model: JEV_KEY, query: 'What is the capital of France?', documents: ['Berlin', 'Paris', 'Madrid'],
