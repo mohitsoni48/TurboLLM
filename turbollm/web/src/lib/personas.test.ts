@@ -38,8 +38,8 @@ test('buildSystemPrompt: blank agent still returns an empty system prompt (uncha
 })
 
 // ADR-434 (d): the in-app assistant describes TurboLLM's gateway from this text, so it has to name the
-// two Jev endpoints or it will tell a user there is no way to classify or rerank.
-test('the TurboLLM Expert persona lists /v1/classify and /v1/rerank in its Gateway section', () => {
+// Jev endpoints, or it will tell a user there is no way to classify, rerank or run System One.
+test('the TurboLLM Expert persona lists /v1/systemone, /v1/classify and /v1/rerank in its Gateway section', () => {
   const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
   assert.ok(expert)
   const gateway = expert!.systemPrompt.split('## Gateway')[1].split('\n## ')[0]

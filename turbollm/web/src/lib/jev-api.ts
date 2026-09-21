@@ -9,9 +9,9 @@ import { ApiError, authHeaders } from './api'
 import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
 import type { ActiveWork } from './types'
 
-/** Upper bound on hypotheses (check) or options (choose) in one request. Mirrors
- *  MAX_JEV_INPUTS in src/gateway/jev-endpoints.ts, so a panel can refuse before the
- *  round trip rather than showing the user a 400. */
+/** Documentation mirror of MAX_JEV_INPUTS in src/gateway/jev-serving.ts: the batch cap of /v1/classify
+ *  and /v1/rerank and the chunk size /v1/systemone splits its hypotheses into. Nothing in the web app
+ *  reads it. */
 export const MAX_JEV_INPUTS = 128
 
 export async function systemone(req: SystemOneRequest): Promise<SystemOneResponse> {

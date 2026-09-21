@@ -1,6 +1,7 @@
 // POST /v1/systemone (ADR-439, ADR-436 (3)): a whole set of questions about one state, answered by one batched
 // Jev engine call. Dispatched from the single `/v1/*` handler like the other Jev endpoints (ADR-421), and built
-// only from ./jev-serving so it never imports a sibling endpoint. User strings are validated, never trimmed.
+// only from ./jev-serving so it never imports a sibling endpoint. User strings are validated, never trimmed,
+// except that the jev-latest alias match ignores case and surrounding whitespace.
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { noteLocalActivity } from '../link/host-idle'

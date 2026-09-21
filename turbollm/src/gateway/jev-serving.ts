@@ -1,6 +1,8 @@
 // The primitives every Jev endpoint shares: refusal shapes, model resolution and routing, and the one
 // batched engine call (ADR-434 (d), ADR-436 (3)). /v1/classify, /v1/rerank and /v1/systemone import from here,
-// so no endpoint owns the infrastructure another one needs. User strings are validated, never trimmed.
+// so no endpoint owns the infrastructure another one needs. The jev-latest alias resolution near the end is the
+// one part only /v1/systemone uses; it lives here so it stays unit-testable. User strings are validated, never
+// trimmed, except that the jev-latest alias match ignores case and surrounding whitespace.
 import type { Context } from 'hono'
 import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import type { Deps } from '../deps'

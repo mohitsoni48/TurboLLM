@@ -67,7 +67,7 @@ describe('getActivity', () => {
 })
 
 describe('MAX_JEV_INPUTS', () => {
-  it('mirrors the gateway limit, so the panels can refuse before the round trip', () => {
+  it("mirrors the gateway's batch limit", () => {
     expect(MAX_JEV_INPUTS).toBe(128)
   })
 })

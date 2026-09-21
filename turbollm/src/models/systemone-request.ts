@@ -36,6 +36,9 @@ type PlainObject = Record<string, unknown>
 
 type PathedValue = readonly [path: string, value: unknown]
 
+/** Defence in depth: nestingProblem is iterative and runs first, so no nesting can overflow the stack here.
+ *  Any other RangeError raised while reading the body (for example a string-length limit inside
+ *  JSON.stringify) is refused as a body problem too. The message is pinned, so it is not made generic. */
 export function parseSystemOneBody(raw: unknown): ParseResult {
   try {
     return parseBody(raw)
@@ -290,6 +293,9 @@ function inputFrom(body: PlainObject): SystemOneInput {
   }
 }
 
+/** Rebuilt with Object.fromEntries, which defines every id as an own property: an assignment loop would treat
+ *  an id of __proto__ as a setter. Each entry has already passed questionProblem, so the per-entry cast only
+ *  restores that. */
 function questionsFrom(questions: PlainObject): Record<string, Question> {
   return Object.fromEntries(
     Object.entries(questions).map(([id, question]): [string, Question] => [id, question as Question]),
