@@ -485,6 +485,67 @@ describe('JevPlaygroundScreen running the request', () => {
   })
 })
 
+describe('JevPlaygroundScreen announcing a run to screen readers', () => {
+  const announcement = () => within(screen.getByRole('region', { name: 'Response' })).getByRole('status')
+
+  const ONE_ANSWER: SystemOneResponse = { ...RESPONSE, answers: { urgent: RESPONSE.answers.urgent } }
+
+  it('has one status line in the Response section, empty before any run and visible only to screen readers', () => {
+    renderScreen()
+    const line = announcement()
+    expect(line.textContent).toBe('')
+    expect(line).toHaveClass('sr-only')
+  })
+
+  it('says the request is running while a run is in flight', async () => {
+    const settle = slowRun()
+    renderScreen()
+    await userEvent.click(runButton())
+    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
+
+    expect(announcement().textContent).toBe('The request is running.')
+    await settle()
+  })
+
+  it.each([
+    ['three answers', RESPONSE, /^Answered 3 questions in \d+ ms\.$/],
+    ['one answer', ONE_ANSWER, /^Answered 1 question in \d+ ms\.$/],
+  ])('says how many questions were answered, and how fast, after a run with %s', async (_kind, reply, announced) => {
+    h.systemone.mockResolvedValue(reply)
+    renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByText('0.945')
+
+    expect(announcement().textContent).toMatch(announced)
+  })
+
+  it('announces nothing for a run that failed, since the answers still on screen belong to an earlier run', async () => {
+    renderScreen()
+    const run = runButton()
+    await userEvent.click(run)
+    await screen.findByText('0.945')
+    expect(announcement().textContent).toMatch(/^Answered 3 questions/)
+
+    h.systemone.mockRejectedValueOnce(new Error('boom'))
+    await userEvent.click(run)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('boom')
+    expect(screen.getByText('0.945')).toBeInTheDocument()
+    expect(announcement().textContent).toBe('')
+  })
+
+  it('announces nothing once picking an example has dropped the run', async () => {
+    renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByText('0.945')
+    expect(announcement().textContent).toMatch(/^Answered 3 questions/)
+
+    await userEvent.selectOptions(picker(), 'yes-no')
+
+    expect(announcement().textContent).toBe('')
+  })
+})
+
 describe('JevPlaygroundScreen picking an example', () => {
   it('offers the four examples by their labels', () => {
     renderScreen()

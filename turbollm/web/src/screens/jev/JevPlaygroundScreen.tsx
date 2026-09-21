@@ -184,6 +184,7 @@ export function JevPlaygroundScreen() {
             )}
             <AnswerList answers={run?.response.answers ?? null} stale={running && run !== null} />
             <ResponsePanel run={run} origin={window.location.origin} />
+            <p role="status" className="sr-only">{announcementOf({ running, error, run })}</p>
           </section>
         </div>
       </div>
@@ -208,6 +209,15 @@ function activeEngine(status: Status | undefined): { name: string; kind: string 
 function failureMessage(e: unknown): string {
   if (e instanceof ApiError) return e.message
   return e instanceof Error ? e.message : 'The request failed.'
+}
+
+/** What a screen reader hears about the run. A failed run says nothing here: the alert carries it,
+ *  and the answers still on screen belong to an earlier run. */
+function announcementOf({ running, error, run }: { running: boolean; error: string | null; run: SystemOneRun | null }): string {
+  if (running) return 'The request is running.'
+  if (error !== null || run === null) return ''
+  const answered = Object.keys(run.response.answers).length
+  return `Answered ${answered} ${answered === 1 ? 'question' : 'questions'} in ${run.ms} ms.`
 }
 
 function firstDraft(): SystemOneDraft {
