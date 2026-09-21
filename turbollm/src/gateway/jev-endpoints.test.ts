@@ -770,3 +770,15 @@ test('handleJevRequest: rerank with hypothesis_template "Answer: {}" builds the 
 
   assert.deepEqual(engineInputsSent(harness), CITIES.map((city) => `Premise: ${FRANCE_QUERY}\nHypothesis: Answer: ${city}`))
 })
+
+test('handleJevRequest: the jev-latest alias belongs to /v1/systemone, so classify and rerank do not know it', async () => {
+  const harness = jevHarness()
+  const noSuchModel = {
+    status: 404, code: 'model_not_found', type: 'invalid_request_error', message: "No local model matches 'jev-latest'.",
+  } as const
+
+  await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody({ model: 'jev-latest' })), noSuchModel)
+  await assertRefused(await postJson(harness.app, '/v1/rerank', rerankBody({ model: 'jev-latest' })), noSuchModel)
+
+  assert.deepEqual(harness.routed, [])
+})

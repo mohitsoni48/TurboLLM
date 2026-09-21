@@ -11,10 +11,13 @@ import { clientAbort } from './gateway'
 import {
   callEngineClassify,
   jevErrorResponse,
+  isJevLatest,
   JevEndpointError,
   jsonBodyOf,
   MAX_JEV_INPUTS,
+  NO_JEV_MODEL_FOR_LATEST,
   refusalFor,
+  resolveJevLatest,
   resolveJevModel,
   routeToJevModel,
   type EngineClassifyRow,
@@ -66,7 +69,7 @@ async function answerSystemOne(
   input: SystemOneInput,
   fetchImpl: typeof fetch,
 ): Promise<SystemOneResponse> {
-  const { entry, nliTemplate } = resolveJevModel(d, input.model)
+  const { entry, nliTemplate } = resolveJevModel(d, requestedModelName(d, input.model))
   const plan = planSystemOne(input)
   requireWithinBudget(plan)
   noteLocalActivity()
@@ -96,6 +99,19 @@ function chunksOf<T>(items: readonly T[], size: number): T[][] {
   return Array.from({ length: Math.ceil(items.length / size) }, (_, chunk) =>
     items.slice(chunk * size, (chunk + 1) * size),
   )
+}
+
+/** Only this endpoint knows the `jev-latest` alias, and only it reads the alive slots and the library. A model that is
+ *  being stopped is not alive: routing to it would reload it. */
+function requestedModelName(d: Deps, model: string): string {
+  if (!isJevLatest(model)) return model
+  const aliveKeys = d.modelRouter
+    .aliveSlots()
+    .filter((slot) => slot.state !== 'stopping')
+    .map((slot) => slot.modelKey)
+  const latest = resolveJevLatest(aliveKeys, d.scanner.list().models)
+  if (!latest) throw new JevEndpointError(NO_JEV_MODEL_FOR_LATEST)
+  return latest.key
 }
 
 function unprocessable(problem: RequestProblem): JevHttpError {

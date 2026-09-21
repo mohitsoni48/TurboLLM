@@ -12,7 +12,7 @@ import { lastLocalActivityMs, resetLocalActivity } from '../link/host-idle'
 import type { JevInfo } from '../models/jev'
 import type { ModelEntry } from '../models/scanner'
 import type { Answer, Question } from '../models/systemone'
-import type { RouteResult } from './model-router'
+import type { AliveSlot, RouteResult } from './model-router'
 import { handleSystemOne, MAX_PAIR_CHARS } from './systemone-endpoint'
 
 const MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
@@ -59,10 +59,13 @@ const THREE_QUESTION_ENTAILMENT = [0.945, 0.321, 0.515, 0.185, 0.005, 0.086, 0.0
 
 interface HarnessSetup {
   entries?: ModelEntry[]
+  linkedId?: string
+  aliveSlots?: AliveSlot[]
   route?: RouteResult
   entailment?: number[]
   usages?: number[]
   reply?: (call: number) => Response
+  fetchImpl?: typeof fetch
 }
 
 interface EngineCall {
@@ -81,6 +84,7 @@ interface Harness {
   app: Hono
   routed: ModelEntry[]
   resolvedLocally: string[]
+  aliasLookups: string[]
   engineCalls: EngineCall[]
   generationStarted: string[]
   maxInFlight: () => number
@@ -89,6 +93,7 @@ interface Harness {
 interface Recorder {
   routed: ModelEntry[]
   resolvedLocally: string[]
+  aliasLookups: string[]
   generationStarted: string[]
 }
 
@@ -110,6 +115,37 @@ function jevInfo(overrides: Partial<JevInfo> = {}): JevInfo {
 
 function jevEntry(overrides: Partial<JevInfo> = {}): ModelEntry {
   return { key: MODEL_KEY, name: MODEL_NAME, jev: jevInfo(overrides) } as unknown as ModelEntry
+}
+
+function libraryModel(fields: { key: string; name: string; sizeBytes: number; jev?: JevInfo }): ModelEntry {
+  return fields as unknown as ModelEntry
+}
+
+/** The library, in name order, as the scanner lists it: only the two smaller Jev models are verified. */
+const CHAT = libraryModel({ key: 'qwen3.6-35b-a3b-q3', name: 'Qwen3.6-35B Q3', sizeBytes: 100 })
+const JEV_08B = libraryModel({
+  key: 'qwen3.5 0.8b nli v2s long|mlx-fp16|1700000000',
+  name: 'qwen3.5 0.8b nli v2s long',
+  sizeBytes: 1_700_000_000,
+  jev: jevInfo({ verified: true }),
+})
+const JEV_35B = libraryModel({
+  key: 'qwen3.5 35b a3b nli|mlx-fp16|69000000000',
+  name: 'qwen3.5 35b a3b nli',
+  sizeBytes: 69_000_000_000,
+  jev: jevInfo({ verified: false }),
+})
+const JEV_4B = libraryModel({ key: MODEL_KEY, name: MODEL_NAME, sizeBytes: 9_100_000_000, jev: jevInfo() })
+const JEV_SMALL_UNVERIFIED = libraryModel({
+  key: 'small nli|mlx-fp16|1700000000',
+  name: 'small nli',
+  sizeBytes: 1_700_000_000,
+  jev: jevInfo({ verified: false }),
+})
+const LIBRARY = [CHAT, JEV_08B, JEV_35B, JEV_4B]
+
+function aliveSlot(entry: ModelEntry, state: AliveSlot['state'] = 'running'): AliveSlot {
+  return { modelKey: entry.key, state, primary: true, lastUsedMs: 0 }
 }
 
 /** Row i answers input i with P(entailment) = entailment[i], on the default contradiction/entailment/neutral labels. */
@@ -155,13 +191,14 @@ function scriptedEngine(setup: HarnessSetup): ScriptedEngine {
   return { fetchImpl, calls, maxInFlight: () => peak }
 }
 
-/** The router double answers only what the endpoint may ask it; route() and the generation gate must never be touched. */
+/** The router double answers only what the endpoint may ask it; route() and the generation gate must never be touched.
+ *  The alive slots and the library are read only to resolve the `jev-latest` alias, and every such read is recorded. */
 function depsDouble(setup: HarnessSetup, recorder: Recorder): Deps {
   const entries = setup.entries ?? [jevEntry()]
   return {
     modelRouter: {
       route: () => { throw new Error('handleSystemOne must never call route()') },
-      resolveRemoteTarget: () => undefined,
+      resolveRemoteTarget: (id: string) => (id === setup.linkedId ? { target: 'https://rig.invalid' } : undefined),
       resolveLocal: (id: string) => {
         recorder.resolvedLocally.push(id)
         return entries.find((entry) => entry.key === id || entry.name === id)
@@ -169,6 +206,16 @@ function depsDouble(setup: HarnessSetup, recorder: Recorder): Deps {
       routeTo: async (entry: ModelEntry) => {
         recorder.routed.push(entry)
         return setup.route ?? { target: ENGINE_TARGET }
+      },
+      aliveSlots: () => {
+        recorder.aliasLookups.push('aliveSlots')
+        return setup.aliveSlots ?? []
+      },
+    },
+    scanner: {
+      list: () => {
+        recorder.aliasLookups.push('scanner.list')
+        return { models: entries, scanning: false, lastScanAt: '' }
       },
     },
     gate: { acquire: () => { throw new Error('a System One request must never queue on the generation gate') } },
@@ -180,11 +227,11 @@ function depsDouble(setup: HarnessSetup, recorder: Recorder): Deps {
 }
 
 function systemOneHarness(setup: HarnessSetup = {}): Harness {
-  const recorder: Recorder = { routed: [], resolvedLocally: [], generationStarted: [] }
+  const recorder: Recorder = { routed: [], resolvedLocally: [], aliasLookups: [], generationStarted: [] }
   const engine = scriptedEngine(setup)
   const d = depsDouble(setup, recorder)
   const app = new Hono()
-  app.post('/v1/systemone', (c) => handleSystemOne(c, d, engine.fetchImpl))
+  app.post('/v1/systemone', (c) => handleSystemOne(c, d, setup.fetchImpl ?? engine.fetchImpl))
   return { app, ...recorder, engineCalls: engine.calls, maxInFlight: engine.maxInFlight }
 }
 
@@ -270,6 +317,20 @@ function optionHypothesis(index: number): string {
 
 function batchSizes(harness: Harness): number[] {
   return harness.engineCalls.map((call) => call.input.length)
+}
+
+/** A yes/no request for `model` (the `jev-latest` alias by default) against the four-model library. */
+async function requestModel(
+  setup: HarnessSetup = {},
+  model = 'jev-latest',
+): Promise<{ harness: Harness; res: Response }> {
+  const harness = systemOneHarness({ entries: LIBRARY, ...setup })
+  return { harness, res: await postJson(harness.app, systemOneRequest({ model })) }
+}
+
+function assertRoutedOnlyTo(harness: Harness, entry: ModelEntry): void {
+  assert.equal(harness.routed.length, 1)
+  assert.equal(harness.routed[0], entry)
 }
 
 test('a yes/no question is answered from one engine call, with the model key and the token usage', async () => {
@@ -648,4 +709,233 @@ test('a long but legal premise reaches the engine whole, never truncated', async
   await postJson(harness.app, systemOneRequest({ state, questions }))
 
   assert.ok(harness.engineCalls[0].input[0].includes(state))
+})
+
+test('jev-latest is served by the alive Jev model, whatever its size, and the resolved key is what gets routed', async () => {
+  const { harness, res } = await requestModel({ aliveSlots: [aliveSlot(JEV_08B)] })
+
+  assert.equal((await servedBody(res)).model, JEV_08B.key)
+  assertRoutedOnlyTo(harness, JEV_08B)
+  assert.deepEqual(harness.resolvedLocally, [JEV_08B.key])
+})
+
+test('jev-latest is matched case-insensitively on the trimmed model field', async () => {
+  const { harness, res } = await requestModel({ aliveSlots: [aliveSlot(JEV_08B)] }, '  JEV-Latest ')
+
+  assert.equal((await servedBody(res)).model, JEV_08B.key)
+  assertRoutedOnlyTo(harness, JEV_08B)
+})
+
+test('with nothing alive, jev-latest picks the largest verified Jev model, not the first by name and not an unverified giant', async () => {
+  const { harness, res } = await requestModel()
+
+  assert.equal((await servedBody(res)).model, JEV_4B.key)
+  assertRoutedOnlyTo(harness, JEV_4B)
+})
+
+test('with no verified Jev model, jev-latest picks the largest Jev model', async () => {
+  const { harness, res } = await requestModel({ entries: [CHAT, JEV_35B, JEV_SMALL_UNVERIFIED] })
+
+  assert.equal((await servedBody(res)).model, JEV_35B.key)
+  assertRoutedOnlyTo(harness, JEV_35B)
+})
+
+test('a Jev slot that is being stopped is not alive for jev-latest, because routing to it would reload it', async () => {
+  const { harness, res } = await requestModel({ aliveSlots: [aliveSlot(JEV_08B, 'stopping')] })
+
+  assert.equal((await servedBody(res)).model, JEV_4B.key)
+  assertRoutedOnlyTo(harness, JEV_4B)
+})
+
+test('jev-latest with no Jev model in the library is a 404 that names the alias, and nothing is resolved or routed', async () => {
+  resetLocalActivity()
+  const { harness, res } = await requestModel({ entries: [CHAT] })
+
+  await assertRefused(res, {
+    status: 404,
+    code: 'model_not_found',
+    type: 'invalid_request_error',
+    message: "No Jev model in your library for 'jev-latest'.",
+  })
+
+  assert.deepEqual(harness.resolvedLocally, [])
+  assert.deepEqual(harness.routed, [])
+  assert.equal(harness.engineCalls.length, 0)
+  assert.equal(lastLocalActivityMs(), null)
+})
+
+test('with auto-swap off the router refuses the alias\'s model with 503, never a silent load', async () => {
+  const notLoaded = "'qwen3.5 4b nli v2' is not loaded. Load it from Models, or turn on auto-swap."
+
+  const { harness, res } = await requestModel({ route: { status: 503, message: notLoaded } })
+
+  await assertRefused(res, { status: 503, code: 'model_not_loaded', type: 'api_error', message: notLoaded })
+  assert.equal(harness.engineCalls.length, 0)
+})
+
+test('a model requested by key never asks for the alive slots or the library', async () => {
+  const { harness, res } = await requestModel({}, MODEL_KEY)
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(harness.aliasLookups, [])
+})
+
+test('a model no library entry matches is a 404', async () => {
+  const { harness, res } = await requestModel({}, 'nope')
+
+  await assertRefused(res, {
+    status: 404,
+    code: 'model_not_found',
+    type: 'invalid_request_error',
+    message: "No local model matches 'nope'.",
+  })
+  assert.deepEqual(harness.routed, [])
+})
+
+test('a chat model is a 400 not_a_jev_model, and nothing is loaded', async () => {
+  const { harness, res } = await requestModel({}, CHAT.key)
+
+  await assertRefused(res, {
+    status: 400,
+    code: 'not_a_jev_model',
+    type: 'invalid_request_error',
+    message: "'Qwen3.6-35B Q3' is not a Jev model — /v1/classify and /v1/rerank need a model whose config.json " +
+      'declares an NLI head (contradiction / entailment / neutral).',
+  })
+  assert.deepEqual(harness.routed, [])
+})
+
+test('a Jev model without an nli_template is a 400 jev_template_missing, and nothing is loaded or counted', async () => {
+  resetLocalActivity()
+  const templateless = libraryModel({
+    key: 'nli-no-template',
+    name: 'nli no template',
+    sizeBytes: 5,
+    jev: jevInfo({ nliTemplate: null }),
+  })
+
+  const { harness, res } = await requestModel({ entries: [templateless] }, templateless.key)
+
+  await assertRefused(res, {
+    status: 400,
+    code: 'jev_template_missing',
+    type: 'invalid_request_error',
+    message: "'nli no template' doesn't say how to combine premise and hypothesis (its config.json has no " +
+      "nli_template), so TurboLLM can't build its input.",
+  })
+  assert.deepEqual(harness.routed, [])
+  assert.equal(lastLocalActivityMs(), null)
+})
+
+test('a Turbo Link machine/model id is a 400 link_jev_unsupported, never resolved locally', async () => {
+  const { harness, res } = await requestModel({ linkedId: 'Rig/qwen3.5 4b nli v2' }, 'Rig/qwen3.5 4b nli v2')
+
+  await assertRefused(res, {
+    status: 400,
+    code: 'link_jev_unsupported',
+    type: 'invalid_request_error',
+    message: 'Turbo Link does not carry the Jev endpoints — call the machine that has the model.',
+  })
+  assert.deepEqual(harness.resolvedLocally, [])
+  assert.deepEqual(harness.routed, [])
+})
+
+test('an engine 4xx is a 400 engine_rejected carrying the engine\'s message', async () => {
+  const reply = jsonReply({ error: { message: 'bad' } }, 422)
+
+  const { res } = await requestModel({ reply }, MODEL_KEY)
+
+  await assertRefused(res, { status: 400, code: 'engine_rejected', type: 'invalid_request_error', message: 'bad' })
+})
+
+test('an engine 5xx is a 502 engine_error carrying the engine\'s message', async () => {
+  const reply = jsonReply({ error: { message: 'engine down' } }, 503)
+
+  const { res } = await requestModel({ reply }, MODEL_KEY)
+
+  await assertRefused(res, { status: 502, code: 'engine_error', type: 'api_error', message: 'engine down' })
+})
+
+const THREE_ROWS = entailmentRows([0.1, 0.2, 0.3])
+const THREE_ROW_USAGE = { prompt_tokens: 30, total_tokens: 30 }
+const MALFORMED_ENGINE_REPLIES: Array<[string, () => Response]> = [
+  ['a probs vector of the wrong length', jsonReply({
+    data: [{ ...THREE_ROWS[0], probs: [0.5, 0.5] }, THREE_ROWS[1], THREE_ROWS[2]],
+    usage: THREE_ROW_USAGE,
+  })],
+  ['two rows claiming the same index', jsonReply({
+    data: [THREE_ROWS[0], { ...THREE_ROWS[1], index: 0 }, THREE_ROWS[2]],
+    usage: THREE_ROW_USAGE,
+  })],
+  ['two rows for three inputs', jsonReply({ data: THREE_ROWS.slice(0, 2), usage: THREE_ROW_USAGE })],
+  ['a body that is not JSON', () => new Response('not json', { status: 200 })],
+  ['a probs entry that is not a number', jsonReply({
+    data: [{ ...THREE_ROWS[0], probs: ['x', 0, 0] }, THREE_ROWS[1], THREE_ROWS[2]],
+    usage: THREE_ROW_USAGE,
+  })],
+]
+
+for (const [name, reply] of MALFORMED_ENGINE_REPLIES) {
+  test(`an engine reply with ${name} is a 502 engine_bad_response`, async () => {
+    const harness = systemOneHarness({ reply })
+
+    const res = await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(3) } }))
+
+    await assertRefused(res, {
+      status: 502,
+      code: 'engine_bad_response',
+      type: 'api_error',
+      message: 'The engine returned an unexpected /classify response.',
+    })
+  })
+}
+
+test('an engine that cannot be reached is a 500 engine_unreachable', async () => {
+  const fetchImpl = (async () => { throw new Error('connect ECONNREFUSED') }) as typeof fetch
+
+  const { res } = await requestModel({ fetchImpl }, MODEL_KEY)
+
+  await assertRefused(res, {
+    status: 500,
+    code: 'engine_unreachable',
+    type: 'api_error',
+    message: 'Engine unreachable: connect ECONNREFUSED',
+  })
+})
+
+test('a client that has already disconnected is a 500 with the disconnect message', async () => {
+  const left = new AbortController()
+  left.abort()
+  const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError')
+    return classifyResponse([0.5], 32)
+  }) as typeof fetch
+  const harness = systemOneHarness({ fetchImpl })
+
+  const res = await harness.app.request('/v1/systemone', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(systemOneRequest()),
+    signal: left.signal,
+  })
+
+  await assertRefused(res, {
+    status: 500,
+    code: 'engine_unreachable',
+    type: 'api_error',
+    message: 'Client disconnected before the engine responded.',
+  })
+})
+
+test('an unknown model is a 404 even when the state is too long: the model is resolved before the length check', async () => {
+  const harness = systemOneHarness({ entries: LIBRARY })
+
+  const res = await postJson(harness.app, systemOneRequest({ model: 'nope', state: 'a'.repeat(MAX_PAIR_CHARS + 1) }))
+
+  await assertRefused(res, {
+    status: 404,
+    code: 'model_not_found',
+    type: 'invalid_request_error',
+    message: "No local model matches 'nope'.",
+  })
 })
