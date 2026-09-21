@@ -114,6 +114,16 @@ function runButton(): HTMLElement {
   return screen.getByRole('button', { name: 'Run' })
 }
 
+function picker(): HTMLElement {
+  return screen.getByLabelText('Example')
+}
+
+function exampleNamed(id: string) {
+  const example = SYSTEMONE_EXAMPLES.find((candidate) => candidate.id === id)
+  if (example === undefined) throw new Error(`There is no example named ${id}.`)
+  return example
+}
+
 function pressRunShortcut(modifier: 'ctrlKey' | 'metaKey' = 'ctrlKey'): boolean {
   return fireEvent.keyDown(window, { key: 'Enter', [modifier]: true })
 }
@@ -459,5 +469,103 @@ describe('JevPlaygroundScreen running the request', () => {
     await userEvent.click(runButton())
     await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
     expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull()
+  })
+})
+
+describe('JevPlaygroundScreen picking an example', () => {
+  it('offers the four examples by their labels', () => {
+    renderScreen()
+    const labels = within(picker()).getAllByRole('option').map((option) => option.textContent)
+    expect(labels).toEqual(SYSTEMONE_EXAMPLES.map((example) => example.label))
+  })
+
+  it('loads the picked example into both editors without running it', async () => {
+    renderScreen()
+    await userEvent.selectOptions(picker(), 'routing')
+
+    const routing = exampleNamed('routing')
+    expect(screen.getByLabelText('state')).toHaveValue(routing.stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(routing.questionsText)
+    expect(picker()).toHaveValue('routing')
+    expect(h.systemone).not.toHaveBeenCalled()
+    expect(h.track).toHaveBeenCalledWith('workspace', 'jev_load_example')
+  })
+
+  it('replaces what the user had typed', async () => {
+    renderScreen()
+    editText('state', 'Typed by hand.')
+    editText('questions', '{"typed":"by hand"}')
+
+    await userEvent.selectOptions(picker(), 'yes-no')
+
+    expect(screen.getByLabelText('state')).toHaveValue(exampleNamed('yes-no').stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(exampleNamed('yes-no').questionsText)
+  })
+
+  it('clears the answers of a previous run', async () => {
+    renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByText('0.945')
+
+    await userEvent.selectOptions(picker(), 'yes-no')
+
+    expect(screen.queryByText('0.945')).toBeNull()
+    expect(screen.getByText('Run, or press ⌘/Ctrl+Enter.')).toBeInTheDocument()
+    expect(screen.getByText('Run to see the response and the request as curl.')).toBeInTheDocument()
+  })
+
+  it('clears the failure line of a previous run', async () => {
+    h.systemone.mockRejectedValue(new Error('boom'))
+    renderScreen()
+    await userEvent.click(runButton())
+    expect(await screen.findByRole('alert')).toHaveTextContent('boom')
+
+    await userEvent.selectOptions(picker(), 'yes-no')
+
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('leaves the picker usable while a run is in flight', async () => {
+    const settle = slowRun()
+    renderScreen()
+    await userEvent.click(runButton())
+    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
+
+    expect(picker()).not.toBeDisabled()
+    await settle()
+  })
+
+  it('drops the answer of a run the user has moved on from, and posts the picked example next', async () => {
+    const settle = slowRun()
+    renderScreen()
+    const run = runButton()
+    await userEvent.click(run)
+    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
+
+    await userEvent.selectOptions(picker(), 'routing')
+    expect(run).toBeDisabled()
+
+    await settle()
+    expect(screen.queryByText('0.945')).toBeNull()
+    expect(screen.getByText('Run, or press ⌘/Ctrl+Enter.')).toBeInTheDocument()
+    await waitFor(() => expect(run).toBeEnabled())
+
+    h.systemone.mockResolvedValue(RESPONSE)
+    await userEvent.click(run)
+    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(2))
+    expect(h.systemone).toHaveBeenLastCalledWith(requestOf(exampleNamed('routing')))
+  })
+
+  it('drops the failure of a run the user has moved on from', async () => {
+    let refuse: (reason: Error) => void = () => {}
+    h.systemone.mockImplementation(() => new Promise((_resolve, reject) => { refuse = reject }))
+    renderScreen()
+    await userEvent.click(runButton())
+    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
+
+    await userEvent.selectOptions(picker(), 'routing')
+    await act(async () => { refuse(new Error('too late')) })
+
+    expect(screen.queryByRole('alert')).toBeNull()
   })
 })

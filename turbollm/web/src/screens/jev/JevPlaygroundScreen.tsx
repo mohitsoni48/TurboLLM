@@ -6,7 +6,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Button } from '../../components/ui/button'
-import { ApiError, stopEngine } from '../../lib/api'
+import { ApiError, stopEngine, track } from '../../lib/api'
 import { systemone } from '../../lib/jev-api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useModels, useStatus } from '../../lib/queries'
@@ -34,6 +34,7 @@ export function JevPlaygroundScreen() {
   const [run, setRun] = useState<SystemOneRun | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
+  const [exampleId, setExampleId] = useState(SYSTEMONE_EXAMPLES[0].id)
   const [switchOpen, setSwitchOpen] = useState(false)
 
   // One run at a time. The ref rather than the `running` state is the guard: the
@@ -84,6 +85,24 @@ export function JevPlaygroundScreen() {
 
   const drafted = draftRequest(jev.key, draft)
   const problems = drafted.ok ? [] : drafted.problems
+
+  /** What is on screen stops being the answer to what the editors now ask. */
+  function dropCurrentRun() {
+    currentRun.current += 1
+    setRun(null)
+  }
+
+  // Loading an example replaces the draft and never runs it. The run in flight, if any, is not
+  // cancelled (there is nothing to cancel it with): it settles unseen, and Run waits for it.
+  function pickExample(id: string) {
+    const example = SYSTEMONE_EXAMPLES.find((candidate) => candidate.id === id)
+    if (!example) return
+    track('workspace', 'jev_load_example')
+    setExampleId(id)
+    setDraft({ stateText: example.stateText, questionsText: example.questionsText })
+    setError(null)
+    dropCurrentRun()
+  }
 
   function pickModel(m: ModelEntry) {
     setSwitchOpen(false)
@@ -136,6 +155,16 @@ export function JevPlaygroundScreen() {
                 {running ? 'Running…' : 'Run'}
               </Button>
               <span className="text-[12px] text-muted">⌘/Ctrl+Enter</span>
+              <select
+                aria-label="Example"
+                value={exampleId}
+                onChange={(e) => pickExample(e.target.value)}
+                className="max-w-[210px] rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink"
+              >
+                {SYSTEMONE_EXAMPLES.map((example) => (
+                  <option key={example.id} value={example.id}>{example.label}</option>
+                ))}
+              </select>
             </div>
           </section>
 
