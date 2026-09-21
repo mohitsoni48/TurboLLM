@@ -248,9 +248,9 @@ test('a trailing slash does not let a Turbo Link peer past the /v1/classify refu
 })
 
 const CANNOT_CHAT = "'qwen3.5 4b nli v2' is a Jev model: it labels premise/hypothesis pairs and cannot chat. " +
-  'Call POST /v1/classify (or /v1/rerank) instead.'
+  'Call POST /v1/systemone (or /v1/classify, /v1/rerank) instead.'
 const CANNOT_EMBED = "'qwen3.5 4b nli v2' is a Jev model: it labels premise/hypothesis pairs and cannot produce " +
-  'embeddings. Call POST /v1/classify (or /v1/rerank) instead.'
+  'embeddings. Call POST /v1/systemone (or /v1/classify, /v1/rerank) instead.'
 
 test('POST /v1/chat/completions on a Jev model → 400 jev_model_wrong_endpoint, nothing routed or loaded', async () => {
   const routed: string[] = []

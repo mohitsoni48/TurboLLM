@@ -103,7 +103,7 @@ function asClientStatus(status: number): ContentfulStatusCode {
 function jevWrongEndpointMessage(modelName: string, request: 'chat' | 'embeddings'): string {
   const cannot = request === 'chat' ? 'chat' : 'produce embeddings'
   return `'${modelName}' is a Jev model: it labels premise/hypothesis pairs and cannot ${cannot}. ` +
-    'Call POST /v1/classify (or /v1/rerank) instead.'
+    'Call POST /v1/systemone (or /v1/classify, /v1/rerank) instead.'
 }
 
 /** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
@@ -769,9 +769,9 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // see GatewayV1Options.pathname. Defaults to the real one, so the public mount is unchanged.
   const pathname = opts.pathname ?? url.pathname
 
-  // POST /v1/classify and /v1/rerank (Jev models, ADR-434 (d)) live in their own module and are
-  // dispatched here rather than registered as Hono routes: the Turbo Link façade mounts this same
-  // handler, and a separately registered route is the registration-order bug class of ADR-421.
+  // POST /v1/classify, /v1/rerank and /v1/systemone (Jev models, ADR-434 (d), ADR-439) live in their own
+  // modules and are dispatched here rather than registered as Hono routes: the Turbo Link façade mounts this
+  // same handler, and a separately registered route is the registration-order bug class of ADR-421.
   const jevEndpoint = jevEndpointFor(c.req.method, pathname)
   if (jevEndpoint) return handleJevRequest(c, d, jevEndpoint, opts)
 
