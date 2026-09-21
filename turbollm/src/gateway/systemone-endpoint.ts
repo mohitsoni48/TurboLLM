@@ -12,6 +12,7 @@ import {
   callEngineClassify,
   jevErrorResponse,
   jsonBodyOf,
+  MAX_JEV_INPUTS,
   refusalFor,
   resolveJevModel,
   routeToJevModel,
@@ -24,6 +25,18 @@ interface SystemOneResponse {
   model: string
   answers: Record<string, Answer>
   usage: { input_tokens: number; output_tokens: number }
+}
+
+/** Where and how one request reaches its engine: one abort signal for the whole request, not one per call. */
+interface EngineConnection {
+  target: string
+  signal: AbortSignal
+  fetchImpl: typeof fetch
+}
+
+interface Scores {
+  entailment: number[]
+  inputTokens: number
 }
 
 /** One System One request. It never takes the generation gate (classification is not a generation), does not
@@ -50,12 +63,31 @@ async function answerSystemOne(
   const plan = planSystemOne(input)
   noteLocalActivity()
   const target = await routeToJevModel(d, entry)
-  const engine = await callEngineClassify(target, engineInputsOf(plan, nliTemplate), clientAbort(c).signal, fetchImpl)
+  const engine: EngineConnection = { target, signal: clientAbort(c).signal, fetchImpl }
+  const { entailment, inputTokens } = await scoreInChunks(entry, engineInputsOf(plan, nliTemplate), engine)
   return {
     model: entry.key,
-    answers: answersFrom(input, plan, entailmentOf(entry, engine.rows)),
-    usage: { input_tokens: engine.usage.prompt_tokens, output_tokens: 0 },
+    answers: answersFrom(input, plan, entailment),
+    usage: { input_tokens: inputTokens, output_tokens: 0 },
   }
+}
+
+/** Sequential and in plan order: one engine call at a time, and chunk boundaries that depend on nothing but the
+ *  request. The first chunk that fails fails the whole request, so a partial answer is never reported. */
+async function scoreInChunks(entry: JevModel, inputs: readonly string[], engine: EngineConnection): Promise<Scores> {
+  const scores: Scores = { entailment: [], inputTokens: 0 }
+  for (const chunk of chunksOf(inputs, MAX_JEV_INPUTS)) {
+    const { rows, usage } = await callEngineClassify(engine.target, chunk, engine.signal, engine.fetchImpl)
+    scores.entailment.push(...entailmentOf(entry, rows))
+    scores.inputTokens += usage.prompt_tokens
+  }
+  return scores
+}
+
+function chunksOf<T>(items: readonly T[], size: number): T[][] {
+  return Array.from({ length: Math.ceil(items.length / size) }, (_, chunk) =>
+    items.slice(chunk * size, (chunk + 1) * size),
+  )
 }
 
 function unprocessable(problem: RequestProblem): JevHttpError {

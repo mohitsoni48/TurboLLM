@@ -62,7 +62,7 @@ interface HarnessSetup {
   route?: RouteResult
   entailment?: number[]
   usages?: number[]
-  reply?: () => Response
+  reply?: (call: number) => Response
 }
 
 interface EngineCall {
@@ -71,12 +71,19 @@ interface EngineCall {
   input: string[]
 }
 
+interface ScriptedEngine {
+  fetchImpl: typeof fetch
+  calls: EngineCall[]
+  maxInFlight: () => number
+}
+
 interface Harness {
   app: Hono
   routed: ModelEntry[]
   resolvedLocally: string[]
   engineCalls: EngineCall[]
   generationStarted: string[]
+  maxInFlight: () => number
 }
 
 interface Recorder {
@@ -110,27 +117,42 @@ function entailmentRows(entailment: readonly number[]): Array<Record<string, unk
   return entailment.map((e, index) => ({ index, label: 'entailment', probs: [0, e, 1 - e], num_classes: 3 }))
 }
 
-function jsonReply(body: unknown, status = 200): () => Response {
-  return () => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
 }
 
-/** A fetch double that records each call and answers from `setup`; the entailment values are consumed across calls in order. */
-function scriptedEngine(setup: HarnessSetup): { fetchImpl: typeof fetch; calls: EngineCall[] } {
+function jsonReply(body: unknown, status = 200): () => Response {
+  return () => jsonResponse(body, status)
+}
+
+function classifyResponse(entailment: readonly number[], promptTokens: number): Response {
+  return jsonResponse({
+    data: entailmentRows(entailment),
+    usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
+  })
+}
+
+/** A fetch double that records each call and answers from `setup`; the entailment values are consumed across calls
+ *  in order. It yields between taking and releasing an in-flight slot, so overlapping calls would show in `maxInFlight`. */
+function scriptedEngine(setup: HarnessSetup): ScriptedEngine {
   const calls: EngineCall[] = []
   const remaining = [...(setup.entailment ?? [])]
+  let inFlight = 0
+  let peak = 0
   const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
     const input = (JSON.parse(String(init?.body)) as { input: string[] }).input
     assert.ok(input.length <= MAX_JEV_INPUTS, 'one engine batch never exceeds MAX_JEV_INPUTS')
-    calls.push({ url: String(url), init: init ?? {}, input })
-    if (setup.reply) return setup.reply()
-    const entailment = input.map(() => remaining.shift() ?? UNSET_ENTAILMENT)
-    const promptTokens = setup.usages?.[calls.length - 1] ?? 32
-    return jsonReply({
-      data: entailmentRows(entailment),
-      usage: { prompt_tokens: promptTokens, total_tokens: promptTokens },
-    })()
+    const call = calls.push({ url: String(url), init: init ?? {}, input }) - 1
+    const reply = setup.reply
+      ? setup.reply(call)
+      : classifyResponse(input.map(() => remaining.shift() ?? UNSET_ENTAILMENT), setup.usages?.[call] ?? 32)
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
+    await Promise.resolve()
+    inFlight -= 1
+    return reply
   }) as typeof fetch
-  return { fetchImpl, calls }
+  return { fetchImpl, calls, maxInFlight: () => peak }
 }
 
 /** The router double answers only what the endpoint may ask it; route() and the generation gate must never be touched. */
@@ -163,7 +185,7 @@ function systemOneHarness(setup: HarnessSetup = {}): Harness {
   const d = depsDouble(setup, recorder)
   const app = new Hono()
   app.post('/v1/systemone', (c) => handleSystemOne(c, d, engine.fetchImpl))
-  return { app, ...recorder, engineCalls: engine.calls }
+  return { app, ...recorder, engineCalls: engine.calls, maxInFlight: engine.maxInFlight }
 }
 
 function systemOneRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -220,6 +242,20 @@ function premised(hypothesis: string, premise = STATE_URGENT): string {
 
 function nestedArrays(depth: number): string {
   return '['.repeat(depth) + ']'.repeat(depth)
+}
+
+/** A pick-one question with options o0..o(n-1) and no descriptions: one hypothesis per option. */
+function choiceQuestion(optionCount: number): Question {
+  const criteria = Object.fromEntries(Array.from({ length: optionCount }, (_, index) => [`o${index}`, null]))
+  return { type: 'choice', instructions: 'Q?', criteria }
+}
+
+function optionHypothesis(index: number): string {
+  return premised(`Q? The correct answer is: o${index}`)
+}
+
+function batchSizes(harness: Harness): number[] {
+  return harness.engineCalls.map((call) => call.input.length)
 }
 
 test('a yes/no question is answered from one engine call, with the model key and the token usage', async () => {
@@ -414,4 +450,92 @@ test('integer-like question ids are re-ordered by JSON.parse, and the answers an
 
   assert.deepEqual(Object.keys(body.answers), ['2', 'b'])
   assert.deepEqual(harness.engineCalls[0].input, [premised('Two?', 's'), premised('Bee?', 's')])
+})
+
+test('200 hypotheses go in two engine calls of 128 and 72, in plan order, and one question spans the boundary', async () => {
+  const entailment = Array.from({ length: 200 }, (_, index) => (index + 1) / 1000)
+  const harness = systemOneHarness({ entailment, usages: [50, 30] })
+
+  const body = await servedBody(
+    await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(200) } })),
+  )
+
+  assert.deepEqual(batchSizes(harness), [128, 72])
+  assert.deepEqual(
+    harness.engineCalls.flatMap((call) => call.input),
+    Array.from({ length: 200 }, (_, index) => optionHypothesis(index)),
+  )
+  assert.equal(body.usage.input_tokens, 80, 'the input tokens are the sum over the chunks')
+  const answer = choiceOf(body.answers.q)
+  assert.equal(answer.choice, 'o199')
+  assertClose(answer.probabilities.o0, 0.001 / entailment.reduce((sum, value) => sum + value, 0))
+  assertClose(Object.values(answer.probabilities).reduce((sum, value) => sum + value, 0), 1)
+})
+
+test('exactly 128 hypotheses go in one engine call', async () => {
+  const harness = systemOneHarness()
+
+  await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(128) } }))
+
+  assert.deepEqual(batchSizes(harness), [128])
+})
+
+test('129 hypotheses go in two engine calls of 128 and 1', async () => {
+  const harness = systemOneHarness()
+
+  await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(129) } }))
+
+  assert.deepEqual(batchSizes(harness), [128, 1])
+})
+
+test('512 hypotheses, the most a request may produce, go in four engine calls of 128', async () => {
+  const harness = systemOneHarness()
+  const questions = { c1: choiceQuestion(255), c2: choiceQuestion(255), n1: Q_NOUL, n2: Q_NOUL }
+
+  await servedBody(await postJson(harness.app, systemOneRequest({ questions })))
+
+  assert.deepEqual(batchSizes(harness), [128, 128, 128, 128])
+})
+
+test('513 hypotheses are a 422 on the questions, and nothing is sent or routed', async () => {
+  const harness = systemOneHarness()
+  const questions = { c1: choiceQuestion(255), c2: choiceQuestion(255), n1: Q_NOUL, n2: Q_NOUL, n3: Q_NOUL }
+
+  await assertRefused(
+    await postJson(harness.app, systemOneRequest({ questions })),
+    unprocessable('questions must produce at most 512 hypotheses in total.'),
+  )
+
+  assert.equal(harness.engineCalls.length, 0)
+  assert.deepEqual(harness.routed, [])
+})
+
+test('the chunks are sent one after another, never in parallel', async () => {
+  const harness = systemOneHarness()
+
+  await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(200) } }))
+
+  assert.equal(harness.engineCalls.length, 2)
+  assert.equal(harness.maxInFlight(), 1)
+})
+
+test('identical requests are cut at identical chunk boundaries', async () => {
+  const harness = systemOneHarness()
+  const request = systemOneRequest({ questions: { q: choiceQuestion(200) } })
+
+  await postJson(harness.app, request)
+  await postJson(harness.app, request)
+
+  assert.deepEqual(batchSizes(harness), [128, 72, 128, 72])
+})
+
+test('a failing later chunk fails the whole request with that chunk\'s refusal and no partial answer', async () => {
+  const firstChunkAnswered = classifyResponse(Array.from({ length: MAX_JEV_INPUTS }, () => 0.5), 40)
+  const reply = (call: number) =>
+    call === 0 ? firstChunkAnswered : jsonResponse({ error: { message: 'engine overloaded' } }, 503)
+  const harness = systemOneHarness({ reply })
+
+  const res = await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(200) } }))
+
+  await assertRefused(res, { status: 502, code: 'engine_error', type: 'api_error', message: 'engine overloaded' })
 })

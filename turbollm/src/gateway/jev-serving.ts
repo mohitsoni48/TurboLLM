@@ -9,7 +9,8 @@ import { JevShapeError, type JevInfo } from '../models/jev'
 import type { ModelEntry } from '../models/scanner'
 import { describeEngineError } from './gateway'
 
-/** Upper bound on hypotheses (classify) or documents (rerank) in one request — one engine batch. */
+/** Upper bound on one engine batch: hypotheses per /v1/classify, documents per /v1/rerank, and the chunk size
+ *  /v1/systemone splits its hypotheses into. */
 export const MAX_JEV_INPUTS = 128
 
 /** A refusal in the OpenAI error envelope's terms. */
