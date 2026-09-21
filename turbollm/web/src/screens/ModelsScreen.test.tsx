@@ -17,7 +17,7 @@ const requestLoad = vi.fn()
 vi.mock('../lib/queries', () => ({
   queryKeys: { models: ['models'], status: ['status'] },
   useModels: () => ({ data: { models: state.models, scanning: false }, isLoading: false, isError: false, refetch: vi.fn() }),
-  useModelDirs: () => ({ data: { dirs: ['D:\models'], primaryDir: 'D:\models' } }),
+  useModelDirs: () => ({ data: { dirs: ['/models'], primaryDir: '/models' } }),
   useModelMutations: () => ({
     rescan: { mutate: vi.fn() }, addDir: { mutate: vi.fn(), isPending: false, error: null },
     removeDir: { mutate: vi.fn() }, setPrimaryDir: { mutate: vi.fn(), isPending: false },
@@ -61,8 +61,8 @@ const JEV: JevInfo = {
 
 function entry(over: Partial<ModelEntry> = {}): ModelEntry {
   return {
-    key: 'local-1', name: 'Local Llama', quant: 'Q4_K_M', arch: 'llama', dir: 'D:\models',
-    path: 'D:\models\local.gguf', sizeBytes: 4e9, nativeCtx: 8192, loaded: false,
+    key: 'local-1', name: 'Local Llama', quant: 'Q4_K_M', arch: 'llama', dir: '/models',
+    path: '/models/local.gguf', sizeBytes: 4e9, nativeCtx: 8192, loaded: false,
     compatibleWithActiveEngine: true, format: 'gguf', hasChatTemplate: true,
     ...over,
   } as ModelEntry
@@ -105,6 +105,39 @@ describe('ModelsScreen — Jev models', () => {
     renderScreen()
     expect(screen.getByText("1 model is hidden — the active engine can't load it.")).toBeTruthy()
     expect(screen.queryByText('Mistral MLX')).toBeNull()
+  })
+
+  // …but with the rows revealed it must count what is actually on screen: the Jev model carries
+  // a can't-load chip of its own, so saying "1" beside two such rows is simply false.
+  it('counts every model that cannot load once they are all shown', async () => {
+    state.models = [
+      jevEntry({ compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' }),
+      entry({ key: 'mlx-1', name: 'Mistral MLX', format: 'mlx', compatibleWithActiveEngine: false }),
+    ]
+    renderScreen()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Show all' }))
+
+    expect(screen.getByText("Showing all models. 2 can't load on the active engine.")).toBeTruthy()
+    expect(screen.getByText('Mistral MLX')).toBeTruthy()
+  })
+
+  // Divergence row 3's own rationale is "no churn for other models": `incompatibleReason` is the
+  // short chip label, so serving it as the tooltip dropped the actionable half of the sentence.
+  it('keeps the full "switch to" tooltip for a model that is not a Jev model', async () => {
+    state.models = [entry({ key: 'mlx-1', name: 'Mistral MLX', format: 'mlx', compatibleWithActiveEngine: false, incompatibleReason: 'needs MLX or vLLM' })]
+    renderScreen()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Show all' }))
+
+    expect(screen.getByRole('button', { name: 'Load' }).getAttribute('title'))
+      .toBe("The active engine can't load this model — switch to MLX or vLLM")
+  })
+
+  it('gives a Jev model the daemon\'s own reason instead', () => {
+    state.models = [jevEntry({ compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' })]
+    renderScreen()
+    expect(screen.getByRole('button', { name: 'Load' }).getAttribute('title')).toBe('Needs vLLM (Linux or WSL2)')
   })
 
   it('never labels a Jev model "no chat template" — it never chats', () => {

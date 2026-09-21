@@ -120,6 +120,12 @@ function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): 
   return [...groups.filter(isGroupPinned), ...groups.filter((g) => !isGroupPinned(g))]
 }
 
+/** Hidden by the engine filter — which a Jev model never is (ADR-434 (g)): it stays on the
+ *  list as unavailable, so it is not something "Show all" reveals. */
+function hiddenByEngine(m: ModelEntry): boolean {
+  return !m.compatibleWithActiveEngine && !m.jev
+}
+
 export function ModelsScreen() {
   const navigate = useNavigate()
   // Onboarding's Discover handoff (Pro, "pick a different model", "nothing fits this
@@ -202,9 +208,11 @@ export function ModelsScreen() {
   const models = modelsQ.data?.models ?? []
   const dirs = dirsQ.data?.dirs ?? []
   const primaryDir = dirsQ.data?.primaryDir ?? ''
-  // A Jev model is never hidden by the engine filter (ADR-434 (g)): it shows as unavailable
-  // instead, so it is not one of the models this banner offers to reveal.
-  const incompatibleCount = models.filter((m) => !m.compatibleWithActiveEngine && !m.jev).length
+  // Two different questions, so two counts. A Jev model is never hidden by the engine filter
+  // (ADR-434 (g)) — it shows as unavailable instead — so it is not one of the models the banner
+  // offers to reveal, but it IS one of the models that cannot load once they are all on screen.
+  const hiddenCount = models.filter(hiddenByEngine).length
+  const cannotLoadCount = models.filter((m) => !m.compatibleWithActiveEngine).length
 
   // Facet-aware filter chips: only offer a facet that at least one model actually has.
   const facetCounts = useMemo(
@@ -219,7 +227,7 @@ export function ModelsScreen() {
 
   const q = search.trim().toLowerCase()
   const filtered = models.filter((m) => {
-    if (!showIncompatible && !m.compatibleWithActiveEngine && !m.jev) return false
+    if (!showIncompatible && hiddenByEngine(m)) return false
     if (q && !m.name.toLowerCase().includes(q)) return false
     if (filter === 'vision') return m.vision
     if (filter === 'moe') return m.moe
@@ -384,7 +392,8 @@ export function ModelsScreen() {
           filter={filter}
           setFilter={setFilter}
           facetCounts={facetCounts}
-          incompatibleCount={incompatibleCount}
+          hiddenCount={hiddenCount}
+          cannotLoadCount={cannotLoadCount}
           showIncompatible={showIncompatible}
           setShowIncompatible={setShowIncompatible}
           rescan={() => mut.rescan.mutate()}
@@ -455,7 +464,8 @@ function LibraryTab({
   filter,
   setFilter,
   facetCounts,
-  incompatibleCount,
+  hiddenCount,
+  cannotLoadCount,
   showIncompatible,
   setShowIncompatible,
   rescan,
@@ -489,7 +499,8 @@ function LibraryTab({
   filter: Filter
   setFilter: (f: Filter) => void
   facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
-  incompatibleCount: number
+  hiddenCount: number
+  cannotLoadCount: number
   showIncompatible: boolean
   setShowIncompatible: (v: boolean) => void
   rescan: () => void
@@ -574,12 +585,12 @@ function LibraryTab({
         </div>
       </div>
 
-      {incompatibleCount > 0 && (
+      {hiddenCount > 0 && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">
           <span className="text-muted">
             {showIncompatible
-              ? `Showing all models. ${incompatibleCount} can't load on the active engine.`
-              : `${incompatibleCount} ${incompatibleCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${incompatibleCount === 1 ? 'it' : 'them'}.`}
+              ? `Showing all models. ${cannotLoadCount} can't load on the active engine.`
+              : `${hiddenCount} ${hiddenCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${hiddenCount === 1 ? 'it' : 'them'}.`}
           </span>
           <button
             type="button"
@@ -704,6 +715,14 @@ function useDeleteModel() {
       void qc.invalidateQueries({ queryKey: queryKeys.status })
     },
   })
+}
+
+/** Why the Load button is dead. Only a Jev model takes the daemon's own wording (divergence
+ *  row 3): `incompatibleReason` is the short chip label, and serving it here for every model
+ *  would duplicate the chip beside it and drop the half that says what to do about it. */
+function cannotLoadTitle(m: ModelEntry, needsEngine: string): string {
+  if (m.jev && m.incompatibleReason) return m.incompatibleReason
+  return `The active engine can't load this model — switch to ${needsEngine}`
 }
 
 /** One row per model name. Multiple quants collapse into a single row with a quant
@@ -869,7 +888,7 @@ function ModelRow({
             !loadable
               ? 'Model is incomplete or unreadable'
               : !compatible
-                ? m.incompatibleReason ?? `The active engine can't load this model — switch to ${needsEngine}`
+                ? cannotLoadTitle(m, needsEngine)
                 : ''
           }
         >
