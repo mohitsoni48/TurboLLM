@@ -98,6 +98,17 @@ test('jevEndpointFor: only ONE trailing slash is forgiven, and never on a longer
   assert.equal(jevEndpointFor('POST', '/'), null)
 })
 
+test('jevEndpointFor: POST on /v1/systemone, with or without one trailing slash, is the System One endpoint', () => {
+  assert.equal(jevEndpointFor('POST', '/v1/systemone'), 'systemone')
+  assert.equal(jevEndpointFor('POST', '/v1/systemone/'), 'systemone')
+})
+
+test('jevEndpointFor: another method, a doubled slash or a longer path is not /v1/systemone', () => {
+  assert.equal(jevEndpointFor('GET', '/v1/systemone'), null)
+  assert.equal(jevEndpointFor('POST', '/v1/systemone//'), null)
+  assert.equal(jevEndpointFor('POST', '/v1/systemone/x'), null)
+})
+
 test('MAX_JEV_INPUTS is 128', () => {
   assert.equal(MAX_JEV_INPUTS, 128)
 })
@@ -617,6 +628,7 @@ function jevHarness(setup: HarnessSetup = {}): Harness {
   const app = new Hono()
   app.post('/v1/classify', (c) => handleJevRequest(c, d, 'classify', opts, engine.fetchImpl))
   app.post('/v1/rerank', (c) => handleJevRequest(c, d, 'rerank', opts, engine.fetchImpl))
+  app.post('/v1/systemone', (c) => handleJevRequest(c, d, 'systemone', opts, engine.fetchImpl))
   return { app, routed, resolvedLocally, engineCalls: engine.calls }
 }
 
@@ -650,6 +662,19 @@ test('handleJevRequest step 1: a Turbo Link peer is refused before anything is r
   const harness = jevHarness({ origin: 'link' })
 
   await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), LINK_JEV_UNSUPPORTED)
+
+  assert.deepEqual(harness.resolvedLocally, [])
+  assert.deepEqual(harness.routed, [])
+  assert.equal(harness.engineCalls.length, 0)
+  assert.equal(lastLocalActivityMs(), null, 'a peer request never counts as the owner using the machine')
+})
+
+test('handleJevRequest step 1: a Turbo Link peer is refused on /v1/systemone too, before anything is read or routed', async () => {
+  resetLocalActivity()
+  const harness = jevHarness({ origin: 'link' })
+  const request = { state: 's', model: MODEL_KEY, questions: { q: { type: 'noul', instructions: 'Q?' } } }
+
+  await assertRefused(await postJson(harness.app, '/v1/systemone', request), LINK_JEV_UNSUPPORTED)
 
   assert.deepEqual(harness.resolvedLocally, [])
   assert.deepEqual(harness.routed, [])

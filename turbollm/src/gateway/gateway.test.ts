@@ -8,6 +8,7 @@ import { Hono } from 'hono'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import { clientAbort, describeEngineError, gatewayV1Handler, registerGateway } from './gateway'
+import type { AliveSlot, RouteResult } from './model-router'
 
 test('describeEngineError reads the OpenAI-shaped error message an engine returns', async () => {
   const res = new Response(JSON.stringify({ error: { message: 'bad input' } }), { status: 400 })
@@ -319,4 +320,177 @@ test('GET /v1/models marks a Jev model kind "jev" with no claude- alias; other r
     { id: GGUF_KEY, object: 'model', owned_by: 'turbollm' },
     { id: `claude-${GGUF_KEY}`, object: 'model', display_name: 'Qwen3 8B — TurboLLM' },
   ])
+})
+
+const LINKED = 'Rig/qwen3.5 4b nli v2'
+const URGENT_REQUEST = {
+  state: 'Thanks, that fixed it! Have a nice day.',
+  model: JEV_KEY,
+  questions: { urgent: { type: 'noul', instructions: 'Does the message convey urgency?' } },
+}
+const URGENT_ENGINE_REPLY = {
+  data: [{ index: 0, label: 'entailment', probs: [0, 0.945, 0.055], num_classes: 3 }],
+  usage: { prompt_tokens: 32, total_tokens: 32 },
+}
+const URGENT_RESPONSE = {
+  model: JEV_KEY,
+  answers: { urgent: { type: 'noul', noul: 0.945 } },
+  usage: { input_tokens: 32, output_tokens: 0 },
+}
+const LISTED_MODELS = [
+  { id: JEV_KEY, object: 'model', owned_by: 'turbollm', kind: 'jev' },
+  { id: GGUF_KEY, object: 'model', owned_by: 'turbollm' },
+  { id: `claude-${GGUF_KEY}`, object: 'model', display_name: 'Qwen3 8B — TurboLLM' },
+]
+
+interface SystemOneRouter {
+  routedTo?: ModelEntry[]
+  routed?: string[]
+  routeResult?: RouteResult
+  aliveSlots?: AliveSlot[]
+}
+
+/** jevGatewayDeps with a router that records what it is routed to, knows one Turbo Link model id and lists its alive slots. */
+function systemOneDeps(setup: SystemOneRouter = {}): Deps {
+  const base = jevGatewayDeps(setup.routed)
+  return {
+    ...base,
+    modelRouter: {
+      ...base.modelRouter,
+      routeTo: async (entry: ModelEntry) => {
+        setup.routedTo?.push(entry)
+        return setup.routeResult ?? { target: ENGINE }
+      },
+      resolveRemoteTarget: (id: string) => (id === LINKED ? { target: 'https://rig.invalid' } : undefined),
+      aliveSlots: () => setup.aliveSlots ?? [],
+    },
+  } as unknown as Deps
+}
+
+async function assertRefusedWith(res: Response, status: number, code: string): Promise<void> {
+  assert.equal(res.status, status)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, code)
+}
+
+test('POST /v1/systemone is served by the Jev dispatch: one engine /classify call, the System One body', async () => {
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps()), '/v1/systemone', URGENT_REQUEST)
+
+    assert.deepEqual(calls, [{ url: 'http://engine.local/classify', method: 'POST' }])
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), URGENT_RESPONSE)
+  })
+})
+
+test('POST /v1/systemone/ (trailing slash) is served identically, not proxied to the primary engine', async () => {
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps()), '/v1/systemone/', URGENT_REQUEST)
+
+    assert.deepEqual(calls, [{ url: 'http://engine.local/classify', method: 'POST' }])
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), URGENT_RESPONSE)
+  })
+})
+
+test('gatewayV1Handler behind the Turbo Link façade refuses /v1/systemone (origin link)', async () => {
+  const app = new Hono()
+  const d = systemOneDeps()
+  app.post('/api/link/v1/systemone', (c) => gatewayV1Handler(c, d, { origin: 'link', pathname: '/v1/systemone' }))
+
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(app, '/api/link/v1/systemone', URGENT_REQUEST)
+
+    await assertRefusedWith(res, 400, 'link_jev_unsupported')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('a trailing slash does not let a Turbo Link peer past the /v1/systemone refusal either', async () => {
+  const app = new Hono()
+  const d = systemOneDeps()
+  app.post('/api/link/v1/systemone/', (c) => gatewayV1Handler(c, d, { origin: 'link', pathname: '/v1/systemone/' }))
+
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(app, '/api/link/v1/systemone/', URGENT_REQUEST)
+
+    await assertRefusedWith(res, 400, 'link_jev_unsupported')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('a Turbo Link machine/model id on /v1/systemone is refused, with nothing routed and no engine call', async () => {
+  const routedTo: ModelEntry[] = []
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps({ routedTo })), '/v1/systemone', { ...URGENT_REQUEST, model: LINKED })
+
+    await assertRefusedWith(res, 400, 'link_jev_unsupported')
+    assert.deepEqual(routedTo, [])
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('a GGUF model on /v1/systemone is a 400 not_a_jev_model', async () => {
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps()), '/v1/systemone', { ...URGENT_REQUEST, model: GGUF_KEY })
+
+    await assertRefusedWith(res, 400, 'not_a_jev_model')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('an unknown model on /v1/systemone is a 404 model_not_found', async () => {
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps()), '/v1/systemone', { ...URGENT_REQUEST, model: 'nope' })
+
+    await assertRefusedWith(res, 404, 'model_not_found')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('/v1/systemone routes with routeTo to exactly the named model and never calls route()', async () => {
+  const routedTo: ModelEntry[] = []
+  const routed: string[] = []
+  await withEngine(URGENT_ENGINE_REPLY, async () => {
+    await postJson(gatewayApp(systemOneDeps({ routedTo, routed })), '/v1/systemone', URGENT_REQUEST)
+  })
+
+  assert.deepEqual(routedTo, [OPENJEV_ENTRY])
+  assert.deepEqual(routed, [], 'route() would answer with whatever the primary holds')
+})
+
+test('a router that cannot produce a target answers /v1/systemone with 503 model_not_loaded', async () => {
+  const routeResult: RouteResult = { status: 503, message: "'qwen3.5 4b nli v2' is not loaded. Turn on auto-swap." }
+  await withEngine(URGENT_ENGINE_REPLY, async (calls) => {
+    const res = await postJson(gatewayApp(systemOneDeps({ routeResult })), '/v1/systemone', URGENT_REQUEST)
+
+    await assertRefusedWith(res, 503, 'model_not_loaded')
+    assert.deepEqual(calls, [])
+  })
+})
+
+test('an empty /v1/systemone body is a 422 invalid_request through the real gateway', async () => {
+  const res = await postJson(gatewayApp(systemOneDeps()), '/v1/systemone', {})
+
+  assert.equal(res.status, 422)
+  assert.deepEqual(await res.json(), {
+    error: { message: 'model must be a non-empty string.', type: 'invalid_request_error', code: 'invalid_request' },
+  })
+})
+
+test('jev-latest is accepted by /v1/systemone but never advertised by GET /v1/models', async () => {
+  const aliveSlots: AliveSlot[] = [{ modelKey: JEV_KEY, state: 'running', primary: true, lastUsedMs: 0 }]
+  const app = gatewayApp(systemOneDeps({ aliveSlots }))
+  const listedIds = async () => ((await (await app.request('/v1/models')).json()) as { data: Array<{ id: string }> }).data
+
+  const before = await listedIds()
+  await withEngine(URGENT_ENGINE_REPLY, async () => {
+    const res = await postJson(app, '/v1/systemone', { ...URGENT_REQUEST, model: 'jev-latest' })
+
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), URGENT_RESPONSE)
+  })
+
+  assert.deepEqual(before, LISTED_MODELS)
+  assert.deepEqual(await listedIds(), LISTED_MODELS)
+  assert.equal(before.some((row) => row.id.includes('jev-latest')), false)
 })

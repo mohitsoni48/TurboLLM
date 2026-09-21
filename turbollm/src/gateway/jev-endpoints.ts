@@ -1,7 +1,8 @@
-// /v1/classify and /v1/rerank — the gateway endpoints for Jev (NLI cross-encoder) models
-// (ADR-434 (d)). They live in their own module, dispatched from the single
-// `/v1/*` handler, so the gateway hub doesn't grow and no new Hono route can be shadowed by
-// registration order (ADR-421). User strings are validated, never trimmed.
+// /v1/classify, /v1/rerank and /v1/systemone — the gateway endpoints for Jev (NLI cross-encoder) models
+// (ADR-434 (d), ADR-439). They live outside gateway.ts and are dispatched from the single `/v1/*` handler,
+// so the gateway hub doesn't grow and no new Hono route can be shadowed by registration order (ADR-421).
+// classify and rerank are served here, /v1/systemone by ./systemone-endpoint. User strings are validated,
+// never trimmed.
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { noteLocalActivity } from '../link/host-idle'
@@ -31,8 +32,9 @@ import {
   type JevHttpError,
   type JevModel,
 } from './jev-serving'
+import { handleSystemOne } from './systemone-endpoint'
 
-export type JevEndpoint = 'classify' | 'rerank'
+export type JevEndpoint = 'classify' | 'rerank' | 'systemone'
 
 export interface ClassifyInput {
   model: string
@@ -75,8 +77,8 @@ export function jevEndpointFor(method: string, pathname: string): JevEndpoint | 
   return Object.hasOwn(JEV_ENDPOINT_PATHS, path) ? JEV_ENDPOINT_PATHS[path] : null
 }
 
-/** One /v1/classify or /v1/rerank request: refuse a Turbo Link peer, validate, resolve exactly the
- *  named local Jev model, route to it (auto-swap may load it), then one batched engine call. It never
+/** One /v1/classify, /v1/rerank or /v1/systemone request: refuse a Turbo Link peer, validate, resolve exactly the
+ *  named local Jev model, route to it (auto-swap may load it), then the batched engine call. It never
  *  takes the generation gate (classification is not a generation) and writes no request-log or usage
  *  entry. */
 export async function handleJevRequest(
@@ -87,6 +89,7 @@ export async function handleJevRequest(
   fetchImpl: typeof fetch = fetch,
 ): Promise<Response> {
   if (opts.origin === 'link') return jevErrorResponse(c, LINK_JEV_UNSUPPORTED)
+  if (endpoint === 'systemone') return handleSystemOne(c, d, fetchImpl)
   return endpoint === 'classify'
     ? serveJevRequest(c, d, CLASSIFY_ENDPOINT, fetchImpl)
     : serveJevRequest(c, d, RERANK_ENDPOINT, fetchImpl)
@@ -151,6 +154,7 @@ export function toRerankResponse(
 const JEV_ENDPOINT_PATHS: Readonly<Record<string, JevEndpoint>> = {
   '/v1/classify': 'classify',
   '/v1/rerank': 'rerank',
+  '/v1/systemone': 'systemone',
 }
 
 /** What the two endpoints do differently; serveJevRequest is everything they share. */
