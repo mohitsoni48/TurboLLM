@@ -139,6 +139,40 @@ describe('systemone', () => {
     await expect(refused).rejects.toMatchObject({ name: 'ApiError', code: 'invalid_request', message, status: 422 })
     await expect(refused).rejects.toBeInstanceOf(ApiError)
   })
+
+  describe('when the server answers 200 with something that is not a System One response', () => {
+    const NOT_A_SYSTEMONE_RESPONSE = 'The server answered, but not with a System One response.'
+
+    const stubReply = (respond: () => Response) => vi.stubGlobal('fetch', vi.fn(async () => respond()))
+    const jsonReply = (body: unknown) => () => new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+
+    it('rejects an empty body with a readable ApiError instead of returning undefined', async () => {
+      stubReply(() => new Response('', { status: 200 }))
+      const refused = systemone(SYSTEMONE_REQUEST)
+      await expect(refused).rejects.toBeInstanceOf(ApiError)
+      await expect(refused).rejects.toMatchObject({ code: 'bad_response', message: NOT_A_SYSTEMONE_RESPONSE, status: 200 })
+    })
+
+    it.each<[string, () => Response]>([
+      ['an html page', () => new Response('<html>Sign in</html>', { status: 200, headers: { 'content-type': 'text/html' } })],
+      ['a 204 with no body', () => new Response(null, { status: 204 })],
+      ['a JSON null', jsonReply(null)],
+      ['a reply without answers', jsonReply({ model: 'm', usage: { input_tokens: 1, output_tokens: 0 } })],
+      ['a reply without usage', jsonReply({ model: 'm', answers: {} })],
+      ['answers that are an array', jsonReply({ ...SYSTEMONE_REPLY, answers: [] })],
+      ['answers that are a string', jsonReply({ ...SYSTEMONE_REPLY, answers: 'none' })],
+      ['usage that is a string', jsonReply({ ...SYSTEMONE_REPLY, usage: 'many' })],
+      ['usage.input_tokens that is a string', jsonReply({ ...SYSTEMONE_REPLY, usage: { input_tokens: '42', output_tokens: 1 } })],
+    ])('rejects %s the same way', async (_case, respond) => {
+      stubReply(respond)
+      const refused = systemone(SYSTEMONE_REQUEST)
+      await expect(refused).rejects.toBeInstanceOf(ApiError)
+      await expect(refused).rejects.toMatchObject({ code: 'bad_response', message: NOT_A_SYSTEMONE_RESPONSE })
+    })
+  })
 })
 
 describe('buildCurl for systemone', () => {

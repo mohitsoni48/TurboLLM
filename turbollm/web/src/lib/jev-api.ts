@@ -14,8 +14,23 @@ import type { ActiveWork } from './types'
  *  round trip rather than showing the user a 400. */
 export const MAX_JEV_INPUTS = 128
 
-export function systemone(req: SystemOneRequest): Promise<SystemOneResponse> {
-  return request<SystemOneResponse>('/v1/systemone', { method: 'POST', json: req })
+export async function systemone(req: SystemOneRequest): Promise<SystemOneResponse> {
+  const reply = await request<unknown>('/v1/systemone', { method: 'POST', json: req })
+  if (!isSystemOneResponse(reply)) throw new ApiError('bad_response', NOT_A_SYSTEMONE_RESPONSE, 200)
+  return reply
+}
+
+const NOT_A_SYSTEMONE_RESPONSE = 'The server answered, but not with a System One response.'
+
+/** `answers` and `usage` are what the playground reads without checking; the answers inside are
+ *  still rendered defensively by AnswerCard. */
+function isSystemOneResponse(reply: unknown): reply is SystemOneResponse {
+  return isPlainRecord(reply) && isPlainRecord(reply.answers) && isPlainRecord(reply.usage)
+    && typeof reply.usage.input_tokens === 'number'
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 export function getActivity(): Promise<ActiveWork> {
