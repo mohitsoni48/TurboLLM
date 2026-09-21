@@ -42,8 +42,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **`/v1/rerank` now belongs to Jev models.** TurboLLM serves it itself instead of passing it
   through to the engine, so a llama.cpp reranker is no longer reachable on that path.
 - **An NLI cross-encoder already in your library is now treated as a Jev model.** It is no longer
-  listed as an embedding model and no longer answers `/v1/embeddings`, and loading it takes the
-  main model slot, as a chat model does, instead of loading beside your chat model.
+  listed as an embedding model and no longer answers `/v1/embeddings`. Loading it from Models now
+  replaces the model in the main slot instead of loading beside your chat model. A request through
+  the gateway that names it can still load it beside a chat model, when Keep-N is 2 or more and
+  there is room.
 
 ### Fixed
 
