@@ -5,7 +5,7 @@
 // that same order.
 import { ArrowLeftRight } from 'lucide-react'
 import { Button } from '../../components/ui/button'
-import type { JevStatus } from '../../lib/types'
+import type { JevStatus, LoadedJev } from '../../lib/types'
 
 const STATE_DOT: Record<JevStatus['state'], string> = {
   running: 'bg-ok',
@@ -18,7 +18,7 @@ export function JevHeader({
   engine,
   onSwitch,
 }: {
-  jev: JevStatus
+  jev: LoadedJev
   engine: { name: string; kind: string }
   onSwitch: () => void
 }) {

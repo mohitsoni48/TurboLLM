@@ -10,7 +10,7 @@ import { Scale } from 'lucide-react'
 import { ApiError, stopEngine, track } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useModels, useStatus } from '../../lib/queries'
-import type { JevStatus, ModelEntry, Status } from '../../lib/types'
+import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { CheckPanel } from './CheckPanel'
 import { ChoosePanel } from './ChoosePanel'
 import { JevHeader } from './JevHeader'
@@ -227,12 +227,12 @@ function WorkspaceColumn() {
 
 /** `status.jev` when the daemon says so; otherwise the loaded Jev model in the catalog — a
  *  remote-access token scoped to `models:use` cannot read /status at all (ADR-422, R8). */
-function loadedJev(status: Status | undefined, models: ModelEntry[] | undefined): JevStatus | null {
+function loadedJev(status: Status | undefined, models: ModelEntry[] | undefined): LoadedJev | null {
   if (status?.jev) return status.jev
   if (status?.jev === null) return null
   const entry = models?.find((m) => m.jev && m.loaded)
   if (!entry?.jev) return null
-  return { key: entry.key, name: entry.name, labels: entry.jev.labels, state: 'running', slot: 'primary' }
+  return { key: entry.key, name: entry.name, labels: entry.jev.labels, state: 'running', slot: null }
 }
 
 function activeEngine(status: Status | undefined): { name: string; kind: string } {

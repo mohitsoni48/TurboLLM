@@ -331,4 +331,18 @@ describe('JevPlaygroundScreen', () => {
     expect(h.stopEngine).toHaveBeenCalledWith(KEY)
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_switch_model')
   })
+
+  // N3: read off the models list, the slot is unknowable — claiming `primary` silently skipped
+  // the ADR-427 (c) eject for a Jev model that really was in a pool slot.
+  it('does not claim a slot the models list cannot know', async () => {
+    const chat = { key: 'gemma-27b', name: 'Gemma 27B', loaded: false, incomplete: false, parseError: null, embedding: false, compatibleWithActiveEngine: true } as ModelEntry
+    state.status = status({ jev: undefined })
+    state.models = [jevModel(), chat]
+    renderScreen()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Switch model' }))
+    await userEvent.click(within(screen.getByRole('group', { name: 'Chat models' })).getByRole('button'))
+
+    await waitFor(() => expect(h.stopEngine).toHaveBeenCalledWith(KEY))
+  })
 })

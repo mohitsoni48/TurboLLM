@@ -7,7 +7,9 @@
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
 import { toast } from '../../components/ui/sonner'
-import type { JevStatus, ModelEntry } from '../../lib/types'
+import type { LoadedJev, ModelEntry } from '../../lib/types'
+
+const NOTHING_LOADABLE = 'Nothing else here can load on the active engine. Change it on the Engines screen.'
 
 type SwitchDeps = {
   stopEngine(key: string): Promise<unknown>
@@ -19,7 +21,7 @@ export function SwitchModelMenu({
   models,
   onPick,
 }: {
-  current: JevStatus
+  current: LoadedJev
   models: ModelEntry[]
   onPick: (m: ModelEntry) => void
 }) {
@@ -27,8 +29,14 @@ export function SwitchModelMenu({
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border p-3">
-      <ModelGroup title="Chat models" models={loadable.filter((m) => !m.jev)} onPick={onPick} />
-      <ModelGroup title="Jev models" models={loadable.filter((m) => m.jev)} onPick={onPick} />
+      {loadable.length === 0 ? (
+        <p className="text-[13px] text-muted">{NOTHING_LOADABLE}</p>
+      ) : (
+        <>
+          <ModelGroup title="Chat models" models={loadable.filter((m) => !m.jev)} onPick={onPick} />
+          <ModelGroup title="Jev models" models={loadable.filter((m) => m.jev)} onPick={onPick} />
+        </>
+      )}
     </div>
   )
 }
@@ -37,17 +45,20 @@ export function SwitchModelMenu({
  *  slot — a primary swap already replaces what is running. A slot that refuses to eject stops
  *  the switch and says so: loading on top of it would leave the playground open with no
  *  explanation (QA E17, H19). */
-export async function switchToModel(current: JevStatus, m: ModelEntry, deps: SwitchDeps): Promise<void> {
+export async function switchToModel(current: LoadedJev, m: ModelEntry, deps: SwitchDeps): Promise<void> {
   track('workspace', 'jev_switch_model')
   if (needsEject(current, m) && !(await ejected(current, deps))) return
   deps.requestLoad(m)
 }
 
-function needsEject(current: JevStatus, m: ModelEntry): boolean {
-  return !m.jev && current.slot === 'pool'
+/** Only a primary slot is replaced by the load itself. An unknown slot (the catalog fallback
+ *  cannot read one) is ejected too: leaving a pool slot held keeps Workspace in the playground
+ *  with nothing said, while an unnecessary stop only costs the engine a restart. */
+function needsEject(current: LoadedJev, m: ModelEntry): boolean {
+  return !m.jev && current.slot !== 'primary'
 }
 
-async function ejected(current: JevStatus, deps: SwitchDeps): Promise<boolean> {
+async function ejected(current: LoadedJev, deps: SwitchDeps): Promise<boolean> {
   try {
     await deps.stopEngine(current.key)
     return true
@@ -81,6 +92,6 @@ function ModelGroup({ title, models, onPick }: { title: string; models: ModelEnt
 }
 
 /** Only models that would really load right now — an offer that 400s is worse than no offer. */
-function canLoad(m: ModelEntry, current: JevStatus): boolean {
+function canLoad(m: ModelEntry, current: LoadedJev): boolean {
   return !m.incomplete && !m.parseError && m.compatibleWithActiveEngine && !m.embedding && m.key !== current.key
 }

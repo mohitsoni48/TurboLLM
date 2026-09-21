@@ -91,6 +91,20 @@ describe('SwitchModelMenu', () => {
     expect(screen.queryByRole('button', { name: CURRENT.name })).toBeNull()
   })
 
+  // N2: both groups can empty at once — a library of GGUF chat models plus one safetensors Jev
+  // model under vLLM leaves nothing loadable — and an empty bordered box explains nothing.
+  it('says where to go when nothing here can load', () => {
+    renderMenu([model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false })])
+    expect(screen.getByText('Nothing else here can load on the active engine. Change it on the Engines screen.')).toBeTruthy()
+    expect(screen.queryByText('Chat models')).toBeNull()
+    expect(screen.queryByText('Jev models')).toBeNull()
+  })
+
+  it('says nothing of the sort once there is something to pick', () => {
+    renderMenu([CHAT])
+    expect(screen.queryByText(/Engines screen/)).toBeNull()
+  })
+
   it('hands the picked model back whole', async () => {
     const { onPick } = renderMenu([CHAT, OTHER_JEV])
     await userEvent.click(within(screen.getByRole('group', { name: 'Chat models' })).getByRole('button'))
@@ -128,6 +142,16 @@ describe('switchToModel', () => {
     await switchToModel({ ...CURRENT, slot: 'pool' }, OTHER_JEV, d)
     expect(d.stopEngine).not.toHaveBeenCalled()
     expect(d.requestLoad).toHaveBeenCalledWith(OTHER_JEV)
+  })
+
+  // N3: the R8 fallback cannot read the slot. Not ejecting a pool slot leaves the Jev engine
+  // running, `status.jev` set, and Workspace stuck in the playground with nothing said — so an
+  // unknown slot is ejected, and a stop that was not needed only costs a restart.
+  it('ejects a slot it cannot name, rather than assuming it is the primary one', async () => {
+    const d = deps()
+    await switchToModel({ ...CURRENT, slot: null }, CHAT, d)
+    expect(d.stopEngine).toHaveBeenCalledWith(CURRENT.key)
+    expect(d.order).toEqual(['stop', 'load'])
   })
 
   it('records the switch whichever model was picked', async () => {
