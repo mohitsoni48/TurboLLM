@@ -162,3 +162,165 @@ test('parseSystemOneBody turns a RangeError raised while reading the body into a
 
   assert.deepEqual(refusalOf(body), { field: 'body', message: 'body is nested too deeply to be processed.' })
 })
+
+const Q_NOUL = { type: 'noul', instructions: 'Does the message convey urgency?' }
+
+const Q_CHOICE = {
+  type: 'choice',
+  instructions: 'Which team should handle this message?',
+  criteria: {
+    billing: 'Payment, invoices, refunds or subscription charges',
+    technical: 'Bugs, outages or integration problems',
+    sales: 'Pricing, plans, upgrades or discounts',
+    documentation: 'Questions about where to find docs or reference material',
+  },
+}
+
+const Q_MOOD = {
+  type: 'score',
+  instructions: "What is the customer's tone?",
+  criteria: [
+    'Calm, just asking or stating facts',
+    'Mildly annoyed but polite',
+    'Clearly frustrated',
+    'Very angry, strong language',
+  ],
+}
+
+function withQuestion(question: unknown, id = 'q'): Record<string, unknown> {
+  return validBody({ questions: { [id]: question } })
+}
+
+test('parseSystemOneBody requires a question id of 1 to 128 characters', () => {
+  const tooLong = 'i'.repeat(129)
+
+  assert.deepEqual(refusalOf(withQuestion(Q_NOUL, '')), {
+    field: 'questions.',
+    message: 'questions. must have an id of 1 to 128 characters.',
+  })
+  assert.deepEqual(refusalOf(withQuestion(Q_NOUL, tooLong)), {
+    field: `questions.${tooLong}`,
+    message: `questions.${tooLong} must have an id of 1 to 128 characters.`,
+  })
+  assert.ok(parseSystemOneBody(withQuestion(Q_NOUL, 'i'.repeat(128))).ok)
+})
+
+test('parseSystemOneBody requires each question to be an object', () => {
+  for (const question of [null, 'x', [], 5]) {
+    assert.deepEqual(refusalOf(withQuestion(question)), { field: 'questions.q', message: 'questions.q must be an object.' })
+  }
+})
+
+test('parseSystemOneBody refuses a question field it does not know', () => {
+  assert.deepEqual(refusalOf(withQuestion({ ...Q_NOUL, extra: 1 })), {
+    field: 'questions.q.extra',
+    message: 'questions.q.extra is not a known field.',
+  })
+})
+
+test('parseSystemOneBody requires a question type of noul, choice or score', () => {
+  const expected = { field: 'questions.q.type', message: 'questions.q.type must be "noul", "choice" or "score".' }
+
+  for (const type of [undefined, 'yesno', 7]) assert.deepEqual(refusalOf(withQuestion({ ...Q_NOUL, type })), expected)
+  for (const question of [Q_NOUL, Q_CHOICE, Q_MOOD]) assert.ok(parseSystemOneBody(withQuestion(question)).ok)
+})
+
+test('parseSystemOneBody requires instructions to be a string, an object or an array', () => {
+  const expected = {
+    field: 'questions.q.instructions',
+    message: 'questions.q.instructions is required and must be a string, an object or an array.',
+  }
+
+  for (const instructions of [undefined, null, 42, true]) {
+    assert.deepEqual(refusalOf(withQuestion({ type: 'noul', instructions })), expected)
+  }
+  for (const instructions of ['a string', { question: '?' }, ['a']]) {
+    assert.ok(parseSystemOneBody(withQuestion({ type: 'noul', instructions })).ok)
+  }
+})
+
+test('parseSystemOneBody bounds the serialised instructions to 1 to 4000 characters', () => {
+  const expected = {
+    field: 'questions.q.instructions',
+    message: 'questions.q.instructions must be 1 to 4000 characters.',
+  }
+
+  assert.deepEqual(refusalOf(withQuestion({ type: 'noul', instructions: '' })), expected)
+  assert.deepEqual(refusalOf(withQuestion({ type: 'noul', instructions: 'i'.repeat(4001) })), expected)
+  assert.ok(parseSystemOneBody(withQuestion({ type: 'noul', instructions: 'i'.repeat(4000) })).ok)
+  assert.ok(parseSystemOneBody(withQuestion({ type: 'noul', instructions: {} })).ok)
+})
+
+test('parseSystemOneBody names the second question in a problem found there', () => {
+  const questions = { a: Q_NOUL, b: { ...Q_NOUL, type: 'yesno' } }
+
+  assert.equal(refusalOf(validBody({ questions })).field, 'questions.b.type')
+})
+
+test('parseSystemOneBody reports the first question failing before a later one', () => {
+  const questions = { a: { ...Q_NOUL, type: 'yesno' }, b: null }
+
+  assert.equal(refusalOf(validBody({ questions })).field, 'questions.a.type')
+})
+
+test('parseSystemOneBody gives every question failure its exact message', () => {
+  const cases: Array<{ question: unknown; id?: string; field: string; message: string }> = [
+    { question: Q_NOUL, id: '', field: 'questions.', message: 'questions. must have an id of 1 to 128 characters.' },
+    { question: 5, field: 'questions.q', message: 'questions.q must be an object.' },
+    { question: { ...Q_NOUL, extra: 1 }, field: 'questions.q.extra', message: 'questions.q.extra is not a known field.' },
+    {
+      question: { ...Q_NOUL, type: 'yesno' },
+      field: 'questions.q.type',
+      message: 'questions.q.type must be "noul", "choice" or "score".',
+    },
+    {
+      question: { type: 'noul' },
+      field: 'questions.q.instructions',
+      message: 'questions.q.instructions is required and must be a string, an object or an array.',
+    },
+    {
+      question: { type: 'noul', instructions: '' },
+      field: 'questions.q.instructions',
+      message: 'questions.q.instructions must be 1 to 4000 characters.',
+    },
+  ]
+
+  for (const { question, id, field, message } of cases) {
+    assert.deepEqual(refusalOf(withQuestion(question, id)), { field, message })
+  }
+})
+
+test('parseSystemOneBody accepts a valid noul question with no criteria end to end', () => {
+  const body = withQuestion(Q_NOUL)
+
+  const result = parseSystemOneBody(body)
+
+  assert.ok(result.ok)
+  assert.deepEqual(result.input, body)
+})
+
+test('parseSystemOneBody bounds the nesting inside a question (pinned)', () => {
+  assert.deepEqual(refusalOf(withQuestion(nested(33))), {
+    field: 'questions.q',
+    message: 'questions.q must not be nested more than 32 levels deep.',
+  })
+  assert.deepEqual(refusalOf(withQuestion({ type: 'noul', instructions: nested(33) })), {
+    field: 'questions.q.instructions',
+    message: 'questions.q.instructions must not be nested more than 32 levels deep.',
+  })
+  assert.ok(parseSystemOneBody(withQuestion({ type: 'noul', instructions: nested(32) })).ok)
+})
+
+test('parseSystemOneBody reports a too-deep unknown key as nesting, not as an unknown field (pinned)', () => {
+  assert.deepEqual(refusalOf(withQuestion({ ...Q_NOUL, extra: nested(33) })), {
+    field: 'questions.q.extra',
+    message: 'questions.q.extra must not be nested more than 32 levels deep.',
+  })
+})
+
+test('parseSystemOneBody refuses instructions nested 5000 levels deep without throwing (pinned)', () => {
+  assert.deepEqual(refusalOf(withQuestion({ type: 'noul', instructions: nested(5000) })), {
+    field: 'questions.q.instructions',
+    message: 'questions.q.instructions must not be nested more than 32 levels deep.',
+  })
+})

@@ -1,7 +1,11 @@
 // System One request validation (ADR-439, ADR-436 (1)): an untrusted body becomes a SystemOneInput or
 // exactly one { field, message } problem (the first failure wins). Pure: it knows field paths and limits
 // and nothing about HTTP status codes, and it never throws on bad input.
-import type { Question, StateValue, SystemOneInput } from './systemone'
+import { instructionTextOf, type Question, type StateValue, type SystemOneInput } from './systemone'
+
+const MIN_NAME_CHARS = 1
+const QUESTION_FIELDS: readonly string[] = ['type', 'instructions', 'criteria']
+const QUESTION_TYPES: readonly unknown[] = ['noul', 'choice', 'score']
 
 export const MIN_QUESTIONS = 1
 export const MAX_QUESTIONS = 64
@@ -104,15 +108,62 @@ function stateProblem(body: PlainObject): RequestProblem | undefined {
 
 function questionsProblem(body: PlainObject): RequestProblem | undefined {
   const { questions } = body
-  if (isPlainObject(questions) && isWithinQuestionCount(Object.keys(questions).length)) return undefined
-  return {
-    field: 'questions',
-    message: `questions must be an object with ${MIN_QUESTIONS} to ${MAX_QUESTIONS} questions.`,
+  if (!isPlainObject(questions) || !isWithinQuestionCount(Object.keys(questions).length)) {
+    return {
+      field: 'questions',
+      message: `questions must be an object with ${MIN_QUESTIONS} to ${MAX_QUESTIONS} questions.`,
+    }
   }
+  return firstQuestionProblem(questions)
 }
 
 function isWithinQuestionCount(count: number): boolean {
   return count >= MIN_QUESTIONS && count <= MAX_QUESTIONS
+}
+
+function firstQuestionProblem(questions: PlainObject): RequestProblem | undefined {
+  for (const [id, question] of Object.entries(questions)) {
+    const problem = questionProblem(id, question)
+    if (problem) return problem
+  }
+  return undefined
+}
+
+function questionProblem(id: string, question: unknown): RequestProblem | undefined {
+  const field = `questions.${id}`
+  if (id.length < MIN_NAME_CHARS || id.length > MAX_QUESTION_ID_CHARS) {
+    return { field, message: `${field} must have an id of ${MIN_NAME_CHARS} to ${MAX_QUESTION_ID_CHARS} characters.` }
+  }
+  if (!isPlainObject(question)) return { field, message: `${field} must be an object.` }
+  return unknownFieldProblem(field, question) ?? typeProblem(field, question) ?? instructionsProblem(field, question)
+}
+
+function unknownFieldProblem(field: string, question: PlainObject): RequestProblem | undefined {
+  const unknownField = Object.keys(question).find((key) => !QUESTION_FIELDS.includes(key))
+  if (unknownField === undefined) return undefined
+  return { field: `${field}.${unknownField}`, message: `${field}.${unknownField} is not a known field.` }
+}
+
+function typeProblem(field: string, question: PlainObject): RequestProblem | undefined {
+  if (QUESTION_TYPES.includes(question.type)) return undefined
+  return { field: `${field}.type`, message: `${field}.type must be "noul", "choice" or "score".` }
+}
+
+function instructionsProblem(field: string, question: PlainObject): RequestProblem | undefined {
+  const { instructions } = question
+  const instructionsField = `${field}.instructions`
+  if (!isTextOrContainer(instructions)) {
+    return {
+      field: instructionsField,
+      message: `${instructionsField} is required and must be a string, an object or an array.`,
+    }
+  }
+  const length = instructionTextOf(instructions).length
+  if (length >= MIN_INSTRUCTIONS_CHARS && length <= MAX_INSTRUCTIONS_CHARS) return undefined
+  return {
+    field: instructionsField,
+    message: `${instructionsField} must be ${MIN_INSTRUCTIONS_CHARS} to ${MAX_INSTRUCTIONS_CHARS} characters.`,
+  }
 }
 
 /** Every field has passed its rule above, so the casts only restore what those rules established. */
@@ -153,4 +204,8 @@ function isContainer(value: unknown): value is object {
 
 function isPlainObject(value: unknown): value is PlainObject {
   return isContainer(value) && !Array.isArray(value)
+}
+
+function isTextOrContainer(value: unknown): value is string | PlainObject | unknown[] {
+  return typeof value === 'string' || isContainer(value)
 }
