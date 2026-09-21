@@ -1,6 +1,6 @@
 // ADR-434 (i)(3): loading a Jev model stops whatever is running, so it asks first — but only
 // when something really is running, the same "active work, not an open window" rule as the
-// daemon-restart gate. Loading a chat model keeps today's behaviour exactly (divergence row 17).
+// daemon-restart gate. Loading a chat model keeps today's behaviour exactly.
 //
 // The rule that matters most here is the failure direction: when the activity probe cannot be
 // read, this must fail OPEN to a confirmation, never closed to a silent load. "I couldn't ask"
@@ -46,7 +46,7 @@ vi.mock('react-router-dom', async (importOriginal) => {
 })
 
 // The caller hands over what it already has about the model; the model's own `jev` field is
-// what decides, so there is no `isJev` flag a call site can forget (§5 ruling 9).
+// what decides, so there is no `isJev` flag a call site can forget.
 const JEV = {
   key: 'jev-key',
   name: 'qwen3.5 4b nli v2',
@@ -232,7 +232,7 @@ describe('a Jev load that fails', () => {
   })
 })
 
-// QA E17, E31(c): a refused load is never a silent no-op. Every load started here is marked
+// A refused load is never a silent no-op. Every load started here is marked
 // for the mutation to report, whether or not the caller passed a handler of its own — the
 // report has to outlive the surface, so it cannot be a `mutate()` callback.
 describe('a load nobody asked to hear about', () => {
@@ -257,7 +257,7 @@ describe('a load nobody asked to hear about', () => {
 
 // ADR-434 (i)(3): answering the confirmation must not change what the load does — same pending
 // key, same failure surface, same caller callbacks as the load that was never interrupted.
-describe('useConfirmedLoad — the (i)(3) confirmation, accepted', () => {
+describe('useConfirmedLoad — the Jev-load confirmation, accepted', () => {
   function confirmedLoad() {
     return renderHook(() => useConfirmedLoad()).result
   }
@@ -314,7 +314,7 @@ describe('useConfirmedLoad — the (i)(3) confirmation, accepted', () => {
   })
 })
 
-// C-7, C-8: the load that is really running, not this hook's own mutation observer — which is
+// The load that is really running, not this hook's own mutation observer — which is
 // blind to a load the confirmation dialog fired. `queries.test.tsx` pins the other half: the
 // mutation keeps this key itself, so it survives the firing surface closing.
 describe('pending state', () => {
@@ -338,7 +338,7 @@ describe('pending state', () => {
 })
 
 // ADR-434 (i)(3): success is announced, never acted on. The toast offers the playground; only
-// the user's click goes there. (i)(4): a load this browser did not start — a Routine's pinned
+// the user's click goes there. ADR-434 (i)(4): a load this browser did not start — a Routine's pinned
 // swap, an API client's auto-swap — gets no toast at all, which is what `pendingJevKey` decides.
 const READY: JevStatus = {
   key: 'jev-key',

@@ -1,4 +1,4 @@
-// The one way the UI loads a local model (ADR-434 (i)(3), divergence row 19).
+// The one way the UI loads a local model (ADR-434 (i)(3)).
 //
 // A chat model loads exactly as it always has. A Jev model unloads whatever is running and
 // takes Workspace over, so it asks first — but only when something really is running, the same
@@ -56,7 +56,7 @@ export function useModelLoader(): {
   }
 }
 
-/** "Load anyway" answers the (i)(3) question with the very load it interrupted: same pending
+/** "Load anyway" answers the confirmation with the very load it interrupted: same pending
  *  key, same failure report, same caller callbacks. Narrower than `useModelLoader` on purpose
  *  — the confirmation host is mounted for the life of the app and shows no load state, so it
  *  must not re-render on every transition of every load. */
@@ -95,7 +95,7 @@ function useLoadStarters(): {
 /** Announces a Jev load THIS browser started, once the model is really running (ADR-434 (i)(3)).
  *  It offers the playground and never goes there on its own. A swap this browser did not start
  *  — a Routine's pinned model, an API client's auto-swap — leaves `pendingJevKey` unset and so
- *  says nothing at all ((i)(4)). Mounted once, at the app level. */
+ *  says nothing at all (ADR-434 (i)(4)). Mounted once, at the app level. */
 export function useJevLoadedToast(): void {
   const pendingJevKey = useJevLoadStore((s) => s.pendingJevKey)
   const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)

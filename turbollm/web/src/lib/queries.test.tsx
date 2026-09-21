@@ -173,7 +173,7 @@ describe('the pending load every surface reads', () => {
   })
 })
 
-// QA E17, E31(c): a refused load is never a silent no-op, and the surface that fired it has
+// A refused load is never a silent no-op, and the surface that fired it has
 // usually navigated away by the time the engine gives up.
 describe('a load that fails after its surface has gone', () => {
   it('tells the user once, and gives back the "is ready" claim the Jev load made', async () => {

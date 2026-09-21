@@ -45,7 +45,7 @@ describe('jevPresence', () => {
     expect(jevPresence(statusWith(null), [model({ jev: JEV_INFO, loaded: true })])).toBe('none')
   })
 
-  it('falls back to the models list when status carries no jev field at all (R8)', () => {
+  it('falls back to the models list when status carries no jev field at all', () => {
     expect(jevPresence(statusWithoutJevField(), [model({ jev: JEV_INFO, loaded: true })])).toBe('loaded')
     expect(jevPresence(statusWithoutJevField(), [model({ jev: JEV_INFO, loaded: false })])).toBe('none')
     expect(jevPresence(statusWithoutJevField(), [model({ loaded: true })])).toBe('none')

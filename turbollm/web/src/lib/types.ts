@@ -684,7 +684,7 @@ export type JevStatus = {
 }
 
 /** The loaded Jev model as a screen knows it. The daemon always names the slot, but a client
- *  that cannot read /status has to read the model off the catalog instead (ADR-422, R8), and
+ *  that cannot read /status has to read the model off the catalog instead (ADR-422), and
  *  the catalog cannot tell which slot the engine took: `null` says so rather than guessing
  *  `primary` and skipping the ADR-427 (c) eject. */
 export type LoadedJev = Omit<JevStatus, 'slot'> & { slot: JevStatus['slot'] | null }

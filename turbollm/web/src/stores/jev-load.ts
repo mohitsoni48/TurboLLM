@@ -9,7 +9,7 @@ import { create } from 'zustand'
 import type { ActiveWork, LoadProfile } from '../lib/types'
 
 /** The model a load site asked for — its own `jev` field, not a flag the caller has to
- *  remember, is what decides whether the activity probe runs (§5 ruling 9). Structural, so a
+ *  remember, is what decides whether the activity probe runs. Structural, so a
  *  `ModelEntry` and an `HfCheckpoint`'s narrower `jev` both fit. */
 export type LoadTarget = { key: string; name: string; jev?: { architecture: string } | null }
 
