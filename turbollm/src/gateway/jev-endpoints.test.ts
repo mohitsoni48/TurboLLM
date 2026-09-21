@@ -11,22 +11,24 @@ import type { ModelEntry } from '../models/scanner'
 import type { GatewayV1Options } from './gateway'
 import type { RouteResult } from './model-router'
 import {
-  callEngineClassify,
   handleJevRequest,
-  JevEndpointError,
   jevEndpointFor,
-  jevErrorResponse,
-  MAX_JEV_INPUTS,
-  nliTemplateFor,
   parseClassifyBody,
   parseRerankBody,
   toClassifyResponse,
   toRerankResponse,
   type ClassifyInput,
-  type EngineClassifyResult,
-  type JevHttpError,
   type RerankInput,
 } from './jev-endpoints'
+import {
+  callEngineClassify,
+  JevEndpointError,
+  jevErrorResponse,
+  MAX_JEV_INPUTS,
+  nliTemplateFor,
+  type EngineClassifyResult,
+  type JevHttpError,
+} from './jev-serving'
 
 const MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
 const MODEL_NAME = 'qwen3.5 4b nli v2'
