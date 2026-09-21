@@ -29,15 +29,19 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   returning to an earlier conversation skips re-processing. A new **Prompt cache RAM (MiB)** field in a
   model's Advanced settings caps that (`--cache-ram`), and `0` turns it off to free the memory. It is
   blank by default, so nothing changes until you set it. Shown only on engines that support the flag.
-- **Jev models: classify and rerank with a local NLI model.** TurboLLM now recognises NLI
-  cross-encoders (such as OpenJev) and runs them through vLLM. While one is loaded, Workspace
-  becomes the **Jev Playground**: check a premise against up to 128 hypotheses, or rank options
-  against a question, with the model's own labels and probabilities and a copyable request for the
-  matching endpoint. On the API: `POST /v1/classify` and `POST /v1/rerank`. A Jev model loads with
-  an 8,192-token limit per request by default (the model's **Max model length** setting); longer
-  input is refused with a clear 400. Downloading one is
-  easier too: a Hugging Face repo that keeps several checkpoints in subfolders now lists them one
-  per row, and each row downloads only its own files. Full guide: https://turbollm.dev/docs/jev
+- **Jev models: ask structured questions about anything, locally.** TurboLLM now recognises NLI
+  cross-encoders (such as OpenJev) and runs them through vLLM. `POST /v1/systemone` takes a piece of
+  content and a set of questions — yes/no, pick-one, or a position on a scale — and answers each one
+  (a number for a yes/no question, probabilities plus a confidence for a pick-one or a scale) in the
+  same field names as the public System One API, so a client written for that shape only changes its
+  base URL and key. `POST /v1/classify` and `POST /v1/rerank` are there too for raw
+  premise/hypothesis work. While a Jev model is loaded, Workspace becomes the **Jev Playground**: a
+  state editor and a questions editor that *are* the request, Ctrl/Cmd+Enter to run, the answers per
+  question, the raw response and a copyable `curl`. The answers are the model's NLI entailment
+  scores, not a calibrated decision model, and the docs say exactly how each number is computed. A
+  Jev model loads with an 8,192-token limit per request by default. Downloading one is easier too: a
+  Hugging Face repo that keeps several checkpoints in subfolders now lists them one per row.
+  Full guide: https://turbollm.dev/docs/jev
 
 ### Changed
 
