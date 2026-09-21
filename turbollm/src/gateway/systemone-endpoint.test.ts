@@ -13,7 +13,7 @@ import type { JevInfo } from '../models/jev'
 import type { ModelEntry } from '../models/scanner'
 import type { Answer, Question } from '../models/systemone'
 import type { RouteResult } from './model-router'
-import { handleSystemOne } from './systemone-endpoint'
+import { handleSystemOne, MAX_PAIR_CHARS } from './systemone-endpoint'
 
 const MODEL_KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
 const MODEL_NAME = 'qwen3.5 4b nli v2'
@@ -206,6 +206,15 @@ function unprocessable(message: string): JevHttpError {
   return { status: 422, code: 'invalid_request', type: 'invalid_request_error', message }
 }
 
+function tooLong(field: string): JevHttpError {
+  return {
+    status: 422,
+    code: 'context_length_exceeded',
+    type: 'invalid_request_error',
+    message: `${field} is too long: this model reads about 8,192 tokens for the state and one question together.`,
+  }
+}
+
 async function assertRefused(res: Response, expected: JevHttpError): Promise<void> {
   assert.equal(res.status, expected.status)
   assert.match(res.headers.get('content-type') ?? '', /json/)
@@ -242,6 +251,11 @@ function premised(hypothesis: string, premise = STATE_URGENT): string {
 
 function nestedArrays(depth: number): string {
   return '['.repeat(depth) + ']'.repeat(depth)
+}
+
+/** A yes/no question whose hypothesis is `instructions` followed by a `criteria.true` of `criterionChars` characters. */
+function noulQuestionWithCriterion(criterionChars: number): Question {
+  return { type: 'noul', instructions: Q_NOUL.instructions, criteria: { true: 'x'.repeat(criterionChars) } }
 }
 
 /** A pick-one question with options o0..o(n-1) and no descriptions: one hypothesis per option. */
@@ -538,4 +552,100 @@ test('a failing later chunk fails the whole request with that chunk\'s refusal a
   const res = await postJson(harness.app, systemOneRequest({ questions: { q: choiceQuestion(200) } }))
 
   await assertRefused(res, { status: 502, code: 'engine_error', type: 'api_error', message: 'engine overloaded' })
+})
+
+test('the character budget is four characters for each token of the launch-default context', () => {
+  assert.equal(MAX_PAIR_CHARS, 32_768)
+})
+
+test('a state over the budget is a 422 naming the state, and nothing is routed, sent or counted as activity', async () => {
+  resetLocalActivity()
+  const harness = systemOneHarness()
+
+  await assertRefused(
+    await postJson(harness.app, systemOneRequest({ state: 'a'.repeat(MAX_PAIR_CHARS + 1) })),
+    tooLong('state'),
+  )
+
+  assert.equal(harness.engineCalls.length, 0)
+  assert.deepEqual(harness.routed, [])
+  assert.equal(lastLocalActivityMs(), null, 'a refused request is not activity')
+})
+
+test('a question whose pair with a short state is over the budget is a 422 naming that question, and nothing is routed', async () => {
+  const harness = systemOneHarness()
+  const questions = { urgent: noulQuestionWithCriterion(MAX_PAIR_CHARS) }
+
+  await assertRefused(await postJson(harness.app, systemOneRequest({ state: 's', questions })), tooLong('questions.urgent'))
+
+  assert.equal(harness.engineCalls.length, 0)
+  assert.deepEqual(harness.routed, [])
+})
+
+test('a pair exactly at the budget is accepted', async () => {
+  const harness = systemOneHarness()
+  const questions = { urgent: { type: 'noul', instructions: 'Q?' } }
+
+  const res = await postJson(harness.app, systemOneRequest({ state: 'a'.repeat(MAX_PAIR_CHARS - 2), questions }))
+
+  assert.equal(res.status, 200)
+  assert.equal(harness.engineCalls.length, 1)
+})
+
+test('a state of exactly the budget leaves no room for a question, so the refusal names the question, not the state', async () => {
+  const harness = systemOneHarness()
+
+  await assertRefused(
+    await postJson(harness.app, systemOneRequest({ state: 'a'.repeat(MAX_PAIR_CHARS) })),
+    tooLong('questions.urgent'),
+  )
+})
+
+test('only the offending pair counts: a long description on the second option names its question', async () => {
+  const question: Question = {
+    type: 'choice',
+    instructions: 'Q?',
+    criteria: { short: 'ok', long: 'x'.repeat(MAX_PAIR_CHARS) },
+  }
+
+  await assertRefused(
+    await postJson(systemOneHarness().app, systemOneRequest({ state: 's', questions: { q: question } })),
+    tooLong('questions.q'),
+  )
+})
+
+test('of two questions where only the second is too long, the second is named', async () => {
+  const questions = { first: Q_NOUL, second: noulQuestionWithCriterion(MAX_PAIR_CHARS) }
+
+  await assertRefused(
+    await postJson(systemOneHarness().app, systemOneRequest({ state: 's', questions })),
+    tooLong('questions.second'),
+  )
+})
+
+test('when several questions are too long, the first in request order is named, not the first alphabetically', async () => {
+  const questions = { zulu: noulQuestionWithCriterion(MAX_PAIR_CHARS), alpha: noulQuestionWithCriterion(MAX_PAIR_CHARS) }
+
+  await assertRefused(
+    await postJson(systemOneHarness().app, systemOneRequest({ state: 's', questions })),
+    tooLong('questions.zulu'),
+  )
+})
+
+test('the refusal says how much the model reads, in tokens', async () => {
+  const res = await postJson(systemOneHarness().app, systemOneRequest({ state: 'a'.repeat(MAX_PAIR_CHARS + 1) }))
+
+  const { error } = (await res.json()) as { error: { message: string } }
+
+  assert.match(error.message, /about 8,192 tokens/)
+})
+
+test('a long but legal premise reaches the engine whole, never truncated', async () => {
+  const harness = systemOneHarness()
+  const state = 'a'.repeat(MAX_PAIR_CHARS - 10)
+  const questions = { urgent: { type: 'noul', instructions: 'Q?' } }
+
+  await postJson(harness.app, systemOneRequest({ state, questions }))
+
+  assert.ok(harness.engineCalls[0].input[0].includes(state))
 })

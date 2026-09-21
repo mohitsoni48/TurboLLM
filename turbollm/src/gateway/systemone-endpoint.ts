@@ -4,13 +4,14 @@
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { noteLocalActivity } from '../link/host-idle'
-import { buildNliInput, mapProbs } from '../models/jev'
+import { buildNliInput, JEV_DEFAULT_MAX_MODEL_LEN, mapProbs } from '../models/jev'
 import { answersFrom, planSystemOne, type Answer, type SystemOneInput, type SystemOnePlan } from '../models/systemone'
 import { parseSystemOneBody, type RequestProblem } from '../models/systemone-request'
 import { clientAbort } from './gateway'
 import {
   callEngineClassify,
   jevErrorResponse,
+  JevEndpointError,
   jsonBodyOf,
   MAX_JEV_INPUTS,
   refusalFor,
@@ -20,6 +21,12 @@ import {
   type JevHttpError,
   type JevModel,
 } from './jev-serving'
+
+/** The local, approximate context guard: four characters to a token of the launch-default context (ADR-438).
+ *  The daemon has no tokenizer, so this is a cheap first line; a pair that slips past it and is really too long
+ *  is refused by the engine itself, exactly. Nothing is ever truncated: a shortened premise is a confident wrong
+ *  answer with no signal. */
+export const MAX_PAIR_CHARS = 4 * JEV_DEFAULT_MAX_MODEL_LEN
 
 interface SystemOneResponse {
   model: string
@@ -61,6 +68,7 @@ async function answerSystemOne(
 ): Promise<SystemOneResponse> {
   const { entry, nliTemplate } = resolveJevModel(d, input.model)
   const plan = planSystemOne(input)
+  requireWithinBudget(plan)
   noteLocalActivity()
   const target = await routeToJevModel(d, entry)
   const engine: EngineConnection = { target, signal: clientAbort(c).signal, fetchImpl }
@@ -92,6 +100,28 @@ function chunksOf<T>(items: readonly T[], size: number): T[][] {
 
 function unprocessable(problem: RequestProblem): JevHttpError {
   return { status: 422, code: 'invalid_request', type: 'invalid_request_error', message: problem.message }
+}
+
+function requireWithinBudget(plan: SystemOnePlan): void {
+  const field = overLongField(plan)
+  if (field !== undefined) throw new JevEndpointError(contextLengthExceeded(field))
+}
+
+/** `state` when the premise alone is over budget, otherwise the first question, in plan order, whose pair is. */
+function overLongField(plan: SystemOnePlan): string | undefined {
+  if (plan.premise.length > MAX_PAIR_CHARS) return 'state'
+  const offender = plan.hypotheses.find((hypothesis) => plan.premise.length + hypothesis.text.length > MAX_PAIR_CHARS)
+  return offender === undefined ? undefined : `questions.${offender.questionId}`
+}
+
+function contextLengthExceeded(field: string): JevHttpError {
+  const tokens = JEV_DEFAULT_MAX_MODEL_LEN.toLocaleString('en-US')
+  return {
+    status: 422,
+    code: 'context_length_exceeded',
+    type: 'invalid_request_error',
+    message: `${field} is too long: this model reads about ${tokens} tokens for the state and one question together.`,
+  }
 }
 
 function engineInputsOf(plan: SystemOnePlan, nliTemplate: string): string[] {
