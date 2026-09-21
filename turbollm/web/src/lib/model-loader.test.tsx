@@ -14,8 +14,6 @@ import type { ActiveWork, JevStatus, Status } from './types'
 const h = vi.hoisted(() => ({
   loadMutate: vi.fn(),
   getActivity: vi.fn(),
-  loadIsPending: false,
-  loadVariables: undefined as { key: string } | undefined,
   status: undefined as Status | undefined,
   pathname: '/models',
   navigate: vi.fn(),
@@ -26,7 +24,7 @@ const h = vi.hoisted(() => ({
 
 vi.mock('./queries', () => ({
   useModelActions: () => ({
-    load: { mutate: h.loadMutate, isPending: h.loadIsPending, variables: h.loadVariables },
+    load: { mutate: h.loadMutate },
   }),
   useStatus: () => ({ data: h.status }),
 }))
@@ -67,11 +65,9 @@ beforeEach(() => {
   h.toastSuccess.mockReset()
   h.toastError.mockReset()
   h.track.mockReset()
-  h.loadIsPending = false
-  h.loadVariables = undefined
   h.status = undefined
   h.pathname = '/models'
-  useJevLoadStore.setState({ confirm: null, pendingJevKey: null })
+  useJevLoadStore.setState({ confirm: null, pendingJevKey: null, pendingLoadKey: null, loadError: null })
 })
 
 function loader() {
@@ -294,21 +290,26 @@ describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
   })
 })
 
+// C-7, C-8: the load that is really running, not this hook's own mutation observer — which is
+// blind to a load the confirmation dialog fired. `queries.test.tsx` pins the other half: the
+// mutation keeps this key itself, so it survives the firing surface closing.
 describe('pending state', () => {
-  it('reports the load mutation\'s own busy state and the key it is loading', () => {
-    h.loadIsPending = true
-    h.loadVariables = { key: 'jev-key' }
+  it('reports the load that is running and the key it is loading, whoever started it', () => {
+    useJevLoadStore.setState({ pendingLoadKey: 'jev-key' })
     const result = loader()
     expect(result.current.isPending).toBe(true)
     expect(result.current.pendingKey).toBe('jev-key')
   })
 
   it('names no key while idle', () => {
-    h.loadIsPending = false
-    h.loadVariables = { key: 'jev-key' }
     const result = loader()
     expect(result.current.isPending).toBe(false)
     expect(result.current.pendingKey).toBeUndefined()
+  })
+
+  it('hands on why the last load failed, against the model it was loading', () => {
+    useJevLoadStore.setState({ loadError: { key: 'jev-key', message: 'vLLM is not installed.' } })
+    expect(loader().current.loadError).toEqual({ key: 'jev-key', message: 'vLLM is not installed.' })
   })
 })
 

@@ -1,9 +1,10 @@
-// Jev load state that has to outlive the component that started the load (ADR-434 (i)(3)).
+// Load state that has to outlive the component that started the load (ADR-434 (i)(3)).
 //
 // ModelDetailDialog closes itself the moment it fires a load, so a confirmation owned by the
-// dialog would unmount before the user could answer it. Both fields are app-level and the
-// store is deliberately NOT persisted: a reload must not resurrect a dialog about work that
-// finished, or a toast for a load this browser never fired.
+// dialog would unmount before the user could answer it — and so would any pending state kept
+// in the dialog's own mutation. Every field here is app-level, and the store is deliberately
+// NOT persisted: a reload must not resurrect a dialog about work that finished, a toast for a
+// load this browser never fired, or a spinner for a load that is long over.
 import { create } from 'zustand'
 import type { ActiveWork, LoadProfile } from '../lib/types'
 
@@ -26,13 +27,28 @@ interface JevLoadState {
   confirm: { target: LoadTarget; work: ActiveWork | null; opts: LoadOptions } | null
   /** The key of a Jev load THIS browser fired — the one thing that entitles it to a toast. */
   pendingJevKey: string | null
+  /** The model being loaded right now, for every surface at once (C-7, C-8). Each
+   *  `useModelActions()` builds its own mutation observer, so a page that reads its own
+   *  observer is blind to a load the confirmation dialog fired. */
+  pendingLoadKey: string | null
+  /** Why the last load failed, and which model it was — kept against the key so a dialog
+   *  cannot show another model's failure. */
+  loadError: { key: string; message: string } | null
   setConfirm(c: JevLoadState['confirm']): void
   setPendingJevKey(k: string | null): void
+  loadStarted(key: string): void
+  loadFailed(key: string, message: string): void
+  loadSettled(): void
 }
 
 export const useJevLoadStore = create<JevLoadState>((set) => ({
   confirm: null,
   pendingJevKey: null,
+  pendingLoadKey: null,
+  loadError: null,
   setConfirm: (confirm) => set({ confirm }),
   setPendingJevKey: (pendingJevKey) => set({ pendingJevKey }),
+  loadStarted: (key) => set({ pendingLoadKey: key, loadError: null }),
+  loadFailed: (key, message) => set({ loadError: { key, message } }),
+  loadSettled: () => set({ pendingLoadKey: null }),
 }))

@@ -118,7 +118,9 @@ import {
   type SysInfo,
   type TelemetryLevel,
   getAgentAvailability,
+  ApiError,
 } from './api'
+import { useJevLoadStore } from '../stores/jev-load'
 import type {
   BenchState,
   BuildPrereqs,
@@ -770,6 +772,14 @@ export function useModelActions() {
     }),
     load: useMutation({
       mutationFn: (v: { key: string; overrides?: Partial<LoadProfile> }) => loadModel(v.key, v.overrides),
+      // Kept on the load itself rather than on this observer: every surface reads one pending
+      // key (C-7, C-8), and the surface that fired the load may already have closed itself,
+      // which would drop a callback passed to `mutate()` and leave the key set for good.
+      onMutate: (v) => useJevLoadStore.getState().loadStarted(v.key),
+      onError: (e, v) => {
+        if (e instanceof ApiError) useJevLoadStore.getState().loadFailed(v.key, e.message)
+      },
+      onSettled: () => useJevLoadStore.getState().loadSettled(),
       onSuccess: (_d, v) => {
         invalidate()
         void qc.invalidateQueries({ queryKey: ['model', v.key] })

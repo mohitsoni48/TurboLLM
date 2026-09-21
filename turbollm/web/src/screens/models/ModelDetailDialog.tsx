@@ -289,6 +289,12 @@ function PresetsPanel({
   )
 }
 
+/** The shared loader's last failure, and only when it is this model's: the dialog's own
+ *  mutation observer never sees one, because it closes itself in the same click (C-7, C-8). */
+function failureOf(failure: { key: string; message: string } | null, modelKey: string | undefined): string | null {
+  return failure && failure.key === modelKey ? failure.message : null
+}
+
 export function ModelDetailDialog({
   modelKey,
   onClose,
@@ -430,7 +436,7 @@ export function ModelDetailDialog({
   const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) =>
     setDraft((d) => (d ? { ...d, vllm: { ...(d.vllm ?? defaultVllm()), [k]: v } } : d))
 
-  const loadError = actions.load.error instanceof ApiError ? actions.load.error.message : null
+  const loadError = failureOf(loader.loadError, detail?.key)
 
   // Auto-tune (spec 09 §1). A run owns the engine exclusively, so a loaded model must
   // be stopped first — the button offers "Stop & benchmark" when this model is loaded.
@@ -954,7 +960,7 @@ export function ModelDetailDialog({
                   }
                   onClose()
                 }}
-                disabled={actions.load.isPending}
+                disabled={loader.isPending}
               >
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}

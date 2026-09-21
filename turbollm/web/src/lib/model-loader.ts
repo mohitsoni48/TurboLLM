@@ -21,10 +21,15 @@ export function useModelLoader(): {
   confirmLoad(target: LoadTarget, opts: LoadOptions): void
   isPending: boolean
   pendingKey: string | undefined
+  loadError: { key: string; message: string } | null
 } {
   const actions = useModelActions()
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
   const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
+  // The load itself, not this hook's own mutation observer — a surface must report the load
+  // that is really running, whichever surface started it (C-7, C-8).
+  const pendingLoadKey = useJevLoadStore((s) => s.pendingLoadKey)
+  const loadError = useJevLoadStore((s) => s.loadError)
 
   function startLoad(target: LoadTarget, opts: LoadOptions): void {
     actions.load.mutate({ key: target.key, overrides: opts.overrides }, {
@@ -61,8 +66,9 @@ export function useModelLoader(): {
     // "Load anyway" answers the (i)(3) question with the very load it interrupted: same
     // pending key, same failure surface, same caller callbacks.
     confirmLoad: startJevLoad,
-    isPending: actions.load.isPending,
-    pendingKey: actions.load.isPending ? actions.load.variables?.key : undefined,
+    isPending: pendingLoadKey !== null,
+    pendingKey: pendingLoadKey ?? undefined,
+    loadError,
   }
 }
 

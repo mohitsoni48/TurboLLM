@@ -83,8 +83,11 @@ vi.mock('../../lib/queries', () => ({
   }),
   useModels: () => ({ data: { models: [] } }),
 }))
+// The dialog reads the shared loader, not its own mutation observer: it closes itself in the
+// same click that fires a load, and a load started anywhere must busy this button (C-7, C-8).
+let loaderState: { isPending: boolean; pendingKey?: string; loadError: { key: string; message: string } | null }
 vi.mock('../../lib/model-loader', () => ({
-  useModelLoader: () => ({ requestLoad, isPending: false, pendingKey: undefined }),
+  useModelLoader: () => ({ requestLoad, confirmLoad: vi.fn(), ...loaderState }),
 }))
 vi.mock('../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/api')>()),
@@ -102,6 +105,7 @@ function renderDialog(d: ModelDetail) {
 }
 
 beforeEach(() => {
+  loaderState = { isPending: false, pendingKey: undefined, loadError: null }
   requestLoad.mockClear()
   saveMutate.mockClear()
 })
@@ -122,6 +126,25 @@ describe('ModelDetailDialog — loading through the shared loader', () => {
     await userEvent.click(await screen.findByRole('button', { name: /load model/i }))
     expect(requestLoad.mock.calls[0][0]).toEqual(expect.objectContaining({ key: 'chat-1', name: 'Qwen3 8B' }))
     expect(requestLoad.mock.calls[0][0].jev).toBeUndefined()
+  })
+
+  it('busies the button for a load another surface started', async () => {
+    loaderState = { isPending: true, pendingKey: 'other-model', loadError: null }
+    renderDialog(VERIFIED)
+    expect((await screen.findByRole('button', { name: /load model/i })).hasAttribute('disabled')).toBe(true)
+  })
+
+  it('says why the last load of this model failed', async () => {
+    loaderState = { isPending: false, loadError: { key: 'jev-1', message: 'vLLM is not installed.' }, pendingKey: undefined }
+    renderDialog(VERIFIED)
+    expect(await screen.findByText('vLLM is not installed.')).toBeTruthy()
+  })
+
+  it('never shows another model\'s failure', async () => {
+    loaderState = { isPending: false, loadError: { key: 'chat-1', message: 'vLLM is not installed.' }, pendingKey: undefined }
+    renderDialog(VERIFIED)
+    await screen.findByRole('button', { name: /load model/i })
+    expect(screen.queryByText('vLLM is not installed.')).toBeNull()
   })
 
   it('still saves before loading when "Remember these settings" is on', async () => {
