@@ -324,3 +324,269 @@ test('parseSystemOneBody refuses instructions nested 5000 levels deep without th
     message: 'questions.q.instructions must not be nested more than 32 levels deep.',
   })
 })
+
+const STATE_URGENT =
+  "I've been unable to connect my payment provider for three days and the integration keeps failing. " +
+  "I'm losing sales, please help as soon as possible."
+
+function noulWith(criteria: unknown): Record<string, unknown> {
+  return { type: 'noul', instructions: 'i', criteria }
+}
+
+function choiceWith(criteria: unknown): Record<string, unknown> {
+  return { type: 'choice', instructions: 'i', criteria }
+}
+
+function scoreWith(criteria: unknown): Record<string, unknown> {
+  return { type: 'score', instructions: 'i', criteria }
+}
+
+function optionsOf(count: number): Record<string, null> {
+  return Object.fromEntries(Array.from({ length: count }, (_, position) => [`o${position}`, null]))
+}
+
+function levelsOf(count: number): string[] {
+  return Array.from({ length: count }, (_, position) => `level ${position}`)
+}
+
+function problemAt(field: string, message: string): RequestProblem {
+  return { field, message }
+}
+
+test('parseSystemOneBody accepts noul criteria that are absent or hold only true and false', () => {
+  for (const criteria of [{ true: 'T', false: 'F' }, { true: 'T' }, {}]) {
+    assert.ok(parseSystemOneBody(withQuestion(noulWith(criteria))).ok)
+  }
+  assert.ok(parseSystemOneBody(withQuestion(Q_NOUL)).ok)
+})
+
+test('parseSystemOneBody refuses noul criteria that are not an object of only true and false', () => {
+  for (const criteria of [null, 'x', [], { maybe: 'x' }]) {
+    assert.deepEqual(
+      refusalOf(withQuestion(noulWith(criteria))),
+      problemAt('questions.q.criteria', 'questions.q.criteria must be an object with only "true" and/or "false".'),
+    )
+  }
+})
+
+test('parseSystemOneBody checks each noul criterion against the string, object, array or null rule', () => {
+  assert.deepEqual(
+    refusalOf(withQuestion(noulWith({ true: 5 }))),
+    problemAt('questions.q.criteria.true', 'questions.q.criteria.true must be a string, an object, an array or null.'),
+  )
+  assert.deepEqual(
+    refusalOf(withQuestion(noulWith({ false: true }))),
+    problemAt('questions.q.criteria.false', 'questions.q.criteria.false must be a string, an object, an array or null.'),
+  )
+  for (const criterion of [null, 'text', { k: 1 }, [1]]) {
+    assert.ok(parseSystemOneBody(withQuestion(noulWith({ true: criterion, false: criterion }))).ok)
+  }
+})
+
+test('parseSystemOneBody requires choice criteria to be an object of 2 to 255 options', () => {
+  const expected = problemAt('questions.q.criteria', 'questions.q.criteria must be an object of 2 to 255 options.')
+
+  assert.deepEqual(refusalOf(withQuestion({ type: 'choice', instructions: 'i' })), expected)
+  for (const criteria of [null, [], 'x']) assert.deepEqual(refusalOf(withQuestion(choiceWith(criteria))), expected)
+  assert.ok(parseSystemOneBody(withQuestion(choiceWith(optionsOf(2)))).ok)
+  assert.deepEqual(refusalOf(withQuestion(choiceWith(optionsOf(1)))), expected)
+  assert.ok(parseSystemOneBody(withQuestion(choiceWith(optionsOf(255)))).ok)
+  assert.deepEqual(refusalOf(withQuestion(choiceWith(optionsOf(256)))), expected)
+})
+
+test('parseSystemOneBody requires each choice option to be named with 1 to 255 characters', () => {
+  const tooLong = 'n'.repeat(256)
+
+  assert.deepEqual(
+    refusalOf(withQuestion(choiceWith({ '': 'x', b: 'y' }))),
+    problemAt('questions.q.criteria.', 'questions.q.criteria. must be named with 1 to 255 characters.'),
+  )
+  assert.ok(parseSystemOneBody(withQuestion(choiceWith({ ['n'.repeat(255)]: 'x', b: 'y' }))).ok)
+  assert.deepEqual(
+    refusalOf(withQuestion(choiceWith({ [tooLong]: 'x', b: 'y' }))),
+    problemAt(
+      `questions.q.criteria.${tooLong}`,
+      `questions.q.criteria.${tooLong} must be named with 1 to 255 characters.`,
+    ),
+  )
+})
+
+test('parseSystemOneBody requires each choice description to be a string, an object, an array or null', () => {
+  for (const description of [5, true]) {
+    assert.deepEqual(
+      refusalOf(withQuestion(choiceWith({ o: description, p: 'x' }))),
+      problemAt('questions.q.criteria.o', 'questions.q.criteria.o must be a string, an object, an array or null.'),
+    )
+  }
+  for (const description of ['text', null, { k: 1 }, [1]]) {
+    assert.ok(parseSystemOneBody(withQuestion(choiceWith({ o: description, p: 'x' }))).ok)
+  }
+})
+
+test('parseSystemOneBody requires score criteria to be an ordered array of 2 to 10 levels', () => {
+  const expected = problemAt(
+    'questions.q1.criteria',
+    'questions.q1.criteria must be an ordered array of 2 to 10 level descriptions.',
+  )
+
+  assert.deepEqual(refusalOf(withQuestion({ type: 'score', instructions: 'i' }, 'q1')), expected)
+  for (const criteria of [{}, 'x']) assert.deepEqual(refusalOf(withQuestion(scoreWith(criteria), 'q1')), expected)
+  assert.ok(parseSystemOneBody(withQuestion(scoreWith(levelsOf(2)), 'q1')).ok)
+  assert.deepEqual(refusalOf(withQuestion(scoreWith(levelsOf(1)), 'q1')), expected)
+  assert.ok(parseSystemOneBody(withQuestion(scoreWith(levelsOf(10)), 'q1')).ok)
+  assert.deepEqual(refusalOf(withQuestion(scoreWith(levelsOf(11)), 'q1')), expected)
+})
+
+test('parseSystemOneBody requires each score level to be a non-empty string, an object or an array', () => {
+  for (const level of [null, 5, true, '']) {
+    assert.deepEqual(
+      refusalOf(withQuestion(scoreWith(['ok', level]))),
+      problemAt('questions.q.criteria.1', 'questions.q.criteria.1 must be a non-empty string, an object or an array.'),
+    )
+  }
+  for (const level of ['text', { k: 1 }, [1]]) assert.ok(parseSystemOneBody(withQuestion(scoreWith(['ok', level]))).ok)
+})
+
+test('parseSystemOneBody caps the whole request at 512 hypotheses', () => {
+  const noul = { type: 'noul', instructions: 'i' }
+  const atLimit = { q1: choiceWith(optionsOf(255)), q2: choiceWith(optionsOf(255)), q3: noul, q4: noul }
+
+  assert.ok(parseSystemOneBody(validBody({ questions: atLimit })).ok)
+  assert.deepEqual(
+    refusalOf(validBody({ questions: { ...atLimit, q5: noul } })),
+    problemAt('questions', 'questions must produce at most 512 hypotheses in total.'),
+  )
+})
+
+test('parseSystemOneBody keeps __proto__ question ids and option names as data', () => {
+  const body = JSON.parse(
+    '{"state":"s","model":"m","questions":{"__proto__":{"type":"noul","instructions":"i"},' +
+      '"q":{"type":"choice","instructions":"i","criteria":{"__proto__":"d","b":null}}}}',
+  ) as unknown
+
+  const result = parseSystemOneBody(body)
+
+  assert.ok(result.ok)
+  assert.deepEqual(Object.keys(result.input.questions), ['__proto__', 'q'])
+  assert.ok(Object.hasOwn(result.input.questions, '__proto__'))
+  assert.equal(Object.getPrototypeOf(result.input.questions), Object.prototype)
+  assert.equal(({} as Record<string, unknown>).type, undefined)
+  const choice = result.input.questions.q
+  assert.ok(choice.type === 'choice')
+  assert.deepEqual(Object.keys(choice.criteria), ['__proto__', 'b'])
+})
+
+test('parseSystemOneBody gives every criteria failure its exact message', () => {
+  const cases: Array<{ question: unknown; id?: string; field: string; message: string }> = [
+    {
+      question: noulWith('x'),
+      field: 'questions.q.criteria',
+      message: 'questions.q.criteria must be an object with only "true" and/or "false".',
+    },
+    {
+      question: noulWith({ true: 5 }),
+      field: 'questions.q.criteria.true',
+      message: 'questions.q.criteria.true must be a string, an object, an array or null.',
+    },
+    {
+      question: noulWith({ false: 5 }),
+      field: 'questions.q.criteria.false',
+      message: 'questions.q.criteria.false must be a string, an object, an array or null.',
+    },
+    {
+      question: choiceWith(optionsOf(1)),
+      field: 'questions.q.criteria',
+      message: 'questions.q.criteria must be an object of 2 to 255 options.',
+    },
+    {
+      question: choiceWith({ '': 'x', b: 'y' }),
+      field: 'questions.q.criteria.',
+      message: 'questions.q.criteria. must be named with 1 to 255 characters.',
+    },
+    {
+      question: choiceWith({ o: 5, p: 'x' }),
+      field: 'questions.q.criteria.o',
+      message: 'questions.q.criteria.o must be a string, an object, an array or null.',
+    },
+    {
+      question: scoreWith(levelsOf(1)),
+      id: 'q1',
+      field: 'questions.q1.criteria',
+      message: 'questions.q1.criteria must be an ordered array of 2 to 10 level descriptions.',
+    },
+    {
+      question: scoreWith(['ok', null]),
+      field: 'questions.q.criteria.1',
+      message: 'questions.q.criteria.1 must be a non-empty string, an object or an array.',
+    },
+  ]
+
+  for (const { question, id, field, message } of cases) {
+    assert.deepEqual(refusalOf(withQuestion(question, id)), { field, message })
+  }
+})
+
+test('parseSystemOneBody accepts the complete three-question request and returns it unchanged', () => {
+  const body = validBody({ state: STATE_URGENT, questions: { urgent: Q_NOUL, team: Q_CHOICE, mood: Q_MOOD } })
+
+  const result = parseSystemOneBody(body)
+
+  assert.ok(result.ok)
+  assert.deepEqual(result.input, body)
+})
+
+test('parseSystemOneBody reports the first fault in a fixed order inside criteria', () => {
+  assert.equal(refusalOf(withQuestion(choiceWith({ a: 5, '': 'x' }))).field, 'questions.q.criteria.a')
+  assert.equal(refusalOf(withQuestion(choiceWith({ '': 5, a: 'x' }))).field, 'questions.q.criteria.')
+  assert.equal(refusalOf(withQuestion(noulWith({ true: 5, false: 5 }))).field, 'questions.q.criteria.true')
+  assert.equal(refusalOf(withQuestion(noulWith({ false: 5, true: 5 }))).field, 'questions.q.criteria.true')
+})
+
+test('parseSystemOneBody counts choice options before it checks any option', () => {
+  assert.equal(refusalOf(withQuestion(choiceWith({ o: 5 }))).field, 'questions.q.criteria')
+})
+
+test('parseSystemOneBody accepts blank strings and never trims them, except an empty score level', () => {
+  const blank = { state: ' ', model: '  ', questions: { q: scoreWith(['  ', 'ok']) } }
+  const blankInstructions = withQuestion({ type: 'noul', instructions: '  ' })
+
+  assert.ok(parseSystemOneBody(validBody(blank)).ok)
+  assert.ok(parseSystemOneBody(blankInstructions).ok)
+  assert.equal(refusalOf(withQuestion(scoreWith(['ok', '']))).field, 'questions.q.criteria.1')
+})
+
+test('parseSystemOneBody counts the criteria wrapper as one nesting level (pinned)', () => {
+  const tooDeep = problemAt(
+    'questions.q.criteria',
+    'questions.q.criteria must not be nested more than 32 levels deep.',
+  )
+
+  assert.ok(parseSystemOneBody(withQuestion(noulWith({ true: nested(31) }))).ok)
+  assert.deepEqual(refusalOf(withQuestion(noulWith({ true: nested(32) }))), tooDeep)
+  assert.ok(parseSystemOneBody(withQuestion(choiceWith({ a: nested(31), b: 'x' }))).ok)
+  assert.deepEqual(refusalOf(withQuestion(choiceWith({ a: nested(32), b: 'x' }))), tooDeep)
+  assert.ok(parseSystemOneBody(withQuestion(scoreWith([nested(31), 'x']))).ok)
+  assert.deepEqual(refusalOf(withQuestion(scoreWith([nested(32), 'x']))), tooDeep)
+})
+
+test('parseSystemOneBody refuses criteria nested 5000 levels deep without throwing (pinned)', () => {
+  const tooDeep = problemAt(
+    'questions.q.criteria',
+    'questions.q.criteria must not be nested more than 32 levels deep.',
+  )
+
+  assert.deepEqual(refusalOf(withQuestion(noulWith({ true: nested(5000) }))), tooDeep)
+  assert.deepEqual(refusalOf(withQuestion(choiceWith({ a: nested(5000), b: 'x' }))), tooDeep)
+  assert.deepEqual(refusalOf(withQuestion(scoreWith([nested(5000), 'x']))), tooDeep)
+})
+
+test('parseSystemOneBody reports too-deep criteria as nesting even when a criteria rule would also fail (pinned)', () => {
+  const tooDeep = problemAt(
+    'questions.q.criteria',
+    'questions.q.criteria must not be nested more than 32 levels deep.',
+  )
+
+  assert.deepEqual(refusalOf(withQuestion(noulWith({ true: 5, false: nested(32) }))), tooDeep)
+  assert.deepEqual(refusalOf(withQuestion(choiceWith({ a: 5, b: nested(32) }))), tooDeep)
+  assert.deepEqual(refusalOf(withQuestion(scoreWith([null, nested(32)]))), tooDeep)
+})

@@ -1,11 +1,18 @@
 // System One request validation (ADR-439, ADR-436 (1)): an untrusted body becomes a SystemOneInput or
 // exactly one { field, message } problem (the first failure wins). Pure: it knows field paths and limits
 // and nothing about HTTP status codes, and it never throws on bad input.
-import { instructionTextOf, type Question, type StateValue, type SystemOneInput } from './systemone'
+import {
+  instructionTextOf,
+  type Criterion,
+  type Question,
+  type StateValue,
+  type SystemOneInput,
+} from './systemone'
 
 const MIN_NAME_CHARS = 1
 const QUESTION_FIELDS: readonly string[] = ['type', 'instructions', 'criteria']
 const QUESTION_TYPES: readonly unknown[] = ['noul', 'choice', 'score']
+const NOUL_CRITERIA_KEYS: readonly string[] = ['true', 'false']
 
 export const MIN_QUESTIONS = 1
 export const MAX_QUESTIONS = 64
@@ -43,7 +50,10 @@ export function parseSystemOneBody(raw: unknown): ParseResult {
 function parseBody(raw: unknown): ParseResult {
   if (!isPlainObject(raw)) return refused({ field: 'body', message: 'body must be a JSON object.' })
   const problem = firstProblemIn(raw)
-  return problem ? refused(problem) : { ok: true, input: inputFrom(raw) }
+  if (problem) return refused(problem)
+  const input = inputFrom(raw)
+  const oversize = checkHypothesisTotal(input.questions)
+  return oversize ? refused(oversize) : { ok: true, input }
 }
 
 function refused(problem: RequestProblem): ParseResult {
@@ -135,7 +145,12 @@ function questionProblem(id: string, question: unknown): RequestProblem | undefi
     return { field, message: `${field} must have an id of ${MIN_NAME_CHARS} to ${MAX_QUESTION_ID_CHARS} characters.` }
   }
   if (!isPlainObject(question)) return { field, message: `${field} must be an object.` }
-  return unknownFieldProblem(field, question) ?? typeProblem(field, question) ?? instructionsProblem(field, question)
+  return (
+    unknownFieldProblem(field, question) ??
+    typeProblem(field, question) ??
+    instructionsProblem(field, question) ??
+    criteriaProblem(field, question)
+  )
 }
 
 function unknownFieldProblem(field: string, question: PlainObject): RequestProblem | undefined {
@@ -163,6 +178,106 @@ function instructionsProblem(field: string, question: PlainObject): RequestProbl
   return {
     field: instructionsField,
     message: `${instructionsField} must be ${MIN_INSTRUCTIONS_CHARS} to ${MAX_INSTRUCTIONS_CHARS} characters.`,
+  }
+}
+
+/** `typeProblem` has already refused every type but these three, so the default is never reached. */
+function criteriaProblem(field: string, question: PlainObject): RequestProblem | undefined {
+  switch (question.type) {
+    case 'noul':
+      return checkNoulCriteria(`${field}.criteria`, question.criteria)
+    case 'choice':
+      return checkChoiceCriteria(`${field}.criteria`, question.criteria)
+    case 'score':
+      return checkScoreCriteria(`${field}.criteria`, question.criteria)
+    default:
+      return undefined
+  }
+}
+
+function checkNoulCriteria(field: string, criteria: unknown): RequestProblem | undefined {
+  if (criteria === undefined) return undefined
+  if (!isPlainObject(criteria) || Object.keys(criteria).some((key) => !NOUL_CRITERIA_KEYS.includes(key))) {
+    return { field, message: `${field} must be an object with only "true" and/or "false".` }
+  }
+  return checkNoulCriterion(field, 'true', criteria.true) ?? checkNoulCriterion(field, 'false', criteria.false)
+}
+
+function checkNoulCriterion(field: string, key: string, criterion: unknown): RequestProblem | undefined {
+  if (criterion === undefined || isCriterion(criterion)) return undefined
+  return { field: `${field}.${key}`, message: `${field}.${key} must be a string, an object, an array or null.` }
+}
+
+function checkChoiceCriteria(field: string, criteria: unknown): RequestProblem | undefined {
+  if (!isPlainObject(criteria) || !isWithinOptionCount(Object.keys(criteria).length)) {
+    return {
+      field,
+      message: `${field} must be an object of ${MIN_CHOICE_OPTIONS} to ${MAX_CHOICE_OPTIONS} options.`,
+    }
+  }
+  for (const [option, description] of Object.entries(criteria)) {
+    const problem = checkOption(field, option, description)
+    if (problem) return problem
+  }
+  return undefined
+}
+
+function isWithinOptionCount(count: number): boolean {
+  return count >= MIN_CHOICE_OPTIONS && count <= MAX_CHOICE_OPTIONS
+}
+
+function checkOption(field: string, option: string, description: unknown): RequestProblem | undefined {
+  const optionField = `${field}.${option}`
+  if (option.length < MIN_NAME_CHARS || option.length > MAX_OPTION_CHARS) {
+    return {
+      field: optionField,
+      message: `${optionField} must be named with ${MIN_NAME_CHARS} to ${MAX_OPTION_CHARS} characters.`,
+    }
+  }
+  if (isCriterion(description)) return undefined
+  return { field: optionField, message: `${optionField} must be a string, an object, an array or null.` }
+}
+
+function checkScoreCriteria(field: string, criteria: unknown): RequestProblem | undefined {
+  if (!Array.isArray(criteria) || !isWithinLevelCount(criteria.length)) {
+    return {
+      field,
+      message: `${field} must be an ordered array of ${MIN_SCORE_LEVELS} to ${MAX_SCORE_LEVELS} level descriptions.`,
+    }
+  }
+  for (const [index, level] of criteria.entries()) {
+    if (!isLevelDescription(level)) {
+      return {
+        field: `${field}.${index}`,
+        message: `${field}.${index} must be a non-empty string, an object or an array.`,
+      }
+    }
+  }
+  return undefined
+}
+
+function isWithinLevelCount(count: number): boolean {
+  return count >= MIN_SCORE_LEVELS && count <= MAX_SCORE_LEVELS
+}
+
+/** The whole request is one engine batch, so its size is a property of all the questions together. */
+function checkHypothesisTotal(questions: Record<string, Question>): RequestProblem | undefined {
+  const total = Object.values(questions).reduce((sum, question) => sum + hypothesisCountOf(question), 0)
+  if (total <= MAX_SYSTEMONE_HYPOTHESES) return undefined
+  return {
+    field: 'questions',
+    message: `questions must produce at most ${MAX_SYSTEMONE_HYPOTHESES} hypotheses in total.`,
+  }
+}
+
+function hypothesisCountOf(question: Question): number {
+  switch (question.type) {
+    case 'noul':
+      return 1
+    case 'choice':
+      return Object.keys(question.criteria).length
+    case 'score':
+      return question.criteria.length
   }
 }
 
@@ -208,4 +323,12 @@ function isPlainObject(value: unknown): value is PlainObject {
 
 function isTextOrContainer(value: unknown): value is string | PlainObject | unknown[] {
   return typeof value === 'string' || isContainer(value)
+}
+
+function isCriterion(value: unknown): value is Criterion {
+  return value === null || isTextOrContainer(value)
+}
+
+function isLevelDescription(value: unknown): boolean {
+  return typeof value === 'string' ? value !== '' : isContainer(value)
 }
