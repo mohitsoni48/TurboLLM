@@ -1,4 +1,4 @@
-// Jev (ADR-434 (c), (d)): the classify/rerank client and the copyable curl of the API view.
+// Jev (ADR-434 (c), (d), ADR-439): the systemone client and the copyable curl of the API view.
 //
 // The curl is the one place the playground hands a user something they will paste into a
 // shell, so two things are asserted byte-for-byte: a single quote inside their own text is
@@ -7,25 +7,12 @@
 // people put in issues and blog posts.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
-import { MAX_JEV_INPUTS, buildCurl, classify, getActivity, rerank, systemone } from './jev-api'
+import * as api from './jev-api'
+import { MAX_JEV_INPUTS, buildCurl, getActivity, systemone } from './jev-api'
 import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
-import type { ActiveWork, ClassifyResponse, RerankResponse } from './types'
+import type { ActiveWork } from './types'
 
 const AUTH_KEY = 'tllm.authToken'
-
-const KITCHEN: ClassifyResponse = {
-  model: 'qwen3.5 4b nli v2|mlx-fp16|9012345678',
-  results: [
-    { hypothesis: 'Someone is preparing food.', label: 'entailment', probs: { contradiction: 0, entailment: 0.957, neutral: 0.043 } },
-  ],
-  usage: { prompt_tokens: 69, total_tokens: 69 },
-}
-
-const FRANCE: RerankResponse = {
-  model: 'qwen3.5 4b nli v2|mlx-fp16|9012345678',
-  results: [{ index: 1, document: { text: 'Paris' }, relevance_score: 0.941, label: 'entailment' }],
-  usage: { prompt_tokens: 51, total_tokens: 51 },
-}
 
 const IDLE: ActiveWork = { items: [], engineGenerating: false }
 
@@ -67,49 +54,6 @@ function requestOf(mock: ReturnType<typeof stubFetch>) {
   const [path, init] = mock.mock.calls[0]
   return { path: String(path), init: init as RequestInit, headers: (init as RequestInit).headers as Record<string, string> }
 }
-
-describe('classify', () => {
-  it('posts the request body to the gateway endpoint', async () => {
-    const mock = stubFetch(KITCHEN)
-    const res = await classify({ model: 'm', premise: 'p', hypotheses: ['h'] })
-    const { path, init, headers } = requestOf(mock)
-    expect(path).toBe('/v1/classify')
-    expect(init.method).toBe('POST')
-    expect(headers['Content-Type']).toBe('application/json')
-    expect(init.body).toBe('{"model":"m","premise":"p","hypotheses":["h"]}')
-    expect(res).toEqual(KITCHEN)
-  })
-
-  it('sends the stored key, so the playground works over the LAN too', async () => {
-    storage.set(AUTH_KEY, 'secret-key')
-    const mock = stubFetch(KITCHEN)
-    await classify({ model: 'm', premise: 'p', hypotheses: ['h'] })
-    expect(requestOf(mock).headers['X-TurboLLM-Auth']).toBe('secret-key')
-  })
-
-  it('turns the gateway refusal into an ApiError that keeps the machine-checkable code', async () => {
-    stubFetch({ error: { code: 'not_a_jev_model', message: 'x', type: 'invalid_request_error' } }, 400)
-    await expect(classify({ model: 'm', premise: 'p', hypotheses: ['h'] })).rejects.toMatchObject({
-      name: 'ApiError',
-      code: 'not_a_jev_model',
-      message: 'x',
-      status: 400,
-    })
-    await expect(classify({ model: 'm', premise: 'p', hypotheses: ['h'] })).rejects.toBeInstanceOf(ApiError)
-  })
-})
-
-describe('rerank', () => {
-  it('posts the request body to its own endpoint', async () => {
-    const mock = stubFetch(FRANCE)
-    const res = await rerank({ model: 'm', query: 'q', documents: ['a', 'b'] })
-    const { path, init } = requestOf(mock)
-    expect(path).toBe('/v1/rerank')
-    expect(init.method).toBe('POST')
-    expect(init.body).toBe('{"model":"m","query":"q","documents":["a","b"]}')
-    expect(res).toEqual(FRANCE)
-  })
-})
 
 describe('getActivity', () => {
   it('reads the daemon probe for what a load would interrupt', async () => {
@@ -229,5 +173,13 @@ describe('buildCurl for systemone', () => {
   it('never carries the stored key, even from a LAN origin', () => {
     storage.set(AUTH_KEY, 'secret-key')
     expect(buildCurl('http://192.168.1.5:6996', 'systemone', SYSTEMONE_REQUEST)).not.toContain('secret-key')
+  })
+})
+
+describe('the exported client surface', () => {
+  it('no longer offers a classify or a rerank call, only systemone', () => {
+    expect('classify' in api).toBe(false)
+    expect('rerank' in api).toBe(false)
+    expect('systemone' in api).toBe(true)
   })
 })

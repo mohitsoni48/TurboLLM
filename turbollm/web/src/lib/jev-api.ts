@@ -1,26 +1,18 @@
-// Jev (ADR-434 (c), (d), ADR-439): the three gateway endpoints a Jev model answers (classify,
-// rerank and systemone), the daemon probe for what a load would interrupt, and the curl the
-// playground hands the user.
+// Jev (ADR-434 (c), (d), ADR-439): the systemone call the playground makes, the daemon probe
+// for what a load would interrupt, and the curl the playground hands the user for any of the
+// three gateway endpoints a Jev model answers (classify, rerank and systemone).
 //
 // `request()` in api.ts is module-private, so every sibling API module (link-api.ts,
 // code-api.ts, chat-api.ts, …) re-implements the same shape locally against the shared
 // ApiError/authHeaders — this follows that convention rather than exporting it.
 import { ApiError, authHeaders } from './api'
 import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
-import type { ActiveWork, ClassifyRequest, ClassifyResponse, RerankRequest, RerankResponse } from './types'
+import type { ActiveWork } from './types'
 
 /** Upper bound on hypotheses (check) or options (choose) in one request. Mirrors
  *  MAX_JEV_INPUTS in src/gateway/jev-endpoints.ts, so a panel can refuse before the
  *  round trip rather than showing the user a 400. */
 export const MAX_JEV_INPUTS = 128
-
-export function classify(req: ClassifyRequest): Promise<ClassifyResponse> {
-  return request<ClassifyResponse>('/v1/classify', { method: 'POST', json: req })
-}
-
-export function rerank(req: RerankRequest): Promise<RerankResponse> {
-  return request<RerankResponse>('/v1/rerank', { method: 'POST', json: req })
-}
 
 export function systemone(req: SystemOneRequest): Promise<SystemOneResponse> {
   return request<SystemOneResponse>('/v1/systemone', { method: 'POST', json: req })
