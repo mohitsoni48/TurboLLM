@@ -160,10 +160,15 @@ describe('DeveloperScreen — API reference', () => {
     await user.click(screen.getByText('API reference'))
   }
 
-  it('lists /v1/classify and /v1/rerank straight after /v1/embeddings, with the existing rows unchanged', async () => {
+  it('lists /v1/systemone, /v1/classify and /v1/rerank straight after /v1/embeddings, with the existing rows unchanged', async () => {
     await renderApiReferenceOpen()
     const paths = screen.getAllByText(/^\/v1\//).map((el) => el.textContent)
-    expect(paths).toEqual(['/v1/chat/completions', '/v1/messages', '/v1/embeddings', '/v1/classify', '/v1/rerank', '/v1/models'])
+    expect(paths).toEqual(['/v1/chat/completions', '/v1/messages', '/v1/embeddings', '/v1/systemone', '/v1/classify', '/v1/rerank', '/v1/models'])
+  })
+
+  it('describes /v1/systemone as answering questions about content', async () => {
+    await renderApiReferenceOpen()
+    expect(screen.getByText('Jev: answer questions about content')).toBeInTheDocument()
   })
 
   it('describes the two Jev endpoints in one line each', async () => {

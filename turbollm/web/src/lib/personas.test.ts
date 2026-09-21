@@ -43,7 +43,7 @@ test('the TurboLLM Expert persona lists /v1/classify and /v1/rerank in its Gatew
   const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
   assert.ok(expert)
   const gateway = expert!.systemPrompt.split('## Gateway')[1].split('\n## ')[0]
-  assert.match(gateway, /\*\*OpenAI-compatible\*\*: .*`POST \/v1\/embeddings`, `POST \/v1\/classify`, `POST \/v1\/rerank` \(Jev models\)/)
+  assert.match(gateway, /\*\*OpenAI-compatible\*\*: .*`POST \/v1\/embeddings`, `POST \/v1\/systemone`, `POST \/v1\/classify`, `POST \/v1\/rerank` \(Jev models\)/)
 })
 
 // getDefaultAgentId/getConvAgentId's isAndroid fallback (personas.ts) isn't covered here: both
