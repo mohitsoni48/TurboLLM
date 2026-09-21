@@ -3,16 +3,18 @@
 // JSON editors ARE the body that gets posted, and the answers sit beside them.
 //
 // It holds no conversation, no history and no sidebar: there is exactly one thing to do here.
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useLocation } from 'react-router-dom'
-import { stopEngine } from '../../lib/api'
+import { Button } from '../../components/ui/button'
+import { ApiError, stopEngine } from '../../lib/api'
+import { systemone } from '../../lib/jev-api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useModels, useStatus } from '../../lib/queries'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { AnswerList } from './AnswerList'
 import { JevHeader } from './JevHeader'
 import { JsonEditor } from './JsonEditor'
-import { ResponsePanel } from './ResponsePanel'
+import { ResponsePanel, type SystemOneRun } from './ResponsePanel'
 import { SwitchModelMenu, switchToModel } from './SwitchModelMenu'
 import { draftRequest, type DraftProblem, type SystemOneDraft } from './systemone-draft'
 import { SYSTEMONE_EXAMPLES } from './systemone-examples'
@@ -29,7 +31,52 @@ export function JevPlaygroundScreen() {
   const jev = loadedJev(statusQ.data, models)
 
   const [draft, setDraft] = useState<SystemOneDraft>(firstDraft)
+  const [run, setRun] = useState<SystemOneRun | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [running, setRunning] = useState(false)
   const [switchOpen, setSwitchOpen] = useState(false)
+
+  // One run at a time. The ref rather than the `running` state is the guard: the
+  // shortcut and a click can both enter before a state update has landed.
+  const inFlight = useRef(false)
+  // And only the latest run asked may answer: an answer the screen has moved on from is dropped.
+  const currentRun = useRef(0)
+
+  async function runDraft(key: string) {
+    if (inFlight.current) return
+    const drafted = draftRequest(key, draft)
+    if (!drafted.ok) return
+    const asked = ++currentRun.current
+    inFlight.current = true
+    setRunning(true)
+    setError(null)
+    const started = performance.now()
+    try {
+      const response = await systemone(drafted.request)
+      const ms = Math.round(performance.now() - started)
+      if (asked === currentRun.current) setRun({ request: drafted.request, response, ms })
+    } catch (e) {
+      if (asked === currentRun.current) setError(failureMessage(e))
+    } finally {
+      inFlight.current = false
+      setRunning(false)
+    }
+  }
+
+  // The listener is on the window so the shortcut works with the focus anywhere on the page,
+  // and `latestRun` keeps it subscribed once instead of re-binding on every keystroke. The
+  // model-running check lives here, so the shortcut sends nothing while the model is loading.
+  const latestRun = useRef<() => void>(() => {})
+  latestRun.current = () => { if (jev?.state === 'running') void runDraft(jev.key) }
+  useEffect(() => {
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key !== 'Enter' || !(e.ctrlKey || e.metaKey)) return
+      e.preventDefault()
+      latestRun.current()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [])
 
   if (!jev) return null
   // The handlers below are hoisted past the guard, so they need the narrowed value by name.
@@ -79,11 +126,27 @@ export function JevPlaygroundScreen() {
                 {problem.message}
               </p>
             ))}
+            <div className="flex flex-wrap items-center gap-3">
+              <Button
+                type="button"
+                aria-keyshortcuts="Meta+Enter Control+Enter"
+                disabled={running || problems.length > 0 || jev.state !== 'running'}
+                onClick={() => latestRun.current()}
+              >
+                {running ? 'Running…' : 'Run'}
+              </Button>
+              <span className="text-[12px] text-muted">⌘/Ctrl+Enter</span>
+            </div>
           </section>
 
           <section aria-label="Response" className="flex min-w-0 flex-col gap-3">
-            <AnswerList answers={null} stale={false} />
-            <ResponsePanel run={null} origin={window.location.origin} />
+            {error && (
+              <p role="alert" className="text-[13px] text-err">
+                {error}
+              </p>
+            )}
+            <AnswerList answers={run?.response.answers ?? null} stale={running && run !== null} />
+            <ResponsePanel run={run} origin={window.location.origin} />
           </section>
         </div>
       </div>
@@ -103,6 +166,11 @@ function loadedJev(status: Status | undefined, models: ModelEntry[] | undefined)
 
 function activeEngine(status: Status | undefined): { name: string; kind: string } {
   return { name: status?.engine?.name ?? '', kind: status?.engine?.kind ?? '' }
+}
+
+function failureMessage(e: unknown): string {
+  if (e instanceof ApiError) return e.message
+  return e instanceof Error ? e.message : 'The request failed.'
 }
 
 function firstDraft(): SystemOneDraft {
