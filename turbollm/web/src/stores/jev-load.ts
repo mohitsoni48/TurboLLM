@@ -27,9 +27,9 @@ interface JevLoadState {
   confirm: { target: LoadTarget; work: ActiveWork | null; opts: LoadOptions } | null
   /** The key of a Jev load THIS browser fired — the one thing that entitles it to a toast. */
   pendingJevKey: string | null
-  /** The model being loaded right now, for every surface at once (C-7, C-8). Each
-   *  `useModelActions()` builds its own mutation observer, so a page that reads its own
-   *  observer is blind to a load the confirmation dialog fired. */
+  /** The model being loaded right now, for every surface at once. Each `useModelActions()`
+   *  builds its own mutation observer, so a page that reads its own observer is blind to a
+   *  load another surface fired. */
   pendingLoadKey: string | null
   /** Why the last load failed, and which model it was — kept against the key so a dialog
    *  cannot show another model's failure. */
@@ -38,7 +38,7 @@ interface JevLoadState {
   setPendingJevKey(k: string | null): void
   loadStarted(key: string): void
   loadFailed(key: string, message: string): void
-  loadSettled(): void
+  loadSettled(key: string): void
 }
 
 export const useJevLoadStore = create<JevLoadState>((set) => ({
@@ -48,7 +48,17 @@ export const useJevLoadStore = create<JevLoadState>((set) => ({
   loadError: null,
   setConfirm: (confirm) => set({ confirm }),
   setPendingJevKey: (pendingJevKey) => set({ pendingJevKey }),
-  loadStarted: (key) => set({ pendingLoadKey: key, loadError: null }),
-  loadFailed: (key, message) => set({ loadError: { key, message } }),
-  loadSettled: () => set({ pendingLoadKey: null }),
+  // The daemon loads one model at a time (ADR-285), so the load that got there first is the
+  // one every surface should be reading: a second one is refused and settles at once, and
+  // neither claiming the key nor releasing it is that refusal's to do.
+  loadStarted: (key) => set((s) => (
+    s.pendingLoadKey === null || s.pendingLoadKey === key ? { pendingLoadKey: key, loadError: null } : {}
+  )),
+  // A failed load also gives back the "is ready" claim it made, so a later swap of the same
+  // model by somebody else is not announced as this browser's (ADR-434 (i)(4)).
+  loadFailed: (key, message) => set((s) => ({
+    loadError: { key, message },
+    pendingJevKey: s.pendingJevKey === key ? null : s.pendingJevKey,
+  })),
+  loadSettled: (key) => set((s) => (s.pendingLoadKey === key ? { pendingLoadKey: null } : {})),
 }))

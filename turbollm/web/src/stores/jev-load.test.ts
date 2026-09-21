@@ -17,7 +17,7 @@ const TARGET = {
 const BUSY: ActiveWork = { items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], engineGenerating: false }
 
 beforeEach(() => {
-  useJevLoadStore.setState({ confirm: null, pendingJevKey: null })
+  useJevLoadStore.setState({ confirm: null, pendingJevKey: null, pendingLoadKey: null, loadError: null })
 })
 
 describe('useJevLoadStore', () => {
@@ -57,5 +57,46 @@ describe('useJevLoadStore', () => {
 
   it('is not persisted — a reload must not resurrect a dialog or a stale toast', () => {
     expect('persist' in useJevLoadStore).toBe(false)
+  })
+})
+
+describe('the load every surface reads', () => {
+  const store = () => useJevLoadStore.getState()
+
+  it('names the load that is running, and lets go when that same load settles', () => {
+    store().loadStarted('model-a')
+    expect(store().pendingLoadKey).toBe('model-a')
+
+    store().loadSettled('model-a')
+
+    expect(store().pendingLoadKey).toBeNull()
+  })
+
+  // The daemon loads one model at a time (ADR-285), so a second load while one is running is
+  // refused and settles at once. The load that is really running keeps the key.
+  it('keeps the running load when a second one is started and refused', () => {
+    store().loadStarted('model-a')
+    store().loadStarted('model-b')
+    store().loadFailed('model-b', 'Another model is loading.')
+    store().loadSettled('model-b')
+
+    expect(store().pendingLoadKey).toBe('model-a')
+  })
+
+  it('gives back the "is ready" claim of the load that failed', () => {
+    store().setPendingJevKey('jev-key')
+
+    store().loadFailed('jev-key', 'Out of VRAM')
+
+    expect(store().pendingJevKey).toBeNull()
+    expect(store().loadError).toEqual({ key: 'jev-key', message: 'Out of VRAM' })
+  })
+
+  it('keeps a claim that another model\'s failure has nothing to do with', () => {
+    store().setPendingJevKey('jev-key')
+
+    store().loadFailed('chat-key', 'Out of VRAM')
+
+    expect(store().pendingJevKey).toBe('jev-key')
   })
 })

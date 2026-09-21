@@ -88,7 +88,7 @@ describe('requestLoad — a chat model', () => {
     await act(async () => { result.current.requestLoad(CHAT, { overrides: { ctx: 4096 }, onError, onSuccess }) })
 
     expect(h.loadMutate).toHaveBeenCalledTimes(1)
-    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'chat-key', overrides: { ctx: 4096 } })
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'chat-key', overrides: { ctx: 4096 }, announceFailure: true })
     mutateCallbacks().onSuccess?.()
     expect(onSuccess).toHaveBeenCalledTimes(1)
   })
@@ -111,7 +111,7 @@ describe('requestLoad — a Jev model with nothing running', () => {
 
     await waitFor(() => expect(h.loadMutate).toHaveBeenCalledTimes(1))
     expect(h.getActivity).toHaveBeenCalledTimes(1)
-    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 } })
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 }, announceFailure: true })
     expect(useJevLoadStore.getState().confirm).toBeNull()
   })
 
@@ -172,11 +172,13 @@ describe('requestLoad — a Jev model while work is running', () => {
   })
 })
 
+// The failure itself is the mutation's to record and to report (`queries.test.tsx`), because
+// the surface that fired the load has usually closed by then. What the loader owes a caller is
+// that its own handlers still reach the load.
 describe('a Jev load that fails', () => {
-  it('clears the pending key before the caller hears about it, so no toast is left armed', async () => {
+  it('hands the failure on to a caller that asked to hear about it', async () => {
     h.getActivity.mockResolvedValue(IDLE)
-    let pendingWhenCallerRan: string | null = 'not called'
-    const onError = vi.fn(() => { pendingWhenCallerRan = useJevLoadStore.getState().pendingJevKey })
+    const onError = vi.fn()
     const result = loader()
 
     await act(async () => { result.current.requestLoad(JEV, { onError }) })
@@ -185,8 +187,6 @@ describe('a Jev load that fails', () => {
     act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
 
     expect(onError).toHaveBeenCalledTimes(1)
-    expect(pendingWhenCallerRan).toBeNull()
-    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
   })
 
   it('still passes a success through to the caller', async () => {
@@ -202,49 +202,26 @@ describe('a Jev load that fails', () => {
   })
 })
 
-// QA E17, E31(c): a refused load is never a silent no-op. The handler is the loader's, not the
-// call site's, so a surface that passes nothing still says something.
+// QA E17, E31(c): a refused load is never a silent no-op. Every load started here is marked
+// for the mutation to report, whether or not the caller passed a handler of its own — the
+// report has to outlive the surface, so it cannot be a `mutate()` callback.
 describe('a load nobody asked to hear about', () => {
-  it('toasts the failure of a chat load', async () => {
+  it('marks a chat load as one the mutation reports', async () => {
     const result = loader()
+
     await act(async () => { result.current.requestLoad(CHAT) })
 
-    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
-
-    expect(h.toastError).toHaveBeenCalledWith('Could not load model: check the engine logs on the Engines screen.')
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'chat-key', overrides: undefined, announceFailure: true })
   })
 
-  it('relays the daemon\'s own words when it gave a reason', async () => {
-    const { ApiError } = await import('./api')
-    const result = loader()
-    await act(async () => { result.current.requestLoad(CHAT) })
-
-    act(() => { mutateCallbacks().onError?.(new ApiError('engine_start_failed', 'vLLM is not installed.', 409)) })
-
-    expect(h.toastError).toHaveBeenCalledWith('Could not load model: vLLM is not installed.')
-  })
-
-  it('toasts a Jev load failure too', async () => {
+  it('marks a Jev load the same way, handler of its own or not', async () => {
     h.getActivity.mockResolvedValue(IDLE)
     const result = loader()
-    await act(async () => { result.current.requestLoad(JEV) })
+
+    await act(async () => { result.current.requestLoad(JEV, { onError: vi.fn() }) })
+
     await waitFor(() => expect(h.loadMutate).toHaveBeenCalledTimes(1))
-
-    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
-
-    expect(h.toastError).toHaveBeenCalledTimes(1)
-    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
-  })
-
-  it('stays out of the way when the caller handles the failure itself', async () => {
-    const onError = vi.fn()
-    const result = loader()
-    await act(async () => { result.current.requestLoad(CHAT, { onError }) })
-
-    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
-
-    expect(onError).toHaveBeenCalledTimes(1)
-    expect(h.toastError).not.toHaveBeenCalled()
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: undefined, announceFailure: true })
   })
 })
 
@@ -257,18 +234,8 @@ describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
     act(() => { result.current.confirmLoad(JEV, {}) })
 
     expect(h.loadMutate).toHaveBeenCalledTimes(1)
-    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: undefined })
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: undefined, announceFailure: true })
     expect(useJevLoadStore.getState().pendingJevKey).toBe('jev-key')
-  })
-
-  it('gives the toast back and says so once when the load fails', () => {
-    const result = loader()
-    act(() => { result.current.confirmLoad(JEV, {}) })
-
-    act(() => { mutateCallbacks().onError?.(new Error('engine refused')) })
-
-    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
-    expect(h.toastError).toHaveBeenCalledTimes(1)
   })
 
   it('still calls the caller\'s onSuccess, so the surface that asked can close itself', () => {
@@ -286,7 +253,7 @@ describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
 
     act(() => { result.current.confirmLoad(JEV, { overrides: { ctx: 8192 } }) })
 
-    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 } })
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 }, announceFailure: true })
   })
 })
 

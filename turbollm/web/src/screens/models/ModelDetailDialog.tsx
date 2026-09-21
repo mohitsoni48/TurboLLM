@@ -937,22 +937,10 @@ export function ModelDetailDialog({
                 onClick={() => {
                   track('models', 'load_model_with_settings')
                   // Sequence: persist (when remembering) → then (re)load. Firing both
-                  // at once raced the profile write against the reload. The reload
-                  // surfaces failures via toast — otherwise a bad param silently stops
+                  // at once raced the profile write against the reload. The loader
+                  // reports a refusal itself — otherwise a bad param silently stops
                   // the engine and the model "never loads again" with no feedback.
-                  const fireLoad = () =>
-                    loader.requestLoad(
-                      detail,
-                      {
-                        overrides: draft,
-                        onError: (e) =>
-                          toast.error(
-                            e instanceof ApiError
-                              ? `Could not load model: ${e.message}`
-                              : 'Could not load model — check the engine logs on the Engines screen.',
-                          ),
-                      },
-                    )
+                  const fireLoad = () => loader.requestLoad(detail, { overrides: draft })
                   if (remember) {
                     actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
                   } else {

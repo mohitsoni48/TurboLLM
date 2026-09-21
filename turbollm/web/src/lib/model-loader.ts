@@ -8,7 +8,7 @@ import { useEffect } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 import { toast } from '../components/ui/sonner'
 import { useJevLoadStore, type LoadOptions, type LoadTarget } from '../stores/jev-load'
-import { ApiError, track } from './api'
+import { track } from './api'
 import { getActivity } from './jev-api'
 import { JEV_PATH } from './jev-mode'
 import { useModelActions, useStatus } from './queries'
@@ -27,27 +27,25 @@ export function useModelLoader(): {
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
   const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
   // The load itself, not this hook's own mutation observer — a surface must report the load
-  // that is really running, whichever surface started it (C-7, C-8).
+  // that is really running, whichever surface started it.
   const pendingLoadKey = useJevLoadStore((s) => s.pendingLoadKey)
   const loadError = useJevLoadStore((s) => s.loadError)
 
+  /** `announceFailure` is what makes this the loader's load: the mutation reports a refusal
+   *  once, wherever the user has gone by then. A caller's own `onError` is extra behaviour on
+   *  top of that, never the report itself. */
   function startLoad(target: LoadTarget, opts: LoadOptions): void {
-    actions.load.mutate({ key: target.key, overrides: opts.overrides }, {
-      onError: failureHandler(opts.onError),
-      onSuccess: opts.onSuccess,
-    })
+    actions.load.mutate(
+      { key: target.key, overrides: opts.overrides, announceFailure: true },
+      { onError: opts.onError, onSuccess: opts.onSuccess },
+    )
   }
 
-  /** Claims the toast for this browser first, and gives it back if the load fails. */
+  /** Claims the "is ready" toast for this browser; the mutation gives it back if the load
+   *  fails (ADR-434 (i)(4)). */
   function startJevLoad(target: LoadTarget, opts: LoadOptions): void {
     setPendingJevKey(target.key)
-    actions.load.mutate({ key: target.key, overrides: opts.overrides }, {
-      onError: (e) => {
-        setPendingJevKey(null)
-        failureHandler(opts.onError)(e)
-      },
-      onSuccess: opts.onSuccess,
-    })
+    startLoad(target, opts)
   }
 
   async function askBeforeJevLoad(target: LoadTarget, opts: LoadOptions): Promise<void> {
@@ -70,16 +68,6 @@ export function useModelLoader(): {
     pendingKey: pendingLoadKey ?? undefined,
     loadError,
   }
-}
-
-/** A refused load is never a silent no-op (QA E17, E31(c)): a caller that passes no handler
- *  of its own still gets told. */
-function failureHandler(onError: LoadOptions['onError']): (e: unknown) => void {
-  return onError ?? ((e) => toast.error(loadFailureMessage(e)))
-}
-
-function loadFailureMessage(e: unknown): string {
-  return `Could not load model: ${e instanceof ApiError ? e.message : 'check the engine logs on the Engines screen.'}`
 }
 
 /** Announces a Jev load THIS browser started, once the model is really running (ADR-434 (i)(3)).

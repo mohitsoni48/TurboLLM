@@ -206,7 +206,6 @@ describe('HfRepoDialog — a repo with several checkpoints', () => {
       jev: { architecture: 'Qwen3_5ForSequenceClassification', verified: true },
     })
     expect(typeof opts.onSuccess).toBe('function')
-    expect(typeof opts.onError).toBe('function')
   })
 
   it('gives the loader nothing to confirm for a plain safetensors checkpoint', async () => {

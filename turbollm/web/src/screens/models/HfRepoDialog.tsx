@@ -246,7 +246,6 @@ export function HfRepoContent({
           toast.success(`Loading ${selectedFile?.quant ?? 'model'}`)
           onClose()
         },
-        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
       },
     )
   }
@@ -260,7 +259,6 @@ export function HfRepoContent({
           toast.success(`Loading ${cp.name}`)
           onClose()
         },
-        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not load model.'),
       },
     )
   }

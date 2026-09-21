@@ -118,7 +118,6 @@ describe('ModelDetailDialog — loading through the shared loader', () => {
     const [target, opts] = requestLoad.mock.calls[0]
     expect(target).toEqual(expect.objectContaining({ key: 'jev-1', name: 'qwen3.5-4b-nli-v2', jev: jev() }))
     expect(opts.overrides).toEqual(profile())
-    expect(typeof opts.onError).toBe('function')
   })
 
   it('loads a plain model through the same loader, with nothing to confirm', async () => {
