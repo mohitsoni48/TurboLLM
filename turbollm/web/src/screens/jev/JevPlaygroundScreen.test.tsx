@@ -127,6 +127,55 @@ describe('JevPlaygroundScreen', () => {
     await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(2))
   })
 
+  // ADR-434 (c), QA E5: Results / JSON / API are three views of ONE run. A second run started
+  // over the first, or an older answer landing last, breaks that.
+  describe('one run at a time', () => {
+    /** A run that stays in flight until the test resolves it. */
+    function slowClassify() {
+      let answer: (() => void) | undefined
+      h.classify.mockImplementation(() => new Promise<ClassifyResponse>((resolve) => {
+        answer = () => resolve(CLASSIFY_REPLY)
+      }))
+      return () => answer?.()
+    }
+
+    it('ignores Ctrl+Enter while a run is still in flight', async () => {
+      const answer = slowClassify()
+      renderScreen()
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
+
+      fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true })
+      fireEvent.keyDown(window, { key: 'Enter', ctrlKey: true })
+
+      expect(h.classify).toHaveBeenCalledTimes(1)
+      answer()
+      await waitFor(() => expect(screen.getByText('0.957')).toBeTruthy())
+    })
+
+    it('will not let an example be picked mid-run', async () => {
+      slowClassify()
+      renderScreen()
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
+
+      expect(screen.getByRole('combobox')).toBeDisabled()
+    })
+
+    // The reviewer's own path (picking a Choose example mid-run) is unreachable now that the
+    // picker is disabled; the Mode toggle reaches the same mechanism and is not disabled.
+    it('drops an answer the user has already moved on from', async () => {
+      const answer = slowClassify()
+      renderScreen()
+      await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))
+
+      await userEvent.click(screen.getByRole('button', { name: 'Choose' }))
+      answer()
+
+      await waitFor(() => expect(screen.getByRole('combobox')).not.toBeDisabled())
+      expect(screen.queryByText('0.957')).toBeNull()
+      expect(screen.getByText('Run to see results.')).toBeTruthy()
+    })
+  })
+
   it('says what is missing instead of sending an empty check', async () => {
     renderScreen()
     await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(1))

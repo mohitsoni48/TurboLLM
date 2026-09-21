@@ -56,17 +56,28 @@ export function JevPlaygroundScreen() {
   const [switchOpen, setSwitchOpen] = useState(false)
   const [exampleId, setExampleId] = useState(JEV_EXAMPLES.check[0].id)
 
+  // One run at a time (QA E5). The ref rather than the `running` state is the guard: the
+  // shortcut and the auto-run effect can both enter before a state update has landed.
+  const inFlight = useRef(false)
+  // And only the run the panel is still asking about may answer it: ADR-434 (c) makes Results,
+  // JSON and API three views of ONE run, so an answer the user has moved on from is dropped.
+  const currentRun = useRef(0)
+
   async function runDraft(next: JevMode, check_: CheckDraft, choose_: ChooseDraft, key: string) {
     const missing = next === 'check' ? checkDraftError(check_) : chooseDraftError(choose_)
     setProblem(missing)
-    if (missing) return
+    if (missing || inFlight.current) return
+    const asked = ++currentRun.current
     track('workspace', RUN_ACTION[next])
+    inFlight.current = true
     setRunning(true)
     try {
-      setRun(next === 'check' ? await runCheck(key, check_) : await runChoose(key, choose_))
+      const answer = next === 'check' ? await runCheck(key, check_) : await runChoose(key, choose_)
+      if (asked === currentRun.current) setRun(answer)
     } catch (e) {
-      setProblem(failureMessage(e))
+      if (asked === currentRun.current) setProblem(failureMessage(e))
     } finally {
+      inFlight.current = false
       setRunning(false)
     }
   }
@@ -98,11 +109,17 @@ export function JevPlaygroundScreen() {
   // The handlers below are hoisted past the guard, so they need the narrowed value by name.
   const current = jev
 
+  /** What is on screen stops being the answer to what the panel now asks. */
+  function dropCurrentRun() {
+    currentRun.current += 1
+    setRun(null)
+  }
+
   function pickMode(next: JevMode) {
     track('workspace', MODE_ACTION[next])
     setMode(next)
     setProblem(null)
-    setRun(null)
+    dropCurrentRun()
   }
 
   function pickExample(id: string) {
@@ -113,7 +130,7 @@ export function JevPlaygroundScreen() {
       const draft = { premise: example.premise, hypotheses: [...example.hypotheses] }
       setMode('check')
       setCheck(draft)
-      setRun(null)
+      dropCurrentRun()
       void runDraft('check', draft, choose, current.key)
       return
     }
@@ -122,7 +139,7 @@ export function JevPlaygroundScreen() {
     const draft = { question: picked.question, options: [...picked.options] }
     setMode('choose')
     setChoose(draft)
-    setRun(null)
+    dropCurrentRun()
     void runDraft('choose', check, draft, current.key)
   }
 
@@ -164,6 +181,7 @@ export function JevPlaygroundScreen() {
             <select
               aria-label="Example"
               value={exampleId}
+              disabled={running}
               onChange={(e) => pickExample(e.target.value)}
               className="max-w-[210px] rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink"
             >
