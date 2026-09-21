@@ -239,3 +239,42 @@ function tokenCount(reported: unknown): number {
 export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
+
+export const JEV_LATEST = 'jev-latest'
+
+export const NO_JEV_MODEL_FOR_LATEST: JevHttpError = {
+  status: 404,
+  code: 'model_not_found',
+  type: 'invalid_request_error',
+  message: "No Jev model in your library for 'jev-latest'.",
+}
+
+export function isJevLatest(requested: string): boolean {
+  return requested.trim().toLowerCase() === JEV_LATEST
+}
+
+/** The alias `jev-latest` (ADR-439): the alive Jev model, else the verified Jev model with the largest
+ *  `sizeBytes` (a tie goes to library order), else the largest Jev model, else undefined. `verified` says the
+ *  architecture is known to launch, not that this checkpoint was tested, so size is a heuristic and not a
+ *  quality ranking. */
+export function resolveJevLatest(aliveKeys: readonly string[], models: readonly ModelEntry[]): ModelEntry | undefined {
+  const jevModels = models.filter(isJevModel)
+  const verifiedModels = jevModels.filter((model) => model.jev.verified)
+  return aliveJevModel(aliveKeys, jevModels) ?? largestModel(verifiedModels.length > 0 ? verifiedModels : jevModels)
+}
+
+function aliveJevModel(aliveKeys: readonly string[], jevModels: readonly ModelEntry[]): ModelEntry | undefined {
+  for (const key of aliveKeys) {
+    const alive = jevModels.find((model) => model.key === key)
+    if (alive) return alive
+  }
+  return undefined
+}
+
+/** The first maximum, so a size tie goes to the earlier model in library order. */
+function largestModel(models: readonly ModelEntry[]): ModelEntry | undefined {
+  return models.reduce<ModelEntry | undefined>(
+    (largest, model) => (largest === undefined || model.sizeBytes > largest.sizeBytes ? model : largest),
+    undefined,
+  )
+}
