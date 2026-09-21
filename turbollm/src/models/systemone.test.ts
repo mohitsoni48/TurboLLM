@@ -4,6 +4,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import {
+  answersFrom,
   choiceConfidence,
   criterionTextOf,
   instructionTextOf,
@@ -12,6 +13,7 @@ import {
   scoreConfidence,
   serialiseState,
   weightedLevel,
+  type Answer,
   type Criterion,
   type Instructions,
   type Question,
@@ -61,6 +63,26 @@ function textsOf(plan: SystemOnePlan): string[] {
 
 function assertClose(actual: number, expected: number, tolerance = 1e-9): void {
   assert.ok(Math.abs(actual - expected) <= tolerance, `expected ${actual} to be within ${tolerance} of ${expected}`)
+}
+
+type ChoiceAnswer = Extract<Answer, { type: 'choice' }>
+type ScoreAnswer = Extract<Answer, { type: 'score' }>
+
+function answersOf(questions: Record<string, Question>, entailment: readonly number[]): Record<string, Answer> {
+  const input = { state: STATE_URGENT, model: 'm', questions }
+  return answersFrom(input, planSystemOne(input), entailment)
+}
+
+function choiceAnswerOf(answers: Record<string, Answer>, questionId: string): ChoiceAnswer {
+  const answer = answers[questionId]
+  assert.ok(answer.type === 'choice', `${questionId} is not a choice answer`)
+  return answer
+}
+
+function scoreAnswerOf(answers: Record<string, Answer>, questionId: string): ScoreAnswer {
+  const answer = answers[questionId]
+  assert.ok(answer.type === 'score', `${questionId} is not a score answer`)
+  return answer
 }
 
 function choiceConfidenceOf(raw: readonly number[]): number {
@@ -403,4 +425,177 @@ test('scoreConfidence takes fit from the raw scores, not from the normalised vec
 
   assertClose(weightedLevel(probabilities), 2.013, 1e-12)
   assertClose(scoreConfidence(halfScale, probabilities), 0.3479733884691852)
+})
+
+test('answersFrom maps the nine entailment scores of the three-question fixture to three answers', () => {
+  const answers = answersOf(
+    { urgent: Q_NOUL, team: Q_CHOICE, mood: Q_MOOD },
+    [0.945, 0.321, 0.515, 0.185, 0.005, 0.086, 0.089, 0.551, 0.274],
+  )
+
+  assert.deepEqual(Object.keys(answers), ['urgent', 'team', 'mood'])
+  assert.deepEqual(answers.urgent, { type: 'noul', noul: 0.945 })
+
+  const team = choiceAnswerOf(answers, 'team')
+  assert.equal(team.choice, 'technical')
+  assert.deepEqual(Object.keys(team.probabilities), ['billing', 'technical', 'sales', 'documentation'])
+  assertClose(team.probabilities.billing, 0.3128654970760234)
+  assertClose(team.probabilities.technical, 0.5019493177387915)
+  assertClose(team.probabilities.sales, 0.18031189083820662)
+  assertClose(team.probabilities.documentation, 0.004873294346978557)
+  assertClose(Object.values(team.probabilities).reduce((sum, p) => sum + p, 0), 1, 1e-10)
+  assertClose(team.confidence, 0.31205475103149055)
+
+  const mood = scoreAnswerOf(answers, 'mood')
+  assertClose(mood.score, 2.013)
+  assert.deepEqual(mood.legend, {
+    '0': 'Calm, just asking or stating facts',
+    '1': 'Mildly annoyed but polite',
+    '2': 'Clearly frustrated',
+    '3': 'Very angry, strong language',
+  })
+  assert.deepEqual(Object.keys(mood.probabilities), ['0', '1', '2', '3'])
+  assertClose(mood.probabilities['0'], 0.086)
+  assertClose(mood.probabilities['1'], 0.089)
+  assertClose(mood.probabilities['2'], 0.551)
+  assertClose(mood.probabilities['3'], 0.274)
+  assertClose(mood.confidence, 0.49210868531804325)
+})
+
+test('answersFrom keeps a noul answer as the raw entailment, even when criteria.true is given', () => {
+  const withCriteria: Question = {
+    type: 'noul',
+    instructions: 'Does the message convey urgency?',
+    criteria: { true: 'The customer needs help within hours.' },
+  }
+
+  assert.deepEqual(answersOf({ urgent: Q_NOUL }, [0.945]).urgent, { type: 'noul', noul: 0.945 })
+  assert.deepEqual(answersOf({ urgent: withCriteria }, [0.5]).urgent, { type: 'noul', noul: 0.5 })
+})
+
+test('answersFrom picks the earliest option when a choice is tied', () => {
+  const question: Question = { type: 'choice', instructions: 'Pick.', criteria: { a: 'x', b: 'y', c: 'z' } }
+
+  assert.equal(choiceAnswerOf(answersOf({ q: question }, [0.4, 0.4, 0.1]), 'q').choice, 'a')
+})
+
+test('answersFrom gives uniform probabilities, zero confidence and no NaN for all-zero raws', () => {
+  for (const size of [2, 4, 7, 10]) {
+    const names = Array.from({ length: size }, (_, position) => `o${position}`)
+    const choice: Question = {
+      type: 'choice',
+      instructions: 'Pick.',
+      criteria: Object.fromEntries(names.map((name) => [name, name])),
+    }
+    const score: Question = { type: 'score', instructions: 'Rate.', criteria: names }
+    const zeros = names.map(() => 0)
+
+    const chosen = choiceAnswerOf(answersOf({ q: choice }, zeros), 'q')
+    assert.equal(chosen.choice, 'o0')
+    assert.equal(chosen.confidence, 0)
+    assert.deepEqual(Object.values(chosen.probabilities), names.map(() => 1 / size))
+
+    const scored = scoreAnswerOf(answersOf({ q: score }, zeros), 'q')
+    assert.equal(scored.confidence, 0)
+    assert.deepEqual(Object.values(scored.probabilities), names.map(() => 1 / size))
+    assert.ok(Math.abs(scored.score - (size - 1) / 2) < 1e-12, `score ${scored.score} for ${size} levels`)
+  }
+})
+
+test('answersFrom puts an object score level into the legend as pretty JSON under string keys', () => {
+  const question: Question = { type: 'score', instructions: 'Rate.', criteria: [{ k: 1 }, 'plain'] }
+
+  const mood = scoreAnswerOf(answersOf({ q: question }, [0.3, 0.7]), 'q')
+
+  assert.deepEqual(mood.legend, { '0': '{\n  "k": 1\n}', '1': 'plain' })
+  assert.deepEqual(Object.keys(mood.legend), ['0', '1'])
+})
+
+test('answersFrom throws a RangeError when the entailment is one score short or one score long', () => {
+  const input = { state: STATE_URGENT, model: 'm', questions: { team: Q_CHOICE } }
+  const plan = planSystemOne(input)
+
+  assert.throws(() => answersFrom(input, plan, [0.1, 0.2, 0.3]), RangeError)
+  assert.throws(() => answersFrom(input, plan, [0.1, 0.2, 0.3, 0.4, 0.5]), RangeError)
+})
+
+test('answersFrom keeps a __proto__ question id and option name as own keys', () => {
+  const questions = JSON.parse(
+    '{"__proto__":{"type":"noul","instructions":"i"},' +
+      '"q":{"type":"choice","instructions":"i","criteria":{"__proto__":"d","b":null}}}',
+  ) as Record<string, Question>
+
+  const answers = answersOf(questions, [0.3, 0.6, 0.2])
+
+  assert.ok(Object.hasOwn(answers, '__proto__'))
+  assert.equal(Object.getPrototypeOf(answers), Object.prototype)
+  assert.ok(Object.hasOwn(choiceAnswerOf(answers, 'q').probabilities, '__proto__'))
+})
+
+test('answersFrom gives each question its own slice when two questions of one type surround another', () => {
+  const choice: Question = { type: 'choice', instructions: 'Pick.', criteria: { a: 'x', b: 'y' } }
+
+  const answers = answersOf({ q1: Q_NOUL, q2: choice, q3: Q_NOUL }, [0.1, 0.6, 0.2, 0.9])
+
+  assert.deepEqual(answers.q1, { type: 'noul', noul: 0.1 })
+  assert.deepEqual(answers.q3, { type: 'noul', noul: 0.9 })
+  const picked = choiceAnswerOf(answers, 'q2')
+  assert.equal(picked.choice, 'a')
+  assertClose(picked.probabilities.a, 0.75)
+  assertClose(picked.probabilities.b, 0.25)
+})
+
+test('answersFrom gives the same answers for the same inputs', () => {
+  const questions = { urgent: Q_NOUL, team: Q_CHOICE, mood: Q_MOOD }
+  const entailment = [0.945, 0.321, 0.515, 0.185, 0.005, 0.086, 0.089, 0.551, 0.274]
+
+  assert.deepEqual(answersOf(questions, entailment), answersOf(questions, entailment))
+})
+
+test('answersFrom takes the confidence fit from the raw scores end to end', () => {
+  const mood = scoreAnswerOf(answersOf({ mood: Q_MOOD }, [0.043, 0.0445, 0.2755, 0.137]), 'mood')
+
+  assertClose(mood.probabilities['0'], 0.086)
+  assertClose(mood.probabilities['1'], 0.089)
+  assertClose(mood.probabilities['2'], 0.551)
+  assertClose(mood.probabilities['3'], 0.274)
+  assertClose(mood.score, 2.013)
+  assertClose(mood.confidence, 0.3479733884691852)
+})
+
+test('answersFrom orders integer-like question ids the way JSON.parse iterates them (pinned)', () => {
+  const noul = '{"type":"noul","instructions":"i"}'
+  const questions = JSON.parse(`{"b":${noul},"2":${noul},"10":${noul}}`) as Record<string, Question>
+
+  const answers = answersOf(questions, [0.2, 0.4, 0.6])
+
+  assert.deepEqual(Object.keys(answers), ['2', '10', 'b'])
+  assert.deepEqual(answers['2'], { type: 'noul', noul: 0.2 })
+  assert.deepEqual(answers['10'], { type: 'noul', noul: 0.4 })
+  assert.deepEqual(answers.b, { type: 'noul', noul: 0.6 })
+})
+
+test('answersFrom orders integer-like option names the way JSON.parse iterates them and throws for a null level', () => {
+  const choice: Question = {
+    type: 'choice',
+    instructions: 'Pick.',
+    criteria: JSON.parse('{"3":"c","1":"a","2":"b"}') as Record<string, string>,
+  }
+  const nullLevel: Question = { type: 'score', instructions: 'Rate.', criteria: ['a', null] }
+  const handBuiltPlan: SystemOnePlan = {
+    premise: STATE_URGENT,
+    hypotheses: [
+      { questionId: 'q', index: 0, text: 'a' },
+      { questionId: 'q', index: 1, text: 'b' },
+    ],
+  }
+
+  const picked = choiceAnswerOf(answersOf({ q: choice }, [0.4, 0.4, 0.1]), 'q')
+
+  assert.deepEqual(Object.keys(picked.probabilities), ['1', '2', '3'])
+  assert.equal(picked.choice, '1')
+  assert.throws(
+    () => answersFrom({ state: STATE_URGENT, model: 'm', questions: { q: nullLevel } }, handBuiltPlan, [0.5, 0.5]),
+    TypeError,
+  )
 })

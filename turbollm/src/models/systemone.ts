@@ -176,3 +176,81 @@ function concentrationOf(probabilities: readonly number[]): number {
   const variance = probabilities.reduce((sum, probability, level) => sum + probability * (level - mean) ** 2, 0)
   return Math.max(0, 1 - (2 * Math.sqrt(variance)) / (probabilities.length - 1))
 }
+
+export type Answer =
+  | { type: 'noul'; noul: number }
+  | { type: 'choice'; choice: string; probabilities: Record<string, number>; confidence: number }
+  | {
+      type: 'score'
+      score: number
+      legend: Record<string, string>
+      probabilities: Record<string, number>
+      confidence: number
+    }
+
+/** `entailment[i]` answers `plan.hypotheses[i]`. A length mismatch is a bug in the caller, not a refusal. */
+export function answersFrom(
+  input: SystemOneInput,
+  plan: SystemOnePlan,
+  entailment: readonly number[],
+): Record<string, Answer> {
+  if (entailment.length !== plan.hypotheses.length) {
+    throw new RangeError(`Expected ${plan.hypotheses.length} entailment scores but received ${entailment.length}.`)
+  }
+  const rawPerQuestion = rawScoresPerQuestion(plan, entailment)
+  return Object.fromEntries(
+    Object.entries(input.questions).map(([questionId, question], position): [string, Answer] => [
+      questionId,
+      answerOf(question, rawPerQuestion[position]),
+    ]),
+  )
+}
+
+/** The plan lists each question's hypotheses together, starting at index 0, so a new slice starts there. */
+function rawScoresPerQuestion(plan: SystemOnePlan, entailment: readonly number[]): number[][] {
+  const perQuestion: number[][] = []
+  plan.hypotheses.forEach((hypothesis, position) => {
+    if (hypothesis.index === 0) perQuestion.push([])
+    perQuestion[perQuestion.length - 1].push(entailment[position])
+  })
+  return perQuestion
+}
+
+function answerOf(question: Question, raw: readonly number[]): Answer {
+  switch (question.type) {
+    case 'noul':
+      return { type: 'noul', noul: raw[0] }
+    case 'choice':
+      return choiceAnswer(question, raw)
+    case 'score':
+      return scoreAnswer(question, raw)
+  }
+}
+
+function choiceAnswer(question: ChoiceQuestion, raw: readonly number[]): Answer {
+  const options = Object.keys(question.criteria)
+  const probabilities = normalise(raw)
+  return {
+    type: 'choice',
+    choice: options[raw.indexOf(Math.max(...raw))],
+    probabilities: Object.fromEntries(
+      options.map((option, position): [string, number] => [option, probabilities[position]]),
+    ),
+    confidence: choiceConfidence(raw, probabilities),
+  }
+}
+
+function scoreAnswer(question: ScoreQuestion, raw: readonly number[]): Answer {
+  const probabilities = normalise(raw)
+  return {
+    type: 'score',
+    score: weightedLevel(probabilities),
+    legend: Object.fromEntries(
+      question.criteria.map((level, position): [string, string] => [String(position), levelTextOf(level)]),
+    ),
+    probabilities: Object.fromEntries(
+      probabilities.map((probability, position): [string, number] => [String(position), probability]),
+    ),
+    confidence: scoreConfidence(raw, probabilities),
+  }
+}
