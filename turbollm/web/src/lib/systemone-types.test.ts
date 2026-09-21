@@ -125,9 +125,9 @@ describe('the request limits', () => {
   })
 })
 
+// The typed fixtures are the assertion: a drifted type fails npm run typecheck, not this run.
 describe('the request and response types', () => {
   it('describe a request with one question of each type', () => {
-    expect(REQUEST).toEqual({ ...REQUEST })
     expect(Object.values(REQUEST.questions).map((question) => question.type)).toEqual(['noul', 'choice', 'score'])
   })
 
@@ -138,7 +138,6 @@ describe('the request and response types', () => {
 
     expect(team.choice).toBe('technical')
     expect(mood.score).toBe(2.013)
-    expect(RESPONSE).toEqual({ ...RESPONSE })
   })
 })
 
