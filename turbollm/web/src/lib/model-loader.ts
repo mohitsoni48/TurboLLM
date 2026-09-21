@@ -50,8 +50,16 @@ export function useModelLoader(): {
 
   async function askBeforeJevLoad(target: LoadTarget, opts: LoadOptions): Promise<void> {
     const work = await readActiveWork()
-    if (work && !isBusy(work)) startJevLoad(target, opts)
-    else setConfirm({ target, work, opts })
+    if (work && !isBusy(work)) {
+      startJevLoad(target, opts)
+      return
+    }
+    // A question already on screen is the one the user is answering. Rewriting it would swap
+    // the model under a click already on its way to "Load anyway", and drop the callbacks the
+    // first caller is waiting on. The request is ignored: nothing was claimed, so nothing is
+    // left behind, and the row can be clicked again once the dialog is gone.
+    if (useJevLoadStore.getState().confirm) return
+    setConfirm({ target, work, opts })
   }
 
   function requestLoad(target: LoadTarget, opts: LoadOptions = {}): void {

@@ -52,6 +52,7 @@ const JEV = {
   name: 'qwen3.5 4b nli v2',
   jev: { labels: [], nliTemplate: null, architecture: 'Qwen3_5ForSequenceClassification', verified: true },
 }
+const OTHER_JEV = { ...JEV, key: 'other-jev-key', name: 'deberta v3 nli' }
 const CHAT = { key: 'chat-key', name: 'qwen3.8 30b' }
 
 const IDLE: ActiveWork = { items: [], engineGenerating: false }
@@ -158,6 +159,35 @@ describe('requestLoad — a Jev model while work is running', () => {
 
     await waitFor(() => expect(useJevLoadStore.getState().confirm?.work).toEqual(API_GENERATING))
     expect(h.loadMutate).not.toHaveBeenCalled()
+  })
+
+  // The Load buttons only go disabled once a mutation starts, and the activity probe is a
+  // round trip before that: two clicks inside that window must not swap the question under a
+  // user already reaching for "Load anyway", taking the first caller's callbacks with it.
+  it('leaves a question already on screen alone', async () => {
+    h.getActivity.mockResolvedValue(CHATTING)
+    const onSuccess = vi.fn()
+    const result = loader()
+    await act(async () => { result.current.requestLoad(JEV, { onSuccess }) })
+    await waitFor(() => expect(useJevLoadStore.getState().confirm).not.toBeNull())
+
+    await act(async () => { result.current.requestLoad(OTHER_JEV) })
+
+    expect(useJevLoadStore.getState().confirm).toEqual({ target: JEV, work: CHATTING, opts: { onSuccess } })
+    expect(h.loadMutate).not.toHaveBeenCalled()
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+
+  it('asks the next question once the first one has been answered', async () => {
+    h.getActivity.mockResolvedValue(CHATTING)
+    const result = loader()
+    await act(async () => { result.current.requestLoad(JEV) })
+    await waitFor(() => expect(useJevLoadStore.getState().confirm).not.toBeNull())
+
+    act(() => { useJevLoadStore.getState().setConfirm(null) })
+    await act(async () => { result.current.requestLoad(OTHER_JEV) })
+
+    await waitFor(() => expect(useJevLoadStore.getState().confirm?.target).toEqual(OTHER_JEV))
   })
 
   it('fails OPEN when the probe cannot be read: it still asks, with no work to name', async () => {
