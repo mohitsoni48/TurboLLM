@@ -7,7 +7,7 @@
 // is not "nothing is running".
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { useJevLoadedToast, useModelLoader } from './model-loader'
+import { useConfirmedLoad, useJevLoadedToast, useModelLoader } from './model-loader'
 import { useJevLoadStore } from '../stores/jev-load'
 import type { ActiveWork, JevStatus, Status } from './types'
 
@@ -257,11 +257,15 @@ describe('a load nobody asked to hear about', () => {
 
 // ADR-434 (i)(3): answering the confirmation must not change what the load does — same pending
 // key, same failure surface, same caller callbacks as the load that was never interrupted.
-describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
-  it('claims the toast for this browser, exactly as an unasked Jev load does', () => {
-    const result = loader()
+describe('useConfirmedLoad — the (i)(3) confirmation, accepted', () => {
+  function confirmedLoad() {
+    return renderHook(() => useConfirmedLoad()).result
+  }
 
-    act(() => { result.current.confirmLoad(JEV, {}) })
+  it('claims the toast for this browser, exactly as an unasked Jev load does', () => {
+    const result = confirmedLoad()
+
+    act(() => { result.current(JEV, {}) })
 
     expect(h.loadMutate).toHaveBeenCalledTimes(1)
     expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: undefined, announceFailure: true })
@@ -270,20 +274,43 @@ describe('confirmLoad — the (i)(3) confirmation, accepted', () => {
 
   it('still calls the caller\'s onSuccess, so the surface that asked can close itself', () => {
     const onSuccess = vi.fn()
-    const result = loader()
+    const result = confirmedLoad()
 
-    act(() => { result.current.confirmLoad(JEV, { onSuccess }) })
+    act(() => { result.current(JEV, { onSuccess }) })
     mutateCallbacks().onSuccess?.()
 
     expect(onSuccess).toHaveBeenCalledTimes(1)
   })
 
   it('carries the overrides the caller asked for', () => {
-    const result = loader()
+    const result = confirmedLoad()
 
-    act(() => { result.current.confirmLoad(JEV, { overrides: { ctx: 8192 } }) })
+    act(() => { result.current(JEV, { overrides: { ctx: 8192 } }) })
 
     expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'jev-key', overrides: { ctx: 8192 }, announceFailure: true })
+  })
+
+  // The confirmation host is mounted for the whole life of the app and renders nothing until
+  // it has a question to ask. Reading load state it never shows would re-render it on every
+  // transition of every load.
+  it('costs nothing to a surface that reads no load state', () => {
+    let renders = 0
+    renderHook(() => { renders += 1; return useConfirmedLoad() })
+    const beforeTheLoad = renders
+
+    act(() => { useJevLoadStore.getState().loadStarted('someone-elses-load') })
+
+    expect(renders).toBe(beforeTheLoad)
+  })
+
+  it('still re-renders the surfaces that do read it', () => {
+    let renders = 0
+    renderHook(() => { renders += 1; return useModelLoader() })
+    const beforeTheLoad = renders
+
+    act(() => { useJevLoadStore.getState().loadStarted('someone-elses-load') })
+
+    expect(renders).toBeGreaterThan(beforeTheLoad)
   })
 })
 

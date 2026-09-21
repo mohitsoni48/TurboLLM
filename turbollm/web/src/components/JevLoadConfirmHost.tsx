@@ -15,7 +15,7 @@ import {
   AlertDialogTitle,
 } from './ui/alert-dialog'
 import { track } from '../lib/api'
-import { useModelLoader } from '../lib/model-loader'
+import { useConfirmedLoad } from '../lib/model-loader'
 import { useJevLoadStore } from '../stores/jev-load'
 import type { ActiveWork, ActiveWorkItem } from '../lib/types'
 
@@ -28,13 +28,14 @@ const LABEL_MAX = 60
 export function JevLoadConfirmHost() {
   const confirm = useJevLoadStore((s) => s.confirm)
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
-  const { confirmLoad } = useModelLoader()
+  const confirmLoad = useConfirmedLoad()
 
   if (!confirm) return null
   const { target, work, opts } = confirm
 
-  // The load runs through the loader, not a mutation of this dialog's own: a second observer
-  // would keep its own pending state and forget the caller's callbacks (ADR-436 (6)).
+  // Answering the question does not start a load of this dialog's own: it is the interrupted
+  // load, resumed. The callbacks the surface that asked for it is waiting on travel in
+  // `confirm.opts`, and it claims the same pending key (ADR-436 (6)).
   function loadAnyway() {
     track('models', 'confirm_jev_load')
     confirmLoad(target, opts)
@@ -88,11 +89,11 @@ function interruptedWork(work: ActiveWork | null): string[] {
 function describeItem(item: ActiveWorkItem): string {
   if (item.kind === 'chat') return `a reply in "${item.label}"`
   if (item.kind === 'code') return `a Code turn in "${item.label}"`
-  return `the routine "${oneLine(item.label)}"`
+  return `the routine "${truncated(item.label)}"`
 }
 
 /** A routine has no name of its own, so it is labelled with its prompt — which can be a whole
  *  paragraph. This dialog lists what stops; it is not the place to read the prompt. */
-function oneLine(label: string): string {
+function truncated(label: string): string {
   return label.length > LABEL_MAX ? `${label.slice(0, LABEL_MAX).trimEnd()}…` : label
 }

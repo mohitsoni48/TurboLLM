@@ -15,7 +15,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
-import { useModelLoader } from './model-loader'
+import { useConfirmedLoad, useModelLoader } from './model-loader'
 import { useModelActions } from './queries'
 import { useJevLoadStore } from '../stores/jev-load'
 
@@ -57,7 +57,8 @@ function deferredLoad() {
 
 /** Every way a surface can start a load, from a component the test can close. */
 function Firer() {
-  const { requestLoad, confirmLoad } = useModelLoader()
+  const { requestLoad } = useModelLoader()
+  const confirmLoad = useConfirmedLoad()
   const actions = useModelActions()
   return (
     <>

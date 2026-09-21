@@ -18,35 +18,16 @@ export type { LoadOptions, LoadTarget }
 
 export function useModelLoader(): {
   requestLoad(target: LoadTarget, opts?: LoadOptions): void
-  confirmLoad(target: LoadTarget, opts: LoadOptions): void
   isPending: boolean
   pendingKey: string | undefined
   loadError: { key: string; message: string } | null
 } {
-  const actions = useModelActions()
+  const { startLoad, startJevLoad } = useLoadStarters()
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
-  const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
   // The load itself, not this hook's own mutation observer — a surface must report the load
   // that is really running, whichever surface started it.
   const pendingLoadKey = useJevLoadStore((s) => s.pendingLoadKey)
   const loadError = useJevLoadStore((s) => s.loadError)
-
-  /** `announceFailure` is what makes this the loader's load: the mutation reports a refusal
-   *  once, wherever the user has gone by then. A caller's own `onError` is extra behaviour on
-   *  top of that, never the report itself. */
-  function startLoad(target: LoadTarget, opts: LoadOptions): void {
-    actions.load.mutate(
-      { key: target.key, overrides: opts.overrides, announceFailure: true },
-      { onError: opts.onError, onSuccess: opts.onSuccess },
-    )
-  }
-
-  /** Claims the "is ready" toast for this browser; the mutation gives it back if the load
-   *  fails (ADR-434 (i)(4)). */
-  function startJevLoad(target: LoadTarget, opts: LoadOptions): void {
-    setPendingJevKey(target.key)
-    startLoad(target, opts)
-  }
 
   async function askBeforeJevLoad(target: LoadTarget, opts: LoadOptions): Promise<void> {
     const work = await readActiveWork()
@@ -69,13 +50,46 @@ export function useModelLoader(): {
 
   return {
     requestLoad,
-    // "Load anyway" answers the (i)(3) question with the very load it interrupted: same
-    // pending key, same failure surface, same caller callbacks.
-    confirmLoad: startJevLoad,
     isPending: pendingLoadKey !== null,
     pendingKey: pendingLoadKey ?? undefined,
     loadError,
   }
+}
+
+/** "Load anyway" answers the (i)(3) question with the very load it interrupted: same pending
+ *  key, same failure report, same caller callbacks. Narrower than `useModelLoader` on purpose
+ *  — the confirmation host is mounted for the life of the app and shows no load state, so it
+ *  must not re-render on every transition of every load. */
+export function useConfirmedLoad(): (target: LoadTarget, opts: LoadOptions) => void {
+  return useLoadStarters().startJevLoad
+}
+
+/** The two ways to start a load the mutation itself reports. */
+function useLoadStarters(): {
+  startLoad(target: LoadTarget, opts: LoadOptions): void
+  startJevLoad(target: LoadTarget, opts: LoadOptions): void
+} {
+  const actions = useModelActions()
+  const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
+
+  /** `announceFailure` is what makes this the loader's load: the mutation reports a refusal
+   *  once, wherever the user has gone by then. A caller's own `onError` is extra behaviour on
+   *  top of that, never the report itself. */
+  function startLoad(target: LoadTarget, opts: LoadOptions): void {
+    actions.load.mutate(
+      { key: target.key, overrides: opts.overrides, announceFailure: true },
+      { onError: opts.onError, onSuccess: opts.onSuccess },
+    )
+  }
+
+  /** Claims the "is ready" toast for this browser; the mutation gives it back if the load
+   *  fails (ADR-434 (i)(4)). */
+  function startJevLoad(target: LoadTarget, opts: LoadOptions): void {
+    setPendingJevKey(target.key)
+    startLoad(target, opts)
+  }
+
+  return { startLoad, startJevLoad }
 }
 
 /** Announces a Jev load THIS browser started, once the model is really running (ADR-434 (i)(3)).

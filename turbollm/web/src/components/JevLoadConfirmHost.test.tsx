@@ -13,9 +13,10 @@ const h = vi.hoisted(() => ({
   track: vi.fn(),
 }))
 
-// The dialog runs no mutation of its own: "Load anyway" is the loader's load (ADR-436 (6)).
+// The dialog runs no mutation of its own: "Load anyway" is the interrupted load, resumed
+// (ADR-436 (6)).
 vi.mock('../lib/model-loader', () => ({
-  useModelLoader: () => ({ requestLoad: vi.fn(), confirmLoad: h.confirmLoad, isPending: false, pendingKey: undefined }),
+  useConfirmedLoad: () => h.confirmLoad,
 }))
 vi.mock('../lib/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/api')>()
