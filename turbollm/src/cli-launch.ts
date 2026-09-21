@@ -258,6 +258,9 @@ interface DaemonStatus {
   engine?: { state?: string; parallelSlots?: number }
   model?: { name?: string; key?: string; ctx?: number } | null
   lastLoaded?: { modelKey?: string } | null
+  /** The daemon's own report of the alive Jev model (ADR-434 (i)(1)): null when none is, and
+   *  absent from a daemon that predates the field — "unknown", which is not the same as "none". */
+  jev?: { key: string; name: string } | null
   /** Turbo Link (ADR-382): the qualified `<machine>/<model>` id the user pointed this install
    *  at in the UI, or '' / absent for 'this machine'. Daemon state, so this process can see a
    *  choice made in a browser. */
@@ -429,6 +432,20 @@ function chatModels(models: ModelEntry[]): ModelEntry[] {
 function refuseJevModel(name: string): number {
   process.stderr.write(`'${name}' is a Jev model (it labels text) — coding agents need a chat model.\n`)
   return 1
+}
+
+/** The name of the Jev model the engine's main slot holds, or null when it holds a chat model.
+ *
+ *  The daemon reports its alive Jev model on `/status` (`jev`), so the answer needs no second
+ *  request and cannot be lost to a failed library listing — `fetchModels` returns [] on any error,
+ *  which would read as "not a Jev model" and pin the agent to one. Only a daemon that predates the
+ *  field leaves `jev` out; that one is asked for its library instead. */
+async function loadedJevName(base: string, status: DaemonStatus, _fetch: typeof fetch): Promise<string | null> {
+  const loadedKey = status.model?.key
+  if (status.jev !== undefined) return status.jev && status.jev.key === loadedKey ? status.jev.name : null
+
+  const library = await fetchModels(base, _fetch)
+  return library.find((m) => m.key === loadedKey && m.jev)?.name ?? null
 }
 
 /** Fetch the model list. Returns [] on network error. */
@@ -1524,8 +1541,8 @@ export async function launchCli(
     // No --model and no linked-machine pick, so the launch reuses whatever is already loaded. That
     // has to be a chat model too: the two branches above never run for it, and it would otherwise be
     // pinned into the harness below (a gateway auto-swap can leave a Jev model loaded).
-    const loaded = (await fetchModels(base, _fetch)).find((m) => m.key === status?.model?.key)
-    if (loaded?.jev) return refuseJevModel(loaded.name)
+    const loadedJev = await loadedJevName(base, status, _fetch)
+    if (loadedJev) return refuseJevModel(loadedJev)
   }
 
   // At this point we expect a model to be loaded — UNLESS it is a remote one, in which
