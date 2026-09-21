@@ -1,39 +1,21 @@
 // The Jev Playground — the Workspace's only surface while a Jev model is loaded
-// (ADR-434 (b), (c), (i)(1), (i)(5)).
+// (ADR-434 (b), (c), (i)(1), (i)(5)), rebuilt as the System One request itself (ADR-439): the two
+// JSON editors ARE the body that gets posted, and the answers sit beside them.
 //
-// A Jev model answers two different questions ("does this follow?" and "which of these?"), so
-// the screen keeps a draft for each and never discards one to show the other. It holds no
-// conversation, no history and no sidebar: there is exactly one thing to do here.
-import { useEffect, useRef, useState } from 'react'
+// It holds no conversation, no history and no sidebar: there is exactly one thing to do here.
+import { useState } from 'react'
 import { useLocation } from 'react-router-dom'
-import { Scale } from 'lucide-react'
-import { ApiError, stopEngine, track } from '../../lib/api'
+import { stopEngine } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useModels, useStatus } from '../../lib/queries'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
-import { CheckPanel } from './CheckPanel'
-import { ChoosePanel } from './ChoosePanel'
+import { AnswerList } from './AnswerList'
 import { JevHeader } from './JevHeader'
-import { JevOutput, type JevView } from './JevOutput'
-import { JEV_EXAMPLES } from './jev-examples'
-import {
-  checkDraftError,
-  chooseDraftError,
-  runCheck,
-  runChoose,
-  type CheckDraft,
-  type ChooseDraft,
-  type JevRun,
-} from './jev-run'
+import { JsonEditor } from './JsonEditor'
+import { ResponsePanel } from './ResponsePanel'
 import { SwitchModelMenu, switchToModel } from './SwitchModelMenu'
-
-type JevMode = 'check' | 'choose'
-
-const MODE_ACTION: Record<JevMode, string> = { check: 'jev_mode_check', choose: 'jev_mode_choose' }
-
-const RUN_ACTION: Record<JevMode, string> = { check: 'jev_run_check', choose: 'jev_run_choose' }
-
-const CHOOSE_EXPLAINER = 'Each option is checked as "The correct answer is: …" and ranked by entailment.'
+import { draftRequest, type DraftProblem, type SystemOneDraft } from './systemone-draft'
+import { SYSTEMONE_EXAMPLES } from './systemone-examples'
 
 const NOTICE = 'Chat, Code and Routines are unavailable while a Jev model is loaded.'
 
@@ -46,190 +28,65 @@ export function JevPlaygroundScreen() {
   const models = modelsQ.data?.models
   const jev = loadedJev(statusQ.data, models)
 
-  const [mode, setMode] = useState<JevMode>('check')
-  const [check, setCheck] = useState<CheckDraft>(firstCheckDraft)
-  const [choose, setChoose] = useState<ChooseDraft>(firstChooseDraft)
-  const [run, setRun] = useState<JevRun | null>(null)
-  const [view, setView] = useState<JevView>('results')
-  const [problem, setProblem] = useState<string | null>(null)
-  const [running, setRunning] = useState(false)
+  const [draft, setDraft] = useState<SystemOneDraft>(firstDraft)
   const [switchOpen, setSwitchOpen] = useState(false)
-  const [exampleId, setExampleId] = useState(JEV_EXAMPLES.check[0].id)
-
-  // One run at a time. The ref rather than the `running` state is the guard: the
-  // shortcut and the auto-run effect can both enter before a state update has landed.
-  const inFlight = useRef(false)
-  // And only the run the panel is still asking about may answer it: ADR-434 (c) makes Results,
-  // JSON and API three views of ONE run, so an answer the user has moved on from is dropped.
-  const currentRun = useRef(0)
-
-  async function runDraft(next: JevMode, check_: CheckDraft, choose_: ChooseDraft, key: string) {
-    // The run in flight is the reason nothing new starts, and it has nothing to say about the
-    // draft: only a run that was really refused gets to write the line under the panel.
-    if (inFlight.current) return
-    const missing = next === 'check' ? checkDraftError(check_) : chooseDraftError(choose_)
-    setProblem(missing)
-    if (missing) return
-    const asked = ++currentRun.current
-    track('workspace', RUN_ACTION[next])
-    inFlight.current = true
-    setRunning(true)
-    try {
-      const answer = next === 'check' ? await runCheck(key, check_) : await runChoose(key, choose_)
-      if (asked === currentRun.current) setRun(answer)
-    } catch (e) {
-      if (asked === currentRun.current) setProblem(failureMessage(e))
-    } finally {
-      inFlight.current = false
-      setRunning(false)
-    }
-  }
-
-  // The listener is on the window so the shortcut works with the focus anywhere on the page,
-  // and `latestRun` keeps it subscribed once instead of re-binding on every keystroke.
-  const latestRun = useRef<() => void>(() => {})
-  latestRun.current = () => { if (jev) void runDraft(mode, check, choose, jev.key) }
-  useEffect(() => {
-    function onKeyDown(e: KeyboardEvent) {
-      if (e.key !== 'Enter' || !(e.ctrlKey || e.metaKey)) return
-      e.preventDefault()
-      latestRun.current()
-    }
-    window.addEventListener('keydown', onKeyDown)
-    return () => window.removeEventListener('keydown', onKeyDown)
-  }, [])
-
-  // One automatic run, when the model is first seen answering: the screen opens on an example,
-  // and an example with no answer under it does not show what the model does.
-  const greeted = useRef(false)
-  useEffect(() => {
-    if (greeted.current || jev?.state !== 'running') return
-    greeted.current = true
-    latestRun.current()
-  }, [jev?.state])
 
   if (!jev) return null
   // The handlers below are hoisted past the guard, so they need the narrowed value by name.
   const current = jev
 
-  /** What is on screen stops being the answer to what the panel now asks. */
-  function dropCurrentRun() {
-    currentRun.current += 1
-    setRun(null)
-  }
-
-  function pickMode(next: JevMode) {
-    track('workspace', MODE_ACTION[next])
-    setMode(next)
-    setProblem(null)
-    dropCurrentRun()
-  }
-
-  function pickExample(id: string) {
-    // The picker is disabled while a run is in flight, but the first run starts from an effect
-    // that lands after the paint that would disable it. Picking in that frame would throw the
-    // answer on screen away to start a run this guard then refuses.
-    if (inFlight.current) return
-    track('workspace', 'jev_load_example')
-    setExampleId(id)
-    const example = JEV_EXAMPLES.check.find((e) => e.id === id)
-    if (example) {
-      const draft = { premise: example.premise, hypotheses: [...example.hypotheses] }
-      setMode('check')
-      setCheck(draft)
-      dropCurrentRun()
-      void runDraft('check', draft, choose, current.key)
-      return
-    }
-    const picked = JEV_EXAMPLES.choose.find((e) => e.id === id)
-    if (!picked) return
-    const draft = { question: picked.question, options: [...picked.options] }
-    setMode('choose')
-    setChoose(draft)
-    dropCurrentRun()
-    void runDraft('choose', check, draft, current.key)
-  }
+  const drafted = draftRequest(jev.key, draft)
+  const problems = drafted.ok ? [] : drafted.problems
 
   function pickModel(m: ModelEntry) {
     setSwitchOpen(false)
-    // Nothing to catch: a refused eject and a refused load both report themselves as a toast,
-    // and `problem` is the line under the panel, which belongs to a run.
+    // Nothing to catch: a refused eject and a refused load both report themselves as a toast.
     void switchToModel(current, m, { stopEngine, requestLoad })
   }
 
-  const template = models?.find((m) => m.key === jev.key)?.jev?.nliTemplate ?? null
-
   return (
     <div className="h-full overflow-y-auto">
-      <div className="mx-auto flex max-w-3xl gap-4 px-4 py-4">
-        <WorkspaceColumn />
-        <div className="flex min-w-0 flex-1 flex-col gap-3">
-          {(location.state as { jevNotice?: boolean } | null)?.jevNotice && (
-            <p className="text-[13px] text-muted">{NOTICE}</p>
-          )}
+      <div className="mx-auto flex max-w-6xl flex-col gap-3 px-4 py-4">
+        {(location.state as { jevNotice?: boolean } | null)?.jevNotice && (
+          <p className="text-[13px] text-muted">{NOTICE}</p>
+        )}
 
-          <JevHeader jev={jev} engine={activeEngine(statusQ.data)} onSwitch={() => setSwitchOpen((open) => !open)} />
-          {switchOpen && <SwitchModelMenu current={jev} models={models ?? []} onPick={pickModel} />}
+        <JevHeader jev={jev} engine={activeEngine(statusQ.data)} onSwitch={() => setSwitchOpen((open) => !open)} />
+        {switchOpen && <SwitchModelMenu current={jev} models={models ?? []} onPick={pickModel} />}
 
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="inline-flex w-fit rounded-md border border-border p-0.5" role="group" aria-label="Mode">
-              {(['check', 'choose'] as const).map((candidate) => (
-                <button
-                  key={candidate}
-                  type="button"
-                  aria-pressed={mode === candidate}
-                  onClick={() => pickMode(candidate)}
-                  className={`rounded px-3 py-1 text-[13px] font-medium transition-colors ${
-                    mode === candidate ? 'bg-accent/12 text-accent' : 'text-muted hover:text-ink'
-                  }`}
-                >
-                  {candidate === 'check' ? 'Check' : 'Choose'}
-                </button>
-              ))}
-            </div>
-            <select
-              aria-label="Example"
-              value={exampleId}
-              disabled={running}
-              onChange={(e) => pickExample(e.target.value)}
-              className="max-w-[210px] rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink"
-            >
-              {[...JEV_EXAMPLES.check, ...JEV_EXAMPLES.choose].map((example) => (
-                <option key={example.id} value={example.id}>{example.label}</option>
-              ))}
-            </select>
-          </div>
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <section aria-label="Request" className="flex min-w-0 flex-col gap-3">
+            <p className="font-mono text-[12px] text-muted">POST /v1/systemone</p>
+            <JsonEditor
+              id="jev-state"
+              label="state"
+              mode="json-or-text"
+              caption="JSON object or array, or plain text."
+              value={draft.stateText}
+              onChange={(next) => setDraft((d) => ({ ...d, stateText: next }))}
+              problem={problems.find(isStateProblem)?.message}
+            />
+            <JsonEditor
+              id="jev-questions"
+              label="questions"
+              mode="json"
+              value={draft.questionsText}
+              onChange={(next) => setDraft((d) => ({ ...d, questionsText: next }))}
+              problem={problems.find(isQuestionsProblem)?.message}
+            />
+            {problems.filter(isRequestProblem).map((problem) => (
+              <p key={problem.field} role="alert" className="text-[13px] text-err">
+                {problem.message}
+              </p>
+            ))}
+          </section>
 
-          {mode === 'check' ? (
-            <>
-              <CheckPanel value={check} onChange={setCheck} onRun={() => latestRun.current()} running={running} />
-              {template && <p className="text-[12px] text-muted">{templateHint(template)}</p>}
-            </>
-          ) : (
-            <>
-              <ChoosePanel value={choose} onChange={setChoose} onRun={() => latestRun.current()} running={running} />
-              <p className="text-[12px] text-muted">{CHOOSE_EXPLAINER}</p>
-            </>
-          )}
-
-          {problem && <p className="text-[13px] text-err">{problem}</p>}
-          <JevOutput run={run} view={view} onView={setView} origin={window.location.origin} />
+          <section aria-label="Response" className="flex min-w-0 flex-col gap-3">
+            <AnswerList answers={null} stale={false} />
+            <ResponsePanel run={null} origin={window.location.origin} />
+          </section>
         </div>
       </div>
-    </div>
-  )
-}
-
-/** The left rail: one item, and the reason the others are missing. Hidden on a phone,
- *  where the single column IS the answer to "where did everything go". */
-function WorkspaceColumn() {
-  return (
-    <div className="hidden w-[150px] shrink-0 flex-col gap-2 md:flex">
-      <span className="text-[12px] text-muted">Workspace</span>
-      <span className="flex items-center gap-2 rounded-md bg-panel-2 px-2 py-1.5 text-[13px] font-medium text-ink">
-        <Scale size={16} /> Jev Playground
-      </span>
-      <p className="text-[12px] leading-5 text-muted">Chat, Code and Routines are hidden while a Jev model is loaded.</p>
     </div>
   )
 }
@@ -248,23 +105,14 @@ function activeEngine(status: Status | undefined): { name: string; kind: string 
   return { name: status?.engine?.name ?? '', kind: status?.engine?.kind ?? '' }
 }
 
-/** The model's own template with its slots shown as ellipses, on one line. */
-function templateHint(template: string): string {
-  const filled = template.replaceAll('{premise}', '…').replaceAll('{hypothesis}', '…').replaceAll('\n', ' ')
-  return `Sent as the model's own template: "${filled}"`
+function firstDraft(): SystemOneDraft {
+  const { stateText, questionsText } = SYSTEMONE_EXAMPLES[0]
+  return { stateText, questionsText }
 }
 
-function failureMessage(e: unknown): string {
-  if (e instanceof ApiError) return e.message
-  return e instanceof Error ? e.message : 'The request failed.'
-}
+const isStateProblem = (problem: DraftProblem): boolean => problem.field === 'state'
 
-function firstCheckDraft(): CheckDraft {
-  const example = JEV_EXAMPLES.check[0]
-  return { premise: example.premise, hypotheses: [...example.hypotheses] }
-}
+const isQuestionsProblem = (problem: DraftProblem): boolean => problem.field.startsWith('questions')
 
-function firstChooseDraft(): ChooseDraft {
-  const example = JEV_EXAMPLES.choose[0]
-  return { question: example.question, options: [...example.options] }
-}
+/** A fault in the request as a whole (its size, its model): neither editor owns it, so the screen does. */
+const isRequestProblem = (problem: DraftProblem): boolean => !isStateProblem(problem) && !isQuestionsProblem(problem)
