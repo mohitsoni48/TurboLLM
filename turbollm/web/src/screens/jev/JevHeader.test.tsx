@@ -33,7 +33,7 @@ describe('JevHeader', () => {
   })
 
   it('leaves out an engine it cannot name', () => {
-    // A remote-access token scoped to models:use cannot read /status (ADR-422, R8), so the
+    // A remote-access token scoped to models:use cannot read /status (ADR-422), so the
     // screen knows which Jev model is loaded but not what is running it. Better a shorter
     // chip than one with a gap where the engine should be.
     render(<JevHeader jev={JEV} engine={{ name: '', kind: '' }} onSwitch={vi.fn()} />)

@@ -56,7 +56,7 @@ export function JevPlaygroundScreen() {
   const [switchOpen, setSwitchOpen] = useState(false)
   const [exampleId, setExampleId] = useState(JEV_EXAMPLES.check[0].id)
 
-  // One run at a time (QA E5). The ref rather than the `running` state is the guard: the
+  // One run at a time. The ref rather than the `running` state is the guard: the
   // shortcut and the auto-run effect can both enter before a state update has landed.
   const inFlight = useRef(false)
   // And only the run the panel is still asking about may answer it: ADR-434 (c) makes Results,
@@ -220,7 +220,7 @@ export function JevPlaygroundScreen() {
   )
 }
 
-/** The mockup's left rail: one item, and the reason the others are missing. Hidden on a phone,
+/** The left rail: one item, and the reason the others are missing. Hidden on a phone,
  *  where the single column IS the answer to "where did everything go". */
 function WorkspaceColumn() {
   return (
@@ -235,7 +235,7 @@ function WorkspaceColumn() {
 }
 
 /** `status.jev` when the daemon says so; otherwise the loaded Jev model in the catalog — a
- *  remote-access token scoped to `models:use` cannot read /status at all (ADR-422, R8). */
+ *  remote-access token scoped to `models:use` cannot read /status at all (ADR-422). */
 function loadedJev(status: Status | undefined, models: ModelEntry[] | undefined): LoadedJev | null {
   if (status?.jev) return status.jev
   if (status?.jev === null) return null

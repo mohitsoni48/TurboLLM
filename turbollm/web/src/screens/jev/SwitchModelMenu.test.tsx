@@ -91,7 +91,7 @@ describe('SwitchModelMenu', () => {
     expect(screen.queryByRole('button', { name: CURRENT.name })).toBeNull()
   })
 
-  // N2: both groups can empty at once — a library of GGUF chat models plus one safetensors Jev
+  // Both groups can empty at once — a library of GGUF chat models plus one safetensors Jev
   // model under vLLM leaves nothing loadable — and an empty bordered box explains nothing.
   it('says where to go when nothing here can load', () => {
     renderMenu([model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false })])
@@ -144,7 +144,7 @@ describe('switchToModel', () => {
     expect(d.requestLoad).toHaveBeenCalledWith(OTHER_JEV)
   })
 
-  // N3: the R8 fallback cannot read the slot. Not ejecting a pool slot leaves the Jev engine
+  // The models-list fallback cannot read the slot. Not ejecting a pool slot leaves the Jev engine
   // running, `status.jev` set, and Workspace stuck in the playground with nothing said — so an
   // unknown slot is ejected, and a stop that was not needed only costs a restart.
   it('ejects a slot it cannot name, rather than assuming it is the primary one', async () => {
@@ -160,8 +160,8 @@ describe('switchToModel', () => {
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_switch_model')
   })
 
-  // QA E17: never a silent no-op. A rejected eject used to escape as an unhandled rejection
-  // with the panel already closed, so the pick looked like it did nothing.
+  // Never a silent no-op. A rejected eject is reported even though the panel has already
+  // closed, so the pick cannot look like it did nothing.
   it('says why the switch stopped when the slot will not eject, and loads nothing on top of it', async () => {
     const { ApiError } = await import('../../lib/api')
     const d = deps()

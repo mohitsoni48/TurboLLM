@@ -1,8 +1,7 @@
-// The built-in playground examples the founder approved (ADR-434 (c), mockup.html).
+// The built-in playground examples the founder approved (ADR-434 (c)).
 //
-// Inputs only. The mockup carried recorded probabilities beside each one so it could demo
-// without an engine; here the numbers must come from the model that is actually loaded, which
-// need not be the one those were measured on.
+// Inputs only. No example carries recorded probabilities: the numbers must come from the model
+// that is actually loaded, which need not be the one those were measured on.
 
 export type CheckExample = {
   id: string

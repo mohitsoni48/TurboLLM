@@ -128,7 +128,7 @@ describe('JevPlaygroundScreen', () => {
     await waitFor(() => expect(h.classify).toHaveBeenCalledTimes(2))
   })
 
-  // ADR-434 (c), QA E5: Results / JSON / API are three views of ONE run. A second run started
+  // ADR-434 (c): Results / JSON / API are three views of ONE run. A second run started
   // over the first, or an older answer landing last, breaks that.
   describe('one run at a time', () => {
     /** A run that stays in flight until the test resolves it. */
@@ -197,8 +197,8 @@ describe('JevPlaygroundScreen', () => {
       expect(screen.getByLabelText('Premise')).toHaveValue('A chef is chopping onions in a busy restaurant kitchen.')
     })
 
-    // The reviewer's own path (picking a Choose example mid-run) is unreachable now that the
-    // picker is disabled; the Mode toggle reaches the same mechanism and is not disabled.
+    // The example picker is disabled mid-run, so it cannot start a run the user then abandons;
+    // the Mode toggle can, because it is not disabled, and it reaches the same mechanism.
     it('drops an answer the user has already moved on from', async () => {
       const answer = slowClassify()
       renderScreen()
@@ -369,8 +369,8 @@ describe('JevPlaygroundScreen', () => {
     expect(h.track).toHaveBeenCalledWith('workspace', 'jev_switch_model')
   })
 
-  // N3: read off the models list, the slot is unknowable — claiming `primary` silently skipped
-  // the ADR-427 (c) eject for a Jev model that really was in a pool slot.
+  // Read off the models list, the slot is unknowable — claiming `primary` would silently skip
+  // the ADR-427 (c) eject for a Jev model that really is in a pool slot.
   it('does not claim a slot the models list cannot know', async () => {
     const chat = { key: 'gemma-27b', name: 'Gemma 27B', loaded: false, incomplete: false, parseError: null, embedding: false, compatibleWithActiveEngine: true } as ModelEntry
     state.status = status({ jev: undefined })

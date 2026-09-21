@@ -44,7 +44,7 @@ export function SwitchModelMenu({
 /** ADR-427: a Jev model in a POOL slot keeps its own engine, so a chat pick has to eject that
  *  slot — a primary swap already replaces what is running. A slot that refuses to eject stops
  *  the switch and says so: loading on top of it would leave the playground open with no
- *  explanation (QA E17, H19). */
+ *  explanation. */
 export async function switchToModel(current: LoadedJev, m: ModelEntry, deps: SwitchDeps): Promise<void> {
   track('workspace', 'jev_switch_model')
   if (needsEject(current, m) && !(await ejected(current, deps))) return

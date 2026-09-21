@@ -1,8 +1,7 @@
-// The four examples the founder approved in the mockup (ADR-434 (c)).
+// The four examples the founder approved (ADR-434 (c)).
 //
-// They are INPUTS only. The mockup shipped recorded probabilities beside each one so it could
-// demo without an engine; a hardcoded number in the real playground would be a lie about the
-// loaded model, which may not even be the one those numbers came from.
+// They are INPUTS only. A hardcoded probability in the real playground would be a lie about
+// the loaded model, which may not even be the one those numbers came from.
 import { describe, expect, it } from 'vitest'
 import { JEV_EXAMPLES } from './jev-examples'
 
