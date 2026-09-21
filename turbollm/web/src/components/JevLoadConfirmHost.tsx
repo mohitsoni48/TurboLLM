@@ -23,6 +23,8 @@ const UNKNOWN_WORK = "TurboLLM couldn't check what is running right now — load
 
 const API_GENERATION = 'a request an API client is generating'
 
+const LABEL_MAX = 60
+
 export function JevLoadConfirmHost() {
   const confirm = useJevLoadStore((s) => s.confirm)
   const setConfirm = useJevLoadStore((s) => s.setConfirm)
@@ -86,5 +88,11 @@ function interruptedWork(work: ActiveWork | null): string[] {
 function describeItem(item: ActiveWorkItem): string {
   if (item.kind === 'chat') return `a reply in "${item.label}"`
   if (item.kind === 'code') return `a Code turn in "${item.label}"`
-  return `the routine "${item.label}"`
+  return `the routine "${oneLine(item.label)}"`
+}
+
+/** A routine has no name of its own, so it is labelled with its prompt — which can be a whole
+ *  paragraph. This dialog lists what stops; it is not the place to read the prompt. */
+function oneLine(label: string): string {
+  return label.length > LABEL_MAX ? `${label.slice(0, LABEL_MAX).trimEnd()}…` : label
 }

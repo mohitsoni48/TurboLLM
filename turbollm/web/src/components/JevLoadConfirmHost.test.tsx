@@ -66,6 +66,21 @@ describe('JevLoadConfirmHost', () => {
     expect(screen.getByText('the routine "Morning digest"')).toBeTruthy()
   })
 
+  // A routine has no name of its own — the activity probe labels it with its prompt, which can
+  // be a whole paragraph. This dialog is a list of what stops, not a transcript.
+  it('cuts a routine prompt down to one line', () => {
+    openConfirm({
+      items: [{
+        kind: 'routine',
+        id: 'r1',
+        label: 'Check every open GitHub issue for a reproduction, summarise the ones that have one, and post the digest to Discord',
+      }],
+      engineGenerating: false,
+    })
+    render(<JevLoadConfirmHost />)
+    expect(screen.getByText('the routine "Check every open GitHub issue for a reproduction, summarise…"')).toBeTruthy()
+  })
+
   it('names a generation that has no item of its own', () => {
     openConfirm({ items: [], engineGenerating: true })
     render(<JevLoadConfirmHost />)
