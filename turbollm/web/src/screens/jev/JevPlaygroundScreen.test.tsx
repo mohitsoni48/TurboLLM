@@ -3,7 +3,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { JevPlaygroundScreen } from './JevPlaygroundScreen'
 import { draftRequest } from './systemone-draft'
 import { SYSTEMONE_EXAMPLES } from './systemone-examples'
@@ -38,6 +38,8 @@ vi.mock('../../lib/api', async (importOriginal) => ({
 }))
 
 const KEY = 'qwen3.5 4b nli v2|mlx-fp16|9012345678'
+
+const DRAFT_KEY = 'tllm.jev.systemone.draft'
 
 const FIRST_EXAMPLE = SYSTEMONE_EXAMPLES[0]
 
@@ -147,11 +149,22 @@ function slowRun(): () => Promise<void> {
 /** Lets every timer and promise that is already due run, so "nothing was sent" is a settled claim. */
 const tick = () => act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 0)) })
 
+/** The slice of `Storage` the screen uses, with every call recorded. */
+function fakeStorage(initial: Record<string, string> = {}) {
+  const items = new Map(Object.entries(initial))
+  return {
+    getItem: vi.fn((key: string) => items.get(key) ?? null),
+    setItem: vi.fn((key: string, value: string) => { items.set(key, value) }),
+    removeItem: vi.fn((key: string) => { items.delete(key) }),
+  }
+}
+
 beforeEach(() => {
   for (const spy of Object.values(h)) spy.mockReset()
   h.systemone.mockResolvedValue(RESPONSE)
   state.status = status()
   state.models = [jevModel()]
+  window.localStorage.clear()
 })
 
 describe('JevPlaygroundScreen', () => {
@@ -567,5 +580,134 @@ describe('JevPlaygroundScreen picking an example', () => {
     await act(async () => { refuse(new Error('too late')) })
 
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+})
+
+describe('JevPlaygroundScreen remembering the draft', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  const advance = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+
+  it('reads the stored draft once on mount and shows it instead of the first example', () => {
+    const storage = fakeStorage({ [DRAFT_KEY]: JSON.stringify({ stateText: 'S', questionsText: '{}' }) })
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    expect(screen.getByLabelText('state')).toHaveValue('S')
+    expect(screen.getByLabelText('questions')).toHaveValue('{}')
+
+    editText('state', 'S, edited')
+    expect(storage.getItem).toHaveBeenCalledTimes(1)
+    expect(storage.getItem).toHaveBeenCalledWith(DRAFT_KEY)
+  })
+
+  it('writes an edit only after 400 ms, as the JSON of both texts', () => {
+    const storage = fakeStorage()
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    editText('state', 'Typed by hand.')
+    advance(399)
+    expect(storage.setItem).not.toHaveBeenCalled()
+
+    advance(1)
+    expect(storage.setItem).toHaveBeenCalledTimes(1)
+    expect(storage.setItem).toHaveBeenCalledWith(
+      DRAFT_KEY,
+      JSON.stringify({ stateText: 'Typed by hand.', questionsText: FIRST_EXAMPLE.questionsText }),
+    )
+  })
+
+  it('writes once for a burst of edits, with the last text', () => {
+    const storage = fakeStorage()
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    editText('state', 'A')
+    advance(100)
+    editText('state', 'AB')
+    advance(100)
+    editText('state', 'ABC')
+    advance(399)
+    expect(storage.setItem).not.toHaveBeenCalled()
+
+    advance(1)
+    expect(storage.setItem).toHaveBeenCalledTimes(1)
+    expect(storage.setItem).toHaveBeenCalledWith(
+      DRAFT_KEY,
+      JSON.stringify({ stateText: 'ABC', questionsText: FIRST_EXAMPLE.questionsText }),
+    )
+  })
+
+  it('writes nothing once the screen has gone', () => {
+    const storage = fakeStorage()
+    vi.stubGlobal('localStorage', storage)
+    const { unmount } = renderScreen()
+
+    editText('state', 'Typed by hand.')
+    unmount()
+    advance(1000)
+
+    expect(storage.setItem).not.toHaveBeenCalled()
+  })
+
+  it('still opens on the first example when storage cannot be read', () => {
+    const storage = fakeStorage()
+    storage.getItem.mockImplementation(() => { throw new DOMException('denied', 'SecurityError') })
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    expect(screen.getByLabelText('state')).toHaveValue(FIRST_EXAMPLE.stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(FIRST_EXAMPLE.questionsText)
+  })
+
+  it('stays usable when storage refuses a write', () => {
+    const storage = fakeStorage()
+    storage.setItem.mockImplementation(() => { throw new DOMException('full', 'QuotaExceededError') })
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    editText('state', 'Typed by hand.')
+    expect(() => advance(400)).not.toThrow()
+    expect(screen.getByLabelText('state')).toHaveValue('Typed by hand.')
+  })
+
+  it.each([
+    ['text that is not JSON', 'not json'],
+    ['JSON that is not an object', 'null'],
+    ['a field that is not a string', JSON.stringify({ stateText: 1, questionsText: '{}' })],
+    ['a field that is missing', JSON.stringify({ stateText: 'S' })],
+  ])('ignores stored %s and opens on the first example', (_kind, stored) => {
+    vi.stubGlobal('localStorage', fakeStorage({ [DRAFT_KEY]: stored }))
+    renderScreen()
+
+    expect(screen.getByLabelText('state')).toHaveValue(FIRST_EXAMPLE.stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(FIRST_EXAMPLE.questionsText)
+  })
+
+  it('stores nothing but the two texts, under the one key, after a run and an example pick', async () => {
+    const storage = fakeStorage()
+    vi.stubGlobal('localStorage', storage)
+    renderScreen()
+
+    fireEvent.click(runButton())
+    await act(async () => {})
+    expect(screen.getByText('0.945')).toBeInTheDocument()
+    fireEvent.change(picker(), { target: { value: 'routing' } })
+    advance(400)
+
+    const keysWritten = new Set(storage.setItem.mock.calls.map(([key]) => key))
+    expect([...keysWritten]).toEqual([DRAFT_KEY])
+    expect(storage.removeItem).not.toHaveBeenCalled()
+    const written = JSON.parse(storage.setItem.mock.calls[storage.setItem.mock.calls.length - 1][1])
+    expect(Object.keys(written)).toEqual(['stateText', 'questionsText'])
+    expect(written.stateText).toBe(exampleNamed('routing').stateText)
   })
 })

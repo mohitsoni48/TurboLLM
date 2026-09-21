@@ -21,6 +21,9 @@ import { SYSTEMONE_EXAMPLES } from './systemone-examples'
 
 const NOTICE = 'Chat, Code and Routines are unavailable while a Jev model is loaded.'
 
+const DRAFT_STORAGE_KEY = 'tllm.jev.systemone.draft'
+const DRAFT_SAVE_DELAY_MS = 400
+
 export function JevPlaygroundScreen() {
   const statusQ = useStatus()
   const modelsQ = useModels()
@@ -30,12 +33,17 @@ export function JevPlaygroundScreen() {
   const models = modelsQ.data?.models
   const jev = loadedJev(statusQ.data, models)
 
-  const [draft, setDraft] = useState<SystemOneDraft>(firstDraft)
+  const [draft, setDraft] = useState<SystemOneDraft>(() => readStoredDraft() ?? firstDraft())
   const [run, setRun] = useState<SystemOneRun | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
   const [exampleId, setExampleId] = useState(SYSTEMONE_EXAMPLES[0].id)
   const [switchOpen, setSwitchOpen] = useState(false)
+
+  useEffect(() => {
+    const pendingSave = setTimeout(() => saveDraft(draft), DRAFT_SAVE_DELAY_MS)
+    return () => clearTimeout(pendingSave)
+  }, [draft])
 
   // One run at a time. The ref rather than the `running` state is the guard: the
   // shortcut and a click can both enter before a state update has landed.
@@ -205,6 +213,32 @@ function failureMessage(e: unknown): string {
 function firstDraft(): SystemOneDraft {
   const { stateText, questionsText } = SYSTEMONE_EXAMPLES[0]
   return { stateText, questionsText }
+}
+
+/** The draft the user left, or null when there is none worth showing: a private window or blocked
+ *  site data must not break the screen, and neither must a value someone else wrote there. */
+function readStoredDraft(): SystemOneDraft | null {
+  try {
+    const stored = localStorage.getItem(DRAFT_STORAGE_KEY)
+    return stored === null ? null : draftFrom(JSON.parse(stored))
+  } catch {
+    return null
+  }
+}
+
+function draftFrom(value: unknown): SystemOneDraft | null {
+  if (typeof value !== 'object' || value === null) return null
+  const { stateText, questionsText } = value as Record<string, unknown>
+  if (typeof stateText !== 'string' || typeof questionsText !== 'string') return null
+  return { stateText, questionsText }
+}
+
+function saveDraft(draft: SystemOneDraft) {
+  try {
+    localStorage.setItem(DRAFT_STORAGE_KEY, JSON.stringify(draft))
+  } catch {
+    // A refused write only means the draft is not remembered: the editors keep working.
+  }
 }
 
 const isStateProblem = (problem: DraftProblem): boolean => problem.field === 'state'
