@@ -28,6 +28,10 @@ test('MAX_JEV_INPUTS is 128', () => {
   assert.equal(serving.MAX_JEV_INPUTS, 128)
 })
 
+test('MAX_JEV_INPUT_CHARS is 4000', () => {
+  assert.equal(serving.MAX_JEV_INPUT_CHARS, 4000)
+})
+
 test('refusalFor gives back the refusal a JevEndpointError carries', () => {
   const refusal: serving.JevHttpError = {
     status: 503,

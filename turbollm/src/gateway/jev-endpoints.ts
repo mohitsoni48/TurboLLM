@@ -21,6 +21,7 @@ import {
   jevErrorResponse,
   jsonBodyOf,
   LINK_JEV_UNSUPPORTED,
+  MAX_JEV_INPUT_CHARS,
   MAX_JEV_INPUTS,
   refusalFor,
   resolveJevModel,
@@ -99,8 +100,14 @@ export function parseClassifyBody(raw: unknown): ClassifyInput | JevHttpError {
   if (!isJsonObject(raw)) return invalidRequest(NOT_A_JSON_OBJECT)
   if (!isNonEmptyString(raw.model)) return invalidRequest(MODEL_REQUIRED)
   if (!isNonEmptyString(raw.premise)) return invalidRequest('premise must be a non-empty string.')
+  if (raw.premise.length > MAX_JEV_INPUT_CHARS) {
+    return invalidRequest(`premise must be at most ${MAX_JEV_INPUT_CHARS} characters.`)
+  }
   if (!isInputList(raw.hypotheses, isNonEmptyString)) {
     return invalidRequest(`hypotheses must be an array of 1 to ${MAX_JEV_INPUTS} non-empty strings.`)
+  }
+  if (raw.hypotheses.some(overLength)) {
+    return invalidRequest(`each hypothesis must be at most ${MAX_JEV_INPUT_CHARS} characters.`)
   }
   return { model: raw.model, premise: raw.premise, hypotheses: raw.hypotheses }
 }
@@ -109,17 +116,18 @@ export function parseRerankBody(raw: unknown): RerankInput | JevHttpError {
   if (!isJsonObject(raw)) return invalidRequest(NOT_A_JSON_OBJECT)
   if (!isNonEmptyString(raw.model)) return invalidRequest(MODEL_REQUIRED)
   if (!isNonEmptyString(raw.query)) return invalidRequest('query must be a non-empty string.')
+  if (raw.query.length > MAX_JEV_INPUT_CHARS) {
+    return invalidRequest(`query must be at most ${MAX_JEV_INPUT_CHARS} characters.`)
+  }
   if (!isInputList(raw.documents, isRerankDocument)) return invalidRequest(documentsRequired())
+  const documents = raw.documents.map(documentText)
+  if (documents.some(overLength)) {
+    return invalidRequest(`each document must be at most ${MAX_JEV_INPUT_CHARS} characters.`)
+  }
   if (!isAbsentOr(raw.top_n, isPositiveInteger)) return invalidRequest('top_n must be an integer of at least 1.')
   const hypothesisTemplate = chosenHypothesisTemplate(raw.hypothesis_template)
   if (typeof hypothesisTemplate !== 'string') return hypothesisTemplate
-  return {
-    model: raw.model,
-    query: raw.query,
-    documents: raw.documents.map(documentText),
-    topN: raw.top_n,
-    hypothesisTemplate,
-  }
+  return { model: raw.model, query: raw.query, documents, topN: raw.top_n, hypothesisTemplate }
 }
 
 /** One result per hypothesis, in input order, labelled through the model's own id2label. */
@@ -246,4 +254,8 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
+}
+
+function overLength(value: string): boolean {
+  return value.length > MAX_JEV_INPUT_CHARS
 }

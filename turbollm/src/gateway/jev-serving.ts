@@ -15,6 +15,12 @@ import { describeEngineError } from './gateway'
  *  /v1/systemone splits its hypotheses into. */
 export const MAX_JEV_INPUTS = 128
 
+/** Upper bound on any one user string /v1/classify or /v1/rerank builds an engine input from: `premise`,
+ *  `query`, each `hypothesis`, each `document`. Without it, a caller can multiply an unbounded string by
+ *  MAX_JEV_INPUTS items (and, on /v1/rerank, by every `{}` slot in `hypothesis_template`) into a body that
+ *  never reaches the engine because building it exhausts memory first. */
+export const MAX_JEV_INPUT_CHARS = 4000
+
 /** A refusal in the OpenAI error envelope's terms. */
 export interface JevHttpError {
   status: ContentfulStatusCode

@@ -24,6 +24,7 @@ import {
   callEngineClassify,
   JevEndpointError,
   jevErrorResponse,
+  MAX_JEV_INPUT_CHARS,
   MAX_JEV_INPUTS,
   nliTemplateFor,
   type EngineClassifyResult,
@@ -144,6 +145,27 @@ test('classify: premise must be a non-empty string', () => {
   }
 })
 
+test('classify: premise up to 4000 characters is accepted, 4001 is refused', () => {
+  const atLimit = 'x'.repeat(MAX_JEV_INPUT_CHARS)
+  assert.deepEqual(parseClassifyBody(classifyBody({ premise: atLimit })), {
+    model: MODEL_KEY,
+    premise: atLimit,
+    hypotheses: KITCHEN_HYPOTHESES,
+  })
+  assert.deepEqual(
+    parseClassifyBody(classifyBody({ premise: `${atLimit}x` })),
+    invalidRequest(`premise must be at most ${MAX_JEV_INPUT_CHARS} characters.`),
+  )
+})
+
+test('classify: an over-long hypothesis is refused, even among otherwise valid ones', () => {
+  const tooLong = 'x'.repeat(MAX_JEV_INPUT_CHARS + 1)
+  assert.deepEqual(
+    parseClassifyBody(classifyBody({ hypotheses: ['ok', tooLong] })),
+    invalidRequest(`each hypothesis must be at most ${MAX_JEV_INPUT_CHARS} characters.`),
+  )
+})
+
 test('classify: hypotheses must be an array of 1 to 128 non-empty strings', () => {
   for (const hypotheses of [undefined, 'one', [], ['ok', ''], ['ok', 5], [{ text: 'x' }]]) {
     assert.deepEqual(parseClassifyBody(classifyBody({ hypotheses })), BAD_HYPOTHESES)
@@ -206,6 +228,28 @@ test('rerank: query must be a non-empty string', () => {
   for (const query of [undefined, '', 1]) {
     assert.deepEqual(parseRerankBody(rerankBody({ query })), invalidRequest('query must be a non-empty string.'))
   }
+})
+
+test('rerank: query up to 4000 characters is accepted, 4001 is refused', () => {
+  const atLimit = 'x'.repeat(MAX_JEV_INPUT_CHARS)
+  assert.deepEqual(parseRerankBody(rerankBody({ query: atLimit })), {
+    model: MODEL_KEY,
+    query: atLimit,
+    documents: CITIES,
+    topN: undefined,
+    hypothesisTemplate: DEFAULT_HYPOTHESIS_TEMPLATE,
+  })
+  assert.deepEqual(
+    parseRerankBody(rerankBody({ query: `${atLimit}x` })),
+    invalidRequest(`query must be at most ${MAX_JEV_INPUT_CHARS} characters.`),
+  )
+})
+
+test('rerank: an over-long document is refused, as a bare string or as {text}', () => {
+  const tooLong = 'x'.repeat(MAX_JEV_INPUT_CHARS + 1)
+  const overLong = invalidRequest(`each document must be at most ${MAX_JEV_INPUT_CHARS} characters.`)
+  assert.deepEqual(parseRerankBody(rerankBody({ documents: ['Paris', tooLong] })), overLong)
+  assert.deepEqual(parseRerankBody(rerankBody({ documents: ['Paris', { text: tooLong }] })), overLong)
 })
 
 test('rerank: documents must be 1 to 128 non-empty strings or {text} objects', () => {
