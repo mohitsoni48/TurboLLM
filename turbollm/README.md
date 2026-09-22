@@ -369,6 +369,25 @@ there. Entirely local; nothing leaves your machine.
 </details>
 
 <details>
+<summary><strong>🧠 Jev — ask structured questions about any text, locally</strong></summary>
+
+<br/>
+
+- **Load an NLI model (such as OpenJev) and TurboLLM detects it as a Jev model.** Workspace turns
+  into a JSON-first playground: two editors — the content, and the questions you're asking about
+  it — *are* the request. Ctrl/Cmd+Enter to run; see the answers per question, the raw response,
+  and a copyable `curl`.
+- **`POST /v1/systemone`** answers yes/no, pick-one, and scale questions in one call, using the
+  public System One API's exact field names — a client written for that shape only changes its
+  base URL and key. `POST /v1/classify` and `POST /v1/rerank` are there too for raw
+  premise/hypothesis work.
+- **Honestly labelled:** answers are the model's NLI entailment scores, not a calibrated decision
+  model, and the docs explain exactly how each number is computed.
+- Runs on vLLM (Linux or WSL2). Full guide: <https://turbollm.dev/docs/jev>.
+
+</details>
+
+<details>
 <summary><strong>🔌 APIs &amp; integrations — OpenAI + Anthropic, a model-loading gateway, and a stateful chat API</strong></summary>
 
 <br/>

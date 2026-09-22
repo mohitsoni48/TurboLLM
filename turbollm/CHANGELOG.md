@@ -23,6 +23,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.14.0] - 2026-09-22
+
 ### Added
 
 - **Prompt cache RAM setting.** llama.cpp keeps finished prompts in RAM (up to 8 GB by default) so
@@ -60,6 +64,20 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   `RuntimeError: UVA is not available`. On WSL, TurboLLM now starts vLLM with its previous model
   runner, which works there. Native Linux is unchanged. If you set `VLLM_USE_V2_MODEL_RUNNER`
   yourself, your setting is kept.
+
+### Discord
+
+- 🧠 **New: ask structured questions about any text, locally.** Load a Jev model (like OpenJev) and
+  TurboLLM turns Workspace into a playground for `POST /v1/systemone` — send content plus a list of
+  yes/no, pick-one, or scale questions, get back the answers with probabilities and a confidence
+  score. Same field names as the public System One API, so an existing client mostly just points at
+  your local TurboLLM.
+- The playground is now two plain JSON editors — the request you send *is* what's on screen, with a
+  copyable `curl` and the raw response right beside it.
+- 🐛 Fixed: vLLM couldn't start at all under WSL on recent versions — that's sorted.
+- Also in this release: a Prompt cache RAM setting to cap how much RAM llama.cpp keeps for finished
+  conversations.
+- Full guide: https://turbollm.dev/docs/jev
 
 ## [1.13.7] - 2026-09-19
 
