@@ -9,7 +9,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { RingBuffer, subscribeToBuffer, type BufferedEvent } from './code-run-manager'
+import { mkdtempSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ConversationStore } from '../chat/db'
+import { CodeRunManager, RingBuffer, subscribeToBuffer, type BufferedEvent, type CodeSessionRunner } from './code-run-manager'
+import type { Deps } from '../deps'
 
 // ── RingBuffer ──────────────────────────────────────────────────────────────────────
 
@@ -213,4 +218,62 @@ test('subscribeToBuffer: two independent subscribers both see the same live even
   assert.equal((r1.value as BufferedEvent).seq, 0)
   assert.equal((r2.value as BufferedEvent).seq, 0)
   s1.close(); s2.close()
+})
+
+// ── activeSessionIds (ADR-434 (i)(3)) ─────────────────────────────────────────────────────
+// The Jev-load confirmation names the Code turns a load would interrupt: every session with a
+// running or queued turn — the same predicate as anyActive(), per session. Driven through the
+// real CodeRunManager with an injected runner that holds each turn until the test releases it,
+// the way code-run-manager.reconnect.test.ts drives it (real store, no model, no port).
+
+function codeRunHarness() {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-code-active-'))
+  const store = new ConversationStore(dir)
+  const d = {
+    db: store,
+    manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }) },
+    store: { dir: () => dir, snapshot: () => ({ daemon: { autoGenerateTitles: false } }) },
+  } as unknown as Deps
+  const heldTurns: (() => void)[] = []
+  const runner = (async () => {
+    await new Promise<void>((resolve) => heldTurns.push(resolve))
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as unknown as CodeSessionRunner
+  const releaseHeldTurns = () => { for (const release of heldTurns.splice(0)) release() }
+  return { store, mgr: new CodeRunManager(d, { runner }), releaseHeldTurns }
+}
+
+function startTurn(h: ReturnType<typeof codeRunHarness>, task: string, sessionId?: string) {
+  const conv = h.store.createConversation({ kind: 'code' })
+  const run = sessionId ?? h.store.createAgentRun({ convId: conv.id, title: task, allowedTools: [], repoRoot: '.' }).id
+  const userMsg = h.store.addMessage(conv.id, 'user', task)
+  h.mgr.enqueue(run, { convId: conv.id, repoRoot: '.', task, userMsgId: userMsg.id })
+  return run
+}
+
+async function untilIdle(h: ReturnType<typeof codeRunHarness>, sessionId: string): Promise<void> {
+  for await (const _ of h.mgr.subscribe(sessionId, 0)) { /* drain to the idle end */ }
+}
+
+test('activeSessionIds lists a running session and one with a queued turn, not an idle one', async () => {
+  const h = codeRunHarness()
+  const idle = startTurn(h, 'finished')
+  h.releaseHeldTurns()
+  await untilIdle(h, idle)
+
+  const running = startTurn(h, 'running')
+  const withQueue = startTurn(h, 'first')
+  startTurn(h, 'queued follow-up', withQueue)
+
+  assert.deepEqual(h.mgr.activeSessionIds().sort(), [running, withQueue].sort())
+
+  h.releaseHeldTurns()
+  await untilIdle(h, running)
+  h.releaseHeldTurns()
+  await untilIdle(h, withQueue)
+  assert.deepEqual(h.mgr.activeSessionIds(), [], 'every session idle once its turns finish')
+})
+
+test('activeSessionIds is empty for a fresh manager', () => {
+  assert.deepEqual(codeRunHarness().mgr.activeSessionIds(), [])
 })

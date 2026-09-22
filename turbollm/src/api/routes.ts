@@ -53,7 +53,7 @@ import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalog
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
-import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
+import { modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
 import { estimateVram, type LoadProfile, resolveProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
@@ -73,6 +73,9 @@ import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
+import { jevStatus } from './jev-status'
+import { annotateCheckpoint } from '../hf/checkpoints'
+import { registerActivityRoutes } from './active-work'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 500 | 501 | 503
 
@@ -141,6 +144,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // from it, and `turbollm launch <cli>` (which has no access to browser state) uses it
       // instead of auto-loading a local model the user did not ask for.
       selectedRemoteModel: d.store.snapshot().selectedRemoteModel ?? '',
+      // The alive Jev model, if any (ADR-434 (i)(1)): Workspace becomes the Jev Playground while
+      // one is loaded in any slot. Local-only, like `launchCommand` — not in the shared builder.
+      jev: jevStatus(d),
       engineStats: core.engineStats,
       liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
@@ -182,6 +188,11 @@ export function registerApi(app: Hono, d: Deps): void {
       features: enabledFeatures(),
     })
   })
+
+  // What a model load would interrupt (ADR-434 (i)(3)). Its own module so this 3,000-line hub
+  // does not grow another handler, registered HERE and synchronously so it can never end up
+  // behind the SPA fallback (ADR-421).
+  registerActivityRoutes(app, d)
 
   // ---- artifact screenshot (faithful export) ----
   // Pixel-perfect raster of an HTML artifact via a real headless Chrome (ADR-121 follow-up).
@@ -2462,7 +2473,11 @@ export function registerApi(app: Hono, d: Deps): void {
         }
         return { ...f, downloaded: !!local, localKey: local?.key ?? null }
       })
-      return c.json({ ...detail, files, verifying })
+      // Checkpoint rows (ADR-434 (h)) are annotated the same way, but by sha or destination
+      // path: provenance `filename` is a basename, so two checkpoints' identical
+      // `model.safetensors` cannot be told apart by name.
+      const checkpoints = detail.checkpoints?.map((cp) => ({ ...cp, ...annotateCheckpoint(repo, cp, prov, models) }))
+      return c.json({ ...detail, files, ...(checkpoints ? { checkpoints } : {}), verifying })
     } catch (e) {
       return hfErr(c, e)
     }
@@ -2638,10 +2653,11 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // Whether the *active* engine can load this model (ADR-044) — drives the model-
   // list filter so e.g. only GGUFs show under a llama.cpp engine, safetensors under
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
+  // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
   const active = d.registry.active()
-  const compatibleWithActiveEngine = active
-    ? engineAcceptsFormat(active.kind, e.format) && !(e.audio && engineRejectsAudioModel(active.kind))
-    : true
+  const inc = active ? modelIncompatibility(active.kind, e) : null
+  const compatibleWithActiveEngine = !inc
+  const incompatibleReason = inc?.label ?? null
   // Source HF repo: confirmed from download provenance, else inferred from the
   // on-disk layout (LM Studio / huggingface-cli store models as
   // <root>/<owner>/<repo>/<file>). Lets the library open the model's HF page —
@@ -2661,7 +2677,10 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // advertised the wrong window until it happened to be loaded. Undefined when the model has no
   // profile for this engine — the caller then falls back to nativeCtx, which is the honest answer.
   const configuredCtx = resolveConfiguredCtx(snap, e.key, active?.id ?? '')
-  return { ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps, compatibleWithActiveEngine, sourceRepo }
+  return {
+    ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps,
+    compatibleWithActiveEngine, incompatibleReason, sourceRepo,
+  }
 }
 
 // ---- helpers ----

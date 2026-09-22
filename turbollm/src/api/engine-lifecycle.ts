@@ -13,7 +13,7 @@ import { basename } from 'node:path'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { engineAcceptsFormat, engineRejectsAudioModel } from '../engines/compat'
+import { modelIncompatibility } from '../engines/compat'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -59,26 +59,10 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     if (entry.incomplete || entry.parseError) {
       return err(c, 409, 'model_not_loadable', 'This model is incomplete or unreadable.')
     }
-    // Engine/model format must match (spec 03 §2b/2c): llama.cpp + forks load
-    // GGUF; MLX and vLLM load safetensors model directories.
-    if (!engineAcceptsFormat(active.kind, entry.format)) {
-      return err(c, 409, 'engine_model_mismatch', formatMismatchMessage(active.kind, entry.format))
-    }
-    if (entry.audio && engineRejectsAudioModel(active.kind)) {
-      const engineLabel = active.kind === 'mlx-vlm' ? 'MLX-VLM' : 'Rapid-MLX'
-      // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
-      // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
-      // precautionarily from reading the source, not a fresh live reproduction — say so
-      // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
-      // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
-      const certainty = active.kind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
-      return err(
-        c,
-        409,
-        'engine_model_mismatch',
-        `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
-      )
-    }
+    // Engine and model must be compatible (spec 03 §2b/2c, ADR-434 (g)): format, audio
+    // tower, and a Jev model's vLLM requirement — the one shared rule in compat.ts.
+    const inc = modelIncompatibility(active.kind, entry)
+    if (inc) return err(c, 409, 'engine_model_mismatch', inc.message)
 
     // Embedding models get their own pool slot via the router (same coexistence rule
     // the auto-swap gateway path already uses — model-router.ts's `chatSlotCount`/
@@ -198,22 +182,6 @@ export function stopEngine(c: Context, d: Deps, b: EngineStopBody = {}): Respons
   abortAllInFlightChats()
   d.manager.stop()
   return c.json({ ok: true }, 202)
-}
-
-/** User-facing message when the active engine can't load a model's format (ADR-044). */
-function formatMismatchMessage(engineKind: string, format: 'gguf' | 'mlx'): string {
-  if (engineKind === 'mlx')
-    return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'rapid-mlx')
-    return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'mlx-vlm')
-    return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'vllm')
-    return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
-  // llama.cpp / fork active, model is a safetensors dir.
-  return format === 'mlx'
-    ? 'This is a safetensors model — activate an MLX or vLLM engine to load it.'
-    : 'The active engine can only load GGUF models.'
 }
 
 function deriveModel(modelPath: string, name: string, extraArgs: string[]): ModelInfo {

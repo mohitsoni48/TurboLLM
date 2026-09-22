@@ -72,6 +72,14 @@ export class ToolRegistry {
     this.isRoutinesEnabled = routinesEnabled ?? (() => true)
   }
 
+  /** Does this key name a Jev model? A Jev model labels text: it can neither chat nor run a
+   *  routine (ADR-434 (f)), so the tool path refuses it in the same words the REST route does.
+   *  Undefined when no models store was injected, which leaves the check off entirely. */
+  private jevModelPredicate(): ((key: string) => boolean) | undefined {
+    const models = this.models
+    return models ? (key: string) => !!models.list().models.find((m) => m.key === key)?.jev : undefined
+  }
+
   /** Update config (called on settings change without restart). */
   updateConfig(toolsCfg: ToolsConfig): void {
     this.toolsCfg = toolsCfg
@@ -206,10 +214,10 @@ export class ToolRegistry {
         // both call executeTool with name: 'create_routine').
         if (!this.isRoutinesEnabled()) return `Error: ${ROUTINES_DISABLED_MESSAGE}`
         const modelExists = this.models ? (key: string) => this.models!.list().models.some((m) => m.key === key) : undefined
-        return execCreateRoutine(args, this.routines, isCodeAuthorized, modelExists)
+        return execCreateRoutine(args, this.routines, isCodeAuthorized, modelExists, this.jevModelPredicate())
       }
       if (name === 'list_routines') return execListRoutines(args, this.routines)
-      if (name === 'update_routine') return execUpdateRoutine(args, this.routines, isCodeAuthorized)
+      if (name === 'update_routine') return execUpdateRoutine(args, this.routines, isCodeAuthorized, this.jevModelPredicate())
       if (name === 'delete_routine') return execDeleteRoutine(args, this.routines)
       if (name === 'run_routine_now') {
         // Same kill switch as create_routine — RoutineScheduler.runNow() (cli.ts's injected

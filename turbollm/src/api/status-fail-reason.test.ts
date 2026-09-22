@@ -42,6 +42,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
     registry: {
       active: () => ({ id: 'eng-1', name: 'llama.cpp', kind: 'llama.cpp', binPath: '/opt/turbollm/engines/llama-server' }),
     },
+    modelRouter: { aliveSlots: () => [] },
     bench: { status: () => ({ state: 'idle' }) },
     downloads: { activeCount: () => 0 },
     provision: { get: () => undefined },

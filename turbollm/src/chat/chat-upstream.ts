@@ -89,6 +89,16 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
   if (ms.state !== 'running' || !ms.model) {
     return { ok: false, status: 409, code: 'model_not_loaded', message: 'Load a model first.' }
   }
+  // A Jev model labels premise/hypothesis pairs and has no chat route (ADR-434 (f)): say so,
+  // rather than let the turn reach the engine and come back as an opaque 404.
+  if (d.scanner.get(ms.model.key)?.jev) {
+    return {
+      ok: false,
+      status: 409,
+      code: 'jev_model_loaded',
+      message: 'A Jev model is loaded — it labels text and cannot chat. Switch to a chat model, or use the Jev Playground.',
+    }
+  }
   const target = d.manager.target()
   if (!target) {
     return { ok: false, status: 409, code: 'model_not_loaded', message: 'Engine not running.' }

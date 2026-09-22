@@ -40,7 +40,7 @@ function fakeDeps(run: { id: string; convId: string } | null = { id: 'sess-1', c
   const spy: DbSpy = { getAgentRunIds: [], messages: [], runUpdates: [] }
   const deps = {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target: 'http://engine.invalid.local:1' }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: 'http://engine.invalid.local:1' }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
     manager: {
       status: () => ({ state: 'running', model: { name: 'Qwen3 8B', key: 'qwen3-8b|Q4|123' } }),

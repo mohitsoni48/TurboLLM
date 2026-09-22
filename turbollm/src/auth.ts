@@ -475,6 +475,10 @@ export function requiredCapability(method: string, path: string): LinkCapability
   if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'
   if (path.startsWith('/api/v1/settings')) return read ? 'config:read' : 'config:write'
   if (path === '/api/v1/status') return 'config:read'
+  // ADR-434 (i)(3): the work a model load would interrupt (chat titles, Code sessions, routine
+  // names). Only a caller that may load models needs the confirmation this feeds, and routine
+  // names are not a `models:use` read. Read-only surface: a write maps to nothing.
+  if (path === '/api/v1/activity') return read ? 'models:load' : null
   // C2 (Phase 5 final review): the actual chat surface the web SPA calls — conversations
   // (send/edit/regenerate/branch/tool-approval/folder-move/save-skill/export/share/import),
   // folders, auto-memory, the tool catalog, and (read-only) hardware info. None of it touches

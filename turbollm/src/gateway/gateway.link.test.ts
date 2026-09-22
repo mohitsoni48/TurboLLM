@@ -16,7 +16,7 @@ const REMOTE = { linkId: 'lnk1', baseUrl: 'https://rig.trycloudflare.com', token
 function fakeDeps(): Deps {
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
@@ -230,6 +230,7 @@ function ledgerDeps(over: { remote?: boolean } = {}): { deps: Deps; ledger: Ledg
   const deps = {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: {
+      targetEntry: () => undefined,
       route: async () => (remote ? { target: REMOTE.baseUrl, remote } : { target: 'http://127.0.0.1:8081' }),
       resolveRemoteTarget: () => undefined,
     },

@@ -8,17 +8,21 @@ export function CopyButton({
   size = 13,
   className,
   screen,
+  action = 'copy_button_click',
 }: {
   text: string
   label?: string
   size?: number
   className?: string
-  screen: 'engines' | 'models' | 'developer' | 'settings' | 'code' | 'chat' | 'monitor'
+  screen: 'engines' | 'models' | 'developer' | 'settings' | 'code' | 'chat' | 'monitor' | 'workspace'
+  /** The `UI_ACTIONS` entry this copy stands for, when the surface has one of its own
+   *  (the Jev Playground's `jev_copy_request`). Defaults to the generic copy event. */
+  action?: string
 }) {
   const [copied, setCopied] = useState(false)
 
   const handle = () => {
-    track(screen, 'copy_button_click')
+    track(screen, action)
     void navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)

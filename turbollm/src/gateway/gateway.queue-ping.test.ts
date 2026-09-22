@@ -42,7 +42,7 @@ async function withFakeStreamingEngine(): Promise<{ url: string; close: () => Pr
 function fakeDeps(target: string, gate: GenerationGate | undefined, dbCalls: unknown[]): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),

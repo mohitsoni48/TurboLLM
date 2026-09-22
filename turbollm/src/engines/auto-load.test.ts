@@ -146,6 +146,24 @@ test('an MLX last model with an audio tower on Rapid-MLX skips as engine-incompa
   }))
 })
 
+test('a Jev last model on a non-vLLM engine skips because it needs vLLM', () => {
+  const jevModel = entry({
+    format: 'mlx',
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  })
+  const { plan } = planFor({ engine: engineOfKind('mlx', 'MLX'), findModel: recordingLibrary(jevModel).findModel })
+
+  assert.deepEqual(plan, skip({
+    code: 'engine-incompatible', modelKey: KEY, engineName: 'MLX', engineKind: 'mlx',
+    detail: 'Needs vLLM (Linux or WSL2)',
+  }))
+})
+
 test('a loadable GGUF last model on llama-server plans a load onto the active engine', () => {
   const lastModel = entry()
   const { plan } = planFor({ engine: LLAMA_SERVER, findModel: recordingLibrary(lastModel).findModel })
@@ -311,6 +329,17 @@ test('skip line: engine cannot load an audio tower', () => {
     skipLine(INCOMPATIBLE_ON_AUDIO),
     'auto-load skipped: engine "llama.cpp" (rapid-mlx) can\'t load last model "gemma 4 e4b|Q6_K|6217256480" '
       + '(audio tower not supported)',
+  )
+})
+
+test('skip line: a Jev last model needs vLLM', () => {
+  assert.equal(
+    skipLine({
+      code: 'engine-incompatible', modelKey: KEY, engineName: 'llama.cpp', engineKind: 'llama-server',
+      detail: 'Needs vLLM (Linux or WSL2)',
+    }),
+    'auto-load skipped: engine "llama.cpp" (llama-server) can\'t load last model "gemma 4 e4b|Q6_K|6217256480" '
+      + '(Needs vLLM (Linux or WSL2))',
   )
 })
 

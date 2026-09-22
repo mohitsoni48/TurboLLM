@@ -10,9 +10,12 @@
 // shape other tests use — since there's no public seeder that doesn't drive a real load.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
 import { ModelRouter } from './model-router'
-import type { Manager, Status } from '../engines/manager'
-import type { ConfigStore, Engine } from '../config/config'
+import type { Manager, StartOpts, Status } from '../engines/manager'
+import { defaultConfig, type Config, type ConfigStore, type Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 
@@ -310,6 +313,63 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
   assert.ok(loadedWith, 'expected Manager.load to be called even though autoSwap is disabled')
 })
 
+// ── doLoad: the shared modelIncompatibility() rule (ADR-434 (g)) ──
+// An auto-swap to a model the active engine cannot load answers 503 with the same message the
+// manual load guard uses, before anything is evicted or loaded. That includes the audio check.
+function recordingPrimary() {
+  const loads: unknown[] = []
+  const manager = {
+    status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async (opts: unknown) => { loads.push(opts) },
+    target: () => null,
+    touch: () => {},
+  } as unknown as Manager
+  return { manager, loads }
+}
+
+function autoSwapRouter(engineKind: string, entry: ModelEntry, primary: Manager): ModelRouter {
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine(engineKind) } as unknown as Registry
+  return new ModelRouter(fakeFullStore(), registry, primary, scanner, undefined)
+}
+
+test('route: an audio-tower model on Rapid-MLX is refused with the audio message and never loads', async () => {
+  const { manager, loads } = recordingPrimary()
+  const audioModel = { ...fakeEntry('gemma-audio'), audio: true } as ModelEntry
+  const r = autoSwapRouter('rapid-mlx', audioModel, manager)
+
+  const result = await r.route('gemma-audio')
+
+  assert.deepEqual(result, {
+    status: 503,
+    message:
+      'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+  })
+  assert.deepEqual(loads, [])
+})
+
+test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and never loads', async () => {
+  const { manager, loads } = recordingPrimary()
+  const jevModel = {
+    ...fakeEntry('qwen3.5 4b nli v2'),
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  } as ModelEntry
+  const r = autoSwapRouter('llama-server', jevModel, manager)
+
+  const result = await r.route('qwen3.5 4b nli v2')
+
+  assert.deepEqual(result, {
+    status: 503,
+    message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+  })
+  assert.deepEqual(loads, [])
+})
+
 test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {
   const scanner = { get: () => undefined, list: () => ({ models: [] }) } as unknown as import('../models/scanner').Scanner
   let loadCalled = false
@@ -322,4 +382,253 @@ test('loadExplicit reports 503 for an unknown model key without touching the man
   const result = await r.loadExplicit('nonexistent')
   assert.equal('status' in result && result.status, 503)
   assert.equal(loadCalled, false)
+})
+
+// ── buildOpts: gateway loads build StartOpts through the one shared builder ──
+// A source scan, as engine-lifecycle.shared-builder.test.ts does for startEngine: a re-introduced
+// inline copy produces correct StartOpts on the day it lands, and only drifts later.
+const MODEL_ROUTER_SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'model-router.ts'), 'utf8')
+
+const INLINE_BUILDER_CALLS = [
+  'profileToArgs(',
+  'koboldcppProfileToArgs(',
+  'vllmProfileToArgs(',
+  'mlxSamplingArgs(',
+  'resolveProfile(',
+  'getModelProfile(',
+]
+
+test('model-router.ts calls the shared buildStartOpts exactly once', () => {
+  assert.equal(MODEL_ROUTER_SOURCE.split('buildStartOpts(').length - 1, 1)
+})
+
+test('model-router.ts resolves no profile and builds no engine args of its own', () => {
+  const inlineCalls = INLINE_BUILDER_CALLS.filter((call) => MODEL_ROUTER_SOURCE.includes(call))
+
+  assert.deepEqual(inlineCalls, [], `build these through buildStartOpts instead:\n${inlineCalls.join('\n')}`)
+})
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+function builderEngine(kind: string): Engine {
+  return {
+    id: 'eng1', name: kind, kind, binPath: 'llama-server', version: 'b1',
+    capabilities: { kvTypes: [], flags: [] }, addedAt: 't',
+  } as unknown as Engine
+}
+
+function builderEntry(overrides: Partial<ModelEntry>): ModelEntry {
+  return {
+    key: 'model-a', name: 'Model A', path: '/models/model-a.gguf', dir: '/models',
+    format: 'gguf', sizeBytes: 1, sizeLabel: '1 GB', arch: 'qwen3', quant: 'Q4_K_M', nativeCtx: 4096,
+    blockCount: 1, headCountKv: 1, headDim: 1, moe: false, expertCount: 0, nextnLayers: 0,
+    vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true,
+    reasoningEffort: false, embedding: false, incomplete: false, parseError: null,
+    ...overrides,
+  } as unknown as ModelEntry
+}
+
+function routerWithConfig(cfg: Config): ModelRouter {
+  const store = { snapshot: () => cfg } as unknown as ConfigStore
+  return new ModelRouter(store, {} as never, fakeManager('stopped', null), {} as never, undefined)
+}
+
+function buildOptsOf(r: ModelRouter, entry: ModelEntry, engine: Engine): StartOpts | null {
+  return (r as unknown as { buildOpts(e: ModelEntry, g: Engine): StartOpts | null }).buildOpts(entry, engine)
+}
+
+test('buildOpts: a Jev model auto-swapped onto vLLM launches with the verified flags', () => {
+  const jevModel = builderEntry({
+    key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', format: 'mlx', path: '/models/openjev/qwen3.5-4b-nli-v2',
+    nativeCtx: 262144,
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  })
+
+  const opts = buildOptsOf(routerWithConfig(defaultConfig()), jevModel, builderEngine('vllm'))
+
+  assert.deepEqual(opts?.extraArgs.slice(-OPENJEV_LAUNCH_TOKENS.length), OPENJEV_LAUNCH_TOKENS)
+  assert.equal(opts?.trigger, 'gateway_switch')
+})
+
+test('buildOpts: a gateway load honours the saved profile pinned port', () => {
+  const cfg = defaultConfig()
+  cfg.modelProfiles['model-a'] = { eng1: { profile: { port: 6997 }, updatedAt: '2026-09-19T00:00:00.000Z' } }
+
+  const opts = buildOptsOf(routerWithConfig(cfg), builderEntry({}), builderEngine('llama-server'))
+
+  assert.equal(opts?.preferredPort, 6997)
+})
+
+test('buildOpts: an incomplete model builds nothing', () => {
+  const opts = buildOptsOf(routerWithConfig(defaultConfig()), builderEntry({ incomplete: true }), builderEngine('llama-server'))
+
+  assert.equal(opts, null)
+})
+
+// ── resolveLocal / targetEntry / routeTo / aliveSlots (ADR-060, ADR-376) ──
+// routeTo routes to exactly the entry it is given and never falls back to whatever the primary
+// holds; targetEntry answers "which local model would route() hit" without loading anything.
+// Targets are opaque strings here: nothing is ever contacted.
+const PRIMARY_TARGET = 'http://primary.invalid'
+const BETA_SLOT_TARGET = 'http://slot-beta.invalid'
+
+function namedEntry(key: string, name: string): ModelEntry {
+  return { ...fakeEntry(key), name } as ModelEntry
+}
+
+const ALPHA = namedEntry('alpha-key', 'Alpha Model')
+const BETA = namedEntry('beta-key', 'Beta')
+
+/** A primary Manager double holding `loadedKey` (running) or nothing. Its load() throws, so a test
+ *  that must not load anything fails loudly if it does. */
+function primaryHolding(loadedKey: string | null): Manager {
+  const model = loadedKey ? { key: loadedKey, name: loadedKey, quant: 'Q4', ctx: 4096, vision: false } : null
+  return {
+    status: (): Status => ({ state: loadedKey ? 'running' : 'stopped', err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    target: () => (loadedKey ? PRIMARY_TARGET : null),
+    touch: () => {},
+    load: () => { throw new Error('this test must not load a model') },
+  } as unknown as Manager
+}
+
+function slotManager(state: Status['state'], modelKey: string, target: string): Manager {
+  const model = { key: modelKey, name: modelKey, quant: 'Q4', ctx: 4096, vision: false }
+  return {
+    status: (): Status => ({ state, err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    target: () => target,
+    touch: () => {},
+  } as unknown as Manager
+}
+
+function routingRouter(opts: {
+  models: ModelEntry[]
+  primary: Manager
+  autoSwap?: boolean
+  slots?: PoolSlotShape[]
+}): ModelRouter {
+  const cfg = { gateway: { autoSwap: opts.autoSwap ?? true, keepN: 1 }, modelProfiles: {}, comfyui: {}, links: [] }
+  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as unknown as ConfigStore
+  const scanner = {
+    list: () => ({ models: opts.models }),
+    get: (key: string) => opts.models.find((m) => m.key === key),
+  } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, opts.primary, scanner, undefined)
+  const slots = new Map<string, PoolSlotShape>()
+  for (const s of opts.slots ?? []) slots.set(s.modelKey, s)
+  ;(r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots = slots
+  return r
+}
+
+test('resolveLocal: exact key, exact name, case-insensitive name, then substring', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(null) })
+
+  assert.equal(r.resolveLocal('beta-key'), BETA)
+  assert.equal(r.resolveLocal('Alpha Model'), ALPHA)
+  assert.equal(r.resolveLocal('alpha model'), ALPHA)
+  assert.equal(r.resolveLocal('pha mod'), ALPHA)
+  assert.equal(r.resolveLocal('gamma'), undefined)
+})
+
+test('targetEntry: a Turbo Link qualified id is never a local entry', () => {
+  const r = routingRouter({ models: [ALPHA], primary: primaryHolding('alpha-key') })
+  ;(r as unknown as { catalog: unknown }).catalog = {
+    linkByName: (name: string) => (name === 'workstation'
+      ? { id: 'l1', name: 'workstation', baseUrl: 'https://ws.invalid', token: 't', status: 'online' }
+      : undefined),
+    modelOn: () => ({ key: 'Alpha Model', name: 'Alpha Model' }),
+  }
+
+  assert.equal(r.targetEntry('workstation/Alpha Model'), undefined)
+})
+
+test('targetEntry: auto-swap off answers with the primary entry, whatever was named', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false })
+
+  assert.equal(r.targetEntry('Beta'), ALPHA)
+})
+
+test('targetEntry: an empty model answers with the primary entry', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.equal(r.targetEntry(''), ALPHA)
+})
+
+test('targetEntry: a resolvable model answers with that entry, without loading it', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.equal(r.targetEntry('Beta'), BETA)
+})
+
+test('targetEntry: an unresolvable model answers with the primary entry, matched by path too', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(ALPHA.path) })
+
+  assert.equal(r.targetEntry('gamma'), ALPHA)
+})
+
+test('targetEntry: with nothing loaded an unresolvable model has no target entry', () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding(null) })
+
+  assert.equal(r.targetEntry('gamma'), undefined)
+  assert.equal(r.targetEntry(''), undefined)
+})
+
+test('routeTo: the entry running in the primary gets the primary target, with no load', async () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key') })
+
+  assert.deepEqual(await r.routeTo(ALPHA), { target: PRIMARY_TARGET })
+})
+
+test('routeTo: the entry running in a pool slot gets that slot target', async () => {
+  const slot = { manager: slotManager('running', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [slot] })
+
+  assert.deepEqual(await r.routeTo(BETA), { target: BETA_SLOT_TARGET })
+})
+
+test('routeTo: an entry that is not alive is loaded once when auto-swap is on', async () => {
+  const { manager, finishLoad, calls } = controllableManager()
+  const r = routingRouter({ models: [ALPHA, BETA], primary: manager })
+
+  const routed = r.routeTo(BETA)
+  await tick()
+  finishLoad()
+
+  assert.deepEqual(await routed, { target: manager.target() })
+  assert.deepEqual(calls, ['beta-key'])
+})
+
+test('routeTo: with auto-swap off an entry that is not loaded is a 503, never the primary target', async () => {
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false })
+
+  assert.deepEqual(await r.routeTo(BETA), {
+    status: 503,
+    message: "'Beta' is not loaded. Load it from Models, or turn on auto-swap.",
+  })
+})
+
+test('aliveSlots: the primary first, then alive pool slots; stopped slots are left out', () => {
+  const r = routingRouter({
+    models: [ALPHA, BETA],
+    primary: primaryHolding('alpha-key'),
+    slots: [
+      { manager: slotManager('starting', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 5 },
+      { manager: slotManager('stopped', 'gamma-key', 'http://slot-gamma.invalid'), modelKey: 'gamma-key', lastUsedMs: 7 },
+    ],
+  })
+
+  assert.deepEqual(r.aliveSlots(), [
+    { modelKey: 'alpha-key', state: 'running', primary: true, lastUsedMs: 0 },
+    { modelKey: 'beta-key', state: 'starting', primary: false, lastUsedMs: 5 },
+  ])
 })

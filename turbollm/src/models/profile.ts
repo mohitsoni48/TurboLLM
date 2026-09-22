@@ -5,6 +5,7 @@ import type { Capabilities, ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
+import { jevLaunchArgs, jevMaxModelLen, type JevInfo } from './jev'
 
 export interface Sampling {
   temp: number
@@ -1010,17 +1011,24 @@ export function profileToArgs(
  *
  *  `nativeCtx` is the model's own uncapped `max_position_embeddings` (`ModelEntry.nativeCtx`) —
  *  deliberately NOT `p.ctx`, which `deriveDefault()` caps at 8192 for llama.cpp/MLX's KV-memory
- *  sizing and has no bearing on vLLM once `--max-model-len` is left unset (see below). */
-export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number): string[] {
+ *  sizing and has no bearing on vLLM once `--max-model-len` is left unset (see below).
+ *
+ *  `jev` (ADR-434 (g)): a Jev model's verified classifier flags go between the profile's flags and
+ *  the user's extra args, minus any flag the user already set, so the user wins without duplicates.
+ *  A Jev model that has chosen no length of its own also gets a capped `--max-model-len`
+ *  ({@link jevMaxModelLen}) rather than vLLM's own derivation, which crashes its profile run. */
+export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number, jev?: JevInfo): string[] {
   const v = p.vllm ?? defaultVllm()
   const a: string[] = []
-  if (v.maxModelLen > 0) a.push('--max-model-len', String(v.maxModelLen))
+  const jevDefaultLen = jev ? jevMaxModelLen(nativeCtx, p.extraArgs) : 0
+  const maxModelLen = v.maxModelLen > 0 ? v.maxModelLen : jevDefaultLen
+  if (maxModelLen > 0) a.push('--max-model-len', String(maxModelLen))
   // vLLM's own --max-num-batched-tokens defaults to 2048, and its scheduler config
   // validator hard-rejects (refuses to start) any effective max-model-len larger than
   // that — not a soft truncation. When --max-model-len is left unset, vLLM derives its
   // own from the model's real max_position_embeddings, so --max-num-batched-tokens must
   // be raised to match THAT (nativeCtx), not the 8192-capped p.ctx used elsewhere.
-  const effectiveMaxLen = v.maxModelLen > 0 ? v.maxModelLen : nativeCtx || 8192
+  const effectiveMaxLen = maxModelLen > 0 ? maxModelLen : nativeCtx || 8192
   if (effectiveMaxLen > 2048) a.push('--max-num-batched-tokens', String(effectiveMaxLen))
   if (v.gpuMemoryUtilization > 0 && v.gpuMemoryUtilization !== 0.9) {
     a.push('--gpu-memory-utilization', String(v.gpuMemoryUtilization))
@@ -1030,6 +1038,7 @@ export function vllmProfileToArgs(p: LoadProfile, nativeCtx: number): string[] {
   if (v.kvCacheDtype !== 'auto') a.push('--kv-cache-dtype', v.kvCacheDtype)
   if (v.enforceEager) a.push('--enforce-eager')
   if (v.trustRemoteCode) a.push('--trust-remote-code')
+  if (jev) a.push(...jevLaunchArgs(jev, p.extraArgs))
   a.push(...p.extraArgs)
   return a
 }

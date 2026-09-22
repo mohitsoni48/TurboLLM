@@ -118,7 +118,10 @@ import {
   type SysInfo,
   type TelemetryLevel,
   getAgentAvailability,
+  ApiError,
 } from './api'
+import { toast } from '../components/ui/sonner'
+import { useJevLoadStore } from '../stores/jev-load'
 import type {
   BenchState,
   BuildPrereqs,
@@ -742,6 +745,10 @@ export function useModelDetail(key: string | null, engineId?: string): UseQueryR
   })
 }
 
+/** `announceFailure` marks a load the shared loader started, and so the one whose failure the
+ *  user hears about from here rather than from the screen that fired it. */
+export type LoadRequest = { key: string; overrides?: Partial<LoadProfile>; announceFailure?: boolean }
+
 export function useModelActions() {
   const qc = useQueryClient()
   const invalidate = () => {
@@ -769,7 +776,21 @@ export function useModelActions() {
       },
     }),
     load: useMutation({
-      mutationFn: (v: { key: string; overrides?: Partial<LoadProfile> }) => loadModel(v.key, v.overrides),
+      mutationFn: (v: LoadRequest) => loadModel(v.key, v.overrides),
+      // The whole life of a load is kept here, on the mutation, rather than on the callbacks a
+      // surface passes to `mutate()`. Two rules: every surface reads one pending key, and a
+      // refused load is reported exactly once. Both have to hold after the surface that fired
+      // the load has gone — it routinely closes itself in the same click — and React Query
+      // drops a `mutate()` callback whose observer has unmounted.
+      onMutate: (v) => useJevLoadStore.getState().loadStarted(v.key),
+      onError: (e, v) => {
+        const reason = loadFailureReason(e)
+        useJevLoadStore.getState().loadFailed(v.key, reason)
+        // Only a load the shared loader started. A screen that loads through its own mutation
+        // reports its own failures, and would otherwise say the same thing twice.
+        if (v.announceFailure) toast.error(`Could not load model: ${reason}`)
+      },
+      onSettled: (_d, _e, v) => useJevLoadStore.getState().loadSettled(v.key),
       onSuccess: (_d, v) => {
         invalidate()
         void qc.invalidateQueries({ queryKey: ['model', v.key] })
@@ -780,6 +801,12 @@ export function useModelActions() {
       onSuccess: invalidate,
     }),
   }
+}
+
+/** One wording for one failure: the toast and the inline message a detail dialog shows must
+ *  never describe the same refusal differently. */
+function loadFailureReason(e: unknown): string {
+  return e instanceof ApiError ? e.message : 'check the engine logs on the Engines screen.'
 }
 
 export function useMcpMutations() {

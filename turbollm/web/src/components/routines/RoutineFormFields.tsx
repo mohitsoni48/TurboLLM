@@ -4,6 +4,7 @@ import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
+import { isChatModel } from '../../lib/model-kind'
 
 // Labels say plainly which one runs in-process and which shell out — the distinction that the
 // value names encode with the `_cli` suffix (routine-types.ts).
@@ -71,7 +72,8 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   const [browserOpen, setBrowserOpen] = useState(false)
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
-  const models = modelsQ.data?.models ?? []
+  const catalog = modelsQ.data?.models ?? []
+  const models = catalog.filter(isChatModel)
   const agents = agentsQ.data ?? []
   // A controlled <select> whose value matches no <option> falls back to the first one — here the
   // placeholder — so the field would read as unset while the draft still holds a real value and
@@ -79,7 +81,11 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   // required field, and an untouched submit silently re-persisting the invisible value. Happens
   // on first paint of an edit form before the catalog query resolves, and permanently once a
   // model/agent is deleted. Rendering the stored value as its own option keeps it visible.
-  const orphanModelKey = draft.modelKey && !models.some((m) => m.key === draft.modelKey) ? draft.modelKey : null
+  const storedModel = catalog.find((m) => m.key === draft.modelKey)
+  // A routine saved before Jev detection existed can name a model that is now a Jev model: it IS in
+  // the catalog, it just cannot run a routine, so it gets its own text rather than "not in the catalog".
+  const storedJevModel = storedModel && !isChatModel(storedModel) ? storedModel : null
+  const orphanModelKey = draft.modelKey && !storedModel ? draft.modelKey : null
   const orphanAgentId = draft.agentId && !agents.some((a) => a.id === draft.agentId) ? draft.agentId : null
   // Ids so each <label> actually points at its control — these are plain selects/inputs, not
   // wrapped controls, so without htmlFor a screen reader reads them as unlabelled.
@@ -132,6 +138,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
         <select id={id('model')} disabled={disabled} className={inputCls} value={draft.modelKey} onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}>
           <option value="">Choose a model…</option>
           {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
+          {storedJevModel && <option value={storedJevModel.key}>{storedJevModel.name} (a Jev model — it can&apos;t run a routine)</option>}
           {/* Quant + dir, not just name: the catalog can hold several entries with the SAME
               display name (different quant, or the same quant re-downloaded to a different
               path) — without this an option like "Qwen3.6-35B-A3B" is ambiguous among 4+ real

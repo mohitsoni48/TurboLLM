@@ -672,6 +672,16 @@ export const UI_ACTIONS = [
   // the manual trigger and how often people undo a compaction are the two numbers that say
   // whether the fixed 80% threshold is right, so neither may be silently dropped again.
   'manual_compact', 'undo_compaction',
+
+  // Jev (ADR-434): the Jev Playground (screen `workspace`), the Discover checkpoint picker and
+  // the Jev load confirmation/toast (screen `models`). Listed before the call sites exist, for
+  // the CLOSED-enum reason spelled out twice directly above.
+  'jev_mode_check', 'jev_mode_choose', 'jev_run_check', 'jev_run_choose',
+  'jev_add_hypothesis', 'jev_remove_hypothesis', 'jev_add_option', 'jev_remove_option',
+  'jev_load_example', 'jev_view_results', 'jev_view_json', 'jev_view_api', 'jev_copy_request',
+  'jev_switch_model',
+  'download_hf_checkpoint', 'load_hf_checkpoint',
+  'confirm_jev_load', 'cancel_jev_load', 'open_jev_playground_toast',
 ] as const
 
 export const uiAction = defineEvent({

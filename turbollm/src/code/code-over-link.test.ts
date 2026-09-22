@@ -72,6 +72,7 @@ function mkHost(opts: { requireApiKey?: boolean } = {}): { d: Deps; h: HostHarne
     db: { recordApiUsage: () => {}, getConversation: () => null, getAgentRun: () => null },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
     modelRouter: {
+      targetEntry: () => undefined,
       route: async (m: string) => { h.routed.push(m); return { target: 'http://engine.local' } },
       resolveRemoteTarget: () => undefined,
     },

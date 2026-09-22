@@ -10,6 +10,7 @@ import type { ModelEntry } from '../models/scanner'
 import { type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import type { StartOpts } from './manager'
+import { mlxSamplingArgs } from './mlx'
 import { buildStartOpts } from './start-opts'
 
 const NO_GPU_MACHINE: SysInfo = { os: 'win32', cpu: 'test', cores: 8, ramMB: 32768, gpus: [] }
@@ -32,6 +33,26 @@ test('koboldcpp gets KoboldCpp flags, including --nogpu on a machine with no GPU
   assert.deepEqual(opts.extraArgs, koboldcppProfileToArgs(opts.profile!, primaryVendor(NO_GPU_MACHINE), false))
   assert.ok(opts.extraArgs.includes('--nogpu'))
   assert.ok(!opts.extraArgs.includes('-c'))
+})
+
+// KoboldCpp's backend comes from the primary vendor, not from gpus[0]: an Intel iGPU listed
+// before an NVIDIA card must not pick Vulkan. The shared builder ranks vendors.
+test('koboldcpp picks its GPU backend from the primary vendor, not the first GPU listed', () => {
+  const igpuFirst: SysInfo = {
+    ...NO_GPU_MACHINE,
+    gpus: [
+      { name: 'Intel UHD', vramMb: 1024, vendor: 'intel' },
+      { name: 'RTX 5070 Ti', vramMb: 16384, vendor: 'nvidia' },
+    ],
+  }
+
+  const opts = buildStartOpts({
+    entry: ggufModel(), engine: testEngine('koboldcpp'), cfg: defaultConfig(), sys: igpuFirst,
+    overrides: { ngl: 99 }, trigger: 'gateway_switch',
+  })
+
+  assert.ok(opts.extraArgs.includes('--usecuda'))
+  assert.ok(!opts.extraArgs.includes('--usevulkan'))
 })
 
 test('vllm gets --max-model-len from the saved vLLM profile', () => {
@@ -60,6 +81,41 @@ test('building StartOpts leaves the config snapshot it reads unchanged', () => {
   }
 
   assert.deepEqual(cfg, before)
+})
+
+const OPENJEV_LAUNCH_TOKENS = [
+  '--runner', 'pooling',
+  '--convert', 'classify',
+  '--hf-overrides', '{"architectures":["Qwen3_5ForConditionalGeneration"]}',
+  '--limit-mm-per-prompt', '{"image":0,"video":0}',
+]
+
+function jevModel(): ModelEntry {
+  return ggufModel({
+    format: 'mlx', nativeCtx: 262144, path: 'D:\\models\\openjev\\qwen3.5-4b-nli-v2',
+    jev: {
+      labels: ['contradiction', 'entailment', 'neutral'],
+      nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+      architecture: 'Qwen3_5ForSequenceClassification',
+      verified: true,
+    },
+  })
+}
+
+// The length is capped here, not passed through: vLLM's profile run on this model's native
+// 262,144 died with a CUDA illegal memory access (2026-09-21, vLLM 0.29.0) — see jev.ts.
+test('a Jev model on vLLM launches with the verified classifier flags after the profile flags', () => {
+  const opts = resumeLoad(jevModel(), 'vllm')
+
+  assert.deepEqual(opts.extraArgs, [
+    '--max-model-len', '8192', '--max-num-batched-tokens', '8192', ...OPENJEV_LAUNCH_TOKENS,
+  ])
+})
+
+test('a Jev model on MLX keeps the MLX sampling path, with no Jev flags', () => {
+  const opts = resumeLoad(jevModel(), 'mlx')
+
+  assert.deepEqual(opts.extraArgs, mlxSamplingArgs(undefined))
 })
 
 function resumeLoad(entry: ModelEntry, kind: string, cfg: Config = defaultConfig()): StartOpts {

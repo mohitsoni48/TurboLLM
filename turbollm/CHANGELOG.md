@@ -23,12 +23,39 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [1.14.0] - 2026-09-22
+
 ### Added
 
 - **Prompt cache RAM setting.** llama.cpp keeps finished prompts in RAM (up to 8 GB by default) so
   returning to an earlier conversation skips re-processing. A new **Prompt cache RAM (MiB)** field in a
   model's Advanced settings caps that (`--cache-ram`), and `0` turns it off to free the memory. It is
   blank by default, so nothing changes until you set it. Shown only on engines that support the flag.
+- **Jev models: ask structured questions about anything, locally.** TurboLLM now recognises NLI
+  cross-encoders (such as OpenJev) and runs them through vLLM. `POST /v1/systemone` takes a piece of
+  content and a set of questions — yes/no, pick-one, or a position on a scale — and answers each one
+  (a number for a yes/no question, probabilities plus a confidence for a pick-one or a scale) in the
+  same field names as the public System One API, so a client written for that shape only changes its
+  base URL and key. `POST /v1/classify` and `POST /v1/rerank` are there too for raw
+  premise/hypothesis work. While a Jev model is loaded, Workspace becomes the **Jev Playground**: a
+  state editor and a questions editor that *are* the request, Ctrl/Cmd+Enter to run, the answers per
+  question, the raw response and a copyable `curl`. The answers are the model's NLI entailment
+  scores, not a calibrated decision model, and the docs say exactly how each number is computed. A
+  Jev model loads with an 8,192-token limit per request by default. Downloading one is easier too: a
+  Hugging Face repo that keeps several checkpoints in subfolders now lists them one per row.
+  Full guide: https://turbollm.dev/docs/jev
+
+### Changed
+
+- **`/v1/rerank` now belongs to Jev models.** TurboLLM serves it itself instead of passing it
+  through to the engine, so a llama.cpp reranker is no longer reachable on that path.
+- **An NLI cross-encoder already in your library is now treated as a Jev model.** It is no longer
+  listed as an embedding model and no longer answers `/v1/embeddings`. Loading it from Models now
+  replaces the model in the main slot instead of loading beside your chat model. A request through
+  the gateway that names it can still load it beside a chat model, when Keep-N is 2 or more and
+  there is room.
 
 ### Fixed
 
@@ -37,6 +64,20 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   `RuntimeError: UVA is not available`. On WSL, TurboLLM now starts vLLM with its previous model
   runner, which works there. Native Linux is unchanged. If you set `VLLM_USE_V2_MODEL_RUNNER`
   yourself, your setting is kept.
+
+### Discord
+
+- 🧠 **New: ask structured questions about any text, locally.** Load a Jev model (like OpenJev) and
+  TurboLLM turns Workspace into a playground for `POST /v1/systemone` — send content plus a list of
+  yes/no, pick-one, or scale questions, get back the answers with probabilities and a confidence
+  score. Same field names as the public System One API, so an existing client mostly just points at
+  your local TurboLLM.
+- The playground is now two plain JSON editors — the request you send *is* what's on screen, with a
+  copyable `curl` and the raw response right beside it.
+- 🐛 Fixed: vLLM couldn't start at all under WSL on recent versions — that's sorted.
+- Also in this release: a Prompt cache RAM setting to cap how much RAM llama.cpp keeps for finished
+  conversations.
+- Full guide: https://turbollm.dev/docs/jev
 
 ## [1.13.7] - 2026-09-19
 

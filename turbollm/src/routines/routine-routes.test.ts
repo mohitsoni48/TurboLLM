@@ -6,7 +6,7 @@ import { mkdtempSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { ConversationStore } from '../chat/db'
-import { registerRoutineRoutes, CODE_GATE_MESSAGE } from './routine-routes'
+import { registerRoutineRoutes, validateCreate, CODE_GATE_MESSAGE, JEV_ROUTINE_MODEL_MESSAGE } from './routine-routes'
 import { RoutineScheduler } from './scheduler'
 import { executeRoutine } from './execute'
 import type { Deps } from '../deps'
@@ -14,6 +14,7 @@ import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
 import type { GenerationGate } from '../agents/gate'
 
+const JEV_KEY = 'jev-fake-v2'
 const RAW_KEY = 'tllm-TestKeyTestKeyTestKeyTestKeyTestKey1'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
@@ -52,7 +53,7 @@ function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: 
       }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
-    scanner: { list: () => ({ models: [{ key: 'm', name: 'm' }, { key: 'qwen3-coder-32b', name: 'qwen3-coder-32b' }] }) },
+    scanner: { list: () => ({ models: [{ key: 'm', name: 'm' }, { key: 'qwen3-coder-32b', name: 'qwen3-coder-32b' }, { key: JEV_KEY, name: 'jev fake v2', jev: { labels: ['contradiction', 'entailment', 'neutral'], architecture: 'Qwen3_5ForSequenceClassification', verified: true } }] }) },
   } as unknown as Deps
   registerRoutineRoutes(app, d)
   return { app, db }
@@ -982,4 +983,70 @@ test('a stale approve on an OLD needs_approval run does not release a DIFFERENT,
   await scheduler.tick()
   await new Promise((resolve) => setImmediate(resolve))
   assert.deepEqual(fired, [routine.id, routine.id], 'released correctly — the routine can fire again')
+})
+
+// ── a routine can never be pinned to a Jev model (ADR-434 (f) + its correction to (i)(4)) ─────
+// A Jev model labels text: a routine pinned to one would swap it in (model-swap.ts) and then
+// fail every single run on the in-app chat guard's 409. Refused at creation instead.
+
+const CHAT_ROUTINE_BODY = {
+  flavor: 'chat', prompt: 'Summarize my inbox', scheduleDisplay: 'Runs daily at 9:00 AM',
+  scheduleRule: { kind: 'daily', hour: 9, minute: 0 }, agentId: 'agent-1',
+} as const
+
+async function postRoutine(app: Hono, modelKey: string): Promise<Response> {
+  return app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ...CHAT_ROUTINE_BODY, modelKey }),
+  })
+}
+
+test('POST /api/v1/routines refuses a Jev modelKey with a clear 400, creating nothing', async () => {
+  const { app, db } = testApp()
+
+  const res = await postRoutine(app, JEV_KEY)
+
+  assert.equal(res.status, 400)
+  assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: JEV_ROUTINE_MODEL_MESSAGE(JEV_KEY) } })
+  assert.deepEqual(db.listRoutines(), [])
+})
+
+test('POST /api/v1/routines still creates a routine on a chat model', async () => {
+  const { app } = testApp()
+
+  const res = await postRoutine(app, 'qwen3-coder-32b')
+
+  assert.equal(res.status, 201)
+})
+
+test('PUT /api/v1/routines/:id refuses a switch to a Jev model and leaves the routine alone', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ modelKey: JEV_KEY }),
+  })
+
+  assert.equal(res.status, 400)
+  assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: JEV_ROUTINE_MODEL_MESSAGE(JEV_KEY) } })
+  assert.equal(db.getRoutine(created.id)?.modelKey, 'm')
+})
+
+test('PUT /api/v1/routines/:id that does not touch modelKey is unaffected', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ prompt: 'a new prompt' }),
+  })
+
+  assert.equal(res.status, 200)
+  assert.equal(db.getRoutine(created.id)?.prompt, 'a new prompt')
+})
+
+test('validateCreate with no predicates behaves exactly as before', () => {
+  assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: JEV_KEY } as never), null)
+  assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: '   ' } as never), 'modelKey is required.')
 })

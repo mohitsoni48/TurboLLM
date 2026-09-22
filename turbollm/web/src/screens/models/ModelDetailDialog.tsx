@@ -1,6 +1,7 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
+import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
 import { Input } from '../../components/ui/input'
@@ -288,6 +289,12 @@ function PresetsPanel({
   )
 }
 
+/** The shared loader's last failure, and only when it is this model's: the dialog's own
+ *  mutation observer never sees one, because it closes itself in the same click. */
+function failureOf(failure: { key: string; message: string } | null, modelKey: string | undefined): string | null {
+  return failure && failure.key === modelKey ? failure.message : null
+}
+
 export function ModelDetailDialog({
   modelKey,
   onClose,
@@ -305,6 +312,7 @@ export function ModelDetailDialog({
   const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
   const detailQ = useModelDetail(modelKey, activeEngine?.id)
   const actions = useModelActions()
+  const loader = useModelLoader()
   const bench = useBenchActions()
   const benchState = useBenchState()
   const [pendingBenchKey, setPendingBenchKey] = useState<string | null>(null)
@@ -428,7 +436,7 @@ export function ModelDetailDialog({
   const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) =>
     setDraft((d) => (d ? { ...d, vllm: { ...(d.vllm ?? defaultVllm()), [k]: v } } : d))
 
-  const loadError = actions.load.error instanceof ApiError ? actions.load.error.message : null
+  const loadError = failureOf(loader.loadError, detail?.key)
 
   // Auto-tune (spec 09 §1). A run owns the engine exclusively, so a loaded model must
   // be stopped first — the button offers "Stop & benchmark" when this model is loaded.
@@ -581,6 +589,14 @@ export function ModelDetailDialog({
                 MLX-VLM manages context and KV cache automatically — there are no context/GPU-layer/KV
                 knobs to set, and no launch-time sampling defaults either; sampling is set
                 <span className="text-ink"> per-conversation</span> in chat.
+              </div>
+            )}
+
+            {detail.jev && (
+              <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">
+                {detail.jev.verified
+                  ? `Jev model — launched as a classifier with verified settings for ${detail.jev.architecture}.`
+                  : "Jev model — Not verified: launched with plain --runner pooling; if vLLM can't load it, its own error is shown."}
               </div>
             )}
 
@@ -921,21 +937,10 @@ export function ModelDetailDialog({
                 onClick={() => {
                   track('models', 'load_model_with_settings')
                   // Sequence: persist (when remembering) → then (re)load. Firing both
-                  // at once raced the profile write against the reload. The reload
-                  // surfaces failures via toast — otherwise a bad param silently stops
+                  // at once raced the profile write against the reload. The loader
+                  // reports a refusal itself — otherwise a bad param silently stops
                   // the engine and the model "never loads again" with no feedback.
-                  const fireLoad = () =>
-                    actions.load.mutate(
-                      { key: detail.key, overrides: draft },
-                      {
-                        onError: (e) =>
-                          toast.error(
-                            e instanceof ApiError
-                              ? `Could not load model: ${e.message}`
-                              : 'Could not load model — check the engine logs on the Engines screen.',
-                          ),
-                      },
-                    )
+                  const fireLoad = () => loader.requestLoad(detail, { overrides: draft })
                   if (remember) {
                     actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
                   } else {
@@ -943,7 +948,7 @@ export function ModelDetailDialog({
                   }
                   onClose()
                 }}
-                disabled={actions.load.isPending}
+                disabled={loader.isPending}
               >
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}

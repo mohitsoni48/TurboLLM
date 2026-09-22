@@ -22,6 +22,7 @@ import {
   Zap,
 } from 'lucide-react'
 import { ApiError, deleteModel, track } from '../lib/api'
+import { useModelLoader } from '../lib/model-loader'
 import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus } from '../lib/queries'
 import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
@@ -119,6 +120,12 @@ function groupModels(models: ModelEntry[], isPinned: (key: string) => boolean): 
   return [...groups.filter(isGroupPinned), ...groups.filter((g) => !isGroupPinned(g))]
 }
 
+/** Hidden by the engine filter — which a Jev model never is (ADR-434 (g)): it stays on the
+ *  list as unavailable, so it is not something "Show all" reveals. */
+function hiddenByEngine(m: ModelEntry): boolean {
+  return !m.compatibleWithActiveEngine && !m.jev
+}
+
 export function ModelsScreen() {
   const navigate = useNavigate()
   // Onboarding's Discover handoff (Pro, "pick a different model", "nothing fits this
@@ -140,6 +147,7 @@ export function ModelsScreen() {
   const mut = useModelMutations()
   const actions = useModelActions()
   const del = useDeleteModel()
+  const loader = useModelLoader()
   const { data: status } = useStatus()
   const { isPinned, togglePinned } = usePinnedModels()
   const linksQ = useLinks()
@@ -149,9 +157,9 @@ export function ModelsScreen() {
   // A load isn't instant: POST /load returns 202, then the engine spends seconds in
   // `starting` before `running`. Keep the Load buttons busy across that whole window.
   const engineState = status?.engine.state
-  const loadBusy = actions.load.isPending || engineState === 'starting' || engineState === 'stopping'
-  const loadingKey = actions.load.isPending
-    ? actions.load.variables?.key
+  const loadBusy = loader.isPending || engineState === 'starting' || engineState === 'stopping'
+  const loadingKey = loader.isPending
+    ? loader.pendingKey
     : engineState === 'starting'
       ? status?.model?.key
       : undefined
@@ -200,7 +208,11 @@ export function ModelsScreen() {
   const models = modelsQ.data?.models ?? []
   const dirs = dirsQ.data?.dirs ?? []
   const primaryDir = dirsQ.data?.primaryDir ?? ''
-  const incompatibleCount = models.filter((m) => !m.compatibleWithActiveEngine).length
+  // Two different questions, so two counts. A Jev model is never hidden by the engine filter
+  // (ADR-434 (g)) — it shows as unavailable instead — so it is not one of the models the banner
+  // offers to reveal, but it IS one of the models that cannot load once they are all on screen.
+  const hiddenCount = models.filter(hiddenByEngine).length
+  const cannotLoadCount = models.filter((m) => !m.compatibleWithActiveEngine).length
 
   // Facet-aware filter chips: only offer a facet that at least one model actually has.
   const facetCounts = useMemo(
@@ -215,7 +227,7 @@ export function ModelsScreen() {
 
   const q = search.trim().toLowerCase()
   const filtered = models.filter((m) => {
-    if (!showIncompatible && !m.compatibleWithActiveEngine) return false
+    if (!showIncompatible && hiddenByEngine(m)) return false
     if (q && !m.name.toLowerCase().includes(q)) return false
     if (filter === 'vision') return m.vision
     if (filter === 'moe') return m.moe
@@ -369,6 +381,7 @@ export function ModelsScreen() {
         <LibraryTab
           modelsQ={modelsQ}
           actions={actions}
+          onLoad={(m) => loader.requestLoad(m)}
           loadBusy={loadBusy}
           loadingKey={loadingKey}
           dirs={dirs}
@@ -379,7 +392,8 @@ export function ModelsScreen() {
           filter={filter}
           setFilter={setFilter}
           facetCounts={facetCounts}
-          incompatibleCount={incompatibleCount}
+          hiddenCount={hiddenCount}
+          cannotLoadCount={cannotLoadCount}
           showIncompatible={showIncompatible}
           setShowIncompatible={setShowIncompatible}
           rescan={() => mut.rescan.mutate()}
@@ -439,6 +453,7 @@ export function ModelsScreen() {
 function LibraryTab({
   modelsQ,
   actions,
+  onLoad,
   loadBusy,
   loadingKey,
   dirs,
@@ -449,7 +464,8 @@ function LibraryTab({
   filter,
   setFilter,
   facetCounts,
-  incompatibleCount,
+  hiddenCount,
+  cannotLoadCount,
   showIncompatible,
   setShowIncompatible,
   rescan,
@@ -472,6 +488,7 @@ function LibraryTab({
 }: {
   modelsQ: ReturnType<typeof useModels>
   actions: ReturnType<typeof useModelActions>
+  onLoad: (m: ModelEntry) => void
   loadBusy: boolean
   loadingKey: string | undefined
   dirs: string[]
@@ -482,7 +499,8 @@ function LibraryTab({
   filter: Filter
   setFilter: (f: Filter) => void
   facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
-  incompatibleCount: number
+  hiddenCount: number
+  cannotLoadCount: number
   showIncompatible: boolean
   setShowIncompatible: (v: boolean) => void
   rescan: () => void
@@ -567,12 +585,12 @@ function LibraryTab({
         </div>
       </div>
 
-      {incompatibleCount > 0 && (
+      {hiddenCount > 0 && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">
           <span className="text-muted">
             {showIncompatible
-              ? `Showing all models. ${incompatibleCount} can't load on the active engine.`
-              : `${incompatibleCount} ${incompatibleCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${incompatibleCount === 1 ? 'it' : 'them'}.`}
+              ? `Showing all models. ${cannotLoadCount} can't load on the active engine.`
+              : `${hiddenCount} ${hiddenCount === 1 ? 'model is' : 'models are'} hidden — the active engine can't load ${hiddenCount === 1 ? 'it' : 'them'}.`}
           </span>
           <button
             type="button"
@@ -648,7 +666,7 @@ function LibraryTab({
                     origin={r.origin}
                     showOrigin={hasLinks}
                     layout={isDesktop ? 'row' : 'card'}
-                    onLoad={(key) => actions.load.mutate({ key })}
+                    onLoad={onLoad}
                     onEject={(key) => actions.eject.mutate(key)}
                     onTune={(key) => setOpenKey(key)}
                     onDelete={(m) => setConfirmDelete(m)}
@@ -699,6 +717,14 @@ function useDeleteModel() {
   })
 }
 
+/** Why the Load button is dead. Only a Jev model takes the daemon's own wording:
+ *  `incompatibleReason` is the short chip label, and serving it here for every model
+ *  would duplicate the chip beside it and drop the half that says what to do about it. */
+function cannotLoadTitle(m: ModelEntry, needsEngine: string): string {
+  if (m.jev && m.incompatibleReason) return m.incompatibleReason
+  return `The active engine can't load this model — switch to ${needsEngine}`
+}
+
 /** One row per model name. Multiple quants collapse into a single row with a quant
  *  dropdown; the selected quant drives Size / Ctx / Speed / Load and the row actions. */
 function ModelRow({
@@ -727,7 +753,7 @@ function ModelRow({
   showOrigin: boolean
   /** 'row' = the aligned desktop table row; 'card' = the mobile stacked card. */
   layout?: 'row' | 'card'
-  onLoad: (key: string) => void
+  onLoad: (m: ModelEntry) => void
   onEject: (key: string) => void
   onTune: (key: string) => void
   onDelete: (m: ModelEntry) => void
@@ -755,13 +781,14 @@ function ModelRow({
   // template directly), so a missing one is a real, user-visible dead end at chat time —
   // surfaced here instead of a first-message 400. Only checked once the model is otherwise
   // loadable/compatible; an incomplete or engine-mismatched model has a more pressing problem.
-  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate
+  // …and never for a Jev model, which labels text and never chats (ADR-434 (g)).
+  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate && !m.jev
   const problem = m.incomplete
     ? 'missing parts'
     : m.parseError
       ? 'unreadable'
       : !compatible
-        ? `needs ${needsEngine}`
+        ? m.incompatibleReason ?? `needs ${needsEngine}`
         : noChatTemplate
           ? 'no chat template'
           : null
@@ -771,6 +798,7 @@ function ModelRow({
   // that's ALSO Vision+MoE (common for the bigger models that carry a NextN head) always had
   // its NextN tag silently crowded out despite the NextN filter/count already finding it.
   const caps = [
+    m.jev && 'Jev',
     (m.nextnLayers ?? 0) > 0 && 'NextN',
     m.embedding && 'Embed',
     m.vision && 'Vision',
@@ -854,13 +882,13 @@ function ModelRow({
       ) : (
         <Button
           size="sm"
-          onClick={() => { track('models', 'load_model'); onLoad(m.key) }}
+          onClick={() => { track('models', 'load_model'); onLoad(m) }}
           disabled={!loadable || !compatible || busy}
           title={
             !loadable
               ? 'Model is incomplete or unreadable'
               : !compatible
-                ? `The active engine can't load this model — switch to ${needsEngine}`
+                ? cannotLoadTitle(m, needsEngine)
                 : ''
           }
         >

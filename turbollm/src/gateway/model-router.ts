@@ -3,14 +3,13 @@
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
 import { Manager, type StartOpts } from '../engines/manager'
-import { getModelProfile, type ConfigStore, type Engine } from '../config/config'
+import type { ConfigStore, Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
-import { resolveProfile, profileToArgs, vllmProfileToArgs, type LoadProfile } from '../models/profile'
-import { mlxSamplingArgs } from '../engines/mlx'
-import { koboldcppProfileToArgs } from '../engines/koboldcpp'
-import { engineAcceptsFormat } from '../engines/compat'
+import type { LoadProfile } from '../models/profile'
+import { modelIncompatibility } from '../engines/compat'
+import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
@@ -28,6 +27,14 @@ export type RouteResult =
 interface PoolSlot {
   manager: Manager
   modelKey: string
+  lastUsedMs: number
+}
+
+/** One loaded (or loading / unloading) model across the pool, as `aliveSlots()` reports it. */
+export interface AliveSlot {
+  modelKey: string
+  state: 'running' | 'starting' | 'stopping'
+  primary: boolean
   lastUsedMs: number
 }
 
@@ -94,31 +101,53 @@ export class ModelRouter {
         : { status: 503, message: `No model matching '${requestedModel}' found. Add one in TurboLLM.` }
     }
 
-    // Fast path: correct model already running in the primary manager.
-    {
-      const ms = this.manager.status()
-      if (ms.state === 'running' && ms.model && this.keysMatch(ms.model.key, entry)) {
-        this.primaryLastUsed = Date.now()
-        this.manager.touch()
-        return { target: this.manager.target()! }
-      }
-    }
-
-    // Fast path: already running in a pool slot.
-    const slot = this.extraSlots.get(entry.key)
-    if (slot) {
-      const ss = slot.manager.status()
-      if (ss.state === 'running') {
-        slot.lastUsedMs = Date.now()
-        slot.manager.touch()
-        return { target: slot.manager.target()! }
-      }
-      this.extraSlots.delete(entry.key) // dead slot — clean up
-    }
+    const alive = this.routeResolved(entry)
+    if (alive) return alive
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
     return this.withSwapLock(() => this.doLoad(entry))
+  }
+
+  /** Route to exactly `entry` — never to a different model (ADR-434). Unlike
+   *  route(), an entry that isn't alive is never answered by whatever the primary holds: with
+   *  auto-swap on it is loaded (the same serialised doLoad route() uses); with it off, a 503. */
+  async routeTo(entry: ModelEntry): Promise<RouteResult> {
+    const alive = this.routeResolved(entry)
+    if (alive) return alive
+    if (!this.store.snapshot().gateway.autoSwap) {
+      return { status: 503, message: `'${entry.name}' is not loaded. Load it from Models, or turn on auto-swap.` }
+    }
+    return this.withSwapLock(() => this.doLoad(entry))
+  }
+
+  /** The local entry `requested` names — exact key → exact name → ci name → substring. No remote,
+   *  no fallback. */
+  resolveLocal(requested: string): ModelEntry | undefined {
+    return this.resolveEntry(requested)
+  }
+
+  /** Which local entry route(requested) would hit, WITHOUT loading anything. Mirrors route():
+   *  remote id → undefined; auto-swap off or no model named → the primary's entry; resolved → that
+   *  entry; unresolved → the primary's entry. */
+  targetEntry(requested: string): ModelEntry | undefined {
+    if (this.resolveRemote(requested)) return undefined
+    if (!this.store.snapshot().gateway.autoSwap || !requested.trim()) return this.primaryEntry()
+    return this.resolveEntry(requested) ?? this.primaryEntry()
+  }
+
+  /** Every alive slot (running | starting | stopping), primary first. */
+  aliveSlots(): AliveSlot[] {
+    const slots: AliveSlot[] = []
+    const ms = this.manager.status()
+    if (this.isOccupied(ms.state) && ms.model) {
+      slots.push({ modelKey: ms.model.key, state: ms.state, primary: true, lastUsedMs: this.primaryLastUsed })
+    }
+    for (const slot of this.extraSlots.values()) {
+      const state = slot.manager.status().state
+      if (this.isOccupied(state)) slots.push({ modelKey: slot.modelKey, state, primary: false, lastUsedMs: slot.lastUsedMs })
+    }
+    return slots
   }
 
   /** Load `modelKey` unconditionally — used by a Routine's pinned-model swap (spec 20 §5), which
@@ -220,6 +249,33 @@ export class ModelRouter {
 
   // ── internal ──────────────────────────────────────────────────────────────
 
+  /** The fast paths shared by route() and routeTo(): `entry` already running in the primary or in
+   *  a pool slot → its target. undefined = not alive (a dead pool slot is cleaned up on the way). */
+  private routeResolved(entry: ModelEntry): RouteResult | undefined {
+    // Fast path: correct model already running in the primary manager.
+    {
+      const ms = this.manager.status()
+      if (ms.state === 'running' && ms.model && this.keysMatch(ms.model.key, entry)) {
+        this.primaryLastUsed = Date.now()
+        this.manager.touch()
+        return { target: this.manager.target()! }
+      }
+    }
+
+    // Fast path: already running in a pool slot.
+    const slot = this.extraSlots.get(entry.key)
+    if (slot) {
+      const ss = slot.manager.status()
+      if (ss.state === 'running') {
+        slot.lastUsedMs = Date.now()
+        slot.manager.touch()
+        return { target: slot.manager.target()! }
+      }
+      this.extraSlots.delete(entry.key) // dead slot — clean up
+    }
+    return undefined
+  }
+
   private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
     // Re-check after acquiring the lock — another queued request may have already
     // loaded this model while we were waiting.
@@ -244,9 +300,8 @@ export class ModelRouter {
 
     const active = this.registry.active()
     if (!active) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    if (!engineAcceptsFormat(active.kind, entry.format)) {
-      return { status: 503, message: `Active engine cannot load model format '${entry.format}'.` }
-    }
+    const inc = modelIncompatibility(active.kind, entry)
+    if (inc) return { status: 503, message: inc.message }
 
     const opts = this.buildOpts(entry, active, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
@@ -302,7 +357,7 @@ export class ModelRouter {
    *  a founder-reported "it loaded 2 models" during a manual switch while a terminal
    *  session was open, confirmed via two concurrent llama-server.exe processes on
    *  8081/8082 where only 8081 was known to /api/v1/status.  */
-  private isOccupied(state: string): boolean {
+  private isOccupied(state: string): state is AliveSlot['state'] {
     return state === 'running' || state === 'starting' || state === 'stopping'
   }
 
@@ -424,50 +479,22 @@ export class ModelRouter {
     return loadedKey === entry.key || loadedKey === entry.path
   }
 
+  /** The scanned entry of the model running in the primary — what route()'s fallback answers from. */
+  private primaryEntry(): ModelEntry | undefined {
+    const ms = this.manager.status()
+    if (ms.state !== 'running' || !ms.model) return undefined
+    const loadedKey = ms.model.key
+    return this.scanner.list().models.find(e => this.keysMatch(loadedKey, e))
+  }
+
+  /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
+   *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
+   *  auto-swap loads too. doLoad has already checked compatibility, buildStartOpts's precondition. */
   private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
-    const cfg = this.store.snapshot()
-    const sys = getSysInfo()
-    if (entry.format !== 'gguf') {
-      const savedProfile = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-      // Resolved once regardless of engine kind — see routes.ts's identical load
-      // route for why (model_load telemetry, spec 23 §3.3, wants the same
-      // full-config shape whichever engine actually ends up loading).
-      const profile = resolveProfile(entry, sys, savedProfile, overrides, cfg.modelDefaults)
-      return {
-        engine,
-        model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
-        modelPath: entry.path,
-        // MLX honors sampling as launch defaults; vLLM honors its own load controls (F-027).
-        extraArgs:
-          engine.kind === 'mlx'
-            ? mlxSamplingArgs(savedProfile?.sampling)
-            : engine.kind === 'vllm'
-              ? vllmProfileToArgs(profile, entry.nativeCtx)
-              : [],
-        tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
-        profile,
-        trigger: 'gateway_switch',
-      }
-    }
-    const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
-    const profile = resolveProfile(entry, sys, saved, overrides, cfg.modelDefaults)
-    // KoboldCpp is a GGUF engine but uses its OWN flag names, so it gets its own small
-    // arg-map (ctx/ngl + GPU backend) rather than the llama-server profileToArgs. llamafile
-    // IS llama.cpp's server under the hood, so it keeps the full profileToArgs flags — the
-    // manager's llamafileServerCommand only prepends `--server --no-webui`.
-    const extraArgs =
-      engine.kind === 'koboldcpp'
-        ? koboldcppProfileToArgs(profile, sys.gpus[0]?.vendor ?? 'unknown', sys.gpus.length > 0)
-        : profileToArgs(profile, entry, engine.capabilities, sys.cores, sys, engine.binPath)
-    return {
-      engine,
-      model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
-      modelPath: entry.path,
-      extraArgs,
-      profile,
-      trigger: 'gateway_switch',
-    }
+    return buildStartOpts({
+      entry, engine, cfg: this.store.snapshot(), sys: getSysInfo(), overrides, trigger: 'gateway_switch',
+    })
   }
 
 }

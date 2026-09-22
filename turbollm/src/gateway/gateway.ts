@@ -18,6 +18,7 @@ import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
+import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
 import {
   extractSearchQuery,
@@ -55,7 +56,7 @@ function resolveHarness(c: Context, d: Deps, protocol: 'anthropic' | 'openai'): 
  *  turn, hits ESC, times out, or closes). Wiring its signal into the upstream engine
  *  fetch is what stops abandoned requests from running to completion and clogging the
  *  engine's queue — the in-app chat path already does this; the gateway must too. */
-function clientAbort(c: { req: { raw: Request } }): AbortController {
+export function clientAbort(c: { req: { raw: Request } }): AbortController {
   const ac = new AbortController()
   const sig = c.req.raw.signal
   if (sig) {
@@ -69,7 +70,7 @@ function clientAbort(c: { req: { raw: Request } }): AbortController {
  *  response. These engines mirror the OpenAI `{error:{message,type}}` shape on failure; falls
  *  back to the raw body (truncated) when it isn't JSON-shaped, so a crash page or a plain-text
  *  panic still surfaces something readable instead of a blanket "Engine error." */
-async function describeEngineError(res: Response): Promise<{ message: string; type?: string }> {
+export async function describeEngineError(res: Response): Promise<{ message: string; type?: string }> {
   const raw = await res.text().catch(() => '')
   try {
     const parsed = JSON.parse(raw) as { error?: { message?: string; type?: string } }
@@ -96,6 +97,13 @@ function anthropicErrorType(status: number): string {
  *  out-of-range status from a misbehaving engine can't crash response construction. */
 function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
+}
+
+/** Why a chat / embeddings / messages request naming a Jev model is refused, and where to go instead. */
+function jevWrongEndpointMessage(modelName: string, request: 'chat' | 'embeddings'): string {
+  const cannot = request === 'chat' ? 'chat' : 'produce embeddings'
+  return `'${modelName}' is a Jev model: it labels premise/hypothesis pairs and cannot ${cannot}. ` +
+    'Call POST /v1/systemone (or /v1/classify, /v1/rerank) instead.'
 }
 
 /** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
@@ -224,6 +232,15 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // Enforce the global "max response tokens" cap on external (Claude Code) traffic.
     const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
     req.max_tokens = clampMaxTokens(req.max_tokens, maxLimit) ?? req.max_tokens
+
+    // A Jev model never chats (ADR-434 (f)); refuse before route() could auto-swap it in.
+    const jevModel = d.modelRouter.targetEntry(req.model ?? '')
+    if (jevModel?.jev) {
+      return c.json(
+        { type: 'error', error: { type: 'invalid_request_error', message: jevWrongEndpointMessage(jevModel.name, 'chat') } },
+        400,
+      )
+    }
 
     // Route to the requested model — may trigger an auto-swap (v0.6.0).
     const routeResult = await d.modelRouter.route(req.model ?? '')
@@ -752,6 +769,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // see GatewayV1Options.pathname. Defaults to the real one, so the public mount is unchanged.
   const pathname = opts.pathname ?? url.pathname
 
+  // POST /v1/classify, /v1/rerank and /v1/systemone (Jev models, ADR-434 (d), ADR-439) live in their own
+  // modules and are dispatched here rather than registered as Hono routes: the Turbo Link façade mounts this
+  // same handler, and a separately registered route is the registration-order bug class of ADR-421.
+  const jevEndpoint = jevEndpointFor(c.req.method, pathname)
+  if (jevEndpoint) return handleJevRequest(c, d, jevEndpoint, opts)
+
   // GET /v1/models: always synthesise the list from the WHOLE local library (not just
   // the loaded model), regardless of whether an engine is running — real key entries for
   // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
@@ -759,11 +782,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // strips back to the real key before routing) is only added when gateway.autoSwap is
   // on: picking a model from Claude Code's /model always requires a swap, so advertising
   // it while auto-swap is off would let the user pick a model that silently never loads.
+  // A Jev model is marked `kind: "jev"` and gets no alias: it never chats, so Claude Code can't use it.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
     const autoSwap = d.store.snapshot().gateway.autoSwap
     const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
-      { id: m.key, object: 'model', owned_by: 'turbollm' },
-      ...(autoSwap ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+      { id: m.key, object: 'model', owned_by: 'turbollm', ...(m.jev ? { kind: 'jev' } : {}) },
+      ...(autoSwap && !m.jev ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
     ])
     // Turbo Link (ADR-376 §1 decision 7): every model on every ONLINE linked host, under
     // its qualified `<machine>/<model>` id — the exact id ModelRouter.resolveRemote routes
@@ -846,6 +870,15 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     : null
 
   const requestedModel = (isChat || isEmbeddings) ? ((parsedBody?.model as string | undefined) ?? '') : ''
+  // A Jev model can neither chat nor embed (ADR-434 (f)). Asked of targetEntry, which loads nothing,
+  // so the refusal never swaps the Jev model in first.
+  if (isChat || isEmbeddings) {
+    const jevModel = d.modelRouter.targetEntry(requestedModel)
+    if (jevModel?.jev) {
+      const message = jevWrongEndpointMessage(jevModel.name, isChat ? 'chat' : 'embeddings')
+      return c.json({ error: { type: 'invalid_request_error', code: 'jev_model_wrong_endpoint', message } }, 400)
+    }
+  }
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
     return c.json(

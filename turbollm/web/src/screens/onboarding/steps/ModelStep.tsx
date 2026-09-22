@@ -5,6 +5,7 @@ import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
 import { useDownloadMutations, useModels, useSysInfo } from '../../../lib/queries'
 import { loadModel, track } from '../../../lib/api'
 import { pickOnboardingModel } from '../../../lib/onboarding-pick'
+import { isChatModel } from '../../../lib/model-kind'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -27,7 +28,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
   const [selectedKey, setSelectedKey] = useState('')
   const [usingExisting, setUsingExisting] = useState(false)
 
-  const existingModels = modelsQuery.data?.models ?? []
+  const existingModels = (modelsQuery.data?.models ?? []).filter(isChatModel)
 
   const useExisting = async () => {
     const entry = existingModels.find((m) => m.key === selectedKey)

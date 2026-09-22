@@ -20,7 +20,7 @@ const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
 function fakeDeps(target = 'http://engine.invalid.local:1'): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target }) },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),

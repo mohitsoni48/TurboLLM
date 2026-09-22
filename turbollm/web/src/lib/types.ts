@@ -222,6 +222,9 @@ export type Status = {
   comfyui?: ComfyRuntime | null
   /** Background agent tasks (reviewer + skill distill) — running + recently finished. */
   agentTasks?: AgentTask[]
+  /** The loaded Jev model, or null when none is (ADR-434 (i)(1)). Absent from an older
+   *  daemon and over Turbo Link, which is read as "unknown", not as "none". */
+  jev?: JevStatus | null
   telemetryLevel: string
   uptimeSec: number
   /** Locally-enabled feature flags (TURBOLLM_FEATURES env var) — internal/dev only,
@@ -635,6 +638,13 @@ export type ModelEntry = {
    *  on-disk layout (<root>/<owner>/<repo>/<file>) for imported files. Null when it
    *  can't be determined. Lets the library open the model's HF page (card + quants). */
   sourceRepo?: string | null
+  /** Set only for a Jev model — an NLI cross-encoder served through vLLM (ADR-434 (g)).
+   *  Absent means "not a Jev model"; the twin is `JevInfo` in src/models/jev.ts. */
+  jev?: JevInfo
+  /** Why the active engine cannot load this model, in the user's words ('Needs vLLM
+   *  (Linux or WSL2)'), or null when it can. The daemon owns the wording so every
+   *  surface says the same thing. */
+  incompatibleReason?: string | null
   mtime: string
 }
 
@@ -642,6 +652,84 @@ export type ModelsList = {
   models: ModelEntry[]
   scanning: boolean
   lastScanAt: string
+}
+
+// ── Jev — NLI cross-encoders (ADR-434) ───────────────────────────────────────
+/** The three NLI classes. Twin of src/models/jev.ts; a model declares them itself
+ *  (config.json `id2label`), so probabilities are always read through the model's
+ *  own label order rather than a hardcoded one. */
+export type JevLabel = 'contradiction' | 'entailment' | 'neutral'
+
+/** What makes a scanned model a Jev model (ADR-434 (g)). */
+export type JevInfo = {
+  /** Canonical label per class id, in `id2label` index order. */
+  labels: JevLabel[]
+  /** The model's own premise/hypothesis template, or null when it has none usable. */
+  nliTemplate: string | null
+  /** `architectures[0]` as declared, e.g. 'Qwen3_5ForSequenceClassification'. */
+  architecture: string
+  /** True when the architecture has a verified launch row; false → "Not verified". */
+  verified: boolean
+}
+
+/** The alive Jev model on GET /api/v1/status — local only, never part of the Turbo
+ *  Link façade's status. Null when none is loaded, which is what puts Workspace back
+ *  to Chat/Code/Routines (ADR-434 (i)(1)). */
+export type JevStatus = {
+  key: string
+  name: string
+  labels: JevLabel[]
+  state: 'starting' | 'running' | 'stopping'
+  slot: 'primary' | 'pool'
+}
+
+/** The loaded Jev model as a screen knows it. The daemon always names the slot, but a client
+ *  that cannot read /status has to read the model off the catalog instead (ADR-422), and
+ *  the catalog cannot tell which slot the engine took: `null` says so rather than guessing
+ *  `primary` and skipping the ADR-427 (c) eject. */
+export type LoadedJev = Omit<JevStatus, 'slot'> & { slot: JevStatus['slot'] | null }
+
+export type ClassifyRequest = {
+  model: string
+  premise: string
+  hypotheses: string[]
+}
+
+export type ClassifyResponse = {
+  model: string
+  results: Array<{ hypothesis: string; label: JevLabel; probs: Record<JevLabel, number> }>
+  usage: { prompt_tokens: number; total_tokens: number }
+}
+
+export type RerankRequest = {
+  model: string
+  query: string
+  /** The gateway also accepts `{ text }` objects; this app only ever sends strings. */
+  documents: string[]
+  top_n?: number
+  /** API-only (ADR-434 (d)) — the playground keeps the gateway's default. */
+  hypothesis_template?: string
+}
+
+export type RerankResponse = {
+  model: string
+  /** Sorted by `relevance_score` descending; `index` points back into `documents`. */
+  results: Array<{ index: number; document: { text: string }; relevance_score: number; label: JevLabel }>
+  usage: { prompt_tokens: number; total_tokens: number }
+}
+
+/** One thing a model load would interrupt right now (ADR-434 (i)(3)). */
+export type ActiveWorkItem = {
+  kind: 'chat' | 'code' | 'routine'
+  id: string
+  label: string
+}
+
+export type ActiveWork = {
+  items: ActiveWorkItem[]
+  /** A generation running through the gateway. It has no item of its own: the daemon
+   *  knows a request is in flight, not whose it is. */
+  engineGenerating: boolean
 }
 
 export type ModelDirs = {
@@ -935,6 +1023,28 @@ export type HfRepoDetail = {
    *  size-matching local files are this repo's quants (spec 10 §3). The UI re-polls
    *  until it clears, then the "Downloaded" badges are final. */
   verifying?: boolean
+  /** The repo's downloadable model directories (ADR-434 (h)). Absent for a GGUF repo,
+   *  which keeps today's flat `files` list. */
+  checkpoints?: HfCheckpoint[]
+}
+
+/** One downloadable model directory in a safetensors repo (ADR-434 (h)). A repo with
+ *  exactly one behaves exactly as today; OpenJev-style repos get one row per folder. */
+export type HfCheckpoint = {
+  /** Repo-relative directory, POSIX '/'; '' = the repo root. */
+  dir: string
+  /** Last segment of `dir`, or the repo's own name for the root. */
+  name: string
+  /** Sum of this directory's own .safetensors files. */
+  sizeBytes: number
+  /** This directory's own component files, mapped exactly like the root `files` list. */
+  files: HfRepoFile[]
+  /** Read from this checkpoint's own config.json; null when it is not a Jev model. */
+  jev: { architecture: string; verified: boolean } | null
+  /** True when this checkpoint was downloaded via TurboLLM and is still on disk. */
+  downloaded?: boolean
+  /** The local model key for it when downloaded — lets a row offer "Load". */
+  localKey?: string | null
 }
 
 export type HfTokenTest = {

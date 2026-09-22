@@ -2,16 +2,20 @@ import { useState } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoutineFormFields } from './RoutineFormFields'
 import { emptyRoutineDraft, type RoutineDraft } from '../../lib/routine-form'
+import type { ModelEntry } from '../../lib/types'
+
+const MODEL_A: Partial<ModelEntry> = { key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }
+let mockLibrary: Array<Partial<ModelEntry>> = [MODEL_A]
 
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
   return {
     ...actual,
     useChatAgents: () => ({ data: [{ id: 'agent-1', name: 'Research Agent', description: '', systemPrompt: '', skillIds: [], tools: [] }] }),
-    useModels: () => ({ data: { models: [{ key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }] } }),
+    useModels: () => ({ data: { models: mockLibrary } }),
   }
 })
 
@@ -231,5 +235,49 @@ describe('RoutineFormFields — cleared time input', () => {
     renderControlled({ ...emptyRoutineDraft(), scheduleRule: { kind: 'daily', hour: 14, minute: 35 } }, onChange)
     fireEvent.change(screen.getByLabelText('Time of day'), { target: { value: '07:05' } })
     expect((onChange.mock.calls[0][0] as RoutineDraft).scheduleRule).toEqual({ kind: 'daily', hour: 7, minute: 5 })
+  })
+})
+
+// ADR-434 (f): a Jev model labels text and can never run a routine, so the model picker leaves it
+// out. It stays UNfiltered by engine on purpose: a routine may target a model the active engine
+// can't load right now, because the routine swaps it in when it fires.
+describe('RoutineFormFields — model picker offers chat models only', () => {
+  const jevModel: Partial<ModelEntry> = {
+    key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', quant: 'BF16', dir: 'D:\\models\\nli', path: 'D:\\models\\nli', compatibleWithActiveEngine: true,
+    jev: { labels: ['contradiction', 'entailment', 'neutral'], nliTemplate: 'Premise: {premise} Hypothesis: {hypothesis}', architecture: 'Qwen3_5ForSequenceClassification', verified: true },
+  }
+  const wrongEngineChatModel: Partial<ModelEntry> = { key: 'gguf-on-vllm', name: 'GGUF on vLLM', quant: 'Q4_K_M', dir: 'D:\\models\\gguf', path: 'D:\\models\\gguf\\m.gguf', compatibleWithActiveEngine: false }
+
+  afterEach(() => { mockLibrary = [MODEL_A] })
+
+  it('omits a Jev model from the model select', () => {
+    mockLibrary = [MODEL_A, jevModel]
+    renderForm()
+    expect(screen.getByRole('option', { name: /Model A/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /qwen3.5 4b nli v2/ })).not.toBeInTheDocument()
+  })
+
+  it('still lists a chat model the active engine cannot load', () => {
+    mockLibrary = [MODEL_A, jevModel, wrongEngineChatModel]
+    renderForm()
+    expect(screen.getByRole('option', { name: /GGUF on vLLM/ })).toBeInTheDocument()
+  })
+
+  // A routine saved before this release can name a model that is now detected as Jev. The model
+  // IS in the catalog, so calling it missing would be false; it just cannot run a routine.
+  it('says a stored Jev model is a Jev model, not that it is missing from the catalog', () => {
+    mockLibrary = [MODEL_A, jevModel]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: jevModel.key! }, vi.fn())
+    const select = screen.getByLabelText('Model') as HTMLSelectElement
+    expect(screen.getByRole('option', { name: /qwen3\.5 4b nli v2 \(a Jev model/ })).toBeInTheDocument()
+    expect(screen.queryByText(/not in the current catalog/)).not.toBeInTheDocument()
+    expect(select.value).toBe(jevModel.key)
+  })
+
+  it('still calls a stored key that is in no catalog entry at all missing, beside a Jev model', () => {
+    mockLibrary = [MODEL_A, jevModel]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: 'deleted-model' }, vi.fn())
+    expect(screen.getByRole('option', { name: /deleted-model \(not in the current catalog\)/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /a Jev model/ })).not.toBeInTheDocument()
   })
 })

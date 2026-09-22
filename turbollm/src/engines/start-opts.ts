@@ -45,7 +45,7 @@ function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trig
     engine.kind === 'mlx'
       ? mlxSamplingArgs(savedProfile?.sampling)
       : engine.kind === 'vllm'
-        ? vllmProfileToArgs(profile, entry.nativeCtx)
+        ? vllmProfileToArgs(profile, entry.nativeCtx, entry.jev)
         : []
   return {
     engine,

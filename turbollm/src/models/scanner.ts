@@ -6,6 +6,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
 import { CoalescedRunner } from '../util/coalesced-runner'
+import { detectJev, type JevInfo } from './jev'
 
 export interface ModelEntry {
   key: string
@@ -78,6 +79,9 @@ export interface ModelEntry {
   /** True for embedding models (BERT-family arch or known embed filename patterns).
    *  Passed to llama-server as --embeddings to activate /v1/embeddings. */
   embedding: boolean
+  /** Present only for a Jev (NLI cross-encoder) model, ADR-434 (g) — absent = not a Jev model.
+   *  A Jev entry is always `vision: false` and `embedding: false`. */
+  jev?: JevInfo
   incomplete: boolean
   parseError: string | null
   loaded: boolean
@@ -682,6 +686,9 @@ interface MlxConfig {
   /** Presence (not contents) is the only thing read — an audio tower/encoder exists
    *  (e.g. gemma4's Conformer audio module). */
   audio_config?: unknown
+  /** Classification heads only — read by detectJev() (jev.ts) to recognise a Jev model. */
+  id2label?: Record<string, unknown>
+  nli_template?: unknown
 }
 
 /** Human quant label for a safetensors model dir. Recognizes HF/vLLM post-training
@@ -771,6 +778,10 @@ export function mlxEntryFor(dir: string): ModelEntry {
   const quant = detectSafetensorsQuant(cfg)
   const arch = cfg.model_type || cfg.architectures?.[0] || lm.model_type || 'unknown'
   const name = basename(dir).replace(/[-_]/g, ' ').replace(/\s+/g, ' ').trim()
+  // A Jev model claims neither vision (image premises are untested, ADR-434) nor embedding (it
+  // must never take the embedding pool slot, ADR-389/427), whatever its config or name says.
+  const jev = detectJev(cfg)
+  const isJev = jev !== undefined
 
   return {
     key: `${name.toLowerCase()}|mlx-${quant}|${sizeBytes}`,
@@ -789,13 +800,14 @@ export function mlxEntryFor(dir: string): ModelEntry {
     moe: expertCount > 0,
     expertCount,
     nextnLayers: 0,
-    vision: cfg.vision_config != null,
+    vision: !isJev && cfg.vision_config != null,
     audio: cfg.audio_config != null,
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate,
     reasoningEffort,
-    embedding: isEmbeddingModel(arch, basename(dir)),
+    embedding: !isJev && isEmbeddingModel(arch, basename(dir)),
+    ...(isJev ? { jev } : {}),
     incomplete,
     parseError,
     loaded: false,

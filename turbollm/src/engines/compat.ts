@@ -1,13 +1,75 @@
 // Engine ↔ model compatibility (ADR-044). The single source of truth for which
 // model formats an engine kind can load. Used by the load guard (routes), the
-// model-list overlay (filter by active engine), and the CLI auto-load. The web UI
-// mirrors this rule in web/src/lib/engineCompat.ts — keep the two in sync.
+// model-list overlay (filter by active engine), and the CLI auto-load.
 
 import type { HardwareProfile } from './hardware'
 import type { HardwareReq } from './catalog'
 import type { GpuVendor } from '../sysinfo/sysinfo'
+import type { ModelEntry } from '../models/scanner'
 
 export type ModelFormat = 'gguf' | 'mlx'
+
+export type Incompatibility =
+  | { code: 'format'; label: string; message: string }
+  | { code: 'audio'; label: string; message: string }
+  | { code: 'needs_vllm'; label: 'Needs vLLM (Linux or WSL2)'; message: string }
+
+/** null = the engine of `engineKind` can load `entry`. Order: needs_vllm (most specific), then
+ *  format, then audio. The ONE place this rule lives; engineAcceptsFormat/engineRejectsAudioModel
+ *  stay exported as its building blocks. `label` is the short text a model row shows. */
+export function modelIncompatibility(
+  engineKind: string,
+  entry: Pick<ModelEntry, 'format' | 'audio' | 'jev'>,
+): Incompatibility | null {
+  if (entry.jev && engineKind !== 'vllm') return NEEDS_VLLM
+  if (!engineAcceptsFormat(engineKind, entry.format)) return formatIncompatibility(engineKind, entry.format)
+  if (entry.audio && engineRejectsAudioModel(engineKind)) return audioIncompatibility(engineKind)
+  return null
+}
+
+const NEEDS_VLLM: Incompatibility = {
+  code: 'needs_vllm',
+  label: 'Needs vLLM (Linux or WSL2)',
+  message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+}
+
+const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'
+
+function formatIncompatibility(engineKind: string, format: ModelFormat): Incompatibility {
+  const label = format === 'gguf' ? 'needs llama.cpp' : NEEDS_PYTHON_ENGINE_LABEL
+  return { code: 'format', label, message: formatMismatchMessage(engineKind, format) }
+}
+
+/** User-facing message when the active engine can't load a model's format (ADR-044). */
+function formatMismatchMessage(engineKind: string, format: ModelFormat): string {
+  if (engineKind === 'mlx')
+    return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'rapid-mlx')
+    return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'mlx-vlm')
+    return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'vllm')
+    return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
+  // llama.cpp / fork active, model is a safetensors dir.
+  return format === 'mlx'
+    ? 'This is a safetensors model — activate an MLX or vLLM engine to load it.'
+    : 'The active engine can only load GGUF models.'
+}
+
+function audioIncompatibility(engineKind: string): Incompatibility {
+  const engineLabel = engineKind === 'mlx-vlm' ? 'MLX-VLM' : 'Rapid-MLX'
+  // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
+  // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
+  // precautionarily from reading the source, not a fresh live reproduction — say so
+  // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
+  // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
+  const certainty = engineKind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
+  return {
+    code: 'audio',
+    label: NEEDS_PYTHON_ENGINE_LABEL,
+    message: `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
+  }
+}
 
 /**
  * True when an engine of `engineKind` can load a model of `format`:

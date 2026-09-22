@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
-import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS } from './compat'
+import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS, modelIncompatibility } from './compat'
+import type { JevInfo } from '../models/jev'
 import { vllmServerCommand, vllmServeBlocker, classifyVllmBlocker } from './vllm'
 import { UvloopPreflight } from './py-engine-blocker'
 import { mlxServerCommand, mlxSamplingArgs } from './mlx'
@@ -39,6 +40,93 @@ test('engineRejectsAudioModel: true for rapid-mlx and mlx-vlm only', () => {
   assert.equal(engineRejectsAudioModel('mlx'), false)
   assert.equal(engineRejectsAudioModel('vllm'), false)
   assert.equal(engineRejectsAudioModel('llama-server'), false)
+})
+
+const OPENJEV: JevInfo = {
+  labels: ['contradiction', 'entailment', 'neutral'],
+  nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+  architecture: 'Qwen3_5ForSequenceClassification',
+  verified: true,
+}
+const JEV_ENTRY = { format: 'mlx', audio: false, jev: OPENJEV } as const
+const PLAIN_GGUF = { format: 'gguf', audio: false } as const
+const PLAIN_MLX = { format: 'mlx', audio: false } as const
+const AUDIO_MLX = { format: 'mlx', audio: true } as const
+const NEEDS_VLLM_MESSAGE =
+  'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.'
+
+for (const engineKind of ['llama-server', 'mlx', 'rapid-mlx', 'mlx-vlm', 'koboldcpp']) {
+  test(`modelIncompatibility: a Jev model on ${engineKind} needs vLLM`, () => {
+    assert.deepEqual(modelIncompatibility(engineKind, JEV_ENTRY), {
+      code: 'needs_vllm',
+      label: 'Needs vLLM (Linux or WSL2)',
+      message: NEEDS_VLLM_MESSAGE,
+    })
+  })
+}
+
+test('modelIncompatibility: a Jev model on vLLM is loadable', () => {
+  assert.equal(modelIncompatibility('vllm', JEV_ENTRY), null)
+})
+
+test('modelIncompatibility: a GGUF model on vLLM is a format mismatch that needs llama.cpp', () => {
+  assert.deepEqual(modelIncompatibility('vllm', PLAIN_GGUF), {
+    code: 'format',
+    label: 'needs llama.cpp',
+    message: 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.',
+  })
+})
+
+test('modelIncompatibility: a safetensors model on llama.cpp is a format mismatch that needs MLX or vLLM', () => {
+  assert.deepEqual(modelIncompatibility('llama-server', PLAIN_MLX), {
+    code: 'format',
+    label: 'needs MLX or vLLM',
+    message: 'This is a safetensors model — activate an MLX or vLLM engine to load it.',
+  })
+})
+
+test('modelIncompatibility: the format messages move verbatim for every engine kind', () => {
+  const messageFor = (engineKind: string, entry: typeof PLAIN_GGUF | typeof PLAIN_MLX) =>
+    modelIncompatibility(engineKind, entry)?.message
+  assert.equal(
+    messageFor('mlx', PLAIN_GGUF),
+    'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.',
+  )
+  assert.equal(
+    messageFor('rapid-mlx', PLAIN_GGUF),
+    'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.',
+  )
+  assert.equal(
+    messageFor('mlx-vlm', PLAIN_GGUF),
+    'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.',
+  )
+  assert.equal(messageFor('koboldcpp', PLAIN_MLX), 'This is a safetensors model — activate an MLX or vLLM engine to load it.')
+})
+
+test('modelIncompatibility: an audio-tower model on Rapid-MLX fails, and needs MLX or vLLM', () => {
+  assert.deepEqual(modelIncompatibility('rapid-mlx', AUDIO_MLX), {
+    code: 'audio',
+    label: 'needs MLX or vLLM',
+    message:
+      'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+  })
+})
+
+test('modelIncompatibility: an audio-tower model on MLX-VLM is expected to fail', () => {
+  assert.deepEqual(modelIncompatibility('mlx-vlm', AUDIO_MLX), {
+    code: 'audio',
+    label: 'needs MLX or vLLM',
+    message:
+      'MLX-VLM cannot load models with an audio tower — the audio encoder is expected to fail due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+  })
+})
+
+test('modelIncompatibility: an audio-tower model on plain MLX is loadable', () => {
+  assert.equal(modelIncompatibility('mlx', AUDIO_MLX), null)
+})
+
+test('modelIncompatibility: needs vLLM wins over a format mismatch for a Jev model', () => {
+  assert.equal(modelIncompatibility('llama-server', { ...JEV_ENTRY, audio: true })?.code, 'needs_vllm')
 })
 
 test('engineModelAlias: fixed alias for mlx/vllm, null (keep caller value) for llama.cpp', () => {

@@ -171,7 +171,7 @@ export class DownloadManager {
     if (!dir) throw new DownloadError('no_model_dir', 'Add a model folder in Settings before downloading.')
 
     let repo = (input.repo ?? '').trim()
-    const explicitSubdir = (input.subdir ?? '').trim()
+    const explicitSubdir = safeRelativeSubdir(input.subdir)
     let rfilename = (input.rfilename ?? '').trim()
     let rev = 'main'
 
@@ -675,6 +675,14 @@ function hfResolveUrl(repo: string, rev: string, rfilename: string): string {
 
 /** Sanitise an HF repo id (`owner/name`) into a safe relative subdirectory: forward
  *  slashes only, no absolute/`..`/`.` segments that could escape the model dir. */
+/** The subdir a caller asked for, reduced to a relative path that cannot leave the model
+ *  folder: the same segment filter {@link repoSubdir} applies to a repo id. The checkpoint
+ *  picker builds this from Hugging-Face-provided directory names (ADR-434 (h)), and the value
+ *  is joined straight onto the library path — so `..` must never survive it. */
+function safeRelativeSubdir(subdir: string | undefined): string {
+  return repoSubdir((subdir ?? '').trim())
+}
+
 function repoSubdir(repo: string): string {
   return repo
     .replace(/\\/g, '/')

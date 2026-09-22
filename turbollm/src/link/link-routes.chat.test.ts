@@ -40,6 +40,7 @@ function mkDeps(keys: ApiKey[], opts: { busy?: boolean; loaded?: string | null }
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
     modelRouter: {
+      targetEntry: () => undefined,
       route: async (m: string) => { h.routed.push(m); return { target: 'http://engine.local' } },
       // This box has no links of its own, so nothing a peer asks for can be a second hop.
       resolveRemoteTarget: () => undefined,

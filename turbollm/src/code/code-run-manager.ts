@@ -145,6 +145,12 @@ export class CodeRunManager {
     return false
   }
 
+  /** Every session mid-turn (running or queued) — the per-session form of {@link anyActive}, for
+   *  the active-work probe that names what a model load would interrupt (ADR-434 (i)(3)). */
+  activeSessionIds(): string[] {
+    return [...this.sessions.keys()].filter((id) => this.isActive(id))
+  }
+
   /** The turns currently WAITING behind the active turn (not the running one) — the server-side
    *  message queue, surfaced to the UI so its "Queued" chips survive a disconnect. `userMsgId`
    *  (not just index) identifies each entry so a per-chip action (sendNow) can target one
