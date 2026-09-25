@@ -29,13 +29,12 @@ const WINDOWS_ONLY = { skip: process.platform !== 'win32' && 'job-object reaping
 
 const supervisors = []
 const tempDirs = []
+const unsettledDirs = new Set()
 
 after(() => {
   for (const supervisor of supervisors) supervisor.stop()
-  for (const dir of tempDirs) {
-    readPids(dir).filter(alive).forEach(endLeftoverDaemon)
-    rmSync(dir, { recursive: true, force: true })
-  }
+  for (const dir of unsettledDirs) readPids(dir).filter(alive).forEach(endLeftoverDaemon)
+  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true })
 })
 
 test('the restart exit code is 75', () => {
@@ -120,6 +119,7 @@ test('a requested restart (exit 75) is respawned and the new daemon is the one t
   assert.equal(launches.count, 2, 'no daemon is spawned after stop()')
   assert.equal(readPids(dir).length, 2, 'nothing is respawned after stop()')
   assert.deepEqual(lost, [])
+  settled(dir)
 })
 
 test('a crash is never respawned: the app is told the daemon is lost, once', async () => {
@@ -134,6 +134,7 @@ test('a crash is never respawned: the app is told the daemon is lost, once', asy
   assert.equal(launches.count, 1, 'a crash is never respawned')
   assert.deepEqual(lost, ['exited (code=1, signal=none)'])
   assert.equal(readPids(dir).length, 1)
+  settled(dir)
 })
 
 // POSIX runs the fixture's SIGTERM handler, which exits 75; Windows terminates it. Neither may respawn.
@@ -156,6 +157,7 @@ test('a daemon that exits while the app is quitting is not respawned', async () 
   assert.equal(launches.count, 1, 'no daemon is spawned after stop()')
   assert.equal(readPids(dir).length, 1)
   assert.deepEqual(lost, [])
+  settled(dir)
 })
 
 test('start() returns the spawned child and current() tracks it', () => {
@@ -191,6 +193,7 @@ test('a daemon that cannot be spawned is reported lost once, not thrown', async 
   assert.equal(lost.length, 1)
   assert.match(lost[0], /^failed: /)
   assert.match(lost[0], /ENOENT/)
+  settled(dir)
 })
 
 test('a respawn that throws is reported lost with its reason', async () => {
@@ -207,6 +210,7 @@ test('a respawn that throws is reported lost with its reason', async () => {
   await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the failed respawn to be reported lost')
   assert.deepEqual(lost, ['could not be restarted: spawn blocked for test'])
   assert.equal(readPids(dir).length, 1)
+  settled(dir)
 })
 
 test('an error followed by an exit reports the daemon lost once', () => {
@@ -294,6 +298,7 @@ test('on Windows a supervised daemon dies with its host even without stop()', WI
     PROCESS_GONE_DEADLINE_MS,
     'both daemons to die with their host'
   )
+  settled(dir)
 })
 
 test(
@@ -313,6 +318,7 @@ test(
 
     process.kill(pid)
     await waitUntil(() => !alive(pid), PROCESS_GONE_DEADLINE_MS, 'the control survivor to be killed')
+    settled(dir)
   }
 )
 
@@ -371,7 +377,14 @@ function fakeChild () {
 function newDir () {
   const dir = mkdtempSync(join(tmpdir(), 'tllm-supervisor-'))
   tempDirs.push(dir)
+  unsettledDirs.add(dir)
   return dir
+}
+
+// A test calls this once it has proved every daemon it recorded is dead. after() then never probes
+// those PIDs again: Windows may already have given the number to an unrelated process.
+function settled (dir) {
+  unsettledDirs.delete(dir)
 }
 
 function readPids (dir) {
