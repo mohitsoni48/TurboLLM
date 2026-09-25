@@ -11,7 +11,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ModelsScreen } from './ModelsScreen'
 import type { JevInfo, ModelEntry } from '../lib/types'
 
-const state: { models: ModelEntry[] } = { models: [] }
+const state: { models: ModelEntry[]; status: unknown } = { models: [], status: undefined }
 const requestLoad = vi.fn()
 
 vi.mock('../lib/queries', () => ({
@@ -26,7 +26,7 @@ vi.mock('../lib/queries', () => ({
     load: { mutate: vi.fn(), isPending: false, variables: undefined },
     eject: { mutate: vi.fn(), isPending: false },
   }),
-  useStatus: () => ({ data: { engine: { state: 'stopped' }, model: null } }),
+  useStatus: () => ({ data: state.status ?? { engine: { state: 'stopped' }, model: null } }),
 }))
 vi.mock('../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad, isPending: false, pendingKey: undefined }),
@@ -91,6 +91,7 @@ function renderScreen() {
 }
 
 beforeEach(() => {
+  state.status = undefined
   state.models = [entry()]
   requestLoad.mockClear()
 })
@@ -109,6 +110,28 @@ describe('ModelsScreen — Jev models', () => {
     renderScreen()
     expect(screen.getByText('laya')).toBeTruthy()
     expect(screen.getByText('Laya')).toBeTruthy()
+  })
+
+  it('shows a Laya model as loading, not running, while its engine prepares', () => {
+    state.models = [layaEntry({ loaded: true, compatibleWithActiveEngine: true })]
+    state.status = {
+      engine: { state: 'stopped' }, model: null,
+      laya: { key: 'laya-1', name: 'laya', checkpoints: ['english'], state: 'starting' },
+    }
+    renderScreen()
+    expect(screen.getByRole('button', { name: /Loading/ })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: /Eject/ })).toBeNull()
+    expect(screen.queryByText(/· running/)).toBeNull()
+  })
+
+  it('shows a Laya model as running once its engine is ready', () => {
+    state.models = [layaEntry({ loaded: true, compatibleWithActiveEngine: true })]
+    state.status = {
+      engine: { state: 'stopped' }, model: null,
+      laya: { key: 'laya-1', name: 'laya', checkpoints: ['english'], state: 'running' },
+    }
+    renderScreen()
+    expect(screen.getByRole('button', { name: /Eject/ })).toBeTruthy()
   })
 
   it('never warns that a Laya model has no chat template: it never chats', () => {

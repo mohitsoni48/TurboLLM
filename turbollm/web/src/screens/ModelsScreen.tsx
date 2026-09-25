@@ -159,11 +159,14 @@ export function ModelsScreen() {
   // `starting` before `running`. Keep the Load buttons busy across that whole window.
   const engineState = status?.engine.state
   const loadBusy = loader.isPending || engineState === 'starting' || engineState === 'stopping'
+  // A Laya model loads in its own slot, not the primary, so its 'starting' is on status.laya (ADR-443).
   const loadingKey = loader.isPending
     ? loader.pendingKey
     : engineState === 'starting'
       ? status?.model?.key
-      : undefined
+      : status?.laya?.state === 'starting'
+        ? status.laya.key
+        : undefined
 
   // Reads the `tab` query param on mount so links like `/models?tab=discover`
   // (onboarding's Pro Discover handoff and its "pick a different model"
@@ -772,7 +775,9 @@ function ModelRow({
   const [selKey, setSelKey] = useState(() => (variants.find((v) => v.loaded) ?? variants[0]).key)
   const m = variants.find((v) => v.key === selKey) ?? variants[0]
 
-  const loaded = m.loaded
+  // A Laya model still loading reads as loading, not running: its pool slot counts as loaded from the moment the
+  // load starts (ADR-443).
+  const loaded = m.loaded && !(m.laya && loadingKey === m.key)
   const pinned = isPinned(m.key)
   const loadable = !m.incomplete && !m.parseError
   const compatible = m.compatibleWithActiveEngine !== false

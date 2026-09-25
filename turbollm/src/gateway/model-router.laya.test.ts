@@ -102,3 +102,65 @@ test('a chat model in the primary still takes the chat slot', () => {
   const chatSlots = (r as unknown as { chatSlotCount: () => number }).chatSlotCount()
   assert.equal(chatSlots, 1)
 })
+
+/** A slot manager whose load only finishes (or fails) when the test says so. */
+function heldSlot() {
+  let state: Status['state'] = 'stopped'
+  let finish: (() => void) | null = null
+  let fail: ((e: Error) => void) | null = null
+  let stopped = 0
+  const manager = {
+    status: (): Status => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: () => {
+      state = 'starting'
+      return new Promise<void>((resolve, reject) => {
+        finish = () => { state = 'running'; resolve() }
+        fail = (e) => { state = 'error'; reject(e) }
+      })
+    },
+    stop: () => { stopped++; state = 'stopped' },
+    target: () => 'http://laya-slot',
+    touch: () => {},
+  } as unknown as Manager
+  return { manager, finish: () => finish?.(), fail: (e: Error) => fail?.(e), stops: () => stopped }
+}
+
+const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+test('a Laya model is alive as "starting" from the moment its load starts, not only once it is ready', async () => {
+  const slot = heldSlot()
+  const r = new ModelRouter(store(), registry(true), stoppedPrimary().manager, scannerOf(LAYA_MODEL), undefined, undefined, () => slot.manager)
+  const loading = r.routeTo(LAYA_MODEL)
+  await tick()
+  assert.deepEqual(r.aliveSlots().map((s) => ({ key: s.modelKey, state: s.state, primary: s.primary })), [
+    { key: LAYA_MODEL.key, state: 'starting', primary: false },
+  ])
+  assert.ok(r.loadedModelKeys().has(LAYA_MODEL.key))
+  slot.finish()
+  await loading
+  assert.deepEqual(r.aliveSlots().map((s) => s.state), ['running'])
+})
+
+test('a Laya load that fails leaves no slot behind', async () => {
+  const slot = heldSlot()
+  const r = new ModelRouter(store(), registry(true), stoppedPrimary().manager, scannerOf(LAYA_MODEL), undefined, undefined, () => slot.manager)
+  const loading = r.routeTo(LAYA_MODEL)
+  await tick()
+  slot.fail(new Error('boom'))
+  const result = await loading
+  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(r.aliveSlots(), [])
+  assert.equal(r.loadedModelKeys().has(LAYA_MODEL.key), false)
+})
+
+test('ejecting a Laya model while it is still loading stops it', async () => {
+  const slot = heldSlot()
+  const r = new ModelRouter(store(), registry(true), stoppedPrimary().manager, scannerOf(LAYA_MODEL), undefined, undefined, () => slot.manager)
+  const loading = r.routeTo(LAYA_MODEL)
+  await tick()
+  assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
+  assert.equal(slot.stops(), 1)
+  slot.fail(new Error('stopped'))
+  await loading
+  assert.deepEqual(r.aliveSlots(), [])
+})

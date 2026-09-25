@@ -274,7 +274,9 @@ export class ModelRouter {
         slot.manager.touch()
         return { target: slot.manager.target()! }
       }
-      this.extraSlots.delete(entry.key) // dead slot — clean up
+      // A slot still loading is not dead: its own doLoad holds the swap lock, and a caller that queues behind it
+      // finds it running.
+      if (ss.state !== 'starting') this.extraSlots.delete(entry.key) // dead slot — clean up
     }
     return undefined
   }
@@ -323,6 +325,11 @@ export class ModelRouter {
             : this.newSlotManager())
         : this.evictChatLru()
 
+    // A pool slot is registered as the load starts, not once it is ready: its 'starting' state is what /status
+    // shows while a side model (a Laya model takes 20 s or so) prepares, and what an eject can stop.
+    const inPool = targetManager !== this.manager
+    if (inPool) this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
+
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
@@ -331,21 +338,25 @@ export class ModelRouter {
         beforeStart: () => this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve(),
       })
     } catch (e) {
+      if (inPool) this.dropSlot(entry.key, targetManager)
       return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
     }
 
     const s = targetManager.status()
     if (s.state !== 'running') {
+      if (inPool) this.dropSlot(entry.key, targetManager)
       return { status: 503, message: s.err?.message ?? 'Model failed to become ready.' }
     }
 
     const target = targetManager.target()
     if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.' }
 
-    if (targetManager === this.manager) {
-      this.primaryLastUsed = Date.now()
+    if (inPool) {
+      const slot = this.extraSlots.get(entry.key)
+      if (slot?.manager !== targetManager) return { status: 503, message: 'The model was unloaded while it was loading.' }
+      slot.lastUsedMs = Date.now()
     } else {
-      this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
+      this.primaryLastUsed = Date.now()
     }
 
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
@@ -368,6 +379,12 @@ export class ModelRouter {
    *  8081/8082 where only 8081 was known to /api/v1/status.  */
   private isOccupied(state: string): state is AliveSlot['state'] {
     return state === 'running' || state === 'starting' || state === 'stopping'
+  }
+
+  /** Forget a pool slot whose load failed — only if it is still this load's, so a later load of the same model
+   *  is never dropped by an earlier one's failure. */
+  private dropSlot(modelKey: string, manager: Manager): void {
+    if (this.extraSlots.get(modelKey)?.manager === manager) this.extraSlots.delete(modelKey)
   }
 
   private isSideModelKey(modelKey: string): boolean {
