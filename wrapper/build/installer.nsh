@@ -72,3 +72,70 @@
     Pop $R2
   ${EndIf}
 !macroend
+
+; Graceful first, so TurboLLM can quit through its own shutdown; forced after, for what cannot answer
+; a close (no window yet, a cancelled close, a background process left under the install folder).
+; ${_OUT} ends as the last probe: 1 means something still runs after the whole budget.
+!macro TURBOLLM_CLOSE_ALL _OUT
+  !insertmacro TURBOLLM_SIGNAL_CLOSE
+  ${For} $R1 1 ${TURBOLLM_GRACE_POLLS}
+    Sleep ${TURBOLLM_POLL_MS}
+    !insertmacro TURBOLLM_IS_RUNNING ${_OUT}
+    ${If} ${_OUT} == 0
+      ${ExitFor}
+    ${EndIf}
+  ${Next}
+  ${If} ${_OUT} == 1
+    ${For} $R1 1 ${TURBOLLM_FORCE_ATTEMPTS}
+      !insertmacro TURBOLLM_FORCE_CLOSE
+      Sleep ${TURBOLLM_POLL_MS}
+      !insertmacro TURBOLLM_IS_RUNNING ${_OUT}
+      ${If} ${_OUT} == 0
+        ${ExitFor}
+      ${EndIf}
+    ${Next}
+  ${EndIf}
+!macroend
+
+; The hook electron-builder inserts instead of its own check, once per compile. There is no "TurboLLM
+; is running" prompt: the installer closes it itself. Retry/Cancel appears only after a whole automatic
+; attempt has failed (for example a TurboLLM started as administrator), and Retry runs that whole
+; attempt again. The marker is printed at compile time only, so the build log proves the insertion.
+!macro customCheckAppRunning
+  !verbose push
+  !verbose 4
+  !echo "TURBOLLM: customCheckAppRunning inserted"
+  !verbose pop
+
+  Var /GLOBAL turbollmSelfPid
+  ${GetProcessInfo} 0 $turbollmSelfPid $1 $2 $3 $4
+  ${If} $3 != "${APP_EXECUTABLE_FILENAME}"
+    !insertmacro IS_POWERSHELL_AVAILABLE
+    !insertmacro TURBOLLM_EXPORT_INSTDIR
+    !insertmacro TURBOLLM_IS_RUNNING $R0
+    ${If} $R0 == 1
+      ; The install section runs under SetDetailsPrint none, so the status line has to be forced
+      ; through. The uninstaller prints nothing, as stock did: "Installing" would be wrong there.
+      !ifndef BUILD_UNINSTALLER
+        SetDetailsPrint textonly
+        DetailPrint "$(appClosing)"
+        SetDetailsPrint lastused
+      !endif
+      ${Do}
+        !insertmacro TURBOLLM_CLOSE_ALL $R0
+        ${If} $R0 == 0
+          ${ExitDo}
+        ${EndIf}
+        ${IfNot} ${Cmd} `MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "$(appCannotBeClosed)" /SD IDCANCEL IDRETRY`
+          Quit
+        ${EndIf}
+      ${Loop}
+      !ifndef BUILD_UNINSTALLER
+        SetDetailsPrint textonly
+        DetailPrint "$(installing)"
+        SetDetailsPrint lastused
+      !endif
+    ${EndIf}
+    !insertmacro TURBOLLM_CLEAR_INSTDIR
+  ${EndIf}
+!macroend
