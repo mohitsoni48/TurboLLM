@@ -24,7 +24,7 @@ test('every local module main.js requires ships in the packaged app', () => {
     assert.ok(!packagedPath.startsWith('..'), 'main.js must not require outside wrapper/: it would not be packaged')
     assert.ok(
       config.files.includes(packagedPath),
-      `main.js requires ${packagedPath}: add it to files in electron-builder.config.cjs or the packaged app cannot start`
+      `main.js requires ${packagedPath}: add it to files in electron-builder.config.cjs so it gets packaged`
     )
   }
 })
