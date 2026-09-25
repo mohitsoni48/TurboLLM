@@ -45,3 +45,11 @@ test('pyEngineEnv: a LAYA_API_KEY set on the daemon is not handed to the Laya en
   const env = pyEngineEnv('laya', join(dataDir), join(dataDir, 'engines', 'laya', 'venv', 'bin', 'python'))
   assert.equal(env?.LAYA_API_KEY, undefined)
 })
+
+test('pyEngineEnv: the LAYA_API_KEY strip ignores case, as Windows environment names do', (t) => {
+  const dataDir = freshDataDir(t)
+  process.env.Laya_Api_Key = 'secret'
+  t.after(() => { delete process.env.Laya_Api_Key })
+  const env = pyEngineEnv('laya', dataDir, join(dataDir, 'engines', 'laya', 'venv', 'bin', 'python')) ?? {}
+  assert.deepEqual(Object.keys(env).filter((name) => name.toUpperCase() === 'LAYA_API_KEY'), [])
+})

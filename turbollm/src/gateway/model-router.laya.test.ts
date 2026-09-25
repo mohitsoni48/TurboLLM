@@ -124,25 +124,43 @@ function gatedSlot(gate: Promise<void>, { failsToStart = false } = {}) {
   let loadedKey: string | null = null
   let stops = 0
   let loads = 0
+  let startedEngines = 0
   const manager = {
     status: (): Status => ({
       state, err: null, port: 0, pid: 0, loadElapsedMs: 0,
       model: loadedKey ? { key: loadedKey, name: loadedKey, quant: '', ctx: 0, vision: false } : null,
     }),
-    load: async (opts: StartOpts) => {
+    load: async (opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }) => {
       loads++
       await gate
+      await hooks?.beforeStart?.()
+      startedEngines++
       state = 'starting'
       await tick()
+      if (state !== 'starting') return // stopped while starting, as the real readiness check leaves it
       if (failsToStart) { state = 'error'; return }
       state = 'running'
       loadedKey = opts.model.key
     },
-    stop: () => { stops++; if (state === 'running' || state === 'starting') state = 'stopped' },
+    // A graceful stop takes a moment (the real one waits up to 8 s), and stop() does not wait for it.
+    stop: () => {
+      stops++
+      if (state === 'running' || state === 'starting') {
+        state = 'stopping'
+        void tick().then(() => tick()).then(() => { state = 'stopped' })
+      }
+    },
+    stopAndWait: async () => {
+      stops++
+      if (state === 'running' || state === 'starting') state = 'stopping'
+      await tick()
+      await tick()
+      state = 'stopped'
+    },
     target: () => 'http://laya-slot',
     touch: () => {},
   } as unknown as Manager
-  return { manager, stops: () => stops, loads: () => loads }
+  return { manager, stops: () => stops, loads: () => loads, startedEngines: () => startedEngines }
 }
 
 function routerWithSlots(gate: Promise<void>, options: { keepN?: number; models?: ModelEntry[]; failsToStart?: boolean } = {}) {
@@ -204,7 +222,6 @@ test('ejecting a Laya model before its engine has spawned cancels the load: noth
   const loading = r.routeTo(LAYA_MODEL)
   await tick()
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
-  assert.deepEqual(r.aliveSlots(), [], 'an ejected model is no longer alive')
   gate.resolve()
   const result = await loading
   assert.equal('status' in result && result.status, 503)
@@ -242,4 +259,83 @@ test('a chat model in a pool slot is registered only once it has loaded, as befo
   gate.resolve()
   assert.deepEqual(await loadingB, { target: 'http://laya-slot' })
   assert.equal(r.aliveSlots().some((s) => s.modelKey === 'B' && s.state === 'running'), true)
+})
+
+// ── the v1.14.1 second-pass review: cancelled loads ────────────────────────────────────────────────────────────────
+
+test('ejecting a Laya model before its engine has spawned aborts the load, so no engine is ever started for it', async () => {
+  const gate = deferred()
+  const { r, made } = routerWithSlots(gate.promise)
+  const loading = r.routeTo(LAYA_MODEL)
+  await tick()
+  assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
+  gate.resolve()
+  const result = await loading
+  assert.equal('status' in result && result.status, 503)
+  assert.equal(made[0].startedEngines(), 0, 'the cancelled load never spawned an engine')
+})
+
+test('a cancelled Laya load stays alive as "stopping" until it has settled, so nothing else touches a live engine', async () => {
+  const gate = deferred()
+  const { r, made } = routerWithSlots(gate.promise)
+  const loading = r.routeTo(LAYA_MODEL)
+  gate.resolve()
+  await tick()
+  assert.equal(made[0].manager.status().state, 'starting', 'precondition')
+  assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
+  assert.deepEqual(r.aliveSlots().map((s) => ({ key: s.modelKey, state: s.state })), [{ key: LAYA_MODEL.key, state: 'stopping' }])
+  assert.ok(r.loadedModelKeys().has(LAYA_MODEL.key))
+  await loading
+  assert.deepEqual(r.aliveSlots(), [])
+  assert.equal(made[0].manager.status().state, 'stopped')
+})
+
+test('a Laya load started again right after an eject waits for the first engine to be fully stopped', async () => {
+  const gate = deferred()
+  const { r, made } = routerWithSlots(gate.promise)
+  const first = r.routeTo(LAYA_MODEL)
+  gate.resolve()
+  await tick()
+  assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
+  let firstStateWhenSecondStarted = ''
+  const second = r.routeTo(LAYA_MODEL)
+  await Promise.all([first, second])
+  firstStateWhenSecondStarted = made[0].manager.status().state
+  assert.equal(made.length, 2)
+  assert.equal(firstStateWhenSecondStarted, 'stopped', 'never two Laya processes at once')
+  assert.equal(made[1].manager.status().state, 'running')
+})
+
+test('ejecting a Laya model whose earlier slot died still cancels the load in flight', async () => {
+  const gate = deferred()
+  const { r, made } = routerWithSlots(gate.promise)
+  // A slot that stopped (an idle stop, a crash) leaves its entry behind; loadExplicit does not clean it up.
+  const dead = gatedSlot(Promise.resolve())
+  ;(r as unknown as { extraSlots: Map<string, unknown> }).extraSlots.set(LAYA_MODEL.key, {
+    manager: dead.manager, modelKey: LAYA_MODEL.key, lastUsedMs: 0,
+  })
+  const loading = r.loadExplicit(LAYA_MODEL.key)
+  await tick()
+  assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
+  gate.resolve()
+  const result = await loading
+  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(r.aliveSlots(), [])
+  assert.equal(made[0].startedEngines(), 0)
+})
+
+test('a Laya model is never reported twice by aliveSlots', async () => {
+  const gate = deferred()
+  const { r } = routerWithSlots(gate.promise)
+  const stopping = gatedSlot(Promise.resolve())
+  await stopping.manager.load({ model: { key: LAYA_MODEL.key } } as StartOpts)
+  stopping.manager.stop()
+  ;(r as unknown as { extraSlots: Map<string, unknown> }).extraSlots.set(LAYA_MODEL.key, {
+    manager: stopping.manager, modelKey: LAYA_MODEL.key, lastUsedMs: 0,
+  })
+  const loading = r.loadExplicit(LAYA_MODEL.key)
+  await tick()
+  assert.deepEqual(r.aliveSlots().map((s) => s.modelKey), [LAYA_MODEL.key])
+  gate.resolve()
+  await loading
 })

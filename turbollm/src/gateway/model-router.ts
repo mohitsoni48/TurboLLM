@@ -31,6 +31,8 @@ interface PoolSlot {
   lastUsedMs: number
 }
 
+const UNLOADED_WHILE_LOADING = 'The model was unloaded while it was loading.'
+
 /** A Laya load that has begun and not yet settled (ADR-443). `cancelled` is set by an eject while it loads. */
 interface LayaLoad {
   manager: Manager
@@ -162,7 +164,7 @@ export class ModelRouter {
       if (this.isOccupied(state)) slots.push({ modelKey: slot.modelKey, state, primary: false, lastUsedMs: slot.lastUsedMs })
     }
     for (const load of this.layaLoads.values()) {
-      slots.push({ modelKey: load.modelKey, state: 'starting', primary: false, lastUsedMs: load.startedMs })
+      slots.push({ modelKey: load.modelKey, state: load.cancelled ? 'stopping' : 'starting', primary: false, lastUsedMs: load.startedMs })
     }
     return slots
   }
@@ -225,19 +227,19 @@ export class ModelRouter {
    *  ejecting a specific model (e.g. an embedding model loaded alongside a chat model) stops
    *  THAT engine only, not whatever happens to be in the primary slot. */
   stopExplicit(modelKey: string): boolean {
-    const slot = this.extraSlots.get(modelKey)
-    if (slot) {
-      slot.manager.stop()
-      this.extraSlots.delete(modelKey)
+    // A Laya load still in flight comes first: its engine may not have spawned yet, so stopping the manager is not
+    // enough on its own — the load is marked cancelled, and doLoad stops whatever it then brings up. The entry stays,
+    // reported as 'stopping', until doLoad settles it, so nothing else touches an engine that is still going away.
+    const loading = this.layaLoads.get(modelKey)
+    if (loading) {
+      loading.cancelled = true
+      loading.manager.stop()
       return true
     }
-    // A Laya load still in flight: its engine may not have spawned yet, so stopping the manager is not enough on
-    // its own — the load is marked cancelled, and doLoad stops whatever it then brings up.
-    const loading = this.layaLoads.get(modelKey)
-    if (!loading) return false
-    loading.cancelled = true
-    loading.manager.stop()
-    this.layaLoads.delete(modelKey)
+    const slot = this.extraSlots.get(modelKey)
+    if (!slot) return false
+    slot.manager.stop()
+    this.extraSlots.delete(modelKey)
     return true
   }
 
@@ -351,25 +353,46 @@ export class ModelRouter {
     // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
     // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
     const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
+    try {
+      return await this.loadInto(entry, engine, opts, targetManager, inFlight)
+    } finally {
+      if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
+    }
+  }
 
+  /** The load itself, and what follows it. A Laya load (`inFlight`) stays tracked until this returns, so a cancelled
+   *  load is still reported (as 'stopping') while its engine is being stopped. */
+  private async loadInto(
+    entry: ModelEntry,
+    engine: Engine,
+    opts: StartOpts,
+    targetManager: Manager,
+    inFlight: LayaLoad | undefined,
+  ): Promise<RouteResult> {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
     try {
       await targetManager.load(opts, {
-        beforeStart: () => this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve(),
+        beforeStart: async () => {
+          // Ejected while it waited for the gate: never spawn an engine for it.
+          if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
+          await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+        },
       })
     } catch (e) {
+      if (inFlight?.cancelled) {
+        await this.stopCancelled(targetManager)
+        return { status: 503, message: UNLOADED_WHILE_LOADING }
+      }
       return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
-    } finally {
-      if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
 
-    // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, so nothing
-    // is left running that the router no longer tracks.
+    // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, and waited for,
+    // so nothing is left running that the router no longer tracks and a load queued behind this one never overlaps it.
     if (inFlight?.cancelled) {
-      targetManager.stop()
-      return { status: 503, message: 'The model was unloaded while it was loading.' }
+      await this.stopCancelled(targetManager)
+      return { status: 503, message: UNLOADED_WHILE_LOADING }
     }
 
     const s = targetManager.status()
@@ -411,9 +434,21 @@ export class ModelRouter {
   /** Note a Laya load as in flight. It shows as a 'starting' slot and counts as loaded (aliveSlots,
    *  loadedModelKeys), and stopExplicit can cancel it, until doLoad settles it. */
   private trackLayaLoad(modelKey: string, manager: Manager): LayaLoad {
+    // Whatever slot the router still holds for this key is dead or going away: doLoad found no running one under the
+    // swap lock. Dropping it means the model is reported once, and an eject reaches the load and not a stale entry.
+    this.extraSlots.delete(modelKey)
     const load: LayaLoad = { manager, modelKey, startedMs: Date.now(), cancelled: false }
     this.layaLoads.set(modelKey, load)
     return load
+  }
+
+  /** Stop the engine of a cancelled load and wait until it is gone. Best effort: the load is over either way. */
+  private async stopCancelled(manager: Manager): Promise<void> {
+    try {
+      await manager.stopAndWait()
+    } catch {
+      /* the engine may already be gone */
+    }
   }
 
   private isSideModelKey(modelKey: string): boolean {

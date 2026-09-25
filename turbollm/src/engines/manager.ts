@@ -844,8 +844,8 @@ export function pyEngineEnv(kind: string, dataDir: string, binPath: string): Nod
 /** laya-serve requires a bearer token whenever LAYA_API_KEY is set, and the daemon never sends one, so a key the user set
  *  for their own use of laya would make the engine refuse every forwarded request. */
 function withoutLayaApiKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const { LAYA_API_KEY: _key, ...rest } = env
-  return rest
+  // Case-insensitively: Windows environment names are, and a spread of process.env keeps whatever casing was set.
+  return Object.fromEntries(Object.entries(env).filter(([name]) => name.toUpperCase() !== 'LAYA_API_KEY'))
 }
 
 /** Scan a Python engine's log tail for a fatal model-load failure. mlx-lm loads the
