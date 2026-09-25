@@ -14,6 +14,7 @@ import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { modelIncompatibility } from '../engines/compat'
+import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -41,30 +42,31 @@ export interface EngineStartBody {
 /** Start (or swap to) a model. Fire-and-forget: returns 202 as soon as the load is queued —
  *  the caller polls `/status` for the starting→running/error transition. */
 export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Promise<Response> {
-  const active = d.registry.active()
-  if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
-  // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
-  // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
-  if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
   const cfg = d.store.snapshot()
-  const sys = getSysInfo()
-
   // Preferred (A4): start by modelKey with a resolved LoadProfile. An empty
   // request (the Engines "Start" button) re-loads the last model.
   let key = b.modelKey ?? ''
   if (!key && !b.modelPath && cfg.lastLoaded.modelKey) key = cfg.lastLoaded.modelKey
   const entry = key ? d.scanner.get(key) : undefined
 
+  // A Laya model loads on the Laya engine whichever engine is active; every other model on the active one.
+  const active = entry ? engineForModel(d.registry, entry) : d.registry.active()
+  if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
+  // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
+  if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
+  const sys = getSysInfo()
+
   if (entry) {
     if (entry.incomplete || entry.parseError) {
       return err(c, 409, 'model_not_loadable', 'This model is incomplete or unreadable.')
     }
     // Engine and model must be compatible (spec 03 §2b/2c, ADR-434 (g)): format, audio
-    // tower, and a Jev model's vLLM requirement — the one shared rule in compat.ts.
+    // tower, a Jev model's vLLM requirement and a Laya model's Laya engine — the one shared rule in compat.ts.
     const inc = modelIncompatibility(active.kind, entry)
     if (inc) return err(c, 409, 'engine_model_mismatch', inc.message)
 
-    // Embedding models get their own pool slot via the router (same coexistence rule
+    // Side models — embedding and Laya — get their own pool slot via the router (same coexistence rule
     // the auto-swap gateway path already uses — model-router.ts's `chatSlotCount`/
     // `evictChatLru`) instead of replacing whatever's in the primary manager. Without
     // this, clicking "Load" on an embedding model in the UI killed a running chat
@@ -72,7 +74,7 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     // Skips the kill switch below too: that exists to stop in-flight chats/auto-tune
     // against an engine that's "going away" (chat-routes.ts's abortAllInFlightChats
     // docblock) — the primary engine isn't going away here, so nothing needs aborting.
-    if (entry.embedding) {
+    if (entry.embedding || entry.laya) {
       void d.modelRouter
         .loadExplicit(entry.key, b.profileOverrides)
         .catch((e) => console.warn(`engine load failed: ${e}`))

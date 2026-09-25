@@ -14,7 +14,7 @@ import { UnreachableOverlay } from './components/UnreachableOverlay'
 import { AuthGate } from './components/AuthGate'
 import { JevLoadConfirmHost } from './components/JevLoadConfirmHost'
 import { useStatus, useSettings, useDownloads, useModels } from './lib/queries'
-import { jevPresence, workspaceRedirect } from './lib/jev-mode'
+import { jevPresence, layaLoaded, workspaceRedirect } from './lib/jev-mode'
 import { useJevLoadedToast } from './lib/model-loader'
 import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
@@ -87,7 +87,8 @@ export function WorkspaceModeGate() {
   const statusQ = useStatus()
   const modelsQ = useModels()
   const { pathname } = useLocation()
-  const redirect = workspaceRedirect(pathname, jevPresence(statusQ.data, modelsQ.data?.models))
+  const models = modelsQ.data?.models
+  const redirect = workspaceRedirect(pathname, jevPresence(statusQ.data, models), layaLoaded(statusQ.data, models))
   if (!redirect) return <Outlet />
   return <Navigate to={redirect.to} replace state={{ jevNotice: redirect.notice }} />
 }

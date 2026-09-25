@@ -201,3 +201,12 @@ describe('AnswerCard', () => {
     expect(names).toEqual([`a ${EM_DASH} unknown`, `b ${EM_DASH} unknown`])
   })
 })
+
+describe('AnswerCard for a Laya model', () => {
+  it('captions a yes/no answer as the probability of yes, not as an entailment score it is not', () => {
+    render(<AnswerCard id="urgent" answer={URGENT} laya />)
+    const card = screen.getByRole('group', { name: `urgent ${EM_DASH} noul` })
+    expect(within(card).getByText('probability of yes')).toBeInTheDocument()
+    expect(within(card).queryByText('entailment probability')).toBeNull()
+  })
+})

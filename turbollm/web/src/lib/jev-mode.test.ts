@@ -5,7 +5,7 @@
 // /status, so "I can't tell" would otherwise read as "nothing loaded" and bounce a deep
 // link the user typed on purpose).
 import { describe, expect, it } from 'vitest'
-import { JEV_PATH, isWorkspaceWorkPath, jevPresence, workspaceRedirect } from './jev-mode'
+import { JEV_PATH, isWorkspaceWorkPath, jevPresence, layaLoaded, workspaceRedirect } from './jev-mode'
 import type { JevInfo, JevStatus, ModelEntry, Status } from './types'
 
 const JEV_INFO: JevInfo = {
@@ -124,5 +124,34 @@ describe('workspaceRedirect', () => {
   it('leaves bare /workspace to the router, which already sends it to chat', () => {
     expect(workspaceRedirect('/workspace', 'loaded')).toBeNull()
     expect(workspaceRedirect('/workspace', 'none')).toBeNull()
+  })
+})
+
+describe('workspaceRedirect with a Laya model loaded', () => {
+  it('keeps the playground open while a Laya model is loaded and no Jev model is', () => {
+    expect(workspaceRedirect(JEV_PATH, 'none', true)).toBeNull()
+  })
+
+  it('never takes chat, code or routines over: a Laya model runs beside the chat model', () => {
+    expect(workspaceRedirect('/workspace/chat', 'none', true)).toBeNull()
+    expect(workspaceRedirect('/workspace/code/abc123', 'none', true)).toBeNull()
+  })
+
+  it('still sends the playground back to chat when neither kind is loaded', () => {
+    expect(workspaceRedirect(JEV_PATH, 'none', false)).toEqual({ to: '/workspace/chat', notice: false })
+  })
+})
+
+describe('layaLoaded', () => {
+  const LAYA_STATUS = { key: 'laya|laya|1455', name: 'laya', checkpoints: ['english'], state: 'running' as const }
+
+  it('reads the daemon status when it has the field', () => {
+    expect(layaLoaded({ laya: LAYA_STATUS } as unknown as Status, undefined)).toBe(true)
+    expect(layaLoaded({ laya: null } as unknown as Status, [{ laya: { checkpoints: [] }, loaded: true } as unknown as ModelEntry])).toBe(false)
+  })
+
+  it('falls back to the catalog when the status has no laya field', () => {
+    expect(layaLoaded(undefined, [{ laya: { checkpoints: ['english'] }, loaded: true } as unknown as ModelEntry])).toBe(true)
+    expect(layaLoaded(undefined, [{ laya: { checkpoints: ['english'] }, loaded: false } as unknown as ModelEntry])).toBe(false)
   })
 })

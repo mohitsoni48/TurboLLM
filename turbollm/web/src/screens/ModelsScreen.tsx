@@ -28,6 +28,7 @@ import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import type { ModelEntry } from '../lib/types'
+import { isChatModel } from '../lib/model-kind'
 import { cn } from '../lib/utils'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
@@ -158,11 +159,14 @@ export function ModelsScreen() {
   // `starting` before `running`. Keep the Load buttons busy across that whole window.
   const engineState = status?.engine.state
   const loadBusy = loader.isPending || engineState === 'starting' || engineState === 'stopping'
+  // A Laya model loads in its own slot, not the primary, so its 'starting' is on status.laya (ADR-443).
   const loadingKey = loader.isPending
     ? loader.pendingKey
     : engineState === 'starting'
       ? status?.model?.key
-      : undefined
+      : status?.laya?.state === 'starting'
+        ? status.laya.key
+        : undefined
 
   // Reads the `tab` query param on mount so links like `/models?tab=discover`
   // (onboarding's Pro Discover handoff and its "pick a different model"
@@ -771,7 +775,9 @@ function ModelRow({
   const [selKey, setSelKey] = useState(() => (variants.find((v) => v.loaded) ?? variants[0]).key)
   const m = variants.find((v) => v.key === selKey) ?? variants[0]
 
-  const loaded = m.loaded
+  // A Laya model still loading reads as loading, not running: its pool slot counts as loaded from the moment the
+  // load starts (ADR-443).
+  const loaded = m.loaded && !(m.laya && loadingKey === m.key)
   const pinned = isPinned(m.key)
   const loadable = !m.incomplete && !m.parseError
   const compatible = m.compatibleWithActiveEngine !== false
@@ -781,8 +787,8 @@ function ModelRow({
   // template directly), so a missing one is a real, user-visible dead end at chat time —
   // surfaced here instead of a first-message 400. Only checked once the model is otherwise
   // loadable/compatible; an incomplete or engine-mismatched model has a more pressing problem.
-  // …and never for a Jev model, which labels text and never chats (ADR-434 (g)).
-  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate && !m.jev
+  // …and never for a Jev or Laya model, which answers questions and never chats (ADR-434 (g), ADR-443).
+  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate && isChatModel(m)
   const problem = m.incomplete
     ? 'missing parts'
     : m.parseError
@@ -799,6 +805,7 @@ function ModelRow({
   // its NextN tag silently crowded out despite the NextN filter/count already finding it.
   const caps = [
     m.jev && 'Jev',
+    m.laya && 'Laya',
     (m.nextnLayers ?? 0) > 0 && 'NextN',
     m.embedding && 'Embed',
     m.vision && 'Vision',

@@ -225,6 +225,9 @@ export type Status = {
   /** The loaded Jev model, or null when none is (ADR-434 (i)(1)). Absent from an older
    *  daemon and over Turbo Link, which is read as "unknown", not as "none". */
   jev?: JevStatus | null
+  /** The loaded Laya model, or null (ADR-443). It keeps the System One playground open but, unlike a Jev
+   *  model, never takes the Workspace over. Absent from an older daemon and over Turbo Link. */
+  laya?: LayaStatus | null
   telemetryLevel: string
   uptimeSec: number
   /** Locally-enabled feature flags (TURBOLLM_FEATURES env var) — internal/dev only,
@@ -641,6 +644,10 @@ export type ModelEntry = {
   /** Set only for a Jev model — an NLI cross-encoder served through vLLM (ADR-434 (g)).
    *  Absent means "not a Jev model"; the twin is `JevInfo` in src/models/jev.ts. */
   jev?: JevInfo
+  /** Set only for a Laya model — a System One decision model served by its own 'laya' engine
+   *  (huggingface.co/convaiinnovations/laya). `checkpoints` names the folders it ships,
+   *  e.g. `['english', 'multilingual']`. Absent means "not a Laya model". */
+  laya?: { checkpoints: string[] }
   /** Why the active engine cannot load this model, in the user's words ('Needs vLLM
    *  (Linux or WSL2)'), or null when it can. The daemon owns the wording so every
    *  surface says the same thing. */
@@ -687,7 +694,19 @@ export type JevStatus = {
  *  that cannot read /status has to read the model off the catalog instead (ADR-422), and
  *  the catalog cannot tell which slot the engine took: `null` says so rather than guessing
  *  `primary` and skipping the ADR-427 (c) eject. */
-export type LoadedJev = Omit<JevStatus, 'slot'> & { slot: JevStatus['slot'] | null }
+export type LoadedJev = Omit<JevStatus, 'slot'> & {
+  slot: JevStatus['slot'] | null
+  /** Set for a Laya model (ADR-443): the checkpoints it answers with. A Laya model has no labels of its own. */
+  checkpoints?: string[]
+}
+
+/** The alive Laya model, from /api/v1/status (ADR-443). Always in its own pool slot. */
+export type LayaStatus = {
+  key: string
+  name: string
+  checkpoints: string[]
+  state: 'starting' | 'running' | 'stopping'
+}
 
 export type ClassifyRequest = {
   model: string
@@ -1026,6 +1045,10 @@ export type HfRepoDetail = {
   /** The repo's downloadable model directories (ADR-434 (h)). Absent for a GGUF repo,
    *  which keeps today's flat `files` list. */
   checkpoints?: HfCheckpoint[]
+  /** True for a Laya repo (huggingface.co/convaiinnovations/laya): a safetensors repo with no
+   *  `checkpoints` list of its own — `files` carries the whole nested layout (root config +
+   *  per-checkpoint subfolders like 'multilingual/model.safetensors') as one flat download. */
+  laya?: boolean
 }
 
 /** One downloadable model directory in a safetensors repo (ADR-434 (h)). A repo with

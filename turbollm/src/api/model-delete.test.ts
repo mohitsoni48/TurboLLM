@@ -15,6 +15,7 @@ for (const [code, status] of [['unsafe_model_delete', 409], ['no_such_model', 40
         delete: async () => { throw new ScannerError(code, message) },
       },
       manager: { status: () => ({ state: 'stopped' }) },
+      modelRouter: { loadedModelKeys: () => new Set<string>() },
     } as unknown as Deps)
     const response = await app.request('/api/v1/models/model', { method: 'DELETE' })
     assert.equal(response.status, status)

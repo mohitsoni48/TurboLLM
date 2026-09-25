@@ -66,3 +66,37 @@ test('getRepo: safetensors repo file list still excludes nested (non-root) files
     assert.ok(!names.some((n) => n.startsWith('onnx/')), `expected no nested files in ${JSON.stringify(names)}`)
   })
 })
+
+test('getRepo: a Laya repo is marked laya and lists its nested checkpoint files, with no checkpoint rows', async () => {
+  const tree: TreeEntry[] = [
+    { type: 'file', path: 'README.md', size: 5 },
+    { type: 'file', path: 'encoder/config.json', size: 20 },
+    { type: 'file', path: 'model.safetensors', lfs: { oid: 'en', size: 808 } },
+    { type: 'file', path: 'multilingual/encoder/config.json', size: 20 },
+    { type: 'file', path: 'multilingual/model.safetensors', lfs: { oid: 'ml', size: 647 } },
+    { type: 'file', path: 'multilingual/rl_agent_config.json', size: 5 },
+    { type: 'file', path: 'multilingual/tokenizer/tokenizer.json', size: 30 },
+    { type: 'file', path: 'rl_agent_config.json', size: 5 },
+    { type: 'file', path: 'tokenizer/tokenizer.json', size: 30 },
+  ]
+  await withRepo(tree, async () => {
+    const detail = await client().getRepo('convaiinnovations/laya')
+    assert.equal(detail.safetensors, true)
+    assert.equal(detail.laya, true)
+    assert.equal(detail.checkpoints, undefined)
+    assert.ok(detail.files.some((f) => f.name === 'multilingual/model.safetensors'))
+    assert.ok(detail.files.some((f) => f.name === 'encoder/config.json'))
+    assert.ok(!detail.files.some((f) => f.name === 'README.md'))
+  })
+})
+
+test('getRepo: an ordinary safetensors repo is not marked laya', async () => {
+  const tree: TreeEntry[] = [
+    { type: 'file', path: 'config.json', size: 100 },
+    { type: 'file', path: 'tokenizer.json', size: 200 },
+    { type: 'file', path: 'model.safetensors', lfs: { oid: 'a', size: 1000 } },
+  ]
+  await withRepo(tree, async () => {
+    assert.equal((await client().getRepo('some/repo')).laya, undefined)
+  })
+})

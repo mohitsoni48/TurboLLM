@@ -682,6 +682,8 @@ export const UI_ACTIONS = [
   'jev_switch_model',
   'download_hf_checkpoint', 'load_hf_checkpoint',
   'confirm_jev_load', 'cancel_jev_load', 'open_jev_playground_toast',
+  // ADR-443: the Workspace sidebar's way into the playground while a Laya model is loaded.
+  'open_laya_playground',
 ] as const
 
 export const uiAction = defineEvent({

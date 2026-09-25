@@ -14,22 +14,22 @@ type ScoreAnswer = Extract<Answer, { type: 'score' }>
 
 const MISSING_VALUE = '—'
 
-export function AnswerCard({ id, answer }: { id: string; answer: Answer }) {
+export function AnswerCard({ id, answer, laya = false }: { id: string; answer: Answer; laya?: boolean }) {
   return (
     <div
       role="group"
       aria-label={`${id} — ${typeOf(answer)}`}
       className="flex min-w-0 flex-col gap-2 rounded-md border border-border p-3 [overflow-wrap:anywhere]"
     >
-      <AnswerBody answer={answer} />
+      <AnswerBody answer={answer} laya={laya} />
     </div>
   )
 }
 
-function AnswerBody({ answer }: { answer: Answer }) {
+function AnswerBody({ answer, laya }: { answer: Answer; laya: boolean }) {
   switch (answer?.type) {
     case 'noul':
-      return <NoulBody answer={answer} />
+      return <NoulBody answer={answer} laya={laya} />
     case 'choice':
       return <ChoiceBody answer={answer} />
     case 'score':
@@ -39,12 +39,13 @@ function AnswerBody({ answer }: { answer: Answer }) {
   }
 }
 
-function NoulBody({ answer }: { answer: NoulAnswer }) {
+/** A Jev yes/no answer is the model's entailment score; a Laya one is its own probability of yes (ADR-443). */
+function NoulBody({ answer, laya }: { answer: NoulAnswer; laya: boolean }) {
   return (
     <>
       <div className="flex items-baseline gap-2">
         <span className="text-[20px] font-medium text-ink">{fixed(answer.noul, 3)}</span>
-        <span className="text-[12px] text-muted">entailment probability</span>
+        <span className="text-[12px] text-muted">{laya ? 'probability of yes' : 'entailment probability'}</span>
       </div>
       <Bar probability={answer.noul} />
     </>
