@@ -396,6 +396,18 @@ export const LOCAL_MCPS: LocalEntry[] = [
       { key: 'CONTEXT7_API_KEY', desc: 'Optional — from context7.com/dashboard for higher rate limits', required: false },
     ],
   },
+  {
+    id: 'mcp-web-engine',
+    name: 'MCP Web Engine',
+    cat: 'Search',
+    desc: 'Privacy-first, self-hostable & SSRF-hardened web search engine and scraper for AI agents.',
+    cmd: 'uvx mcp-web-engine',
+    uvx: true,
+    argNote: 'Requires a running SearXNG instance.',
+    envs: [
+      { key: 'SEARXNG_URL', desc: 'SearXNG meta-search endpoint (default: http://127.0.0.1:8082/search)', required: true },
+    ],
+  },
 ]
 
 export const CLOUD_CATS: string[] = ['All', ...new Set(CLOUD_MCPS.map((m) => m.cat))]
