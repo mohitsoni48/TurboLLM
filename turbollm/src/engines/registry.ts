@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe } from './probe'
 import { normRepoUrl, sameRepo } from './build-runner'
+import type { ModelEntry } from '../models/scanner'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -242,6 +243,36 @@ export class Registry {
       if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
+  }
+
+  /** Register the Laya engine (kind='laya'). binPath is a venv python. Unlike every other kind it is never made
+   *  the active engine: it serves only Laya models, which load on it whatever engine is active (layaEngine), so
+   *  activating it would only stop every other model from loading. */
+  addLaya(name: string, binPath: string, version: string): Engine {
+    const eng: Engine = {
+      id: randomUUID(),
+      name: name.trim() || 'Laya',
+      binPath,
+      kind: 'laya',
+      version,
+      capabilities: { kvTypes: [], flags: [] },
+      addedAt: new Date().toISOString(),
+    }
+    this.store.update((c) => {
+      const existing = c.engines.find((e) => e.kind === 'laya' && e.binPath === binPath)
+      if (existing) {
+        existing.version = version
+        eng.id = existing.id
+      } else {
+        c.engines.push(eng)
+      }
+    })
+    return eng
+  }
+
+  /** The engine every Laya model loads on, whichever engine is active; undefined until Laya is installed. */
+  layaEngine(): Engine | undefined {
+    return this.store.snapshot().engines.find((e) => e.kind === 'laya')
   }
 
   /** Register a KoboldCpp engine (kind='koboldcpp'). binPath is the single KoboldCpp
@@ -500,4 +531,12 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
   // way, nothing extra to report) is NOT stale; only `undefined` (never probed) is.
   if (flagInfo === undefined) return true
   return false
+}
+
+/** The engine that loads `entry`: the Laya engine for a Laya model, the active engine for every other one. A
+ *  Laya model with no Laya engine installed gets the active engine, whose compat check refuses it with the reason
+ *  (compat.ts NEEDS_LAYA). Free-standing, and asking for the Laya engine only for a Laya model, so every caller's
+ *  registry needs nothing beyond active() for every other model. */
+export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
+  return (entry.laya && registry.layaEngine()) || registry.active()
 }

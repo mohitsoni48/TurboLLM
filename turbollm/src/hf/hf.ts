@@ -6,6 +6,7 @@
 import { quantFromName } from '../gguf/gguf'
 import { detectJev } from '../models/jev'
 import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
+import { isLayaRepo, layaRepoFiles } from './laya-repo'
 
 const BASE = 'https://huggingface.co'
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -103,6 +104,9 @@ export interface HfRepoDetail {
   files: HfRepoFile[]
   /** True when the repo is a safetensors model (no GGUFs — covers MLX and vLLM). */
   safetensors?: boolean
+  /** True for a Laya System One repo: `files` then holds its checkpoints' nested paths, and there are no
+   *  `checkpoints` rows (./laya-repo). */
+  laya?: boolean
   /** Every downloadable checkpoint folder of a safetensors repo (ADR-434 (h)), root first.
    *  Present only for safetensors repos; `files` above is unchanged either way. */
   checkpoints?: HfCheckpoint[]
@@ -184,7 +188,11 @@ export class HfClient {
     let files: HfRepoFile[]
     let safetensors: boolean | undefined
     let checkpoints: HfCheckpoint[] | undefined
-    if (isSafetensors) {
+    const laya = isSafetensors && isLayaRepo(tree)
+    if (laya) {
+      safetensors = true
+      files = layaRepoFiles(tree, (path) => this.fileUrl(repo, path))
+    } else if (isSafetensors) {
       safetensors = true
       // Collect all component files: safetensors weights + JSON config/tokenizer files +
       // the chat template. Modern HF repos ship the chat template as a standalone
@@ -230,6 +238,7 @@ export class HfClient {
       card: await this.getCard(repo),
       files,
       ...(safetensors ? { safetensors } : {}),
+      ...(laya ? { laya } : {}),
       ...(checkpoints ? { checkpoints } : {}),
     }
   }

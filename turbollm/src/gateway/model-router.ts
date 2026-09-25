@@ -9,6 +9,7 @@ import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
 import { modelIncompatibility } from '../engines/compat'
+import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
@@ -60,6 +61,8 @@ export class ModelRouter {
      *  construction site keeps compiling unchanged; when absent, `route()` behaves
      *  exactly as it did before — there are no links, so nothing can be remote. */
     private catalog?: RemoteCatalog,
+    /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
+    private newSlotManager: () => Manager = () => new Manager(store),
   ) {}
 
   /** Route a request to the correct model target URL.
@@ -298,23 +301,27 @@ export class ModelRouter {
       return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
 
-    const active = this.registry.active()
-    if (!active) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    const inc = modelIncompatibility(active.kind, entry)
+    const engine = engineForModel(this.registry, entry)
+    if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
+    const inc = modelIncompatibility(engine.kind, entry)
     if (inc) return { status: 503, message: inc.message }
 
-    const opts = this.buildOpts(entry, active, overrides)
+    const opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
     const keepN = Math.max(1, this.store.snapshot().gateway.keepN)
-    // Embedding models don't consume a chat slot — they get their own implicit slot
-    // so a loaded chat model is never evicted just because an embed model is requested.
-    const needsNewSlot = entry.embedding || this.chatSlotCount() < keepN
-    const targetManager = needsNewSlot
-      ? (this.manager.status().state === 'stopped' || this.manager.status().state === 'error'
-          ? this.manager
-          : new Manager(this.store))
-      : this.evictChatLru()
+    // Side models (embedding, Laya) don't consume a chat slot — they get their own implicit slot
+    // so a loaded chat model is never evicted just because a side model is requested.
+    const needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    // A Laya model never takes the primary, even an empty one: the chat screen shows and talks to whatever the
+    // primary holds, and a Laya engine answers only /v1/systemone.
+    const targetManager = entry.laya
+      ? this.newSlotManager()
+      : needsNewSlot
+        ? (this.manager.status().state === 'stopped' || this.manager.status().state === 'error'
+            ? this.manager
+            : this.newSlotManager())
+        : this.evictChatLru()
 
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
@@ -341,7 +348,9 @@ export class ModelRouter {
       this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
-    this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: active.id } })
+    // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
+    // refuses it, so recording it would leave the machine with no model at all after a restart.
+    if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
     return { target }
   }
 
@@ -361,16 +370,21 @@ export class ModelRouter {
     return state === 'running' || state === 'starting' || state === 'stopping'
   }
 
-  /** Count of occupied chat (non-embedding) slots. Embedding models don't consume
-   *  a keepN slot so chat models and embedding models can coexist independently. */
+  private isSideModelKey(modelKey: string): boolean {
+    const entry = this.scanner.get(modelKey)
+    return entry !== undefined && isSideModel(entry)
+  }
+
+  /** Count of occupied chat (non-side-model) slots. Side models (embedding, Laya) don't consume
+   *  a keepN slot so chat models and side models can coexist independently. */
   private chatSlotCount(): number {
     const ms = this.manager.status()
     const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
-      (this.scanner.get(ms.model.key)?.embedding ?? false)
+      this.isSideModelKey(ms.model.key)
     const extraChat = [...this.extraSlots.values()].filter(
       s => this.isOccupied(s.manager.status().state) &&
-        !(this.scanner.get(s.modelKey)?.embedding ?? false),
+        !this.isSideModelKey(s.modelKey),
     ).length
     return (primaryAlive && !primaryEmbed ? 1 : 0) + extraChat
   }
@@ -382,14 +396,14 @@ export class ModelRouter {
     const ms = this.manager.status()
     const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
-      (this.scanner.get(ms.model.key)?.embedding ?? false)
+      this.isSideModelKey(ms.model.key)
 
     let lruManager: Manager = this.manager
     let lruTime = (primaryAlive && !primaryEmbed) ? this.primaryLastUsed : Infinity
     let lruKey: string | null = null
 
     for (const slot of this.extraSlots.values()) {
-      const slotEmbed = this.scanner.get(slot.modelKey)?.embedding ?? false
+      const slotEmbed = this.isSideModelKey(slot.modelKey)
       if (this.isOccupied(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
         lruTime = slot.lastUsedMs
         lruManager = slot.manager
@@ -497,4 +511,10 @@ export class ModelRouter {
     })
   }
 
+}
+
+/** A model that runs beside the chat model instead of in a chat slot: an embedding model (ADR-389) or a Laya
+ *  decision model. */
+function isSideModel(entry: Pick<ModelEntry, 'embedding' | 'laya'>): boolean {
+  return entry.embedding || entry.laya !== undefined
 }

@@ -9,6 +9,7 @@ import type { ConfigStore, Engine } from '../config/config'
 import type { LoadProfile } from '../models/profile'
 import { mlxServerCommand } from './mlx'
 import { rapidMlxServerCommand } from './rapid-mlx'
+import { layaServerCommand } from './laya'
 import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
@@ -739,7 +740,12 @@ export function shellWrapped(cmd: string, args: string[]): { cmd: string; args: 
 
 /** Build the spawn command for an engine, branching on its kind (spec 03 §2b).
  *  `slotSavePath` (F-014) is appended only for llama.cpp; mlx/vllm don't support it. */
-function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { cmd: string; args: string[] } {
+export function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { cmd: string; args: string[] } {
+  if (opts.engine.kind === 'laya') {
+    // Laya: the launcher serves laya's own /v1/systemone app over the model folder's checkpoints. It has no
+    // launch flags, so opts.extraArgs is never used.
+    return layaServerCommand(opts.engine.binPath, opts.modelPath, port, '127.0.0.1')
+  }
   if (opts.engine.kind === 'mlx') {
     // MLX: run the mlx-lm OpenAI server via the provisioned venv python. For MLX,
     // opts.extraArgs carries mlx-lm's OWN flags (sampling defaults), built by the
@@ -808,7 +814,7 @@ const READINESS_TIMEOUT_MS = 600_000
  *     CacheNotFound when `~/.cache/huggingface/hub` is absent, and
  *   - on WSL, run vLLM's V1 model runner, since V2 cannot start there (`vllmModelRunnerEnv`). */
 export function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
-  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang') {
+  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang' && kind !== 'laya') {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
     // Append the existing value only if it's non-empty — glibc's dynamic linker treats an

@@ -23,7 +23,16 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Laya decision models** ([convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya), Apache-2.0).
+  Laya is a System One model: give it a state and typed questions (`noul`, `choice`, `score`) and it answers
+  with calibrated probabilities in one forward pass, in 100+ languages. A new **Laya engine** (Engines page;
+  Windows, macOS and Linux, on CPU, NVIDIA or Apple GPU) runs it, and `POST /v1/systemone` and the Jev playground
+  answer with a Laya model exactly as they do with a Jev one. The response adds `routing`, which names the
+  checkpoint that answered (English or multilingual). A Laya model always loads on the Laya engine, beside your chat
+  model and whichever engine is active. Downloading the repo fetches the English and multilingual checkpoints
+  (~1.5 GB).
 
 ## [1.14.0] - 2026-09-22
 
