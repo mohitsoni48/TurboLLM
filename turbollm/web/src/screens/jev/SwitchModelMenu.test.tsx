@@ -169,6 +169,32 @@ describe('switchToModel', () => {
     expect(d.order).toEqual(['stop', 'load'])
   })
 
+  // The v1.14.1 Opus review: a Laya load never replaces the primary, so a Jev model left loaded there keeps the
+  // playground on the Jev model and the Laya "ready" toast (which reads status.jev first) never fires.
+  it('ejects a Jev model in the primary slot before loading a Laya model, which never replaces the primary', async () => {
+    const d = deps()
+    await switchToModel(CURRENT, LAYA, d)
+    expect(d.stopEngine).toHaveBeenCalledWith(CURRENT.key)
+    expect(d.order).toEqual(['stop', 'load'])
+    expect(d.requestLoad).toHaveBeenCalledWith(LAYA)
+  })
+
+  it('leaves a loaded Laya model alone when the next model is a chat model: it runs beside chat', async () => {
+    const d = deps()
+    const layaCurrent = { key: 'laya', name: 'Laya', labels: [], checkpoints: ['english'], state: 'running' as const, slot: 'pool' as const }
+    await switchToModel(layaCurrent, CHAT, d)
+    expect(d.stopEngine).not.toHaveBeenCalled()
+    expect(d.requestLoad).toHaveBeenCalledWith(CHAT)
+  })
+
+  it('ejects a loaded Laya model before loading another Laya model', async () => {
+    const d = deps()
+    const layaCurrent = { key: 'laya-old', name: 'Laya old', labels: [], checkpoints: ['english'], state: 'running' as const, slot: 'pool' as const }
+    await switchToModel(layaCurrent, LAYA, d)
+    expect(d.stopEngine).toHaveBeenCalledWith('laya-old')
+    expect(d.order).toEqual(['stop', 'load'])
+  })
+
   it('records the switch whichever model was picked', async () => {
     const d = deps()
     await switchToModel(CURRENT, CHAT, d)

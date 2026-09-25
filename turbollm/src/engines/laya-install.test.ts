@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { installLayaEngine, type LayaInstallDeps } from './laya-install'
+import { installLayaEngine, layaEngineBusy, type LayaInstallDeps } from './laya-install'
 import type { LayaRuntime } from './laya'
 
 function recorder() {
@@ -60,4 +60,23 @@ test('installLayaEngine reports a failed install with its reason and registers n
   await installLayaEngine(deps, '/engines', false, async () => { throw new Error('no wheel for this platform') })
   assert.deepEqual(added, [])
   assert.deepEqual(events, ['start laya runtime_env', 'fail Could not install Laya: no wheel for this platform'])
+})
+
+// An install or update rewrites the venv the running Laya engine is executing from; on Windows that breaks it.
+test('layaEngineBusy: refuses while a Laya model is loaded or loading, and says what to do', () => {
+  const alive = (state: string) => ({
+    modelRouter: { aliveSlots: () => [{ modelKey: 'laya', state, primary: false, lastUsedMs: 0 }] },
+    scanner: { get: () => ({ key: 'laya', name: 'laya', laya: { checkpoints: ['english'] } }) },
+  }) as unknown as Parameters<typeof layaEngineBusy>[0]
+  for (const state of ['running', 'starting']) {
+    assert.equal(layaEngineBusy(alive(state)), 'Eject the Laya model before installing or updating the Laya engine.')
+  }
+})
+
+test('layaEngineBusy: is null when no Laya model is alive, whatever else is', () => {
+  const chatOnly = {
+    modelRouter: { aliveSlots: () => [{ modelKey: 'qwen', state: 'running', primary: true, lastUsedMs: 0 }] },
+    scanner: { get: () => ({ key: 'qwen', name: 'qwen' }) },
+  } as unknown as Parameters<typeof layaEngineBusy>[0]
+  assert.equal(layaEngineBusy(chatOnly), null)
 })

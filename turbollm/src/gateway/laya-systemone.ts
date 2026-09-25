@@ -68,11 +68,15 @@ async function engineJson(res: Response): Promise<unknown> {
   }
 }
 
-/** laya-serve refuses a request it cannot answer with 400, 413 or 422 and a FastAPI `detail`; each is a request the
- *  caller must change, which this endpoint answers with 422 (ADR-440). Anything else is the engine failing. */
+/** The statuses laya-serve uses for a request it cannot answer: 400, 413 and 422, each with a FastAPI `detail`. */
+const CALLER_REFUSALS: ReadonlySet<number> = new Set([400, 413, 422])
+
+/** Each of those is a request the caller must change, which this endpoint answers with 422 (ADR-440). Any other
+ *  non-2xx is the engine failing (a 401 from a key the caller never sent, a 404 from a route that is gone), which a
+ *  422 would blame on the caller. */
 function refusalFrom(status: number, body: unknown): JevHttpError {
   const message = detailOf(body) ?? `The Laya engine answered HTTP ${status}.`
-  return status < 500
+  return CALLER_REFUSALS.has(status)
     ? { status: 422, code: 'invalid_request', type: 'invalid_request_error', message }
     : { status: 502, code: 'engine_error', type: 'api_error', message }
 }

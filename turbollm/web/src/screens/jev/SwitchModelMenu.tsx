@@ -57,6 +57,10 @@ export async function switchToModel(current: LoadedJev, m: ModelEntry, deps: Swi
  *  cannot read one) is ejected too: leaving a pool slot held keeps Workspace in the playground
  *  with nothing said, while an unnecessary stop only costs the engine a restart. */
 function needsEject(current: LoadedJev, m: ModelEntry): boolean {
+  // A Laya load never replaces the primary and runs beside chat models (ADR-443): a loaded Laya model is replaced only
+  // by another Laya model, and any Laya pick has to eject a Jev model, wherever it sits.
+  if (current.checkpoints) return !!m.laya
+  if (m.laya) return true
   return !m.jev && current.slot !== 'primary'
 }
 

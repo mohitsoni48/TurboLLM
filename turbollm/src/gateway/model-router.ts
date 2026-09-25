@@ -31,6 +31,14 @@ interface PoolSlot {
   lastUsedMs: number
 }
 
+/** A Laya load that has begun and not yet settled (ADR-443). `cancelled` is set by an eject while it loads. */
+interface LayaLoad {
+  manager: Manager
+  modelKey: string
+  startedMs: number
+  cancelled: boolean
+}
+
 /** One loaded (or loading / unloading) model across the pool, as `aliveSlots()` reports it. */
 export interface AliveSlot {
   modelKey: string
@@ -45,6 +53,9 @@ export interface AliveSlot {
 export class ModelRouter {
   /** Extra pool slots beyond the primary manager. Only populated when keepN > 1. */
   private extraSlots = new Map<string, PoolSlot>()
+  /** Laya loads in flight, by model key. Separate from extraSlots on purpose: a slot is registered only once its
+   *  load has succeeded, so a request can never be routed to a manager that is still loading. */
+  private layaLoads = new Map<string, LayaLoad>()
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -150,6 +161,9 @@ export class ModelRouter {
       const state = slot.manager.status().state
       if (this.isOccupied(state)) slots.push({ modelKey: slot.modelKey, state, primary: false, lastUsedMs: slot.lastUsedMs })
     }
+    for (const load of this.layaLoads.values()) {
+      slots.push({ modelKey: load.modelKey, state: 'starting', primary: false, lastUsedMs: load.startedMs })
+    }
     return slots
   }
 
@@ -212,9 +226,18 @@ export class ModelRouter {
    *  THAT engine only, not whatever happens to be in the primary slot. */
   stopExplicit(modelKey: string): boolean {
     const slot = this.extraSlots.get(modelKey)
-    if (!slot) return false
-    slot.manager.stop()
-    this.extraSlots.delete(modelKey)
+    if (slot) {
+      slot.manager.stop()
+      this.extraSlots.delete(modelKey)
+      return true
+    }
+    // A Laya load still in flight: its engine may not have spawned yet, so stopping the manager is not enough on
+    // its own — the load is marked cancelled, and doLoad stops whatever it then brings up.
+    const loading = this.layaLoads.get(modelKey)
+    if (!loading) return false
+    loading.cancelled = true
+    loading.manager.stop()
+    this.layaLoads.delete(modelKey)
     return true
   }
 
@@ -247,6 +270,7 @@ export class ModelRouter {
     for (const slot of this.extraSlots.values()) {
       if (isAlive(slot.manager.status().state)) add(slot.modelKey)
     }
+    for (const load of this.layaLoads.values()) add(load.modelKey)
     return keys
   }
 
@@ -274,9 +298,7 @@ export class ModelRouter {
         slot.manager.touch()
         return { target: slot.manager.target()! }
       }
-      // A slot still loading is not dead: its own doLoad holds the swap lock, and a caller that queues behind it
-      // finds it running.
-      if (ss.state !== 'starting') this.extraSlots.delete(entry.key) // dead slot — clean up
+      this.extraSlots.delete(entry.key) // dead slot — clean up
     }
     return undefined
   }
@@ -325,10 +347,10 @@ export class ModelRouter {
             : this.newSlotManager())
         : this.evictChatLru()
 
-    // A pool slot is registered as the load starts, not once it is ready: its 'starting' state is what /status
-    // shows while a side model (a Laya model takes 20 s or so) prepares, and what an eject can stop.
-    const inPool = targetManager !== this.manager
-    if (inPool) this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
+    // A Laya load takes 10-20 s, and /status must say it is loading for all of it: it is tracked while it is in
+    // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
+    // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
+    const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
 
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
@@ -338,25 +360,30 @@ export class ModelRouter {
         beforeStart: () => this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve(),
       })
     } catch (e) {
-      if (inPool) this.dropSlot(entry.key, targetManager)
       return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
+    } finally {
+      if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
+    }
+
+    // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, so nothing
+    // is left running that the router no longer tracks.
+    if (inFlight?.cancelled) {
+      targetManager.stop()
+      return { status: 503, message: 'The model was unloaded while it was loading.' }
     }
 
     const s = targetManager.status()
     if (s.state !== 'running') {
-      if (inPool) this.dropSlot(entry.key, targetManager)
       return { status: 503, message: s.err?.message ?? 'Model failed to become ready.' }
     }
 
     const target = targetManager.target()
     if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.' }
 
-    if (inPool) {
-      const slot = this.extraSlots.get(entry.key)
-      if (slot?.manager !== targetManager) return { status: 503, message: 'The model was unloaded while it was loading.' }
-      slot.lastUsedMs = Date.now()
-    } else {
+    if (targetManager === this.manager) {
       this.primaryLastUsed = Date.now()
+    } else {
+      this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
@@ -381,10 +408,12 @@ export class ModelRouter {
     return state === 'running' || state === 'starting' || state === 'stopping'
   }
 
-  /** Forget a pool slot whose load failed — only if it is still this load's, so a later load of the same model
-   *  is never dropped by an earlier one's failure. */
-  private dropSlot(modelKey: string, manager: Manager): void {
-    if (this.extraSlots.get(modelKey)?.manager === manager) this.extraSlots.delete(modelKey)
+  /** Note a Laya load as in flight. It shows as a 'starting' slot and counts as loaded (aliveSlots,
+   *  loadedModelKeys), and stopExplicit can cancel it, until doLoad settles it. */
+  private trackLayaLoad(modelKey: string, manager: Manager): LayaLoad {
+    const load: LayaLoad = { manager, modelKey, startedMs: Date.now(), cancelled: false }
+    this.layaLoads.set(modelKey, load)
+    return load
   }
 
   private isSideModelKey(modelKey: string): boolean {

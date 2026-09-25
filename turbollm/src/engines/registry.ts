@@ -2,7 +2,7 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
+import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
 import { probe } from './probe'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
@@ -357,7 +357,7 @@ export class Registry {
       const i = c.engines.findIndex((e) => e.id === id)
       if (i < 0) throw new NotFoundError()
       c.engines.splice(i, 1)
-      if (c.activeEngineId === id) c.activeEngineId = c.engines[0]?.id ?? ''
+      if (c.activeEngineId === id) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
     })
   }
 

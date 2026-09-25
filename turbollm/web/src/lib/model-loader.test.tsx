@@ -462,7 +462,7 @@ describe('useJevLoadedToast — a Laya model', () => {
 
     expect(h.toastSuccess).toHaveBeenCalledTimes(1)
     expect(h.toastSuccess.mock.calls[0][0]).toBe('laya is ready')
-    expect(toastAction().label).toBe('Open Jev Playground')
+    expect(toastAction().label).toBe('Open playground')
     expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
   })
 })

@@ -114,7 +114,8 @@ export function useJevLoadedToast(): void {
     if (pathname === JEV_PATH) return
     toast.success(`${jev.name} is ready`, {
       action: {
-        label: 'Open Jev Playground',
+        // A Laya model is not a Jev model, and the playground it opens is the same one (ADR-443).
+        label: status?.jev ? 'Open Jev Playground' : 'Open playground',
         onClick: () => {
           track('models', 'open_jev_playground_toast')
           navigate(JEV_PATH)

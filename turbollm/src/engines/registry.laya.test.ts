@@ -86,3 +86,41 @@ test('activate refuses the Laya engine and leaves the active engine as it was', 
   assert.throws(() => reg.activate(laya.id), (e: Error) => e.name === 'ValueError' && /never the active engine/.test(e.message))
   assert.equal(reg.active()?.id, llama.id)
 })
+
+// The Opus review of v1.14.1: two fallbacks made the first engine active without going through activate(), so the
+// Laya engine could become active by removing the engine before it.
+test('removing the active engine never makes the Laya engine active', () => {
+  const store = ConfigStore.load(join(mkdtempSync(join(tmpdir(), 'tllm-laya-registry-')), 'config.json'))
+  const llama: Engine = {
+    id: 'llama', name: 'llama.cpp', binPath: '/x/llama-server', kind: 'llama-server', version: '',
+    capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+  }
+  const other: Engine = { ...llama, id: 'other', name: 'other llama.cpp', binPath: '/y/llama-server' }
+  store.update((c) => {
+    c.engines = [llama]
+    c.activeEngineId = llama.id
+  })
+  const reg = new Registry(store)
+  const laya = reg.addLaya('Laya', '/venv/bin/python', 'laya 0.3.20')
+  store.update((c) => { c.engines.push(other) })
+  assert.deepEqual(reg.list().engines.map((e) => e.kind), ['llama-server', 'laya', 'llama-server'])
+  reg.remove(llama.id)
+  assert.equal(reg.list().activeEngineId, other.id, 'the next engine that can be active, not the Laya one')
+  reg.remove(other.id)
+  assert.equal(reg.list().activeEngineId, '', 'with only the Laya engine left there is no active engine')
+  assert.equal(reg.layaEngine()?.id, laya.id)
+})
+
+test('a config whose active engine id is empty does not load with the Laya engine active', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-laya-config-'))
+  const path = join(dir, 'config.json')
+  const store = ConfigStore.load(path)
+  store.update((c) => {
+    c.engines = [
+      { id: 'laya', name: 'Laya', binPath: '/venv/bin/python', kind: 'laya', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
+      { id: 'llama', name: 'llama.cpp', binPath: '/x/llama-server', kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
+    ] as Engine[]
+    c.activeEngineId = ''
+  })
+  assert.equal(ConfigStore.load(path).snapshot().activeEngineId, 'llama')
+})

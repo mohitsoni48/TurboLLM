@@ -169,3 +169,17 @@ test('a malformed request is refused before any engine is touched, for a Laya mo
   assert.deepEqual(h.routed, [])
   assert.equal(h.calls.length, 0)
 })
+
+// ADR-443: only 400, 413 and 422 are requests the caller must change. Any other status is the engine misbehaving (a
+// 401 from an API key the caller never sent, a 404 from a route that is gone), which a 422 would blame on the caller.
+test('only the engine\'s 400, 413 and 422 are the caller\'s to fix; every other non-2xx is a 502', async () => {
+  for (const status of [400, 413, 422]) {
+    const res = await post(harness({ reply: () => json({ detail: 'nope' }, status) }).app, REQUEST)
+    assert.equal(res.status, 422, `engine ${status}`)
+  }
+  for (const status of [401, 403, 404, 405, 429, 500, 503]) {
+    const res = await post(harness({ reply: () => json({ detail: 'nope' }, status) }).app, REQUEST)
+    assert.equal(res.status, 502, `engine ${status}`)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'engine_error')
+  }
+})

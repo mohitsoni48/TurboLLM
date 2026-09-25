@@ -33,3 +33,15 @@ test('engineCommand: a Laya engine runs the launcher on loopback with the model 
     args: ['-c', LAYA_LAUNCHER_SOURCE, '/models/laya', '127.0.0.1', '6997'],
   })
 })
+
+test('pyEngineEnv: a LAYA_API_KEY set on the daemon is not handed to the Laya engine, which would then refuse every forwarded request', (t) => {
+  const dataDir = freshDataDir(t)
+  const before = process.env.LAYA_API_KEY
+  process.env.LAYA_API_KEY = 'secret'
+  t.after(() => {
+    if (before === undefined) delete process.env.LAYA_API_KEY
+    else process.env.LAYA_API_KEY = before
+  })
+  const env = pyEngineEnv('laya', join(dataDir), join(dataDir, 'engines', 'laya', 'venv', 'bin', 'python'))
+  assert.equal(env?.LAYA_API_KEY, undefined)
+})

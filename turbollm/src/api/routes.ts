@@ -42,7 +42,7 @@ import { appUpdateClicked } from '../telemetry/events/app-update'
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv } from '../engines/mlx'
 import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
-import { installLayaEngine } from '../engines/laya-install'
+import { installLayaEngine, layaEngineBusy } from '../engines/laya-install'
 import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
@@ -526,7 +526,7 @@ export function registerApi(app: Hono, d: Deps): void {
   // kind='laya' engine. Never activated: Laya models load on it whichever engine is active. 202 + progress
   // via /status; ?update=1 upgrades within the pinned line.
   app.post('/api/v1/engines/laya', (c) => {
-    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    { const busy = engineWorkBusy(d) ?? layaEngineBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     void installLayaEngine(d, join(d.store.dir(), 'engines'), c.req.query('update') === '1')
     return c.json({ accepted: true, engine: 'laya' }, 202)
   })
