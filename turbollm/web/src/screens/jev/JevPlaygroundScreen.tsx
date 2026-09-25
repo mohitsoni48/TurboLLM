@@ -10,6 +10,7 @@ import { ApiError, stopEngine, track } from '../../lib/api'
 import { systemone } from '../../lib/jev-api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useModels, useStatus } from '../../lib/queries'
+import { loadedSystemOneModel } from '../../lib/systemone-model'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { AnswerList } from './AnswerList'
 import { JevHeader } from './JevHeader'
@@ -31,7 +32,7 @@ export function JevPlaygroundScreen() {
   const { requestLoad } = useModelLoader()
 
   const models = modelsQ.data?.models
-  const jev = loadedJev(statusQ.data, models)
+  const jev = loadedSystemOneModel(statusQ.data, models)
 
   const [draft, setDraft] = useState<SystemOneDraft>(() => readStoredDraft() ?? firstDraft())
   const [run, setRun] = useState<SystemOneRun | null>(null)
@@ -125,7 +126,7 @@ export function JevPlaygroundScreen() {
           <p className="text-[13px] text-muted">{NOTICE}</p>
         )}
 
-        <JevHeader jev={jev} engine={activeEngine(statusQ.data)} onSwitch={() => setSwitchOpen((open) => !open)} />
+        <JevHeader jev={jev} engine={engineOf(jev, statusQ.data)} onSwitch={() => setSwitchOpen((open) => !open)} />
         {switchOpen && <SwitchModelMenu current={jev} models={models ?? []} onPick={pickModel} />}
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -182,7 +183,7 @@ export function JevPlaygroundScreen() {
                 {error}
               </p>
             )}
-            <AnswerList answers={run?.response.answers ?? null} stale={running && run !== null} />
+            <AnswerList answers={run?.response.answers ?? null} stale={running && run !== null} laya={jev.checkpoints !== undefined} />
             <ResponsePanel run={run} origin={window.location.origin} />
             <p role="status" className="sr-only">{announcementOf({ running, error, run })}</p>
           </section>
@@ -192,14 +193,10 @@ export function JevPlaygroundScreen() {
   )
 }
 
-/** `status.jev` when the daemon says so; otherwise the loaded Jev model in the catalog — a
- *  remote-access token scoped to `models:use` cannot read /status at all (ADR-422). */
-function loadedJev(status: Status | undefined, models: ModelEntry[] | undefined): LoadedJev | null {
-  if (status?.jev) return status.jev
-  if (status?.jev === null) return null
-  const entry = models?.find((m) => m.jev && m.loaded)
-  if (!entry?.jev) return null
-  return { key: entry.key, name: entry.name, labels: entry.jev.labels, state: 'running', slot: null }
+/** The engine answering: a Laya model always runs on the Laya engine, whichever engine is active (ADR-443). */
+function engineOf(model: LoadedJev, status: Status | undefined): { name: string; kind: string } {
+  if (model.checkpoints) return { name: 'Laya', kind: 'laya' }
+  return activeEngine(status)
 }
 
 function activeEngine(status: Status | undefined): { name: string; kind: string } {

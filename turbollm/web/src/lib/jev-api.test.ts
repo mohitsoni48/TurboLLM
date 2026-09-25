@@ -113,7 +113,35 @@ describe('buildCurl', () => {
   })
 })
 
+// Laya (huggingface.co/convaiinnovations/laya) answers the same POST /v1/systemone endpoint as
+// Jev, but with a top-level `routing` block (which of its own checkpoints answered, and why) and
+// extra per-answer fields (`answer_confidence`, `action`) that Jev responses never carry. The
+// validator only checks the shape it actually reads (answers/usage) — it must not reject a real
+// reply just because it carries fields beyond that, the same way it doesn't today for whatever
+// extra fields a Jev response's own `answers` entries might carry.
+const LAYA_REPLY = {
+  model: 'k',
+  answers: {
+    d: {
+      type: 'choice',
+      choice: 'billing',
+      probabilities: { billing: 0.97, other: 0.03 },
+      confidence: 0.87,
+      answer_confidence: 0.97,
+      action: { act_probability: 1 },
+    },
+  },
+  usage: { input_tokens: 264, output_tokens: 0 },
+  routing: { model: 'english', reason: 'English Latin text' },
+}
+
 describe('systemone', () => {
+  it('accepts a Laya-shaped response — routing and per-answer extras are not grounds to reject it', async () => {
+    stubFetch(LAYA_REPLY)
+    const res = await systemone(SYSTEMONE_REQUEST)
+    expect(res).toEqual(LAYA_REPLY)
+  })
+
   it('posts the request to its own endpoint and returns the parsed answers', async () => {
     const mock = stubFetch(SYSTEMONE_REPLY)
     const res = await systemone(SYSTEMONE_REQUEST)

@@ -23,6 +23,7 @@ import { useLinks, useRemoteDownloadActions } from '../../lib/link-queries'
 import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
+import { downloadSubdir } from '../../lib/download-subdir'
 import { gpuBudgetMb } from '../../lib/vram'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
@@ -213,19 +214,26 @@ export function HfRepoContent({
     )
   }
 
-  const queueInto = (files: HfRepoFile[], subdir: string) => {
+  /** `repoName` names the model's own top-level folder; each file's OWN subdir underneath it
+   *  is computed per file (`downloadSubdir`) from its repo-relative path, so a repo whose files
+   *  span more than one directory (a Jev checkpoint's own folder, or Laya's nested
+   *  encoder/tokenizer/multilingual layout) keeps that structure instead of every file
+   *  flattening to `<repoName>/<basename>` and colliding. `toastLabel` is what the user reads —
+   *  `repoName` for a whole-repo download, or the picked checkpoint's own folder. */
+  const queueInto = (repoName: string, files: HfRepoFile[], toastLabel: string) => {
     if (!detail) return
     for (const f of files) {
-      dlMut.enqueue.mutate({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir })
+      dlMut.enqueue.mutate({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir: downloadSubdir(repoName, f.name) })
     }
-    toast.success(`Queued ${files.length} files for ${subdir}`)
+    toast.success(`Queued ${files.length} files for ${toastLabel}`)
     onClose()
   }
 
-  // Safetensors repos (MLX / vLLM) download all component files into a subdirectory.
+  // Safetensors repos (MLX / vLLM / Laya) download all component files into a subdirectory.
   const onDownloadSafetensors = () => {
     if (!detail?.safetensors || !detail.files.length) return
-    queueInto(detail.files, detail.repo.split('/').pop() ?? detail.repo)
+    const repoName = detail.repo.split('/').pop() ?? detail.repo
+    queueInto(repoName, detail.files, repoName)
   }
 
   /** One checkpoint folder lands in its own subdirectory; a root checkpoint keeps today's
@@ -233,7 +241,7 @@ export function HfRepoContent({
   const onDownloadCheckpoint = (cp: HfCheckpoint) => {
     if (!detail) return
     const repoName = detail.repo.split('/').pop() ?? detail.repo
-    queueInto(cp.files, cp.dir ? `${repoName}/${cp.dir}` : repoName)
+    queueInto(repoName, cp.files, cp.dir ? `${repoName}/${cp.dir}` : repoName)
   }
 
   const onLoad = () => {
@@ -686,7 +694,7 @@ function MlxRepoBody({
   onDownload,
   isPending,
 }: {
-  detail: { repo: string; files: { sizeBytes: number }[]; gated: boolean }
+  detail: { repo: string; files: { sizeBytes: number }[]; gated: boolean; laya?: boolean }
   vramMb: number | undefined
   engineKind: string
   hfTokenSet: boolean
@@ -697,12 +705,16 @@ function MlxRepoBody({
   const totalBytes = detail.files.reduce((s, f) => s + f.sizeBytes, 0)
   const fit = fileFit(totalBytes, vramMb)
   const isMlxFamily = engineKind === 'mlx' || engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm'
-  const description = isMlxFamily
-    ? 'MLX model — runs on Apple Silicon via MLX. Downloads as a directory of safetensors weights.'
-    : engineKind === 'vllm'
-      ? 'HuggingFace model — runs via vLLM. Downloads as a directory of safetensors weights.'
-      : 'Safetensors model — downloads as a directory of weight files.'
-  const btnLabel = isMlxFamily ? 'Download MLX model' : 'Download model'
+  // Laya (huggingface.co/convaiinnovations/laya) always loads on its own 'laya' engine, never
+  // whatever engine is currently active — so this branch is checked before `engineKind` at all.
+  const description = detail.laya
+    ? 'Laya decision model — runs on the Laya engine (any OS, CPU or GPU). Downloads the English and multilingual checkpoints as one folder.'
+    : isMlxFamily
+      ? 'MLX model — runs on Apple Silicon via MLX. Downloads as a directory of safetensors weights.'
+      : engineKind === 'vllm'
+        ? 'HuggingFace model — runs via vLLM. Downloads as a directory of safetensors weights.'
+        : 'Safetensors model — downloads as a directory of weight files.'
+  const btnLabel = detail.laya ? 'Download Laya model' : isMlxFamily ? 'Download MLX model' : 'Download model'
   return (
     <div className="flex flex-col gap-4">
       <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">

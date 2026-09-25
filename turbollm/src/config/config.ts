@@ -1300,7 +1300,7 @@ function normalize(c: Config): void {
     e.updatePolicy = e.updatePolicy === 'off' || e.updatePolicy === 'auto' ? e.updatePolicy : 'notify'
   }
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) c.activeEngineId = ''
-  if (!c.activeEngineId && c.engines.length > 0) c.activeEngineId = c.engines[0].id
+  if (!c.activeEngineId) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
   // A primary that no longer exists in modelDirs (folder removed/renamed) falls
   // back to the effective default (first dir) — reset rather than throw.
   if (c.primaryModelDir && !c.modelDirs.includes(c.primaryModelDir)) c.primaryModelDir = ''
@@ -1521,6 +1521,12 @@ function isWithinDir(p: string, dir: string): boolean {
 
 function isAbsolutePath(p: string): boolean {
   return /^([a-zA-Z]:[\\/]|[\\/])/.test(p)
+}
+
+/** The first engine that can be the active one: every kind but the Laya engine, which serves only Laya models and
+ *  loads them whatever engine is active (ADR-443) — so picking "the first engine" when none is active must skip it. */
+export function firstActivatableEngine(engines: Engine[]): Engine | undefined {
+  return engines.find((e) => e.kind !== 'laya')
 }
 
 export function findEngine(engines: Engine[], id: string): Engine | undefined {

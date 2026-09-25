@@ -257,6 +257,10 @@ export function installMlxVlm(): Promise<{ accepted: true; engine: 'mlx-vlm' }> 
   return request('/api/v1/engines/mlx-vlm', { method: 'POST', json: {} })
 }
 
+export function installLaya(): Promise<{ accepted: true; engine: 'laya' }> {
+  return request('/api/v1/engines/laya', { method: 'POST', json: {} })
+}
+
 export function getEngineCatalog(): Promise<EngineCatalog> {
   return request<EngineCatalog>('/api/v1/engines/catalog')
 }
@@ -454,6 +458,11 @@ export function updateRapidMlx(): Promise<{ accepted: true; engine: 'rapid-mlx' 
 /** Update (upgrade) the MLX-VLM engine to the latest release (passes --upgrade to uv pip install). */
 export function updateMlxVlm(): Promise<{ accepted: true; engine: 'mlx-vlm' }> {
   return request('/api/v1/engines/mlx-vlm?update=1', { method: 'POST', json: {} })
+}
+
+/** Update (upgrade) the Laya engine to the latest release. */
+export function updateLaya(): Promise<{ accepted: true; engine: 'laya' }> {
+  return request('/api/v1/engines/laya?update=1', { method: 'POST', json: {} })
 }
 
 /** Update (re-download latest release) the TurboQuant engine. */

@@ -12,7 +12,7 @@ import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bo
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError, customSourceKey, nameTakenMessage } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
@@ -42,6 +42,7 @@ import { appUpdateClicked } from '../telemetry/events/app-update'
 import type { BackendId } from '../engines/download'
 import { ensureMlxEnv } from '../engines/mlx'
 import { ensureRapidMlxEnv } from '../engines/rapid-mlx'
+import { installLayaEngine, layaEngineBusy } from '../engines/laya-install'
 import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
@@ -74,6 +75,8 @@ import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } fr
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
+import { layaStatus } from './laya-status'
+import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
 
@@ -147,6 +150,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // The alive Jev model, if any (ADR-434 (i)(1)): Workspace becomes the Jev Playground while
       // one is loaded in any slot. Local-only, like `launchCommand` — not in the shared builder.
       jev: jevStatus(d),
+      // The alive Laya model, if any (ADR-443): the System One playground runs against it. It never changes the
+      // Workspace — a Laya model runs beside the chat model.
+      laya: layaStatus(d),
       engineStats: core.engineStats,
       liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
@@ -516,6 +522,15 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ accepted: true, engine: 'mlx-vlm' }, 202)
   })
 
+  // Provision the Laya engine (every desktop platform): uv → venv → laya[serve], then register it as a
+  // kind='laya' engine. Never activated: Laya models load on it whichever engine is active. 202 + progress
+  // via /status; ?update=1 upgrades within the pinned line.
+  app.post('/api/v1/engines/laya', (c) => {
+    { const busy = engineWorkBusy(d) ?? layaEngineBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    void installLayaEngine(d, join(d.store.dir(), 'engines'), c.req.query('update') === '1')
+    return c.json({ accepted: true, engine: 'laya' }, 202)
+  })
+
   // Engine catalog (ADR-044): the hardcoded, browsable list of installable
   // engines for this platform. Per-entry `installed` is disk-based (files exist);
   // `enabled` is registry-based (a registered engine entry exists for this kind).
@@ -530,7 +545,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let enabled: boolean | undefined
       if (e.provision === 'pip') {
         // pip engines: installed = venv python exists on disk; enabled = registered in registry.
-        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/mlx-vlm/vllm/sglang).
+        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/mlx-vlm/vllm/sglang/laya).
         const pyPath = join(enginesRoot, e.id, 'venv',
           process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
         installed = existsSync(pyPath)
@@ -1162,8 +1177,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/engines/:id', (c) => {
     const id = c.req.param('id')
-    const { activeEngineId } = d.registry.list()
-    if (id === activeEngineId && engineBusy(d)) {
+    const target = d.registry.get(id)
+    if (target && engineDeleteBlocked(d, target)) {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
     const purge = c.req.query('purge') === '1'
@@ -1780,9 +1795,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const key = decodeURIComponent(c.req.param('key'))
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
-    const ms = d.manager.status()
-    const loadedKey = ms.state === 'running' || ms.state === 'starting' ? ms.model?.key : undefined
-    if (loadedKey === e.path || loadedKey === e.key) {
+    // Any slot, not just the primary: a Laya model always runs in its own (ADR-443).
+    if (modelDeleteBlocked(d, e)) {
       return err(c, 409, 'model_loaded', 'This model is currently loaded. Eject it before deleting.')
     }
     try {
@@ -2654,8 +2668,9 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // list filter so e.g. only GGUFs show under a llama.cpp engine, safetensors under
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
   // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
-  const active = d.registry.active()
-  const inc = active ? modelIncompatibility(active.kind, e) : null
+  // A Laya model is checked against the Laya engine it loads on, not the active one (engineForModel).
+  const engine = engineForModel(d.registry, e)
+  const inc = engine ? modelIncompatibility(engine.kind, e) : null
   const compatibleWithActiveEngine = !inc
   const incompatibleReason = inc?.label ?? null
   // Source HF repo: confirmed from download provenance, else inferred from the
@@ -2676,7 +2691,7 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // for every model except the one currently loaded, so a 262144-native model configured at 163328
   // advertised the wrong window until it happened to be loaded. Undefined when the model has no
   // profile for this engine — the caller then falls back to nativeCtx, which is the honest answer.
-  const configuredCtx = resolveConfiguredCtx(snap, e.key, active?.id ?? '')
+  const configuredCtx = resolveConfiguredCtx(snap, e.key, engine?.id ?? '')
   return {
     ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps,
     compatibleWithActiveEngine, incompatibleReason, sourceRepo,
@@ -2972,6 +2987,7 @@ function regErr(c: Context, e: unknown) {
  *   - pip kind='rapid-mlx'  → engines/rapid-mlx/venv
  *   - pip kind='mlx-vlm'    → engines/mlx-vlm/venv
  *   - pip kind='vllm'       → engines/vllm/venv
+ *   - pip kind='laya'       → engines/laya/venv
  *   - TurboQuant fork       → engines/turboquant (detected by its binPath pattern)
  *   - llama.cpp backends    → engines/llama.cpp-{tag}-{id} (via DELETE /backends/:id)
  *
@@ -2996,6 +3012,11 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
   // pip: mlx-vlm venv
   if (eng.kind === 'mlx-vlm') {
     const d = join(enginesRoot, 'mlx-vlm', 'venv')
+    return inside(d) ? d : null
+  }
+  // pip: laya venv
+  if (eng.kind === 'laya') {
+    const d = join(enginesRoot, 'laya', 'venv')
     return inside(d) ? d : null
   }
   // pip: vllm venv

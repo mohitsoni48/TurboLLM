@@ -4,6 +4,7 @@ import { AlarmClock, Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronR
 import type { Conversation, Folder } from '../../lib/chat-types'
 import { useConversationMutations, useConversations, useFolders } from '../../lib/chat-queries'
 import { Button } from '../../components/ui/button'
+import { PlaygroundLink } from '../../components/PlaygroundLink'
 import { Input } from '../../components/ui/input'
 import { toast } from '../../components/ui/sonner'
 import {
@@ -585,6 +586,7 @@ export function ConversationSidebar({
             <Icon size={15} />
           </Link>
         ))}
+        <PlaygroundLink collapsed />
         <Button size="icon" variant="ghost" onClick={trackNew} title={newLabel} className="h-7 w-7">
           <NewIcon size={15} />
         </Button>
@@ -633,6 +635,7 @@ export function ConversationSidebar({
           )}
         </div>
       </div>
+      <PlaygroundLink />
 
       <div className="flex items-center gap-2 px-3 pb-3 pt-2">
         {onToggle && (

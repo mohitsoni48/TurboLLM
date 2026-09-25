@@ -52,3 +52,13 @@ describe('JevHeader', () => {
     expect(onSwitch).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('JevHeader with a Laya model', () => {
+  const LAYA = { key: 'laya|laya|1455', name: 'laya', labels: [], checkpoints: ['english', 'multilingual'], state: 'running' as const, slot: 'pool' as const }
+
+  it('names the checkpoints the model answers with instead of labels it does not have', () => {
+    render(<JevHeader jev={LAYA} engine={{ name: 'Laya', kind: 'laya' }} onSwitch={vi.fn()} />)
+    expect(screen.getByText('Checkpoints: english, multilingual')).toBeTruthy()
+    expect(screen.queryByText(/Labels read from the model/)).toBeNull()
+  })
+})

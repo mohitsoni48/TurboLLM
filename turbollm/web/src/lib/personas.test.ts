@@ -43,7 +43,15 @@ test('the TurboLLM Expert persona lists /v1/systemone, /v1/classify and /v1/rera
   const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
   assert.ok(expert)
   const gateway = expert!.systemPrompt.split('## Gateway')[1].split('\n## ')[0]
-  assert.match(gateway, /\*\*OpenAI-compatible\*\*: .*`POST \/v1\/embeddings`, `POST \/v1\/systemone`, `POST \/v1\/classify`, `POST \/v1\/rerank` \(Jev models\)/)
+  assert.match(gateway, /\*\*OpenAI-compatible\*\*: .*`POST \/v1\/embeddings`, `POST \/v1\/systemone` \(Jev and Laya models\), `POST \/v1\/classify`, `POST \/v1\/rerank` \(Jev models\)/)
+})
+
+test('the TurboLLM Expert persona knows Laya models run on their own engine and where to find them (ADR-443)', () => {
+  const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
+  assert.ok(expert)
+  const gateway = expert!.systemPrompt.split('## Gateway')[1].split('\n## ')[0]
+  assert.match(gateway, /Laya models run on their own Laya engine/)
+  assert.match(gateway, /searching "laya" in Discover/)
 })
 
 // getDefaultAgentId/getConvAgentId's isAndroid fallback (personas.ts) isn't covered here: both

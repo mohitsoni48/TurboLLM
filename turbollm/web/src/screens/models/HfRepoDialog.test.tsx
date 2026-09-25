@@ -178,6 +178,44 @@ describe('HfRepoDialog — a repo with exactly one checkpoint', () => {
   })
 })
 
+describe('HfRepoDialog — a Laya repo (nested layout, no checkpoints list)', () => {
+  const LAYA_FILES = [
+    file('rl_agent_config.json', 2e3, 'sha-cfg'),
+    file('model.safetensors', 1e9, 'sha-root'),
+    file('encoder/config.json', 1e3, 'sha-enc-cfg'),
+    file('tokenizer/tokenizer.json', 5e5, 'sha-tok'),
+    file('multilingual/model.safetensors', 2e9, 'sha-ml-root'),
+    file('multilingual/encoder/config.json', 1e3, 'sha-ml-enc-cfg'),
+  ]
+
+  function layaDetail(over: Partial<HfRepoDetail> = {}): HfRepoDetail {
+    return repoDetail({ repo: 'convaiinnovations/laya', files: LAYA_FILES, laya: true, checkpoints: undefined, ...over })
+  }
+
+  it('describes itself as a Laya decision model and offers a Laya-labeled button', async () => {
+    renderContent(layaDetail())
+    expect(await screen.findByText(
+      'Laya decision model — runs on the Laya engine (any OS, CPU or GPU). Downloads the English and multilingual checkpoints as one folder.',
+    )).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Download Laya model' })).toBeTruthy()
+  })
+
+  it('keeps every nested file at its OWN subfolder, so same-named files never collide', async () => {
+    renderContent(layaDetail())
+    await userEvent.click(await screen.findByRole('button', { name: 'Download Laya model' }))
+    const bySubdir = Object.fromEntries(queued().map((q) => [q.rfilename, q.subdir]))
+    expect(bySubdir).toEqual({
+      'rl_agent_config.json': 'laya',
+      'model.safetensors': 'laya',
+      'encoder/config.json': 'laya/encoder',
+      'tokenizer/tokenizer.json': 'laya/tokenizer',
+      'multilingual/model.safetensors': 'laya/multilingual',
+      'multilingual/encoder/config.json': 'laya/multilingual/encoder',
+    })
+    expect(toastSuccess).toHaveBeenCalledWith('Queued 6 files for laya')
+  })
+})
+
 describe('HfRepoDialog — a repo with several checkpoints', () => {
   it('lets the user pick one instead of downloading the lot', async () => {
     renderContent(repoDetail({ files: [], checkpoints: [checkpoint(), V1, BIG] }))

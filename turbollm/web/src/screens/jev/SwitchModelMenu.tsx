@@ -6,6 +6,7 @@
 // Workspace gate takes the user back on its own.
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
+import { isSystemOneModel } from '../../lib/model-kind'
 import { toast } from '../../components/ui/sonner'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
@@ -33,8 +34,9 @@ export function SwitchModelMenu({
         <p className="text-[13px] text-muted">{NOTHING_LOADABLE}</p>
       ) : (
         <>
-          <ModelGroup title="Chat models" models={loadable.filter((m) => !m.jev)} onPick={onPick} />
+          <ModelGroup title="Chat models" models={loadable.filter((m) => !isSystemOneModel(m))} onPick={onPick} />
           <ModelGroup title="Jev models" models={loadable.filter((m) => m.jev)} onPick={onPick} />
+          <ModelGroup title="Laya models" models={loadable.filter((m) => m.laya)} onPick={onPick} />
         </>
       )}
     </div>
@@ -55,6 +57,11 @@ export async function switchToModel(current: LoadedJev, m: ModelEntry, deps: Swi
  *  cannot read one) is ejected too: leaving a pool slot held keeps Workspace in the playground
  *  with nothing said, while an unnecessary stop only costs the engine a restart. */
 function needsEject(current: LoadedJev, m: ModelEntry): boolean {
+  // A Laya load never replaces the primary and runs beside chat models (ADR-443), and a loaded Laya model keeps the
+  // playground open. So switching model in the playground has to eject what the playground is showing, and any Laya
+  // pick has to eject a Jev model, wherever it sits.
+  if (current.checkpoints) return true
+  if (m.laya) return true
   return !m.jev && current.slot !== 'primary'
 }
 
