@@ -3,7 +3,7 @@ const test = require('node:test')
 const { after } = require('node:test')
 const assert = require('node:assert/strict')
 const { spawn } = require('node:child_process')
-const { EventEmitter } = require('node:events')
+const { EventEmitter, once } = require('node:events')
 const { existsSync, mkdtempSync, readFileSync, rmSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join } = require('node:path')
@@ -20,8 +20,12 @@ const DAEMON_RESTART_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-r
 const DAEMON_EXIT_CODE_DECLARATION = /export const RESTART_REQUESTED_EXIT_CODE = (\d+)/
 
 const FAKE_DAEMON = join(__dirname, 'test-fixtures', 'fake-daemon.js')
+const SUPERVISOR_HOST = join(__dirname, 'test-fixtures', 'supervisor-host.js')
 const DEADLINE_MS = 10_000
 const POLL_INTERVAL_MS = 50
+const PROCESS_GONE_DEADLINE_MS = 5_000
+const SURVIVAL_WINDOW_MS = 2_000
+const WINDOWS_ONLY = { skip: process.platform !== 'win32' && 'job-object reaping is Windows-only' }
 
 const supervisors = []
 const tempDirs = []
@@ -268,6 +272,41 @@ test('quitting in the gap after an exit 75 kills nothing and respawns nothing', 
   assert.deepEqual(lost, [])
 })
 
+test('on Windows a supervised daemon dies with its host even without stop()', WINDOWS_ONLY, async () => {
+  const dir = newDir()
+
+  const hostExitCode = await runSupervisorHost(dir, 'supervised')
+  assert.equal(hostExitCode, 0, 'host exit code (3: the supervisor lost the daemon, 4: it timed out)')
+  const pids = readPids(dir)
+  assert.equal(pids.length, 2)
+
+  await waitUntil(
+    () => pids.every((pid) => !alive(pid)),
+    PROCESS_GONE_DEADLINE_MS,
+    'both daemons to die with their host'
+  )
+})
+
+test(
+  'control: on Windows a detached child survives its host (the shape that orphaned the daemon)',
+  WINDOWS_ONLY,
+  async () => {
+    const dir = newDir()
+
+    const hostExitCode = await runSupervisorHost(dir, 'detached-control')
+    assert.equal(hostExitCode, 0, 'host exit code (4: the detached child never recorded its PID)')
+    const pids = readPids(dir)
+    assert.equal(pids.length, 1)
+    const [pid] = pids
+
+    await sleep(SURVIVAL_WINDOW_MS)
+    assert.ok(alive(pid), 'the liveness probe cannot see a survivor, so the job-object test proves nothing')
+
+    process.kill(pid)
+    await waitUntil(() => !alive(pid), PROCESS_GONE_DEADLINE_MS, 'the control survivor to be killed')
+  }
+)
+
 function supervise (deps) {
   const supervisor = createDaemonSupervisor({ log: { log () {}, error () {} }, ...deps })
   supervisors.push(supervisor)
@@ -280,6 +319,12 @@ function fakeDaemon (dir, mode, delayMs) {
     [FAKE_DAEMON, dir, mode, String(delayMs ?? 0)],
     { stdio: 'ignore', windowsHide: true }
   )
+}
+
+async function runSupervisorHost (dir, mode) {
+  const host = spawn(process.execPath, [SUPERVISOR_HOST, dir, mode], { stdio: 'ignore', windowsHide: true })
+  const [exitCode] = await once(host, 'exit')
+  return exitCode
 }
 
 function fakeLaunches () {
