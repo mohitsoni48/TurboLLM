@@ -65,6 +65,16 @@ function libraryFilterFor(engineKind?: string): string {
   return 'filter=gguf&'
 }
 
+/** A Laya-tagged repo the Laya engine can run: a transformers/laya checkpoint, not an MLX, CoreML, ONNX or ggmlc
+ *  GGUF port. Whether its folder really is a Laya bundle is decided when it is opened (laya-repo.ts). */
+function isLayaEngineRepo(m: RawSearchItem): boolean {
+  return m.library_name === 'transformers' || m.library_name === 'laya'
+}
+
+function repoIdOf(m: RawSearchItem): string {
+  return m.id ?? m.modelId ?? ''
+}
+
 function toSearchItem(m: RawSearchItem): HfSearchItem {
   return {
     repo: m.id ?? m.modelId ?? '',
@@ -153,11 +163,18 @@ export class HfClient {
   async searchModels(query: string, engineKind?: string, sort: HfSortOption = 'best-match'): Promise<HfSearchItem[]> {
     const q = query.trim()
     const sortParam = sort === 'best-match' ? '' : `sort=${SORT_PARAM[sort]}&direction=-1&`
-    const url =
-      `${BASE}/api/models?search=${encodeURIComponent(q)}&` +
-      `${libraryFilterFor(engineKind)}${sortParam}limit=30&full=false`
-    const raw = await this.getJson<RawSearchItem[]>(url)
-    return raw.map(toSearchItem)
+    const search = (filter: string) =>
+      `${BASE}/api/models?search=${encodeURIComponent(q)}&${filter}${sortParam}limit=30&full=false`
+    const filter = libraryFilterFor(engineKind)
+    // The Laya engine is never the active engine (ADR-443), so a format-narrowed search would never show a Laya
+    // repo it can run. Best-effort: a failed Laya search leaves the search as it was.
+    const [raw, laya] = await Promise.all([
+      this.getJson<RawSearchItem[]>(search(filter)),
+      filter ? this.getJson<RawSearchItem[]>(search('filter=laya&')).catch(() => []) : Promise.resolve([]),
+    ])
+    const runnable = laya.filter(isLayaEngineRepo)
+    const listed = new Set(runnable.map(repoIdOf))
+    return [...runnable, ...raw.filter((m) => !listed.has(repoIdOf(m)))].map(toSearchItem)
   }
 
   /** Browse repos with no search term (spec 10 §7 rewrite) — the live equivalent of
@@ -476,6 +493,7 @@ export class HfClient {
 interface RawSearchItem {
   id?: string
   modelId?: string
+  library_name?: string
   downloads?: number
   likes?: number
   lastModified?: string

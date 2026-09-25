@@ -20,8 +20,9 @@ export type Incompatibility =
  *  stay exported as its building blocks. `label` is the short text a model row shows. */
 export function modelIncompatibility(
   engineKind: string,
-  entry: Pick<ModelEntry, 'format' | 'audio' | 'jev' | 'laya'>,
+  entry: Pick<ModelEntry, 'format' | 'audio' | 'jev' | 'laya'> & Partial<Pick<ModelEntry, 'arch'>>,
 ): Incompatibility | null {
+  if (entry.format === 'gguf' && entry.arch === GGMLC_ARCH) return GGMLC_GGUF
   if (entry.laya) return engineKind === 'laya' ? null : NEEDS_LAYA
   if (entry.jev && engineKind !== 'vllm') return NEEDS_VLLM
   if (!engineAcceptsFormat(engineKind, entry.format)) return formatIncompatibility(engineKind, entry.format)
@@ -39,6 +40,18 @@ const NEEDS_LAYA: Incompatibility = {
   code: 'needs_laya',
   label: 'Needs the Laya engine',
   message: 'This is a Laya model — it runs only on the Laya engine. Install Laya from Engines to load it.',
+}
+
+/** The architecture of the Laya GGUF conversions on Hugging Face (mys/laya-GGUF and friends): a separate runtime,
+ *  which llama.cpp refuses with "unknown model architecture: 'ggmlc'" — so every engine refuses it up front. */
+const GGMLC_ARCH = 'ggmlc'
+
+const GGMLC_GGUF: Incompatibility = {
+  code: 'format',
+  label: 'ggmlc GGUF — not loadable',
+  message:
+    "This GGUF uses the ggmlc architecture, which llama.cpp can't load. For Laya, download " +
+    'convaiinnovations/laya instead: it runs on the Laya engine.',
 }
 
 const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'

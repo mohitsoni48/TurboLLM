@@ -36,3 +36,23 @@ test('engineAcceptsFormat: no plain format belongs to the Laya engine', () => {
 test('engineModelAlias: laya-serve ignores the model field, so the caller keeps its own', () => {
   assert.equal(engineModelAlias('laya'), null)
 })
+
+// The Laya GGUF conversions on Hugging Face (mys/laya-GGUF and friends) use the `ggmlc` architecture, a separate
+// runtime llama.cpp cannot load ("unknown model architecture: 'ggmlc'"), found live on 6996, 2026-09-25.
+const GGMLC_GGUF = { format: 'gguf' as const, audio: false, arch: 'ggmlc' }
+
+test('modelIncompatibility: a ggmlc GGUF is refused on every engine, pointing at the Laya repo that runs', () => {
+  for (const engineKind of ['llama-server', 'koboldcpp', 'llamafile', 'laya', 'vllm']) {
+    assert.deepEqual(modelIncompatibility(engineKind, GGMLC_GGUF), {
+      code: 'format',
+      label: 'ggmlc GGUF — not loadable',
+      message:
+        "This GGUF uses the ggmlc architecture, which llama.cpp can't load. For Laya, download " +
+        'convaiinnovations/laya instead: it runs on the Laya engine.',
+    }, engineKind)
+  }
+})
+
+test('modelIncompatibility: an ordinary GGUF on llama.cpp is still loadable', () => {
+  assert.equal(modelIncompatibility('llama-server', { format: 'gguf', audio: false, arch: 'qwen3' }), null)
+})
