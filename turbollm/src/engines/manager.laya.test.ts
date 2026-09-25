@@ -1,16 +1,16 @@
 // The Laya engine is a Python engine like MLX and vLLM: offline Hugging Face, the TurboLLM hf-cache, and the venv
 // on PATH — and it is launched through the laya launcher, never with llama.cpp flags.
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import type { Engine } from '../config/config'
 import { LAYA_LAUNCHER_SOURCE } from './laya'
 import { engineCommand, pyEngineEnv, type StartOpts } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
 function freshDataDir(t: TestContext): string {
-  const dataDir = mkdtempSync(join(tmpdir(), 'turbollm-laya-env-'))
+  const dataDir = tmpDir('turbollm-laya-env-')
   t.after(() => rmSync(dataDir, { recursive: true, force: true }))
   return dataDir
 }

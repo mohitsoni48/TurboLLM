@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { isLayaModelDir, layaEntryFor } from './laya'
+import { tmpDir } from '../test-support/tmp'
 
 const ENGLISH = { encoder: 'answerdotai/ModernBERT-large', max_len: 512 }
 const MULTILINGUAL = { encoder: 'jhu-clsp/mmBERT-base', max_len: 1024 }
@@ -16,7 +16,7 @@ function checkpoint(dir: string, config: object, weightBytes: number): void {
 }
 
 function library(t: TestContext): string {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-laya-'))
+  const root = tmpDir('turbollm-laya-')
   t.after(() => rmSync(root, { recursive: true, force: true }))
   return join(root, 'laya')
 }
