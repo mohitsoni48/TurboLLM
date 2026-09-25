@@ -23,6 +23,7 @@ function createDaemonSupervisor ({ spawnDaemon, onDaemonLost, log = console, kil
     current = child
     if (state === 'idle') state = 'running'
     child.on('exit', (code, signal) => onExit(child, code, signal))
+    child.on('error', (err) => onError(child, err))
     return child
   }
 
@@ -33,9 +34,19 @@ function createDaemonSupervisor ({ spawnDaemon, onDaemonLost, log = console, kil
     else if (decision.action === 'lost') lose(decision.reason)
   }
 
+  // Node may emit 'error' without 'exit' (a spawn that never started), or both.
+  function onError (child, err) {
+    if (child !== current || state !== 'running') return
+    lose(`failed: ${err.message}`)
+  }
+
   function respawn () {
     log.log(`TurboLLM daemon restarting (requested, exit ${RESTART_REQUESTED_EXIT_CODE})`)
-    start()
+    try {
+      start()
+    } catch (err) {
+      lose(`could not be restarted: ${err.message}`)
+    }
   }
 
   function lose (reason) {
@@ -47,7 +58,13 @@ function createDaemonSupervisor ({ spawnDaemon, onDaemonLost, log = console, kil
   function stop () {
     state = 'stopping'
     const child = current
-    if (isRunning(child)) child.kill('SIGTERM')
+    if (isRunning(child)) endDaemon(child)
+  }
+
+  function endDaemon (child) {
+    child.kill('SIGTERM')
+    const escalation = setTimeout(() => isRunning(child) && child.kill('SIGKILL'), killGraceMs)
+    escalation.unref() // a daemon that ignores SIGTERM must not hold the quitting app open
   }
 
   return { start, stop, current: () => current }

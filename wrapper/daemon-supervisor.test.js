@@ -165,6 +165,109 @@ test('start() lets a synchronous spawn failure reach the caller', () => {
   assert.deepEqual(lost, [])
 })
 
+test('a daemon that cannot be spawned is reported lost once, not thrown', async () => {
+  const dir = newDir()
+  const lost = []
+  supervise({
+    spawnDaemon: () => spawn(join(dir, 'no-such-daemon-binary'), [], { stdio: 'ignore', windowsHide: true }),
+    onDaemonLost: (reason) => lost.push(reason)
+  }).start()
+
+  await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the daemon to be reported lost')
+  await sleep(300)
+  assert.equal(lost.length, 1)
+  assert.match(lost[0], /^failed: /)
+  assert.match(lost[0], /ENOENT/)
+})
+
+test('a respawn that throws is reported lost with its reason', async () => {
+  const dir = newDir()
+  const lost = []
+  let spawnCalls = 0
+  const spawnOnlyTheFirstDaemon = () => {
+    spawnCalls += 1
+    if (spawnCalls === 1) return fakeDaemon(dir, '75')()
+    throw new Error('spawn blocked for test')
+  }
+  supervise({ spawnDaemon: spawnOnlyTheFirstDaemon, onDaemonLost: (reason) => lost.push(reason) }).start()
+
+  await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the failed respawn to be reported lost')
+  assert.deepEqual(lost, ['could not be restarted: spawn blocked for test'])
+  assert.equal(readPids(dir).length, 1)
+})
+
+test('an error followed by an exit reports the daemon lost once', () => {
+  const lost = []
+  const launches = fakeLaunches()
+  const child = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: (reason) => lost.push(reason) }).start()
+
+  child.emit('error', new Error('boom'))
+  child.exitCode = 1
+  child.emit('exit', 1, null)
+
+  assert.deepEqual(lost, ['failed: boom'])
+  assert.equal(launches.spawned.length, 1)
+})
+
+test('an exit followed by an error reports the daemon lost once', () => {
+  const lost = []
+  const launches = fakeLaunches()
+  const child = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: (reason) => lost.push(reason) }).start()
+
+  child.exitCode = 1
+  child.emit('exit', 1, null)
+  child.emit('error', new Error('boom'))
+
+  assert.deepEqual(lost, ['exited (code=1, signal=none)'])
+})
+
+test('stop() escalates to SIGKILL when the daemon ignores SIGTERM', async () => {
+  const launches = fakeLaunches()
+  const supervisor = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: () => {}, killGraceMs: 30 })
+  const child = supervisor.start()
+
+  supervisor.stop()
+  assert.deepEqual(child.killCalls, ['SIGTERM'])
+  await sleep(150)
+  assert.deepEqual(child.killCalls, ['SIGTERM', 'SIGKILL'])
+})
+
+test('stop() does not escalate when the daemon exits within the grace period', async () => {
+  const lost = []
+  const launches = fakeLaunches()
+  const supervisor = supervise({
+    spawnDaemon: launches.spawnDaemon,
+    onDaemonLost: (reason) => lost.push(reason),
+    killGraceMs: 30
+  })
+  const child = supervisor.start()
+
+  supervisor.stop()
+  child.exitCode = 0
+  child.emit('exit', 0, null)
+  await sleep(150)
+
+  assert.deepEqual(child.killCalls, ['SIGTERM'])
+  assert.deepEqual(lost, [])
+  assert.equal(launches.spawned.length, 1)
+})
+
+// The exit 75 has happened but its 'exit' event is still queued when the app starts quitting.
+test('quitting in the gap after an exit 75 kills nothing and respawns nothing', () => {
+  const lost = []
+  const launches = fakeLaunches()
+  const supervisor = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: (reason) => lost.push(reason) })
+  const child = supervisor.start()
+
+  child.exitCode = 75
+  supervisor.stop()
+  assert.deepEqual(child.killCalls, [])
+
+  child.emit('exit', 75, null)
+  assert.equal(launches.spawned.length, 1)
+  assert.deepEqual(lost, [])
+})
+
 function supervise (deps) {
   const supervisor = createDaemonSupervisor({ log: { log () {}, error () {} }, ...deps })
   supervisors.push(supervisor)
@@ -177,6 +280,16 @@ function fakeDaemon (dir, mode, delayMs) {
     [FAKE_DAEMON, dir, mode, String(delayMs ?? 0)],
     { stdio: 'ignore', windowsHide: true }
   )
+}
+
+function fakeLaunches () {
+  const spawned = []
+  const spawnDaemon = () => {
+    const child = fakeChild()
+    spawned.push(child)
+    return child
+  }
+  return { spawned, spawnDaemon }
 }
 
 function fakeChild () {
