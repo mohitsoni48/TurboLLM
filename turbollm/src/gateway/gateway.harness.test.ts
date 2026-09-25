@@ -5,19 +5,18 @@
 // gateway entry points (/v1/messages Anthropic-protocol, /v1/chat/completions OpenAI-protocol).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { registerGateway } from './gateway'
 import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-gateway-harness-'))
+  return tmpDir('turbollm-gateway-harness-')
 }
 
 function makeTelemetry(dir: string): Emitter {

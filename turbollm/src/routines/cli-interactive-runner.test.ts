@@ -1,9 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { GenerationGate } from '../agents/gate'
 import {
   CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, runCliInteractiveRoutine, sweepInteractiveCliRuns,
@@ -13,7 +10,7 @@ import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
 import type { Routine, RoutineRun } from './schema'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'cli-interactive-runner-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 function interactiveRoutine(store: ConversationStore, overrides: Partial<Parameters<ConversationStore['createRoutine']>[0]> = {}): Routine {

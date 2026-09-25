@@ -5,16 +5,13 @@
 // `!== undefined` guards treat `undefined` as "leave alone", and the Conversation type's
 // compaction fields are `string | undefined`, never `| null`).
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
 import { ConversationStore } from './db'
+import { tmpDir } from '../test-support/tmp'
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-compaction-db-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-compaction-db-test-')
 }
 
 test('a fresh conversation has no compaction fields set', () => {

@@ -3,11 +3,10 @@
 // may ever observe another scope's row through ANY read path.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../db.js'
 import type { Scope } from './types.js'
+import { tmpDir } from '../../test-support/tmp'
 
 // Deterministic PRNG so a failure is reproducible from the seed in the assertion message.
 function rng(seed: number): () => number {
@@ -16,7 +15,7 @@ function rng(seed: number): () => number {
 }
 
 test('no scope can observe another scope rows under randomized interleaving', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-isolation-'))
+  const dir = tmpDir('turbollm-isolation-')
   const conv = new ConversationStore(dir)
   const store = conv.chatStore
   try {

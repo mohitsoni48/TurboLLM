@@ -2,8 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { SpawnOptions } from 'node:child_process'
 import {
@@ -13,6 +12,7 @@ import {
   type CliChildProcess,
   type SpawnCliProcess,
 } from './cli-process'
+import { tmpDir } from '../test-support/tmp'
 
 /** A fake child process: EventEmitter + fake stdin/stdout/stderr streams + a killed() spy,
  *  matching the narrow shape runClaudeCliProcess actually touches. */
@@ -214,7 +214,7 @@ test('stdin is closed even when there is no prompt, so a reading child sees EOF'
 })
 
 test('a hostile prompt executes nothing even with the shell branch forced', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-inj-'))
+  const dir = tmpDir('turbollm-cli-inj-')
   try {
     const victim = join(dir, 'victim.cjs')
     const marker = join(dir, 'INJECTED.txt')
@@ -255,7 +255,7 @@ test('a hostile prompt executes nothing even with the shell branch forced', asyn
 })
 
 test('an unquotable ARGUMENT on the shell branch is refused, not quoted', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-inj-'))
+  const dir = tmpDir('turbollm-cli-inj-')
   try {
     const victim = join(dir, 'victim.cjs')
     const marker = join(dir, 'INJECTED.txt')
@@ -284,7 +284,7 @@ test('an unquotable ARGUMENT on the shell branch is refused, not quoted', async 
 // `.cmd` shim. The DIRECT branch is the one that runs in production on a native-binary install, and
 // until now nothing in CI proved the prompt actually reaches a real process's stdin without a shell.
 test('a real subprocess on the DIRECT (no-shell) branch gets the prompt byte-exact on stdin', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-cli-direct-'))
+  const dir = tmpDir('turbollm-cli-direct-')
   try {
     const victim = join(dir, 'victim.cjs')
     writeFileSync(

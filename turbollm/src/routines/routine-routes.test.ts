@@ -2,10 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { createHash } from 'node:crypto'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { registerRoutineRoutes, validateCreate, CODE_GATE_MESSAGE, JEV_ROUTINE_MODEL_MESSAGE } from './routine-routes'
 import { RoutineScheduler } from './scheduler'
 import { executeRoutine } from './execute'
@@ -31,7 +28,7 @@ function assertAtMostOneRunning(db: ConversationStore, routineId: string, messag
  *  pre-existing test here relies on. Set it true to simulate a LAN-exposed daemon, where a
  *  code-flavor routine must present a key. `hasKey` seeds RAW_KEY as a valid stored key. */
 function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: boolean } = {}): { app: Hono; db: ConversationStore } {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const apiKeys = opts.hasKey
     ? [{ id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }]
@@ -528,7 +525,7 @@ test('POST .../runs/:runId/approve on a run for a DIFFERENT routine returns 404 
 // be stuck unable to ever fire again."
 
 test('approve releases the scheduler-parked routine once resumeRoutineRun settles, even on failure', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
   db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
@@ -574,7 +571,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
 })
 
 test('approve does NOT release the parked guard on a retryable resume failure (gate_timeout)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
   db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
@@ -637,7 +634,7 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
 // already-gated create/update case if left ungated.
 
 test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device with no key is rejected (I2)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const apiKeys: unknown[] = []
   const d = {
@@ -659,7 +656,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
 })
 
 test('POST /api/v1/routines/:id/run-now on a code routine from the host (loopback-only bind) needs no key (I2)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
   const routine = db.createRoutine({
@@ -807,7 +804,7 @@ test('PUT /:id/confirm + /pause + /resume on a code routine from the host (loopb
 // ── I3: an unhandled throw from resumeRoutineRun must not escape as a raw, unshaped 500 ────
 
 test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if resumeRoutineRun throws (I3)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
   db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
@@ -859,7 +856,7 @@ test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if res
 // survives for the whole duration of the winner's dispatch, not just "eventually settles right."
 
 test('two concurrent approve calls on the same stalled run: only one executes, and the guard survives the race (C1)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
   db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
@@ -942,7 +939,7 @@ test('two concurrent approve calls on the same stalled run: only one executes, a
 // fire of the SAME routine.
 
 test('a stale approve on an OLD needs_approval run does not release a DIFFERENT, currently-live parked fire (C2)', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-routes-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
   db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')

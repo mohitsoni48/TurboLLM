@@ -1,15 +1,14 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../db.js'
 import { LOCAL_SCOPE } from './chat-store.js'
 import { ChatStoreRouter } from './router.js'
+import { tmpDir } from '../../test-support/tmp'
 
 function twoStores() {
-  const a = mkdtempSync(join(tmpdir(), 'turbollm-router-local-'))
-  const b = mkdtempSync(join(tmpdir(), 'turbollm-router-adapter-'))
+  const a = tmpDir('turbollm-router-local-')
+  const b = tmpDir('turbollm-router-adapter-')
   const localConv = new ConversationStore(a)
   const adapterConv = new ConversationStore(b)
   return {
@@ -47,7 +46,7 @@ test('a non-local tenant is served by the adapter, never the local store', async
 })
 
 test('with no adapter configured, a non-local tenant is refused rather than silently served locally', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-router-solo-'))
+  const dir = tmpDir('turbollm-router-solo-')
   const conv = new ConversationStore(dir)
   const router = new ChatStoreRouter(conv.chatStore, null)
   try {

@@ -13,9 +13,7 @@ import { test, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { registerLinkApi } from './link-routes'
 import { registerGateway } from '../gateway/gateway'
 import { resetLocalActivity } from './host-idle'
@@ -23,6 +21,7 @@ import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
+import { tmpDir } from '../test-support/tmp'
 
 const LOADED = 'gemma-27b'
 const COLD = 'qwen3-35b'
@@ -42,7 +41,7 @@ function key(raw: string, caps: string[]): ApiKey {
  *  `telemetry/emit.test.ts` and `link-admin-routes.test.ts`. Nothing leaves the machine:
  *  the emitter only ever writes the local queue file, which is what `readQueue` reads. */
 function mkTelemetry(): { telemetry: Emitter; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-link-attribution-'))
+  const dir = tmpDir('turbollm-link-attribution-')
   const cfg = { telemetry: { level: 'anon', machineId: '44444444-4444-4444-4444-444444444444' } }
   const telemetry = new Emitter({
     dataDir: dir,

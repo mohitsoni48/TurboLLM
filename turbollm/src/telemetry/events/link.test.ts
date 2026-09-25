@@ -1,13 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { validateEvent } from '../schema'
 import { Emitter } from '../emit'
 import { readQueue } from '../queue'
 import { emit } from '../runtime/typed-emit'
 import { linkMinted, linkAdded, linkStatusChanged, inferenceServed, LINK_ADDED_OUTCOMES, LINK_STATUSES, INFERENCE_ORIGINS } from './link'
+import { tmpDir } from '../../test-support/tmp'
 
 function envelope(event: string, payload: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -78,7 +77,7 @@ test('validateEvent: link_status_changed requires known from/to values', () => {
 // link-admin-routes.test.ts's raw-token regression tests.
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-link-telemetry-'))
+  return tmpDir('turbollm-link-telemetry-')
 }
 
 function fakeStore(level: string) {

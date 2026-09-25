@@ -10,22 +10,18 @@
 // WHO owns and re-streams the run. It needs no loaded model, so it's deterministic and CI-safe.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { CodeRunManager, type BufferedEvent, type CodeSessionRunner } from './code-run-manager'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
-
-/** A minimal Deps with a real in-memory-ish ConversationStore + a stub engine manager reporting
+/** A minimal Deps with a real in-memory ConversationStore + a stub engine manager reporting
  *  a loaded model (all the CodeRunManager's turn executor reads). Everything else is unused. */
 function makeDeps(): { d: Deps; store: ConversationStore; dir: string } {
-  const dir = tmp('tllm-code-mgr-')
-  const store = new ConversationStore(dir)
+  const dir = tmpDir('tllm-code-mgr-')
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db: store,
     manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }) },
@@ -93,7 +89,7 @@ async function collect(
 test('run is daemon-owned: a client disconnect does NOT stop it; a reconnect replays + completes', async () => {
   const { d, store, dir } = makeDeps()
   const mgr = new CodeRunManager(d, { runner: pacedRunner('alpha') })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'do alpha')
 
   // Start the run (daemon-owned; returns immediately).
@@ -138,7 +134,7 @@ test('run is daemon-owned: a client disconnect does NOT stop it; a reconnect rep
 test('reconnect after the run already finished ends immediately without replaying a stale turn', async () => {
   const { d, store } = makeDeps()
   const mgr = new CodeRunManager(d, { runner: pacedRunner('beta') })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'do beta')
 
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'do beta', userMsgId })
@@ -167,7 +163,7 @@ test('a queued follow-up survives a mid-run disconnect and runs in order server-
     return pacedRunner(marker)(params)
   }
   const mgr = new CodeRunManager(d, { runner })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
 
   // Turn 1 starts.
@@ -212,7 +208,7 @@ test('sendNow() stops the active turn and promotes the target queued turn, keepi
     return pacedRunner(marker)(params)
   }
   const mgr = new CodeRunManager(d, { runner })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
 
   // Turn 1 active; queue turns 2 and 3 behind it, in that order.
@@ -246,7 +242,7 @@ test('sendNow() stops the active turn and promotes the target queued turn, keepi
 test('sendNow() on an unknown/already-run userMsgId is a harmless no-op', async () => {
   const { d, store } = makeDeps()
   const mgr = new CodeRunManager(d, { runner: pacedRunner('delta') })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'do delta')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'do delta', userMsgId })
 
@@ -263,7 +259,7 @@ test('sendNow() on an unknown/already-run userMsgId is a harmless no-op', async 
 test('stop() aborts the active run and drops everything queued behind it', async () => {
   const { d, store } = makeDeps()
   const mgr = new CodeRunManager(d, { runner: pacedRunner('gamma') })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'do gamma')
 
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'do gamma', userMsgId })
@@ -292,7 +288,7 @@ test('stop() aborts the active run and drops everything queued behind it', async
 
 test('an aborted turn does not report ctxUsed lower than the last completed turn (context cannot shrink)', async () => {
   const { d, store } = makeDeps()
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   // Turn 1: a runner that completes normally with a real, healthy contextUsed.
   const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 5000, contextMax: 131072, aborted: false })) as CodeSessionRunner
   const mgr1 = new CodeRunManager(d, { runner: goodRunner })
@@ -318,7 +314,7 @@ test('an aborted turn does not report ctxUsed lower than the last completed turn
 
 test('an aborted turn that reports a HIGHER ctxUsed than before is trusted as-is', async () => {
   const { d, store } = makeDeps()
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 5000, contextMax: 131072, aborted: false })) as CodeSessionRunner
   const mgr1 = new CodeRunManager(d, { runner: goodRunner })
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
@@ -341,7 +337,7 @@ test('an aborted turn that reports a HIGHER ctxUsed than before is trusted as-is
 
 test('a manual session rename is not reverted by a later successful turn\'s auto-title mirror', async () => {
   const { d, store } = makeDeps()
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const okRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: false })) as CodeSessionRunner
   const mgr = new CodeRunManager(d, { runner: okRunner })
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
@@ -369,7 +365,7 @@ test('a manual session rename is not reverted by a later successful turn\'s auto
 
 test('a runner that THROWS AbortError also floors ctxUsed at the last confirmed value', async () => {
   const { d, store } = makeDeps()
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const goodRunner: CodeSessionRunner = (async () => ({ finalText: 'ok', contextUsed: 3000, contextMax: 8192, aborted: false })) as CodeSessionRunner
   const mgr1 = new CodeRunManager(d, { runner: goodRunner })
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
@@ -427,7 +423,7 @@ function steerableRunner(opts: { steerLog: string[]; streaming?: boolean; holdMs
 test('enqueue tags a queued follow-up with kind:followUp by default', async () => {
   const { d, store } = makeDeps()
   const mgr = new CodeRunManager(d, { runner: pacedRunner('fu') })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
   const sub1 = mgr.subscribe(sessionId, 0)
@@ -443,7 +439,7 @@ test('steer() injects into the ACTIVE turn via the live handle, and does NOT que
   const { d, store } = makeDeps()
   const steerLog: string[] = []
   const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, holdMs: 250 }) })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
 
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
@@ -464,7 +460,7 @@ test('steer() with no active turn falls back to starting the turn (never errors)
   const { d, store } = makeDeps()
   const steerLog: string[] = []
   const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, holdMs: 20 }) })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
 
   // Idle session: nothing live to steer, so it falls back to enqueue, which STARTS the turn.
@@ -482,7 +478,7 @@ test('steer() falls back to the queue (tagged kind:steer) when the live turn is 
   const steerLog: string[] = []
   // streaming:false → the handle returns false, simulating the turn having just settled (race).
   const mgr = new CodeRunManager(d, { runner: steerableRunner({ steerLog, streaming: false, holdMs: 250 }) })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
 
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
@@ -512,7 +508,7 @@ test('a todos frame is captured into the run\'s live state and exposed via todos
   const { d, store } = makeDeps()
   const list = [{ content: 'step 1', status: 'in_progress' }, { content: 'step 2', status: 'pending' }]
   const mgr = new CodeRunManager(d, { runner: todoRunner(list) })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'multi-step')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'multi-step', userMsgId })
   await collect(mgr.subscribe(sessionId, 0), () => false)
@@ -527,7 +523,7 @@ test('a new turn resets the checklist so a prior turn\'s todos never leak forwar
     return (async () => ({ finalText: 'ok', contextUsed: 1, contextMax: 2, aborted: false }))()
   }
   const mgr = new CodeRunManager(d, { runner })
-  const repoRoot = tmp('tllm-code-repo-')
+  const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
   await collect(mgr.subscribe(sessionId, 0), () => false)

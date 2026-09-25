@@ -1,15 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { enqueue, readQueue } from './queue'
 import { flush, type Transport } from './uploader'
 import { readSentLog } from './log'
 import { TELEMETRY_ENV } from './disabled'
+import { tmpDir } from '../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-uploader-'))
+  return tmpDir('turbollm-uploader-')
 }
 
 function validEvent(over: Record<string, unknown> = {}): Record<string, unknown> {

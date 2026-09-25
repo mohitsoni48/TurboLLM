@@ -646,6 +646,10 @@ function rowToMsg(r: MsgRow): Message {
 
 interface Changes { changes: number }
 
+/** SQLite's own name for a database that lives only in RAM. Pass it as `dataDir` for a store
+ *  that writes nothing to disk and is gone when closed. */
+export const IN_MEMORY_DATA_DIR = ':memory:'
+
 export class ConversationStore {
   private db: SqlDb
 
@@ -664,7 +668,7 @@ export class ConversationStore {
   }
 
   constructor(dataDir: string) {
-    this.db = openSqlDb(join(dataDir, 'turbollm.db'))
+    this.db = openSqlDb(dataDir === IN_MEMORY_DATA_DIR ? IN_MEMORY_DATA_DIR : join(dataDir, 'turbollm.db'))
     this.migrate()
   }
 

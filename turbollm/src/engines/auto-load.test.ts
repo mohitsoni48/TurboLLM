@@ -4,8 +4,7 @@
 // is a contract (architecture §4.4 plus the AC10 row), not something to rebuild from a template.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   defaultConfig, migrateModelKey, type Config, type ConfigStore, type DevModel, type Engine,
@@ -24,6 +23,7 @@ import {
 } from './auto-load'
 import type { StartOpts } from './manager'
 import { buildStartOpts } from './start-opts'
+import { tmpDir } from '../test-support/tmp'
 
 const KEY = 'gemma 4 e4b|Q6_K|6217256480'
 const LINKED_MODEL = 'workstation/Qwen3-35B'
@@ -661,7 +661,7 @@ test('runAutoLoad AC5: a key the scan migrates resumes under the new key with th
 })
 
 test('runAutoLoad AC5 with a real Scanner: the boot scan migrates the key before the resume reads config', async () => {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-autoload-test-'))
+  const root = tmpDir('turbollm-autoload-test-')
   try {
     writeGguf(root, 'Qwen3.8-27B-UD-IQ2_M.gguf', [
       ['general.architecture', 'qwen3'],

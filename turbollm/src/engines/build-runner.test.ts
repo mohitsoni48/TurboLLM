@@ -2,8 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
 import { join, relative } from 'node:path'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpDir } from '../test-support/tmp'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
   assert.equal(buildDirName('https://github.com/ikawrakow/ik_llama.cpp.git', 'sidestream'), 'ikawrakow-ik_llama.cpp-sidestream')
@@ -479,7 +479,7 @@ test('patchChecksumMismatchError: actionable hard-fail when bytes do not match t
 const serverExe = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
 
 function withEnginesRoot(dirs: string[], body: (enginesRoot: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-engines-'))
+  const root = tmpDir('tllm-engines-')
   try {
     for (const dir of dirs) {
       const bin = join(root, 'build', dir, 'build', 'bin')
@@ -630,7 +630,7 @@ const HOSTILE_REPO_URLS = ['https://..', 'https://github.com/..', 'https://githu
 // A name is safe when joining it under build/ lands exactly one level down, on itself. ".." lands on
 // the engines root and "x/.." on build/ itself; a name that merely STARTS with dots ("..-..") is fine.
 function isStrictChildOfBuildDir(dirName: string): boolean {
-  const buildDir = join(tmpdir(), 'engines', 'build')
+  const buildDir = '/data/engines/build'
   return dirName !== '' && dirName !== '.' && dirName !== '..' && relative(buildDir, join(buildDir, dirName)) === dirName
 }
 

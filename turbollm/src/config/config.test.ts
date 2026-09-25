@@ -12,8 +12,7 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   ANY_ENGINE,
@@ -30,6 +29,7 @@ import {
   type ModelPreset,
   type ProfileEntry,
 } from './config'
+import { tmpDir } from '../test-support/tmp'
 
 /** A minimal but LoadProfile-shaped flat profile — the discriminator only needs a
  *  numeric `ctx` at the top level, but we carry a couple more fields to prove the whole
@@ -39,7 +39,7 @@ function flatProfile(over: Record<string, unknown> = {}): Record<string, unknown
 }
 
 function tmpConfigPath(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-cfg-'))
+  const dir = tmpDir('tllm-cfg-')
   return join(dir, 'config.json')
 }
 

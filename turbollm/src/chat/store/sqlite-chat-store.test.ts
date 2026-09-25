@@ -5,15 +5,14 @@
 // ConversationStore for its migrations and then exercise the store hanging off it.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../db.js'
 import { LOCAL_SCOPE } from './chat-store.js'
 import type { SqliteChatStore } from './sqlite-chat-store.js'
+import { tmpDir } from '../../test-support/tmp'
 
 function makeStore(): { store: SqliteChatStore; conv: ConversationStore; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-chatstore-test-'))
+  const dir = tmpDir('turbollm-chatstore-test-')
   const conv = new ConversationStore(dir)
   return {
     store: conv.chatStore,

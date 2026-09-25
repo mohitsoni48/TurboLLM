@@ -1,14 +1,13 @@
 // turbollm/src/ext/audit.test.ts
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../chat/db.js'
 import { AuditLog } from './audit.js'
+import { tmpDir } from '../test-support/tmp'
 
 function make() {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-audit-'))
+  const dir = tmpDir('turbollm-audit-')
   const db = new ConversationStore(dir)
   return { audit: new AuditLog(db), db, cleanup: () => { db.close(); rmSync(dir, { recursive: true, force: true }) } }
 }

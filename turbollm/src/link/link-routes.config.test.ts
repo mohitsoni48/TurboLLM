@@ -14,13 +14,13 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { Hono } from 'hono'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { registerLinkApi } from './link-routes'
 import { ConfigStore, ValueError, type ApiKey, type Config } from '../config/config'
 import type { Deps } from '../deps'
 import { CONFIG_BOUNDS, coerceBounded, type BoundedConfigPath } from '../config/config-bounds'
+import { tmpDir } from '../test-support/tmp'
 
 function key(raw: string, caps?: string[]): ApiKey {
   return {
@@ -53,7 +53,7 @@ function stable(cfg: Config): string {
 }
 
 function mkDeps(t: { after: (fn: () => void) => void }, keys: ApiKey[], seed?: (c: Config) => void): Harness {
-  const dir = mkdtempSync(join(tmpdir(), 'tl-link-config-'))
+  const dir = tmpDir('tl-link-config-')
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const path = join(dir, 'config.json')
   const store = ConfigStore.load(path)
@@ -382,7 +382,7 @@ test('PARITY: nothing the link route accepts would be rejected by the owner\'s o
 // actionable half; the prose is not.
 
 test('a failed host validate() yields the FIELD, never the message that carries a host path', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'tl-link-config-val-'))
+  const dir = tmpDir('tl-link-config-val-')
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const hostPath = join(dir, 'agents')
   const real = mkDeps(t, [key('tllm-a', ['config:write', 'config:read'])])

@@ -1,8 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { validateEvent } from '../schema'
 import { Emitter } from '../emit'
 import { readQueue } from '../queue'
@@ -16,6 +14,7 @@ import {
   REMOTE_PREFLIGHT_FAILURE_KINDS,
 } from './remote'
 import { REMOTE_PROVIDERS } from '../../config/config'
+import { tmpDir } from '../../test-support/tmp'
 
 function envelope(event: string, payload: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -88,7 +87,7 @@ test('validateEvent: remote_access_preflight_failed requires a known provider an
 // renamed field can't slip past a narrowly-typed assertion.
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-remote-telemetry-'))
+  return tmpDir('turbollm-remote-telemetry-')
 }
 
 function fakeStore(level: string) {

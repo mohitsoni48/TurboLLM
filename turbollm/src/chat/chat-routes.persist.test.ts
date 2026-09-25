@@ -12,13 +12,12 @@
 // database, because the database row is the artifact the user loses.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { runGeneration, resilientSink } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import type { EmitSink } from './emit-sink.js'
+import { tmpDir } from '../test-support/tmp'
 
 interface Harness {
   d: Deps
@@ -27,7 +26,7 @@ interface Harness {
 }
 
 function mkHarness(): Harness {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-persist-'))
+  const dir = tmpDir('tllm-chat-persist-')
   const store = new ConversationStore(dir)
   const cfg = {
     modelDefaults: { maxTokens: 0 },

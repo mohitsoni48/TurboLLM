@@ -1,8 +1,7 @@
 // Agents+Skills Phase 1 tests: guard containment, skill store, config normalize
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, symlinkSync, rmSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { symlinkSync, rmSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { isInsideAny, makeToolCallGuard, type ToolCallGuardResult } from './fs-guard'
 import { SkillStore, isBuiltinSkill } from './skills'
@@ -36,7 +35,7 @@ test('isInsideAny: sibling-prefix is not inside (no /home/bobby in /home/bob)', 
 test('guard: blocks .. traversal out of root (via canonicalize)', () => {
   // The REAL boundary: the guard canonicalizes, so a ../ path that escapes the root
   // is blocked even though the raw string starts with the root prefix.
-  const root = mkdtempSync(join(tmpdir(), 'guard-trav-'))
+  const root = tmpDir('guard-trav-')
   try {
     const guard = makeToolCallGuard(
       { id: 'default', name: 'Default Agent', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
@@ -91,7 +90,7 @@ test('guard: allows read_file inside root', () => {
   // Use a REAL tmp dir so realpathSync can canonicalize (matches production, where
   // dataDir/roots are always real absolute paths). Fictional paths hit the no-parent
   // fallback which is platform-dependent and not representative.
-  const root = mkdtempSync(join(tmpdir(), 'guard-read-'))
+  const root = tmpDir('guard-read-')
   try {
     const guard = makeToolCallGuard(
       { id: 'default', name: 'Default Agent', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
@@ -127,7 +126,7 @@ test('guard: blocks write_file outside write roots', () => {
 })
 
 test('guard: allows write_file inside write root', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guard-write-'))
+  const root = tmpDir('guard-write-')
   const out = join(root, 'out')
   mkdirSync(out, { recursive: true })
   try {
@@ -201,7 +200,7 @@ test('SkillStore: lists builtins when no skills dir', () => {
 // ── Guard — readRoots with dataDir placeholder ────────────────────────────────
 
 test('guard: dataDir placeholder resolves in roots', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guard-datadir-'))
+  const root = tmpDir('guard-datadir-')
   try {
     const guard = makeToolCallGuard(
       { id: 'default', name: 'Default Agent', description: '', skills: [], readRoots: ['<dataDir>'], writeRoots: [], callableAgents: [] },
@@ -218,7 +217,7 @@ test('guard: dataDir placeholder resolves in roots', () => {
 // ── Symlink escape BLOCKER test ───────────────────────────────────────────────
 
 test('guard: blocks symlink escape out of root', async () => {
-  const tmp = mkdtempSync(join(tmpdir(), 'symlink-test-'))
+  const tmp = tmpDir('symlink-test-')
   const inside = join(tmp, 'inside')
   const outside = '/etc' // or use a real outside path
 
@@ -255,7 +254,7 @@ test('guard: blocks symlink escape out of root', async () => {
 import { isValidSkillId } from './skills'
 
 test('guard: glob is checked on its `root` field, not `path`', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guard-glob-'))
+  const root = tmpDir('guard-glob-')
   try {
     const guard = makeToolCallGuard(
       { id: 'd', name: 'd', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
@@ -264,7 +263,7 @@ test('guard: glob is checked on its `root` field, not `path`', () => {
     // In-root glob root → allowed.
     assert.ok(allowed(guard('glob', { pattern: '**', root })))
     // glob with a root OUTSIDE the read roots → blocked (even with no `path` field).
-    assert.ok(blocked(guard('glob', { pattern: '**', root: tmpdir() })))
+    assert.ok(blocked(guard('glob', { pattern: '**', root: tmpDir('guard-glob-outside-') })))
     // glob with NO root → blocked (can't validate).
     assert.ok(blocked(guard('glob', { pattern: '**' })))
   } finally {
@@ -273,7 +272,7 @@ test('guard: glob is checked on its `root` field, not `path`', () => {
 })
 
 test('guard: write_file blocked outside writeRoots even when inside readRoots', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guard-ws-'))
+  const root = tmpDir('guard-ws-')
   const sub = join(root, 'writable')
   mkdirSync(sub, { recursive: true })
   try {
@@ -290,7 +289,7 @@ test('guard: write_file blocked outside writeRoots even when inside readRoots', 
 })
 
 test('guard: rejects embedded-NUL paths', () => {
-  const root = mkdtempSync(join(tmpdir(), 'guard-nul-'))
+  const root = tmpDir('guard-nul-')
   try {
     const guard = makeToolCallGuard(
       { id: 'd', name: 'd', description: '', skills: [], readRoots: [root], writeRoots: [], callableAgents: [] },
@@ -315,6 +314,7 @@ test('isValidSkillId: rejects traversal / separators / absolute', () => {
 // ── Skill-creator toolset (chat integration) ──────────────────────────────────
 
 import { buildSaveSkillTool } from './agent-tools'
+import { tmpDir } from '../test-support/tmp'
 
 test('buildSaveSkillTool: grants exactly save_skill', () => {
   const ts = buildSaveSkillTool(() => 'ok')

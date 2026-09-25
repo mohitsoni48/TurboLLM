@@ -7,8 +7,7 @@
 // calls canonicalized to a path OUTSIDE the root and were falsely rejected in every mode.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, resolve, sep } from 'node:path'
 import {
   canonicalize,
@@ -17,6 +16,7 @@ import {
   isContained,
   isContainedFromRoot,
 } from './containment'
+import { tmpDir } from '../test-support/tmp'
 
 const isWin = process.platform === 'win32'
 
@@ -79,7 +79,7 @@ test('canonicalize: null / empty / non-string / NUL → null', () => {
 })
 
 test('canonicalize: resolves .. against a real existing ancestor', () => {
-  const root = mkdtempSync(join(tmpdir(), 'canon-'))
+  const root = tmpDir('canon-')
   try {
     // root/sub/../x canonicalizes to root/x (the `..` is collapsed).
     const got = canonicalize(join(root, 'sub', '..', 'x'))
@@ -92,7 +92,7 @@ test('canonicalize: resolves .. against a real existing ancestor', () => {
 // ── isContained (relative resolved against process.cwd — the pre-fix behavior) ─────
 
 test('isContained: absolute in-bounds path (descendant) → true', () => {
-  const root = mkdtempSync(join(tmpdir(), 'contained-'))
+  const root = tmpDir('contained-')
   try {
     assert.ok(isContained(join(root, 'sub', 'file.txt'), root))
   } finally {
@@ -101,7 +101,7 @@ test('isContained: absolute in-bounds path (descendant) → true', () => {
 })
 
 test('isContained: exact root → true', () => {
-  const root = mkdtempSync(join(tmpdir(), 'contained-'))
+  const root = tmpDir('contained-')
   try {
     assert.ok(isContained(root, root))
   } finally {
@@ -110,7 +110,7 @@ test('isContained: exact root → true', () => {
 })
 
 test('isContained: .. escape out of root → false', () => {
-  const root = mkdtempSync(join(tmpdir(), 'contained-'))
+  const root = tmpDir('contained-')
   try {
     assert.ok(!isContained(join(root, '..', 'escapee.txt'), root))
   } finally {
@@ -119,7 +119,7 @@ test('isContained: .. escape out of root → false', () => {
 })
 
 test('isContained: sibling-prefix directory is NOT contained', () => {
-  const base = mkdtempSync(join(tmpdir(), 'contained-'))
+  const base = tmpDir('contained-')
   const root = join(base, 'project')
   const evil = join(base, 'project-evil') // shares the "project" string prefix
   try {
@@ -134,7 +134,7 @@ test('isContained: sibling-prefix directory is NOT contained', () => {
 })
 
 test('isContained: non-string / NUL input → false', () => {
-  const root = mkdtempSync(join(tmpdir(), 'contained-'))
+  const root = tmpDir('contained-')
   try {
     assert.ok(!isContained(null, root))
     assert.ok(!isContained(undefined, root))
@@ -148,7 +148,7 @@ test('isContained: non-string / NUL input → false', () => {
 // ── isContainedFromRoot — the fixed tool-call path check ───────────────────────────
 
 test('isContainedFromRoot: bare relative filename resolves against root → true', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
+  const root = tmpDir('fromroot-')
   try {
     writeFileSync(join(root, 'math-utils.js'), '// x')
     assert.ok(isContainedFromRoot('math-utils.js', root))
@@ -158,7 +158,7 @@ test('isContainedFromRoot: bare relative filename resolves against root → true
 })
 
 test('isContainedFromRoot: ./file and . (cwd) resolve against root → true', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
+  const root = tmpDir('fromroot-')
   try {
     writeFileSync(join(root, 'index.js'), '// x')
     assert.ok(isContainedFromRoot('./index.js', root))
@@ -170,7 +170,7 @@ test('isContainedFromRoot: ./file and . (cwd) resolve against root → true', ()
 })
 
 test('isContainedFromRoot: absolute in-bounds still allowed', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
+  const root = tmpDir('fromroot-')
   try {
     assert.ok(isContainedFromRoot(join(root, 'sub', 'f.txt'), root))
   } finally {
@@ -179,7 +179,7 @@ test('isContainedFromRoot: absolute in-bounds still allowed', () => {
 })
 
 test('isContainedFromRoot: relative .. escape still rejected (fails closed)', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
+  const root = tmpDir('fromroot-')
   try {
     assert.ok(!isContainedFromRoot('../evil.txt', root))
     assert.ok(!isContainedFromRoot('../../../../etc/passwd', root))
@@ -190,8 +190,8 @@ test('isContainedFromRoot: relative .. escape still rejected (fails closed)', ()
 })
 
 test('isContainedFromRoot: absolute out-of-root path rejected', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
-  const other = mkdtempSync(join(tmpdir(), 'other-'))
+  const root = tmpDir('fromroot-')
+  const other = tmpDir('other-')
   try {
     assert.ok(!isContainedFromRoot(join(other, 'secret.txt'), root))
   } finally {
@@ -201,7 +201,7 @@ test('isContainedFromRoot: absolute out-of-root path rejected', () => {
 })
 
 test('isContainedFromRoot: non-string / empty / NUL → false', () => {
-  const root = mkdtempSync(join(tmpdir(), 'fromroot-'))
+  const root = tmpDir('fromroot-')
   try {
     assert.ok(!isContainedFromRoot(null, root))
     assert.ok(!isContainedFromRoot(undefined, root))
@@ -218,8 +218,8 @@ test('isContainedFromRoot: non-string / empty / NUL → false', () => {
 // contained. This is the precise defect the verify pass reproduced 3x (read './math-utils.js',
 // read 'math-utils.js', ls '.').
 test('REGRESSION: relative path wrong against a foreign cwd, correct against repoRoot', () => {
-  const repoRoot = mkdtempSync(join(tmpdir(), 'repo-'))
-  const foreignCwd = mkdtempSync(join(tmpdir(), 'daemoncwd-')) // stands in for D:\...\turbollm
+  const repoRoot = tmpDir('repo-')
+  const foreignCwd = tmpDir('daemoncwd-') // stands in for D:\...\turbollm
   try {
     writeFileSync(join(repoRoot, 'math-utils.js'), '// real file in the repo')
 

@@ -5,13 +5,13 @@
 //   • saveSlot: POSTs …/slots/0?action=save; true on ok, false on !ok / throw / timeout.
 //   • restoreSlot: POSTs …/slots/0?action=restore; deletes the file + true on ok, false else.
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { StartOpts } from './manager'
 import { cacheEligible, restoreSlot, saveSlot, slotCacheDir, slotCacheKey, sweepExpired } from './slot-cache'
 import type { SlotHttp } from './slot-cache'
+import { tmpDir } from '../test-support/tmp'
 
 /** Records the slot POSTs so tests can assert URL + body, returning a scripted response.
  *  `throws` simulates a timeout / unreachable server. */
@@ -85,7 +85,7 @@ test('cacheEligible is false for non-llama engines, vision models, and parallel 
 
 // ── saveSlot ──────────────────────────────────────────────────────────────────
 test('saveSlot POSTs the save action with the filename and returns true on ok', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'slot-save-'))
+  const dir = tmpDir('slot-save-')
   try {
     const h = fakeHttp({ ok: true })
     const ok = await saveSlot({
@@ -107,7 +107,7 @@ test('saveSlot POSTs the save action with the filename and returns true on ok', 
 })
 
 test('saveSlot returns false on a non-ok response and on a thrown/timed-out request', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'slot-save-'))
+  const dir = tmpDir('slot-save-')
   try {
     const bad = fakeHttp({ ok: false, status: 501 }) // e.g. multimodal
     assert.equal(
@@ -128,7 +128,7 @@ test('saveSlot returns false on a non-ok response and on a thrown/timed-out requ
 
 // ── restoreSlot ───────────────────────────────────────────────────────────────
 test('restoreSlot POSTs restore, deletes the file, and returns true on ok', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'slot-restore-'))
+  const dir = tmpDir('slot-restore-')
   try {
     const file = 'slot-xyz.bin'
     writeFileSync(join(dir, file), 'kv-bytes')
@@ -144,7 +144,7 @@ test('restoreSlot POSTs restore, deletes the file, and returns true on ok', asyn
 })
 
 test('restoreSlot returns false and keeps the file on a non-ok response', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'slot-restore-'))
+  const dir = tmpDir('slot-restore-')
   try {
     const file = 'slot-keep.bin'
     writeFileSync(join(dir, file), 'kv-bytes')
@@ -159,7 +159,7 @@ test('restoreSlot returns false and keeps the file on a non-ok response', async 
 
 // ── sweepExpired ──────────────────────────────────────────────────────────────
 test('sweepExpired deletes only slot-*.bin files older than the TTL', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'slot-sweep-'))
+  const dir = tmpDir('slot-sweep-')
   try {
     writeFileSync(join(dir, 'slot-old.bin'), 'x')
     writeFileSync(join(dir, 'slot-new.bin'), 'x')

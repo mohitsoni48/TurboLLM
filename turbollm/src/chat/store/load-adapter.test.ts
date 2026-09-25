@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { loadChatStoreAdapter } from './load-adapter.js'
+import { tmpDir } from '../../test-support/tmp'
 
 const here = fileURLToPath(new URL('.', import.meta.url))
 const ECHO = join(here, 'fixtures', 'echo-store.mjs')
@@ -37,7 +37,7 @@ test('a missing module fails loudly rather than falling back to sqlite', async (
 })
 
 test('a module with no default export is rejected', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-adapter-bad-'))
+  const dir = tmpDir('turbollm-adapter-bad-')
   const p = join(dir, 'no-default.mjs')
   writeFileSync(p, 'export const notDefault = 1\n')
   try {
@@ -48,7 +48,7 @@ test('a module with no default export is rejected', async () => {
 })
 
 test('a factory returning an object missing interface methods is rejected', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-adapter-partial-'))
+  const dir = tmpDir('turbollm-adapter-partial-')
   const p = join(dir, 'partial.mjs')
   writeFileSync(p, 'export default () => ({ capabilities: {}, async health() { return { ok: true } } })\n')
   try {
@@ -59,7 +59,7 @@ test('a factory returning an object missing interface methods is rejected', asyn
 })
 
 test('an adapter whose health check fails is rejected at load time', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-adapter-sick-'))
+  const dir = tmpDir('turbollm-adapter-sick-')
   const p = join(dir, 'sick.mjs')
   const methods = [
     'createChat', 'getChat', 'listChats', 'updateChat', 'deleteChat', 'addMessage', 'getMessage',

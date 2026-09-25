@@ -14,20 +14,18 @@
 // which is exactly what these tests exercise.
 import assert from 'node:assert/strict'
 import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 // walk() only records .gguf files >= 1 MiB — write shards just over that threshold.
 const SHARD_BYTES = (1 << 20) + 16
 const SHARD_BUF = Buffer.alloc(SHARD_BYTES)
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-split-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-split-test-')
 }
 
 /** Minimal ConfigStore stub: the Scanner only reads dir() (cache location) and

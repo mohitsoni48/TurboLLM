@@ -7,13 +7,14 @@
 //     "looking connected" after the process dies)
 //   • and that the engine never falsely reaches "running" (ends in "error").
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore } from '../config/config'
 import { Manager, type StartOpts } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
+const FAKE_MODEL_PATH = join(tmpDir('tllm-fake-model-'), 'does-not-need-to-exist.gguf')
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function fakeOpts(): StartOpts {
@@ -25,7 +26,7 @@ function fakeOpts(): StartOpts {
       version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
     },
     model: { key: 'm', name: 'Fake Model', quant: 'Q4', ctx: 4096, vision: false },
-    modelPath: join(tmpdir(), 'does-not-need-to-exist.gguf'),
+    modelPath: FAKE_MODEL_PATH,
     extraArgs: [],
   }
 }
@@ -40,7 +41,7 @@ async function waitForState(m: Manager, want: string, timeoutMs = 10_000): Promi
 }
 
 test('engine log carries the port header + exit marker, and never falsely shows running', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-test-'))
+  const dir = tmpDir('tllm-test-')
   const store = ConfigStore.load(join(dir, 'config.json'))
   const manager = new Manager(store)
 

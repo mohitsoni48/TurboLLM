@@ -7,14 +7,13 @@
 // args array and NO shell, which these tests pin.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { chmodSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { requiresShell, resolveExecutable } from './resolve-executable'
+import { tmpDir } from '../test-support/tmp'
 
 function sandbox(files: string[]): string {
-  const dir = mkdtempSync(join(tmpdir(), 'rex-'))
-  mkdirSync(dir, { recursive: true })
+  const dir = tmpDir('rex-')
   for (const f of files) {
     const p = join(dir, f)
     writeFileSync(p, '')

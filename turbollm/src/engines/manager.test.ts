@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { needsShellWrapper, pyEngineEnv, shellWrapped } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
 // Regression: llamafile ships as an "Actually Portable Executable" (Cosmopolitan libc) polyglot —
 // spawning it directly via Node's execve()-based spawn() failed with ENOEXEC on macOS (confirmed
@@ -64,7 +64,7 @@ function assignDaemonEnv(vars: Record<string, string | undefined>): void {
 }
 
 function freshDataDir(t: TestContext): string {
-  const dataDir = mkdtempSync(join(tmpdir(), 'turbollm-pyenv-'))
+  const dataDir = tmpDir('turbollm-pyenv-')
   t.after(() => rmSync(dataDir, { recursive: true, force: true }))
   return dataDir
 }

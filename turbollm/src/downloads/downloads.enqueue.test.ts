@@ -6,11 +6,11 @@
 //  - a degenerate repo id is rejected rather than silently mis-placed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DownloadManager, DownloadError } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
+import { tmpDir } from '../test-support/tmp'
 
 /** Minimal ConfigStore stand-in: only the two members DownloadManager touches. */
 function fakeStore(modelDir: string, stateDir: string) {
@@ -33,7 +33,7 @@ function stubFetch(): () => void {
 }
 
 function newDirs() {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-dl-'))
+  const root = tmpDir('tllm-dl-')
   const modelDir = join(root, 'models')
   const stateDir = join(root, 'state')
   mkdirSync(modelDir, { recursive: true })

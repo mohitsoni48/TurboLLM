@@ -1,14 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync, existsSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { installedBackendBuild, deleteAllBackendBuilds } from './download'
+import { tmpDir } from '../test-support/tmp'
 
 const serverBin = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
 
 function tmpRoot(): string {
-  return mkdtempSync(join(tmpdir(), 'tllm-dl-'))
+  return tmpDir('tllm-dl-')
 }
 
 /** Create a FULLY (marker included) extracted backend build dir `llama.cpp-<tag>-<id>/`
@@ -118,7 +118,7 @@ test('installedBackendBuild recognizes a legacy non-CUDA build with no marker (s
 })
 
 test('installedBackendBuild returns null for a missing engines root', () => {
-  assert.equal(installedBackendBuild(join(tmpdir(), 'tllm-does-not-exist-xyz'), 'cuda'), null)
+  assert.equal(installedBackendBuild(join(tmpDir('tllm-installed-'), 'does-not-exist'), 'cuda'), null)
 })
 
 test('deleteAllBackendBuilds removes every build of a backend, leaving others intact', () => {

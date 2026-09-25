@@ -5,16 +5,13 @@
 // visible on a separate tab. sessions/messages/streak/peak-hour/favorite-model stay chat-only:
 // those are chat-conversation-shaped concepts a gateway request doesn't participate in.
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
 import { ConversationStore } from './db'
+import { tmpDir } from '../test-support/tmp'
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-tokenusage-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-tokenusage-test-')
 }
 
 test('tokenUsageStats: Total tokens and Lifetime tokens are chat + API combined', () => {

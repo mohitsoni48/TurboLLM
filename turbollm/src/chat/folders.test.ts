@@ -6,13 +6,12 @@
 // than cascade-deleting them.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from './db.js'
+import { tmpDir } from '../test-support/tmp'
 
 function makeStore(): { store: ConversationStore; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-folders-test-'))
+  const dir = tmpDir('turbollm-folders-test-')
   const store = new ConversationStore(dir)
   return { store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
 }

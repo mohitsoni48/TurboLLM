@@ -1,8 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { EXT_ROUTES, buildOpenApiDocument } from './openapi.js'
 import { registerExtChatRoutes } from './routes.chats.js'
@@ -11,6 +9,7 @@ import { PublicRunManager } from './run-manager.js'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import { hashKey } from '../auth.js'
+import { tmpDir } from '../test-support/tmp'
 
 type JsonSchemaLike = { required?: string[]; allOf?: { $ref?: string }[] }
 
@@ -150,7 +149,7 @@ test('MessageInput does not require content, matching the server\'s content-OR-a
 // calls, so importing it here would re-register and re-run every one of routes.runs.test.ts's
 // tests a second time whenever this file runs as part of the full suite glob.)
 test('no run route is registered that the manifest does not document', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-openapi-'))
+  const dir = tmpDir('turbollm-ext-openapi-')
   const conv = new ConversationStore(dir)
   try {
     const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
@@ -200,7 +199,7 @@ test('GET /audit response body satisfies every field its own documented schema r
   const schemaName = (schemaRef.$ref as string).replace('#/components/schemas/', '')
   const required = resolveRequired(doc.components.schemas[schemaName] as JsonSchemaLike, doc.components.schemas as Record<string, JsonSchemaLike>)
 
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-openapi-audit-'))
+  const dir = tmpDir('turbollm-ext-openapi-audit-')
   const conv = new ConversationStore(dir)
   try {
     const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)

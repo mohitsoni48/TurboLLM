@@ -1,9 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { GenerationGate } from '../agents/gate'
 import { sessionAuth } from '../code/session-auth'
 import { CLI_ROUTINE_TIMEOUT_MS, type CliProcessResult } from './cli-process'
@@ -13,7 +10,7 @@ import type { Routine } from './schema'
 const OK_STDOUT = '{"type":"result","is_error":false,"result":"done"}'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'cli-routine-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 /** A confirmed (active) CLI-flavor Code Routine. `createRoutine` returns it as

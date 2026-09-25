@@ -6,15 +6,14 @@
 // memory instead. These tests cover the identity key and the record/forget lifecycle;
 // GET /api/v1/engines' derived customDisabled list is exercised at the route level.
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore } from '../config/config'
 import { Registry, customSourceKey } from './registry'
+import { tmpDir } from '../test-support/tmp'
 
 function freshRegistry(): { reg: Registry; store: ConfigStore } {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-custom-src-'))
+  const dir = tmpDir('tllm-custom-src-')
   const store = ConfigStore.load(join(dir, 'config.json'))
   return { reg: new Registry(store), store }
 }
@@ -104,7 +103,7 @@ test('forgetCustomSource: forgetting an unknown key is a harmless no-op', () => 
 })
 
 test('recordCustomSource: survives being re-loaded from disk (real persistence, not in-memory only)', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-custom-src-'))
+  const dir = tmpDir('tllm-custom-src-')
   const configPath = join(dir, 'config.json')
   const reg1 = new Registry(ConfigStore.load(configPath))
   reg1.recordCustomSource({ name: 'My Fork', binPath: '/build/my-fork/llama-server', kind: 'llama-server', sourceRepo: 'https://github.com/user/fork' })

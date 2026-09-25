@@ -10,13 +10,12 @@
 // a running local manager but fail without one, chat is still secretly local.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 const REMOTE = {
   linkId: 'lnk1',
@@ -44,7 +43,7 @@ function mkApp(opts: { localRunning?: boolean } = {}): {
   ledger: Ledger
   cleanup: () => void
 } {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-remote-'))
+  const dir = tmpDir('tllm-chat-remote-')
   const store = new ConversationStore(dir)
   const ledger: Ledger = {
     generationStarts: 0, generationEnds: 0, liveGens: 0, completions: 0, gateAcquires: 0, loads: [],

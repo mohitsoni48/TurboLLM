@@ -1,14 +1,14 @@
 // turbollm/src/chat/store/conformance.test.ts
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { ConversationStore } from '../db.js'
 import { runConformanceSuite } from './conformance.js'
 import { loadChatStoreAdapter } from './load-adapter.js'
+import { tmpDir } from '../../test-support/tmp'
 
 runConformanceSuite('SqliteChatStore', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-conformance-'))
+  const dir = tmpDir('turbollm-conformance-')
   const conv = new ConversationStore(dir)
   return {
     store: conv.chatStore,
