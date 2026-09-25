@@ -31,7 +31,7 @@ module.exports = {
   // electron-builder resolves the *production* dependency tree itself, so the
   // devDependencies (electron, electron-builder) are still excluded — only the
   // ~16 packages under `electron-updater` come along.
-  files: ['main.js', 'package.json', 'node_modules/**/*'],
+  files: ['main.js', 'daemon-supervisor.js', 'package.json', 'node_modules/**/*'],
   // Emit latest.yml / latest-linux.yml / latest-mac.yml + .blockmap files
   // alongside the installers. Without a publish provider electron-builder
   // generates no update manifests at all, and electron-updater cannot work.

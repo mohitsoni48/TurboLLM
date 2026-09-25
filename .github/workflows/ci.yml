@@ -32,6 +32,19 @@ jobs:
         run: npm test
         working-directory: turbollm
 
+  wrapper:
+    name: Desktop wrapper unit tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: npm test
+        working-directory: wrapper
+
   # NOTE: the standalone "telemetry-schema-hash" PR/push gate that used to live
   # here (ADR-331/333) was retired once `scripts/release.mjs`'s `preflight`
   # phase started enforcing the same check itself, with `--approved` able to

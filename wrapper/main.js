@@ -6,6 +6,7 @@ const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
+const { createDaemonSupervisor } = require('./daemon-supervisor')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
 
@@ -38,7 +39,8 @@ function getDaemonDir () {
   return null
 }
 
-let daemonProcess = null
+// Owns the daemon's lifetime across requested restarts (daemon-supervisor.js).
+let supervisor = null
 
 // ── Auto-update (spec 29 B.2) ─────────────────────────────────────────────────
 // The desktop app updates itself through electron-updater against the `latest*.yml`
@@ -121,7 +123,9 @@ function waitForDaemon (retryMs = 500, timeoutMs = 45000) {
 }
 
 // ── Spawn the daemon ──────────────────────────────────────────────────────────
-function launchDaemon () {
+// Resolved once at startup, so every respawn after a requested restart is launched
+// exactly like the first launch: same node, argv, cwd and env.
+function daemonLaunchSpec () {
   const node = getDaemonNode()
   const daemonDir = getDaemonDir()
 
@@ -135,34 +139,45 @@ function launchDaemon () {
 
   const cliPath = join(daemonDir, 'bin', 'turbollm.mjs')
 
-  daemonProcess = spawn(node, [cliPath, '--port', String(PORT), '--addr', `127.0.0.1:${PORT}`], {
-    cwd: daemonDir,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true, // hide the console window on Windows
-    // The daemon's install-method detection (spec 29 B.1) reads this. It can infer the
-    // desktop case from `resources/daemon` in its own path, but that is a heuristic over a
-    // packaging layout; this is the wrapper stating the fact outright. It matters because
-    // getting it wrong means the daemon offering `npm i -g` inside an app bundle, which
-    // would "succeed" against an entirely different copy of TurboLLM.
-    env: { ...process.env, TURBOLLM_DESKTOP: '1' },
-  })
+  return {
+    node,
+    args: [cliPath, '--port', String(PORT), '--addr', `127.0.0.1:${PORT}`],
+    options: {
+      cwd: daemonDir,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true, // hide the console window on Windows
+      // The daemon's install-method detection (spec 29 B.1) reads this. It can infer the
+      // desktop case from `resources/daemon` in its own path, but that is a heuristic over a
+      // packaging layout; this is the wrapper stating the fact outright. It matters because
+      // getting it wrong means the daemon offering `npm i -g` inside an app bundle, which
+      // would "succeed" against an entirely different copy of TurboLLM. It is also what tells
+      // the daemon this app will respawn it after a restart (daemon-supervisor.js).
+      env: { ...process.env, TURBOLLM_DESKTOP: '1' },
+    },
+  }
+}
 
-  daemonProcess.stdout.on('data', (data) => { process.stdout.write(data) })
-  daemonProcess.stderr.on('data', (data) => { process.stderr.write(data) })
+function spawnDaemonFrom (spec) {
+  const child = spawn(spec.node, spec.args, spec.options)
+  child.stdout.on('data', (data) => { process.stdout.write(data) })
+  child.stderr.on('data', (data) => { process.stderr.write(data) })
+  return child
+}
 
-  daemonProcess.on('exit', (code, signal) => {
-    if (code !== 0 && daemonProcess.exitCode === code) {
-      console.error(`TurboLLM daemon exited (code=${code}, signal=${signal || 'none'})`)
-      setImmediate(() => app.quit())
-    }
-  })
+function onDaemonLost (reason) {
+  console.error(`TurboLLM daemon ${reason}`)
+  setImmediate(() => app.quit())
 }
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 let mainWindow = null
 
 app.whenReady().then(() => {
-  try { launchDaemon() }
+  try {
+    const spec = daemonLaunchSpec()
+    supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(spec), onDaemonLost })
+    supervisor.start()
+  }
   catch (err) {
     console.error('Failed to start TurboLLM daemon:', err.message)
     app.quit()
@@ -212,15 +227,6 @@ app.whenReady().then(() => {
   })
 
   app.on('before-quit', () => {
-    if (daemonProcess && !daemonProcess.exitCode) {
-      daemonProcess.kill('SIGTERM')
-      setTimeout(() => {
-        if (daemonProcess && daemonProcess.exitCode === null) daemonProcess.kill('SIGKILL')
-      }, 5000)
-    }
-  })
-
-  app.on('unexpected-shutdown', () => {
-    if (daemonProcess && !daemonProcess.exitCode) daemonProcess.kill('SIGTERM')
+    supervisor?.stop()
   })
 })
