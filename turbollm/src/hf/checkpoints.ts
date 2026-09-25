@@ -83,7 +83,7 @@ function describeCheckpoint(
 
 /** The same mapping `getRepo`'s root list uses, so a single-checkpoint repo is byte-identical
  *  to today: `name` is the full repo path, which is what makes the resolve URL right. */
-function toRepoFile(path: string, entry: RawTreeEntry | undefined, fileUrl: (path: string) => string): HfRepoFile {
+export function toRepoFile(path: string, entry: RawTreeEntry | undefined, fileUrl: (path: string) => string): HfRepoFile {
   return {
     name: path,
     quant: 'mlx',

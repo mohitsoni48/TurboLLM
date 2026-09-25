@@ -25,6 +25,37 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 _Nothing yet._
 
+## [1.14.1] - 2026-09-25
+
+### Added
+
+- **Laya decision models** ([convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya), Apache-2.0).
+  Laya is a System One model: give it a state and typed questions (`noul`, `choice`, `score`), and it answers with
+  calibrated probabilities in one forward pass, in 100+ languages.
+  - A new **Laya engine** runs it (Engines page; Windows, macOS and Linux, on CPU, NVIDIA or Apple GPU).
+  - `POST /v1/systemone` and the playground answer with a Laya model exactly as they do with a Jev one. The response
+    adds `routing`, which names the checkpoint that answered (English or multilingual).
+  - A Laya model always loads on the Laya engine, beside your chat model, whichever engine is active. Chat stays
+    available, and the Workspace sidebar links to the playground while it is loaded.
+  - Search for "laya" in Discover to find it. Its download fetches the English and multilingual checkpoints
+    (~1.5 GB).
+  - The GGUF conversions of Laya on Hugging Face use a separate runtime (`ggmlc`) that llama.cpp can't load. They are
+    marked as not loadable and point you at the model that runs.
+
+### Fixed
+
+- **A model loaded in its own slot beside the chat model (an embedding model, for example) can no longer be deleted
+  while it runs.** Delete now asks you to eject it first, as it already did for the chat model. Before, the check
+  only looked at the chat model's slot.
+
+### Discord
+
+- **TurboLLM now runs Laya**, an open decision model. Ask it yes/no, pick-one and rating-scale questions about any
+  text, and get calibrated answers in a fraction of a second, in 100+ languages.
+- It runs beside your chat model on its own engine, on any OS, on your CPU or GPU. Install it from Engines, then
+  search "laya" in Discover.
+- Try it in the playground, or call `POST /v1/systemone` from your own code.
+
 ## [1.14.0] - 2026-09-22
 
 ### Added

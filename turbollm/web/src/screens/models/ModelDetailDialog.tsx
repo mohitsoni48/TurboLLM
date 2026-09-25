@@ -6,6 +6,7 @@ import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDe
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultVllm } from '../../lib/types'
+import { loadModeFor } from '../../lib/load-mode'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
 import { tokenizeExtraArgs } from '../../lib/argv'
 import { Button } from '../../components/ui/button'
@@ -23,29 +24,6 @@ import {
 } from '../../components/ui/alert-dialog'
 import { toast } from '../../components/ui/sonner'
 
-/**
- * Which load-config UI a model gets is decided by the engine that will load it — NOT by the
- * model format (safetensors dirs report format 'mlx' under any engine, so format can't tell
- * MLX from vLLM). `'none'` covers an absent/unrecognised engine: show sampling only, assume nothing.
- */
-type LoadMode = 'llamacpp' | 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm' | 'none'
-
-function loadModeForEngine(engineKind: string | undefined): LoadMode {
-  switch (engineKind) {
-    case 'llama-server':
-      return 'llamacpp'
-    case 'mlx':
-      return 'mlx'
-    case 'rapid-mlx':
-      return 'rapid-mlx'
-    case 'mlx-vlm':
-      return 'mlx-vlm'
-    case 'vllm':
-      return 'vllm'
-    default:
-      return 'none'
-  }
-}
 
 /** The "leave it to the engine" entry in the `--load-mode` dropdown (GitHub #222), mapping to an
  *  empty `LoadProfile.loadMode` so no flag is emitted. It sits in the same list as the engine's
@@ -447,7 +425,7 @@ export function ModelDetailDialog({
   const benchDone = !!benchState?.done && benchHere && !benchState.running
   const benchErr = bench.start.error instanceof ApiError ? bench.start.error.message : null
   // The load knobs follow the engine that will load the model (BUG-004), not the model format.
-  const loadMode = loadModeForEngine(activeEngine?.kind)
+  const loadMode = loadModeFor(detail ?? {}, activeEngine?.kind)
   const isLlamaCpp = loadMode === 'llamacpp'
   const isMlx = loadMode === 'mlx'
   const isRapidMlx = loadMode === 'rapid-mlx'

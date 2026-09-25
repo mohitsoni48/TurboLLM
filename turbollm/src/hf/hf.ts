@@ -6,6 +6,7 @@
 import { quantFromName } from '../gguf/gguf'
 import { detectJev } from '../models/jev'
 import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
+import { isLayaRepo, layaRepoFiles } from './laya-repo'
 
 const BASE = 'https://huggingface.co'
 const CACHE_TTL_MS = 5 * 60 * 1000
@@ -64,6 +65,16 @@ function libraryFilterFor(engineKind?: string): string {
   return 'filter=gguf&'
 }
 
+/** A Laya-tagged repo the Laya engine can run: a transformers/laya checkpoint, not an MLX, CoreML, ONNX or ggmlc
+ *  GGUF port. Whether its folder really is a Laya bundle is decided when it is opened (laya-repo.ts). */
+function isLayaEngineRepo(m: RawSearchItem): boolean {
+  return m.library_name === 'transformers' || m.library_name === 'laya'
+}
+
+function repoIdOf(m: RawSearchItem): string {
+  return m.id ?? m.modelId ?? ''
+}
+
 function toSearchItem(m: RawSearchItem): HfSearchItem {
   return {
     repo: m.id ?? m.modelId ?? '',
@@ -103,6 +114,9 @@ export interface HfRepoDetail {
   files: HfRepoFile[]
   /** True when the repo is a safetensors model (no GGUFs — covers MLX and vLLM). */
   safetensors?: boolean
+  /** True for a Laya System One repo: `files` then holds its checkpoints' nested paths, and there are no
+   *  `checkpoints` rows (./laya-repo). */
+  laya?: boolean
   /** Every downloadable checkpoint folder of a safetensors repo (ADR-434 (h)), root first.
    *  Present only for safetensors repos; `files` above is unchanged either way. */
   checkpoints?: HfCheckpoint[]
@@ -149,11 +163,18 @@ export class HfClient {
   async searchModels(query: string, engineKind?: string, sort: HfSortOption = 'best-match'): Promise<HfSearchItem[]> {
     const q = query.trim()
     const sortParam = sort === 'best-match' ? '' : `sort=${SORT_PARAM[sort]}&direction=-1&`
-    const url =
-      `${BASE}/api/models?search=${encodeURIComponent(q)}&` +
-      `${libraryFilterFor(engineKind)}${sortParam}limit=30&full=false`
-    const raw = await this.getJson<RawSearchItem[]>(url)
-    return raw.map(toSearchItem)
+    const search = (filter: string) =>
+      `${BASE}/api/models?search=${encodeURIComponent(q)}&${filter}${sortParam}limit=30&full=false`
+    const filter = libraryFilterFor(engineKind)
+    // The Laya engine is never the active engine (ADR-443), so a format-narrowed search would never show a Laya
+    // repo it can run. Best-effort: a failed Laya search leaves the search as it was.
+    const [raw, laya] = await Promise.all([
+      this.getJson<RawSearchItem[]>(search(filter)),
+      filter ? this.getJson<RawSearchItem[]>(search('filter=laya&')).catch(() => []) : Promise.resolve([]),
+    ])
+    const runnable = laya.filter(isLayaEngineRepo)
+    const listed = new Set(runnable.map(repoIdOf))
+    return [...runnable, ...raw.filter((m) => !listed.has(repoIdOf(m)))].map(toSearchItem)
   }
 
   /** Browse repos with no search term (spec 10 §7 rewrite) — the live equivalent of
@@ -184,7 +205,11 @@ export class HfClient {
     let files: HfRepoFile[]
     let safetensors: boolean | undefined
     let checkpoints: HfCheckpoint[] | undefined
-    if (isSafetensors) {
+    const laya = isSafetensors && isLayaRepo(tree)
+    if (laya) {
+      safetensors = true
+      files = layaRepoFiles(tree, (path) => this.fileUrl(repo, path))
+    } else if (isSafetensors) {
       safetensors = true
       // Collect all component files: safetensors weights + JSON config/tokenizer files +
       // the chat template. Modern HF repos ship the chat template as a standalone
@@ -230,6 +255,7 @@ export class HfClient {
       card: await this.getCard(repo),
       files,
       ...(safetensors ? { safetensors } : {}),
+      ...(laya ? { laya } : {}),
       ...(checkpoints ? { checkpoints } : {}),
     }
   }
@@ -467,6 +493,7 @@ export class HfClient {
 interface RawSearchItem {
   id?: string
   modelId?: string
+  library_name?: string
   downloads?: number
   likes?: number
   lastModified?: string

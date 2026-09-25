@@ -44,3 +44,7 @@ test('the screens these actions are tracked on already exist', () => {
   assert.ok((SCREENS as readonly string[]).includes('workspace'))
   assert.ok((SCREENS as readonly string[]).includes('models'))
 })
+
+test('the Laya playground link is a recognised UI action (ADR-443)', () => {
+  assert.ok((UI_ACTIONS as readonly string[]).includes('open_laya_playground'))
+})

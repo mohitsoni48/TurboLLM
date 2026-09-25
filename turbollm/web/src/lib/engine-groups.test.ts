@@ -46,6 +46,13 @@ test('engineGroupKey maps pip engines to their kind', () => {
   assert.equal(engineGroupKey(eng({ id: 'k', kind: 'koboldcpp' })), 'koboldcpp')
   assert.equal(engineGroupKey(eng({ id: 'rm', kind: 'rapid-mlx' })), 'rapid-mlx')
   assert.equal(engineGroupKey(eng({ id: 'mv', kind: 'mlx-vlm' })), 'mlx-vlm')
+  assert.equal(engineGroupKey(eng({ id: 'ly', kind: 'laya' })), 'laya')
+})
+
+test('groupLabel reads Laya engines as "Laya", same as any other pip engine group', () => {
+  const laya = eng({ id: 'ly', kind: 'laya' })
+  const groups = groupEngines([laya])
+  assert.equal(groups[0].label, 'Laya')
 })
 
 test('engineGroupKey detects TurboQuant by path', () => {

@@ -7,6 +7,7 @@ import { migrateModelKey, type ConfigStore } from '../config/config'
 import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf'
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
+import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
 
 export interface ModelEntry {
   key: string
@@ -82,6 +83,8 @@ export interface ModelEntry {
   /** Present only for a Jev (NLI cross-encoder) model, ADR-434 (g) — absent = not a Jev model.
    *  A Jev entry is always `vision: false` and `embedding: false`. */
   jev?: JevInfo
+  /** Present only for a Laya System One model (./laya) — absent = not a Laya model. */
+  laya?: LayaInfo
   incomplete: boolean
   parseError: string | null
   loaded: boolean
@@ -363,7 +366,7 @@ export class Scanner {
 
   private async scanOnce(): Promise<void> {
     const dirs = this.store.snapshot().modelDirs
-    const scan: ScanResult = { ggufs: [], mlxDirs: [] }
+    const scan: ScanResult = { ggufs: [], mlxDirs: [], layaDirs: [] }
     const roots = new Map<string, string>()
     for (const dir of dirs) {
       try {
@@ -376,7 +379,8 @@ export class Scanner {
     this.pendingKeyMigrations = []
     const gguf = await this.build(scan.ggufs)
     const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
-    this.entries = [...gguf, ...mlx].sort((a, b) => a.name.localeCompare(b.name))
+    const laya = scan.layaDirs.map((dir) => layaEntryFor(dir))
+    this.entries = [...gguf, ...mlx, ...laya].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
     this.saveCache()
     // One config write for the whole scan (see `entryFor`), not one per affected model.
@@ -591,6 +595,8 @@ interface FileInfo {
 interface ScanResult {
   ggufs: FileInfo[]
   mlxDirs: string[]
+  /** Laya folders: one entry per bundle, whose checkpoint subfolders are part of it (./laya). */
+  layaDirs: string[]
 }
 
 /** A directory holds an MLX/HF model when it has config.json + safetensors weights
@@ -637,7 +643,9 @@ async function walk(dir: string, out: ScanResult, state: WalkState, depth = 0, a
     return // permission / gone / broken link
   }
   const mlx = isMlxModelDir(names)
+  const laya = !mlx && isLayaModelDir(names)
   if (mlx && allowMlx) out.mlxDirs.push(dir)
+  if (laya && allowMlx) out.layaDirs.push(dir)
   // Still discover GGUF variants, but don't turn training checkpoints into new
   // Safetensors models. A checkpoint can be opted into as an explicit root.
   for (const name of names) {
@@ -645,7 +653,7 @@ async function walk(dir: string, out: ScanResult, state: WalkState, depth = 0, a
     const full = join(dir, name)
     try {
       const st = await stat(full)
-      if (st.isDirectory()) await walk(full, out, state, depth + 1, allowMlx && !mlx)
+      if (st.isDirectory()) await walk(full, out, state, depth + 1, allowMlx && !mlx && !laya)
       else if (st.isFile() && name.toLowerCase().endsWith('.gguf') && st.size >= 1 << 20) {
         const real = await realpath(full)
         // Projectors are shared per directory; shards are deduped as groups in

@@ -72,7 +72,12 @@ function CurlView({ request, origin }: { request: SystemOneRequest; origin: stri
   )
 }
 
-/** How long the run took and how much went in: the two numbers the playground exists to show. */
+/** How long the run took and how much went in: the two numbers the playground exists to show.
+ *  A Laya response also carries `routing` (which of its own checkpoints actually answered, and
+ *  why) — worth naming here since it's the one line every run already reads; a plain Jev
+ *  response carries no `routing` and this stays exactly as it always has. */
 function footerOf(run: SystemOneRun): string {
-  return `${run.ms} ms · ${run.response.usage.input_tokens} input tokens`
+  const base = `${run.ms} ms · ${run.response.usage.input_tokens} input tokens`
+  const routing = run.response.routing
+  return routing ? `${base} · answered by the ${routing.model} checkpoint` : base
 }

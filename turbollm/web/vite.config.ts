@@ -51,6 +51,7 @@ export default defineConfig({
       // suite assumes the real daemon on 6996, not a dev-server proxy.
       '**/e2e-onboarding/**',
       'src/lib/argv.test.ts',
+      'src/lib/download-subdir.test.ts',
       'src/lib/engine-groups.test.ts',
       'src/lib/personas.test.ts',
       'src/lib/tool-explain.test.ts',

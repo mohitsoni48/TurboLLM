@@ -228,7 +228,7 @@ const TURBOLLM_KNOWLEDGE =
   'TurboLLM also ships as a native Android app (separate from `npx turbollm`) — the daemon runs inside the APK with a bundled Vulkan-accelerated engine for on-device GPU inference, no separate install step. The UI is the same shared codebase, adapted for a phone: Engines/Discover/Chat simplified, Code and Agents management hidden (desktop-only), model recommendations filtered to what the device can actually hold, and hardware Back / safe-area / swipe gestures behave like a native app. A fresh install starts on a lightweight default agent with thinking off, tuned for phone-class memory/compute.\n\n' +
   '## Gateway\n\n' +
   'TurboLLM at `http://localhost:6996` exposes:\n' +
-  '- **OpenAI-compatible**: `POST /v1/chat/completions`, `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/systemone`, `POST /v1/classify`, `POST /v1/rerank` (Jev models)\n' +
+  '- **OpenAI-compatible**: `POST /v1/chat/completions`, `GET /v1/models`, `POST /v1/embeddings`, `POST /v1/systemone` (Jev and Laya models), `POST /v1/classify`, `POST /v1/rerank` (Jev models). Laya models run on their own Laya engine (Engines page, any OS, CPU or GPU) beside the chat model; find them by searching "laya" in Discover, and open the playground from the Workspace sidebar while one is loaded.\n' +
   '- **Anthropic-compatible**: `POST /v1/messages`\n' +
   '- **Auto model-swap**: request arrives with any model name → fuzzy-matched against available models → loads it automatically (mutex-serialized). Works with Claude Code, Continue, Open WebUI, any compatible client.\n' +
   '- **Keep-N pool**: 1–4 models simultaneously with LRU eviction (Settings → Models & loading).\n' +

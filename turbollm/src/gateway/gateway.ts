@@ -99,11 +99,16 @@ function asClientStatus(status: number): ContentfulStatusCode {
   return (status >= 400 && status <= 599 ? status : 500) as ContentfulStatusCode
 }
 
-/** Why a chat / embeddings / messages request naming a Jev model is refused, and where to go instead. */
+/** Why a chat / embeddings / messages request naming a Jev or Laya model is refused, and where to go instead. */
 function jevWrongEndpointMessage(modelName: string, request: 'chat' | 'embeddings'): string {
   const cannot = request === 'chat' ? 'chat' : 'produce embeddings'
   return `'${modelName}' is a Jev model: it labels premise/hypothesis pairs and cannot ${cannot}. ` +
     'Call POST /v1/systemone (or /v1/classify, /v1/rerank) instead.'
+}
+
+function layaWrongEndpointMessage(modelName: string, request: 'chat' | 'embeddings'): string {
+  const cannot = request === 'chat' ? 'chat' : 'produce embeddings'
+  return `'${modelName}' is a Laya model: it answers System One questions and cannot ${cannot}. Call POST /v1/systemone instead.`
 }
 
 /** Classifies a `d.gate.acquire()` failure into one {status, type, message} shape shared by both
@@ -235,11 +240,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
 
     // A Jev model never chats (ADR-434 (f)); refuse before route() could auto-swap it in.
     const jevModel = d.modelRouter.targetEntry(req.model ?? '')
-    if (jevModel?.jev) {
-      return c.json(
-        { type: 'error', error: { type: 'invalid_request_error', message: jevWrongEndpointMessage(jevModel.name, 'chat') } },
-        400,
-      )
+    if (jevModel?.jev || jevModel?.laya) {
+      const message = jevModel.jev ? jevWrongEndpointMessage(jevModel.name, 'chat') : layaWrongEndpointMessage(jevModel.name, 'chat')
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message } }, 400)
     }
 
     // Route to the requested model — may trigger an auto-swap (v0.6.0).
@@ -782,12 +785,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // strips back to the real key before routing) is only added when gateway.autoSwap is
   // on: picking a model from Claude Code's /model always requires a swap, so advertising
   // it while auto-swap is off would let the user pick a model that silently never loads.
-  // A Jev model is marked `kind: "jev"` and gets no alias: it never chats, so Claude Code can't use it.
+  // A Jev or Laya model is marked `kind: "jev"` / `kind: "laya"` and gets no alias: it never chats, so Claude Code can't use it.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
     const autoSwap = d.store.snapshot().gateway.autoSwap
     const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
-      { id: m.key, object: 'model', owned_by: 'turbollm', ...(m.jev ? { kind: 'jev' } : {}) },
-      ...(autoSwap && !m.jev ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
+      { id: m.key, object: 'model', owned_by: 'turbollm', ...(m.jev ? { kind: 'jev' } : m.laya ? { kind: 'laya' } : {}) },
+      ...(autoSwap && !m.jev && !m.laya ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
     ])
     // Turbo Link (ADR-376 §1 decision 7): every model on every ONLINE linked host, under
     // its qualified `<machine>/<model>` id — the exact id ModelRouter.resolveRemote routes
@@ -877,6 +880,10 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     if (jevModel?.jev) {
       const message = jevWrongEndpointMessage(jevModel.name, isChat ? 'chat' : 'embeddings')
       return c.json({ error: { type: 'invalid_request_error', code: 'jev_model_wrong_endpoint', message } }, 400)
+    }
+    if (jevModel?.laya) {
+      const message = layaWrongEndpointMessage(jevModel.name, isChat ? 'chat' : 'embeddings')
+      return c.json({ error: { type: 'invalid_request_error', code: 'laya_model_wrong_endpoint', message } }, 400)
     }
   }
   const routeResult = await d.modelRouter.route(requestedModel)

@@ -7,6 +7,7 @@ import {
   useQueryClient,
   type UseQueryResult,
 } from '@tanstack/react-query'
+import { modelsRefetchInterval } from './models-poll'
 import {
   activateEngine,
   addEngine,
@@ -43,6 +44,7 @@ import {
   updateMlx,
   updateRapidMlx,
   updateMlxVlm,
+  updateLaya,
   updateTurboquant,
   updateKoboldcpp,
   updateLlamafile,
@@ -64,6 +66,7 @@ import {
   installMlx,
   installRapidMlx,
   installMlxVlm,
+  installLaya,
   installVllm,
   installSglang,
   installTurboquant,
@@ -416,6 +419,7 @@ export function useBackendInstall() {
     mlx: useMutation({ mutationFn: () => installMlx(), onSuccess: invalidate }),
     rapidMlx: useMutation({ mutationFn: () => installRapidMlx(), onSuccess: invalidate }),
     mlxVlm: useMutation({ mutationFn: () => installMlxVlm(), onSuccess: invalidate }),
+    laya: useMutation({ mutationFn: () => installLaya(), onSuccess: invalidate }),
     vllm: useMutation({ mutationFn: () => installVllm(), onSuccess: invalidate }),
     sglang: useMutation({ mutationFn: () => installSglang(), onSuccess: invalidate }),
     turboquant: useMutation({ mutationFn: () => installTurboquant(), onSuccess: invalidate }),
@@ -431,6 +435,7 @@ export function useBackendInstall() {
     updateMlx: useMutation({ mutationFn: () => updateMlx(), onSuccess: invalidate }),
     updateRapidMlx: useMutation({ mutationFn: () => updateRapidMlx(), onSuccess: invalidate }),
     updateMlxVlm: useMutation({ mutationFn: () => updateMlxVlm(), onSuccess: invalidate }),
+    updateLaya: useMutation({ mutationFn: () => updateLaya(), onSuccess: invalidate }),
     updateTurboquant: useMutation({ mutationFn: () => updateTurboquant(), onSuccess: invalidate }),
     updateKoboldcpp: useMutation({ mutationFn: () => updateKoboldcpp(), onSuccess: invalidate }),
     updateLlamafile: useMutation({ mutationFn: () => updateLlamafile(), onSuccess: invalidate }),
@@ -603,29 +608,8 @@ export function useModels(): UseQueryResult<ModelsList> {
   return useQuery({
     queryKey: queryKeys.models,
     queryFn: getModels,
-    refetchInterval: (q) => {
-      if (q.state.data?.scanning) return 1200
-      if (q.state.data?.models.some((m) => m.loaded)) return 4000
-      const status = qc.getQueryData<Status>(queryKeys.status)
-      if (status?.engine.state === 'starting') return 1000
-      // A finished download whose file the scanner hasn't caught up to yet — keep polling
-      // until it appears, or this query goes permanently quiet the moment it happens to be
-      // asked before a download even starts (empty model dir, nothing scanning, nothing
-      // loaded) and never wakes back up. Found live: a real onboarding run against real
-      // HuggingFace got stuck on "Loading your model" forever — the download genuinely
-      // finished and the file scanned fine server-side minutes later, but this query's
-      // first poll (fired right after clicking "Download this," before the download even
-      // began) had already disabled itself, so LoadStep's `matchedEntry` never resolved and
-      // `loadModel()` never fired. `useDownloads()`'s own poll noticing the download finish
-      // doesn't invalidate this query — nothing else did either.
-      const downloads = qc.getQueryData<DownloadsList>(queryKeys.downloads)
-      const models = q.state.data?.models ?? []
-      const hasUnmatchedFinishedDownload = downloads?.downloads.some(
-        (d) => d.status === 'done' && !models.some((m) => d.dest.endsWith(m.name) || m.path === d.dest),
-      )
-      if (hasUnmatchedFinishedDownload) return 1500
-      return false
-    },
+    refetchInterval: (q) =>
+      modelsRefetchInterval(q.state.data, qc.getQueryData<Status>(queryKeys.status), qc.getQueryData<DownloadsList>(queryKeys.downloads)),
     refetchIntervalInBackground: false,
     placeholderData: (prev) => prev,
     retry: false,

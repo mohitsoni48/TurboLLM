@@ -384,6 +384,10 @@ there. Entirely local; nothing leaves your machine.
 - **Honestly labelled:** answers are the model's NLI entailment scores, not a calibrated decision
   model, and the docs explain exactly how each number is computed.
 - Runs on vLLM (Linux or WSL2). Full guide: <https://turbollm.dev/docs/jev>.
+- **Laya decision models, too** ([convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya)):
+  - What it is: a calibrated System One model that answers the same `/v1/systemone` questions in 100+ languages.
+  - Where it runs: on its own Laya engine (Engines page; Windows, macOS, Linux; CPU or GPU), beside your chat model.
+  - How to get it: search "laya" in Discover. The playground opens from the Workspace sidebar while it is loaded.
 
 </details>
 

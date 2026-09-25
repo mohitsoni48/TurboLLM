@@ -13,14 +13,17 @@ export type Incompatibility =
   | { code: 'format'; label: string; message: string }
   | { code: 'audio'; label: string; message: string }
   | { code: 'needs_vllm'; label: 'Needs vLLM (Linux or WSL2)'; message: string }
+  | { code: 'needs_laya'; label: 'Needs the Laya engine'; message: string }
 
-/** null = the engine of `engineKind` can load `entry`. Order: needs_vllm (most specific), then
+/** null = the engine of `engineKind` can load `entry`. Order: needs_laya and needs_vllm (most specific), then
  *  format, then audio. The ONE place this rule lives; engineAcceptsFormat/engineRejectsAudioModel
  *  stay exported as its building blocks. `label` is the short text a model row shows. */
 export function modelIncompatibility(
   engineKind: string,
-  entry: Pick<ModelEntry, 'format' | 'audio' | 'jev'>,
+  entry: Pick<ModelEntry, 'format' | 'audio' | 'jev' | 'laya'> & Partial<Pick<ModelEntry, 'arch'>>,
 ): Incompatibility | null {
+  if (entry.format === 'gguf' && entry.arch === GGMLC_ARCH) return GGMLC_GGUF
+  if (entry.laya) return engineKind === 'laya' ? null : NEEDS_LAYA
   if (entry.jev && engineKind !== 'vllm') return NEEDS_VLLM
   if (!engineAcceptsFormat(engineKind, entry.format)) return formatIncompatibility(engineKind, entry.format)
   if (entry.audio && engineRejectsAudioModel(engineKind)) return audioIncompatibility(engineKind)
@@ -33,6 +36,24 @@ const NEEDS_VLLM: Incompatibility = {
   message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
 }
 
+const NEEDS_LAYA: Incompatibility = {
+  code: 'needs_laya',
+  label: 'Needs the Laya engine',
+  message: 'This is a Laya model — it runs only on the Laya engine. Install Laya from Engines to load it.',
+}
+
+/** The architecture of the Laya GGUF conversions on Hugging Face (mys/laya-GGUF and friends): a separate runtime,
+ *  which llama.cpp refuses with "unknown model architecture: 'ggmlc'" — so every engine refuses it up front. */
+const GGMLC_ARCH = 'ggmlc'
+
+const GGMLC_GGUF: Incompatibility = {
+  code: 'format',
+  label: 'ggmlc GGUF — not loadable',
+  message:
+    "This GGUF uses the ggmlc architecture, which llama.cpp can't load. For Laya, download " +
+    'convaiinnovations/laya instead: it runs on the Laya engine.',
+}
+
 const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'
 
 function formatIncompatibility(engineKind: string, format: ModelFormat): Incompatibility {
@@ -42,6 +63,7 @@ function formatIncompatibility(engineKind: string, format: ModelFormat): Incompa
 
 /** User-facing message when the active engine can't load a model's format (ADR-044). */
 function formatMismatchMessage(engineKind: string, format: ModelFormat): string {
+  if (engineKind === 'laya') return 'The Laya engine runs only Laya models — load this one on another engine.'
   if (engineKind === 'mlx')
     return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'rapid-mlx')
@@ -81,12 +103,15 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *   - MLX-VLM (kind 'mlx-vlm') → the same MLX-format directories, for vision-language models
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
+ *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
+ *     recognises by `entry.laya` before the format is ever checked
  */
 export function engineAcceptsFormat(engineKind: string, format: ModelFormat): boolean {
   if (engineKind === 'mlx') return format === 'mlx'
   if (engineKind === 'rapid-mlx') return format === 'mlx'
   if (engineKind === 'mlx-vlm') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
+  if (engineKind === 'laya') return false
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return format === 'gguf'
 }
