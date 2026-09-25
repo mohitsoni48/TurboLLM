@@ -2,8 +2,7 @@
 // All OS interactions are injected via hooks so no real processes are touched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   writePidfile,
@@ -13,11 +12,12 @@ import {
   stopDaemon,
   type StopHooks,
 } from './daemon-pid.js'
+import { tmpDir } from './test-support/tmp'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function makeTmpDir(): { dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-pid-test-'))
+  const dir = tmpDir('turbollm-pid-test-')
   return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) }
 }
 

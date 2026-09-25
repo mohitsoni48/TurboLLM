@@ -4,16 +4,14 @@
 // Fix: scanner reads model.safetensors.index.json and checks every listed
 // shard exists on disk; sets incomplete=true when any shard is absent.
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { mlxEntryFor } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 function makeTmpDir(): string {
-  const dir = join(tmpdir(), `turbollm-mlx-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-mlx-test-')
 }
 
 /** Create a minimal MLX model directory.

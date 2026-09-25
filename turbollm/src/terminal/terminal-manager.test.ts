@@ -11,11 +11,11 @@
 // narrow cast" pattern already used by model-router.test.ts for its own private state.
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, readdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { TerminalManager, reapStaleTerminals, killTrackedTerminalsSync } from './terminal-manager'
+import { tmpDir } from '../test-support/tmp'
 
 type Handler = { onData?: (data: string) => void; onClose?: () => void }
 
@@ -238,7 +238,7 @@ function terminalPidFiles(dir: string): string[] {
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 test('reapStaleTerminals: reaps a tracked shell with no live owner, and clears its pidfile', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const dir = tmpDir('tllm-term-reap-')
   const shell = await spawnFakeShell()
   try {
     writeTerminalPidFile(dir, shell.pid) // no owner field — ownerless/legacy, must be reaped
@@ -255,7 +255,7 @@ test('reapStaleTerminals: reaps a tracked shell with no live owner, and clears i
 })
 
 test('reapStaleTerminals: does NOT reap a shell still owned by a live daemon', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const dir = tmpDir('tllm-term-reap-')
   const shell = await spawnFakeShell()
   try {
     // owner = this (alive) test process — a live daemon manages this terminal; a starting
@@ -274,7 +274,7 @@ test('reapStaleTerminals: does NOT reap a shell still owned by a live daemon', a
 })
 
 test('killTrackedTerminalsSync: kills only shells owned by THIS process', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-term-reap-'))
+  const dir = tmpDir('tllm-term-reap-')
   const owned = await spawnFakeShell()
   const other = await spawnFakeShell()
   try {

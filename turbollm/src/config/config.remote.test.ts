@@ -1,16 +1,16 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { defaultConfig, ConfigStore, normalizeProvider, resolveIngressPort } from './config'
+import { tmpDir } from '../test-support/tmp'
 
 // `normalize` is module-private; it runs on every load. Exercise it the way
 // config.link.test.ts's own `loadRaw` does — write a real config.json to a temp dir and
 // load it through ConfigStore.load, so migrate()+normalize() run for real against a genuine
 // file, not a helper that only pretends to.
 function loadRaw(raw: unknown) {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-remote-cfg-'))
+  const dir = tmpDir('tllm-remote-cfg-')
   const path = join(dir, 'config.json')
   writeFileSync(path, JSON.stringify(raw), 'utf8')
   return ConfigStore.load(path).snapshot()

@@ -6,10 +6,10 @@
 // network, no real files).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DownloadManager } from './downloads'
+import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {
@@ -19,7 +19,7 @@ function fakeStore(modelDir: string, stateDir: string) {
 }
 
 function newDirs() {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-dl-settled-'))
+  const root = tmpDir('tllm-dl-settled-')
   const modelDir = join(root, 'models')
   const stateDir = join(root, 'state')
   mkdirSync(modelDir, { recursive: true })

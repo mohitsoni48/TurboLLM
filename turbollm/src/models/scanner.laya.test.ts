@@ -1,10 +1,10 @@
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { defaultConfig, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 function checkpoint(dir: string, encoder: string): void {
   mkdirSync(join(dir, 'encoder'), { recursive: true })
@@ -17,7 +17,7 @@ function checkpoint(dir: string, encoder: string): void {
 }
 
 function scannerOver(t: TestContext): { library: string; scanner: Scanner } {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-laya-scan-'))
+  const root = tmpDir('turbollm-laya-scan-')
   t.after(() => rmSync(root, { recursive: true, force: true }))
   const library = join(root, 'library')
   const data = join(root, 'data')

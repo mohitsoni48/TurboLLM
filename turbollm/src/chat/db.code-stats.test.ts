@@ -6,17 +6,10 @@
 // and the real diff-line math now that ADR-199 persists tool-call diffs.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from './db'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { ConversationStore, IN_MEMORY_DATA_DIR } from './db'
 
 function makeStore(): ConversationStore {
-  return new ConversationStore(tmp('tllm-codestats-'))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 test('codeStats: no code runs at all → all zeros, empty heatmap', () => {

@@ -4,13 +4,12 @@
 // (see the module's own header for the live, timed testing that found the original bug).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRobustBashOperations } from './robust-bash'
+import { tmpDir } from '../test-support/tmp'
 
 function tmp(): string {
-  return mkdtempSync(join(tmpdir(), 'tllm-robust-bash-'))
+  return tmpDir('tllm-robust-bash-')
 }
 
 test('exec: runs a real command and returns its output + exit code', async () => {

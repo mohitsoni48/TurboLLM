@@ -8,8 +8,7 @@
 // the HTTP shape. Only paths that return before a build starts are exercised, so nothing here
 // touches git, a compiler or the network.
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
@@ -17,6 +16,7 @@ import { ConfigStore, type Engine } from '../config/config'
 import { Registry } from '../engines/registry'
 import type { Deps } from '../deps'
 import { registerApi } from './routes'
+import { tmpDir } from '../test-support/tmp'
 
 const serverExe = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
 
@@ -35,7 +35,7 @@ interface HarnessOpts {
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-build-routes-'))
+  const dir = tmpDir('tllm-build-routes-')
   const store = ConfigStore.load(join(dir, 'config.json'))
   const enginesRoot = join(store.dir(), 'engines')
   const engines = typeof opts.engines === 'function' ? opts.engines(enginesRoot) : (opts.engines ?? [])

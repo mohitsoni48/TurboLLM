@@ -4,17 +4,10 @@
 // "reasoning → all tool calls grouped → final text" layout.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore, type MessageTimelineBlock } from './db'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { ConversationStore, IN_MEMORY_DATA_DIR, type MessageTimelineBlock } from './db'
 
 function makeStore(): ConversationStore {
-  return new ConversationStore(tmp('tllm-timeline-'))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 test('timeline: absent by default on a freshly added message (no backfill)', () => {

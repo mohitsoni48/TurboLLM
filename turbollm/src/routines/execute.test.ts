@@ -1,10 +1,7 @@
 // turbollm/src/routines/execute.test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { executeRoutine, resumeRoutineRun, runCliRoutineBranch, runCliInteractiveBranch } from './execute'
 import type { CliRoutineDeps } from './cli-routine'
 import type { CliInteractiveDeps } from './cli-interactive-runner'
@@ -14,11 +11,12 @@ import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
 import type { GenerationGate } from '../agents/gate'
 import type { RoutineRunStatus } from './schema'
+import { tmpDir } from '../test-support/tmp'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
 function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate }): { d: Deps; db: ConversationStore; loadCalls: string[] } {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'execute-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const loadCalls: string[] = []
   let current = opts.loadedKey
   const manager = {
@@ -37,7 +35,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
       // runCliInteractiveBranch's `getTerminalManager(d)` builds the module singleton for the
       // first time in this process — a real tmp dir keeps that harmless in tests that never
       // actually spawn a PTY (they replace `_runInteractive` before it would be reached).
-      dir: () => mkdtempSync(join(tmpdir(), 'execute-test-terminals-')),
+      dir: () => tmpDir('execute-test-terminals-'),
     },
     gate: opts.gate,
   } as unknown as Deps

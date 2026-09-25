@@ -5,12 +5,12 @@
 // false, the model-router's embedding-coexistence logic (ADR-060/062, ADR-389) never engaged —
 // loading it manually evicted whatever chat model was running, same as any ordinary model.
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { defaultConfig, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
 const T_STRING = 8
@@ -52,7 +52,7 @@ function memStore(root: string, seed: Partial<Config> = {}): ConfigStore {
 }
 
 function makeRoot(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-embed-test-'))
+  return tmpDir('turbollm-embed-test-')
 }
 
 test('a Qwen3-architecture embedding model is flagged embedding: true by filename', async () => {

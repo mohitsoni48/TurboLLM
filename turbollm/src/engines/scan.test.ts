@@ -1,15 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { resolveServerBinary, suggestEngineName, meaningfulFolder, cleanVersionLabel } from './scan'
 import { findFile } from './download'
+import { tmpDir } from '../test-support/tmp'
 
 const BIN = 'llama-server-test-bin'
 
 function tempTree(): string {
-  return mkdtempSync(join(tmpdir(), 'tllm-scan-'))
+  return tmpDir('tllm-scan-')
 }
 
 test('resolveServerBinary: finds the binary nested in a chosen folder', () => {
@@ -48,7 +48,7 @@ test('resolveServerBinary: returns null when the folder has no binary', () => {
 })
 
 test('resolveServerBinary: returns null for a non-existent path', () => {
-  assert.equal(resolveServerBinary(join(tmpdir(), 'tllm-does-not-exist-xyz'), BIN), null)
+  assert.equal(resolveServerBinary(join(tmpDir('tllm-scan-'), 'does-not-exist'), BIN), null)
 })
 
 test('findFile: skipDir prunes pruned subtrees (node_modules / dotdirs)', () => {

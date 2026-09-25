@@ -1,15 +1,14 @@
 // The Laya engine serves only Laya models, which load on it whatever engine is active — so registering it must
 // never make it the active engine, or every chat model would stop loading.
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { engineForModel, Registry } from './registry'
+import { tmpDir } from '../test-support/tmp'
 
 function emptyRegistry(): Registry {
-  const store = ConfigStore.load(join(mkdtempSync(join(tmpdir(), 'tllm-laya-registry-')), 'config.json'))
+  const store = ConfigStore.load(join(tmpDir('tllm-laya-registry-'), 'config.json'))
   store.update((c) => {
     c.engines = []
     c.activeEngineId = ''
@@ -19,7 +18,7 @@ function emptyRegistry(): Registry {
 
 /** A registry whose only engine is an active llama.cpp one. */
 function registryWithLlamaCpp(): { reg: Registry; llama: Engine } {
-  const store = ConfigStore.load(join(mkdtempSync(join(tmpdir(), 'tllm-laya-registry-')), 'config.json'))
+  const store = ConfigStore.load(join(tmpDir('tllm-laya-registry-'), 'config.json'))
   const llama: Engine = {
     id: 'llama', name: 'llama.cpp', binPath: '/x/llama-server', kind: 'llama-server', version: '',
     capabilities: { kvTypes: [], flags: [] }, addedAt: '',
@@ -90,7 +89,7 @@ test('activate refuses the Laya engine and leaves the active engine as it was', 
 // The Opus review of v1.14.1: two fallbacks made the first engine active without going through activate(), so the
 // Laya engine could become active by removing the engine before it.
 test('removing the active engine never makes the Laya engine active', () => {
-  const store = ConfigStore.load(join(mkdtempSync(join(tmpdir(), 'tllm-laya-registry-')), 'config.json'))
+  const store = ConfigStore.load(join(tmpDir('tllm-laya-registry-'), 'config.json'))
   const llama: Engine = {
     id: 'llama', name: 'llama.cpp', binPath: '/x/llama-server', kind: 'llama-server', version: '',
     capabilities: { kvTypes: [], flags: [] }, addedAt: '',
@@ -112,7 +111,7 @@ test('removing the active engine never makes the Laya engine active', () => {
 })
 
 test('a config whose active engine id is empty does not load with the Laya engine active', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-laya-config-'))
+  const dir = tmpDir('tllm-laya-config-')
   const path = join(dir, 'config.json')
   const store = ConfigStore.load(path)
   store.update((c) => {

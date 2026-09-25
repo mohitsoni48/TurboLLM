@@ -3,16 +3,13 @@
 // terminal-agent session's most recent gateway request, the same way lastRealStats already
 // does for a 'turbollm' chat session's last turn.
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
 import { ConversationStore } from './db'
+import { tmpDir } from '../test-support/tmp'
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-apiusage-session-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-apiusage-session-test-')
 }
 
 test('getLastApiUsageForSession: null for a session with no recorded usage yet', () => {

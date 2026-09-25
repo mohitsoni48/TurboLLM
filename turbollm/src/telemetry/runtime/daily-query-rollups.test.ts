@@ -1,14 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Emitter } from '../emit'
 import { readQueue } from '../queue'
 import { checkDailyQueryRollups } from './daily-query-rollups'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-daily-query-rollups-'))
+  return tmpDir('turbollm-daily-query-rollups-')
 }
 
 function makeEmitter(dir: string) {

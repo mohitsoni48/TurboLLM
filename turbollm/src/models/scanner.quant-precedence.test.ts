@@ -12,12 +12,12 @@
 // just carried MORE information, e.g. "Q4_K_XL" vs "Q4_K_M") or was this exact bug — zero cases
 // favored metadata (see ADR in decision-log for the full comparison).
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { defaultConfig, migrateModelKey, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
 const T_STRING = 8
@@ -66,8 +66,7 @@ function memStore(root: string, seed: Partial<Config> = {}): ConfigStore {
 }
 
 function makeRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-quant-test-'))
-  return root
+  return tmpDir('turbollm-quant-test-')
 }
 
 test('filename wins when it disagrees with a present general.file_type (the real bug)', async () => {

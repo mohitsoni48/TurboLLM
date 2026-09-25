@@ -5,13 +5,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
 import { enqueue, readQueue } from '../telemetry/queue'
 import { Emitter } from '../telemetry/emit'
+import { tmpDir } from '../test-support/tmp'
 
 type FakeConfig = {
   daemon: { lanBind: boolean; requireApiKey: boolean; port: number }
@@ -57,7 +56,7 @@ function validEvent(): Record<string, unknown> {
 test('GET /api/v1/telemetry/preview?level=off: discloses the one-time consent ping', async () => {
   // This endpoint exists so a user can check our claims against reality, so it
   // must not claim "nothing is sent" while the Off ping ships (ADR-299).
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'off', machineId: '' })
     const res = await app.request('/api/v1/telemetry/preview?level=off')
@@ -72,7 +71,7 @@ test('GET /api/v1/telemetry/preview?level=off: discloses the one-time consent pi
 })
 
 test('POST /api/v1/telemetry/regenerate-id: replaces the machine id', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const old = '11111111-1111-1111-1111-111111111111'
     const { app, cfg } = fakeApp(dir, { level: 'anon', machineId: old })
@@ -90,7 +89,7 @@ test('POST /api/v1/telemetry/regenerate-id: replaces the machine id', async () =
 })
 
 test('GET /api/v1/telemetry/preview?level=full: renders the categories spec 23 §6a found undisclosed (interaction tracking, connected-tool identity, resolved load config)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' })
     const res = await app.request('/api/v1/telemetry/preview?level=full')
@@ -110,7 +109,7 @@ test('GET /api/v1/telemetry/preview?level=full: renders the categories spec 23 �
 // ── POST /api/v1/telemetry/ui (spec 23 §3.8, Phase 6) ───────────────────────
 
 test('POST /api/v1/telemetry/ui: a valid screen/action reaches the queue as ui_action, and always 202s', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
     const res = await app.request('/api/v1/telemetry/ui', {
@@ -128,7 +127,7 @@ test('POST /api/v1/telemetry/ui: a valid screen/action reaches the queue as ui_a
 })
 
 test('POST /api/v1/telemetry/ui: an unrecognized screen/action is silently dropped, not thrown, and still 202s', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
     const res = await app.request('/api/v1/telemetry/ui', {
@@ -144,7 +143,7 @@ test('POST /api/v1/telemetry/ui: an unrecognized screen/action is silently dropp
 })
 
 test('POST /api/v1/telemetry/ui: anon consent must not send a click — ui_action/ui_daily are full-only', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'anon', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
     await app.request('/api/v1/telemetry/ui', {
@@ -159,7 +158,7 @@ test('POST /api/v1/telemetry/ui: anon consent must not send a click — ui_actio
 })
 
 test('POST /api/v1/telemetry/ui: a missing screen or action is a no-op, not a 500', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
     const res = await app.request('/api/v1/telemetry/ui', {
@@ -175,7 +174,7 @@ test('POST /api/v1/telemetry/ui: a missing screen or action is a no-op, not a 50
 })
 
 test('POST /api/v1/telemetry/ui: no telemetry on Deps (real daemon shape before wiring) never 500s', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' })
     const res = await app.request('/api/v1/telemetry/ui', {
@@ -192,7 +191,7 @@ test('POST /api/v1/telemetry/ui: no telemetry on Deps (real daemon shape before 
 test('POST /api/v1/telemetry/regenerate-id: discards events queued under the old id', async () => {
   // Uploading them after a regenerate would link the old and new ids together,
   // which is exactly what regenerating is meant to prevent.
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+  const dir = tmpDir('turbollm-routes-')
   try {
     const { app } = fakeApp(dir, { level: 'anon', machineId: '11111111-1111-1111-1111-111111111111' })
     enqueue(dir, validEvent())
@@ -221,7 +220,7 @@ test('POST /api/v1/telemetry/ui: every Turbo Link fleet action is recorded, not 
     'cancel_remote_download', 'download_hf_quant_remote',
   ]
   for (const action of actions) {
-    const dir = mkdtempSync(join(tmpdir(), 'turbollm-routes-'))
+    const dir = tmpDir('turbollm-routes-')
     try {
       const { app } = fakeApp(dir, { level: 'full', machineId: '11111111-1111-1111-1111-111111111111' }, { withEmitter: true })
       const res = await app.request('/api/v1/telemetry/ui', {

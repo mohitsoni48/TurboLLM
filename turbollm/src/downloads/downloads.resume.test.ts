@@ -6,10 +6,10 @@
 // had no way back — the UI only offered Cancel.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { DownloadManager } from './downloads'
+import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {
@@ -19,7 +19,7 @@ function fakeStore(modelDir: string, stateDir: string) {
 }
 
 function newDirs() {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-dl-resume-'))
+  const root = tmpDir('tllm-dl-resume-')
   const modelDir = join(root, 'models')
   const stateDir = join(root, 'state')
   mkdirSync(modelDir, { recursive: true })

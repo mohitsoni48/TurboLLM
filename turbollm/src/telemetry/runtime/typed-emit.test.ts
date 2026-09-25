@@ -1,16 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Emitter } from '../emit'
 import { readQueue } from '../queue'
 import { errorEvent } from '../events/meta'
 import { appFirstRun } from '../events/lifecycle'
 import { emit, emitOnce, emitBenchResult } from './typed-emit'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-typed-emit-'))
+  return tmpDir('turbollm-typed-emit-')
 }
 
 function makeEmitter(dir: string, level: string) {

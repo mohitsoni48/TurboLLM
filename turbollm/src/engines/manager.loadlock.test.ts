@@ -4,13 +4,13 @@
 // shared by every Manager, held through readiness, so two engines can never spin up at
 // once. This test drives two Managers concurrently and asserts their loads serialise.
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore } from '../config/config'
 import { Manager, type StartOpts } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
+const FAKE_MODEL_PATH = join(tmpDir('tllm-fake-model-'), 'does-not-need-to-exist.gguf')
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 function fakeOpts(): StartOpts {
@@ -22,13 +22,13 @@ function fakeOpts(): StartOpts {
       version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
     },
     model: { key: 'm', name: 'Fake Model', quant: 'Q4', ctx: 4096, vision: false },
-    modelPath: join(tmpdir(), 'does-not-need-to-exist.gguf'),
+    modelPath: FAKE_MODEL_PATH,
     extraArgs: [],
   }
 }
 
 test('two concurrent loads on different Managers run one-at-a-time (global lock)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-lock-'))
+  const dir = tmpDir('tllm-lock-')
   const store = ConfigStore.load(join(dir, 'config.json'))
   const a = new Manager(store)
   const b = new Manager(store)

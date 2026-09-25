@@ -7,8 +7,7 @@
 // of test that passes while the feature is broken.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   agentCwd,
@@ -21,18 +20,12 @@ import {
   sanitizeBranchName,
   WORKTREES_SUBDIR,
 } from './worktree'
+import { copyBaseRepo } from '../test-support/git-repo'
+import { tmpDir } from '../test-support/tmp'
 
-/** A real git repo with one commit. Returned path is absolute. */
+/** A real git repo with one commit, in a folder of its own. Returned path is absolute. */
 async function makeRepo(): Promise<string> {
-  const root = join(mkdtempSync(join(tmpdir(), 'twt-')), 'repo')
-  mkdirSync(root, { recursive: true })
-  await runGit(root, ['init', '-q', '-b', 'main', '.'])
-  await runGit(root, ['config', 'user.email', 't@t.t'])
-  await runGit(root, ['config', 'user.name', 't'])
-  writeFileSync(join(root, 'README.md'), 'hello\n')
-  await runGit(root, ['add', '-A'])
-  await runGit(root, ['commit', '-qm', 'init'])
-  return root
+  return copyBaseRepo(join(tmpDir('twt-'), 'repo'))
 }
 
 // ── pure helpers ─────────────────────────────────────────────────────────────
@@ -58,7 +51,7 @@ test('sanitizeBranchName: produces something git will actually accept', () => {
 
 test('isGitRepo: true inside a repo, false outside one', async () => {
   const root = await makeRepo()
-  const plain = mkdtempSync(join(tmpdir(), 'twt-plain-'))
+  const plain = tmpDir('twt-plain-')
   try {
     assert.equal(await isGitRepo(root), true)
     assert.equal(await isGitRepo(plain), false)
@@ -202,7 +195,7 @@ test('createSessionWorktree: an unresolvable base falls back to HEAD instead of 
 })
 
 test('createSessionWorktree: a non-git folder is refused with an actionable message', async () => {
-  const plain = mkdtempSync(join(tmpdir(), 'twt-plain-'))
+  const plain = tmpDir('twt-plain-')
   try {
     const r = await createSessionWorktree({ repoRoot: plain, branch: 'feature' })
     assert.equal(r.ok, false)

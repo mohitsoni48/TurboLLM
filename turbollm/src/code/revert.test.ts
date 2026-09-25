@@ -3,16 +3,12 @@
 // fixtures so the format matches exactly what pi's real edit tool produces).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, writeFileSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { createPatch } from 'diff'
 import { revertFileEdits } from './revert'
 import type { Message, ToolCallRecord } from '../chat/db'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { tmpDir } from '../test-support/tmp'
 
 /** A minimal fake Message carrying the given edit tool calls — only the fields revertFileEdits
  *  actually reads (toolCalls) matter for these tests. */
@@ -28,7 +24,7 @@ function editPatch(relPath: string, before: string, after: string): string {
 }
 
 test('revertFileEdits: a single edit is reversed, the file returns to its pre-edit content', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   writeFileSync(join(repoRoot, 'a.txt'), 'line1\nnew\nline3\n')
   const patch = editPatch('a.txt', 'line1\nold\nline3\n', 'line1\nnew\nline3\n')
   const result = revertFileEdits([msgWithEdits([{ path: 'a.txt', patch }])], repoRoot)
@@ -38,7 +34,7 @@ test('revertFileEdits: a single edit is reversed, the file returns to its pre-ed
 })
 
 test('revertFileEdits: two edits to the SAME file are walked back most-recent-first, ending at the ORIGINAL content', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   const v0 = 'start\n'
   const v1 = 'start\nmiddle\n'
   const v2 = 'start\nmiddle\nend\n'
@@ -53,8 +49,8 @@ test('revertFileEdits: two edits to the SAME file are walked back most-recent-fi
 })
 
 test('revertFileEdits: a file outside repoRoot is refused, not reverted', () => {
-  const repoRoot = tmp('tllm-revert-')
-  const outside = tmp('tllm-revert-outside-')
+  const repoRoot = tmpDir('tllm-revert-')
+  const outside = tmpDir('tllm-revert-outside-')
   writeFileSync(join(outside, 'evil.txt'), 'new content\n')
   const patch = editPatch('evil.txt', 'old content\n', 'new content\n')
   // ../ escape attempt, or an absolute path elsewhere — both must fail containment.
@@ -66,7 +62,7 @@ test('revertFileEdits: a file outside repoRoot is refused, not reverted', () => 
 })
 
 test('revertFileEdits: a missing file is reported failed, not created', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   const patch = editPatch('gone.txt', 'old\n', 'new\n')
   const result = revertFileEdits([msgWithEdits([{ path: 'gone.txt', patch }])], repoRoot)
   assert.deepEqual(result.failed, ['gone.txt'])
@@ -74,7 +70,7 @@ test('revertFileEdits: a missing file is reported failed, not created', () => {
 })
 
 test('revertFileEdits: a patch that no longer applies cleanly (file drifted) fails WITHOUT partially writing', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   // The file on disk does NOT match what the patch expects as its "new" content — simulates
   // the file being hand-edited (or touched by something else) since the recorded turn.
   writeFileSync(join(repoRoot, 'c.txt'), 'completely different content\n')
@@ -87,7 +83,7 @@ test('revertFileEdits: a patch that no longer applies cleanly (file drifted) fai
 })
 
 test('revertFileEdits: a multi-edit chain where the EARLIER (chronologically) patch fails leaves the file untouched, not half-reverted', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   const v1 = 'start\nmiddle\n'
   const v2 = 'start\nmiddle\nend\n'
   writeFileSync(join(repoRoot, 'd.txt'), v2)
@@ -104,7 +100,7 @@ test('revertFileEdits: a multi-edit chain where the EARLIER (chronologically) pa
 })
 
 test('revertFileEdits: a write-tool call (no patch) is ignored, not treated as failed', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   writeFileSync(join(repoRoot, 'e.txt'), 'content\n')
   const msg = { toolCalls: [{ id: 'tc-1', name: 'write', args: { path: 'e.txt' } }] } as unknown as Message
   const result = revertFileEdits([msg], repoRoot)
@@ -113,7 +109,7 @@ test('revertFileEdits: a write-tool call (no patch) is ignored, not treated as f
 })
 
 test('revertFileEdits: multiple independent files each revert correctly', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   writeFileSync(join(repoRoot, 'f1.txt'), 'new1\n')
   writeFileSync(join(repoRoot, 'f2.txt'), 'new2\n')
   const patch1 = editPatch('f1.txt', 'old1\n', 'new1\n')
@@ -125,7 +121,7 @@ test('revertFileEdits: multiple independent files each revert correctly', () => 
 })
 
 test('revertFileEdits: a nested-directory relative path resolves correctly under repoRoot', () => {
-  const repoRoot = tmp('tllm-revert-')
+  const repoRoot = tmpDir('tllm-revert-')
   mkdirSync(join(repoRoot, 'src', 'lib'), { recursive: true })
   writeFileSync(join(repoRoot, 'src', 'lib', 'util.ts'), 'export const x = 2\n')
   const patch = editPatch('src/lib/util.ts', 'export const x = 1\n', 'export const x = 2\n')

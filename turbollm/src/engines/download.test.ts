@@ -3,9 +3,6 @@
 // used by turboquantAssetUrl to pick the right release asset per OS.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import {
   scoreAsset,
   pickReleaseAsset,
@@ -17,6 +14,7 @@ import {
   provisionBackend,
 } from './download'
 import type { ReleaseAsset } from './download'
+import { tmpDir } from '../test-support/tmp'
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -268,7 +266,7 @@ test('availableBackends: win32 rocm carries an assetPattern matching both the ol
 })
 
 test('provisionBackend: resolves the real asset name from the release when assetPatterns is set', { skip: process.platform !== 'win32' && 'Windows-only extraction path (PowerShell Expand-Archive)' }, async (t) => {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-dl-rocm-'))
+  const root = tmpDir('tllm-dl-rocm-')
   const realFetch = globalThis.fetch
   t.after(() => { globalThis.fetch = realFetch })
   const calls: string[] = []

@@ -5,13 +5,12 @@
 // migration is a no-op (spec 27 §9.1).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../db.js'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-migration-'))
+  return tmpDir('turbollm-migration-')
 }
 
 test('v45 adds tenant/owner/version/metadata to conversations and messages', () => {

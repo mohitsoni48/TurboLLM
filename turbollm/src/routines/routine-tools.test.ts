@@ -1,9 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import {
   execCreateRoutine, execListRoutines, execUpdateRoutine, execDeleteRoutine, execRunRoutineNow,
   CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL,
@@ -12,7 +9,7 @@ import {
 import { CODE_GATE_MESSAGE, JEV_ROUTINE_MODEL_MESSAGE } from './routine-routes'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-tools-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 function chatRoutine(store: ConversationStore, prompt = 'x') {

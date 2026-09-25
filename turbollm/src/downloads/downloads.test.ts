@@ -4,10 +4,10 @@
 // Temp directories only; fetch is frozen, so nothing is downloaded and no port is touched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { DownloadManager, DownloadError } from './downloads'
+import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {
@@ -24,7 +24,7 @@ function stubFetch(): () => void {
 }
 
 function newManager() {
-  const root = mkdtempSync(join(tmpdir(), 'tllm-dl-subdir-'))
+  const root = tmpDir('tllm-dl-subdir-')
   const modelDir = join(root, 'models')
   const stateDir = join(root, 'state')
   mkdirSync(modelDir, { recursive: true })

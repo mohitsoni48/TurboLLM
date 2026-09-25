@@ -1,9 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { CodeRunManager } from '../code/code-run-manager'
 import { runCodeRoutine, resumeCodeRoutine } from './code-runner'
 import type { Routine } from './schema'
@@ -13,7 +10,7 @@ import type { CodeSessionRunner } from '../code/code-run-manager'
 import { waitForToolApproval } from '../tools/approval-gate'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'code-runner-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 function codeRoutine(store: ConversationStore, overrides: Partial<Parameters<ConversationStore['createRoutine']>[0]> = {}): Routine {

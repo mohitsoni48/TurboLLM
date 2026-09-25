@@ -3,14 +3,14 @@
 // database is the failure mode this test exists to prevent.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ConversationStore } from '../db.js'
 import { buildChatStore } from './startup.js'
+import { tmpDir } from '../../test-support/tmp'
 
 test('with kind sqlite the router serves the local tenant and refuses others', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-startup-'))
+  const dir = tmpDir('turbollm-startup-')
   const conv = new ConversationStore(dir)
   try {
     const router = await buildChatStore({ kind: 'sqlite' }, conv.chatStore, dir)
@@ -23,7 +23,7 @@ test('with kind sqlite the router serves the local tenant and refuses others', a
 })
 
 test('a broken adapter aborts startup instead of silently degrading to sqlite', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-startup-bad-'))
+  const dir = tmpDir('turbollm-startup-bad-')
   const conv = new ConversationStore(dir)
   const bad = join(dir, 'broken.mjs')
   writeFileSync(bad, 'throw new Error("boom")\n')

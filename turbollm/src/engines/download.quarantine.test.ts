@@ -1,10 +1,10 @@
 import { describe, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
 import { execFileSync } from 'node:child_process'
 import { stripMacOsQuarantine } from './download'
+import { tmpDir } from '../test-support/tmp'
 
 function xattrList(path: string): string {
   try {
@@ -17,7 +17,7 @@ function xattrList(path: string): string {
 describe('stripMacOsQuarantine', () => {
   test('is a no-op and does not throw on non-darwin platforms', () => {
     if (process.platform === 'darwin') return
-    const tmp = mkdtempSync(join(tmpdir(), 'turbollm-quarantine-test-'))
+    const tmp = tmpDir('turbollm-quarantine-test-')
     try {
       assert.doesNotThrow(() => stripMacOsQuarantine(tmp))
     } finally {
@@ -28,7 +28,7 @@ describe('stripMacOsQuarantine', () => {
   test('removes com.apple.quarantine attribute from directory on macOS', {
     skip: process.platform !== 'darwin' ? 'macOS only' : false,
   }, () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'turbollm-quarantine-test-'))
+    const tmp = tmpDir('turbollm-quarantine-test-')
     try {
       execFileSync('xattr', ['-w', 'com.apple.quarantine', '0083;00000000;test;00000000-0000-0000-0000-000000000000', tmp])
       assert.ok(xattrList(tmp).includes('com.apple.quarantine'), 'precondition: quarantine attribute was not set')
@@ -44,7 +44,7 @@ describe('stripMacOsQuarantine', () => {
   test('does not throw when quarantine attribute is absent on macOS', {
     skip: process.platform !== 'darwin' ? 'macOS only' : false,
   }, () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'turbollm-quarantine-test-'))
+    const tmp = tmpDir('turbollm-quarantine-test-')
     try {
       assert.doesNotThrow(() => stripMacOsQuarantine(tmp))
     } finally {
@@ -55,7 +55,7 @@ describe('stripMacOsQuarantine', () => {
   test('strips quarantine recursively from files inside the directory on macOS', {
     skip: process.platform !== 'darwin' ? 'macOS only' : false,
   }, () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'turbollm-quarantine-test-'))
+    const tmp = tmpDir('turbollm-quarantine-test-')
     const nested = join(tmp, 'bin')
     const nestedFile = join(nested, 'llama-server')
     try {

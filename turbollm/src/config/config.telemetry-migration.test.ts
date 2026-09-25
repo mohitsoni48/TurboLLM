@@ -12,13 +12,13 @@
 // `"telemetry": { "level": "off", "machineId": "" }`.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ConfigStore, SCHEMA_VERSION, defaultConfig } from './config'
+import { tmpDir } from '../test-support/tmp'
 
 function tmpConfigPath(): string {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-cfg-telemetry-'))
+  const dir = tmpDir('tllm-cfg-telemetry-')
   return join(dir, 'config.json')
 }
 

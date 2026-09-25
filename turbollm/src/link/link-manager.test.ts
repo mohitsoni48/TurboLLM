@@ -1,13 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { LinkManager } from './link-manager'
 import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 import type { LinkRecord } from './types'
+import { tmpDir } from '../test-support/tmp'
 
 function mkDeps(links: LinkRecord[], telemetry?: Emitter): { d: Deps; cfg: { links: LinkRecord[] } } {
   const cfg = { links, daemon: {}, apiKeys: [] }
@@ -20,7 +19,7 @@ function mkDeps(links: LinkRecord[], telemetry?: Emitter): { d: Deps; cfg: { lin
 
 /** Real `Emitter` over a temp data dir, at `anon` consent. */
 function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-link-manager-telemetry-'))
+  const dir = tmpDir('turbollm-link-manager-telemetry-')
   const cfg = { telemetry: { level: 'anon', machineId: '44444444-4444-4444-4444-444444444444' } }
   const telemetry = new Emitter({
     dataDir: dir,

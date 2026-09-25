@@ -1,12 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { recordSent, readSentLog, MAX_LOGGED, MAX_LOGGED_UI } from './log'
+import { tmpDir } from '../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-log-'))
+  return tmpDir('turbollm-log-')
 }
 
 function evt(name = 'app_first_run'): Record<string, unknown> {

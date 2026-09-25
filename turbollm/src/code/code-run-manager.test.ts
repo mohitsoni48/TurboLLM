@@ -9,12 +9,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { CodeRunManager, RingBuffer, subscribeToBuffer, type BufferedEvent, type CodeSessionRunner } from './code-run-manager'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 // ── RingBuffer ──────────────────────────────────────────────────────────────────────
 
@@ -227,8 +225,8 @@ test('subscribeToBuffer: two independent subscribers both see the same live even
 // the way code-run-manager.reconnect.test.ts drives it (real store, no model, no port).
 
 function codeRunHarness() {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-code-active-'))
-  const store = new ConversationStore(dir)
+  const dir = tmpDir('tllm-code-active-')
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db: store,
     manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }) },

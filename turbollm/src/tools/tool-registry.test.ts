@@ -3,15 +3,12 @@
 // identical state against a REAL ConversationStore.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { ToolRegistry } from './tool-registry'
 import type { RoutineToolsStore, RunRoutineNowFn } from '../routines/routine-tools'
 import { CODE_GATE_MESSAGE, ROUTINES_DISABLED_MESSAGE, JEV_ROUTINE_MODEL_MESSAGE } from '../routines/routine-routes'
 import type { Routine } from '../routines/schema'
 import type { ToolsConfig, CustomChatAgent } from '../config/config'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import type { AgentToolsStore } from '../chat/chat-agent-tools'
 import type { ModelToolsStore } from '../models/model-tools'
 
@@ -157,7 +154,7 @@ test('executeTool: create_routine with flavor "code" is REFUSED when isCodeAutho
 })
 
 test('executeTool: create_routine with flavor "code" is ALLOWED when the caller passes isCodeAuthorized true', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-codegate-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db)
   const out = await reg.executeTool({
     id: 't1', name: 'create_routine',
@@ -231,7 +228,7 @@ test('executeTool: run_routine_now on a CHAT-flavor routine is unaffected by isC
 })
 
 test('executeTool: isCodeAuthorized never affects a CHAT-flavor routine', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-chatflavor-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db)
   const out = await reg.executeTool({
     id: 't1', name: 'create_routine',
@@ -247,7 +244,7 @@ test('executeTool: isCodeAuthorized never affects a CHAT-flavor routine', async 
 
 test('executeTool: create_routine against a REAL ConversationStore lands pending_confirmation, ' +
   'visible the same way regardless of which surface (chat or Code) made the call', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-routine-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db)
   const out = await reg.executeTool({
     id: 't1',
@@ -309,7 +306,7 @@ test('executeTool: list_agents/create_agent route to the injected agent store, u
 })
 
 test('executeTool: create_routine can consume the agentId create_agent just returned, in one flow', async () => {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'tool-registry-agentflow-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const reg = new ToolRegistry(EMPTY_TOOLS_CFG, db, undefined, fakeAgentStore())
 
   const created = await reg.executeTool({ id: 't1', name: 'create_agent', args: { name: 'Job Search Assistant', tools: ['web_search'] } })

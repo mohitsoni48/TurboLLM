@@ -1,15 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ConfigStore } from './config'
+import { tmpDir } from '../test-support/tmp'
 
 /** Write `raw` as a config.json in a fresh temp dir and load it the way the daemon
  *  does. Mirrors the existing config.test.ts pattern — migrate() + normalize() run for
  *  real, so this tests the actual upgrade path a user's file takes, not a helper. */
 function loadRaw(raw: unknown) {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-link-cfg-'))
+  const dir = tmpDir('tllm-link-cfg-')
   const path = join(dir, 'config.json')
   writeFileSync(path, JSON.stringify(raw), 'utf8')
   const store = ConfigStore.load(path)

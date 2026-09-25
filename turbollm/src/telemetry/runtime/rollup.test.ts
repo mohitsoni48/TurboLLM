@@ -1,12 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { DailyRollup } from './rollup'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-rollup-'))
+  return tmpDir('turbollm-rollup-')
 }
 
 type ChatCounters = { conversations: number; messages: number }

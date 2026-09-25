@@ -1,13 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { RoutineScheduler } from './scheduler'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-sched-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 /** M1: the invariant that actually matters for the double-fire fix — not fire-counts or
