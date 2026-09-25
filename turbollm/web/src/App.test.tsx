@@ -92,3 +92,17 @@ describe('WorkspaceModeGate', () => {
     expect(landOn('/models')).toBe('/models null')
   })
 })
+
+describe('WorkspaceModeGate with a Laya model loaded', () => {
+  const LAYA = { key: 'laya|laya|1455', name: 'laya', checkpoints: ['english'], state: 'running' } as NonNullable<Status['laya']>
+
+  it('keeps the playground open', () => {
+    state.status = { jev: null, laya: LAYA } as Status
+    expect(landOn('/workspace/jev')).toBe('/workspace/jev null')
+  })
+
+  it('leaves chat, code and routines alone: a Laya model runs beside the chat model', () => {
+    state.status = { jev: null, laya: LAYA } as Status
+    expect(landOn('/workspace/chat/abc')).toBe('/workspace/chat/abc null')
+  })
+})

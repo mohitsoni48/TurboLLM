@@ -772,3 +772,29 @@ describe('JevPlaygroundScreen remembering the draft', () => {
     expect(written.stateText).toBe(exampleNamed('routing').stateText)
   })
 })
+
+describe('JevPlaygroundScreen with a Laya model', () => {
+  const LAYA_KEY = 'laya|laya|1455'
+
+  beforeEach(() => {
+    state.status = {
+      engine: { id: 'llama', name: 'llama.cpp', kind: 'llama-server', state: 'running' },
+      jev: null,
+      laya: { key: LAYA_KEY, name: 'laya', checkpoints: ['english', 'multilingual'], state: 'running' },
+    } as unknown as Status
+    state.models = [{ key: LAYA_KEY, name: 'laya', laya: { checkpoints: ['english', 'multilingual'] }, loaded: true } as ModelEntry]
+  })
+
+  it('runs against the loaded Laya model and names the Laya engine, not the active chat engine', async () => {
+    renderScreen()
+    expect(screen.getByText('laya · Laya · running')).toBeInTheDocument()
+    await userEvent.click(runButton())
+    expect(h.systemone).toHaveBeenCalledWith(expect.objectContaining({ model: LAYA_KEY }))
+  })
+
+  it('says the answers are Laya\'s own probabilities', () => {
+    renderScreen()
+    expect(screen.queryByText(/NLI entailment scores/)).toBeNull()
+    expect(screen.getByText(/Laya's own probabilities/)).toBeInTheDocument()
+  })
+})

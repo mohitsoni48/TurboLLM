@@ -61,7 +61,7 @@ export function engineGroupKey(e: Engine): string {
     const backend = parseLlamaBuild(e.binPath)?.backend
     return backend ? `official-llama-${backend}` : 'official-llama'
   }
-  if (e.kind === 'koboldcpp' || e.kind === 'mlx' || e.kind === 'rapid-mlx' || e.kind === 'mlx-vlm' || e.kind === 'vllm') return e.kind
+  if (e.kind === 'koboldcpp' || e.kind === 'mlx' || e.kind === 'rapid-mlx' || e.kind === 'mlx-vlm' || e.kind === 'vllm' || e.kind === 'laya') return e.kind
   // A TurboQuant build built via "Add via git repo" (ADR-186) lands at
   // engines/build/atomic-llama-cpp-turboquant/…, not the auto-download layout the binPath
   // regex below matches — check sourceRepo first so both install paths collapse into one
@@ -79,6 +79,7 @@ const GROUP_LABEL: Record<string, string> = {
   'mlx-vlm': 'MLX-VLM',
   vllm: 'vLLM',
   turboquant: 'TurboQuant',
+  laya: 'Laya',
 }
 
 /** Display label for a logical-engine group. Per-backend llama.cpp groups read as

@@ -46,6 +46,7 @@ function model(over: Partial<ModelEntry> & { key: string; name: string }): Model
 
 const CHAT = model({ key: 'gemma-27b', name: 'Gemma 27B' })
 const OTHER_JEV = model({ key: 'jev-other', name: 'Other NLI', jev: { ...JEV_INFO, labels: [...JEV_INFO.labels] } })
+const LAYA = model({ key: 'laya', name: 'Laya', laya: { checkpoints: ['english', 'multilingual'] } })
 
 function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT) {
   const onPick = vi.fn()
@@ -71,6 +72,20 @@ describe('SwitchModelMenu', () => {
     renderMenu([CHAT])
     expect(screen.getByText('Chat models')).toBeTruthy()
     expect(screen.queryByText('Jev models')).toBeNull()
+  })
+
+  // POST /v1/systemone now answers with either a Jev or a Laya model (ADR-439 follow-up), so
+  // the picker offers Laya models too, grouped separately from Jev's own vLLM-served ones.
+  it('also groups Laya models, separately from Jev', () => {
+    renderMenu([CHAT, OTHER_JEV, LAYA])
+    expect(screen.getByText('Jev models')).toBeTruthy()
+    expect(screen.getByText('Laya models')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Laya' })).toBeTruthy()
+  })
+
+  it('leaves out the Laya group when there is nothing in it', () => {
+    renderMenu([CHAT, OTHER_JEV])
+    expect(screen.queryByText('Laya models')).toBeNull()
   })
 
   it('offers only models that could actually load right now', () => {
@@ -151,6 +166,35 @@ describe('switchToModel', () => {
     const d = deps()
     await switchToModel({ ...CURRENT, slot: null }, CHAT, d)
     expect(d.stopEngine).toHaveBeenCalledWith(CURRENT.key)
+    expect(d.order).toEqual(['stop', 'load'])
+  })
+
+  // The v1.14.1 Opus review: a Laya load never replaces the primary, so a Jev model left loaded there keeps the
+  // playground on the Jev model and the Laya "ready" toast (which reads status.jev first) never fires.
+  it('ejects a Jev model in the primary slot before loading a Laya model, which never replaces the primary', async () => {
+    const d = deps()
+    await switchToModel(CURRENT, LAYA, d)
+    expect(d.stopEngine).toHaveBeenCalledWith(CURRENT.key)
+    expect(d.order).toEqual(['stop', 'load'])
+    expect(d.requestLoad).toHaveBeenCalledWith(LAYA)
+  })
+
+  // A Laya model runs beside chat, so leaving it loaded would keep the playground open: the pick would load in the
+  // background and the screen would not move. Switching model in the playground replaces the playground's model.
+  it('ejects a loaded Laya model when a chat model is picked, so the pick takes the Workspace back to chat', async () => {
+    const d = deps()
+    const layaCurrent = { key: 'laya', name: 'Laya', labels: [], checkpoints: ['english'], state: 'running' as const, slot: 'pool' as const }
+    await switchToModel(layaCurrent, CHAT, d)
+    expect(d.stopEngine).toHaveBeenCalledWith('laya')
+    expect(d.order).toEqual(['stop', 'load'])
+    expect(d.requestLoad).toHaveBeenCalledWith(CHAT)
+  })
+
+  it('ejects a loaded Laya model before loading another Laya model', async () => {
+    const d = deps()
+    const layaCurrent = { key: 'laya-old', name: 'Laya old', labels: [], checkpoints: ['english'], state: 'running' as const, slot: 'pool' as const }
+    await switchToModel(layaCurrent, LAYA, d)
+    expect(d.stopEngine).toHaveBeenCalledWith('laya-old')
     expect(d.order).toEqual(['stop', 'load'])
   })
 

@@ -34,13 +34,22 @@ export function isWorkspaceWorkPath(pathname: string): boolean {
 export function workspaceRedirect(
   pathname: string,
   presence: JevPresence,
+  layaIsLoaded = false,
 ): { to: string; notice: boolean } | null {
   if (presence === 'unknown') return null
   if (presence === 'loaded' && isWorkspaceWorkPath(pathname)) return { to: JEV_PATH, notice: true }
-  if (presence === 'none' && isAtOrUnder(pathname, JEV_PATH)) return { to: CHAT_PATH, notice: false }
+  // A loaded Laya model keeps the playground open (ADR-443) but, unlike Jev, never takes the Workspace over.
+  if (presence === 'none' && !layaIsLoaded && isAtOrUnder(pathname, JEV_PATH)) return { to: CHAT_PATH, notice: false }
   return null
 }
 
 function isAtOrUnder(pathname: string, section: string): boolean {
   return pathname === section || pathname.startsWith(`${section}/`)
+}
+
+/** Whether a Laya model is loaded (ADR-443). Status is the authority; the models list is the fallback for a
+ *  client that cannot read it. */
+export function layaLoaded(status: Status | undefined, models: ModelEntry[] | undefined): boolean {
+  if (status && 'laya' in status) return !!status.laya
+  return models?.some((m) => m.laya && m.loaded) ?? false
 }

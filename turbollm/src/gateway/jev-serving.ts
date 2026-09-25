@@ -118,9 +118,19 @@ export interface ResolvedJevModel {
 /** Exactly the model the request names — a Turbo Link id is refused (ADR-427's embeddings stance)
  *  and nothing ever falls back to another local model. */
 export function resolveJevModel(d: Deps, requested: string): ResolvedJevModel {
+  return jevModelFrom(resolveLocalModel(d, requested))
+}
+
+/** The local model `requested` names, whatever kind it is; a Turbo Link id and an unknown name are refused. */
+export function resolveLocalModel(d: Deps, requested: string): ModelEntry {
   if (d.modelRouter.resolveRemoteTarget(requested)) throw new JevEndpointError(LINK_JEV_UNSUPPORTED)
   const entry = d.modelRouter.resolveLocal(requested)
   if (!entry) throw new JevEndpointError(modelNotFound(requested))
+  return entry
+}
+
+/** `entry` as a Jev model with its NLI template, or the refusal that says why it is not one. */
+export function jevModelFrom(entry: ModelEntry): ResolvedJevModel {
   if (!isJevModel(entry)) throw new JevEndpointError(notAJevModel(entry.name))
   const nliTemplate = throwIfRefused(nliTemplateFor(entry))
   return { entry, nliTemplate }

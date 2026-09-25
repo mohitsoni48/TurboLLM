@@ -381,6 +381,31 @@ const ALL: CatalogEngine[] = [
     ],
   },
   {
+    id: 'laya',
+    name: 'Laya',
+    kind: 'laya',
+    description:
+      'Runs Laya System One decision models (convaiinnovations/laya): typed yes/no, choice and score answers with calibrated probabilities, over POST /v1/systemone. CPU, NVIDIA or Apple GPU.',
+    provision: 'pip',
+    homepage: 'https://github.com/NandhaKishorM/laya',
+    repo: 'NandhaKishorM/laya',
+    platforms: ['win32', 'darwin', 'linux'],
+    support: 'experimental',
+    installEndpoint: '/api/v1/engines/laya',
+    note: 'Serves only Laya models, beside your chat model — it is never the active engine. Installs a Python environment with PyTorch (several GB with GPU support).',
+    variants: [
+      {
+        id: 'laya',
+        label: 'PyTorch (CPU, NVIDIA or Apple GPU)',
+        repo: 'NandhaKishorM/laya',
+        requires: { platform: ['win32', 'darwin', 'linux'] },
+        stability: 'experimental',
+        speed: 'fast',
+        hasPrebuilt: true,
+      },
+    ],
+  },
+  {
     id: 'sglang',
     name: 'SGLang',
     kind: 'sglang',

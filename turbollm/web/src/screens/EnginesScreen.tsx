@@ -24,6 +24,7 @@ import {
   Pencil,
   RefreshCw,
   Rocket,
+  Scale,
   Server,
   Wrench,
   Zap,
@@ -142,6 +143,7 @@ function buildContextFor(e: Engine, backends: EngineBackends | undefined): strin
   if (e.kind === 'vllm') return 'vLLM'
   if (e.kind === 'koboldcpp') return 'KoboldCpp'
   if (e.kind === 'llamafile') return 'llamafile'
+  if (e.kind === 'laya') return 'Laya'
   if (isOfficialLlama(e.binPath)) {
     const active = backends?.backends.find((b) => b.active)
     return active ? `llama.cpp · ${active.label}` : 'llama.cpp'
@@ -295,6 +297,17 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'One-line install, no compiling',
     ],
     cons: ['macOS Apple Silicon only', 'Some architectures need extra deps (torch)', 'Experimental; single-maintainer project'],
+  },
+  laya: {
+    icon: Scale,
+    tagline: 'System One decision models',
+    format: 'safetensors',
+    pros: [
+      'Runs on Windows, macOS and Linux — CPU or GPU',
+      'Purpose-built for Laya decision models',
+      'Ships its own POST /v1/systemone server',
+    ],
+    cons: ['Only loads Laya-family models', 'Never the "active" engine — a Laya model always runs on it directly'],
   },
   nexa: {
     icon: Cpu,
@@ -621,7 +634,10 @@ function EngineHeaderBar({
     .filter(Boolean)
     .join(' · ')
 
-  const installed = list?.engines ?? []
+  // A Laya model always loads on its own 'laya' engine, whichever engine is "active" — so
+  // unlike every other engine kind, it must never be offered as a pickable row in this
+  // selector (there is nothing to "switch to": picking it here would do nothing useful).
+  const installed = (list?.engines ?? []).filter((e) => e.kind !== 'laya')
   // Group into LOGICAL engines (ADR-091): one row per engine, per-build variants collapsed.
   const groups = useMemo(() => groupEngines(installed), [installed])
   const activeGroup = activeEngine
@@ -832,11 +848,13 @@ function EngineGallery({
     install.turboquant.isPending ||
     install.koboldcpp.isPending ||
     install.llamafile.isPending ||
+    install.laya.isPending ||
     install.updateVllm.isPending ||
     install.updateSglang.isPending ||
     install.updateMlx.isPending ||
     install.updateRapidMlx.isPending ||
     install.updateMlxVlm.isPending ||
+    install.updateLaya.isPending ||
     install.updateTurboquant.isPending ||
     install.updateKoboldcpp.isPending ||
     install.updateLlamafile.isPending ||
@@ -854,6 +872,7 @@ function EngineGallery({
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.turboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.koboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.llamafile
+    if (e.installEndpoint === '/api/v1/engines/laya') return install.laya
     return null
   }
   const updateFor = (e: CatalogEngine) => {
@@ -865,6 +884,7 @@ function EngineGallery({
     if (e.installEndpoint === '/api/v1/engines/turboquant') return install.updateTurboquant
     if (e.installEndpoint === '/api/v1/engines/koboldcpp') return install.updateKoboldcpp
     if (e.installEndpoint === '/api/v1/engines/llamafile') return install.updateLlamafile
+    if (e.installEndpoint === '/api/v1/engines/laya') return install.updateLaya
     return null
   }
   const registryEngineId = (e: CatalogEngine): string | undefined => {

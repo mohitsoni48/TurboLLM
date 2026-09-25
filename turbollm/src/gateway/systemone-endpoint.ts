@@ -1,5 +1,5 @@
 // POST /v1/systemone (ADR-439, ADR-436 (3)): a whole set of questions about one state, answered by one batched
-// Jev engine call. Dispatched from the single `/v1/*` handler like the other Jev endpoints (ADR-421), and built
+// Jev engine call — or, for a Laya model, by the Laya engine's own /v1/systemone (./laya-systemone). Dispatched from the single `/v1/*` handler like the other Jev endpoints (ADR-421), and built
 // only from ./jev-serving so it never imports a sibling endpoint. User strings are validated, never trimmed,
 // except that the jev-latest alias match ignores case and surrounding whitespace.
 import type { Context } from 'hono'
@@ -9,6 +9,7 @@ import { buildNliInput, JEV_DEFAULT_MAX_MODEL_LEN, mapProbs } from '../models/je
 import { answersFrom, planSystemOne, type Answer, type SystemOneInput, type SystemOnePlan } from '../models/systemone'
 import { parseSystemOneBody, type RequestProblem } from '../models/systemone-request'
 import { clientAbort } from './gateway'
+import { answerWithLaya, type LayaSystemOneResponse } from './laya-systemone'
 import {
   callEngineClassify,
   jevErrorResponse,
@@ -19,7 +20,8 @@ import {
   NO_JEV_MODEL_FOR_LATEST,
   refusalFor,
   resolveJevLatest,
-  resolveJevModel,
+  jevModelFrom,
+  resolveLocalModel,
   routeToJevModel,
   type EngineClassifyRow,
   type JevHttpError,
@@ -69,8 +71,14 @@ async function answerSystemOne(
   d: Deps,
   input: SystemOneInput,
   fetchImpl: typeof fetch,
-): Promise<SystemOneResponse> {
-  const { entry, nliTemplate } = resolveJevModel(d, requestedModelName(d, input.model))
+): Promise<SystemOneResponse | LayaSystemOneResponse> {
+  const named = resolveLocalModel(d, requestedModelName(d, input.model))
+  if (named.laya) {
+    noteLocalActivity()
+    const target = await routeToJevModel(d, named)
+    return answerWithLaya(named, input, target, clientAbort(c).signal, fetchImpl)
+  }
+  const { entry, nliTemplate } = jevModelFrom(named)
   const plan = planSystemOne(input)
   requireWithinBudget(plan)
   noteLocalActivity()

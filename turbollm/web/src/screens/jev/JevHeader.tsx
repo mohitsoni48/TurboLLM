@@ -33,9 +33,15 @@ export function JevHeader({
           <ArrowLeftRight size={14} /> Switch model
         </Button>
       </div>
-      <p className="text-[12px] text-muted">Labels read from the model: {jev.labels.join(', ')}</p>
+      <p className="text-[12px] text-muted">{modelLine(jev)}</p>
     </div>
   )
+}
+
+/** A Jev model's own labels; a Laya model has none (its questions carry them), so its checkpoints instead. */
+function modelLine(jev: LoadedJev): string {
+  if (jev.checkpoints) return `Checkpoints: ${jev.checkpoints.join(', ')}`
+  return `Labels read from the model: ${jev.labels.join(', ')}`
 }
 
 /** "starting" is engine-speak; a user watching a model come up reads "Loading…". */

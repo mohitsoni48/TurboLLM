@@ -9,6 +9,7 @@ import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
 import { modelIncompatibility } from '../engines/compat'
+import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
@@ -30,6 +31,16 @@ interface PoolSlot {
   lastUsedMs: number
 }
 
+const UNLOADED_WHILE_LOADING = 'The model was unloaded while it was loading.'
+
+/** A Laya load that has begun and not yet settled (ADR-443). `cancelled` is set by an eject while it loads. */
+interface LayaLoad {
+  manager: Manager
+  modelKey: string
+  startedMs: number
+  cancelled: boolean
+}
+
 /** One loaded (or loading / unloading) model across the pool, as `aliveSlots()` reports it. */
 export interface AliveSlot {
   modelKey: string
@@ -44,6 +55,9 @@ export interface AliveSlot {
 export class ModelRouter {
   /** Extra pool slots beyond the primary manager. Only populated when keepN > 1. */
   private extraSlots = new Map<string, PoolSlot>()
+  /** Laya loads in flight, by model key. Separate from extraSlots on purpose: a slot is registered only once its
+   *  load has succeeded, so a request can never be routed to a manager that is still loading. */
+  private layaLoads = new Map<string, LayaLoad>()
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -60,6 +74,8 @@ export class ModelRouter {
      *  construction site keeps compiling unchanged; when absent, `route()` behaves
      *  exactly as it did before — there are no links, so nothing can be remote. */
     private catalog?: RemoteCatalog,
+    /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
+    private newSlotManager: () => Manager = () => new Manager(store),
   ) {}
 
   /** Route a request to the correct model target URL.
@@ -147,6 +163,9 @@ export class ModelRouter {
       const state = slot.manager.status().state
       if (this.isOccupied(state)) slots.push({ modelKey: slot.modelKey, state, primary: false, lastUsedMs: slot.lastUsedMs })
     }
+    for (const load of this.layaLoads.values()) {
+      slots.push({ modelKey: load.modelKey, state: load.cancelled ? 'stopping' : 'starting', primary: false, lastUsedMs: load.startedMs })
+    }
     return slots
   }
 
@@ -208,6 +227,15 @@ export class ModelRouter {
    *  ejecting a specific model (e.g. an embedding model loaded alongside a chat model) stops
    *  THAT engine only, not whatever happens to be in the primary slot. */
   stopExplicit(modelKey: string): boolean {
+    // A Laya load still in flight comes first: its engine may not have spawned yet, so stopping the manager is not
+    // enough on its own — the load is marked cancelled, and doLoad stops whatever it then brings up. The entry stays,
+    // reported as 'stopping', until doLoad settles it, so nothing else touches an engine that is still going away.
+    const loading = this.layaLoads.get(modelKey)
+    if (loading) {
+      loading.cancelled = true
+      loading.manager.stop()
+      return true
+    }
     const slot = this.extraSlots.get(modelKey)
     if (!slot) return false
     slot.manager.stop()
@@ -244,6 +272,7 @@ export class ModelRouter {
     for (const slot of this.extraSlots.values()) {
       if (isAlive(slot.manager.status().state)) add(slot.modelKey)
     }
+    for (const load of this.layaLoads.values()) add(load.modelKey)
     return keys
   }
 
@@ -298,33 +327,72 @@ export class ModelRouter {
       return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
 
-    const active = this.registry.active()
-    if (!active) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    const inc = modelIncompatibility(active.kind, entry)
+    const engine = engineForModel(this.registry, entry)
+    if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
+    const inc = modelIncompatibility(engine.kind, entry)
     if (inc) return { status: 503, message: inc.message }
 
-    const opts = this.buildOpts(entry, active, overrides)
+    const opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
 
     const keepN = Math.max(1, this.store.snapshot().gateway.keepN)
-    // Embedding models don't consume a chat slot — they get their own implicit slot
-    // so a loaded chat model is never evicted just because an embed model is requested.
-    const needsNewSlot = entry.embedding || this.chatSlotCount() < keepN
-    const targetManager = needsNewSlot
-      ? (this.manager.status().state === 'stopped' || this.manager.status().state === 'error'
-          ? this.manager
-          : new Manager(this.store))
-      : this.evictChatLru()
+    // Side models (embedding, Laya) don't consume a chat slot — they get their own implicit slot
+    // so a loaded chat model is never evicted just because a side model is requested.
+    const needsNewSlot = isSideModel(entry) || this.chatSlotCount() < keepN
+    // A Laya model never takes the primary, even an empty one: the chat screen shows and talks to whatever the
+    // primary holds, and a Laya engine answers only /v1/systemone.
+    const targetManager = entry.laya
+      ? this.newSlotManager()
+      : needsNewSlot
+        ? (this.manager.status().state === 'stopped' || this.manager.status().state === 'error'
+            ? this.manager
+            : this.newSlotManager())
+        : this.evictChatLru()
 
+    // A Laya load takes 10-20 s, and /status must say it is loading for all of it: it is tracked while it is in
+    // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
+    // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
+    const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
+    try {
+      return await this.loadInto(entry, engine, opts, targetManager, inFlight)
+    } finally {
+      if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
+    }
+  }
+
+  /** The load itself, and what follows it. A Laya load (`inFlight`) stays tracked until this returns, so a cancelled
+   *  load is still reported (as 'stopping') while its engine is being stopped. */
+  private async loadInto(
+    entry: ModelEntry,
+    engine: Engine,
+    opts: StartOpts,
+    targetManager: Manager,
+    inFlight: LayaLoad | undefined,
+  ): Promise<RouteResult> {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
     try {
       await targetManager.load(opts, {
-        beforeStart: () => this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve(),
+        beforeStart: async () => {
+          // Ejected while it waited for the gate: never spawn an engine for it.
+          if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
+          await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+        },
       })
     } catch (e) {
+      if (inFlight?.cancelled) {
+        await this.stopCancelled(targetManager)
+        return { status: 503, message: UNLOADED_WHILE_LOADING }
+      }
       return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
+    }
+
+    // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, and waited for,
+    // so nothing is left running that the router no longer tracks and a load queued behind this one never overlaps it.
+    if (inFlight?.cancelled) {
+      await this.stopCancelled(targetManager)
+      return { status: 503, message: UNLOADED_WHILE_LOADING }
     }
 
     const s = targetManager.status()
@@ -341,7 +409,9 @@ export class ModelRouter {
       this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
-    this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: active.id } })
+    // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
+    // refuses it, so recording it would leave the machine with no model at all after a restart.
+    if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
     return { target }
   }
 
@@ -361,16 +431,41 @@ export class ModelRouter {
     return state === 'running' || state === 'starting' || state === 'stopping'
   }
 
-  /** Count of occupied chat (non-embedding) slots. Embedding models don't consume
-   *  a keepN slot so chat models and embedding models can coexist independently. */
+  /** Note a Laya load as in flight. It shows as a 'starting' slot and counts as loaded (aliveSlots,
+   *  loadedModelKeys), and stopExplicit can cancel it, until doLoad settles it. */
+  private trackLayaLoad(modelKey: string, manager: Manager): LayaLoad {
+    // Whatever slot the router still holds for this key is dead or going away: doLoad found no running one under the
+    // swap lock. Dropping it means the model is reported once, and an eject reaches the load and not a stale entry.
+    this.extraSlots.delete(modelKey)
+    const load: LayaLoad = { manager, modelKey, startedMs: Date.now(), cancelled: false }
+    this.layaLoads.set(modelKey, load)
+    return load
+  }
+
+  /** Stop the engine of a cancelled load and wait until it is gone. Best effort: the load is over either way. */
+  private async stopCancelled(manager: Manager): Promise<void> {
+    try {
+      await manager.stopAndWait()
+    } catch {
+      /* the engine may already be gone */
+    }
+  }
+
+  private isSideModelKey(modelKey: string): boolean {
+    const entry = this.scanner.get(modelKey)
+    return entry !== undefined && isSideModel(entry)
+  }
+
+  /** Count of occupied chat (non-side-model) slots. Side models (embedding, Laya) don't consume
+   *  a keepN slot so chat models and side models can coexist independently. */
   private chatSlotCount(): number {
     const ms = this.manager.status()
     const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
-      (this.scanner.get(ms.model.key)?.embedding ?? false)
+      this.isSideModelKey(ms.model.key)
     const extraChat = [...this.extraSlots.values()].filter(
       s => this.isOccupied(s.manager.status().state) &&
-        !(this.scanner.get(s.modelKey)?.embedding ?? false),
+        !this.isSideModelKey(s.modelKey),
     ).length
     return (primaryAlive && !primaryEmbed ? 1 : 0) + extraChat
   }
@@ -382,14 +477,14 @@ export class ModelRouter {
     const ms = this.manager.status()
     const primaryAlive = this.isOccupied(ms.state)
     const primaryEmbed = primaryAlive && !!ms.model &&
-      (this.scanner.get(ms.model.key)?.embedding ?? false)
+      this.isSideModelKey(ms.model.key)
 
     let lruManager: Manager = this.manager
     let lruTime = (primaryAlive && !primaryEmbed) ? this.primaryLastUsed : Infinity
     let lruKey: string | null = null
 
     for (const slot of this.extraSlots.values()) {
-      const slotEmbed = this.scanner.get(slot.modelKey)?.embedding ?? false
+      const slotEmbed = this.isSideModelKey(slot.modelKey)
       if (this.isOccupied(slot.manager.status().state) && !slotEmbed && slot.lastUsedMs < lruTime) {
         lruTime = slot.lastUsedMs
         lruManager = slot.manager
@@ -497,4 +592,10 @@ export class ModelRouter {
     })
   }
 
+}
+
+/** A model that runs beside the chat model instead of in a chat slot: an embedding model (ADR-389) or a Laya
+ *  decision model. */
+function isSideModel(entry: Pick<ModelEntry, 'embedding' | 'laya'>): boolean {
+  return entry.embedding || entry.laya !== undefined
 }

@@ -29,6 +29,9 @@ export type SystemOneResponse = {
   model: string
   answers: Record<string, Answer>
   usage: { input_tokens: number; output_tokens: number }
+  /** Laya only: which of Laya's own checkpoints (e.g. 'english', 'multilingual') actually
+   *  answered this request, and why it was picked. Absent for a Jev response. */
+  routing?: { model: string; reason: string }
 }
 
 export const MIN_QUESTIONS = 1 // twin: src/models/systemone-request.ts MIN_QUESTIONS
