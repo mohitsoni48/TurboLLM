@@ -54,6 +54,9 @@ module.exports = {
     oneClick: false,
     allowToChangeInstallationDirectory: true,
     createDesktopShortcut: true,
+    // Replaces electron-builder's app-running check: always close a running TurboLLM (and
+    // anything running from the install folder) without asking. See build/installer.nsh (#250).
+    include: 'build/installer.nsh',
   },
   // Native-arch-only for now (no cross-arch build): the bundled Node binary
   // above is resolved from THIS build machine, so a multi-arch build would

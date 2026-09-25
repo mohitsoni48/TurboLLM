@@ -12,12 +12,12 @@
 // truncated lines — a fresh connection should instead start from the file's current end.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { appendFileSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { appendFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 /** Reads SSE `event: ...` frames off a Response body as they arrive — same pattern as
  *  `gateway.queue-ping.test.ts`'s `sseEventReader`, duplicated locally rather than shared across
@@ -64,7 +64,7 @@ function fakeApp(getPath: () => string) {
 }
 
 test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-log-stream-'))
+  const dir = tmpDir('tllm-log-stream-')
   t.after(() => rmSync(dir, { recursive: true, force: true }))
 
   await t.test('a fresh connection does NOT replay existing history — its first frame is the next NEW line, not the old backlog', async () => {

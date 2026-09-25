@@ -12,10 +12,9 @@ import {
 import type { Conversation, Message } from './db.js'
 import type { ChatUpstream } from './chat-upstream.js'
 import { ConversationStore } from './db.js'
-import { mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 function makeMsg(role: 'user' | 'assistant', content: string, overrides: Partial<Message> = {}): Message {
   return {
@@ -296,9 +295,7 @@ test('pickCompactionCut: preserveThinking defaults to false — a caller that om
 // ── compactConversation / maybeAutoCompact ──────────────────────────────────────────────
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-chat-compaction-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-chat-compaction-test-')
 }
 
 /** Same shape as chat-upstream.request-log.test.ts's own jsonFetch — a fake fetchImpl that

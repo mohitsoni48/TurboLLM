@@ -6,17 +6,10 @@
 // (that's runtime/daily-query-rollups.test.ts's job).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from './db'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { ConversationStore, IN_MEMORY_DATA_DIR } from './db'
 
 function makeStore(): ConversationStore {
-  return new ConversationStore(tmp('tllm-dailyrollup-'))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 function today(): string {

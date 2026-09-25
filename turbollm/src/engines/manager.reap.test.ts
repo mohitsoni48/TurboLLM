@@ -8,11 +8,10 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { reapStaleEngines } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -57,7 +56,7 @@ function pidFiles(dir: string): string[] {
 }
 
 test('reaps a tracked engine whose port is still alive, and clears its pidfile', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-reap-'))
+  const dir = tmpDir('tllm-reap-')
   const eng = await spawnFakeEngine()
   try {
     writePidFile(dir, eng.pid, eng.port)
@@ -74,7 +73,7 @@ test('reaps a tracked engine whose port is still alive, and clears its pidfile',
 })
 
 test('does NOT reap an engine still owned by a live daemon (restart-overlap safety)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-reap-'))
+  const dir = tmpDir('tllm-reap-')
   const eng = await spawnFakeEngine()
   try {
     // owner = this (alive) test process → a live daemon manages this engine; a starting
@@ -93,7 +92,7 @@ test('does NOT reap an engine still owned by a live daemon (restart-overlap safe
 })
 
 test('does NOT kill when the tracked port is dead (recycled-pid guard), but clears the file', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-reap-'))
+  const dir = tmpDir('tllm-reap-')
   // A pid that is extremely unlikely to exist, paired with a port nothing is listening on.
   // portAlive() returns false → reap must skip the kill entirely and just clear the file.
   writePidFile(dir, 999_999, 1) // port 1 is not bound by us

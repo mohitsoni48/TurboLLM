@@ -1,8 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { registerLinkAdminRoutes } from './link-admin-routes'
 import { decodeLinkString, encodeLinkString } from '../link/link-string'
@@ -11,6 +9,7 @@ import { hashKey } from '../auth'
 import { Emitter } from '../telemetry/emit'
 import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>) {
   const cfg: Record<string, unknown> = {
@@ -33,7 +32,7 @@ function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<st
  *  `telemetry/emit.test.ts`'s `makeEmitter`. Returns the dir so a test can read
  *  back exactly what was queued via `readQueue`. */
 function mkTelemetry(): { telemetry: Emitter; dir: string; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-link-admin-telemetry-'))
+  const dir = tmpDir('turbollm-link-admin-telemetry-')
   const cfg = { telemetry: { level: 'anon', machineId: '33333333-3333-3333-3333-333333333333' } }
   const telemetry = new Emitter({
     dataDir: dir,

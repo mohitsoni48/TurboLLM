@@ -4,9 +4,7 @@
 // route contract — persistence, streaming, resumption, cancellation — without a model.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
@@ -20,6 +18,7 @@ import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter } from './limits.js'
 import { AuditLog } from './audit.js'
 import type { Status } from '../engines/manager.js'
+import { tmpDir } from '../test-support/tmp'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
@@ -36,7 +35,7 @@ function harness(
   ext?: ExtRouteDeps,
   managerStatus?: () => Status,
 ) {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-'))
+  const dir = tmpDir('turbollm-ext-runs-')
   const conv = new ConversationStore(dir)
   const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
   const d = {
@@ -108,7 +107,7 @@ function chatStoreThatThrows(base: ChatStore, method: 'getChat' | 'listMessages'
 }
 
 function harnessWithThrowingStore(method: 'getChat' | 'listMessages', n = Infinity) {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-runs-throw-'))
+  const dir = tmpDir('turbollm-ext-runs-throw-')
   const conv = new ConversationStore(dir)
   const chatStore = chatStoreThatThrows(new ChatStoreRouter(conv.chatStore, conv.chatStore), method, n)
   const d = {

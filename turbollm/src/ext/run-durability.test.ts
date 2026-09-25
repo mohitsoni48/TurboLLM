@@ -3,16 +3,15 @@
 // 404 that looks like the run never existed.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../chat/db.js'
 import { PublicRunManager } from './run-manager.js'
+import { tmpDir } from '../test-support/tmp'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
 
 test('a completed run is readable after the manager is rebuilt', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-run-durable-'))
+  const dir = tmpDir('turbollm-run-durable-')
   const db = new ConversationStore(dir)
   try {
     const first = new PublicRunManager({ db })
@@ -33,7 +32,7 @@ test('a completed run is readable after the manager is rebuilt', async () => {
 })
 
 test('a run still streaming at restart is reconciled to failed/daemon_restarted', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-run-orphan-'))
+  const dir = tmpDir('turbollm-run-orphan-')
   const db = new ConversationStore(dir)
   try {
     db.upsertExtRun({
@@ -55,7 +54,7 @@ test('a run still streaming at restart is reconciled to failed/daemon_restarted'
 })
 
 test('listing runs is tenant-scoped and survives a restart', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-run-list-'))
+  const dir = tmpDir('turbollm-run-list-')
   const db = new ConversationStore(dir)
   try {
     const runs = new PublicRunManager({ db })
@@ -72,7 +71,7 @@ test('listing runs is tenant-scoped and survives a restart', async () => {
 })
 
 test('listing runs is owner-scoped even when reading back from the persisted DB rows', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-run-list-owner-'))
+  const dir = tmpDir('turbollm-run-list-owner-')
   const db = new ConversationStore(dir)
   try {
     const runs = new PublicRunManager({ db })

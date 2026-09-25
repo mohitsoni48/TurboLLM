@@ -1,10 +1,7 @@
 // turbollm/src/routines/chat-runner.test.ts
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { ToolRegistry } from '../tools/tool-registry'
 import { runChatRoutine, resumeChatRoutine } from './chat-runner'
 import type { Routine } from './schema'
@@ -20,7 +17,7 @@ import type { Deps } from '../deps'
 const AGENT = { id: 'agent-1', name: 'Researcher', description: '', systemPrompt: 'You research things.', skillIds: [], tools: ['run_code'] }
 
 function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry; engineKind: string; modelPath: string | null }> = {}): { d: Deps; db: ConversationStore } {
-  const db = new ConversationStore(mkdtempSync(join(tmpdir(), 'chat-runner-test-')))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db,
     store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },

@@ -1,12 +1,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { shouldEmitBenchResult, benchRateLimitKey, BENCH_RATE_LIMIT_MS } from './bench-rate-limit'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-bench-rate-limit-'))
+  return tmpDir('turbollm-bench-rate-limit-')
 }
 
 test('shouldEmitBenchResult: the first measurement for a key is always allowed', () => {

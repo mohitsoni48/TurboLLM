@@ -3,11 +3,11 @@
 // "must not claim") and never claims embedding (it must not take the embedding pool slot,
 // ADR-389/427), whatever its config or folder name suggests.
 import assert from 'node:assert/strict'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { mlxEntryFor } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 /** The OpenJev config.json fields that matter. */
 function openJevConfig(): Record<string, unknown> {
@@ -31,7 +31,7 @@ function plainMultimodalConfig(): Record<string, unknown> {
 
 /** A model folder named `folderName` holding `config` and one (empty) weights file. */
 function withModelFolder(folderName: string, config: unknown, check: (dir: string) => void): void {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-jev-'))
+  const root = tmpDir('turbollm-jev-')
   try {
     const dir = join(root, folderName)
     mkdirSync(dir)

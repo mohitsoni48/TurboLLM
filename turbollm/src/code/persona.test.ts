@@ -3,24 +3,20 @@
 // appended to the system prompt automatically, no per-session setup required.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, writeFileSync, mkdirSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { agentsMdBlock, agentsMdPresence, buildAppendPrompt } from './persona'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { tmpDir } from '../test-support/tmp'
 
 test('agentsMdBlock: returns "" when neither file exists', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   assert.equal(agentsMdBlock(repoRoot, globalDir), '')
 })
 
 test('agentsMdBlock: includes only the project file when only it exists', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), 'Use pnpm, not npm, in this repo.')
   const block = agentsMdBlock(repoRoot, globalDir)
   assert.match(block, /Use pnpm, not npm, in this repo\./)
@@ -29,8 +25,8 @@ test('agentsMdBlock: includes only the project file when only it exists', () => 
 })
 
 test('agentsMdBlock: includes only the global file when only it exists', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   writeFileSync(join(globalDir, 'agents.md'), 'Always write commit messages in present tense.')
   const block = agentsMdBlock(repoRoot, globalDir)
   assert.match(block, /Always write commit messages in present tense\./)
@@ -39,8 +35,8 @@ test('agentsMdBlock: includes only the global file when only it exists', () => {
 })
 
 test('agentsMdBlock: includes BOTH, global before project', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   writeFileSync(join(globalDir, 'agents.md'), 'GLOBAL_MARKER')
   writeFileSync(join(repoRoot, 'AGENTS.md'), 'PROJECT_MARKER')
   const block = agentsMdBlock(repoRoot, globalDir)
@@ -51,15 +47,15 @@ test('agentsMdBlock: includes BOTH, global before project', () => {
 })
 
 test('agentsMdBlock: a whitespace-only file counts as absent', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), '   \n\n  ')
   assert.equal(agentsMdBlock(repoRoot, globalDir), '')
 })
 
 test('agentsMdBlock: a path that is a directory, not a file, is silently skipped (not a crash)', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   mkdirSync(join(repoRoot, 'AGENTS.md')) // a directory named AGENTS.md, not a file
   assert.doesNotThrow(() => agentsMdBlock(repoRoot, globalDir))
   assert.equal(agentsMdBlock(repoRoot, globalDir), '')
@@ -69,34 +65,34 @@ test('agentsMdBlock: a path that is a directory, not a file, is silently skipped
 // same lookup + whitespace-counts-as-absent rule as agentsMdBlock so "shown loaded" == "injected".
 
 test('agentsMdPresence: both false when neither file exists', () => {
-  assert.deepEqual(agentsMdPresence(tmp('tllm-amp-repo-'), tmp('tllm-amp-global-')), { project: false, global: false })
+  assert.deepEqual(agentsMdPresence(tmpDir('tllm-amp-repo-'), tmpDir('tllm-amp-global-')), { project: false, global: false })
 })
 
 test('agentsMdPresence: detects a project AGENTS.md only', () => {
-  const repoRoot = tmp('tllm-amp-repo-')
-  const globalDir = tmp('tllm-amp-global-')
+  const repoRoot = tmpDir('tllm-amp-repo-')
+  const globalDir = tmpDir('tllm-amp-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), 'Use pnpm here.')
   assert.deepEqual(agentsMdPresence(repoRoot, globalDir), { project: true, global: false })
 })
 
 test('agentsMdPresence: detects a global agents.md only', () => {
-  const repoRoot = tmp('tllm-amp-repo-')
-  const globalDir = tmp('tllm-amp-global-')
+  const repoRoot = tmpDir('tllm-amp-repo-')
+  const globalDir = tmpDir('tllm-amp-global-')
   writeFileSync(join(globalDir, 'agents.md'), 'Always present tense.')
   assert.deepEqual(agentsMdPresence(repoRoot, globalDir), { project: false, global: true })
 })
 
 test('agentsMdPresence: detects both when both exist', () => {
-  const repoRoot = tmp('tllm-amp-repo-')
-  const globalDir = tmp('tllm-amp-global-')
+  const repoRoot = tmpDir('tllm-amp-repo-')
+  const globalDir = tmpDir('tllm-amp-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), 'project')
   writeFileSync(join(globalDir, 'agents.md'), 'global')
   assert.deepEqual(agentsMdPresence(repoRoot, globalDir), { project: true, global: true })
 })
 
 test('agentsMdPresence: a whitespace-only file counts as absent (matches agentsMdBlock)', () => {
-  const repoRoot = tmp('tllm-amp-repo-')
-  const globalDir = tmp('tllm-amp-global-')
+  const repoRoot = tmpDir('tllm-amp-repo-')
+  const globalDir = tmpDir('tllm-amp-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), '   \n\n  ')
   assert.deepEqual(agentsMdPresence(repoRoot, globalDir), { project: false, global: false })
 })
@@ -107,8 +103,8 @@ test('buildAppendPrompt: omitting agentsMd (existing call sites) keeps output un
 })
 
 test('buildAppendPrompt: passing agentsMd with real files appends the block last', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   writeFileSync(join(repoRoot, 'AGENTS.md'), 'REPO_RULE_MARKER')
   const blocks = buildAppendPrompt('auto', [], { repoRoot, globalDir })
   const last = blocks.at(-1)!
@@ -116,8 +112,8 @@ test('buildAppendPrompt: passing agentsMd with real files appends the block last
 })
 
 test('buildAppendPrompt: passing agentsMd with no files present adds nothing extra', () => {
-  const repoRoot = tmp('tllm-agentsmd-repo-')
-  const globalDir = tmp('tllm-agentsmd-global-')
+  const repoRoot = tmpDir('tllm-agentsmd-repo-')
+  const globalDir = tmpDir('tllm-agentsmd-global-')
   const withAgents = buildAppendPrompt('auto', [], { repoRoot, globalDir })
   const without = buildAppendPrompt('auto')
   assert.deepEqual(withAgents, without)

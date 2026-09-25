@@ -21,10 +21,7 @@
 // real binary. If a real run's output doesn't match, fix `cli-output.ts` and re-run this.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { GenerationGate } from '../agents/gate'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
 import { isClaudeCliAvailable } from './cli-preflight'
@@ -43,7 +40,7 @@ test(
   async () => {
     assert.equal(await isClaudeCliAvailable(), true, 'the claude CLI must be installed on PATH for this smoke test')
 
-    const store = new ConversationStore(mkdtempSync(join(tmpdir(), 'cli-routine-smoke-')))
+    const store = new ConversationStore(IN_MEMORY_DATA_DIR)
     const created = store.createRoutine({
       flavor: 'code',
       prompt: 'Reply with exactly the words: smoke test ok',

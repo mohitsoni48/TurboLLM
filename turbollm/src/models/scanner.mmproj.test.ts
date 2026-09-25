@@ -12,11 +12,11 @@
 // so the mtime tiebreak is what actually resolves that case.
 import assert from 'node:assert/strict'
 import { mkdirSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 // walk() only records .gguf files >= 1 MiB (real mmproj files are much larger than this
 // in practice, but the floor applies to the fixture too).
@@ -24,7 +24,7 @@ const BYTES = (1 << 20) + 16
 const BUF = Buffer.alloc(BYTES)
 
 function makeTmpRoot(): string {
-  return join(tmpdir(), `turbollm-mmproj-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
+  return tmpDir('turbollm-mmproj-test-')
 }
 
 function stubStore(root: string): ConfigStore {

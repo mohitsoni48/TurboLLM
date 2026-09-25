@@ -1,15 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { readQueue } from './queue'
 import { TELEMETRY_ENV } from './disabled'
 import { Emitter } from './emit'
 import { EVENT_NAMES } from './schema'
+import { tmpDir } from '../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-emit-'))
+  return tmpDir('turbollm-emit-')
 }
 
 /** Minimal store double — the emitter only needs the consent level, the machine

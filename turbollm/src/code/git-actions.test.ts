@@ -6,8 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, appendFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   buildGithubCompareUrl,
@@ -17,27 +16,16 @@ import {
   GitError,
   pushGitBranch,
 } from './git-actions'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { tmpGitRepo } from '../test-support/git-repo'
+import { tmpDir } from '../test-support/tmp'
 
 function gitSync(args: string[], cwd: string): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', windowsHide: true }).trim()
 }
 
-/** A real repo, one commit in, on a fixed branch name (explicit -b so tests never depend on the
- *  ambient init.defaultBranch config) with local test-only identity so commits work in any CI
- *  environment regardless of global git config. */
-function initRepo(branch = 'main'): string {
-  const dir = tmp('tllm-git-actions-')
-  gitSync(['init', '-b', branch, '-q'], dir)
-  gitSync(['config', 'user.email', 'test@example.com'], dir)
-  gitSync(['config', 'user.name', 'Test'], dir)
-  writeFileSync(join(dir, 'README.md'), 'hello\n')
-  gitSync(['add', 'README.md'], dir)
-  gitSync(['commit', '-q', '-m', 'init'], dir)
-  return dir
+/** A real repo, one commit in, on `main`, with a repo-local identity (see git-repo.ts). */
+function initRepo(): string {
+  return tmpGitRepo('tllm-git-actions-')
 }
 
 /** A real bare repo (a valid git remote — just a filesystem path) to push/pull against, so the
@@ -46,21 +34,21 @@ function initRepo(branch = 'main'): string {
  *  init.defaultBranch resolves to locally (often 'master'), which doesn't exist once a push only
  *  ever creates 'main', so a later `git clone` of it fails to check anything out. */
 function initBareRemote(): string {
-  const dir = tmp('tllm-git-actions-remote-')
+  const dir = tmpDir('tllm-git-actions-remote-')
   gitSync(['init', '--bare', '-q'], dir)
   gitSync(['symbolic-ref', 'HEAD', 'refs/heads/main'], dir)
   return dir
 }
 
 test('getGitStatus: a plain non-repo folder reports isRepo:false', async () => {
-  const dir = tmp('tllm-git-actions-notrepo-')
+  const dir = tmpDir('tllm-git-actions-notrepo-')
   const status = await getGitStatus(dir)
   assert.equal(status.isRepo, false)
   assert.deepEqual(status.files, [])
 })
 
 test('getGitStatus: a brand-new repo with no commits (unborn HEAD) is still isRepo:true, with an empty branch', async () => {
-  const dir = tmp('tllm-git-actions-unborn-')
+  const dir = tmpDir('tllm-git-actions-unborn-')
   gitSync(['init', '-b', 'main', '-q'], dir)
   const status = await getGitStatus(dir)
   assert.equal(status.isRepo, true)
@@ -69,7 +57,7 @@ test('getGitStatus: a brand-new repo with no commits (unborn HEAD) is still isRe
 })
 
 test('getGitStatus: a clean tree after a commit reports no files, and the real branch name', async () => {
-  const dir = initRepo('main')
+  const dir = initRepo()
   const status = await getGitStatus(dir)
   assert.equal(status.isRepo, true)
   assert.equal(status.branch, 'main')
@@ -147,7 +135,7 @@ test('commitGitChanges: an explicit file list stages ONLY those paths, leaving t
 test('commitGitChanges: refuses a path outside the repo root (containment), without staging anything', async () => {
   const dir = initRepo()
   writeFileSync(join(dir, 'a.txt'), 'a\n')
-  const outside = join(tmpdir(), 'not-in-repo.txt')
+  const outside = join(tmpDir('tllm-git-actions-outside-'), 'not-in-repo.txt')
   await assert.rejects(
     () => commitGitChanges(dir, 'escape attempt', [outside]),
     /outside the repo/,
@@ -198,7 +186,7 @@ test('pushGitBranch: a diverged remote is rejected as "diverged", never force-pu
 
   // A second, independent clone of the SAME remote — diverges by committing without ever
   // fetching a's later commit.
-  const b = tmp('tllm-git-actions-clone-')
+  const b = tmpDir('tllm-git-actions-clone-')
   gitSync(['clone', '-q', remote, '.'], b)
   gitSync(['config', 'user.email', 'test@example.com'], b)
   gitSync(['config', 'user.name', 'Test'], b)

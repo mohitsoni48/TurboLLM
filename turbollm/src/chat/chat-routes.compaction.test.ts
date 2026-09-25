@@ -6,17 +6,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 // Mirrors chat-routes.persist.test.ts's mkHarness() exactly — same field set, same
 // cast-through-unknown style, same "omit what's only reached via optional chaining".
 function makeApp(): { app: Hono; store: ConversationStore; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-compaction-route-'))
+  const dir = tmpDir('tllm-chat-compaction-route-')
   const store = new ConversationStore(dir)
   const cfg = {
     modelDefaults: { maxTokens: 0 },

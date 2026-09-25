@@ -1,13 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { readFileSync } from 'node:fs'
 import { bucketCount, recordFeatureUse, flushStaleDailyUsage, persistDailyUsage } from './daily-usage'
+import { tmpDir } from '../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-daily-usage-'))
+  return tmpDir('turbollm-daily-usage-')
 }
 
 test('bucketCount: never returns the raw number — always one of COUNT_BUCKETS', () => {

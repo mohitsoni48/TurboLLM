@@ -6,14 +6,13 @@
 // pass with tool_choice:'none' and use that result as the final reply.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
 import { recentTitleTurns, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 // ── stripThinkingBlocks ───────────────────────────────────────────────────────
 
@@ -220,7 +219,7 @@ test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, n
 // engine fetch held open, in the style of chat-routes.remote.test.ts (real store, no port).
 
 function inFlightHarness() {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-inflight-'))
+  const dir = tmpDir('tllm-chat-inflight-')
   const store = new ConversationStore(dir)
   const cfg = {
     modelDefaults: { maxTokens: 0 },

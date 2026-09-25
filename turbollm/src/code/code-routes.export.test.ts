@@ -6,19 +6,15 @@
 // composes with real DB state (a /clear'd session, an "active" run).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createPatch } from 'diff'
 import { Hono } from 'hono'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { registerCodeRoutes } from './code-routes'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
-
-function tmp(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix))
-}
+import { tmpDir } from '../test-support/tmp'
 
 /** registerCodeRoutes's export handler only ever touches `d.db` (confirmed by reading the route:
  *  `const md = serializeCodeSessionMarkdown(run, conv); ...`, no reference to `d.manager`/
@@ -40,7 +36,7 @@ function seedSession(db: ConversationStore, opts: { title?: string; repoRoot?: s
 }
 
 test('GET .../export: 200 with real Content-Disposition/Content-Type headers and a Markdown body', async () => {
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db)
   db.addMessage(conv.id, 'user', 'Add a health check endpoint.')
@@ -56,7 +52,7 @@ test('GET .../export: 200 with real Content-Disposition/Content-Type headers and
 })
 
 test('GET .../export: 404 for a session that does not exist', async () => {
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
 
   const res = await app.request('/api/v1/code/sessions/does-not-exist/export')
@@ -66,7 +62,7 @@ test('GET .../export: 404 for a session that does not exist', async () => {
 })
 
 test('GET .../export?format=html: 400 unsupported_format (HTML export is not built yet)', async () => {
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { run } = seedSession(db)
 
@@ -85,7 +81,7 @@ test('GET .../export: succeeds even while the run\'s persisted status is "runnin
   // (confirmed by reading code-routes.ts — unlike /compact, /clear, /revert, which all check
   // `runs.isActive(id)` before proceeding) — a persisted 'running' status is the closest
   // reachable proxy for "this session looks like it's mid-turn" without that deeper seam.
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db)
   db.addMessage(conv.id, 'user', 'Do the thing.')
@@ -102,7 +98,7 @@ test('GET .../export on a /clear\'d session EXCLUDES the cleared history — mat
   // true) and this export route read) filters is_active=1, so cleared history is now omitted at the
   // source: export matches the transcript, no longer leaking what the user hid. Drives the REAL
   // /clear route end-to-end (not just the DB helper), so the whole path is covered.
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db)
   db.addMessage(conv.id, 'user', 'An early attempt the user later cleared away.')
@@ -121,7 +117,7 @@ test('GET .../export on a /clear\'d session EXCLUDES the cleared history — mat
 })
 
 test('POST .../resume after a /clear brings the cleared history back into the export', async () => {
-  const db = new ConversationStore(tmp('tllm-export-route-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db)
   db.addMessage(conv.id, 'user', 'A message that gets cleared then resumed.')
@@ -140,7 +136,7 @@ test('POST .../resume after a /clear brings the cleared history back into the ex
 // route-level tests pin that invariant end-to-end (the guards existed but weren't route-tested).
 
 test('POST .../revert is refused (409 session_cleared) while the session is /clear\'d', async () => {
-  const db = new ConversationStore(tmp('tllm-clear-revert-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db, { repoRoot: '/repo' })
   db.addMessage(conv.id, 'user', 'first')
@@ -154,7 +150,7 @@ test('POST .../revert is refused (409 session_cleared) while the session is /cle
 })
 
 test('POST .../clear is refused (409 session_reverted) while the session has a pending /revert', async () => {
-  const db = new ConversationStore(tmp('tllm-clear-revert-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db, { repoRoot: '/repo' })
   db.addMessage(conv.id, 'user', 'first')
@@ -169,7 +165,7 @@ test('POST .../clear is refused (409 session_reverted) while the session has a p
 })
 
 test('POST .../revert while already reverted SUPERSEDES (200, not 409) when reverting further back', async () => {
-  const db = new ConversationStore(tmp('tllm-revert-supersede-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db, { repoRoot: '/repo' })
   const first = db.addMessage(conv.id, 'user', 'first')
@@ -199,7 +195,7 @@ test('POST .../revert while already reverted SUPERSEDES (200, not 409) when reve
 })
 
 test('the mutual-exclusion lock releases: /clear → /resume → /revert all succeed in sequence', async () => {
-  const db = new ConversationStore(tmp('tllm-clear-revert-'))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db, { repoRoot: '/repo' })
   db.addMessage(conv.id, 'user', 'first')
@@ -218,8 +214,8 @@ test('the mutual-exclusion lock releases: /clear → /resume → /revert all suc
 // reach edit patches from a PRIOR revert's already-deactivated range too, not just the newly-
 // exposed active range — see code-routes.ts's /revert handler comment for the full mechanism.
 test('POST .../revert (superseding, revertFiles: true) reaches an edit patch from a PRIOR chat-only revert\'s already-hidden range', async () => {
-  const repoRoot = mkdtempSync(join(tmpdir(), 'tllm-revert-supersede-files-'))
-  const db = new ConversationStore(tmp('tllm-revert-supersede-files-'))
+  const repoRoot = tmpDir('tllm-revert-supersede-files-')
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const { app } = makeApp(db)
   const { conv, run } = seedSession(db, { repoRoot })
 

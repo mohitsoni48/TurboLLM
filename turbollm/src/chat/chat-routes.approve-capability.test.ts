@@ -9,14 +9,13 @@
 // pending tool call is required.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import { hashKey } from '../auth.js'
 import type { Deps } from '../deps.js'
+import { tmpDir } from '../test-support/tmp'
 
 interface FakeConfig {
   tools: { toolPolicies: Record<string, string>; autoAllowAll: boolean }
@@ -24,7 +23,7 @@ interface FakeConfig {
 }
 
 function mkApp(): { app: Hono; store: ConversationStore; cfg: FakeConfig; cleanup: () => void } {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-chat-approve-'))
+  const dir = tmpDir('tllm-chat-approve-')
   const store = new ConversationStore(dir)
   const cfg: FakeConfig = { tools: { toolPolicies: {}, autoAllowAll: false }, apiKeys: [] }
   const d = {

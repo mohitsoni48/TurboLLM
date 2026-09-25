@@ -6,12 +6,12 @@
 // that replaced it: one pass at a time, and every caller waits for a pass that started no
 // earlier than its own call.
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { defaultConfig, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
 const T_STRING = 8
@@ -57,7 +57,7 @@ function memStore(root: string, opts: { throwOnSnapshot?: boolean } = {}) {
 }
 
 async function withLibraryRoot(body: (root: string) => Promise<void>): Promise<void> {
-  const root = mkdtempSync(join(tmpdir(), 'turbollm-scan-conc-'))
+  const root = tmpDir('turbollm-scan-conc-')
   try {
     await body(root)
   } finally {

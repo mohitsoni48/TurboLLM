@@ -1,9 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
@@ -15,6 +13,7 @@ import { PublicRunManager } from './run-manager.js'
 import { IdempotencyStore } from './idempotency.js'
 import { TenantLimiter, MAX_BODY_BYTES, MAX_ATTACHMENTS } from './limits.js'
 import { AuditLog } from './audit.js'
+import { tmpDir } from '../test-support/tmp'
 
 const ACME = 'Bearer tllm-ext-acme'
 const GLOBEX = 'Bearer tllm-ext-globex'
@@ -31,7 +30,7 @@ function keyHash(bearer: string): string {
 }
 
 function harness(ext?: ExtRouteDeps) {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-'))
+  const dir = tmpDir('turbollm-ext-routes-')
   const conv = new ConversationStore(dir)
   // Both tenants are served by the same SQLite store here; scoping is what keeps them apart.
   const d = {
@@ -55,7 +54,7 @@ function harness(ext?: ExtRouteDeps) {
 // store without a try/catch lets that rejection escape as an uncaught exception, which Hono
 // turns into a bare, non-JSON 500 — exactly the regression this harness exercises.
 function harnessNoAdapter() {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-noadapter-'))
+  const dir = tmpDir('turbollm-ext-routes-noadapter-')
   const conv = new ConversationStore(dir)
   const d = {
     db: conv,
@@ -83,7 +82,7 @@ const json = (auth: string, body?: unknown) => ({
 // (gate it on an unresolved promise) to exercise the in-flight-guard tests. Mirrors
 // routes.runs.test.ts's own `harness()`.
 function harnessWithRuns(bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>, ext?: ExtRouteDeps) {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-runs-'))
+  const dir = tmpDir('turbollm-ext-routes-runs-')
   const conv = new ConversationStore(dir)
   const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
   const d = {
@@ -133,7 +132,7 @@ function chatStoreThatDelaysGetChat(base: ChatStore, gate: Promise<void>): ChatS
 }
 
 function harnessWithRunsDelayedGetChat(gate: Promise<void>) {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-delay-'))
+  const dir = tmpDir('turbollm-ext-routes-delay-')
   const conv = new ConversationStore(dir)
   const chatStore = chatStoreThatDelaysGetChat(new ChatStoreRouter(conv.chatStore, conv.chatStore), gate)
   const d = {
@@ -1275,7 +1274,7 @@ test('the forwarding path\'s message.create audit row targets the real created m
 // here, this test would fail the same way the original regression did — which is itself proof
 // this harness genuinely exercises the mechanism `server.ts` relies on, not a tautology.
 test('an unhandled throw anywhere on this surface still returns a JSON error envelope, not a bare 500 (catch-all backstop)', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-routes-backstop-'))
+  const dir = tmpDir('turbollm-ext-routes-backstop-')
   const conv = new ConversationStore(dir)
   const d = {
     db: conv,

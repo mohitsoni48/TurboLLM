@@ -2,15 +2,14 @@
 // arrived AFTER the compile finished. The message now names the holder, and says why when the holder
 // is another branch of the same repo (which is a separate engine by design, ADR-431).
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { NameTakenError, Registry } from './registry'
+import { tmpDir } from '../test-support/tmp'
 
 function registryWith(engines: Partial<Engine>[]): Registry {
-  const store = ConfigStore.load(join(mkdtempSync(join(tmpdir(), 'tllm-name-taken-')), 'config.json'))
+  const store = ConfigStore.load(join(tmpDir('tllm-name-taken-'), 'config.json'))
   store.update((c) => {
     for (const e of engines) {
       c.engines.push({

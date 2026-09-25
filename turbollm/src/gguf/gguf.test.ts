@@ -4,10 +4,10 @@
 // dim is 256; see profile.ts's estimateVram).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { parseGguf, quantFromName } from './gguf'
+import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
 const T_BOOL = 7
@@ -50,7 +50,7 @@ function buildGguf(kvs: Array<[string, KvValue]>): Buffer {
 }
 
 function withGgufFile(kvs: Array<[string, KvValue]>, run: (path: string) => void): void {
-  const dir = mkdtempSync(join(tmpdir(), 'gguf-test-'))
+  const dir = tmpDir('gguf-test-')
   const path = join(dir, 'model.gguf')
   try {
     writeFileSync(path, buildGguf(kvs))

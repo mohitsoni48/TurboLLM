@@ -4,16 +4,13 @@
 // --resume flag is only ever the latter kind on a later launch. v38 is a same-day follow-up
 // data fix — see its own comment in db.ts and the test below for the live bug it closes.
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { test } from 'node:test'
 import { ConversationStore } from './db'
+import { tmpDir } from '../test-support/tmp'
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-terminal-launched-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-terminal-launched-test-')
 }
 
 test('terminalLaunchedOnce: defaults to false on a freshly created Code session', () => {

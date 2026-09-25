@@ -2,11 +2,14 @@
 // whole point is that a user's `!command` runs a genuine shell in the repo root.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { tmpdir } from 'node:os'
 import { runShellCommand, shellContextText } from './code-shell'
+import { tmpDir } from '../test-support/tmp'
+
+// None of these commands write to their cwd, so one directory serves the whole file.
+const SHELL_CWD = tmpDir('code-shell-')
 
 test('runShellCommand captures stdout and a zero exit code', async () => {
-  const r = await runShellCommand('echo hello-shell', tmpdir(), 'test')
+  const r = await runShellCommand('echo hello-shell', SHELL_CWD, 'test')
   assert.match(r.output, /hello-shell/)
   assert.equal(r.exitCode, 0)
   assert.equal(r.timedOut, false)
@@ -14,26 +17,26 @@ test('runShellCommand captures stdout and a zero exit code', async () => {
 })
 
 test('runShellCommand reports a non-zero exit code without throwing', async () => {
-  const r = await runShellCommand('exit 3', tmpdir(), 'test')
+  const r = await runShellCommand('exit 3', SHELL_CWD, 'test')
   assert.equal(r.exitCode, 3)
   assert.equal(r.timedOut, false)
 })
 
 test('runShellCommand runs in the given cwd (repoRoot containment)', async () => {
-  const r = await runShellCommand('pwd', tmpdir(), 'test')
-  // pwd should echo the cwd we handed it (allowing for symlink canonicalization of tmpdir).
+  const r = await runShellCommand('pwd', SHELL_CWD, 'test')
+  // pwd should echo the cwd we handed it (allowing for symlink canonicalization of the directory).
   assert.ok(r.output.trim().length > 0)
   assert.equal(r.exitCode, 0)
 })
 
 test('runShellCommand caps output at maxOutput and flags truncated', async () => {
-  const r = await runShellCommand("printf 'x%.0s' $(seq 1 5000)", tmpdir(), 'test', { maxOutput: 100 })
+  const r = await runShellCommand("printf 'x%.0s' $(seq 1 5000)", SHELL_CWD, 'test', { maxOutput: 100 })
   assert.equal(r.truncated, true)
   assert.ok(r.output.length <= 100, `expected <=100 chars, got ${r.output.length}`)
 })
 
 test('runShellCommand times out a hung command and reports timedOut (no throw)', async () => {
-  const r = await runShellCommand('sleep 5', tmpdir(), 'test', { timeoutSec: 1 })
+  const r = await runShellCommand('sleep 5', SHELL_CWD, 'test', { timeoutSec: 1 })
   assert.equal(r.timedOut, true)
   assert.equal(r.exitCode, null)
 })

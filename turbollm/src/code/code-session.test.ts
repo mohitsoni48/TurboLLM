@@ -8,13 +8,10 @@
 // paths are covered by the live SSE re-test, not by mocks.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
 import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, nearOverflowReserveTokens, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
-import { ConversationStore, type Message } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
 import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent'
@@ -54,7 +51,7 @@ test('toSessionStatus: running / queued → review', () => {
 // ConversationStore.deactivateMessagesFrom (below), not a clearedUpToMessageId cut point ---------
 
 function makeRevertConv(): { store: ConversationStore; convId: string } {
-  const store = new ConversationStore(mkdtempSync(join(tmpdir(), 'tllm-revert-cut-')))
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const conv = store.createConversation({ kind: 'code' })
   return { store, convId: conv.id }
 }
@@ -515,7 +512,7 @@ test('buildAppendPrompt: an empty skills array behaves exactly like omitting the
 // pure DB logic and fully testable without one.
 
 function makeCodeConv(): { d: Deps; store: ConversationStore; convId: string; sessionId: string } {
-  const store = new ConversationStore(mkdtempSync(join(tmpdir(), 'tllm-compact-')))
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const conv = store.createConversation({ kind: 'code' })
   const run = store.createAgentRun({ convId: conv.id, title: 'test', allowedTools: [], repoRoot: '/repo' })
   const d = { db: store } as unknown as Deps

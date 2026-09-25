@@ -11,20 +11,19 @@
 // messages instead of needing to push 200+ real rows through the store.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import {
   loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
   extractChunkUsage, buildUsagePatch, buildEngineRequestBody, mapSampling,
 } from './generation.js'
+import { tmpDir } from '../test-support/tmp'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
 
 function harness() {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-ext-gen-'))
+  const dir = tmpDir('turbollm-ext-gen-')
   const conv = new ConversationStore(dir)
   const chatStore = new ChatStoreRouter(conv.chatStore, conv.chatStore)
   return { chatStore, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }

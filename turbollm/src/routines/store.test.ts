@@ -1,12 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { ConversationStore } from '../chat/db'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 
 function freshStore(): ConversationStore {
-  return new ConversationStore(mkdtempSync(join(tmpdir(), 'routine-store-test-')))
+  return new ConversationStore(IN_MEMORY_DATA_DIR)
 }
 
 test('createRoutine starts pending_confirmation with no next_fire_at', () => {

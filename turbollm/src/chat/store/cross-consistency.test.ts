@@ -4,14 +4,13 @@
 // now lying to its callers.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from '../db.js'
 import { LOCAL_SCOPE } from './chat-store.js'
+import { tmpDir } from '../../test-support/tmp'
 
 function make() {
-  const dir = mkdtempSync(join(tmpdir(), 'turbollm-xconsist-'))
+  const dir = tmpDir('turbollm-xconsist-')
   const conv = new ConversationStore(dir)
   return { conv, store: conv.chatStore, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }

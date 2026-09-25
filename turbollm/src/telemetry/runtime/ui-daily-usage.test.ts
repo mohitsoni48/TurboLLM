@@ -1,12 +1,12 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { recordUiAction, flushStaleUiUsage, persistUiDailyUsage } from './ui-daily-usage'
+import { tmpDir } from '../../test-support/tmp'
 
 function tempDir(): string {
-  return mkdtempSync(join(tmpdir(), 'turbollm-ui-daily-usage-'))
+  return tmpDir('turbollm-ui-daily-usage-')
 }
 
 test('recordUiAction: first-ever click for a screen has nothing to roll over', () => {

@@ -6,12 +6,12 @@
 // forces every cached row to re-parse once, which is the only thing that makes a parseGguf
 // fix actually reach a model a user already had scanned before upgrading.
 import assert from 'node:assert/strict'
-import { mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
+import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
 const T_STRING = 8
@@ -40,9 +40,7 @@ function buildGguf(kvs: Array<[string, string | number]>): Buffer {
 }
 
 function makeTmpRoot(): string {
-  const dir = join(tmpdir(), `turbollm-cacheversion-test-${Date.now()}-${Math.floor(Math.random() * 1e9)}`)
-  mkdirSync(dir, { recursive: true })
-  return dir
+  return tmpDir('turbollm-cacheversion-test-')
 }
 
 /** Minimal ConfigStore stub: the Scanner only reads dir() (cache location) and

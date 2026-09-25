@@ -4,13 +4,12 @@
 // verification (no HTTP harness in this test suite).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { ConversationStore } from './db.js'
+import { tmpDir } from '../test-support/tmp'
 
 function tempStore(): { store: ConversationStore; dir: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'tllm-preserve-thinking-'))
+  const dir = tmpDir('tllm-preserve-thinking-')
   return { store: new ConversationStore(dir), dir }
 }
 

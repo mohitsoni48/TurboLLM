@@ -5,11 +5,10 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { rmSync } from 'node:fs'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 type ErrLike = { code: string; message: string; exitCode: number; logTail: string[] }
 
@@ -54,7 +53,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
 }
 
 async function statusEngine(err: ErrLike | undefined) {
-  const dir = mkdtempSync(join(tmpdir(), 'tl-status-'))
+  const dir = tmpDir('tl-status-')
   try {
     const res = await appWithEngineError(dir, err).request('/api/v1/status')
     const body = (await res.json()) as { engine?: { error?: { failReason?: string } } }
