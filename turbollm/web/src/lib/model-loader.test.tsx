@@ -433,3 +433,36 @@ describe('useJevLoadedToast', () => {
     expect(h.toastSuccess).not.toHaveBeenCalled()
   })
 })
+
+describe('requestLoad — a Laya model', () => {
+  const LAYA = { key: 'laya-key', name: 'laya', laya: { checkpoints: ['english', 'multilingual'] } }
+
+  it('loads at once without asking: it runs beside whatever is loaded and interrupts nothing', async () => {
+    const result = loader()
+    await act(async () => { result.current.requestLoad(LAYA) })
+    expect(h.getActivity).not.toHaveBeenCalled()
+    expect(useJevLoadStore.getState().confirm).toBeNull()
+    expect(h.loadMutate).toHaveBeenCalledTimes(1)
+    expect(h.loadMutate.mock.calls[0][0]).toEqual({ key: 'laya-key', overrides: undefined, announceFailure: true })
+  })
+
+  it('records the load as this browser\'s, so its "ready" toast can offer the playground', async () => {
+    const result = loader()
+    await act(async () => { result.current.requestLoad(LAYA) })
+    expect(useJevLoadStore.getState().pendingJevKey).toBe('laya-key')
+  })
+})
+
+describe('useJevLoadedToast — a Laya model', () => {
+  it('announces the Laya model this browser asked for once it is running, and offers the playground', () => {
+    useJevLoadStore.setState({ pendingJevKey: 'laya-key' })
+    h.status = { jev: null, laya: { key: 'laya-key', name: 'laya', checkpoints: ['english'], state: 'running' } } as unknown as Status
+
+    renderHook(() => useJevLoadedToast())
+
+    expect(h.toastSuccess).toHaveBeenCalledTimes(1)
+    expect(h.toastSuccess.mock.calls[0][0]).toBe('laya is ready')
+    expect(toastAction().label).toBe('Open Jev Playground')
+    expect(useJevLoadStore.getState().pendingJevKey).toBeNull()
+  })
+})

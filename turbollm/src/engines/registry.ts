@@ -388,7 +388,13 @@ export class Registry {
 
   activate(id: string): void {
     this.store.update((c) => {
-      if (!findEngine(c.engines, id)) throw new NotFoundError()
+      const engine = findEngine(c.engines, id)
+      if (!engine) throw new NotFoundError()
+      // Laya models load on the Laya engine whatever engine is active (engineForModel), so activating it would
+      // only stop every other model from loading.
+      if (engine.kind === 'laya') {
+        throw new ValueError('engine', 'the Laya engine is never the active engine: Laya models load on it directly.')
+      }
       c.activeEngineId = id
     })
   }

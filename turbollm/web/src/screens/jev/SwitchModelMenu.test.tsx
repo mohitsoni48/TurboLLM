@@ -46,6 +46,7 @@ function model(over: Partial<ModelEntry> & { key: string; name: string }): Model
 
 const CHAT = model({ key: 'gemma-27b', name: 'Gemma 27B' })
 const OTHER_JEV = model({ key: 'jev-other', name: 'Other NLI', jev: { ...JEV_INFO, labels: [...JEV_INFO.labels] } })
+const LAYA = model({ key: 'laya', name: 'Laya', laya: { checkpoints: ['english', 'multilingual'] } })
 
 function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT) {
   const onPick = vi.fn()
@@ -71,6 +72,20 @@ describe('SwitchModelMenu', () => {
     renderMenu([CHAT])
     expect(screen.getByText('Chat models')).toBeTruthy()
     expect(screen.queryByText('Jev models')).toBeNull()
+  })
+
+  // POST /v1/systemone now answers with either a Jev or a Laya model (ADR-439 follow-up), so
+  // the picker offers Laya models too, grouped separately from Jev's own vLLM-served ones.
+  it('also groups Laya models, separately from Jev', () => {
+    renderMenu([CHAT, OTHER_JEV, LAYA])
+    expect(screen.getByText('Jev models')).toBeTruthy()
+    expect(screen.getByText('Laya models')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Laya' })).toBeTruthy()
+  })
+
+  it('leaves out the Laya group when there is nothing in it', () => {
+    renderMenu([CHAT, OTHER_JEV])
+    expect(screen.queryByText('Laya models')).toBeNull()
   })
 
   it('offers only models that could actually load right now', () => {

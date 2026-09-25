@@ -90,6 +90,19 @@ describe('ResponsePanel', () => {
     expect(screen.getByText('123 ms · 42 input tokens')).toBeTruthy()
   })
 
+  // Laya answers with an extra `routing` block naming which of its own checkpoints actually
+  // answered, and why — worth surfacing in the one summary line the playground already shows.
+  it('names the Laya checkpoint that answered, when the response carries routing', () => {
+    const routed: SystemOneRun = { ...RUN, response: { ...RUN.response, routing: { model: 'english', reason: 'English Latin text' } } }
+    renderPanel(routed)
+    expect(screen.getByText('123 ms · 42 input tokens · answered by the english checkpoint')).toBeTruthy()
+  })
+
+  it('says nothing extra for a plain Jev response, which carries no routing', () => {
+    renderPanel()
+    expect(screen.queryByText(/answered by/)).toBeNull()
+  })
+
   it('leads the curl with the auth hint from a LAN origin, and never shows the stored key anywhere', async () => {
     localStorage.setItem(AUTH_KEY, 'secret-key')
     expect(localStorage.getItem(AUTH_KEY)).toBe('secret-key')

@@ -79,3 +79,10 @@ test('engineForModel: a Laya model with no Laya engine installed falls back to t
   const { reg, llama } = registryWithLlamaCpp()
   assert.equal(engineForModel(reg, { laya: { checkpoints: ['english'] } })?.id, llama.id)
 })
+
+test('activate refuses the Laya engine and leaves the active engine as it was', () => {
+  const { reg, llama } = registryWithLlamaCpp()
+  const laya = reg.addLaya('Laya', '/venv/bin/python', 'laya 0.3.20')
+  assert.throws(() => reg.activate(laya.id), (e: Error) => e.name === 'ValueError' && /never the active engine/.test(e.message))
+  assert.equal(reg.active()?.id, llama.id)
+})

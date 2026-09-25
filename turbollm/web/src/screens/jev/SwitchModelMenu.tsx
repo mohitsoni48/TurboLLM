@@ -6,6 +6,7 @@
 // Workspace gate takes the user back on its own.
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
+import { isSystemOneModel } from '../../lib/model-kind'
 import { toast } from '../../components/ui/sonner'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
@@ -33,8 +34,9 @@ export function SwitchModelMenu({
         <p className="text-[13px] text-muted">{NOTHING_LOADABLE}</p>
       ) : (
         <>
-          <ModelGroup title="Chat models" models={loadable.filter((m) => !m.jev)} onPick={onPick} />
+          <ModelGroup title="Chat models" models={loadable.filter((m) => !isSystemOneModel(m))} onPick={onPick} />
           <ModelGroup title="Jev models" models={loadable.filter((m) => m.jev)} onPick={onPick} />
+          <ModelGroup title="Laya models" models={loadable.filter((m) => m.laya)} onPick={onPick} />
         </>
       )}
     </div>

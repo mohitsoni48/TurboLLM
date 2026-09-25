@@ -45,6 +45,9 @@ export function useModelLoader(): {
 
   function requestLoad(target: LoadTarget, opts: LoadOptions = {}): void {
     if (target.jev) void askBeforeJevLoad(target, opts)
+    // A Laya model runs in its own slot beside whatever is loaded, so there is nothing to ask about; it still
+    // claims the "is ready" toast, which is how the user finds the playground (ADR-443).
+    else if (target.laya) startJevLoad(target, opts)
     else startLoad(target, opts)
   }
 
@@ -99,7 +102,8 @@ function useLoadStarters(): {
 export function useJevLoadedToast(): void {
   const pendingJevKey = useJevLoadStore((s) => s.pendingJevKey)
   const setPendingJevKey = useJevLoadStore((s) => s.setPendingJevKey)
-  const jev = useStatus().data?.jev
+  const status = useStatus().data
+  const jev = status?.jev ?? status?.laya
   const { pathname } = useLocation()
   const navigate = useNavigate()
 

@@ -11,7 +11,13 @@ import type { ActiveWork, LoadProfile } from '../lib/types'
 /** The model a load site asked for — its own `jev` field, not a flag the caller has to
  *  remember, is what decides whether the activity probe runs. Structural, so a
  *  `ModelEntry` and an `HfCheckpoint`'s narrower `jev` both fit. */
-export type LoadTarget = { key: string; name: string; jev?: { architecture: string } | null }
+export type LoadTarget = {
+  key: string
+  name: string
+  jev?: { architecture: string } | null
+  /** Set for a Laya model (ADR-443): it loads beside whatever runs, so it asks nothing first. */
+  laya?: { checkpoints: string[] } | null
+}
 
 /** What a load site asks for beyond the model itself. Carried through the confirmation, so a
  *  confirmed load behaves exactly like one that was never interrupted (ADR-434 (i)(3)). */

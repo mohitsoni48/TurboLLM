@@ -98,3 +98,12 @@ describe('AnswerList', () => {
     expect(container.querySelector('b')).toBeNull()
   })
 })
+
+describe('AnswerList for a Laya model', () => {
+  it('says the probabilities are Laya\'s own, with the model card\'s own caveat, not that they are NLI scores', () => {
+    render(<AnswerList answers={null} stale={false} laya />)
+    expect(screen.getByText("These are Laya's own probabilities. Its model card says they ship over-confident, so check them on your own data.")).toBeInTheDocument()
+    expect(screen.queryByText(/NLI entailment scores/)).toBeNull()
+    expect(screen.getByRole('link', { name: 'How it works →' })).toHaveAttribute('href', 'https://huggingface.co/convaiinnovations/laya')
+  })
+})

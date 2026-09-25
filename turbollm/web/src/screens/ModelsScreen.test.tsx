@@ -74,6 +74,13 @@ function jevEntry(over: Partial<ModelEntry> = {}): ModelEntry {
   })
 }
 
+function layaEntry(over: Partial<ModelEntry> = {}): ModelEntry {
+  return entry({
+    key: 'laya-1', name: 'laya', format: 'mlx', arch: 'laya',
+    laya: { checkpoints: ['english', 'multilingual'] }, ...over,
+  })
+}
+
 function renderScreen() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
@@ -95,6 +102,13 @@ describe('ModelsScreen — Jev models', () => {
     expect(screen.getByText('qwen3.5-4b-nli-v2')).toBeTruthy()
     expect(screen.getByText('Needs vLLM (Linux or WSL2)')).toBeTruthy()
     expect(screen.getByText('Jev')).toBeTruthy()
+  })
+
+  it('badges a Laya model the same way a Jev model is badged', () => {
+    state.models = [layaEntry()]
+    renderScreen()
+    expect(screen.getByText('laya')).toBeTruthy()
+    expect(screen.getByText('Laya')).toBeTruthy()
   })
 
   it('leaves a Jev model out of the hidden-model banner', () => {

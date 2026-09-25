@@ -75,6 +75,8 @@ import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } fr
 import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
+import { layaStatus } from './laya-status'
+import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
 
@@ -148,6 +150,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // The alive Jev model, if any (ADR-434 (i)(1)): Workspace becomes the Jev Playground while
       // one is loaded in any slot. Local-only, like `launchCommand` — not in the shared builder.
       jev: jevStatus(d),
+      // The alive Laya model, if any (ADR-443): the System One playground runs against it. It never changes the
+      // Workspace — a Laya model runs beside the chat model.
+      laya: layaStatus(d),
       engineStats: core.engineStats,
       liveGeneration: core.liveGeneration,
       // Auto-tune runner state (spec 09 §1): real progress while a sweep runs, then
@@ -1172,8 +1177,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/engines/:id', (c) => {
     const id = c.req.param('id')
-    const { activeEngineId } = d.registry.list()
-    if (id === activeEngineId && engineBusy(d)) {
+    const target = d.registry.get(id)
+    if (target && engineDeleteBlocked(d, target)) {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
     const purge = c.req.query('purge') === '1'
@@ -1790,9 +1795,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const key = decodeURIComponent(c.req.param('key'))
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
-    const ms = d.manager.status()
-    const loadedKey = ms.state === 'running' || ms.state === 'starting' ? ms.model?.key : undefined
-    if (loadedKey === e.path || loadedKey === e.key) {
+    // Any slot, not just the primary: a Laya model always runs in its own (ADR-443).
+    if (modelDeleteBlocked(d, e)) {
       return err(c, 409, 'model_loaded', 'This model is currently loaded. Eject it before deleting.')
     }
     try {

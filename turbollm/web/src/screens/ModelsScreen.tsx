@@ -799,6 +799,7 @@ function ModelRow({
   // its NextN tag silently crowded out despite the NextN filter/count already finding it.
   const caps = [
     m.jev && 'Jev',
+    m.laya && 'Laya',
     (m.nextnLayers ?? 0) > 0 && 'NextN',
     m.embedding && 'Embed',
     m.vision && 'Vision',
