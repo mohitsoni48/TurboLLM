@@ -45,8 +45,13 @@ class MissingCheckpoint:
 
     def on_route(self, ctx):
         wanted = ctx.decision["model"]
-        if wanted not in self.present:
-            raise ValueError(
+        if wanted in self.present:
+            return
+        if wanted == "english" and "multilingual" in self.present:
+            ctx.decision = dict(ctx.decision, model="multilingual",
+                                reason=ctx.decision["reason"] + "; answered by the multilingual checkpoint, the one here")
+            return
+        raise ValueError(
                 "this request needs the Laya '%s' checkpoint (%s), which is not in this model folder"
                 % (wanted, ctx.decision["reason"]))
 

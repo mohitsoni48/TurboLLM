@@ -45,3 +45,10 @@ test('the launcher warms every preloaded checkpoint before it serves, so readine
   assert.ok(warm < serve, 'the warm-up must finish before the server binds (readiness is its /health)')
   assert.match(LAYA_LAUNCHER_SOURCE, /for name in preloaded:\n\s+router\.predict\(/)
 })
+
+test('a folder with only the multilingual checkpoint answers English text with it instead of refusing', () => {
+  // convaiinnovations/laya-multilingual is a standalone repo: its root IS the multilingual checkpoint, which reads
+  // English too. Only the reverse — non-English text with only the English checkpoint — is refused.
+  assert.match(LAYA_LAUNCHER_SOURCE, /if wanted == "english" and "multilingual" in self\.present:/)
+  assert.match(LAYA_LAUNCHER_SOURCE, /ctx\.decision = dict\(ctx\.decision, model="multilingual"/)
+})
