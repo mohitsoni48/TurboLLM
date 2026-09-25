@@ -19,18 +19,18 @@ export function AnswerList({ answers, stale, laya = false }: { answers: Record<s
   return (
     <div className="flex flex-col gap-3">
       <div aria-busy={stale} className={cn('flex flex-col gap-3', stale && 'opacity-60')}>
-        {answers ? <Cards answers={answers} /> : <p className="text-[13px] text-muted">{EMPTY_HINT}</p>}
+        {answers ? <Cards answers={answers} laya={laya} /> : <p className="text-[13px] text-muted">{EMPTY_HINT}</p>}
       </div>
       <HonestLabel laya={laya} />
     </div>
   )
 }
 
-function Cards({ answers }: { answers: Record<string, Answer> }) {
+function Cards({ answers, laya }: { answers: Record<string, Answer>; laya: boolean }) {
   return (
     <>
       {Object.entries(answers).map(([id, answer]) => (
-        <AnswerCard key={id} id={id} answer={answer} />
+        <AnswerCard key={id} id={id} answer={answer} laya={laya} />
       ))}
     </>
   )

@@ -107,3 +107,10 @@ describe('AnswerList for a Laya model', () => {
     expect(screen.getByRole('link', { name: 'How it works →' })).toHaveAttribute('href', 'https://huggingface.co/convaiinnovations/laya')
   })
 })
+
+describe('AnswerList passes the model kind to its cards', () => {
+  it('captions a Laya yes/no answer as the probability of yes', () => {
+    render(<AnswerList answers={{ urgent: { type: 'noul', noul: 0.5 } }} stale={false} laya />)
+    expect(screen.getByText('probability of yes')).toBeInTheDocument()
+  })
+})

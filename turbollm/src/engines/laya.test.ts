@@ -37,3 +37,11 @@ test('layaInstallArgs passes --upgrade only for an update', () => {
 test('LAYA_PACKAGE pins the 0.3 line the launcher is written against', () => {
   assert.equal(LAYA_PACKAGE, 'laya[serve]>=0.3.20,<0.4')
 })
+
+test('the launcher warms every preloaded checkpoint before it serves, so readiness means the first request is fast', () => {
+  const warm = LAYA_LAUNCHER_SOURCE.indexOf('router.predict(')
+  const serve = LAYA_LAUNCHER_SOURCE.indexOf('uvicorn.run(')
+  assert.ok(warm > 0, 'no warm-up prediction')
+  assert.ok(warm < serve, 'the warm-up must finish before the server binds (readiness is its /health)')
+  assert.match(LAYA_LAUNCHER_SOURCE, /for name in preloaded:\n\s+router\.predict\(/)
+})

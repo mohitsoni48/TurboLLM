@@ -28,6 +28,7 @@ import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import type { ModelEntry } from '../lib/types'
+import { isChatModel } from '../lib/model-kind'
 import { cn } from '../lib/utils'
 import { useIsDesktop } from '../lib/useIsDesktop'
 import { EmptyState, InlineError, ScreenHeader } from '../components/common'
@@ -781,8 +782,8 @@ function ModelRow({
   // template directly), so a missing one is a real, user-visible dead end at chat time —
   // surfaced here instead of a first-message 400. Only checked once the model is otherwise
   // loadable/compatible; an incomplete or engine-mismatched model has a more pressing problem.
-  // …and never for a Jev model, which labels text and never chats (ADR-434 (g)).
-  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate && !m.jev
+  // …and never for a Jev or Laya model, which answers questions and never chats (ADR-434 (g), ADR-443).
+  const noChatTemplate = m.format === 'mlx' && !m.hasChatTemplate && isChatModel(m)
   const problem = m.incomplete
     ? 'missing parts'
     : m.parseError

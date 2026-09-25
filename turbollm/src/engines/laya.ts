@@ -35,6 +35,9 @@ export interface LayaRuntime {
  *  answered by another checkpoint: the English one is confidently wrong on non-English text. */
 export const LAYA_LAUNCHER_SOURCE = `import json, os, sys
 
+# The first forward pass pays a one-time GPU warm-up (~16 s measured on CUDA); paying it here, before the server
+# binds, keeps it out of the first request, since readiness is the server's /health.
+WARM_UP_QUESTION = {"warm_up": {"type": "noul", "instructions": "Is this a warm-up?"}}
 
 class MissingCheckpoint:
     def __init__(self, present):
@@ -69,7 +72,10 @@ def main():
     router = Router(device=os.environ.get("LAYA_DEVICE") or None, hooks=[MissingCheckpoint(found)],
                     default=next(iter(found)))
     router.models.update(found)
-    router.preload([name for name in found if name != "typed-decisions"])
+    preloaded = [name for name in found if name != "typed-decisions"]
+    router.preload(preloaded)
+    for name in preloaded:
+        router.predict("warm up", WARM_UP_QUESTION, model=name)
     uvicorn.run(create_app(router), host=host, port=port, log_level="info")
 
 

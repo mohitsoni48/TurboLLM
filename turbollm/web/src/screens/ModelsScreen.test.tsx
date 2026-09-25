@@ -111,6 +111,12 @@ describe('ModelsScreen — Jev models', () => {
     expect(screen.getByText('Laya')).toBeTruthy()
   })
 
+  it('never warns that a Laya model has no chat template: it never chats', () => {
+    state.models = [layaEntry({ hasChatTemplate: false, compatibleWithActiveEngine: true })]
+    renderScreen()
+    expect(screen.queryByText('no chat template')).toBeNull()
+  })
+
   it('leaves a Jev model out of the hidden-model banner', () => {
     state.models = [
       jevEntry({ compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' }),
