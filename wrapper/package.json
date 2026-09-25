@@ -7,7 +7,8 @@
   "scripts": {
     "start": "electron .",
     "prepare-daemon": "node prepare-daemon.js",
-    "package": "npm run prepare-daemon && electron-builder --config electron-builder.config.cjs --publish never"
+    "package": "npm run prepare-daemon && electron-builder --config electron-builder.config.cjs --publish never",
+    "test": "node --test \"*.test.js\""
   },
   "dependencies": {
     "electron-updater": "^6.6.2"
