@@ -102,7 +102,8 @@ test('isRunning: only a child with neither an exit code nor a signal is running'
 test('a requested restart (exit 75) is respawned and the new daemon is the one tracked', async () => {
   const dir = newDir()
   const lost = []
-  const supervisor = supervise({ spawnDaemon: fakeDaemon(dir, '75'), onDaemonLost: (reason) => lost.push(reason) })
+  const launches = countingSpawner(fakeDaemon(dir, '75'))
+  const supervisor = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: (reason) => lost.push(reason) })
   supervisor.start()
 
   await waitUntil(() => readPids(dir).length === 2, DEADLINE_MS, 'the respawned daemon')
@@ -112,9 +113,11 @@ test('a requested restart (exit 75) is respawned and the new daemon is the one t
   await waitUntil(() => !alive(pids[0]), DEADLINE_MS, 'the restarted daemon to be gone')
   assert.ok(alive(pids[1]), 'the respawned daemon is alive')
 
+  const stopped = once(supervisor.current(), 'exit')
   supervisor.stop()
   await waitUntil(() => !alive(pids[1]), DEADLINE_MS, 'the respawned daemon to stop')
-  await sleep(300)
+  await stopped
+  assert.equal(launches.count, 2, 'no daemon is spawned after stop()')
   assert.equal(readPids(dir).length, 2, 'nothing is respawned after stop()')
   assert.deepEqual(lost, [])
 })
@@ -122,10 +125,13 @@ test('a requested restart (exit 75) is respawned and the new daemon is the one t
 test('a crash is never respawned: the app is told the daemon is lost, once', async () => {
   const dir = newDir()
   const lost = []
-  supervise({ spawnDaemon: fakeDaemon(dir, '1'), onDaemonLost: (reason) => lost.push(reason) }).start()
+  const launches = countingSpawner(fakeDaemon(dir, '1'))
+  const child = supervise({ spawnDaemon: launches.spawnDaemon, onDaemonLost: (reason) => lost.push(reason) }).start()
+  const exited = once(child, 'exit')
 
   await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the daemon to be reported lost')
-  await sleep(300)
+  await exited
+  assert.equal(launches.count, 1, 'a crash is never respawned')
   assert.deepEqual(lost, ['exited (code=1, signal=none)'])
   assert.equal(readPids(dir).length, 1)
 })
@@ -134,17 +140,20 @@ test('a crash is never respawned: the app is told the daemon is lost, once', asy
 test('a daemon that exits while the app is quitting is not respawned', async () => {
   const dir = newDir()
   const lost = []
+  const launches = countingSpawner(fakeDaemon(dir, '75', 10_000))
   const supervisor = supervise({
-    spawnDaemon: fakeDaemon(dir, '75', 10_000),
+    spawnDaemon: launches.spawnDaemon,
     onDaemonLost: (reason) => lost.push(reason)
   })
   supervisor.start()
   await waitUntil(() => readPids(dir).length === 1, DEADLINE_MS, 'the daemon to start')
   const [pid] = readPids(dir)
 
+  const stopped = once(supervisor.current(), 'exit')
   supervisor.stop()
   await waitUntil(() => !alive(pid), DEADLINE_MS, 'the daemon to stop')
-  await sleep(500)
+  await stopped
+  assert.equal(launches.count, 1, 'no daemon is spawned after stop()')
   assert.equal(readPids(dir).length, 1)
   assert.deepEqual(lost, [])
 })
@@ -335,6 +344,15 @@ function fakeLaunches () {
     return child
   }
   return { spawned, spawnDaemon }
+}
+
+function countingSpawner (spawnDaemon) {
+  const launches = { count: 0 }
+  launches.spawnDaemon = () => {
+    launches.count += 1
+    return spawnDaemon()
+  }
+  return launches
 }
 
 function fakeChild () {
