@@ -53,6 +53,7 @@ import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
+import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
 import { registerTerminalWs } from './terminal/terminal-routes'
@@ -1155,11 +1156,17 @@ deps.rebind = () => {
 //   2. force open keep-alive sockets shut (SSE log/chat streams would otherwise hold
 //      the listen socket open forever and block server.close),
 //   3. close the server so the OLD process releases the port,
-//   4. ONLY THEN spawn the detached replacement → no port-bind race,
-//   5. exit.
-// A watchdog spawns + exits anyway if close hasn't completed in time. Fail-safe:
-// on any thrown error we still spawn + exit, so the user is never left daemonless.
+//   4. ONLY THEN finish, the way planRestartExit (daemon-restart.ts) decides:
+//      - npm/CLI: spawn the detached replacement (no port-bind race), then exit 0;
+//      - desktop app (TURBOLLM_DESKTOP=1): spawn nothing and exit 75. The app
+//        supervises this process and starts the fresh daemon itself, as its own
+//        non-detached child; a detached replacement would outlive the app (ADR-442);
+//      - exitOnly (app self-update, below): spawn nothing and exit 0.
+// A watchdog finishes anyway if close hasn't completed in time. Fail-safe: on any
+// thrown error we still finish, so the user is never left daemonless.
 let restarting = false
+// Evaluated once: the environment the parent gave this process cannot change.
+const supervisedByDesktop = isDesktopSupervised(process.env)
 function spawnReplacement(): void {
   // Re-exec with the SAME interpreter + argv (minus argv[0]=node) and cwd, detached
   // so it outlives this dying parent. `stdio:'ignore'` (NOT 'inherit') is essential:
@@ -1194,23 +1201,25 @@ function spawnReplacement(): void {
 deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   if (restarting) return
   restarting = true
-  const respawn = !opts?.exitOnly
+  const plan = planRestartExit({ exitOnly: opts?.exitOnly === true, supervised: supervisedByDesktop })
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
   clearInterval(cliInteractiveSweepTimer)
   comfy.stop() // don't let a tick reload a model mid-teardown
-  let spawned = false
+  let finished = false
   const finish = () => {
-    if (spawned) return
-    spawned = true
-    if (respawn) {
+    if (finished) return
+    finished = true
+    if (plan.kind === 'self-respawn') {
       try {
         spawnReplacement()
       } catch (e) {
         console.warn(`restart spawn failed: ${e}`)
       }
+    } else if (plan.kind === 'supervisor-respawn') {
+      console.log(`  Restarting: exiting with code ${plan.exitCode} so the TurboLLM desktop app starts a fresh daemon (TURBOLLM_DESKTOP=1 is set; outside the desktop app nothing restarts it).`)
     }
-    process.exit(0)
+    process.exit(plan.exitCode)
   }
   // Watchdog: if graceful teardown truly stalls, restart anyway. MUST exceed the
   // engine's own force-kill window (gracefulStop force-kills llama-server after ~8s —

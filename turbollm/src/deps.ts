@@ -76,9 +76,13 @@ export interface Deps {
   version: string
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).
-   *  Gracefully stops the engine, releases the listen socket, then spawns a detached
-   *  replacement and exits. Optional: only wired in the real `serve()` entrypoint
-   *  (cli.ts); absent under tests, where the restart route returns 501. */
+   *  Gracefully stops the engine and releases the listen socket, then ends one of three
+   *  ways (daemon-restart.ts `planRestartExit`): from a terminal or npm install it spawns
+   *  a detached replacement and exits 0; under the desktop app (TURBOLLM_DESKTOP=1) it
+   *  exits with RESTART_REQUESTED_EXIT_CODE (75) and the app starts the fresh daemon;
+   *  with `exitOnly` (app self-update) it exits 0 and spawns nothing. Optional: only
+   *  wired in the real `serve()` entrypoint (cli.ts); absent under tests, where the
+   *  restart route returns 501. */
   requestRestart?: (opts?: { exitOnly?: boolean }) => void
   /** In-flight (or just-finished) app self-update state, spec 29 B.1. Optional — absent
    *  under tests that don't exercise the apply routes, same convention as `appUpdates`. */

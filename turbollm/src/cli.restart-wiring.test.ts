@@ -104,3 +104,52 @@ test('no code path in cli.ts exits with the restart code directly', () => {
   const directExits = DIRECT_RESTART_EXITS.filter((exit) => CLI.includes(exit))
   assert.deepEqual(directExits, [], 'the restart exit code comes from planRestartExit, never a hand-written exit')
 })
+
+const RESTART_HANDLER_OPENING = 'deps.requestRestart = ('
+const SUPERVISION_GATE = 'const supervisedByDesktop = isDesktopSupervised(process.env)'
+const RESTART_PLAN_REQUEST =
+  'planRestartExit({ exitOnly: opts?.exitOnly === true, supervised: supervisedByDesktop })'
+const PLANNED_EXIT = 'process.exit(plan.exitCode)'
+const SELF_RESPAWN_BRANCH = /if \(plan\.kind === 'self-respawn'\) \{\s*try \{\s*spawnReplacement\(\)/
+const SUPERVISOR_RESPAWN_BRANCH = "plan.kind === 'supervisor-respawn'"
+
+test('the supervision gate is evaluated once, from process.env, before the restart handler', () => {
+  assert.ok(CLI.includes("from './daemon-restart'"), "cli.ts must import the restart planner from './daemon-restart'")
+  assert.equal(occurrencesOf(CLI, 'isDesktopSupervised('), 1, 'isDesktopSupervised() must be called exactly once')
+  assert.equal(occurrencesOf(CLI, SUPERVISION_GATE), 1, `cli.ts must contain "${SUPERVISION_GATE}" exactly once`)
+  assert.ok(
+    CLI.indexOf(SUPERVISION_GATE) < CLI.indexOf(RESTART_HANDLER_OPENING),
+    'the supervision gate must be evaluated before the restart handler is defined',
+  )
+})
+
+test('the restart handler asks planRestartExit how to end, passing exitOnly through unchanged', () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  assert.ok(restartHandler.includes(RESTART_PLAN_REQUEST), `the restart handler must call ${RESTART_PLAN_REQUEST}`)
+  assert.ok(!restartHandler.includes('const respawn'), 'the respawn decision belongs to planRestartExit now')
+})
+
+test("finish() exits with the plan's code and never with a literal 0", () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  assert.equal(occurrencesOf(restartHandler, PLANNED_EXIT), 1, `the restart handler must end with ${PLANNED_EXIT}`)
+  assert.ok(!restartHandler.includes('process.exit(0)'), 'a literal exit 0 would hide the desktop restart code')
+  assert.ok(restartHandler.includes('if (finished) return'), 'finish() must still run at most once')
+})
+
+test('the detached replacement is spawned only on the self-respawn plan, before the exit', () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  assert.match(restartHandler, SELF_RESPAWN_BRANCH)
+  assert.ok(
+    restartHandler.indexOf('spawnReplacement()') < restartHandler.indexOf(PLANNED_EXIT),
+    'the replacement must be spawned before this process exits',
+  )
+})
+
+test('the desktop-supervised plan spawns nothing itself', () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  assert.ok(
+    restartHandler.includes(SUPERVISOR_RESPAWN_BRANCH),
+    `the restart handler must handle ${SUPERVISOR_RESPAWN_BRANCH}`,
+  )
+  assert.ok(!restartHandler.includes('spawn('), 'under the desktop app the supervisor starts the fresh daemon')
+})
