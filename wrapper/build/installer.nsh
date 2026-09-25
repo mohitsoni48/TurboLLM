@@ -4,11 +4,13 @@
 ; a process that still holds files under the install folder, so the install stops at "TurboLLM
 ; cannot be closed". This file replaces that check through electron-builder's customCheckAppRunning
 ; hook, in the installer and the uninstaller alike: a running TurboLLM, and anything running from
-; the install folder, is always closed without asking.
+; the install folder (that part needs PowerShell), is closed without asking first. A Retry/Cancel
+; message appears only if that fails.
 ;
 ; Bound to app-builder-lib 26.15.3 template internals: $CmdPath, $PowerShellPath,
-; IS_POWERSHELL_AVAILABLE, getProcessInfo.nsh, and the LangStrings appClosing, appCannotBeClosed and
-; installing. Re-verify every one of them on any electron-builder upgrade.
+; IS_POWERSHELL_AVAILABLE and its $IsPowerShellAvailable (0 = available), getProcessInfo.nsh, the
+; defines APP_EXECUTABLE_FILENAME and BUILD_UNINSTALLER, and the LangStrings appClosing,
+; appCannotBeClosed and installing. Re-verify every one of them on any electron-builder upgrade.
 ;
 ; Never define preInit, customInit or customHeader here. electron-builder EXECUTES the uninstaller
 ; stub on the build machine, so anything those add would run there. This file holds macros only.
@@ -22,7 +24,13 @@
 ; nsExec's /TIMEOUT waits for output and restarts whenever output arrives. The commands below print
 ; next to nothing before they exit, which is what keeps each call bounded in practice.
 !define TURBOLLM_EXEC_TIMEOUT_MS   15000
+; The two PowerShell commands below spell this name literally: rename all three together, or the
+; install-folder check silently reads "not running".
 !define TURBOLLM_INSTDIR_ENV       "TURBOLLM_SETUP_INSTDIR"
+
+; The probe and close macros below rely on what customCheckAppRunning sets up first: it declares and
+; fills $turbollmSelfPid, runs IS_POWERSHELL_AVAILABLE and exports the install folder. Without those
+; the install-folder check silently reads "not running".
 
 ; The install folder reaches PowerShell through the environment instead of being inlined into the
 ; command, so an apostrophe in the path cannot break the path probe.
@@ -62,6 +70,10 @@
   Pop $R2
 !macroend
 
+; Forced end of this user's TurboLLM.exe and of every process whose image is under the install
+; folder: the daemon and its helpers hold files there too. No tree kill: it would also end programs
+; the user started from TurboLLM's terminal. The guard and the process filter are the same as in
+; TURBOLLM_IS_RUNNING: change both together. Exit codes are ignored; the next probe decides.
 !macro TURBOLLM_FORCE_CLOSE
   nsExec::Exec /TIMEOUT=${TURBOLLM_EXEC_TIMEOUT_MS} `"$CmdPath" /C taskkill /F /IM "${APP_EXECUTABLE_FILENAME}" /FI "USERNAME eq %USERNAME%" /FI "PID ne $turbollmSelfPid"`
   Pop $R2
@@ -73,18 +85,24 @@
   ${EndIf}
 !macroend
 
-; Graceful first, so TurboLLM can quit through its own shutdown; forced after, for what cannot answer
-; a close (no window yet, a cancelled close, a background process left under the install folder).
-; ${_OUT} ends as the last probe: 1 means something still runs after the whole budget.
+; Called only when something runs. The installer closes gracefully first, so TurboLLM can quit
+; through its own shutdown, then forces what cannot answer a close (no window yet, a cancelled
+; close, a background process left under the install folder). The uninstaller forces at once: a
+; graceful quit lets electron-updater start a downloaded update's installer, which would then run
+; next to this uninstaller (only the installer holds the one-instance mutex). A forced end runs no
+; quit handler. ${_OUT} ends as the last probe: 1 means something still runs after the whole budget.
 !macro TURBOLLM_CLOSE_ALL _OUT
-  !insertmacro TURBOLLM_SIGNAL_CLOSE
-  ${For} $R1 1 ${TURBOLLM_GRACE_POLLS}
-    Sleep ${TURBOLLM_POLL_MS}
-    !insertmacro TURBOLLM_IS_RUNNING ${_OUT}
-    ${If} ${_OUT} == 0
-      ${ExitFor}
-    ${EndIf}
-  ${Next}
+  StrCpy ${_OUT} 1
+  !ifndef BUILD_UNINSTALLER
+    !insertmacro TURBOLLM_SIGNAL_CLOSE
+    ${For} $R1 1 ${TURBOLLM_GRACE_POLLS}
+      Sleep ${TURBOLLM_POLL_MS}
+      !insertmacro TURBOLLM_IS_RUNNING ${_OUT}
+      ${If} ${_OUT} == 0
+        ${ExitFor}
+      ${EndIf}
+    ${Next}
+  !endif
   ${If} ${_OUT} == 1
     ${For} $R1 1 ${TURBOLLM_FORCE_ATTEMPTS}
       !insertmacro TURBOLLM_FORCE_CLOSE
@@ -115,7 +133,7 @@
     !insertmacro TURBOLLM_IS_RUNNING $R0
     ${If} $R0 == 1
       ; The install section runs under SetDetailsPrint none, so the status line has to be forced
-      ; through. The uninstaller prints nothing, as stock did: "Installing" would be wrong there.
+      ; through. The uninstaller prints no status here: "Installing" would be wrong there.
       !ifndef BUILD_UNINSTALLER
         SetDetailsPrint textonly
         DetailPrint "$(appClosing)"
