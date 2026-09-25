@@ -23,7 +23,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Windows installer: no more "TurboLLM cannot be closed" when TurboLLM is open** (GitHub #250). The
+  installer now closes a running TurboLLM itself, without asking first, and also stops any TurboLLM
+  background process still running from the install folder, which could outlive the window and keep its
+  files locked. It asks you to close TurboLLM yourself only if that fails (for example when TurboLLM was
+  started as administrator), and Retry then tries the whole close again.
 
 ## [1.14.0] - 2026-09-22
 
