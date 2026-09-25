@@ -23,7 +23,16 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **Desktop app: quitting after a daemon restart now stops the daemon too.** Restarting the daemon
+  from Settings used to start the new daemon as a separate background process the app lost track
+  of, so it kept running after you quit TurboLLM, holding port 6996 and files in the install
+  folder (a likely cause of the installer's "TurboLLM cannot be closed" message, #250). The app
+  now starts the restarted daemon itself and stops it when you quit. Restarting from a terminal
+  (`npx turbollm` or a global npm install) is unchanged. One other change, on macOS and Linux:
+  stopping the daemon from outside the app (for example `turbollm --stop` in a terminal) now
+  closes the desktop app too, instead of leaving it open with no daemon behind it.
 
 ## [1.14.0] - 2026-09-22
 
