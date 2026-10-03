@@ -8,6 +8,7 @@
 // gets StartOpts for exactly the config snapshot and hardware it made its decision with.
 import { type Config, type Engine, getModelProfile } from '../config/config'
 import { koboldcppProfileToArgs } from './koboldcpp'
+import { litertLmProfileToConfig } from './litert-lm'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
 import { type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
@@ -27,6 +28,7 @@ export interface BuildStartOptsInput {
 }
 
 export function buildStartOpts(input: BuildStartOptsInput): StartOpts {
+  if (input.entry.format === 'litertlm') return buildLitertLmStartOpts(input)
   if (input.entry.format !== 'gguf') return buildModelDirectoryStartOpts(input)
   return buildGgufStartOpts(input)
 }
@@ -74,6 +76,23 @@ function buildGgufStartOpts({ entry, engine, cfg, sys, overrides, trigger }: Bui
     model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: entry.vision },
     modelPath: entry.path,
     extraArgs,
+    preferredPort: profile.port,
+    profile,
+    trigger,
+  }
+}
+
+function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }: BuildStartOptsInput): StartOpts {
+  // LiteRT-LM: a single-file .litertlm bundle. Backend (cpu/gpu), context and threads reach the server through its
+  // --config file (litertLmProfileToConfig); the model path itself travels in each request, not on the command line.
+  const saved = getModelProfile(cfg, entry.key, engine.id) as Partial<LoadProfile> | undefined
+  const profile = resolveProfile(entry, sys, saved, overrides, cfg.modelDefaults)
+  return {
+    engine,
+    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: false },
+    modelPath: entry.path,
+    extraArgs: profile.extraArgs,
+    litertLmConfig: litertLmProfileToConfig(profile, sys.gpus.length > 0),
     preferredPort: profile.port,
     profile,
     trigger,

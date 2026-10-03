@@ -8,6 +8,7 @@ describe('loadModeFor', () => {
     expect(loadModeFor({}, 'llama-server')).toBe('llamacpp')
     expect(loadModeFor({}, 'vllm')).toBe('vllm')
     expect(loadModeFor({}, 'mlx')).toBe('mlx')
+    expect(loadModeFor({}, 'litert-lm')).toBe('litert-lm')
     expect(loadModeFor({}, undefined)).toBe('none')
   })
 

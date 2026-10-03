@@ -52,7 +52,7 @@ import type { ChatStore } from '../chat/store/chat-store.js'
 import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
-import { engineModelAlias } from '../engines/compat.js'
+import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -294,6 +294,7 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     else delete reqBody.max_tokens
+    applyEngineTokenLimit(engineKind, reqBody)
     if (toolsSupported) reqBody.tools = toolDefs
 
     let res: Response

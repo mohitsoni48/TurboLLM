@@ -606,7 +606,7 @@ export type ModelEntry = {
   name: string
   path: string
   dir: string
-  format: 'gguf' | 'mlx'
+  format: 'gguf' | 'mlx' | 'litertlm'
   sizeBytes: number
   sizeLabel: string
   arch: string
@@ -906,6 +906,8 @@ export type LoadProfile = {
   gpu: GpuProfile
   /** vLLM-specific load controls (F-027). Mirrors the daemon's VllmProfile. */
   vllm: VllmProfile
+  /** LiteRT-LM load controls. Mirrors the daemon's LitertLmProfile. */
+  litertLm?: LitertLmProfile
   extraArgs: string[]
   /** llama.cpp --batch-size. Prompt processing batch size. 0 / absent = engine default (2048). */
   batchSize?: number
@@ -976,6 +978,14 @@ export type VllmProfile = {
   enforceEager: boolean
   /** --trust-remote-code (models shipping custom modelling code). */
   trustRemoteCode: boolean
+}
+
+/** LiteRT-LM load controls. `auto` = GPU when one is detected and GPU layers > 0; `gpu` forces it (needed where the
+ *  GPU cannot be detected, e.g. Android/Termux); `cpu` forces CPU. */
+export type LitertLmProfile = { backend: 'auto' | 'cpu' | 'gpu' }
+
+export function defaultLitertLm(): LitertLmProfile {
+  return { backend: 'auto' }
 }
 
 export function defaultVllm(): VllmProfile {

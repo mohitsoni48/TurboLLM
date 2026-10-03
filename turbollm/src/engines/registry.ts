@@ -282,6 +282,14 @@ export class Registry {
     return this.addSingleBinary('koboldcpp', name || 'KoboldCpp', binPath, version)
   }
 
+  /** Register a LiteRT-LM engine (kind='litert-lm'). binPath is the venv python the CLI runs under (not a
+   *  llama-server), so llama.cpp capabilities/flags don't apply — its backend/context/threads go through a
+   *  generated --config file instead (see litertLmProfileToConfig). Registration is otherwise identical to a
+   *  single-binary engine, so it shares that path. */
+  addLitertLm(name: string, binPath: string, version: string): Engine {
+    return this.addSingleBinary('litert-lm', name || 'LiteRT-LM', binPath, version)
+  }
+
   /** Register a llamafile engine (kind='llamafile'). binPath is the single llamafile
    *  executable; it runs as llama.cpp's server (launched with --server --no-webui) and
    *  accepts the standard llama.cpp profile flags. */
@@ -290,7 +298,7 @@ export class Registry {
   }
 
   /** Shared registration for a single-binary, non-llama-server engine kind (koboldcpp,
-   *  llamafile). Mirrors addMlx/addVllm: no llama-server probe, empty capabilities, and
+   *  llamafile, litert-lm). Mirrors addMlx/addVllm: no llama-server probe, empty capabilities, and
    *  replace-in-place when the same path is re-registered. */
   private addSingleBinary(kind: string, name: string, binPath: string, version: string): Engine {
     const eng: Engine = {

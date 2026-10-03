@@ -7,7 +7,7 @@ import type { HardwareReq } from './catalog'
 import type { GpuVendor } from '../sysinfo/sysinfo'
 import type { ModelEntry } from '../models/scanner'
 
-export type ModelFormat = 'gguf' | 'mlx'
+export type ModelFormat = 'gguf' | 'mlx' | 'litertlm'
 
 export type Incompatibility =
   | { code: 'format'; label: string; message: string }
@@ -57,13 +57,17 @@ const GGMLC_GGUF: Incompatibility = {
 const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'
 
 function formatIncompatibility(engineKind: string, format: ModelFormat): Incompatibility {
-  const label = format === 'gguf' ? 'needs llama.cpp' : NEEDS_PYTHON_ENGINE_LABEL
+  const label = format === 'gguf' ? 'needs llama.cpp' : format === 'litertlm' ? 'needs LiteRT-LM' : NEEDS_PYTHON_ENGINE_LABEL
   return { code: 'format', label, message: formatMismatchMessage(engineKind, format) }
 }
 
 /** User-facing message when the active engine can't load a model's format (ADR-044). */
 function formatMismatchMessage(engineKind: string, format: ModelFormat): string {
   if (engineKind === 'laya') return 'The Laya engine runs only Laya models — load this one on another engine.'
+  // A .litertlm bundle is loadable by exactly one engine, whatever the active one is.
+  if (format === 'litertlm') return 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.'
+  if (engineKind === 'litert-lm')
+    return 'The active engine is LiteRT-LM — pick a .litertlm model, or switch to the engine this model\'s format needs.'
   if (engineKind === 'mlx')
     return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'rapid-mlx')
@@ -103,6 +107,7 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *   - MLX-VLM (kind 'mlx-vlm') → the same MLX-format directories, for vision-language models
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
+ *   - LiteRT-LM (kind 'litert-lm') → `.litertlm` bundles, a format no other engine reads
  *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
  *     recognises by `entry.laya` before the format is ever checked
  */
@@ -112,6 +117,8 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
   if (engineKind === 'mlx-vlm') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
   if (engineKind === 'laya') return false
+  // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
+  if (engineKind === 'litert-lm') return format === 'litertlm'
   // llama-server / forks, llamafile, koboldcpp — all GGUF.
   return format === 'gguf'
 }
@@ -173,7 +180,23 @@ export const RAPID_MLX_MODEL_ALIAS = 'default'
 export function engineModelAlias(engineKind: string, modelPath?: string | null): string | null {
   if (engineKind === 'rapid-mlx') return RAPID_MLX_MODEL_ALIAS
   if (engineKind === 'mlx-vlm') return modelPath ?? null
+  // LiteRT-LM is the same shape as MLX-VLM: its `model` field is a real, load-bearing reference (here the .litertlm
+  // file path), not a name it ignores and not an alias it was launched under.
+  if (engineKind === 'litert-lm') return modelPath ?? null
   return engineKind === 'mlx' || engineKind === 'vllm' || engineKind === 'sglang' ? ENGINE_MODEL_ALIAS : null
+}
+
+/**
+ * LiteRT-LM's server only honors `max_completion_tokens`; a plain `max_tokens` is silently ignored, so a capped request
+ * would run to the context limit. Moves the cap to the key that engine reads (an explicit `max_completion_tokens` wins).
+ * No-op for every other engine. Mutates and returns `body`.
+ */
+export function applyEngineTokenLimit<T extends Record<string, unknown>>(engineKind: string, body: T): T {
+  if (engineKind !== 'litert-lm' || !('max_tokens' in body)) return body
+  const b = body as Record<string, unknown>
+  if (b.max_completion_tokens == null && b.max_tokens != null) b.max_completion_tokens = b.max_tokens
+  delete b.max_tokens
+  return body
 }
 
 // ─── Hardware ↔ variant matching (engine overhaul, Phase 1) ──────────────────

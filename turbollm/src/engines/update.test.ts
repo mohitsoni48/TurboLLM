@@ -198,6 +198,14 @@ test('resolveUpdateSource: sglang → PyPI package + stripped version (regressio
   })
 })
 
+test('resolveUpdateSource: litert-lm → PyPI package + stripped version', () => {
+  assert.deepEqual(resolveUpdateSource(eng({ kind: 'litert-lm', version: 'litert-lm 0.17.1' })), {
+    source: 'pip',
+    ref: 'litert-lm',
+    installed: '0.17.1',
+  })
+})
+
 test('resolveUpdateSource: koboldcpp/llamafile → GitHub repo + stored tag (Phase 4)', () => {
   assert.deepEqual(resolveUpdateSource(eng({ kind: 'koboldcpp', version: 'v1.115.2' })), {
     source: 'github-release',

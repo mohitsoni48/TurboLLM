@@ -13,6 +13,8 @@ const LLAMA_BACKENDS = new Set(['cuda', 'rocm', 'sycl', 'vulkan', 'metal', 'cpu'
 /** Friendly engine name for the provision banner, from the `backend` id. */
 function engineLabel(backend: string): string {
   if (backend === 'vllm') return 'vLLM engine'
+  if (backend === 'sglang') return 'SGLang engine'
+  if (backend === 'litert-lm') return 'LiteRT-LM engine'
   if (backend === 'mlx') return 'MLX engine'
   if (backend === 'rapid-mlx') return 'Rapid-MLX engine'
   if (backend === 'mlx-vlm') return 'MLX-VLM engine'

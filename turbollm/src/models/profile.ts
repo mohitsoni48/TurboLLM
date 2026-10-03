@@ -45,6 +45,19 @@ export function defaultGpu(): GpuProfile {
   return { splitMode: 'layer', tensorSplit: [], mainGpu: -1, tensorParallelSize: 1 }
 }
 
+/** LiteRT-LM load controls. The runtime has no partial GPU offload, so the one real choice is where the model runs:
+ *    auto → GPU when the machine reports one and `ngl` > 0, otherwise CPU (the KoboldCpp convention)
+ *    cpu  → always CPU
+ *    gpu  → always GPU, even when no GPU was detected. This exists because some platforms (Android/Termux) cannot
+ *           report a GPU to us although the runtime can use it; `auto` would silently pin those devices to CPU. */
+export interface LitertLmProfile {
+  backend: 'auto' | 'cpu' | 'gpu'
+}
+
+export function defaultLitertLm(): LitertLmProfile {
+  return { backend: 'auto' }
+}
+
 /** vLLM-specific load controls (F-027). vLLM is a full server with richer load-time config
  *  than llama.cpp — these map to its CLI flags in {@link vllmProfileToArgs}. Defaults are
  *  deliberate no-ops (match vLLM's own defaults) so a fresh profile emits no extra flags:
@@ -160,6 +173,8 @@ export interface LoadProfile {
   gpu: GpuProfile
   /** vLLM-specific load controls (F-027). See {@link VllmProfile}. Ignored by llama.cpp/MLX. */
   vllm: VllmProfile
+  /** LiteRT-LM load controls. See {@link LitertLmProfile}. Ignored by every other engine. */
+  litertLm: LitertLmProfile
   /** GBNF grammar enforced at startup (--grammar). Empty string = no constraint.
    *  Power-user override for models that should always respond in a fixed format. */
   grammar: string
@@ -621,6 +636,7 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
     ropeFreqScale: 0,
     gpu: defaultGpu(),
     vllm: defaultVllm(),
+    litertLm: defaultLitertLm(),
     grammar: '',
     extraArgs: [],
   }
@@ -742,6 +758,7 @@ export function resolveProfile(
     gpu: { ...base.gpu, ...(saved?.gpu ?? {}), ...(overrides?.gpu ?? {}) },
     // vllm deep-merged for the same reason — old/partial profiles keep the defaults.
     vllm: { ...base.vllm, ...(saved?.vllm ?? {}), ...(overrides?.vllm ?? {}) },
+    litertLm: { ...base.litertLm, ...(saved?.litertLm ?? {}), ...(overrides?.litertLm ?? {}) },
     // useMmproj has no UI control (only mmprojGpu — GPU-vs-CPU placement — is user-facing;
     // see ModelDetailDialog's "Vision encoder on GPU" toggle), so there is no legitimate way
     // for a saved profile or draft override to carry a meaningful `false` here. Forcing it to

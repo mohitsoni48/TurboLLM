@@ -16,6 +16,17 @@ import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
+import {
+  litertLmConfigPath,
+  litertLmLoadFailureMessage,
+  litertLmModelRef,
+  litertLmPathBlocker,
+  litertLmServeBlocker,
+  litertLmServerCommand,
+  warmUpLitertLm,
+  writeLitertLmConfig,
+  type LitertLmConfig,
+} from './litert-lm'
 
 export type State = 'stopped' | 'starting' | 'running' | 'stopping' | 'error'
 
@@ -40,6 +51,9 @@ export interface StartOpts {
   /** vLLM multi-GPU shard count (ADR-054). Only consumed by the vllm branch of
    *  {@link engineCommand}; llama.cpp carries its GPU flags in extraArgs instead. */
   tensorParallelSize?: number
+  /** LiteRT-LM backend/context/threads (litertLmProfileToConfig). Written to a per-port JSON file and passed with
+   *  `--config`; only consumed by the litert-lm branch of {@link engineCommand}. */
+  litertLmConfig?: LitertLmConfig
   /** Per-model pinned port (LoadProfile.port), engine-agnostic. Tried first by
    *  allocPort(); falls back to the normal 8081+ walk if unset or already taken. */
   preferredPort?: number
@@ -317,6 +331,15 @@ export class Manager {
       }
     }
 
+    if (opts.engine.kind === 'litert-lm') {
+      const blocker = litertLmPathBlocker(opts.modelPath) ?? (await litertLmServeBlocker(opts.engine.binPath))
+      if (blocker) {
+        this.state = 'error'
+        this.errInfo = { code: 'engine_unsupported', message: blocker, exitCode: -1, logTail: [] }
+        return
+      }
+    }
+
     const port = await allocPort(opts.preferredPort)
     const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
     mkdirSync(dirname(logPath), { recursive: true })
@@ -346,7 +369,15 @@ export class Manager {
       }
     }
 
-    const { cmd, args } = engineCommand(opts, port, slotSavePath)
+    // LiteRT-LM takes backend/context/threads from a JSON file (`serve --config`), one per port so two
+    // engines never share (and overwrite) each other's settings.
+    let litertConfigPath: string | undefined
+    if (opts.engine.kind === 'litert-lm') {
+      litertConfigPath = litertLmConfigPath(this.store.dir(), port)
+      writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: { backend: 'cpu' } })
+    }
+
+    const { cmd, args } = engineCommand(opts, port, slotSavePath, litertConfigPath)
     // The UNWRAPPED command (before the POSIX-llamafile shell-quoting workaround below) is
     // what a human would actually type in their own terminal — stored for "copy exact launch
     // command" (GitHub Discord ask). Not logged before now: the file only ever had a port-only
@@ -686,6 +717,30 @@ export class Manager {
         }
       }
       if (await probeReady(port)) {
+        // LiteRT-LM binds its socket and answers /v1/models before any model is loaded (it loads on the first chat
+        // request), so the socket is not readiness: load it with a one-token warm-up, which is also where a bad
+        // bundle or an unusable GPU surfaces.
+        if (kind === 'litert-lm' && this.opts) {
+          const backend = this.opts.litertLmConfig?.default.backend ?? 'cpu'
+          const res = await warmUpLitertLm(
+            port,
+            litertLmModelRef(this.opts.modelPath),
+            AbortSignal.timeout(Math.max(1000, deadline - Date.now())),
+          )
+          if (!res.ok) {
+            if (this.child === child && this.state === 'starting') {
+              this.state = 'error'
+              this.errInfo = {
+                code: 'model_load_failed',
+                message: litertLmLoadFailureMessage(res.message, backend),
+                exitCode: -1,
+                logTail: readTail(this.logPathStr, 20),
+              }
+              child.kill('SIGKILL')
+            }
+            return
+          }
+        }
         if (this.child === child && this.state === 'starting') {
           this.state = 'running'
           this.lastActivity = Date.now()
@@ -740,7 +795,12 @@ export function shellWrapped(cmd: string, args: string[]): { cmd: string; args: 
 
 /** Build the spawn command for an engine, branching on its kind (spec 03 §2b).
  *  `slotSavePath` (F-014) is appended only for llama.cpp; mlx/vllm don't support it. */
-export function engineCommand(opts: StartOpts, port: number, slotSavePath?: string): { cmd: string; args: string[] } {
+export function engineCommand(opts: StartOpts, port: number, slotSavePath?: string, configPath?: string): { cmd: string; args: string[] } {
+  if (opts.engine.kind === 'litert-lm') {
+    // LiteRT-LM: `serve` has no model argument (the model path rides in each request) — launch options come from
+    // the --config file. opts.extraArgs are the user's own `serve` flags.
+    return litertLmServerCommand(opts.engine.binPath, configPath!, port, '127.0.0.1', opts.extraArgs)
+  }
   if (opts.engine.kind === 'laya') {
     // Laya: the launcher serves laya's own /v1/systemone app over the model folder's checkpoints. It has no
     // launch flags, so opts.extraArgs is never used.
@@ -804,7 +864,7 @@ const READINESS_TIMEOUT_MS = 600_000
  *  default — without this, a self-built engine fails to start with missing-library errors.
  *  macOS's dyld ignores LD_LIBRARY_PATH, so the same dir also goes on DYLD_LIBRARY_PATH there.
  *  Harmless when nothing is bundled there. Native engines on Windows still inherit the
- *  daemon env unchanged (undefined). For Python engines we:
+ *  daemon env unchanged (undefined). For Python engines (MLX, vLLM, SGLang, LiteRT-LM) we:
  *   - prepend the venv's bin dir to PATH so venv-installed tools (notably `ninja`,
  *     used by FlashInfer's JIT kernel compiler) are found without a system install
  *     (BUG-005),
@@ -815,7 +875,7 @@ const READINESS_TIMEOUT_MS = 600_000
  *     CacheNotFound when `~/.cache/huggingface/hub` is absent, and
  *   - on WSL, run vLLM's V1 model runner, since V2 cannot start there (`vllmModelRunnerEnv`). */
 export function pyEngineEnv(kind: string, dataDir: string, binPath: string): NodeJS.ProcessEnv | undefined {
-  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang' && kind !== 'laya') {
+  if (kind !== 'mlx' && kind !== 'rapid-mlx' && kind !== 'mlx-vlm' && kind !== 'vllm' && kind !== 'sglang' && kind !== 'litert-lm' && kind !== 'laya') {
     if (process.platform === 'win32') return undefined
     const dir = dirname(binPath)
     // Append the existing value only if it's non-empty — glibc's dynamic linker treats an

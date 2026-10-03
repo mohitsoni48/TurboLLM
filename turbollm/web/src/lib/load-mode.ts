@@ -4,7 +4,7 @@
 // engine is active (ADR-443): show sampling only, assume nothing.
 import type { ModelEntry } from './types'
 
-export type LoadMode = 'llamacpp' | 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm' | 'none'
+export type LoadMode = 'llamacpp' | 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm' | 'litert-lm' | 'none'
 
 export function loadModeFor(model: Pick<ModelEntry, 'laya'>, activeEngineKind: string | undefined): LoadMode {
   if (model.laya) return 'none'
@@ -19,6 +19,8 @@ export function loadModeFor(model: Pick<ModelEntry, 'laya'>, activeEngineKind: s
       return 'mlx-vlm'
     case 'vllm':
       return 'vllm'
+    case 'litert-lm':
+      return 'litert-lm'
     default:
       return 'none'
   }

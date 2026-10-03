@@ -44,6 +44,14 @@ export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolea
     }
   }
 
+  if (prof.litertLm !== undefined) {
+    const l = prof.litertLm as Record<string, unknown>
+    if (!l || typeof l !== 'object' || Array.isArray(l)) return 'litertLm must be a JSON object.'
+    if (l.backend !== undefined && !['auto', 'cpu', 'gpu'].includes(l.backend as string)) {
+      return 'litertLm.backend must be auto, cpu, or gpu.'
+    }
+  }
+
   if (prof.nCpuMoe !== undefined) {
     const n = prof.nCpuMoe
     if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) {

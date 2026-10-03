@@ -6,7 +6,7 @@
 // The fragile bits the spike surfaced are baked in here (disable thinking, json_object,
 // strip fences, exact model alias) so the loop can't silently degrade to NO_LESSON.
 import type { Deps } from '../deps'
-import { engineModelAlias } from '../engines/compat'
+import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
 
 const REVIEWER_SYSTEM = `You review a COMPLETED, user-approved agent task and extract at most ONE reusable lesson — ONLY if there is concrete evidence of a problem.
 
@@ -43,7 +43,7 @@ export async function reviewConversation(
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(applyEngineTokenLimit(d.registry.active()?.kind ?? '', {
         model,
         messages: [
           { role: 'system', content: REVIEWER_SYSTEM },
@@ -55,7 +55,7 @@ export async function reviewConversation(
         chat_template_kwargs: { enable_thinking: false },
         response_format: { type: 'json_object' },
         stream: false,
-      }),
+      })),
       signal: AbortSignal.timeout(90_000),
     })
     if (!res.ok) return { lesson: null, evidence: null }

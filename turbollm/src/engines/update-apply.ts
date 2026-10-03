@@ -26,6 +26,7 @@ import { ensureMlxEnv } from './mlx'
 import { ensureRapidMlxEnv } from './rapid-mlx'
 import { ensureMlxVlmEnv } from './mlx-vlm'
 import { ensureVllmEnv } from './vllm'
+import { ensureLitertLmEnv } from './litert-lm'
 import { ensureKoboldcpp, koboldcppDir } from './koboldcpp'
 import { ensureLlamafile, llamafileDir } from './llamafile'
 import { primaryVendor } from '../sysinfo/sysinfo'
@@ -50,6 +51,7 @@ export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, sign
   if (engine.kind === 'rapid-mlx') return applyPipUpdate(d, 'rapid-mlx', engine, root)
   if (engine.kind === 'mlx-vlm') return applyPipUpdate(d, 'mlx-vlm', engine, root)
   if (engine.kind === 'vllm') return applyPipUpdate(d, 'vllm', engine, root)
+  if (engine.kind === 'litert-lm') return applyPipUpdate(d, 'litert-lm', engine, root)
   if (engine.kind === 'koboldcpp') return applyKoboldcppUpdate(d, engine, root, signal)
   if (engine.kind === 'llamafile') return applyLlamafileUpdate(d, engine, root, signal)
   if (engine.kind === 'llama-server') {
@@ -158,11 +160,13 @@ async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: st
   }
 }
 
-const PIP_ENGINE_LABEL: Record<'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm', string> =
-  { mlx: 'MLX', 'rapid-mlx': 'Rapid-MLX', 'mlx-vlm': 'MLX-VLM', vllm: 'vLLM' }
+type PipEngineKind = 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm' | 'litert-lm'
 
-/** vLLM / MLX / Rapid-MLX / MLX-VLM: upgrade the package in place (uv pip install -U/--upgrade). */
-async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'rapid-mlx' | 'mlx-vlm' | 'vllm', engine: Engine, root: string): Promise<void> {
+const PIP_ENGINE_LABEL: Record<PipEngineKind, string> =
+  { mlx: 'MLX', 'rapid-mlx': 'Rapid-MLX', 'mlx-vlm': 'MLX-VLM', vllm: 'vLLM', 'litert-lm': 'LiteRT-LM' }
+
+/** vLLM / MLX / Rapid-MLX / MLX-VLM / LiteRT-LM: upgrade the package in place (uv pip install -U/--upgrade). */
+async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: Engine, root: string): Promise<void> {
   d.provision.start(kind, 'auto_update')
   try {
     if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
@@ -177,6 +181,10 @@ async function applyPipUpdate(d: UpdateApplyDeps, kind: 'mlx' | 'rapid-mlx' | 'm
     } else if (kind === 'mlx-vlm') {
       const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
+      d.registry.activate(eng.id)
+    } else if (kind === 'litert-lm') {
+      const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
+      const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
       d.registry.activate(eng.id)
     } else {
       const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)

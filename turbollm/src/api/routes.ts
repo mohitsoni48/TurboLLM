@@ -33,6 +33,7 @@ import {
   recommendBackendId,
 } from '../engines/download'
 import {
+  computeUpdateStatus,
   normalizeUpdatePolicy,
   tagFromManagedBinPath,
   latestTagForInstalled,
@@ -47,6 +48,7 @@ import { installLayaEngine, layaEngineBusy } from '../engines/laya-install'
 import { ensureMlxVlmEnv } from '../engines/mlx-vlm'
 import { ensureVllmEnv } from '../engines/vllm'
 import { ensureSglangEnv } from '../engines/sglang'
+import { ensureLitertLmEnv } from '../engines/litert-lm'
 import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/koboldcpp'
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
@@ -558,7 +560,7 @@ export function registerApi(app: Hono, d: Deps): void {
       let enabled: boolean | undefined
       if (e.provision === 'pip') {
         // pip engines: installed = venv python exists on disk; enabled = registered in registry.
-        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/mlx-vlm/vllm/sglang/laya).
+        // Every pip catalog id names its own venv subdir 1:1 (mlx/rapid-mlx/mlx-vlm/vllm/sglang/laya/litert-lm).
         const pyPath = join(enginesRoot, e.id, 'venv',
           process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python')
         installed = existsSync(pyPath)
@@ -976,6 +978,53 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ accepted: true, engine: 'sglang' }, 202)
   })
 
+  // Provision the LiteRT-LM engine: uv → venv → `uv pip install litert-lm` (a small wheel that bundles its native
+  // runtime — no torch/CUDA), then register as a kind='litert-lm' engine. 202 + progress via GET /status
+  // engineProvision. ?update=1 upgrades litert-lm to the latest release (passes -U to uv pip install), but only
+  // after an honest upstream check: when the registered engine is already at the real PyPI latest, the route
+  // answers `alreadyLatest` WITHOUT provisioning — the old unconditional re-provision lit the global
+  // "Downloading…" banner for a no-op every time "Check for update" was clicked (the llama.cpp backends
+  // already behaved this way; see /engines/backends/:id/update above). Cancellable via the same channel.
+  app.post('/api/v1/engines/litert-lm', async (c) => {
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    const root = join(d.store.dir(), 'engines')
+    const upgrade = c.req.query('update') === '1'
+    // Only a POSITIVE "already latest" short-circuits; any check failure (offline, engine not
+    // registered) falls through to the old re-provision path, which surfaces its own error.
+    // Prefers the daemon's UpdateChecker — it shares the injectable fetcher the /engines/updates
+    // route uses, keeps the honest-cache semantics (a cached real answer survives an offline
+    // re-check), and lets tests stub the upstream.
+    if (upgrade) {
+      const registered = d.registry.list().engines.find((e) => e.kind === 'litert-lm')
+      const status = registered
+        ? await (d.updates
+            ? d.updates.check(registered, AbortSignal.timeout(15_000))
+            : computeUpdateStatus(registered, undefined, AbortSignal.timeout(15_000))
+          ).catch(() => null)
+        : null
+      if (status && status.latest !== null && !status.hasUpdate) {
+        return c.json({ accepted: false, alreadyLatest: true, version: status.latest, engine: 'litert-lm' })
+      }
+    }
+    const ac = new AbortController()
+    provisionAbort = ac
+    void (async () => {
+      try {
+        d.provision.start('litert-lm', 'runtime_env')
+        const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade, ac.signal)
+        const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
+        d.registry.activate(eng.id)
+        d.provision.done()
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') d.provision.done() // user cancelled — nothing failed
+        else d.provision.fail(`Could not install LiteRT-LM: ${e instanceof Error ? e.message : e}`)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
+      }
+    })()
+    return c.json({ accepted: true, engine: 'litert-lm' }, 202)
+  })
+
   // Provision a catalog fork via GitHub release (ADR-044) — TurboQuant. Downloads
   // the platform-matching prebuilt llama-server, probes it (it IS llama-server
   // compatible), and registers it as a kind='llama-server' engine. 202 + progress
@@ -1345,6 +1394,15 @@ export function registerApi(app: Hono, d: Deps): void {
         const purgeDir = engineInstallDir(eng, enginesRoot)
         if (purgeDir && existsSync(purgeDir)) {
           rmSync(purgeDir, { recursive: true, force: true })
+        }
+        // LiteRT-LM keeps one launch-config file per port next to its venv (engines/litert-lm/config-<port>.json).
+        if (eng.kind === 'litert-lm') {
+          const cfgDir = join(enginesRoot, 'litert-lm')
+          try {
+            for (const f of readdirSync(cfgDir)) {
+              if (/^config-\d+\.json$/.test(f)) rmSync(join(cfgDir, f), { force: true })
+            }
+          } catch { /* directory already gone */ }
         }
         // A purge is a real delete, not a Disable — drop any remembered custom-engine
         // identity too, so a purged engine doesn't linger as a "disabled" card with a
@@ -3167,6 +3225,11 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
   // pip: laya venv
   if (eng.kind === 'laya') {
     const d = join(enginesRoot, 'laya', 'venv')
+    return inside(d) ? d : null
+  }
+  // pip: litert-lm venv (its per-port config files are removed by the purge caller)
+  if (eng.kind === 'litert-lm') {
+    const d = join(enginesRoot, 'litert-lm', 'venv')
     return inside(d) ? d : null
   }
   // pip: vllm venv

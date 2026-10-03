@@ -8,13 +8,14 @@ import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
+import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor } from './litertlm'
 
 export interface ModelEntry {
   key: string
   name: string
   path: string
   dir: string
-  format: 'gguf' | 'mlx'
+  format: 'gguf' | 'mlx' | 'litertlm'
   sizeBytes: number
   sizeLabel: string
   arch: string
@@ -366,7 +367,7 @@ export class Scanner {
 
   private async scanOnce(): Promise<void> {
     const dirs = this.store.snapshot().modelDirs
-    const scan: ScanResult = { ggufs: [], mlxDirs: [], layaDirs: [] }
+    const scan: ScanResult = { ggufs: [], mlxDirs: [], layaDirs: [], litertlms: [] }
     const roots = new Map<string, string>()
     for (const dir of dirs) {
       try {
@@ -380,7 +381,8 @@ export class Scanner {
     const gguf = await this.build(scan.ggufs)
     const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
     const laya = scan.layaDirs.map((dir) => layaEntryFor(dir))
-    this.entries = [...gguf, ...mlx, ...laya].sort((a, b) => a.name.localeCompare(b.name))
+    const litertlm = scan.litertlms.map((f) => litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime))
+    this.entries = [...gguf, ...mlx, ...laya, ...litertlm].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
     this.saveCache()
     // One config write for the whole scan (see `entryFor`), not one per affected model.
@@ -597,6 +599,8 @@ interface ScanResult {
   mlxDirs: string[]
   /** Laya folders: one entry per bundle, whose checkpoint subfolders are part of it (./laya). */
   layaDirs: string[]
+  /** LiteRT-LM bundles (`.litertlm`): one file per model, no companions to group. */
+  litertlms: FileInfo[]
 }
 
 /** A directory holds an MLX/HF model when it has config.json + safetensors weights
@@ -662,6 +666,11 @@ async function walk(dir: string, out: ScanResult, state: WalkState, depth = 0, a
         if (!companion && state.files.has(real)) continue
         state.files.add(real)
         out.ggufs.push({ path: full, realPath: real, size: st.size, mtime: st.mtimeMs })
+      } else if (st.isFile() && isLitertlmFileName(name) && (await hasLitertlmMagic(full))) {
+        const real = await realpath(full)
+        if (state.files.has(real)) continue
+        state.files.add(real)
+        out.litertlms.push({ path: full, realPath: real, size: st.size, mtime: st.mtimeMs })
       }
     } catch { /* permission / gone / broken link */ }
   }

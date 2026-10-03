@@ -20,6 +20,7 @@ import {
   Minus,
   MoreHorizontal,
   Network,
+  Smartphone,
   Package,
   Pencil,
   RefreshCw,
@@ -29,8 +30,10 @@ import {
   Wrench,
   Zap,
 } from 'lucide-react'
+import { useQueryClient } from '@tanstack/react-query'
 import {
   activeEngineOf,
+  queryKeys,
   useBackendInstall,
   useBuild,
   useEngineBackends,
@@ -44,7 +47,7 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, track } from '../lib/api'
+import { ApiError, getEngineUpdates, track } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -212,6 +215,18 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'OpenAI-compatible server out of the box',
     ],
     cons: ['Linux + NVIDIA only', 'Heavy install; needs recent CUDA', 'Overkill for a single desktop user'],
+  },
+  'litert-lm': {
+    icon: Smartphone,
+    tagline: "Google's on-device runtime",
+    format: '.litertlm',
+    pros: [
+      'Small install — no PyTorch or CUDA',
+      'CPU or GPU, on phones and desktops',
+      'Runs Gemma, Qwen3 and Phi-4-mini bundles',
+      'OpenAI-compatible server out of the box',
+    ],
+    cons: ['.litertlm models only (not GGUF)', 'First load of a model can be slow — a minute or more', 'Android needs Termux + Python (not the standalone app)', 'Experimental'],
   },
   mlx: {
     icon: Cpu,
@@ -816,6 +831,7 @@ function EngineGallery({
   const install = useBackendInstall()
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
+  const qc = useQueryClient()
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
 
   const catalogById = useMemo(() => {
@@ -842,6 +858,7 @@ function EngineGallery({
     provisioning ||
     install.vllm.isPending ||
     install.sglang.isPending ||
+    install.litertLm.isPending ||
     install.mlx.isPending ||
     install.rapidMlx.isPending ||
     install.mlxVlm.isPending ||
@@ -851,6 +868,7 @@ function EngineGallery({
     install.laya.isPending ||
     install.updateVllm.isPending ||
     install.updateSglang.isPending ||
+    install.updateLitertLm.isPending ||
     install.updateMlx.isPending ||
     install.updateRapidMlx.isPending ||
     install.updateMlxVlm.isPending ||
@@ -866,6 +884,7 @@ function EngineGallery({
   const installFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.vllm
     if (e.installEndpoint === '/api/v1/engines/sglang') return install.sglang
+    if (e.installEndpoint === '/api/v1/engines/litert-lm') return install.litertLm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.mlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.rapidMlx
     if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.mlxVlm
@@ -878,6 +897,7 @@ function EngineGallery({
   const updateFor = (e: CatalogEngine) => {
     if (e.installEndpoint === '/api/v1/engines/vllm') return install.updateVllm
     if (e.installEndpoint === '/api/v1/engines/sglang') return install.updateSglang
+    if (e.installEndpoint === '/api/v1/engines/litert-lm') return install.updateLitertLm
     if (e.installEndpoint === '/api/v1/engines/mlx') return install.updateMlx
     if (e.installEndpoint === '/api/v1/engines/rapid-mlx') return install.updateRapidMlx
     if (e.installEndpoint === '/api/v1/engines/mlx-vlm') return install.updateMlxVlm
@@ -931,12 +951,66 @@ function EngineGallery({
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not disable ${e.name}.`),
     })
   }
-  const doUpdate = (e: CatalogEngine) => {
+  // "Check for update" (the card knows of no update): a LIVE status re-check, never a
+  // re-provision. The update POST always answers 202 and lights the global "Downloading…"
+  // banner — pip resolves to the same version and installs nothing, so the banner was a lie
+  // that ran for however long `uv pip install -U` took (the reporter's "downloading pop-up
+  // shows even when already latest"). The llama.cpp backend rows already did this honestly;
+  // pip engines now match. Only a card that already knows `hasUpdate` fires the real update.
+  const checkLive = async (e: CatalogEngine) => {
+    track('engines', 'check_engine_update')
+    const toastId = `engine-update-check-${e.id}`
+    toast.loading(`Checking ${e.name} for updates…`, { id: toastId, duration: 60_000 })
+    try {
+      const res = await getEngineUpdates(true)
+      const st = registryEngineId(e) ? res.updates[registryEngineId(e)!] : undefined
+      if (!st) {
+        // Engine not registered (e.g. disabled) — no honest status can exist. Fall back to
+        // the re-provision path, which is what this action has always meant for a disabled
+        // engine (re-install + re-register).
+        const m = updateFor(e)
+        if (!m) { toast.error(`Could not check ${e.name}.`, { id: toastId }); return }
+        m.mutate(undefined, {
+          onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not update ${e.name}.`, { id: toastId }),
+        })
+        toast.dismiss(toastId)
+        return
+      }
+      if (st.error === 'offline') {
+        toast.error(`Couldn't reach the update source for ${e.name} — try again when online.`, { id: toastId })
+        return
+      }
+      if (st.error === 'rate_limited') {
+        toast.error('GitHub rate limit reached — add a token in Settings → GitHub.', { id: toastId })
+        return
+      }
+      if (st.error === 'no_source' || !st.comparable) {
+        toast.error(`Update status is unavailable for ${e.name}.`, { id: toastId })
+        return
+      }
+      if (st.hasUpdate && st.latest) {
+        toast.success(`Update available for ${e.name}: ${st.installed || '?'} → ${st.latest}`, { id: toastId })
+      } else {
+        toast.success(`${e.name} is up to date (${st.latest ?? st.installed})`, { id: toastId })
+      }
+      // Flip the card's own status line + menu item ("Check for update" → "Update now").
+      void qc.invalidateQueries({ queryKey: queryKeys.engineUpdates })
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : `Could not check ${e.name} for updates.`, { id: toastId })
+    }
+  }
+  const doUpdate = (e: CatalogEngine, hasUpdate: boolean) => {
     const m = updateFor(e)
     if (!m) return
+    if (!hasUpdate) { void checkLive(e); return }
     track('engines', 'update_engine')
     m.mutate(undefined, {
-      onSuccess: () => toast.success(`Updating ${e.name} to the latest release…`),
+      // `alreadyLatest` is the backend's honest refusal (the daemon re-checks at apply time;
+      // a stale card could still think an update exists) — mirror the backend-row message.
+      onSuccess: (res) =>
+        res && (res as { alreadyLatest?: boolean }).alreadyLatest
+          ? toast.success(`${e.name} is already on the latest release (${(res as { version?: string }).version ?? 'installed version'})`)
+          : toast.success(`Updating ${e.name} to the latest release…`),
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not update ${e.name}.`),
     })
   }
@@ -1186,7 +1260,10 @@ function EngineCard({
   onInstall: (e: CatalogEngine) => void
   onEnable: (e: CatalogEngine) => void
   onDisable: (e: CatalogEngine) => void
-  onUpdate: (e: CatalogEngine) => void
+  /** `hasUpdate` tells the gallery whether the card already KNOWS an update exists: true →
+   *  apply it (the provision + banner is then legitimate); false → this is a "Check for
+   *  update", which must never light the downloading banner for a no-op. */
+  onUpdate: (e: CatalogEngine, hasUpdate: boolean) => void
   onDelete: (e: CatalogEngine) => void
   onSetPolicy: (e: CatalogEngine, policy: UpdatePolicy) => void
   onRefetchCatalog: () => void
@@ -1397,7 +1474,7 @@ function EngineCard({
           ) : !catalog ? null : isInstalled ? (
             <>
               {isEnabled && updateStatus?.hasUpdate && !sourceBuilt && (
-                <Button size="sm" variant="outline" disabled={provisioning} onClick={() => onUpdate(catalog)}>
+                <Button size="sm" variant="outline" disabled={provisioning} onClick={() => onUpdate(catalog, true)}>
                   <Download size={13} /> Update
                 </Button>
               )}
@@ -1415,7 +1492,7 @@ function EngineCard({
                       <RefreshCw size={14} /> {updateStatus?.hasUpdate ? 'Rebuild (new commit)' : 'Rebuild'}
                     </DropdownMenuItem>
                   ) : (
-                    <DropdownMenuItem onSelect={() => onUpdate(catalog)} disabled={provisioning}>
+                    <DropdownMenuItem onSelect={() => onUpdate(catalog, !!updateStatus?.hasUpdate)} disabled={provisioning}>
                       <Download size={14} /> {updateStatus?.hasUpdate ? 'Update now' : 'Check for update'}
                     </DropdownMenuItem>
                   )}

@@ -21,3 +21,14 @@ test('cacheRam: anything else is rejected before it can reach the engine command
     assert.match(String(validateWithCacheRam(bad)), /cacheRam must be a non-negative whole number/, `cacheRam=${String(bad)}`)
   }
 })
+
+test('litertLm.backend: auto, cpu and gpu are accepted; anything else is rejected', () => {
+  for (const backend of ['auto', 'cpu', 'gpu']) {
+    assert.equal(validateLoadProfileFields({ ctx: 4096, litertLm: { backend } }, { requireCtx: true }), null, backend)
+  }
+  assert.equal(validateLoadProfileFields({ ctx: 4096, litertLm: {} }, { requireCtx: true }), null)
+  for (const bad of ['npu', 'GPU', 3, null]) {
+    assert.match(String(validateLoadProfileFields({ ctx: 4096, litertLm: { backend: bad } }, { requireCtx: true })), /litertLm\.backend must be/, String(bad))
+  }
+  assert.match(String(validateLoadProfileFields({ ctx: 4096, litertLm: 'gpu' }, { requireCtx: true })), /litertLm must be a JSON object/)
+})

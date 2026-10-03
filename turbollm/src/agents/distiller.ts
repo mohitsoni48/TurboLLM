@@ -7,7 +7,7 @@
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Deps } from '../deps'
-import { engineModelAlias } from '../engines/compat'
+import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
 
 const DISTILL_SYSTEM = `You write a single reusable SKILL from the material provided. A skill captures a repeatable approach so it can be applied to similar future tasks.
 
@@ -36,7 +36,7 @@ async function distill(d: Deps, material: string): Promise<DistilledSkill> {
     const res = await fetch(`${target}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+      body: JSON.stringify(applyEngineTokenLimit(d.registry.active()?.kind ?? '', {
         model,
         messages: [
           { role: 'system', content: DISTILL_SYSTEM },
@@ -48,7 +48,7 @@ async function distill(d: Deps, material: string): Promise<DistilledSkill> {
         chat_template_kwargs: { enable_thinking: false },
         response_format: { type: 'json_object' },
         stream: false,
-      }),
+      })),
       signal: AbortSignal.timeout(90_000),
     })
     if (!res.ok) return { name: null, description: null, procedure: null }

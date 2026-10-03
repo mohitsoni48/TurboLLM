@@ -7,7 +7,7 @@ import { createPatch } from 'diff'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { engineModelAlias } from '../engines/compat'
+import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
 import { linkHeaders, proxyStream } from '../link/link-proxy'
@@ -1000,6 +1000,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       if (parsedBody && maxLimit > 0) {
         parsedBody.max_tokens = clampMaxTokens(parsedBody.max_tokens as number | undefined, maxLimit)
       }
+      // LiteRT-LM only reads `max_completion_tokens` (see applyEngineTokenLimit).
+      if (parsedBody) applyEngineTokenLimit(d.registry.active()?.kind ?? '', parsedBody)
       // Rewrite the outbound model id for engines that serve under a fixed alias
       // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
       // Routing above already used the caller's original id.
