@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { track } from '../../lib/api'
+import { copyToClipboard } from '../../lib/clipboard'
 
 export function CopyButton({
   text,
@@ -23,10 +24,13 @@ export function CopyButton({
 
   const handle = () => {
     track(screen, action)
-    void navigator.clipboard.writeText(text).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    })
+    copyToClipboard(text)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      })
+      // No "Copied!" flash is the failure signal; nothing more a button can usefully say.
+      .catch(() => undefined)
   }
 
   const padding = label != null ? 'px-2 py-1 text-[12px]' : 'p-1'

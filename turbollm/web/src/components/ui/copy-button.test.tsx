@@ -28,6 +28,16 @@ describe('CopyButton', () => {
     expect(h.track).toHaveBeenCalledWith('developer', 'copy_button_click')
   })
 
+  it('still copies and confirms when opened over plain http (no navigator.clipboard)', async () => {
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true })
+    const execCommand = vi.fn().mockReturnValue(true)
+    Object.defineProperty(document, 'execCommand', { value: execCommand, configurable: true })
+    render(<CopyButton text="lan text" screen="chat" />)
+    await userEvent.click(screen.getByRole('button', { name: 'Copy' }))
+    expect(execCommand).toHaveBeenCalledWith('copy')
+    expect(await screen.findByRole('button', { name: 'Copied' })).toBeTruthy()
+  })
+
   it('records the action the caller names instead', async () => {
     render(<CopyButton text="curl" screen="workspace" action="jev_copy_request" />)
     await userEvent.click(screen.getByRole('button', { name: 'Copy' }))

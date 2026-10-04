@@ -6,6 +6,7 @@ import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
 import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus, useSysInfo } from '../lib/queries'
 import { isAndroidOs } from '../lib/platform'
+import { copyToClipboard } from '../lib/clipboard'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
@@ -530,10 +531,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const copyText = async (text: string, successMsg: string, title: string) => {
     try {
-      await navigator.clipboard.writeText(text)
+      await copyToClipboard(text)
       toast.success(successMsg)
     } catch {
-      // Clipboard API unavailable — show fallback modal with pre-selected text
+      // No copy path worked — show fallback modal with pre-selected text
       setClipboardFallback({ text, title })
     }
   }
