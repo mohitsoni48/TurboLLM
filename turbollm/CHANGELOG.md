@@ -23,7 +23,21 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Add your own engine by uploading its .zip.** In the Add-engine flow, "Upload a .zip…" now sits beside
+  "Choose folder…": pick a fork's release archive and TurboLLM searches it at any depth for `llama-server`,
+  extracts the binary together with the runtime libraries it needs (`.dll` / `.dylib` / `.so` and versioned
+  sonames, found anywhere in the archive, symlinked library chains included), and probes it — the same
+  confirm-and-register step as a folder. The files land under TurboLLM's own engine storage as
+  `engines/build/<zip-name>/`, laid out flat so the Windows loader and the library search path the engine
+  already launches with resolve them — including on Termux/Android — and the engine's Delete button removes
+  them, exactly like a self-built engine. Re-uploading a same-named zip updates that engine in place, and a
+  failed or wrong-platform re-upload leaves the working install untouched. Official llama.cpp Windows zips
+  work (a CUDA build without the separate cudart zip gets a clear warning); on Linux, macOS, and Termux the
+  official release assets are `.tar.gz`, so there it covers fork zips. The packaged Android app declines with
+  a clear message (its OS forbids running downloaded binaries). Corrupt, encrypted, or oversized archives
+  fail cleanly and never leave a half-installed build behind.
 
 ## [1.14.3] - 2026-09-30
 

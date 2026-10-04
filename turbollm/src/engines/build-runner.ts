@@ -370,10 +370,12 @@ export function buildDirName(repoUrl: string, branch?: string, commit?: string):
  *  [A-Za-z0-9._-] to one dash (which also folds normRepoUrl's "/" separator, e.g. "owner/repo" →
  *  "owner-repo"). A name made only of dots is a path step, not a name: "..", or "/.." which the
  *  dash-trimming reduces to "..", would make `<engines>/build/<name>` the engines root itself, and
- *  `runBuild`'s clean-start `rmSync` would delete every installed engine. Those become "engine". */
-function asDirName(raw: string): string {
+ *  `runBuild`'s clean-start `rmSync` would delete every installed engine. Those become `fallback`
+ *  ("engine" for build dirs, "zip-build" for the zip-install flow — the one path-safety rule,
+ *  kept here so both spell it identically). */
+export function asDirName(raw: string, fallback = 'engine'): string {
   const slug = raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
-  return isPathStep(slug) ? 'engine' : slug
+  return isPathStep(slug) ? fallback : slug
 }
 
 /** PURE: a name made only of dots ("." / ".." / "...") is a path step, not a directory name — and

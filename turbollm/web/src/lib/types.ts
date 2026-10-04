@@ -370,7 +370,11 @@ export type EnginesList = {
 /** POST /api/v1/engines/scan result (engine overhaul, Phase 3). Read-only preflight
  *  for the guided Add-engine flow: `found:false` when no server binary turned up in
  *  the chosen folder, else the located binary + its probed version/capabilities and
- *  a pre-filled suggested name. ProbeError surfaces as an ApiError (wrong-OS / timeout). */
+ *  a pre-filled suggested name. ProbeError surfaces as an ApiError (wrong-OS / timeout).
+ *  The .zip upload (/api/v1/engines/zip) answers with the same shape, plus: `warning`
+ *  for a non-blocking caveat to show at the confirm step (a CUDA build without its
+ *  cudart runtime), and `updated` when the upload replaced an engine that already lived
+ *  in that build folder — its registration was refreshed in place, so Add is already done. */
 export type EngineScanResult =
   | { found: false }
   | {
@@ -379,6 +383,8 @@ export type EngineScanResult =
       version: string
       capabilities: EngineCapabilities
       suggestedName: string
+      warning?: { code: string; message: string }
+      updated?: { id: string; name: string }
     }
 
 /** A selectable llama.cpp backend variant (ADR-025). A "build" of the official

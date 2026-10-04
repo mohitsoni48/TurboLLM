@@ -3,7 +3,7 @@
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
-import { probe } from './probe'
+import { probe, type ProbeResult } from './probe'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
 
@@ -443,6 +443,25 @@ export class Registry {
     this.store.update((c) => {
       const ce = findEngine(c.engines, id)
       if (!ce) throw new NotFoundError()
+      ce.version = pr.version
+      ce.capabilities = pr.capabilities
+      out = structuredClone(ce)
+    })
+    return out!
+  }
+
+  /** Refresh a registered engine's probed identity IN PLACE from a probe result the caller
+   *  already holds — the zip-upload update flow: the files under the engine's build dir were
+   *  replaced by a same-named re-upload, so the registration must reflect the new binary
+   *  while KEEPING its id, name and history. A fresh add() would register a second engine on
+   *  the same binary, and purging either would delete the files both use. reprobe() is the
+   *  same refresh for the manual path, re-running the probe itself. */
+  refresh(id: string, pr: ProbeResult, binPath?: string): Engine {
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const ce = findEngine(c.engines, id)
+      if (!ce) throw new NotFoundError()
+      if (binPath) ce.binPath = binPath
       ce.version = pr.version
       ce.capabilities = pr.capabilities
       out = structuredClone(ce)

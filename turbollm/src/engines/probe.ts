@@ -10,16 +10,24 @@ import type { FlagInfo } from '../config/config'
  *  never reach `probe()`. Mirrors manager.ts's native-engine env exactly (a source build's
  *  bundled runtime `.so`s — CUDA on Linux, or the whole runtime on Android, which ships with no
  *  RPATH at all — aren't found without this): unlike Windows, the dynamic linker doesn't search
- *  the executable's own directory by default. Confirmed live: an Android NDK cross-compiled
- *  llama-server failed even `--version`/`--help` without it (GitHub #52 item 6 / ADR-390/391) —
- *  a gap in the probe path specifically, since the actual launch path (manager.ts) already sets
- *  this; probing and launching had silently drifted apart. Windows inherits the daemon env
- *  unchanged, same as manager.ts. */
+ *  the executable's own directory by default. macOS's dyld additionally ignores
+ *  LD_LIBRARY_PATH, so the same dir goes on DYLD_LIBRARY_PATH there (not SIP-stripped: that
+ *  only happens for hardened system binaries, not user-built engines). Confirmed live: an
+ *  Android NDK cross-compiled llama-server failed even `--version`/`--help` without it
+ *  (GitHub #52 item 6 / ADR-390/391) — a gap in the probe path specifically, since the actual
+ *  launch path (manager.ts) already sets this; probing and launching had silently drifted
+ *  apart. Windows inherits the daemon env unchanged, same as manager.ts. */
 function probeEnv(bin: string): NodeJS.ProcessEnv | undefined {
   if (process.platform === 'win32') return undefined
   const dir = dirname(bin)
+  const env: NodeJS.ProcessEnv = { ...process.env }
   const existing = process.env.LD_LIBRARY_PATH
-  return { ...process.env, LD_LIBRARY_PATH: existing ? `${dir}:${existing}` : dir }
+  env.LD_LIBRARY_PATH = existing ? `${dir}:${existing}` : dir
+  if (process.platform === 'darwin') {
+    const dyld = process.env.DYLD_LIBRARY_PATH
+    env.DYLD_LIBRARY_PATH = dyld ? `${dir}:${dyld}` : dir
+  }
+  return env
 }
 
 export interface ProbeResult {

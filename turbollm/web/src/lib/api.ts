@@ -233,6 +233,27 @@ export function scanEngineFolder(path: string): Promise<EngineScanResult> {
   return request<EngineScanResult>('/api/v1/engines/scan', { method: 'POST', json: { path } })
 }
 
+/** Upload a custom build .zip: the daemon searches it at any depth for the server binary
+ *  and this platform's shared libraries, extracts them under its own engines storage, and
+ *  probes the result. Same response contract as {@link scanEngineFolder} — registration
+ *  still goes through {@link addEngine}, and Delete purges the extracted files. When the
+ *  zip's name matches an engine this flow installed earlier, the response instead carries
+ *  `updated` (that engine was refreshed in place) and no Add is needed. */
+export function uploadEngineZip(file: File): Promise<EngineScanResult> {
+  const form = new FormData()
+  form.append('file', file, file.name)
+  return request<EngineScanResult>('/api/v1/engines/zip', { method: 'POST', body: form })
+}
+
+/** Remove an UNCONFIRMED .zip extraction — the Add-engine dialog's best-effort cleanup
+ *  when it is dismissed between an upload and Add, so an abandoned build doesn't sit on
+ *  disk forever. Server-side it only removes a marker-carrying dir no engine claims. */
+export function deleteEngineZipInstall(binPath: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/zip?binPath=${encodeURIComponent(binPath)}`, {
+    method: 'DELETE',
+  })
+}
+
 export function getEngineBackends(): Promise<EngineBackends> {
   return request<EngineBackends>('/api/v1/engines/backends')
 }

@@ -278,6 +278,16 @@ test('validateEvent: ui_action accepts the Phase 6o AddEngineDialog batch action
   }
 })
 
+test('validateEvent: ui_action accepts the AddEngineDialog .zip-upload action', () => {
+  const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action: 'upload_new_engine_zip' } }))
+  assert.equal(r.ok, true, r.ok === false ? `engines/upload_new_engine_zip: ${r.reason}` : '')
+})
+
+test('validateEvent: ui_action accepts the AddEngineDialog zip-update-done action', () => {
+  const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action: 'done_zip_engine_update' } }))
+  assert.equal(r.ok, true, r.ok === false ? `engines/done_zip_engine_update: ${r.reason}` : '')
+})
+
 test('validateEvent: ui_action accepts the Phase 6p SkillEditPage batch actions', () => {
   const actions = ['back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill']
   for (const action of actions) {

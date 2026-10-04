@@ -798,10 +798,11 @@ export function engineCommand(opts: StartOpts, port: number, slotSavePath?: stri
 const READINESS_TIMEOUT_MS = 600_000
 
 /** Environment for a spawned engine. For native engines (llama.cpp, koboldcpp, llamafile) on
- *  Linux, points `LD_LIBRARY_PATH` at the binary's own directory: a source build compiled
- *  with CUDA bundles its runtime `.so` files there (build-runner.ts `copyCudaRuntimeLibs`),
+ *  Linux and Android, points `LD_LIBRARY_PATH` at the binary's own directory: a source build
+ *  compiled with CUDA bundles its runtime `.so` files there (build-runner.ts `copyCudaRuntimeLibs`),
  *  but unlike Windows the dynamic linker doesn't search the executable's directory by
  *  default — without this, a self-built engine fails to start with missing-library errors.
+ *  macOS's dyld ignores LD_LIBRARY_PATH, so the same dir also goes on DYLD_LIBRARY_PATH there.
  *  Harmless when nothing is bundled there. Native engines on Windows still inherit the
  *  daemon env unchanged (undefined). For Python engines we:
  *   - prepend the venv's bin dir to PATH so venv-installed tools (notably `ninja`,
@@ -822,7 +823,15 @@ export function pyEngineEnv(kind: string, dataDir: string, binPath: string): Nod
     // directory", which a trailing `:${undefined ?? ''}` would otherwise produce whenever
     // LD_LIBRARY_PATH wasn't already set.
     const existing = process.env.LD_LIBRARY_PATH
-    return { ...process.env, LD_LIBRARY_PATH: existing ? `${dir}:${existing}` : dir }
+    const env: NodeJS.ProcessEnv = { ...process.env, LD_LIBRARY_PATH: existing ? `${dir}:${existing}` : dir }
+    // macOS's dyld ignores LD_LIBRARY_PATH — the same dir must also go on DYLD_LIBRARY_PATH
+    // or a build without a self-referential rpath can't find its bundled dylibs. probeEnv
+    // (probe.ts) sets the same pair, so probing and launching stay mirrored.
+    if (process.platform === 'darwin') {
+      const dyld = process.env.DYLD_LIBRARY_PATH
+      env.DYLD_LIBRARY_PATH = dyld ? `${dir}:${dyld}` : dir
+    }
+    return env
   }
   const hfHome = join(dataDir, 'hf-cache')
   const hubCache = join(hfHome, 'hub')

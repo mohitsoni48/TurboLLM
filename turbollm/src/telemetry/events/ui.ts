@@ -591,6 +591,7 @@ export const UI_ACTIONS = [
 
   'browse_new_engine_folder', 'browse_new_engine_binary', 'cancel_add_engine',
   'back_to_add_engine_choose', 'submit_new_engine', 'select_new_engine_path',
+  'upload_new_engine_zip', 'done_zip_engine_update',
 
   'back_to_skills', 'save_skill', 'delete_skill', 'cancel_delete_skill',
 
