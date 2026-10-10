@@ -1962,7 +1962,7 @@ export class ConversationStore {
     const byGroup = new Map<string, { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
     for (const r of rows) {
       const harness = r.harness ?? 'unknown'
-      const key = `${r.source} ${harness}`
+      const key = `${r.source}\x00${harness}`
       const t = byGroup.get(key) ?? { protocol: r.source, harness, requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
       t.requests++
       t.promptTokens += r.prompt_tokens
