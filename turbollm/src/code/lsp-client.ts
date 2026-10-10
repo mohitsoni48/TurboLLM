@@ -138,7 +138,7 @@ export class LspClient {
         }))
         this.diagnosticsByUri.set(params.uri, list)
         const waiters = this.waitersByUri.get(params.uri)
-        if (waiters) { waiters.forEach((w) => w()); this.waitersByUri.delete(params.uri) }
+        if (waiters) { for (const w of waiters) w(); this.waitersByUri.delete(params.uri) }
       })
       conn.listen()
 

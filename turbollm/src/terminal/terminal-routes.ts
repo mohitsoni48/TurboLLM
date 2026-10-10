@@ -169,6 +169,7 @@ export const MAX_SEEDED_MESSAGE_CHARS = 4000
  *  What's still blocked here is the genuine remainder: a literal quote, and any other non-
  *  printable control byte (NUL, ESC, …) that has no safe single-line form and could otherwise
  *  inject a terminal escape sequence once it reaches the PTY. */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: this IS the escape-injection blocklist; see the comment above
 const UNSEEDABLE = /["\u0000-\u0008\u000b\u000c\u000e-\u001f]/
 
 /** Fold a message's own line breaks and tabs into plain spaces before it crosses the PowerShell

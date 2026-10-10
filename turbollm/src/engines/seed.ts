@@ -101,7 +101,7 @@ export async function seedDefaultEngines(
   // CPU backend even for an image explicitly built for an NVIDIA GPU box.
   const forced = process.env.TURBOLLM_SEED_BACKEND as BackendId | undefined
 
-  let chain
+  let chain: Awaited<ReturnType<typeof fallbackChain>>
   try {
     const recommended = forced && VALID_BACKENDS.includes(forced)
       ? forced

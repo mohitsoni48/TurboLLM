@@ -769,7 +769,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!command) return err(c, 400, 'invalid_input', 'A command is required.')
     const feedToModel = b.feedToModel !== false // default true (the `!` variant); `!!` sends false
 
-    let result
+    let result: Awaited<ReturnType<typeof runShellCommand>>
     try {
       result = await runShellCommand(command, agentCwd(run), id)
     } catch (e) {

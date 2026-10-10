@@ -36,7 +36,7 @@ export function runConformanceSuite(name: string, factory: () => Promise<Harness
       assert.equal(got?.title, 'Round trip')
       assert.equal(got?.model, 'm1')
       assert.equal(got?.systemPrompt, 'be terse')
-      assert.equal((got?.sampling as { temperature?: number }).temperature, 0.4)
+      assert.equal((got?.sampling as { temperature?: number } | undefined)?.temperature, 0.4)
     })
   })
 
