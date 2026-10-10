@@ -471,7 +471,7 @@ const appUpdates = new AppUpdateChecker(version)
 // misconfigured adapter must stop the daemon with a message the operator can act on —
 // never surface later as mysterious per-request failures, and never silently fall back
 // to SQLite for tenants the operator configured to go elsewhere.
-let chatStore
+let chatStore: Awaited<ReturnType<typeof buildChatStore>>
 try {
   chatStore = await buildChatStore(store.snapshot().chatStore, db.chatStore, store.dir())
 } catch (e) {

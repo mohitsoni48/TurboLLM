@@ -258,6 +258,7 @@ function sharedPrefixLen(a: string, b: string): number {
  *  control characters (a hostile archive member like "con", NUL, or "\n" would otherwise
  *  make writeFileSync throw mid-extraction). */
 function unwritableBase(base: string): boolean {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: control characters in a path segment are exactly what this rejects
   return base === '' || base === '.' || base === '..' || /[\x00-\x1f]/.test(base)
 }
 

@@ -274,7 +274,7 @@ function buildSchemas(): Record<string, JsonSchema> {
 
   // `type.enum` is spread from EXT_ERROR_TYPES — the same frozen nine values errors.ts exports —
   // so the schema and the runtime enum cannot drift apart the way a hand-copied list would.
-  const Error: JsonSchema = {
+  const errorSchema: JsonSchema = {
     type: 'object',
     description: 'The public error envelope (spec 27 §7.1).',
     properties: {
@@ -407,7 +407,7 @@ function buildSchemas(): Record<string, JsonSchema> {
   }
 
   return {
-    Chat, Message, Run, Page, Error,
+    Chat, Message, Run, Page, Error: errorSchema,
     Capabilities, ChatInput, ChatPatch, MessageInput, MessagePatch,
     ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage: pageOf('Run'),
     AuditRow, AuditPage,

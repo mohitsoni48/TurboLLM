@@ -757,7 +757,7 @@ export function registerApi(app: Hono, d: Deps): void {
     d.build.start(name ?? repoUrl)
     void (async () => {
       try {
-        let out
+        let out: Awaited<ReturnType<typeof runBuild>>
         try {
           out = await runBuild(
             { repoUrl, branch, commit, patchUrl, patchSha256, enginesRoot, toolchainDirs },
