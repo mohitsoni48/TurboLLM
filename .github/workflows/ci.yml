@@ -40,6 +40,10 @@ jobs:
       - name: Install ripgrep, fd and tini
         run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find tini
 
+      - name: Lint
+        run: npm run lint
+        working-directory: turbollm
+
       - name: Unit tests
         run: npm test
         working-directory: turbollm
