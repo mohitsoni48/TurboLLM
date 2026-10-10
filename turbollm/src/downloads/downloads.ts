@@ -1,4 +1,4 @@
-// Download manager (spec 10 §5–6, §8). Streams GGUF files from Hugging Face or an
+// Download manager (spec 10 §5–6, §8). Streams model files from Hugging Face or an
 // arbitrary HTTP(S) URL into the effective primaryModelDir, with single-connection
 // resume (.part + Range), max 2 concurrent, disk-space pre-check, manifest
 // persistence across daemon restarts, and a scan trigger on completion. Fail-safe:
@@ -60,7 +60,9 @@ interface ManifestEntry {
  *  quant "Downloaded" only for the SPECIFIC repo it was pulled from — the identical
  *  model+quant from a different repo (a different requant, different sha256) is
  *  correctly shown as not-downloaded. Keyed primarily by sha256 (exact file
- *  identity), with (repo, filename) as the fallback when no hash is known. */
+ *  identity), with (repo, filename) as the fallback when no hash is known.
+ *  `filename` is the destination BASENAME — a repo listing that disambiguates
+ *  same-named files by full path must basename its side before comparing. */
 export interface ProvenanceEntry {
   repo: string
   filename: string
@@ -70,6 +72,18 @@ export interface ProvenanceEntry {
 }
 
 const MAX_CONCURRENT = 2
+
+/** The model file formats that make sense as a STANDALONE single-file download: a GGUF
+ *  and a LiteRT-LM bundle each carry everything a load needs (weights, tokenizer, and
+ *  for multimodal models the encoders) inside one file, so one URL/rfilename is a
+ *  complete model. Safetensors weights are deliberately NOT here — they only work as a
+ *  directory of component files (config.json + tokenizer + shards), which the HF repo
+ *  path downloads file-by-file under a subdir; a lone .safetensors would land in the
+ *  library as a file no engine can load. Shared by the raw-URL and repo-file guards so
+ *  the two never drift apart; also imported by the Turbo Link façade's file guard
+ *  (link/link-routes.ts) for the same reason, and mirrored client-side by the web's
+ *  web/src/lib/single-file-model.ts (parity-tested there against this definition). */
+export const SINGLE_FILE_MODEL_RE = /\.(gguf|litertlm)$/i
 
 export interface EnqueueInput {
   repo?: string
@@ -189,9 +203,13 @@ export class DownloadManager {
       } else {
         // A non-HF host: a single flat file — its repo structure is unknowable.
         const path = safePathname(u)
-        if (!explicitSubdir && !/\.gguf$/i.test(path)) throw new DownloadError('invalid_url', 'URL must point to a .gguf file.')
+        if (!explicitSubdir && !SINGLE_FILE_MODEL_RE.test(path)) {
+          throw new DownloadError('invalid_url', 'URL must point to a .gguf or .litertlm model file.')
+        }
         const filename = basename(path)
-        if (!explicitSubdir && !/\.gguf$/i.test(filename)) throw new DownloadError('invalid_url', 'Could not derive a .gguf filename from that URL.')
+        if (!explicitSubdir && !SINGLE_FILE_MODEL_RE.test(filename)) {
+          throw new DownloadError('invalid_url', 'Could not derive a .gguf or .litertlm filename from that URL.')
+        }
         const destDir = explicitSubdir ? join(dir, explicitSubdir) : dir
         mkdirSync(destDir, { recursive: true })
         if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
@@ -204,7 +222,9 @@ export class DownloadManager {
     // HF repos are always `owner/name` — reject anything that can't be one (also stops a
     // degenerate `repo` from sanitising to an empty subfolder that lands in the root).
     if (!repo.includes('/') || !rfilename) throw new DownloadError('invalid_request', 'repo and rfilename are required.')
-    if (!explicitSubdir && !/\.gguf$/i.test(rfilename)) throw new DownloadError('invalid_url', 'The file must be a .gguf.')
+    if (!explicitSubdir && !SINGLE_FILE_MODEL_RE.test(rfilename)) {
+      throw new DownloadError('invalid_url', 'The file must be a .gguf or .litertlm model file.')
+    }
 
     // Safetensors/MLX pass an explicit subdir and enqueue each component file themselves
     // — no expansion. Place it (single file) directly under that subdir.
@@ -220,10 +240,12 @@ export class DownloadManager {
       ])
     }
 
-    // Expand a GGUF into every concrete file: all split shards + the shared mmproj. Each
-    // model gets its own <owner>/<repo>/<repo-subdir> folder (mirrors HF's layout and the
-    // primary library's structure), so a model's shards + mmproj sit together for the
-    // scanner to group and two quants that share a shard basename never collide.
+    // Expand a single-file model into every concrete file to fetch. GGUF: all split
+    // shards + the shared mmproj projector, each model in its own
+    // <owner>/<repo>/<repo-subdir> folder (mirrors HF's layout and the primary library's
+    // structure), so a model's shards + mmproj sit together for the scanner to group and
+    // two quants that share a shard basename never collide. A .litertlm bundle is one
+    // self-contained file with no siblings to group (handled inside the expander).
     const { dir: modelDir, files } = await this.expand(repo, rfilename, rev)
     const destDir = join(dir, repoSubdir(repo), modelDir)
     mkdirSync(destDir, { recursive: true })
@@ -638,10 +660,10 @@ function hfBaseUrl(): string {
 }
 
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file
- *  path: `<hfBaseUrl()>/<owner>/<repo>/resolve/<rev>/<path…>.gguf`. Segments are
+ *  path: `<hfBaseUrl()>/<owner>/<repo>/resolve/<rev>/<path…>.gguf|.litertlm`. Segments are
  *  URL-decoded (so a `%20` in the path becomes a real space). Returns null for any host that
- *  isn't the configured HF base or a URL that isn't a .gguf resolve link, so those stay raw
- *  imports. */
+ *  isn't the configured HF base or a URL that isn't a single-file model resolve link, so
+ *  those stay raw imports. */
 function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: string } | null {
   let parsed: URL
   let base: URL
@@ -662,7 +684,7 @@ function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: s
     .slice(ri + 2)
     .map((s) => decodeURIComponent(s))
     .join('/')
-  if (!repo.includes('/') || !rev || !rfilename || !/\.gguf$/i.test(rfilename)) return null
+  if (!repo.includes('/') || !rev || !rfilename || !SINGLE_FILE_MODEL_RE.test(rfilename)) return null
   return { repo, rev, rfilename }
 }
 

@@ -2,15 +2,18 @@
 // gated/license metadata, present a single-select quant dropdown (each option:
 // quant · size · fit dot · "Downloaded" tag), a live VRAM verdict line, and a
 // primary action that is "Download" (enqueue) for a remote quant or "Load" for a
-// quant already in the local library. Gated repos with no token show guidance and
-// disable downloading.
+// quant already in the local library. Safetensors repos (MLX / vLLM) download as a
+// directory; .litertlm repos (LiteRT-LM) reuse the picker as a VARIANT picker —
+// one self-contained bundle per row (variant · precision · size, no fit signal
+// and no auto-pick: the hardware target is the user's call). Gated repos with no
+// token show guidance and disable downloading.
 //
 // The actual content is `HfRepoContent` — Sheet-free, so DiscoverTab's split-pane
 // layout can render it inline as the permanent right column. `HfRepoDialog` just
 // wraps it in the Sheet chrome for the one other call site (ModelsScreen's Library
 // tab "View HF page" hand-off), which has no split-pane of its own.
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
@@ -124,6 +127,7 @@ export function HfRepoContent({
   const settingsQ = useSettings()
   const engineKind = statusQ.data?.engine.kind ?? ''
   const detail = detailQ.data
+  const isLitertlm = !!detail?.litertlm
   // Discover has no load profile yet; use the default budget across all GPUs.
   const vramMb = gpuBudgetMb(sysQ.data?.gpus ?? [])
   const isSafetensors = !!detail?.safetensors
@@ -135,10 +139,29 @@ export function HfRepoContent({
   // "largest first" in that fallback used to default to the biggest/unquantized file
   // (a 1.5TB BF16 for GLM-5.2-GGUF), the least viable option, not the most. Re-runs when
   // the file list changes.
+  //
+  // .litertlm repos OPT OUT of the auto-pick: the heuristic estimates GPU VRAM fit from a
+  // GGUF's file size, but LiteRT-LM often runs on CPU and a bundle embeds its encoders, so
+  // "largest that fits" can land on a Web or SoC-specific build that has nothing to do
+  // with this machine's GPU (a small GPU would auto-pick the web bundle). The variant is
+  // a hardware choice only the user can make — the picker starts empty instead, and the
+  // selection is RESET when a different repo opens so a stale name can never carry over —
+  // and ONLY then: `detail` gets a fresh reference on every verifying poll (1.5s) and every
+  // window-focus refetch, so resetting on each run would clear a variant the user already
+  // picked (e.g. once starting a download flips the badges). `lastRepo` tracks which repo
+  // the current selection belongs to; it is updated for every repo, GGUF ones included, so
+  // returning to a bundle repo after a GGUF one still resets.
+  const lastRepo = useRef<string | null>(null)
   useEffect(() => {
     if (!detail) return
+    const repoChanged = lastRepo.current !== detail.repo
+    lastRepo.current = detail.repo
     const ggufs = detail.files.filter((f) => !f.mmproj)
     if (ggufs.length === 0) return
+    if (isLitertlm) {
+      if (repoChanged) setSelected('')
+      return
+    }
     const fits = ggufs.filter((f) => fileFit(f.sizeBytes, vramMb) === 'fits')
     const pool = fits.length > 0 ? fits : ggufs
     const sizeDir = fits.length > 0 ? 1 : -1
@@ -149,10 +172,11 @@ export function HfRepoContent({
       return aK - bK
     })[0]
     setSelected(best.name)
-  }, [detail, vramMb])
+  }, [detail, vramMb, isLitertlm])
 
   // Quant options sorted by size (smallest → largest) so the listing reads in a
-  // sensible progression instead of alphabetically by filename.
+  // sensible progression instead of alphabetically by filename. Holds GGUF quants or
+  // .litertlm variants — both single-file models, rendered by the same picker.
   const ggufFiles = useMemo(
     () => (detail ? detail.files.filter((f) => !f.mmproj).sort((a, b) => a.sizeBytes - b.sizeBytes) : []),
     [detail],
@@ -195,6 +219,10 @@ export function HfRepoContent({
       },
       {
         onSuccess: () => { toast.success(`Downloading ${selectedFile.name} on ${machine}`) },
+        // No version-skew special case: an older host (still on the .gguf-only guard) refuses a
+        // .litertlm with invalid_request, but the peer proxy (link-admin-routes remoteFailure)
+        // relays only a 400's STATUS and CODE and replaces its message, so this UI cannot tell
+        // that refusal from any other invalid_request — it reads as the generic failure.
         onError: (e) => setRemoteDlError(describeRemoteFailure(e, machine).message),
       },
     )
@@ -309,13 +337,24 @@ export function HfRepoContent({
           onLoadCheckpoint={onLoadCheckpoint}
         />
       ) : !detail || ggufFiles.length === 0 ? (
-        <div className="py-10 text-center text-[13px] text-muted">No GGUF files found in this repo.</div>
+        <div className="py-10 text-center text-[13px] text-muted">No downloadable model files found in this repo.</div>
       ) : (
         <div className="flex flex-col gap-4">
-          {/* Quant selector */}
+          {/* What a .litertlm repo is, before the variant picker — same shape as the
+              safetensors body's explainer: a user landing here from a search has no
+              reason to know what a bundle is or which engine runs it. */}
+          {isLitertlm && (
+            <div className="rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px] text-muted">
+              LiteRT-LM model — each file is one self-contained bundle (weights + tokenizer) that
+              runs on the LiteRT-LM engine. Pick the variant matching your hardware (GPU, browser,
+              or a specific device).
+            </div>
+          )}
+
+          {/* Quant / variant selector */}
           <div className="flex flex-col gap-1.5">
             <label className="flex items-center gap-1.5 text-[12px] font-medium text-ink">
-              Quant
+              {isLitertlm ? 'Variant' : 'Quant'}
               {detail.verifying && (
                 <span className="text-[11px] font-normal text-faint">· checking your library…</span>
               )}
@@ -323,8 +362,11 @@ export function HfRepoContent({
             <QuantDropdown files={ggufFiles} selected={selected} onSelect={setSelected} vramMb={vramMb} />
           </div>
 
-          {/* VRAM verdict line */}
-          {selectedFile && (
+          {/* VRAM verdict line — a GGUF signal only: it estimates from the file size, and a
+              .litertlm bundle (encoders embedded, often CPU-bound under LiteRT-LM) would make
+              the dot and the sentence misleading. The picker's size column carries the file
+              size for bundles; nothing about VRAM is claimed. */}
+          {selectedFile && !isLitertlm && (
             <div className="flex items-center gap-2 rounded-md border border-border bg-panel-2 px-3 py-2.5 text-[12px]">
               <FitDot fit={fit} size={10} />
               <span className="text-muted">
@@ -407,7 +449,9 @@ export function FitDot({ fit, size = 8 }: { fit: FitVerdict; size?: number }) {
 
 /** Quant picker replacing a native `<select>`: a native `<option>` can't render a
  *  colored dot, and the fit signal (green/yellow/red) is the whole point here — so
- *  this is a real listbox (Radix DropdownMenu) instead. */
+ *  this is a real listbox (Radix DropdownMenu) instead. For `.litertlm` bundles the fit
+ *  dot is skipped: it estimates GPU VRAM from file size, and a bundle (encoders embedded,
+ *  often CPU-bound) would make it noise — the row reads variant · precision · size. */
 function QuantDropdown({
   files,
   selected,
@@ -427,15 +471,15 @@ function QuantDropdown({
       >
         {selectedFile ? (
           <span className="flex min-w-0 items-center gap-2">
-            <FitDot fit={fileFit(selectedFile.sizeBytes, vramMb)} />
+            {!selectedFile.litertlm && <FitDot fit={fileFit(selectedFile.sizeBytes, vramMb)} />}
             <span className="truncate">
-              {selectedFile.quant} · {fmtSize(selectedFile.sizeBytes)}
+              {pickerLabel(selectedFile)} · {fmtSize(selectedFile.sizeBytes)}
               {selectedFile.parts > 1 ? ` · ${selectedFile.parts} parts` : ''}
               {selectedFile.downloaded ? ' · Downloaded' : ''}
             </span>
           </span>
         ) : (
-          <span className="text-faint">Select a quant…</span>
+          <span className="text-faint">{files.some((f) => f.litertlm) ? 'Select a variant…' : 'Select a quant…'}</span>
         )}
         <ChevronDown size={14} className="shrink-0 text-faint" />
       </DropdownMenuTrigger>
@@ -446,9 +490,9 @@ function QuantDropdown({
         {files.map((f) => (
           <DropdownMenuItem key={f.name} onSelect={() => { track('models', 'select_hf_quant'); onSelect(f.name) }} className="justify-between gap-2">
             <span className="flex min-w-0 items-center gap-2">
-              <FitDot fit={fileFit(f.sizeBytes, vramMb)} />
+              {!f.litertlm && <FitDot fit={fileFit(f.sizeBytes, vramMb)} />}
               <span className="truncate">
-                {f.quant} · {fmtSize(f.sizeBytes)}
+                {pickerLabel(f)} · {fmtSize(f.sizeBytes)}
                 {f.parts > 1 ? ` · ${f.parts} parts` : ''}
               </span>
             </span>
@@ -462,6 +506,15 @@ function QuantDropdown({
       </DropdownMenuContent>
     </DropdownMenu>
   )
+}
+
+/** How one row of the picker reads: a GGUF by its quant, a `.litertlm` bundle by its
+ *  hardware variant with the precision appended when the name states one (and the variant
+ *  doesn't already say it) — 'Mediatek MT6989 · Q4 · 1.0 GB', never 'MT6989 · MT6989'. */
+function pickerLabel(f: HfRepoFile): string {
+  if (!f.litertlm) return f.quant
+  const quant = f.quant !== '?' && f.quant.toLowerCase() !== (f.variant ?? '').toLowerCase() ? f.quant : null
+  return quant ? `${f.variant ?? ''} · ${quant}` : (f.variant ?? f.quant)
 }
 
 /** Rendered model card (README). A deliberately plain markdown renderer — no

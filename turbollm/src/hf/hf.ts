@@ -5,7 +5,9 @@
 // them to a stable error envelope.
 import { quantFromName } from '../gguf/gguf'
 import { detectJev } from '../models/jev'
+import { litertlmQuantFromName } from '../models/litertlm'
 import type { TextClassifierRuntime } from '../models/text-classifier'
+import { DownloadError } from '../downloads/downloads'
 import { findCheckpoints, MAX_CHECKPOINT_CONFIG_FETCHES, type HfCheckpoint } from './checkpoints'
 import { isLayaEngineRepo, isLayaRepo, isOtherRuntimePort, layaRepoFiles } from './laya-repo'
 import { repoIdOf } from './repo-id'
@@ -62,11 +64,13 @@ const SORT_PARAM: Record<Exclude<HfSortOption, 'best-match'>, string> = {
  *  — NEVER hardcoded to GGUF, since the format that actually runs depends on the engine:
  *  - llama-server / koboldcpp / llamafile / TurboQuant (all llama.cpp-family) → gguf
  *  - mlx / rapid-mlx (same on-disk MLX format)                               → mlx (HF library tag)
- *  - vllm / anything else                                                     → no filter (all HF repos)
+ *  - vllm / sglang (HF safetensors directories)                               → no filter (all HF repos)
+ *  - litert-lm (`.litertlm` bundles, e.g. the litert-community org)            → litert-lm
  *  Shared by `searchModels` and `browseModels` so the two never drift apart. */
 function libraryFilterFor(engineKind?: string): string {
   if (engineKind === 'mlx' || engineKind === 'rapid-mlx' || engineKind === 'mlx-vlm') return 'filter=mlx&'
-  if (engineKind === 'vllm') return ''
+  if (engineKind === 'vllm' || engineKind === 'sglang') return ''
+  if (engineKind === 'litert-lm') return 'filter=litert-lm&'
   return 'filter=gguf&'
 }
 
@@ -93,6 +97,14 @@ export interface HfRepoFile {
   mmproj: boolean
   /** True for safetensors component files (MLX and vLLM repos). */
   safetensors?: boolean
+  /** True for LiteRT-LM bundle files (.litertlm) — one self-contained model per file. */
+  litertlm?: boolean
+  /** For a `.litertlm` bundle: the HARDWARE-VARIANT label ('GPU', 'Mediatek MT6993') — the
+   *  build this bundle targets, from the name suffix its repo's bundles don't share.
+   *  `quant` keeps the meaning it has everywhere else (the precision the name states —
+   *  'INT4', 'Q8', '?', exactly what the library scanner's litertlmQuantFromName reads),
+   *  so no field carries two meanings and Discover and the library agree on a file. */
+  variant?: string
   /** HF LFS sha256 when published in the tree metadata; used for integrity. */
   sha256?: string
   /** Download URL for the first/only part (resolve/main). */
@@ -109,6 +121,10 @@ export interface HfRepoDetail {
   files: HfRepoFile[]
   /** True when the repo is a safetensors model (no GGUFs — covers MLX and vLLM). */
   safetensors?: boolean
+  /** True when the repo ships LiteRT-LM bundles (.litertlm) instead of GGUF/safetensors
+   *  models — `files` then holds one self-contained entry per bundle (the litert-community
+   *  convention: gpu/web/device variants of the same model in one repo). */
+  litertlm?: boolean
   /** True for a Laya System One repo: `files` then holds its checkpoints' nested paths, and there are no
    *  `checkpoints` rows (./laya-repo). */
   laya?: boolean
@@ -142,6 +158,11 @@ interface CacheRow {
 }
 
 const SPLIT_RE = /^(.*)-(\d{5})-of-(\d{5})\.gguf$/i
+
+/** A LiteRT-LM bundle — one self-contained model per `.litertlm` file. One definition
+ *  shared by every branch that recognises the format (repo classification, expansion,
+ *  variant labelling) so the extension can never drift between them. */
+const LITERTLM_RE = /\.litertlm$/i
 
 export class HfClient {
   private cache = new Map<string, CacheRow>()
@@ -198,26 +219,41 @@ export class HfClient {
     return raw.map(toSearchItem)
   }
 
-  /** Repo detail (spec 10 §3): card data + the GGUF file tree, with split parts
-   *  grouped and quant/mmproj detected per file. */
+  /** Repo detail (spec 10 §3): card data + the model file tree — GGUF quants (split parts
+   *  grouped, quant/mmproj detected per file), safetensors components (MLX / vLLM), or
+   *  `.litertlm` bundles (LiteRT-LM), with the format the repo actually ships. */
   async getRepo(repo: string): Promise<HfRepoDetail> {
     const info = await this.getJson<RawRepoInfo>(`${BASE}/api/models/${repo}`)
     const tree = await this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/main?recursive=true`)
 
     const ggufEntries = tree.filter((e) => e.type === 'file' && /\.gguf$/i.test(e.path))
     const safetensorsEntries = tree.filter((e) => e.type === 'file' && /\.safetensors$/i.test(e.path))
+    const litertlmEntries = tree.filter((e) => e.type === 'file' && LITERTLM_RE.test(e.path))
 
     // Safetensors repo (MLX or vLLM): has safetensors weights but no GGUFs.
     const isSafetensors = ggufEntries.length === 0 && safetensorsEntries.length > 0
+    // LiteRT-LM repo: .litertlm bundles and no OTHER loadable format — the litert-community
+    // convention (one repo, gpu/web/device variants of one model). A repo can also ship a
+    // stray `.safetensors` beside its bundles (original weights, an adapter): without a
+    // root config.json those weights are not a loadable HF directory either, so the
+    // bundles win and the repo classifies as litertlm — classifying it safetensors would
+    // hand the LiteRT-LM engine (Discover was filtered to library=litert-lm) a directory
+    // download it cannot load. With a config.json the safetensors branch keeps today's
+    // classification, and a bundle-only repo that used to fall through to groupFiles()
+    // with zero GGUFs (rendering as an empty "No GGUF files found" dead end) resolves too.
+    const hasModelConfig = tree.some((e) => e.type === 'file' && e.path === 'config.json')
+    const isLitertlm =
+      ggufEntries.length === 0 && litertlmEntries.length > 0 && (safetensorsEntries.length === 0 || !hasModelConfig)
 
     let files: HfRepoFile[]
     let safetensors: boolean | undefined
+    let litertlm: boolean | undefined
     let checkpoints: HfCheckpoint[] | undefined
-    const laya = isSafetensors && isLayaRepo(tree) && !isOtherRuntimePort(info)
+    const laya = isSafetensors && !isLitertlm && isLayaRepo(tree) && !isOtherRuntimePort(info)
     if (laya) {
       safetensors = true
       files = layaRepoFiles(tree, (path) => this.fileUrl(repo, path))
-    } else if (isSafetensors) {
+    } else if (isSafetensors && !isLitertlm) {
       safetensors = true
       // Collect all component files: safetensors weights + JSON config/tokenizer files +
       // the chat template. Modern HF repos ship the chat template as a standalone
@@ -245,6 +281,9 @@ export class HfClient {
       // flatten a multi-checkpoint repo into one folder and have its checkpoints overwrite
       // each other. The checkpoint rows are additive, and each downloads only its own files.
       checkpoints = await this.withJevBadges(repo, findCheckpoints(repo, tree, (path) => this.fileUrl(repo, path)))
+    } else if (isLitertlm) {
+      litertlm = true
+      files = litertlmFiles(litertlmEntries, (path) => this.fileUrl(repo, path))
     } else {
       files = groupFiles(repo, ggufEntries)
     }
@@ -263,6 +302,7 @@ export class HfClient {
       card: await this.getCard(repo),
       files,
       ...(safetensors ? { safetensors } : {}),
+      ...(litertlm ? { litertlm } : {}),
       ...(laya ? { laya } : {}),
       ...(checkpoints ? { checkpoints } : {}),
     }
@@ -292,15 +332,17 @@ export class HfClient {
     return `${BASE}/${repo}/resolve/main/${dir ? `${dir}/` : ''}config.json`
   }
 
-  /** Expand a chosen GGUF into every concrete file needed for a working model
-   *  (spec 10 §3): all shards of its split group (NNNNN-of-NNNNN) plus its mmproj vision
-   *  projector. Matching is scoped to the chosen file's OWN repo directory so a repo
-   *  that organises quants in per-quant subfolders (e.g. `Q4_K_M/…`, `Q8_0/…`) never
-   *  cross-matches another quant's identically-named shards. The mmproj is preferred
-   *  from the same directory (mirrors the scanner's per-directory pairing), falling back
-   *  to the largest anywhere in the repo. `rev` is the git revision (branch/tag/commit)
-   *  the download targets. Best-effort: on any HF failure it returns just the one
-   *  requested file. When the requested file is itself an mmproj, none is paired. */
+  /** Expand a chosen single-file model into every concrete file needed for a working
+   *  model (spec 10 §3). A GGUF becomes all shards of its split group (NNNNN-of-NNNNN)
+   *  plus its mmproj vision projector — matching is scoped to the chosen file's OWN repo
+   *  directory so a repo that organises quants in per-quant subfolders (e.g. `Q4_K_M/…`,
+   *  `Q8_0/…`) never cross-matches another quant's identically-named shards, and the mmproj
+   *  is preferred from the same directory (mirrors the scanner's per-directory pairing),
+   *  falling back to the largest anywhere in the repo. A `.litertlm` bundle IS the whole
+   *  model (weights + tokenizer + encoders in one file), so it expands to just itself.
+   *  `rev` is the git revision (branch/tag/commit) the download targets. Best-effort: on
+   *  any HF failure it returns just the one requested file. When the requested file is
+   *  itself an mmproj, none is paired. */
   async expandModelFiles(repo: string, rfilename: string, rev = 'main'): Promise<HfModelFiles> {
     const wantBase = base(rfilename).toLowerCase()
     let tree: RawTreeEntry[]
@@ -309,6 +351,46 @@ export class HfClient {
     } catch {
       return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
     }
+
+    // A .litertlm bundle is one self-contained file: no split siblings to group, no mmproj
+    // companion to pair. Resolve the full repo path — the UI sends a basename for unique
+    // names (the GGUF-picker convention) or the full path when a basename is ambiguous —
+    // plus size and sha256 from the tree so the enqueue disk-guard and the integrity
+    // check actually run (a 0-size fallback would skip both). The exact-path match wins
+    // first; the basename fallback exists for callers that only know the name — but NEVER
+    // as a guess: when two bundles share that basename, size and sha256 would come from
+    // whichever entry comes first, the caller's own sha256 is ignored on this path, and
+    // the wrong variant would install silently with a passing integrity check. A typed
+    // rejection instead (the caller — an older peer UI over Turbo Link, a raw API client
+    // — must send the full repo path); a plain Error would surface as an 'internal' 500.
+    if (LITERTLM_RE.test(rfilename)) {
+      const exact = tree.find((e) => e.type === 'file' && e.path === rfilename)
+      let chosen = exact
+      if (!chosen) {
+        const byBasename = tree.filter(
+          (e) => e.type === 'file' && base(e.path).toLowerCase() === wantBase,
+        )
+        if (byBasename.length > 1) {
+          throw new DownloadError(
+            'invalid_request',
+            `Ambiguous '.litertlm' name '${base(rfilename)}' — this repo has ${byBasename.length} bundles with that filename. Pass the full repo path (e.g. '${byBasename[0].path}').`,
+          )
+        }
+        chosen = byBasename[0]
+      }
+      return {
+        dir: dirOf(chosen?.path ?? rfilename),
+        files: [
+          {
+            rfilename: chosen?.path ?? rfilename,
+            size: chosen ? sizeOf(chosen) : 0,
+            sha256: chosen?.lfs?.oid,
+            mmproj: false,
+          },
+        ],
+      }
+    }
+
     const ggufs = tree.filter((e) => e.type === 'file' && /\.gguf$/i.test(e.path))
 
     // Locate the chosen file by basename (the UI carries a split group's first-shard
@@ -580,6 +662,95 @@ function fileFor(
     sha256: e.lfs?.oid,
     url: `${BASE}/${repo}/resolve/main/${e.path}`,
   }
+}
+
+/** One HfRepoFile per `.litertlm` bundle. Each bundle is a complete standalone model
+ *  (weights, tokenizer and, for multimodal models, the encoders in one file), so there is
+ *  nothing to group and no mmproj to pair — unlike GGUFs, where a repo's files are quants
+ *  of the same model, litert-community repos hold gpu/web/device VARIANTS, and `variant`
+ *  carries that label so the same single-file picker the GGUF branch uses reads naturally
+ *  for them, while `quant` holds the precision the name states ('INT4', '?') exactly as
+ *  the library scanner reads it. `name` is the basename (the GGUF convention) so download
+ *  provenance matches what the repo detail lists — EXCEPT when two bundles share a
+ *  basename across subfolders: then every colliding entry carries its full repo path
+ *  instead, so the picker's selection, the enqueue provenance and expandModelFiles'
+ *  exact-path match all resolve the RIGHT bundle rather than whichever entry the basename
+ *  fallback finds first (the Turbo Link file guard already accepts subfolder paths, so
+ *  remote downloads keep working too). */
+function litertlmFiles(entries: RawTreeEntry[], urlFor: (path: string) => string): HfRepoFile[] {
+  const basenameCount = new Map<string, number>()
+  for (const e of entries) {
+    const b = base(e.path)
+    basenameCount.set(b, (basenameCount.get(b) ?? 0) + 1)
+  }
+  // The label machinery's per-REPO inputs, derived once: every bundle's stem, and the
+  // longest stem prefix they all share. Every entry's label is a pure slice against that
+  // one prefix — deriving stems/prefix per entry rescanned the whole file list each time
+  // for the same shared answer.
+  const stems = entries.map((e) => e.path.replace(LITERTLM_RE, ''))
+  const prefix = sharedStemPrefix(stems)
+  return entries
+    .map((e) => ({
+      name: (basenameCount.get(base(e.path)) ?? 0) > 1 ? e.path : base(e.path),
+      quant: litertlmQuantFromName(base(e.path)),
+      variant: litertlmVariantLabel(prefix, e.path.replace(LITERTLM_RE, '')),
+      sizeBytes: sizeOf(e),
+      parts: 1,
+      mmproj: false,
+      litertlm: true,
+      sha256: e.lfs?.oid,
+      url: urlFor(e.path),
+    }))
+    .sort((a, b) => a.sizeBytes - b.sizeBytes)
+}
+
+/** The longest stem prefix every bundle in a repo shares, backed up to a token boundary
+ *  so no suffix starts mid-word: '…_mt6989' beside '…_mt6991' shares '…_mt69', which as a
+ *  prefix would read as a stray '89' fragment — it backs up to the last separator so the
+ *  labels read 'MT6989'/'MT6991'. Empty when the bundles share no stem at all. */
+function sharedStemPrefix(stems: string[]): string {
+  let prefix = stems[0] ?? ''
+  for (const s of stems) {
+    while (prefix && !s.startsWith(prefix)) prefix = prefix.slice(0, -1)
+  }
+  // A prefix that cuts a token in half would leave every label starting mid-word — back
+  // it up to the last separator (or nothing) so suffixes always start at a token boundary.
+  if (prefix && stems.some((s) => s.length > prefix.length && !/[-_.\/]/.test(s[prefix.length] ?? ''))) {
+    const lastSep = Math.max(prefix.lastIndexOf('-'), prefix.lastIndexOf('_'), prefix.lastIndexOf('.'), prefix.lastIndexOf('/'))
+    prefix = lastSep >= 0 ? prefix.slice(0, lastSep + 1) : ''
+  }
+  return prefix
+}
+
+/** The label one `.litertlm` file gets in the variant picker: the file's distinguishing
+ *  suffix after the stem prefix all the repo's bundles share ('gemma-4-E2B-it-gpu'
+ *  beside 'gemma-4-E2B-it' → 'GPU'; 'Qwen3-0.6B.mediatek.mt6993' → 'Mediatek MT6993'),
+ *  titled the way quant labels read. Stems keep their repo-relative DIRECTORY, so bundles
+ *  that share a basename across subfolders ('gpu/model.litertlm' vs 'web/model.litertlm')
+ *  label apart ('GPU Model' / 'WEB Model') instead of both reading 'Default'; for the
+ *  all-root layout litert-community actually ships, the directory is empty and the label
+ *  is exactly the basename suffix it always was. The file that IS the shared stem gets
+ *  'Default'.
+ *  Labels are derived from the file set AS IT STANDS and are display-only — a repo adding
+ *  a file can shift them (a new bare bundle turns 'GPU' into 'Default') — so nothing may
+ *  persist them; downloads and provenance key off `name`, never off the label. */
+function litertlmVariantLabel(prefix: string, stem: string): string {
+  const suffix = stem.length > prefix.length ? stem.slice(prefix.length).replace(/^[-_.\/ ]+/, '') : ''
+  // Acronyms and letter+digit compounds read uppercase whole — 'gpu'/'web' → 'GPU'/'WEB'
+  // like quant labels write Q4, FP16, INT4, and SoC ids write MT6989/SM8750 (an 'int4'
+  // next to a 'q4' must not read 'Int4' vs 'Q4'); pure words title-case
+  // ('Google Tensor G5', 'Mediatek', not 'GOOGLE' or 'mediatek').
+  const label = suffix
+    .split(/[-_.\/ ]+/)
+    .filter(Boolean)
+    .map((tok) =>
+      tok.length <= 3 || (/[a-z]/i.test(tok) && /\d/.test(tok))
+        ? tok.toUpperCase()
+        : tok[0].toUpperCase() + tok.slice(1),
+    )
+    .join(' ')
+    .trim()
+  return label || 'Default'
 }
 
 function sizeOf(e: RawTreeEntry): number {

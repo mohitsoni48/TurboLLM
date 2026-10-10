@@ -259,6 +259,19 @@ function appWithRepoDetail(detail: unknown, provenance: unknown[], models: Model
   return app
 }
 
+/** Fetch a repo detail and return its `files` rows — the provenance-overlay tests
+ *  below assert on the annotated `downloaded` flags. */
+async function repoDetailFiles(
+  detail: { repo: string },
+  provenance: unknown[],
+  models: ModelEntry[],
+): Promise<{ downloaded: boolean }[]> {
+  const res = await appWithRepoDetail(detail, provenance, models).request(`/api/v1/hf/models/${detail.repo}`)
+  assert.equal(res.status, 200)
+  const body = (await res.json()) as { files: { downloaded: boolean }[] }
+  return body.files
+}
+
 test('GET /api/v1/hf/models/:owner/:name annotates every checkpoint, leaving files untouched', async () => {
   const cp = (dir: string, sha: string) => ({
     dir,
@@ -300,4 +313,82 @@ test('a GGUF repo detail (no checkpoints) comes back exactly as before', async (
   const body = (await res.json()) as Record<string, unknown>
   assert.equal('checkpoints' in body, false)
   assert.deepEqual(body.files, [{ ...detail.files[0], downloaded: false, localKey: null }])
+})
+
+// The files overlay's provenance fallback: `filename` is always a BASENAME (downloads.ts
+// records the destination filename), while a repo that disambiguates same-named bundles
+// across subfolders lists them by FULL path (hf.ts litertlmFiles). Rows listed by basename
+// keep the legacy unconditional name match; full-path rows match by sha256 or by their
+// path being the tail of the recorded dest (dest mirrors the repo's folder layout).
+test('provenance fallback: unconditional by name, full-path rows resolve by sha256 or dest path', async () => {
+  const bundle = (name: string, sha: string) => ({ name, quant: 'GPU', sizeBytes: 5, parts: 1, mmproj: false, litertlm: true, sha256: sha, url: 'u' })
+  const detail = {
+    repo: 'litert-community/x-litert-lm', gated: false, license: '', downloads: 0, likes: 0, card: '',
+    litertlm: true,
+    files: [bundle('gpu/model.litertlm', 'sha-gpu'), bundle('web/model.litertlm', 'sha-web')],
+  }
+  const repoDir = join('D:', 'models', 'litert-community', 'x-litert-lm')
+  const gpuDest = join(repoDir, 'gpu', 'model.litertlm')
+  const webDest = join(repoDir, 'web', 'model.litertlm')
+  const models = [entry({ key: 'gpu-key', path: gpuDest }), entry({ key: 'web-key', path: webDest })]
+  const rec = (over: object) => ({ repo: 'litert-community/x-litert-lm', filename: 'model.litertlm', dest: gpuDest, at: '', ...over })
+
+  // No provenance hash: the dest path tells the two same-named bundles apart — only the
+  // one that was actually downloaded is Downloaded, not both by basename.
+  let files = await repoDetailFiles(detail, [rec({})], models)
+  assert.deepEqual(files.map((f) => f.downloaded), [true, false])
+
+  // Hash known and equal: the exact bundle, and still only that one.
+  files = await repoDetailFiles(detail, [rec({ sha256: 'sha-gpu' })], models)
+  assert.deepEqual(files.map((f) => f.downloaded), [true, false])
+
+  // The repo re-uploaded the GPU bundle (new LFS oid, same path): the dest path keeps it
+  // Downloaded — and the sibling still is not.
+  files = await repoDetailFiles(detail, [rec({ sha256: 'sha-old-gpu' })], models)
+  assert.deepEqual(files.map((f) => f.downloaded), [true, false])
+
+  // Windows-style separators in the recorded dest resolve the same way.
+  const winDest = 'D:\\models\\litert-community\\x-litert-lm\\web\\model.litertlm'
+  files = await repoDetailFiles(detail, [rec({ dest: winDest })], [entry({ key: 'web-key', path: winDest })])
+  assert.deepEqual(files.map((f) => f.downloaded), [false, true])
+
+  // A flat dest (no subfolder recorded) cannot identify a full-path row by name, so
+  // neither row claims it — sha256 stays the only way such a download matches.
+  const flat = join(repoDir, 'model.litertlm')
+  files = await repoDetailFiles(detail, [rec({ dest: flat })], [entry({ key: 'flat-key', path: flat })])
+  assert.deepEqual(files.map((f) => f.downloaded), [false, false])
+
+  // A basename-listed bundle keeps the legacy unconditional name match: a re-upload
+  // (new LFS oid, same name) stays Downloaded.
+  const flatDest = join(repoDir, 'model.litertlm')
+  const flatDetail = { ...detail, files: [bundle('model.litertlm', 'sha-new')] }
+  files = await repoDetailFiles(flatDetail, [rec({ filename: 'model.litertlm', sha256: 'sha-old', dest: flatDest })], [entry({ key: 'flat-bundle', path: flatDest })])
+  assert.deepEqual(files.map((f) => f.downloaded), [true])
+
+  // Same for a GGUF whose repo re-uploaded it: both hashes known and different, the
+  // row stays Downloaded by name, exactly as before this PR.
+  const reupload = {
+    repo: 'bartowski/Qwen3-8B-GGUF', gated: false, license: '', downloads: 0, likes: 0, card: '',
+    files: [{ name: 'qwen3-8b-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 4, parts: 1, mmproj: false, sha256: 'new', url: 'u' }],
+  }
+  const reDest = join('D:', 'models', 'bartowski', 'Qwen3-8B-GGUF', 'qwen3-8b-Q4_K_M.gguf')
+  files = await repoDetailFiles(
+    reupload,
+    [{ repo: 'bartowski/Qwen3-8B-GGUF', filename: 'qwen3-8b-Q4_K_M.gguf', sha256: 'old', dest: reDest, at: '' }],
+    [entry({ key: 'gguf-key', path: reDest })],
+  )
+  assert.deepEqual(files.map((f) => f.downloaded), [true])
+
+  // A basename-listed GGUF with no hash on either side keeps matching by name, as before.
+  const ggufDetail = {
+    repo: 'bartowski/Qwen3-8B-GGUF', gated: false, license: '', downloads: 0, likes: 0, card: '',
+    files: [{ name: 'qwen3-8b-Q4_K_M.gguf', quant: 'Q4_K_M', sizeBytes: 4, parts: 1, mmproj: false, url: 'u' }],
+  }
+  const ggufDest = join('D:', 'models', 'bartowski', 'Qwen3-8B-GGUF', 'qwen3-8b-Q4_K_M.gguf')
+  files = await repoDetailFiles(
+    ggufDetail,
+    [{ repo: 'bartowski/Qwen3-8B-GGUF', filename: 'qwen3-8b-Q4_K_M.gguf', dest: ggufDest, at: '' }],
+    [entry({ key: 'gguf-key', path: ggufDest })],
+  )
+  assert.deepEqual(files.map((f) => f.downloaded), [true])
 })

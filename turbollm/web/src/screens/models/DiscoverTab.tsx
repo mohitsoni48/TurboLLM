@@ -4,8 +4,8 @@
 // a debounced HF search once you type) and a permanent detail pane on the right showing
 // whatever's selected — no dialog/modal in between. Clicking a row just swaps what the
 // right pane shows. Offline/HF-unreachable errors render a friendly card in the list
-// instead of results. The library/format filter (gguf/mlx/none) adapts to the active
-// engine server-side (src/hf/hf.ts) — never hardcoded here.
+// instead of results. The library/format filter (gguf/mlx/litert-lm/none) adapts to the
+// active engine server-side (src/hf/hf.ts) — never hardcoded here.
 
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type RefObject } from 'react'
 import { Link2, Lock, Search } from 'lucide-react'

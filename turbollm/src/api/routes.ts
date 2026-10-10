@@ -2650,8 +2650,8 @@ export function registerApi(app: Hono, d: Deps): void {
   // wildcard tail. Each file is annotated `downloaded` + `localKey` so the SAME
   // model+quant from a different repo is correctly NOT marked downloaded. Two
   // signals (spec 10 §3): (1) download provenance for files pulled via TurboLLM
-  // (sha256 exact, or repo+filename); (2) for imported / pre-existing files with no
-  // provenance, a content sha256 match — computed lazily and only for a local file
+  // (sha256 exact, or repo+filename); (2) for imported / pre-existing files with
+  // no provenance, a content sha256 match — computed lazily and only for a local file
   // whose byte size exactly matches a repo file (so we almost never hash). While a
   // hash is still being computed the response carries `verifying:true` and the UI
   // re-polls until the badge resolves.
@@ -2670,12 +2670,27 @@ export function registerApi(app: Hono, d: Deps): void {
 
       let verifying = false
       const files = detail.files.map((f) => {
-        // 1) Provenance: downloaded via TurboLLM.
-        const pmatch = prov.find(
-          (p) =>
-            (!!p.sha256 && !!f.sha256 && p.sha256 === f.sha256) ||
-            (p.repo === repo && p.filename === f.name),
-        )
+        // 1) Provenance: downloaded via TurboLLM. sha256 is the exact-identity key. The
+        //    (repo, filename) name fallback is UNCONDITIONAL for every row listed by its
+        //    basename — exactly as before .litertlm support — so a re-uploaded quant
+        //    (new LFS oid, same name: requant fixes do this a lot) keeps its
+        //    "Downloaded"/Load badge, and a split GGUF (never sha-checked: step 2 is gated
+        //    on parts === 1) keeps its name match too.
+        //    A row listed by FULL PATH is the other case: hf.ts lists same-named bundles
+        //    from different subfolders that way ('gpu/model.litertlm' vs
+        //    'web/model.litertlm'), and provenance `filename` is always a basename
+        //    (downloads.ts records the destination filename), which cannot tell them apart.
+        //    But `dest` mirrors the repo's folder layout (<repo>/gpu/model.litertlm), so the
+        //    row's own path must be the tail of the recorded dest — that identifies the exact
+        //    bundle with or without a hash, and keeps a re-uploaded one (new sha, same path)
+        //    Downloaded, while a sibling variant never matches by name alone.
+        const listedByPath = f.name !== basename(f.name)
+        const pmatch = prov.find((p) => {
+          if (!!p.sha256 && !!f.sha256 && p.sha256 === f.sha256) return true
+          if (p.repo !== repo) return false
+          if (!listedByPath) return p.filename === f.name
+          return p.filename === basename(f.name) && p.dest.replace(/\\/g, '/').endsWith('/' + f.name)
+        })
         let local = pmatch ? models.find((m) => m.path === pmatch.dest) : undefined
 
         // 2) Content hash: imported / pre-existing files with no provenance. Gated
