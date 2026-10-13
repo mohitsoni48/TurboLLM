@@ -32,7 +32,7 @@ test('a run completes and its stream ends with a done event', async () => {
   assert.deepEqual(events.filter((e) => e.event === 'delta').map((e) => (e.data as { content: string }).content), ['t0', 't1', 't2'])
   const done = events.at(-1)
   assert.equal(done?.event, 'done')
-  assert.equal((done?.data as { status: string }).status, 'complete')
+  assert.equal((done?.data as { status: string } | undefined)?.status, 'complete')
   assert.equal(runs.get(run.id)?.status, 'complete')
 })
 

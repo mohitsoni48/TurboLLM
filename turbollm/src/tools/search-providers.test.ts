@@ -93,7 +93,7 @@ test('kagi adapter maps data[] (type 0) and sends Bot auth header', async () => 
   assert.equal(out.length, 2)
   assert.equal(out[0].url, 'https://k1.com')
   assert.equal(out[0].content, 'kk1')
-  const auth = (calls[0].init?.headers as Record<string, string>)['Authorization']
+  const auth = (calls[0].init?.headers as Record<string, string> | undefined)?.['Authorization']
   assert.equal(auth, 'Bot kagikey')
 })
 

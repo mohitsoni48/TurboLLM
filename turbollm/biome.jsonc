@@ -1,0 +1,30 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "files": {
+    "includes": ["src/**/*.ts"]
+  },
+  "formatter": {
+    "enabled": false
+  },
+  "assist": {
+    "enabled": false
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "style": {
+        // 696 findings across the codebase — this is house style, not a defect signal.
+        "noNonNullAssertion": "off"
+      },
+      "suspicious": {
+        // `??=` accumulation (`(cfg.x ??= []).push(...)`) and assignment-in-condition loops
+        // are deliberate idioms here; see build-runner.ts's log-line splitter.
+        "noAssignInExpressions": "off",
+        // Route registries widen to `any` on purpose; the code predates this linter and
+        // carries explicit eslint-disable comments saying so.
+        "noExplicitAny": "off"
+      }
+    }
+  }
+}
