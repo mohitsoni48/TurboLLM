@@ -239,7 +239,12 @@ test('a hostile prompt executes nothing even with the shell branch forced', asyn
       realSpawnCliProcess(process.execPath, args, opts, { needsShell: () => true })
 
     const result = await runClaudeCliProcess(
-      [victim],
+      // A RELATIVE script path, deliberately: tmpDir() lives under the runner's temp root,
+      // which on Windows is the short-name form (`C:\Users\RUNNER~1\…`), and `~` is not on the
+      // shell allow-list — an absolute path would be refused before the spawn ever happened and
+      // stdout would stay empty, hiding exactly what this test exists to prove. `cwd` is the
+      // fixture dir, so the child resolves it there.
+      ['victim.cjs'],
       { cwd: dir, env: process.env, stdin: hostile, timeoutMs: 30_000 },
       spawnThroughShell,
       () => {},

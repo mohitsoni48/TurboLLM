@@ -1084,11 +1084,13 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // Provision a catalog fork via GitHub release (ADR-044) — TurboQuant. Downloads
-  // the platform-matching prebuilt llama-server, probes it (it IS llama-server
-  // compatible), and registers it as a kind='llama-server' engine. 202 + progress
-  // via /status. The fork currently ships macOS prebuilts only, so the install is
-  // platform-guarded to where an asset actually exists (matches the OS prefilter).
-  // ?update=1 removes the existing install dir so the latest release is re-downloaded.
+  // the prebuilt llama-server matching this OS/arch/GPU (CUDA on NVIDIA; see download.ts
+  // turboquantCandidates), verifies the backend it promised actually loads (retrying the next
+  // candidate if not), probes it (it IS llama-server compatible), and registers it as a
+  // kind='llama-server' engine. 202 + progress via /status. Hardware with no prebuilt fails
+  // with no_release_asset (→ build from source).
+  // ?update=1 re-installs the latest release over the existing build (the removal happens
+  // inside provisionTurboquant, only after its release lookup succeeds).
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
     if (!entry?.repo) return err(c, 500, 'internal', 'TurboQuant catalog entry is misconfigured.')
@@ -1101,23 +1103,25 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
-        // For update: remove existing dir so provisionTurboquant re-downloads the latest.
+        // `update=1` replaces the install dir under whatever is running from it: stop the engine
+        // — and any pool slot — on it first, the way the update path does (update-apply.ts). A
+        // plain install reuses an existing install as-is (provisionTurboquant's fast path), so
+        // it must not tear a serving engine down for nothing.
         if (upgrade) {
-          const tqDir = join(root, 'turboquant')
-          if (existsSync(tqDir)) rmSync(tqDir, { recursive: true, force: true })
+          const turboquantDir = join(root, 'turboquant')
+          const runningFromIt = d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, turboquantDir))
+          if (runningFromIt) await stopEngineUsers(d, runningFromIt.id)
         }
-        // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
         const bin = await provisionTurboquant(root, entry.repo!, (p) =>
           d.provision.progress(p.phase, p.pct, p.part, p.parts),
-        )
-        let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-        if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
+        undefined, undefined, upgrade)
+        const eng = await d.registry.addOrReprobe('TurboQuant', bin)
         d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
-            ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
+            ? 'TurboQuant has no prebuilt binary for this system. Build llama-server from the fork, then use "Add your own engine".'
             : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
       }

@@ -24,6 +24,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 ## [Unreleased]
 
 ### Added
+
 - **LiteRT-LM in the standalone Android app.** The app now ships LiteRT-LM built in: a native port of
   `litert-lm serve` over the same `liblitert-lm.so` runtime Termux users run through Python, registered at boot
   as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
@@ -36,6 +37,41 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   limited to GGUF repos while LiteRT-LM is the active engine.
 
 ### Fixed
+
+- **TurboQuant installs no longer keep a build that can't use the GPU.** A build that downloaded and
+  unpacked correctly but whose GPU backend then failed to load (the Windows CUDA 13.3 archive ships no
+  CUDA runtime; an old driver has no kernels for the CUDA 12.4 build) used to be recorded as installed
+  and then silently ran on the CPU. TurboLLM now asks the binary which devices it actually sees after
+  installing, and moves on to the next build for that machine (CUDA 13.3 → CUDA 12.4 → Vulkan → CPU)
+  when the GPU backend it promised is missing. The CPU build is now the last resort on x64, so a GPU
+  whose drivers can't load them still leaves you with an engine instead of none; and when the last
+  build on offer is the one that doesn't come up, it is installed with a warning rather than thrown
+  away.
+- **TurboQuant update check can no longer offer an older release than the one installed.** The newest
+  release is now chosen by version rather than by the order GitHub lists releases in, so a patch cut for
+  an older line is no longer picked for fresh installs and updates. The update check and the installer
+  now rank tags with the same comparator, so the release the check offers is the release an install
+  lands on.
+- **A failed TurboQuant download or release lookup leaves the working engine in place.** The install
+  directory used to be removed before the release was even resolved, so an offline or rate-limited
+  check uninstalled the engine; the removal now happens only once the release resolved. Every candidate
+  is also built and backend-checked in a staging directory that is only swapped in once it passed, so a
+  forced update that fails on all of them (a truncated download, a checksum mismatch, a broken archive)
+  leaves the installed build — and the registry entry pointing at it — exactly where it was.
+- **A failed `nvidia-smi` no longer replaces a working CUDA TurboQuant build with Vulkan.** When the
+  driver version can't be read, the CUDA builds drop out of the candidate list and the machine used to
+  be re-provisioned onto Vulkan (a ~500 MB download) and then kept there for the daemon's lifetime.
+  An unreadable driver version on an NVIDIA box now counts as "can't tell": the install is left alone,
+  and the hardware probe that came back incomplete is re-run instead of being cached.
+- **The TurboQuant install is re-probed after an update**, so the stored version changes and the update
+  isn't offered again forever.
+- **CUDA version detection on 600-series NVIDIA drivers.** They print `CUDA UMD Version: 13.4` rather
+  than `CUDA Version:`, which read as "no CUDA", which also affected CUDA toolkit auto-provisioning.
+- **TurboQuant downloads are verified against the sha256 GitHub publishes for the asset** — where the
+  release publishes one; older fork releases don't, and those downloads now say so instead of reading
+  as if they had been verified.
+- **A TurboQuant build with no prebuilt for this machine says so**, instead of reporting the update
+  check as "offline".
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
@@ -56,6 +92,7 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   kernel where the vendor lets apps read it.
 
 ### Changed
+
 - The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
   Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
   Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.

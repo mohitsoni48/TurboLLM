@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { autoThreadCount, availableMemBytes, packagedAppGpu, perfCoresFromSpeeds } from '../sysinfo/sysinfo'
 import { tmpDir } from '../test-support/tmp'
-import { isNativeLitertLm, LITERT_LM_NATIVE_SERVER, litertLmNativeVersion, litertLmProfileToConfig, litertLmServerCommand } from './litert-lm'
+import { isNativeLitertLm, LITERT_LM_NATIVE_SERVER, litertLmNativeVersion, litertLmProfileToConfig, litertLmServerCommand, parseLitertLmNativeVersion } from './litert-lm'
 import { pyEngineEnv } from './manager'
 import { engineForModel, Registry } from './registry'
 import { ensureAndroidBundledEngine, ensureAndroidModelsDir } from './seed'
@@ -19,7 +19,9 @@ import { buildStartOpts } from './start-opts'
 import { litertlmEntryFor } from '../models/litertlm'
 import { resolveUpdateSource } from './update'
 
-/** A stand-in for the native server: answers `--version` exactly as the real one does. */
+/** A POSIX-only stand-in for the native server: answers `--version` exactly as the real one does. It is a `#!` script
+ *  named liblitertlm_server.so — the name the shipped server has in the APK — so Windows cannot execute it (spawn
+ *  EFTYPE); every test using it therefore splits, rather than drops, what it can still prove there. */
 function fakeNativeServer(dir: string, litertVersion = '0.18.0'): string {
   mkdirSync(dir, { recursive: true })
   const bin = join(dir, LITERT_LM_NATIVE_SERVER)
@@ -58,15 +60,37 @@ test('litertLmServerCommand: the native server takes the same serve arguments, w
 })
 
 test('litertLmNativeVersion: reads the runtime version from --version, in the stored pip-style form', async () => {
+  // The format is pinned through the parser, which needs no child process and so holds on every platform: the banner
+  // names two versions and only the parenthesised runtime one may become the stored "litert-lm 0.18.0".
+  assert.equal(parseLitertLmNativeVersion('turbollm-litertlm-server 1.0.0 (LiteRT-LM 0.18.0)\n'), 'litert-lm 0.18.0')
+  assert.equal(parseLitertLmNativeVersion('litert-lm 0.17.0\n'), 'litert-lm litert-lm 0.17.0', 'banner with no runtime token keeps its own text')
+  assert.equal(parseLitertLmNativeVersion('  \n'), 'litert-lm unknown', 'silent server: a version is still recorded')
+
   const bin = fakeNativeServer(tmpDir('tllm-litert-native-'))
+  // The spawn half is what the fixture's platform limit forbids: Windows has no `#!` loader, so execFile of the stub
+  // fails with EFTYPE and the version can only come from seed.ts's fallback there. Asserted, not skipped, so a
+  // Windows regression in how the failure surfaces still shows up here.
+  if (process.platform === 'win32') {
+    await assert.rejects(() => litertLmNativeVersion(bin), { code: 'EFTYPE' })
+    return
+  }
   assert.equal(await litertLmNativeVersion(bin), 'litert-lm 0.18.0')
 })
 
 test('pyEngineEnv: the native server gets the native library path, not a venv environment', () => {
   const dataDir = tmpDir('tllm-litert-native-')
-  const native = pyEngineEnv('litert-lm', dataDir, '/app/lib/arm64/liblitertlm_server.so')!
-  assert.match(native.LD_LIBRARY_PATH ?? '', /^\/app\/lib\/arm64(:|$)/)
-  assert.equal(native.HF_HUB_OFFLINE, undefined)
+  const bin = '/app/lib/arm64/liblitertlm_server.so'
+  // The native library path is a POSIX-only contract: pyEngineEnv returns undefined for a native engine on Windows on
+  // purpose (manager.ts), because Windows' loader already searches the executable's own directory for a bundled DLL,
+  // so the engine inherits the daemon environment unchanged. Both branches assert the real contract of that platform.
+  if (process.platform === 'win32') {
+    assert.equal(pyEngineEnv('litert-lm', dataDir, bin), undefined)
+  } else {
+    const native = pyEngineEnv('litert-lm', dataDir, bin)!
+    assert.match(native.LD_LIBRARY_PATH ?? '', /^\/app\/lib\/arm64(:|$)/)
+    assert.equal(native.HF_HUB_OFFLINE, undefined)
+  }
+  // The Python half of the same kind is platform-independent: a venv install still gets the offline HuggingFace env.
   const py = pyEngineEnv('litert-lm', dataDir, '/venv/bin/python')!
   assert.equal(py.HF_HUB_OFFLINE, '1')
 })
@@ -107,6 +131,11 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   t.mock.method(console, 'log', () => {})
   const reg = registry([], '')
 
+  // The version probe runs the stub above, so its result is platform-dependent: Windows can't execute the `#!` file
+  // and seed.ts then stores its documented 'litert-lm (bundled)' placeholder instead of losing the engine over a
+  // --version that cannot run there. Name, id and binPath stay asserted identically on both platforms.
+  const versionOf = (stub: string) => (process.platform === 'win32' ? 'litert-lm (bundled)' : `litert-lm ${stub}`)
+
   const first = join(tmpDir('tllm-litert-native-'), 'lib')
   fakeNativeServer(first)
   process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = first
@@ -115,7 +144,7 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   assert.equal(mine.length, 1)
   assert.equal(mine[0].name, 'litert-lm-android')
   assert.equal(mine[0].binPath, join(first, LITERT_LM_NATIVE_SERVER))
-  assert.equal(mine[0].version, 'litert-lm 0.18.0')
+  assert.equal(mine[0].version, versionOf('0.18.0'))
   const id = mine[0].id
 
   // A reinstall moves nativeLibraryDir and may ship a newer runtime: same engine, new path and version.
@@ -127,7 +156,7 @@ test('ensureAndroidBundledEngine: registers the bundled LiteRT-LM server, then f
   assert.equal(mine.length, 1)
   assert.equal(mine[0].id, id)
   assert.equal(mine[0].binPath, join(second, LITERT_LM_NATIVE_SERVER))
-  assert.equal(mine[0].version, 'litert-lm 0.19.0')
+  assert.equal(mine[0].version, versionOf('0.19.0'))
 })
 
 test('ensureAndroidBundledEngine: an APK built without LiteRT-LM registers no LiteRT-LM engine', async (t) => {
@@ -175,8 +204,13 @@ test('litertLmProfileToConfig: auto threads become the performance-core count; a
 
 test('pyEngineEnv: the native LiteRT-LM server gets a writable cache directory for read-only model folders', () => {
   const dataDir = tmpDir('tllm-litert-native-')
-  assert.equal(pyEngineEnv('litert-lm', dataDir, '/app/lib/arm64/liblitertlm_server.so')!.TURBOLLM_LITERT_CACHE_DIR, join(dataDir, 'cache', 'litert-lm'))
-  assert.equal(pyEngineEnv('llama-server', dataDir, '/app/lib/arm64/libllama-server.so')!.TURBOLLM_LITERT_CACHE_DIR, undefined)
+  // Same Windows split as the LD_LIBRARY_PATH test, and for the same reason: pyEngineEnv returns no env at all for a
+  // native engine there, so the cache dir is unset by design rather than by omission. Optional chaining makes the
+  // assertion run on both platforms and still fail if POSIX ever stops setting the dir (undefined !== the path).
+  const native = pyEngineEnv('litert-lm', dataDir, '/app/lib/arm64/liblitertlm_server.so')
+  assert.equal(native?.TURBOLLM_LITERT_CACHE_DIR, process.platform === 'win32' ? undefined : join(dataDir, 'cache', 'litert-lm'))
+  // A llama.cpp engine never gets it on either platform: undefined here means "not a litert-lm native server".
+  assert.equal(pyEngineEnv('llama-server', dataDir, '/app/lib/arm64/libllama-server.so')?.TURBOLLM_LITERT_CACHE_DIR, undefined)
 })
 
 test('availableMemBytes: reads MemAvailable, which counts the page cache Android keeps full', () => {
@@ -243,9 +277,19 @@ test('engineInUse / stopEngineUsers: an extra pool slot on the engine counts, an
 
 test('ensureAndroidModelsDir: the app\'s imported-models folder is always a model folder there, and only there', (t) => {
   const home = tmpDir('tllm-android-home-')
+  // os.homedir() reads HOME on POSIX but USERPROFILE on Windows (HOMEDRIVE+HOMEPATH only when it is unset or empty),
+  // so the fake home has to be published under both names or this asserts against the runner's real profile. Both
+  // variables are restored — or removed again when they were not set — so no later test sees a home that never existed.
   const prevHome = process.env.HOME
+  const prevProfile = process.env.USERPROFILE
   process.env.HOME = home
-  t.after(() => { process.env.HOME = prevHome })
+  process.env.USERPROFILE = home
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.HOME
+    else process.env.HOME = prevHome
+    if (prevProfile === undefined) delete process.env.USERPROFILE
+    else process.env.USERPROFILE = prevProfile
+  })
   const store = ConfigStore.load(join(tmpDir('tllm-litert-native-'), 'config.json'))
   ensureAndroidModelsDir(store, {}) // Termux / desktop: untouched
   assert.deepEqual(store.snapshot().modelDirs, [])

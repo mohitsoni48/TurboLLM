@@ -30,7 +30,8 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, sep } from 'node:path'
 import { asDirName, isEngineInBuildDir } from './build-runner'
-import { serverBinName, suggestEngineName } from './scan'
+import { serverBinNameFor } from './download'
+import { suggestEngineName } from './scan'
 import { probe, type ProbeResult } from './probe'
 import { inflateEntry, isInstallMarkerName, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError, type ArchiveMember, type ZipEntry } from './zip-reader'
 
@@ -112,7 +113,11 @@ export type ZipSelection = InstallSelection<ZipEntry>
 export function pickInstallFiles<T extends ArchiveMember>(
   entries: T[],
   platform: NodeJS.Platform = process.platform,
-  binName = serverBinName,
+  // The name to look for follows the platform being SELECTED FOR, not the host's: callers pass
+  // a platform to answer "what would run there", and defaulting the name to the machine's own
+  // (`llama-server.exe` on Windows) made `pickInstallFiles(entries, 'linux')` search a Linux
+  // archive for a Windows binary and find nothing.
+  binName = serverBinNameFor(platform),
 ): InstallSelection<T> | null {
   const binKey = binName.toLowerCase()
   const candidates = entries.filter((e) => !e.isDir && baseOf(e.name).toLowerCase() === binKey)

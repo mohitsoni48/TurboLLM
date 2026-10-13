@@ -4,10 +4,10 @@
 // resolution logic is unit-testable without HTTP.
 import { dirname } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
-import { findFile } from './download'
+import { findFile, serverBinNameFor } from './download'
 
 /** The server binary name for the daemon's OS — same convention as download.ts. */
-export const serverBinName = process.platform === 'win32' ? 'llama-server.exe' : 'llama-server'
+export const serverBinName = serverBinNameFor()
 
 /** Dirs we never descend into during a scan: VCS/dep/dotdirs would make a big tree
  *  hang and never hold an engine binary anyway. */

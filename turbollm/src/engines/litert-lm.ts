@@ -480,6 +480,16 @@ export function isNativeLitertLm(binPath: string): boolean {
 export async function litertLmNativeVersion(binPath: string): Promise<string> {
   // 5 s: it runs at every boot of the app, where a hung probe would hold up engine registration.
   const { stdout } = await execFileP(binPath, ['--version'], { timeout: 5_000 })
+  return parseLitertLmNativeVersion(stdout)
+}
+
+/** `litertLmNativeVersion`'s banner-to-stored-version mapping, split out from the spawn so the format stays
+ *  assertable wherever the server itself cannot run — it ships as a native library (ELF/PE), and Windows refuses to
+ *  execute a `#!` stand-in with a spawn EFTYPE, which is exactly why seed.ts's registration has a fallback version. */
+export function parseLitertLmNativeVersion(stdout: string): string {
+  // The banner carries two versions — "turbollm-litertlm-server <server> (LiteRT-LM <runtime>)" — and the kind stores
+  // the RUNTIME one in pip style, so only the parenthesised token is read; an unrecognised banner keeps its own
+  // trimmed text (or reads "unknown" when it printed nothing) rather than being reported as an empty version.
   const m = /LiteRT-LM\s+([\w.+-]+)/.exec(stdout)
   return `litert-lm ${m ? m[1] : stdout.trim() || 'unknown'}`
 }

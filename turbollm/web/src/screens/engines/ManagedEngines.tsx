@@ -77,6 +77,9 @@ function UpdateStatusLine({ st }: { st: EngineUpdateStatus | undefined }) {
   if (st.error === 'offline') {
     return <span className="text-[12px] text-muted">Couldn&apos;t check for updates (offline)</span>
   }
+  if (st.error === 'no_release_asset') {
+    return <span className="text-[12px] text-muted">The latest release has no build for this machine</span>
+  }
   if (st.error === 'no_source' || !st.comparable) {
     return <span className="text-[12px] text-muted">Update status unavailable for this build</span>
   }

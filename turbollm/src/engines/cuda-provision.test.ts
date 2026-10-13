@@ -1,6 +1,19 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { majorMinor, cmpMajorMinor, pickCudaVersion } from './cuda-provision'
+import { parseComputeCaps, parseDriverMaxCuda } from './nvidia-smi'
+
+test('parseComputeCaps: one value per GPU line, junk skipped', () => {
+  assert.deepEqual(parseComputeCaps('12.0\n'), [12])
+  assert.deepEqual(parseComputeCaps('8.9\r\n6.1\r\n'), [8.9, 6.1])
+  assert.deepEqual(parseComputeCaps('[N/A]\n'), [])
+})
+
+test('parseDriverMaxCuda: reads both the classic and the 600-series nvidia-smi header', () => {
+  assert.equal(parseDriverMaxCuda('| NVIDIA-SMI 580.95.05   Driver Version: 580.95.05   CUDA Version: 13.0 |'), '13.0')
+  assert.equal(parseDriverMaxCuda('| NVIDIA-SMI 615.71.09   KMD Version: 615.71.09   CUDA UMD Version: 13.4 |'), '13.4')
+  assert.equal(parseDriverMaxCuda('NVIDIA-SMI has failed because it could not communicate with the driver'), null)
+})
 
 test('majorMinor: takes the first two components', () => {
   assert.equal(majorMinor('13.0.1'), '13.0')

@@ -206,21 +206,21 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   }
 }
 
-/** TurboQuant fork: remove the install dir + re-provision the fork's latest release. */
+/** TurboQuant fork: re-provision the fork's newest release, replacing the install dir. */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('turboquant', 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     if (oldEng) await stopEngineUsers(d, oldEng.id)
-    const tqDir = join(root, 'turboquant')
-    rmSync(tqDir, { recursive: true, force: true })
+    // `force` re-installs over the existing build. The deletes live inside provisionTurboquant,
+    // AFTER its release lookup: removing the install first (as this did) meant a failed or
+    // offline lookup left the user with no engine at all.
     const bin = await provisionTurboquant(
       root, 'AtomicBot-ai/atomic-llama-cpp-turboquant',
       (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
-      signal,
+      signal, undefined, true,
     )
-    let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-    if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
+    const eng = await d.registry.addOrReprobe('TurboQuant', bin)
     d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {

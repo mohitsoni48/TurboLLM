@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { asDirName } from './build-runner'
-import { driverMaxCuda } from './cuda-provision'
+import { driverMaxCuda } from './nvidia-smi'
 import { downloadFile, extractArchive, stripMacOsQuarantine, type ProvisionProgress, type ReleaseAsset } from './download'
 import { probe, ProbeError, type ProbeResult } from './probe'
 import {

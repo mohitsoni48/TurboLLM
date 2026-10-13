@@ -504,7 +504,7 @@ export type EngineUpdateStatus = {
   latest: string | null
   hasUpdate: boolean
   checkedAt: string
-  error?: 'offline' | 'rate_limited' | 'no_source'
+  error?: 'offline' | 'rate_limited' | 'no_release_asset' | 'no_source'
   comparable: boolean
   /** Set for source-built engines (ADR-088): the update is a source change that can't be
    *  auto-applied (TurboLLM can't recompile). The UI shows "newer source available →

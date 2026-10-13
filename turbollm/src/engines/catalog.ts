@@ -601,17 +601,13 @@ const ALL: CatalogEngine[] = [
     provision: 'github-release',
     homepage: 'https://github.com/AtomicBot-ai/atomic-llama-cpp-turboquant',
     repo: 'AtomicBot-ai/atomic-llama-cpp-turboquant',
-    // A well-known llama.cpp fork. Self-contained prebuilts ship on GitHub Releases for
-    // macOS-arm64 and Linux-x64 (Vulkan), resolved per-platform-tag by download.ts
-    // turboquantAssetUrl (the repo tags releases PER OS, so `releases/latest` can't be
-    // used). Windows is build-from-source: the only Windows binary (on HuggingFace) is a
-    // MinGW build with a UCRT linkage defect that won't load on a standard box
-    // (0xC0000135) and isn't self-contained — flip it to a prebuilt variant the day the
-    // fork ships a working, self-contained Windows release.
+    // A well-known llama.cpp fork. Each GitHub release carries prebuilts for every
+    // platform/backend; download.ts turboquantCandidates picks the build (CUDA on NVIDIA,
+    // else Vulkan/CPU; Metal on Apple Silicon) and resolveTurboquantRelease the release.
     platforms: ['win32', 'darwin', 'linux'],
     support: 'experimental',
     installEndpoint: '/api/v1/engines/turboquant',
-    note: 'Prebuilt: macOS (Apple Silicon), Linux x64 (Vulkan). On Windows, build llama-server from the fork, then use "Add your own engine".',
+    note: 'Prebuilt: macOS (Apple Silicon), Windows + Linux x64 (CUDA on NVIDIA, Vulkan otherwise), Linux arm64 (CUDA). Elsewhere, build llama-server from the fork, then use "Add your own engine".',
     defaultBranch: 'master',
     variants: [
       {
@@ -624,17 +620,26 @@ const ALL: CatalogEngine[] = [
         hasPrebuilt: true,
       },
       {
-        id: 'turboquant-linux-vulkan',
-        label: 'Vulkan (Linux x64)',
+        id: 'turboquant-cuda',
+        label: 'CUDA (NVIDIA)',
         repo: 'AtomicBot-ai/atomic-llama-cpp-turboquant',
-        requires: { platform: ['linux'], arch: ['x64'] },
+        requires: { platform: ['linux', 'win32'], gpuVendor: ['nvidia'] },
+        stability: 'experimental',
+        speed: 'fastest',
+        hasPrebuilt: true,
+      },
+      {
+        id: 'turboquant-vulkan',
+        label: 'Vulkan (any GPU)',
+        repo: 'AtomicBot-ai/atomic-llama-cpp-turboquant',
+        requires: { platform: ['linux', 'win32'], arch: ['x64'] },
         stability: 'experimental',
         speed: 'fast',
         hasPrebuilt: true,
       },
       {
-        // Catch-all for hardware with no self-contained prebuilt (Windows; non-x64 Linux;
-        // etc.) → "build from source → Add your own engine".
+        // Catch-all for hardware with no self-contained prebuilt (Intel Macs; non-NVIDIA
+        // arm64 Linux; etc.) → "build from source → Add your own engine".
         id: 'turboquant-source',
         label: 'Build from source',
         repo: 'AtomicBot-ai/atomic-llama-cpp-turboquant',

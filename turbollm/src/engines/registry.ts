@@ -470,6 +470,15 @@ export class Registry {
     return out!
   }
 
+  /** Register a binary that a managed install just (re)placed at `binPath`. An engine already
+   *  registered at that path is re-probed in place — an update reinstalls to the same path, and
+   *  without the re-probe its stored version stays the OLD build's, so the update check keeps
+   *  offering the update it just applied. */
+  async addOrReprobe(name: string, binPath: string): Promise<Engine> {
+    const existing = this.list().engines.find((e) => e.binPath === binPath)
+    return existing ? this.reprobe(existing.id) : (await this.add(name, binPath)).engine
+  }
+
   async reprobe(id: string): Promise<Engine> {
     const e = this.get(id)
     if (!e) throw new NotFoundError()

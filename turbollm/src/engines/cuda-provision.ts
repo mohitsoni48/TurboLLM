@@ -9,14 +9,11 @@
 // manifest mapping every component to a per-platform { relative_path, sha256, size }.
 //
 // Windows + x86_64 only, matching the guided build's scope (Linux/macOS build is parked).
-import { execFile } from 'node:child_process'
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { downloadFile, extractArchive } from './download'
-
-const execFileP = promisify(execFile)
+import { driverMaxCuda } from './nvidia-smi'
 
 const REDIST_BASE = 'https://developer.download.nvidia.com/compute/cuda/redist/'
 
@@ -70,18 +67,6 @@ export function cmpMajorMinor(a: string, b: string): number {
   const [am, an] = a.split('.').map(Number)
   const [bm, bn] = b.split('.').map(Number)
   return am !== bm ? am - bm : (an || 0) - (bn || 0)
-}
-
-/** The max CUDA version the installed NVIDIA driver supports, via `nvidia-smi` ("CUDA
- *  Version: 13.0" in its header). Null if nvidia-smi is absent/unparseable. */
-export async function driverMaxCuda(): Promise<string | null> {
-  try {
-    const { stdout } = await execFileP('nvidia-smi', [], { timeout: 8000, windowsHide: true, maxBuffer: 1024 * 1024 })
-    const m = stdout.match(/CUDA Version:\s*([\d.]+)/i)
-    return m ? m[1] : null
-  } catch {
-    return null
-  }
 }
 
 /** PURE: from `KNOWN_CUDA_VERSIONS` (newest first), the newest whose major.minor is ≤ the

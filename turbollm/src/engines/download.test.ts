@@ -1,9 +1,13 @@
 // Tests for scoreAsset and pickReleaseAsset (ADR-044).
-// These cover the asset-matching logic for all supported platforms / arches,
-// used by turboquantAssetUrl to pick the right release asset per OS.
+// These cover the generic asset-matching logic for all supported platforms / arches.
+// TurboQuant's resolver matches exact asset names instead (download.turboquant.test.ts).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import {
+  downloadFile,
   scoreAsset,
   pickReleaseAsset,
   recommendBackendId,
@@ -296,6 +300,22 @@ test('provisionBackend: resolves the real asset name from the release when asset
     calls.some((c) => c === 'https://dl.example/rocm.zip'),
     `expected a download from the resolved rocm asset URL, got: ${JSON.stringify(calls)}`,
   )
+})
+
+test('downloadFile: verifies a published sha256 and removes a file that fails it', async (t) => {
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  const bytes = Buffer.from('engine archive bytes')
+  globalThis.fetch = (async () => new Response(new Uint8Array(bytes), { status: 200 })) as typeof fetch
+  const dest = join(tmpDir('tllm-dl-'), 'engine.tar.gz')
+  const good = createHash('sha256').update(bytes).digest('hex')
+
+  await downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, globalThis.fetch, good)
+  assert.deepEqual(readFileSync(dest), bytes)
+
+  // A truncated/corrupted 530 MB engine archive is exactly what this exists to stop.
+  await assert.rejects(downloadFile('https://dl.example/engine.tar.gz', dest, undefined, undefined, globalThis.fetch, '0'.repeat(64)), /checksum_failed/)
+  assert.equal(existsSync(dest), false, 'the corrupt download was removed')
 })
 
 test('isRateLimited: only a 403/429 WITH x-ratelimit-remaining 0 counts', () => {
