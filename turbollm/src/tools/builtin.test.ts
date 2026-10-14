@@ -1,6 +1,27 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { execRunCode, resolveSearchQuery } from './builtin'
+import { execRunCode, execWebSearch, resolveSearchQuery, RUN_CODE_TOOL } from './builtin'
+
+// A provider failure (bad key, quota, outage) used to reach the model as "No results found.",
+// which it read as a real, empty search and answered from memory.
+test('execWebSearch: a provider failure is an explicit error, not "No results found."', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response('invalid api key', { status: 401 })) as typeof fetch
+  try {
+    const out = await execWebSearch({ query: 'python' }, { provider: 'tavily', tavilyApiKey: 'expired' })
+    assert.match(out, /^Error: could not reach the tavily search provider — Tavily returned 401/)
+  } finally { globalThis.fetch = original }
+})
+
+// The schema used to promise "the last expression is the return value", but the code runs as
+// a function body — a model following it got "(no output)" for every calculation.
+test('run_code schema describes what the sandbox actually returns', async () => {
+  const desc = RUN_CODE_TOOL.function.parameters.properties.code.description
+  assert.doesNotMatch(desc, /last expression is the return value/)
+  assert.match(desc, /`return`/)
+  assert.equal(await execRunCode({ code: 'const x = 21; x * 2' }), '(no output)')
+  assert.equal(await execRunCode({ code: 'return 21 * 2' }), '42')
+})
 
 // ── resolveSearchQuery ────────────────────────────────────────────────────────
 // Regression: a model emitting `queries: [...]` instead of the schema's `query` used to

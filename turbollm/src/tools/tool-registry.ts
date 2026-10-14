@@ -34,9 +34,18 @@ export interface ToolCall {
   args: Record<string, unknown>
 }
 
+/** Everything a live MCP client is built from — a change to any of it needs a new client. */
+function mcpFingerprint(srv: McpServer): string {
+  return JSON.stringify([srv.name, srv.transport, srv.command, srv.args, srv.env, srv.url, srv.apiKey])
+}
+
 export class ToolRegistry {
   private toolsCfg: ToolsConfig
   private mcpClients = new Map<string, IMcpClient>()
+  /** serverId -> the config its live client was built from (see mcpFingerprint). */
+  private mcpFingerprints = new Map<string, string>()
+  /** Tail of the serialized syncMcpServers chain (see syncMcpServers). */
+  private mcpSync: Promise<void> = Promise.resolve()
   private routines?: RoutineToolsStore
   private runRoutineNowFn?: RunRoutineNowFn
   private agents?: AgentToolsStore
@@ -87,15 +96,26 @@ export class ToolRegistry {
     this.toolsCfg = toolsCfg
   }
 
-  /** Connect/disconnect MCP servers to match the current config list. */
-  async syncMcpServers(servers: McpServer[]): Promise<void> {
-    const enabledIds = new Set(servers.filter((s) => s.enabled).map((s) => s.id))
+  /** Connect/disconnect MCP servers to match the current config list. Serialized: the boot sync
+   *  (cli.ts, which can take tens of seconds) and a sync from an MCP add/edit/toggle/delete would
+   *  otherwise both see a still-connecting server as missing, spawn it twice, and orphan one. */
+  syncMcpServers(servers: McpServer[]): Promise<void> {
+    const run = this.mcpSync.then(() => this.doSyncMcpServers(servers))
+    this.mcpSync = run.catch(() => {})
+    return run
+  }
 
-    // Disconnect removed/disabled servers
+  private async doSyncMcpServers(servers: McpServer[]): Promise<void> {
+    const enabled = new Map(servers.filter((s) => s.enabled).map((s) => [s.id, s]))
+
+    // Disconnect removed/disabled servers, and servers whose config was edited since their client
+    // was built — the connect loop below then rebuilds those from the new config.
     for (const [id, client] of this.mcpClients) {
-      if (!enabledIds.has(id)) {
+      const srv = enabled.get(id)
+      if (!srv || this.mcpFingerprints.get(id) !== mcpFingerprint(srv)) {
         client.disconnect()
         this.mcpClients.delete(id)
+        this.mcpFingerprints.delete(id)
       }
     }
 
@@ -106,6 +126,7 @@ export class ToolRegistry {
         const client = createMcpClient(srv)
         await client.connect()
         this.mcpClients.set(srv.id, client)
+        this.mcpFingerprints.set(srv.id, mcpFingerprint(srv))
       } catch {
         // Non-fatal: MCP server failed to connect; it won't appear in tool list
       }
@@ -115,6 +136,7 @@ export class ToolRegistry {
   disconnectAll(): void {
     for (const client of this.mcpClients.values()) client.disconnect()
     this.mcpClients.clear()
+    this.mcpFingerprints.clear()
   }
 
   /** Build the full tools array to send to the engine. Returns [] when no tools are available. */

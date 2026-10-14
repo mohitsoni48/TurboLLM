@@ -1749,7 +1749,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           'and return the result. Useful for calculations, data transformation, and quick logic checks.',
         promptSnippet: 'run_code(code) - execute a sandboxed JS snippet and return the result',
         parameters: Type.Object({
-          code: Type.String({ description: 'JavaScript code to execute. The last expression is the return value.' }),
+          code: Type.String({ description: 'JavaScript code to execute, run as a function body: use a `return` statement for the result (e.g. `return 21 * 2`) — a bare last expression is discarded. console.log output is also captured.' }),
         }),
         async execute(toolCallId, params) {
           const text = await tools.executeTool({ id: toolCallId, name: 'run_code', args: params })

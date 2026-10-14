@@ -1,7 +1,7 @@
 // Built-in tool definitions and execution (v0.7.0).
 // Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox, isolated in a worker thread).
 import { Worker } from 'node:worker_threads'
-import { checkSsrf } from './security.js'
+import { fetchWithSsrfCheck } from './security.js'
 import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
 import { type SearchConfig } from './search-providers.js'
 import {
@@ -96,7 +96,7 @@ export const RUN_CODE_TOOL = {
     parameters: {
       type: 'object',
       properties: {
-        code: { type: 'string', description: 'JavaScript code to execute. The last expression is the return value.' },
+        code: { type: 'string', description: 'JavaScript code to execute, run as a function body: use a `return` statement for the result (e.g. `return 21 * 2`) — a bare last expression is discarded. console.log output is also captured.' },
       },
       required: ['code'],
     },
@@ -236,13 +236,15 @@ export async function backfillPublishedDates(results: ResearchResult[]): Promise
 
   await Promise.allSettled(
     missing.map(async (r) => {
-      if (await checkSsrf(r.url)) return // same guard as fetch_url; never probe internal hosts
       let resp: Response
       try {
-        resp = await fetch(r.url, {
+        // Same guard as fetch_url, on every redirect hop; never probe internal hosts.
+        const fetched = await fetchWithSsrfCheck(r.url, {
           headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
           signal: AbortSignal.timeout(DATE_PROBE_TIMEOUT_MS),
         })
+        if (typeof fetched === 'string') return
+        resp = fetched
       } catch {
         return
       }
@@ -471,6 +473,13 @@ export function extractModifiedDate(html: string): string | undefined {
  */
 export const FETCH_URL_MAX_CHARS = 20_000
 
+/** Raw bytes fetch_url reads before it stops. Far above FETCH_URL_MAX_CHARS because the tool
+ *  returns TEXT: an HTML page's scripts, styles and markup are stripped first, and on a heavy page
+ *  they can fill most of the first megabyte before the content starts. Still a hard bound, so an
+ *  enormous or endless body cannot balloon the daemon's memory (a phone's, on Android); a page cut
+ *  here gets the truncation marker below like any other over-long page. */
+const FETCH_URL_MAX_BYTES = 2 * 1024 * 1024
+
 /** Appended when a page is cut, so the model knows it is looking at a PREFIX and can decide
  *  to fetch a more specific URL rather than concluding the page did not contain the answer.
  *  Static text: no page content reaches it, so it cannot be spoofed into a different field. */
@@ -483,21 +492,41 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   if (!url) return 'Error: url is required.'
   if (!/^https?:\/\//i.test(url)) return 'Error: URL must start with http:// or https://'
 
-  const ssrfErr = await checkSsrf(url)
-  if (ssrfErr) return ssrfErr
-
   let resp: Response
   try {
-    resp = await fetch(url, {
+    const fetched = await fetchWithSsrfCheck(url, {
       headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
       signal: AbortSignal.timeout(15_000),
     })
+    if (typeof fetched === 'string') return fetched
+    resp = fetched
   } catch (e) {
     return `Error: could not fetch URL — ${(e as Error).message}`
   }
 
   const contentType = resp.headers.get('content-type') ?? ''
-  const text = await resp.text().catch(() => '')
+  // Streamed up to FETCH_URL_MAX_BYTES instead of resp.text(), which would buffer a huge or
+  // endless body whole before any of it is cut.
+  let text = ''
+  let cut = false
+  if (resp.body) {
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let read = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        read += value.byteLength
+        text += decoder.decode(value, { stream: true })
+        if (read >= FETCH_URL_MAX_BYTES) { cut = true; break }
+      }
+      text += decoder.decode()
+    } catch {
+      text = ''
+    }
+    await reader.cancel().catch(() => {})
+  }
   let content: string
   let published: string | undefined
   let modified: string | undefined
@@ -532,7 +561,7 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   // Reserve room for the marker so a truncated page still fits under the ceiling — the old
   // code sliced to the full budget and THEN appended, overshooting by the marker's length.
   const budget = FETCH_URL_MAX_CHARS - header.length - 1 - FETCH_URL_TRUNCATION_MARKER.length
-  if (content.length > budget) content = content.slice(0, budget) + FETCH_URL_TRUNCATION_MARKER
+  if (content.length > budget || cut) content = content.slice(0, budget) + FETCH_URL_TRUNCATION_MARKER
   return `${header}\n${content || '(empty response)'}`
 }
 

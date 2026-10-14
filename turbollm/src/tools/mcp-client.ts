@@ -81,7 +81,10 @@ export class StdioMcpClient implements IMcpClient {
     const args = isWin ? ['/c', this.command, ...this.args] : this.args
     this.proc = spawn(file, args, {
       env: { ...process.env, ...this.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // stderr is discarded, not piped: nothing reads it, and once an unread pipe fills (~128 KB of
+      // logging — the Python MCP SDK logs every request at INFO) the server blocks on its next
+      // stderr write and every later request times out.
+      stdio: ['pipe', 'pipe', 'ignore'],
     })
 
     this.proc.stdout?.on('data', (chunk: Buffer) => {
@@ -107,11 +110,19 @@ export class StdioMcpClient implements IMcpClient {
     this.proc.on('error', () => this.cleanup())
     this.proc.on('exit', () => this.cleanup())
 
-    await this.sendRequest('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: { tools: {} },
-      clientInfo: { name: 'turbollm', version: '0.7.0' },
-    })
+    try {
+      await this.sendRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        clientInfo: { name: 'turbollm', version: '0.7.0' },
+      })
+    } catch (e) {
+      // A rejected or timed-out initialize (a first-run `npx -y`/`uvx` download easily outlasts
+      // the 30 s timeout) must not leave the child running: the caller drops this client, so
+      // nothing else would ever kill it, and the next sync spawns another.
+      this.cleanup()
+      throw e
+    }
     await this.sendNotification('notifications/initialized', {})
     this.initialized = true
   }
@@ -235,7 +246,7 @@ export class SseMcpClient implements IMcpClient {
     return result.isError ? `Error: ${text}` : (text || '(no output)')
   }
 
-  private async sendRequest(method: string, params: unknown): Promise<unknown> {
+  private async sendRequest(method: string, params: unknown, retried = false): Promise<unknown> {
     const id = ++this.msgId
     const req: JsonRpcRequest = { jsonrpc: '2.0', id, method, params }
     const reqHeaders: Record<string, string> = {
@@ -243,7 +254,8 @@ export class SseMcpClient implements IMcpClient {
       'Accept': 'application/json, text/event-stream',
       ...this.headers,
     }
-    if (this.sessionId) reqHeaders['Mcp-Session-Id'] = this.sessionId
+    const sentSession = this.sessionId
+    if (sentSession) reqHeaders['Mcp-Session-Id'] = sentSession
 
     const resp = await fetch(this.baseUrl, {
       method: 'POST',
@@ -251,6 +263,20 @@ export class SseMcpClient implements IMcpClient {
       body: JSON.stringify(req),
       signal: AbortSignal.timeout(30_000),
     })
+
+    // MCP 2025-03-26: a 404 to a request carrying a session id means the server ended that session
+    // (restart, idle expiry) and the client MUST start a new one. Once per request, so a server
+    // that keeps answering 404 still surfaces as an error below. (An initialize that carried a
+    // stale id is simply resent without one — it IS the new session.)
+    if (resp.status === 404 && sentSession && !retried) {
+      await resp.body?.cancel().catch(() => {})
+      if (this.sessionId === sentSession) {
+        this.sessionId = null
+        this.initialized = false
+      }
+      if (method !== 'initialize') await this.connect()
+      return this.sendRequest(method, params, true)
+    }
 
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '')
