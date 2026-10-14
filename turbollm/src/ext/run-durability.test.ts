@@ -90,6 +90,28 @@ test('listing runs is owner-scoped even when reading back from the persisted DB 
   }
 })
 
+// The owner filter ran in JS AFTER the tenant-wide `LIMIT 100`, so once a run left the
+// in-memory map, an owner whose runs were older than 100 other owners' runs got an empty list.
+test("an owner's persisted runs are listed even when other owners in the tenant have 100+ newer runs", () => {
+  const dir = tmpDir('turbollm-run-list-limit-')
+  const db = new ConversationStore(dir)
+  try {
+    const row = (id: string, owner: string, createdAt: string) => ({
+      id, chatId: 'c', messageId: 'm', tenant: 'acme', owner, status: 'complete' as const,
+      eventSeq: 0, error: null, createdAt, endedAt: createdAt,
+    })
+    db.upsertExtRun(row('run_b', 'u-b', '2026-01-01T00:00:00.000Z'))
+    for (let i = 0; i < 100; i++) db.upsertExtRun(row(`run_a${i}`, 'u-a', new Date(Date.UTC(2026, 0, 2, 0, 0, i)).toISOString()))
+
+    // A fresh manager: nothing in memory, so this reads the persisted rows only.
+    const runs = new PublicRunManager({ db })
+    assert.deepEqual(runs.list('acme', 'u-b').map((r) => r.id), ['run_b'])
+    assert.equal(runs.list('acme', 'u-a').length, 100)
+  } finally {
+    db.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('with no db the manager still works, purely in memory', async () => {
   const runs = new PublicRunManager()
   const run = runs.start({ scope: SCOPE, chatId: 'c1', messageId: 'm1', body: async () => ({ status: 'complete' }) })

@@ -12,7 +12,7 @@ import type { Scope } from '../chat/store/types.js'
 import { extAuth, requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError, requestId as makeRequestId } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
-import { IdempotencyStore } from './idempotency.js'
+import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 import {
   TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   MAX_BODY_BYTES, MAX_ATTACHMENTS,
@@ -176,6 +176,8 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     // the SAME scope, so they can never disagree about which owner this request is for.
     const scope = scopeFor(c, b.owner)
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+    // The fields createChat receives — what makes a retry "the same request" (idempotency.ts).
+    const fingerprint = idempotencyKey ? requestFingerprint([b.title, b.model, b.system_prompt, b.sampling, b.metadata]) : ''
 
     // Idempotent replay (spec §7.6): a cached key means THIS chat was already created by an
     // earlier attempt of the same request — return that frozen result rather than creating a
@@ -185,13 +187,19 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     // owner reusing the same Idempotency-Key value would replay THIS owner's chat verbatim,
     // private metadata included (live-reproduced in the review this fixes).
     if (idempotencyKey) {
-      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as { id?: string } | null
+      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as { dto: { id?: string }; fingerprint: string } | null
       if (cached) {
+        // Same key, different body: a different request, never a replay of this one.
+        if (cached.fingerprint !== fingerprint) {
+          return extError(c, 'conflict', 'idempotency_key_reused',
+            'This Idempotency-Key was already used for a different request. Use a new Idempotency-Key for a new chat.',
+            { status: 409, retryable: false })
+        }
         // Route has no `:id` param to fall back on (this is POST /chats) — without this, the
         // audit row for a replay would carry a null targetId even though the real chat id is
         // sitting right here in the cached DTO.
-        if (cached.id) c.set('auditTargetId', cached.id)
-        return c.json(cached, 201)
+        if (cached.dto.id) c.set('auditTargetId', cached.dto.id)
+        return c.json(cached.dto, 201)
       }
     }
 
@@ -210,7 +218,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       // concurrent retries still can't both observe a miss (the second's `createChat` may still
       // create a duplicate chat under a true race — see idempotency.ts's own residual-window
       // note — but a SEQUENTIAL retry, the actual reported failure mode, is fully covered).
-      if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, dto)
+      if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { dto, fingerprint })
       return c.json(dto, 201)
     } catch (e) {
       const m = mapStoreError(e)
@@ -527,7 +535,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       }
     }
     try {
-      const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since') })
+      const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since'), before: c.req.query('before') || undefined })
       return c.json({ data: rows.map(toAuditDTO) })
     } catch (e) {
       const m = mapStoreError(e)

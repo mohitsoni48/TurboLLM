@@ -348,13 +348,19 @@ test('a duplicate Idempotency-Key on POST /chats returns the same chat rather th
     assert.equal(first.status, 201)
     const firstBody = await first.json() as { id: string; title: string }
 
-    // A retry with the SAME key but a DIFFERENT body — proving the replay returns the frozen
-    // original result rather than re-running createChat with the new content.
-    const second = await app.request('/api/ext/v1/chats', post('A different title'))
+    // A genuine retry (SAME key, SAME body) returns the frozen original result rather than
+    // re-running createChat.
+    const second = await app.request('/api/ext/v1/chats', post('Hello'))
     assert.equal(second.status, 201)
     const secondBody = await second.json() as { id: string; title: string }
     assert.equal(secondBody.id, firstBody.id, 'the replay must return the SAME chat, not a new one')
     assert.equal(secondBody.title, firstBody.title, 'the replay returns the ORIGINAL result, not a re-execution')
+
+    // The SAME key with a DIFFERENT body is a different request — refused, not answered
+    // with a chat that does not match what was asked for.
+    const reused = await app.request('/api/ext/v1/chats', post('A different title'))
+    assert.equal(reused.status, 409)
+    assert.equal((await reused.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
 
     const list = await app.request('/api/ext/v1/chats?owner=u1', { headers: { Authorization: ACME } })
     const page = await list.json() as { data: unknown[] }
@@ -529,6 +535,23 @@ test('GET /audit with a negative or zero limit is refused with a clean 400', asy
     const res = await app.request('/api/ext/v1/audit?owner=u1&limit=0', { headers: { Authorization: ACME } })
     assert.equal(res.status, 400)
     assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+// GET /audit could never return anything past the newest page — `since` is a lower bound
+// on a newest-first list. `before=<oldest id received>` is how the route pages backward.
+test('GET /audit pages backward with before=<oldest id received>', async () => {
+  const { app, cleanup } = harness()
+  try {
+    for (const title of ['A', 'B', 'C']) await app.request('/api/ext/v1/chats', json(ACME, { title, owner: 'u1' }))
+    const get = async (q: string) => (await (await app.request(`/api/ext/v1/audit?owner=u1&${q}`, { headers: { Authorization: ACME } })).json() as { data: Array<{ id: string }> }).data
+    const page1 = await get('limit=2')
+    assert.equal(page1.length, 2)
+    const page2 = await get(`limit=2&before=${page1[1].id}`)
+    assert.equal(page2.length, 1, 'the third, oldest row is reachable on the next page')
+    assert.ok(!page1.some((r) => r.id === page2[0].id), 'the next page holds only older rows')
   } finally {
     cleanup()
   }

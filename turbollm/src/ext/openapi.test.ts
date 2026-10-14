@@ -228,3 +228,118 @@ test('GET /audit response body satisfies every field its own documented schema r
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// OpenAPI builds a request URL as server URL + path key. Both carried /api/ext/v1, so a
+// client generated from this document called /api/ext/v1/api/ext/v1/... and got 404s.
+test('server URL + path key names each route exactly once under /api/ext/v1', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  for (const server of doc.servers) {
+    for (const key of Object.keys(doc.paths)) {
+      const url = new URL(server.url.replace(/\/+$/, '') + key)
+      assert.equal(url.pathname.split('/api/ext/v1').length - 1, 1, `${server.url} + ${key} -> ${url.pathname}`)
+      assert.ok(url.pathname.startsWith('/api/ext/v1/'), `${url.pathname} must be served under /api/ext/v1`)
+    }
+  }
+})
+
+const KEY_FULL = 'tllm-ext-openapi-full'
+const KEY_READONLY = 'tllm-ext-openapi-readonly'
+const KEY_LOCAL = 'tllm-ext-openapi-local'
+
+/** A real chat + run route set over a temp store. `adapter: false` leaves the chat store with no
+ *  adapter, which is how every non-local tenant's store call gets 501 not_supported. */
+function statusHarness(opts: { adapter: boolean }) {
+  const dir = tmpDir('turbollm-ext-openapi-status-')
+  const conv = new ConversationStore(dir)
+  const d = {
+    db: conv,
+    chatStore: new ChatStoreRouter(conv.chatStore, opts.adapter ? conv.chatStore : null),
+    store: { snapshot: () => ({ apiKeys: [
+      { hash: hashKey(KEY_FULL), tenant: 'acme' },
+      { hash: hashKey(KEY_READONLY), tenant: 'acme', scopes: ['chats:read'] },
+      { hash: hashKey(KEY_LOCAL), tenant: 'local' },
+    ] }) },
+    // A 1000-token window, so a long message is refused with context_overflow.
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: 'Q4_K_M', ctx: 1000, vision: false } }),
+      target: () => 'http://127.0.0.1:9999',
+    },
+  } as never
+  const runs = new PublicRunManager()
+  const app = new Hono()
+  registerExtChatRoutes(app, d, undefined, runs)
+  registerExtRunRoutes(app, d, runs, { makeBody: () => async () => ({ status: 'complete' as const }) })
+  return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+// The documented error statuses drifted from what the routes send — 403 (scope / local
+// tenant), 413 (body caps) and 501 (no store adapter) were missing, and context_overflow (type
+// `engine`) is sent as 409, not the documented 502. Each case below drives a REAL route into
+// that error and checks the document lists that status, naming the envelope's `type`.
+test('every error status a route really sends is documented on that route, with its type', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const big = 'x'.repeat(1_048_577)
+  const call = (app: Hono, method: string, path: string, key: string, body?: unknown) => app.request(`/api/ext/v1${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const check = async (res: Response, expected: number, method: string, route: string) => {
+    assert.equal(res.status, expected, `${method} ${route}: expected the route to answer ${expected}`)
+    const type = (await res.json() as { error: { type: string } }).error.type
+    const op = doc.paths[`/api/ext/v1${route}`][method.toLowerCase()] as { responses: Record<string, { description: string }> }
+    const documented = op.responses[String(expected)]
+    assert.ok(documented, `${method} ${route} sends ${expected} but does not document it (has ${Object.keys(op.responses).join(', ')})`)
+    assert.ok(documented.description.includes(type), `${method} ${route} ${expected} must name type "${type}": ${documented.description}`)
+  }
+
+  const full = statusHarness({ adapter: true })
+  try {
+    const chat = await (await call(full.app, 'POST', '/chats', KEY_FULL, { title: 'T', owner: 'u1' })).json() as { id: string }
+    const msg = await (await call(full.app, 'POST', `/chats/${chat.id}/messages`, KEY_FULL, { content: 'hi', owner: 'u1', generate: false })).json() as { id: string }
+
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_READONLY, { content: 'hi', owner: 'u1' }), 403, 'POST', '/chats/{id}/messages/generate')
+    await check(await call(full.app, 'GET', '/runs', KEY_LOCAL), 403, 'GET', '/runs')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'POST', '/chats/{id}/messages/generate')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'POST', '/chats/{id}/messages')
+    await check(await call(full.app, 'PATCH', `/messages/${msg.id}`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'PATCH', '/messages/{id}')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_FULL, { content: 'x'.repeat(8000), owner: 'u1' }), 409, 'POST', '/chats/{id}/messages/generate')
+  } finally {
+    full.cleanup()
+  }
+  const op = doc.paths['/api/ext/v1/chats/{id}/messages/generate'].post as { responses: Record<string, unknown> }
+  assert.ok(!op.responses['502'], 'no HTTP response of this route is ever 502')
+
+  const noAdapter = statusHarness({ adapter: false })
+  try {
+    await check(await call(noAdapter.app, 'GET', '/chats', KEY_FULL), 501, 'GET', '/chats')
+    await check(await call(noAdapter.app, 'POST', '/chats', KEY_FULL, { title: 'T' }), 501, 'POST', '/chats')
+  } finally {
+    noAdapter.cleanup()
+  }
+})
+
+// Same drift as GET /audit (above): GET /runs was documented as a cursor page (`pageOf('Run')`,
+// requiring has_more/next_cursor) while the route returns only `{ data }`.
+test('GET /runs response body satisfies every field its own documented schema requires', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const operation = doc.paths['/api/ext/v1/runs'].get as {
+    responses: Record<string, { content?: { 'application/json'?: { schema: { $ref?: string } } } }>
+  }
+  const schemaRef = operation.responses['200']?.content?.['application/json']?.schema
+  assert.ok(schemaRef?.$ref, 'GET /runs has no documented application/json response schema')
+  const schemaName = (schemaRef.$ref as string).replace('#/components/schemas/', '')
+  const required = resolveRequired(doc.components.schemas[schemaName] as JsonSchemaLike, doc.components.schemas as Record<string, JsonSchemaLike>)
+
+  const h = statusHarness({ adapter: true })
+  try {
+    const res = await h.app.request('/api/ext/v1/runs', { headers: { Authorization: `Bearer ${KEY_FULL}` } })
+    assert.equal(res.status, 200)
+    const responseBody = await res.json() as Record<string, unknown>
+    for (const field of required) {
+      assert.ok(field in responseBody, `${schemaName} declares "${field}" required, but the real GET /runs response has no such key (got: ${Object.keys(responseBody).join(', ')}) — schema/route drift`)
+    }
+  } finally {
+    h.cleanup()
+  }
+})

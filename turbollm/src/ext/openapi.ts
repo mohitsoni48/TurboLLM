@@ -54,6 +54,10 @@ export interface RouteSpec {
    *  inference function, so the NEXT route that doesn't fit the convention fails loudly (a
    *  missing successStatus falls back to the wrong default) instead of silently drifting again. */
   successStatus?: string
+  /** Error `type`s this route can answer with, each documented at that type's usual status
+   *  (`errorResponses`). `type:status` documents a type a route sends with a different status
+   *  — e.g. `auth:403` (insufficient_scope / tenant_not_supported, auth.ts) next to the plain
+   *  401, or `engine:409` (context_overflow, routes.runs.ts). */
   errors: string[]
 }
 
@@ -61,8 +65,17 @@ export interface RouteSpec {
 // (`app.use(BASE/*, ...)`, registered ahead of every route including ones added later by
 // routes.runs.ts and mount.ts) — spec §5.4 confirms read AND write traffic is rate limited, so
 // `capacity` belongs in the shared read-error set, not just the write one.
-const CHAT_ERRORS = ['auth', 'not_found', 'invalid_request', 'capacity']
+// `auth:403`: every scoped route refuses a key lacking the scope, or resolving to the local
+// tenant, with 403 (auth.ts) — 401 alone undersold it.
+const CHAT_ERRORS = ['auth', 'auth:403', 'not_found', 'invalid_request', 'capacity']
 const WRITE_ERRORS = [...CHAT_ERRORS, 'conflict', 'storage']
+// Routes that call the chat store also surface mapStoreError's 501 `not_supported` (errors.ts) —
+// the answer for every such call when no adapter serves the key's tenant.
+const STORE_READ_ERRORS = [...CHAT_ERRORS, 'unsupported']
+const STORE_WRITE_ERRORS = [...WRITE_ERRORS, 'unsupported']
+// Body caps (limits.ts) are `invalid_request` sent as 413 payload_too_large; the context-window
+// refusal is `engine` sent as 409 context_overflow (routes.runs.ts), never the type's 502.
+const BODY_CAP_ERRORS = ['invalid_request:413']
 
 export const EXT_ROUTES: RouteSpec[] = [
   // ── routes.chats.ts ───────────────────────────────────────────────────────────────────────
@@ -76,34 +89,34 @@ export const EXT_ROUTES: RouteSpec[] = [
   {
     method: 'GET', path: '/chats',
     summary: 'List chats, cursor-paginated.',
-    scope: 'chats:read', responseSchema: 'ChatPage', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'ChatPage', errors: STORE_READ_ERRORS,
   },
   {
     method: 'POST', path: '/chats',
     summary: 'Create a chat.',
     scope: 'chats:write', audited: 'chat.create',
-    requestSchema: 'ChatInput', responseSchema: 'Chat', errors: WRITE_ERRORS,
+    requestSchema: 'ChatInput', responseSchema: 'Chat', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'GET', path: '/chats/:id',
     summary: 'Fetch one chat.',
-    scope: 'chats:read', responseSchema: 'Chat', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'Chat', errors: STORE_READ_ERRORS,
   },
   {
     method: 'PATCH', path: '/chats/:id',
     summary: 'Update title, system_prompt, sampling, or metadata.',
     scope: 'chats:write', audited: 'chat.update',
-    requestSchema: 'ChatPatch', responseSchema: 'Chat', errors: WRITE_ERRORS,
+    requestSchema: 'ChatPatch', responseSchema: 'Chat', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'DELETE', path: '/chats/:id',
     summary: 'Delete a chat and its messages.',
-    scope: 'chats:write', audited: 'chat.delete', errors: WRITE_ERRORS,
+    scope: 'chats:write', audited: 'chat.delete', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'GET', path: '/chats/:id/messages',
     summary: 'List messages in a chat, cursor-paginated.',
-    scope: 'chats:read', responseSchema: 'MessagePage', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'MessagePage', errors: STORE_READ_ERRORS,
   },
   {
     method: 'POST', path: '/chats/:id/messages',
@@ -120,23 +133,23 @@ export const EXT_ROUTES: RouteSpec[] = [
       status: '202', schema: 'Run', sse: true,
       description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON) or an SSE stream, per Accept (spec §5.1).',
     },
-    errors: [...WRITE_ERRORS, 'engine'],
+    errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
   },
   {
     method: 'GET', path: '/messages/:id',
     summary: 'Fetch one message.',
-    scope: 'chats:read', responseSchema: 'Message', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'Message', errors: STORE_READ_ERRORS,
   },
   {
     method: 'PATCH', path: '/messages/:id',
     summary: 'Edit message content.',
     scope: 'chats:write', audited: 'message.update',
-    requestSchema: 'MessagePatch', responseSchema: 'Message', errors: WRITE_ERRORS,
+    requestSchema: 'MessagePatch', responseSchema: 'Message', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS],
   },
   {
     method: 'DELETE', path: '/messages/:id',
     summary: 'Delete a message.',
-    scope: 'chats:write', audited: 'message.delete', errors: WRITE_ERRORS,
+    scope: 'chats:write', audited: 'message.delete', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'GET', path: '/audit',
@@ -150,7 +163,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Start a generation run for a chat (SSE or JSON, per Accept).',
     scope: 'runs:write', audited: 'run.start',
     requestSchema: 'MessageInput', responseSchema: 'Run', sse: true,
-    successStatus: '202', errors: [...WRITE_ERRORS, 'engine'],
+    successStatus: '202', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
   },
   {
     method: 'GET', path: '/runs',
@@ -164,7 +177,7 @@ export const EXT_ROUTES: RouteSpec[] = [
   },
   {
     method: 'GET', path: '/runs/:id/stream',
-    summary: "Attach or re-attach to a run's SSE event stream.",
+    summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it to replay from the first frame.",
     scope: 'chats:read', sse: true, errors: [...CHAT_ERRORS, 'conflict'],
   },
   {
@@ -253,7 +266,7 @@ function buildSchemas(): Record<string, JsonSchema> {
       chat_id: { type: 'string' },
       message_id: { type: 'string' },
       status: { type: 'string', enum: ['queued', 'streaming', 'complete', 'failed', 'aborted'] },
-      event_seq: { type: 'integer', description: 'Monotonic event counter — the resume token (spec §6.3).' },
+      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event, 0 before the first one — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received.' },
       error: { type: ['object', 'null'], additionalProperties: true },
       created_at: { type: 'string', format: 'date-time' },
       ended_at: { type: ['string', 'null'], format: 'date-time' },
@@ -395,21 +408,30 @@ function buildSchemas(): Record<string, JsonSchema> {
   }
 
   // NOT `pageOf('AuditRow')`: unlike the other List endpoints, GET /audit isn't cursor-paginated
-  // — `AuditLog.list()` (audit.ts) takes only `limit`/`since`, no cursor, and the route
-  // (routes.chats.ts) returns exactly `{ data: [...] }`. `pageOf()`'s `allOf: [Page]` would
+  // — `AuditLog.list()` (audit.ts) takes `limit`/`since`/`before` (a row id), no opaque cursor,
+  // and the route (routes.chats.ts) returns exactly `{ data: [...] }`. `pageOf()`'s `allOf: [Page]` would
   // require `has_more`/`next_cursor`, which this response never has (openapi.test.ts's
   // response-fidelity test catches that mismatch directly).
   const AuditPage: JsonSchema = {
     type: 'object',
-    description: 'A page of audit rows (spec 27 §10). Not cursor-paginated — page backward using `since`.',
+    description: 'A page of audit rows (spec 27 §10), newest first, at most `limit` (default and max 200). No has_more/next_cursor: page backward by passing the `id` of the oldest row received as `before`, until a page holds fewer than `limit` rows. `since` (ISO timestamp, inclusive) bounds how far back to read.',
     properties: { data: { type: 'array', items: { $ref: '#/components/schemas/AuditRow' } } },
+    required: ['data'],
+  }
+
+  // NOT `pageOf('Run')`, for the same reason as AuditPage: GET /runs (routes.runs.ts) returns
+  // exactly `{ data: [...] }` — no cursor, no has_more/next_cursor.
+  const RunPage: JsonSchema = {
+    type: 'object',
+    description: "The caller's runs. Not cursor-paginated.",
+    properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Run' } } },
     required: ['data'],
   }
 
   return {
     Chat, Message, Run, Page, Error,
     Capabilities, ChatInput, ChatPatch, MessageInput, MessagePatch,
-    ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage: pageOf('Run'),
+    ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage,
     AuditRow, AuditPage,
     OpenApiDocument: { type: 'object', description: 'This document itself.', additionalProperties: true },
   }
@@ -441,15 +463,23 @@ function templatePath(path: string): string {
 const NO_OWNER_PARAM_PATHS = new Set(['/capabilities', '/openapi.json'])
 
 function errorResponses(codes: string[]): Record<string, JsonSchema> {
-  const responses: Record<string, JsonSchema> = {}
   const statusFor: Record<string, number> = {
     auth: 401, not_found: 404, invalid_request: 400, conflict: 409,
     capacity: 429, engine: 502, storage: 503, unsupported: 501, internal: 500,
   }
-  for (const code of codes) {
-    const status = String(statusFor[code] ?? 500)
+  // Grouped by status: two types can share one (`conflict` and `engine:409`), and the response
+  // must name both rather than the last one overwriting the first.
+  const typesByStatus: Record<string, string[]> = {}
+  for (const entry of codes) {
+    const [type, explicit] = entry.split(':')
+    const status = explicit ?? String(statusFor[type] ?? 500)
+    const types = typesByStatus[status] ?? (typesByStatus[status] = [])
+    if (!types.includes(type)) types.push(type)
+  }
+  const responses: Record<string, JsonSchema> = {}
+  for (const [status, types] of Object.entries(typesByStatus)) {
     responses[status] = {
-      description: `${code} — see the Error schema's \`type\` enum.`,
+      description: `${types.join(', ')} — see the Error schema's \`type\` enum.`,
       content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
     }
   }
@@ -580,7 +610,9 @@ export function buildOpenApiDocument(version: string): {
       license: { name: 'FSL-1.1-ALv2', url: 'https://github.com/mohitsoni48/TurboLLM/blob/main/LICENSE.md' },
     },
     servers: [
-      { url: 'http://127.0.0.1:6996/api/ext/v1', description: 'Default loopback port; configurable per instance.' },
+      // Origin only: every `paths` key already starts with /api/ext/v1, and OpenAPI appends the
+      // path key to the server URL, so a prefix here would double it (/api/ext/v1/api/ext/v1/...).
+      { url: 'http://127.0.0.1:6996', description: 'Default loopback port; configurable per instance.' },
     ],
     components: {
       securitySchemes: {

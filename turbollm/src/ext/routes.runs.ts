@@ -18,7 +18,7 @@ import { extError, mapStoreError } from './errors.js'
 import { checkContextFits } from './context-limit.js'
 import { loadFullHistory, buildGenerationCtx } from './generation.js'
 import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
-import { IdempotencyStore } from './idempotency.js'
+import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 import {
   TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   MAX_BODY_BYTES, MAX_ATTACHMENTS,
@@ -47,7 +47,12 @@ export interface ExtRouteDeps {
  *  already-created run, not a frozen response body — the true "result" of a generation is live
  *  and possibly still streaming, so a replay reconnects to the same run rather than replaying a
  *  stale snapshot (see the replay branch in the route below). */
-interface GenerateReplay { runId: string; userMessageId: string; messageId: string }
+interface GenerateReplay {
+  runId: string; userMessageId: string; messageId: string
+  /** `requestFingerprint` of the chat id + message body this key was first used for — a hit
+   *  for a different chat or body is refused rather than replayed (see idempotency.ts). */
+  fingerprint: string
+}
 
 function toRunDTO(r: PublicRun): Record<string, unknown> {
   return {
@@ -144,6 +149,10 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     const content = (b.content ?? '').trim()
     const attachments = b.attachments
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+    // Everything that makes this "the same request" for a replay: the target chat and the
+    // message body as it would be persisted. `role` is not included — this route always
+    // persists a user turn, whatever the body says.
+    const fingerprint = idempotencyKey ? requestFingerprint([chatId, content, attachments ?? null, b.metadata ?? null]) : ''
 
     // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —
     // a cached key means a run for this exact request already exists, so we reattach to THAT
@@ -169,6 +178,13 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
           // prevent, so an aged-out replay is refused rather than risked.
           return extError(c, 'conflict', 'idempotency_replay_expired',
             'The original run for this Idempotency-Key is no longer available to replay. If you intend to send a new message, retry with a new Idempotency-Key.',
+            { status: 409, retryable: false })
+        }
+        // Same key, different chat or body: a different request, not a retry of this one.
+        // Replaying would report this message as sent while it is never persisted.
+        if (cached.fingerprint !== fingerprint) {
+          return extError(c, 'conflict', 'idempotency_key_reused',
+            'This Idempotency-Key was already used for a different request (another chat or different message content). Use a new Idempotency-Key for a new message.',
             { status: 409, retryable: false })
         }
         // The real run id — this route's own `:id` param names the CHAT, not the run, and a
@@ -330,7 +346,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // already returned a live `PublicRun` at this line; the injected body's own first engine
     // fetch is still at least one microtask away. A retry that lands anywhere after this line
     // finds this entry and reattaches via the branch above instead of starting a second run.
-    if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
+    if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId, fingerprint } satisfies GenerateReplay)
     // The chat reservation from before the first `await` above stays held — no "upgrade" step is
     // needed: `runs.reserveChat`/`isChatActive` (run-manager.ts) don't care whether a real
     // `PublicRun` exists yet, only that the chat is reserved, and it already is.
@@ -367,13 +383,16 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     const scope = scopeFor(c, c.req.query('owner'))
     const run = runs.get(c.req.param('id'))
     if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
-    const after = c.req.query('after') ? Number(c.req.query('after')) : 0
-    if (!runs.canReplayFrom(run.id, after)) {
+    // `after` is EXCLUSIVE: it is the last SSE `id` (event_seq) the client already has, so the
+    // replay starts at the next frame. Absent ⇒ replay from the first frame (seq 0).
+    const afterParam = c.req.query('after')
+    const from = afterParam ? Number(afterParam) + 1 : 0
+    if (!runs.canReplayFrom(run.id, from)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
         'That cursor has aged out of the replay buffer. Re-read the message, then attach at the run current event_seq.')
     }
     return streamSSE(c, async (stream) => {
-      const sub = runs.subscribe(run.id, after)
+      const sub = runs.subscribe(run.id, from)
       stream.onAbort(() => { sub.close() })
       for await (const ev of sub) {
         await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })

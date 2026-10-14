@@ -2248,9 +2248,11 @@ export class ConversationStore {
     return r ? rowToExtRun(r) : null
   }
 
-  listExtRuns(tenant: string, limit = 100): ExtRunRecord[] {
-    return (this.db.prepare(`SELECT * FROM ext_runs WHERE tenant = $t ORDER BY created_at DESC LIMIT $l`)
-      .all({ $t: tenant, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
+  /** `owner` filters in SQL, before the LIMIT: filtering the tenant's newest `limit` rows
+   *  afterwards dropped an owner's runs whenever other owners had `limit` newer ones. */
+  listExtRuns(tenant: string, owner?: string, limit = 100): ExtRunRecord[] {
+    return (this.db.prepare(`SELECT * FROM ext_runs WHERE tenant = $t AND ($o IS NULL OR owner = $o) ORDER BY created_at DESC LIMIT $l`)
+      .all({ $t: tenant, $o: owner ?? null, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
   }
 
   /** Close out runs left mid-stream by a previous process (spec 27 §6.4). */
