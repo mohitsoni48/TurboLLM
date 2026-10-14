@@ -72,8 +72,9 @@ export function modeGuidance(mode: CodeMode): string {
   switch (mode) {
     case 'plan':
       return [
-        'MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls). You cannot edit,',
-        'write, or run commands in this mode. Explore the codebase as needed, then produce a',
+        'MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls, plus any listed research',
+        'tools such as web search; skills and sub-agents you start are read-only too). You cannot',
+        'edit, write, or run shell commands in this mode. Explore the codebase as needed, then produce a',
         'clear, concrete, step-by-step implementation plan as your final message: which files',
         'to change, what each change is, and any risks. Do not ask for permission to explore —',
         'just investigate and deliver the plan.',
@@ -191,13 +192,24 @@ export function todoTrackerGuidance(): string {
   ].join(' ')
 }
 
+/** TurboLLM's own registered tools (code-session.ts) that plan mode keeps. pi applies the `tools`
+ *  allowlist to extension tools too, so anything not named here is silently gone in plan mode.
+ *  Only tools that change nothing: web_search/fetch_url (lookups), run_code (sandboxed: no fs,
+ *  network or process access), lookback_history (a tool-less Q&A over saved history),
+ *  list_routines, and invoke_skill/delegate_task, whose sub-agents a plan run starts in plan mode
+ *  (read-only) too. Left out on purpose: bash/edit/write, install_lsp (downloads and spawns a
+ *  server), update_todos (plan's deliverable already IS the step list — see todoTrackerGuidance),
+ *  the routine tools that create/change/run routines, and every mcp__* tool. A name that isn't
+ *  registered in a given session (no ToolRegistry, a sub-agent) is simply ignored by pi. */
+const PLAN_MODE_EXTENSION_TOOLS = ['web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']
+
 /** The pi tool set for a Code mode. plan is READ-ONLY (its real safety mechanism): mutating
  *  tools simply aren't in the toolset, so nothing reaches the containment/approval hook to gate.
  *  auto/ask use pi's DEFAULT tool set (read/bash/edit/write) — returned as `undefined` so the
  *  caller omits the `tools` option entirely. Mirrors modeGuidance('plan') above (read/grep/find/
- *  ls), which must stay in sync with this list. */
+ *  ls plus the read-only TurboLLM tools), which must stay in sync with this list. */
 export function toolsForMode(mode: CodeMode): string[] | undefined {
-  return mode === 'plan' ? ['read', 'grep', 'find', 'ls'] : undefined
+  return mode === 'plan' ? ['read', 'grep', 'find', 'ls', ...PLAN_MODE_EXTENSION_TOOLS] : undefined
 }
 
 /** Formats a FULL skill (name/description/instructions) for direct injection — used only for
@@ -325,9 +337,8 @@ export function buildAppendPrompt(
   hasWebTools = false,
 ): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
-  // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — install_lsp
-  // is still registered in plan mode, but pre-warming a server with nothing to attach diagnostics
-  // to isn't worth explaining in the prompt.
+  // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — and neither
+  // install_lsp nor update_todos is in plan mode's toolset (see PLAN_MODE_EXTENSION_TOOLS).
   if (mode !== 'plan') {
     blocks.push(editReliabilityGuidance())
     blocks.push(lspGuidance())

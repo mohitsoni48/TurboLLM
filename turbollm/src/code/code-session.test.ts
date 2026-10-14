@@ -10,19 +10,41 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { toolsForMode, buildAppendPrompt, skillsBlock, skillCatalogBlock, type CodeMode } from './persona'
 import { toSessionStatus, resolveRevertCut } from './code-routes'
-import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, nearOverflowReserveTokens, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
+import { MUTATING_TOOLS, PATH_TOOLS, WRITE_PATH_TOOLS, resolveEffectiveHistory, compactCodeSession, lookbackPreCompactionHistory, isDependencyAddCommand, compactionSettingsFor, nearOverflowReserveTokens, keepRecentTokensFor, ToolLoopTracker, toolCallSignature, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER, codeEventToFrame, validateDelegateTask, subAgentMode, seedPriorHistory, countReplayEntries, normalizeDelegateResult, DELEGATE_SUBAGENT_TIMEOUT_MS, normalizeTodos, summarizeTodos, MAX_TODOS, pickPrefillProgress, PREFILL_POLL_MS, type TodoItem } from './code-session'
 import { ConversationStore, IN_MEMORY_DATA_DIR, type Message } from '../chat/db'
 import type { Deps } from '../deps'
 import type { Skill } from '../agents/skills'
-import type { AgentSessionEvent } from '@earendil-works/pi-coding-agent'
+import { SessionManager, type AgentSessionEvent } from '@earendil-works/pi-coding-agent'
 
 // ── toolsForMode ──────────────────────────────────────────────────────────────────
 
 test('toolsForMode: plan is read-only (read/grep/find/ls, no mutating tools)', () => {
   const tools = toolsForMode('plan')
-  assert.deepEqual(tools, ['read', 'grep', 'find', 'ls'])
+  // The exact list: anything appended to it (e.g. a mutating tool) must fail here and be reviewed.
+  assert.deepEqual(tools, ['read', 'grep', 'find', 'ls', 'web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task'])
   // The safety invariant: plan mode never exposes a mutating tool.
   for (const t of ['edit', 'write', 'bash']) assert.ok(!tools!.includes(t))
+})
+
+test('toolsForMode: plan keeps TurboLLM\'s read-only tools (pi filters registered tools by this list too) and nothing that changes state', () => {
+  const tools = toolsForMode('plan')!
+  for (const t of ['web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']) {
+    assert.ok(tools.includes(t), `${t} available in plan mode`)
+  }
+  for (const t of ['install_lsp', 'update_todos', 'create_routine', 'update_routine', 'delete_routine', 'run_routine_now']) {
+    assert.ok(!tools.includes(t), `${t} not available in plan mode`)
+  }
+  assert.ok(!tools.some((t) => t.startsWith('mcp__')))
+})
+
+test('subAgentMode: a plan run\'s skills/sub-agents stay in plan even after a live switch away from plan', () => {
+  assert.equal(subAgentMode('plan', 'plan'), 'plan')
+  assert.equal(subAgentMode('plan', 'auto'), 'plan')
+  assert.equal(subAgentMode('plan', 'ask'), 'plan')
+  // Unchanged for auto/ask runs: a live switch applies, except a switch TO plan keeps the start mode.
+  assert.equal(subAgentMode('auto', 'ask'), 'ask')
+  assert.equal(subAgentMode('ask', 'auto'), 'auto')
+  assert.equal(subAgentMode('ask', 'plan'), 'ask')
 })
 
 test('toolsForMode: auto and ask use pi defaults (undefined → caller omits `tools`)', () => {
@@ -518,6 +540,26 @@ function makeCodeConv(): { d: Deps; store: ConversationStore; convId: string; se
   const d = { db: store } as unknown as Deps
   return { d, store, convId: conv.id, sessionId: run.id }
 }
+
+test('seedPriorHistory: a sub-agent\'s tool calls stay out of the replayed history; the session\'s own call and its summary stay in', () => {
+  const { store, convId } = makeCodeConv()
+  store.addMessage(convId, 'user', 'investigate X')
+  store.addMessage(convId, 'assistant', 'done', {
+    toolCalls: [
+      { id: 'sub-1', name: 'read', args: { path: 'a.ts' }, result: 'a 50 KB file the sub-agent read', subagent: true },
+      { id: 'own-1', name: 'delegate_task', args: { task: 'look' }, result: 'summary' },
+    ],
+  })
+  const messages = store.getConversation(convId, true)!.messages!
+  const sm = SessionManager.inMemory('/repo')
+  const entryIds: string[] = []
+  seedPriorHistory(sm, messages, 'm', (id) => entryIds.push(id))
+  const seeded = JSON.stringify(sm.getEntries())
+  assert.ok(seeded.includes('own-1') && seeded.includes('summary'))
+  assert.ok(!seeded.includes('sub-1') && !seeded.includes('50 KB file'))
+  assert.equal(entryIds.length, 3, 'user + assistant(text, own call) + its toolResult')
+  assert.equal(countReplayEntries(messages), 3, 'the seed-count check agrees, so no spurious plain-text fallback')
+})
 
 test('resolveEffectiveHistory: no compaction yet — returns every message, no summary', () => {
   const { d, store, convId, sessionId } = makeCodeConv()

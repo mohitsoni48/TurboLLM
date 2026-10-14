@@ -110,6 +110,11 @@ export class CodeRunManager {
   private d: Deps
   private runner: CodeSessionRunner
   private sessions = new Map<string, SessionState>()
+  /** At least every seq any idle-GC'd session buffer handed out. A session's buffer is dropped
+   *  IDLE_RETAIN_MS after it goes idle, but its web client keeps its seq cursor for the life of the
+   *  page — a replacement buffer restarting at 0 would sit below that cursor, so a mid-turn
+   *  reconnect (?fromSeq=<old cursor>) would replay nothing. New buffers start here instead. */
+  private seqFloor = 0
 
   constructor(d: Deps, opts?: { runner?: CodeSessionRunner }) {
     this.d = d
@@ -177,7 +182,7 @@ export class CodeRunManager {
     if (!s) {
       const emitter = new EventEmitter()
       emitter.setMaxListeners(0) // unbounded: many tabs may watch one session
-      s = { convId, repoRoot, buffer: new RingBuffer(), emitter, queue: [], active: null, replayFloor: 0, todos: [] }
+      s = { convId, repoRoot, buffer: new RingBuffer(undefined, this.seqFloor), emitter, queue: [], active: null, replayFloor: 0, todos: [] }
       this.sessions.set(sessionId, s)
     }
     if (s.cleanupTimer) { clearTimeout(s.cleanupTimer); s.cleanupTimer = undefined }
@@ -293,6 +298,14 @@ export class CodeRunManager {
     const push = (event: string, data: unknown) => {
       const ss = this.sessions.get(sessionId)
       if (!ss) return
+      // A tool_progress frame carries the call's WHOLE output so far (pi's bash re-sends its
+      // cumulative, up-to-50 KB snapshot every ~100 ms) and the client replaces, never appends
+      // (applyToolProgress) — so keep only the latest one per call for replay. Otherwise one
+      // chatty command fills the 6000-event ring with snapshots (hundreds of MB per session).
+      if (event === 'tool_progress') {
+        const id = (data as { id?: unknown }).id
+        ss.buffer.dropLast((e) => e.event === 'tool_progress' && (e.data as { id?: unknown }).id === id)
+      }
       const ev = ss.buffer.push(event, data)
       ss.emitter.emit('event', ev)
     }
@@ -342,6 +355,9 @@ export class CodeRunManager {
           diff: data.diff as string | undefined,
           patch: data.patch as string | undefined,
           firstChangedLine: data.firstChangedLine as number | undefined,
+          // A delegate_task/invoke_skill sub-agent's own call (code-session.ts tags those frames):
+          // kept for the transcript and revert, but never replayed into the parent model's history.
+          ...(data.subagent === true ? { subagent: true } : {}),
         })
         timeline.push({ type: 'tool', id })
       }
@@ -366,6 +382,10 @@ export class CodeRunManager {
         thinkingBudget: turn.thinkingBudget,
         reasoningEffort: turn.reasoningEffort,
         task: turn.task,
+        // Not prior history for this turn: its own user message + placeholder, and the follow-ups
+        // still queued behind it (their user rows are already in the DB, ahead of this turn's
+        // placeholder) — see RunCodeParams.excludeFromHistory.
+        excludeFromHistory: [turn.userMsgId, assistantMsg.id, ...s.queue.map((t) => t.userMsgId)],
         model: turn.model,
         signal: ac.signal,
         sink,
@@ -378,12 +398,16 @@ export class CodeRunManager {
         },
       })
 
-      const finalContent = content.trim() || result.finalText
+      // Not for an aborted turn: one stopped before its first token has no text of its own, and
+      // pi's getLastAssistantText() then skips that empty aborted message and returns the PREVIOUS
+      // turn's seeded reply — which must not be saved as this turn's content.
+      const fallbackText = result.aborted ? '' : result.finalText
+      const finalContent = content.trim() || fallbackText
       // Rare fallback: pi's own getLastAssistantText() produced text the delta stream never
       // carried (result.finalText used instead of the empty accumulated `content`). Mirror it
       // into the timeline too so a completed message's timeline text always matches its content
       // — otherwise the interleaved render would silently drop this reply's only content.
-      if (!content.trim() && result.finalText.trim()) timeline.push({ type: 'text', text: result.finalText })
+      if (!content.trim() && fallbackText.trim()) timeline.push({ type: 'text', text: fallbackText })
       const ctxStats = this.reliableContextStats(s.convId, { ctxUsed: result.contextUsed, ctxMax: result.contextMax }, result.aborted)
       this.d.db.updateMessage(assistantMsg.id, {
         content: finalContent,
@@ -399,7 +423,7 @@ export class CodeRunManager {
           ttftMs: result.ttftMs, totalMs: result.totalMs,
         },
       })
-      if (result.finalText.trim()) this.d.db.upsertRunDoc(sessionId, result.finalText.trim())
+      if (fallbackText.trim()) this.d.db.upsertRunDoc(sessionId, fallbackText.trim()) // same aborted-turn rule as `content`
       this.d.db.updateAgentRun(sessionId, { status: result.aborted ? 'interrupted' : 'done', endedAt: new Date().toISOString() })
       push('done', { contextUsed: ctxStats.ctxUsed, contextMax: ctxStats.ctxMax, aborted: result.aborted })
       // Code sessions never go through the chat message endpoint, so nothing else fires
@@ -457,7 +481,10 @@ export class CodeRunManager {
           // transcript; live subscribers get an 'idle' signal to end their loops.
           ss.replayFloor = ss.buffer.head()
           ss.emitter.emit('idle')
-          ss.cleanupTimer = setTimeout(() => { this.sessions.delete(sessionId) }, IDLE_RETAIN_MS)
+          ss.cleanupTimer = setTimeout(() => {
+            this.seqFloor = Math.max(this.seqFloor, ss.buffer.head())
+            this.sessions.delete(sessionId)
+          }, IDLE_RETAIN_MS)
         }
       }
     }

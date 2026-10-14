@@ -447,6 +447,9 @@ export interface ToolCallRecord {
   diff?: string
   patch?: string
   firstChangedLine?: number
+  /** Code mode only: made by a delegate_task/invoke_skill sub-agent, not the session's own model
+   *  — shown and revertable like any call, but never replayed into the parent model's history. */
+  subagent?: boolean
 }
 
 /** Code, item 6 (2026-07-13): an ordered text/tool-call timeline for an assistant message, in
