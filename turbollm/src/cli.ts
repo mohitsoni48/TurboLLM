@@ -453,6 +453,11 @@ const remoteCatalog = new RemoteCatalog(
   { isEnabled: () => isTurboLinkEnabled(deps) },
 )
 const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, remoteCatalog)
+// A render frees the gateway's extra pool slots too (keep-N chat models, embedding / Laya side
+// models), not just the primary: they hold VRAM of their own. Force-stopped, like the primary.
+comfy.setPoolStopper(async () => {
+  await Promise.all([...modelRouter.poolEngineIds()].map((id) => modelRouter.stopPoolSlotsOnEngine(id, { force: true })))
+})
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on

@@ -43,9 +43,12 @@ function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trig
   // it, but `model_load` telemetry — spec 23 §3.3 — wants the same full-config
   // shape for every engine, not just vLLM).
   const profile = resolveProfile(entry, sys, savedProfile, overrides, cfg.modelDefaults)
+  // A "this load only" override (the load dialog with "Remember" unchecked) wins over the saved profile, as
+  // in `profile`. MLX sampling and the shard count still read only what the user set, not `profile`'s
+  // defaults: no args / undefined when nothing is set, as before.
   const extraArgs =
     engine.kind === 'mlx'
-      ? mlxSamplingArgs(savedProfile?.sampling)
+      ? mlxSamplingArgs({ ...savedProfile?.sampling, ...overrides?.sampling })
       : engine.kind === 'vllm'
         ? vllmProfileToArgs(profile, entry.nativeCtx, entry.jev)
         : []
@@ -54,8 +57,8 @@ function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trig
     model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: entry.nativeCtx, vision: entry.vision },
     modelPath: entry.path,
     extraArgs,
-    tensorParallelSize: savedProfile?.gpu?.tensorParallelSize,
-    preferredPort: savedProfile?.port,
+    tensorParallelSize: overrides?.gpu?.tensorParallelSize ?? savedProfile?.gpu?.tensorParallelSize,
+    preferredPort: profile.port,
     profile,
     trigger,
   }

@@ -24,7 +24,13 @@ export type RouteResult =
        *  Absent = an ordinary local engine target, unchanged. */
       remote?: { linkId: string; baseUrl: string; token: string; modelKey: string }
     }
-  | { status: 503; message: string }
+  | {
+      status: 503
+      message: string
+      /** Clears by itself (ComfyUI's queue drains), so a client may retry. Every other refusal repeats until the user
+       *  acts, and a retry of a failed load re-runs that load — the gateway tells clients not to retry those. */
+      transient?: true
+    }
 
 interface PoolSlot {
   manager: Manager
@@ -82,7 +88,7 @@ export class ModelRouter {
      *  exactly as it did before — there are no links, so nothing can be remote. */
     private catalog?: RemoteCatalog,
     /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
-    private newSlotManager: () => Manager = () => new Manager(store),
+    private newSlotManager: () => Manager = () => new Manager(store, { poolSlot: true }),
   ) {}
 
   /** Route a request to the correct model target URL.
@@ -264,13 +270,15 @@ export class ModelRouter {
   }
 
   /** Stop and drop every extra pool slot running on `engineId`, resolving once they have exited — before that
-   *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers). */
-  async stopPoolSlotsOnEngine(engineId: string): Promise<void> {
+   *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers).
+   *  `force` kills at once, as ComfyUI's acquire does the primary: a render must not wait out the graceful stop
+   *  (on Windows its full 8 s timer, which a windowless llama-server never cuts short). */
+  async stopPoolSlotsOnEngine(engineId: string, opts?: { force?: boolean }): Promise<void> {
     const stopping: Promise<unknown>[] = []
     for (const [key, slot] of this.extraSlots) {
       if (slot.manager.currentOpts()?.engine.id !== engineId) continue
       this.extraSlots.delete(key)
-      stopping.push(slot.manager.stopAndWait())
+      stopping.push(slot.manager.stopAndWait(opts))
     }
     await Promise.all(stopping)
   }
@@ -404,18 +412,29 @@ export class ModelRouter {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
+    let comfyRefused = false
     try {
       await targetManager.load(opts, {
         beforeStart: async () => {
           // Ejected while it waited for the gate: never spawn an engine for it.
           if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
-          await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+          try {
+            await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+          } catch (e) {
+            comfyRefused = true
+            throw e
+          }
         },
       })
     } catch (e) {
       if (inFlight?.cancelled) {
         await this.stopCancelled(targetManager)
         return { status: 503, message: UNLOADED_WHILE_LOADING }
+      }
+      // The hook throws only when a ComfyUI render started while this load waited (for the gate or for /free):
+      // the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client may retry.
+      if (comfyRefused) {
+        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }
       }
       return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
     }

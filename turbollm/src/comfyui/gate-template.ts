@@ -10,7 +10,7 @@
 //   • queue drained (last task_done): POST {base}/api/v1/comfyui/release → reload.
 
 /** Version stamp written into the node so the installer can detect/upgrade it. */
-export const GATE_VERSION = 2
+export const GATE_VERSION = 3
 
 /** Render the Python source for the gate node, with TurboLLM's base URL baked in.
  *  `baseUrl` is TurboLLM's own origin (e.g. http://127.0.0.1:6996), reachable from
@@ -110,31 +110,27 @@ def _install_hooks() -> None:
     def put(self, item, *args, **kwargs):
         global _busy
         # Acquire BEFORE enqueuing so the worker can't start executing until TurboLLM
-        # has freed the GPU. Only on the rising edge (idle -> busy).
+        # has freed the GPU. Only on the rising edge (idle -> busy). The lock is held
+        # through the acquire and the enqueue, and task_done holds it through its
+        # release: a put racing a draining queue waits for that release to reach
+        # TurboLLM, then acquires again. Otherwise TurboLLM, still holding the GPU,
+        # answers the acquire at once and the late release reloads its model mid-render.
         with _lock:
             if not _busy:
                 _busy = True
-                acquire = True
-            else:
-                acquire = False
-        if acquire:
-            _acquire_blocking()
-        return orig_put(self, item, *args, **kwargs)
+                _acquire_blocking()
+            return orig_put(self, item, *args, **kwargs)
 
     def task_done(self, *args, **kwargs):
         global _busy
         result = orig_task_done(self, *args, **kwargs)
-        try:
-            remaining = self.get_tasks_remaining()
-        except Exception:  # noqa: BLE001
-            remaining = 0
-        if remaining <= 0:
-            do_release = False
-            with _lock:
-                if _busy:
-                    _busy = False
-                    do_release = True
-            if do_release:
+        with _lock:
+            try:
+                remaining = self.get_tasks_remaining()
+            except Exception:  # noqa: BLE001
+                remaining = 0
+            if remaining <= 0 and _busy:
+                _busy = False
                 _free_self()
                 _release()
         return result

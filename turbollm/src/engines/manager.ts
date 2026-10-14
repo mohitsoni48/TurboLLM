@@ -183,11 +183,10 @@ export class Manager {
    *  stub. A throwing observer must never break a load. `opts` is the exact
    *  `StartOpts` this attempt was called with (spec 23 §3.3's `model_load`
    *  needs the resolved config) — passed explicitly by the caller rather than
-   *  read off `this.opts`, because `this.opts` is only assigned partway
-   *  through `startInternal()`; an early preflight failure (vLLM/SGLang
-   *  unsupported) returns before reaching that assignment and would otherwise
-   *  report the PREVIOUS load's config for a failure that has nothing to do
-   *  with it. */
+   *  read off `this.opts`, so the report never depends on where `this.opts`
+   *  is assigned: an early preflight failure (vLLM/SGLang unsupported) once
+   *  returned before that assignment and reported the PREVIOUS load's config
+   *  for a failure that had nothing to do with it. */
   onLoadSettled?: (ok: boolean, err: ErrInfo | null, opts: StartOpts) => void
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
@@ -197,9 +196,16 @@ export class Manager {
   private generation = 0
   private liveGen: LiveGen | null = null
   private session: SessionAccumulator = freshSession()
+  /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
+   *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
+   *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
+  private watchdog: ReturnType<typeof setInterval> | null = null
+  private readonly poolSlot: boolean
 
-  constructor(private store: ConfigStore) {
-    setInterval(() => this.watchdogTick(), 60_000).unref()
+  /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
+   *  engine, so its engine log gets a file of its own (see startInternal). */
+  constructor(private store: ConfigStore, options: { poolSlot?: boolean } = {}) {
+    this.poolSlot = options.poolSlot ?? false
   }
 
   /** Load a model, freeing any currently-loaded one first — the single atomic
@@ -219,6 +225,10 @@ export class Manager {
         if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
           await this.stopAndWait()
         }
+        // Recorded before the hook, which can refuse the load (ComfyUI rendering): restart() then retries
+        // THIS model, not the one just stopped (startInternal records it too, for start()).
+        this.opts = opts
+        this.lastCommand = null
         if (hooks?.beforeStart) await hooks.beforeStart()
         await this.startInternal(opts)
         await this.awaitNotStarting()
@@ -307,6 +317,11 @@ export class Manager {
     if (this.state === 'starting' || this.state === 'running' || this.state === 'stopping') {
       throw new BusyError()
     }
+    // From here on this attempt is the engine's model, even when it fails before the spawn (a preflight
+    // return or a throw below): restart() retries it, and launchCommand() shows no argv rather than the
+    // previous model's.
+    this.opts = opts
+    this.lastCommand = null
     if (!opts.engine.binPath) throw new Error('no_active_engine')
     if (!opts.modelPath) throw new Error('no_such_model')
 
@@ -347,9 +362,16 @@ export class Manager {
     }
 
     const port = await allocPort(opts.preferredPort)
-    const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
+    // A pool slot often runs on the same engine as the primary, so it logs to a file named by its port (unique
+    // among live engines): sharing the primary's file truncated it and interleaved both engines' output, and every
+    // reader of logPath() (logs route, error banner, mmproj fallback, load-failure checks) saw the other's lines.
+    const logName = this.poolSlot ? `engine-${opts.engine.id}-${port}.log` : `engine-${opts.engine.id}.log`
+    const logPath = join(this.store.dir(), 'logs', logName)
     mkdirSync(dirname(logPath), { recursive: true })
     const logStream = createWriteStream(logPath) // truncates
+    // The log is best-effort: without a listener, a failed write (disk full) is an unhandled 'error' event,
+    // which takes the whole daemon down.
+    logStream.on('error', (e) => console.warn(`[engine] log write failed: ${e.message}`))
     // Header so the raw engine log is self-explanatory. `port` is the engine's OWN
     // loopback port (allocated 8081+), DISTINCT from the TurboLLM app/UI port the
     // user configures — surfacing it here stops the "it says 8081 even though I
@@ -395,10 +417,15 @@ export class Manager {
     // shared log stream and drop the other's output. We close it in onTerminated.
     child.stdout?.pipe(logStream, { end: false })
     child.stderr?.pipe(logStream, { end: false })
+    // pipe() detaches on that error and leaves the engine's output paused: keep draining it, or the engine
+    // blocks for good once its stdout pipe fills.
+    logStream.once('error', () => {
+      child.stdout?.resume()
+      child.stderr?.resume()
+    })
 
     this.state = 'starting'
     this.session = freshSession() // each running session starts with fresh stats (B4)
-    this.opts = opts
     this.port = port
     this.pid = child.pid ?? 0
     // Track the OS process on disk so a daemon that dies WITHOUT running its signal
@@ -411,6 +438,10 @@ export class Manager {
     this.errInfo = null
     this.lastActivity = Date.now()
     this.logPathStr = logPath
+    if (!this.watchdog) {
+      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
+      this.watchdog.unref()
+    }
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
@@ -512,11 +543,10 @@ export class Manager {
     // engine is in 'error' and `lastCommand` is exactly the argv that just failed — the
     // most useful diagnostic a "show launch command" control could show. Excluding it
     // left that button a documented no-op: the daemon had nothing to show, so toggling it
-    // visibly did nothing. This is still never a STALE command: the two 'error' returns
-    // that happen before a spawn is attempted (the vLLM/SGLang capability preflight,
-    // above) leave `lastCommand` at whatever the previous successful load set it to,
-    // which is a real "last command that ran" — not the made-up one this doc originally
-    // warned about (a different model's command shown as if it were the current one).
+    // visibly did nothing. This is still never a STALE command: an attempt that fails before
+    // a spawn (the vLLM/SGLang/LiteRT-LM preflight, a refused or throwing load) clears
+    // `lastCommand` (startInternal, load), so its error shows no command rather than the
+    // previous model's (a different model's command shown as if it were the current one).
     if (this.state !== 'running' && this.state !== 'starting' && this.state !== 'error') return null
     if (!this.lastCommand) return null
     const args = this.lastCommand.args.filter((a) => a !== '--no-webui')
@@ -693,6 +723,8 @@ export class Manager {
     }
     this.child = null
     this.pid = 0
+    if (this.watchdog) clearInterval(this.watchdog)
+    this.watchdog = null
     this.session = freshSession() // session ended — clear stats (B4)
     this.resolveExited?.()
   }
@@ -716,7 +748,7 @@ export class Manager {
       // a fatal load-failure traceback in the log and surface it as an engine error
       // instead. (Checked before probeReady so we win the race.)
       if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang') {
-        const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
+        const loadErr = detectPyLoadFailure(kind, readTail(this.logPathStr, 200))
         if (loadErr) {
           if (this.child === child && this.state === 'starting') {
             this.state = 'error'
@@ -941,8 +973,9 @@ function withoutLayaApiKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *  architecture or quantization the installed mlx-lm version doesn't support), that
  *  thread dies but the HTTP server keeps answering /v1/models, so chat requests queue
  *  to a dead thread and hang forever. We catch the crash and return a concise message;
- *  null when no such failure is present. */
-function detectPyLoadFailure(lines: string[]): string | null {
+ *  null when no such failure is present. The message names `kind`'s engine and package:
+ *  readiness runs this for vLLM and SGLang too. */
+export function detectPyLoadFailure(kind: string, lines: string[]): string | null {
   const text = lines.join('\n')
   // Gate on the load path specifically so unrelated tracebacks (e.g. the /v1/models
   // CacheNotFound handler) never false-trigger this.
@@ -955,10 +988,20 @@ function detectPyLoadFailure(lines: string[]): string | null {
   // The final "SomeError: message" / "SomeException: message" line is the useful detail.
   const errLine = [...lines].reverse().find((l) => /^[A-Za-z_][\w.]*(Error|Exception):/.test(l.trim()))
   const detail = (errLine ? errLine.trim() : 'the model failed to load').slice(0, 200)
+  const [engine, pkg] = PY_ENGINE_NAMES[kind] ?? PY_ENGINE_NAMES.mlx
   return (
-    `MLX could not load this model — ${detail} ` +
-    `This usually means the installed mlx-lm version does not support this model's architecture or quantization.`
+    `${engine} could not load this model — ${detail} ` +
+    `This usually means the installed ${pkg} version does not support this model's architecture or quantization.`
   )
+}
+
+/** Display name and installed package of each engine kind detectPyLoadFailure runs for. */
+const PY_ENGINE_NAMES: Record<string, [engine: string, pkg: string]> = {
+  mlx: ['MLX', 'mlx-lm'],
+  'rapid-mlx': ['Rapid-MLX', 'rapid-mlx'],
+  'mlx-vlm': ['MLX-VLM', 'mlx-vlm'],
+  vllm: ['vLLM', 'vllm'],
+  sglang: ['SGLang', 'sglang'],
 }
 
 function buildArgs(opts: StartOpts, port: number, slotSavePath?: string): string[] {

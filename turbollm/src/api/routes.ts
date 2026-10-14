@@ -1954,8 +1954,13 @@ export function registerApi(app: Hono, d: Deps): void {
     if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — benchmarking is paused until its queue finishes.')
     // Reverse gate (F-011): a sweep loads the model repeatedly, so free ComfyUI's VRAM
     // once before it begins — the sweep then owns the GPU. No-op unless the reverse gate
-    // is enabled and ComfyUI is idle; non-fatal on failure (benchmarks anyway).
-    await d.comfy?.freeComfyUIBeforeLoad()
+    // is enabled and ComfyUI is idle; non-fatal on failure (benchmarks anyway). It throws
+    // only when a ComfyUI render is starting (an acquire in flight): the same 409 as above.
+    try {
+      await d.comfy?.freeComfyUIBeforeLoad()
+    } catch {
+      return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — benchmarking is paused until its queue finishes.')
+    }
     try {
       // `base` is the user's current config (dialog draft): auto-tune fixes its ctx +
       // KV quant and sweeps only offload on top (spec 09 §1, honoring the user's config).

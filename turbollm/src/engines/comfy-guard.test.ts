@@ -183,8 +183,53 @@ test('reverse gate does NOT fire while holding the GPU for ComfyUI (render in fl
     mgr as never, undefined, f.impl,
   )
   await g.acquire() // ComfyUI now holds the GPU (held === true)
-  await g.freeComfyUIBeforeLoad()
+  // The hook runs inside the load gate right before the spawn: a load that got this far is refused.
+  await assert.rejects(g.freeComfyUIBeforeLoad(), /ComfyUI is rendering/)
   assert.equal(f.calls.length, 0, 'never interrupt an in-flight render via the reverse gate')
+})
+
+// A load that is already past the routes' isBlocked() check (waiting for the load gate, or in its
+// /free call) must not spawn once a render has acquired the GPU in the meantime.
+test('a load whose /free call is in flight when ComfyUI acquires is refused', async () => {
+  const { mgr } = fakeManager({ state: 'stopped', opts: null })
+  let answer!: () => void
+  const slowFree: FetchImpl = () => new Promise((r) => { answer = () => r({ ok: true, status: 200 }) })
+  const g = new ComfyGuard(
+    fakeStore({ enabled: true, gatePath: '/cn/g', url: 'http://127.0.0.1:8188', reverseGate: true }),
+    mgr as never, undefined, slowFree,
+  )
+  const hook = g.freeComfyUIBeforeLoad()
+
+  await g.acquire()
+  answer()
+
+  await assert.rejects(hook, /ComfyUI is rendering/)
+})
+
+test('acquire during a model swap force-stops the model that is still stopping', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopping', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+
+  await g.acquire()
+
+  assert.equal(calls.forceStops, 1, 'the graceful stop (up to 8 s) is cut short')
+  assert.equal(g.isBlocked(), true)
+})
+
+test('acquire also stops the gateway pool slots, before it reports the GPU free', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('m') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  const events: string[] = []
+  g.setPoolStopper(async () => {
+    await new Promise((r) => setTimeout(r, 20))
+    events.push('pool slots stopped')
+  })
+
+  await g.acquire()
+  events.push('acquire returned')
+
+  assert.deepEqual(events, ['pool slots stopped', 'acquire returned'])
+  assert.equal(g.isBlocked(), true)
 })
 
 test('reverse gate HTTP failure is non-fatal (load proceeds)', async () => {

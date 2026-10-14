@@ -399,3 +399,29 @@ test('interleaveByRepo: alternates two ranked lists and drops a repo both return
   const r = (repo: string) => ({ repo })
   assert.deepEqual(interleaveByRepo([r('a'), r('b'), r('c')], [r('x'), r('a')]).map((x) => x.repo), ['a', 'x', 'b', 'c'])
 })
+
+// The bench route checks isBlocked() (a render holding the GPU) first; the reverse-gate hook after it also refuses
+// while a render is STARTING (an acquire in flight). That refusal is the same 409, not an unhandled 500.
+test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook refuses', async () => {
+  let started = false
+  const d = {
+    store: { snapshot: () => ({}) },
+    comfy: {
+      isBlocked: () => false,
+      freeComfyUIBeforeLoad: async () => { throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.') },
+    },
+    bench: { start: () => { started = true } },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const res = await app.request('/api/v1/bench', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ modelKey: 'm' }),
+  })
+
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'comfyui_busy')
+  assert.equal(started, false)
+})

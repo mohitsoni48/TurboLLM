@@ -129,6 +129,26 @@ test('stopExplicit: a key naming no extra slot reports false and touches nothing
   assert.deepEqual([...r.loadedModelKeys()].sort(), ['bge-m3', 'llama-8b'], 'nothing was stopped')
 })
 
+// ComfyUI's acquire (cli.ts's pool stopper) force-stops the slots, as it does the primary; the engine-update
+// callers keep the graceful stop they always had.
+test('stopPoolSlotsOnEngine: passes force through to the slot, and stops only slots on that engine', async () => {
+  const stops: Array<{ key: string; force: boolean | undefined }> = []
+  const slotOn = (key: string, engineId: string): Manager => ({
+    ...fakeManager('running', key),
+    currentOpts: () => ({ engine: { id: engineId } }),
+    stopAndWait: async (o?: { force?: boolean }) => { stops.push({ key, force: o?.force }) },
+  } as unknown as Manager)
+  const r = router(fakeManager('stopped', null), STORE, [
+    { manager: slotOn('bge-m3', 'cuda'), modelKey: 'bge-m3', lastUsedMs: 0 },
+    { manager: slotOn('qwen', 'vulkan'), modelKey: 'qwen', lastUsedMs: 0 },
+  ])
+
+  await r.stopPoolSlotsOnEngine('cuda', { force: true })
+  await r.stopPoolSlotsOnEngine('vulkan')
+
+  assert.deepEqual(stops, [{ key: 'bge-m3', force: true }, { key: 'qwen', force: undefined }])
+})
+
 // ── chatSlotCount / evictChatLru: 'stopping' must count as occupied ──────────────
 // Regression for a real, live bug: a manual model swap (routes.ts's /api/v1/engine/start,
 // which calls the PRIMARY manager directly, bypassing this router) passes the primary
@@ -368,6 +388,29 @@ test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and
     message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
   })
   assert.deepEqual(loads, [])
+})
+
+// A load that an acquire overtook while it waited (for the load gate or ComfyUI's /free) is refused by the guard's
+// pre-start hook. That clears by itself, like doLoad's isBlocked() refusal, so it is a transient (retryable) 503.
+test('route: a load refused by the ComfyUI pre-start hook is a transient 503', async () => {
+  const entry = fakeEntry('model-a')
+  const primary = {
+    status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async (_opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => { await hooks?.beforeStart?.() },
+    target: () => null,
+    touch: () => {},
+  } as unknown as Manager
+  const comfy = {
+    isBlocked: () => false, // the acquire landed after doLoad's check
+    freeComfyUIBeforeLoad: async () => { throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.') },
+  } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(fakeFullStore(), registry, primary, scanner, comfy)
+
+  const result = await r.route('model-a')
+
+  assert.equal('status' in result && result.transient, true, JSON.stringify(result))
 })
 
 test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {

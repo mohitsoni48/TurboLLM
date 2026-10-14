@@ -76,6 +76,8 @@ function formatMismatchMessage(engineKind: string, format: ModelFormat): string 
     return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
   if (engineKind === 'vllm')
     return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
+  if (engineKind === 'sglang')
+    return 'The active engine is SGLang — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
   // llama.cpp / fork active, model is a safetensors dir.
   return format === 'mlx'
     ? 'This is a safetensors model — activate an MLX or vLLM engine to load it.'
@@ -107,6 +109,7 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *   - MLX-VLM (kind 'mlx-vlm') → the same MLX-format directories, for vision-language models
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
+ *   - SGLang (kind 'sglang') → the same HF safetensors directories as vLLM
  *   - LiteRT-LM (kind 'litert-lm') → `.litertlm` bundles, a format no other engine reads
  *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
  *     recognises by `entry.laya` before the format is ever checked
@@ -116,6 +119,7 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
   if (engineKind === 'rapid-mlx') return format === 'mlx'
   if (engineKind === 'mlx-vlm') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
+  if (engineKind === 'sglang') return format === 'mlx'
   if (engineKind === 'laya') return false
   // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
   if (engineKind === 'litert-lm') return format === 'litertlm'

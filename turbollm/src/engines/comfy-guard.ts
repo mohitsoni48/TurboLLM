@@ -74,6 +74,9 @@ export class ComfyGuard {
   // cycle (or null if the save was skipped/failed/ineligible). Gates the restore in
   // release() — we only restore a cache we actually wrote this acquire.
   private cachedFile: string | null = null
+  // Stops the gateway's extra pool slots (keep-N chat models, embedding / Laya side models), which
+  // hold VRAM beside the primary. Set by setPoolStopper once the router exists (cli.ts).
+  private stopPoolSlots: (() => Promise<void>) | null = null
 
   private readonly leaseMs: number
   private readonly fetchImpl: FetchImpl
@@ -95,6 +98,11 @@ export class ComfyGuard {
     return this.store.snapshot().comfyui.enabled
   }
 
+  /** Wire the pool-slot stopper: the router is built after the guard (it takes the guard). */
+  setPoolStopper(stop: () => Promise<void>): void {
+    this.stopPoolSlots = stop
+  }
+
   /** True when a model load should be refused right now (ComfyUI holds the GPU). The
    *  HTTP load route, bench route, and startup auto-load all consult this. */
   isBlocked(): boolean {
@@ -113,7 +121,9 @@ export class ComfyGuard {
     this.acquiring = (async () => {
       const st = this.manager.status()
       this.cachedFile = null
-      if (st.state === 'running' || st.state === 'starting') {
+      // 'stopping' too: a model swap stopping the previous model (gracefully, up to 8 s) is killed
+      // now, and the incoming model's load is refused while we hold the GPU (freeComfyUIBeforeLoad).
+      if (st.state === 'running' || st.state === 'starting' || st.state === 'stopping') {
         const opts = this.manager.currentOpts()
         if (opts && !this.suspended) this.suspended = opts
         // KV prompt-cache persistence (F-014): only a RUNNING engine has a real cache and a
@@ -142,6 +152,10 @@ export class ComfyGuard {
         console.log('[comfy-guard] ComfyUI acquired the GPU — force-unloading the model.')
         await this.manager.stopAndWait({ force: true })
       }
+      // Not suspended for release(), by decision: a pool slot's model comes back only when the gateway
+      // reloads it on demand, which takes auto-swap on and a caller allowed to load models. Otherwise
+      // it stays unloaded after the render until the user loads it again.
+      await this.stopPoolSlots?.()
       this.held = true
     })()
     try {
@@ -202,6 +216,23 @@ export class ComfyGuard {
     return new Promise((r) => setTimeout(r, ms))
   }
 
+  /** The pre-start hook every model-load path runs inside the global load gate (Manager.load's
+   *  beforeStart): the reverse gate below, bracketed by a refusal while ComfyUI holds the GPU.
+   *  The routes check isBlocked() before queuing a load, but a load that then waited for the gate
+   *  (a swap stopping the previous model) or for the /free call (up to 10 s) can meet an acquire
+   *  that arrived meanwhile — it must not spawn mid-render. The throw becomes the load's error. */
+  async freeComfyUIBeforeLoad(): Promise<void> {
+    this.refuseLoadWhileHeld()
+    await this.requestComfyUIFree()
+    this.refuseLoadWhileHeld()
+  }
+
+  private refuseLoadWhileHeld(): void {
+    if (this.enabled() && (this.held || this.acquiring)) {
+      throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.')
+    }
+  }
+
   /** REVERSE gate (F-011): TurboLLM is about to load a model — ask ComfyUI to drop its
    *  VRAM first by calling its native `POST {url}/free`. Symmetric counterpart of the
    *  forward acquire/release gate. Every model-load entry point (the HTTP load route,
@@ -213,7 +244,7 @@ export class ComfyGuard {
    *  timeout, non-2xx) is NON-FATAL: we log a warning and return so the load proceeds,
    *  exactly as the gate node treats an unreachable TurboLLM. Concurrent calls (rapid
    *  LLM↔image alternation) collapse onto one in-flight POST so we never double-free. */
-  async freeComfyUIBeforeLoad(): Promise<void> {
+  private async requestComfyUIFree(): Promise<void> {
     const cfg = this.store.snapshot().comfyui
     if (!cfg.enabled || !cfg.reverseGate || !cfg.url || this.held) return
     if (this.freeing) return this.freeing

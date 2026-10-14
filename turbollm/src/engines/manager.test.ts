@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
-import { needsShellWrapper, pyEngineEnv, shellWrapped } from './manager'
+import { detectPyLoadFailure, needsShellWrapper, pyEngineEnv, shellWrapped } from './manager'
 import { tmpDir } from '../test-support/tmp'
 
 // Regression: llamafile ships as an "Actually Portable Executable" (Cosmopolitan libc) polyglot —
@@ -41,6 +41,22 @@ test('shellWrapped: routes through /bin/sh with cmd/args as separate argv entrie
   const { cmd, args } = shellWrapped('/path/to/llamafile', ['--server', '-m', '/path with spaces/model.gguf'])
   assert.equal(cmd, '/bin/sh')
   assert.deepEqual(args, ['-c', 'exec "$0" "$@"', '/path/to/llamafile', '--server', '-m', '/path with spaces/model.gguf'])
+})
+
+// Readiness runs the Python load-failure check for vLLM and SGLang too: the banner must name the
+// engine that failed and its package, not always MLX / mlx-lm.
+test('detectPyLoadFailure: the message names the engine and package that failed to load the model', () => {
+  const traceback = [
+    'Traceback (most recent call last):',
+    '  File "/venv/lib/python3.12/site-packages/x/loader.py", line 10, in load_model',
+    'ValueError: unsupported architecture Foo',
+  ]
+  const vllm = detectPyLoadFailure('vllm', traceback) ?? ''
+  assert.match(vllm, /^vLLM could not load this model — ValueError: unsupported architecture Foo /)
+  assert.match(vllm, /installed vllm version/)
+  assert.doesNotMatch(vllm, /MLX|mlx-lm/)
+  assert.match(detectPyLoadFailure('sglang', traceback) ?? '', /^SGLang could not load .* installed sglang version/)
+  assert.match(detectPyLoadFailure('mlx', traceback) ?? '', /^MLX could not load .* installed mlx-lm version/)
 })
 
 // The child env is what actually reaches the spawned engine, so the vLLM model-runner choice
