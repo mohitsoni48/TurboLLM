@@ -155,8 +155,11 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
   // resolves only after `onSuccess` has already updated the cache, so
   // awaiting it before navigating closes the race.
   const skip = useCallback(async () => {
-    dispatch({ type: 'skip' })
+    // Persist FIRST: dispatching 'skip' clears currentStep, and OnboardingScreen renders
+    // nothing without one — so a rejected request after the dispatch left a blank page with
+    // no controls. A failure now leaves the user on the step they were on.
     await setOnboarding.mutateAsync({ status: 'skipped' })
+    dispatch({ type: 'skip' })
     clearSavedStepId()
   }, [setOnboarding])
 

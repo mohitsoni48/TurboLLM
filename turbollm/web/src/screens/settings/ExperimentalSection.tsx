@@ -1,4 +1,4 @@
-import { FlaskConical, Rocket, Brain, AlarmClock, Network } from 'lucide-react'
+import { FlaskConical, Rocket, Brain, AlarmClock, Network, Globe } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError } from '../../lib/api'
 import { Badge } from '../../components/ui/badge'
@@ -58,10 +58,10 @@ function FeatureRow({
  *  saved links and granted tokens stay in config, untouched, for when it goes back on. */
 export function ExperimentalSection() {
   const { query: settingsQ, save } = useSettings()
-  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false, turboLink: false }
+  const experimental = settingsQ.data?.experimental ?? { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false }
   const busy = save.isPending
 
-  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines' | 'turboLink', value: boolean) => {
+  const setFlag = (key: 'memory' | 'cloudDeploy' | 'routines' | 'turboLink' | 'remoteAccess', value: boolean) => {
     save.mutate(
       { experimental: { [key]: value } },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update experimental setting.') },
@@ -101,6 +101,17 @@ export function ExperimentalSection() {
         description="Scheduled tasks that fire automatically with no one present — chat or Code agents on a timer. Unlocks the Routines tab in Workspace and lets chat/Code create one when on."
         checked={experimental.routines}
         onChange={(v) => setFlag('routines', v)}
+        disabled={busy}
+      />
+      {/* Remote access (ADR-422): the CHANGELOG/README point users here to switch it on, and
+          without this row the flag could only be set by hand-editing config.json. Same
+          two-layer shape as Turbo Link — the settings live in Network & sharing. */}
+      <FeatureRow
+        icon={Globe}
+        title="Remote access"
+        description="Share this machine over Cloudflare, Tailscale, ngrok or your own tunnel, with a scoped access token. Its settings live in Network & sharing. Not yet verified against real provider accounts."
+        checked={experimental.remoteAccess}
+        onChange={(v) => setFlag('remoteAccess', v)}
         disabled={busy}
       />
       <FeatureRow

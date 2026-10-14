@@ -28,6 +28,21 @@ export function routineToDraft(r: Routine): RoutineDraft {
   }
 }
 
+/** What a code routine with NO stored `permissionMode` actually runs as. `create_routine` (chat or
+ *  Code tool) and REST may store none, and the daemon resolves that per coding agent
+ *  (src/routines/execute.ts's dispatch): the in-app pi engine runs it as 'auto' (code-runner.ts);
+ *  claude_cli takes the one-shot `claude -p` path with no `--permission-mode` (cli-routine.ts), so
+ *  Claude's own defaults apply and anything it would ask about is refused; the other terminal
+ *  agents run the live-terminal path's 'ask' (cli-interactive-runner.ts). Every surface that shows
+ *  or edits a routine's mode uses this for the unset case, so what is displayed is what runs —
+ *  and nothing stores it: an unset mode stays unset until the user actually picks one. */
+export function unsetPermissionModeLabel(codingAgent: CodingAgentChoice | undefined): string {
+  if (codingAgent === 'pi') return 'Auto — runs tools without asking'
+  if (codingAgent === 'claude_cli') return "One-shot claude -p with Claude's default permissions — anything it would ask about is refused"
+  if (codingAgent === 'opencode_cli' || codingAgent === 'pi_cli') return 'Ask before each tool call'
+  return 'Depends on the coding agent'
+}
+
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 
 function formatTime(hour: number, minute: number): string {

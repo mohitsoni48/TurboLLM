@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
 import { Bot, ChevronRight, Code2, Globe, Key, Loader2, Lock, Plug, Plus, Sparkles, Terminal, Trash2, Workflow, Wrench } from 'lucide-react'
 import { CopyButton } from '../components/ui/copy-button'
@@ -255,14 +255,21 @@ export function ConnectionPanel() {
 // ── Connect an app ────────────────────────────────────────────────────────────
 
 export function ConnectSection() {
-  const { data: net } = useNetworkInfo()
+  const netQ = useNetworkInfo()
+  const net = netQ.data
   const [selected, setSelected] = useState<string>(CLI_LIST[0].id)
   const cli = CLI_LIST.find((c) => c.id === selected) ?? CLI_LIST[0]
   // Setup snippets embed a live API key when the daemon is LAN-exposed (routes.ts's
   // GET /api/v1/connect/:cli mints one on every call) — same lock as the API-keys list above,
-  // and just as necessary here: unlike that list, this fires automatically the moment the
-  // page loads (no click needed) for whichever CLI is selected by default.
+  // and just as necessary here: unlike that list, the snippets can be fetched with no
+  // "create" step at all.
   const keysLocked = isKeysLocked(net)
+  // That GET also REVOKES the `cli-<id>` key it minted before, so on a LAN-bound daemon
+  // SetupPanel fetches only on an explicit click — opening this page must never break a CLI
+  // already set up elsewhere. Undefined while a network read is in flight: a cached
+  // lanBind:false from before LAN was switched on (Settings applies it in place) must not
+  // let a mount through as if this were still loopback-only.
+  const lanBind = netQ.isFetching ? undefined : net?.lanBind
 
   return (
     <section>
@@ -286,7 +293,7 @@ export function ConnectSection() {
           </span>
         </div>
       ) : (
-        <SetupPanel key={cli.id} cli={cli} />
+        <SetupPanel key={cli.id} cli={cli} lanBind={lanBind} />
       )}
     </section>
   )
@@ -312,20 +319,38 @@ function AppCard({ cli, selected, onSelect }: { cli: Cli; selected: boolean; onS
   )
 }
 
-function SetupPanel({ cli }: { cli: Cli }) {
-  const q = useQuery({ queryKey: ['connect', cli.id], queryFn: () => getConnect(cli.id) })
+function SetupPanel({ cli, lanBind }: { cli: Cli; lanBind: boolean | undefined }) {
+  const qc = useQueryClient()
+  // Fetches on its own only for a loopback-only daemon (no key minted — see ConnectSection).
+  // Keyed on lanBind too, so a loopback snippet cached before LAN was switched on is never
+  // shown in place of the LAN one; a generated LAN snippet stays cached across card switches.
+  const q = useQuery({ queryKey: ['connect', cli.id, lanBind], queryFn: () => getConnect(cli.id), enabled: lanBind === false })
+  const generate = () => {
+    void q.refetch().then(() => qc.invalidateQueries({ queryKey: ['apiKeys'] }))
+  }
   return (
     <div
       className="mt-3 rounded-xl border bg-panel p-4"
       style={{ borderColor: 'color-mix(in srgb, var(--accent) 45%, var(--border))' }}
     >
       <div className="mb-3 text-[13px] font-medium text-ink">{cli.name} — setup</div>
-      {q.isLoading && (
+      {(q.isLoading || lanBind === undefined) && (
         <div className="flex items-center gap-2 text-[13px] text-muted">
           <Loader2 size={14} className="animate-spin" /> Loading…
         </div>
       )}
       {q.isError && <p className="text-[13px]" style={{ color: 'var(--err)' }}>Could not fetch setup snippets.</p>}
+      {lanBind && !q.data && !q.isFetching && (
+        <div className="flex flex-col items-start gap-2">
+          <p className="text-[13px] text-muted">
+            Over the LAN these snippets include an API key. Generating one replaces the key made
+            here before for {cli.name}, so anything already set up with it will need the new one.
+          </p>
+          <Button size="sm" onClick={generate}>
+            <Key size={13} /> Generate setup with a new key
+          </Button>
+        </div>
+      )}
       {q.data && (
         <div className="flex flex-col gap-2.5">
           {q.data.steps.map((step, i) => (

@@ -123,8 +123,11 @@ function formToPayload(f: McpFormState): Omit<McpServer, 'id'> {
   return {
     name: f.name.trim(), transport: f.transport,
     command: f.transport === 'stdio' ? f.command.trim() || undefined : undefined,
-    args: f.transport === 'stdio' && args.length ? args : undefined,
-    env: f.transport === 'stdio' && Object.keys(env).length ? env : undefined,
+    // Sent even when empty: the PUT route only assigns args/env when present, so dropping an
+    // empty list made "remove the last arg / env var" a silent no-op on edit. (Create stores
+    // `?? []` / `?? {}` anyway.)
+    args: f.transport === 'stdio' ? args : undefined,
+    env: f.transport === 'stdio' ? env : undefined,
     url: f.transport === 'sse' ? f.url.trim() || undefined : undefined,
     apiKey: f.transport === 'sse' && f.apiKey.trim() ? f.apiKey.trim() : undefined,
     enabled: f.enabled,

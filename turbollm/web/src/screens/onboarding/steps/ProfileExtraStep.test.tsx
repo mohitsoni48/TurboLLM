@@ -36,3 +36,12 @@ describe('ProfileExtraStep endpoint copy', () => {
     expect(await screen.findByRole('button', { name: 'Copied' })).toBeInTheDocument()
   })
 })
+
+describe('ProfileExtraStep endpoint', () => {
+  it('shows the endpoint on the origin actually serving the UI, not a hard-coded :6996', () => {
+    // The Android app serves on --port 7000; desktop users can move the port too.
+    render(<ProfileExtraStep onContinue={vi.fn()} onSkip={vi.fn()} ctx={developerCtx} />)
+    expect(screen.getByText(`${window.location.origin}/v1`)).toBeInTheDocument()
+    expect(screen.queryByText(/:6996\/v1/)).not.toBeInTheDocument()
+  })
+})

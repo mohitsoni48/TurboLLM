@@ -90,6 +90,16 @@ describe('RoutineConfirmCard — create mode', () => {
     expect(confirmMutate).toHaveBeenCalledWith('r1', expect.anything())
   })
 
+  it('names what a code routine with no stored permission mode actually runs as, not a blank', () => {
+    // create_routine may persist no permissionMode; the daemon runs that as 'auto' for in-app pi
+    // (code-runner.ts) and as the one-shot `claude -p` for claude_cli (execute.ts).
+    const { unmount } = renderCreate({ flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined })
+    expect(screen.getByText('Permission mode:').parentElement!.textContent).toBe('Permission mode: Not set: Auto — runs tools without asking')
+    unmount()
+    renderCreate({ flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: undefined })
+    expect(screen.getByText('Permission mode:').parentElement!.textContent).toMatch(/^Permission mode: Not set: One-shot claude -p/)
+  })
+
   it('Confirm is disabled when a flavor-required field is missing (spec 20 §3 / 21 §3)', () => {
     renderCreate({ agentId: undefined })
     expect(screen.getByRole('button', { name: /Confirm/ })).toBeDisabled()
@@ -154,6 +164,20 @@ describe('RoutineConfirmCard — update mode', () => {
     expect(screen.getByText('Agent', { selector: 'span.font-medium' })).toBeInTheDocument()
     expect(screen.getByText('− agent-1')).toBeInTheDocument()
     expect(screen.getByText('+ agent-2')).toBeInTheDocument()
+  })
+
+  it('keeps an unset permission mode unset on Confirm, and diffs a picked one against what actually ran', async () => {
+    const user = userEvent.setup()
+    const original = pendingChatRoutine({ status: 'active', flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined })
+    const draft: RoutineDraft = { flavor: 'code', prompt: 'New prompt', scheduleRule: original.scheduleRule, modelKey: 'model-a', workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined }
+    const { unmount } = renderUpdate(original, draft)
+    expect(screen.queryByText('Permission mode', { selector: 'span.font-medium' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Confirm/ }))
+    expect(updateMutate.mock.calls[0][0].patch.permissionMode).toBeUndefined()
+    unmount()
+    renderUpdate(original, { ...draft, permissionMode: 'ask' })
+    expect(screen.getByText('− Not set: Auto — runs tools without asking')).toBeInTheDocument()
+    expect(screen.getByText('+ ask')).toBeInTheDocument()
   })
 
   it('Save changes inside an update-mode inline edit persists nothing — only Confirm writes', async () => {

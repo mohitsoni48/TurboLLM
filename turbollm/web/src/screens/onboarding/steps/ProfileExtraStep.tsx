@@ -7,7 +7,7 @@ import type { StepComponentProps } from '../OnboardingScreen'
 
 /** Step 4 — Profile step (spec 25 §4), runs during the download.
  *  - Developer: tool-permission note + a copyable OpenAI/Anthropic-compatible
- *    endpoint (real port — CLAUDE.md's hard-coded 6996).
+ *    endpoint (the origin actually serving this UI, not a hard-coded 6996).
  *  - Pro: a real engine picker over the actually-installed catalog
  *    (`useEngines()`), not a static list of names. Casual never reaches this
  *    step at all (`registry.ts`'s `appliesTo` excludes it); Enthusiast's
@@ -17,7 +17,9 @@ export default function ProfileExtraStep({ onContinue, ctx }: StepComponentProps
   const enginesQuery = useEngines()
   const [activating, setActivating] = useState<string | null>(null)
 
-  const endpoint = `${window.location.protocol}//${window.location.hostname}:6996/v1`
+  // The port really serving this UI — same as DeveloperScreen. The Android app runs the
+  // daemon on --port 7000, and desktop users can move it with --port or Settings.
+  const endpoint = `${window.location.origin}/v1`
 
   const pickEngine = async (id: string) => {
     setActivating(id)

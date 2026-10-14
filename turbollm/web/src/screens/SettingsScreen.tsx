@@ -20,6 +20,7 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
+  useSysInfo,
 } from '../lib/queries'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
@@ -32,7 +33,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
-import { ApiError, track, type TelemetryLevel } from '../lib/api'
+import { ApiError, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import { toast } from '../components/ui/sonner'
@@ -142,6 +143,30 @@ function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
   )
 }
 
+/** The main Save form's draft values as seeded from `settings` (same defaults as `dirty`). */
+function draftsFrom(s: DaemonSettings) {
+  return {
+    ttl: s.idleTtlMinutes,
+    vramHeadroom: s.vramHeadroomMb ?? 1024,
+    port: s.port ?? 6996,
+    autoTitle: s.autoGenerateTitles,
+    openBrowser: s.openBrowserOnStart,
+    autoLoad: s.autoLoadOnStart ?? false,
+    defCtx: s.modelDefaults?.ctx ?? 8192,
+    defNgl: s.modelDefaults?.ngl ?? 99,
+    defImageMax: s.modelDefaults?.imageMaxTokens ?? 0,
+    defMaxTokens: s.modelDefaults?.maxTokens ?? 0,
+    telemetry: (s.telemetryLevel ?? 'off') as TelemetryLevel,
+    lanBind: s.lanBind ?? false,
+    requireApiKey: s.requireApiKey ?? true,
+    comfyEnabled: s.comfyui?.enabled ?? false,
+    comfyUrl: s.comfyui?.url ?? '',
+    comfyReverseGate: s.comfyui?.reverseGate ?? false,
+    gatewayAutoSwap: s.gateway?.autoSwap ?? true,
+    gatewayKeepN: s.gateway?.keepN ?? 1,
+  }
+}
+
 export function SettingsScreen() {
   // Issue #178: a long, plain list screen — the window scrolls it, not an inner box.
   useDocumentScroll()
@@ -187,28 +212,46 @@ export function SettingsScreen() {
 
   // Whether the Code-only sections under "Tools & safety" render at all — see the gate there.
   const codeEnabled = useCodeFeatureEnabled()
+  // The packaged Android app (bundledEnginesOnly — the same test the daemon uses) cannot restart
+  // its daemon: it is the app's own once-per-process Node, so exiting it closes the whole app and
+  // nothing brings it back. The daemon answers 501 there; don't offer the button. Termux keeps it.
+  const inAndroidApp = !!useSysInfo().data?.bundledEnginesOnly
+
+  // What each draft was last seeded with. Many sections save on their own (tokens, Experimental,
+  // Memory, Remote access, …) and every such save swaps in a new `settings` object — so a
+  // re-seed only overwrites a draft that still holds its last-seeded value. An unsaved edit
+  // anywhere else on the page survives it. After this page's own Save, `sent` (the drafts as
+  // they were sent) is the baseline instead: every draft still holding what was sent takes the
+  // stored value (server clamps included), and one edited during the round trip keeps the edit.
+  const seededRef = useRef<ReturnType<typeof draftsFrom> | null>(null)
+  const seedDrafts = (s: DaemonSettings, sent?: ReturnType<typeof draftsFrom>) => {
+    const prev = sent ?? seededRef.current
+    const next = draftsFrom(s)
+    seededRef.current = next
+    const keep = <K extends keyof typeof next>(k: K) => (cur: (typeof next)[K]) => (!prev || cur === prev[k] ? next[k] : cur)
+    setTtl(keep('ttl'))
+    setVramHeadroom(keep('vramHeadroom'))
+    setPort(keep('port'))
+    setAutoTitle(keep('autoTitle'))
+    setOpenBrowser(keep('openBrowser'))
+    setAutoLoad(keep('autoLoad'))
+    setDefCtx(keep('defCtx'))
+    setDefNgl(keep('defNgl'))
+    setDefImageMax(keep('defImageMax'))
+    setDefMaxTokens(keep('defMaxTokens'))
+    setTelemetry(keep('telemetry'))
+    setLanBind(keep('lanBind'))
+    setRequireApiKey(keep('requireApiKey'))
+    setComfyEnabled(keep('comfyEnabled'))
+    setComfyUrl(keep('comfyUrl'))
+    setComfyReverseGate(keep('comfyReverseGate'))
+    setGatewayAutoSwap(keep('gatewayAutoSwap'))
+    setGatewayKeepN(keep('gatewayKeepN'))
+  }
 
   useEffect(() => {
-    if (settings) {
-      setTtl(settings.idleTtlMinutes)
-      setVramHeadroom(settings.vramHeadroomMb ?? 1024)
-      setPort(settings.port ?? 6996)
-      setAutoTitle(settings.autoGenerateTitles)
-      setOpenBrowser(settings.openBrowserOnStart)
-      setAutoLoad(settings.autoLoadOnStart ?? false)
-      setDefCtx(settings.modelDefaults?.ctx ?? 8192)
-      setDefNgl(settings.modelDefaults?.ngl ?? 99)
-      setDefImageMax(settings.modelDefaults?.imageMaxTokens ?? 0)
-      setDefMaxTokens(settings.modelDefaults?.maxTokens ?? 0)
-      setTelemetry(settings.telemetryLevel ?? 'off')
-      setLanBind(settings.lanBind ?? false)
-      setRequireApiKey(settings.requireApiKey ?? true)
-      setComfyEnabled(settings.comfyui?.enabled ?? false)
-      setComfyUrl(settings.comfyui?.url ?? '')
-      setComfyReverseGate(settings.comfyui?.reverseGate ?? false)
-      setGatewayAutoSwap(settings.gateway?.autoSwap ?? true)
-      setGatewayKeepN(settings.gateway?.keepN ?? 1)
-    }
+    if (settings) seedDrafts(settings)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings])
 
   // Persist the thinking budget immediately (no Save round-trip; it's client-only).
@@ -246,8 +289,13 @@ export function SettingsScreen() {
   })
 
   const handleSave = () => {
+    const sent: ReturnType<typeof draftsFrom> = {
+      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
+      lanBind, requireApiKey, comfyEnabled, comfyUrl, comfyReverseGate, gatewayAutoSwap, gatewayKeepN,
+    }
     save.mutate(settingsPayload(), {
       onSuccess: (res) => {
+        seedDrafts(res, sent)
         const rb = res.rebind
         if (rb?.portChanged) {
           // The listener moved to a new port — hop the browser over once it's up.
@@ -671,7 +719,7 @@ export function SettingsScreen() {
           {activeCat === 'network' && (
             <>
               {/* Network (spec 08 §2) */}
-              <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} />
+              <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} inAndroidApp={inAndroidApp} />
 
               {/* ComfyUI GPU coordination */}
               <ComfyUiSection
@@ -718,7 +766,7 @@ export function SettingsScreen() {
               {TELEMETRY_UI_ENABLED && <PrivacySection level={telemetry} setLevel={setTelemetry} />}
 
               {/* Advanced (spec 08 §2): daemon restart */}
-              <AdvancedSection onRestart={requestRestart} />
+              {!inAndroidApp && <AdvancedSection onRestart={requestRestart} />}
 
               {/* About + app self-update check (F-006) */}
               <AboutSection />
@@ -1005,6 +1053,7 @@ function NetworkSection({
   setRequireApiKey,
   port,
   setPort,
+  inAndroidApp,
 }: {
   lanBind: boolean
   setLanBind: (v: boolean) => void
@@ -1012,6 +1061,7 @@ function NetworkSection({
   setRequireApiKey: (v: boolean) => void
   port: number
   setPort: (v: number) => void
+  inAndroidApp: boolean
 }) {
   // hasApiKey + the reachable LAN URL come from the daemon (server-derived IP/port).
   const { data: net } = useNetworkInfo()
@@ -1022,20 +1072,25 @@ function NetworkSection({
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Network</h2>
 
-      <div className="flex items-center justify-between py-2">
-        <div>
-          <div className="text-[14px] font-medium text-ink">Port</div>
-          <div className="text-[12px] text-muted">Port the daemon listens on (1024–65535)</div>
+      {/* No Port row in the packaged Android app: it pins 7000 (its --port, WebView URL and native
+          calls), and its WebView refuses the hop to any other 127.0.0.1 port, so a change would
+          strand the page on a daemon that has moved away. The LAN toggle keeps the bound port. */}
+      {!inAndroidApp && (
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="text-[14px] font-medium text-ink">Port</div>
+            <div className="text-[12px] text-muted">Port the daemon listens on (1024–65535)</div>
+          </div>
+          <NumberField
+            value={port}
+            min={1024}
+            max={65535}
+            onCommit={setPort}
+            ariaLabel="Daemon port"
+            className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+          />
         </div>
-        <NumberField
-          value={port}
-          min={1024}
-          max={65535}
-          onCommit={setPort}
-          ariaLabel="Daemon port"
-          className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
-        />
-      </div>
+      )}
 
       <label className="flex cursor-pointer items-center justify-between py-2">
         <div>
@@ -1106,11 +1161,12 @@ function NetworkSection({
       )}
 
       {/* Port + LAN binding apply in place on Save — the listener re-binds without a
-          full restart, so the model stays loaded (spec 08 §2). */}
+          full restart, so the model stays loaded (spec 08 §2). No port clause in the Android
+          app, which has no Port row (above). */}
       <div className="mt-2 border-t border-border pt-3 text-[12px] text-faint">
         Click <span className="font-medium text-ink">Save settings</span> to apply. The
-        listener re-binds in place (no restart, model stays loaded); a port change
-        reconnects this page automatically.
+        listener re-binds in place (no restart, model stays loaded)
+        {inAndroidApp ? '.' : '; a port change reconnects this page automatically.'}
       </div>
     </section>
   )

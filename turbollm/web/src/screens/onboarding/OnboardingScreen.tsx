@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import { OnboardingMachineProvider, useOnboardingMachine } from '../../lib/onboarding/useOnboardingMachine'
 import { useOnboardingRecommendation, useOnboardingState } from '../../lib/onboarding-queries'
 import { track } from '../../lib/api'
+import { toast } from '../../components/ui/sonner'
 import type { OnboardingCtx } from '../../lib/onboarding/types'
 import type { StepDescriptor } from './steps/define'
 
@@ -125,7 +126,13 @@ function OnboardingScreenInner() {
     // `skip()` clears currentStep. Wired by ADR-350 — the schema predates this call
     // site by days; nothing ever actually fired it until now.
     track('onboarding', `skip_onboarding_${currentStep.id.replace(/-/g, '_')}`)
-    await skip()
+    try {
+      await skip()
+    } catch (e) {
+      // skip() persists before leaving the step, so the user is still on it — say why.
+      toast.error(e instanceof Error ? e.message : 'Could not skip onboarding — try again.')
+      return
+    }
     navigate('/workspace/chat', { replace: true })
   }
 
