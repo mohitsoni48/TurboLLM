@@ -157,6 +157,15 @@ test('pickZipFiles: install-provenance markers in the binary dir are never selec
   assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
 })
 
+test('pickZipFiles: a marker in another letter case is not selected either (on NTFS/APFS it IS the marker file)', () => {
+  const entries = readZipEntries(
+    buildZipArchive([member('llama-server'), member('.TurboLLM-Release-Install', '{}'), member('.TURBOLLM-ZIP-INSTALL'), member('libggml.so')]),
+  )
+  const sel = pickZipFiles(entries, 'linux', 'llama-server')
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
+})
+
 test('pickZipFiles: multiple binaries → shallowest wins, deterministically', () => {
   const entries = readZipEntries(
     buildZipArchive([member('deep/nested/dir/llama-server'), member('cuda/llama-server'), member('cuda/ggml.so')]),
@@ -316,6 +325,26 @@ test('extractZipFiles: symlinked library chains materialize as their target\'s b
     assert.equal(readFileSync(join(dir, 'libggml.so'), 'utf8'), 'real-so-bytes')
     assert.equal(readFileSync(join(dir, 'libggml.so.0'), 'utf8'), 'real-so-bytes')
     assert.equal(readFileSync(join(dir, 'libggml.so.0.0.1'), 'utf8'), 'real-so-bytes')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('extractZipFiles: symlink copies count toward the total uncompressed cap, checked before anything is written', () => {
+  // Each link declares only its link text but is written as a full copy of its target. The
+  // declared size stands in for real bytes: the cap must refuse before any inflate, so the
+  // under-filled member below is never even decompressed.
+  const almost2GiB = 2 * 1024 * 1024 * 1024 - 1
+  const buf = buildZipArchive([
+    { name: 'bin/llama-server', lieSize: almost2GiB },
+    { name: 'bin/libggml.so', data: Buffer.from('llama-server'), symlink: true },
+    { name: 'bin/libllama.so', data: Buffer.from('llama-server'), symlink: true },
+  ])
+  const sel = pickZipFiles(readZipEntries(buf), 'linux')!
+  const dir = tmpDir('tllm-zip-')
+  try {
+    assertZipError(() => extractZipFiles(buf, sel, dir), 'zip_too_large', 'total uncompressed-size cap')
+    assert.deepEqual(readdirSync(dir), [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

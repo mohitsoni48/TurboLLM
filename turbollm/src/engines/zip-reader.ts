@@ -3,8 +3,9 @@
 // CRC-checked member inflation, with no dependency on anything else in this package. It must
 // stay a leaf — download.ts imports it, and zip-install.ts reaches download.ts through
 // scan.ts, so any relative import here would close an import cycle (import-cycles.test.ts).
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { dirname, posix, resolve, sep } from 'node:path'
+import { promisify } from 'node:util'
 import * as nodeZlib from 'node:zlib'
 
 /** Central-directory-declared uncompressed-size guards (zip-bomb class). Checked BEFORE any
@@ -13,6 +14,16 @@ import * as nodeZlib from 'node:zlib'
 const MAX_ENTRY_UNCOMPRESSED = 2 * 1024 * 1024 * 1024
 const MAX_TOTAL_UNCOMPRESSED = 4 * 1024 * 1024 * 1024
 const MAX_ENTRIES = 10_000
+
+/** The total cap again, over the bytes an extractor will actually WRITE (pass the regular
+ *  members it writes plus, once per symlink member, the file it is copied from): a link
+ *  declares only its link text but is written as a full copy of its target, so the declared
+ *  sum readZipEntries checks does not bound the output. Run before any inflate. */
+export function assertWithinTotalCap(written: ZipEntry[]): void {
+  let total = 0
+  for (const e of written) total += e.size
+  if (total > MAX_TOTAL_UNCOMPRESSED) throw new ZipError('zip_too_large', 'Archive expands past the total uncompressed-size cap.')
+}
 
 export type ZipErrorCode =
   | 'bad_zip' // not a zip archive, or a structurally corrupt one
@@ -193,10 +204,34 @@ export function inflateEntry(buf: Buffer, entry: ZipEntry): Buffer {
   try {
     data = entry.method === 8 ? nodeZlib.inflateRawSync(raw, { maxOutputLength: Math.max(1, entry.size) }) : raw
   } catch (e) {
-    if ((e as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE')
-      throw new ZipError('zip_too_large', `"${entry.name}" expands past its declared size.`)
-    throw new ZipError('bad_zip', `"${entry.name}" could not be decompressed — the archive is corrupt.`)
+    throw inflateFailure(entry, e)
   }
+  return verifiedMember(entry, data)
+}
+
+const inflateRawAsync = promisify(nodeZlib.inflateRaw)
+
+/** inflateEntry with the inflate on libuv's thread pool, for whole-archive extraction: a
+ *  release zip can expand to gigabytes, and the sync inflate would freeze the daemon's event
+ *  loop (UI polling, SSE, the gateway's token stream) for all of it. Same guards. */
+async function inflateEntryAsync(buf: Buffer, entry: ZipEntry): Promise<Buffer> {
+  const raw = buf.subarray(entry.dataOffset, entry.dataOffset + entry.compSize)
+  let data: Buffer
+  try {
+    data = entry.method === 8 ? await inflateRawAsync(raw, { maxOutputLength: Math.max(1, entry.size) }) : raw
+  } catch (e) {
+    throw inflateFailure(entry, e)
+  }
+  return verifiedMember(entry, data)
+}
+
+function inflateFailure(entry: ZipEntry, e: unknown): ZipError {
+  if ((e as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE')
+    return new ZipError('zip_too_large', `"${entry.name}" expands past its declared size.`)
+  return new ZipError('bad_zip', `"${entry.name}" could not be decompressed — the archive is corrupt.`)
+}
+
+function verifiedMember(entry: ZipEntry, data: Buffer): Buffer {
   if (data.length !== entry.size) throw new ZipError('bad_zip', `"${entry.name}" does not match its declared size.`)
   if (crc32(data) !== entry.crc32) throw new ZipError('zip_crc_mismatch', `"${entry.name}" failed its CRC-32 check — the archive is corrupt.`)
   return data
@@ -212,7 +247,8 @@ export const RELEASE_INSTALL_MARKER = '.turbollm-release-install'
 /** True for a member whose basename is one of this app's own install markers. An archive or
  *  scanned folder must never supply one: the marker is trusted as proof of how a dir was made. */
 export function isInstallMarkerName(memberName: string): boolean {
-  const base = posix.basename(memberName.replaceAll('\\', '/'))
+  // Case-insensitive: on NTFS and default APFS '.TurboLLM-Release-Install' IS the marker file.
+  const base = posix.basename(memberName.replaceAll('\\', '/')).toLowerCase()
   return base === ZIP_BUILD_MARKER || base === RELEASE_INSTALL_MARKER
 }
 
@@ -224,25 +260,30 @@ const MAX_LINK_CHAIN = 8
  *  (the way the tar walk dereferences in-root links), and dropped otherwise — never created as
  *  a link, never followed outside the tree. A member whose normalised path would land outside
  *  destDir is refused with ZipError('bad_zip') before anything for it is written. Install
- *  markers are never extracted. */
-export function extractZipAll(buf: Buffer, destDir: string): void {
+ *  markers are never extracted. Inflation and writes are async, so the daemon keeps serving
+ *  meanwhile; the archive itself is still one in-memory buffer (bounded by the size cap). */
+export async function extractZipAll(buf: Buffer, destDir: string): Promise<void> {
   const root = resolve(destDir)
-  mkdirSync(root, { recursive: true })
+  await mkdir(root, { recursive: true })
   const entries = readZipEntries(buf).filter((e) => !isInstallMarkerName(e.name))
-  const byPath = new Map(entries.map((e) => [containedPath(root, e.name), e]))
-  for (const [target, entry] of byPath) {
-    if (entry.isDir) mkdirSync(target, { recursive: true })
-    else if (!entry.symlink) writeMember(target, inflateEntry(buf, entry))
-  }
+  const byPath = new Map(entries.map((e) => [containedPath(root, e.name, e.isDir), e]))
+  // Links are resolved first: their copies count toward the cap, checked before any inflate.
+  const copies: Array<[string, ZipEntry]> = []
   for (const [target, entry] of byPath) {
     const real = entry.symlink ? resolveLinkedFile(buf, root, byPath, target, entry, 0) : null
-    if (real) writeMember(target, inflateEntry(buf, real))
+    if (real) copies.push([target, real])
   }
+  assertWithinTotalCap([...[...byPath.values()].filter((e) => !e.isDir && !e.symlink), ...copies.map(([, real]) => real)])
+  for (const [target, entry] of byPath) {
+    if (entry.isDir) await mkdir(target, { recursive: true })
+    else if (!entry.symlink) await writeMember(target, await inflateEntryAsync(buf, entry))
+  }
+  for (const [target, real] of copies) await writeMember(target, await inflateEntryAsync(buf, real))
 }
 
-function writeMember(target: string, data: Buffer): void {
-  mkdirSync(dirname(target), { recursive: true })
-  writeFileSync(target, data)
+async function writeMember(target: string, data: Buffer): Promise<void> {
+  await mkdir(dirname(target), { recursive: true })
+  await writeFile(target, data)
 }
 
 /** The regular-file member a symlink member ultimately names, or null when the link dangles,
@@ -264,10 +305,13 @@ function resolveLinkedFile(
   return target.symlink ? resolveLinkedFile(buf, root, byPath, targetPath, target, depth + 1) : target
 }
 
-function containedPath(root: string, memberName: string): string {
+/** A DIRECTORY member may resolve to root itself (a no-op): `bsdtar -a -cf x.zip .` writes a
+ *  './' entry first. A file member must land strictly inside. */
+function containedPath(root: string, memberName: string, isDir: boolean): string {
   const name = posix.normalize(memberName.replaceAll('\\', '/'))
   const escapes = name === '..' || name.startsWith('../') || posix.isAbsolute(name) || /^[A-Za-z]:/.test(name)
   const target = resolve(root, name)
-  if (escapes || !target.startsWith(root + sep)) throw new ZipError('bad_zip', `"${memberName}" would extract outside the destination.`)
+  if (escapes || !(target.startsWith(root + sep) || (isDir && target === root)))
+    throw new ZipError('bad_zip', `"${memberName}" would extract outside the destination.`)
   return target
 }

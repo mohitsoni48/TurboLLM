@@ -5,6 +5,7 @@
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { execFile, execFileSync } from 'node:child_process'
 import { basename, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
@@ -412,7 +413,9 @@ export function archiveExtractor(
 
 function zipExtractor(archive: string, destDir: string, platform: NodeJS.Platform): ArchiveExtractor {
   if (platform === 'win32') return { kind: 'powershell' }
-  if (platform === 'darwin') return { kind: 'tar', cmd: 'tar', args: ['-xf', archive, '-C', destDir] }
+  // Pinned like Windows' System32 tar.exe: only bsdtar reads zip, and a GNU tar first on PATH
+  // (Homebrew's gnubin) would fail every .zip. /usr/bin/tar on macOS is always bsdtar.
+  if (platform === 'darwin') return { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', archive, '-C', destDir] }
   return { kind: 'node-zip' }
 }
 
@@ -439,7 +442,7 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   const extractor = archiveExtractor(archive, destDir, process.platform, process.env, existsSync)
   switch (extractor.kind) {
     case 'node-zip':
-      extractZipAll(readFileSync(archive), destDir)
+      await extractZipAll(await readFile(archive), destDir)
       break
     case 'unsupported':
       throw extractionError('unsupported_archive', extractor.reason)

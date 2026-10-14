@@ -1,8 +1,9 @@
 // promoteProbedInstall: the probe-then-swap unit shared by the zip and release install flows.
 // The probe is a fake, so these tests are platform-independent.
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { promoteProbedInstall, SwapBlockedError } from './zip-install'
@@ -93,4 +94,51 @@ test('promoteProbedInstall: the probe sees the tmp path, not the final path', as
     },
   })
   assert.deepEqual(probed, [join(staged, BIN)])
+})
+
+/** Make the next renames fail with `codes` (in order; '' lets one through) while
+ *  `process.platform` reads 'win32'. renameWithRetry imports renameSync by name:
+ *  syncBuiltinESMExports carries the patched function to that binding. */
+function windowsRenameLocks(t: TestContext, codes: string[]) {
+  const realRenameSync = fs.renameSync
+  const mocked = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    const code = codes.shift()
+    if (code) throw Object.assign(new Error(`${code}: rename`), { code })
+    return realRenameSync(from, to)
+  })
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  syncBuiltinESMExports()
+  t.after(() => {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    mocked.mock.restore()
+    syncBuiltinESMExports()
+  })
+  return mocked
+}
+
+test('promoteProbedInstall: on Windows a just-probed build held open for a moment (EPERM/EBUSY) is still swapped in', async (t) => {
+  const root = tmpDir('promote-')
+  priorInstall(root, 'slug', 'old')
+  const staged = stagedInstall(root, 'slug', 'new')
+  // The park succeeds; the promote is refused twice (AV scanning the .exe the probe just ran).
+  const renames = windowsRenameLocks(t, ['', 'EPERM', 'EBUSY'])
+  const res = await promoteProbedInstall({ enginesRoot: root, slug: 'slug', tmpDir: staged, binFileName: BIN, probeFn: okProbe })
+  assert.equal(renames.mock.callCount(), 4)
+  assert.equal(readFileSync(res.finalBin, 'utf8'), 'new')
+  assert.deepEqual(readdirSync(join(root, 'build')), ['slug'])
+})
+
+test('promoteProbedInstall: a briefly locked restore still puts the working build back, never leaving it parked', async (t) => {
+  const root = tmpDir('promote-')
+  const prior = priorInstall(root, 'slug', 'old')
+  const staged = stagedInstall(root, 'slug', 'new')
+  // The park succeeds, the promote fails for real (not a lock), and the restore is refused once.
+  windowsRenameLocks(t, ['', 'EXDEV', 'EPERM'])
+  await assert.rejects(
+    promoteProbedInstall({ enginesRoot: root, slug: 'slug', tmpDir: staged, binFileName: BIN, probeFn: okProbe }),
+    { code: 'EXDEV' },
+  )
+  assert.equal(readFileSync(join(prior, BIN), 'utf8'), 'old')
+  assert.deepEqual(readdirSync(join(root, 'build')).filter((d) => d.endsWith('.old')), [], 'no parked build for the GC sweep to delete')
 })

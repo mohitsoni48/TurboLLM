@@ -27,12 +27,13 @@
 // user zip arrives as .zip on every platform, and GNU tar (plain Linux, Termux) cannot read
 // zip, while `unzip` is an optional package there.
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, sep } from 'node:path'
 import { asDirName, isEngineInBuildDir } from './build-runner'
+import { renameWithRetry } from './download'
 import { serverBinName, suggestEngineName } from './scan'
 import { probe, type ProbeResult } from './probe'
-import { inflateEntry, isInstallMarkerName, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError, type ArchiveMember, type ZipEntry } from './zip-reader'
+import { assertWithinTotalCap, inflateEntry, isInstallMarkerName, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError, type ArchiveMember, type ZipEntry } from './zip-reader'
 
 export { crc32, extractZipAll, inflateEntry, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError } from './zip-reader'
 export type { ArchiveMember, ZipEntry, ZipErrorCode } from './zip-reader'
@@ -206,15 +207,18 @@ function isLinkToFileInside(path: string, realRoot: string): boolean {
  *  honest can be written, and a genuinely needed library then fails the probe by name. */
 export function extractZipFiles(buf: Buffer, selection: ZipSelection, destDir: string): string {
   mkdirSync(destDir, { recursive: true })
+  // Links are resolved first: each copy counts toward the total cap, checked before any inflate.
+  const copies: Array<[ZipEntry, ZipEntry]> = []
+  for (const entry of selection.files.values()) {
+    const target = entry.symlink ? followLink(buf, selection, entry, 0) : null
+    if (target) copies.push([entry, target])
+  }
+  assertWithinTotalCap([...[...selection.files.values()].filter((e) => !e.symlink), ...copies.map(([, target]) => target)])
   for (const entry of selection.files.values()) {
     if (entry.symlink) continue
     writeFileSync(join(destDir, baseOf(entry.name)), inflateEntry(buf, entry))
   }
-  for (const entry of selection.files.values()) {
-    if (!entry.symlink) continue
-    const target = followLink(buf, selection, entry, 0)
-    if (target) writeFileSync(join(destDir, baseOf(entry.name)), inflateEntry(buf, target))
-  }
+  for (const [link, target] of copies) writeFileSync(join(destDir, baseOf(link.name)), inflateEntry(buf, target))
   const binPath = join(destDir, baseOf(selection.binary.name))
   if (process.platform !== 'win32') {
     try {
@@ -322,13 +326,14 @@ export async function promoteProbedInstall(o: {
   if (blocked) throw new SwapBlockedError(blocked)
   // Never leave a moment where neither install exists: park the old dir, move the new one
   // in, and delete the old one only once that worked — moving it back if the rename failed
-  // (on Windows a just-probed .exe can stay locked by antivirus for a moment: EPERM/EBUSY).
+  // (on Windows a just-probed .exe can stay locked by antivirus for a moment: EPERM/EBUSY,
+  // which renameWithRetry waits out).
   const parked = existsSync(destDir) ? join(enginesRoot, 'build', `.${slug}-${randomUUID().slice(0, 8)}.old`) : null
-  if (parked) renameSync(destDir, parked)
+  if (parked) await renameWithRetry(destDir, parked)
   try {
-    renameSync(tmpDir, destDir)
+    await renameWithRetry(tmpDir, destDir)
   } catch (e) {
-    if (parked) renameSync(parked, destDir)
+    if (parked) await renameWithRetry(parked, destDir)
     throw e
   }
   if (parked) {

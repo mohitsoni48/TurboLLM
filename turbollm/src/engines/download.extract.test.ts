@@ -19,7 +19,8 @@ const plan = (archive: string, platform: NodeJS.Platform, env: { SystemRoot?: st
 
 test('archiveExtractor: .zip per platform', () => {
   assert.deepEqual(plan('a.zip', 'win32'), { kind: 'powershell' })
-  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: 'tar', args: ['-xf', 'a.zip', '-C', DEST] })
+  // Pinned: only bsdtar reads zip, and a GNU tar first on PATH (Homebrew gnubin) cannot.
+  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', 'a.zip', '-C', DEST] })
   assert.deepEqual(plan('a.zip', 'linux'), { kind: 'node-zip' })
   assert.deepEqual(plan('a.zip', 'android'), { kind: 'node-zip' })
 })
