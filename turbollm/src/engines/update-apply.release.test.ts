@@ -139,6 +139,21 @@ test('workBusy short-circuits before any network call or job', async () => {
   assert.deepEqual(h.refreshed, [])
 })
 
+test('a job that takes the slot during the release listing makes the update back off before its own job', async () => {
+  const h = harness()
+  const gh = fakeGithub([NEWER])
+  let busy: string | null = null
+  const listing = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await gh.fetchImpl(input, init)
+    if (String(input).includes('/releases?')) busy = 'A release install is in progress' // started while GitHub answered
+    return res
+  }) as typeof fetch
+  await applyEngineUpdate({ ...h.deps, fetchImpl: listing, workBusy: () => busy }, h.engine)
+  assert.deepEqual(h.calls, [])
+  assert.deepEqual(h.refreshed, [])
+  assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
+})
+
 test('workBusy returning null lets the update proceed', async () => {
   const h = harness()
   await applyEngineUpdate({ ...h.deps, fetchImpl: fakeGithub([NEWER]).fetchImpl, workBusy: () => null }, h.engine)

@@ -96,6 +96,7 @@ async function applyReleaseUpdate(
   if (poolBlock) throw new Error(poolBlock)
   const newer = await newestMatchingRelease(installed, signal, d.fetchImpl)
   if (!newer || newer.tag === installed.tag) return
+  if (d.workBusy?.()) return // the listing await let another engine job take the slot; the next tick retries
 
   d.provision.start('github-release', d.trigger ?? 'auto_update')
   try {
@@ -179,7 +180,7 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   const newDef = backendDefAt(backendId, latestTag)
   if (!newDef) throw new Error('No upstream build of this backend for your platform.')
 
-  d.provision.start(backendId, 'auto_update')
+  d.provision.start(backendId, d.trigger ?? 'auto_update')
   try {
     const newBin = await provisionBackend(
       root, newDef, latestTag,
@@ -226,7 +227,7 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
 /** TurboQuant fork: re-provision the fork's latest release, swapped in over the install dir
  *  only once it is fully on disk (a failed fetch leaves the working install untouched). */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('turboquant', 'auto_update')
+  d.provision.start('turboquant', d.trigger ?? 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
@@ -241,7 +242,8 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
     if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
-    d.provision.fail(`Could not update TurboQuant: ${msg(e)}`)
+    if ((e as Error)?.name === 'AbortError') d.provision.done()
+    else d.provision.fail(`Could not update TurboQuant: ${msg(e)}`)
     throw e
   }
 }
@@ -249,7 +251,7 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
 /** KoboldCpp: re-download the latest release binary over the installed one (replaced only
  *  once the download completed). Mirrors the fork path. */
 async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('koboldcpp', 'auto_update')
+  d.provision.start('koboldcpp', d.trigger ?? 'auto_update')
   const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
@@ -259,7 +261,8 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
     if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
-    d.provision.fail(`Could not update KoboldCpp: ${msg(e)}`)
+    if ((e as Error)?.name === 'AbortError') d.provision.done()
+    else d.provision.fail(`Could not update KoboldCpp: ${msg(e)}`)
     throw e
   }
 }
@@ -267,7 +270,7 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
 /** llamafile: re-download the latest portable binary over the installed one (replaced only
  *  once the download completed). */
 async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
-  d.provision.start('llamafile', 'auto_update')
+  d.provision.start('llamafile', d.trigger ?? 'auto_update')
   const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
@@ -276,7 +279,8 @@ async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: st
     if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
-    d.provision.fail(`Could not update llamafile: ${msg(e)}`)
+    if ((e as Error)?.name === 'AbortError') d.provision.done()
+    else d.provision.fail(`Could not update llamafile: ${msg(e)}`)
     throw e
   }
 }
@@ -288,7 +292,7 @@ const PIP_ENGINE_LABEL: Record<PipEngineKind, string> =
 
 /** vLLM / MLX / Rapid-MLX / MLX-VLM / LiteRT-LM: upgrade the package in place (uv pip install -U/--upgrade). */
 async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: Engine, root: string): Promise<void> {
-  d.provision.start(kind, 'auto_update')
+  d.provision.start(kind, d.trigger ?? 'auto_update')
   // An update re-activates an engine only when it was the active engine already: the scheduler also updates engines
   // that are merely installed. (For LiteRT-LM it matters twice — it serves .litertlm models without being active
   // (engineForModel), and activating it sends every GGUF to it.)

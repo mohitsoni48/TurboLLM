@@ -1541,8 +1541,12 @@ export function registerApi(app: Hono, d: Deps): void {
     const targetDir = join(enginesRoot, 'build', slug)
     const claims = (p: string) => isEngineInBuildDir(p, targetDir)
     const occupant = d.registry.list().engines.find((e) => claims(e.binPath)) ?? d.registry.customSources().find((s) => claims(s.binPath))
-    if (occupant && !existsSync(join(targetDir, RELEASE_INSTALL_MARKER)))
-      return err(c, 409, 'build_dir_taken', `The build folder "${slug}" already belongs to "${occupant.name}" — delete that engine first.`)
+    // The occupant's folder as spelled on disk: a repo typed in another case is the same repo (GitHub ignores case),
+    // but a case-sensitive file system (Linux) would not find the marker under the typed spelling.
+    const occupantDir = occupant ? sourceBuildDirOf(occupant.binPath, enginesRoot) : null
+    const installDir = occupantDir && occupantDir.toLowerCase() === targetDir.toLowerCase() ? occupantDir : targetDir
+    if (occupant && !existsSync(join(installDir, RELEASE_INSTALL_MARKER)))
+      return err(c, 409, 'build_dir_taken', `The build folder "${basename(installDir)}" already belongs to "${occupant.name}" — delete that engine first.`)
     const replaceBlocked = (): string | null => {
       for (const occupantEngine of d.registry.list().engines.filter((e) => claims(e.binPath))) {
         const reason = releaseSwapBlockReason(d, occupantEngine)
@@ -1563,6 +1567,7 @@ export function registerApi(app: Hono, d: Deps): void {
     releaseJob.start(plan, async () => {
       try {
         const result = await installReleaseAsset(enginesRoot, plan, {
+          slug: basename(installDir),
           blockSwap: replaceBlocked,
           onProgress: (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
           signal: ac.signal,
@@ -1726,9 +1731,13 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
     const engine = d.registry.get(id)
     if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
-    if (!resolveUpdateSource(engine)) return err(c, 409, 'no_update_source', 'This engine has no automatic update source.')
+    const source = resolveUpdateSource(engine)
+    // applyEngineUpdate has no branch for a source-built engine (notify-only "rebuild") or for SGLang.
+    if (!source || source.source === 'source' || engine.kind === 'sglang')
+      return err(c, 409, 'no_update_source', 'This engine has no automatic update source.')
     const ac = new AbortController()
-    provisionAbort = ac
+    // Only the release and GitHub-release branches take the signal: a pip upgrade cannot be cancelled.
+    if (source.source !== 'pip') provisionAbort = ac
     engineUpdateInFlight = true
     const startsBefore = d.provision.startCount()
     void applyEngineUpdate(

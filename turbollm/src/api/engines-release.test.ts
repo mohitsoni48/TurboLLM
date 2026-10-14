@@ -32,8 +32,10 @@ interface Opts {
   runningBinPath?: string
   /** Engine id an extra pool slot is running on (the primary is stopped). */
   poolEngineId?: string
-  engines?: Array<{ id: string; name: string; binPath: string; release?: ReleaseProvenance }>
+  engines?: Array<{ id: string; name: string; binPath: string; release?: ReleaseProvenance; kind?: string; version?: string; sourceRepo?: string }>
   customSources?: Array<{ name: string; binPath: string }>
+  /** What stopping the engine's pool slots does (an update's first step); resolves at once by default. */
+  stopPoolSlots?: () => Promise<void>
 }
 
 interface Harness {
@@ -62,7 +64,10 @@ function harness(o: Opts = {}): Harness {
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
-    manager: { status: () => ({ state: o.runningBinPath ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }) },
+    manager: {
+      status: () => ({ state: o.runningBinPath ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => null,
+    },
     provision: {
       get: () => ({ ...realProvision.get(), active: realProvision.get().active || o.busy === 'download' }),
       startCount: () => realProvision.startCount(),
@@ -74,7 +79,7 @@ function harness(o: Opts = {}): Harness {
     build: { isActive: () => o.busy === 'build' },
     modelRouter: {
       poolSlotsOnEngine: (id: string) => (id === o.poolEngineId ? 1 : 0),
-      stopPoolSlotsOnEngine: async () => {},
+      stopPoolSlotsOnEngine: o.stopPoolSlots ?? (async () => {}),
     },
     registry: {
       active: () => (o.runningBinPath ? { id: 'e-run', name: 'Running', binPath: o.runningBinPath, kind: 'llama-server' } : undefined),
@@ -447,6 +452,26 @@ test('N-1: DELETE of the ready result resets the job; DELETE of another path doe
   })
 })
 
+test('install: a repo typed in another case updates the engine in its own folder, not build_dir_taken', posixOnly, async () => {
+  // Installed from the catalog as O/R; the user now types o/r. GitHub ignores the case, a Linux file system does not.
+  const dataDir = tmpDir('tllm-rel-route-')
+  const ownSlug = releaseInstallDirName({ repo: 'O/R', assetKey: ASSET_KEY })
+  const dir = join(dataDir, 'engines', 'build', ownSlug)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, serverBinName), 'x')
+  writeReleaseMarker(dir, { ...PROVENANCE, repo: 'O/R' })
+  const h = harness({ dataDir, engines: [{ id: 'e1', name: 'Rel', binPath: join(dir, serverBinName), release: { ...PROVENANCE, repo: 'O/R' } }] })
+  await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET, bytes: scriptZip() }] }, async () => {
+    const res = await postInstall(h, { repo: REPO, tag: 'b1', asset: ZIP_ASSET })
+    assert.equal(res.status, 202, JSON.stringify(await res.clone().json()))
+    const view = (await jobState(h)) as { state: string; updated?: { id: string }; result?: { binPath: string } }
+    assert.equal(view.state, 'updated')
+    assert.equal(view.updated?.id, 'e1')
+    assert.equal(view.result?.binPath, join(dir, serverBinName))
+  })
+  assert.deepEqual(readdirSync(h.buildDir), [ownSlug])
+})
+
 test('POST /engines reads provenance from the on-disk marker and ignores a client-supplied release', async () => {
   const h = harness()
   const dir = seedMarkedDir(h, RELEASE_INSTALL_MARKER, PROVENANCE)
@@ -665,4 +690,59 @@ test('POST /engines/:id/update: an extra pool slot on the engine ends the update
     assert.equal(requests.some((u) => u.startsWith('https://cdn.test/')), false)
   })
   assert.match(h.provisionLog.find((l) => l.startsWith('fail:')) ?? '', /Stop "Rel"/)
+})
+
+// The route keeps its "any engine with an automatic update source" contract (ADR-085): every branch it reaches records
+// the user's trigger, ends a Cancel as done(), offers Cancel only when the branch takes the signal, and a kind with no
+// apply branch is refused up front instead of answering 202 and then failing.
+async function cancelProvision(h: Harness): Promise<boolean> {
+  const res = await h.app.request('/api/v1/engines/backends/cancel', { method: 'POST' })
+  return ((await res.json()) as { ok: boolean }).ok
+}
+
+test('POST /engines/:id/update: 409 no_update_source for a source-built engine and for SGLang, before any job', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const h = harness({
+    engines: [
+      { id: 'src', name: 'Built', kind: 'llama-server', binPath: join(dir, 'build', 'mine', serverBinName), sourceRepo: 'https://github.com/ggml-org/llama.cpp' },
+      { id: 'sg', name: 'SGLang', kind: 'sglang', binPath: join(dir, 'sglang', 'python'), version: 'sglang 0.4.0' },
+    ],
+  })
+  for (const id of ['src', 'sg']) {
+    const res = await postUpdate(h, id)
+    assert.equal(res.status, 409, id)
+    assert.equal((await errorOf(res)).code, 'no_update_source', id)
+  }
+  assert.deepEqual(h.provisionLog, [])
+})
+
+test('POST /engines/:id/update: a cancelled KoboldCpp update ends as a quiet user_update cancel, not a failure', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const h = harness({ engines: [{ id: 'kc', name: 'KoboldCpp', kind: 'koboldcpp', binPath: join(dir, 'koboldcpp', 'koboldcpp'), version: 'v1.70' }] })
+  const hangGithub: Responder = (url, init) =>
+    url.includes('api.github.com')
+      ? new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+      : null
+  await withGithub('missing', async () => {
+    assert.equal((await postUpdate(h, 'kc')).status, 202)
+    assert.equal(await cancelProvision(h), true)
+    await waitUntil(() => settled(h))
+  }, hangGithub)
+  assert.deepEqual(h.provisionLog, ['start:koboldcpp:user_update', 'done'])
+  assert.deepEqual(h.settlements, [{ ok: true, trigger: 'user_update' }])
+})
+
+test('POST /engines/:id/update: a pip upgrade records user_update and offers no Cancel it cannot honour', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  let failStop = (_e: Error) => {}
+  // Hold the update at its first step, then fail it there: the real uv/pip upgrade never runs in a test.
+  const stopPoolSlots = () => new Promise<void>((_resolve, reject) => { failStop = reject })
+  const h = harness({ stopPoolSlots, engines: [{ id: 'vl', name: 'vLLM', kind: 'vllm', binPath: join(dir, 'vllm', 'python'), version: 'vllm 0.6.0' }] })
+  assert.equal((await postUpdate(h, 'vl')).status, 202)
+  assert.equal(await cancelProvision(h), false)
+  failStop(new Error('stopped by the test'))
+  await waitUntil(() => settled(h))
+  assert.equal(h.provisionLog[0], 'start:vllm:user_update')
 })

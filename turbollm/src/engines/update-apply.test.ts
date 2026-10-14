@@ -15,6 +15,7 @@ import { ConfigStore, type Engine } from '../config/config'
 import { tmpDir } from '../test-support/tmp'
 import { availableBackends, installedBackendBuild } from './download'
 import { koboldcppAssetName, koboldcppBinPath } from './koboldcpp'
+import { llamafileBinPath } from './llamafile'
 import { Registry } from './registry'
 import { applyEngineUpdate, type UpdateApplyDeps } from './update-apply'
 
@@ -86,6 +87,14 @@ test('llama.cpp update of the active engine: the new build becomes active', { sk
   assert.equal(d.registry.active()?.binPath, join(newDir, 'llama-server'))
 })
 
+test('llama.cpp update started by the user is recorded as user_update', { skip: posixOnly }, async (t) => {
+  const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  const starts: string[] = []
+  d.provision = { start: (_b: string, trigger: string) => { starts.push(trigger) }, progress() {}, done() {}, fail() {} } as unknown as UpdateApplyDeps['provision']
+  await applyEngineUpdate({ ...d, trigger: 'user_update' }, oldEngine)
+  assert.deepEqual(starts, ['user_update'])
+})
+
 test('llama.cpp update whose new build fails its probe: the new build is removed, the working one stays installed', { skip: posixOnly }, async (t) => {
   const { d, root, newDir, oldEngine } = llamaCppUpdate(t, BROKEN_SERVER)
   await assert.rejects(applyEngineUpdate(d, oldEngine))
@@ -113,6 +122,36 @@ test('KoboldCpp update: a failed download keeps the binary; an update never acti
   assert.equal(readFileSync(bin, 'utf8'), 'kobold v2')
   assert.equal(d.registry.get('kobold')?.version, 'v2.0.0')
   assert.equal(d.registry.active()?.id, 'cuda')
+})
+
+// POST /engines/:id/update reaches these branches with the user's trigger and a Cancel signal (the scheduler passes
+// neither). A Cancel is a quiet done(), never a failed update, and the run is recorded as the caller's trigger.
+test('a cancelled KoboldCpp, llamafile or TurboQuant update ends in done() with the caller\'s trigger, never fail()', async (t) => {
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError')
+    return new Response(null, { status: 500 })
+  }) as typeof fetch
+  const cancelled = new AbortController()
+  cancelled.abort()
+  const cases: Array<[string, (root: string) => Engine]> = [
+    ['koboldcpp', (root) => engine({ id: 'koboldcpp', kind: 'koboldcpp', binPath: koboldcppBinPath(root), version: 'v1.0.0' })],
+    ['llamafile', (root) => engine({ id: 'llamafile', kind: 'llamafile', binPath: llamafileBinPath(root), version: '0.9.0' })],
+  ]
+  // TurboQuant has no Windows prebuilt: there it fails before any request, so there is nothing to cancel.
+  if (process.platform !== 'win32') cases.push(['turboquant', (root) => engine({ id: 'turboquant', binPath: join(root, 'turboquant', 'llama-server') })])
+  for (const [id, make] of cases) {
+    const { d } = setup((root) => [make(root)])
+    const log: string[] = []
+    d.provision = {
+      start: (backend: string, trigger: string) => { log.push(`start:${backend}:${trigger}`) },
+      progress() {},
+      done: () => { log.push('done') },
+      fail: (m: string) => { log.push(`fail:${m}`) },
+    } as unknown as UpdateApplyDeps['provision']
+    await assert.rejects(applyEngineUpdate({ ...d, trigger: 'user_update' }, d.registry.get(id)!, cancelled.signal), (e: Error) => e.name === 'AbortError', id)
+    assert.deepEqual(log, [`start:${id}:user_update`, 'done'], id)
+  }
 })
 
 test('a custom llama-server with no release provenance has no automatic update source', async () => {
