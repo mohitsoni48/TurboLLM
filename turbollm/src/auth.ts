@@ -447,6 +447,22 @@ export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
   const hash = hashKey(raw)
   const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
   if (!match) return undefined
+  touchLastUsed(d, match)
+  return match
+}
+
+/** How stale a key's `lastUsedAt` may get before a use rewrites it. Every bump is a full,
+ *  synchronous config.json rewrite on the event loop, and an authenticated LAN/remote UI polls
+ *  several times a second (twice per request for a remote token or a LAN Code call), so
+ *  bumping on every use rewrote the whole config continuously. The value is only ever shown
+ *  as "last used N minutes ago". */
+const LAST_USED_RESOLUTION_MS = 60_000
+
+/** Best-effort lastUsedAt bump (spec 06 §5), skipped while the stored value is recent. A
+ *  value in the future (clock moved back) counts as stale, so it cannot freeze. */
+function touchLastUsed(d: Deps, match: ApiKey): void {
+  const last = match.lastUsedAt ? Date.parse(match.lastUsedAt) : NaN
+  if (Number.isFinite(last) && Math.abs(Date.now() - last) < LAST_USED_RESOLUTION_MS) return
   try {
     d.store.update((mut) => {
       const k = mut.apiKeys.find((x) => x.id === match.id)
@@ -455,7 +471,6 @@ export function resolveKey(c: Context, d: Deps): ApiKey | undefined {
   } catch {
     /* swallow — usage tracking is best-effort */
   }
-  return match
 }
 
 /** Is this stored key a Turbo Link FAÇADE-ONLY credential — usable only on `/api/link/v1`
@@ -581,14 +596,7 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean 
   // function answers "is this credential usable here at all".
   if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
-  try {
-    d.store.update((mut) => {
-      const k = mut.apiKeys.find((x) => x.id === match.id)
-      if (k) k.lastUsedAt = new Date().toISOString()
-    })
-  } catch {
-    /* swallow — usage tracking is best-effort */
-  }
+  touchLastUsed(d, match)
   return true
 }
 

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, codeAuth, requiredCapability } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, verifyKeyValue, codeAuth, requiredCapability } from './auth'
 import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
@@ -482,6 +482,30 @@ test('requiredCapability: reading /api/v1/activity needs models:load; nothing ma
   assert.equal(requiredCapability('GET', '/api/v1/activity'), 'models:load')
   assert.equal(requiredCapability('HEAD', '/api/v1/activity'), 'models:load')
   assert.equal(requiredCapability('POST', '/api/v1/activity'), null)
+})
+
+// Every key check used to rewrite config.json (a full synchronous serialize + write + rename
+// on the event loop) just to bump lastUsedAt — once or twice per request, for a UI that polls
+// every 1–2 s. The bump is display-only, so a recent value is left alone.
+test('verifyKeyValue: lastUsedAt is persisted at most about once a minute, not on every request', () => {
+  const key = { id: 'k1', name: 't', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null as string | null }
+  let writes = 0
+  const d = {
+    store: {
+      snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [{ ...key }] }),
+      update: (fn: (cfg: { apiKeys: typeof key[] }) => void) => { writes++; fn({ apiKeys: [key] }) },
+    },
+  } as unknown as Deps
+
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 1, 'a never-used key is stamped')
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 1, 'a fresh stamp is not rewritten on every request')
+
+  key.lastUsedAt = new Date(Date.now() - 2 * 60_000).toISOString()
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 2, 'a stale stamp is refreshed')
 })
 
 // `--addr 0.0.0.0:…` / daemon.host bind every interface without setting lanBind; the
