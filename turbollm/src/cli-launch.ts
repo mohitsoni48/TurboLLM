@@ -537,11 +537,16 @@ const realFs: ConfigFs = {
  *  Regenerated on every launch rather than written once: content is fully determined by `port`,
  *  cheap to overwrite, and a stale port left over from a previous daemon would otherwise point
  *  the CLI at a server that no longer exists. */
-export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs): Promise<string> {
+export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs, platform: NodeJS.Platform = process.platform): Promise<string> {
   const dir = join(fs.home, '.turbollm')
   await fs.mkdir(dir)
   const path = join(dir, 'mcp-launch-config.json')
-  const config = { mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server', '--port', String(port)] } } }
+  const npxArgs = ['turbollm', 'mcp-server', '--port', String(port)]
+  // npx is a `.cmd` shim on native Windows, which claude can't spawn as a bare command (the
+  // server dies with "Connection closed") — run it through `cmd /c`, the wrapper Claude Code's
+  // own docs prescribe and the same one tools/mcp-client.ts uses for its stdio servers.
+  const server = platform === 'win32' ? { command: 'cmd', args: ['/c', 'npx', ...npxArgs] } : { command: 'npx', args: npxArgs }
+  const config = { mcpServers: { turbollm: server } }
   await fs.writeFile(path, JSON.stringify(config, null, 2))
   return path
 }
