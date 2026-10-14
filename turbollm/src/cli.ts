@@ -708,10 +708,10 @@ setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000
 // (routines/code-runner.ts: "Code execution is not available (codeRuns not wired)") — this
 // is an already-supported state, not a new one.
 //
-// code-run-manager.ts ships as its OWN tsup entry, in its OWN separate build pass (see
-// tsup.config.ts) — not chunked/shared with cli.js — so this dynamic import can never
-// accidentally pull the pi-coding-agent chain into cli.js's own static output (esbuild's
-// default chunk-splitting did exactly that once, confirmed live). The specifier is built
+// code-run-manager.ts ships as its OWN tsup entry (see tsup.config.ts), loaded through a
+// specifier esbuild cannot follow, so this dynamic import can never pull the pi-coding-agent
+// chain into cli.js's own static output (a static import did exactly that once, confirmed
+// live). Same build pass as cli.js, so the modules both reach are one instance. The specifier is built
 // via pathToFileURL(join(...)) rather than `new URL('./relative', import.meta.url)` on
 // purpose — that two-argument form is a recognized esbuild asset-reference idiom (the same
 // one builtin.ts's WORKER_PATH deliberately relies on for `new Worker(url)`) and esbuild
