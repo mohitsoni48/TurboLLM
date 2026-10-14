@@ -1006,6 +1006,10 @@ let prevHost = host // remembered before a rebind so we can revert if the new bi
 let prevPort = port
 function listen(attempt = 0): void {
   const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
+    // What auth.ts's gates key off (isLanExposed): the address really bound, so a non-loopback
+    // --addr/daemon.host enforces keys like lanBind does. Set here, on every successful bind
+    // (initial, retry, rebind, revert), before this listener serves its first request.
+    deps.bindHost = host
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
     const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
 

@@ -1,9 +1,14 @@
 // LAN auth enforcement (spec 06 §5). The daemon binds loopback-only by default
 // (daemon.lanBind=false), so local dev and the embedded web UI need no key. Once
-// the user flips the LAN-expose toggle (lanBind=true → bind 0.0.0.0), the listener
-// is reachable from other machines and EVERY non-loopback request to the API /
-// gateway surface must carry a valid API key. Loopback is always exempt so the
-// local browser UI and `turbollm launch claude` keep working with no key.
+// the listener is reachable from other machines (the LAN-expose toggle, lanBind=true
+// → bind 0.0.0.0, or a non-loopback `--addr`/`daemon.host` — see isLanExposed),
+// EVERY non-loopback request to the API / gateway surface must carry a valid API key
+// (requireApiKey, on by default). Loopback is exempt so the local browser UI and
+// `turbollm launch claude` keep working with no key, but only a loopback caller whose
+// Host names this machine (DNS rebinding, see hostNamesThisMachine); anyone else is
+// judged like a LAN peer, and on a loopback-only bind needs a key even with
+// requireApiKey off. lanAuth also refuses a browser's cross-site writes to /api/* on
+// any bind.
 //
 // Remote access (ADR-422, formerly the Cloud Launch tunnel of ADR-045/152) breaks the
 // loopback-as-trust assumption BY ADDRESS ALONE: every provider's local leg connects to
@@ -120,6 +125,43 @@ export function isLoopbackBindHost(host: string): boolean {
   const h = host.trim().toLowerCase().replace(/^\[|\]$/g, '')
   if (h === 'localhost' || h === '::1' || h === '::ffff:127.0.0.1') return true
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
+}
+
+/** Is the main listener reachable from other machines? True when LAN access is switched on
+ *  (`daemon.lanBind`) OR when the address actually bound is not loopback: `--addr 0.0.0.0:…`
+ *  and `daemon.host` bind such an address without ever setting lanBind, and keying every gate
+ *  below off the flag alone left that daemon listening on all interfaces with no auth at all
+ *  (while `--help` promised key enforcement). `bindHost` is recorded by cli.ts on every
+ *  successful bind, so an in-place rebind keeps this current. Read this, never `lanBind`, for
+ *  an auth decision. */
+export function isLanExposed(d: Deps): boolean {
+  if (d.store.snapshot().daemon.lanBind) return true
+  return d.bindHost !== undefined && !isLoopbackBindHost(d.bindHost)
+}
+
+/** Does a request's Host header name this machine — a loopback name or the exact address the
+ *  daemon is bound to? Loopback trust assumes the browser that sent a request believes it is
+ *  talking to THIS machine. A DNS-rebinding page (an attacker's hostname re-resolved to
+ *  127.0.0.1) arrives from a loopback address and is same-origin as far as the browser is
+ *  concerned, so only its Host header gives it away. `*.localhost` always resolves to loopback
+ *  in browsers and has no public zone, so no attacker can serve a page under it. An absent Host
+ *  (HTTP/1.0, Node test harnesses) passes: every browser sends one.
+ *
+ *  Also passed, because none of them can be rebound: `*.internal` (reserved for private use, no
+ *  public zone) — Docker Desktop's `host.docker.internal` reaches a loopback-bound daemon over
+ *  the host's own loopback, which is how a containerised client such as Open WebUI talks to
+ *  it — and any IP literal: rebinding needs a DNS name to re-resolve, and a page served from an
+ *  IP is same-origin only with that IP, never with 127.0.0.1. */
+function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
+  if (!host) return true
+  const h = host.trim().toLowerCase()
+  // Drop the port: `[v6]:port` keeps its brackets, `name:port` loses everything after the colon.
+  const name = (h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '')).replace(/\.$/, '')
+  if (isLoopbackBindHost(name) || name.endsWith('.localhost')) return true
+  if (name.endsWith('.internal')) return true
+  if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name) || /^\[[0-9a-f:.]*:[0-9a-f:.]*\]$/.test(name)) return true
+  const unbracket = (s: string) => s.replace(/^\[|\]$/g, '')
+  return d.bindHost !== undefined && unbracket(name) === unbracket(d.bindHost.trim().toLowerCase())
 }
 
 /** Mint the ONE bootstrap API key a headless install needs, or return null if it isn't
@@ -276,7 +318,8 @@ function isTunneled(c: Context, d: Deps): boolean {
  *  own terminal, `--stop`, `launch claude`) is unaffected. */
 export function isLocalRequest(c: Context, d: Deps): boolean {
   if (isTunneled(c, d)) return false
-  if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
+  if (!hostNamesThisMachine(c.req.header('host'), d)) return false // DNS rebinding — see hostNamesThisMachine
+  if (!isLanExposed(d)) return true // loopback-only bind → always local
   return isLoopback(c) === true
 }
 
@@ -336,7 +379,7 @@ export function hostGate(c: Context, d: Deps): boolean {
 export function isLocalUpgrade(
   remoteAddress: string | undefined,
   socketLocalPort: number | undefined,
-  _headers: NodeJS.Dict<string | string[]>,
+  headers: NodeJS.Dict<string | string[]>,
   d: Deps,
 ): boolean {
   const ingress = d.remote?.ingressPort()
@@ -344,7 +387,10 @@ export function isLocalUpgrade(
     if (socketLocalPort === undefined) return false
     if (socketLocalPort === ingress) return false
   }
-  if (!d.store.snapshot().daemon.lanBind) return true // loopback-only bind → always local
+  // DNS rebinding — see hostNamesThisMachine. A refused handshake still gets in with a `key`.
+  const host = headers.host
+  if (!hostNamesThisMachine(typeof host === 'string' ? host : undefined, d)) return false
+  if (!isLanExposed(d)) return true // loopback-only bind → always local
   return !!remoteAddress && LOOPBACK.has(remoteAddress)
 }
 
@@ -381,9 +427,11 @@ export function bypassesAuth(opts: {
  *  bare loopback shortcut. */
 export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
   const daemon = d.store.snapshot().daemon
-  const tunneled = isTunneled(c, d)
-  if (!daemon.lanBind && !tunneled) return true // loopback-only bind, not tunneled → always local
-  if (isLoopback(c) === true && !tunneled) return true // local client
+  // Loopback trust needs a Host naming this machine (DNS rebinding — see hostNamesThisMachine).
+  // Without one the request is judged like a LAN one, which lanAuth has already held to a key.
+  const trusted = !isTunneled(c, d) && hostNamesThisMachine(c.req.header('host'), d)
+  if (!isLanExposed(d) && trusted) return true // loopback-only bind, not tunneled → always local
+  if (isLoopback(c) === true && trusted) return true // local client
   return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
 }
 
@@ -551,9 +599,12 @@ export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boole
 }
 
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
- *  BEFORE the API/chat/gateway routes. Enforcement only kicks in when the daemon
- *  is LAN-exposed (lanBind=true); with the default loopback-only bind it is a pure
- *  pass-through, so local dev and the UI can never be locked out. */
+ *  BEFORE the API/chat/gateway routes. LAN peers need a key once the daemon is
+ *  LAN-exposed (see isLanExposed) and requireApiKey is on (the default). The default
+ *  loopback-only bind is NOT a pass-through: past the SPA shell and /healthz it admits
+ *  keyless only loopback callers whose Host names this machine (anyone else needs a key
+ *  even with requireApiKey off), and browser cross-site writes to /api/* get a 403 on
+ *  every bind. */
 export function lanAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
     // Hand the façade to its own gate before any of the LAN reasoning below — see
@@ -561,12 +612,32 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // applies"; the opposite is true here, a STRICTER one does.
     if (isLinkFacade(c)) return next()
 
+    // Cross-site writes. A "simple" POST (text/plain, form) needs no CORS preflight, so the
+    // /api/* origin allowlist stops a hostile page from READING the answer but not the request
+    // from running, and the loopback trust below would wave it straight into the local-admin
+    // routes. Same rule as the engine-zip upload guard (routes.ts): refuse anything a browser
+    // marks as coming from another site. The app's own UI is same-origin, and CLIs/SDKs send
+    // no Sec-Fetch-Site at all.
+    if (c.req.path.startsWith('/api/') && c.req.method !== 'GET' && c.req.method !== 'HEAD' && c.req.method !== 'OPTIONS') {
+      const site = c.req.header('sec-fetch-site')
+      if (site && site !== 'same-origin' && site !== 'none') {
+        return c.json({ error: { code: 'forbidden', message: 'Cross-site request refused.' } }, 403)
+      }
+    }
+
     const daemon = d.store.snapshot().daemon
+    const tunneled = isTunneled(c, d)
+    // A loopback connection whose Host names some other machine (DNS rebinding — see
+    // hostNamesThisMachine) gets no loopback trust: it is judged exactly like a LAN request on
+    // a LAN-exposed listener. With nothing LAN-exposed, `requireApiKey: false` opened the API
+    // to no one, so it is not read as consent to open it to a rebinding page: such a caller
+    // needs a key.
+    const foreignHost = !tunneled && !hostNamesThisMachine(c.req.header('host'), d)
     const allow = bypassesAuth({
-      lanBind: daemon.lanBind,
-      requireApiKey: daemon.requireApiKey,
-      tunneled: isTunneled(c, d),
-      loopback: isLoopback(c),
+      lanBind: isLanExposed(d) || foreignHost,
+      requireApiKey: daemon.requireApiKey || (foreignHost && !isLanExposed(d)),
+      tunneled,
+      loopback: foreignHost ? false : isLoopback(c),
       exempt: isExempt(c),
     })
     if (allow) return next()

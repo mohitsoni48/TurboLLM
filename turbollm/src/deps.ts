@@ -91,6 +91,10 @@ export interface Deps {
    *  restart — keeps the engine + model loaded. Used for LAN/port changes. Wired only
    *  in the real `serve()` entrypoint (cli.ts); absent under tests. */
   rebind?: () => void
+  /** The host the main listener is actually bound to, recorded by cli.ts on every successful
+   *  bind (initial, retry, rebind, revert). auth.ts treats a non-loopback one as LAN-exposed
+   *  even with `daemon.lanBind` off (`--addr 0.0.0.0:…`, `daemon.host`). Absent under tests. */
+  bindHost?: string
   /** The daemon-owned Code-session run registry (code-run-manager.ts), shared between the live
    *  Code UI routes and Routine execution (this phase, Task 7) so a routine's in-app-pi run is
    *  the SAME kind of observable session a live one is. Optional: only wired in the real

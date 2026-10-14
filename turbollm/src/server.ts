@@ -80,8 +80,10 @@ export function createApp(d: Deps): Hono {
     await next()
   })
 
-  // LAN auth gate (spec 06 §5): no-op while loopback-only (lanBind=false); once
-  // LAN-exposed, requires a valid API key for non-loopback /api/* and /v1/* calls.
+  // LAN auth gate (spec 06 §5): once LAN-exposed and requireApiKey is on (the default),
+  // requires a valid API key for non-loopback /api/* and /v1/* calls. Not a no-op while
+  // loopback-only either: it admits keyless only loopback callers whose Host names this
+  // machine, and refuses browser cross-site writes to /api/* — see lanAuth's doc comment.
   app.use('*', lanAuth(d))
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.

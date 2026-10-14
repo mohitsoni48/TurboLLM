@@ -483,3 +483,35 @@ test('requiredCapability: reading /api/v1/activity needs models:load; nothing ma
   assert.equal(requiredCapability('HEAD', '/api/v1/activity'), 'models:load')
   assert.equal(requiredCapability('POST', '/api/v1/activity'), null)
 })
+
+// `--addr 0.0.0.0:…` / daemon.host bind every interface without setting lanBind; the
+// local-only gates must follow the address actually bound.
+test('isLocalRequest / isLocalOrAuthenticated: a non-loopback bind is LAN-exposed even with lanBind off', () => {
+  const d = fakeDeps({ lanBind: false, requireApiKey: false })
+  d.bindHost = '0.0.0.0'
+  const c = fakeContext({}) // address undetermined → fails closed on a LAN-exposed listener
+  assert.equal(isLocalRequest(c, d), false)
+  assert.equal(isLocalOrAuthenticated(c, d), false)
+  d.bindHost = '127.0.0.1'
+  assert.equal(isLocalRequest(c, d), true, 'a loopback bind is unchanged')
+})
+
+// DNS rebinding — loopback trust needs a Host that names this machine.
+test('isLocalRequest: a foreign Host header is never local, even on a loopback-only bind', () => {
+  const d = fakeDeps({ lanBind: false })
+  assert.equal(isLocalRequest(fakeContext({ host: 'rebind.attacker.example:6996' }), d), false)
+  assert.equal(isLocalOrAuthenticated(fakeContext({ host: 'rebind.attacker.example' }), d), false)
+  assert.equal(isLocalRequest(fakeContext({ host: '127.0.0.1:6996' }), d), true)
+  assert.equal(isLocalRequest(fakeContext({ host: 'localhost' }), d), true)
+})
+
+// Docker Desktop's `host.docker.internal` arrives on the host's loopback; neither a `.internal`
+// name nor an IP literal can be DNS-rebound, so both keep loopback trust.
+test('isLocalRequest: a .internal or IP-literal Host stays local on a loopback-only bind', () => {
+  const d = fakeDeps({ lanBind: false })
+  for (const host of ['host.docker.internal:6996', '192.168.1.20:6996', '[fe80::1]:6996']) {
+    assert.equal(isLocalRequest(fakeContext({ host }), d), true, host)
+    assert.equal(isLocalOrAuthenticated(fakeContext({ host }), d), true, host)
+  }
+  assert.equal(isLocalRequest(fakeContext({ host: 'evil.example' }), d), false)
+})

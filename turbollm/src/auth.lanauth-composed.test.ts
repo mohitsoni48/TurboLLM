@@ -17,7 +17,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, createSign, randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
-import { lanAuth, hostGate, hashKey, provisionRemoteApiKey } from './auth'
+import { lanAuth, hostGate, hashKey, provisionRemoteApiKey, isLocalOrAuthenticated, isLocalUpgrade } from './auth'
 import { defaultConfig } from './config/config'
 import type { Deps } from './deps'
 
@@ -82,7 +82,20 @@ function buildApp(d: Deps): Hono {
   })
   app.post('/api/v1/conversations/:id/messages', (c) => c.json({ ok: true }))
   app.get('/api/v1/status', (c) => c.json({ ok: true }))
+  app.get('/v1/models', (c) => c.json({ data: [] }))
+  // Mirrors the local-admin routes (POST /engines, /build/*, /mcp/servers): isLocalOrAuthenticated.
+  app.post('/api/v1/build/run', (c) => {
+    if (!isLocalOrAuthenticated(c, d)) return c.json({ error: { code: 'forbidden', message: 'Host-only action.' } }, 403)
+    return c.json({ ok: true })
+  })
   return app
+}
+
+/** A request from this machine's own loopback to the MAIN listener (not the ingress socket). */
+function loopbackRequest(app: Hono, path: string, init: RequestInit = {}): Response | Promise<Response> {
+  return app.request(path, init, {
+    incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+  } as never)
 }
 
 /** A request that arrived over remote access: local port matches the ingress socket AND the
@@ -335,3 +348,110 @@ test('I6: Tailscale Serve identity still wins over an unrelated requireAccess=tr
   })
   assert.equal(res.status, 200, 'Access is genuinely not in a Serve request\'s path — this is intended, not a bypass')
 })
+
+// ── Auth must follow the address ACTUALLY bound, not only the lanBind flag. ─────────────────
+// `turbollm --addr 0.0.0.0:6996` (or daemon.host) binds every interface without setting
+// lanBind, and every gate read lanBind alone — so the daemon enforced nothing at all, while
+// `--help` promised key enforcement and the banner printed a freshly minted key.
+
+test('a non-loopback bind with lanBind OFF still enforces the key for a LAN caller', async () => {
+  const { d } = makeDeps(() => {}) // defaults: lanBind false, requireApiKey true
+  d.bindHost = '0.0.0.0'
+  const app = buildApp(d)
+  assert.equal((await lanRequest(app, '/api/v1/status')).status, 401, 'no key from the LAN → refused')
+  assert.equal((await lanRequest(app, '/api/v1/build/run', { method: 'POST' })).status, 401)
+  assert.equal(isLocalUpgrade('192.168.1.77', 6996, {}, d), false, 'the terminal WebSocket must not treat a LAN peer as local')
+  // The box's own loopback stays trusted, exactly as with lanBind on.
+  assert.equal((await loopbackRequest(app, '/api/v1/status')).status, 200)
+})
+
+test('the same daemon bound to loopback is unchanged — nothing to enforce', async () => {
+  const { d } = makeDeps(() => {})
+  d.bindHost = '127.0.0.1'
+  assert.equal((await lanRequest(buildApp(d), '/api/v1/status')).status, 200)
+  assert.equal(isLocalUpgrade('127.0.0.1', 6996, {}, d), true)
+})
+
+// ── Cross-site browser writes must not reach the loopback-trusted API (CSRF). ───────────────
+
+test('a cross-site POST from a browser is refused on the default loopback install', async () => {
+  const { d } = makeDeps(() => {})
+  const app = buildApp(d)
+  for (const site of ['cross-site', 'same-site']) {
+    const res = await loopbackRequest(app, '/api/v1/build/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain', Origin: 'https://evil.example', 'Sec-Fetch-Site': site },
+      body: '{}',
+    })
+    assert.equal(res.status, 403, `Sec-Fetch-Site: ${site} must be refused`)
+  }
+  // The app's own UI (same-origin), a typed URL (none) and a CLI/SDK (no header) still work.
+  for (const headers of [{ 'Sec-Fetch-Site': 'same-origin' }, { 'Sec-Fetch-Site': 'none' }, {}] as Record<string, string>[]) {
+    assert.equal((await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers })).status, 200)
+  }
+  // Reads are untouched: CORS already stops a cross-site page from reading the answer.
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status, 200)
+})
+
+// ── DNS rebinding — a loopback request whose Host names another site gets no loopback trust.
+
+test('a loopback request with a foreign Host header is judged like a LAN request', async () => {
+  const { d } = makeDeps(() => {}) // loopback-only bind, requireApiKey on (the defaults)
+  const app = buildApp(d)
+  const evil = { Host: 'rebind.attacker.example:6996' }
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: evil })).status, 401)
+  assert.equal(
+    (await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers: { ...evil, 'Sec-Fetch-Site': 'same-origin' } })).status,
+    401,
+  )
+  assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host: 'rebind.attacker.example:6996' }, d), false, 'terminal WebSocket too')
+  // Every way the box's own clients address it keeps loopback trust.
+  for (const host of ['127.0.0.1:6996', 'localhost:6996', 'LOCALHOST', '[::1]:6996', 'app.localhost:5173', '127.0.0.2']) {
+    assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: host } })).status, 200, host)
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), true, host)
+  }
+  // ...and so does the exact address the daemon is bound to.
+  d.bindHost = '0.0.0.0'
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: '0.0.0.0:6996' } })).status, 200)
+})
+
+// Docker Desktop delivers a container's `host.docker.internal` connection on the host's own
+// loopback, which is how Open WebUI (README) reaches a default, loopback-bound daemon. Neither a
+// `.internal` name (no public zone) nor an IP literal (nothing to re-resolve) can be rebound.
+test('a loopback request whose Host is a .internal name or an IP literal keeps loopback trust', async () => {
+  const { d } = makeDeps(() => {}) // loopback-only bind, requireApiKey on (the defaults)
+  const app = buildApp(d)
+  assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: 'host.docker.internal:6996' } })).status, 200)
+  for (const host of [
+    'host.docker.internal', 'gateway.docker.internal:6996', 'host.containers.internal:6996',
+    '192.168.1.20:6996', '10.0.0.5', '[fe80::1]:6996', '[2001:db8::7]', '[::ffff:7f00:1]:6996',
+  ]) {
+    assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: host } })).status, 200, host)
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), true, host)
+  }
+  // A DNS name that merely contains one of those shapes is still foreign.
+  for (const host of ['evil.example', 'evil.example:6996', 'internal.evil.example', 'host.docker.internal.evil.example', '127.0.0.1.evil.example']) {
+    assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: host } })).status, 401, host)
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), false, host)
+  }
+})
+
+// With requireApiKey off and nothing LAN-exposed, the open-LAN branch ("the user opted into
+// keyless LAN access") must not swallow a rebinding page: no LAN access was ever opened, so
+// that setting is no consent for a foreign site — the request needs a key like any LAN one.
+test('a foreign Host still needs a key when requireApiKey is off and nothing is LAN-exposed', async () => {
+  const { d } = makeDeps((cfg) => {
+    cfg.daemon.requireApiKey = false
+  })
+  d.bindHost = '127.0.0.1'
+  const app = buildApp(d)
+  const evil = { Host: 'rebind.attacker.example:6996' }
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: evil })).status, 401)
+  assert.equal((await loopbackRequest(app, '/v1/models', { headers: evil })).status, 401)
+  // The box's own clients are untouched by the key setting.
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: '127.0.0.1:6996' } })).status, 200)
+  // Once LAN access really is open without a key, a foreign Host is no worse than any LAN peer.
+  d.bindHost = '0.0.0.0'
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: evil })).status, 200)
+})
+

@@ -1,6 +1,6 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
-import { generateApiKey, hostGate } from '../auth'
+import { generateApiKey, hostGate, isLanExposed } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
@@ -97,10 +97,11 @@ export function registerLinkAdminRoutes(
     // clear that bar — the owner, at the keyboard — and it is the one that actually decides
     // the mint, since hostGate lets a local caller straight through in this posture.
     //
-    // With `lanBind` off there is no open LAN to close (a tunneled request always enforces
-    // regardless of requireApiKey, see bypassesAuth), so this never fires there.
+    // With the listener loopback-only there is no open LAN to close (a tunneled request always
+    // enforces regardless of requireApiKey, see bypassesAuth), so this never fires there.
+    // isLanExposed, not `lanBind`: a non-loopback --addr/daemon.host is just as open.
     const daemon = d.store.snapshot().daemon
-    if (daemon.lanBind && daemon.requireApiKey !== true) {
+    if (isLanExposed(d) && daemon.requireApiKey !== true) {
       return c.json(
         {
           error: {

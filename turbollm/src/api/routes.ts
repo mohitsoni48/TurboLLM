@@ -2435,6 +2435,11 @@ export function registerApi(app: Hono, d: Deps): void {
   // ── MCP server management (v0.7.0) ────────────────────────────────────────
 
   app.post('/api/v1/mcp/servers', async (c) => {
+    // A stdio server is a caller-chosen command the daemon spawns right away (syncMcpServers).
+    // Same isLocalOrAuthenticated rule as every other route that executes a caller-supplied
+    // program (POST /engines, /engines/scan, /build/*, ADR-394).
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Adding an MCP server requires a valid API key from a non-host device.')
     const b = await body<Partial<McpServer>>(c)
     const transport = b.transport === 'sse' ? 'sse' : 'stdio'
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
@@ -2469,6 +2474,9 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.put('/api/v1/mcp/servers/:id', async (c) => {
+    // Can swap in a new command and respawns it — same rule as the create route above.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Editing an MCP server requires a valid API key from a non-host device.')
     const id = c.req.param('id')
     const b = await body<Partial<McpServer>>(c)
     const cfg = d.store.snapshot()
