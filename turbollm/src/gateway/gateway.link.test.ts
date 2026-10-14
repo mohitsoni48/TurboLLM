@@ -376,3 +376,53 @@ test("the SAME engine error is still spelled out in full on the local mount", as
   // Same machine, same user — the diagnostic is theirs to read.
   assert.ok((await res.text()).includes(enginePath))
 })
+
+test("a host reply fetch already decompressed is not relayed with the host's content-encoding", async () => {
+  // fetch decodes a gzip/br body (Cloudflare's edge compresses JSON for a client that accepts it) but keeps the
+  // header. Relayed as-is, the peer's client tried to gunzip plain JSON: "incorrect header check".
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const body = JSON.stringify({ choices: [{ message: { content: 'hi' } }] })
+  const f = captureFetch(async () => new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': '57' },
+  }))
+  let res: Response
+  try {
+    res = await app.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'Rig/Qwen3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.equal(res.headers.get('content-encoding'), null)
+  assert.equal(res.headers.get('content-length'), null)
+  assert.equal(await res.text(), body)
+})
+
+test("a remote stream drops the usage chunk only this machine asked the host for", async () => {
+  // The peer injects `stream_options.include_usage` (the host then honours it as the caller's own), so the
+  // `choices: []` chunk has to come off on THIS side — the tee that filters a local stream never runs for a remote one.
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const f = captureFetch(async () => new Response(
+    'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+    'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n' +
+    'data: [DONE]\n\n',
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  ))
+  let res: Response
+  try {
+    res = await app.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'Rig/Qwen3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.deepEqual(JSON.parse(f.calls[0].body).stream_options, { include_usage: true })
+  assert.equal(await res.text(), 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n')
+})

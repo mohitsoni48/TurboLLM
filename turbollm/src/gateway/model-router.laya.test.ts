@@ -47,6 +47,7 @@ function stoppedPrimary() {
     load: async (opts: StartOpts) => { loads.push(opts); state = 'running' },
     target: () => 'http://laya-slot',
     touch: () => {},
+    currentOpts: () => null,
   } as unknown as Manager
   return { manager, loads }
 }
@@ -159,6 +160,7 @@ function gatedSlot(gate: Promise<void>, { failsToStart = false } = {}) {
     },
     target: () => 'http://laya-slot',
     touch: () => {},
+    currentOpts: () => null,
   } as unknown as Manager
   return { manager, stops: () => stops, loads: () => loads, startedEngines: () => startedEngines }
 }

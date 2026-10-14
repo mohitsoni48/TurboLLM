@@ -492,6 +492,9 @@ export interface StreamToAnthropicOptions {
    *  this generator was even constructed — e.g. right when the client's SSE connection opens,
    *  ahead of queueing for an engine slot. Emitting it again here would send message_start twice. */
   skipMessageStart?: boolean
+  /** Applied to an in-stream engine error's text before it reaches the client — gateway.ts hands
+   *  in redactLocalPaths, as it does for describeEngineError. */
+  redact?: (text: string) => string
 }
 
 export async function* streamToAnthropic(
@@ -500,7 +503,7 @@ export async function* streamToAnthropic(
   msgId: string,
   opts: StreamToAnthropicOptions = {},
 ): AsyncGenerator<SseEvent> {
-  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false } = opts
+  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false, redact = (t: string) => t } = opts
   let blockIdx = 0
   let inThinking = false
   let inText = false
@@ -579,6 +582,18 @@ export async function* streamToAnthropic(
           continue
         }
 
+        // An error the engine hit AFTER streaming began, sent in-stream before it closes:
+        // llama-server's `data: {"error":{...}}`, LiteRT-LM's `event: response.error` with
+        // `data: {"error":"…"}`. It has no `choices`, so it used to be skipped and the stream
+        // ended as a clean end_turn — a truncated answer the client took as complete.
+        if (chunk.error) {
+          failed = true
+          const e = chunk.error as { message?: unknown } | string
+          const message = typeof e === 'string' ? e : typeof e.message === 'string' ? e.message : 'Engine error.'
+          yield sse('error', { error: { type: 'api_error', message: redact(message) } })
+          break outer
+        }
+
         // Prompt-processing progress (return_progress): drives the live prefill % on
         // the engine card. Consumed here — never forwarded to the Anthropic client.
         const pp = chunk.prompt_progress as { processed?: number; total?: number } | undefined
@@ -609,9 +624,23 @@ export async function* streamToAnthropic(
         if (choice.finish_reason) stopReason = FINISH[choice.finish_reason] ?? 'end_turn'
         const delta: OAIDelta = choice.delta ?? {}
 
+        // At most one block is open at a time: whichever one is open is closed before another kind
+        // starts. Text after a tool call (between parallel calls, or trailing) and reasoning after
+        // text both happen; reusing the open block's index there made Claude Code's accumulator
+        // overwrite the tool_use and then throw "Content block not found" on the stray stop.
         // reasoning_content → thinking block
         if (delta.reasoning_content) {
           if (!inThinking) {
+            if (inText) {
+              yield cbStop(blockIdx)
+              inText = false
+              blockIdx++
+            }
+            if (activeToolIdx >= 0) {
+              yield cbStop(blockIdx)
+              activeToolIdx = -1
+              blockIdx++
+            }
             inThinking = true
             yield cbStart(blockIdx, { type: 'thinking', thinking: '' })
           }
@@ -624,6 +653,11 @@ export async function* streamToAnthropic(
           if (inThinking) {
             yield cbStop(blockIdx)
             inThinking = false
+            blockIdx++
+          }
+          if (activeToolIdx >= 0) {
+            yield cbStop(blockIdx)
+            activeToolIdx = -1
             blockIdx++
           }
           if (!inText) {

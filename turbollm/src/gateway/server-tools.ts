@@ -338,11 +338,13 @@ export function* serverToolSseEvents(
   })
 
   for (const [index, block] of blocks.entries()) {
-    yield ev('content_block_start', { index, content_block: block })
-    // A text block must also arrive as a delta: the SDK accumulates `text` from `text_delta`
-    // events and would otherwise assemble an EMPTY string for it, dropping the entire digest
-    // while the structured result block still arrived — search "working" but with no content.
+    // A text block must also arrive as a delta: Claude Code resets `text` on start and accumulates
+    // it from `text_delta` events, so it would otherwise assemble an EMPTY string, dropping the
+    // entire digest while the structured result block still arrived — search "working" but with no
+    // content. The start then carries an empty `text`, as the real API's always does: the official
+    // SDK keeps the start's text and appends each delta to it, so the digest arrived twice there.
     const b = block as { type?: string; text?: string }
+    yield ev('content_block_start', { index, content_block: b.type === 'text' ? { ...b, text: '' } : block })
     if (b.type === 'text' && b.text) {
       yield ev('content_block_delta', { index, delta: { type: 'text_delta', text: b.text } })
     }

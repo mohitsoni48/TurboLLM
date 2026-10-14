@@ -85,7 +85,29 @@ test('/v1/messages: budget 0 disables thinking entirely, overriding an enabled r
     })
   } finally { capture.restore() }
 
-  assert.equal(capture.calls[0].body?.thinking_budget_tokens, undefined, 'no thinking budget forwarded when the override is 0 (off)')
+  // Off is sent explicitly, like every other "off" in the daemon. No budget at all is how
+  // "unlimited" is spelled — this used to assert exactly that, and passed on the bug.
+  assert.equal(capture.calls[0].body?.thinking_budget_tokens, 0, 'a zero budget is forwarded when the override is 0 (off)')
+  assert.equal((capture.calls[0].body?.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking, false)
+})
+
+test('/v1/chat/completions: budget 0 disables thinking too, instead of removing the cap', async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-override-off-openai')
+  sessionAuth.setThinkingBudget('sess-override-off-openai', 0)
+
+  const capture = captureOutboundFetch()
+  try {
+    await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false, thinking_budget_tokens: 111 }),
+    })
+  } finally { capture.restore() }
+
+  assert.equal(capture.calls[0].body?.thinking_budget_tokens, 0)
+  assert.equal((capture.calls[0].body?.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking, false)
 })
 
 test('/v1/messages: no override set for the session — the request passes through unmodified', async () => {

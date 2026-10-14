@@ -23,6 +23,12 @@ export type RouteResult =
        *  upstream URL and to present the LINK token instead of the caller's credential.
        *  Absent = an ordinary local engine target, unchanged. */
       remote?: { linkId: string; baseUrl: string; token: string; modelKey: string }
+      /** The engine serving `target` when it is an extra pool slot, read from that slot's manager: a `.litertlm` model
+       *  there runs on LiteRT-LM whatever the primary runs. The gateway shapes the outbound request (model alias or path,
+       *  token-limit key) and labels the reply from these; absent (the primary, remote) it reads the primary, as before. */
+      engineKind?: string
+      modelPath?: string
+      modelName?: string
     }
   | {
       status: 503
@@ -338,7 +344,7 @@ export class ModelRouter {
       if (ss.state === 'running') {
         slot.lastUsedMs = Date.now()
         slot.manager.touch()
-        return { target: slot.manager.target()! }
+        return this.served(slot.manager, slot.manager.target()!)
       }
       this.extraSlots.delete(entry.key) // dead slot — clean up
     }
@@ -359,12 +365,12 @@ export class ModelRouter {
       if (slot && slot.manager.status().state === 'running') {
         slot.lastUsedMs = Date.now()
         slot.manager.touch()
-        return { target: slot.manager.target()! }
+        return this.served(slot.manager, slot.manager.target()!)
       }
     }
 
     if (this.comfy?.isBlocked()) {
-      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
+      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }
     }
 
     const engine = engineForModel(this.registry, entry)
@@ -463,7 +469,14 @@ export class ModelRouter {
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
     // refuses it, so recording it would leave the machine with no model at all after a restart.
     if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
-    return { target }
+    return targetManager === this.manager ? { target } : this.served(targetManager, target)
+  }
+
+  /** A route to a pool slot, described from that slot's own manager (see RouteResult). The primary's routes carry
+   *  none of this: the gateway's fallback already reads the primary. */
+  private served(manager: Manager, target: string): RouteResult {
+    const opts = manager.currentOpts()
+    return opts ? { target, engineKind: opts.engine.kind, modelPath: opts.modelPath, modelName: opts.model.name } : { target }
   }
 
   /** A slot counts as occupied while 'stopping' too, not just 'running'/'starting' —

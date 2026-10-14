@@ -327,3 +327,92 @@ test('describeEngineError: the redactor is applied to both the structured and th
   const raw = new Response('panic at /secret/model.gguf', { status: 500 })
   assert.equal((await describeEngineError(raw, redact)).message, 'panic at <model>')
 })
+
+// ── Hop-by-hop request headers: the local pass-through copied the caller's whole header set to
+// the engine fetch, and undici refuses `expect`, `transfer-encoding`, `keep-alive` and `upgrade` before
+// any I/O — curl's automatic `Expect: 100-continue` on a >1 MB vision body, or any chunked upload, was a
+// 500 engine_unreachable. A real engine socket, since only the real undici fetch refuses them.
+
+for (const [name, value] of [['expect', '100-continue'], ['transfer-encoding', 'chunked'], ['keep-alive', 'timeout=5'], ['upgrade', 'h2c']]) {
+  test(`POST /v1/chat/completions with a client \`${name}\` header still reaches the engine`, async () => {
+    let engineSaw: string | undefined = 'unset'
+    const engine = await withFakeEngine((req, res) => {
+      engineSaw = req.headers[name] as string | undefined
+      req.resume()
+      req.on('end', () => {
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }] }))
+      })
+    })
+    try {
+      const app = new Hono()
+      registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+      const res = await app.request('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [name]: value },
+        body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false }),
+      })
+      assert.equal(res.status, 200, await res.clone().text())
+      assert.equal(((await res.json()) as { choices: Array<{ message: { content: string } }> }).choices[0].message.content, 'hi')
+      if (name !== 'transfer-encoding') assert.equal(engineSaw, undefined, `the caller's \`${name}\` is not forwarded`)
+    } finally {
+      await engine.close()
+    }
+  })
+}
+
+test('POST /v1/chat/completions does not hand TurboLLM\'s own credentials to the engine port', async () => {
+  const engineSaw: Record<string, string | undefined> = {}
+  const engine = await withFakeEngine((req, res) => {
+    for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'x-custom']) engineSaw[h] = req.headers[h] as string | undefined
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }] }))
+    })
+  })
+  try {
+    const app = new Hono()
+    registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json', cookie: 'turbollm_app=s3cret', 'x-turbollm-auth': 'tllm_key',
+        'x-turbollm-app': 's3cret', 'x-custom': 'kept',
+      },
+      body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false }),
+    })
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.deepEqual(engineSaw, { cookie: undefined, 'x-turbollm-auth': undefined, 'x-turbollm-app': undefined, 'x-custom': 'kept' })
+  } finally {
+    await engine.close()
+  }
+})
+
+// ── Route failures: every one is a 503, and Claude Code retries any 5xx up to 10 times unless told not to —
+// re-running a model load that fails (evicting whatever was loaded) on every attempt. Only a refusal that clears by
+// itself (ComfyUI's queue) is left retryable. The status codes are unchanged.
+
+for (const [label, result, retry] of [
+  ['a failed model load', { status: 503, message: 'Engine start failed: out of memory' }, 'false'],
+  ['ComfyUI holding the GPU', { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }, null],
+] as const) {
+  for (const [path, body] of [
+    ['/v1/messages', { model: 'big', max_tokens: 100, messages: [] }],
+    ['/v1/chat/completions', { model: 'big', messages: [] }],
+  ] as const) {
+    test(`${path}: ${label} → 503 with x-should-retry ${retry ?? 'unset'}`, async () => {
+      const app = new Hono()
+      const deps = fakeDeps() as unknown as { modelRouter: { route: () => Promise<unknown> } }
+      deps.modelRouter.route = async () => result
+      registerGateway(app, deps as unknown as Deps)
+      const res = await app.request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      assert.equal(res.status, 503)
+      assert.equal(res.headers.get('x-should-retry'), retry)
+    })
+  }
+}

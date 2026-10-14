@@ -550,6 +550,7 @@ function slotManager(state: Status['state'], modelKey: string, target: string): 
     status: (): Status => ({ state, err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
     target: () => target,
     touch: () => {},
+    currentOpts: () => null,
   } as unknown as Manager
 }
 
@@ -637,6 +638,19 @@ test('routeTo: the entry running in a pool slot gets that slot target', async ()
   const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [slot] })
 
   assert.deepEqual(await r.routeTo(BETA), { target: BETA_SLOT_TARGET })
+})
+
+test('route: a pool slot is described by its OWN engine, so the gateway does not shape the request for the primary', async () => {
+  const manager = {
+    ...slotManager('running', 'beta-key', BETA_SLOT_TARGET),
+    currentOpts: () => ({ engine: { kind: 'litert-lm' }, modelPath: '/models/beta.litertlm', model: { name: 'Beta' } }),
+  } as unknown as Manager
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [{ manager, modelKey: 'beta-key', lastUsedMs: 0 }] })
+
+  assert.deepEqual(await r.route('Beta'), {
+    target: BETA_SLOT_TARGET, engineKind: 'litert-lm', modelPath: '/models/beta.litertlm', modelName: 'Beta',
+  })
+  assert.deepEqual(await r.route('Alpha Model'), { target: PRIMARY_TARGET }, 'the primary is left to the gateway, as before')
 })
 
 test('routeTo: an entry that is not alive is loaded once when auto-swap is on', async () => {
