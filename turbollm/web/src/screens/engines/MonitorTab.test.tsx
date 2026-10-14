@@ -61,14 +61,13 @@ vi.mock('../../lib/api', async (importOriginal) => {
   }
 })
 
-// jsdom has no EventSource. Neither `useEngineLog` nor `useRequestLog` need more than the
-// constructor + addEventListener/close/onerror — nothing here fires a real frame.
-class FakeEventSource {
-  onerror: (() => void) | null = null
-  addEventListener() {}
-  close() {}
-}
-vi.stubGlobal('EventSource', FakeEventSource)
+// `useEngineLog` / `useRequestLog` tail their streams through `subscribeSse` (an authenticated
+// fetch, retried every 3 s). Stub it so nothing here opens a real request — nothing here needs
+// a live frame.
+vi.mock('../../lib/sse', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/sse')>()),
+  subscribeSse: () => () => {},
+}))
 
 function engine(over: Partial<Engine> = {}): Engine {
   return {

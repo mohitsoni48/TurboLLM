@@ -549,7 +549,7 @@ export function getEngineLogs(tail = 200): Promise<EngineLogs> {
   return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}`)
 }
 
-/** URL for the SSE live log tail (consumed via EventSource). */
+/** URL for the SSE live log tail (consumed via sse.ts's subscribeSse — not EventSource, which can't send the key). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
@@ -582,7 +582,7 @@ export function clearRequests(): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/requests', { method: 'DELETE' })
 }
 
-/** URL for the SSE live entry stream (consumed via EventSource), same convention as
+/** URL for the SSE live entry stream (consumed via sse.ts's subscribeSse), same convention as
  *  {@link engineLogStreamUrl}. */
 export const requestsStreamUrl = '/api/v1/requests/stream'
 
@@ -1204,28 +1204,39 @@ export async function getDebugSnapshot(convId: string): Promise<string> {
 
 // ── F-024: export / import chat ───────────────────────────────────────────────
 
-/** Trigger a browser download of the chat as a .turbollm-chat.json file. */
-export function downloadChatExport(convId: string): void {
-  // Build a hidden anchor with auth header isn't possible; use a form or direct href.
-  // Since the auth token may be needed, fetch the blob and trigger download via object URL.
-  const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders() }
-  fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, { headers })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`Export failed with status ${res.status}`)
-      const cd = res.headers.get('Content-Disposition') ?? ''
-      const nameMatch = cd.match(/filename="([^"]+)"/)
-      const filename = nameMatch ? nameMatch[1] : 'chat.turbollm-chat.json'
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-    })
-    .catch(() => { /* silently ignore — caller shows error via toast */ })
+/** Fetch `path` with the API key and save the response as a browser download (Blob + a temporary
+ *  `<a download>`, named from the daemon's Content-Disposition). A plain `<a href>` can't send
+ *  X-TurboLLM-Auth, so over LAN/remote access it would save the daemon's 401 JSON instead of the
+ *  file. Rejects with an `ApiError` on a non-OK response, so the caller can toast it. */
+async function downloadWithAuth(path: string, fallbackName: string): Promise<void> {
+  const res = await fetch(path, { headers: { Accept: 'application/json', ...authHeaders() } })
+  if (!res.ok) {
+    const env = safeJson(await res.text().catch(() => '')) as { error?: { code?: string; message?: string } } | undefined
+    throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Download failed with status ${res.status}.`, res.status)
+  }
+  const cd = res.headers.get('Content-Disposition') ?? ''
+  const nameMatch = cd.match(/filename="([^"]+)"/)
+  const filename = nameMatch ? nameMatch[1] : fallbackName
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** Trigger a browser download of the chat as a .turbollm-chat.json file. Rejects when the export
+ *  fails (401 on LAN without a key, deleted chat, network error) so the caller can tell the user. */
+export function downloadChatExport(convId: string): Promise<void> {
+  return downloadWithAuth(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, 'chat.turbollm-chat.json')
+}
+
+/** Download the last auto-tune run's log (GET /api/v1/bench/log). Rejects like {@link downloadChatExport}. */
+export function downloadBenchLog(): Promise<void> {
+  return downloadWithAuth('/api/v1/bench/log', 'autotune-log.json')
 }
 
 /** Import a chat from a parsed JSON object. Returns the new conversation id. */

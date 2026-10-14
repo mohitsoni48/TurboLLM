@@ -1,5 +1,6 @@
 import type { Conversation, Folder, Message, ChatSseEvent, MemoryFact } from './chat-types'
 import { ApiError, authHeaders } from './api'
+import { readSseStream } from './sse'
 import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -162,32 +163,16 @@ export async function* sendMessage(
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
 
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
+  yield* chatSseEvents(res.body)
+}
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      let event = ''
-      for (const line of lines) {
-        if (line.startsWith('event: '))      { event = line.slice(7).trim() }
-        else if (line.startsWith('data: ')) {
-          const raw = line.slice(6).trim()
-          try {
-            const data = JSON.parse(raw)
-            if (event) yield { event, data } as ChatSseEvent
-          } catch { /* skip malformed */ }
-          event = ''
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock()
+/** Typed chat events off a turn's SSE body — unnamed or malformed (non-JSON) messages skipped. */
+async function* chatSseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ChatSseEvent> {
+  for await (const msg of readSseStream(body)) {
+    if (!msg.event) continue
+    let data: unknown
+    try { data = JSON.parse(msg.data) } catch { continue /* skip malformed */ }
+    yield { event: msg.event, data } as ChatSseEvent
   }
 }
 
@@ -214,25 +199,5 @@ export async function* continueConversation(
     const env = (() => { try { return JSON.parse(text) } catch { return undefined } })() as { error?: { code?: string; message?: string } } | undefined
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      let event = ''
-      for (const line of lines) {
-        if (line.startsWith('event: ')) { event = line.slice(7).trim() }
-        else if (line.startsWith('data: ')) {
-          const raw = line.slice(6).trim()
-          try { const data = JSON.parse(raw); if (event) yield { event, data } as ChatSseEvent } catch { /* skip */ }
-          event = ''
-        }
-      }
-    }
-  } finally { reader.releaseLock() }
+  yield* chatSseEvents(res.body)
 }

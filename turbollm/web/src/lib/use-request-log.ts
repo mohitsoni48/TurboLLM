@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { getRequests, requestsStreamUrl } from './api'
+import { subscribeSse } from './sse'
 import type { RequestLogEntry } from './types'
 
 const MAX_ENTRIES = 500
@@ -37,10 +38,12 @@ export function useRequestLog(active: boolean) {
         /* daemon may be down — leave panel empty rather than crash */
       })
 
-    const es = new EventSource(requestsStreamUrl)
-    es.addEventListener('entry', (ev) => {
+    // Not an EventSource: it can't send the API key, so the tail would 401 over LAN/remote access.
+    // subscribeSse reconnects the same way when the stream drops.
+    const close = subscribeSse(requestsStreamUrl, (msg) => {
+      if (msg.event !== 'entry') return
       try {
-        const entry = JSON.parse((ev as MessageEvent).data) as RequestLogEntry
+        const entry = JSON.parse(msg.data) as RequestLogEntry
         setEntries((prev) => {
           const idx = prev.findIndex((e) => e.id === entry.id)
           const next = idx === -1 ? [...prev, entry] : prev.map((e, i) => (i === idx ? entry : e))
@@ -50,13 +53,10 @@ export function useRequestLog(active: boolean) {
         /* ignore malformed frames */
       }
     })
-    es.onerror = () => {
-      /* connection drops silently; the browser's EventSource reconnects on its own */
-    }
 
     return () => {
       cancelled = true
-      es.close()
+      close()
     }
   }, [active])
 

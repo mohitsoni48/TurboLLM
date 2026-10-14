@@ -1,6 +1,6 @@
 ﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
-import { ApiError, track } from '../../lib/api'
+import { ApiError, downloadBenchLog, track } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
@@ -471,10 +471,9 @@ export function ModelDetailDialog({
         // (cancel included), clobbering unsaved local edits before the user had even decided
         // Save vs. Cancel — that effect is deleted; a real save is the only thing that should
         // ever trigger a refetch, and the existing hook-level invalidation already does that.
+        // Fetched with the API key, not a plain <a href> — that would save a 401 over LAN/remote.
         if (downloadLog) {
-          const a = document.createElement('a')
-          a.href = '/api/v1/bench/log'
-          a.click()
+          downloadBenchLog().catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not download the run log.'))
         }
       },
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save tuned settings.'),

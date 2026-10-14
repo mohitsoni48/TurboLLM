@@ -86,8 +86,9 @@ export interface CodeSessionClientHandlers {
 export type CodeStreamFn = (sessionId: string, fromSeq: number, signal: AbortSignal) => AsyncGenerator<CodeStreamEvent>
 
 /** One reconnectable GET /stream subscription for a single Code session. Create one per session;
- *  discard (after abort()) and make a fresh one on session change — that's what resets the seq
- *  cursor and active-assistant id, so there's no explicit reset method. */
+ *  discard (after abort()) and make a fresh one on session change — that's what resets the
+ *  active-assistant id (the seq cursor also resets whenever the session goes idle), so there's
+ *  no explicit reset method. */
 export class CodeSessionClient {
   private static readonly RECONNECT_MAX = 6
 
@@ -191,6 +192,10 @@ export class CodeSessionClient {
           }
         }
         // Generator completed = the daemon says this session is idle. Stop and reconcile with DB.
+        // The cursor only has to survive reconnects WITHIN a run; the next turn starts from 0
+        // like a fresh client (the daemon floors replay at that turn's meta), so a daemon that
+        // restarted meanwhile and renumbers from 0 still replays the whole next turn.
+        this.lastSeq = 0
         this.active = false
         this.emitLive(null)
         this.handlers.onIdle()

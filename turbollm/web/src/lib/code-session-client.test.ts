@@ -149,6 +149,29 @@ describe('CodeSessionClient', () => {
     expect(handlers.onTurnDone).toHaveBeenCalledTimes(1)
   })
 
+  it('starts the next turn from seq 0 once the stream ends idle (a restarted daemon renumbers from 0)', async () => {
+    const { handlers, liveStates } = makeHandlers()
+    const seenFromSeq: number[] = []
+    let stream = 0
+    const fn: CodeStreamFn = async function* (_sid, fromSeq) {
+      seenFromSeq.push(fromSeq)
+      // Turn 1 runs up to seq 41. Turn 2 comes from a restarted daemon whose seqs begin at 0, and
+      // which (like subscribeToBuffer) replays only seq >= fromSeq.
+      const frames = stream++ === 0
+        ? [{ event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 40 }, { event: 'done', data: { contextUsed: 1, contextMax: 2, aborted: false }, seq: 41 }]
+        : [{ event: 'meta', data: { userMessageId: 'u2', assistantMessageId: 'a2' }, seq: 0 }, { event: 'delta', data: { delta: 'backlog' }, seq: 1 }]
+      for (const f of frames as CodeStreamEvent[]) if (f.seq! >= fromSeq) yield f
+    }
+    const client = new CodeSessionClient('s1', handlers, fn)
+    client.connect()
+    await flush()
+    expect(handlers.onIdle).toHaveBeenCalledTimes(1)
+    client.connect()
+    await flush()
+    expect(seenFromSeq).toEqual([0, 0])
+    expect(liveStates.some((s) => s?.assistantId === 'a2' && s.content === 'backlog')).toBe(true)
+  })
+
   it('reports a silent lost-connection for a 404 (run is gone)', async () => {
     vi.useFakeTimers()
     const { handlers } = makeHandlers()
