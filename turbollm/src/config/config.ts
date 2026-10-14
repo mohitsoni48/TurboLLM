@@ -1568,21 +1568,36 @@ export function resolveConfiguredCtx(cfg: Config, modelKey: string, engineId: st
   return typeof profile?.ctx === 'number' && profile.ctx > 0 ? profile.ctx : undefined
 }
 
+/** `map[key]` for an OWN entry only. The per-model config maps (`modelProfiles`, `modelPresets`,
+ *  `lastPresetId`, a model's per-engine slots) are plain objects indexed by request input — a
+ *  path's model key, `?engine=` — and a key like `constructor` or `__proto__` would otherwise
+ *  resolve to the Object constructor or Object.prototype, so a later write or `delete` through it
+ *  changes those for the whole process (one request could delete `Object.entries`). */
+export function ownEntry<T>(map: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return map !== undefined && Object.hasOwn(map, key) ? map[key] : undefined
+}
+
+/** Keys no per-model config map may be written under: assigning `__proto__` swaps the map's
+ *  prototype instead of adding an entry, and the other two only ever name built-ins. */
+export function isUnsafeMapKey(key: string): boolean {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype'
+}
+
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model
   // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —
   // auto-tune seeds its search from this function and needs "this engine's own" profile.
   // A pin pointing at a deleted preset, or at a preset for another engine, falls straight
-  // through to the logic below. `?? {}` guards hand-built Configs that skip normalize().
-  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+  // through to the logic below. `ownEntry` also guards hand-built Configs that skip normalize().
+  const pinnedId = ownEntry(cfg.lastPresetId, modelKey)
   if (pinnedId) {
-    const pinned = (cfg.modelPresets ?? {})[modelKey]?.find((p) => p.id === pinnedId)
+    const pinned = ownEntry(cfg.modelPresets, modelKey)?.find((p) => p.id === pinnedId)
     if (pinned && (pinned.engineId === '' || pinned.engineId === engineId)) return pinned.profile
   }
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return undefined
-  const exact = byEngine[engineId]
+  const exact = ownEntry(byEngine, engineId)
   if (exact) return exact.profile
   // `>=` (not `>`): object key insertion order matches save order, so on an exact
   // millisecond tie (two rapid-fire saves) the later-inserted entry — the truly more
@@ -1599,7 +1614,8 @@ export function getModelProfile(cfg: Config, modelKey: string, engineId: string)
  *  engines. Creates the per-model map if absent; never touches other engines' profiles
  *  for the same model. */
 export function setModelProfile(cfg: Config, modelKey: string, engineId: string, profile: unknown): void {
-  ;(cfg.modelProfiles[modelKey] ??= {})[engineId] = { profile, updatedAt: new Date().toISOString() }
+  if (isUnsafeMapKey(modelKey) || isUnsafeMapKey(engineId)) throw new ValueError('modelProfiles', 'invalid model key or engine id.')
+  ;(ownEntry(cfg.modelProfiles, modelKey) ?? (cfg.modelProfiles[modelKey] = {}))[engineId] = { profile, updatedAt: new Date().toISOString() }
 }
 
 /** Move every piece of state keyed on `oldKey` to `newKey` — profiles, presets, the preset pin,
@@ -1649,7 +1665,7 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
  *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
 export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return
   delete byEngine[engineId]
   if (Object.keys(byEngine).length === 0) delete cfg.modelProfiles[modelKey]

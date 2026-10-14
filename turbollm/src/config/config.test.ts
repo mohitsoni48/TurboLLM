@@ -225,6 +225,29 @@ test('deleteModelProfile removes only the target slot, pruning the model when em
   assert.doesNotThrow(() => deleteModelProfile(cfg, 'gone|q4|1', 'aaaa'))
 })
 
+test('profile helpers never reach Object or Object.prototype through a key like constructor or __proto__', () => {
+  // A probe stands in for a built-in such as Object.entries, which
+  // `delete cfg.modelProfiles["constructor"][engine]` used to remove process-wide.
+  const probe = '__tllmProfileProbe'
+  const objects = [Object, Object.prototype] as unknown as Array<Record<string, unknown>>
+  for (const o of objects) Object.defineProperty(o, probe, { value: 1, configurable: true, writable: true })
+  try {
+    const cfg = defaultConfig()
+    deleteModelProfile(cfg, 'constructor', probe)
+    deleteModelProfile(cfg, '__proto__', probe)
+    for (const o of objects) assert.equal(o[probe], 1)
+    assert.equal(getModelProfile(cfg, 'constructor', probe), undefined)
+    assert.throws(() => setModelProfile(cfg, '__proto__', 'aaaa', flatProfile()))
+    assert.throws(() => setModelProfile(cfg, 'm|q4|1', '__proto__', flatProfile()))
+    // An inherited name that is not reserved becomes an ordinary own entry.
+    setModelProfile(cfg, 'toString', 'aaaa', flatProfile({ ctx: 1024 }))
+    assert.equal(Object.hasOwn(cfg.modelProfiles, 'toString'), true)
+    assert.equal((getModelProfile(cfg, 'toString', 'aaaa') as { ctx: number }).ctx, 1024)
+  } finally {
+    for (const o of objects) delete o[probe]
+  }
+})
+
 test('bug #35 scenario: two engines for one model keep independent profiles; unknown falls back to the last-used one', () => {
   // Start from a migrated model: a single legacy profile lives under '*'.
   const cfg = defaultConfig()

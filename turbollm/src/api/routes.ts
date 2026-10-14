@@ -8,12 +8,12 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage, type Registry } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
@@ -175,7 +175,11 @@ export function registerApi(app: Hono, d: Deps): void {
       // a lingering done/error snapshot the detail dialog reads to show the result.
       bench: d.bench.status(),
       downloads: { active: d.downloads.activeCount() },
-      engineProvision: d.provision.get(),
+      // `cancellable`: whether POST /engines/backends/cancel can stop this run — only the
+      // downloads that register `provisionAbort` (declared with the backend routes below). The
+      // first-run seed, auto-updates and the uv/pip runtime installs (MLX*, vLLM, SGLang, Laya)
+      // take no signal, so the banner hides its Cancel for them instead of offering a no-op.
+      engineProvision: { ...d.provision.get(), cancellable: provisionAbort !== null },
       // Background agent tasks (reviewer + skill distill): running + recently-finished,
       // so the UI can show them inline in the conversation + a side panel on click.
       agentTasks: d.agentTasks?.list() ?? [],
@@ -1908,13 +1912,14 @@ export function registerApi(app: Hono, d: Deps): void {
       // TRUNCATES the log file (a restart rewrites the same path from empty) and `logPath()`
       // itself changes on an engine switch — either way the file can shrink below `bytePos`,
       // and unless the cursor is fixed the loop stalls forever: no error, no new lines, until
-      // the new file eventually regrows past the old length. Detecting "this is effectively a
-      // new log" (different path, OR the same path now shorter than what's already been read)
-      // and reseeding `bytePos` to the file's CURRENT size — rather than 0 — also covers a
-      // brand-new connection's first tick: it starts from "now" instead of replaying the whole
-      // history, which would otherwise race the client's own initial-tail GET (whichever
-      // arrived first, the result was either duplicated or truncated lines). Same semantics as
-      // before this rewrite (ADR-409's review, PR #216) — only the READ shape changed.
+      // the new file eventually regrows past the old length. So "this is effectively a new log"
+      // (different path, OR the same path now shorter than what's already been read) restarts the
+      // cursor at 0 — the new run's opening lines (build, GPU detection, GGUF metadata) are exactly
+      // what the user needs, and the client never refetches the tail on a restart. Only a
+      // brand-new connection's FIRST look starts at the file's CURRENT size: it starts from "now"
+      // instead of replaying the whole history, which would otherwise race the client's own
+      // initial-tail GET (whichever arrived first, the result was either duplicated or truncated
+      // lines). ADR-409's review, PR #216.
       //
       // Perf follow-up (docs/TODO.md, "Verification & chores", ADR-409 review item 2): the
       // previous version did `readFileSync(path).split('\n')` — the WHOLE file, synchronously,
@@ -1929,6 +1934,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // technique `drainOpenAiSseForLog` uses for the exact same reason.
       let bytePos = 0
       let lastPath = ''
+      let firstLook = true // this connection has not polled the log yet
       let carry = '' // a line seen but not yet newline-terminated, held for the next tick
       const dec = new TextDecoder()
       let aborted = false
@@ -1941,7 +1947,7 @@ export function registerApi(app: Hono, d: Deps): void {
         if (path && existsSync(path)) {
           const size = statSync(path).size
           if (path !== lastPath || size < bytePos) {
-            bytePos = size
+            bytePos = firstLook ? size : 0
             lastPath = path
             carry = ''
             dec.decode() // flush/reset any pending partial-char state from the OLD file
@@ -1964,6 +1970,8 @@ export function registerApi(app: Hono, d: Deps): void {
             }
           }
         }
+        // Set whether or not a log existed yet: one that appears later is a new run's, read from 0.
+        firstLook = false
         if (++ticks % 37 === 0) await stream.writeSSE({ data: '', event: 'ping' })
         await stream.sleep(400)
       }
@@ -2081,7 +2089,11 @@ export function registerApi(app: Hono, d: Deps): void {
   app.get('/api/v1/models', (c) => {
     const { models, scanning, lastScanAt } = d.scanner.list()
     const lastTps = d.db.lastGenTpsByModel()
-    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps)), scanning, lastScanAt })
+    // One config snapshot (and one lookup per registry engine) for the whole list, not per row:
+    // each is a structuredClone of the full config, which itself grows with the library
+    // (profiles, presets, bench results are per model), and the UI polls this every few seconds.
+    const shared = overlayShared(d)
+    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps, shared)), scanning, lastScanAt })
   })
 
   app.post('/api/v1/models/rescan', (c) => {
@@ -2091,8 +2103,10 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Delete a model's file(s) from disk (spec 05). Split GGUFs delete all shards.
   // Blocked while the model is the one currently loaded in the running engine.
+  // `c.req.param()` is already percent-decoded (see custom-sources/:key) — decoding again broke
+  // every key containing '%' (a URIError 500, or a different key: '%41' → 'A').
   app.delete('/api/v1/models/:key', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     // Any slot, not just the primary: a Laya model always runs in its own (ADR-443).
@@ -2109,7 +2123,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/models/:key', (c) => {
-    const e = d.scanner.get(decodeURIComponent(c.req.param('key')))
+    const e = d.scanner.get(c.req.param('key'))
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const sys = getSysInfo()
     const snap = d.store.snapshot()
@@ -2124,7 +2138,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.put('/api/v1/models/:key/profile', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const p = await body<LoadProfile>(c)
@@ -2136,6 +2150,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // Per-engine profile (issue #35): save into the slot for the engine the client is
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
+    if (isUnsafeMapKey(engineId)) return err(c, 400, 'invalid_profile_value', 'Invalid engine id.')
     d.store.update((cfg) => {
       setModelProfile(cfg, key, engineId, p)
       // An explicit manual save that CHANGES something supersedes the pin: PUT writes
@@ -2146,9 +2161,9 @@ export function registerApi(app: Hono, d: Deps): void {
       //    unpinning there silently broke "your pick is remembered and auto-applied next load".
       //  - The pin is per-MODEL, this save is per-ENGINE. Clearing a pin belonging to a DIFFERENT
       //    engine drops that engine's tune for an edit unrelated to it (issue #35's contract).
-      const pinnedId = cfg.lastPresetId[key]
+      const pinnedId = ownEntry(cfg.lastPresetId, key)
       if (pinnedId) {
-        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         const thisEngine = !pinned || pinned.engineId === '' || pinned.engineId === engineId
         if (thisEngine && !(pinned && profilesEqual(pinned.profile, p))) delete cfg.lastPresetId[key]
       }
@@ -2157,7 +2172,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/models/:key/profile/reset', (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
+    // Same model-existence guard as PUT above. Without it the raw key reached the config maps:
+    // `constructor`/`__proto__` resolved to Object/Object.prototype, and the delete below removed
+    // a built-in (`?engine=entries` → Object.entries) for the whole process.
+    if (!d.scanner.get(key)) return err(c, 404, 'no_such_model', 'No model with that key.')
     // Per-engine profile (issue #35): reset only the edited engine's slot (?engine=<id>),
     // falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
@@ -2166,9 +2185,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // A reset must not leave a stale pin shadowing the result — but only for the engine being
       // reset. The pin is per-MODEL and this reset is per-ENGINE, so clearing a pin that belongs
       // to a different engine would drop that engine's tune for an unrelated action (issue #35).
-      const pinnedId = cfg.lastPresetId[key]
+      const pinnedId = ownEntry(cfg.lastPresetId, key)
       if (pinnedId) {
-        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         if (!pinned || pinned.engineId === '' || pinned.engineId === engineId) delete cfg.lastPresetId[key]
       }
     })
@@ -2978,6 +2997,26 @@ export function registerApi(app: Hono, d: Deps): void {
   registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
 }
 
+/** What {@link overlayModel} reads from the config and the registry, taken once per request by
+ *  the list endpoint (every registry lookup is a config snapshot too). The registry lookups are
+ *  lazy and memoized: most rows only need `active`. */
+type OverlayShared = { snap: Config; registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'> }
+
+function overlayShared(d: Deps): OverlayShared {
+  const once = <T>(f: () => T): (() => T) => {
+    let v: { r: T } | undefined
+    return () => (v ??= { r: f() }).r
+  }
+  return {
+    snap: d.store.snapshot(),
+    registry: {
+      active: once(() => d.registry.active()),
+      layaEngine: once(() => d.registry.layaEngine()),
+      litertLmEngine: once(() => d.registry.litertLmEngine()),
+    },
+  }
+}
+
 /** Overlay the live-dynamic flags (loaded, hasProfile) and tiered t/s (lastTps,
  *  liveTps) onto a scanned entry (spec 04 §5). `lastTps` is the most-recent gen
  *  t/s recorded for this model; pass the precomputed map on the list endpoint to
@@ -2985,10 +3024,12 @@ export function registerApi(app: Hono, d: Deps): void {
  *  session-stats accumulator yet (that's a separate B4 task), so we surface the
  *  loaded model's last recorded gen t/s as its live figure — non-null only while
  *  that model is the one currently loaded. */
-function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) {
+function overlayModel(
+  e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>,
+  { snap, registry }: OverlayShared = { snap: d.store.snapshot(), registry: d.registry },
+) {
   const ms = d.manager.status()
   const loadedKey = ms.state === 'running' ? ms.model?.key : undefined
-  const snap = d.store.snapshot()
   const profiles = snap.modelProfiles
   const loadedInPrimary = loadedKey === e.path || loadedKey === e.key
   // F-033: a model loaded via gateway auto-swap (keepN > 1) lives in a separate Manager
@@ -3008,7 +3049,7 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
   // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
   // A Laya model is checked against the Laya engine it loads on, not the active one (engineForModel).
-  const engine = engineForModel(d.registry, e)
+  const engine = engineForModel(registry, e)
   const inc = engine ? modelIncompatibility(engine.kind, e) : null
   const compatibleWithActiveEngine = !inc
   const incompatibleReason = inc?.label ?? null

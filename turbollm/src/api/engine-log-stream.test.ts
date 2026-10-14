@@ -108,9 +108,12 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     await new Promise((r) => setTimeout(r, 600)) // let the reset-detection tick run
     writeFileSync(logB, 'restarted\nsecond\n')
 
+    // The new run's log is read from its start: its first line — written before the tick that
+    // noticed the restart — must arrive too (it used to be skipped by reseeding at the new end).
     const frame = await events.next()
     assert.equal(frame.event, 'line')
-    assert.deepEqual(JSON.parse(frame.data), { line: 'second' }, 'must recover and keep streaming instead of stalling past the shrink')
+    assert.deepEqual(JSON.parse(frame.data), { line: 'restarted' }, 'the new run\'s first line must not be dropped')
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'second' }, 'must recover and keep streaming instead of stalling past the shrink')
   })
 
   await t.test('an engine SWITCH (logPath() changes to a different, shorter file) does not stall the stream forever', async () => {
@@ -130,9 +133,24 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     await new Promise((r) => setTimeout(r, 600)) // let the path-change detection tick run
     writeFileSync(logC2, 'engine two, line 1\nengine two, line 2\n')
 
+    // Engine two's log is streamed from its start, not from wherever it was when the switch was seen.
     const frame = await events.next()
     assert.equal(frame.event, 'line')
-    assert.deepEqual(JSON.parse(frame.data), { line: 'engine two, line 2' })
+    assert.deepEqual(JSON.parse(frame.data), { line: 'engine two, line 1' })
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'engine two, line 2' })
+  })
+
+  await t.test('a log that first appears after the connection opened is streamed from its first line', async () => {
+    const logE = join(dir, 'e.log')
+    const app = fakeApp(() => logE)
+
+    const res = await app.request('/api/v1/engine/logs/stream')
+    const events = sseEventReader(res.body!)
+    await new Promise((r) => setTimeout(r, 600)) // a tick with no log file at all (no engine run yet)
+    writeFileSync(logE, 'first run, line 1\nfirst run, line 2\n')
+
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'first run, line 1' })
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'first run, line 2' })
   })
 
   // Perf follow-up coverage (docs/TODO.md, ADR-409 review item 2): the delta-read rewrite

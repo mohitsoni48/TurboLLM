@@ -71,6 +71,9 @@ export type EngineProvision = {
   part?: number // 1-based current archive (multi-asset backends like CUDA)
   parts?: number // total archives for this backend
   error: string | null
+  /** False when POST /engines/backends/cancel can't stop this run (first-run seed, auto-update,
+   *  uv/pip runtime installs). Absent from daemons that predate it. */
+  cancellable?: boolean
 }
 
 /** In-app compile-from-source status (ADR-100), from GET /api/v1/status. A build streams

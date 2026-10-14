@@ -73,15 +73,19 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
         <Download size={14} className="text-accent" />
         <span className="flex-1">{label}</span>
         {pct != null && <span className="tabular-nums text-muted">{pct}%</span>}
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-6 px-2 text-[12px]"
-          onClick={() => { track('engines', 'cancel_engine_provision'); cancel.mutate() }}
-          disabled={cancel.isPending}
-        >
-          <X size={13} /> Cancel
-        </Button>
+        {/* Only where the daemon can actually stop the run: for the rest (seed, uv/pip installs)
+            the cancel endpoint answers {ok:false} and the button silently did nothing. */}
+        {p.cancellable !== false && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[12px]"
+            onClick={() => { track('engines', 'cancel_engine_provision'); cancel.mutate() }}
+            disabled={cancel.isPending}
+          >
+            <X size={13} /> Cancel
+          </Button>
+        )}
       </div>
       <div
         className="mt-1.5 h-1 w-full overflow-hidden rounded-full"

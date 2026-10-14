@@ -103,6 +103,41 @@ test('with no active engine every model is compatible, with no reason', async ()
   ])
 })
 
+test('GET /models takes the config snapshot and registry lookups once per request, not once per model', async () => {
+  // Each snapshot (and each registry lookup, which takes one) is a structuredClone of the whole
+  // config; per row, a large library spent hundreds of ms of event loop on every poll.
+  const count = async (n: number) => {
+    const calls = { snapshot: 0, active: 0, laya: 0, litert: 0 }
+    const cfg = { modelProfiles: {}, benchResults: {}, modelDirs: [] }
+    const models = Array.from({ length: n }, (_, i) =>
+      entry({ key: `m${i}|Q4_K_M|1`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
+    const d = {
+      version: 'test',
+      store: { snapshot: () => (calls.snapshot++, cfg), dir: () => '/tmp/unused' },
+      scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
+      manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }) },
+      modelRouter: { loadedModelKeys: () => new Set<string>() },
+      db: { lastGenTpsByModel: () => new Map<string, number>() },
+      registry: {
+        active: () => (calls.active++, { id: 'eng-1', name: 'llama', kind: 'llama-server', binPath: 'engine' }),
+        layaEngine: () => (calls.laya++, undefined),
+        litertLmEngine: () => (calls.litert++, undefined),
+      },
+      downloads: { provenance: () => [] },
+    } as unknown as Deps
+    const app = new Hono()
+    registerApi(app, d)
+    const res = await app.request('/api/v1/models')
+    assert.equal(res.status, 200)
+    assert.equal(((await res.json()) as { models: unknown[] }).models.length, n)
+    return calls
+  }
+  const one = await count(3)
+  const many = await count(30)
+  assert.deepEqual(many, one)
+  assert.ok(one.snapshot <= 1 && one.active <= 1 && one.laya <= 1 && one.litert <= 1, JSON.stringify(one))
+})
+
 // `GET /api/v1/status` carries a local-only `jev` field so Workspace can
 // follow a loaded Jev model. The double mirrors status-fail-reason.test.ts's status double.
 function appWithPrimary(primaryKey: string | null) {
