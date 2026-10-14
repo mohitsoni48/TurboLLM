@@ -73,13 +73,31 @@ async function waitForExit(pid) {
   return false
 }
 
+/** One argument for a cmd.exe line that runs one of npm's `.cmd` shims (npm.cmd/npx.cmd):
+ *  MSVCRT-quoted for the node.exe the shim starts, then every cmd metacharacter ^-escaped
+ *  TWICE — once for cmd.exe /c, once more for the shim's own `%*` re-parse (the scheme
+ *  cross-spawn uses for npm's shims). So a recorded argv path with spaces, `&`, `(`, `%`
+ *  or `"` arrives intact and can never start a second command. */
+const CMD_META = /([()\][%!^"`<>&|;, *?])/g
+function quoteForCmdShim(arg) {
+  const quoted = `"${String(arg).replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, '$1$1')}"`
+  return quoted.replace(CMD_META, '^$1').replace(CMD_META, '^$1')
+}
+
+/** spawn() for `npm`/`npx`. On Windows they are `.cmd` shims, and since the CVE-2024-27980
+ *  fix Node refuses to spawn a `.cmd` without a shell — it throws EINVAL synchronously,
+ *  which used to leave an npx user with no daemon at all after Update. So there the whole
+ *  line goes to cmd.exe as one pre-quoted string (no args array: with `shell` Node would
+ *  only space-join it, unquoted — DEP0190). */
+function spawnNpm(cmd, args, options) {
+  if (process.platform !== 'win32') return spawn(cmd, args, options)
+  return spawn([cmd, ...args.map(quoteForCmdShim)].join(' '), { ...options, shell: true })
+}
+
 function run(cmd, args) {
   return new Promise((res) => {
     log(`> ${cmd} ${args.join(' ')}`)
-    // `shell: false`. On Windows the executable is `npm.cmd`, which Node spawns directly;
-    // going through a shell would mean quoting user-influenced strings into a command
-    // line, and there is no reason to when every argument here is a fixed literal.
-    const child = spawn(cmd, args, { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true })
+    const child = spawnNpm(cmd, args, { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true })
     child.on('error', (e) => res({ ok: false, error: String(e && e.message ? e.message : e) }))
     child.on('exit', (code) => res(code === 0 ? { ok: true } : { ok: false, error: `${cmd} exited with code ${code}` }))
   })
@@ -99,7 +117,9 @@ function relaunch() {
   const exe = opts.method === 'npx' ? (process.platform === 'win32' ? 'npx.cmd' : 'npx') : opts.execPath
   const args = opts.method === 'npx' ? ['-y', 'turbollm@latest', ...(opts.argv ?? []).slice(1)] : opts.argv ?? []
   log(`relaunching: ${exe} ${args.join(' ')}`)
-  const child = spawn(exe, args, { cwd: opts.cwd, detached: true, stdio: ['ignore', out, out], windowsHide: true })
+  const options = { cwd: opts.cwd, detached: true, stdio: ['ignore', out, out], windowsHide: true }
+  // npx is a .cmd shim on Windows (see spawnNpm); execPath is node itself and spawns directly.
+  const child = opts.method === 'npx' ? spawnNpm(exe, args, options) : spawn(exe, args, options)
   child.unref()
 }
 
