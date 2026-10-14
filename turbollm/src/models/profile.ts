@@ -304,7 +304,7 @@ function linearLayerCount(m: ModelEntry): number {
  *     KV cache; the rest hold a constant recurrent state — a ~4x over-count.
  *   - sliding-window (Gemma 3/4): most layers cap at a fixed window, and Gemma also uses
  *     a different head dim AND a different KV-head count on sliding vs global layers —
- *     measured up to an ~18x over-count.
+ *     measured up to an ~16x over-count.
  *
  *  Over-counting isn't cosmetic here: it pushes the fit verdict to "tight"/"overflow"
  *  and mis-drives auto-tune's headroom gate for a very popular model family.
@@ -319,9 +319,16 @@ function linearLayerCount(m: ModelEntry): number {
  *  AND feeds auto-tune's headroom gate, so an under-estimate buys a failed load and a
  *  bad tune, while an over-estimate only costs a pessimistic verdict.
  *
+ *  A sliding layer holds more than its window, though: llama.cpp sizes that cache
+ *  `GGML_PAD(min(ctx, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256)`
+ *  (llama-kv-cache-iswa.cpp) — room for the in-flight ubatch, and for every sequence's window
+ *  when the cache is unified. `swaSeqs` is that sequence factor (the parallel count under a
+ *  unified cache, else 1: a non-unified cache is one stream per sequence, which the callers
+ *  already multiply in) and `ubatch` is --ubatch-size (llama.cpp's default 512).
+ *
  *  Pure and exported for unit testing against the measured ground truth in
  *  profile.kv.test.ts. */
-export function kvCacheElems(m: ModelEntry, ctx: number): number {
+export function kvCacheElems(m: ModelEntry, ctx: number, swaSeqs = 1, ubatch = 512): number {
   const blocks = m.blockCount || 1
   const kvHeads = m.headCountKv || 8
   const headDim = m.headDim || HEAD_DIM
@@ -348,13 +355,14 @@ export function kvCacheElems(m: ModelEntry, ctx: number): number {
   // this is the branch essentially every model in the wild takes.
   if (swaPattern === undefined && !hybrid) return 2 * blocks * ctx * kvHeads * headDim
 
+  const swaTokens = Math.ceil(Math.min(ctx, window * swaSeqs + ubatch) / 256) * 256
   let elems = 0
   for (let i = 0; i < blocks; i++) {
     // Linear/SSM layers keep no ctx-scaled cache at all; their constant state is
     // accounted for separately by ssmStateElems so it can't be scaled by ctx.
     if (hybrid && !isFullAttentionLayer(i, interval)) continue
     const sliding = swaPattern?.[i] === true
-    const tokens = sliding ? Math.min(ctx, window) : ctx
+    const tokens = sliding ? swaTokens : ctx
     const heads = perLayerHeads?.[i] || kvHeads
     const dim = sliding ? swaHeadDim : headDim
     elems += 2 * tokens * heads * dim // ×2 for the K and V caches
@@ -410,7 +418,7 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // Attention-layout-aware KV sizing (ADR-223): counts each layer for what it actually
   // caches instead of assuming every layer holds full context. Falls back to exactly the
   // old all-layer formula for any model that doesn't declare its layout — see kvCacheElems.
-  const kvElems = kvCacheElems(m, p.ctx)
+  const kvElems = kvCacheElems(m, p.ctx, p.kvUnified ? Math.max(1, p.parallel) : 1, p.uBatchSize || 512)
   // The linear/SSM layers' constant recurrent state. Sized at f32 (4 bytes) and NOT scaled by
   // --cache-type-k: llama.cpp keeps recurrent state unquantized, so applying the user's KV quant
   // here would under-count it. f32 rather than f16 is the deliberate, safer reading — this
@@ -426,9 +434,11 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // asymmetric quant (e.g. K=q8_0, V=q4_0) is weighted correctly instead of assuming V
   // matches K's byte width.
   const kvBytesMb = ((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6
+  // The recurrent state is one cell per sequence whether or not the KV cache is unified
+  // (llama.cpp's recurrent_rs_size = max(1, n_seq_max)), so it always scales with parallel.
   const kvMb = p.kvOffload === false
     ? 0
-    : (kvBytesMb + ssmMb) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : kvBytesMb * (p.kvUnified ? 1 : Math.max(1, p.parallel)) + ssmMb * Math.max(1, p.parallel)
 
   // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
   // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead
@@ -518,11 +528,12 @@ export function estimateVramPerGpu(p: LoadProfile, m: ModelEntry, sys: SysInfo):
 
   // KV rides along with the layer that owns it (llama.cpp allocates it per-layer on that device),
   // so it follows the same distribution as the weights and needs no placement of its own.
-  const kvElems = kvCacheElems(m, p.ctx)
+  const kvElems = kvCacheElems(m, p.ctx, p.kvUnified ? Math.max(1, p.parallel) : 1, p.uBatchSize || 512)
   const kvTotalMb = p.kvOffload === false
     ? 0
-    : ((((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
-        + (ssmStateElems(m) * 4) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : (((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
+        * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+      + ((ssmStateElems(m) * 4) / 1e6) * Math.max(1, p.parallel) // per sequence either way, as in estimateVram
   const kvPerLayerMb = kvTotalMb / Math.max(1, residentLayers)
 
   const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? (m.mmprojSizeBytes / 1e6) * 1.15 : 0
@@ -833,7 +844,16 @@ export function profileToArgs(
   // -fit aborts, and the engine falls through to loading -ngl layers — every expert included —
   // with zero MoE offload, an instant CUDA OOM on a VRAM-constrained card.
   const moeAutoFit = m.moe && p.nCpuMoeFit
-  if (!moeAutoFit && (!p.nglFit || m.moe) && p.ngl > 0) a.push('-ngl', String(p.ngl))
+  // ngl 0 means CPU only (the slider, Settings' default, auto-tune's verdict) and must be sent
+  // as an explicit `-ngl 0`: current llama.cpp reads an ABSENT -ngl as "auto" and fits the model
+  // onto the GPU anyway. Only where a GPU is detected, though: there a 0 is always a deliberate
+  // choice, since deriveDefault and the global defaults give 99 / the user's own value. With no
+  // detected GPU the 0 is merely deriveDefault's placeholder, and -ngl stays absent so a GPU the
+  // detection missed but the engine can use (Termux without vulkaninfo, a container without
+  // lspci) keeps offloading exactly as it does today.
+  const gpuDetected = (sys?.gpus.length ?? 0) > 0
+  const nglExplicit = !moeAutoFit && (!p.nglFit || m.moe) && (p.ngl > 0 || (p.ngl === 0 && gpuDetected))
+  if (nglExplicit) a.push('-ngl', String(p.ngl))
   // Multi-GPU split (ADR-054). Defaults are no-ops: 'layer' + empty tensorSplit +
   // mainGpu -1 emit nothing, preserving llama.cpp's built-in even split across GPUs.
   const g = p.gpu
@@ -850,7 +870,7 @@ export function profileToArgs(
   if (has('--parallel')) a.push('--parallel', String(p.parallel))
   if (p.parallel > 1 && p.kvUnified && has('--kv-unified')) a.push('--kv-unified')
   // nCpuMoeFit: omit --n-cpu-moe so -fit's finer-grained MoE offload strategy decides instead.
-  // Outside auto-fit, pass it explicitly whenever -ngl is ALSO explicit (p.ngl > 0 — the same
+  // Outside auto-fit, pass it explicitly whenever -ngl is ALSO explicit (nglExplicit — the same
   // gate as the -ngl push above) — including 0 — found 2026-08-06 from a live BeeLlama.cpp repro:
   // omitting --n-cpu-moe (on the old assumption that "0" and "absent" are equivalent) while -ngl
   // is explicit leaves it ambiguous whether the engine should auto-fit its own placement or use
@@ -858,11 +878,11 @@ export function profileToArgs(
   // absent, which then aborts on seeing -ngl already pinned ("n_gpu_layers already set by user to
   // N, abort") and falls through to loading every expert on GPU with no real offload — silently
   // spilling to system RAM instead of erroring, so auto-tune's own nCpuMoe=0 search candidate can
-  // look like it fits when it doesn't. Gating on p.ngl > 0 (not unconditional) matters: when ngl
-  // is 0 (a CPU-only box, or a user dragging the still-visible MoE ngl slider to 0) there's no
-  // -ngl on the command line to collide with, so forcing --n-cpu-moe 0 there would needlessly
-  // suppress a fit pass that runs cleanly on its own.
-  if (m.moe && !p.nCpuMoeFit && p.ngl > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
+  // look like it fits when it doesn't. Gating on nglExplicit (not unconditional) matters: when
+  // -ngl is absent (ngl 0 with no detected GPU) there's no -ngl on the command line to collide
+  // with, so forcing --n-cpu-moe 0 there would needlessly suppress a fit pass that runs cleanly
+  // on its own.
+  if (m.moe && nglExplicit && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
   // Emit a non-default KV cache type only when the engine supports the VALUE, not just
   // the --cache-type-k FLAG: e.g. TurboQuant's turbo2/3/4 must NOT leak into a standard
   // llama.cpp / llamafile engine (which has the flag but rejects the value → launch fails).

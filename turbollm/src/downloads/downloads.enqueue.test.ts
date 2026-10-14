@@ -394,3 +394,73 @@ test('enqueue: a non-HF raw URL stays a single flat file', async () => {
     restore()
   }
 })
+
+test('run: the HF token goes only to the HF origin — never to a raw-URL import host', async () => {
+  const { modelDir, stateDir } = newDirs()
+  const real = globalThis.fetch
+  const seen: Array<{ url: string; headers: Record<string, string> }> = []
+  globalThis.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ url: String(url), headers: { ...init.headers } })
+    return new Response('x', { status: 200 })
+  }) as unknown as typeof fetch
+  try {
+    const auth = () => ({ 'User-Agent': 'TurboLLM/test', Authorization: 'Bearer hf_SECRET' })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, auth, echoExpand())
+    for (const url of ['http://192.168.1.5/model.gguf', 'https://mirror.example/model.gguf', 'http://huggingface.co/x.gguf']) {
+      const [rec] = await dm.enqueue({ url })
+      await waitTerminal(dm, rec.id)
+    }
+    const [hfRec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+    await waitTerminal(dm, hfRec.id)
+
+    const raw = seen.filter((s) => !s.url.startsWith('https://huggingface.co/'))
+    assert.equal(raw.length, 3)
+    for (const s of raw) {
+      assert.equal(s.headers.Authorization, undefined, `no token for ${s.url}`)
+      assert.equal(s.headers['User-Agent'], 'TurboLLM/test', 'other headers are kept')
+    }
+    const hf = seen.find((s) => s.url === 'https://huggingface.co/owner/repo/resolve/main/model.gguf')
+    assert.equal(hf?.headers.Authorization, 'Bearer hf_SECRET', 'an HF download still authenticates (gated repos)')
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test('enqueue: a ".." segment in the file path is rejected (decoded resolve URL or raw rfilename)', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    // The expander's fallback (tree 404 / file not in the tree) echoes the caller's own path.
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    await assert.rejects(
+      () => dm.enqueue({ url: 'https://huggingface.co/x/y/resolve/main/..%2F..%2F..%2F..%2Fescaped%2Fevil.gguf' }),
+      (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+    )
+    for (const rfilename of ['../../escaped/evil.gguf', 'sub/../../evil.gguf', '..\\..\\evil.gguf']) {
+      await assert.rejects(
+        () => dm.enqueue({ repo: 'owner/repo', rfilename }),
+        (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+        rfilename,
+      )
+    }
+    assert.equal(dm.list().length, 0)
+  } finally {
+    restore()
+  }
+})
+
+test("enqueue: the expander's dir is sanitised, so it can never place files outside the model dir", async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const hostile = async (): Promise<HfModelFiles> => ({
+      dir: '../../escaped',
+      files: [{ rfilename: 'evil.gguf', size: 10, mmproj: false }],
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), hostile)
+    const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'evil.gguf' })
+    assert.equal(rec.dest, join(modelDir, 'owner', 'repo', 'escaped', 'evil.gguf'))
+  } finally {
+    restore()
+  }
+})

@@ -13,6 +13,8 @@ const sys: SysInfo = {
   gpus: [{ name: 'Test GPU', vramMb: 16000, vendor: 'nvidia' }],
 }
 
+const cpuOnly: SysInfo = { ...sys, gpus: [] }
+
 const denseModel: ModelEntry = {
   key: 'dense-test', name: 'Dense Test', path: 'x.gguf', dir: '.', format: 'gguf',
   sizeBytes: 1e9, sizeLabel: '1B', arch: 'llama', quant: 'Q4_K_M', nativeCtx: 8192,
@@ -67,15 +69,38 @@ test('profileToArgs: still emits --n-cpu-moe 0 explicitly when -ngl is also expl
   assert.deepEqual(args.slice(args.indexOf('--n-cpu-moe'), args.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '0'])
 })
 
-test('profileToArgs: nCpuMoe=0 stays omitted when ngl=0 too — no -ngl to collide with', () => {
-  // ngl=0 means -ngl itself is never emitted (gated on p.ngl > 0, same as -ngl's own push), so
-  // there's no explicit -ngl on the command line for an absent --n-cpu-moe to collide with. This
-  // is the real shape of a CPU-only box (deriveDefault sets ngl: 0 with no GPU) or a user
-  // manually dragging the still-visible MoE ngl slider to 0 — forcing --n-cpu-moe 0 here would
-  // needlessly suppress a fit pass that runs cleanly on its own.
-  const p = { ...deriveDefault(moeModel, sys), ngl: 0, nCpuMoe: 0 }
-  const args = profileToArgs(p, moeModel, caps)
+test('profileToArgs: nCpuMoe=0 stays omitted when ngl=0 on a box with no detected GPU — no -ngl to collide with', () => {
+  // With no detected GPU, ngl=0 is deriveDefault's placeholder and -ngl itself stays absent (the
+  // engine's own default), so there's no explicit -ngl on the command line for an absent
+  // --n-cpu-moe to collide with — forcing --n-cpu-moe 0 here would needlessly suppress a fit pass
+  // that runs cleanly on its own.
+  const p = { ...deriveDefault(moeModel, cpuOnly), ngl: 0, nCpuMoe: 0 }
+  const args = profileToArgs(p, moeModel, caps, 16, cpuOnly)
+  assert.equal(args.includes('-ngl'), false)
   assert.equal(args.includes('--n-cpu-moe'), false)
+})
+
+test('profileToArgs: ngl=0 on a GPU box emits an explicit -ngl 0 — an absent -ngl means "auto" (GPU) to llama.cpp', () => {
+  // Current llama.cpp defaults n_gpu_layers to -1 ("auto") with -fit on, so omitting -ngl
+  // auto-fits the model onto the GPU: a user who set GPU layers to 0 (to keep the GPU free, or
+  // to dodge a broken GPU backend) got a GPU load while the UI said "0 layers".
+  const dense = profileToArgs({ ...deriveDefault(denseModel, sys), ngl: 0 }, denseModel, caps, 16, sys)
+  assert.deepEqual(dense.slice(dense.indexOf('-ngl'), dense.indexOf('-ngl') + 2), ['-ngl', '0'])
+  // MoE: -ngl is explicit now, so --n-cpu-moe follows it (the BeeLlama fit-abort rule above).
+  const moe = profileToArgs({ ...deriveDefault(moeModel, sys), ngl: 0, nCpuMoe: 4 }, moeModel, caps, 16, sys)
+  assert.deepEqual(moe.slice(moe.indexOf('-ngl'), moe.indexOf('-ngl') + 2), ['-ngl', '0'])
+  assert.deepEqual(moe.slice(moe.indexOf('--n-cpu-moe'), moe.indexOf('--n-cpu-moe') + 2), ['--n-cpu-moe', '4'])
+  // Auto-fit still omits it; and without a SysInfo (no detected GPU known) nothing changes.
+  assert.equal(profileToArgs({ ...deriveDefault(denseModel, sys), ngl: 0, nglFit: true }, denseModel, caps, 16, sys).includes('-ngl'), false)
+  assert.equal(profileToArgs({ ...deriveDefault(denseModel, sys), ngl: 0 }, denseModel, caps).includes('-ngl'), false)
+})
+
+test('profileToArgs: the no-GPU-detected default (ngl 0) still leaves -ngl to the engine, as before', () => {
+  // deriveDefault/applyGlobalDefaults put 0 here only because no GPU was detected — not a user
+  // choice — so a GPU the detection missed keeps the engine's own offload behaviour.
+  const p = deriveDefault(denseModel, cpuOnly)
+  assert.equal(p.ngl, 0)
+  assert.equal(profileToArgs(p, denseModel, caps, 16, cpuOnly).includes('-ngl'), false)
 })
 
 test('profileToArgs: --n-cpu-moe stays gated by engine capability even at nCpuMoe=0', () => {

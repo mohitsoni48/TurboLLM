@@ -81,14 +81,26 @@ test('kvCacheElems: Qwen3.5-9B counts only its 8 full-attention layers', () => {
 })
 
 test('kvCacheElems: Gemma-4-26B-A4B sizes sliding and global layers separately', () => {
-  // 5 global (2 heads × dim 512 × full ctx) + 25 sliding (8 heads × dim 256 × 1024 tok).
-  assert.equal(kvCacheElems(gemma4_26b, CTX), 440_401_920)
-  // ~18x smaller than the all-layer formula — the worst over-count measured.
-  assert.ok(legacyElems(gemma4_26b, CTX) / kvCacheElems(gemma4_26b, CTX) > 17)
+  // 5 global (2 heads × dim 512 × full ctx) + 25 sliding (8 heads × dim 256 × 1536 cells: the
+  // 1024-token window plus llama.cpp's 512-token ubatch, padded to 256 — llama-kv-cache-iswa.cpp).
+  assert.equal(kvCacheElems(gemma4_26b, CTX), 492_830_720)
+  // ~16x smaller than the all-layer formula — the worst over-count measured.
+  assert.ok(legacyElems(gemma4_26b, CTX) / kvCacheElems(gemma4_26b, CTX) > 16)
 })
 
 test('kvCacheElems: Gemma-4-E4B (scalar KV heads) sizes 35 sliding + 7 global layers', () => {
-  assert.equal(kvCacheElems(gemma4_e4b, CTX), 488_112_128)
+  // 7 global × 2 × 32768 × 2 × 512 + 35 sliding × 2 × (512 window + 512 ubatch) × 2 × 256.
+  assert.equal(kvCacheElems(gemma4_e4b, CTX), 506_462_208)
+})
+
+test('kvCacheElems: a sliding layer holds window × (unified sequences) + ubatch, padded to 256, like llama.cpp', () => {
+  // Capping sliding layers at the bare window under-counted what llama.cpp allocates:
+  // GGML_PAD(min(ctx, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256).
+  const globals = 2 * 5 * CTX * 2 * 512
+  const sliding = (cells: number) => 2 * 25 * cells * 8 * 256
+  assert.equal(kvCacheElems(gemma4_26b, CTX, 4, 512), globals + sliding(4 * 1024 + 512)) // unified, --parallel 4
+  assert.equal(kvCacheElems(gemma4_26b, CTX, 1, 300), globals + sliding(1536)) // 1324 pads up to 1536
+  assert.equal(kvCacheElems(gemma4_26b, 2048, 4, 512), 2 * 5 * 2048 * 2 * 512 + sliding(2048)) // never past ctx
 })
 
 // ── Safe degradation ────────────────────────────────────────────────────────────────
@@ -131,7 +143,7 @@ test('kvCacheElems: a sliding pattern with no declared window is not actionable'
 test('kvCacheElems: sliding layers stop growing past the window; only globals scale', () => {
   const small = kvCacheElems(gemma4_26b, 8192)
   const large = kvCacheElems(gemma4_26b, 131072)
-  const slidingTerm = 2 * 25 * 1024 * 8 * 256 // capped at the 1024-token window in both
+  const slidingTerm = 2 * 25 * 1536 * 8 * 256 // capped at the 1024-token window (+512 ubatch) in both
   assert.equal(small - slidingTerm, 2 * 5 * 8192 * 2 * 512)
   assert.equal(large - slidingTerm, 2 * 5 * 131072 * 2 * 512)
   // i.e. the two contexts differ ONLY in the global-layer term.
@@ -184,6 +196,19 @@ test('estimateVram: Qwen3.6-27B no longer reads as an overflow at 32k', () => {
   // direction for a number that also gates auto-tune's headroom.
   const ssmMb = (38_633_472 * 4) / 1e6
   assert.equal(fit.estMb, Math.round(1000 + kvMb + ssmMb + 800))
+})
+
+test('estimateVram: parallel slots grow the sliding cache (unified) and the recurrent state (always)', () => {
+  const sliding = (cells: number) => 2 * 25 * cells * 8 * 256
+  const globals = 2 * 5 * CTX * 2 * 512
+  const unified = { ...deriveDefault(gemma4_26b, sys), ctx: CTX, ngl: 99, nCpuMoe: 0, parallel: 4, kvUnified: true }
+  const kvMb = ((globals + sliding(4 * 1024 + 512)) * 2) / 1e6
+  assert.equal(estimateVram(unified, gemma4_26b, sys).estMb, Math.round(1000 + kvMb + 800))
+  // llama.cpp's recurrent_rs_size is max(1, n_seq_max) even for a unified KV cache.
+  const q = { ...deriveDefault(qwen36_27b, sys), ctx: CTX, ngl: 99, parallel: 4, kvUnified: true }
+  const qKvMb = (1_073_741_824 * 2) / 1e6
+  const ssmMb = (38_633_472 * 4) / 1e6
+  assert.equal(estimateVram(q, qwen36_27b, sys).estMb, Math.round(1000 + qKvMb + 4 * ssmMb + 800))
 })
 
 test('estimateVram: --no-kv-offload still zeroes the KV term, recurrent state included', () => {

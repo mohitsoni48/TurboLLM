@@ -5,6 +5,7 @@
 // a failed job sets status='error' with a message and never crashes the daemon.
 import { createHash } from 'node:crypto'
 import {
+  createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -72,6 +73,10 @@ export interface ProvenanceEntry {
 }
 
 const MAX_CONCURRENT = 2
+
+/** Statuses whose record still owns its .part (writing it, or able to resume from it) — the
+ *  same set {@link DownloadManager.hasLiveDest} treats as live. */
+const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
 
 /** The model file formats that make sense as a STANDALONE single-file download: a GGUF
  *  and a LiteRT-LM bundle each carry everything a load needs (weights, tokenizer, and
@@ -222,6 +227,12 @@ export class DownloadManager {
     // HF repos are always `owner/name` — reject anything that can't be one (also stops a
     // degenerate `repo` from sanitising to an empty subfolder that lands in the root).
     if (!repo.includes('/') || !rfilename) throw new DownloadError('invalid_request', 'repo and rfilename are required.')
+    // A `..` segment — raw in a request body, or `..%2F` decoded out of a resolve URL — would
+    // climb out of the model folder, both in the fetched path and in the destination the
+    // expander's fallback derives from it.
+    if (rfilename.split(/[\\/]/).includes('..')) {
+      throw new DownloadError('invalid_request', 'The file path must not contain ".." segments.')
+    }
     if (!explicitSubdir && !SINGLE_FILE_MODEL_RE.test(rfilename)) {
       throw new DownloadError('invalid_url', 'The file must be a .gguf or .litertlm model file.')
     }
@@ -247,7 +258,9 @@ export class DownloadManager {
     // two quants that share a shard basename never collide. A .litertlm bundle is one
     // self-contained file with no siblings to group (handled inside the expander).
     const { dir: modelDir, files } = await this.expand(repo, rfilename, rev)
-    const destDir = join(dir, repoSubdir(repo), modelDir)
+    // The expander's dir is HF-derived (or, on its fallbacks, the caller's own rfilename) —
+    // sanitised like the repo id so it can never leave the model folder.
+    const destDir = join(dir, repoSubdir(repo), repoSubdir(modelDir))
     mkdirSync(destDir, { recursive: true })
 
     const targets = files
@@ -296,6 +309,17 @@ export class DownloadManager {
     return false
   }
 
+  /** True when ANOTHER record with one of `statuses` targets this record's dest. hasLiveDest
+   *  lets a fresh enqueue through while an errored row for the same file remains, so two rows
+   *  can share one .part: the stale row must neither delete it under the live one (cancel /
+   *  remove) nor start a second writer on it (resume). */
+  private sharesDest(rec: DownloadRecord, statuses: DownloadStatus[]): boolean {
+    for (const r of this.records.values()) {
+      if (r.id !== rec.id && r.dest === rec.dest && statuses.includes(r.status)) return true
+    }
+    return false
+  }
+
   /** Materialise queued records from resolved targets, persist once, and kick the queue. */
   private commit(
     targets: Array<{ name: string; repo: string; url: string; dest: string; total: number; sha256?: string }>,
@@ -333,7 +357,7 @@ export class DownloadManager {
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
     if (rec.status !== 'done') {
-      rmSync(`${rec.dest}.part`, { force: true })
+      if (!this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
       rec.status = 'cancelled'
       rec.bytesPerSec = 0
     }
@@ -350,6 +374,8 @@ export class DownloadManager {
   resume(id: string): boolean {
     const rec = this.records.get(id)
     if (!rec || (rec.status !== 'paused' && rec.status !== 'error')) return false
+    // Another row is already (about to be) writing this .part — a second writer would interleave.
+    if (this.sharesDest(rec, ['queued', 'downloading'])) return false
     rec.status = 'queued'
     rec.error = null
     this.persist()
@@ -363,7 +389,7 @@ export class DownloadManager {
     if (!rec) return false
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
-    if (rec.status !== 'done') rmSync(`${rec.dest}.part`, { force: true })
+    if (rec.status !== 'done' && !this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
     this.records.delete(id)
     this.persist()
     this.pump()
@@ -429,7 +455,22 @@ export class DownloadManager {
       }
       rec.received = startAt
 
+      // sha256 covers the whole file, so a resume first hashes the prefix already in the .part
+      // (streamed, never buffered whole): a stale or corrupt prefix then fails the checksum
+      // instead of being spliced onto the new bytes and accepted as done. Done BEFORE the
+      // request so a large prefix never holds an open response idle.
+      let hash = rec.sha256 ? createHash('sha256') : null
+      if (hash && startAt > 0) {
+        for await (const chunk of createReadStream(part, { end: startAt - 1 })) {
+          if (ac.signal.aborted) break // cancelled mid-hash: the fetch below rejects with AbortError
+          hash.update(chunk as Buffer)
+        }
+      }
+
       const headers: Record<string, string> = { ...this.authHeaders() }
+      // The HF token is for Hugging Face alone: a raw-URL import can name any host, even over
+      // plain http://, so only a request to the HF origin may carry it.
+      if (!isHfOrigin(rec.url)) delete headers.Authorization
       if (startAt > 0) headers.Range = `bytes=${startAt}-`
 
       const res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
@@ -444,6 +485,7 @@ export class DownloadManager {
         rmSync(part, { force: true })
         startAt = 0
         rec.received = 0
+        if (hash) hash = createHash('sha256') // the hashed prefix is gone with the .part
       }
 
       const clen = Number(res.headers.get('content-length') ?? 0)
@@ -456,9 +498,7 @@ export class DownloadManager {
       // instead of silently filling the disk.
       if (clen > 0) this.assertDisk(dirname(part), clen)
 
-      const hash = rec.sha256 ? createHash('sha256') : null
-      // sha256 can only be verified over the full file; skip it on a partial resume.
-      const verifyHash = hash !== null && startAt === 0
+      const verifyHash = hash !== null
 
       let lastTick = Date.now()
       let lastBytes = startAt
@@ -657,6 +697,16 @@ function safePathname(u: string): string {
 function hfBaseUrl(): string {
   const override = process.env.TURBOLLM_HF_BASE?.trim()
   return override ? override.replace(/\/+$/, '') : 'https://huggingface.co'
+}
+
+/** True when `u` is on the HF origin (scheme, host and port of {@link hfBaseUrl}) — the only
+ *  place the user's HF token may be sent. */
+function isHfOrigin(u: string): boolean {
+  try {
+    return new URL(u).origin === new URL(hfBaseUrl()).origin
+  } catch {
+    return false
+  }
 }
 
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file

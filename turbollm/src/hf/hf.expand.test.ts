@@ -238,3 +238,39 @@ test('expandModelFiles: HF failure falls back to the single requested file', asy
     globalThis.fetch = real
   }
 })
+
+test('expandModelFiles: a full repo path picks that exact folder even when its basename is shared', async () => {
+  const tree: TreeEntry[] = [
+    { type: 'file', path: 'Q4_K_M/model-00001-of-00002.gguf', lfs: { oid: 'a1', size: 10 } },
+    { type: 'file', path: 'Q4_K_M/model-00002-of-00002.gguf', lfs: { oid: 'a2', size: 10 } },
+    { type: 'file', path: 'Q8_0/model-00001-of-00002.gguf', lfs: { oid: 'b1', size: 20 } },
+    { type: 'file', path: 'Q8_0/model-00002-of-00002.gguf', lfs: { oid: 'b2', size: 20 } },
+  ]
+  await withTree(tree, async () => {
+    const { dir, files } = await client().expandModelFiles('owner/repo', 'Q8_0/model-00001-of-00002.gguf')
+    assert.equal(dir, 'Q8_0')
+    assert.deepEqual(files.map((f) => f.rfilename), ['Q8_0/model-00001-of-00002.gguf', 'Q8_0/model-00002-of-00002.gguf'])
+  })
+})
+
+test('expandModelFiles: a split group straddling a tree page boundary still expands to every shard', async () => {
+  const page1: TreeEntry[] = [
+    { type: 'file', path: 'big-00001-of-00003.gguf', lfs: { oid: 's1', size: 10 } },
+    { type: 'file', path: 'big-00002-of-00003.gguf', lfs: { oid: 's2', size: 10 } },
+  ]
+  const page2: TreeEntry[] = [{ type: 'file', path: 'big-00003-of-00003.gguf', lfs: { oid: 's3', size: 10 } }]
+  const real = globalThis.fetch
+  globalThis.fetch = (async (url: string | URL) => {
+    const second = new URL(String(url)).searchParams.get('cursor') === 'p2'
+    return new Response(JSON.stringify(second ? page2 : page1), {
+      status: 200,
+      headers: second ? {} : { link: '<https://huggingface.co/api/models/owner/repo/tree/main?recursive=true&cursor=p2>; rel="next"' },
+    })
+  }) as typeof fetch
+  try {
+    const { files } = await client().expandModelFiles('owner/repo', 'big-00001-of-00003.gguf')
+    assert.deepEqual(files.map((f) => f.rfilename), ['big-00001-of-00003.gguf', 'big-00002-of-00003.gguf', 'big-00003-of-00003.gguf'])
+  } finally {
+    globalThis.fetch = real
+  }
+})
