@@ -68,3 +68,28 @@ export function evaluateWindow(
 
   return { next, success: next.count <= limit }
 }
+
+/**
+ * What the IP tier is keyed on. An IPv6 host normally controls a whole /64
+ * (2^64 source addresses), so keying on the full address hands an attacker a
+ * fresh IP_LIMIT per address; key on the /64 instead. IPv4, an IPv6 address
+ * with an embedded IPv4 tail (::ffff:1.2.3.4, whose /64 is shared by every
+ * such address) and anything unparseable keep the whole string, as before.
+ */
+export function ipRateLimitSubject(ip: string): string {
+  if (!ip.includes(':') || ip.includes('.')) return ip
+  const halves = ip.toLowerCase().split('::')
+  if (halves.length > 2) return ip
+  const split = (s: string): string[] => (s ? s.split(':') : [])
+  const head = split(halves[0])
+  const tail = halves.length === 2 ? split(halves[1]) : []
+  const zeros = halves.length === 2 ? 8 - head.length - tail.length : 0
+  if (zeros < 0) return ip
+  const groups = [...head, ...Array<string>(zeros).fill('0'), ...tail]
+  if (groups.length !== 8 || !groups.every((g) => /^[0-9a-f]{1,4}$/.test(g))) return ip
+  // parseInt drops leading zeros, so every spelling of one /64 yields one key.
+  return `${groups
+    .slice(0, 4)
+    .map((g) => parseInt(g, 16).toString(16))
+    .join(':')}::/64`
+}
