@@ -95,15 +95,19 @@ test('send() throws ApiError instead of silently yielding nothing on a pre-strea
   )
 })
 
-test('resume() reconciles past the replay window via runs.get()', async () => {
-  let call = 0
+// The 409 fallback used to reattach at run.event_seq without re-reading the message and with
+// no signal to the caller, so the frames between the cursor (5) and the reattach point (100)
+// silently became a hole in the rendered text — and this test counted that as success. The server
+// asks the client to re-read the message, then attach; `resyncMessage` carries it to the caller.
+test('resume() past the replay window re-reads the message and hands it back as resyncMessage', async () => {
   const seenUrls: string[] = []
+  let streamCalls = 0
+  let runGets = 0
   const fakeFetch: typeof fetch = (async (url: string) => {
-    call++
     const u = String(url)
     seenUrls.push(u)
     if (u.includes('/stream')) {
-      if (call === 1) {
+      if (++streamCalls === 1) {
         return new Response(
           JSON.stringify({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }),
           { status: 409, headers: { 'Content-Type': 'application/json' } },
@@ -115,25 +119,124 @@ test('resume() reconciles past the replay window via runs.get()', async () => {
         { status: 200, headers: { 'Content-Type': 'text/event-stream' } },
       )
     }
+    if (u.includes('/messages/')) {
+      return new Response(
+        JSON.stringify({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content: 'text so far', status: 'streaming', version: 3, created_at: 't', edited: false }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
+    // The run moves on between reads: only the event_seq read AFTER the message is a safe
+    // reattach point (the message can trail it, never lead it).
+    const eventSeq = ++runGets === 1 ? 90 : 100
     return new Response(
-      JSON.stringify({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'streaming', event_seq: 100, error: null, created_at: 't', ended_at: null }),
+      JSON.stringify({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'streaming', event_seq: eventSeq, error: null, created_at: 't', ended_at: null }),
       { status: 200, headers: { 'Content-Type': 'application/json' } },
     )
   }) as unknown as typeof fetch
 
   const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
   const resumed = await client.resume('run_1', 5, { owner: 'user_123' })
+  assert.equal(resumed.resyncMessage?.content, 'text so far', 'the caller must get the re-read message to re-render from')
   const seen: string[] = []
   for await (const ev of resumed) seen.push(ev.event)
   assert.deepEqual(seen, ['delta', 'done'])
   assert.equal(resumed.lastEventSeq, 102)
-  // Release-gate I5: resume() previously sent no `owner` on ANY of its 3 requests (the initial
-  // stream probe, the runs.get resync, and the retry stream) — every run route resolves owner
-  // from the query string, so a run created for a non-default owner 404'd on every one of
-  // these, making resume() (the client's headline feature) unusable for exactly the multi-owner
-  // case send()'s own `owner` param exists for.
-  assert.equal(seenUrls.length, 3, 'expected the initial probe, runs.get, and the retry stream')
+  // Probe, runs.get (for the message id), messages.get, runs.get again, then the stream after
+  // the event_seq read AFTER the message.
+  assert.equal(seenUrls.length, 5, `expected probe, runs.get, messages.get, runs.get, stream; got ${seenUrls.join(' | ')}`)
+  assert.ok(seenUrls[2].includes('/messages/m1'), `the run's own message is re-read: ${seenUrls[2]}`)
+  assert.ok(/\/runs\/run_1\?/.test(seenUrls[3]), `the run is re-read after the message: ${seenUrls[3]}`)
+  assert.ok(seenUrls[4].includes('/stream') && seenUrls[4].includes('after=100'), `reattaches after the event_seq read last: ${seenUrls[4]}`)
+  // Release-gate I5: every one of these is owner-scoped server-side.
   for (const u of seenUrls) assert.ok(u.includes('owner=user_123'), `expected owner=user_123 in ${u}`)
+})
+
+// Reading the message first means a run that ends between the two reads leaves a checkpoint that
+// trails event_seq with no later frame to fill the gap; the message is final by then, so re-read it.
+test('resume() past the replay window re-reads the final message when the run ended in between', async () => {
+  let messageGets = 0
+  const fakeFetch: typeof fetch = (async (url: string) => {
+    const u = String(url)
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+    if (u.includes('/stream?')) {
+      if (u.includes('after=5')) return json({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }, 409)
+      return new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }
+    if (u.includes('/messages/')) {
+      const content = ++messageGets === 1 ? 'text so' : 'text so far, all of it'
+      return json({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content, status: 'complete', version: 3, created_at: 't', edited: false })
+    }
+    return json({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'complete', event_seq: 120, error: null, created_at: 't', ended_at: 't2' })
+  }) as unknown as typeof fetch
+
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
+  const resumed = await client.resume('run_1', 5)
+  assert.equal(resumed.resyncMessage?.content, 'text so far, all of it')
+})
+
+test('resume() within the window streams directly and leaves resyncMessage unset; no afterSeq omits after', async () => {
+  const seenUrls: string[] = []
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async (url: string) => {
+      seenUrls.push(String(url))
+      return new Response('id: 3\nevent: done\ndata: {"status":"complete"}\n\n', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }) as unknown as typeof fetch,
+  })
+  const resumed = await client.resume('run_1', 2)
+  for await (const _ of resumed) { /* drain */ }
+  assert.equal(resumed.resyncMessage, undefined)
+  assert.equal(resumed.outcome, 'complete')
+  assert.ok(seenUrls[0].includes('after=2'))
+  await client.resume('run_1', undefined)
+  assert.ok(!seenUrls[1].includes('after='), `no cursor yet means replay from the start: ${seenUrls[1]}`)
+})
+
+/** A fetch stub whose SSE body is a real ReadableStream the test controls. */
+function controlledSse(): { fetch: typeof fetch; ctrl: Promise<ReadableStreamDefaultController<Uint8Array>>; cancelled: Promise<void> } {
+  let resolveCtrl!: (c: ReadableStreamDefaultController<Uint8Array>) => void
+  let resolveCancelled!: () => void
+  const ctrl = new Promise<ReadableStreamDefaultController<Uint8Array>>((r) => { resolveCtrl = r })
+  const cancelled = new Promise<void>((r) => { resolveCancelled = r })
+  const body = new ReadableStream<Uint8Array>({
+    start(c) { resolveCtrl(c) },
+    cancel() { resolveCancelled() },
+  })
+  const fetchStub = (async () => new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })) as unknown as typeof fetch
+  return { fetch: fetchStub, ctrl, cancelled }
+}
+
+// A dropped connection made `reader.read()` reject, and that TypeError escaped the caller's
+// `for await` — so the README's "check outcome === 'unknown', then reconcile" code never ran.
+test('a connection that drops mid-stream ends the loop with outcome unknown instead of throwing', async () => {
+  const sse = controlledSse()
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: sse.fetch })
+  const stream = client.send('c1', { content: 'hi', owner: 'u1' })
+  const c = await sse.ctrl
+  const enc = new TextEncoder()
+  c.enqueue(enc.encode('event: run\ndata: {"run_id":"run_1"}\n\nid: 0\nevent: delta\ndata: {"content":"a"}\n\nid: 1\nevent: del'))
+  setTimeout(() => c.error(new TypeError('terminated')), 10)
+
+  const seen: string[] = []
+  for await (const ev of stream) seen.push(ev.event)
+  assert.deepEqual(seen, ['run', 'delta'], 'frames before the drop are delivered; the cut-off partial frame is not')
+  assert.equal(stream.outcome, 'unknown')
+  assert.equal(stream.runId, 'run_1')
+  assert.equal(stream.lastEventSeq, 0)
+})
+
+// Breaking out of the loop returned the generator without cancelling the reader, so the
+// HTTP response stayed open and kept receiving frames for the rest of the generation.
+test('breaking out of the loop early cancels the response body', async () => {
+  const sse = controlledSse()
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: sse.fetch })
+  const stream = client.send('c1', { content: 'hi', owner: 'u1' })
+  const c = await sse.ctrl
+  c.enqueue(new TextEncoder().encode('id: 0\nevent: delta\ndata: {"content":"a"}\n\n'))
+  for await (const _ of stream) break
+  const outcome = await Promise.race([sse.cancelled.then(() => 'cancelled'), new Promise((r) => setTimeout(() => r('still open'), 200))])
+  assert.equal(outcome, 'cancelled')
 })
 
 test('runs.get/list/cancel/stream all forward owner as a query param', async () => {
