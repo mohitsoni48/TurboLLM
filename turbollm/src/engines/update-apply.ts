@@ -3,7 +3,7 @@
 //   - official llama.cpp  → download the latest tag into a NEW tag-keyed dir, probe it,
 //                           and only on success register + activate it and GC the old dir;
 //                           on any failure the old install is left untouched (rollback).
-//   - TurboQuant fork     → re-provision the fork's latest GitHub release (replace dir).
+//   - TurboQuant fork     → re-provision the fork's latest GitHub release, swapped in once fetched.
 //   - vLLM / MLX / Rapid-MLX (pip) → `uv pip install -U/--upgrade` into the existing venv.
 //
 // Shared by the HTTP update endpoints AND the auto-update scheduler so both take the
@@ -28,8 +28,8 @@ import { ensureRapidMlxEnv } from './rapid-mlx'
 import { ensureMlxVlmEnv } from './mlx-vlm'
 import { ensureVllmEnv } from './vllm'
 import { ensureLitertLmEnv } from './litert-lm'
-import { ensureKoboldcpp, koboldcppDir } from './koboldcpp'
-import { ensureLlamafile, llamafileDir } from './llamafile'
+import { ensureKoboldcpp } from './koboldcpp'
+import { ensureLlamafile } from './llamafile'
 import { primaryVendor } from '../sysinfo/sysinfo'
 import { stopEngineUsers } from './serving'
 import { backendIdFromBinPath, tagFromManagedBinPath, latestTagForInstalled } from './update'
@@ -88,11 +88,28 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
       signal,
     )
     let newEng = d.registry.list().engines.find((e) => e.binPath === newBin)
-    if (!newEng) newEng = (await d.registry.add(`llama.cpp ${latestTag} (${backendId})`, newBin)).engine
+    if (!newEng) {
+      try {
+        newEng = (await d.registry.add(`llama.cpp ${latestTag} (${backendId})`, newBin)).engine
+      } catch (e) {
+        // The new build doesn't run here (its probe failed). Remove it: left on disk with its
+        // completion marker, the newest-tag-wins lookups (installedBackendBuild) would pick it
+        // over the working build — Update would then claim "already latest" and Enable 500.
+        // Retries: the probe just ran this tree's exe/DLLs, and a Windows AV/indexer handle can still be
+        // open. Best effort — a failed cleanup must not replace the probe error as the reported cause.
+        try { rmSync(backendDir(root, backendId, latestTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
+        throw e
+      }
+    }
     // Stop the running engine only if it's the OLD build of this backend.
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
+    // The scheduler also auto-updates engines that are merely installed: the new build takes the
+    // old one's place — active only if the old one was, and with its update policy (it is a new
+    // engine id, so the policy would otherwise fall back to notify and `auto` apply only once).
+    const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
     if (oldEng) await stopEngineUsers(d, oldEng.id)
-    d.registry.activate(newEng.id)
+    if (wasActive) d.registry.activate(newEng.id)
+    if (oldEng?.updatePolicy && oldEng.id !== newEng.id) d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy)
     if (oldEng && oldEng.id !== newEng.id) {
       try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
     }
@@ -107,22 +124,22 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   }
 }
 
-/** TurboQuant fork: remove the install dir + re-provision the fork's latest release. */
+/** TurboQuant fork: re-provision the fork's latest release, swapped in over the install dir
+ *  only once it is fully on disk (a failed fetch leaves the working install untouched). */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('turboquant', 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
+    const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
     if (oldEng) await stopEngineUsers(d, oldEng.id)
-    const tqDir = join(root, 'turboquant')
-    rmSync(tqDir, { recursive: true, force: true })
     const bin = await provisionTurboquant(
       root, 'AtomicBot-ai/atomic-llama-cpp-turboquant',
       (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
-      signal,
+      signal, { replace: true },
     )
     let eng = d.registry.list().engines.find((e) => e.binPath === bin)
     if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
-    d.registry.activate(eng.id)
+    if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
     d.provision.fail(`Could not update TurboQuant: ${msg(e)}`)
@@ -130,17 +147,17 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
   }
 }
 
-/** KoboldCpp: remove the install dir + re-download the latest release binary. Mirrors
- *  the fork path (single dir, replaced wholesale). */
+/** KoboldCpp: re-download the latest release binary over the installed one (replaced only
+ *  once the download completed). Mirrors the fork path. */
 async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('koboldcpp', 'auto_update')
+  const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
-    rmSync(koboldcppDir(root), { recursive: true, force: true })
     const hasNvidia = primaryVendor() === 'nvidia'
-    const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal)
+    const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
     const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
-    d.registry.activate(eng.id)
+    if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
     d.provision.fail(`Could not update KoboldCpp: ${msg(e)}`)
@@ -148,15 +165,16 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
   }
 }
 
-/** llamafile: remove the install dir + re-download the latest portable binary. */
+/** llamafile: re-download the latest portable binary over the installed one (replaced only
+ *  once the download completed). */
 async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('llamafile', 'auto_update')
+  const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
-    rmSync(llamafileDir(root), { recursive: true, force: true })
-    const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal)
+    const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
     const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
-    d.registry.activate(eng.id)
+    if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {
     d.provision.fail(`Could not update llamafile: ${msg(e)}`)
@@ -172,23 +190,24 @@ const PIP_ENGINE_LABEL: Record<PipEngineKind, string> =
 /** vLLM / MLX / Rapid-MLX / MLX-VLM / LiteRT-LM: upgrade the package in place (uv pip install -U/--upgrade). */
 async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: Engine, root: string): Promise<void> {
   d.provision.start(kind, 'auto_update')
-  // LiteRT-LM serves .litertlm models without being active (engineForModel), and activating it sends every GGUF to
-  // it, so an update re-activates it only when it was the active engine already.
+  // An update re-activates an engine only when it was the active engine already: the scheduler also updates engines
+  // that are merely installed. (For LiteRT-LM it matters twice — it serves .litertlm models without being active
+  // (engineForModel), and activating it sends every GGUF to it.)
   const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
     if (kind === 'mlx') {
       const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
-      d.registry.activate(eng.id)
+      if (wasActive) d.registry.activate(eng.id)
     } else if (kind === 'rapid-mlx') {
       const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
-      d.registry.activate(eng.id)
+      if (wasActive) d.registry.activate(eng.id)
     } else if (kind === 'mlx-vlm') {
       const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
-      d.registry.activate(eng.id)
+      if (wasActive) d.registry.activate(eng.id)
     } else if (kind === 'litert-lm') {
       const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
@@ -196,7 +215,7 @@ async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: E
     } else {
       const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
-      d.registry.activate(eng.id)
+      if (wasActive) d.registry.activate(eng.id)
     }
     d.provision.done()
   } catch (e) {

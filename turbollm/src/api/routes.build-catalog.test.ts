@@ -235,3 +235,30 @@ test('GET /engines/catalog: nothing on disk and nothing registered means not bui
     h.cleanup()
   }
 })
+
+// Termux reports process.platform 'android'. build-prereqs, runBuild and the catalog's Android
+// source card all support it, yet the route used to 409 every non-desktop platform. Only the
+// packaged Android app (W^X: it can never exec a built binary) is refused.
+test('POST /build/run: Termux reaches the build, the packaged Android app is refused', async () => {
+  const actualPlatform = process.platform
+  const actualLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  const h = harness()
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  try {
+    delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    // An invalid repo URL is the first check past the platform gate — 400 here means "allowed".
+    const termux = await postBuild(h.app, { repoUrl: 'not-a-url' })
+    assert.equal(termux.status, 400)
+    assert.equal(termux.json.error?.code, 'invalid_config_value')
+
+    process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/lib/arm64'
+    const app = await postBuild(h.app, { repoUrl: 'not-a-url' })
+    assert.equal(app.status, 409)
+    assert.equal(app.json.error?.code, 'unsupported_platform')
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    if (actualLibDir === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    else process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = actualLibDir
+    h.cleanup()
+  }
+})

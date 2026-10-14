@@ -231,6 +231,10 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   // parseable GitHub source repo, compare its built commit hash against the repo's
   // latest commit (notify-only "rebuild" — we can't recompile).
   if (engine.sourceRepo) {
+    // A commit-pinned build (a catalog pin like Solar Open 2, a user's A/B snapshot) is a fixed
+    // snapshot with no "newer source": compared to the branch tip it showed "rebuild" forever,
+    // and no rebuild of the same commit could clear it.
+    if (engine.sourceCommit?.trim()) return null
     const ref = parseGitRepo(engine.sourceRepo)
     if (ref) {
       return {

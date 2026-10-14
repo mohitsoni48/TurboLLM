@@ -422,6 +422,19 @@ test('resolveUpdateSource: sourceRepo takes precedence → source mode with bran
   assert.deepEqual(src, { source: 'source', ref: 'owner/repo', branch: 'main', installed: '0a635dc' })
 })
 
+test('resolveUpdateSource: a commit-pinned source build has no update source (never "newer source · rebuild")', async () => {
+  const pinned = eng({
+    binPath: '/root/engines/build/ggml-org-llama.cpp-846e991ec3c7/build/bin/llama-server',
+    version: '1 (846e991)',
+    sourceRepo: 'https://github.com/ggml-org/llama.cpp',
+    sourceCommit: '846e991ec3c7ccec49112ff2c5b00b710e5f551d',
+  })
+  assert.equal(resolveUpdateSource(pinned), null)
+  const st = await computeUpdateStatus(pinned, async () => 'abcdef0123456789abcdef0123456789abcdef01')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
+})
+
 test('resolveUpdateSource: sourceRepo with no branch → empty branch (default branch)', () => {
   const src = resolveUpdateSource(
     eng({ binPath: '/opt/my/llama-server', version: '1 (0a635dc)', sourceRepo: 'https://github.com/owner/repo' }),

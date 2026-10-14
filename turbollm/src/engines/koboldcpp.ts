@@ -21,7 +21,7 @@
 import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GpuVendor } from '../sysinfo/sysinfo'
-import { downloadFile, latestGithubRelease, type ProvisionProgress, type ReleaseAsset } from './download'
+import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset } from './download'
 
 export const KOBOLDCPP_REPO = 'LostRuins/koboldcpp'
 
@@ -92,14 +92,16 @@ export interface KoboldcppRuntime {
  * Provision KoboldCpp: resolve the latest GitHub release, pick the asset for this
  * OS/arch + GPU class, download the RAW binary into <root>/koboldcpp/, and (POSIX)
  * mark it executable. Returns the binary path + the release tag. `hasNvidia` selects
- * the CUDA build where one exists. When `upgrade` is true the caller has already
- * removed the dir so the latest is re-downloaded.
+ * the CUDA build where one exists. `replace` (an update) re-downloads the latest even
+ * when a binary is present; the download only replaces it once complete, so a failed
+ * fetch or download leaves the working binary in place.
  */
 export async function ensureKoboldcpp(
   root: string,
   hasNvidia: boolean,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  opts: { replace?: boolean } = {},
 ): Promise<KoboldcppRuntime> {
   const dir = koboldcppDir(root)
   const binPath = koboldcppBinPath(root)
@@ -107,7 +109,9 @@ export async function ensureKoboldcpp(
   const rel = await latestGithubRelease(KOBOLDCPP_REPO, signal)
   const version = rel.tag_name ?? ''
 
-  if (existsSync(binPath)) return { binPath, version }
+  // Already installed: report the release it was downloaded as, not the latest — Disable → Install
+  // re-registers an older binary, and labelling it latest made the update check say "up to date".
+  if (existsSync(binPath) && !opts.replace) return { binPath, version: recordedReleaseTag(binPath) || version }
 
   const asset = pickKoboldcppAsset(rel.assets ?? [], hasNvidia)
   if (!asset) throw new Error('no_release_asset')
@@ -123,6 +127,7 @@ export async function ensureKoboldcpp(
       /* best-effort — a non-executable file fails loudly at spawn instead */
     }
   }
+  recordReleaseTag(binPath, version)
   return { binPath, version }
 }
 

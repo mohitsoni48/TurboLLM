@@ -6,15 +6,18 @@
 // UpdateChecker with an injected fetcher, so no test touches the network.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import { UpdateChecker } from '../engines/update'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 function appWithChecker(
   fetcher: (src: { source: string; ref: string }) => Promise<string>,
   installedVersion = '0.17.1',
-  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null } = {},
+  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string } = {},
 ) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
@@ -47,6 +50,7 @@ function appWithChecker(
   ]
   const provisionCalls: string[] = []
   const managerCalls: string[] = []
+  const activateCalls: string[] = []
   // The route's stop-guard keys on the engine that is RUNNING (manager currentOpts), not the
   // registry's active engine — an install activates without stopping what is loaded, so the
   // two can differ (v1.14.5). Both knobs stay mockable so every combination can be expressed;
@@ -54,7 +58,7 @@ function appWithChecker(
   const runningKind = opts.runningKind === undefined ? 'litert-lm' : opts.runningKind
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/turbollm-litert-route' },
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => opts.storeDir ?? '/tmp/turbollm-litert-route' },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     manager: {
       status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),
@@ -71,7 +75,7 @@ function appWithChecker(
       active: () =>
         opts.activeEngineId === null ? undefined : engines.find((e) => e.id === (opts.activeEngineId ?? 'litert-1')),
       addLitertLm: (name: string) => ({ id: 'litert-2', name, activate: () => {} }),
-      activate: () => {},
+      activate: (id: string) => activateCalls.push(id),
     },
     downloads: { provenance: () => [] },
     provision: {
@@ -88,7 +92,7 @@ function appWithChecker(
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, provisionCalls, managerCalls }
+  return { app, provisionCalls, managerCalls, activateCalls }
 }
 
 test('?update=1 with the installed version already latest refuses without provisioning', async () => {
@@ -226,4 +230,31 @@ test('nothing is stopped when nothing is running, or when a DIFFERENT engine is 
   const r2 = await other.app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
   assert.equal(r2.status, 202)
   assert.deepEqual(other.managerCalls, [], 'a running non-LiteRT-LM engine must not be stopped')
+})
+
+// ── An update keeps the active engine, as the scheduler's applyPipUpdate does: the route behind the card's Update
+// button made LiteRT-LM the active engine whatever was active before, and an active LiteRT-LM is sent every GGUF —
+// so updating it on a llama.cpp desktop broke every GGUF load. An install still activates it. The provision runs
+// for real here, offline, against a fake uv and venv python (shell scripts). ──
+test('?update=1 leaves another active engine active; an update of the active LiteRT-LM and an install activate it', async (t) => {
+  if (process.platform === 'win32') return t.skip('fakes uv and the venv python with shell scripts')
+  const storeDir = tmpDir('tllm-litert-activate-')
+  const engines = join(storeDir, 'engines')
+  mkdirSync(join(engines, 'uv'), { recursive: true })
+  writeFileSync(join(engines, 'uv', 'uv'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  mkdirSync(join(engines, 'litert-lm', 'venv', 'bin'), { recursive: true })
+  writeFileSync(join(engines, 'litert-lm', 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.18.0\n', { mode: 0o755 })
+  const provision = async (query: string, activeEngineId: string) => {
+    const h = appWithChecker(async () => '0.18.0', '0.17.1', { activeEngineId, runningKind: null, storeDir })
+    const res = await h.app.request(`/api/v1/engines/litert-lm${query}`, { method: 'POST' })
+    assert.equal(res.status, 202)
+    for (let i = 0; i < 1000 && !h.provisionCalls.some((c) => c === 'done' || c.startsWith('fail:')); i++) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.deepEqual(h.provisionCalls, ['start:litert-lm', 'done'])
+    return h.activateCalls
+  }
+  assert.deepEqual(await provision('?update=1', 'other-1'), [], 'an update must not make LiteRT-LM the active engine')
+  assert.deepEqual(await provision('?update=1', 'litert-1'), ['litert-2'])
+  assert.deepEqual(await provision('', 'other-1'), ['litert-2'], 'an install activates it')
 })

@@ -1,6 +1,10 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { majorMinor, cmpMajorMinor, pickCudaVersion } from './cuda-provision'
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import { join } from 'node:path'
+import { majorMinor, cmpMajorMinor, pickCudaVersion, swapInStagedDir } from './cuda-provision'
+import { tmpDir } from '../test-support/tmp'
 
 test('majorMinor: takes the first two components', () => {
   assert.equal(majorMinor('13.0.1'), '13.0')
@@ -40,4 +44,100 @@ test('pickCudaVersion: unknown driver → newest known', () => {
 
 test('pickCudaVersion: accepts a full driver-max like "13.0.88"', () => {
   assert.equal(pickCudaVersion('13.0.88', KNOWN), '13.0.1')
+})
+
+// The toolkit swap must be a rename, never a copy: an interrupted ~1 GB copy wrote bin/nvcc.exe
+// before include/ and lib/, and provisionCuda's reuse check (bin/nvcc.exe exists) then took the
+// half-copied toolkit as complete forever.
+test('swapInStagedDir: renames the staged toolkit into place, replacing an incomplete one', async (t) => {
+  const dir = tmpDir('tllm-cuda-swap-')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const stage = join(dir, '13.0.partial')
+  const dest = join(dir, '13.0')
+  mkdirSync(join(stage, 'bin'), { recursive: true })
+  mkdirSync(join(stage, 'include'))
+  writeFileSync(join(stage, 'bin', 'nvcc.exe'), 'new')
+  writeFileSync(join(stage, 'include', 'cuda.h'), 'header')
+  mkdirSync(join(dest, 'bin'), { recursive: true })
+  writeFileSync(join(dest, 'bin', 'stale.dll'), 'old')
+  const stagedHeader = statSync(join(stage, 'include', 'cuda.h')).ino
+
+  await swapInStagedDir(stage, dest)
+
+  assert.equal(statSync(join(dest, 'include', 'cuda.h')).ino, stagedHeader, 'moved, not copied')
+  assert.equal(readFileSync(join(dest, 'bin', 'nvcc.exe'), 'utf8'), 'new')
+  assert.equal(existsSync(join(dest, 'bin', 'stale.dll')), false)
+  assert.deepEqual(readdirSync(dir), ['13.0'])
+})
+
+// Once the new toolkit is in place the install has succeeded: a Windows lock on the replaced one (AV, indexer) must
+// not turn that into a reported failure. The leftover is removed by the next swap.
+test('swapInStagedDir: a failed delete of the replaced toolkit does not fail the swap', async (t) => {
+  const dir = tmpDir('tllm-cuda-swap-locked-')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const stage = join(dir, '13.0.partial')
+  const dest = join(dir, '13.0')
+  mkdirSync(join(stage, 'bin'), { recursive: true })
+  writeFileSync(join(stage, 'bin', 'nvcc.exe'), 'new')
+  mkdirSync(join(dest, 'bin'), { recursive: true })
+  const realRmSync = fs.rmSync
+  // `swapInStagedDir` imports rmSync by name: syncBuiltinESMExports carries the patched function to that binding.
+  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p) === `${dest}.old` && existsSync(p)) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    await swapInStagedDir(stage, dest)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+
+  assert.equal(readFileSync(join(dest, 'bin', 'nvcc.exe'), 'utf8'), 'new')
+  assert.ok(locked.mock.calls.some((c) => String(c.arguments[0]) === `${dest}.old`), 'the replaced toolkit was deleted through the patched rmSync')
+
+  // The next swap removes the leftover first.
+  mkdirSync(join(stage, 'bin'), { recursive: true })
+  writeFileSync(join(stage, 'bin', 'nvcc.exe'), 'newer')
+  await swapInStagedDir(stage, dest)
+  assert.equal(readFileSync(join(dest, 'bin', 'nvcc.exe'), 'utf8'), 'newer')
+  assert.deepEqual(readdirSync(dir), ['13.0'])
+})
+
+// The stage is thousands of files copied in moments before the swap, and Windows refuses to rename a directory while
+// AV or the indexer holds any file under it open (EPERM). That lock is brief: the swap retries rather than failing the
+// build and throwing away its 1–3 GB download.
+test('swapInStagedDir: a staged toolkit that Windows briefly refuses to rename is still swapped in', async (t) => {
+  const dir = tmpDir('tllm-cuda-swap-eperm-')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const stage = join(dir, '13.0.partial')
+  const dest = join(dir, '13.0')
+  mkdirSync(join(stage, 'bin'), { recursive: true })
+  writeFileSync(join(stage, 'bin', 'nvcc.exe'), 'new')
+  mkdirSync(join(dest, 'bin'), { recursive: true })
+  writeFileSync(join(dest, 'bin', 'stale.dll'), 'old')
+  const realRenameSync = fs.renameSync
+  let refusals = 2
+  // The renames go through download.ts's renameWithRetry, which imports renameSync by name: syncBuiltinESMExports
+  // carries the patched function to that binding.
+  const locked = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(from) === stage && refusals-- > 0) throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
+    return realRenameSync(from, to)
+  })
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'win32' }) // the retry is Windows-only, like the lock it waits out
+  syncBuiltinESMExports()
+  try {
+    await swapInStagedDir(stage, dest)
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+
+  assert.equal(readFileSync(join(dest, 'bin', 'nvcc.exe'), 'utf8'), 'new')
+  assert.equal(existsSync(join(dest, 'bin', 'stale.dll')), false)
+  assert.deepEqual(readdirSync(dir), ['13.0'])
+  assert.equal(locked.mock.calls.filter((c) => String(c.arguments[0]) === stage).length, 3)
 })

@@ -1,9 +1,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
-import { join, relative } from 'node:path'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, delimiter, join, relative } from 'node:path'
+import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { tmpDir } from '../test-support/tmp'
+import { copyCudaRuntimeLibs, runBuild, runStep } from './build-runner'
+import { checkBuildPrereqs } from './build-prereqs'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
   assert.equal(buildDirName('https://github.com/ikawrakow/ik_llama.cpp.git', 'sidestream'), 'ikawrakow-ik_llama.cpp-sidestream')
@@ -654,4 +658,195 @@ test('buildDirName: ordinary URLs keep their existing names (no build directory 
   assert.equal(buildDirName('https://github.com/PrismML-Eng/llama.cpp', 'prism'), 'prismml-eng-llama.cpp-prism')
   assert.equal(buildDirName('https://github.com/ggml-org/llama.cpp'), 'ggml-org-llama.cpp')
   assert.equal(buildDirName('https://gitlab.com/group/sub.repo'), 'gitlab.com-group-sub.repo')
+})
+
+// ── A rebuild that fails or is cancelled keeps the build it was replacing ───────────────────────
+// A rebuild of the same repo+branch lands in the directory the registered engine runs from. It used
+// to be rmSync'd before the clone, so an offline clone, an upstream tip that no longer compiles or a
+// Cancel left the registry pointing at a binary that no longer existed.
+for (const how of ['fails', 'is cancelled'] as const) {
+  test(`runBuild: a rebuild that ${how} puts the previous build back and leaves nothing parked`, async (t) => {
+    if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+    const dir = tmpDir('tllm-rebuild-')
+    const fakeBin = join(dir, 'fakebin')
+    mkdirSync(fakeBin)
+    writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+    const prereqs = await checkBuildPrereqs([fakeBin])
+    if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+      return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+    const enginesRoot = join(dir, 'engines')
+    const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+    const root = join(enginesRoot, 'build', buildDirName(repoUrl, 'main'))
+    const bin = join(root, 'build', 'bin', 'llama-server')
+    mkdirSync(join(root, 'build', 'bin'), { recursive: true })
+    writeFileSync(bin, 'previous working build')
+    const ac = new AbortController()
+    if (how === 'is cancelled') ac.abort()
+    await assert.rejects(
+      runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, ac.signal),
+      (e: Error) => how === 'fails' || e.name === 'AbortError',
+    )
+    assert.equal(readFileSync(bin, 'utf8'), 'previous working build')
+    assert.deepEqual(readdirSync(join(enginesRoot, 'build')), [basename(root)])
+  })
+}
+
+// A parked previous build that was never deleted (the daemon died mid-build) or a failed tree that could not be deleted
+// was left beside the build directory for good, often several GB. The next build of that directory sweeps them — and
+// only its own: another build's directory name can start with this one's.
+test('runBuild: a rebuild sweeps what earlier runs left parked beside its directory, and only that', async (t) => {
+  if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+  const dir = tmpDir('tllm-rebuild-sweep-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+  const prereqs = await checkBuildPrereqs([fakeBin])
+  if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+    return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+  const enginesRoot = join(dir, 'engines')
+  const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+  const name = buildDirName(repoUrl, 'main')
+  const buildDir = join(enginesRoot, 'build')
+  mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
+  for (const left of [`.${name}-1700000000000.prev`, `.${name}-1700000000001.failed`, `.${name}-dev-1700000000002.prev`]) {
+    mkdirSync(join(buildDir, left, 'build'), { recursive: true })
+  }
+  // The build directory works, and the parked build has a binary too (its delete after a successful build failed):
+  // only a build directory WITHOUT a binary gets a parked build put back, so this one is swept, not swapped in.
+  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'stale build')
+  await assert.rejects(runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, new AbortController().signal))
+  assert.deepEqual(readdirSync(buildDir).sort(), [`.${name}-dev-1700000000002.prev`, name].sort())
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
+})
+
+// The daemon died mid-build (or a failed build could not move the parked build back): a partial tree sits in the build
+// directory and the parked build is the only working copy. The sweep used to delete it, so when that next build failed
+// too nothing working was left. It goes back first now — the newest parked build that has a binary — and the rest is
+// swept as before.
+test('runBuild: a parked build that is the only working copy is put back, not swept', async (t) => {
+  if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+  const dir = tmpDir('tllm-rebuild-lastgood-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+  const prereqs = await checkBuildPrereqs([fakeBin])
+  if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+    return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+  const enginesRoot = join(dir, 'engines')
+  const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+  const name = buildDirName(repoUrl, 'main')
+  const buildDir = join(enginesRoot, 'build')
+  mkdirSync(join(buildDir, name, 'src'), { recursive: true })
+  for (const [ms, content] of [['1700000000000', 'older build'], ['1700000000001', 'last working build']]) {
+    mkdirSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin'), { recursive: true })
+    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', 'llama-server'), content)
+  }
+  mkdirSync(join(buildDir, `.${name}-1700000000002.prev`, 'build'), { recursive: true }) // a parked partial tree, no binary
+  const logs: string[] = []
+  await assert.rejects(runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: (l) => logs.push(l) }, new AbortController().signal))
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'last working build')
+  assert.deepEqual(readdirSync(buildDir), [name])
+  assert.ok(logs.some((l) => l.startsWith('Put back the previous build') && l.includes(`.${name}-1700000000001.prev`)), logs.join('\n'))
+})
+
+// When only the delete of the failed tree fails (still locked after the retries, but the rename goes through), it is
+// moved aside so the previous build still goes back; the next build of that directory sweeps the moved-aside tree.
+test('runBuild: a failed tree that cannot be deleted is moved aside and the previous build still goes back', async (t) => {
+  if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+  const dir = tmpDir('tllm-rebuild-locked-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+  const prereqs = await checkBuildPrereqs([fakeBin])
+  if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+    return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+  const enginesRoot = join(dir, 'engines')
+  const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+  const root = join(enginesRoot, 'build', buildDirName(repoUrl, 'main'))
+  const bin = join(root, 'build', 'bin', 'llama-server')
+  mkdirSync(join(root, 'build', 'bin'), { recursive: true })
+  writeFileSync(bin, 'previous working build')
+  const build = () => runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, new AbortController().signal)
+  const realRm = fsp.rm
+  // build-runner imports rm by name: syncBuiltinESMExports carries the patched function to that binding.
+  const locked = t.mock.method(fsp, 'rm', async (p: Parameters<typeof fsp.rm>[0], o?: Parameters<typeof fsp.rm>[1]) => {
+    if (String(p) === root) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRm(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(build())
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.ok(locked.mock.calls.some((c) => String(c.arguments[0]) === root), 'the failed tree was deleted through the patched rm')
+  assert.equal(readFileSync(bin, 'utf8'), 'previous working build')
+  const aside = readdirSync(join(enginesRoot, 'build')).filter((n) => n !== basename(root))
+  assert.equal(aside.length, 1)
+  const prefix = `.${basename(root)}-`
+  assert.ok(aside[0].startsWith(prefix) && /^\d+\.failed$/.test(aside[0].slice(prefix.length)), aside[0])
+
+  // The next build sweeps it.
+  await assert.rejects(build())
+  assert.equal(readFileSync(bin, 'utf8'), 'previous working build')
+  assert.deepEqual(readdirSync(join(enginesRoot, 'build')), [basename(root)])
+})
+
+// ── Windows Cancel kills the compiler tree, not just cmd.exe ─────────────────────────────────────
+// spawn's `signal` only TerminateProcess-es the direct child, which for the configure/compile steps
+// is cmd.exe; cmake/ninja/cl/nvcc kept compiling. Faked here on POSIX with a `taskkill` stand-in.
+test('runStep on Windows: aborting runs taskkill /PID <pid> /T /F and rejects with AbortError', async (t) => {
+  if (process.platform === 'win32') return t.skip('fakes Windows on a POSIX host')
+  const dir = tmpDir('tllm-treekill-')
+  const argsFile = join(dir, 'taskkill-args')
+  writeFileSync(join(dir, 'taskkill'), `#!/bin/sh\necho "$@" > '${argsFile}'\nkill -9 "$2"\n`, { mode: 0o755 })
+  const actualPlatform = process.platform
+  const actualPath = process.env.PATH
+  process.env.PATH = `${dir}${delimiter}${actualPath ?? ''}`
+  const ac = new AbortController()
+  let step: Promise<string>
+  let pid = ''
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  try {
+    step = runStep('sh', ['-c', 'echo $$; exec sleep 30'], { env: { ...process.env }, signal: ac.signal, onLine: (l) => { pid ||= l.trim() } })
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+  }
+  try {
+    while (!pid) await new Promise((r) => setTimeout(r, 10))
+    ac.abort()
+    await assert.rejects(step, { name: 'AbortError' })
+    assert.equal(readFileSync(argsFile, 'utf8').trim(), `/PID ${pid} /T /F`)
+  } finally {
+    process.env.PATH = actualPath
+  }
+})
+
+// ── Linux CUDA bundling keeps the toolkit's symlinks as symlinks ────────────────────────────────
+test('copyCudaRuntimeLibs: .so symlinks become relative links to the bundled library, not extra full copies', (t) => {
+  if (process.platform === 'win32') return t.skip('the Linux toolkit layout relies on symlinks')
+  const dir = tmpDir('tllm-cudalibs-')
+  const cuda = join(dir, 'cuda')
+  mkdirSync(join(cuda, 'bin'), { recursive: true })
+  mkdirSync(join(cuda, 'lib64'))
+  writeFileSync(join(cuda, 'bin', 'nvcc'), '')
+  writeFileSync(join(cuda, 'lib64', 'libcublas.so.12.4.5.8'), 'x'.repeat(1000))
+  symlinkSync('libcublas.so.12.4.5.8', join(cuda, 'lib64', 'libcublas.so.12'))
+  symlinkSync('libcublas.so.12', join(cuda, 'lib64', 'libcublas.so'))
+  // A link that leaves the directory can't be kept as a link: it is still copied as a file.
+  mkdirSync(join(dir, 'elsewhere'))
+  writeFileSync(join(dir, 'elsewhere', 'real-cudart'), 'cudart')
+  symlinkSync(join(dir, 'elsewhere', 'real-cudart'), join(cuda, 'lib64', 'libcudart.so.12'))
+  const dest = join(dir, 'out')
+  mkdirSync(dest)
+  assert.equal(copyCudaRuntimeLibs({ PATH: join(cuda, 'bin') }, dest, () => {}), 4)
+  assert.ok(lstatSync(join(dest, 'libcublas.so.12.4.5.8')).isFile())
+  assert.equal(readlinkSync(join(dest, 'libcublas.so.12')), 'libcublas.so.12.4.5.8')
+  assert.equal(readlinkSync(join(dest, 'libcublas.so')), 'libcublas.so.12')
+  assert.equal(readFileSync(join(dest, 'libcublas.so'), 'utf8').length, 1000)
+  assert.ok(lstatSync(join(dest, 'libcudart.so.12')).isFile())
+  assert.equal(readFileSync(join(dest, 'libcudart.so.12'), 'utf8'), 'cudart')
 })

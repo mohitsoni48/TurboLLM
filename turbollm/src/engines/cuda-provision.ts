@@ -14,7 +14,7 @@ import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
-import { downloadFile, extractArchive } from './download'
+import { downloadFile, extractArchive, renameWithRetry } from './download'
 
 const execFileP = promisify(execFile)
 
@@ -114,6 +114,38 @@ async function resolveVersion(driverMax: string | null, signal: AbortSignal): Pr
   throw new Error('Could not reach NVIDIA to resolve a CUDA Toolkit version (offline?).')
 }
 
+/** Move the assembled toolkit `stage` into place at `dest`, its sibling, by renaming: `dest` is
+ *  then either the old directory or the complete new one. The copy this replaces (~1 GB) wrote
+ *  bin/nvcc.exe before include/ and lib/, so an interrupted one passed provisionCuda's reuse check
+ *  forever. An existing `dest` (an incomplete toolkit that failed that check) is moved aside first,
+ *  since a directory can't be renamed onto an existing one on Windows, and deleted once the new
+ *  one is in place — or moved back if that rename fails. */
+export async function swapInStagedDir(stage: string, dest: string): Promise<void> {
+  const parked = existsSync(dest) ? `${dest}.old` : null
+  if (parked) {
+    // A leftover of an earlier swap whose delete below failed. Retries: Windows AV/indexer locks are brief.
+    rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    await renameWithRetry(dest, parked)
+  }
+  try {
+    // Thousands of files copied in moments ago: AV/the indexer may still hold some open, which blocks
+    // a directory rename on Windows (unlike the copy this replaced, which only read them).
+    await renameWithRetry(stage, dest)
+  } catch (e) {
+    if (parked) await renameWithRetry(parked, dest)
+    throw e
+  }
+  // The new toolkit is in place: deleting the old one is best effort, never a failed install (a leftover
+  // `.old` stays until a later swap of the same version removes it first).
+  if (parked) {
+    try {
+      rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 /** Download the build component set for a resolved version, extract each, and merge them
  *  into one toolkit root. Idempotent: if `<dataDir>/cuda/<version>/bin/nvcc.exe` already
  *  exists we reuse it. Returns the toolkit (its `bin` dir is a ready build toolchain dir). */
@@ -185,13 +217,15 @@ export async function provisionCuda(
       throw new Error('Assembled CUDA toolkit is missing bin/nvcc.exe — the component set may have changed.')
     }
     // Swap staged → final.
-    rmSync(root, { recursive: true, force: true })
     mkdirSync(join(dataDir, 'cuda'), { recursive: true })
-    cpSync(stageRoot, root, { recursive: true, force: true })
+    await swapInStagedDir(stageRoot, root)
     onProgress({ phase: 'assembling', message: `CUDA ${version} ready.` })
     return { root, binDir, version }
   } finally {
-    rmSync(work, { recursive: true, force: true })
-    rmSync(stageRoot, { recursive: true, force: true })
+    // Best effort, with retries: AV can still hold the just-extracted temp files, and a throw here would fail a completed
+    // install (or mask the swap's error) and skip the stage delete below. The next provision clears `work` first.
+    try { rmSync(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* temp leftover is harmless */ }
+    // Retries: after a failed swap the stage's fresh files can still be locked, and a throw here would mask that error.
+    rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 }

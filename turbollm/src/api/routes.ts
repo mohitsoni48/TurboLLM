@@ -318,7 +318,15 @@ export function registerApi(app: Hono, d: Deps): void {
     const existing = installedBackendBuild(root, def.id)
     if (existing) {
       let eng = d.registry.list().engines.find((e) => e.binPath === existing.bin)
-      if (!eng) eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+      if (!eng) {
+        // A build that no longer runs here: a clear 400, as POST /engines gives, not an opaque 500.
+        try {
+          eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+        } catch (e) {
+          if (e instanceof ProbeError) return err(c, 400, e.code, e.message)
+          throw e
+        }
+      }
       d.registry.activate(eng.id)
       return c.json({ accepted: false, alreadyInstalled: true, build: existing.tag })
     }
@@ -405,12 +413,29 @@ export function registerApi(app: Hono, d: Deps): void {
         // Probe + register the new build (add() probes the binary). Only now do we touch
         // the active engine / old install — if the probe throws, the old build still runs.
         let newEng = d.registry.list().engines.find((e) => e.binPath === newBin)
-        if (!newEng) newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin)).engine
+        if (!newEng) {
+          try {
+            newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin)).engine
+          } catch (e) {
+            // The new build doesn't run here: remove it. Left on disk with its completion marker,
+            // installedBackendBuild (newest tag wins) would pick it over the working build, so
+            // Update would claim "already latest" and Enable/Download would hit the failing probe.
+            // Retries: the probe just ran this tree's exe/DLLs, and a Windows AV/indexer handle can still be
+            // open. Best effort — a failed cleanup must not replace the probe error as the reported cause.
+            try { rmSync(backendDir(root, def.id as BackendId, latestTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
+            throw e
+          }
+        }
         // Stop the engine if the OLD build of this backend is the running active one, so the
         // swap doesn't leave a stale process pointing at a dir we're about to delete.
         const oldEng = d.registry.list().engines.find((e) => e.binPath === oldBin)
+        // The new build takes the old one's place: active only if the old one was (updating a
+        // fallback backend must not switch the user's engine), and with its update policy (a new
+        // engine id would otherwise fall back to notify).
+        const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
         if (oldEng) await stopEngineUsers(d, oldEng.id)
-        d.registry.activate(newEng.id)
+        if (wasActive) d.registry.activate(newEng.id)
+        if (oldEng?.updatePolicy && oldEng.id !== newEng.id) d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy)
         // GC the old install: unregister its engine entry + delete its tag-keyed dir.
         if (oldEng && oldEng.id !== newEng.id) {
           try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
@@ -441,7 +466,14 @@ export function registerApi(app: Hono, d: Deps): void {
     const build = installedBackendBuild(root, def.id)
     if (!build) return err(c, 409, 'not_installed', 'Backend is not installed on disk — download it first.')
     let eng = d.registry.list().engines.find((e) => e.binPath === build.bin)
-    if (!eng) eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
+    if (!eng) {
+      try {
+        eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
+      } catch (e) {
+        if (e instanceof ProbeError) return err(c, 400, e.code, e.message) // as POST /engines
+        throw e
+      }
+    }
     d.registry.activate(eng.id)
     return c.json({ ok: true, engineId: eng.id })
   })
@@ -478,9 +510,13 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('mlx', 'runtime_env')
+        // An update leaves the active engine as it was (as update-apply.ts does): activating it would switch engines
+        // under a model running on another. An install activates it. Each pip engine has one registration, replaced
+        // in place by its venv path, so its kind identifies it.
+        const wasActive = upgrade && d.registry.active()?.kind === 'mlx'
         const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX: ${e instanceof Error ? e.message : e}`)
@@ -502,9 +538,10 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('rapid-mlx', 'runtime_env')
+        const wasActive = upgrade && d.registry.active()?.kind === 'rapid-mlx' // an update keeps the active engine (see MLX)
         const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install Rapid-MLX: ${e instanceof Error ? e.message : e}`)
@@ -526,9 +563,10 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('mlx-vlm', 'runtime_env')
+        const wasActive = upgrade && d.registry.active()?.kind === 'mlx-vlm' // an update keeps the active engine (see MLX)
         const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX-VLM: ${e instanceof Error ? e.message : e}`)
@@ -710,8 +748,11 @@ export function registerApi(app: Hono, d: Deps): void {
   app.post('/api/v1/build/run', async (c) => {
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Building an engine requires a valid API key from a non-host device.')
-    if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
-      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
+    // Termux (platform 'android') is supported — build-prereqs/runBuild/the catalog's Android
+    // source card all handle it. The packaged Android app is not: W^X forbids exec of a built binary.
+    const buildPlatform = ['win32', 'linux', 'darwin'].includes(process.platform) || (process.platform === 'android' && !packagedAndroidApp())
+    if (!buildPlatform)
+      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, macOS, or Android (Termux) only.')
     const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }>(c)
     const repoUrl = (b.repoUrl ?? '').trim()
     if (!/^https?:\/\//i.test(repoUrl))
@@ -756,8 +797,8 @@ export function registerApi(app: Hono, d: Deps): void {
     buildAbort = ac
     d.build.start(name ?? repoUrl)
     void (async () => {
+      let out: Awaited<ReturnType<typeof runBuild>> | undefined
       try {
-        let out
         try {
           out = await runBuild(
             { repoUrl, branch, commit, patchUrl, patchSha256, enginesRoot, toolchainDirs },
@@ -765,11 +806,11 @@ export function registerApi(app: Hono, d: Deps): void {
             ac.signal,
           )
         } catch (e) {
-          // The BUILD step (clone/configure/compile) failed or was cancelled: GC the partial
-          // tree so repeated attempts don't fill the disk with multi-GB CUDA objects. Only
-          // here — never after a binary was successfully produced (that would throw away a
-          // good build over a mere registration hiccup).
-          try { rmSync(buildRoot, { recursive: true, force: true }) } catch { /* best effort */ }
+          // The BUILD step (clone/configure/compile) failed or was cancelled. runBuild itself
+          // has already removed the partial tree (so repeated attempts don't fill the disk with
+          // multi-GB CUDA objects) and put back the build it was replacing — deleting buildRoot
+          // here would throw away that working build. Never GC after a binary was successfully
+          // produced either (that would throw away a good build over a mere registration hiccup).
           if ((e as Error)?.name === 'AbortError') {
             d.build.log('Build cancelled.')
             d.build.cancel('Build cancelled.')
@@ -831,6 +872,9 @@ export function registerApi(app: Hono, d: Deps): void {
         d.build.fail(`Built successfully, but couldn't register the engine: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         if (buildAbort === ac) buildAbort = null
+        // The build this one replaced, parked by runBuild. Once a new binary exists it is gone
+        // either way — as before the parking, a registration failure keeps only the new build.
+        if (out?.prevBuildRoot) try { rmSync(out.prevBuildRoot, { recursive: true, force: true }) } catch { /* best effort */ }
       }
     })()
     return c.json({ accepted: true }, 202)
@@ -946,9 +990,10 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('vllm', 'runtime_env')
+        const wasActive = upgrade && d.registry.active()?.kind === 'vllm' // an update keeps the active engine (see MLX)
         const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install vLLM: ${e instanceof Error ? e.message : e}`)
@@ -967,9 +1012,10 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('sglang', 'runtime_env')
+        const wasActive = upgrade && d.registry.active()?.kind === 'sglang' // an update keeps the active engine (see MLX)
         const rt = await ensureSglangEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addSglang(`SGLang (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install SGLang: ${e instanceof Error ? e.message : e}`)
@@ -1022,9 +1068,11 @@ export function registerApi(app: Hono, d: Deps): void {
         // with the same guard keyed on the registry's active engine; main's v1.14.5 refinement is kept —
         // it is the stricter of the two and covers the PR's case.)
         if (d.manager.currentOpts()?.engine.kind === 'litert-lm') await d.manager.stopAndWait()
+        // An update keeps the active engine (see MLX) — for LiteRT-LM especially: an active LiteRT-LM is sent every GGUF.
+        const wasActive = upgrade && d.registry.active()?.kind === 'litert-lm'
         const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade, ac.signal)
         const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') d.provision.done() // user cancelled — nothing failed
@@ -1041,7 +1089,7 @@ export function registerApi(app: Hono, d: Deps): void {
   // compatible), and registers it as a kind='llama-server' engine. 202 + progress
   // via /status. The fork currently ships macOS prebuilts only, so the install is
   // platform-guarded to where an asset actually exists (matches the OS prefilter).
-  // ?update=1 removes the existing install dir so the latest release is re-downloaded.
+  // ?update=1 fetches the latest release and swaps it in only once it is on disk.
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
     if (!entry?.repo) return err(c, 500, 'internal', 'TurboQuant catalog entry is misconfigured.')
@@ -1051,28 +1099,44 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    // Cancellable from the provision banner, like the backend install: the download takes the
+    // signal, and an update only swaps the staged release in once it has fully arrived.
+    const ac = new AbortController()
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
-        // For update: remove existing dir so provisionTurboquant re-downloads the latest.
+        // Update: stop what runs on the install, then let provisionTurboquant stage the latest
+        // beside it and swap only on success. Deleting the dir first left the engine pointing at
+        // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
+        // An update leaves the active engine as it was (as update-apply.ts and the backend update
+        // do): activating it would switch engines under a model running on another. An install
+        // activates it.
+        let wasActive = false
         if (upgrade) {
-          const tqDir = join(root, 'turboquant')
-          if (existsSync(tqDir)) rmSync(tqDir, { recursive: true, force: true })
+          const cur = d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant')))
+          wasActive = !!cur && d.registry.active()?.id === cur.id
+          if (cur) await stopEngineUsers(d, cur.id)
         }
         // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
-        const bin = await provisionTurboquant(root, entry.repo!, (p) =>
-          d.provision.progress(p.phase, p.pct, p.part, p.parts),
+        const bin = await provisionTurboquant(
+          root, entry.repo!,
+          (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
+          ac.signal, { replace: upgrade },
         )
         let eng = d.registry.list().engines.find((e) => e.binPath === bin)
         if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
             : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'turboquant' }, 202)
@@ -1080,8 +1144,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Provision KoboldCpp (engine overhaul, Phase 4): download the single platform/GPU-
   // matching binary from its GitHub release, register as a kind='koboldcpp' engine.
-  // 202 + progress via /status. ?update=1 removes the existing binary so the latest is
-  // re-downloaded. CUDA build is chosen on NVIDIA; portable build elsewhere.
+  // 202 + progress via /status. ?update=1 re-downloads the latest, replacing the existing
+  // binary only once the download completed. CUDA build is chosen on NVIDIA; portable build elsewhere.
   app.post('/api/v1/engines/koboldcpp', (c) => {
     const entry = catalogEngine('koboldcpp')
     if (!entry?.repo) return err(c, 500, 'internal', 'KoboldCpp catalog entry is misconfigured.')
@@ -1092,23 +1156,34 @@ export function registerApi(app: Hono, d: Deps): void {
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
     const hasNvidia = primaryVendor(getSysInfo()) === 'nvidia'
+    // Cancellable (as TurboQuant above): the download streams to a `.part`, so the old binary stays.
+    const ac = new AbortController()
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('koboldcpp', upgrade ? 'user_update' : 'user_install')
+        // Update: stop what runs on the binary (Windows can't replace a running .exe), then
+        // re-download over it — never delete it first. Active afterwards only if it was (see the
+        // TurboQuant route above).
+        let wasActive = false
         if (upgrade) {
-          const dir = koboldcppDir(root)
-          if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+          const cur = d.registry.list().engines.find((e) => e.kind === 'koboldcpp' && e.binPath === koboldcppBinPath(root))
+          wasActive = !!cur && d.registry.active()?.id === cur.id
+          if (cur) await stopEngineUsers(d, cur.id)
         }
-        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts))
+        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'KoboldCpp has no prebuilt binary for this operating system/architecture in its latest release.'
             : `Could not install KoboldCpp: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'koboldcpp' }, 202)
@@ -1116,8 +1191,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Provision llamafile (engine overhaul, Phase 4): download the single portable
   // executable from its GitHub release, register as a kind='llamafile' engine. 202 +
-  // progress via /status. ?update=1 removes the existing binary so the latest is
-  // re-downloaded.
+  // progress via /status. ?update=1 re-downloads the latest, replacing the existing
+  // binary only once the download completed.
   app.post('/api/v1/engines/llamafile', (c) => {
     const entry = catalogEngine('llamafile')
     if (!entry?.repo) return err(c, 500, 'internal', 'llamafile catalog entry is misconfigured.')
@@ -1127,23 +1202,32 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    const ac = new AbortController() // cancellable, as KoboldCpp above
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('llamafile', upgrade ? 'user_update' : 'user_install')
+        // Update: stop, then re-download over the binary — never delete it first; active
+        // afterwards only if it was (as above).
+        let wasActive = false
         if (upgrade) {
-          const dir = llamafileDir(root)
-          if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
+          const cur = d.registry.list().engines.find((e) => e.kind === 'llamafile' && e.binPath === llamafileBinPath(root))
+          wasActive = !!cur && d.registry.active()?.id === cur.id
+          if (cur) await stopEngineUsers(d, cur.id)
         }
-        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts))
+        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'llamafile has no downloadable binary in its latest release.'
             : `Could not install llamafile: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'llamafile' }, 202)

@@ -4,9 +4,9 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
@@ -336,7 +336,53 @@ export async function downloadFile(
       }
     }
   })
-  await pipeline(body, createWriteStream(dest), { signal })
+  // Stream into a sibling `.part` and rename only once the whole body arrived. Written straight to
+  // `dest`, a dropped connection or a quit left a truncated file there — and KoboldCpp/llamafile
+  // treat an existing binary as installed, so the next Install registered the broken one.
+  const part = `${dest}.part`
+  try {
+    await pipeline(body, createWriteStream(part), { signal })
+    await renameWithRetry(part, dest)
+  } catch (e) {
+    rmSync(part, { force: true })
+    throw e
+  }
+}
+
+/** renameSync, retried for ~3 s on Windows. Windows refuses to rename a directory while any file
+ *  under it is open (whatever the share mode, surfaced as EPERM; EACCES/EBUSY likewise), and
+ *  real-time AV and the search indexer open freshly written files for a moment — exactly what a
+ *  just-staged install or download is (graceful-fs retries its win32 renames for the same reason).
+ *  POSIX rename ignores open handles, so elsewhere a failure is real and thrown at once. */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let delay = 100; ; delay *= 2) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (process.platform !== 'win32' || delay > 1600 || (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY')) throw e
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+}
+
+/** The release tag a single-binary engine (KoboldCpp, llamafile) was downloaded as, recorded
+ *  beside it by {@link recordReleaseTag}; '' for an install that predates the record. */
+export function recordedReleaseTag(binPath: string): string {
+  try {
+    return readFileSync(`${binPath}.version`, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
+export function recordReleaseTag(binPath: string, tag: string): void {
+  try {
+    writeFileSync(`${binPath}.version`, `${tag}\n`)
+  } catch {
+    /* best effort — it only labels the version */
+  }
 }
 
 /**
@@ -686,14 +732,53 @@ export async function turboquantAssetUrl(
 /** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`,
  *  resolving the right per-platform source (HF on Windows, GitHub elsewhere) via the
  *  download → extract → locate pipeline. Throws `no_release_asset` when this platform
- *  has no prebuilt. */
+ *  has no prebuilt. `replace` (an update) fetches the latest even when an install exists:
+ *  it is extracted into a staging dir and swapped in only once it holds a llama-server,
+ *  so a failed lookup, download or extract leaves the working install untouched. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  opts: { replace?: boolean } = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
+  if (opts.replace) {
+    // Provision into a staging root exactly as a first install would, then swap the dirs.
+    const stageRoot = join(enginesRoot, '.turboquant-update')
+    const stagedDir = join(stageRoot, 'turboquant')
+    rmSync(stageRoot, { recursive: true, force: true }) // a stale stage from an interrupted update
+    try {
+      const stagedBin = await provisionTurboquant(stageRoot, repo, onProgress, signal)
+      const parked = existsSync(destDir) ? join(enginesRoot, '.turboquant-old') : null
+      if (parked) {
+        // A leftover of an earlier update whose delete below failed. Retries: Windows AV/indexer locks are brief.
+        rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+        await renameWithRetry(destDir, parked)
+      }
+      try {
+        // The staged tree was extracted moments ago: AV/the indexer may still hold its files open.
+        await renameWithRetry(stagedDir, destDir)
+      } catch (e) {
+        if (parked) await renameWithRetry(parked, destDir)
+        throw e
+      }
+      // The new install is in place: deleting the old one is best effort, never a failed update (the next one
+      // removes a leftover first).
+      if (parked) {
+        try {
+          rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+        } catch {
+          /* best effort */
+        }
+      }
+      return join(destDir, relative(stagedDir, stagedBin))
+    } finally {
+      // Retries as above: after a failed swap the stage still holds those fresh files, and a throw here would mask
+      // the real error.
+      rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    }
+  }
   if (existsSync(destDir)) {
     const found = findServer(destDir)
     if (found) {
