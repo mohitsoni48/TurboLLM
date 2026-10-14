@@ -83,6 +83,10 @@ abstract class TailscaleProvider implements RemoteProvider {
     protected run: RunTailscale = runTailscale,
   ) {}
 
+  get publicPort(): TailscalePublicPort {
+    return this.cfg.port
+  }
+
   async preflight(): Promise<PreflightState> {
     let out: { code: number; stdout: string; stderr: string }
     try {

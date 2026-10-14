@@ -49,10 +49,31 @@ export function sanitizeTokenGrant(stored: { capabilities: string[]; models?: st
 // lifetime — spec 30 §6.3's own words — so a reconnect (another Retry click, toggling off
 // and back on) re-shows the SAME token instead of minting and orphaning a fresh one every
 // time. Mirrors cli.ts's own `let tunnelToken: string | null = null` convention for the
-// legacy tunnel token. Cleared by `/stop` below, and only by `/stop` — that is the one
-// action that actually revokes it (`revokeRemoteKeys`), so it is also the only action that
-// may make the NEXT `/start` mint genuinely fresh.
+// legacy tunnel token. Cleared only by stopRemoteAccess below (`/stop`, or switching the
+// experimental flag off) — the one action that actually revokes it (`revokeRemoteKeys`), so
+// it is also the only action that may make the NEXT `/start` mint genuinely fresh.
 let cachedRemoteToken: string | null = null
+
+/** Turn remote access off the way Stop does: persist `enabled: false`, take the tunnel down,
+ *  revoke the scoped remote keys and drop the cached token. Shared by `/stop` and by the
+ *  Settings PATCH that switches the experimental flag off — after which every route here,
+ *  Stop included, refuses, so the flag-off path has to do this itself (spec 30 §8.1: with the
+ *  flag off "the supervisor does not run"). */
+export async function stopRemoteAccess(d: Deps): Promise<number> {
+  d.store.update((cfg) => {
+    cfg.remoteAccess.enabled = false
+  })
+  // Awaited, not fire-and-forget: for a system-state provider this call is what
+  // un-exposes the box, and a disabled toggle in front of a live public URL is the worst
+  // failure this feature can have.
+  await d.remote?.disable()
+  const revoked = revokeRemoteKeys(d)
+  // I5: the ONLY place the cached token is cleared — this is also the only action that
+  // actually revokes it, so it is the only action that may make the next `/start` mint
+  // genuinely fresh rather than handing back a token that no longer exists.
+  cachedRemoteToken = null
+  return revoked
+}
 
 export function registerRemoteApi(app: Hono, d: Deps): void {
   // Every route carries hostGate. Remote-access config IS credential management — it holds a
@@ -125,18 +146,7 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     const refused = guard(c)
     if (refused) return refused
     const provider = d.store.snapshot().remoteAccess.provider
-    d.store.update((cfg) => {
-      cfg.remoteAccess.enabled = false
-    })
-    // Awaited, not fire-and-forget: for a system-state provider this call is what
-    // un-exposes the box, and a disabled toggle in front of a live public URL is the worst
-    // failure this feature can have.
-    await d.remote?.disable()
-    const revoked = revokeRemoteKeys(d)
-    // I5: the ONLY place the cached token is cleared — this is also the only action that
-    // actually revokes it, so it is the only action that may make the next `/start` mint
-    // genuinely fresh rather than handing back a token that no longer exists.
-    cachedRemoteToken = null
+    const revoked = await stopRemoteAccess(d)
     if (d.telemetry) emit(d.telemetry, remoteAccessDisabled, { provider })
     return c.json({ state: d.remote?.state() ?? { kind: 'off' }, revoked })
   })

@@ -161,6 +161,7 @@ class FakeSystemStateProvider implements RemoteProvider {
   readonly lifecycle = 'system-state' as const
   starts = 0
   stops = 0
+  constructor(readonly publicPort = 443) {}
   async preflight(): Promise<PreflightState> {
     return { kind: 'off' }
   }
@@ -621,4 +622,177 @@ test('manager: I3 — a real TailscaleServeProvider CLI failure surfaces as fail
   assert.equal(s.kind === 'failed' && s.reason.includes('Funnel is not enabled for this tailnet'), true)
 
   await m.disable()
+})
+
+/** Models a real provider's start(): it does slow work first (ensureCloudflared's release
+ *  lookup/download, Tailscale's `status --json`) and only THEN brings the tunnel up — and its
+ *  stop() can only undo what is already up (ChildTunnel.stop() returns early with no child;
+ *  Tailscale's `off` before the `--bg` resets nothing). `up` is "a public URL is live". */
+class GatedProvider implements RemoteProvider {
+  starts = 0
+  stops = 0
+  up = false
+  private openGate: (() => void) | undefined
+  private preGate: Promise<void> | undefined
+  private openPreGate: (() => void) | undefined
+  constructor(
+    readonly lifecycle: RemoteProvider['lifecycle'] = 'child-process',
+    readonly id: RemoteProvider['id'] = 'cloudflare-quick',
+    holdPreflight = false,
+    readonly publicPort?: number,
+  ) {
+    if (holdPreflight) this.preGate = new Promise<void>((r) => (this.openPreGate = r))
+  }
+  async preflight(): Promise<PreflightState> {
+    await this.preGate
+    return { kind: 'off' }
+  }
+  async start(): Promise<{ url: string }> {
+    this.starts++
+    await new Promise<void>((r) => (this.openGate = r))
+    this.up = true
+    return { url: 'https://gated.trycloudflare.com' }
+  }
+  async stop(): Promise<void> {
+    this.stops++
+    this.up = false
+  }
+  alive(): boolean {
+    return this.up
+  }
+  onExit(): void {}
+  release(): void {
+    this.openGate?.()
+  }
+  releasePreflight(): void {
+    this.openPreGate?.()
+  }
+}
+
+test('manager: disable() while enable() is still starting the provider tears down what the start brings up', async () => {
+  const p = new GatedProvider()
+  const m = mgr(p)
+  const enabling = m.enable()
+  await waitFor(() => p.starts === 1) // ingress bound, provider.start() in its slow phase
+  await m.disable()
+  assert.equal(m.state().kind, 'off')
+
+  p.release() // the start finishes AFTER the user stopped remote access
+  await enabling
+  assert.equal(p.up, false, 'the late-started tunnel was stopped, not left live behind an `off` toggle')
+  assert.equal(m.state().kind, 'off')
+  assert.equal(m.ingressPort(), undefined)
+})
+
+test('manager: disable() while a restart() is starting the replacement provider tears it down too', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const first = new WatchableProvider()
+  const second = new GatedProvider()
+  let calls = 0
+  const m = new RemoteAccessManager({
+    app,
+    ingressPort: 0,
+    makeProvider: () => (calls++ === 0 ? first : second),
+    probe: async () => true,
+  })
+  await m.enable()
+  first.triggerExit(1) // -> restart(): reconnecting, backoff wait
+  t.mock.timers.tick(backoffDelay(0))
+  await flush()
+  await flush()
+  assert.equal(second.starts, 1) // the replacement's start() is in its slow phase
+
+  await m.disable()
+  assert.equal(m.state().kind, 'off')
+  second.release()
+  await flush()
+  await flush()
+  assert.equal(second.up, false)
+  assert.equal(m.state().kind, 'off')
+})
+
+test('manager: disable() while the ingress is still binding never starts the provider and releases the listener', async () => {
+  const p = new GatedProvider('child-process', 'cloudflare-quick', true)
+  const m = mgr(p)
+  const enabling = m.enable()
+  p.releasePreflight()
+  // Let enable() pass its post-preflight check and reach the bind; no macrotask runs here, so
+  // the listener cannot have finished binding before disable() goes through.
+  for (let i = 0; i < 20; i++) await Promise.resolve()
+  await m.disable()
+  assert.equal(m.state().kind, 'off')
+  await enabling
+  assert.equal(p.starts, 0, 'a superseded flow must not start the provider')
+  assert.equal(m.ingressPort(), undefined, 'the late-bound listener was released')
+})
+
+test('manager: a stale system-state start is reset unless the newer connection writes the same entry', async (t) => {
+  const cases = [
+    // Same id and port: a second `off` from the stale instance would un-expose the live Serve.
+    { name: 'serve:443, then serve:443', staleId: 'tailscale-serve', stalePort: 443, livePort: 443, reset: false },
+    // The late `funnel --bg` (blocked on tailnet-admin approval) would turn the newer Serve public.
+    { name: 'funnel:443, then serve:443', staleId: 'tailscale-funnel', stalePort: 443, livePort: 443, reset: true },
+    // ...or leave a public Funnel entry that no later disable() resets, behind a "tailnet only" UI.
+    { name: 'funnel:443, then serve:8443', staleId: 'tailscale-funnel', stalePort: 443, livePort: 8443, reset: true },
+    { name: 'serve:443, then serve:8443', staleId: 'tailscale-serve', stalePort: 443, livePort: 8443, reset: true },
+  ] as const
+  for (const c of cases) {
+    await t.test(c.name, async () => {
+      const stale = new GatedProvider('system-state', c.staleId, false, c.stalePort)
+      const fresh = new FakeSystemStateProvider(c.livePort)
+      let calls = 0
+      const m = new RemoteAccessManager({
+        app,
+        ingressPort: 0,
+        makeProvider: () => (calls++ === 0 ? stale : fresh),
+        probe: async () => true,
+      })
+      const enabling = m.enable()
+      await waitFor(() => stale.starts === 1)
+      await m.disable() // stale.stops === 1 (its `off` ran before its own `--bg`)
+      await m.enable() // the newer connection, after the user changed provider/port (or not)
+      assert.equal(m.state().kind, 'connected')
+
+      stale.release() // the stale `--bg` now writes its entry
+      await enabling
+      assert.equal(stale.stops, c.reset ? 2 : 1)
+      assert.equal(stale.up, !c.reset)
+      assert.equal(m.state().kind, 'connected')
+      assert.equal(m.activeProvider(), 'tailscale-serve')
+      await m.disable()
+    })
+  }
+})
+
+test('manager: a restart() onto a different Tailscale port resets the old entry, so Stop leaves nothing public', async (t) => {
+  // Settings saves `tailscale.port` while connected; the next health restart builds the
+  // replacement from that config. Only a different entry needs the old one reset.
+  for (const c of [
+    { livePort: 8443, resetOnRestart: true },
+    { livePort: 443, resetOnRestart: false },
+  ]) {
+    await t.test(`443, then ${c.livePort}`, async (st) => {
+      st.mock.timers.enable({ apis: ['setTimeout'] })
+      const old = new FakeSystemStateProvider(443)
+      const fresh = new FakeSystemStateProvider(c.livePort)
+      let calls = 0
+      const m = new RemoteAccessManager({
+        app,
+        ingressPort: 0,
+        makeProvider: () => (calls++ === 0 ? old : fresh),
+        probe: async () => true,
+      })
+      await m.enable()
+      const restarting = m.restart('health probe failed — the public URL stopped answering')
+      st.mock.timers.tick(backoffDelay(0))
+      await restarting
+      assert.equal(m.state().kind, 'connected')
+      assert.equal(fresh.starts, 1)
+      assert.equal(old.stops, c.resetOnRestart ? 1 : 0)
+
+      await m.disable() // the user clicks Stop
+      assert.equal(old.stops, c.resetOnRestart ? 1 : 0)
+      assert.equal(fresh.stops, 1)
+    })
+  }
 })

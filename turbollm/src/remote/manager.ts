@@ -141,8 +141,20 @@ export class RemoteAccessManager implements RemoteIngress {
 
     try {
       const port = await this.ingress.start(this.opts.app, this.opts.ingressPort)
+      if (gen !== this.generation) {
+        // Superseded while binding: a disable() that ran before the bind completed found no
+        // listener to stop, so release the one this flow just bound (a newer enable() binds its
+        // own afresh) and never start the provider at all.
+        await this.ingress.stop()
+        return
+      }
       const { url } = await provider.start(port)
-      if (gen !== this.generation) return // superseded while binding ingress / starting the provider
+      if (gen !== this.generation) {
+        // Superseded while the provider was starting: the disable() that bumped the generation
+        // stopped this same instance before it had brought anything up, so undo it here.
+        await this.abandonStaleStart(provider)
+        return
+      }
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider, gen)
@@ -178,6 +190,31 @@ export class RemoteAccessManager implements RemoteIngress {
     if (provider) await provider.stop()
     await this.ingress.stop()
     this.set({ kind: 'off' })
+  }
+
+  /** Undo a provider start that completed after its flow was superseded (a disable(), maybe
+   *  followed by a fresh enable(), ran while provider.start() was in flight). disable() stopped
+   *  this same instance, but before it had spawned its child or issued its serve — without this
+   *  the tunnel comes up anyway, out of reach of any later disable(): state `off` in front of a
+   *  live public URL. A 'system-state' provider is left alone only while the newer flow's
+   *  provider writes the SAME entry (same id and public port): Tailscale's entry is keyed by the
+   *  public port, not by instance, so this reset would also un-expose that newer connection,
+   *  which owns the entry and resets it itself. Any other pairing is stopped, failing closed: a
+   *  stale `funnel --bg` (it blocks on tailnet-admin approval) landing after the user switched
+   *  to Serve, or to another port, would otherwise leave a public entry nothing owns, or turn
+   *  the newer Serve entry public. When the stale Funnel shares the port, its reset also drops
+   *  the newer Serve entry, which the health loop's restart() re-issues. */
+  private async abandonStaleStart(provider: RemoteProvider): Promise<void> {
+    const live = this.provider
+    if (
+      provider.lifecycle === 'system-state' &&
+      live?.id === provider.id &&
+      provider.publicPort !== undefined &&
+      live.publicPort === provider.publicPort
+    ) {
+      return
+    }
+    await provider.stop().catch(() => {})
   }
 
   /** Watch a child-process provider for an unexpected exit and restart it with backoff. `gen`
@@ -316,11 +353,28 @@ export class RemoteAccessManager implements RemoteIngress {
     if (gen !== this.generation) return
 
     const provider = this.opts.makeProvider()
+    // The replacement is built from the CURRENT config, and Settings saves a Tailscale port
+    // change while connected. A 'system-state' entry outlives its instance and is keyed by the
+    // public port, so if the new instance writes a different entry, reset the old one first:
+    // once `this.provider` moves on, no disable() would ever reset it, leaving the old port
+    // public behind an `off` toggle. Same entry: the new `--bg` simply re-issues it. A disable()
+    // landing during this stop still finds `prev` in `this.provider` and resets it itself.
+    const prev = this.provider
+    if (
+      prev?.lifecycle === 'system-state' &&
+      (prev.id !== provider.id || prev.publicPort !== provider.publicPort)
+    ) {
+      await prev.stop().catch(() => {})
+      if (gen !== this.generation) return
+    }
     this.provider = provider
     try {
       const port = this.ingress.ingressPort() ?? (await this.ingress.start(this.opts.app, this.opts.ingressPort))
       const { url } = await provider.start(port)
-      if (gen !== this.generation) return
+      if (gen !== this.generation) {
+        await this.abandonStaleStart(provider) // a disable() landed mid-start — see enable()
+        return
+      }
       // ADR-422 Phase 3 final review, Important finding I2: start() succeeding is only real
       // evidence of reachability for a 'child-process' provider — spawnAndWait requires the
       // child to print concrete proof (a real URL) before resolving. For 'system-state' and

@@ -86,6 +86,7 @@ import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
 import { stopEngineUsers } from '../engines/serving'
+import { stopRemoteAccess } from '../remote/routes'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 413 | 500 | 501 | 503
 
@@ -2542,6 +2543,15 @@ export function registerApi(app: Hono, d: Deps): void {
     if (telemetryLevel !== undefined && telemetryLevel !== prevTelemetryLevel) void sendConsentChoice(d.store.dir(), telemetryLevel)
 
     const after = d.store.snapshot().daemon
+
+    // Experimental → Remote access switched off: from here every /api/v1/remote/* route (Stop
+    // included) refuses and the UI hides the section, so a running tunnel would stay public
+    // with no way to stop it. Stop it now, as Stop would (spec 30 §8.1: flag off → "the
+    // supervisor does not run"). Only a UI/config-managed tunnel (`remoteAccess.enabled`): the
+    // ungated `--tunnel` override (cli.ts) leaves that false and keeps running.
+    if (before.experimental?.remoteAccess && !after.experimental?.remoteAccess && d.store.snapshot().remoteAccess.enabled) {
+      await stopRemoteAccess(d)
+    }
 
     // A LAN-bind or port change re-points the HTTP listener. Rather than a full daemon
     // restart (which unloads the model), do an in-place rebind that keeps everything

@@ -169,6 +169,19 @@ export class ChildTunnel {
       child.stderr?.on('data', onData)
       child.stdout?.on('data', onData)
 
+      // A spawn failure — ENOENT (the binary was deleted, or quarantined by antivirus) or
+      // EACCES (start()'s best-effort chmod failed) — arrives as an 'error' event and NO
+      // 'exit'. Unlistened, Node throws it as an uncaught exception and the whole daemon dies.
+      // An 'error' on a child that did spawn (e.g. a failed kill) leaves the rest to its 'exit'.
+      child.on('error', (err) => {
+        if (child.pid !== undefined) return
+        if (this.child === child) this.child = null
+        if (!settled) {
+          settled = true
+          reject(err)
+        }
+      })
+
       this.exited = new Promise((res) => {
         child.on('exit', (code) => {
           if (this.child === child) this.child = null

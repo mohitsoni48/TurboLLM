@@ -5,6 +5,7 @@ import type { Deps } from '../deps'
 import { registerRemoteApi, sanitizeTokenGrant } from './routes'
 import { defaultConfig, normalizeProvider } from '../config/config'
 import { isRemoteAccessEnabled } from './gate'
+import { registerApi } from '../api/routes'
 
 test('sanitizeTokenGrant: strips config:*/downloads:* even if stored, keeps the four server capabilities', () => {
   const r = sanitizeTokenGrant({
@@ -171,4 +172,68 @@ test('remote routes: preflight rejects an unknown provider id', async () => {
     body: JSON.stringify({ provider: 'not-a-provider' }),
   }, LOCAL_ENV)
   assert.equal(res.status, 400)
+})
+
+// ── Switching the experimental flag off takes a running tunnel down ─────────────────────
+// With the flag off every route above (Stop included) refuses and the UI hides the section,
+// so a tunnel left running would stay public with no way to stop it (spec 30 §8.1: flag off →
+// "the supervisor does not run"). Driven through the real PATCH /api/v1/settings.
+
+function settingsApp(opts: { uiEnabled: boolean }) {
+  const cfg = defaultConfig()
+  cfg.daemon.experimental.remoteAccess = true
+  // true: started from the UI (/start persists it) or auto-started from it at boot.
+  // false: the ungated `--tunnel` override, which never touches it.
+  cfg.remoteAccess.enabled = opts.uiEnabled
+  cfg.apiKeys = [
+    { id: 'r1', name: 'remote', hash: 'h1', prefix: 'tllm-r', createdAt: 'c', lastUsedAt: null, grant: { kind: 'remote', capabilities: ['models:use'] } },
+    { id: 'n1', name: 'plain', hash: 'h2', prefix: 'tllm-n', createdAt: 'c', lastUsedAt: null },
+  ] as typeof cfg.apiKeys
+  let disabled = 0
+  const d = {
+    version: 'test',
+    // snapshot() is a copy, as in ConfigStore — the PATCH compares before/after snapshots.
+    store: { snapshot: () => structuredClone(cfg), update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+    remote: {
+      ingressPort: () => 6997,
+      state: () => ({ kind: 'connected', url: 'https://x.test', since: '2026-09-10T00:00:00Z' }),
+      url: () => 'https://x.test',
+      enable: async () => {},
+      disable: async () => {
+        disabled++
+      },
+    },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+  const patch = (b: unknown) =>
+    app.request('/api/v1/settings', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(b),
+    })
+  return { patch, cfg, disabled: () => disabled }
+}
+
+test('settings: switching Experimental → Remote access off stops a UI-managed tunnel, exactly as Stop does', async () => {
+  const { patch, cfg, disabled } = settingsApp({ uiEnabled: true })
+  const res = await patch({ experimental: { remoteAccess: false } })
+  assert.equal(res.status, 200)
+  assert.equal(disabled(), 1, 'the tunnel was taken down')
+  assert.equal(cfg.remoteAccess.enabled, false)
+  assert.deepEqual(cfg.apiKeys.map((k) => k.id), ['n1'], 'the scoped remote key was revoked, the plain one kept')
+})
+
+test('settings: switching the flag off leaves the ungated --tunnel override running', async () => {
+  const { patch, disabled } = settingsApp({ uiEnabled: false })
+  assert.equal((await patch({ experimental: { remoteAccess: false } })).status, 200)
+  assert.equal(disabled(), 0)
+})
+
+test('settings: a save that leaves the flag on does not touch the tunnel', async () => {
+  const { patch, cfg, disabled } = settingsApp({ uiEnabled: true })
+  assert.equal((await patch({ experimental: { remoteAccess: true }, autoLoadOnStart: true })).status, 200)
+  assert.equal(disabled(), 0)
+  assert.equal(cfg.remoteAccess.enabled, true)
 })

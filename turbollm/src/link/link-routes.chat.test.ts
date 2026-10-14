@@ -204,3 +204,64 @@ test('a LOCAL model key containing a slash is untouched by the chaining guard', 
   assert.equal(res.status, 200)
   assert.ok(upstream, 'reached the engine')
 })
+
+// ── The allowlist binds the model that ANSWERS, not just the `model` string ─────────────
+// ModelRouter.route() answers with whatever is loaded when `model` is empty or auto-swap is
+// off, so a check on the requested string alone let a restricted token be served a model
+// GET /api/link/v1/models deliberately hid from it.
+
+/** Mirrors ModelRouter.targetEntry: with auto-swap off (or no model named) the loaded model
+ *  answers; otherwise the named one does. */
+function servingDeps(caps: string[], models: string[], autoSwap: boolean): { d: Deps; h: Harness } {
+  const out = mkDeps([key('tllm-a', caps, models)])
+  const cfg = out.d.store.snapshot() as unknown as { gateway: { autoSwap: boolean } }
+  cfg.gateway.autoSwap = autoSwap
+  ;(out.d as unknown as { modelRouter: Record<string, unknown> }).modelRouter.targetEntry =
+    (m: string) => ({ key: !autoSwap || !m ? LOADED : m })
+  return out
+}
+
+function postWithoutModel(d: Deps, token: string) {
+  return app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': token, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+  })
+}
+
+test('an allowlisted token that leaves out `model` is not answered by a model outside its list', async () => {
+  const { d, h } = servingDeps(['models:use'], [COLD], true)
+  const res = await postWithoutModel(d, 'tllm-a')
+  assert.equal(res.status, 403)
+  assert.equal(await errorCode(res), 'forbidden')
+  assert.deepEqual(h.routed, [], 'the loaded model was never reached')
+  assert.equal(upstream, null)
+})
+
+test('the no-`model` fallback is also checked when the router names no entry for it', async () => {
+  // A loaded model the scanner no longer lists: targetEntry() has nothing to say, but
+  // route('') still answers with manager.target() — so the loaded key is what is checked.
+  const { d, h } = mkDeps([key('tllm-a', ['models:use'], [COLD])])
+  const res = await postWithoutModel(d, 'tllm-a')
+  assert.equal(res.status, 403)
+  assert.deepEqual(h.routed, [])
+})
+
+test('with auto-swap off, an allowlisted name the host would answer with ANOTHER model is refused', async () => {
+  const { d, h } = servingDeps(['models:use', 'models:load'], [COLD], false)
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 403)
+  assert.equal(await errorCode(res), 'forbidden')
+  assert.deepEqual(h.routed, [])
+})
+
+test('a restricted token is still served when the answering model is on its list', async () => {
+  // Leaving `model` out is fine when what is loaded is allowed...
+  const a = servingDeps(['models:use'], [LOADED], true)
+  assert.equal((await postWithoutModel(a.d, 'tllm-a')).status, 200)
+  assert.deepEqual(a.h.routed, [''])
+  // ...and an allowed cold model still wakes onto the auto-swap path.
+  const b = servingDeps(['models:use', 'models:wake'], [COLD], true)
+  assert.equal((await post(b.d, 'tllm-a', COLD)).status, 200)
+  assert.deepEqual(b.h.routed, [COLD])
+})

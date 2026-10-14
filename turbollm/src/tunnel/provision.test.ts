@@ -1,6 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { cloudflaredAssetName, cloudflaredBinName, pickCloudflaredAsset } from './provision'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { dirname } from 'node:path'
+import { tmpDir } from '../test-support/tmp'
+import { cloudflaredAssetName, cloudflaredBinName, cloudflaredBinPath, ensureCloudflared, pickCloudflaredAsset } from './provision'
 
 // Fixture: the real asset list from cloudflare/cloudflared's latest release (tag
 // 2026.6.1), fetched via `gh api repos/cloudflare/cloudflared/releases/latest` while
@@ -61,4 +64,64 @@ test('cloudflaredBinName: platform-correct extension, no hardcoded .exe', () => 
   assert.equal(cloudflaredBinName('win32'), 'cloudflared.exe')
   assert.equal(cloudflaredBinName('linux'), 'cloudflared')
   assert.equal(cloudflaredBinName('darwin'), 'cloudflared')
+})
+
+// --- ensureCloudflared: cache and partial-download behaviour (stubbed fetch, real temp dir) ---
+
+test('ensureCloudflared: a cached binary is returned without touching the GitHub API', async (t) => {
+  const dataDir = tmpDir('cf-provision-')
+  const binPath = cloudflaredBinPath(dataDir)
+  mkdirSync(dirname(binPath), { recursive: true })
+  writeFileSync(binPath, 'fake cloudflared')
+  const realFetch = globalThis.fetch
+  let calls = 0
+  // An unreachable / rate-limited GitHub: every request fails.
+  globalThis.fetch = (async () => {
+    calls++
+    throw new TypeError('fetch failed')
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+  })
+  const rt = await ensureCloudflared(dataDir)
+  assert.equal(rt.binPath, binPath)
+  assert.equal(calls, 0)
+})
+
+test('ensureCloudflared: a download that dies mid-stream leaves nothing that reads as installed', async (t) => {
+  const assetName = cloudflaredAssetName()
+  if (!assetName) {
+    t.skip('cloudflared publishes no asset for this platform')
+    return
+  }
+  const dataDir = tmpDir('cf-provision-')
+  const realFetch = globalThis.fetch
+  let calls = 0
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    calls++
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes('api.github.com')) {
+      return new Response(
+        JSON.stringify({ tag_name: '2026.6.1', assets: [{ name: assetName, browser_download_url: 'https://dl.test/cf' }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    // The asset body: one chunk, then the connection drops.
+    const body = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new Uint8Array([0x7f, 0x45, 0x4c, 0x46]))
+        setTimeout(() => c.error(new Error('socket hang up')), 5)
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-length': '1000000' } })
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+  })
+  await assert.rejects(ensureCloudflared(dataDir), /socket hang up/)
+  assert.equal(existsSync(cloudflaredBinPath(dataDir)), false, 'no truncated binary at the final path')
+  // The next start must try to download again, not take a partial file as the cached install.
+  calls = 0
+  await assert.rejects(ensureCloudflared(dataDir), /socket hang up/)
+  assert.equal(calls, 2, 'release lookup + download attempted again')
 })

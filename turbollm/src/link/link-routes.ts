@@ -547,6 +547,22 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
       }
     }
 
+    // The allowlist binds the model that ANSWERS, not only the `model` string checked above.
+    // ModelRouter.route() answers with whatever is loaded when `model` is empty, auto-swap is
+    // off, or the name resolves to nothing — so a restricted token could otherwise leave
+    // `model` out and be served a model GET /api/link/v1/models hid from it. targetEntry() is
+    // route()'s own load-free mirror; when it names no entry, route() can only fall back to
+    // the loaded model (or 503 when there is none).
+    if (key?.grant?.models?.length) {
+      const servedKey = d.modelRouter.targetEntry(requested)?.key ?? loaded
+      if (servedKey && !allowsModel(key, servedKey)) {
+        const message = requested
+          ? `This machine would answer '${requested}' with a model this link may not use.`
+          : "This link may use only specific models — name one in 'model'."
+        return c.json({ error: { code: 'forbidden', message } }, 403)
+      }
+    }
+
     // The SAME function the public /v1/chat/completions mount calls — never a
     // reimplementation. `pathname` is what makes the peer's /api/link/v1 URL behave as
     // the /v1 route it proxies; `origin: 'link'` keeps this out of the local-activity

@@ -75,10 +75,13 @@ export async function ensureCloudflared(
   const dir = cloudflaredDir(dataDir)
   const binPath = cloudflaredBinPath(dataDir)
 
+  // Cache-check BEFORE the release lookup: every tunnel start and restart lands here, and an
+  // unreachable or rate-limited GitHub API must not stop an already-downloaded cloudflared
+  // from starting. The cached copy is never updated, so the latest tag would not describe it.
+  if (existsSync(binPath)) return { binPath, version: '' }
+
   const rel = await latestGithubRelease(CLOUDFLARED_REPO, signal)
   const version = rel.tag_name ?? ''
-
-  if (existsSync(binPath)) return { binPath, version }
 
   const asset = pickCloudflaredAsset(rel.assets ?? [])
   if (!asset) throw new Error('no_release_asset')
@@ -106,7 +109,9 @@ export async function ensureCloudflared(
     return { binPath: found, version }
   }
 
-  // Windows/Linux: raw executable, download straight to the final path.
+  // Windows/Linux: raw executable, downloaded to the final path. downloadFile streams into a
+  // `.part` sibling and renames only on success, so a failed or cancelled download never leaves
+  // a truncated binary at binPath for the cache-check above to take as installed.
   await downloadFile(asset.browser_download_url, binPath, onProgress, signal)
   if (process.platform !== 'win32') {
     try {
