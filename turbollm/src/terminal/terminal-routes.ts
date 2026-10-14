@@ -300,7 +300,7 @@ export function getTerminalManager(d: Deps): TerminalManager {
 
 export type CreateAgentTerminalResult =
   | { ok: true; terminalId: string }
-  | { ok: false; status: 400 | 501 | 500; code: string; message: string }
+  | { ok: false; status: 400 | 409 | 501 | 500; code: string; message: string }
 
 /** The "spawn a fresh terminal" core of `POST /api/v1/code/sessions/:sessionId/terminal`,
  *  factored out so a server-side caller can start the SAME kind of terminal-agent session a
@@ -319,7 +319,7 @@ export type CreateAgentTerminalResult =
 export async function createAgentTerminal(
   d: Deps,
   run: AgentRun,
-  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string } = {},
+  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string; signal?: AbortSignal } = {},
 ): Promise<CreateAgentTerminalResult> {
   if (!run.repoRoot) return { ok: false, status: 400, code: 'invalid_input', message: 'Session has no repo root.' }
   const agent = run.codeAgent ?? 'turbollm'
@@ -358,6 +358,12 @@ export async function createAgentTerminal(
       mode,
       opts.firstMessage,
     )
+    // A routine kickoff abandoned while the probe above was in flight (execute.ts's kickoff bound)
+    // must not launch the CLI at all — see cli-interactive-runner.ts's `kickoffSignal`.
+    if (opts.signal?.aborted) {
+      sessionAuth.revoke(run.id)
+      return { ok: false, status: 409, code: 'aborted', message: 'Starting the terminal was cancelled.' }
+    }
     const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
     if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
     return { ok: true, terminalId }

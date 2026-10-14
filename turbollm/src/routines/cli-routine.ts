@@ -99,7 +99,7 @@ export interface CliRoutineDeps {
    *  `opts.stdin`; it must never be threaded into `args` (see this module's security note). */
   runProcess: (
     args: string[],
-    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal },
   ) => Promise<CliProcessResult>
   /** An already-created run row to write into, instead of creating one here.
    *
@@ -109,6 +109,12 @@ export interface CliRoutineDeps {
    *  scheduler's and this function's) and the run history would show each fire twice. Optional so
    *  a standalone caller (and the smoke test) can still just hand over a routine. */
   existingRun?: RoutineRun
+  /** Aborted by execute.ts's wall-clock bound when it gives up on this run. By then it has already
+   *  written the run's terminal state and the scheduler has released the routine, so a run that is
+   *  still mid-swap must not go on to spawn the CLI behind that 'errored' row (a second fire could
+   *  then run in the same workspace), and a CLI already running is killed (`runProcess`'s
+   *  `signal`). Undefined under tests and standalone callers. */
+  runSignal?: AbortSignal
 }
 
 /** TurboLLM's own fixed, non-interactive invocation. `-p`/`--print` is a BARE boolean flag — it
@@ -126,7 +132,11 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   const run =
     deps.existingRun ??
     deps.store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  // See `runSignal`. The caller already wrote this run's row, so an abandoned run never writes it
+  // again — the model swap it made is still undone in the finally below.
+  const abandoned = () => deps.runSignal?.aborted === true
   const finish = (patch: Parameters<ConversationStore['updateRoutineRun']>[1]) => {
+    if (abandoned()) return
     deps.store.updateRoutineRun(run.id, { ...patch, endedAt: deps.now().toISOString() })
   }
 
@@ -144,7 +154,9 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   try {
     // 1. Availability precondition (spec 20 §6) — checked BEFORE touching the model or the gate at
     // all: there is no point deciding a swap for a CLI that cannot run anyway.
-    if (!(await deps.isAvailable())) {
+    const available = await deps.isAvailable()
+    if (abandoned()) return
+    if (!available) {
       finish({ status: 'skipped', skipReason: 'cli_unavailable' })
       return
     }
@@ -191,12 +203,16 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
       ANTHROPIC_MODEL: pinnedModel,
     }
 
-    // 4. Spawn + wait. cli-process.ts owns the hard wall-clock timeout and never rejects.
+    // 4. Spawn + wait. cli-process.ts owns the hard wall-clock timeout and never rejects. Not once
+    // the run is abandoned (the swap above can outlast execute.ts's bound); an abort after the
+    // spawn kills the CLI.
+    if (abandoned()) return
     const result = await deps.runProcess(buildCliArgs(permissionMode), {
       cwd: routine.workspacePath ?? process.cwd(),
       env,
       stdin: routine.prompt,
       timeoutMs: CLI_ROUTINE_TIMEOUT_MS,
+      signal: deps.runSignal,
     })
 
     if (result.timedOut) {

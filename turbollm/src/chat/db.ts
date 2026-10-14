@@ -2429,6 +2429,16 @@ export class ConversationStore {
     return rows.map(rowToRoutineRun)
   }
 
+  /** Every run row still at 'running', across all routines — read once by
+   *  `RoutineScheduler.start()` to close out runs a daemon restart cut off. Unindexed scan, for
+   *  the same reason as listParkedRoutineRuns above. */
+  listRunningRoutineRuns(): RoutineRun[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM routine_runs WHERE status = 'running'`,
+    ).all() as unknown as RoutineRunRow[]
+    return rows.map(rowToRoutineRun)
+  }
+
   updateRoutineRun(
     id: string,
     patch: Partial<Pick<RoutineRun, 'status' | 'skipReason' | 'pendingToolCall' | 'result' | 'error' | 'endedAt' | 'conversationId' | 'codeSessionId'>>,

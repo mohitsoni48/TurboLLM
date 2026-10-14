@@ -106,13 +106,22 @@ export type SpawnCliProcess = (
  *  the child its own process-group leader so a group with id == pid actually exists. Without that,
  *  `process.kill(-pid)` raises ESRCH and silently degrades to a direct-child-only kill, orphaning
  *  every tool subprocess `claude` started — the two halves have to stay together. */
-export function killCliProcessTree(pid: number): void {
+export function killCliProcessTree(pid: number, onDone?: () => void): void {
   if (process.platform === 'win32') {
-    try { spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', detached: true, windowsHide: true }) } catch { /* best-effort */ }
+    // `onDone` fires once taskkill has finished (or failed to start) — see runClaudeCliProcess's
+    // timeout for why the caller must not kill the root itself before then.
+    let done = false
+    const finish = () => { if (!done) { done = true; onDone?.() } }
+    try {
+      const taskkill = spawn('taskkill', ['/F', '/T', '/PID', String(pid)], { stdio: 'ignore', detached: true, windowsHide: true })
+      taskkill.once('exit', finish)
+      taskkill.once('error', finish)
+    } catch { finish() /* best-effort */ }
   } else {
     try { process.kill(-pid, 'SIGKILL') } catch {
       try { process.kill(pid, 'SIGKILL') } catch { /* already dead */ }
     }
+    onDone?.()
   }
 }
 
@@ -217,12 +226,15 @@ export function realSpawnCliProcess(
  *  the OS-level sweep is fire-and-forget against a raw pid, so a test running against a FAKE child
  *  would otherwise send a real `taskkill /F /T` to whatever unrelated process currently owns that
  *  fake's pid number on the developer's machine. The injected spawn and the injected kill have to
- *  be swapped as a pair or the mock isn't actually a mock. */
+ *  be swapped as a pair or the mock isn't actually a mock.
+ *
+ *  `opts.signal` is the caller giving up on the run (execute.ts's wall-clock bound): an already
+ *  aborted signal spawns nothing, and a later abort kills the child exactly as the timeout does. */
 export function runClaudeCliProcess(
   args: string[],
-  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+  opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal },
   _spawn: SpawnCliProcess = realSpawnCliProcess,
-  _killTree: (pid: number) => void = killCliProcessTree,
+  _killTree: (pid: number, onDone?: () => void) => void = killCliProcessTree,
 ): Promise<CliProcessResult> {
   return new Promise((resolve) => {
     const timeoutMs = opts.timeoutMs ?? CLI_ROUTINE_TIMEOUT_MS
@@ -230,6 +242,11 @@ export function runClaudeCliProcess(
     let stderr = ''
     let timedOut = false
     let settled = false
+
+    if (opts.signal?.aborted) {
+      resolve({ exitCode: null, stdout, stderr: 'The run was abandoned before the CLI started.', timedOut })
+      return
+    }
 
     let child: CliChildProcess
     try {
@@ -256,6 +273,7 @@ export function runClaudeCliProcess(
       settled = true
       clearTimeout(timer)
       if (graceTimer) clearTimeout(graceTimer)
+      opts.signal?.removeEventListener('abort', onAbort)
       child.stdout?.destroy()
       child.stderr?.destroy()
       resolve({ exitCode, stdout, stderr, timedOut })
@@ -286,20 +304,40 @@ export function runClaudeCliProcess(
       if (stdoutEnded && stderrEnded) finish()
     }
 
-    const timer = setTimeout(() => {
-      timedOut = true
-      // Signal the direct child first — the one handle we definitely own — then sweep whatever
-      // subprocesses it started. The direct kill is what makes the timeout observable at all when
-      // the tree sweep is a no-op (a fake child, or a POSIX child that never became a group leader).
-      try { child.kill('SIGKILL') } catch { /* already dead */ }
-      if (child.pid) _killTree(child.pid)
+    /** Kill the child and settle within CLI_KILL_GRACE_MS whether or not it cooperates — once, on
+     *  the wall-clock timeout or on `opts.signal`, whichever comes first. */
+    const killAndSettle = () => {
+      if (hardDeadlineAt !== undefined) return
+      // Sweep the tree AND signal the direct child — the one handle we definitely own. The direct
+      // kill is what makes the timeout observable at all when the tree sweep is a no-op (a fake
+      // child, or a POSIX child that never became a group leader). On POSIX it goes first. On
+      // Windows it must come AFTER taskkill has finished: `taskkill /T` walks the tree down from
+      // the root, and a direct kill (a synchronous TerminateProcess) removes that root before the
+      // asynchronously-started taskkill runs, so the real CLI under a `claude.cmd` shim — or any
+      // tool process claude started — survived the "terminated" run.
+      const killDirect = () => { try { child.kill('SIGKILL') } catch { /* already dead */ } }
+      if (process.platform === 'win32' && child.pid) {
+        _killTree(child.pid, killDirect)
+      } else {
+        killDirect()
+        if (child.pid) _killTree(child.pid)
+      }
       // Then settle regardless of whether the child cooperates: the kill is best-effort, so the
       // promise must not depend on it landing (see CLI_KILL_GRACE_MS). Stamping the deadline here
       // — once, before the grace window is armed — is what stops the child re-arming its way past
       // it; from now on `armGrace` can only ever shorten the remaining wait, never extend it.
       hardDeadlineAt = Date.now() + CLI_KILL_GRACE_MS
       armGrace(CLI_KILL_GRACE_MS)
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      killAndSettle()
     }, timeoutMs)
+    const onAbort = () => {
+      clearTimeout(timer)
+      killAndSettle()
+    }
+    opts.signal?.addEventListener('abort', onAbort, { once: true })
 
     child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
     child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })

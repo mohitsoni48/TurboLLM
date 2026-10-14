@@ -31,7 +31,7 @@ import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
-import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
+import { runCliInteractiveRoutine, terminalLookupsBySession, type CliInteractiveDeps } from './cli-interactive-runner'
 import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
 
 /** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
@@ -132,6 +132,7 @@ export async function runCliRoutineBranch(
   _runCli: (routine: Routine, deps: CliRoutineDeps) => Promise<void> = runCliCodeRoutine,
   _timeoutMs: number = ROUTINE_RUN_TIMEOUT_MS,
 ): Promise<RoutineRunStatus> {
+  const abandon = new AbortController()
   const cliDeps: CliRoutineDeps = {
     store: d.db,
     gate: d.gate ?? ABSENT_GATE,
@@ -144,6 +145,7 @@ export async function runCliRoutineBranch(
     permissionModeChoices: () => claudePermissionModeChoices(),
     runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),
     existingRun: run,
+    runSignal: abandon.signal,
   }
   // Wall-clock ceiling (I2). This branch deliberately skips `createRunDeadline()` (see
   // executeRoutine's comment: the self-deadlock fix), which also removed the ONLY wall-clock
@@ -182,6 +184,10 @@ export async function runCliRoutineBranch(
     // finished in the same tick the timer fired, and its own more specific outcome wins.
     const timedOutStatus = d.db.getRoutineRun(run.id)?.status
     if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
+    // Same race as the interactive kickoff below: a model swap can outlast this bound, and the
+    // scheduler releases the routine once this returns — stop the run from spawning the CLI later
+    // (or kill the one it already spawned) and from overwriting this row.
+    abandon.abort()
     d.db.updateRoutineRun(run.id, { status: 'errored', error: `claude CLI routine exceeded the ${_timeoutMs}ms wall-clock limit before reporting a result.`, endedAt: new Date().toISOString() })
     return 'errored'
   }
@@ -220,6 +226,7 @@ export async function runCliInteractiveBranch(
   _timeoutMs: number = CLI_INTERACTIVE_KICKOFF_TIMEOUT_MS,
 ): Promise<RoutineRunStatus> {
   const tm = getTerminalManager(d)
+  const kickoff = new AbortController()
   const interactiveDeps: CliInteractiveDeps = {
     store: d.db,
     gate: d.gate ?? ABSENT_GATE,
@@ -231,12 +238,13 @@ export async function runCliInteractiveBranch(
     // harness, so a hardcoded `claude --version` would report "not installed" for a machine that has
     // opencode but no claude (and vice versa).
     isAvailable: () => isCliAvailable(terminalHarnessBin(routine)),
-    createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, opts),
-    isTerminalActive: (codeSessionId) => tm.isActive(codeSessionId),
-    isAgentExited: (codeSessionId) => tm.isAgentExited(codeSessionId),
-    getExitCode: (codeSessionId) => tm.getExitCode(codeSessionId),
-    killTerminal: (codeSessionId) => tm.kill(codeSessionId),
+    createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, { ...opts, signal: kickoff.signal }),
+    // TerminalManager is keyed by its own terminal id, not the Code session id — the shared
+    // helper maps every lookup first (the same wiring as cli.ts's sweep), or the abandoned-kickoff
+    // kill in runCliInteractiveRoutine would be a silent no-op.
+    ...terminalLookupsBySession(() => tm),
     releaseParked: d.routineScheduler ? (routineId, runId) => d.routineScheduler!.releaseParked(routineId, runId) : undefined,
+    kickoffSignal: kickoff.signal,
   }
   let timer: ReturnType<typeof setTimeout> | undefined
   const TIMED_OUT = Symbol('cli_interactive_kickoff_timeout')
@@ -256,6 +264,9 @@ export async function runCliInteractiveBranch(
   if (raced === TIMED_OUT) {
     const timedOutStatus = d.db.getRoutineRun(run.id)?.status
     if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
+    // Kickoff is still in flight (a model swap can outlast this bound) — stop it from launching
+    // the CLI later, after this row is 'errored' and the scheduler has released the routine.
+    kickoff.abort()
     d.db.updateRoutineRun(run.id, { status: 'errored', error: `Starting the interactive claude CLI session exceeded the ${_timeoutMs}ms kickoff limit.`, endedAt: new Date().toISOString() })
     return 'errored'
   }
@@ -267,9 +278,10 @@ export async function runCliInteractiveBranch(
  *  'running') before calling this; this function only decides which terminal RoutineRunStatus
  *  the fire reached (writing its own more-specific fields — skipReason, result, error,
  *  pendingToolCall — along the way) and returns it, matching scheduler.ts's own doc comment on
- *  `RoutineSchedulerDeps.runRoutine` exactly. Acquires GenerationGate at 'bg' priority (spec 20
- *  §5: a routine never preempts foreground chat/Code), resolves the model-conflict decision, and
- *  dispatches to the flavor-specific runner.
+ *  `RoutineSchedulerDeps.runRoutine` exactly. For a chat routine, acquires GenerationGate at 'bg'
+ *  priority (spec 20 §5: a routine never preempts foreground chat/Code; a pi Code routine's session
+ *  gates each request itself — see below), resolves the model-conflict decision, and dispatches to
+ *  the flavor-specific runner.
  *
  *  `_runCliBranch` is a default-parameter seam (I1), same pattern as `runCliRoutineBranch`'s own
  *  `_runCli` and cli-process.ts's `_spawn`/`_killTree`. It exists so the DISPATCH CONDITION itself
@@ -316,7 +328,10 @@ export async function executeRoutine(
   try {
     let release: (() => void) | undefined
     try {
-      if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
+      // Chat only: an in-app pi Code session acquires this same gate itself before EVERY provider
+      // request (code-session.ts's before_provider_request hook), so holding it here too would
+      // self-deadlock against a single-slot engine — the same hazard cli-routine.ts documents.
+      if (d.gate && routine.flavor === 'chat') release = await d.gate.acquire('bg', { signal: deadline.signal })
     } catch {
       d.db.updateRoutineRun(run.id, { status: 'skipped', skipReason: 'gate_timeout', endedAt: new Date().toISOString() })
       return 'skipped'
@@ -386,7 +401,8 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
   try {
     let release: (() => void) | undefined
     try {
-      if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
+      // Chat only — see executeRoutine: a pi Code resume gates each provider request itself.
+      if (d.gate && routine.flavor === 'chat') release = await d.gate.acquire('bg', { signal: deadline.signal })
     } catch {
       revertClaim()
       return { ok: false, code: 'gate_timeout', message: 'Timed out waiting for the model server.' }
@@ -398,6 +414,9 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       })
       if (swap.outcome === 'skip-busy') { revertClaim(); return { ok: false, code: 'model_busy', message: 'The model server is busy — try approving again shortly.' } }
       if (swap.outcome === 'skip-load-failed') { revertClaim(); return { ok: false, code: 'model_unavailable', message: swap.message } }
+      // fn never ran here either, so nothing wrote a terminal state — without the revert the run
+      // would sit at 'running' forever and every retry would get 'not_stalled'.
+      if (swap.outcome === 'skip-comfyui-busy') { revertClaim(); return { ok: false, code: 'model_busy', message: 'ComfyUI is rendering — try approving again shortly.' } }
       return { ok: true }
     } catch (e) {
       // dispatchResume/withPinnedModel threw instead of resolving to an outcome (e.g. a

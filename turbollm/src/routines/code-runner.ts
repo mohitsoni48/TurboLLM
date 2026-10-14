@@ -34,6 +34,8 @@ export async function runCodeRoutine(d: Deps, routine: Routine, run: RoutineRun,
   // M3: Routine['permissionMode'] and CodeMode are the exact same literal union
   // ('auto'|'plan'|'ask') — an explicit annotation lets the compiler verify that instead of an
   // unchecked `as CodeMode` silently masking a future divergence between the two types.
+  // Unset runs as 'auto'. The web UI shows an unset mode as exactly that
+  // (web/src/lib/routine-form.ts `unsetPermissionModeLabel`) — keep the two in step.
   const mode: CodeMode = routine.permissionMode ?? 'auto'
   const conv = d.db.createConversation({ kind: 'code', modelKey: routine.modelKey })
   d.db.setConversationMode(conv.id, mode)

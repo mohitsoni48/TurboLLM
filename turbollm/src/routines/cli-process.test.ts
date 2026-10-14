@@ -83,7 +83,8 @@ test('kills the process and reports timedOut once the wall-clock timeout elapses
     ['-p'],
     { cwd: '/repo', env: {}, stdin: 'loop forever', timeoutMs: 10 },
     fakeSpawn,
-    (pid) => { killedTrees.push(pid) },
+    // Reports the sweep finished, as the real one does — on Windows the direct kill waits for it.
+    (pid, onDone) => { killedTrees.push(pid); onDone?.() },
   )
   // Simulate the process only exiting AFTER the kill signal — timeout fires, kill() is called,
   // then the fake process finally reports its exit.
@@ -96,6 +97,71 @@ test('kills the process and reports timedOut once the wall-clock timeout elapses
 
   const result = await resultPromise
   assert.equal(result.timedOut, true)
+})
+
+// On Windows the direct kill used to land first, so `taskkill /T` found no root to walk and
+// the CLI's own subprocesses (or the real CLI under a claude.cmd shim) survived the timeout.
+test('on Windows a timed-out run sweeps the tree before killing the direct child', async () => {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  try {
+    const child = fakeChild()
+    const order: string[] = []
+    const kill = child.kill
+    child.kill = () => { order.push('direct'); return kill() }
+    let sweepDone: (() => void) | undefined
+    const resultPromise = runClaudeCliProcess(
+      ['-p'],
+      { cwd: '/repo', env: {}, timeoutMs: 10 },
+      () => child,
+      (_pid, onDone) => { order.push('tree'); sweepDone = onDone },
+    )
+    await new Promise((r) => setTimeout(r, 30))
+    assert.deepEqual(order, ['tree'], 'the root must still be alive while taskkill /T walks it')
+    sweepDone?.()
+    assert.deepEqual(order, ['tree', 'direct'])
+    child.emit('exit', null, 'SIGKILL')
+    assert.equal((await resultPromise).timedOut, true)
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actual })
+  }
+})
+
+// execute.ts's wall-clock bound gives up on a run by aborting this signal; the CLI it already
+// started must not run on behind the run's 'errored' row.
+test('an abort from the caller kills the child the way the timeout does, without waiting for it', async () => {
+  const child = fakeChild()
+  const killedTrees: number[] = []
+  const ac = new AbortController()
+  const resultPromise = runClaudeCliProcess(
+    ['-p'],
+    { cwd: '/repo', env: {}, timeoutMs: 60_000, signal: ac.signal },
+    () => child,
+    (pid, onDone) => { killedTrees.push(pid); onDone?.() },
+  )
+  assert.equal(child.killed, false)
+  ac.abort()
+  assert.equal(child.killed, true)
+  assert.deepEqual(killedTrees, [4242])
+  child.stdout.end('')
+  child.stderr.end('')
+  child.emit('exit', null, 'SIGKILL')
+  assert.equal((await resultPromise).timedOut, false)
+})
+
+test('an already-aborted signal spawns nothing', async () => {
+  const ac = new AbortController()
+  ac.abort()
+  let spawned = 0
+  const spawnAndExit: SpawnCliProcess = () => {
+    spawned++
+    const child = fakeChild()
+    setImmediate(() => { child.stdout.end(''); child.stderr.end(''); child.emit('exit', 0, null) })
+    return child
+  }
+  const result = await runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, signal: ac.signal }, spawnAndExit, killSpy().spy)
+  assert.equal(spawned, 0)
+  assert.equal(result.exitCode, null)
 })
 
 test('a process that exits normally is never killed and never swept', async () => {

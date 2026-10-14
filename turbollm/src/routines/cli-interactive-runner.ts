@@ -55,6 +55,7 @@ import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 import type { RouteResult } from '../gateway/model-router'
 import { decideModelAction } from './model-conflict'
 import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import type { TerminalManager } from '../terminal/terminal-manager'
 
 /** Generous relative to CLI_ROUTINE_TIMEOUT_MS/ROUTINE_RUN_TIMEOUT_MS's 10 minutes: those bound a
  *  FULLY AUTOMATED run nobody needs to attend. This bounds a run that may genuinely need a human
@@ -82,6 +83,11 @@ export interface CliInteractiveDeps {
   /** RoutineScheduler.releaseParked — undefined under tests/embedders that don't wire a
    *  scheduler, mirroring `Deps.routineScheduler`'s own optionality. */
   releaseParked?: (routineId: string, runId: string) => void
+  /** Aborted by execute.ts's kickoff bound when it gives up on this start. By then it has already
+   *  written the run's terminal state and the scheduler has released the routine, so a start that
+   *  is still mid-swap must not go on to launch a CLI behind that 'errored' row (a second fire
+   *  could then run in the same workspace). Undefined under tests that call this directly. */
+  kickoffSignal?: AbortSignal
 }
 
 /** codeSessionId -> the model that was loaded before this run swapped it out, so it can be
@@ -109,8 +115,13 @@ export async function runCliInteractiveRoutine(
 ): Promise<RoutineRunStatus> {
   const finish = (patch: Parameters<ConversationStore['updateRoutineRun']>[1]) =>
     deps.store.updateRoutineRun(run.id, { ...patch, endedAt: deps.now().toISOString() })
+  // See `kickoffSignal`. The caller already wrote this run's row, so an abandoned start returns
+  // without touching it.
+  const abandoned = () => deps.kickoffSignal?.aborted === true
 
-  if (!(await deps.isAvailable())) {
+  const available = await deps.isAvailable()
+  if (abandoned()) return 'errored'
+  if (!available) {
     finish({ status: 'skipped', skipReason: 'cli_unavailable' })
     return 'skipped'
   }
@@ -137,6 +148,10 @@ export async function runCliInteractiveRoutine(
     }
     previousModel = currentlyLoaded
   }
+  if (abandoned()) {
+    if (previousModel) await restoreModel(deps, previousModel)
+    return 'errored'
+  }
 
   const mode = routine.permissionMode ?? 'ask'
   const conv = deps.store.createConversation({ kind: 'code', modelKey: routine.modelKey })
@@ -161,6 +176,13 @@ export async function runCliInteractiveRoutine(
   // seeding, but still strictly better than erroring the routine outright, and no one is
   // guaranteed to be watching to retype it the way a human would.
   const result = await deps.createTerminal(agentRun, { mode, firstMessage: routine.prompt })
+  if (abandoned()) {
+    // Abandoned while the terminal was being started. execute.ts's createTerminal refuses to spawn
+    // once the signal is aborted; anything that was spawned anyway is closed again right here.
+    if (result.ok) deps.killTerminal(agentRun.id)
+    if (previousModel) await restoreModel(deps, previousModel)
+    return 'errored'
+  }
   if (!result.ok) {
     if (previousModel) await restoreModel(deps, previousModel)
     finish({ status: 'errored', error: `Could not start the interactive ${agentLabel(routine)} CLI session: ${result.message}` })
@@ -215,6 +237,28 @@ export type CliInteractiveSweepDeps = Pick<
   CliInteractiveDeps,
   'store' | 'now' | 'loadExplicit' | 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal' | 'releaseParked'
 >
+
+/** The sweep's four terminal lookups over a TerminalManager (cli.ts wires these). The manager is
+ *  keyed by its OWN terminal id, while a parked run records only its Code session id, so every
+ *  lookup maps through `findByCodeSessionId` first. Handing the session id straight through made
+ *  every lookup miss: the first sweep finalized each parked run as errored (releasing the routine,
+ *  restoring the old model) while its CLI kept running, and the timeout kill was a no-op. A lazy
+ *  getter, so nothing constructs the manager until a parked run actually needs it. */
+export function terminalLookupsBySession(
+  getTm: () => Pick<TerminalManager, 'findByCodeSessionId' | 'isActive' | 'isAgentExited' | 'getExitCode' | 'kill'>,
+): Pick<CliInteractiveSweepDeps, 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal'> {
+  const withTerminal = <T>(codeSessionId: string, fallback: T, fn: (tm: ReturnType<typeof getTm>, terminalId: string) => T): T => {
+    const tm = getTm()
+    const terminalId = tm.findByCodeSessionId(codeSessionId)
+    return terminalId === null ? fallback : fn(tm, terminalId)
+  }
+  return {
+    isTerminalActive: (codeSessionId) => withTerminal(codeSessionId, false, (tm, id) => tm.isActive(id)),
+    isAgentExited: (codeSessionId) => withTerminal(codeSessionId, false, (tm, id) => tm.isAgentExited(id)),
+    getExitCode: (codeSessionId) => withTerminal<number | undefined>(codeSessionId, undefined, (tm, id) => tm.getExitCode(id)),
+    killTerminal: (codeSessionId) => withTerminal(codeSessionId, undefined, (tm, id) => tm.kill(id)),
+  }
+}
 
 /** Periodic safety net (see this module's header) — call on an interval from cli.ts, alongside
  *  the scheduler, AND once synchronously right after `RoutineScheduler.start()` so a run

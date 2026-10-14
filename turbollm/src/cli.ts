@@ -22,7 +22,7 @@ import { UpdateChecker } from './engines/update'
 import { UpdateScheduler } from './engines/update-scheduler'
 import { RoutineScheduler } from './routines/scheduler'
 import { executeRoutine } from './routines/execute'
-import { sweepInteractiveCliRuns, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
+import { sweepInteractiveCliRuns, terminalLookupsBySession, type CliInteractiveSweepDeps } from './routines/cli-interactive-runner'
 import { getTerminalManager } from './terminal/terminal-routes'
 import { AppUpdateChecker } from './app-update'
 import {
@@ -793,10 +793,8 @@ const cliInteractiveSweepDeps: CliInteractiveSweepDeps = {
   store: db,
   now: () => new Date(),
   loadExplicit: (modelKey) => modelRouter.loadExplicit(modelKey),
-  isTerminalActive: (codeSessionId) => getTerminalManager(deps).isActive(codeSessionId),
-  isAgentExited: (codeSessionId) => getTerminalManager(deps).isAgentExited(codeSessionId),
-  getExitCode: (codeSessionId) => getTerminalManager(deps).getExitCode(codeSessionId),
-  killTerminal: (codeSessionId) => getTerminalManager(deps).kill(codeSessionId),
+  // Keyed by the run's Code session id, mapped to the manager's own terminal id (see the helper).
+  ...terminalLookupsBySession(() => getTerminalManager(deps)),
   releaseParked: (routineId, runId) => routineScheduler.releaseParked(routineId, runId),
 }
 sweepInteractiveCliRuns(cliInteractiveSweepDeps)

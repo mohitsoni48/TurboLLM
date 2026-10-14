@@ -3,15 +3,18 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { executeRoutine, resumeRoutineRun, runCliRoutineBranch, runCliInteractiveBranch } from './execute'
-import type { CliRoutineDeps } from './cli-routine'
-import type { CliInteractiveDeps } from './cli-interactive-runner'
-import { parsePendingToolCall } from './approval'
+import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
+import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
+import { parsePendingToolCall, stallRoutineRun } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
 import type { ModelRouter } from '../gateway/model-router'
-import type { GenerationGate } from '../agents/gate'
+import { GenerationGate } from '../agents/gate'
+import { CodeRunManager, type CodeSessionRunner } from '../code/code-run-manager'
 import type { RoutineRunStatus } from './schema'
 import { tmpDir } from '../test-support/tmp'
+import { TerminalManager } from '../terminal/terminal-manager'
+import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
@@ -303,6 +306,37 @@ test('runCliInteractiveBranch is wired with the right deps and reuses the schedu
   assert.equal(db.listRoutineRuns(routine.id).length, 1, 'the scheduler-created run must be reused, not duplicated')
 })
 
+// TerminalManager is keyed by its own terminal id, so every kickoff lookup must map
+// the Code session id first (the shared terminalLookupsBySession wiring cli.ts's sweep uses).
+// Handing the session id straight through misses every time. Patches the prototype, which only the
+// real manager has, so without node-pty this is skipped rather than passing vacuously on the stub.
+test('runCliInteractiveBranch: the terminal lookups map the Code session id to the terminal id', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const proto = TerminalManager.prototype
+  t.mock.method(proto, 'findByCodeSessionId', (sessionId: string) => (sessionId === 'session-1' ? 'terminal-1' : null))
+  t.mock.method(proto, 'isActive', (id: string) => id === 'terminal-1')
+  t.mock.method(proto, 'isAgentExited', (id: string) => id === 'terminal-1')
+  t.mock.method(proto, 'getExitCode', (id: string) => (id === 'terminal-1' ? 3 : undefined))
+  const killed: string[] = []
+  t.mock.method(proto, 'kill', (id: string) => { killed.push(id) })
+
+  let captured: CliInteractiveDeps | undefined
+  await runCliInteractiveBranch(d, routine, run, async (_routine, _run, deps) => {
+    captured = deps
+    deps.store.updateRoutineRun(run.id, { status: 'needs_approval' })
+    return 'needs_approval'
+  })
+
+  assert.ok(captured)
+  assert.equal(captured.isTerminalActive('session-1'), true)
+  assert.equal(captured.isAgentExited('session-1'), true)
+  assert.equal(captured.getExitCode('session-1'), 3)
+  captured.killTerminal('session-1')
+  assert.deepEqual(killed, ['terminal-1'])
+})
+
 test('a hung interactive kickoff still drives the run to a terminal state within its (shorter) wall-clock bound', async () => {
   const { d, db } = fakeDeps({ loadedKey: 'm' })
   const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
@@ -318,6 +352,63 @@ test('a hung interactive kickoff still drives the run to a terminal state within
   assert.equal(finalRun.status, 'errored')
   assert.match(finalRun.error ?? '', /kickoff limit/)
   assert.ok(finalRun.endedAt)
+})
+
+// The kickoff bound covers the model swap, which can outlast it. Once the bound has written
+// 'errored' (and the scheduler has released the routine), the still-running kickoff used to go on
+// to spawn the CLI and flip the row back to 'needs_approval' — a live CLI behind a failed run.
+test('an interactive kickoff that outlasts its bound never launches the CLI afterwards', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let terminalsSpawned = 0
+  const loads: string[] = []
+  let kickoffDone!: Promise<RoutineRunStatus>
+  const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => {
+    kickoffDone = runCliInteractiveRoutine(r, rr, {
+      ...deps,
+      isAvailable: async () => true,
+      getLoadedModelKey: () => 'small-model',
+      getEngineIdle: () => true,
+      gate: { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate,
+      // A model swap slower than the kickoff bound.
+      loadExplicit: async (key) => { loads.push(key); await new Promise((res) => setTimeout(res, 150)); return { target: 'x' } },
+      createTerminal: async () => { terminalsSpawned++; return { ok: true, terminalId: 't' } },
+    })
+    return kickoffDone
+  }, 25)
+  assert.equal(status, 'errored')
+  await kickoffDone
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(terminalsSpawned, 0, 'a timed-out kickoff must not spawn the CLI')
+  assert.equal(finalRun.status, 'errored')
+  assert.ok(finalRun.endedAt)
+  assert.deepEqual(loads, ['big-model', 'small-model'], 'the swap made for the abandoned run is undone')
+})
+
+test('an interactive kickoff abandoned while its terminal is being started closes that terminal again', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const killed: string[] = []
+  let sessionId = ''
+  let kickoffDone!: Promise<RoutineRunStatus>
+  const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => {
+    kickoffDone = runCliInteractiveRoutine(r, rr, {
+      ...deps,
+      isAvailable: async () => true,
+      // A terminal start that outlasts the bound and does not itself honour the abort.
+      createTerminal: async (agentRun) => { sessionId = agentRun.id; await new Promise((res) => setTimeout(res, 150)); return { ok: true, terminalId: 't' } },
+      killTerminal: (id) => { killed.push(id) },
+    })
+    return kickoffDone
+  }, 25)
+  assert.equal(status, 'errored')
+  assert.equal(await kickoffDone, 'errored')
+  assert.deepEqual(killed, [sessionId])
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'errored', 'must not flip back to needs_approval')
+  assert.match(finalRun.error ?? '', /kickoff limit/)
 })
 
 // I2 (re-review): the CLI branch skips createRunDeadline() on purpose (gate self-deadlock), which
@@ -360,6 +451,71 @@ test('a race timeout still reports the orchestrator\'s own terminal status when 
 
   assert.equal(status, 'ok')
   assert.equal(db.getRoutineRun(run.id)!.result, 'done')
+})
+
+// The same for the one-shot path: the wall-clock bound covers the model swap, which can outlast it. Once
+// the bound has written 'errored' (and the scheduler has released the routine), the still-running
+// orchestrator used to go on to spawn the CLI behind that row — a second fire could then run in the
+// same workspace — and to overwrite the row with the CLI's own outcome.
+const CLI_OK_STDOUT = '{"type":"result","is_error":false,"result":"done"}'
+test('a one-shot CLI run that outlasts its bound during the model swap never spawns the CLI afterwards', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let spawned = 0
+  const loads: string[] = []
+  let runDone!: Promise<void>
+  const status = await runCliRoutineBranch(d, routine, run, (r, deps) => {
+    runDone = runCliCodeRoutine(r, {
+      ...deps,
+      isAvailable: async () => true,
+      getLoadedModelKey: () => 'small-model',
+      getEngineIdle: () => true,
+      gate: { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate,
+      // A model swap slower than the bound.
+      loadExplicit: async (key) => { loads.push(key); await new Promise((res) => setTimeout(res, 150)); return { target: 'x' } },
+      permissionModeChoices: async () => [],
+      runProcess: async () => { spawned++; return { exitCode: 0, timedOut: false, stdout: CLI_OK_STDOUT, stderr: '' } },
+    })
+    return runDone
+  }, 25)
+  assert.equal(status, 'errored')
+  await runDone
+  assert.equal(spawned, 0, 'a timed-out run must not spawn the CLI')
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'errored', 'must not be overwritten by the abandoned run')
+  assert.match(finalRun.error ?? '', /wall-clock limit/)
+  assert.deepEqual(loads, ['big-model', 'small-model'], 'the swap made for the abandoned run is undone')
+})
+
+test('a one-shot CLI run abandoned while the CLI runs kills it and leaves the errored row alone', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let signal: AbortSignal | undefined
+  let runDone!: Promise<void>
+  const status = await runCliRoutineBranch(d, routine, run, (r, deps) => {
+    runDone = runCliCodeRoutine(r, {
+      ...deps,
+      isAvailable: async () => true,
+      permissionModeChoices: async () => [],
+      // A CLI that outlasts the bound: it stops when killed (runClaudeCliProcess honours the signal)
+      // and otherwise finishes successfully a little later.
+      runProcess: (_args, opts) => new Promise((resolve) => {
+        signal = opts.signal
+        const done = () => resolve({ exitCode: 0, timedOut: false, stdout: CLI_OK_STDOUT, stderr: '' })
+        opts.signal?.addEventListener('abort', done)
+        setTimeout(done, 150)
+      }),
+    })
+    return runDone
+  }, 25)
+  assert.equal(status, 'errored')
+  await runDone
+  assert.equal(signal?.aborted, true, 'the running CLI is killed when the bound gives up on it')
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'errored', 'must not be overwritten by the abandoned run')
+  assert.match(finalRun.error ?? '', /wall-clock limit/)
 })
 
 // M1 (re-review): the read-back's `?? 'errored'` only caught a MISSING row, but 'running' is a
@@ -600,4 +756,67 @@ test('resumeRoutineRun reverts its claim if dispatch throws instead of resolving
   await assert.rejects(() => resumeRoutineRun(d, stalledRun, 'allow'), /engine exploded/)
   const reverted = db.getRoutineRun(stalledRun.id)!
   assert.equal(reverted.status, 'needs_approval')
+})
+
+// An in-app pi Code session acquires the GenerationGate itself before every provider request
+// (code-session.ts's before_provider_request hook). executeRoutine used to ALSO hold the gate for
+// the whole run, so on a single-slot engine the session queued behind its own routine and the run
+// could only ever time out. Real gate + real CodeRunManager; the runner mirrors code-session.ts's
+// per-request acquire (with a short timeout so the pre-fix deadlock fails fast instead of hanging).
+test('pi Code routine does not deadlock against its own per-request gate acquire on a single-slot engine', async () => {
+  const gate = new GenerationGate(() => 1)
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
+  ;(d.store as unknown as { snapshot: () => unknown }).snapshot = () => ({ daemon: { autoGenerateTitles: false } })
+  let sessionGotGate = false
+  const runner: CodeSessionRunner = (async (params) => {
+    const release = await gate.acquire('fg', { signal: params.signal, timeoutMs: 500 })
+    sessionGotGate = true
+    release()
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+  d.codeRuns = new CodeRunManager(d, { runner })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'm', workspacePath: tmpDir('execute-pi-gate-'), codingAgent: 'pi', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const status = await executeRoutine(d, routine, run)
+  assert.equal(sessionGotGate, true, 'the pi session must be able to take the only engine slot')
+  assert.equal(status, 'ok')
+  assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 })
+})
+
+test('resumeRoutineRun does not take the routine-level gate for a pi Code run', async () => {
+  let acquires = 0
+  const gate = { acquire: async () => { acquires++; return () => {} } } as unknown as GenerationGate
+  const { d, db } = fakeDeps({ loadedKey: 'm', gate })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'm', workspacePath: tmpDir('execute-pi-gate-'), codingAgent: 'pi', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const conv = db.createConversation({ kind: 'code', modelKey: 'm' })
+  stallRoutineRun(db, run.id, { convId: conv.id, assistantContent: '', precedingCalls: [], call: { id: 'c1', name: 'bash', args: {} }, sessionId: conv.id })
+  const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'deny')
+  assert.equal(res.ok, true)
+  assert.equal(acquires, 0)
+  assert.equal(db.getRoutineRun(run.id)!.status, 'errored')
+})
+
+// withPinnedModel can report 'skip-comfyui-busy' without ever running fn. resumeRoutineRun
+// used to fall through to {ok:true}, leaving its claim at 'running' forever (and every retry 409).
+test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const stallStub = stubFetchStall()
+  try { await executeRoutine(d, routine, run) } finally { stallStub.restore() }
+  assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval')
+
+  // A different model is now loaded and ComfyUI is holding the swap.
+  ;(d as unknown as { manager: Manager }).manager = {
+    status: () => ({ state: 'running', model: { key: 'other' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+  } as unknown as Manager
+  ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async () =>
+    ({ status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
+
+  const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'allow')
+  assert.equal(res.ok, false)
+  assert.equal((res as { code: string }).code, 'model_busy')
+  assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval', 'the claim must be reverted so Approve can be retried')
 })

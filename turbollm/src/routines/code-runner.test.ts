@@ -82,6 +82,27 @@ test('runCodeRoutine persists the run.codeSessionId it created, and it resolves 
   assert.equal(store.getConversation(agentRun!.convId)?.kind, 'code')
 })
 
+// create_routine (the chat tool) and REST create both accept no permissionMode. Such a routine
+// has always run unattended in 'auto', and the web UI now displays it as exactly that
+// (routine-form.ts `unsetPermissionModeLabel`) — this pins the behaviour the display describes.
+test('a routine with no stored permission mode runs its session in auto mode', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store, { permissionMode: undefined })
+  assert.equal(routine.permissionMode, undefined)
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let ranWith: string | undefined
+  const runner: CodeSessionRunner = (async (params) => {
+    ranWith = params.mode
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+  const d = depsWith(store, runner)
+
+  await runCodeRoutine(d, routine, run, new AbortController().signal)
+  const agentRun = store.getAgentRun(store.getRoutineRun(run.id)!.codeSessionId!)
+  assert.equal(store.getConversation(agentRun!.convId)?.agentMode, 'auto')
+  assert.equal(ranWith, 'auto')
+})
+
 test('an awaiting_approval tool_call durably stalls the run and aborts the live turn', async () => {
   const store = freshStore()
   const routine = codeRoutine(store)

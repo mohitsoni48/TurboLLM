@@ -580,3 +580,30 @@ test('runningRoutineIds is empty when nothing has fired', () => {
   const scheduler = new RoutineScheduler({ store: freshStore(), now: () => new Date(), runRoutine: async () => 'ok' })
   assert.deepEqual(scheduler.runningRoutineIds(), [])
 })
+
+// A fire cut off mid-execution (or resumeRoutineRun's claim on an approval) by a daemon
+// restart stayed 'running' forever — nothing at startup looked at those rows.
+test('start() closes out runs a daemon restart left at running, and leaves parked ones alone', () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, new Date(Date.now() + 3_600_000).toISOString())
+  const interrupted = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const parked = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  store.updateRoutineRun(parked.id, { status: 'needs_approval' })
+  const finished = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  store.updateRoutineRun(finished.id, { status: 'ok', endedAt: '2026-01-01T00:00:00.000Z' })
+
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'ok', tickIntervalMs: 3_600_000 })
+  try {
+    scheduler.start()
+    const closed = store.getRoutineRun(interrupted.id)!
+    assert.equal(closed.status, 'errored')
+    assert.match(closed.error ?? '', /restarted/)
+    assert.ok(closed.endedAt)
+    assert.equal(store.getRoutineRun(parked.id)!.status, 'needs_approval')
+    assert.equal(store.getRoutineRun(finished.id)!.status, 'ok')
+    assert.equal(store.getRoutineRun(finished.id)!.endedAt, '2026-01-01T00:00:00.000Z')
+  } finally {
+    scheduler.stop()
+  }
+})

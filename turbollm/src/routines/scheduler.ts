@@ -76,6 +76,7 @@ export class RoutineScheduler {
 
   start(): void {
     if (this.timer) return
+    this.reconcileInterruptedRuns()
     this.reconcileParkedRuns()
     this.reconcileMissedRuns()
     this.timer = setInterval(() => void this.tick(), this.deps.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS)
@@ -90,6 +91,21 @@ export class RoutineScheduler {
    *  approval, which wait on the user, not the engine (ADR-434 (i)(3)'s active-work probe). */
   runningRoutineIds(): string[] {
     return [...this.inFlight].filter((routineId) => !this.parked.has(routineId))
+  }
+
+  /** Runs first at start(): a row still 'running' in the DB was cut off by a daemon restart or
+   *  quit — a fire mid-execution, or resumeRoutineRun's claim on an approval — and nothing will
+   *  ever finish it, so it would show "running" forever. Closed as 'errored', the same way
+   *  sweepInteractiveCliRuns closes a parked interactive run whose terminal the restart killed.
+   *  Never re-executed: an approved action may already have run before the restart. Skips a
+   *  routine already in `inFlight` for the same reason reconcileParkedRuns does (N1, below) —
+   *  a no-op at a genuine cold start. */
+  private reconcileInterruptedRuns(): void {
+    const endedAt = this.deps.now().toISOString()
+    for (const run of this.deps.store.listRunningRoutineRuns()) {
+      if (this.inFlight.has(run.routineId)) continue
+      this.deps.store.updateRoutineRun(run.id, { status: 'errored', error: 'Interrupted: the daemon restarted before this run finished.', endedAt })
+    }
   }
 
   /** Runs once at start(), BEFORE reconcileMissedRuns(): the parked guard (`inFlight`/`parked`)

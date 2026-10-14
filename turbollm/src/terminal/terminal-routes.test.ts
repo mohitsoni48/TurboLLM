@@ -11,7 +11,10 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager } from './terminal-routes'
+import type { Deps } from '../deps'
+import type { AgentRun } from '../chat/db'
+import { tmpDir } from '../test-support/tmp'
 import { quotePtyShellArg } from '../util/shell-command'
 import { enforcesPlanMode, permissionModeArgs } from './agent-modes'
 
@@ -334,4 +337,24 @@ test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangle
 test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', () => {
   // The common case must keep working; only the two genuinely unconveyable classes are refused.
   assert.equal(canSeedFirstMessage("don't break this", 'claude'), true)
+})
+
+// A routine kickoff that execute.ts has already given up on (its row is 'errored' and the
+// scheduler has released the routine) passes an aborted signal — the CLI must never be launched.
+test('createAgentTerminal: an aborted signal never spawns the terminal', async () => {
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
+    db: { getConversation: () => undefined, updateAgentRun: () => {} },
+  } as unknown as Deps
+  const run = { id: 'abort-session', convId: 'c', repoRoot: tmpDir('terminal-routes-abort-repo-'), codeAgent: 'opencode' } as unknown as AgentRun
+  const ac = new AbortController()
+  ac.abort()
+  const result = await createAgentTerminal(d, run, { mode: 'ask', signal: ac.signal })
+  const spawned = getTerminalManager(d).findByCodeSessionId(run.id)
+  if (spawned) getTerminalManager(d).kill(spawned)
+  assert.equal(result.ok, false)
+  // The abort outcome itself, not just "no terminal": without node-pty (an optionalDependency) the
+  // stub manager's create() throws, so an unfixed build also fails with no terminal (501).
+  assert.equal((result as { code?: string }).code, 'aborted')
+  assert.equal(spawned, null)
 })
