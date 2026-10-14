@@ -44,6 +44,29 @@ function isSafeIdent(v: unknown): boolean {
 }
 
 /**
+ * A raw hardware/model string made to pass {@link isSafeIdent}, for the places
+ * that BUILD `bench_result`'s identifier fields. Real names routinely break the
+ * charset — `Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz`, `AMD Ryzen 7 7840HS w/
+ * Radeon 780M Graphics`, lspci's `Navi 48 [Radeon RX 9070/9070 XT]` — and
+ * `validateEvent` then drops the whole event before it is ever queued, so those
+ * machines never contributed a benchmark row. The validator stays exactly as
+ * strict; the value is normalized instead: disallowed runs become one space,
+ * `..` collapses, length is capped. A string that already passes is returned
+ * untouched, so every join key that reached the dataset before keeps matching.
+ */
+export function toSafeIdent(v: string): string {
+  if (isSafeIdent(v)) return v
+  const out = String(v ?? '')
+    .replace(/[^A-Za-z0-9 ._:()+\-]+/g, ' ')
+    .replace(/\.{2,}/g, '.')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+    .slice(0, MAX_IDENT_LEN)
+    .trim()
+  return out || 'unknown'
+}
+
+/**
  * `app.os`, specifically — NOT a general identifier.
  *
  * `getSysInfo().os` (sysinfo.ts) is always `${process.platform}/${process.arch}`

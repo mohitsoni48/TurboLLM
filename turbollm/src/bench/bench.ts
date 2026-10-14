@@ -22,6 +22,7 @@ import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
 import { enqueue } from '../telemetry/queue'
+import { toSafeIdent } from '../telemetry/core/validate'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyBenchFailure } from '../telemetry/classify'
 import { telemetryDisabled } from '../telemetry/disabled'
@@ -587,8 +588,11 @@ export class BenchRunner {
     const unified = unifiedMemoryOnly(sys)
 
     if (sys.gpus.length > 0) {
-      // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
-      const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
+      // Binary search ngl ∈ [0, blockCount + 1] for the HIGHEST that loads with enough headroom VRAM.
+      // +1 because llama.cpp offloads n_layer + 1 layers (the repeating blocks plus the output
+      // layer): `-ngl blockCount` still leaves one of them on the CPU ("offloaded 32/33 layers").
+      // The VRAM estimates clamp ngl to blockCount, so the extra step costs them nothing.
+      const hi0 = entry.blockCount > 0 ? entry.blockCount + 1 : 99
 
       // Spill is measured per probe (see moeSearch and spill.ts) — no calibration phase.
       let lo = 0, hi = hi0
@@ -842,7 +846,7 @@ export class BenchRunner {
     let spill: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the readings are final
-      vramAbsMb = await readGpuVramMb(sys)
+      vramAbsMb = await readGpuVramMb(sys, profile)
       spill = spillMb(sharedBefore, await readGpuSharedMb(sys))
     }
     await this.stopEngine()
@@ -928,6 +932,11 @@ export class BenchRunner {
     // Live sub-phase progress so each (possibly multi-minute) trial isn't a silent wait.
     const phase = (p: string) => { this.state = { ...this.state, step: `${stepPrefix} — ${p}` } }
 
+    // A cancel that landed during the search's last probe ends that loop, but the search still
+    // calls benchAt for the best ngl/nCpuMoe found so far — never start another engine load then.
+    // 'crash' is the same non-ok outcome awaitReady reports for a cancel.
+    if (this.cancelled) return fail('crash')
+
     const active = this.registry.active()
     if (!active) return fail('crash')
 
@@ -948,7 +957,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
 
-    const vramBefore = await readGpuVramMb(sys)
+    const vramBefore = await readGpuVramMb(sys, profile)
     const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
@@ -986,7 +995,7 @@ export class BenchRunner {
     }
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
-    const vramAfter = await readGpuVramMb(sys)
+    const vramAfter = await readGpuVramMb(sys, profile)
     // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
     // see, since the probe never generates and so never allocates the prefill compute buffers.
     const sharedAfter = await readGpuSharedMb(sys)
@@ -1389,15 +1398,17 @@ export class BenchRunner {
         ts: record.ts,
         machineId,
         app: { version: appVersion, os: sys.os },
+        // Identifier fields go through toSafeIdent — a raw CPU/GPU name with `@`, `/` or `[...]`
+        // fails validation and the whole result is dropped before it is queued.
         hw: {
-          cpu: sys.cpu,
+          cpu: toSafeIdent(sys.cpu),
           ramMb: sys.ramMB,
-          gpus: sys.gpus.map((g) => ({ name: g.name, vramMb: g.vramMb })),
+          gpus: sys.gpus.map((g) => ({ name: toSafeIdent(g.name), vramMb: g.vramMb })),
         },
         payload: {
           source: 'autotune',
-          model: { name: entry.name, quant: entry.quant, sizeBytes: entry.sizeBytes, arch: entry.arch, moe: entry.moe },
-          engine: { version: engineVersion },
+          model: { name: toSafeIdent(entry.name), quant: toSafeIdent(entry.quant), sizeBytes: entry.sizeBytes, arch: toSafeIdent(entry.arch), moe: entry.moe },
+          engine: { version: toSafeIdent(engineVersion) },
           params: record.params,
           result: { tps: record.tps, ttftMs: record.ttftMs, vramMb: record.vramMb, outcome: 'ok' },
         },
@@ -1542,7 +1553,12 @@ export function buildBenchMessages(ctx: number): BenchMessage[] {
   for (let round = 0; chars < targetChars; round++) {
     const topic = FILLER_TOPICS[round % FILLER_TOPICS.length]
     const q = `Can you explain ${topic}?`
-    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1)
+    // Clip the last answer to what is left of the target. A whole answer is ~2.8k tokens, so
+    // appending it unclipped overshot a small ctx (2-4k) past the slot's n_ctx, which llama-server
+    // rejects outright — every candidate then failed and auto-tune found nothing.
+    const room = targetChars - chars - q.length
+    if (room <= 0) break
+    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1).slice(0, room)
     messages.push({ role: 'user', content: q }, { role: 'assistant', content: a })
     chars += q.length + a.length
   }
@@ -1952,9 +1968,46 @@ export function kvSpeedAdvisory(tps: number | null, currentKv: string, supported
   return `This result used the "${currentKv}" KV cache type. A different type (e.g. "${smallest}") may run faster, at some output-quality cost — try it manually if you want the extra speed.`
 }
 
-/** Best-effort current NVIDIA VRAM use in MB (sum across GPUs). Null on non-NVIDIA
+/** Which card a VRAM reading should cover — see {@link vramCardFor}. `of` is how many cards
+ *  sysinfo enumerated, so a reader can tell whether its own listing lines up with that index. */
+export interface VramCard {
+  index: number
+  of: number
+}
+
+/** The card a single-GPU ('none') split runs on, indexed exactly like `gpuBudgetMb` so the
+ *  reading and the budget it is judged against describe the SAME card (a summed reading against
+ *  one card's budget counted the other cards' desktop/browser/ComfyUI memory as this card's).
+ *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool. */
+export function vramCardFor(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): VramCard | undefined {
+  if (sys.gpus.length < 2 || p?.gpu?.splitMode !== 'none') return undefined
+  return { index: p.gpu.mainGpu >= 0 ? p.gpu.mainGpu : 0, of: sys.gpus.length }
+}
+
+/** Sum of per-card readings — or only `card`'s, when given and the tool listed exactly as many
+ *  cards as sysinfo did. On a count mismatch the index could name the wrong card, so the sum is
+ *  kept: it over-reads (conservative) where a wrong card could under-read. */
+function sumCards(perCard: number[], card?: VramCard): number {
+  const picked = card && perCard.length === card.of ? [perCard[card.index] ?? 0] : perCard
+  return picked.reduce((a, b) => a + b, 0)
+}
+
+/** Pure parser for `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` (one MB
+ *  figure per GPU, in the same order sysinfo enumerated them from the same tool). Sums every
+ *  GPU, or reads just `card` (see {@link sumCards}). Null when nothing positive was read. */
+export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | null {
+  const perCard = stdout
+    .trim()
+    .split('\n')
+    .map((l) => parseInt(l.trim(), 10))
+    .map((n) => (Number.isFinite(n) ? n : 0))
+  const total = sumCards(perCard, card)
+  return total > 0 ? total : null
+}
+
+/** Best-effort current NVIDIA VRAM use in MB (sum across GPUs, or one `card`). Null on non-NVIDIA
  *  or when nvidia-smi is absent — never throws (spec 09 §1). */
-function readNvidiaVramMb(): Promise<number | null> {
+function readNvidiaVramMb(card?: VramCard): Promise<number | null> {
   return new Promise((resolve) => {
     try {
       execFile(
@@ -1963,13 +2016,7 @@ function readNvidiaVramMb(): Promise<number | null> {
         { timeout: 8000, windowsHide: true },
         (err, stdout) => {
           if (err || !stdout) return resolve(null)
-          const total = stdout
-            .trim()
-            .split('\n')
-            .map((l) => parseInt(l.trim(), 10))
-            .filter((n) => Number.isFinite(n))
-            .reduce((a, b) => a + b, 0)
-          resolve(total > 0 ? total : null)
+          resolve(parseNvidiaVramUsed(stdout, card))
         },
       )
     } catch {
@@ -1979,18 +2026,19 @@ function readNvidiaVramMb(): Promise<number | null> {
 }
 
 /** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
- *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card.
+ *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card,
+ *  or reads just `card` (see {@link sumCards}).
  *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
-export function parseRocmVramUsed(memJson: string): number | null {
+export function parseRocmVramUsed(memJson: string, card?: VramCard): number | null {
   try {
     const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
-    let total = 0
+    const perCard: number[] = []
     for (const fields of Object.values(mem)) {
       const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
       const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
-      total += bytes
+      perCard.push(bytes)
     }
-    const mb = Math.round(total / 1e6)
+    const mb = Math.round(sumCards(perCard, card) / 1e6)
     return mb > 0 ? mb : null
   } catch {
     return null
@@ -2003,11 +2051,11 @@ export function parseRocmVramUsed(memJson: string): number | null {
  *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
  *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
  *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
-function readRocmVramMb(): Promise<number | null> {
+function readRocmVramMb(card?: VramCard): Promise<number | null> {
   return new Promise((resolve) => {
     try {
       execFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
-        resolve(err || !stdout ? null : parseRocmVramUsed(stdout))
+        resolve(err || !stdout ? null : parseRocmVramUsed(stdout, card))
       })
     } catch {
       resolve(null)
@@ -2015,15 +2063,17 @@ function readRocmVramMb(): Promise<number | null> {
   })
 }
 
-/** Best-effort current GPU VRAM use in MB (sum across GPUs), vendor-aware (ADR-217). Tries
+/** Best-effort current GPU VRAM use in MB (sum across GPUs — or, given a single-GPU profile `p`,
+ *  just that profile's card, see {@link vramCardFor}), vendor-aware (ADR-217). Tries
  *  nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`), then
  *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
  *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
  *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
-async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
-  const nv = await readNvidiaVramMb()
+async function readGpuVramMb(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): Promise<number | null> {
+  const card = vramCardFor(sys, p)
+  const nv = await readNvidiaVramMb(card)
   if (nv !== null) return nv
-  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb()
+  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb(card)
   return null
 }
 

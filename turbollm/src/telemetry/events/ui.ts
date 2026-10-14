@@ -685,6 +685,20 @@ export const UI_ACTIONS = [
   'confirm_jev_load', 'cancel_jev_load', 'open_jev_playground_toast',
   // ADR-443: the Workspace sidebar's way into the playground while a Laya model is loaded.
   'open_laya_playground',
+
+  // 35 actions that already had a `track()` call site in web/src but no entry here — the same
+  // CLOSED-enum trap as the batches above, found by scanning every literal `track()` call (that
+  // scan is now ui.test.ts, so a new call site without an entry fails the suite). Turbo Link
+  // settings, Remote Access, the app-update flow, the Monitor/Requests panel, and singles.
+  'set_machine_name', 'mint_link', 'revoke_inbound_link', 'add_link', 'edit_link_url',
+  'ack_link_machine_change', 'remove_link',
+  'select_remote_provider', 'save_remote_cloudflare', 'save_remote_ngrok', 'save_remote_tailscale_port',
+  'save_remote_custom_url', 'save_remote_token_grant', 'start_remote', 'stop_remote', 'stop_remote_from_chip',
+  'open_app_update_from_nav', 'open_app_update_from_settings', 'set_app_update_policy', 'apply_app_update',
+  'switch_monitor_view', 'toggle_request_column', 'toggle_request_log_bodies', 'export_request_log',
+  'clear_request_log', 'open_request_detail',
+  'open_system_from_hw_bar', 'switch_engines_tab', 'check_engine_update', 'save_gh_token',
+  'cancel_all_downloads', 'dismiss_all_downloads', 'set_litert_backend', 'set_model_load_mode', 'set_model_no_mmap',
 ] as const
 
 export const uiAction = defineEvent({

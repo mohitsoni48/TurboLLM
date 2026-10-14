@@ -86,7 +86,7 @@ test('row is NOT offered when the user pinned a single GPU — that is a hardwar
 })
 
 test('multi-GPU, model just barely exceeds one card at FULL offload → single-GPU still offered (GitHub #62)', () => {
-  // 15 GB weights on a 16 GB card: doesn't fit at ngl=32 (full offload) but easily fits at a
+  // 15 GB weights on a 16 GB card: doesn't fit at full offload (all 32 blocks) but easily fits at a
   // partial ngl (CPU covering only the tail) — the search should get a shot at that, instead of
   // being forced straight into a slower cross-GPU layer-split the way GitHub #62 reported (a model
   // that easily fit fully split across two cards, with VRAM to spare, was never tried on one card

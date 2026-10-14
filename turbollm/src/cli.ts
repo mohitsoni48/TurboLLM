@@ -705,7 +705,9 @@ setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 *
 // would never roll over — `useFeature` only rolls a feature's tally over the next
 // time THAT SAME feature is used, which may never happen again for an install that
 // stops running. Same unref()/best-effort reasoning as the flush interval.
-setInterval(() => telemetry.flushDailyUsage(), 5 * 60_000).unref()
+// daily_active rides it too: boot was its only call, so a daemon left running across
+// midnight never reported the following days (idempotent per day via the ledger).
+setInterval(() => { telemetry.dailyActive(); telemetry.flushDailyUsage() }, 5 * 60_000).unref()
 // ui_daily (spec 23 §3.8): same in-memory-accumulator/periodic-flush shape as
 // feature_used_daily above, just keyed on screen instead of feature.
 setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()

@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { featureForPath } from './feature-map'
+import { FEATURES } from './core/enums'
 
 test('featureForPath: maps each instrumented surface to its feature', () => {
   assert.equal(featureForPath('/api/v1/code/sessions'), 'code')
@@ -71,4 +72,18 @@ test('featureForPath: a bare segment matches, with or without a trailing slash',
 
 test('featureForPath: a path that merely starts with a feature word does not match', () => {
   assert.equal(featureForPath('/api/v1/codex/thing'), null)
+})
+
+test('every feature featureForPath can return is in the FEATURES enum (Turbo Link was not)', () => {
+  // `firstUse(feature)` spends its once-ever ledger claim BEFORE the event is validated, so a
+  // mapped feature missing from FEATURES is reported as never used, forever. One path per table
+  // entry, plus Turbo Link's peer-facing prefix.
+  const paths = [
+    '/api/v1/chat/stop', '/api/v1/conversations', '/api/v1/code/sessions', '/api/v1/artifacts/a',
+    '/api/v1/mcp/servers', '/api/v1/bench/run', '/api/v1/comfyui/install', '/api/v1/links', '/api/link/v1/hello',
+  ]
+  for (const p of paths) {
+    const feature = featureForPath(p)
+    assert.ok(feature !== null && (FEATURES as readonly string[]).includes(feature), `${p} → ${feature}`)
+  }
 })

@@ -2300,6 +2300,7 @@ export function registerApi(app: Hono, d: Deps): void {
 
     // Telemetry consent level (spec 09 §3): off | anon | full. Validate the enum.
     let telemetryLevel: string | undefined
+    const prevTelemetryLevel = d.store.snapshot().telemetry.level
     if (b.telemetryLevel !== undefined) {
       if (!['off', 'anon', 'full'].includes(b.telemetryLevel)) {
         return err(c, 400, 'invalid_config_value', 'telemetryLevel must be off, anon, or full.')
@@ -2534,8 +2535,11 @@ export function registerApi(app: Hono, d: Deps): void {
     // Report the consent choice once, ever (ADR-299 Decision 5). This is the
     // ONLY transmission a machine that chose Off ever makes, and the consent
     // copy is written to say exactly that. Fire-and-forget: the settings save
-    // must not wait on, or fail because of, a network call.
-    if (telemetryLevel !== undefined) void sendConsentChoice(d.store.dir(), telemetryLevel)
+    // must not wait on, or fail because of, a network call. Only when the level
+    // actually CHANGED: the Settings screen sends telemetryLevel with every save,
+    // so saving any unrelated field would otherwise spend the once-ever ping on
+    // a "choice" the user never made, and a later real opt-out would go unsent.
+    if (telemetryLevel !== undefined && telemetryLevel !== prevTelemetryLevel) void sendConsentChoice(d.store.dir(), telemetryLevel)
 
     const after = d.store.snapshot().daemon
 

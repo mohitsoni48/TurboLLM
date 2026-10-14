@@ -3,8 +3,8 @@
 // faithful alternative to the client-side html2canvas path (which reimplements CSS layout and
 // can't match the live render). Uses the user's INSTALLED browser (no bundled Chromium), and
 // returns null whenever a browser isn't found or anything fails, so the caller falls back to
-// the html2canvas export. Self-contained artifacts only: all external network is blocked, so
-// the render matches the on-screen iframe's `default-src 'none'` CSP.
+// the html2canvas export. Self-contained artifacts only: all external network is blocked — the
+// page carries the on-screen iframe's own `default-src 'none'` CSP (see ARTIFACT_CSP).
 import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -59,6 +59,23 @@ export function findChrome(): string | null {
   return null
 }
 
+/** The on-screen artifact iframe's CSP (`buildSrcdoc` in web/src/components/ArtifactCard.tsx),
+ *  copied by hand — the daemon and the web bundle share no module, so keep the two in sync. The
+ *  render below runs the artifact's scripts too, and request interception only ever sees HTTP(S)
+ *  requests: a WebSocket/EventSource connection is never paused by it. `default-src 'none'`
+ *  (which `connect-src` falls back to) refuses those as well. */
+const ARTIFACT_CSP = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:;">`
+
+/** `html` with {@link ARTIFACT_CSP} as the very first thing the parser sees. A meta CSP only
+ *  governs what is parsed AFTER it, so injecting it into the artifact's own `<head>` would leave
+ *  anything the model placed before that tag unrestricted. It goes after a leading doctype, if
+ *  any, so the page keeps standards mode — matched with HTML's own whitespace only: any other
+ *  leading character would open `<body>` first, where a meta CSP is ignored. */
+export function withArtifactCsp(html: string): string {
+  const doctype = /^[\t\n\f\r ]*<!doctype[^>]*>/i.exec(html)
+  return doctype ? doctype[0] + ARTIFACT_CSP + html.slice(doctype[0].length) : ARTIFACT_CSP + html
+}
+
 export interface ShotOpts {
   /** CSS-px width of the render viewport (a stable desktop width, e.g. 360–1280). */
   width: number
@@ -98,7 +115,7 @@ export async function screenshotArtifact(html: string, opts: ShotOpts): Promise<
       if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('about:')) void req.continue()
       else void req.abort()
     })
-    await page.setContent(html, { waitUntil: 'load', timeout: 8000 }).catch(() => {})
+    await page.setContent(withArtifactCsp(html), { waitUntil: 'load', timeout: 8000 }).catch(() => {})
     // Wait for web-font readiness (string form avoids needing the DOM lib in this Node module).
     await page.evaluate('document.fonts && document.fonts.ready').catch(() => {})
     await new Promise((r) => setTimeout(r, 150))
