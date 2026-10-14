@@ -82,8 +82,9 @@ export function createApp(d: Deps): Hono {
 
   // LAN auth gate (spec 06 §5): once LAN-exposed and requireApiKey is on (the default),
   // requires a valid API key for non-loopback /api/* and /v1/* calls. Not a no-op while
-  // loopback-only either: it admits keyless only loopback callers whose Host names this
-  // machine, and refuses browser cross-site writes to /api/* — see lanAuth's doc comment.
+  // loopback-only either: it admits keyless only loopback callers whose Host names this machine
+  // (and, on Android, that carry the app secret), and refuses browser cross-site writes to
+  // /api/* — see lanAuth's doc comment.
   app.use('*', lanAuth(d))
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.
@@ -194,20 +195,36 @@ export function createApp(d: Deps): Hono {
  *  what silently 404'd every `/api/v1/code/*` route from a7a85c2 onward, since that commit moved
  *  Code/Agents route registration to run lazily, after `createApp()` returned with `/*` already
  *  in place; the old inline comment claiming registration order didn't matter was wrong). */
-export function registerSpaFallback(app: Hono): void {
+export function registerSpaFallback(app: Hono, webRoot: string = WEB_ROOT): void {
   app.get('/*', (c) => {
     const path = decodeURIComponent(new URL(c.req.url).pathname).replace(/^\/+/, '')
     if (path.startsWith('api/') || path.startsWith('v1/')) {
       return c.json({ error: { code: 'not_found', message: 'Unknown endpoint.' } }, 404)
     }
-    let file = normalize(join(WEB_ROOT, path || 'index.html'))
-    if (!file.startsWith(WEB_ROOT) || !existsSync(file) || statSync(file).isDirectory()) {
-      file = join(WEB_ROOT, 'index.html')
+    let file = normalize(join(webRoot, path || 'index.html'))
+    if (!file.startsWith(webRoot) || !existsSync(file) || statSync(file).isDirectory()) {
+      file = join(webRoot, 'index.html')
     }
     if (!existsSync(file)) return c.text('web ui not built — run `npm run build:web`', 500)
-    return new Response(readFileSync(file), { status: 200, headers: { 'Content-Type': contentType(file) } })
+    const headers: Record<string, string> = { 'Content-Type': contentType(file) }
+    if (process.env.TURBOLLM_APP_SECRET && headers['Content-Type'].startsWith('text/html')) {
+      headers['Content-Security-Policy'] = APP_SECRET_CSP
+    }
+    return new Response(readFileSync(file), { status: 200, headers })
   })
 }
+
+/** Sent on the UI's HTML only when `TURBOLLM_APP_SECRET` is set (TurboLLM-Android, see auth.ts).
+ *  The app's WebView blocks requests to other 127.0.0.1 ports, but `shouldInterceptRequest` never
+ *  sees redirect hops: an https image in a model card or chat reply could 302 to
+ *  `http://127.0.0.1:<another app's port>` and carry the host-only `turbollm_app` cookie there.
+ *  CSP is re-checked on every hop and `'self'` is port-exact, so these two directives close that.
+ *  Plain-http images (model cards, markdown in replies) still load: a port-less `http://*` matches
+ *  only the scheme's default port, 80, which an Android app cannot bind without root — and Chromium
+ *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
+ *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
+ *  scripts, and the UI's own fetches are same-origin. */
+const APP_SECRET_CSP = "img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:"
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
  *  `createApp()`, before the server starts accepting connections. NOT folded into

@@ -5,10 +5,10 @@
 // EVERY non-loopback request to the API / gateway surface must carry a valid API key
 // (requireApiKey, on by default). Loopback is exempt so the local browser UI and
 // `turbollm launch claude` keep working with no key, but only a loopback caller whose
-// Host names this machine (DNS rebinding, see hostNamesThisMachine); anyone else is
-// judged like a LAN peer, and on a loopback-only bind needs a key even with
-// requireApiKey off. lanAuth also refuses a browser's cross-site writes to /api/* on
-// any bind.
+// Host names this machine (DNS rebinding, see hostNamesThisMachine) and, on Android, that
+// carries the app's secret (see appSecretPresented); anyone else is judged like a LAN
+// peer, and on a loopback-only bind needs a key even with requireApiKey off. lanAuth
+// also refuses a browser's cross-site writes to /api/* on any bind.
 //
 // Remote access (ADR-422, formerly the Cloud Launch tunnel of ADR-045/152) breaks the
 // loopback-as-trust assumption BY ADDRESS ALONE: every provider's local leg connects to
@@ -22,7 +22,7 @@
 // unlike a header, which only worked for Cloudflare because its edge (not the client)
 // controlled it.
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { ApiKey } from './config/config'
@@ -163,6 +163,35 @@ function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name) || /^\[[0-9a-f:.]*:[0-9a-f:.]*\]$/.test(name)) return true
   const unbracket = (s: string) => s.replace(/^\[|\]$/g, '')
   return d.bindHost !== undefined && unbracket(name) === unbracket(d.bindHost.trim().toLowerCase())
+}
+
+/** The cookie and header that carry {@link appSecretPresented}'s secret. */
+const APP_SECRET_COOKIE = 'turbollm_app'
+const APP_SECRET_HEADER = 'x-turbollm-app'
+
+/** Does a loopback caller prove it is the app that started this daemon? Only asked when
+ *  `TURBOLLM_APP_SECRET` is set, which only TurboLLM-Android does (a fresh random value per
+ *  launch): on a phone every installed app shares 127.0.0.1, so a loopback address says nothing
+ *  about who is calling, and loopback trust would hand any of them the whole API. The app's
+ *  WebView presents the secret as a cookie (the only thing it can attach to every request,
+ *  WebSocket handshakes included), its native code as a header. Unset (desktop, npm, Docker) →
+ *  always true, so loopback trust is exactly what it was. */
+function appSecretPresented(cookie: string | undefined, header: string | undefined): boolean {
+  const secret = process.env.TURBOLLM_APP_SECRET
+  if (!secret) return true
+  const candidates = header ? [header.trim()] : []
+  for (const part of (cookie ?? '').split(';')) {
+    const eq = part.indexOf('=')
+    if (eq !== -1 && part.slice(0, eq).trim() === APP_SECRET_COOKIE) candidates.push(part.slice(eq + 1).trim())
+  }
+  // Digests, not the raw strings: timingSafeEqual needs equal lengths, and a length check of its
+  // own would leak the secret's length.
+  const want = createHash('sha256').update(secret).digest()
+  return candidates.some((v) => timingSafeEqual(createHash('sha256').update(v).digest(), want))
+}
+
+function hasAppSecret(c: Context): boolean {
+  return appSecretPresented(c.req.header('cookie'), c.req.header(APP_SECRET_HEADER))
 }
 
 /** Mint the ONE bootstrap API key a headless install needs, or return null if it isn't
@@ -320,6 +349,7 @@ function isTunneled(c: Context, d: Deps): boolean {
 export function isLocalRequest(c: Context, d: Deps): boolean {
   if (isTunneled(c, d)) return false
   if (!hostNamesThisMachine(c.req.header('host'), d)) return false // DNS rebinding — see hostNamesThisMachine
+  if (!hasAppSecret(c)) return false // another app on the phone — see appSecretPresented
   if (!isLanExposed(d)) return true // loopback-only bind → always local
   return isLoopback(c) === true
 }
@@ -391,6 +421,10 @@ export function isLocalUpgrade(
   // DNS rebinding — see hostNamesThisMachine. A refused handshake still gets in with a `key`.
   const host = headers.host
   if (!hostNamesThisMachine(typeof host === 'string' ? host : undefined, d)) return false
+  // Another app on the phone — see appSecretPresented. The WebView's handshake carries the cookie.
+  const cookie = headers.cookie
+  const app = headers[APP_SECRET_HEADER]
+  if (!appSecretPresented(typeof cookie === 'string' ? cookie : undefined, typeof app === 'string' ? app : undefined)) return false
   if (!isLanExposed(d)) return true // loopback-only bind → always local
   return !!remoteAddress && LOOPBACK.has(remoteAddress)
 }
@@ -428,9 +462,10 @@ export function bypassesAuth(opts: {
  *  bare loopback shortcut. */
 export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
   const daemon = d.store.snapshot().daemon
-  // Loopback trust needs a Host naming this machine (DNS rebinding — see hostNamesThisMachine).
-  // Without one the request is judged like a LAN one, which lanAuth has already held to a key.
-  const trusted = !isTunneled(c, d) && hostNamesThisMachine(c.req.header('host'), d)
+  // Loopback trust needs a Host naming this machine (DNS rebinding — see hostNamesThisMachine),
+  // and on Android the app's secret (see appSecretPresented). Without them the request is judged
+  // like a LAN one, which lanAuth has already held to a key.
+  const trusted = !isTunneled(c, d) && hostNamesThisMachine(c.req.header('host'), d) && hasAppSecret(c)
   if (!isLanExposed(d) && trusted) return true // loopback-only bind, not tunneled → always local
   if (isLoopback(c) === true && trusted) return true // local client
   return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
@@ -611,9 +646,9 @@ export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boole
  *  BEFORE the API/chat/gateway routes. LAN peers need a key once the daemon is
  *  LAN-exposed (see isLanExposed) and requireApiKey is on (the default). The default
  *  loopback-only bind is NOT a pass-through: past the SPA shell and /healthz it admits
- *  keyless only loopback callers whose Host names this machine (anyone else needs a key
- *  even with requireApiKey off), and browser cross-site writes to /api/* get a 403 on
- *  every bind. */
+ *  keyless only loopback callers whose Host names this machine and, on Android, that carry
+ *  the app secret (anyone else needs a key even with requireApiKey off), and browser
+ *  cross-site writes to /api/* get a 403 on every bind. */
 export function lanAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
     // Hand the façade to its own gate before any of the LAN reasoning below — see
@@ -638,15 +673,18 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     const tunneled = isTunneled(c, d)
     // A loopback connection whose Host names some other machine (DNS rebinding — see
     // hostNamesThisMachine) gets no loopback trust: it is judged exactly like a LAN request on
-    // a LAN-exposed listener. With nothing LAN-exposed, `requireApiKey: false` opened the API
-    // to no one, so it is not read as consent to open it to a rebinding page: such a caller
-    // needs a key.
+    // a LAN-exposed listener.
     const foreignHost = !tunneled && !hostNamesThisMachine(c.req.header('host'), d)
+    // Likewise a loopback request without the Android app's secret: another app on the phone (see
+    // appSecretPresented). With nothing LAN-exposed, `requireApiKey: false` opened the API to no
+    // one, so it is not read as consent to open it to every other app (or to a rebinding page,
+    // above): such a caller needs a key.
+    const foreignApp = !tunneled && !foreignHost && !hasAppSecret(c)
     const allow = bypassesAuth({
-      lanBind: isLanExposed(d) || foreignHost,
-      requireApiKey: daemon.requireApiKey || (foreignHost && !isLanExposed(d)),
+      lanBind: isLanExposed(d) || foreignHost || foreignApp,
+      requireApiKey: daemon.requireApiKey || ((foreignHost || foreignApp) && !isLanExposed(d)),
       tunneled,
-      loopback: foreignHost ? false : isLoopback(c),
+      loopback: foreignHost || foreignApp ? false : isLoopback(c),
       exempt: isExempt(c),
     })
     if (allow) return next()
