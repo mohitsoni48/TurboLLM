@@ -7,8 +7,9 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
+import { queryKeys } from '../lib/queries'
 import { customSourceKey } from '../lib/engine-groups'
-import { discardReleaseInstall, getEngineUpdates, updateEngine } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, updateEngine } from '../lib/api'
 import { toast } from '../components/ui/sonner'
 import type { CatalogEngine, CustomEngineSource, Engine, EngineFit, EngineVariant, ReleaseProvenance } from '../lib/types'
 
@@ -56,8 +57,8 @@ const DISABLED_SOURCE: CustomEngineSource = {
 
 const state: {
   engines: Engine[]; customDisabled: CustomEngineSource[]; catalog: CatalogEngine[]; fits: EngineFit[]
-  updates: Record<string, unknown>
-} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {} }
+  updates: Record<string, unknown>; provisioning: boolean
+} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {}, provisioning: false }
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
@@ -72,7 +73,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     }),
     useEngineUpdates: () => ({ data: { updates: state.updates, policies: {} } }),
     useSysInfo: () => ({ data: { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
-    useStatus: () => ({ data: undefined }),
+    useStatus: () => ({ data: state.provisioning ? { engine: { state: 'stopped' }, engineProvision: { active: true } } : undefined }),
     useBuild: () => ({
       start: { mutate: vi.fn(), isPending: false }, cancel: { mutate: vi.fn() },
       cuda: { mutate: vi.fn() }, installPrereq: { mutate: vi.fn() }, refresh: vi.fn(),
@@ -118,11 +119,15 @@ vi.mock('../components/ui/sonner', async (importOriginal) => ({
 
 function renderScreen() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  // A fresh element per render: re-rendering the identical element would bail out without
+  // re-reading the mocked hooks.
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <MemoryRouter><EnginesScreen /></MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
+  const ui = render(tree())
+  return { ...ui, qc, rerender: () => ui.rerender(tree()) }
 }
 
 const cardOf = async (title: string) =>
@@ -162,6 +167,7 @@ beforeEach(() => {
   state.catalog = [PRISM_CATALOG]
   state.fits = [fitFor(PRISM_CATALOG)]
   state.updates = {}
+  state.provisioning = false
 })
 
 describe('N-1: deleting a disabled release engine from its card', () => {
@@ -297,5 +303,61 @@ describe('N-4: "Check for update" on an enabled release card is honest', () => {
     await waitFor(() => expect(updateEngine).toHaveBeenCalledTimes(1))
     expect(vi.mocked(updateEngine).mock.calls[0]?.[0]).toBe('relA')
     expect(getEngineUpdates).not.toHaveBeenCalled()
+  })
+})
+
+describe('Remove on a disabled custom release install (not shown on a catalog card)', () => {
+  const FORK_BIN = '/e/build/someone-fork-win-vulkan/llama-server'
+  const FORK_SOURCE: CustomEngineSource = {
+    name: 'someone/fork Vulkan (b100)', binPath: FORK_BIN, addedAt: '2026-10-09T00:00:00Z', binPathExists: true,
+  }
+
+  it('forgets the source, THEN discards its now-unclaimed release dir', async () => {
+    state.customDisabled = [FORK_SOURCE]
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(FORK_SOURCE)}`, `discard:${FORK_BIN}`]))
+    expect(toast.success).toHaveBeenCalledWith('someone/fork Vulkan (b100) removed')
+    expect(purgeMutate).not.toHaveBeenCalled()
+  })
+
+  it('a refused discard (not a release dir, or still claimed) stays silent', async () => {
+    state.customDisabled = [FORK_SOURCE]
+    vi.mocked(discardReleaseInstall).mockRejectedValue(new ApiError('engine_not_found', 'No unconfirmed release install at that path.', 404))
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FORK_BIN))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(toast.success).toHaveBeenCalledWith('someone/fork Vulkan (b100) removed')
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+})
+
+describe('a finished provision run refreshes the engine list and catalog', () => {
+  it('provisioning true -> false invalidates engines and engineCatalog (a release update settles after its 202)', async () => {
+    showOwnedRelease()
+    state.provisioning = true
+    const { qc, rerender } = renderScreen()
+    await cardOf('Prism')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    rerender()
+    expect(invalidate).not.toHaveBeenCalled()
+
+    state.provisioning = false
+    rerender()
+    await waitFor(() => {
+      const keys = invalidate.mock.calls.map((c) => c[0]?.queryKey)
+      expect(keys).toEqual(expect.arrayContaining([queryKeys.engines, queryKeys.engineCatalog]))
+    })
+  })
+
+  it('a screen that was never provisioning invalidates nothing on re-render', async () => {
+    showOwnedRelease()
+    const { qc, rerender } = renderScreen()
+    await cardOf('Prism')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    rerender()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.engines })
   })
 })

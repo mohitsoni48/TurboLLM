@@ -845,6 +845,16 @@ function EngineGallery({
   const policyMut = useUpdatePolicyMutation()
   const releaseUpdate = useEngineUpdate()
   const qc = useQueryClient()
+  // A release update (card Update, or a dialog install that refreshed a registered engine) changes
+  // the engine in place and settles long after its 202, so refetch when the provision run ends.
+  const wasProvisioning = useRef(provisioning)
+  useEffect(() => {
+    const settled = wasProvisioning.current && !provisioning
+    wasProvisioning.current = provisioning
+    if (!settled) return
+    void qc.invalidateQueries({ queryKey: queryKeys.engines })
+    void qc.invalidateQueries({ queryKey: queryKeys.engineCatalog })
+  }, [provisioning, qc])
   // `reregister`: a Disabled source-built card's delete (see requestDelete).
   const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { reregister?: AddEngineInput }) | null>(null)
   const customDisabled = registry?.customDisabled ?? []
@@ -1140,13 +1150,19 @@ function EngineGallery({
       },
     )
   }
-  // Not routed through the shared delete confirmation dialog (a "remembered but not
-  // registered" source has nothing on disk to warn about) — still a real deletion of the
-  // remembered engine, so it shares `delete_engine` rather than needing its own action.
+  // Not routed through the shared delete confirmation dialog: forgetting a "remembered but
+  // not registered" source leaves nothing the user can still reach (a release install's
+  // now-unclaimed folder is removed below) — still a real deletion of the remembered
+  // engine, so it shares `delete_engine` rather than needing its own action.
   const doForgetCustom = (source: CustomEngineSource) => {
     track('engines', 'delete_engine')
     engineMut.forgetCustomSource.mutate(customSourceKey(source), {
-      onSuccess: () => toast.success(`${source.name} removed`),
+      onSuccess: () => {
+        toast.success(`${source.name} removed`)
+        // A forgotten release install's dir is now unclaimed: remove it. The route answers 404
+        // for any other dir (git build, zip install) and 409 if something still claims it.
+        void discardReleaseInstall(source.binPath).catch(() => {})
+      },
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
     })
   }

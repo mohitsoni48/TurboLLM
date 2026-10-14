@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { ArrowLeft, Download, Loader2, X } from 'lucide-react'
 import { ApiError, discardReleaseInstall, track } from '../../lib/api'
-import { useReleaseAssets, useReleaseInstall, useStatus } from '../../lib/queries'
+import { queryKeys, useReleaseAssets, useReleaseInstall, useStatus } from '../../lib/queries'
 import type { EngineScanResult, RankedReleaseAsset, ReleaseAssetListing } from '../../lib/types'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -40,11 +41,18 @@ export function ReleaseSourcePanel({
 
   const listing = useReleaseAssets(submittedRepo, step !== 'repo')
   const { start, job } = useReleaseInstall(step === 'installing')
+  const qc = useQueryClient()
 
-  // A job still running when the panel goes away (dialog dismissed) is aborted.
+  // A job still running when the panel goes away (dialog dismissed) is aborted. `unmounted` is
+  // re-cleared on every mount so StrictMode's dev mount -> cleanup -> mount cannot leave it true.
   const installing = useRef(false)
-  useEffect(() => () => {
-    if (installing.current) void discardReleaseInstall().catch(() => {})
+  const unmounted = useRef(false)
+  useEffect(() => {
+    unmounted.current = false
+    return () => {
+      unmounted.current = true
+      if (installing.current) void discardReleaseInstall().catch(() => {})
+    }
   }, [])
 
   const leaveInstalling = () => {
@@ -62,6 +70,13 @@ export function ReleaseSourcePanel({
         return
       }
       installing.current = false
+      if (view.state === 'updated') {
+        // A registered engine was refreshed in place with no Add to follow (as a zip re-upload's
+        // `updated`): refetch what shows its version and tag.
+        void qc.invalidateQueries({ queryKey: queryKeys.engines })
+        void qc.invalidateQueries({ queryKey: queryKeys.engineCatalog })
+        void qc.invalidateQueries({ queryKey: queryKeys.status })
+      }
       onReady(view.result.found && view.updated ? { ...view.result, updated: view.updated } : view.result)
     } else if (view.state === 'error') {
       setError(view.error ?? { code: 'unknown', message: 'The install failed.' })
@@ -101,14 +116,20 @@ export function ReleaseSourcePanel({
     }
     setError(null)
     track('engines', 'install_release_asset')
-    start.mutate(
-      { repo: data.repo, tag: data.tag, asset: chosenAsset.name },
-      {
-        onSuccess: () => {
-          installing.current = true
-          setStep('installing')
-        },
-        onError: (e) => setError(toPanelError(e, 'Could not start the install.')),
+    // mutateAsync, not per-call mutate callbacks: those are skipped once the panel unmounts, so a
+    // dialog dismissed before the 202 would leave the job running headless. The abort sent here
+    // goes out after the 202, when the daemon has registered the job's abort handle.
+    void start.mutateAsync({ repo: data.repo, tag: data.tag, asset: chosenAsset.name }).then(
+      () => {
+        if (unmounted.current) {
+          void discardReleaseInstall().catch(() => {})
+          return
+        }
+        installing.current = true
+        setStep('installing')
+      },
+      (e: unknown) => {
+        if (!unmounted.current) setError(toPanelError(e, 'Could not start the install.'))
       },
     )
   }

@@ -15,6 +15,7 @@ import {
   listReleaseAssets,
   startReleaseInstall,
   track,
+  uploadEngineZip,
 } from '../../lib/api'
 import type { CatalogEngine, EngineScanResult, ReleaseAssetListing } from '../../lib/types'
 
@@ -28,6 +29,7 @@ vi.mock('../../lib/api', async (importOriginal) => ({
   startReleaseInstall: vi.fn(),
   getReleaseInstall: vi.fn(),
   getEngineCatalog: vi.fn(),
+  uploadEngineZip: vi.fn(),
 }))
 
 const ASSET = 'llama-prism-prism-b10770-bin-win-cpu-x64.zip'
@@ -164,5 +166,132 @@ describe('AddEngineDialog: GitHub release source', () => {
     await within(dialog).findByText(/Downloading/)
     await userEvent.keyboard('{Escape}')
     await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+  })
+})
+
+describe('AddEngineDialog: release installs supersede an unconfirmed install', () => {
+  const VULKAN: EngineScanResult = { ...FOUND, binPath: '/e/build/prism-vulkan/llama-server', suggestedName: 'Prism Vulkan (b10770)' }
+  const ZIP: EngineScanResult = { ...FOUND, binPath: '/e/build/zip-myfork/llama-server', suggestedName: 'myfork (b4242)' }
+
+  async function installToConfirm(dialog: HTMLElement) {
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await within(dialog).findByText('Confirm engine')
+  }
+  async function backToRelease(dialog: HTMLElement) {
+    await userEvent.click(within(dialog).getByRole('button', { name: /Back/ }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+  }
+
+  it('a second release install discards the first unconfirmed one; Add keeps the second', async () => {
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: VULKAN })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add engine' }))
+    await waitFor(() => expect(vi.mocked(addEngine).mock.calls[0]?.[0]).toEqual({
+      name: VULKAN.suggestedName,
+      binPath: VULKAN.binPath,
+    }))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+    expect(discardReleaseInstall).not.toHaveBeenCalledWith(VULKAN.binPath)
+  })
+
+  it('re-installing into the same dir discards nothing early, and that dir once on dismiss', async () => {
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+  })
+
+  // Windows/macOS fold case: the repo typed in another case is the same physical folder, which
+  // the reinstall replaced in place — discarding the old spelling would delete the new build.
+  it('re-installing into the same dir spelled in another case discards nothing early', async () => {
+    const UPPER: EngineScanResult = { ...FOUND, binPath: 'C:\\e\\build\\PrismML-Eng-llama.cpp-x\\llama-server.exe' }
+    const LOWER: EngineScanResult = { ...FOUND, binPath: 'C:\\e\\build\\prismml-eng-llama.cpp-x\\llama-server.exe' }
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: UPPER })
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: LOWER })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(LOWER.binPath))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+  })
+
+  it('a newer build that renamed the binary inside the same dir discards nothing early', async () => {
+    const RENAMED: EngineScanResult = { ...FOUND, binPath: '/e/build/prism/llama-server-prism' }
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: RENAMED })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  it('an unconfirmed zip upload superseded by a release install is removed through the zip route', async () => {
+    vi.mocked(uploadEngineZip).mockResolvedValue(ZIP)
+    wrap(<AddEngineDialog />)
+    const dialog = await openDialog()
+    userEvent.upload(dialog.querySelector('input[type="file"]') as HTMLInputElement, new File([new Uint8Array([1])], 'myfork.zip'))
+    await within(dialog).findByText('Confirm engine')
+    await userEvent.click(within(dialog).getByRole('button', { name: /Back/ }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    await userEvent.click(await within(dialog).findByRole('button', { name: 'Prism' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Find builds' }))
+    await installToConfirm(dialog)
+
+    await waitFor(() => expect(deleteEngineZipInstall).toHaveBeenCalledWith(ZIP.binPath))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+})
+
+describe('AddEngineDialog: dismissed before the install was accepted', () => {
+  it('aborts the job once the start answers instead of leaving it running headless', async () => {
+    let accept!: (v: { accepted: true }) => void
+    vi.mocked(startReleaseInstall).mockReturnValue(new Promise((res) => { accept = res }))
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await waitFor(() => expect(startReleaseInstall).toHaveBeenCalledTimes(1))
+    await userEvent.keyboard('{Escape}')
+    await within(dialog).findByRole('button', { name: /From a GitHub release/ })
+
+    accept({ accepted: true })
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+    expect(getReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  it('a start that fails after the dismissal sends no abort', async () => {
+    let refuse!: (e: unknown) => void
+    vi.mocked(startReleaseInstall).mockReturnValue(new Promise((_res, rej) => { refuse = rej }))
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await waitFor(() => expect(startReleaseInstall).toHaveBeenCalledTimes(1))
+    await userEvent.keyboard('{Escape}')
+    await within(dialog).findByRole('button', { name: /From a GitHub release/ })
+
+    refuse(new Error('busy'))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
   })
 })
