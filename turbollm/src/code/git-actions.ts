@@ -55,7 +55,9 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       // failure as a normal command error instead of hanging the request.
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     })
-    return stdout.trim()
+    // trimEnd, not trim: `status --porcelain` lines start with a significant space (' M path' =
+    // unstaged change), and stripping the first one shifted that entry's code and path by a char.
+    return stdout.trimEnd()
   } catch (e) {
     const failure = e as { stderr?: string; code?: number; killed?: boolean; message: string }
     if (failure.killed) throw new GitError(`git ${args[0]} timed out after ${timeoutMs}ms`, failure.stderr ?? '', null)

@@ -56,6 +56,10 @@ export function revertFileEdits(messages: Message[], repoRoot: string): RevertFi
       failed.push(path)
       continue
     }
+    // pi's edit tool computes its patch on BOM-stripped text but writes the BOM back, so a hunk
+    // touching line 1 never matches the raw content. Patch without it, restore it on write.
+    const bom = content.startsWith('\uFEFF') ? '\uFEFF' : ''
+    content = content.slice(bom.length)
 
     let ok = true
     for (let i = patches.length - 1; i >= 0; i--) {
@@ -73,7 +77,7 @@ export function revertFileEdits(messages: Message[], repoRoot: string): RevertFi
     if (!ok) { failed.push(path); continue }
 
     try {
-      writeFileSync(absPath, content)
+      writeFileSync(absPath, bom + content)
       reverted.push(path)
     } catch {
       failed.push(path)

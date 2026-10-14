@@ -4,13 +4,16 @@
 // nearest existing ancestor so a symlink ANYWHERE in the path can't escape, Windows case-fold,
 // NUL / non-absolute / drive-relative rejection, exact-or-descendant match) — NOT the old file's
 // per-tool wiring, which is replaced by the pi SDK's real tool_call hook.
-import { realpathSync } from 'node:fs'
+import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { resolve, dirname, basename, join, sep } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const isWin = process.platform === 'win32'
 
 /** Canonicalize an input path: resolve all symlinks in the nearest EXISTING ancestor,
- *  then re-append the non-existent tail (which therefore cannot contain a symlink).
+ *  then re-append the non-existent tail (which therefore cannot contain a symlink — a
+ *  DANGLING symlink is followed to its target rather than treated as part of that tail).
  *  Returns a comparison-normalized absolute path, or null if the input is unusable. */
 export function canonicalize(input: string | null | undefined): string | null {
   if (typeof input !== 'string' || input.length === 0) return null
@@ -25,13 +28,33 @@ export function canonicalize(input: string | null | undefined): string | null {
       const full = tail.length ? join(real, ...[...tail].reverse()) : real
       return normForCompare(full)
     } catch {
+      // A dangling symlink (its target doesn't exist yet) also fails realpath, but it is NOT a
+      // missing entry: fs.writeFile follows it and creates the target, wherever that is. Keep
+      // canonicalizing from the link's target instead of treating the link as an in-root name —
+      // a relative target taken against the link's REAL directory, since `cur` may still be
+      // spelled through another link (`d/up/x` with `d/up -> ..`) where a lexical `..` differs.
+      const link = readLinkOrNull(cur)
+      if (link !== null) {
+        try { cur = resolve(realpathSync(dirname(cur)), link) } catch { return null }
+        continue
+      }
       const parent = dirname(cur)
-      if (parent === cur) return normForCompare(abs) // reached the root; nothing exists
+      // Reached the root; nothing exists. Rebuilt from `cur`, not `abs`: after following a link
+      // `cur` is the link's target (e.g. on a drive that doesn't exist), not the input path.
+      if (parent === cur) return normForCompare(join(cur, ...[...tail].reverse()))
       tail.push(basename(cur))
       cur = parent
     }
   }
-  return normForCompare(abs)
+  return null // only reachable through a symlink cycle — fail closed
+}
+
+function readLinkOrNull(p: string): string | null {
+  try {
+    return lstatSync(p).isSymbolicLink() ? readlinkSync(p) : null
+  } catch {
+    return null
+  }
 }
 
 /** Normalize for containment comparison: unify separators to the OS sep and case-fold
@@ -47,7 +70,10 @@ export function isInsideAny(path: string, roots: string[]): boolean {
   const p = normForCompare(path)
   for (const root of roots) {
     const r = normForCompare(root)
-    if (p === r || p.startsWith(r + sep)) return true
+    // A filesystem/drive root (`/`, `d:\`) already ends in the separator — appending another
+    // would match nothing, rejecting every path under a project opened at a drive root.
+    const prefix = r.endsWith(sep) ? r : r + sep
+    if (p === r || p.startsWith(prefix)) return true
   }
   return false
 }
@@ -80,7 +106,36 @@ export function isContained(input: string | null | undefined, root: string): boo
 export function isContainedFromRoot(input: string | null | undefined, root: string): boolean {
   if (typeof input !== 'string' || input.length === 0) return false
   if (input.includes('\0')) return false
-  let resolved: string
-  try { resolved = resolve(root, input) } catch { return false }
-  return isContained(resolved, root)
+  // Both readings of the string must stay inside: the one pi's write/edit tools act on
+  // (normalizePiToolPath) and the raw one, which git-actions, revert and persona resolve
+  // themselves with a plain resolve/join.
+  const normalized = normalizePiToolPath(input)
+  if (normalized === null) return false
+  for (const candidate of normalized === input ? [input] : [input, normalized]) {
+    let resolved: string
+    try { resolved = resolve(root, candidate) } catch { return false }
+    if (!isContained(resolved, root)) return false
+  }
+  return true
+}
+
+const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g
+
+/** The path pi's write/edit tools ACTUALLY touch is not the raw argument: their resolveToCwd
+ *  (pi utils/paths.js `normalizePath` with normalizeUnicodeSpaces + stripAtPrefix) maps Unicode
+ *  spaces to ' ', strips one leading `@`, expands `~` / `~/` (and `~\` on win32) to the home
+ *  directory, and turns a `file://` URL into a path. Checking the raw string let `~/.bashrc`,
+ *  `@/etc/passwd` and `file:///etc/passwd` pass as in-repo names while pi wrote outside the repo.
+ *  pi doesn't export this from its package entry point, so it is mirrored here (pi 0.80.6; the
+ *  parity test in containment.test.ts drives pi's real write tool to catch drift). Returns null
+ *  when pi's own conversion would throw (an unconvertible file:// URL) — the write fails anyway. */
+function normalizePiToolPath(input: string): string | null {
+  let normalized = input.replace(UNICODE_SPACES, ' ')
+  if (normalized.startsWith('@')) normalized = normalized.slice(1)
+  if (normalized === '~') return homedir()
+  if (normalized.startsWith('~/') || (isWin && normalized.startsWith('~\\'))) return join(homedir(), normalized.slice(2))
+  if (/^file:\/\//.test(normalized)) {
+    try { return fileURLToPath(normalized) } catch { return null }
+  }
+  return normalized
 }

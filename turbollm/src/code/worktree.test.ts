@@ -45,6 +45,8 @@ test('sanitizeBranchName: produces something git will actually accept', () => {
   assert.equal(sanitizeBranchName('weird.lock'), 'weird', 'git rejects a .lock suffix')
   assert.equal(sanitizeBranchName('~^:?*[]'), 'turbollm-session', 'all-illegal falls back, never empty')
   assert.equal(sanitizeBranchName(''), 'turbollm-session')
+  // A leading `-` would reach the internal `git branch` as an option (`unknown switch`).
+  assert.equal(sanitizeBranchName('- fix the login bug'), 'fix-the-login-bug')
 })
 
 // ── against real git ─────────────────────────────────────────────────────────
@@ -283,6 +285,14 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
     'weird.lock',
     '/leading/and/trailing/',
     'a'.repeat(200),
+    // Each of these used to come out as a name git refuses.
+    '- fix the login bug',
+    '-- refactor',
+    'use @{upstream} config',
+    'docs/.hidden notes',
+    'a.lock/b',
+    'a/x.lock.lock/.b',
+    'tab\there\u0001bell\u007f',
   ]
   const root = await makeRepo()
   try {

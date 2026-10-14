@@ -72,6 +72,17 @@ test('getGitStatus: an untracked new file shows up with the real porcelain code'
   assert.deepEqual(status.files, [{ code: '??', path: 'new.txt' }])
 })
 
+test('REGRESSION: getGitStatus keeps the leading space of the FIRST entry (an unstaged modification)', async () => {
+  const dir = initRepo()
+  appendFileSync(join(dir, 'README.md'), 'more\n')
+  const status = await getGitStatus(dir)
+  // Trimming the whole porcelain output used to turn ' M README.md' into code 'M ', path 'EADME.md'.
+  assert.deepEqual(status.files, [{ code: ' M', path: 'README.md' }])
+  // The listed path is what the Git dialog sends back for a selective commit — git must accept it.
+  const result = await commitGitChanges(dir, 'update readme', status.files.map((f) => f.path))
+  assert.equal(result.filesCommitted, 1)
+})
+
 test('getGitStatus: a configured remote is reflected in hasRemote', async () => {
   const dir = initRepo()
   const remote = initBareRemote()

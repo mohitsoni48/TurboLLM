@@ -1,14 +1,17 @@
 // Unit tests for the Code-session path-containment boundary (containment.ts).
 //
-// Pure algorithm tests — no pi SDK, no live model. The single most important case is the
+// Pure algorithm tests — no live model (pi's real write tool is driven once, with no-op filesystem
+// operations, only to check path-normalization parity). The single most important case is the
 // regression at the bottom: a RELATIVE tool-call path (`math-utils.js`, `./index.js`, `.`)
 // must be resolved against the session repoRoot, NOT the daemon's own process.cwd(). Before
 // the fix, `isContained` resolved relative paths against process.cwd(), so legitimate in-bounds
 // calls canonicalized to a path OUTSIDE the root and were falsely rejected in every mode.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { join, resolve, sep } from 'node:path'
+import { mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
+import { join, parse, resolve, sep } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { createWriteToolDefinition } from '@earendil-works/pi-coding-agent'
 import {
   canonicalize,
   normForCompare,
@@ -250,4 +253,87 @@ test('REGRESSION: relative path wrong against a foreign cwd, correct against rep
     rmSync(repoRoot, { recursive: true, force: true })
     rmSync(foreignCwd, { recursive: true, force: true })
   }
+})
+
+// ── REGRESSION: the string pi's write/edit tools act on is not the raw argument ─────────────
+// pi's resolveToCwd strips a leading `@`, expands `~`/`~/`, and converts `file://` URLs. The guard
+// used to check the raw string, so `~/.bashrc` passed as "<repo>/~/.bashrc" while pi wrote to the
+// real home directory.
+
+/** The absolute path pi's REAL write tool would write `input` to, with `root` as its cwd —
+ *  captured through its injectable operations, so nothing is written anywhere. */
+async function piWriteTarget(input: string, root: string): Promise<string> {
+  let target = ''
+  const tool = createWriteToolDefinition(root, {
+    operations: { mkdir: async () => {}, writeFile: async (abs) => { target = abs } },
+  })
+  await tool.execute('t', { path: input, content: '' }, undefined, undefined, undefined as never)
+  return target
+}
+
+test('isContainedFromRoot: ~, @ and file:// paths are judged by where pi actually writes them', async () => {
+  const root = tmpDir('pinorm-')
+  const outside = tmpDir('pinorm-out-')
+  try {
+    const escapes = [
+      '~/.bashrc',
+      '~',
+      '@' + join(outside, 'x.txt'),
+      pathToFileURL(join(outside, 'x.txt')).href,
+      '@' + pathToFileURL(join(outside, 'x.txt')).href,
+    ]
+    for (const p of escapes) assert.ok(!isContainedFromRoot(p, root), `${p} must be rejected`)
+
+    const inBounds = ['@src/a.ts', pathToFileURL(join(root, 'in.txt')).href, 'a\u00A0b.txt', 'src/a.ts']
+    for (const p of inBounds) assert.ok(isContainedFromRoot(p, root), `${p} must stay allowed`)
+
+    // Parity with pi itself: the verdict always matches the real write target's containment.
+    for (const p of [...escapes, ...inBounds, '~\\.bashrc']) {
+      assert.equal(isContainedFromRoot(p, root), isContained(await piWriteTarget(p, root), root), p)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+// File symlinks need Windows developer mode / admin.
+const fileLinks = { skip: isWin }
+
+test('REGRESSION: a dangling symlink inside the root is judged by its target, not its own name', fileLinks, () => {
+  const root = tmpDir('dangle-')
+  const outside = tmpDir('dangle-out-')
+  try {
+    // writeFile follows the link and creates the target, so an outside target must be refused…
+    symlinkSync(join(outside, 'authorized_keys'), join(root, 'cfg.json'))
+    assert.ok(!isContainedFromRoot('cfg.json', root))
+    // …also when the link is a directory component of the path, or its target is relative.
+    symlinkSync(join(outside, 'missing-dir'), join(root, 'dirlink'))
+    assert.ok(!isContainedFromRoot('dirlink/x.txt', root))
+    symlinkSync(join('..', parse(outside).base, 'rel.txt'), join(root, 'rel.json'))
+    assert.ok(!isContainedFromRoot('rel.json', root))
+    // …also when reached through an in-root directory link: `d/up` is root itself, so the relative
+    // target is taken from root (escaping), not lexically from `d/up` (where it would stay in d/).
+    mkdirSync(join(root, 'd'))
+    symlinkSync('..', join(root, 'd', 'up'))
+    assert.ok(!isContainedFromRoot(join('d', 'up', 'rel.json'), root))
+    // A dangling link whose target is inside the root stays allowed.
+    symlinkSync(join(root, 'not-yet.txt'), join(root, 'inside.json'))
+    assert.ok(isContainedFromRoot('inside.json', root))
+    // A link cycle can't be resolved at all — fail closed.
+    symlinkSync(join(root, 'loop-b'), join(root, 'loop-a'))
+    symlinkSync(join(root, 'loop-a'), join(root, 'loop-b'))
+    assert.ok(!isContainedFromRoot('loop-a', root))
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: a filesystem / drive root (`/`, `D:\\`) contains its descendants', () => {
+  const fsRoot = parse(process.cwd()).root // '/' or e.g. 'C:\\'
+  assert.ok(isInsideAny(join(fsRoot, 'src', 'a.ts'), [fsRoot]))
+  assert.ok(isInsideAny(fsRoot, [fsRoot]))
+  assert.ok(isContainedFromRoot(join('src', 'a.ts'), fsRoot))
+  if (isWin) assert.ok(isInsideAny('D:\\src\\a.ts', ['D:\\']))
 })

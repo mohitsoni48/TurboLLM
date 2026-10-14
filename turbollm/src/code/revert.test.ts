@@ -129,3 +129,14 @@ test('revertFileEdits: a nested-directory relative path resolves correctly under
   assert.deepEqual(result.reverted, ['src/lib/util.ts'])
   assert.equal(readFileSync(join(repoRoot, 'src', 'lib', 'util.ts'), 'utf8'), 'export const x = 1\n')
 })
+
+test('REGRESSION: a file with a UTF-8 BOM reverts (an edit touching line 1) and keeps its BOM', () => {
+  const repoRoot = tmpDir('tllm-revert-')
+  // pi's edit tool strips the BOM before diffing and writes it back, so the stored patch is
+  // computed on BOM-less text while the file on disk still starts with U+FEFF.
+  writeFileSync(join(repoRoot, 'a.cs'), '\uFEFF' + 'using New;\nclass A {}\n')
+  const patch = editPatch('a.cs', 'using Old;\nclass A {}\n', 'using New;\nclass A {}\n')
+  const result = revertFileEdits([msgWithEdits([{ path: 'a.cs', patch }])], repoRoot)
+  assert.deepEqual(result, { reverted: ['a.cs'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, 'a.cs'), 'utf8'), '\uFEFF' + 'using Old;\nclass A {}\n')
+})

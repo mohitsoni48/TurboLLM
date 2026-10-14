@@ -74,28 +74,34 @@ export async function isGitRepo(root: string): Promise<boolean> {
   return r.ok && r.stdout.trim() === 'true'
 }
 
-/** Turn arbitrary user text into something `git branch` will accept: git refuses spaces, `~^:?*[`,
- *  `..`, a leading/trailing `/` or `.`, and a trailing `.lock`. Falls back to a fixed stem rather
- *  than returning '' so a name made entirely of illegal characters still produces a usable branch.
- *  Pure. */
+/** Turn arbitrary user text into something `git branch` will accept: git refuses spaces, control
+ *  characters, `~^:?*[\`, `..`, `@{`, a leading `-`, a leading/trailing `/` or `.`, a path
+ *  component starting with `.` or ending in `.lock`, and a trailing `.lock`. Falls back to a fixed
+ *  stem rather than returning '' so a name made entirely of illegal characters still produces a
+ *  usable branch. Pure. */
 export function sanitizeBranchName(raw: string): string {
   const cleaned = raw
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '-')
-    .replace(/[~^:?*[\]\\]/g, '')
+    .replace(/[\x00-\x1f\x7f~^:?*[\]\\]/g, '')
+    .replace(/@\{/g, '-')
     .replace(/\.\.+/g, '-')
+    .replace(/\/\.+/g, '/')
+    .replace(/(?:\.lock)+(?=\/)/g, '')
     .replace(/\/+/g, '/')
-    .replace(/^[/.]+/, '')
-    .replace(/\.lock$/, '')
+    // A leading `-` matters beyond validity: `git worktree add -b` runs `git branch <name>`, which
+    // parses `-fix-the-bug` (a task typed as a markdown bullet) as options and fails.
+    .replace(/^[-/.]+/, '')
     .replace(/-+/g, '-')
     .slice(0, 80)
     // Trailing `-`, `.` and `/` are stripped AFTER the length cap, not before it. Doing it first
     // was a real bug: the cap can land mid-string and re-expose a character git rejects at the end
     // of a ref. Verified against `git check-ref-format` — a 79-character task description followed
     // by a `.` produced `aaa….`, which git refuses ("is not a valid branch name"), so creating the
-    // session failed outright for nothing more than a long description.
-    .replace(/[-./]+$/, '')
+    // session failed outright for nothing more than a long description. A trailing `.lock` is part
+    // of the same run, so stripping one can't re-expose another (`x.lock-` → `x.lock` → `x`).
+    .replace(/(?:\.lock|[-./])+$/, '')
   return cleaned || 'turbollm-session'
 }
 
