@@ -8,6 +8,8 @@ import {
   writePidfile,
   readPidfile,
   removePidfile,
+  removeOwnPidfile,
+  findRunningDaemon,
   resolveDaemonPort,
   stopDaemon,
   type StopHooks,
@@ -229,6 +231,39 @@ test('stopDaemon refuses to kill when the PID is alive but not a TurboLLM daemon
     assert.match(result.message, /kill -9 42/, 'should hand the user the manual command')
     // Pidfile is left intact — we did not confirm ownership, so we do not touch it.
     assert.deepEqual(readPidfile(dir), { pid: 42, port: 7000 })
+  } finally {
+    cleanup()
+  }
+})
+
+// ── Second daemon on the same data dir (owner-scoped pidfile + start guard) ─────────
+
+test('removeOwnPidfile: leaves another daemon\'s pidfile alone, removes its own', () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    // The running daemon (pid 42) owns the file; a second instance (pid 43) exiting must not delete it.
+    writePidfile(dir, 42, 6996)
+    removeOwnPidfile(dir, 43)
+    assert.deepEqual(readPidfile(dir), { pid: 42, port: 6996 })
+    removeOwnPidfile(dir, 42)
+    assert.equal(readPidfile(dir), null)
+    removeOwnPidfile(dir, 42) // absent: silent
+  } finally {
+    cleanup()
+  }
+})
+
+test('findRunningDaemon: a live, answering daemon blocks a start; stale/recycled/own pidfiles do not', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    assert.equal(await findRunningDaemon(dir, makeHooks(true), 43), null, 'no pidfile')
+    writePidfile(dir, 42, 6996)
+    assert.deepEqual(await findRunningDaemon(dir, makeHooks(true), 43), { pid: 42, port: 6996 })
+    assert.equal(await findRunningDaemon(dir, makeHooks(false), 43), null, 'PID gone: stale pidfile')
+    assert.equal(await findRunningDaemon(dir, makeHooks(true, { confirm: false }), 43), null, 'PID recycled / listener closed')
+    const own = makeHooks(true)
+    assert.equal(await findRunningDaemon(dir, own, 42), null, 'our own pidfile')
+    assert.equal(own.confirmCalled, false)
   } finally {
     cleanup()
   }

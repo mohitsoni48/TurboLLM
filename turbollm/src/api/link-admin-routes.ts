@@ -170,7 +170,8 @@ export function registerLinkAdminRoutes(
     })
 
     const cfg = d.store.snapshot()
-    const port = (cfg.daemon as { port?: number }).port ?? 6996
+    // The port really bound (see GET /network's lanUrl): --port/--addr can differ from daemon.port.
+    const port = d.bindPort ?? (cfg.daemon as { port?: number }).port ?? 6996
     const tunnelUrl = d.remote?.url() ?? null
     const baseUrl = tunnelUrl ?? lanBaseUrl(port)
 
@@ -719,7 +720,7 @@ function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response 
   )
 }
 
-/** Base URL for the minted link string, at the port the daemon is configured on.
+/** Base URL for the minted link string, at the port the daemon is bound to.
  *
  *  Prefers the operator's `TURBOLLM_ADVERTISED_HOST` override (see net.ts) over LAN
  *  auto-detection: inside a Docker container the auto-detected address is the

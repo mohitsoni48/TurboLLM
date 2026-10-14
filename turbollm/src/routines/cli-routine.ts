@@ -89,9 +89,9 @@ export interface CliRoutineDeps {
    *  `{ status: 503, message }` on failure — it does not throw for a missing model. */
   loadExplicit: (modelKey: string) => Promise<RouteResult>
   now: () => Date
-  /** The daemon's OWN configured port (`d.store.snapshot().daemon.port`), for ANTHROPIC_BASE_URL —
-   *  the same source `terminal-routes.ts:298` uses and for the same reason: never the incoming
-   *  request's Host, since this spawns a LOCAL subprocess that must reach the real daemon. */
+  /** The daemon's OWN port (`d.bindPort ?? d.store.snapshot().daemon.port`: the bound one), for
+   *  ANTHROPIC_BASE_URL — the same source `createAgentTerminal` uses and for the same reason: never
+   *  the incoming request's Host, since this spawns a LOCAL subprocess that must reach the real daemon. */
   port: number
   isAvailable: () => Promise<boolean>
   permissionModeChoices: () => Promise<string[]>

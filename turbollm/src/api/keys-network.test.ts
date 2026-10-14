@@ -140,3 +140,19 @@ test('GET /api/v1/connect/:cli: 200 for a non-host caller once requireApiKey is 
   const res = await app.request('/api/v1/connect/claude-code', { headers: { 'X-TurboLLM-Auth': RAW } })
   assert.equal(res.status, 200)
 })
+
+test('GET /api/v1/connect/:cli: the snippets carry the port really bound, not daemon.port', async () => {
+  // `--port`/`--addr` (the Android app's 7000, `turbollm --port 8080`) win over the configured port.
+  const cfg = baseConfig({ lanBind: false, port: 6996 })
+  const app = new Hono()
+  const d = {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+    bindPort: 7000,
+  } as unknown as Deps
+  registerApi(app, d)
+  const body = await (await app.request('/api/v1/connect/claude-code')).text()
+  assert.match(body, /http:\/\/127\.0\.0\.1:7000/)
+  assert.doesNotMatch(body, /:6996/)
+})

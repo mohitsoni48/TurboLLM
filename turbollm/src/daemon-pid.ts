@@ -67,6 +67,28 @@ export function removePidfile(dir: string): void {
   }
 }
 
+/** Remove <dir>/daemon.pid only when it is `pid`'s own record — what a daemon's shutdown/exit
+ *  path must use. A second daemon started on the same data dir never wrote one, so on its way
+ *  out it would otherwise delete the RUNNING daemon's pidfile (and `--stop` could no longer
+ *  find it). Best-effort — never throws. */
+export function removeOwnPidfile(dir: string, pid: number = process.pid): void {
+  if (readPidfile(dir)?.pid === pid) removePidfile(dir)
+}
+
+/** The daemon that already owns <dir>/daemon.pid and is alive, or null. Alive means the same
+ *  proof {@link stopDaemon} demands before it kills anything: the PID exists AND a TurboLLM
+ *  answers /api/v1/status on the recorded port — so a stale pidfile, a recycled PID or a daemon
+ *  that already closed its listener (a self-restart handing over) never blocks a start. */
+export async function findRunningDaemon(
+  dir: string,
+  hooks: Pick<StopHooks, 'processExists' | 'confirmTurbollm'> = defaultHooks,
+  selfPid: number = process.pid,
+): Promise<PidfileData | null> {
+  const data = readPidfile(dir)
+  if (!data || data.pid === selfPid || !hooks.processExists(data.pid)) return null
+  return (await hooks.confirmTurbollm(data.port)) ? data : null
+}
+
 // Injection hook types so unit tests can replace the real OS calls.
 export interface StopHooks {
   /** Returns true when the process is still alive. */

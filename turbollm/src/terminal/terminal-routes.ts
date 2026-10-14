@@ -344,7 +344,9 @@ export async function createAgentTerminal(
   const rows = opts.rows && opts.rows > 0 ? Math.floor(opts.rows) : 24
   const m = getManager(d)
   try {
-    const port = d.store.snapshot().daemon.port
+    // The port really bound, not daemon.port: under `--port`/`--addr` the agent would otherwise
+    // dial the configured port, where this daemon is not listening.
+    const port = d.bindPort ?? d.store.snapshot().daemon.port
     const token = sessionAuth.mint(run.id)
     const mode = opts.mode ?? d.db.getConversation(run.convId)?.agentMode ?? 'auto'
     // Only claude's mapping needs the `--help` probe (its accepted value list changed across

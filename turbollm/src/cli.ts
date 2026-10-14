@@ -34,6 +34,7 @@ import {
 } from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
 import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir } from './engines/seed'
+import { packagedAndroidApp } from './engines/zip-install'
 import { runAutoLoad } from './engines/auto-load'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
@@ -52,7 +53,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removePidfile, stopDaemon, resolveDaemonPort } from './daemon-pid'
+import { writePidfile, removeOwnPidfile, findRunningDaemon, stopDaemon, resolveDaemonPort } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -328,6 +329,21 @@ if (hasFlag('--stop')) {
   process.exit(0)
 }
 
+// ── One daemon per data dir ───────────────────────────────────────────────────
+// A second daemon on this data dir must stop HERE, before the boot side effects below: it would
+// reset the running daemon's Tailscale serve, finalize its parked interactive routine runs as
+// errored, start a second scheduler and auto-load a second engine — and then, failing to bind,
+// exit. Refused only when a TurboLLM really answers on the pidfile's port (findRunningDaemon), so a
+// stale pidfile, a recycled PID or a self-restart handing over never blocks a start.
+const runningDaemon = await findRunningDaemon(store.dir())
+if (runningDaemon) {
+  console.error(
+    `TurboLLM is already running for ${store.dir()} (pid ${runningDaemon.pid}, http://127.0.0.1:${runningDaemon.port}).\n` +
+      `Use that one, stop it first with \`turbollm --stop\`, or start this one with its own --config.`,
+  )
+  process.exit(1)
+}
+
 // Reap any engine processes orphaned by a previous daemon that didn't shut down
 // cleanly (terminal closed, killed, crashed) BEFORE we load anything — otherwise a
 // stale llama-server would still hold VRAM and keep draining its queue while this new
@@ -569,7 +585,9 @@ manager.onLoadSettled = (ok, err, opts) => {
         }))
         for (const target of CONFIG_FILE_HARNESSES) {
           await syncHarnessModelConfig(target, {
-            port: store.snapshot().daemon.port,
+            // The BOUND port (what `turbollm launch` wired, via the pidfile), not daemon.port —
+            // they differ under --port/--addr, and isAlreadyWired would then skip every resync.
+            port,
             pinnedModel: st.model.key,
             modelName: st.model.name ?? st.model.key,
             modelCtx: st.model.ctx,
@@ -1002,19 +1020,30 @@ let tunnelToken: string | null = null
 // so the restart handler below always closes the live instance.
 let server!: ReturnType<typeof serve>
 let rebinding = false // suppress the full banner + browser-open during an in-place rebind
+let reverting = false // a failed rebind going back to prevHost:prevPort — still not a boot
 let prevHost = host // remembered before a rebind so we can revert if the new bind fails
 let prevPort = port
+// The configured port the listener last applied. --port/--addr (the Android app's --port 7000)
+// win over it at boot, so a rebind moves ports only when the CONFIGURED port changes — a LAN
+// toggle must not drag the daemon off the port its launcher (and the app's WebView) uses.
+let appliedCfgPort = cfg.daemon.port
+// The boot-time remote-access start is one-shot (see the listen callback).
+let bootRemoteStarted = false
 function listen(attempt = 0): void {
   const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
     // What auth.ts's gates key off (isLanExposed): the address really bound, so a non-loopback
     // --addr/daemon.host enforces keys like lanBind does. Set here, on every successful bind
     // (initial, retry, rebind, revert), before this listener serves its first request.
     deps.bindHost = host
+    deps.bindPort = info.port
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
     const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
 
-    if (rebinding) {
+    // A revert (the rebind's new address failed) is still an in-place rebind, not a boot:
+    // re-running the banner would open another browser tab and, with --print-token, mint a key.
+    if (rebinding || reverting) {
       rebinding = false
+      reverting = false
       console.log(`  Re-bound to ${displayHost}:${info.port} (no restart — model stays loaded)`)
     } else {
       console.log(``)
@@ -1063,7 +1092,8 @@ function listen(attempt = 0): void {
         console.log(`  Token:   ${printToken}`)
         console.log(``)
       }
-      if (!noOpen) {
+      // Settings → "Open browser on start" (daemon.openBrowserOnStart) as well as --no-open.
+      if (!noOpen && store.snapshot().daemon.openBrowserOnStart !== false) {
         openBrowser(uiUrl)
       }
     }
@@ -1071,13 +1101,16 @@ function listen(attempt = 0): void {
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
-    // Runs once, at boot: this whole block is gated by remote.state().kind === 'off', which
-    // is only true before the first ever enable() call in this process's lifetime. All the
-    // work that used to live in this block's .then() callback — wiring the terminal WebSocket
-    // handler onto the ingress server, and printing 'Tunnel:'/'Token:' — now happens in
-    // onRemoteState above, which fires for this first connect AND every later automatic
-    // reconnect (ADR-422 Phase 2 final review, C2), so it is not duplicated here.
-    if (remoteWanted && remote.state().kind === 'off') {
+    // Runs once, at boot (bootRemoteStarted). Not keyed on remote.state().kind === 'off': Stop
+    // (/api/v1/remote/stop → disable()) returns the manager to 'off' too, so every later listen()
+    // — a LAN/port rebind, a revert — re-enabled the tunnel the user had stopped, and with
+    // remoteAccess.enabled now false onRemoteState minted an ungranted console key that /stop
+    // never revokes. All the work that used to live in this block's .then() callback — wiring
+    // the terminal WebSocket handler onto the ingress server, and printing 'Tunnel:'/'Token:' —
+    // now happens in onRemoteState above, which fires for this first connect AND every later
+    // automatic reconnect (ADR-422 Phase 2 final review, C2), so it is not duplicated here.
+    if (remoteWanted && !bootRemoteStarted) {
+      bootRemoteStarted = true
       // Wait for the Tailscale reconcile started near the top of boot to actually finish
       // before handing control to enable() — see the comment at its call site for why a
       // fire-and-forget reconcile racing this exact call was a real bug, not a theoretical
@@ -1094,6 +1127,12 @@ function listen(attempt = 0): void {
     // so this runs for both the initial bind and a rebind. Best-effort.
     try { writePidfile(store.dir(), process.pid, info.port) } catch { /* best-effort */ }
   })
+  // The terminal WebSocket upgrade handler goes on EVERY listener instance: a bind retry, a
+  // rebind and a revert each create a new server, and one without it hands the handshake to
+  // Hono's SPA fallback (404) — every Code terminal then fails until a full restart. It
+  // intercepts /api/v1/code/terminal/ws upgrades before Hono sees them; serve() returns
+  // ServerType (Http2Server | Server), but only the shared .on('upgrade', ...) is used.
+  registerTerminalWs(s as unknown as import('http').Server, deps)
   ;(s as unknown as { on?: (ev: 'error', cb: (e: NodeJS.ErrnoException) => void) => void }).on?.(
     'error',
     (e) => {
@@ -1104,6 +1143,7 @@ function listen(attempt = 0): void {
         // A rebind couldn't bind the new address — revert so the daemon stays reachable.
         console.error(`Could not bind ${host}:${port} (${e?.message ?? e}); reverting to ${prevHost}:${prevPort}.`)
         rebinding = false
+        reverting = true
         host = prevHost
         port = prevPort
         listen()
@@ -1117,12 +1157,6 @@ function listen(attempt = 0): void {
 }
 listen()
 
-// Register the terminal WebSocket upgrade handler on the raw HTTP server.
-// This intercepts /api/v1/code/terminal/ws upgrades before Hono's SPA fallback.
-// serve() returns ServerType (Http2Server | Server) from @hono/node-server,
-// but we only need the .on('upgrade', ...) interface which is common to both.
-registerTerminalWs(server as unknown as import('http').Server, deps)
-
 // In-place rebind (no full restart): re-point the HTTP listener at the host/port the
 // config now wants, keeping the engine, model, DB, and chat state alive. A LAN toggle
 // (same port) is seamless — the browser on 127.0.0.1 keeps working because 0.0.0.0
@@ -1131,7 +1165,8 @@ registerTerminalWs(server as unknown as import('http').Server, deps)
 deps.rebind = () => {
   const c = store.snapshot()
   const want = c.daemon.lanBind ? '0.0.0.0' : (c.daemon.host || '127.0.0.1')
-  const wantPort = c.daemon.port
+  const wantPort = c.daemon.port !== appliedCfgPort ? c.daemon.port : port // see appliedCfgPort
+  appliedCfgPort = c.daemon.port
   if (want === host && wantPort === port) return // nothing changed
   prevHost = host
   prevPort = port
@@ -1203,7 +1238,11 @@ function spawnReplacement(): void {
 // installer against a live daemon, which is the precise failure this whole mechanism
 // exists to avoid. Expressed as a flag on the existing path rather than a second copy of
 // it, so the (carefully ordered, watchdog-guarded) teardown can never drift between the two.
-deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
+// Not wired in the packaged Android app: there the daemon is the app's own in-process Node,
+// which can start only once per process — process.exit() closes the whole app, and the
+// "replacement" would be the app's executable, not node. Left unset, the restart and app-update
+// routes answer 501 (and the web UI hides the control there).
+if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
   if (restarting) return
   restarting = true
   const plan = planRestartExit({ exitOnly: opts?.exitOnly === true, supervised: supervisedByDesktop })
@@ -1285,15 +1324,28 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     if (shuttingDown) return
     shuttingDown = true
     console.log('shutting down')
-    // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry.
-    try { removePidfile(store.dir()) } catch { /* best-effort */ }
+    // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry — only our
+    // own: never another daemon's on this data dir.
+    try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
     updateScheduler.stop()
     routineScheduler.stop()
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
     void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
-      db.close()
+      try {
+        db.close()
+      } catch {
+        /* best-effort — must not skip the close below */
+      }
+      // Drop open connections first, as the restart path does: an SSE stream (Monitor/engine
+      // log panel) otherwise holds close() until the 12 s fallback — and `--stop` SIGKILLs at
+      // 10 s, skipping the 'exit' handler's engine/tunnel/terminal kill net.
+      try {
+        ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
+      } catch {
+        /* best-effort */
+      }
       server.close(() => process.exit(0))
     })
     setTimeout(() => process.exit(0), 12_000).unref()
@@ -1316,6 +1368,7 @@ process.on('exit', () => {
   try { killTrackedTerminalsSync(store.dir()) } catch { /* best-effort */ }
   // Best-effort pidfile cleanup — covers exits that bypass the signal handlers
   // (e.g. process.exit() called elsewhere). Graceful SIGTERM/SIGINT already
-  // removed it above; this is a second-layer safety net.
-  try { removePidfile(store.dir()) } catch { /* best-effort */ }
+  // removed it above; this is a second-layer safety net. Owner-scoped: a daemon that
+  // failed to bind (another one holds the port) never wrote one and must not delete it.
+  try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
 })

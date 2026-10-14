@@ -574,7 +574,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
     const cfg = d.store.snapshot()
-    const share = getShareTarget(cfg.daemon.port)
+    // The port really bound, not daemon.port: `--port`/`--addr` (the Android app's 7000) win over config.
+    const share = getShareTarget(d.bindPort ?? cfg.daemon.port)
     const url = `http://${share.host}:${share.port}/chat/${convId}`
     return c.json({ url, onlyLocal: share.onlyLocal })
   })

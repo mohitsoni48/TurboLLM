@@ -143,6 +143,21 @@ test('claude_cli codingAgent: the CLI branch is wired with the right deps and re
   assert.equal(captured.getLoadedModelKey(), 'm')
 })
 
+// `--port`/`--addr` (the Android app's 7000, `turbollm --port 8080`) win over daemon.port, so the
+// routine's ANTHROPIC_BASE_URL must use the port the listener really bound, or claude dials 6996.
+test('claude_cli codingAgent: ANTHROPIC_BASE_URL uses the bound port, not the configured one', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  d.bindPort = 7000
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let captured: CliRoutineDeps | undefined
+  await runCliRoutineBranch(d, routine, run, async (_routine, deps) => {
+    captured = deps
+    deps.store.updateRoutineRun(deps.existingRun!.id, { status: 'skipped', skipReason: 'cli_unavailable', endedAt: new Date().toISOString() })
+  })
+  assert.equal(captured?.port, 7000)
+})
+
 // The single most regression-prone wiring point on this branch: `getEngineIdle` must be
 // engineIsIdle(manager) — which reads manager.sessionStats().activeRequests, the ONLY signal that
 // observes the main in-app chat stream — and NOT a gate.stats() read. A gate-only busy-check

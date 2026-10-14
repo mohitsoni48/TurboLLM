@@ -2442,7 +2442,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if ((lanChanged || portChanged) && d.rebind) {
       const doRebind = d.rebind
       setTimeout(() => doRebind(), 250)
-      rebind = { portChanged, port: after.port, lanBind: after.lanBind }
+      // The port the listener ends up on: the configured one only when this save changed it —
+      // otherwise the rebind keeps the bound port (`--port`/`--addr`, e.g. the Android app's 7000).
+      rebind = { portChanged, port: portChanged ? after.port : (d.bindPort ?? after.port), lanBind: after.lanBind }
     }
     return c.json({ ...settingsPayload(d), rebind })
   })
@@ -2599,7 +2601,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const cfg = d.store.snapshot()
     return c.json({
       lanBind: cfg.daemon.lanBind,
-      lanUrl: `http://${getLanIp() ?? '127.0.0.1'}:${cfg.daemon.port}`,
+      lanUrl: `http://${getLanIp() ?? '127.0.0.1'}:${d.bindPort ?? cfg.daemon.port}`, // the port really bound
       hasApiKey: cfg.apiKeys.length > 0,
       requireApiKey: cfg.daemon.requireApiKey,
       isHost: isLocalRequest(c, d),
@@ -2853,7 +2855,8 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'Connect setup is only available from this machine until "Require an API key" is turned on.')
     const cli = c.req.param('cli')
     const cfg = d.store.snapshot()
-    const { port, lanBind } = cfg.daemon
+    const { lanBind } = cfg.daemon
+    const port = d.bindPort ?? cfg.daemon.port // the port really bound (see GET /network's lanUrl)
     const host = lanBind ? (getLanIp() ?? '127.0.0.1') : '127.0.0.1'
     const base = `http://${host}:${port}`
     const ms = d.manager.status()

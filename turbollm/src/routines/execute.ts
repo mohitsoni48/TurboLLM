@@ -139,7 +139,7 @@ export async function runCliRoutineBranch(
     getEngineIdle: () => engineIsIdle(d.manager),
     loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
     now: () => new Date(),
-    port: d.store.snapshot().daemon.port,
+    port: d.bindPort ?? d.store.snapshot().daemon.port, // the port really bound (`--port` wins over config)
     isAvailable: () => isClaudeCliAvailable(),
     permissionModeChoices: () => claudePermissionModeChoices(),
     runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),
