@@ -28,11 +28,11 @@
 
 import { spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -508,8 +508,14 @@ async function phasePrepare(state, flags) {
     // No Co-Authored-By / AI attribution, ever (CLAUDE.md hard rule 1).
     const subject = `chore(release): v${version}${flags.summary ? ` — ${flags.summary}` : ''}`;
     mustGit('commit', '-m', subject);
+    note(`committed \`${subject}\` (${release.join(', ')})`);
+  }
+  // Every real run pushes, not only the one that just committed: when a push fails after the
+  // commit, the re-run has nothing left to commit, and recording ok without pushing let `verify`
+  // pass on a PR head without the release commit. Pushing an up-to-date branch is a no-op.
+  if (!flags['dry-run']) {
     mustGit('push');
-    note(`committed + pushed \`${subject}\` (${release.join(', ')})`);
+    note('pushed');
   }
 
   return out.join('\n');
@@ -563,6 +569,22 @@ function latestPrRunId(pr) {
   if (!headRef) return null;
   const r = gh('run', 'list', '--branch', headRef, '--limit', '1', '--json', 'databaseId', '-q', '.[0].databaseId');
   return /^\d+$/.test(r.stdout) ? Number(r.stdout) : null;
+}
+
+// The id of `workflowFile`'s run for exactly `sha`, polled until GitHub has created it (a push run
+// appears a few seconds after the push), or null at the deadline.
+export async function waitForCommitRun(workflowFile, sha, timeoutMs, ghRun = gh, pollMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = ghRun(
+      'run', 'list', '--workflow', workflowFile, '--commit', sha, '--limit', '1',
+      '--json', 'databaseId', '-q', '.[0].databaseId',
+    );
+    if (/^\d+$/.test(r.stdout)) return Number(r.stdout);
+    if (Date.now() > deadline) return null;
+    step(`waiting for the ${workflowFile} run on ${sha.slice(0, 7)} to start…`);
+    await sleep(pollMs);
+  }
 }
 
 async function waitForRun(runId, timeoutMs) {
@@ -636,13 +658,16 @@ async function phaseMerge(state, flags) {
   out.push(delRemote.code === 0 ? `deleted remote ${branch}` : `remote ${branch}: ${delRemote.out}`);
 
   step('polling the post-merge main run…');
-  const idRes = gh('run', 'list', '--branch', 'main', '--limit', '1', '--json', 'databaseId', '-q', '.[0].databaseId');
-  if (!/^\d+$/.test(idRes.stdout)) {
+  // The ci.yml run for THIS merge commit. The newest main run right after merging is usually the
+  // previous one (GitHub creates the push run a few seconds later) or a scheduled runpod-image.yml
+  // run, and a stale green run would wave a red main through.
+  const mergeSha = gh('pr', 'view', String(pr), '--json', 'mergeCommit', '-q', '.mergeCommit.oid').stdout;
+  const runId = /^[0-9a-f]{40}$/i.test(mergeSha) ? await waitForCommitRun('ci.yml', mergeSha, 5 * 60_000) : null;
+  if (runId == null) {
     warnLine('could not find the post-merge main run — check it by hand before publishing');
     out.push('WARN post-merge main run not found');
     return out.join('\n');
   }
-  const runId = Number(idRes.stdout);
   let conclusion = await waitForRun(runId, 30 * 60_000);
   if (conclusion !== 'success') {
     const view = gh('run', 'view', String(runId), '--log-failed');
@@ -739,6 +764,13 @@ async function phasePublish(state, flags) {
   const out = [];
   const note = (s) => { out.push(s); step(s); };
 
+  // Gated before the tag, not at the npm step: creating the GitHub Release is what fires
+  // npm-publish.yml and desktop-release.yml, so a gate checked after it refuses only once CI is
+  // already publishing to npm.
+  if (!flags['dry-run']) {
+    requireApproval(flags, `publishing ${PKG}@${version} (tag ${tag}, GitHub Release, npm via npm-publish.yml / OIDC)`);
+  }
+
   const section = changelogSection(version);
   if (!section) fail(`no \`## [${version}]\` section in turbollm/CHANGELOG.md to use as release notes.`);
 
@@ -787,19 +819,16 @@ async function phasePublish(state, flags) {
   } else if (flags['dry-run']) {
     note(`[dry-run] would wait for npm-publish.yml on ${tag}, then poll npm view ${PKG} version`);
   } else {
-    requireApproval(flags, `publishing ${PKG}@${version} to npm (via npm-publish.yml / OIDC)`);
-    // A GitHub Release that already existed BEFORE npm-publish.yml was added
-    // (or a rerun) won't have fired the `release: published` event for it —
-    // legacyToken() is the local fallback for that one-off case only.
-    const legacy = resolveNpmToken({ optional: true });
-    if (legacy) {
-      warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
-      const res = npmPublishWithToken(legacy.token, { dryRun: false });
-      note(`npm publish (legacy token path) as ${res.whoami}`);
-    } else {
-      note('waiting for the npm-publish.yml workflow (OIDC trusted publishing)…');
-      const runId = await waitForWorkflowRun('npm-publish.yml', tag, 5 * 60_000);
-      if (runId == null) {
+    note('waiting for the npm-publish.yml workflow (OIDC trusted publishing)…');
+    const runId = await waitForWorkflowRun('npm-publish.yml', tag, 5 * 60_000);
+    if (runId == null) {
+      // A GitHub Release that already existed BEFORE npm-publish.yml was added
+      // (or a rerun) won't have fired the `release: published` event for it —
+      // the local token is the fallback for that one-off case only. Only once
+      // no run has shown up: with one running, a local publish would race it
+      // for the same version, and one of the two would fail.
+      const legacy = resolveNpmToken({ optional: true });
+      if (!legacy) {
         fail(
           `no npm-publish.yml run found for ${tag} after 5 minutes.\n`
           + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
@@ -807,6 +836,10 @@ async function phasePublish(state, flags) {
           + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
         );
       }
+      warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
+      const res = npmPublishWithToken(legacy.token, { dryRun: false });
+      note(`npm publish (legacy token path) as ${res.whoami}`);
+    } else {
       const conclusion = await waitForRun(runId, 10 * 60_000);
       if (conclusion !== 'success') {
         fail(`npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}`);
@@ -1181,7 +1214,10 @@ async function main() {
 export function isCliEntry(moduleUrl, argv1) {
   if (!argv1) return false;
   try {
-    return moduleUrl === pathToFileURL(argv1).href;
+    // Real paths on both sides: Node resolves the main module through symlinks (macOS /tmp →
+    // /private/tmp, a symlinked checkout, a Windows junction) but leaves argv[1] as typed, and a
+    // mismatch here skips main() silently — exit 0, no output.
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(argv1);
   } catch {
     return false;
   }
