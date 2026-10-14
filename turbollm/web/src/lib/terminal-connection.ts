@@ -43,6 +43,12 @@ export function useTerminalConnection(
   const [state, setState] = useState<TerminalState>('disconnected')
   const wsRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Attempts since the last successful open — reset by onopen and by disconnect(), so every drop
+  // of a working connection gets a fresh set of retries, but a run that already gave up stays given up.
+  const reconnectAttemptsRef = useRef(0)
+  // `connect` installs the auto-reconnect in each socket's own onclose, and `scheduleReconnect`
+  // (defined below) calls `connect` — this ref breaks that cycle without destabilizing either.
+  const scheduleReconnectRef = useRef<(id: string) => void>(() => {})
   // Keep the latest callbacks in a ref rather than as `connect`'s useCallback deps.
   // Callers (e.g. TerminalView) commonly pass inline arrow functions that are a new
   // reference on every render — if those were in `connect`'s deps, `connect`'s own
@@ -69,6 +75,12 @@ export function useTerminalConnection(
     const ws = new WebSocket(url)
 
     ws.onopen = () => {
+      // A (re)connect landed: end any reconnect cycle so the next drop can start a new one.
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current)
+        reconnectTimerRef.current = null
+      }
+      reconnectAttemptsRef.current = 0
       setState('connected')
       optionsRef.current.onConnect?.()
     }
@@ -82,6 +94,11 @@ export function useTerminalConnection(
     }
 
     ws.onclose = (ev) => {
+      // Auto-reconnect on an unexpected close (1000 = our own disconnect()). Installed here, on
+      // EVERY socket — not by wrapping the first socket's onclose in the effect, which left each
+      // reconnected socket without it. Only for the current socket: one disconnect() already
+      // detached (e.g. closed mid-handshake, which reports 1006) must not resurrect itself.
+      if (ev.code !== 1000 && wsRef.current === ws) scheduleReconnectRef.current(id)
       setState('disconnected')
       optionsRef.current.onClose?.(ev.code, ev.reason)
     }
@@ -107,29 +124,36 @@ export function useTerminalConnection(
     // "1005 error" on a totally normal disconnect was a real, user-visible symptom of this,
     // compounded by (now fixed separately) an effect that was tearing the connection down and
     // reconnecting on nearly every parent re-render.
-    wsRef.current?.close(1000, 'client disconnect')
+    // Detached BEFORE close(), so that socket's own onclose never treats this as an unexpected
+    // drop of the current socket (closing mid-handshake reports 1006, not the 1000 we pass).
+    const ws = wsRef.current
     wsRef.current = null
+    ws?.close(1000, 'client disconnect')
+    reconnectAttemptsRef.current = 0
     setState('disconnected')
   }, [])
 
-  // Reconnect logic — try every 2 seconds, up to a max of 5 reconnect attempts.
+  // Reconnect logic — try every 2 seconds, up to a max of 5 reconnect attempts. The cycle ends
+  // when a socket opens (onopen clears the timer) or the attempts run out.
   const scheduleReconnect = useCallback((id: string) => {
     if (reconnectTimerRef.current) return
-    let attempts = 0
     const maxAttempts = 5
     const doReconnect = () => {
+      reconnectTimerRef.current = null
       if (!id) return
-      attempts++
-      if (attempts > maxAttempts) {
+      if (++reconnectAttemptsRef.current > maxAttempts) {
         setState('disconnected')
         return
       }
-      connect(id)
-      if (wsRef.current?.readyState === WebSocket.OPEN) return
+      // A handshake still in flight is left to finish rather than raced by a second socket —
+      // connect() only bails on OPEN, so a slow (>2 s) handshake used to get a duplicate socket
+      // that overwrote wsRef and was never closed (PTY output then arrived twice).
+      if (wsRef.current?.readyState !== WebSocket.CONNECTING) connect(id)
       reconnectTimerRef.current = setTimeout(doReconnect, 2000)
     }
     reconnectTimerRef.current = setTimeout(doReconnect, 500)
   }, [connect])
+  scheduleReconnectRef.current = scheduleReconnect
 
   // Connect/disconnect based on terminalId changes.
   useEffect(() => {
@@ -137,26 +161,13 @@ export function useTerminalConnection(
       disconnect()
       return
     }
+    // Auto-reconnect on an unexpected close is wired inside connect(), per socket.
     connect(terminalId)
-
-    // Auto-reconnect on unexpected close.
-    const ws = wsRef.current
-    if (!ws) return
-
-    const savedOnClose: ((ev: CloseEvent) => void) | null = ws.onclose
-    ws.onclose = (ev) => {
-      // Don't auto-reconnect on intentional close (code 1000 = normal).
-      if (ev.code !== 1000) {
-        scheduleReconnect(terminalId)
-      }
-      if (savedOnClose) savedOnClose(ev)
-    }
 
     return () => {
       disconnect()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [terminalId, connect, disconnect, scheduleReconnect])
+  }, [terminalId, connect, disconnect])
 
   const send = useCallback((data: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {

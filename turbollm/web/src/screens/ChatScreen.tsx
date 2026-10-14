@@ -561,7 +561,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const handleExportChat = () => {
     if (!activeId) return
-    downloadChatExport(activeId)
+    downloadChatExport(activeId).catch(() => toast.error('Could not export this chat.'))
   }
 
   // ── Import handler (F-024) ────────────────────────────────────────────────

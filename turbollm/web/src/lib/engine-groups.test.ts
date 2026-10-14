@@ -153,6 +153,20 @@ test('customSourceKey: matches the backend registry.ts test vectors byte-for-byt
   assert.equal(customSourceKey({ binPath: '/opt/my-server' }), '/opt/my-server')
 })
 
+test('customSourceKey: a repo URL ending ".git/" keys like the daemon (slashes stripped before ".git")', () => {
+  // Exact daemon output (registry.ts customSourceKey → build-runner.ts normRepoUrl) for this input;
+  // the web used to strip ".git" first and produce "ikawrakow/ik_llama.cpp.git#main#", so "Forget"
+  // on an engine built from such a URL silently matched nothing.
+  assert.equal(
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp.git/', sourceBranch: 'main' }),
+    'ikawrakow/ik_llama.cpp#main#',
+  )
+  assert.equal(
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/user/fork.git//', sourceBranch: '' }),
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/user/fork', sourceBranch: '' }),
+  )
+})
+
 test('customSourceIsLive: true when a live engine shares the same identity, false otherwise', () => {
   const source = { name: 'My Fork', binPath: '/build/v1/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main', addedAt: '', binPathExists: true }
   const liveSameRepo = eng({ id: 'live', binPath: '/build/v2/llama-server', sourceRepo: 'https://github.com/user/fork', sourceBranch: 'main' })
