@@ -9,7 +9,7 @@ import { feedChunk, flushState, initParseState, type ParseState } from './parser
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
-import { buildEngineMessages, maybeAutoCompact, compactConversation } from './chat-compaction.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -68,6 +68,24 @@ export function abortAllInFlightChats(): number {
  *  would abort. Read by the active-work probe (ADR-434 (i)(3)). */
 export function inFlightChatIds(): string[] {
   return [...inflight.keys()]
+}
+
+/** Removes `convId`'s entry only while it is still `ac`'s own. A client disconnect or a kill
+ *  switch drops the entry at once, but the aborted turn can keep unwinding for a long time
+ *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong
+ *  to the NEXT turn, which an unconditional delete would leave untracked: unreachable by Stop
+ *  and the kill switches, invisible to inFlightChatIds, and no longer a 409 guard. */
+function releaseInflight(convId: string, ac: AbortController): void {
+  if (inflight.get(convId) === ac) inflight.delete(convId)
+}
+
+/** A turn route's streamSSE callback, releasing its in-flight entry however the callback
+ *  exits: runGeneration's own finally only covers a turn that reached it, and a throw before
+ *  that (e.g. a malformed request body) left the chat answering 409 until a restart. */
+function releasingInflight<T>(convId: string, ac: AbortController, cb: (stream: T) => Promise<void>): (stream: T) => Promise<void> {
+  return async (stream) => {
+    try { await cb(stream) } finally { releaseInflight(convId, ac) }
+  }
 }
 
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
@@ -181,6 +199,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/conversations/:id', (c) => {
+    // Stop a generation still running for it (a background chat deleted from the sidebar, or
+    // from another device) — otherwise it keeps the engine busy, tool rounds and all, for a
+    // conversation that no longer exists. Its own unwind releases the in-flight entry.
+    inflight.get(c.req.param('id'))?.abort()
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
@@ -288,8 +310,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
 
     // Persist user message — only the typed text is stored as content; images are
-    // kept in attachments (the full doc context is folded into the engine prompt below).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments })
+    // kept in attachments (the full doc context is folded into the engine prompt below,
+    // and kept in docContext so /continue can send this turn again with it).
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
@@ -306,8 +329,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // here. Call the named function; never re-inline the expression (see its doc comment, I1).
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, async (stream) => {
-      stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
+    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
+      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
 
       // Emit meta event
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
@@ -322,22 +345,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
+      // setAsideFrozenCut: a cut left behind on another branch is not this branch's summary.
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(conv, allMsgs)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs)
       // Fold any attached document text into the prompt; attach images as multimodal parts.
-      const fullContent = b.docContext
-        ? (content ? `${b.docContext}\n\n${content}` : b.docContext)
-        : content
-      const userContent: unknown = images.length
-        ? [
-            ...(fullContent ? [{ type: 'text', text: fullContent }] : []),
-            ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
-          ]
-        : fullContent
-      engineMessages.push({ role: 'user', content: userContent })
+      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
 
       await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
-    })
+    }))
   })
 
   // ── continue (regenerate last assistant response for the existing last user
@@ -382,8 +397,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, async (stream) => {
-      stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
+    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
+      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
 
       // Emit meta event (no new user message — reuse the existing last user message id)
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
@@ -397,11 +412,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
       // resolvable; a plain passthrough when not).
+      // `lastUser` is the turn being answered: it goes out with its images and documents, as
+      // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(conv, allMsgs)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
 
       await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
-    })
+    }))
   })
 
   // ── stop (spec 07 §2) ──────────────────────────────────────────────────────
@@ -442,7 +459,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     db.freezeTail(convId, msg.seq, msg.id)
     db.deactivateMessage(msg.id)
     const variantGroup = db.getMessage(msg.id)!.variantGroup!
-    db.addMessage(convId, 'user', trimmed, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments })
+    db.addMessage(convId, 'user', trimmed, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
     return c.json({ messages: db.getMessages(convId) })
   })
 
@@ -515,10 +532,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ variants: db.getMessageVariants(msg.variantGroup) })
   })
 
-  // Chat branching: switch which sibling in a variant group is the active one. For a
-  // user-message group this also swaps the entire downstream tail (freeze the one we're
-  // leaving, restore the one we're entering) — an assistant-reply group never has anything
-  // downstream to move, since /regenerate only ever acts on the last message.
+  // Chat branching: switch which sibling in a variant group is the active one. This also
+  // swaps the entire downstream tail (freeze the one we're leaving, restore the one we're
+  // entering) — for an assistant-reply group too: /regenerate only acts on the last message,
+  // but the chat can go on after it, so an older reply's variants each have their own tail.
   app.post('/api/v1/conversations/:id/messages/:msgId/activate', (c) => {
     const { id: convId, msgId } = c.req.param()
     const msg = db.getMessage(msgId)
@@ -527,11 +544,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
     if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
 
-    if (msg.role === 'user') {
-      const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
-      if (currentActive) db.freezeTail(convId, currentActive.seq, currentActive.id)
-      db.restoreTail(msgId)
-    }
+    const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
+    if (currentActive) db.freezeTail(convId, currentActive.seq, currentActive.id)
+    db.restoreTail(msgId)
     const ok = db.setActiveVariant(msg.variantGroup, msgId)
     if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
     return c.json({ messages: db.getMessages(convId) })
@@ -1604,7 +1619,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     }
   } finally {
     if (localAccounting) d.manager.generationEnd()
-    inflight.delete(convId)
+    releaseInflight(convId, ac)
   }
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see

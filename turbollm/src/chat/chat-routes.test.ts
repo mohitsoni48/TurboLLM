@@ -218,14 +218,15 @@ test('C1 invariant: both chat generation entry points DERIVE isCodeAuthorized, n
 // abortAllInFlightChats() would abort. Driven through the real POST /messages route with the
 // engine fetch held open, in the style of chat-routes.remote.test.ts (real store, no port).
 
-function inFlightHarness() {
+/** `tools`, when given, is the tool registry the chat loop calls, its tools allowed without asking. */
+function inFlightHarness(tools?: unknown) {
   const dir = tmpDir('tllm-chat-inflight-')
   const store = new ConversationStore(dir)
   const cfg = {
     modelDefaults: { maxTokens: 0 },
     gateway: { autoSwap: true },
     daemon: { autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false },
-    tools: { toolPolicies: {}, autoAllowAll: false },
+    tools: { toolPolicies: {}, autoAllowAll: tools !== undefined },
   }
   const d = {
     db: store,
@@ -242,6 +243,7 @@ function inFlightHarness() {
       setLiveGen: () => {},
       recordCompletion: () => {},
     },
+    tools,
   } as unknown as Deps
   const app = new Hono()
   registerChatRoutes(app, d)
@@ -286,5 +288,231 @@ test('inFlightChatIds lists a chat while its reply is generating, and drops it w
   } finally {
     engine.restore()
     h.cleanup()
+  }
+})
+
+// ── Chat fixes, driven through the real routes (inFlightHarness above) ───────────────────────
+
+const sseReply = (text: string) => new Response(
+  `data: ${JSON.stringify({ choices: [{ delta: { content: text } }] })}\n\ndata: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`,
+  { status: 200, headers: { 'content-type': 'text/event-stream' } },
+)
+
+/** Replaces the engine with `impl`, recording every request body sent to it. */
+function fakeEngine(impl: (init: RequestInit | undefined, n: number) => Response | Promise<Response> = () => sseReply('ok')) {
+  const original = globalThis.fetch
+  const bodies: Array<{ messages: Array<{ role: string; content: unknown }> }> = []
+  globalThis.fetch = (async (_u: unknown, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body)))
+    return impl(init, bodies.length)
+  }) as typeof fetch
+  return { bodies, restore: () => { globalThis.fetch = original } }
+}
+
+const json = (body: unknown) => ({ method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+/** Polls `cond` until it holds — a precondition the test waits FOR, never a guessed duration. */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`)
+    await new Promise((r) => setTimeout(r, 2))
+  }
+}
+
+test('Regenerate and edit-and-resend send the answered turn WITH its image and document text, as the first send did', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({
+      content: 'What is in this picture? Also summarize the file.',
+      images: ['data:image/png;base64,AAAA'], docContext: '[Attached: report.txt]\nQ3 revenue was $4M', textAttachments: ['report.txt'],
+    }))).text()
+    const firstSend = engine.bodies[0].messages.at(-1)!.content
+
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(engine.bodies[1].messages.at(-1)!.content, firstSend)
+
+    // Edit the question: the new version keeps the image and the document, with the new text.
+    const userId = h.store.getMessages(conv.id).find((m) => m.role === 'user')!.id
+    await h.app.request(`${base}/messages/${userId}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'Only the file, please.' }) })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(engine.bodies[2].messages.at(-1)!.content, [
+      { type: 'text', text: '[Attached: report.txt]\nQ3 revenue was $4M\n\nOnly the file, please.' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight entry', async () => {
+  let toolDone!: () => void
+  const toolGate = new Promise<void>((r) => { toolDone = r })
+  let toolEntered!: () => void
+  const inTool = new Promise<void>((r) => { toolEntered = r })
+  const h = inFlightHarness({
+    buildToolDefinitions: async () => [{ type: 'function', function: { name: 'slow_tool', description: '', parameters: { type: 'object', properties: {} } } }],
+    executeTool: async () => { toolEntered(); await toolGate; return 'tool result' }, // does not honor abort, like fetch_url/run_code/MCP
+  })
+  const engine = fakeEngine((init, n) => {
+    if (n === 1) { // turn A, round 1: the model calls the slow tool
+      return new Response([
+        `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: 'slow_tool', arguments: '{}' } }] } }] })}\n\n`,
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] })}\n\n`,
+        'data: [DONE]\n\n',
+      ].join(''), { status: 200 })
+    }
+    // turn B: a long generation, held open until it is aborted
+    const signal = init?.signal
+    return new Response(new ReadableStream({
+      start(c) { signal?.addEventListener('abort', () => c.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))) },
+    }), { status: 200 })
+  })
+  try {
+    const conv = h.store.createConversation()
+    const send = () => h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi' }))
+    const resA = await send()
+    // The client reads A's stream as it arrives: unread SSE writes back-pressure the turn before it
+    // ever reaches the tool.
+    const readerA = resA.body!.getReader()
+    void (async () => { try { while (!(await readerA.read()).done) { /* drain */ } } catch { /* cancelled */ } })()
+    await inTool // turn A is now inside slow_tool
+    const replyA = h.store.getMessages(conv.id).find((m) => m.role === 'assistant')!.id
+    await readerA.cancel() // Stop: the client aborts its fetch first (stream.onAbort)
+    await waitFor(() => inFlightChatIds().length === 0, 'turn A\'s onAbort to drop its entry')
+    const resB = await send() // ...and immediately sends a follow-up
+    assert.equal(resB.status, 200)
+    toolDone() // turn A's tool returns; A sees its abort and unwinds through its finally
+    // A's reply is saved right after runGeneration's finally (its first stale release); the rest of
+    // its route callback, up to the second stale release, settles within the next macrotask.
+    await waitFor(() => h.store.getMessage(replyA)?.stats.totalMs !== undefined, 'turn A to unwind and save its reply')
+    await new Promise((r) => setImmediate(r))
+    assert.deepEqual(inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
+    assert.equal((await send()).status, 409, 'a third send must still be refused while B runs')
+
+    await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id })) // Stop reaches B
+    await resB.text()
+    assert.deepEqual(inFlightChatIds(), [])
+  } finally {
+    toolDone()
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a turn that throws before generating releases its in-flight entry (no stuck 409)', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const originalError = console.error
+  console.error = () => {} // Hono logs the callback's throw
+  try {
+    const conv = h.store.createConversation()
+    const url = `/api/v1/conversations/${conv.id}/messages`
+    const bad = await h.app.request(url, json({ content: 'hi', images: 'not-an-array' }))
+    await bad.text() // ends only after the callback (and its release) settles: Hono closes the stream in run()'s finally
+    assert.deepEqual(inFlightChatIds(), [])
+    const ok = await h.app.request(url, json({ content: 'hi again' }))
+    assert.equal(ok.status, 200)
+    await ok.text()
+  } finally {
+    console.error = originalError
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('switching an older assistant reply\'s variant swaps its downstream turns too, and switching back restores them', async () => {
+  const h = inFlightHarness()
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    h.store.addMessage(conv.id, 'user', 'Recommend a language')
+    const a1 = h.store.addMessage(conv.id, 'assistant', 'Use Python')
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    const a2 = h.store.addMessage(conv.id, 'assistant', 'Use Rust', { variantGroup: h.store.getMessage(a1.id)!.variantGroup! })
+    h.store.addMessage(conv.id, 'user', 'How do I install cargo?')
+    h.store.addMessage(conv.id, 'assistant', 'Run rustup ...')
+
+    const toPython = await (await h.app.request(`${base}/messages/${a1.id}/activate`, { method: 'POST' })).json() as { messages: Array<{ content: string }> }
+    assert.deepEqual(toPython.messages.map((m) => m.content), ['Recommend a language', 'Use Python'])
+    const toRust = await (await h.app.request(`${base}/messages/${a2.id}/activate`, { method: 'POST' })).json() as { messages: Array<{ content: string }> }
+    assert.deepEqual(toRust.messages.map((m) => m.content), ['Recommend a language', 'Use Rust', 'How do I install cargo?', 'Run rustup ...'])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const u1 = h.store.addMessage(conv.id, 'user', 'Write a web scraper in Python')
+    h.store.addMessage(conv.id, 'assistant', 'Here is a Python scraper using requests + bs4 ...')
+    h.store.addMessage(conv.id, 'user', 'Add retries')
+    const cut = h.store.addMessage(conv.id, 'assistant', 'Added tenacity-based retries ...')
+    h.store.addMessage(conv.id, 'user', 'Now add a CLI')
+    h.store.addMessage(conv.id, 'assistant', 'argparse CLI ...')
+    h.store.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper.', upToMessageId: cut.id, tokensBefore: 500 })
+    await h.app.request(`/api/v1/conversations/${conv.id}/messages/${u1.id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'Write a web scraper in Go' }) })
+    await (await h.app.request(`/api/v1/conversations/${conv.id}/continue`, json({}))).text()
+    assert.deepEqual(engine.bodies[0].messages, [{ role: 'user', content: 'Write a web scraper in Go' }])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('deleting a conversation aborts its in-flight generation', async () => {
+  const h = inFlightHarness()
+  let engineSignal: AbortSignal | undefined
+  let engineEntered!: () => void
+  const generating = new Promise<void>((r) => { engineEntered = r })
+  const engine = fakeEngine((init) => {
+    engineSignal = init?.signal ?? undefined
+    engineEntered()
+    return new Response(new ReadableStream({
+      start(c) { engineSignal?.addEventListener('abort', () => c.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))) },
+    }), { status: 200 })
+  })
+  try {
+    const conv = h.store.createConversation()
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi' }))
+    await generating
+    assert.equal(engineSignal?.aborted, false)
+    assert.equal((await h.app.request(`/api/v1/conversations/${conv.id}`, { method: 'DELETE' })).status, 200)
+    assert.equal(engineSignal?.aborted, true)
+    await res.text()
+    assert.deepEqual(inFlightChatIds(), [])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// ── share-url ─────────────────────────────────────────────────────────────────────────────────
+// `--port`/`--addr` (the Android app's 7000, `turbollm --port 8080`) win over daemon.port, so the
+// share link must carry the port the listener really bound, or it points at a dead port.
+test('share-url: advertises the port really bound, not daemon.port', async () => {
+  const dir = tmpDir('tllm-chat-share-')
+  const store = new ConversationStore(dir)
+  const savedAdvertised = process.env.TURBOLLM_ADVERTISED_HOST
+  delete process.env.TURBOLLM_ADVERTISED_HOST
+  try {
+    const d = { db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
+    const app = new Hono()
+    registerChatRoutes(app, d)
+    const conv = store.createConversation()
+    const { url } = await (await app.request(`/api/v1/conversations/${conv.id}/share-url`)).json() as { url: string }
+    assert.match(url, new RegExp(`^http://[^/]+:7000/chat/${conv.id}$`))
+  } finally {
+    if (savedAdvertised === undefined) delete process.env.TURBOLLM_ADVERTISED_HOST
+    else process.env.TURBOLLM_ADVERTISED_HOST = savedAdvertised
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
   }
 })

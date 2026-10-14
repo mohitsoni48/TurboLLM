@@ -57,8 +57,9 @@ export interface Conversation {
    *  compactionUpToMessageId when a future turn is built. Undefined = never compacted.
    *  Never cleared automatically by edit/branch/delete — only an explicit undo or a new
    *  compaction overwrites these three fields. See chat-compaction.ts's
-   *  resolveCompactionCut for how a stranded cut (message deactivated or deleted) is
-   *  handled: the summary is never silently dropped. */
+   *  resolveCompactionCut and setAsideFrozenCut for how a stranded cut is handled: a deleted
+   *  cut keeps its summary; a deactivated one (frozen on a branch the user left) is set aside
+   *  while that branch is inactive. */
   compactionSummary?: string
   /** The message id everything ACTIVE at/before this is now covered by compactionSummary. */
   compactionUpToMessageId?: string
@@ -494,6 +495,10 @@ export interface Message {
   reasoning: string
   attachments: string[]
   textAttachments: string[]
+  /** v52: the attached documents' TEXT as the user turn first sent it (`textAttachments` holds only
+   *  their names). Kept so a regenerate or edit-and-resend can send the turn again with its
+   *  documents. Absent when the turn attached none, and on rows written before v52. */
+  docContext?: string
   /** Tool calls made by this assistant turn (v0.7.0). */
   toolCalls: ToolCallRecord[]
   /** Code, item 6 — ordered text/tool-call interleave. Absent on messages persisted before this
@@ -521,7 +526,7 @@ interface ConvRow { id: string; title: string; system_prompt: string; model_key:
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null }
 
 // Named-param objects need an explicit cast to Record<string, SqlValue>
 type P = Record<string, SqlValue>
@@ -641,6 +646,7 @@ function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
   if (r.timeline) msg.timeline = safeJson(r.timeline) as MessageTimelineBlock[]
+  if (r.doc_context) msg.docContext = r.doc_context
   return msg
 }
 
@@ -1311,6 +1317,13 @@ export class ConversationStore {
       if (!this.hasColumn('conversations', 'compaction_applied_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_applied_at TEXT;`)
       this.db.exec(`PRAGMA user_version = 51;`)
     }
+    // v52: a user turn's attached-document text (Message.docContext). It used to exist only in
+    // the request that first sent the turn, so a regenerate or edit-and-resend sent the turn
+    // again without its documents. Nullable, no default: most turns attach nothing.
+    if (v < 52) {
+      if (!this.hasColumn('messages', 'doc_context')) this.db.exec(`ALTER TABLE messages ADD COLUMN doc_context TEXT;`)
+      this.db.exec(`PRAGMA user_version = 52;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1431,7 +1444,7 @@ export class ConversationStore {
       .all({ $cid: convId, $seq: from.seq } as P) as unknown as MsgRow[]).map(rowToMsg)
   }
 
-  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
+  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'docContext' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
     const id = randomUUID()
     const now = new Date().toISOString()
     const row = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id`).get({ $id: convId } as P) as unknown as { ms: number }
@@ -1440,8 +1453,8 @@ export class ConversationStore {
     const modelKey = role === 'assistant' ? this.conversationModelKey(convId) : null
     const textAttachments = extra?.textAttachments?.length ? JSON.stringify(extra.textAttachments) : null
     const toolCalls = extra?.toolCalls?.length ? JSON.stringify(extra.toolCalls) : null
-    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,tool_calls,stats,model_key,created_at,variant_group,is_active) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$tc,$stats,$mk,$now,$vg,1)`)
-      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now, $vg: extra?.variantGroup ?? null } as P)
+    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,doc_context,tool_calls,stats,model_key,created_at,variant_group,is_active) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$dc,$tc,$stats,$mk,$now,$vg,1)`)
+      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $dc: extra?.docContext || null, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now, $vg: extra?.variantGroup ?? null } as P)
     this.touchConversation(convId)
     return this.getMessage(id)!
   }
