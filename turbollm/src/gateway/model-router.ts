@@ -14,6 +14,7 @@ import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
+import { modelLoadsRefused } from '../auth'
 
 export type RouteResult =
   | {
@@ -29,6 +30,12 @@ interface PoolSlot {
   manager: Manager
   modelKey: string
   lastUsedMs: number
+}
+
+/** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused):
+ *  the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. */
+function notLoadedForCaller(entry: ModelEntry): RouteResult {
+  return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.` }
 }
 
 const UNLOADED_WHILE_LOADING = 'The model was unloaded while it was loading.'
@@ -119,6 +126,7 @@ export class ModelRouter {
 
     const alive = this.routeResolved(entry)
     if (alive) return alive
+    if (modelLoadsRefused()) return notLoadedForCaller(entry)
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
@@ -134,6 +142,7 @@ export class ModelRouter {
     if (!this.store.snapshot().gateway.autoSwap) {
       return { status: 503, message: `'${entry.name}' is not loaded. Load it from Models, or turn on auto-swap.` }
     }
+    if (modelLoadsRefused()) return notLoadedForCaller(entry)
     return this.withSwapLock(() => this.doLoad(entry))
   }
 

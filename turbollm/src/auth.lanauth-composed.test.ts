@@ -20,6 +20,10 @@ import { Hono } from 'hono'
 import { lanAuth, hostGate, hashKey, provisionRemoteApiKey, isLocalOrAuthenticated, isLocalUpgrade } from './auth'
 import { defaultConfig } from './config/config'
 import type { Deps } from './deps'
+import { ModelRouter } from './gateway/model-router'
+import type { Manager, Status } from './engines/manager'
+import type { Registry } from './engines/registry'
+import type { Scanner, ModelEntry } from './models/scanner'
 
 // N3 (Phase 5 final-review-fix re-review): a GENUINELY valid, properly-signed Access assertion
 // — the same RS256 keypair machinery access-jwt.test.ts uses — so the C3(b) test below proves
@@ -59,7 +63,8 @@ function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void): { d:
       snapshot: () => cfg,
       update: (fn: (c: typeof cfg) => void) => fn(cfg),
     },
-    remote: { ingressPort: () => INGRESS_PORT },
+    // The running provider mirrors the saved one unless a test says otherwise (they can differ).
+    remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider },
   } as unknown as Deps
   return { d, cfg }
 }
@@ -87,6 +92,12 @@ function buildApp(d: Deps): Hono {
   app.post('/api/v1/build/run', (c) => {
     if (!isLocalOrAuthenticated(c, d)) return c.json({ error: { code: 'forbidden', message: 'Host-only action.' } }, 403)
     return c.json({ ok: true })
+  })
+  // Mirrors gateway.ts: route on the body's `model`, which may auto-swap (load) it.
+  app.post('/v1/chat/completions', async (c) => {
+    const { model } = (await c.req.json()) as { model?: string }
+    const r = await d.modelRouter.route(model ?? '')
+    return 'status' in r ? c.json({ error: { message: r.message } }, r.status) : c.json({ ok: true })
   })
   return app
 }
@@ -455,3 +466,63 @@ test('a foreign Host still needs a key when requireApiKey is off and nothing is 
   assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: evil })).status, 200)
 })
 
+// ── Tailscale identity is trusted only while the RUNNING provider is Tailscale Serve. ──────
+
+test('a forged Tailscale identity is refused when the saved provider is Serve but a public tunnel is running', async () => {
+  const { d } = makeDeps((cfg) => {
+    cfg.remoteAccess.provider = 'tailscale-serve' // saved after a public tunnel was started
+  })
+  ;(d.remote as unknown as { activeProvider: () => string }).activeProvider = () => 'cloudflare-quick'
+  const res = await tunneledRequest(buildApp(d), '/api/v1/conversations/abc/messages', {
+    method: 'POST',
+    headers: { 'Tailscale-User-Login': 'forged@example.com' },
+  })
+  assert.equal(res.status, 401)
+})
+
+// ── A remote token without models:load must not load (and evict) models via /v1/* ──────────
+
+function routerWithUnloadedModel(): { router: ModelRouter; loads: unknown[] } {
+  const loads: unknown[] = []
+  const primary = {
+    status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async (opts: unknown) => { loads.push(opts) },
+    target: () => null,
+    touch: () => {},
+  } as unknown as Manager
+  const entry = { key: 'other-model', name: 'other-model', path: '/m/other.gguf', quant: 'Q4', sizeBytes: 1 } as unknown as ModelEntry
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const store = { snapshot: () => ({ ...defaultConfig(), gateway: { autoSwap: true, keepN: 1 } }), update: () => {} }
+  const registry = { active: () => undefined } as unknown as Registry
+  return { router: new ModelRouter(store as never, registry, primary, scanner, undefined), loads }
+}
+
+test('a models:use remote token gets "not loaded" instead of an auto-swap load on /v1/chat/completions', async () => {
+  const { d } = makeDeps(() => {})
+  const { router, loads } = routerWithUnloadedModel()
+  ;(d as { modelRouter: ModelRouter }).modelRouter = router
+  const raw = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] })
+  const res = await tunneledRequest(buildApp(d), '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': raw, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'other-model' }),
+  })
+  assert.equal(res.status, 503)
+  assert.match(((await res.json()) as { error: { message: string } }).error.message, /may not load models/)
+  assert.deepEqual(loads, [], 'nothing may be loaded or evicted')
+})
+
+test('a remote token WITH models:load still auto-swaps through the router', async () => {
+  const { d } = makeDeps(() => {})
+  const { router } = routerWithUnloadedModel()
+  ;(d as { modelRouter: ModelRouter }).modelRouter = router
+  const raw = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load'] })
+  const res = await tunneledRequest(buildApp(d), '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': raw, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'other-model' }),
+  })
+  // The fake registry has no engine, so the load itself fails — but past the capability refusal.
+  const body = (await res.json()) as { error?: { message: string } }
+  assert.doesNotMatch(body.error?.message ?? '', /may not load models/)
+})

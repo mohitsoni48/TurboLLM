@@ -2315,6 +2315,21 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies = validated
     }
 
+    // Remote-access provider changes only while no tunnel is up. Saved mid-session, the new
+    // provider is what the next crash/health restart (or boot) starts — publishing the box
+    // through a provider whose exposure was never confirmed — while the UI already labels the
+    // still-running old tunnel with it.
+    if (b.remoteAccess?.provider !== undefined && d.remote) {
+      const kind = d.remote.state().kind
+      const running = kind === 'starting' || kind === 'connected' || kind === 'reconnecting'
+      // `enabled` as well: it stays true through failed / needs-setup / unavailable, and the next
+      // boot auto-starts whatever provider is saved — the UI's own rule is "any state but off".
+      const on = running || d.store.snapshot().remoteAccess.enabled
+      if (on && normalizeProvider(b.remoteAccess.provider) !== d.store.snapshot().remoteAccess.provider) {
+        return err(c, 409, 'remote_access_running', 'Turn remote access off before changing its provider.')
+      }
+    }
+
     const before = d.store.snapshot().daemon
     d.store.update((cfg) => {
       Object.assign(cfg.daemon, updates)

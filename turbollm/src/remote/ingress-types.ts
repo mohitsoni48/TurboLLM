@@ -1,4 +1,4 @@
-import type { RemoteState } from './types'
+import type { RemoteProviderId, RemoteState } from './types'
 
 /** The narrow seam auth.ts needs from remote access (ADR-422, spec 30 §2.2).
  *
@@ -8,6 +8,10 @@ import type { RemoteState } from './types'
 export interface RemoteIngress {
   /** The loopback port providers connect to, or undefined when nothing is listening. */
   ingressPort(): number | undefined
+  /** The provider actually serving the ingress right now — NOT the one saved in config, which
+   *  can differ from it. auth.ts trusts Tailscale identity headers only when this is
+   *  'tailscale-serve'. Optional so a fake can omit it; absent reads as "none" (fails closed). */
+  activeProvider?(): RemoteProviderId | undefined
 }
 
 /** What the API and the UI need from remote access, on top of the auth seam. `Deps.remote`

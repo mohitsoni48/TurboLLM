@@ -1,4 +1,4 @@
-// Route-level regressions for a gate in registerApi, on a real Hono app with a minimal Deps
+// Route-level regressions for two gates in registerApi, on a real Hono app with a minimal Deps
 // double (same discipline as keys-network.test.ts). app.request() carries no TCP connection, so
 // auth.ts's isLoopback cannot resolve an address and fails closed: with lanBind on, every request
 // here is a non-host caller.
@@ -8,13 +8,15 @@ import { Hono } from 'hono'
 import { registerApi } from './routes'
 import { defaultConfig, type Config } from '../config/config'
 import type { Deps } from '../deps'
+import type { RemoteState } from '../remote/types'
 
-function fakeApp(cfg: Config): Hono {
+function fakeApp(cfg: Config, remote?: { kind: RemoteState['kind'] }): Hono {
   const app = new Hono()
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
+    ...(remote ? { remote: { ingressPort: () => undefined, state: () => remote } } : {}),
   } as unknown as Deps
   registerApi(app, d)
   return app
@@ -56,4 +58,50 @@ test('POST /api/v1/mcp/servers: still works for the host itself (loopback-only b
   })
   assert.equal(res.status, 201)
   assert.equal(cfg.mcp.servers.length, 1)
+})
+
+// ── The remote-access provider must not change under a running tunnel. Saved mid-session it
+// is what the next crash/health restart starts (skipping the exposure confirmation), and the UI
+// labels the still-running old tunnel with it. ──────────────────────────────────────────────────
+
+test('PATCH /api/v1/settings: 409 for a provider change while remote access is running — config unchanged', async () => {
+  for (const kind of ['starting', 'connected', 'reconnecting'] as const) {
+    const cfg = defaultConfig()
+    cfg.remoteAccess.provider = 'cloudflare-quick'
+    const res = await fakeApp(cfg, { kind }).request('/api/v1/settings', {
+      method: 'PATCH',
+      body: JSON.stringify({ remoteAccess: { provider: 'tailscale-serve' } }),
+    })
+    assert.equal(res.status, 409, kind)
+    assert.equal(cfg.remoteAccess.provider, 'cloudflare-quick', kind)
+  }
+})
+
+test('PATCH /api/v1/settings: 409 for a provider change while remote access is enabled but not up (failed / needs-setup / unavailable)', async () => {
+  // Still `enabled`, so the next boot auto-starts the saved provider — a switch here would publish
+  // through a provider nobody confirmed.
+  for (const kind of ['failed', 'needs-setup', 'unavailable'] as const) {
+    const cfg = defaultConfig()
+    cfg.remoteAccess.provider = 'tailscale-serve'
+    cfg.remoteAccess.enabled = true
+    const res = await fakeApp(cfg, { kind }).request('/api/v1/settings', {
+      method: 'PATCH',
+      body: JSON.stringify({ remoteAccess: { provider: 'cloudflare-quick' } }),
+    })
+    assert.equal(res.status, 409, kind)
+    assert.equal(cfg.remoteAccess.provider, 'tailscale-serve', kind)
+  }
+})
+
+test('PATCH /api/v1/settings: a provider change is accepted while remote access is off', async () => {
+  for (const kind of ['off', 'failed', 'needs-setup'] as const) {
+    const cfg = defaultConfig()
+    cfg.remoteAccess.provider = 'cloudflare-quick'
+    const res = await fakeApp(cfg, { kind }).request('/api/v1/settings', {
+      method: 'PATCH',
+      body: JSON.stringify({ remoteAccess: { provider: 'tailscale-serve' } }),
+    })
+    assert.notEqual(res.status, 409, kind)
+    assert.equal(cfg.remoteAccess.provider, 'tailscale-serve', kind)
+  }
 })

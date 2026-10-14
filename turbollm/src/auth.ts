@@ -21,6 +21,7 @@
 // ever connects to, and a client cannot choose which of the daemon's sockets it lands on —
 // unlike a header, which only worked for Cloudflare because its edge (not the client)
 // controlled it.
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
@@ -643,9 +644,11 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     if (allow) return next()
 
     // Tailscale Serve identity (ADR-422 §6.1): a tailnet-authenticated user needs no shared
-    // secret. Gated on BOTH the ingress socket and the active provider actually being Serve —
-    // Funnel sends no identity headers, so anything claiming one there is a forgery attempt.
-    if (isTunneled(c, d) && d.store.snapshot().remoteAccess.provider === 'tailscale-serve' && tailscaleIdentity(c)) {
+    // secret. Gated on BOTH the ingress socket and the provider actually RUNNING being Serve —
+    // Funnel and every public tunnel send no identity headers, so anything claiming one there is
+    // a forgery attempt. The running provider, not the saved one: the saved one can name Serve
+    // while a public tunnel started under another provider is still serving.
+    if (isTunneled(c, d) && d.remote?.activeProvider?.() === 'tailscale-serve' && tailscaleIdentity(c)) {
       return next()
     }
 
@@ -711,9 +714,26 @@ export function lanAuth(d: Deps): MiddlewareHandler {
           403,
         )
       }
+      // `/v1/*` only needs models:use, but its auto-swap path LOADS whatever model the body
+      // names, evicting the owner's — the exact ADR-376 defect (see isFacadeOnlyKey) that
+      // made "models:load" advice for link tokens. Without models:load, this request may use
+      // only what is already loaded; ModelRouter refuses the load (see modelLoadsRefused).
+      if (!hasCapability(resolved, 'models:load')) return noModelLoads.run(true, next)
     }
     return next()
   }
+}
+
+/** Marks the async context of a request that must not load a model (a remote-access token
+ *  without models:load). An async context rather than a parameter because the load decision
+ *  sits several calls below the gateway handlers (ModelRouter.route/routeTo), and every path
+ *  to it must be covered. */
+const noModelLoads = new AsyncLocalStorage<boolean>()
+
+/** True while serving a request whose credential may not load models — ModelRouter checks it
+ *  right before an auto-swap load and answers "not loaded" instead. */
+export function modelLoadsRefused(): boolean {
+  return noModelLoads.getStore() === true
 }
 
 /** Code-specific gate, INDEPENDENT of the global requireApiKey toggle above. Chat (and most of

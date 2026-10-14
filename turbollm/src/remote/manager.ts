@@ -9,7 +9,7 @@ import { IngressListener } from './ingress'
 import type { RemoteIngress } from './ingress-types'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
 import { HEALTH_INTERVAL_MS, nextHealthCheck } from './health'
-import type { RemoteProvider, RemoteState } from './types'
+import type { RemoteProvider, RemoteProviderId, RemoteState } from './types'
 
 export interface RemoteAccessOptions {
   app: Hono
@@ -69,6 +69,12 @@ export class RemoteAccessManager implements RemoteIngress {
 
   ingressPort(): number | undefined {
     return this.ingress.ingressPort()
+  }
+
+  /** The provider serving the ingress right now (see RemoteIngress.activeProvider), or
+   *  undefined when the ingress is down. */
+  activeProvider(): RemoteProviderId | undefined {
+    return this.ingress.ingressPort() !== undefined ? this.provider?.id : undefined
   }
 
   /** The ingress listener's underlying http.Server once bound, or null (mirrors
