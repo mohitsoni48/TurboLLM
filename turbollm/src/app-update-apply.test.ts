@@ -107,6 +107,17 @@ test('classifyInstall: the desktop env var alone is enough (wrapper-set, path-in
   assert.equal(info.method, 'electron')
 })
 
+test('classifyInstall: macOS desktop users are told to download the .dmg, not that updates are automatic', () => {
+  // The wrapper skips electron-updater on macOS: the unsigned dmg-only build cannot be installed by it.
+  const mac = classifyInstall(signals({ platform: 'darwin', desktopEnv: true }))
+  assert.equal(mac.method, 'electron')
+  assert.match(mac.note, /\.dmg/)
+  assert.doesNotMatch(mac.note, /in the background/)
+
+  const win = classifyInstall(signals({ platform: 'win32', desktopEnv: true }))
+  assert.match(win.note, /in the background/)
+})
+
 test('classifyInstall: a container refuses and shows a rebuild command', () => {
   const info = classifyInstall(signals({ inContainer: true }))
   assert.equal(info.method, 'docker')

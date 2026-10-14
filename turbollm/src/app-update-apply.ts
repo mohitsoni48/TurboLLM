@@ -103,7 +103,12 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
       method: 'electron',
       canSelfUpdate: false,
       command: '',
-      note: 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
+      // The mac build is an unsigned .dmg, which electron-updater cannot install, so the wrapper
+      // never auto-updates on macOS (wrapper/main.js setupAutoUpdate).
+      note:
+        s.platform === 'darwin'
+          ? 'The TurboLLM desktop app cannot update itself on macOS yet: download the new .dmg from the TurboLLM releases page and replace the app.'
+          : 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
     }
   }
 
