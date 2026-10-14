@@ -40,6 +40,7 @@ import {
   useEngineCatalog,
   useEngineMutations,
   useEngineRecommendation,
+  useEngineUpdate,
   useEngineUpdates,
   useEngines,
   useGitBranches,
@@ -47,7 +48,7 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, getEngineUpdates, track, type AddEngineInput } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, track, type AddEngineInput } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -124,13 +125,17 @@ const isOfficialLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test
  *  (`engines/turboquant/…`), not the git-build layout (`engines/build/<repo-name>/…`), so a
  *  self-service TurboQuant/ik_llama.cpp build fell through to the 'llama.cpp' default and
  *  showed the wrong catalog card as active. */
-export function catalogIdFor(e: Engine): string {
+export function catalogIdFor(e: Engine, catalog?: Pick<CatalogEngine, 'id' | 'releaseEngineId'>[]): string {
   if (e.kind === 'mlx') return 'mlx'
   if (e.kind === 'mlx-vlm') return 'mlx-vlm'
   if (e.kind === 'vllm') return 'vllm'
   if (e.kind === 'koboldcpp') return 'koboldcpp'
   if (e.kind === 'llamafile') return 'llamafile'
   if (e.kind === 'litert-lm') return 'litert-lm'
+  // A release-installed engine belongs to the card the BACKEND says owns it, else it is a Custom
+  // card. It must never fall through to 'llama.cpp' below (that card would be marked running for
+  // a Prism build), and no repo matching happens here (ADR-388/431/433).
+  if (e.release) return catalog?.find((c) => c.releaseEngineId === e.id)?.id ?? 'custom'
   const repo = repoSlug(e.sourceRepo)
   if (repo === 'atomicbot-ai/atomic-llama-cpp-turboquant') return 'turboquant'
   if (repo === 'ikawrakow/ik_llama.cpp') return 'ik_llama.cpp'
@@ -382,7 +387,7 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'Tracks upstream llama.cpp closely (per-commit builds)',
       'Same llama-server API + GGUF flow',
     ],
-    cons: ['Niche — most value only for ternary/BitNet-class models', 'No install endpoint yet — build from source', 'Small community'],
+    cons: ['Niche — most value only for ternary/BitNet-class models','Small community'],
   },
   beellama: {
     icon: Layers,
@@ -393,7 +398,7 @@ const ENGINE_META: Record<string, EngineMeta> = {
       'KV precision tail keeps recent tokens exact, cheaply',
       'Adaptive DFlash speculative decoding',
     ],
-    cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)', 'No install endpoint yet — build from source', 'KVarN types are manual-pick only, not in the auto-tune sweep yet'],
+    cons: ['Solo maintainer, fast churn (v0.4.0 dropped TurboQuant/TCQ)','KVarN types are manual-pick only, not in the auto-tune sweep yet'],
   },
 }
 
@@ -521,6 +526,8 @@ function EngineGalleryTab() {
   const provisioning = !!status?.engineProvision?.active
   const recQ = useEngineRecommendation(provisioning)
   const backendsQ = useEngineBackends(provisioning)
+  // Same query (and cache entry) the gallery reads: which card owns the running release engine.
+  const catalogQ = useEngineCatalog(provisioning)
   const logPanelOpen = useUiStore((s) => s.logPanelOpen)
   const setLogPanelOpen = useUiStore((s) => s.setLogPanelOpen)
   // Only read here to decide whether the install gallery is meaningful on this host — see the
@@ -573,7 +580,7 @@ function EngineGalleryTab() {
           <EngineGallery
             rec={recQ.data}
             isLoading={recQ.isLoading}
-            activeCatalogId={activeEngine ? catalogIdFor(activeEngine) : null}
+            activeCatalogId={activeEngine ? catalogIdFor(activeEngine, catalogQ.data?.engines) : null}
             provisioning={provisioning}
           />
         )}
@@ -836,9 +843,11 @@ function EngineGallery({
   const install = useBackendInstall()
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
+  const releaseUpdate = useEngineUpdate()
   const qc = useQueryClient()
   // `reregister`: a Disabled source-built card's delete (see requestDelete).
   const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { reregister?: AddEngineInput }) | null>(null)
+  const customDisabled = registry?.customDisabled ?? []
 
   const catalogById = useMemo(() => {
     const m = new Map<string, CatalogEngine>()
@@ -884,7 +893,8 @@ function EngineGallery({
     install.updateLlamafile.isPending ||
     engineMut.remove.isPending ||
     engineMut.disableCustom.isPending ||
-    engineMut.purge.isPending
+    engineMut.purge.isPending ||
+    releaseUpdate.isPending
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
   const installFor = (e: CatalogEngine) => {
@@ -916,6 +926,7 @@ function EngineGallery({
   const registryEngineId = (e: CatalogEngine): string | undefined => {
     const eng = registry?.engines ?? []
     if (e.sourceEngineId) return e.sourceEngineId
+    if (e.releaseEngineId) return e.releaseEngineId
     if (e.provision === 'pip') return eng.find((x) => x.kind === e.kind)?.id
     if (e.id === 'turboquant') return eng.find((x) => /[\\/]engines[\\/]turboquant[\\/]/.test(x.binPath))?.id
     if (e.id === 'koboldcpp' || e.id === 'llamafile') return eng.find((x) => x.kind === e.kind)?.id
@@ -934,6 +945,19 @@ function EngineGallery({
     if (e.sourceBuilt && e.sourceBinPath) {
       engineMut.add.mutate(
         enableRequestFor(e),
+        {
+          onSuccess: () => toast.success(`${e.name} enabled`),
+          onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not enable ${e.name}.`),
+        },
+      )
+      return
+    }
+    if (e.releaseBinPath) {
+      // A disabled release install: re-register the still-extracted build. No sourceRepo is sent;
+      // the daemon restores provenance from the install marker.
+      const remembered = customDisabled.find((s) => s.binPath === e.releaseBinPath)
+      engineMut.add.mutate(
+        { name: remembered?.name ?? e.name, binPath: e.releaseBinPath },
         {
           onSuccess: () => toast.success(`${e.name} enabled`),
           onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not enable ${e.name}.`),
@@ -979,7 +1003,8 @@ function EngineGallery({
         // engine (re-install + re-register). The loading toast is NOT dismissed here: the
         // mutation owns it now and settles it through onSuccess/onError — dismissing up
         // front blanked the feedback while the install still ran.
-        const m = updateFor(e)
+        // A release card has no re-provision path (updateFor is null for it): say so honestly.
+        const m = e.releaseEngineId ? null : updateFor(e)
         if (!m) { toast.error(`Could not check ${e.name}.`, { id: toastId }); return }
         m.mutate(undefined, {
           onSuccess: () => toast.success(`Reinstalling ${e.name}…`, { id: toastId }),
@@ -989,6 +1014,13 @@ function EngineGallery({
       }
       if (st.error === 'offline') {
         toast.error(`Couldn't reach the update source for ${e.name} — try again when online.`, { id: toastId })
+        return
+      }
+      if (st.error === 'rate_limited' && e.releaseEngineId) {
+        // A release engine's source IS GitHub, so the token advice applies (same copy as the
+        // card's own status line, which now shows the Settings link too).
+        toast.error(`GitHub rate limit reached — add a token in Settings → GitHub.`, { id: toastId })
+        void qc.invalidateQueries({ queryKey: queryKeys.engineUpdates })
         return
       }
       if (st.error === 'rate_limited') {
@@ -1012,7 +1044,21 @@ function EngineGallery({
       toast.error(err instanceof ApiError ? err.message : `Could not check ${e.name} for updates.`, { id: toastId })
     }
   }
+  const updateReleaseEngine = (engineId: string, name: string) => {
+    track('engines', 'update_release_engine')
+    releaseUpdate.mutate(engineId, {
+      onSuccess: () => toast.success(`Updating ${name} to the latest release…`),
+      onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not update ${name}.`),
+    })
+  }
   const doUpdate = (e: CatalogEngine, hasUpdate: boolean) => {
+    if (e.releaseEngineId) {
+      // A release engine has no installEndpoint (Prism's is ''); the update goes through the
+      // engine's own id. "Check for update" only checks and reports; it never applies.
+      if (!hasUpdate) { void checkLive(e); return }
+      updateReleaseEngine(e.releaseEngineId, e.name)
+      return
+    }
     const m = updateFor(e)
     if (!m) return
     // Only LiteRT-LM's "Check for update" is the honest live re-check above; every other
@@ -1030,16 +1076,20 @@ function EngineGallery({
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not update ${e.name}.`),
     })
   }
-  const setPolicy = (e: CatalogEngine, policy: UpdatePolicy) => {
-    const id = registryEngineId(e)
-    if (!id) { toast.error(`Could not find the installed ${e.name} engine.`); return }
+  const setPolicyById = (id: string, policy: UpdatePolicy) => {
     track('engines', 'set_engine_update_policy')
     policyMut.mutate(
       { id, policy },
       { onError: (err) => toast.error(err instanceof ApiError ? err.message : 'Could not change auto-update.') },
     )
   }
+  const setPolicy = (e: CatalogEngine, policy: UpdatePolicy) => {
+    const id = registryEngineId(e)
+    if (!id) { toast.error(`Could not find the installed ${e.name} engine.`); return }
+    setPolicyById(id, policy)
+  }
   const requestDelete = (e: CatalogEngine) => {
+    if (!e.releaseEngineId && e.releaseBinPath) { requestDeleteDisabledRelease(e, e.releaseBinPath); return }
     const registryId = registryEngineId(e)
     // Disable unregisters an engine, and the purge route only deletes a REGISTERED engine's
     // files — so a Disabled card has no id to purge. A source-built one is found the way its
@@ -1052,6 +1102,19 @@ function EngineGallery({
     }
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
     setDeleteTarget(deleteTargetFor(registryId, registry?.engines ?? [], e.name))
+  }
+  // A disabled release has no registered engine to purge: forget its remembered source, then
+  // remove the (now unclaimed) install dir.
+  const requestDeleteDisabledRelease = (e: CatalogEngine, releaseBinPath: string) => {
+    const source = customDisabled.find((s) => s.binPath === releaseBinPath)
+    if (!source) { toast.error(`Could not find ${e.name}'s files — refresh the page.`); return }
+    setDeleteTarget({
+      name: source.name,
+      registryId: '',
+      binPath: source.binPath,
+      sourceKey: customSourceKey(source),
+      releaseBinPath: source.binPath,
+    })
   }
   const requestDeleteCustom = (eng: Engine) => setDeleteTarget(deleteTargetFor(eng.id, [eng], eng.name))
   // Custom-engine parity (GitHub: "treated as an outsider... same UI as catalogue engines"):
@@ -1087,9 +1150,33 @@ function EngineGallery({
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
     })
   }
+  const doDeleteDisabledRelease = (target: DeleteTarget & { sourceKey: string; releaseBinPath: string }) => {
+    engineMut.forgetCustomSource.mutate(target.sourceKey, {
+      onSuccess: () => {
+        // The source is forgotten, so nothing claims the dir any more and the route may remove it.
+        discardReleaseInstall(target.releaseBinPath)
+          .then(() => toast.success(`${target.name} deleted`))
+          .catch((err: unknown) =>
+            toast.error(`${target.name} removed, but its files could not be deleted: ${err instanceof Error ? err.message : 'unknown error'}`))
+          .finally(() => {
+            setDeleteTarget(null)
+            void qc.invalidateQueries({ queryKey: queryKeys.engines })
+            void qc.invalidateQueries({ queryKey: queryKeys.engineCatalog })
+          })
+      },
+      onError: (err) => {
+        setDeleteTarget(null)
+        toast.error(err instanceof ApiError ? err.message : `Could not delete ${target.name}.`)
+      },
+    })
+  }
   const doDelete = () => {
     if (!deleteTarget) return
     track('engines', 'delete_engine')
+    if (deleteTarget.sourceKey && deleteTarget.releaseBinPath) {
+      doDeleteDisabledRelease({ ...deleteTarget, sourceKey: deleteTarget.sourceKey, releaseBinPath: deleteTarget.releaseBinPath })
+      return
+    }
     const onError = (err: unknown) => {
       setDeleteTarget(null)
       toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
@@ -1138,11 +1225,13 @@ function EngineGallery({
   // other identity anywhere in the system — customDisabled (backend customEngineSources) is
   // that memory, so Enable can re-register the still-built binary instead of the entry just
   // vanishing. Already excludes anything matching a currently-live engine (backend-computed).
-  const customDisabled = registry?.customDisabled ?? []
   // Reuses engineMut.add (the same mutation catalog Enable/Install already use) — a disabled
   // custom engine's Enable is exactly that: re-register the still-built binary, no rebuild.
   // engineMut.add is shared with AddEngineDialog/catalog Enable too, so this key just won't
   // match any customDisabled entry while one of THOSE is in flight — harmless, no false spinner.
+  // A disabled release install shows on its catalog card (Enable lives there), not as a second card.
+  const cardReleaseBins = new Set((catalogQ.data?.engines ?? []).map((c) => c.releaseBinPath).filter(Boolean))
+  const customDisabledCards = customDisabled.filter((s) => !cardReleaseBins.has(s.binPath))
   const enablingKey = engineMut.add.isPending ? customSourceKey(engineMut.add.variables ?? { binPath: '' }) : null
 
   return (
@@ -1175,7 +1264,7 @@ function EngineGallery({
         })}
       </div>
 
-      {(customEngines.length > 0 || customDisabled.length > 0) && (
+      {(customEngines.length > 0 || customDisabledCards.length > 0) && (
         <div className="flex flex-col gap-2">
           {customEngines.map((eng) => (
             <CustomEngineCard
@@ -1186,16 +1275,21 @@ function EngineGallery({
               version={eng.version}
               sourceRepo={eng.sourceRepo}
               sourceBranch={eng.sourceBranch}
+              release={eng.release}
+              updateStatus={updates?.updates[eng.id]}
+              policy={updates?.policies[eng.id] ?? 'notify'}
+              onSetPolicy={(policy) => setPolicyById(eng.id, policy)}
               disabled={false}
               binPathExists
               anyPending={anyPending}
               enabling={false}
+              onUpdate={() => updateReleaseEngine(eng.id, eng.name)}
               onDisable={() => doDisableCustom(eng)}
               onEnable={() => {}}
               onDelete={() => requestDeleteCustom(eng)}
             />
           ))}
-          {customDisabled.map((source) => (
+          {customDisabledCards.map((source) => (
             <CustomEngineCard
               key={customSourceKey(source)}
               name={source.name}
@@ -1306,6 +1400,7 @@ function EngineCard({
   const [guideOpen, setGuideOpen] = useState(false)
   const [rebuildOpen, setRebuildOpen] = useState(false)
   const [buildsOpen, setBuildsOpen] = useState(false)
+  const [prebuiltOpen, setPrebuiltOpen] = useState(false)
   // Only the user's OWN pick is state. The default is derived every render: this card can mount
   // before its catalog entry arrives (the gallery waits on the recommendation, not the catalog),
   // and a default captured once at mount froze on 'main' — so the dropdown showed the real branch
@@ -1326,6 +1421,25 @@ function EngineCard({
   const isEnabled = !!catalog?.enabled
   const isDisabled = isInstalled && !isEnabled
   const compat = compatFor(fit)
+  const hasRelease = !!(catalog?.releaseEngineId || catalog?.releaseBinPath)
+  // Installed on disk and remembered, but not registered: no engine id, so no honest update status.
+  const releaseDisabled = !catalog?.releaseEngineId && !!catalog?.releaseBinPath
+  // Prebuilt archives from the repo's GitHub releases (issue #276): offered until installed.
+  const offersPrebuilt = !!catalog?.releaseInstall && !isInstalled && !incompatible
+  const prebuiltButton = offersPrebuilt && (
+    <>
+      <Button
+        size="sm"
+        variant="outline"
+        onClick={() => { track('engines', 'install_prebuilt_from_card'); setPrebuiltOpen(true) }}
+      >
+        <Package size={13} /> Install prebuilt
+      </Button>
+      {prebuiltOpen && (
+        <AddEngineDialog open onOpenChange={setPrebuiltOpen} trigger={null} defaultReleaseRepo={catalog?.repo} />
+      )}
+    </>
+  )
   // Fetch the full branch list in background for branch-capable entries; falls back to
   // ['main'] on failure. Search below filters this list client-side.
   // Fetch the branch list ON DEMAND, not on render. Walking GitHub's pagination costs one
@@ -1359,6 +1473,10 @@ function EngineCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span className="text-sm font-semibold text-ink">{e.name}</span>
+            {hasRelease && <Badge variant="mono">Release</Badge>}
+            {hasRelease && catalog?.release && (
+              <span className="text-[11px] text-faint">{catalog.release.tag}</span>
+            )}
             {isActive ? (
               <span className="inline-flex items-center gap-1 text-[11px] font-medium" style={{ color: 'var(--ok)' }}>
                 <Check size={11} /> Active
@@ -1523,7 +1641,7 @@ function EngineCard({
                     <DropdownMenuItem onSelect={() => { track('engines', 'open_rebuild_guide'); setRebuildOpen(true) }} disabled={anyPending}>
                       <RefreshCw size={14} /> {updateStatus?.hasUpdate ? 'Rebuild (new commit)' : 'Rebuild'}
                     </DropdownMenuItem>
-                  ) : (
+                  ) : releaseDisabled ? null : (
                     <DropdownMenuItem onSelect={() => onUpdate(catalog, !!updateStatus?.hasUpdate)} disabled={provisioning}>
                       <Download size={14} /> {updateStatus?.hasUpdate ? 'Update now' : 'Check for update'}
                     </DropdownMenuItem>
@@ -1554,12 +1672,13 @@ function EngineCard({
                     </>
                   )}
                   <DropdownMenuSeparator />
-                  {/* A Disabled engine has no registry entry to purge; only a source-built one
-                      can be found again without re-installing it (see requestDelete). */}
-                  <DropdownMenuItem destructive disabled={isDisabled && !(sourceBuilt && catalog.sourceBinPath)} onSelect={() => onDelete(catalog)}>
+                  {/* A Disabled engine has no registry entry to purge; only a source-built one or
+                      a release install can be found again without re-installing it (see
+                      requestDelete). */}
+                  <DropdownMenuItem destructive disabled={isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled} onSelect={() => onDelete(catalog)}>
                     Delete
                   </DropdownMenuItem>
-                  {isDisabled && !(sourceBuilt && catalog.sourceBinPath) && (
+                  {isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled && (
                     <p className="px-2 pb-1 text-[11px] text-muted">Enable it first to delete its files.</p>
                   )}
                 </DropdownMenuContent>
@@ -1580,6 +1699,7 @@ function EngineCard({
             </>
           ) : buildYourself ? (
             <>
+              {prebuiltButton}
               <Button
                 size="sm"
                 variant="outline"
@@ -1599,6 +1719,8 @@ function EngineCard({
                 engineName={buildName}
               />
             </>
+          ) : offersPrebuilt && !installFor(catalog) ? (
+            prebuiltButton
           ) : (
             <Button
               size="sm"
@@ -1650,10 +1772,15 @@ function CustomEngineCard({
   version,
   sourceRepo,
   sourceBranch,
+  release,
+  updateStatus,
+  policy = 'notify',
+  onSetPolicy,
   disabled,
   binPathExists,
   anyPending,
   enabling,
+  onUpdate,
   onDisable,
   onEnable,
   onDelete,
@@ -1664,10 +1791,18 @@ function CustomEngineCard({
   version?: string
   sourceRepo?: string
   sourceBranch?: string
+  /** Set for an engine installed from a GitHub release (issue #276): shows its tag, a Release
+   *  badge, Update and the auto-update policy. */
+  release?: Engine['release']
+  updateStatus?: EngineUpdateStatus
+  policy?: UpdatePolicy
+  onSetPolicy?: (policy: UpdatePolicy) => void
   disabled: boolean
   binPathExists: boolean
   anyPending: boolean
   enabling: boolean
+  /** Starts the release update; owned by the gallery so `anyPending` sees it. */
+  onUpdate?: () => void
   onDisable: () => void
   onEnable: () => void
   onDelete: () => void
@@ -1731,13 +1866,19 @@ function CustomEngineCard({
               <span className="truncate text-sm font-medium text-ink">{name}</span>
             )}
             <Badge>Custom</Badge>
+            {release && <Badge variant="mono">Release</Badge>}
             {disabled && <Badge variant="mono">Disabled</Badge>}
           </div>
           <div className="truncate text-[12px] text-muted" title={binPath}>{binPath}</div>
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        {version && <span className="text-[12px] text-faint">{version}</span>}
+        {(release?.tag ?? version) && <span className="text-[12px] text-faint">{release?.tag ?? version}</span>}
+        {release && !disabled && updateStatus?.hasUpdate && !updateStatus.rebuild && (
+          <Button size="sm" variant="outline" disabled={anyPending} onClick={onUpdate}>
+            <Download size={13} /> Update
+          </Button>
+        )}
         {disabled && !binPathExists && (
           <span
             className="text-[11px] text-faint"
@@ -1778,6 +1919,22 @@ function CustomEngineCard({
               <DropdownMenuItem onSelect={onReprobe} disabled={engineMut.reprobe.isPending}>
                 <RefreshCw size={14} /> Re-probe
               </DropdownMenuItem>
+              {release && onSetPolicy && (
+                <>
+                  <DropdownMenuSeparator />
+                  <div className="px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted">
+                    Auto-update
+                  </div>
+                  {(['off', 'notify', 'auto'] as UpdatePolicy[]).map((p) => (
+                    <DropdownMenuItem key={p} onSelect={() => onSetPolicy(p)} className="flex items-center gap-2">
+                      <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                        {policy === p && <Check size={13} className="text-accent" />}
+                      </span>
+                      {AUTO_UPDATE_LABEL[p]}
+                    </DropdownMenuItem>
+                  ))}
+                </>
+              )}
             </DropdownMenuContent>
           </DropdownMenu>
         )}

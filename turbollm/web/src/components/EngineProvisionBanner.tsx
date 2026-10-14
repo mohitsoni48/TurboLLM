@@ -20,6 +20,7 @@ function engineLabel(backend: string): string {
   if (backend === 'mlx-vlm') return 'MLX-VLM engine'
   if (backend === 'turboquant') return 'TurboQuant engine'
   if (backend === 'laya') return 'Laya engine'
+  if (backend === 'github-release') return 'engine from a GitHub release'
   if (LLAMA_BACKENDS.has(backend)) return `llama.cpp engine (${backend})`
   return backend ? `${backend} engine` : 'engine'
 }

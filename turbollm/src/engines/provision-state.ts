@@ -35,7 +35,16 @@ export class ProvisionState {
    *  a user had reached when frequently nobody had done anything. */
   private trigger: ProvisionTrigger = 'seed'
 
+  private starts = 0
+
+  /** How many runs have begun. A caller compares it before and after an async
+   *  operation to learn whether that operation ever reached `start`. */
+  startCount(): number {
+    return this.starts
+  }
+
   start(backend: string, trigger: ProvisionTrigger = 'user_install'): void {
+    this.starts++
     this.trigger = trigger
     this.s = { active: true, phase: 'downloading', backend, pct: 0, part: 1, parts: 1, error: null }
   }

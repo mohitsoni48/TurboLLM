@@ -689,3 +689,19 @@ test('aliveSlots: the primary first, then alive pool slots; stopped slots are le
     { modelKey: 'beta-key', state: 'starting', primary: false, lastUsedMs: 5 },
   ])
 })
+
+function slotOnEngine(modelKey: string, engineId: string): PoolSlotShape {
+  const manager = { currentOpts: () => ({ engine: { id: engineId } }) } as unknown as Manager
+  return { manager, modelKey, lastUsedMs: 0 }
+}
+
+test('poolSlotsOnEngine: counts the extra pool slots running on that engine only', () => {
+  const r = router(fakeManager('running', 'primary-model'), STORE, [
+    slotOnEngine('a', 'litert'),
+    slotOnEngine('b', 'litert'),
+    slotOnEngine('c', 'llama'),
+  ])
+  assert.equal(r.poolSlotsOnEngine('litert'), 2)
+  assert.equal(r.poolSlotsOnEngine('llama'), 1)
+  assert.equal(r.poolSlotsOnEngine('absent'), 0)
+})

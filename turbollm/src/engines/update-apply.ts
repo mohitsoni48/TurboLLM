@@ -11,7 +11,8 @@
 // separate from this I/O-heavy orchestration.
 
 import { rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
+import { sourceBuildDirOf } from './build-runner'
 import type { ConfigStore, Engine } from '../config/config'
 import type { Manager } from './manager'
 import type { ProvisionState } from './provision-state'
@@ -32,16 +33,35 @@ import { ensureKoboldcpp } from './koboldcpp'
 import { ensureLlamafile } from './llamafile'
 import { primaryVendor } from '../sysinfo/sysinfo'
 import { stopEngineUsers } from './serving'
-import { backendIdFromBinPath, tagFromManagedBinPath, latestTagForInstalled } from './update'
+import { backendIdFromBinPath, tagFromManagedBinPath, latestTagForInstalled, type UpdateChecker } from './update'
+import type { ProbeResult } from './probe'
+import { newestMatchingRelease } from './release-assets'
+import {
+  installReleaseAsset,
+  releaseInstallDirName,
+  type ReleaseInstallResult,
+  type ReleaseProvenance,
+} from './release-install'
 
 export interface UpdateApplyDeps {
   store: ConfigStore
   registry: Registry
   manager: Manager
   provision: ProvisionState
+  trigger?: 'auto_update' | 'user_update'
+  /** Test seams, read only by the release branch. */
+  fetchImpl?: typeof fetch
+  probeFn?: (bin: string) => Promise<ProbeResult>
+  /** Reason the engine-work slot is taken, or null. Read only by the release branch. */
+  workBusy?: () => string | null
+  /** Cached update statuses; a finished release update drops its engine's entry. */
+  updates?: UpdateChecker
   /** Optional: when present, pool slots running on the engine being updated are stopped too. */
-  modelRouter?: Pick<ModelRouter, 'stopPoolSlotsOnEngine'>
+  modelRouter?: Pick<ModelRouter, 'stopPoolSlotsOnEngine' | 'poolSlotsOnEngine'>
 }
+
+/** What the swap guard reads: who is running, and which engine is active. */
+export type SwapGuardDeps = Pick<UpdateApplyDeps, 'registry' | 'manager' | 'modelRouter'>
 
 const OFFICIAL_LLAMA_REPO = 'ggml-org/llama.cpp'
 const isManagedLlama = (binPath: string) => /[\\/]engines[\\/]llama\.cpp-/.test(binPath)
@@ -51,6 +71,7 @@ const isTurboquant = (binPath: string) => /[\\/]engines[\\/]turboquant[\\/]/.tes
  *  on the llama.cpp path the existing install is guaranteed untouched when it throws. */
 export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, signal?: AbortSignal): Promise<void> {
   const root = join(d.store.dir(), 'engines')
+  if (engine.release) return applyReleaseUpdate(d, engine, engine.release, root, signal)
   if (engine.kind === 'mlx') return applyPipUpdate(d, 'mlx', engine, root)
   if (engine.kind === 'rapid-mlx') return applyPipUpdate(d, 'rapid-mlx', engine, root)
   if (engine.kind === 'mlx-vlm') return applyPipUpdate(d, 'mlx-vlm', engine, root)
@@ -63,6 +84,84 @@ export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, sign
     if (isTurboquant(engine.binPath)) return applyForkUpdate(d, engine, root, signal)
   }
   throw new Error('This engine has no automatic update source.')
+}
+
+/** Release engine (ADR-453): install the newest build of the same variant into the same slug.
+ *  The old dir is replaced only after the new one probes, so a failure leaves it untouched. */
+async function applyReleaseUpdate(
+  d: UpdateApplyDeps, engine: Engine, installed: ReleaseProvenance, root: string, signal?: AbortSignal,
+): Promise<void> {
+  if (d.workBusy?.()) return // another engine job owns the slot; the next scheduler tick retries
+  const poolBlock = poolSlotBlockReason(d, engine)
+  if (poolBlock) throw new Error(poolBlock)
+  const newer = await newestMatchingRelease(installed, signal, d.fetchImpl)
+  if (!newer || newer.tag === installed.tag) return
+
+  d.provision.start('github-release', d.trigger ?? 'auto_update')
+  try {
+    if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
+    const result = await installReleaseAsset(
+      root,
+      { repo: installed.repo, tag: newer.tag, asset: newer.asset },
+      {
+        probeFn: d.probeFn,
+        fetchImpl: d.fetchImpl,
+        signal,
+        slug: installedSlug(engine, installed, root),
+        blockSwap: () => releaseSwapBlockReason(d, engine),
+        onProgress: (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
+      },
+    )
+    if (!result.found) throw new Error('the newer release has no server binary for this build')
+    recordReleaseUpdate(d.registry, d.updates, engine.id, result)
+    d.provision.done()
+  } catch (e) {
+    if ((e as Error)?.name === 'AbortError') d.provision.done()
+    else d.provision.fail(`Could not update ${engine.name} — your existing build is unchanged: ${msg(e)}`)
+    throw e
+  }
+}
+
+/** The dir the engine actually lives in. After a classification-fallback update the recorded
+ *  assetKey no longer names the original dir, so the slug is read from the path, not rebuilt. */
+function installedSlug(engine: Engine, installed: ReleaseProvenance, root: string): string {
+  const dir = sourceBuildDirOf(engine.binPath, root)
+  return dir ? basename(dir) : releaseInstallDirName(installed)
+}
+
+/** Apply a finished release install to an existing engine: keep its id, record the new
+ *  provenance, and drop its cached update status so the UI stops offering the update. */
+export function recordReleaseUpdate(
+  registry: Registry,
+  updates: UpdateChecker | undefined,
+  engineId: string,
+  result: Extract<ReleaseInstallResult, { found: true }>,
+): void {
+  registry.refresh(engineId, { version: result.version, capabilities: result.capabilities }, result.binPath)
+  registry.setRelease(engineId, result.provenance)
+  updates?.forget(engineId)
+}
+
+/** Why replacing the engine's build folder must wait, or null. Refuses rather than stopping a model the user is
+ *  using (ADR-453): the primary slot and every extra pool slot count. Re-run at the swap, since the engine may
+ *  have been started during the download. */
+export function releaseSwapBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
+  return primarySlotBlockReason(d, engine) ?? poolSlotBlockReason(d, engine)
+}
+
+function primarySlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
+  const state = d.manager.status().state
+  const running = state === 'running' || state === 'starting' || state === 'stopping'
+  if (!running || d.registry.active()?.id !== engine.id) return null
+  return stopBeforeReplacingMessage(engine)
+}
+
+function poolSlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
+  return d.modelRouter?.poolSlotsOnEngine(engine.id) ? stopBeforeReplacingMessage(engine) : null
+}
+
+function stopBeforeReplacingMessage(engine: Pick<Engine, 'name'>): string {
+  return `Stop "${engine.name}" before replacing its files — its build folder is being replaced.`
 }
 
 /** Official llama.cpp: download the real latest tag into its own dir, probe, then swap

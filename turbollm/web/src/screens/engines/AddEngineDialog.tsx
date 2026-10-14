@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { AlertTriangle, ArrowLeft, CheckCircle2, FileArchive, FolderOpen, Loader2, Plus, SearchX } from 'lucide-react'
-import { ApiError, deleteEngineZipInstall, track } from '../../lib/api'
-import { useEngineMutations, useEngineScan, useEngineZipUpload } from '../../lib/queries'
+import { AlertTriangle, ArrowLeft, CheckCircle2, FileArchive, FolderOpen, Loader2, PackageOpen, Plus, SearchX } from 'lucide-react'
+import { ApiError, deleteEngineZipInstall, discardReleaseInstall, track } from '../../lib/api'
+import { useEngineCatalog, useEngineMutations, useEngineScan, useEngineZipUpload } from '../../lib/queries'
 import type { EngineScanResult } from '../../lib/types'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -17,8 +17,14 @@ import {
 import { InlineError } from '../../components/common'
 import { toast } from '../../components/ui/sonner'
 import { FsBrowser } from './FsBrowser'
+import { ReleaseSourcePanel } from './ReleaseSourcePanel'
 
-type Step = 'choose' | 'scanning' | 'confirm' | 'notfound'
+type Step = 'choose' | 'scanning' | 'confirm' | 'notfound' | 'release'
+
+interface PendingInstall {
+  binPath: string
+  discard: (binPath: string) => Promise<unknown>
+}
 
 /** Guided "Add your own engine" flow (engine overhaul, Phase 3). A 2-step journey:
  *  (1) pick a FOLDER (or the binary directly), upload a .zip, or browse — we scan for the
@@ -40,11 +46,15 @@ export function AddEngineDialog({
   open: controlledOpen,
   onOpenChange,
   defaultSourceRepo,
+  defaultReleaseRepo,
   trigger,
 }: {
   open?: boolean
   onOpenChange?: (open: boolean) => void
   defaultSourceRepo?: string
+  /** Opens straight into the GitHub-release source with this `owner/repo` (a card's
+   *  "Install prebuilt"). */
+  defaultReleaseRepo?: string
   trigger?: ReactNode
 } = {}) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false)
@@ -54,7 +64,7 @@ export function AddEngineDialog({
     if (!isControlled) setUncontrolledOpen(o)
     onOpenChange?.(o)
   }
-  const [step, setStep] = useState<Step>('choose')
+  const [step, setStep] = useState<Step>(open && defaultReleaseRepo ? 'release' : 'choose')
   const [browse, setBrowse] = useState<null | 'folder' | 'file'>(null)
   // Which source the in-flight scan came from — only varies the scanning/not-found copy;
   // the confirm step is identical (both paths end in an absolute binPath to register).
@@ -74,10 +84,14 @@ export function AddEngineDialog({
   // dismissed (an upload can outlive the dialog by minutes) is dropped instead of dragging
   // the reset dialog back to the confirm step on a stale upload.
   const flow = useRef(0)
-  // The binPath of a zip upload that extracted but hasn't been registered yet — GC'd
+  // An install (zip upload or release) that extracted but hasn't been registered yet — GC'd
   // (best-effort, server-side marker-verified) when the dialog is dismissed or a new
-  // upload starts, so an abandoned build doesn't sit on disk forever.
-  const pendingZipBin = useRef<string | null>(null)
+  // upload starts, so an abandoned build doesn't sit on disk forever. `discard` is the
+  // removal route of the flow that produced it.
+  const pendingInstall = useRef<PendingInstall | null>(null)
+  // A release install records its own provenance, so the confirm step must not offer a
+  // sourceRepo (that would flip the engine into rebuild mode).
+  const [fromRelease, setFromRelease] = useState(false)
   // Optional source-repo URL (ADR-088): the GitHub repo this build came from. Lets
   // TurboLLM detect "newer source available → rebuild" by comparing commits.
   const [sourceRepo, setSourceRepo] = useState('')
@@ -96,9 +110,14 @@ export function AddEngineDialog({
     if (open && defaultSourceRepo) setSourceRepo(defaultSourceRepo)
   }, [open, defaultSourceRepo])
 
+  // A card's "Install prebuilt" opens (or re-opens) the dialog straight on the release source.
+  useEffect(() => {
+    if (open && defaultReleaseRepo) setStep('release')
+  }, [open, defaultReleaseRepo])
+
   const reset = () => {
     flow.current++ // in-flight scan/upload results are now stale
-    gcPendingZip()
+    discardPendingInstall()
     setStep('choose')
     setBrowse(null)
     setScanSource('path')
@@ -109,21 +128,23 @@ export function AddEngineDialog({
     setUpdated(null)
     setZipWarning(null)
     setSourceRepo('')
+    setFromRelease(false)
     setNameError(null)
     setError(null)
   }
 
   // Best-effort removal of an extracted-but-never-registered zip install; the daemon also
   // GCs abandoned ones on the next upload, this just does it promptly.
-  const gcPendingZip = () => {
-    const bin = pendingZipBin.current
-    pendingZipBin.current = null
-    if (bin) void deleteEngineZipInstall(bin).catch(() => {})
+  const discardPendingInstall = () => {
+    const pending = pendingInstall.current
+    pendingInstall.current = null
+    if (pending) void pending.discard(pending.binPath).catch(() => {})
   }
 
   // Route a scan result (folder scan or zip upload — same response shape) to confirm /
   // notfound. The zip name rides along only for the in-progress copy.
   const applyScanResult = (res: EngineScanResult) => {
+    setFromRelease(false) // a folder/zip result is never a release install; applyReleaseResult re-sets it
     if (!res.found) {
       setStep('notfound')
       return
@@ -135,8 +156,15 @@ export function AddEngineDialog({
     setZipWarning(res.warning?.message ?? null)
     // An updated engine is already registered server-side — nothing left to clean up if
     // the dialog is dismissed from here.
-    pendingZipBin.current = res.updated ? null : res.binPath
+    pendingInstall.current = res.updated ? null : { binPath: res.binPath, discard: deleteEngineZipInstall }
     setStep('confirm')
+  }
+
+  // A finished release install joins the shared confirm step like any other result.
+  const applyReleaseResult = (res: EngineScanResult) => {
+    applyScanResult(res)
+    if (pendingInstall.current) pendingInstall.current.discard = discardReleaseInstall
+    setFromRelease(true)
   }
 
   // Run the read-only scan on the chosen path, then route to confirm / notfound.
@@ -146,6 +174,7 @@ export function AddEngineDialog({
     setNameError(null)
     setScanSource('path')
     setStep('scanning')
+    discardPendingInstall() // a fresh scan supersedes any unconfirmed install (zip or release)
     const token = ++flow.current
     scan.mutate(path, {
       onSuccess: (res) => { if (flow.current === token) applyScanResult(res) },
@@ -168,7 +197,7 @@ export function AddEngineDialog({
     setZipName(file.name)
     setStep('scanning')
     const token = ++flow.current
-    gcPendingZip() // a fresh upload supersedes any unconfirmed one
+    discardPendingInstall() // a fresh upload supersedes any unconfirmed one
     zipUpload.mutate(file, {
       onSuccess: (res) => { if (flow.current === token) applyScanResult(res) },
       onError: (e) => {
@@ -182,13 +211,14 @@ export function AddEngineDialog({
   const submit = () => {
     setNameError(null)
     setError(null)
-    const repo = sourceRepo.trim()
+    // A release install records its own provenance; a sourceRepo would flip it into rebuild mode.
+    const repo = fromRelease ? '' : sourceRepo.trim()
     add.mutate(
       { name: name.trim(), binPath, ...(repo ? { sourceRepo: repo } : {}) },
       {
         onSuccess: (eng) => {
           // Registered — the install is now owned by the engine; reset must not GC it.
-          pendingZipBin.current = null
+          pendingInstall.current = null
           // probe_no_version (spec 03 §2): saved but version unknown — non-blocking warning.
           if (eng.warning === 'no_version') {
             toast.warning('Engine added, but its version could not be detected.')
@@ -248,6 +278,13 @@ export function AddEngineDialog({
               >
                 <FileArchive size={16} /> Upload a .zip…
               </Button>
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => { track('engines', 'open_release_source'); setStep('release') }}
+              >
+                <PackageOpen size={16} /> From a GitHub release…
+              </Button>
               <input
                 ref={zipInput}
                 type="file"
@@ -279,6 +316,23 @@ export function AddEngineDialog({
                 Cancel
               </Button>
             </DialogFooter>
+          </>
+        )}
+
+        {step === 'release' && (
+          <>
+            <DialogHeader>
+              <DialogTitle>Install from a GitHub release</DialogTitle>
+              <DialogDescription>
+                Pick a prebuilt engine from a repository&apos;s newest release. We choose the build
+                that fits this machine.
+              </DialogDescription>
+            </DialogHeader>
+            <ReleaseStep
+              initialRepo={defaultReleaseRepo}
+              onReady={applyReleaseResult}
+              onCancel={() => setStep('choose')}
+            />
           </>
         )}
 
@@ -377,6 +431,7 @@ export function AddEngineDialog({
                 </div>
               </div>
 
+              {!fromRelease && (
               <label className="flex flex-col gap-1.5">
                 <span className="text-[13px] font-medium text-ink">Source repo URL (optional)</span>
                 <Input
@@ -388,6 +443,7 @@ export function AddEngineDialog({
                   Paste the GitHub repo you built this from — lets TurboLLM tell you when a newer build is available.
                 </span>
               </label>
+              )}
 
               {zipWarning && (
                 <div className="flex items-start gap-2.5 rounded-lg border p-3 text-[13px]" style={{ borderColor: 'var(--warn)', background: 'color-mix(in srgb, var(--warn) 10%, transparent)' }}>
@@ -459,4 +515,22 @@ export function AddEngineDialog({
       </DialogContent>
     </Dialog>
   )
+}
+
+/** The release source with its "known fork" chips: the catalog engines that publish prebuilt
+ *  releases for this OS. A separate component so the catalog is only read on this step. */
+function ReleaseStep({
+  initialRepo,
+  onReady,
+  onCancel,
+}: {
+  initialRepo?: string
+  onReady: (res: EngineScanResult) => void
+  onCancel: () => void
+}) {
+  const catalog = useEngineCatalog(false).data
+  const knownRepos = (catalog?.engines ?? [])
+    .filter((e) => e.releaseInstall && e.supportedHere && e.repo)
+    .map((e) => ({ name: e.name, repo: e.repo as string }))
+  return <ReleaseSourcePanel initialRepo={initialRepo} knownRepos={knownRepos} onReady={onReady} onCancel={onCancel} />
 }

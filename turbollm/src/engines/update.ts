@@ -17,6 +17,11 @@
 import type { Engine } from '../config/config'
 import { isNativeLitertLm } from './litert-lm'
 import { type BackendId, GithubRateLimitError, latestBuildTagRelease, latestCommitSha, latestReleaseTag } from './download'
+import { newestMatchingRelease } from './release-assets'
+import type { ReleaseProvenance } from './release-install'
+
+export { parseGitRepo } from './github-repo'
+import { parseGitRepo } from './github-repo'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
@@ -84,11 +89,13 @@ export function comparePipVersions(installed: string, latest: string): CompareRe
 /** Which comparison applies to an engine source. llama.cpp + forks compare build
  *  tags; pip engines compare PEP440-ish versions; source-built engines (ADR-088)
  *  compare the built commit hash against a GitHub repo's latest commit. */
-export type UpdateSource = 'github-release' | 'pip' | 'source'
+export type UpdateSource = 'github-release' | 'pip' | 'source' | 'release-asset'
 
 /** Compare installed vs latest for a given source. The single decision used both by
  *  checkUpdate and the tests. */
 export function compareVersions(source: UpdateSource, installed: string, latest: string): CompareResult {
+  // newestMatchingRelease only returns releases at least as new as the install, so a different tag is newer.
+  if (source === 'release-asset') return installed === latest ? 'equal' : 'newer'
   return source === 'pip' ? comparePipVersions(installed, latest) : compareBuildTags(installed, latest)
 }
 
@@ -160,6 +167,8 @@ export interface ResolvedSource {
   /** Source mode only (ADR-088): the branch to compare commits against. Empty → the
    *  repo's default branch (resolved via the GitHub `HEAD` commits ref). */
   branch?: string
+  /** release-asset mode: the provenance the newer build is matched against. */
+  release?: ReleaseProvenance
 }
 
 const OFFICIAL_LLAMA_REPO = 'ggml-org/llama.cpp'
@@ -188,21 +197,6 @@ export function tagFromVersionString(version: string): string {
   return m ? m[0] : ''
 }
 
-/** Extract `owner/repo` from a GitHub repo URL (ADR-088), tolerating a `.git` suffix,
- *  a trailing slash, and `http(s)://`/`www.`/bare `github.com/` forms. Returns null when
- *  the URL isn't a recognizable GitHub repo URL. PURE — the source-mode update resolver
- *  uses it to turn a user-pasted URL into the `owner/repo` the GitHub API expects. */
-export function parseGitRepo(url: string): string | null {
-  const m = /(?:https?:\/\/)?(?:www\.)?github\.com\/([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[#?].*)?$/i.exec(
-    url.trim(),
-  )
-  if (!m) return null
-  const owner = m[1]
-  const repo = m[2]
-  if (!owner || !repo) return null
-  return `${owner}/${repo}`
-}
-
 /** Pull the build's git short hash out of a probed version string (ADR-088): the first
  *  hex token of 7–40 chars (e.g. "1 (0a635dc)" → "0a635dc", "version: x (abcdef1234)" →
  *  "abcdef1234"). Returns '' when none is present. PURE. NOTE: a digits-only build tag
@@ -227,6 +221,10 @@ const KOBOLDCPP_REPO = 'LostRuins/koboldcpp'
 const LLAMAFILE_REPO = 'Mozilla-Ocho/llamafile'
 
 export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
+  if (engine.release) {
+    const { repo, tag } = engine.release
+    return { source: 'release-asset', ref: repo, installed: tag, release: engine.release }
+  }
   // Source-built provenance (ADR-088) takes precedence: when the engine carries a
   // parseable GitHub source repo, compare its built commit hash against the repo's
   // latest commit (notify-only "rebuild" — we can't recompile).
@@ -301,6 +299,9 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
     if (!res.ok) throw new Error(`pypi query failed: HTTP ${res.status}`)
     const data = (await res.json()) as { info?: { version?: string } }
     return data.info?.version ?? ''
+  }
+  if (src.source === 'release-asset') {
+    return (await newestMatchingRelease(src.release!, signal))?.tag ?? src.installed
   }
   // Source-built engines (ADR-088): the repo's latest commit sha on the branch.
   if (src.source === 'source') return latestCommitSha(src.ref, src.branch ?? '', signal)
@@ -412,6 +413,12 @@ export class UpdateChecker {
       }
     }
     return this.all()
+  }
+
+  /** Drop one engine's cached status (e.g. right after it was updated) so the next read
+   *  never reports the update it just applied as still available. */
+  forget(engineId: string): void {
+    this.cache.delete(engineId)
   }
 
   /** Drop cache entries for engines that no longer exist (removed/disabled). */

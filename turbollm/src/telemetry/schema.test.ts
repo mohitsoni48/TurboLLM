@@ -962,3 +962,11 @@ test('validateEvent: engine_installed accepts every provisioning trigger, includ
     assert.equal(r.ok, true, `${trigger} must validate — ${r.ok === false ? r.reason : ''}`)
   }
 })
+
+test('validateEvent: ui_action accepts the release-source actions', () => {
+  const actions = ['open_release_source', 'install_release_asset', 'update_release_engine', 'install_prebuilt_from_card']
+  for (const action of actions) {
+    const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'engines', action } }))
+    assert.equal(r.ok, true, r.ok === false ? `engines/${action}: ${r.reason}` : '')
+  }
+})

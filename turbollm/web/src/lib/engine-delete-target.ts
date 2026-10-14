@@ -5,6 +5,10 @@ export interface DeleteTarget {
   name: string
   registryId: string
   binPath?: string
+  /** Set when the target is a DISABLED release install (no registered engine): the remembered
+   *  source to forget first, and the install dir to remove afterwards (issue #276). */
+  sourceKey?: string
+  releaseBinPath?: string
 }
 
 /** The dialog must describe the REGISTERED engine that will be purged, never the catalog card that

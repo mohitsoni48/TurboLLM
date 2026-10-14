@@ -107,6 +107,9 @@ export interface CatalogEngine {
    *  the custom-engine card list AND the (non-existent, for this entry) manage-actions UI the
    *  generic match implies. Set true to opt this entry out of that generic match. */
   excludeFromSourceMatch?: boolean
+  /** Offers "Install prebuilt" from the `repo`'s GitHub releases (ADR-453). Set only on entries whose
+   *  release assets were verified runnable (ADR-239). */
+  releaseInstall?: boolean
 }
 
 // Maps each llama.cpp BackendId to the hardware it needs + how fast it is.
@@ -647,17 +650,18 @@ const ALL: CatalogEngine[] = [
     name: 'Prism (llama.cpp fork)',
     kind: 'llama-server',
     description:
-      'A llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Ships llama-server but has no install endpoint here yet — build it, then add your own engine.',
+      'A llama.cpp fork tuned for 1-2 bit ternary/Bonsai models. Install a prebuilt from its releases, or build it from source.',
     provision: 'github-release',
     homepage: 'https://github.com/PrismML-Eng/llama.cpp',
     repo: 'PrismML-Eng/llama.cpp',
-    // The fork itself publishes extensive per-commit prebuilt archives (CUDA/Vulkan/ROCm ×
-    // win/linux/macOS, same naming convention as official llama.cpp) — but TurboLLM doesn't
-    // resolve them automatically (deliberately deferred, see ADR-238). Build-from-source only.
+    // The fork publishes per-commit prebuilt archives (CUDA/Vulkan/ROCm × win/linux/macOS, same
+    // naming convention as official llama.cpp). The release flow (ADR-453) now installs them;
+    // the variants below stay build-from-source.
+    releaseInstall: true,
     platforms: ['win32', 'darwin', 'linux'],
     support: 'experimental',
     installEndpoint: '',
-    note: 'Upstream publishes prebuilt binaries, but TurboLLM builds from source here (guided walkthrough) rather than resolving a specific release asset. Proven on a ternary/Bonsai-class model at 200K context (Q2_0 + q8 KV).',
+    note: 'Proven on a ternary/Bonsai-class model at 200K context (Q2_0 + q8 KV).',
     defaultBranch: 'prism',
     variants: [
       {
@@ -676,17 +680,18 @@ const ALL: CatalogEngine[] = [
     name: 'BeeLlama.cpp',
     kind: 'llama-server',
     description:
-      'A llama.cpp fork adding variance-normalized KV-cache quantization (KVarN), a KV precision tail, and adaptive DFlash speculative decoding. Ships llama-server but has no install endpoint here yet — build it, then add your own engine.',
+      'A llama.cpp fork adding variance-normalized KV-cache quantization (KVarN), a KV precision tail, and adaptive DFlash speculative decoding. Install a prebuilt from its releases, or build it from source.',
     provision: 'github-release',
     homepage: 'https://github.com/Anbeeld/beellama.cpp',
     repo: 'Anbeeld/beellama.cpp',
-    // Also publishes a full prebuilt matrix (CUDA/ROCm/Vulkan/SYCL/CPU) in one normal
-    // release — but solo-maintainer, fast-churn fork (v0.4.0 dropped its own TurboQuant/TCQ
-    // support), so one-click install is deliberately deferred; build-from-source only.
+    // Also publishes a full prebuilt matrix (CUDA/ROCm/Vulkan/SYCL/CPU) in one normal release. The
+    // release flow (ADR-453) now installs it, pinned to an exact stable tag to absorb the fork's
+    // fast churn; the variants below stay build-from-source.
+    releaseInstall: true,
     platforms: ['win32', 'darwin', 'linux'],
     support: 'experimental',
     installEndpoint: '',
-    note: "Upstream publishes prebuilt binaries, but TurboLLM builds from source here. The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) show up directly in the KV cache type dropdown, but aren't in the auto-tune sweep yet — pick one manually.",
+    note: "The KVarN cache types (kvarn2...kvarn8, set via --cache-type-k/-v) show up directly in the KV cache type dropdown, but aren't in the auto-tune sweep yet — pick one manually.",
     defaultBranch: 'main',
     variants: [
       {

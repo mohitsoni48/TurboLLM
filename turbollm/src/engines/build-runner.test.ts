@@ -850,3 +850,73 @@ test('copyCudaRuntimeLibs: .so symlinks become relative links to the bundled lib
   assert.ok(lstatSync(join(dest, 'libcudart.so.12')).isFile())
   assert.equal(readFileSync(join(dest, 'libcudart.so.12'), 'utf8'), 'cudart')
 })
+
+import { findReleaseEngineForCatalogEntry, pickReleaseSource } from './build-runner'
+
+const PRISM_RELEASE_ENTRY = {
+  repo: 'PrismML-Eng/llama.cpp',
+  homepage: 'https://github.com/PrismML-Eng/llama.cpp',
+  releaseInstall: true,
+  defaultBranch: 'prism',
+}
+const releaseEngine = (id: string, repo: string, addedAt?: string) => ({ id, addedAt, release: { repo } })
+
+test('findReleaseEngineForCatalogEntry: claims a release engine of its repo on the default line only', () => {
+  const engines = [releaseEngine('r1', 'PrismML-Eng/llama.cpp')]
+  for (const branch of [undefined, '', 'prism']) {
+    assert.equal(findReleaseEngineForCatalogEntry(engines, PRISM_RELEASE_ENTRY, branch)?.id, 'r1')
+  }
+  assert.equal(findReleaseEngineForCatalogEntry(engines, PRISM_RELEASE_ENTRY, 'master'), undefined)
+})
+
+test('findReleaseEngineForCatalogEntry: excludeFromSourceMatch, no releaseInstall, and pinned entries never claim', () => {
+  const engines = [releaseEngine('r1', 'ggml-org/llama.cpp')]
+  const llamaCpp = { repo: 'ggml-org/llama.cpp', homepage: 'https://github.com/ggml-org/llama.cpp', releaseInstall: true, excludeFromSourceMatch: true }
+  assert.equal(findReleaseEngineForCatalogEntry(engines, llamaCpp), undefined)
+  assert.equal(findReleaseEngineForCatalogEntry(engines, { ...llamaCpp, excludeFromSourceMatch: undefined, releaseInstall: undefined }), undefined)
+  assert.equal(findReleaseEngineForCatalogEntry(engines, { ...llamaCpp, excludeFromSourceMatch: undefined, sourceCommit: 'abc' }), undefined)
+  assert.equal(findReleaseEngineForCatalogEntry(engines, { ...llamaCpp, excludeFromSourceMatch: undefined, patchUrl: 'https://x/p.patch' }), undefined)
+})
+
+test('findReleaseEngineForCatalogEntry: a different repo does not match; URL and case forms of the same repo do', () => {
+  assert.equal(findReleaseEngineForCatalogEntry([releaseEngine('r1', 'Anbeeld/beellama.cpp')], PRISM_RELEASE_ENTRY), undefined)
+  assert.equal(findReleaseEngineForCatalogEntry([releaseEngine('r1', 'https://github.com/PrismML-Eng/llama.cpp')], PRISM_RELEASE_ENTRY)?.id, 'r1')
+  assert.equal(findReleaseEngineForCatalogEntry([releaseEngine('r1', 'prismml-eng/llama.cpp')], PRISM_RELEASE_ENTRY)?.id, 'r1')
+})
+
+test('findReleaseEngineForCatalogEntry: an engine with sourceRepo but no release is never returned', () => {
+  const sourceBuild = { id: 's1', sourceRepo: 'PrismML-Eng/llama.cpp' } as unknown as { id: string; release?: { repo: string } }
+  assert.equal(findReleaseEngineForCatalogEntry([sourceBuild], PRISM_RELEASE_ENTRY), undefined)
+})
+
+test('findReleaseEngineForCatalogEntry: the active engine wins, then the newest addedAt, whatever the registry order', () => {
+  const older = releaseEngine('a', 'PrismML-Eng/llama.cpp', '2026-01-01T00:00:00Z')
+  const newer = releaseEngine('b', 'PrismML-Eng/llama.cpp', '2026-02-01T00:00:00Z')
+  assert.equal(findReleaseEngineForCatalogEntry([older, newer], PRISM_RELEASE_ENTRY)?.id, 'b')
+  assert.equal(findReleaseEngineForCatalogEntry([newer, older], PRISM_RELEASE_ENTRY)?.id, 'b')
+  assert.equal(findReleaseEngineForCatalogEntry([older, newer], PRISM_RELEASE_ENTRY, undefined, 'a')?.id, 'a')
+  assert.equal(findReleaseEngineForCatalogEntry([newer, older], PRISM_RELEASE_ENTRY, undefined, 'a')?.id, 'a')
+})
+
+test('findReleaseEngineForCatalogEntry: an addedAt tie goes to the smallest id', () => {
+  const x = releaseEngine('x', 'PrismML-Eng/llama.cpp', '2026-01-01T00:00:00Z')
+  const y = releaseEngine('y', 'PrismML-Eng/llama.cpp', '2026-01-01T00:00:00Z')
+  assert.equal(findReleaseEngineForCatalogEntry([y, x], PRISM_RELEASE_ENTRY)?.id, 'x')
+  assert.equal(findReleaseEngineForCatalogEntry([x, y], PRISM_RELEASE_ENTRY)?.id, 'x')
+})
+
+test('pickReleaseSource: newest addedAt wins, a tie goes to the smaller binPath, either input order', () => {
+  const a = { binPath: join('b', 'x'), addedAt: '2026-01-01T00:00:00Z' }
+  const b = { binPath: join('a', 'x'), addedAt: '2026-01-01T00:00:00Z' }
+  assert.equal(pickReleaseSource([a, b])?.binPath, b.binPath)
+  assert.equal(pickReleaseSource([b, a])?.binPath, b.binPath)
+  const newest = { binPath: join('z', 'x'), addedAt: '2026-03-01T00:00:00Z' }
+  assert.equal(pickReleaseSource([a, b, newest])?.binPath, newest.binPath)
+})
+
+test('pickReleaseSource: a missing or unparseable addedAt sorts oldest; an empty list is undefined', () => {
+  const dated = { binPath: 'z', addedAt: '2020-01-01T00:00:00Z' }
+  assert.equal(pickReleaseSource([{ binPath: 'a' }, dated])?.binPath, 'z')
+  assert.equal(pickReleaseSource([{ binPath: 'a', addedAt: 'garbage' }, dated])?.binPath, 'z')
+  assert.equal(pickReleaseSource([]), undefined)
+})

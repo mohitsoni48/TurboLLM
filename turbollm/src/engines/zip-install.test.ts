@@ -16,8 +16,10 @@ import {
   isPlatformLib,
   missingCudartWarning,
   packagedAndroidApp,
+  pickInstallFiles,
   pickZipFiles,
   readZipEntries,
+  RELEASE_INSTALL_MARKER,
   SwapBlockedError,
   ZIP_BUILD_MARKER,
   zipBuildDirName,
@@ -144,6 +146,15 @@ test('pickZipFiles: binary at any depth; same-dir files + platform libs anywhere
     [...sel.files.keys()].sort(),
     ['libcudart.so.12', 'libggml.so', 'llama-server', 'readme.txt'],
   )
+})
+
+test('pickZipFiles: install-provenance markers in the binary dir are never selected', () => {
+  const entries = readZipEntries(
+    buildZipArchive([member('llama-server'), member('.turbollm-release-install'), member('.turbollm-zip-install'), member('libggml.so')]),
+  )
+  const sel = pickZipFiles(entries, 'linux', 'llama-server')
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
 })
 
 test('pickZipFiles: multiple binaries → shallowest wins, deterministically', () => {
@@ -561,4 +572,107 @@ test('packagedAndroidApp: W^X guard is exactly the packaged app, not Termux', ()
   assert.equal(packagedAndroidApp('android', { TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/data/app/…/lib' }), true)
   assert.equal(packagedAndroidApp('android', {}), false) // Termux — exec from home works
   assert.equal(packagedAndroidApp('linux', { TURBOLLM_ANDROID_NATIVE_LIB_DIR: '/x' }), false)
+})
+
+// pickInstallFiles (ArchiveMember)
+
+const asMember = (name: string) => ({ name, isDir: false, symlink: false })
+
+test('pickInstallFiles: a nested tarball layout selects the binary and its dylibs', () => {
+  const sel = pickInstallFiles(
+    [
+      asMember('beellama-v0.4.7/llama-server'),
+      asMember('beellama-v0.4.7/libllama.0.dylib'),
+      asMember('beellama-v0.4.7/libllama.0.4.7.dylib'),
+    ],
+    'darwin',
+    'llama-server',
+  )
+  assert.ok(sel)
+  assert.equal(sel.binary.name, 'beellama-v0.4.7/llama-server')
+  assert.deepEqual([...sel.files.keys()].sort(), ['libllama.0.4.7.dylib', 'libllama.0.dylib', 'llama-server'])
+})
+
+test('pickInstallFiles: a flat Windows launcher keeps its impl DLL beside it', () => {
+  const sel = pickInstallFiles(
+    ['llama-server.exe', 'llama-server-impl.dll', 'ggml-cpu-zen4.dll', 'llama-cli.exe'].map(asMember),
+    'win32',
+    'llama-server.exe',
+  )
+  assert.ok(sel)
+  assert.ok(sel.files.has('llama-server-impl.dll'))
+})
+
+test('pickInstallFiles: a rival backend directory contributes no libraries', () => {
+  const sel = pickInstallFiles(
+    [
+      'cuda/bin/llama-server.exe',
+      'cuda/bin/ggml-cuda.dll',
+      'vulkan/bin/llama-server.exe',
+      'vulkan/bin/ggml-vulkan.dll',
+    ].map(asMember),
+    'win32',
+    'llama-server.exe',
+  )
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['ggml-cuda.dll', 'llama-server.exe'])
+})
+
+// gcAbandonedZipInstalls: release markers and stale staging dirs
+
+function buildDirs(names: Array<{ name: string; marker?: string; ageMs?: number }>): { enginesRoot: string; buildRoot: string } {
+  const enginesRoot = join(tmpDir('tllm-gc-'), 'engines')
+  const buildRoot = join(enginesRoot, 'build')
+  for (const { name, marker, ageMs = 0 } of names) {
+    const dir = join(buildRoot, name)
+    mkdirSync(dir, { recursive: true })
+    if (marker) writeFileSync(join(dir, marker), 'x')
+    const t = new Date(Date.now() - ageMs)
+    utimesSync(dir, t, t)
+  }
+  return { enginesRoot, buildRoot }
+}
+
+const THIRTY_HOURS = 30 * 60 * 60 * 1000
+
+test('gcAbandonedZipInstalls: an unclaimed release-marked dir is removed', () => {
+  const { enginesRoot, buildRoot } = buildDirs([{ name: 'rel', marker: RELEASE_INSTALL_MARKER }])
+  gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0 })
+  assert.deepEqual(readdirSync(buildRoot), [])
+})
+
+test('gcAbandonedZipInstalls: a claimed release-marked dir survives', () => {
+  const { enginesRoot, buildRoot } = buildDirs([{ name: 'rel', marker: RELEASE_INSTALL_MARKER }])
+  gcAbandonedZipInstalls(enginesRoot, [join(buildRoot, 'rel', 'llama-server')], { maxAgeMs: 0 })
+  assert.deepEqual(readdirSync(buildRoot), ['rel'])
+})
+
+test('gcAbandonedZipInstalls: an unclaimed dir with no marker (a 1-click git build) survives', () => {
+  const { enginesRoot, buildRoot } = buildDirs([{ name: 'gitbuild' }])
+  gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0 })
+  assert.deepEqual(readdirSync(buildRoot), ['gitbuild'])
+})
+
+test('gcAbandonedZipInstalls: a stale .stage dir is swept by age alone; a fresh one survives', () => {
+  const { enginesRoot, buildRoot } = buildDirs([
+    { name: '.foo-1234abcd.stage', ageMs: THIRTY_HOURS },
+    { name: '.bar-1234abcd.stage', ageMs: 60 * 1000 },
+  ])
+  gcAbandonedZipInstalls(enginesRoot, [])
+  assert.deepEqual(readdirSync(buildRoot), ['.bar-1234abcd.stage'])
+})
+
+test('gcAbandonedZipInstalls: a zip-marked dir is still removed by default', () => {
+  const { enginesRoot, buildRoot } = buildDirs([{ name: 'zipped', marker: ZIP_BUILD_MARKER }])
+  gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0 })
+  assert.deepEqual(readdirSync(buildRoot), [])
+})
+
+test('gcAbandonedZipInstalls: opts.markers restricts which marker counts', () => {
+  const { enginesRoot, buildRoot } = buildDirs([
+    { name: 'rel', marker: RELEASE_INSTALL_MARKER },
+    { name: 'zipped', marker: ZIP_BUILD_MARKER },
+  ])
+  gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0, markers: [ZIP_BUILD_MARKER] })
+  assert.deepEqual(readdirSync(buildRoot), ['rel'])
 })

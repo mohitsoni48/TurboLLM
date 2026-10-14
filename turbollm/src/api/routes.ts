@@ -28,17 +28,37 @@ import {
   deleteAllBackendBuilds,
   installedBackendBuild,
   githubHeaders,
+  GithubRateLimitError,
   isRateLimited,
   provisionBackend,
   provisionTurboquant,
   recommendBackendId,
 } from '../engines/download'
 import {
+  assetKey,
+  classifyReleaseAsset,
+  parseRepoInput,
+  rankReleaseAssets,
+  releaseByTag,
+  ReleaseNotFoundError,
+  resolveInstallableRelease,
+} from '../engines/release-assets'
+import {
+  currentHostProfile,
+  installReleaseAsset,
+  readReleaseMarker,
+  RELEASE_INSTALL_MARKER,
+  releaseInstallDirName,
+  ReleaseInstallJob,
+} from '../engines/release-install'
+import {
   computeUpdateStatus,
   normalizeUpdatePolicy,
+  resolveUpdateSource,
   tagFromManagedBinPath,
   latestTagForInstalled,
 } from '../engines/update'
+import { applyEngineUpdate, recordReleaseUpdate, releaseSwapBlockReason } from '../engines/update-apply'
 import { checkApplyBlockers, currentRunState, detectInstall, spawnUpdateHelper } from '../app-update-apply'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { appUpdateClicked } from '../telemetry/events/app-update'
@@ -54,7 +74,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
 import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroidApp, SwapBlockedError, ZipError, ZIP_BUILD_MARKER, zipBuildDirName } from '../engines/zip-install'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
@@ -89,7 +109,7 @@ import { registerActivityRoutes } from './active-work'
 import { stopEngineUsers } from '../engines/serving'
 import { stopRemoteAccess } from '../remote/routes'
 
-type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 413 | 500 | 501 | 503
+type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 413 | 429 | 500 | 501 | 502 | 503
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
@@ -108,6 +128,10 @@ async function body<T>(c: Context): Promise<T> {
  *  Request-scoped: set synchronously before the body is parsed, cleared in finally, so it
  *  is always false between requests. */
 let zipUploadInFlight = false
+
+/** Whether a manual engine update has been accepted but may not have called provision.start
+ *  yet (the update looks up GitHub first). Reserves the engine-work slot across that gap. */
+let engineUpdateInFlight = false
 
 export function registerApi(app: Hono, d: Deps): void {
   // ---- meta ----
@@ -257,6 +281,10 @@ export function registerApi(app: Hono, d: Deps): void {
   // ---- engine backends (ADR-025): hardware-aware default + override ----
   // Tracks the in-flight backend download so it can be cancelled.
   let provisionAbort: AbortController | null = null
+  // The single slot behind the GitHub-release install flow (ADR-453), and its own abort handle
+  // (provisionAbort is shared with every other engine download).
+  const releaseJob = new ReleaseInstallJob()
+  let releaseAbort: AbortController | null = null
   // Tracks the in-flight 1-click build so it can be cancelled (ADR-100).
   let buildAbort: AbortController | null = null
 
@@ -599,6 +627,16 @@ export function registerApi(app: Hono, d: Deps): void {
     const regEngines = d.registry.list().engines
     const enginesRoot = join(d.store.dir(), 'engines')
     const branchParam = (c.req.query('branch') ?? '').trim() || undefined
+    // A Disabled release install: a remembered custom source whose on-disk marker names this card's repo.
+    const findDisabledReleaseInstall = (entry: ReleaseCatalogEntry, branch?: string) => {
+      const live = new Set(regEngines.map((x) => x.binPath))
+      const found = d.registry.customSources().flatMap((s) => {
+        const release = readReleaseMarker(sourceBuildDirOf(s.binPath, enginesRoot))
+        return release && !live.has(s.binPath) && existsSync(s.binPath) ? [{ ...s, release }] : []
+      })
+      const claimed = found.filter((s) => findReleaseEngineForCatalogEntry([{ id: s.binPath, release: s.release }], entry, branch))
+      return pickReleaseSource(claimed)
+    }
     const items = catalogForPlatform().map((e) => {
       let installed: boolean | undefined
       let enabled: boolean | undefined
@@ -646,13 +684,19 @@ export function registerApi(app: Hono, d: Deps): void {
       // from BOTH the custom-engine card list AND this card's own UI (which never reads
       // `sourceEngineId`) — founder-reported: "now it is only visible for selection in dropdown".
       const srcEng = e.excludeFromSourceMatch ? undefined : findEngineForCatalogEntry(regEngines, e, branchParam)
-      const onDisk = !srcEng && !e.excludeFromSourceMatch ? findCatalogBuildOnDisk(enginesRoot, e, branchParam) : undefined
+      // A release-installed engine of this card's repo (ADR-453) is the card's fallback: a source
+      // build is the exact identity for the branch and wins; a registered release engine beats a
+      // build that is merely on disk. It never sets sourceBuilt/sourceEngineId (ADR-088: Rebuild
+      // must stay unreachable for it).
+      const relEng = !srcEng ? findReleaseEngineForCatalogEntry(regEngines, e, branchParam, d.registry.active()?.id) : undefined
+      const onDisk = !srcEng && !relEng && !e.excludeFromSourceMatch ? findCatalogBuildOnDisk(enginesRoot, e, branchParam) : undefined
+      const disabledRelease = !srcEng && !relEng && !onDisk ? findDisabledReleaseInstall(e, branchParam) : undefined
       const sourceBinPath: string | undefined = srcEng?.binPath ?? onDisk?.binPath
       const sourceBuilt = !!srcEng || !!sourceBinPath
-      if (srcEng) {
+      if (srcEng || relEng) {
         installed = true
         enabled = true
-      } else if (sourceBinPath) {
+      } else if (sourceBinPath || disabledRelease) {
         installed = true
         enabled = enabled ?? false
       }
@@ -664,6 +708,9 @@ export function registerApi(app: Hono, d: Deps): void {
         sourceEngineId: srcEng?.id,
         sourceBranch: srcEng?.sourceBranch ?? onDisk?.branch ?? '',
         sourceBinPath: sourceBinPath ?? '',
+        releaseEngineId: relEng?.id,
+        release: relEng?.release ?? disabledRelease?.release,
+        releaseBinPath: relEng?.binPath ?? disabledRelease?.binPath,
       }
     })
     return c.json({ engines: items })
@@ -1248,19 +1295,23 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
     const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
+    // Provenance comes from the marker this flow wrote on disk, never from the request body.
+    const release = readReleaseMarker(sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines')))
+    // A release install is identified by its marker, never by a source repo (ADR-088, ADR-388):
+    // a source repo would hide it from the disabled-engine list and offer a pointless Rebuild.
+    const source: Pick<typeof b, 'sourceRepo' | 'sourceBranch' | 'sourceCommit' | 'sourcePatchUrl'> = release
+      ? {}
+      : { sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl }
     try {
-      const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, {
-        sourceRepo: b.sourceRepo,
-        sourceBranch: b.sourceBranch,
-        sourceCommit: b.sourceCommit,
-        sourcePatchUrl: b.sourcePatchUrl,
-      })
+      const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, { release: release ?? undefined, ...source })
       // Same custom-source tracking as the 1-click build completion above — a manually
       // pointed-at binary (with or without a sourceRepo) is just as much a "custom engine"
       // as a self-service build, and deserves the same Disable-survives-as-Enable treatment.
-      if (!isCatalogRepo(b.sourceRepo)) {
-        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl })
+      if (!isCatalogRepo(source.sourceRepo)) {
+        d.registry.recordCustomSource({ name: engine.name, binPath: engine.binPath, kind: engine.kind, ...source })
       }
+      const confirmed = releaseJob.get().result
+      if (confirmed?.found && confirmed.binPath === b.binPath) releaseJob.clear()
       // `probe_no_version` is non-blocking (spec 03 §2): the engine is saved, but
       // the response carries a warning flag so the dialog can prompt the user.
       return c.json({ ...engine, warning: warning ?? null }, 201)
@@ -1430,6 +1481,134 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  // Install an engine from a GitHub release (ADR-453): list a repo's builds, start one
+  // install, watch it, discard an unconfirmed result. Registered before PUT/DELETE
+  // /engines/:id, which would otherwise swallow "release".
+  const releaseGuard: MiddlewareHandler = async (c, next) => {
+    const method = c.req.method
+    const site = c.req.header('sec-fetch-site')
+    if (method !== 'GET' && site && site !== 'same-origin' && site !== 'none')
+      return err(c, 403, 'forbidden', 'Engine installs must come from the TurboLLM app itself.')
+    // The flow ends in probe() (executes the downloaded binary) and the listing spends the
+    // user's GitHub token quota — same isLocalOrAuthenticated rule as /engines/scan (ADR-394).
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Installing an engine from a release requires a valid API key from a non-host device.')
+    if (packagedAndroidApp())
+      return err(c, 501, 'android_packaged_app', 'The packaged Android app cannot run downloaded binaries. Install from Termux or a desktop install instead.')
+    // Only a new job needs the engine-work slot: DELETE must stay reachable while the job holds it.
+    const busy = method === 'POST' ? engineWorkBusy(d) : null
+    if (busy) return err(c, 409, 'engine_already_running', busy)
+    await next()
+  }
+
+  app.get('/api/v1/engines/release/assets', releaseGuard, async (c) => {
+    const repo = parseRepoInput(c.req.query('repo') ?? '')
+    if (!repo) return err(c, 400, 'invalid_repo', 'Enter a GitHub repository as owner/name or a github.com link.')
+    const host = await currentHostProfile()
+    try {
+      const release = await resolveInstallableRelease(repo, host)
+      const assets = rankReleaseAssets(release.assets.map(classifyReleaseAsset), host)
+      return c.json({ repo, tag: release.tag, publishedAt: release.publishedAt, prerelease: release.prerelease, fellBack: release.fellBack, assets })
+    } catch (e) {
+      if (e instanceof ReleaseNotFoundError && e.code === 'no_compatible_asset') {
+        const assets = rankReleaseAssets(e.assets.map(classifyReleaseAsset), host)
+        return c.json({ error: { code: e.code, message: e.message }, assets }, 404)
+      }
+      return githubLookupErr(c, e)
+    }
+  })
+
+  app.post('/api/v1/engines/release/install', releaseGuard, async (c) => {
+    const b = await body<{ repo?: string; tag?: string; asset?: string }>(c)
+    const repo = parseRepoInput(b.repo ?? '')
+    if (!repo) return err(c, 400, 'invalid_repo', 'Enter a GitHub repository as owner/name or a github.com link.')
+    if (!b.tag || !b.asset) return err(c, 400, 'invalid_asset', 'tag and asset are required.')
+    const plan = { repo, tag: b.tag, asset: b.asset }
+    const enginesRoot = join(d.store.dir(), 'engines')
+    gcAbandonedZipInstalls(enginesRoot, [...d.registry.list().engines, ...d.registry.customSources()].map((e) => e.binPath))
+
+    // The server re-resolves the asset from GitHub's JSON: no client URL is ever trusted.
+    let main: ReturnType<typeof classifyReleaseAsset> | undefined
+    try {
+      main = (await releaseByTag(repo, plan.tag)).assets.map(classifyReleaseAsset).find((a) => a.name === plan.asset)
+    } catch (e) {
+      return githubLookupErr(c, e)
+    }
+    if (!main || main.companion !== null || main.archive === null)
+      return err(c, 400, 'invalid_asset', `${plan.asset} is not an installable engine archive in ${repo} ${plan.tag}.`)
+
+    const slug = releaseInstallDirName({ repo, assetKey: assetKey(main.name, plan.tag) })
+    const targetDir = join(enginesRoot, 'build', slug)
+    const claims = (p: string) => isEngineInBuildDir(p, targetDir)
+    const occupant = d.registry.list().engines.find((e) => claims(e.binPath)) ?? d.registry.customSources().find((s) => claims(s.binPath))
+    if (occupant && !existsSync(join(targetDir, RELEASE_INSTALL_MARKER)))
+      return err(c, 409, 'build_dir_taken', `The build folder "${slug}" already belongs to "${occupant.name}" — delete that engine first.`)
+    const replaceBlocked = (): string | null => {
+      for (const occupantEngine of d.registry.list().engines.filter((e) => claims(e.binPath))) {
+        const reason = releaseSwapBlockReason(d, occupantEngine)
+        if (reason) return reason
+      }
+      return null
+    }
+    const early = replaceBlocked()
+    if (early) return err(c, 409, 'engine_in_use', early)
+    // The awaits above let another engine job start; re-check before taking the slot.
+    const busyNow = engineWorkBusy(d)
+    if (busyNow) return err(c, 409, 'engine_already_running', busyNow)
+
+    const ac = new AbortController()
+    releaseAbort = ac
+    provisionAbort = ac
+    d.provision.start('github-release', 'user_install')
+    releaseJob.start(plan, async () => {
+      try {
+        const result = await installReleaseAsset(enginesRoot, plan, {
+          blockSwap: replaceBlocked,
+          onProgress: (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
+          signal: ac.signal,
+        })
+        if (!result.found) throw noServerBinaryError()
+        const prior = d.registry.list().engines.find((e) => claims(e.binPath))
+        d.provision.done()
+        if (!prior) return { kind: 'ready', result }
+        recordReleaseUpdate(d.registry, d.updates, prior.id, result)
+        return { kind: 'updated', updated: { id: prior.id, name: prior.name }, result }
+      } catch (e) {
+        if ((e as Error)?.name === 'AbortError') d.provision.done()
+        else d.provision.fail(`Could not install ${plan.asset}: ${e instanceof Error ? e.message : e}`)
+        throw e
+      } finally {
+        if (releaseAbort === ac) releaseAbort = null
+        if (provisionAbort === ac) provisionAbort = null
+      }
+    })
+    return c.json({ accepted: true }, 202)
+  })
+
+  app.get('/api/v1/engines/release/install', releaseGuard, (c) => c.json(releaseJob.get()))
+
+  // Discard an UNCONFIRMED release install (the dialog was dismissed after the build landed):
+  // only a dir this flow marked and nothing claims is removed. Without binPath it cancels the
+  // running install instead.
+  app.delete('/api/v1/engines/release/install', releaseGuard, (c) => {
+    const binPath = c.req.query('binPath')
+    if (!binPath) {
+      releaseAbort?.abort()
+      return c.json({ ok: true })
+    }
+    const dir = sourceBuildDirOf(binPath, join(d.store.dir(), 'engines'))
+    if (!dir || !existsSync(join(dir, RELEASE_INSTALL_MARKER)))
+      return err(c, 404, 'engine_not_found', 'No unconfirmed release install at that path.')
+    const claims = (p: string) => isEngineInBuildDir(p, dir)
+    if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
+      return err(c, 409, 'build_dir_taken', 'That install is in use by an engine — delete the engine instead.')
+    rmSync(dir, { recursive: true, force: true })
+    // This also purges a dir the user chose to forget, so only the job's own ready result resets the view.
+    const result = releaseJob.get().result
+    if (result?.found && result.binPath === binPath) releaseJob.clear()
+    return c.json({ ok: true })
+  })
+
   app.put('/api/v1/engines/:id', async (c) => {
     const b = await body<{ name?: string; sourceRepo?: string; sourceBranch?: string }>(c)
     const id = c.req.param('id')
@@ -1528,6 +1707,43 @@ export function registerApi(app: Hono, d: Deps): void {
     } catch (e) {
       return regErr(c, e)
     }
+  })
+
+  // Manual one-click update of any engine that has an automatic update source (ADR-085).
+  // The scheduler stops a loaded engine itself; the manual path refuses, like zip and delete do.
+  app.post('/api/v1/engines/:id/update', async (c) => {
+    // Downloads and probes (executes) a binary, so only the TurboLLM app itself may trigger it.
+    const site = c.req.header('sec-fetch-site')
+    if (site && site !== 'same-origin' && site !== 'none')
+      return err(c, 403, 'forbidden', 'Engine updates must come from the TurboLLM app itself.')
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Updating an engine requires a valid API key from a non-host device.')
+    const busy = engineWorkBusy(d)
+    if (busy) return err(c, 409, 'engine_already_running', busy)
+    const id = c.req.param('id')
+    const running = d.registry.active()
+    if (engineBusy(d) && running?.id === id)
+      return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
+    const engine = d.registry.get(id)
+    if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
+    if (!resolveUpdateSource(engine)) return err(c, 409, 'no_update_source', 'This engine has no automatic update source.')
+    const ac = new AbortController()
+    provisionAbort = ac
+    engineUpdateInFlight = true
+    const startsBefore = d.provision.startCount()
+    void applyEngineUpdate(
+      { store: d.store, registry: d.registry, manager: d.manager, provision: d.provision, updates: d.updates, modelRouter: d.modelRouter, trigger: 'user_update' },
+      engine,
+      ac.signal,
+    )
+      .catch((e) => {
+        if (d.provision.startCount() === startsBefore) reportPreStartUpdateFailure(d, engine, e)
+      })
+      .finally(() => {
+        engineUpdateInFlight = false
+        if (provisionAbort === ac) provisionAbort = null
+      })
+    return c.json({ accepted: true }, 202)
   })
 
   app.post('/api/v1/engines/:id/reprobe', async (c) => {
@@ -3359,8 +3575,9 @@ function localCountFor(d: Deps, repo: string): number {
  * `<dataDir>/engines` and ends by mutating the registry + flipping the active engine. They
  * must not run at once (ADR-100). Returns a user-facing message when either is in flight,
  * else null. */
-function engineWorkBusy(d: Deps): string | null {
+export function engineWorkBusy(d: Deps): string | null {
   if (zipUploadInFlight) return 'An engine zip upload is in progress — wait for it to finish.'
+  if (engineUpdateInFlight) return 'An engine update is in progress — wait for it to finish.'
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
   if (d.build.isActive()) return 'A build is in progress — wait for it to finish.'
   return null
@@ -3384,6 +3601,27 @@ function benchError(c: Context, e: unknown) {
     return err(c, status, e.code, e.message)
   }
   return err(c, 500, 'internal', (e as Error).message)
+}
+
+function githubLookupErr(c: Context, e: unknown) {
+  if (e instanceof GithubRateLimitError)
+    return err(c, 429, 'github_rate_limited', 'GitHub’s API rate limit is exhausted. Add a GitHub token in Settings to raise it.')
+  if (e instanceof ReleaseNotFoundError) return err(c, 404, e.code, e.message)
+  return err(c, 502, 'github_unreachable', `Could not reach GitHub: ${(e as Error)?.message ?? e}`)
+}
+
+/** A failure before provision.start has not been reported anywhere (applyEngineUpdate
+ *  reports everything after it itself), so surface it here or the UI's "Updating…" would
+ *  end with no outcome. Opens a user_update run first so the outcome carries the right
+ *  trigger and backend. A cancelled update is not a failure. */
+function reportPreStartUpdateFailure(d: Deps, engine: Engine, e: unknown): void {
+  if ((e as Error)?.name === 'AbortError') return
+  d.provision.start(engine.release ? 'github-release' : engine.id, 'user_update')
+  d.provision.fail(`Could not update the engine: ${e instanceof Error ? e.message : e}`)
+}
+
+function noServerBinaryError(): Error {
+  return Object.assign(new Error('The release archive does not contain a llama-server binary.'), { code: 'no_server_binary' })
 }
 
 function engineBusy(d: Deps): boolean {

@@ -340,7 +340,7 @@ test('provisionTurboquant replace: a failed update leaves the working install; a
     const u = url instanceof Request ? url.url : String(url)
     if (!u.includes('api.github.com')) return download()
     const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
-    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: 'https://dl.test/tq' }] }]))
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
   }) as typeof fetch
 
   await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }))

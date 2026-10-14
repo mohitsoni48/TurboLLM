@@ -7,6 +7,7 @@ import {
   useQueryClient,
   type UseQueryResult,
 } from '@tanstack/react-query'
+import { useEffect, useRef } from 'react'
 import { modelsRefetchInterval } from './models-poll'
 import {
   activateEngine,
@@ -92,6 +93,10 @@ import {
   renameEngine,
   scanEngineFolder,
   uploadEngineZip,
+  listReleaseAssets,
+  startReleaseInstall,
+  getReleaseInstall,
+  updateEngine,
   setPrimaryModelDir,
   reprobeEngine,
   rescanModels,
@@ -151,6 +156,7 @@ import type {
   ModelDirs,
   ModelPreset,
   ModelsList,
+  ReleaseInstallPlan,
   Status,
   TokenUsageStats,
   TokenUsageRange,
@@ -165,6 +171,8 @@ export const queryKeys = {
   engineCatalog: ['engine-catalog'] as const,
   engineRecommendation: ['engine-recommendation'] as const,
   engineUpdates: ['engine-updates'] as const,
+  releaseAssets: (repo: string) => ['release-assets', repo] as const,
+  releaseInstall: ['release-install'] as const,
   appUpdate: ['app-update'] as const,
   models: ['models'] as const,
   modelDirs: ['modeldirs'] as const,
@@ -453,14 +461,23 @@ export function useBackendInstall() {
 
 /** Honest per-engine update status (ADR-085, Phase 6). Offline-first: serves the cache,
  *  never a fabricated "latest". Polls while a provision/update is active so a freshly
- *  applied update flips hasUpdate off. */
+ *  applied update flips hasUpdate off. Also refetches once when the run settles, so a
+ *  finish between two polls still clears the badge. */
 export function useEngineUpdates(provisioning = false): UseQueryResult<EngineUpdates> {
-  return useQuery({
+  const query = useQuery({
     queryKey: queryKeys.engineUpdates,
     queryFn: () => getEngineUpdates(false),
     refetchInterval: provisioning ? 3000 : false,
     retry: false,
   })
+  const refetch = query.refetch
+  const wasProvisioning = useRef(provisioning)
+  useEffect(() => {
+    const settled = wasProvisioning.current && !provisioning
+    wasProvisioning.current = provisioning
+    if (settled) void refetch()
+  }, [provisioning, refetch])
+  return query
 }
 
 /** App self-update check (F-006, ADR-031). Offline-first: serves the daemon's 24h cache,
@@ -594,6 +611,55 @@ export function useEngineZipUpload() {
         void qc.invalidateQueries({ queryKey: queryKeys.engines })
         void qc.invalidateQueries({ queryKey: queryKeys.status })
       }
+    },
+  })
+}
+
+/** Ranked builds of a repo's newest installable GitHub release. ON DEMAND ONLY (ADR-396):
+ *  callers pass `enabled` true only after an explicit user action (submit, or opening from a
+ *  card), never on render, and it never retries (a 429 or 404 is the answer, not a glitch). */
+export function useReleaseAssets(repo: string, enabled: boolean) {
+  return useQuery({
+    queryKey: queryKeys.releaseAssets(repo),
+    queryFn: () => listReleaseAssets(repo),
+    enabled: enabled && repo.length > 0,
+    retry: false,
+    staleTime: 60_000,
+  })
+}
+
+/** The release-install job: `start` kicks it off, `job` polls its view once a second while it
+ *  runs. `job` is only fetched while `polling` is true so no other step spends requests. Starting
+ *  resets the cached view so a previous attempt's `error`/`ready` is never mistaken for this one. */
+export function useReleaseInstall(polling: boolean) {
+  const qc = useQueryClient()
+  const start = useMutation({
+    mutationFn: (plan: ReleaseInstallPlan) => startReleaseInstall(plan),
+    onSuccess: () => {
+      void qc.resetQueries({ queryKey: queryKeys.releaseInstall })
+    },
+  })
+  const job = useQuery({
+    queryKey: queryKeys.releaseInstall,
+    queryFn: getReleaseInstall,
+    enabled: polling,
+    retry: false,
+    gcTime: 0,
+    refetchInterval: (q) => (q.state.data?.state === 'running' || q.state.data === undefined ? 1000 : false),
+  })
+  return { start, job }
+}
+
+/** Apply the newest update to one engine now. Progress and outcome ride the provision channel
+ *  (/status), so status is refreshed along with the engine list and the update badges. */
+export function useEngineUpdate() {
+  const qc = useQueryClient()
+  return useMutation({
+    mutationFn: (id: string) => updateEngine(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: queryKeys.engines })
+      void qc.invalidateQueries({ queryKey: queryKeys.status })
+      void qc.invalidateQueries({ queryKey: queryKeys.engineUpdates })
     },
   })
 }

@@ -26,6 +26,11 @@ describe('EngineProvisionBanner — Laya', () => {
     expect(screen.getByText('Downloading Laya engine…')).toBeTruthy()
   })
 
+  it('labels a release install "engine from a GitHub release"', () => {
+    render(<EngineProvisionBanner status={statusWith('github-release')} />)
+    expect(screen.getByText('Downloading engine from a GitHub release…')).toBeTruthy()
+  })
+
   it('labels a Laya extract phase the same way', () => {
     render(<EngineProvisionBanner status={statusWith('laya', 'extracting')} />)
     expect(screen.getByText('Installing Laya engine…')).toBeTruthy()

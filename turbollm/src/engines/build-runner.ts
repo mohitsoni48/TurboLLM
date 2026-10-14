@@ -18,7 +18,7 @@ import { execFile, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
-import { basename, delimiter, dirname, join } from 'node:path'
+import { basename, delimiter, dirname, join, normalize } from 'node:path'
 import { promisify } from 'node:util'
 import {
   buildEnv,
@@ -221,6 +221,50 @@ export function findEngineForCatalogEntry(
 
   const wanted = effectiveBranch(requestedBranch, entry.defaultBranch)
   return pickByBranch(sameBuild, wanted, wanted, entry.defaultBranch)
+}
+
+/** The catalog-entry fields that decide whether a card may own a release-installed engine. */
+export interface ReleaseCatalogEntry extends CatalogEntryIdentity {
+  repo?: string
+  releaseInstall?: boolean
+  excludeFromSourceMatch?: boolean
+}
+
+/** PURE: the registered engine a catalog card owns because it was installed from a GitHub release of
+ *  the card's repo (ADR-453). A release build belongs to the repo's DEFAULT line, so a card asked about
+ *  another branch never claims it; pinned, opted-out and non-`releaseInstall` entries never do either.
+ *  The choice never depends on registry order (ADR-431): the active engine, then the newest `addedAt`,
+ *  then the smallest id. Callers consult findEngineForCatalogEntry first — a source build is the exact
+ *  identity for the branch, a release engine is the card's fallback. */
+export function findReleaseEngineForCatalogEntry<T extends { id: string; addedAt?: string; release?: { repo: string } }>(
+  engines: T[],
+  entry: ReleaseCatalogEntry,
+  requestedBranch?: string,
+  activeId?: string,
+): T | undefined {
+  if (!mayClaimReleaseEngine(entry, requestedBranch)) return undefined
+  const repo = entry.repo ?? entry.homepage
+  const candidates = engines.filter((e) => e.release && sameRepo(e.release.repo, repo))
+  return candidates.find((e) => e.id === activeId) ?? [...candidates].sort(newestThenSmallest((e) => e.id))[0]
+}
+
+function mayClaimReleaseEngine(entry: ReleaseCatalogEntry, requestedBranch?: string): boolean {
+  if (!entry.releaseInstall || entry.excludeFromSourceMatch || isPinnedEntry(entry)) return false
+  return effectiveBranch(requestedBranch, entry.defaultBranch) === effectiveBranch(undefined, entry.defaultBranch)
+}
+
+/** PURE: which disabled release install (a remembered custom source) a card shows. Same rule as the
+ *  registered pick, but a source has no id, so ties go to the smallest normalised binPath. */
+export function pickReleaseSource<T extends { binPath: string; addedAt?: string }>(sources: T[]): T | undefined {
+  return [...sources].sort(newestThenSmallest((s) => normalize(s.binPath)))[0]
+}
+
+function newestThenSmallest<T extends { addedAt?: string }>(key: (item: T) => string) {
+  const addedMs = (item: T) => Date.parse(item.addedAt ?? '') || -Infinity
+  return (a: T, b: T): number => {
+    if (addedMs(a) !== addedMs(b)) return addedMs(b) > addedMs(a) ? 1 : -1
+    return key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0
+  }
 }
 
 /** PURE: the branch values whose build directory a catalog card should look in for a build that is

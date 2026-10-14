@@ -5,6 +5,8 @@
 //    them the active engine, and the new build (a new engine id) must keep the `auto` policy.
 //  - A new build that fails its probe must not stay on disk, where the newest-tag-wins lookups
 //    would pick it over the working build.
+// Also: the dispatch for engines without an automatic update source. The release branch is
+// covered in update-apply.release.test.ts.
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -111,4 +113,10 @@ test('KoboldCpp update: a failed download keeps the binary; an update never acti
   assert.equal(readFileSync(bin, 'utf8'), 'kobold v2')
   assert.equal(d.registry.get('kobold')?.version, 'v2.0.0')
   assert.equal(d.registry.active()?.id, 'cuda')
+})
+
+test('a custom llama-server with no release provenance has no automatic update source', async () => {
+  const deps = { store: { dir: () => 'unused' } } as unknown as UpdateApplyDeps
+  const custom = { id: 'c1', name: 'Custom', kind: 'llama-server', binPath: '/opt/custom/llama-server' } as Engine
+  await assert.rejects(applyEngineUpdate(deps, custom), /no automatic update source/)
 })

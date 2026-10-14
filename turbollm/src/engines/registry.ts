@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
 import { probe, type ProbeResult } from './probe'
+import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
 
@@ -71,7 +72,7 @@ export class Registry {
   async add(
     name: string,
     binPath: string,
-    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string },
+    source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string; release?: ReleaseProvenance },
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
     this.assertNameFree(finalName, source)
@@ -80,6 +81,7 @@ export class Registry {
     const sourceBranch = source?.sourceBranch?.trim() || undefined
     const sourceCommit = source?.sourceCommit?.trim() || undefined
     const sourcePatchUrl = source?.sourcePatchUrl?.trim() || undefined
+    const release = source?.release
     const eng: Engine = {
       id: randomUUID(),
       name: finalName,
@@ -92,6 +94,7 @@ export class Registry {
       ...(sourceBranch ? { sourceBranch } : {}),
       ...(sourceCommit ? { sourceCommit } : {}),
       ...(sourcePatchUrl ? { sourcePatchUrl } : {}),
+      ...(release ? { release } : {}),
     }
     this.store.update((c) => {
       // Re-check under the store lock — the name could have been taken between the
@@ -360,6 +363,19 @@ export class Registry {
         if (v) e.sourceBranch = v
         else delete e.sourceBranch
       }
+      out = structuredClone(e)
+    })
+    return out!
+  }
+
+  /** Replace the release-asset provenance of an existing engine (ADR-453), e.g. after an update
+   *  installed a newer tag of the same build variant. */
+  setRelease(id: string, release: ReleaseProvenance): Engine {
+    let out: Engine | undefined
+    this.store.update((c) => {
+      const e = findEngine(c.engines, id)
+      if (!e) throw new NotFoundError()
+      e.release = release
       out = structuredClone(e)
     })
     return out!

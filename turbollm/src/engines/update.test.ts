@@ -20,6 +20,8 @@ import {
 } from './update'
 import { GithubRateLimitError } from './download'
 import { latestTagForInstalled } from './update'
+import { parseGitRepo as parseGitRepoFromLeaf } from './github-repo'
+import type { ReleaseProvenance } from './release-install'
 import type { Engine } from '../config/config'
 import { engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
@@ -351,6 +353,17 @@ test('UpdateChecker: an offline re-check keeps the prior successful status', asy
   assert.equal(checker.get(e.id)?.latest, 'b9761')
 })
 
+test('UpdateChecker: forget drops the cached status of one engine only', async () => {
+  const a = eng({ id: 'a', binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const b = eng({ id: 'b', binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server' })
+  const checker = new UpdateChecker(async () => 'b9761')
+  await checker.check(a)
+  await checker.check(b)
+  checker.forget('a')
+  assert.equal(checker.get('a'), undefined)
+  assert.equal(checker.get('b')?.latest, 'b9761')
+})
+
 test('UpdateChecker: offline with no prior success caches the offline state', async () => {
   const e = eng({ kind: 'mlx', version: 'mlx-lm 0.31.2' })
   const checker = new UpdateChecker(async () => {
@@ -540,4 +553,63 @@ test('latestTagForInstalled: falls back to releases/latest when no build tag exi
     return new Response(JSON.stringify({ tag_name: 'v1.0.0' }), { status: 200 })
   }) as unknown as typeof fetch
   assert.equal(await latestTagForInstalled('some/repo', 'b1'), 'v1.0.0')
+})
+
+// ─── release-installed engines (GitHub #276) ─────────────────────────────────
+
+const RELEASE_ENGINE_PROVENANCE: ReleaseProvenance = {
+  repo: 'PrismML-Eng/llama.cpp',
+  tag: 'prism-b10770-6684606',
+  asset: 'llama-prism-b10770-6684606-bin-win-cuda-13.3-x64.zip',
+  assetKey: 'llama-bin-win-cuda-13.3-x64.zip',
+  publishedAt: '2026-09-01T00:00:00Z',
+  prerelease: false,
+  companions: [],
+}
+
+function releaseEngine(partial: Partial<Engine> = {}): Engine {
+  return eng({ release: RELEASE_ENGINE_PROVENANCE, ...partial })
+}
+
+test('resolveUpdateSource: release provenance wins over a source repo', () => {
+  const e = releaseEngine({ sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp' })
+  assert.deepEqual(resolveUpdateSource(e), {
+    source: 'release-asset',
+    ref: 'PrismML-Eng/llama.cpp',
+    installed: 'prism-b10770-6684606',
+    release: RELEASE_ENGINE_PROVENANCE,
+  })
+})
+
+test('compareVersions release-asset: a different tag is newer whatever its format', () => {
+  assert.equal(compareVersions('release-asset', 'prism-b10770-6684606', 'prism-b10800-aaaa'), 'newer')
+})
+
+test('compareVersions release-asset: the same tag is equal', () => {
+  assert.equal(compareVersions('release-asset', 'v0.4.7', 'v0.4.7'), 'equal')
+})
+
+test('computeUpdateStatus: a release engine with a newer tag reports a one-click update, not a rebuild', async () => {
+  const st = await computeUpdateStatus(releaseEngine(), async () => 'prism-b10800-aaaa')
+  assert.equal(st.hasUpdate, true)
+  assert.equal(st.comparable, true)
+  assert.equal('rebuild' in st, false)
+})
+
+test('computeUpdateStatus: a release engine whose fetch hit the rate limit reports rate_limited', async () => {
+  const st = await computeUpdateStatus(releaseEngine(), async () => {
+    throw new GithubRateLimitError('PrismML-Eng/llama.cpp')
+  })
+  assert.equal(st.error, 'rate_limited')
+})
+
+test('computeUpdateStatus: a release engine with no newer match stays up to date', async () => {
+  const st = await computeUpdateStatus(releaseEngine(), async (src) => src.installed)
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, true)
+})
+
+test('parseGitRepo stays reachable from update.ts as the shared github-repo helper', () => {
+  assert.equal(parseGitRepo('https://github.com/o/r.git'), 'o/r')
+  assert.equal(parseGitRepo, parseGitRepoFromLeaf)
 })

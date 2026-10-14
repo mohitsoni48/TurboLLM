@@ -4,13 +4,14 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { execFile, execFileSync } from 'node:child_process'
-import { join, relative } from 'node:path'
+import { basename, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import type { GpuVendor } from '../sysinfo/sysinfo'
+import { extractZipAll } from './zip-reader'
 
 const execFileP = promisify(execFile)
 
@@ -319,9 +320,10 @@ export async function downloadFile(
   dest: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  fetchImpl: typeof fetch = fetch,
 ): Promise<void> {
-  const res = await fetch(url, { redirect: 'follow', signal })
-  if (!res.ok || !res.body) throw new Error(`download failed: HTTP ${res.status}`)
+  const res = await fetchImpl(url, { redirect: 'follow', signal })
+  if (!res.ok || !res.body) throw Object.assign(new Error(`download failed: HTTP ${res.status}`), { code: 'download_failed' })
   const total = Number(res.headers.get('content-length') ?? 0)
   let got = 0
   let lastPct = -1
@@ -385,19 +387,88 @@ export function recordReleaseTag(binPath: string, tag: string): void {
   }
 }
 
+export type ArchiveExtractor =
+  | { kind: 'powershell' }
+  | { kind: 'tar'; cmd: string; args: string[] }
+  | { kind: 'node-zip' }
+  | { kind: 'unsupported'; reason: string }
+
+/** PURE: which tool extracts this archive on this platform. The archive's format decides, not
+ *  just the OS: GNU tar (Linux, Termux) cannot read zip, and PowerShell's Expand-Archive cannot
+ *  read tar.gz. Existing callers keep their tool: a Windows .zip is Expand-Archive, a POSIX
+ *  .tar.gz/.tgz is `tar -xzf`. */
+export function archiveExtractor(
+  archive: string,
+  destDir: string,
+  platform: NodeJS.Platform,
+  env: { SystemRoot?: string },
+  exists: (path: string) => boolean,
+): ArchiveExtractor {
+  const name = archive.toLowerCase()
+  if (name.endsWith('.zip')) return zipExtractor(archive, destDir, platform)
+  if (name.endsWith('.tar.gz') || name.endsWith('.tgz')) return tarGzExtractor(archive, destDir, platform, env, exists)
+  return { kind: 'unsupported', reason: `Unsupported archive format: ${basename(archive)}` }
+}
+
+function zipExtractor(archive: string, destDir: string, platform: NodeJS.Platform): ArchiveExtractor {
+  if (platform === 'win32') return { kind: 'powershell' }
+  if (platform === 'darwin') return { kind: 'tar', cmd: 'tar', args: ['-xf', archive, '-C', destDir] }
+  return { kind: 'node-zip' }
+}
+
+function tarGzExtractor(
+  archive: string,
+  destDir: string,
+  platform: NodeJS.Platform,
+  env: { SystemRoot?: string },
+  exists: (path: string) => boolean,
+): ArchiveExtractor {
+  const args = ['-xzf', archive, '-C', destDir]
+  if (platform !== 'win32') return { kind: 'tar', cmd: 'tar', args }
+  const systemTar = win32.join(env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe')
+  if (!exists(systemTar)) return { kind: 'unsupported', reason: 'This Windows install has no tar.exe, so a .tar.gz cannot be extracted.' }
+  return { kind: 'tar', cmd: systemTar, args }
+}
+
 /**
- * Extract an archive into destDir. Windows assets are .zip → PowerShell
- * Expand-Archive (always present, doesn't depend on which `tar` is on PATH).
- * macOS/Linux assets are .tar.gz → `tar -xzf`.
+ * Extract an archive into destDir with the tool `archiveExtractor` picks. A tool failure
+ * (corrupt archive, a symlink Windows cannot create, a truncated file) becomes an Error with
+ * code 'extract_failed'; a ZipError from the pure-Node zip path passes through unchanged.
  */
 export async function extractArchive(archive: string, destDir: string): Promise<void> {
-  if (process.platform === 'win32') {
-    const ps = `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`
-    await execFileP('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { maxBuffer: 16 * 1024 * 1024 })
-  } else {
-    await execFileP('tar', ['-xzf', archive, '-C', destDir])
+  const extractor = archiveExtractor(archive, destDir, process.platform, process.env, existsSync)
+  switch (extractor.kind) {
+    case 'node-zip':
+      extractZipAll(readFileSync(archive), destDir)
+      break
+    case 'unsupported':
+      throw extractionError('unsupported_archive', extractor.reason)
+    case 'powershell':
+      await runExtractionTool(archive, 'powershell', powershellExpandArgs(archive, destDir), { maxBuffer: 16 * 1024 * 1024 })
+      break
+    case 'tar':
+      await runExtractionTool(archive, extractor.cmd, extractor.args, {})
+      break
   }
   stripMacOsQuarantine(destDir)
+}
+
+function powershellExpandArgs(archive: string, destDir: string): string[] {
+  const ps = `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`
+  return ['-NoProfile', '-NonInteractive', '-Command', ps]
+}
+
+async function runExtractionTool(archive: string, cmd: string, args: string[], options: { maxBuffer?: number }): Promise<void> {
+  try {
+    await execFileP(cmd, args, options)
+  } catch (e) {
+    const original = e instanceof Error ? e.message : String(e)
+    throw extractionError('extract_failed', `Could not extract ${basename(archive)}: ${original.slice(0, 500)}`, e)
+  }
+}
+
+function extractionError(code: 'extract_failed' | 'unsupported_archive', message: string, cause?: unknown): Error {
+  return Object.assign(new Error(message, { cause }), { code })
 }
 
 // Written into a backend build dir once EVERY asset (e.g. CUDA's binary + its cudart
@@ -536,6 +607,7 @@ export function deleteAllBackendBuilds(enginesRoot: string, id: BackendId): numb
 export interface ReleaseAsset {
   name: string
   browser_download_url: string
+  size?: number
 }
 
 /** Score how well an asset name matches this OS/arch; -1 = no match (wrong OS/arch
@@ -587,6 +659,9 @@ export function pickReleaseAsset(
 /** One GitHub release as we consume it (latest-release resolution). */
 export interface GithubRelease {
   tag_name?: string
+  published_at?: string
+  prerelease?: boolean
+  draft?: boolean
   assets?: ReleaseAsset[]
 }
 

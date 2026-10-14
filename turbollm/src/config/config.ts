@@ -8,6 +8,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
+import type { ReleaseProvenance } from '../engines/release-install'
 
 export const SCHEMA_VERSION = 4
 
@@ -77,6 +78,10 @@ export interface Engine {
    *  (build-runner's `patchUrl`), e.g. an architecture not yet in mainline llama.cpp. Provenance
    *  only — records that this binary isn't a plain build of `sourceRepo`@`sourceCommit`. */
   sourcePatchUrl?: string
+  /** Set only when this engine was installed from a GitHub release asset (ADR-453). The update
+   *  check reads it instead of the disk. Deliberately NOT sourceRepo/sourceBranch (ADR-088): those
+   *  mean "built from source" and would send a prebuilt down the rebuild path. */
+  release?: ReleaseProvenance
 }
 
 /** A custom (non-catalog) engine's identity, remembered independent of its live

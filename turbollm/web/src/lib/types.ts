@@ -349,6 +349,19 @@ export type Engine = {
   sourceBranch?: string
   /** Set only when this build was pinned to an exact historical commit. */
   sourceCommit?: string
+  /** Set when this engine was installed from a GitHub release asset (issue #276). */
+  release?: ReleaseProvenance
+}
+
+/** Where a release-installed engine came from; mirrors backend ReleaseProvenance. */
+export type ReleaseProvenance = {
+  repo: string
+  tag: string
+  asset: string
+  assetKey: string
+  publishedAt: string
+  prerelease: boolean
+  companions: string[]
 }
 
 /** A custom (non-catalog) engine remembered even while disabled (see backend
@@ -394,6 +407,57 @@ export type EngineScanResult =
       warning?: { code: string; message: string }
       updated?: { id: string; name: string }
     }
+
+/** One build from a GitHub release, ranked for this machine (GET /engines/release/assets). */
+export type RankedReleaseAsset = {
+  name: string
+  size: number | null
+  os: string | null
+  arch: 'x64' | 'arm64' | null
+  backend: string
+  cudaVersion: string | null
+  compatible: boolean
+  /** Why an incompatible build cannot run here. */
+  reason: string | null
+  recommended: boolean
+  /** Archives installed alongside (e.g. the matching cudart zip). */
+  companions: { name: string; size: number | null }[]
+}
+
+export type ReleaseAssetListing = {
+  repo: string
+  tag: string
+  publishedAt: string
+  prerelease: boolean
+  /** True when the newest release had nothing for this OS and an older one was chosen. */
+  fellBack: boolean
+  assets: RankedReleaseAsset[]
+  /** The repo has releases but no build runs on this machine: `assets` are shown with their
+   *  reasons only, nothing can be installed (from a 404 `no_compatible_asset`). */
+  noCompatible?: true
+}
+
+export type ReleaseInstallPlan = { repo: string; tag: string; asset: string }
+
+export type ReleaseJobErrorCode =
+  | 'no_server_binary'
+  | 'zip_too_large'
+  | 'bad_zip'
+  | 'download_failed'
+  | 'cancelled'
+  | 'unsupported_archive'
+  | 'extract_failed'
+  | 'github_rate_limited'
+  | (string & {})
+
+/** GET /engines/release/install: the single-slot install job. */
+export type ReleaseJobView = {
+  state: 'idle' | 'running' | 'ready' | 'updated' | 'error'
+  plan?: ReleaseInstallPlan
+  result?: EngineScanResult
+  updated?: { id: string; name: string }
+  error?: { code: ReleaseJobErrorCode; message: string }
+}
 
 /** A selectable llama.cpp backend variant (ADR-025). A "build" of the official
  *  engine. `engineId` is the registered engine to activate once installed.
@@ -470,6 +534,8 @@ export type CatalogEngine = {
   support: 'stable' | 'experimental'
   installEndpoint: string
   comingSoon?: boolean
+  /** Offers "Install prebuilt" from the repo's GitHub releases (ADR-453). */
+  releaseInstall?: boolean
   note?: string
   /** The default branch for this repo (e.g. 'master' for llama.cpp, 'main' for most others).
     *  Used to pre-select the branch in the dropdown. */
@@ -498,6 +564,13 @@ export type CatalogEngine = {
   sourceBranch?: string
   /** Path to the built binary (used to Enable a built-but-disabled source engine). */
   sourceBinPath?: string
+  /** Registry id of the release-installed engine this card owns (issue #276). Ownership comes
+   *  only from the backend; the web never matches a release engine to a card by repo. */
+  releaseEngineId?: string
+  /** Provenance of that release engine (or of the remembered disabled one). */
+  release?: ReleaseProvenance
+  /** Binary of the owned release engine, or of a disabled one that can be Enabled again. */
+  releaseBinPath?: string
   /** Installable variants (one per hardware path). Optional — llama.cpp derives its
    *  variants at call time; other engines list them inline or leave undefined. */
   variants?: EngineVariant[]

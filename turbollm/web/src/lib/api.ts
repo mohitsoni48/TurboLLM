@@ -18,6 +18,10 @@ import type {
   EngineUpdates,
   EnginesList,
   EngineScanResult,
+  RankedReleaseAsset,
+  ReleaseAssetListing,
+  ReleaseInstallPlan,
+  ReleaseJobView,
   HwUsage,
   UpdatePolicy,
   HfRepoDetail,
@@ -79,7 +83,7 @@ export function setAuthToken(token: string): void {
 
 async function request<T>(
   path: string,
-  init?: RequestInit & { json?: unknown },
+  init?: RequestInit & { json?: unknown; rescue?: (status: number, data: unknown) => T | undefined },
 ): Promise<T> {
   const headers: Record<string, string> = {
     Accept: 'application/json',
@@ -100,6 +104,8 @@ async function request<T>(
   const data = text ? safeJson(text) : undefined
 
   if (!res.ok) {
+    const rescued = init?.rescue?.(res.status, data)
+    if (rescued !== undefined) return rescued
     const env = data as { error?: { code?: string; message?: string } } | undefined
     throw new ApiError(
       env?.error?.code ?? 'http_error',
@@ -252,6 +258,42 @@ export function deleteEngineZipInstall(binPath: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/engines/zip?binPath=${encodeURIComponent(binPath)}`, {
     method: 'DELETE',
   })
+}
+
+/** Builds in a repo's newest installable GitHub release, ranked for this machine. On demand
+ *  only (ADR-396: it spends the user's GitHub quota), so call it from an explicit user action. */
+export function listReleaseAssets(repo: string): Promise<ReleaseAssetListing> {
+  return request<ReleaseAssetListing>(`/api/v1/engines/release/assets?repo=${encodeURIComponent(repo)}`, {
+    rescue: (status, data) => noCompatibleListing(repo, status, data),
+  })
+}
+
+/** A 404 `no_compatible_asset` still carries every build with its reason; keep them as a listing. */
+function noCompatibleListing(repo: string, status: number, data: unknown): ReleaseAssetListing | undefined {
+  const body = data as { error?: { code?: string }; assets?: RankedReleaseAsset[] } | undefined
+  if (status !== 404 || body?.error?.code !== 'no_compatible_asset') return undefined
+  return { repo, tag: '', publishedAt: '', prerelease: false, fellBack: false, assets: body.assets ?? [], noCompatible: true }
+}
+
+/** Start installing one release asset (plus its companions). Progress: {@link getReleaseInstall}. */
+export function startReleaseInstall(plan: ReleaseInstallPlan): Promise<{ accepted: true }> {
+  return request<{ accepted: true }>('/api/v1/engines/release/install', { method: 'POST', json: plan })
+}
+
+export function getReleaseInstall(): Promise<ReleaseJobView> {
+  return request<ReleaseJobView>('/api/v1/engines/release/install')
+}
+
+/** With `binPath`: remove an UNCONFIRMED (or forgotten) release install dir. Without: abort the
+ *  running install. Server-side it only removes a marker-carrying dir no engine claims. */
+export function discardReleaseInstall(binPath?: string): Promise<{ ok: true }> {
+  const query = binPath === undefined ? '' : `?binPath=${encodeURIComponent(binPath)}`
+  return request<{ ok: true }>(`/api/v1/engines/release/install${query}`, { method: 'DELETE' })
+}
+
+/** Apply the newest update to one engine now (release engines; user_update trigger). */
+export function updateEngine(id: string): Promise<{ accepted: true }> {
+  return request<{ accepted: true }>(`/api/v1/engines/${encodeURIComponent(id)}/update`, { method: 'POST', json: {} })
 }
 
 export function getEngineBackends(): Promise<EngineBackends> {
