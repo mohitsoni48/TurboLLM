@@ -34,6 +34,11 @@ import '@xterm/xterm/css/xterm.css'
 import { useTerminalConnection, createTerminalForSession } from '../../lib/terminal-connection'
 import { toast } from '../../components/ui/sonner'
 
+/** Mirrors the daemon's SCROLLBACK_CAP (src/terminal/pty-session.ts; keep the two in step): the
+ *  replay buffer is front-trimmed to this many chars, so a replay SHORTER than it is the PTY's
+ *  whole output and one at it may have lost its oldest lines. */
+const DAEMON_REPLAY_CAP = 512 * 1024
+
 /** Reads the app's --term-* design tokens (index.css) as ACTUAL resolved colors — xterm's theme
  *  option needs real values (hex/rgb/color-mix() output as computed by the browser), not the
  *  var()/color-mix() source strings, which its own internal color parser doesn't understand.
@@ -104,8 +109,19 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // with it at all.
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
+  // Whether THIS xterm instance has already had a socket open. The daemon replays the PTY's
+  // scrollback to every new socket, so a REconnect (Wi-Fi blip, sleep/wake) can show the history
+  // twice (see onMessage). Cleared per Terminal instance in the mount effect.
+  const connectedOnceRef = useRef(false)
+  // Set by a REconnect until that socket's first frame lands: the daemon sends its whole buffered
+  // replay as that one frame, before any live output (terminal-manager.ts registerWsListener).
+  const replayPendingRef = useRef(false)
 
   const { send, sendResize } = useTerminalConnection(terminalId, {
+    onConnect: () => {
+      replayPendingRef.current = connectedOnceRef.current
+      connectedOnceRef.current = true
+    },
     onClose: (code, reason) => {
       if (code !== 1000) {
         toast.warning(`Terminal connection closed: ${reason || code}`)
@@ -120,7 +136,26 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     // server's scrollback replay can arrive before such an effect gets a chance to run,
     // silently dropping it — see the hook's own doc comment for the full trace of the live
     // "terminal goes blank on switching, fixes itself a few switches later" bug this closes).
-    onMessage: (data) => terminalRef.current?.write(data),
+    onMessage: (data) => {
+      const term = terminalRef.current
+      if (replayPendingRef.current) {
+        replayPendingRef.current = false
+        // A reconnect's replay. Wipe the CONTENT first (cursor home, erase screen, erase
+        // scrollback) so the history doesn't show twice — but only when the replay is under the
+        // daemon's cap, i.e. the PTY's whole output, which rebuilds everything the wipe erased.
+        // A capped replay is only the newest 512K chars: an inline TUI (claude, pi) repainting its
+        // spinner pushes the committed transcript out of it, so there keep what the terminal has
+        // and accept that lines inside the window can show twice. Never a full reset(): that also
+        // drops a running TUI's alt screen, mouse tracking and bracketed paste, whose enabling
+        // sequences can have aged out of a capped replay. And only on the NORMAL buffer: on the
+        // alt screen the replay re-applies the TUI's frames over its last frame (?1049h is a
+        // no-op, ?1049l restores the untouched normal buffer), and erasing would blank whatever
+        // static parts the TUI drew once. SGR 0 first because ED erases with the current
+        // background, which a drop can leave mid-colour.
+        if (data.length < DAEMON_REPLAY_CAP && term?.buffer.active.type === 'normal') term.write('\x1b[0m\x1b[H\x1b[2J\x1b[3J')
+      }
+      term?.write(data)
+    },
   })
 
   // Lets CodeSessionScreen drive the CLI's own commands (e.g. `/model`, to switch models
@@ -163,6 +198,8 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     const fitAddon = new FitAddon()
     fitAddonRef.current = fitAddon
     terminalRef.current = term
+    connectedOnceRef.current = false
+    replayPendingRef.current = false
 
     term.loadAddon(fitAddon)
     term.open(containerRef.current)

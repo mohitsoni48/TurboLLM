@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { memo, useState } from 'react'
 import {
   CheckCircle2,
   ChevronRight,
@@ -589,8 +589,12 @@ function CodeCommentary({ content, streaming }: { content: string; streaming?: b
 /** Quiet fade + rise on arrival for a persisted transcript entry — deliberately NOT applied to
  *  CodeStreamingEntry's live chunks below, whose index-keyed shape shifts constantly while
  *  tokens stream in; retriggering this on every reflow there would be distracting flicker, not
- *  polish. A finished message mounts once and stays put, so this only ever plays once. */
-function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
+ *  polish. A finished message mounts once and stays put, so this only ever plays once.
+ *  Memoized: the screen re-renders on every streamed SSE frame, and re-rendering every finished
+ *  turn (with its default-expanded diff tables) made each token cost grow with the transcript.
+ *  While a run is live its props are stable — `message` is the query's own object and `onRevert`
+ *  is undefined. */
+const CodeMessageEntry = memo(function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: () => void }) {
   if (message.role === 'user') {
     // A persisted `!command` (ADR-258) is a user message carrying a `shell` tool call — render it
     // as a terminal entry, not a chat-style instruction bubble.
@@ -646,7 +650,7 @@ function CodeMessageEntry({ message, onRevert }: { message: Message; onRevert?: 
       )}
     </div>
   )
-}
+})
 
 // Chunk a live SSE timeline into text blocks and RUNS of consecutive tool
 // blocks (so a burst of tool calls between two bits of commentary stays a

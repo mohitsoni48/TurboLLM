@@ -504,7 +504,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // untouched, and the browser's own find still works where there is no chat to search.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && (e.key === 'n' || e.key === 'N')) {
+      // Not when embedded (Routines' run view): there is no new chat to start there, and
+      // handleNew would blank the selected run's transcript until another run is picked.
+      if (!embedded && (e.ctrlKey || e.metaKey) && (e.key === 'n' || e.key === 'N')) {
         e.preventDefault()
         handleNew()
         return
@@ -514,7 +516,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         openFind()
         return
       }
-      if (e.key === 'Escape' && activeId && liveByConv[activeId]) { void handleStop() }
+      // An Escape something else already handled (Radix dialogs/menus/popovers dismiss on it
+      // via preventDefault, without stopping propagation) or typed into a field (rename box,
+      // inline message edit) is that thing's "close/cancel", not "stop the reply". A DISABLED
+      // field still counts as "nothing": the composer is disabled while a reply is live, and
+      // focus can stay on it after the Enter that sent the message.
+      const inField = (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) && !e.target.disabled
+      if (e.key === 'Escape' && !e.defaultPrevented && !inField && activeId && liveByConv[activeId]) { void handleStop() }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -602,6 +610,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const handleNew = () => {
     saveScrollOffset()
     setActiveId(null)
+    // Like handleSelect: an edit left open in the old chat would keep this one's composer
+    // disabled, with no Cancel on screen to recover it.
+    setEditingId(null)
     setInput('')
     setSelectedPersonaId(getDefaultAgentId(isAndroid))
     inputRef.current?.focus()
@@ -703,10 +714,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // Every setLiveByConv/abortRefs access below targets `convId` — the parameter — not
   // `activeId`, because by the time an event arrives the user may have navigated to a
   // different conversation while this generation keeps running in the background.
-  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>) => {
+  // Resolves to whether the turn STARTED (a `meta` frame arrived): the daemon sends meta only
+  // after it has stored the user message, so `false` means the message exists nowhere.
+  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>): Promise<boolean> => {
+    let started = false
     try {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
+          started = true
           deltaTimestamps.current[convId] = []
           setLiveByConv((prev) => ({
             ...prev,
@@ -778,6 +793,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     } finally {
       delete abortRefs.current[convId]
     }
+    return started
   }
 
   // Manual compaction (ADR-420), the header button AND `/compact` (below) both dispatch
@@ -822,10 +838,23 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const images = imageAttachments.map((a) => a.dataUrl)
     const docContext = textAttachments.map((a) => `[Attached: ${a.file.name}]\n${a.dataUrl}`).join('\n\n')
 
+    const sentAttachments = attachments
     setInput('')
     setAttachments([])
     setTimeout(autoResize, 0)
     userScrolledUp.current = false
+    // A send refused before the daemon stored it (503 remote_unavailable, 409 model_not_loaded /
+    // generation_in_flight, a failed create) leaves the text nowhere — put it back in the composer.
+    // The composer is enabled again until the turn goes live and its state is shared across
+    // conversations, so only restore into the one this send left (or the chat it just created),
+    // and never over anything typed or attached since.
+    const restoreComposer = () => {
+      const here = activeIdRef.current
+      if (here !== activeId && here !== convId) return
+      setInput((cur) => (cur.trim() ? cur : rawText))
+      setAttachments((cur) => (cur.length ? cur : sentAttachments))
+      setTimeout(autoResize, 0)
+    }
 
     // Hoisted above the try so the catch block can target the right conversation's
     // live/abort state even when it fails partway through creating a new conversation.
@@ -879,6 +908,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         })
         convId = newConv.id
         setConvAgentId(convId, selectedPersonaId)
+        // Carry a thinking budget / reasoning effort picked on the blank chat over to the new
+        // conversation: setActiveId re-reads both from its per-conversation keys, which don't
+        // exist yet, so they'd snap back to the global default after this first turn. Only
+        // written when it differs from that default, so an untouched chat still follows it.
+        if (thinkingBudget !== readThinkingBudget(null)) localStorage.setItem(`tllm.thinkingBudget.${convId}`, String(thinkingBudget))
+        if (reasoningEffort !== readReasoningEffort(null)) localStorage.setItem(`tllm.reasoningEffort.${convId}`, reasoningEffort)
         setActiveId(convId)
         setPendingSkillIds([])
         setPendingSystemPrompt('')
@@ -895,11 +930,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
+      const started = await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
+      // streamFrom toasts the error itself and never rethrows. An abort is the user (or Eject)
+      // stopping it, not a refusal.
+      if (!started && !ac.signal.aborted) restoreComposer()
     } catch (e) {
       if (convId) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
+        restoreComposer()
       }
       if (convId) void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     }
@@ -990,7 +1029,22 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const pendingApprovalBlock = live?.timeline.find((b) => b.kind === 'tool' && b.call.status === 'awaiting_approval')
   const pendingApproval = pendingApprovalBlock?.kind === 'tool' ? pendingApprovalBlock.call : undefined
 
-  const generatingIds = useMemo(() => new Set(Object.keys(liveByConv)), [liveByConv])
+  // The memoized ConversationSidebar must not re-render on every streamed token (liveByConv
+  // changes per delta): this Set only changes identity when WHICH conversations are generating
+  // changes, and the sidebar's callbacks below never change identity — they call the latest
+  // handlers through a ref.
+  const generatingKey = Object.keys(liveByConv).join('\0')
+  const generatingIds = useMemo(() => new Set(generatingKey ? generatingKey.split('\0') : []), [generatingKey])
+  const sidebarHandlersRef = useRef({ handleSelect, handleNew, handleActiveDeleted, isDesktop })
+  sidebarHandlersRef.current = { handleSelect, handleNew, handleActiveDeleted, isDesktop }
+  const sidebarCallbacks = useMemo(() => ({
+    onSelect: (id: string) => { sidebarHandlersRef.current.handleSelect(id); if (!sidebarHandlersRef.current.isDesktop) setMobileSidebarOpen(false) },
+    onNew: () => { sidebarHandlersRef.current.handleNew(); if (!sidebarHandlersRef.current.isDesktop) setMobileSidebarOpen(false) },
+    onImport: () => importFileRef.current?.click(),
+    onToggleOpen: () => setSidebarOpen((o) => !o),
+    onCloseDrawer: () => setMobileSidebarOpen(false),
+    onDeleted: (id: string) => sidebarHandlersRef.current.handleActiveDeleted(id),
+  }), [setSidebarOpen])
 
   // GitHub #177: the DAEMON's own "something is generating right now" signal, selected off the
   // status poll that's already running above (line 59) — no second poller, no new request. The
@@ -1045,15 +1099,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         >
           <ConversationSidebar
             activeId={activeId}
-            onSelect={(id) => { handleSelect(id); if (!isDesktop) setMobileSidebarOpen(false) }}
-            onNew={() => { handleNew(); if (!isDesktop) setMobileSidebarOpen(false) }}
-            onImport={readonly ? undefined : () => importFileRef.current?.click()}
+            onSelect={sidebarCallbacks.onSelect}
+            onNew={sidebarCallbacks.onNew}
+            onImport={readonly ? undefined : sidebarCallbacks.onImport}
             collapsed={isDesktop ? !sidebarOpen : false}
-            onToggle={isDesktop ? () => setSidebarOpen((o) => !o) : () => setMobileSidebarOpen(false)}
+            onToggle={isDesktop ? sidebarCallbacks.onToggleOpen : sidebarCallbacks.onCloseDrawer}
             generating={!!live}
             generatingIds={generatingIds}
             recentlyCompletedIds={recentlyCompletedIds}
-            onDeleted={handleActiveDeleted}
+            onDeleted={sidebarCallbacks.onDeleted}
           />
         </div>
       )}

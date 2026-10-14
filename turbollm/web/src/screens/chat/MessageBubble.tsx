@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref, type RefObject } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type Ref, type RefObject } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
@@ -137,62 +137,67 @@ function childrenToString(node: ReactNode): string {
 // a second markdown pipeline — Code mode's commentary is genuinely the same kind
 // of content chat's is, just presented in a different frame around it.
 export const Markdown = memo(function Markdown({ children, streaming }: { children: string; streaming?: boolean }) {
+  // Built once per `streaming` value, not per render: react-markdown uses these as element
+  // TYPES, so a fresh map on every streamed token made React unmount and remount every code
+  // block, link and table (resetting a sideways-scrolled code line, a selection, the copy
+  // button's state) instead of reconciling them.
+  const components = useMemo<Components>(() => ({
+    a: ({ children, href }) => (
+      // Styling comes entirely from the unlayered .prose-tllm a rules (index.css);
+      // this override exists only to force new-tab + noopener on every link.
+      <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+    ),
+    code: ({ className, children, ...props }) => {
+      // A fenced block without a language tag has no className — detect it by
+      // checking for a trailing newline, which react-markdown always appends to
+      // block code. Inline code never contains newlines in practice.
+      const hasLang = !!className?.includes('language-')
+      const isBlock = hasLang || (typeof children === 'string' && children.includes('\n'))
+      if (!isBlock) return <code className="rounded bg-panel-2 px-1 py-0.5 font-mono text-[0.88em]" {...props}>{children}</code>
+      // rehypeHighlight rewrites the class to "hljs language-html", so a plain
+      // `.replace('language-','')` leaves "hljs html" and breaks artifact detection.
+      // Pull just the language token out of whatever classes are present.
+      const lang = className?.match(/language-(\S+)/)?.[1] ?? ''
+      const artifactType = isArtifactLang(lang)
+      if (artifactType) {
+        // While the message is still streaming, the artifact code is partial and
+        // re-parsed every token — rendering the live iframe makes it flicker. Show
+        // a calm placeholder; the real preview mounts once when generation finishes.
+        if (streaming) {
+          return (
+            <div className="my-2 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+              <Loader2 size={12} className="animate-spin" />
+              Generating artifact…
+            </div>
+          )
+        }
+        return <ArtifactCard lang={lang} code={childrenToString(children).replace(/\n$/, '')} />
+      }
+      return (
+        <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
+          <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
+            <span>{lang}</span>
+            <CopyButton text={childrenToString(children)} size={12} screen="chat" />
+          </div>
+          <div className="overflow-x-auto overscroll-x-contain" onScroll={e => e.stopPropagation()}>
+            <code className={`${className ?? ''} block p-3 font-mono text-[13px] leading-relaxed whitespace-pre`} {...props}>{children}</code>
+          </div>
+        </div>
+      )
+    },
+    pre: ({ children }) => <>{children}</>,
+    // Borders/padding/font-size/weight for table cells come from the unlayered
+    // .prose-tllm table/th/td rules (index.css) — only what prose doesn't set
+    // stays here: the scroll wrapper, full width, header tint, left-aligned th
+    // (UA default centers th). td needs no override at all anymore.
+    table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full text-[13px]">{children}</table></div>,
+    th: ({ children }) => <th className="bg-panel-2 text-left">{children}</th>,
+  }), [streaming])
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
-      components={{
-        a: ({ children, href }) => (
-          // Styling comes entirely from the unlayered .prose-tllm a rules (index.css);
-          // this override exists only to force new-tab + noopener on every link.
-          <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
-        ),
-        code: ({ className, children, ...props }) => {
-          // A fenced block without a language tag has no className — detect it by
-          // checking for a trailing newline, which react-markdown always appends to
-          // block code. Inline code never contains newlines in practice.
-          const hasLang = !!className?.includes('language-')
-          const isBlock = hasLang || (typeof children === 'string' && children.includes('\n'))
-          if (!isBlock) return <code className="rounded bg-panel-2 px-1 py-0.5 font-mono text-[0.88em]" {...props}>{children}</code>
-          // rehypeHighlight rewrites the class to "hljs language-html", so a plain
-          // `.replace('language-','')` leaves "hljs html" and breaks artifact detection.
-          // Pull just the language token out of whatever classes are present.
-          const lang = className?.match(/language-(\S+)/)?.[1] ?? ''
-          const artifactType = isArtifactLang(lang)
-          if (artifactType) {
-            // While the message is still streaming, the artifact code is partial and
-            // re-parsed every token — rendering the live iframe makes it flicker. Show
-            // a calm placeholder; the real preview mounts once when generation finishes.
-            if (streaming) {
-              return (
-                <div className="my-2 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                  <Loader2 size={12} className="animate-spin" />
-                  Generating artifact…
-                </div>
-              )
-            }
-            return <ArtifactCard lang={lang} code={childrenToString(children).replace(/\n$/, '')} />
-          }
-          return (
-            <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
-              <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
-                <span>{lang}</span>
-                <CopyButton text={childrenToString(children)} size={12} screen="chat" />
-              </div>
-              <div className="overflow-x-auto overscroll-x-contain" onScroll={e => e.stopPropagation()}>
-                <code className={`${className ?? ''} block p-3 font-mono text-[13px] leading-relaxed whitespace-pre`} {...props}>{children}</code>
-              </div>
-            </div>
-          )
-        },
-        pre: ({ children }) => <>{children}</>,
-        // Borders/padding/font-size/weight for table cells come from the unlayered
-        // .prose-tllm table/th/td rules (index.css) — only what prose doesn't set
-        // stays here: the scroll wrapper, full width, header tint, left-aligned th
-        // (UA default centers th). td needs no override at all anymore.
-        table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full text-[13px]">{children}</table></div>,
-        th: ({ children }) => <th className="bg-panel-2 text-left">{children}</th>,
-      }}
+      components={components}
     >
       {children}
     </ReactMarkdown>
@@ -720,6 +725,13 @@ export function MessageBubble({
 }) {
   const [editDraft, setEditDraft] = useState(message.content)
   const isEditing = editingId === message.id
+  // Every edit starts from the message itself. beginEdit (the pencil) resets the draft, but the
+  // composer's ArrowUp opens an edit by setting editingId directly — without this it reopened
+  // whatever was typed into an earlier, cancelled edit, ready to be sent by "Save & Resend".
+  useLayoutEffect(() => {
+    if (isEditing) setEditDraft(message.content)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing])
 
   // ── Edit-box sizing: the box IS the bubble ──────────────────────────────────────
   //

@@ -98,7 +98,11 @@ export function ConversationSettingsDialog({
       setSkillIds(draft.skillIds ?? [])
       setPreserveThinking(draft.preserveThinking ?? true)
     }
-  }, [open, conv, draft])
+    // Keyed on the conversation's ID, not the object: every refetch (a reply finishing,
+    // auto-title, another device's message) hands over a new object for the same
+    // conversation, and resyncing on that wiped whatever the user was typing here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, conv?.id, draft])
 
   const toggleSkill = (id: string) =>
     setSkillIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]))
