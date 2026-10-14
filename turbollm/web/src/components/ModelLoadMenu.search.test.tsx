@@ -307,6 +307,20 @@ describe('search box', () => {
     await user.unhover(screen.getByText('Eject model'))
     expect(searchBox()).toHaveFocus()
   })
+
+  it('keeps focus in the box after a click on a disabled row, so typing still searches', async () => {
+    const { onLoad } = await openMenu({
+      links: [link({ id: 'l1', name: 'workstation' })],
+      remoteModels: [remoteRow(false)],
+    })
+    await userEvent.click(screen.getByTitle(/not loaded on workstation/i))
+    expect(toastInfo).toHaveBeenCalledWith(expect.stringMatching(/not loaded on workstation/i))
+    expect(searchBox()).toHaveFocus()
+    await userEvent.keyboard('gem')
+    expect(searchBox()).toHaveValue('gem')
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(GEMMA)
+  })
 })
 
 describe('shortcuts with focus in the box', () => {
@@ -534,23 +548,44 @@ describe('list changes under an open menu', () => {
     return { ...harness, ...view }
   }
 
-  it('falls back to the first remaining match, never Eject, when the highlighted remote row vanishes', async () => {
+  // A refresh that removes the row the user chose leaves NO highlight: sliding to the first match
+  // would make the next Enter load a model the user never highlighted (here, the local twin of
+  // the remote row that went offline).
+  it('highlights nothing, and Enter does nothing, when the highlighted remote row vanishes', async () => {
     const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown', 'ArrowDown'])
     expect(activeRows()).toEqual([rowOf('Qwen3 35B', 1)])
     rerender(element({ remoteModels: [] }))
-    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+    expect(activeRows()).toEqual([])
+    expect(searchBox()).not.toHaveAttribute('aria-activedescendant')
     await userEvent.keyboard('{Enter}')
-    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onEject).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('highlights nothing, and Enter does nothing, when the highlighted local row is removed', async () => {
+    const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown'])
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    const withoutQwen8 = LOCAL.filter((m) => m.key !== QWEN8)
+    rerender(element({ models: withoutQwen8 }))
+    expect(activeRows()).toEqual([])
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).not.toHaveBeenCalled()
     expect(onEject).not.toHaveBeenCalled()
   })
 
-  it('falls back to the first remaining match when the highlighted local row is removed', async () => {
-    const { onEject, rerender, element } = await openAt(['ArrowDown'])
-    const withoutQwen8 = LOCAL.filter((m) => m.key !== QWEN8)
-    rerender(element({ models: withoutQwen8 }))
-    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+  it('never turns a highlighted Eject into a load when the model unloads under the menu', async () => {
+    const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown', 'ArrowDown', 'ArrowDown'])
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    rerender(element({ loadedKey: null, loadedName: null }))
+    expect(screen.queryByText('Eject model')).not.toBeInTheDocument()
+    expect(activeRows()).toEqual([])
     await userEvent.keyboard('{Enter}')
+    expect(onLoad).not.toHaveBeenCalled()
     expect(onEject).not.toHaveBeenCalled()
+    // Arrowing picks up again from the top.
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
   })
 
   it('highlights nothing, and Enter does nothing, when the list shrinks to zero', async () => {
@@ -604,5 +639,61 @@ describe('one highlight for mouse and keyboard', () => {
     await userEvent.hover(screen.getByText('Eject model'))
     expect(activeRows()).toEqual([screen.getByText('Eject model')])
     expect(searchBox()).toHaveFocus()
+  })
+})
+
+describe('duplicate model keys', () => {
+  // The same GGUF in two model folders: the scanner gives both copies one key.
+  const twin = { ...LOCAL[1], path: '/elsewhere/Qwen3-35B-Q4_K_M.gguf' } as ModelEntry
+  const withTwin = [LOCAL[0], LOCAL[1], twin, LOCAL[2]]
+
+  it('shows one row per key, and ArrowDown walks past it to the rows below and Eject', async () => {
+    const { onLoad, onEject } = await openMenu({ models: withTwin, loadedKey: GEMMA, loadedName: 'Gemma 27B' })
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    await userEvent.keyboard('{ArrowDown}{ArrowDown}{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{Enter}')
+    expect(onEject).toHaveBeenCalledTimes(1)
+    expect(onLoad).not.toHaveBeenCalled()
+  })
+
+  it('loads the shared key from the one row', async () => {
+    const { onLoad } = await openMenu({ models: withTwin })
+    await userEvent.keyboard('35b{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+  })
+
+  it("finds the one row by the twin's source repo when the kept copy has none", async () => {
+    // The kept (first) copy sits in a flat folder, so it has no repo; the LM Studio twin has one.
+    const flat = { ...LOCAL[1], sourceRepo: null } as ModelEntry
+    const lms = { ...twin, sourceRepo: 'unsloth/Qwen3-35B-GGUF' } as ModelEntry
+    const { onLoad } = await openMenu({ models: [LOCAL[0], flat, lms, LOCAL[2]] })
+    await userEvent.keyboard('unsloth')
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    expect(screen.queryByText('Gemma 27B')).not.toBeInTheDocument()
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+  })
+
+  it('shows one row when a link advertises the same key twice, and ArrowDown walks past it', async () => {
+    // The HOST has the GGUF in two folders: its /models route lists both copies under one key.
+    const below = { ...remoteRow(true), model: { ...remoteRow(true).model, key: 'qwen3-8b', name: 'Qwen3 8B' } }
+    const { onLoad, onEject } = await openMenu({
+      models: [LOCAL[0]],
+      loadedKey: GEMMA,
+      loadedName: 'Gemma 27B',
+      links: onlineLink(),
+      remoteModels: [remoteRow(true), remoteRow(true), below],
+    })
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    await userEvent.keyboard('{ArrowDown}{ArrowDown}{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{Enter}')
+    expect(onEject).toHaveBeenCalledTimes(1)
+    expect(onLoad).not.toHaveBeenCalled()
   })
 })
