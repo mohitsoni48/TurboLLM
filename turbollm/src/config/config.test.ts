@@ -681,3 +681,21 @@ test('migrateModelKey: renaming to the same key is a no-op', () => {
   const moved = migrateModelKey(cfg, 'm|q4|1', 'm|q4|1')
   assert.equal(moved, false)
 })
+
+// A UTF-8 BOM (Windows editors, PowerShell 5.1 `Set-Content -Encoding UTF8`) made JSON.parse
+// throw, and load() then treated a valid hand-edited config as corrupt and reset it to defaults
+// — API keys, engines and model dirs gone.
+test('ConfigStore.load: a UTF-8 BOM before the JSON is ignored, not treated as a corrupt file', () => {
+  const path = tmpConfigPath()
+  try {
+    const cfg = { ...defaultConfig(), modelDirs: ['/models/bom-test'] }
+    writeFileSync(path, '\uFEFF' + JSON.stringify(cfg))
+
+    const store = ConfigStore.load(path)
+
+    assert.equal(store.brokenBackup(), '', 'no .broken-* backup may be written')
+    assert.deepEqual(store.snapshot().modelDirs, ['/models/bom-test'])
+  } finally {
+    cleanup(path)
+  }
+})

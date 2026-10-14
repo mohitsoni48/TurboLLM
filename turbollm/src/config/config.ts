@@ -704,7 +704,7 @@ export function migrateLegacyDataDir(): void {
   try {
     const cfgPath = join(next, 'config.json')
     if (!existsSync(cfgPath)) return
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8')) as { engines?: { binPath?: string }[] }
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, '')) as { engines?: { binPath?: string }[] }
     let changed = false
     for (const e of cfg.engines ?? []) {
       if (typeof e.binPath === 'string' && e.binPath.startsWith(prev)) {
@@ -795,7 +795,9 @@ export class ConfigStore {
       return store
     }
     let raw: Record<string, unknown>
-    const text = readFileSync(path, 'utf8')
+    // Strip a UTF-8 BOM: Windows editors and PowerShell 5.1's `Set-Content -Encoding UTF8` add
+    // one, JSON.parse rejects it, and the catch below would then reset the whole config.
+    const text = readFileSync(path, 'utf8').replace(/^\uFEFF/, '')
     try {
       raw = JSON.parse(text) as Record<string, unknown>
     } catch {
