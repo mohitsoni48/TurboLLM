@@ -17,6 +17,7 @@ import {
 } from './download'
 import { parseGitRepo } from './github-repo'
 import type { ReleaseProvenance } from './release-install'
+import { compareBuildTags, parseBuildTag } from './version-compare'
 
 export type AssetOs = 'windows' | 'linux' | 'macos' | 'android'
 export type AssetBackend = 'cuda' | 'rocm' | 'sycl' | 'vulkan' | 'metal' | 'cpu' | 'opencl' | 'other'
@@ -77,21 +78,25 @@ const BACKEND_BY_TOKEN: Record<string, AssetBackend> = {
   cann: 'other',
 }
 
-const CUDA_VERSION = /(?:^|[-_])cuda[-_]?(\d+\.\d+)(?=$|[-_])/
+// Also the older llama.cpp spellings `cuda-cu12.4`, `cudart-...-cu12.4` and `cublas-cu12.2.0`, plus
+// a patch component (`cuda-12.4.1`); only major.minor is kept.
+const CUDA_VERSION = /(?:^|[-_])cu(?:da)?[-_]?(\d+\.\d+)(?:\.\d+)?(?=$|[-_])/
 
 export function classifyReleaseAsset(asset: ReleaseAsset & { size?: number }): ClassifiedAsset {
   const archive = archiveKindOf(asset.name)
   const stem = stripArchiveExtension(asset.name.toLowerCase())
   const tokens = nameTokens(stem)
   const os = firstMapped(tokens, OS_BY_TOKEN)
+  const cudaVersion = CUDA_VERSION.exec(stem)?.[1] ?? null
   return {
     name: asset.name,
     url: asset.browser_download_url,
     size: asset.size ?? null,
     os,
     arch: firstMapped(tokens, ARCH_BY_TOKEN),
-    backend: firstMapped(tokens, BACKEND_BY_TOKEN) ?? (os === 'macos' ? 'metal' : 'cpu'),
-    cudaVersion: CUDA_VERSION.exec(stem)?.[1] ?? null,
+    // A CUDA version with no backend token (`cublas-cu12.2.0`, `cuda12.4`, a `cu12.4` cudart) is a CUDA build.
+    backend: firstMapped(tokens, BACKEND_BY_TOKEN) ?? (cudaVersion ? 'cuda' : os === 'macos' ? 'metal' : 'cpu'),
+    cudaVersion,
     archive,
     companion: tokens.includes('cudart') ? 'cudart' : null,
   }
@@ -280,11 +285,18 @@ function stripArchiveExtension(lowerName: string): string {
   return lowerName.replace(/\.(zip|tar\.gz|tgz)$/, '')
 }
 
+/** Removes the tag only as a whole run of tokens: as a raw substring, a short tag such as `v4` or `12`
+ *  would cut into `x64` or `cuda-12.4`, and one file name would key differently per release. Any
+ *  character but a letter or digit is a boundary (`-`, `_`, `+`, `~`, a space, the archive extension's
+ *  `.`), except a `.` that joins digits, as in `12.4`. */
 function removeTag(lowerName: string, lowerTag: string): string {
   const bare = lowerTag.replace(/^v/, '')
   const longestFirst = [...new Set([lowerTag, bare, `v${bare}`])].filter(Boolean).sort((a, b) => b.length - a.length)
-  const present = longestFirst.find((form) => lowerName.includes(form))
-  return present === undefined ? lowerName : lowerName.split(present).join('')
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const asTokens = (form: string, flags = '') =>
+    new RegExp(`(?<![a-z0-9])(?<!\\d\\.)${escape(form)}(?![a-z0-9])(?!\\.\\d)`, flags)
+  const present = longestFirst.find((form) => asTokens(form).test(lowerName))
+  return present === undefined ? lowerName : lowerName.replace(asTokens(present, 'g'), '')
 }
 
 function stripReleasesSuffix(url: string): string {
@@ -377,9 +389,15 @@ export async function newestMatchingRelease(
 ): Promise<MatchingRelease | null> {
   const listed = (await listReleases(provenance.repo, signal, fetchImpl)) ?? []
   const candidates = listed.filter((r) => isUpdateCandidate(r, provenance))
-  return (
-    findByAssetKey(candidates, provenance.assetKey) ?? findByIdenticalClassification(candidates, provenance.asset)
-  )
+  // Newest first, key then classification inside each release. A key-only pass over every candidate
+  // would always stop at the installed release (it is listed, and its own asset has the key), so a
+  // newer release that renamed the asset would never be reached.
+  for (const release of candidates) {
+    const match =
+      findByAssetKey([release], provenance.assetKey) ?? findByIdenticalClassification([release], provenance.asset)
+    if (match) return match
+  }
+  return null
 }
 
 function toResolved(repo: string, release: GithubRelease, fellBack: boolean): ResolvedRelease {
@@ -401,7 +419,17 @@ function hasCompatibleAsset(release: GithubRelease, host: HostProfile): boolean 
 function isUpdateCandidate(release: GithubRelease, installed: ReleaseProvenance): boolean {
   if (release.draft === true) return false
   if (release.prerelease === true && !installed.prerelease) return false
+  // A backport on an older version line (v1.9.5 published after v2.0.0) is not an update. Tags with
+  // no version order (nightly, a commit SHA) keep the publish-time rule.
+  const tag = release.tag_name ?? ''
+  if (versionLike(installed.tag) && versionLike(tag) && compareBuildTags(installed.tag, tag) === 'older') return false
   return (release.published_at ?? '') >= installed.publishedAt
+}
+
+// b<build>, a plain number or a dotted version. compareBuildTags reads the leading digits of any tag,
+// so a commit SHA such as 9f1e2d3 would otherwise be ordered by them (as 9) at random.
+function versionLike(tag: string): boolean {
+  return parseBuildTag(tag) !== null || /^v?\d+(?:\.\d+|$)/.test(tag.trim())
 }
 
 function findByAssetKey(releases: GithubRelease[], key: string): MatchingRelease | null {
