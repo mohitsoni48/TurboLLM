@@ -630,7 +630,18 @@ export function useModels(): UseQueryResult<ModelsList> {
   const qc = useQueryClient()
   return useQuery({
     queryKey: queryKeys.models,
-    queryFn: getModels,
+    queryFn: async () => {
+      const prev = qc.getQueryData<ModelsList>(queryKeys.models)
+      const next = await getModels()
+      // An HF repo panel's Downloaded/"Load" state is resolved by the daemon against this scanned
+      // library, but `useHfRepo` only re-polls while verifying — so a download finishing while the
+      // panel was open left it offering "Download", and clicking it fetched the file again from
+      // zero. A new scan pass is when that answer changes (a finished download triggers one, after
+      // its record already reads `done` — keying on the record would race the scan), so mark every
+      // repo detail stale; only an open panel actually refetches.
+      if (prev && prev.lastScanAt !== next.lastScanAt) void qc.invalidateQueries({ queryKey: ['hf-repo'] })
+      return next
+    },
     refetchInterval: (q) =>
       modelsRefetchInterval(q.state.data, qc.getQueryData<Status>(queryKeys.status), qc.getQueryData<DownloadsList>(queryKeys.downloads)),
     refetchIntervalInBackground: false,

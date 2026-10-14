@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Download, X } from 'lucide-react'
 import type { Status } from '../lib/types'
 import { useBackendInstall } from '../lib/queries'
@@ -31,13 +31,21 @@ function engineLabel(backend: string): string {
  * progress from GET /api/v1/status (polled every 2s).
  */
 export function EngineProvisionBanner({ status }: { status: Status | undefined }) {
-  const [dismissedError, setDismissedError] = useState(false)
   const { cancel } = useBackendInstall()
   const p = status?.engineProvision
+  // Dismissal is keyed to THE failure it was clicked on: this banner is mounted once for the
+  // app's lifetime and is the only place a background install failure shows, so a plain
+  // "dismissed" flag hid every later failure (another engine's, or a retry's) for the session.
+  // A new run starting clears it too, so a retry that fails the same way shows again.
+  const errorKey = p?.phase === 'error' ? `${p.backend}\n${p.error ?? ''}` : null
+  const [dismissedError, setDismissedError] = useState<string | null>(null)
+  useEffect(() => {
+    if (p?.active) setDismissedError(null)
+  }, [p?.active])
   if (!p) return null
 
   if (p.phase === 'error') {
-    if (dismissedError) return null
+    if (dismissedError === errorKey) return null
     return (
       <div
         className="flex items-center gap-3 border-b px-4 py-2 text-[13px]"
@@ -46,7 +54,7 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
         <span className="flex-1">{p.error ?? 'Could not set up the default engine.'}</span>
         <button
           type="button"
-          onClick={() => { track('engines', 'dismiss_engine_provision_error'); setDismissedError(true) }}
+          onClick={() => { track('engines', 'dismiss_engine_provision_error'); setDismissedError(errorKey) }}
           className="grid h-6 w-6 place-items-center rounded text-muted hover:text-ink"
           aria-label="Dismiss"
         >

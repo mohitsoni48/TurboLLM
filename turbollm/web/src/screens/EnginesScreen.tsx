@@ -47,7 +47,7 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, getEngineUpdates, track } from '../lib/api'
+import { ApiError, getEngineUpdates, track, type AddEngineInput } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -592,6 +592,10 @@ function EngineGalleryTab() {
 
 // ─── Zone 1 — hardware + running-engine selector ──────────────────────────────
 
+// engineBuild runs that built no engine: the CUDA Toolkit download and the build guide's
+// package-manager prereq installs (the daemon names those after the tool it installs).
+const NOT_AN_ENGINE_BUILD = new Set(['CUDA Toolkit', 'git', 'cmake', 'gcc', 'cuda'])
+
 function EngineHeaderBar({
   rec,
   list,
@@ -618,7 +622,7 @@ function EngineHeaderBar({
   useEffect(() => {
     if (wasBuilding.current && !buildActive && eb) {
       build.refresh()
-      if (eb.phase === 'done' && eb.engine && eb.engine !== 'CUDA Toolkit') {
+      if (eb.phase === 'done' && eb.engine && !NOT_AN_ENGINE_BUILD.has(eb.engine)) {
         toast.success(`${eb.engine} built and added — it's now your active engine.`)
       } else if (eb.phase === 'error' && eb.error && eb.engine !== 'CUDA Toolkit') {
         toast.error(eb.error)
@@ -833,7 +837,8 @@ function EngineGallery({
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
   const qc = useQueryClient()
-  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
+  // `reregister`: a Disabled source-built card's delete (see requestDelete).
+  const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { reregister?: AddEngineInput }) | null>(null)
 
   const catalogById = useMemo(() => {
     const m = new Map<string, CatalogEngine>()
@@ -1036,6 +1041,15 @@ function EngineGallery({
   }
   const requestDelete = (e: CatalogEngine) => {
     const registryId = registryEngineId(e)
+    // Disable unregisters an engine, and the purge route only deletes a REGISTERED engine's
+    // files — so a Disabled card has no id to purge. A source-built one is found the way its
+    // Enable finds it (its still-built binary): re-register it with that same request, then
+    // purge the new entry. A Disabled pip/TurboQuant/KoboldCpp/llamafile engine has no such
+    // path (its Enable is a re-install that also activates it); its card disables Delete.
+    if (!registryId && e.sourceBuilt && e.sourceBinPath) {
+      setDeleteTarget({ name: e.name, registryId: '', binPath: e.sourceBinPath, reregister: enableRequestFor(e) })
+      return
+    }
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
     setDeleteTarget(deleteTargetFor(registryId, registry?.engines ?? [], e.name))
   }
@@ -1076,16 +1090,23 @@ function EngineGallery({
   const doDelete = () => {
     if (!deleteTarget) return
     track('engines', 'delete_engine')
-    engineMut.purge.mutate(deleteTarget.registryId, {
-      onSuccess: () => {
-        toast.success(`${deleteTarget.name} deleted`)
-        setDeleteTarget(null)
-      },
-      onError: (err) => {
-        setDeleteTarget(null)
-        toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
-      },
-    })
+    const onError = (err: unknown) => {
+      setDeleteTarget(null)
+      toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
+    }
+    const purge = (id: string) =>
+      engineMut.purge.mutate(id, {
+        onSuccess: () => {
+          toast.success(`${deleteTarget.name} deleted`)
+          setDeleteTarget(null)
+        },
+        onError,
+      })
+    if (deleteTarget.reregister) {
+      engineMut.add.mutate(deleteTarget.reregister, { onSuccess: (eng) => purge(eng.id), onError })
+      return
+    }
+    purge(deleteTarget.registryId)
   }
 
   const fits = rec.recommendation.fits
@@ -1533,9 +1554,14 @@ function EngineCard({
                     </>
                   )}
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem destructive onSelect={() => onDelete(catalog)}>
+                  {/* A Disabled engine has no registry entry to purge; only a source-built one
+                      can be found again without re-installing it (see requestDelete). */}
+                  <DropdownMenuItem destructive disabled={isDisabled && !(sourceBuilt && catalog.sourceBinPath)} onSelect={() => onDelete(catalog)}>
                     Delete
                   </DropdownMenuItem>
+                  {isDisabled && !(sourceBuilt && catalog.sourceBinPath) && (
+                    <p className="px-2 pb-1 text-[11px] text-muted">Enable it first to delete its files.</p>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
               {sourceBuilt && catalog && (

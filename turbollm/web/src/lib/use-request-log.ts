@@ -66,5 +66,10 @@ export function useRequestLog(active: boolean) {
     }
   }, [entries, autoScroll])
 
-  return { entries, autoScroll, setAutoScroll, viewportRef }
+  // For the panel's "Clear log", once the daemon has dropped its copy: nothing on the stream says
+  // the log was cleared, so without this every row stayed on screen (and a pending one stayed
+  // pending — the daemon evicted it, so its finalize event never comes).
+  const clear = () => setEntries([])
+
+  return { entries, autoScroll, setAutoScroll, viewportRef, clear }
 }

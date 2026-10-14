@@ -12,6 +12,7 @@ import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, del
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
+import { stripBodies } from '../observability/request-log'
 import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage, type Registry } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
@@ -1996,7 +1997,11 @@ export function registerApi(app: Hono, d: Deps): void {
       stream.onAbort(() => { aborted = true })
       const unsubscribe = d.requestLog.subscribe((entry) => {
         if (aborted) return
-        void stream.writeSSE({ event: 'entry', data: JSON.stringify(entry) })
+        // Bodies stripped like the list endpoint's: with body capture on, every request would
+        // otherwise ship its full prompt (and again with the response on finalize) into a
+        // 500-row browser buffer the daemon's own 32 MB body budget doesn't bound. The detail
+        // drawer fetches bodies per entry (GET /requests/:id).
+        void stream.writeSSE({ event: 'entry', data: JSON.stringify(stripBodies(entry)) })
       })
       let ticks = 0
       try {
