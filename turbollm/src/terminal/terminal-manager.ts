@@ -38,7 +38,9 @@ function terminalPidFile(dataDir: string, pid: number): string {
 function writeTerminalPid(dataDir: string, pid: number): void {
   try {
     mkdirSync(terminalPidDir(dataDir), { recursive: true })
-    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid }))
+    // `startedAt` is what lets the next startup tell this shell apart from an unrelated process
+    // that later got the same pid (see reapStaleTerminals).
+    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now() }))
   } catch {
     /* best-effort — tracking is a safety net, never block a launch on it */
   }
@@ -59,7 +61,7 @@ function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
-function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; file: string }> {
+function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; file: string }> {
   const dir = terminalPidDir(dataDir)
   let names: string[]
   try {
@@ -67,13 +69,14 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
   } catch {
     return [] // no run dir yet
   }
-  const out: Array<{ pid: number; owner: number; file: string }> = []
+  const out: Array<{ pid: number; owner: number; startedAt?: number; file: string }> = []
   for (const name of names) {
     const file = join(dir, name)
     try {
-      const { pid, owner } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number }
-      if (typeof pid === 'number' && pid > 0) out.push({ pid, owner: typeof owner === 'number' ? owner : 0, file })
-      else rmSync(file, { force: true })
+      const { pid, owner, startedAt } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number; startedAt?: number }
+      if (typeof pid === 'number' && pid > 0) {
+        out.push({ pid, owner: typeof owner === 'number' ? owner : 0, startedAt: typeof startedAt === 'number' ? startedAt : undefined, file })
+      } else rmSync(file, { force: true })
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
     }
@@ -81,19 +84,65 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
   return out
 }
 
+/** How far apart the pidfile's `startedAt` and the process's own start time may be for the pid
+ *  to still count as the shell we spawned. `ps` reports elapsed time in whole seconds. */
+const START_TIME_TOLERANCE_MS = 5_000
+
+/** The start time (epoch ms) of each of `pids` that is running and readable, from ONE `ps` /
+ *  PowerShell call (PowerShell alone takes about a second to start). A pid missing from the
+ *  result could not be checked. */
+function processStartTimes(pids: number[]): Map<number, number> {
+  const out = new Map<number, number>()
+  if (pids.length === 0) return out
+  try {
+    if (process.platform === 'win32') {
+      const script =
+        `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { ` +
+        `try { if ($_.StartTime) { '{0} {1}' -f $_.Id, ([DateTimeOffset]$_.StartTime).ToUnixTimeMilliseconds() } } catch {} }`
+      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+        encoding: 'utf8', timeout: 15_000, windowsHide: true,
+      })
+      for (const m of String(r.stdout ?? '').matchAll(/^\s*(\d+)\s+(\d+)\s*$/gm)) out.set(Number(m[1]), Number(m[2]))
+    } else {
+      // etime is [[dd-]hh:]mm:ss on procps, BSD/macOS and toybox ps alike.
+      const now = Date.now()
+      const r = spawnSync('ps', ['-o', 'pid=,etime=', '-p', pids.join(',')], { encoding: 'utf8', timeout: 5_000 })
+      for (const m of String(r.stdout ?? '').matchAll(/^\s*(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/gm)) {
+        const secs = ((Number(m[2] ?? 0) * 24 + Number(m[3] ?? 0)) * 60 + Number(m[4])) * 60 + Number(m[5])
+        out.set(Number(m[1]), now - secs * 1000)
+      }
+    }
+  } catch {
+    /* no way to check — nothing is verified, so nothing gets killed */
+  }
+  return out
+}
+
 /** Reap terminal-agent shell processes left behind by a previous daemon that didn't shut
  *  down cleanly. Called once at startup, alongside reapStaleEngines/reapStaleTunnels. An
- *  orphan is one whose owner daemon is gone. Returns the number reaped. */
+ *  orphan is one whose owner daemon is gone. Returns the number reaped.
+ *
+ *  A pidfile outlives its shell whenever the daemon dies without its exit handler (SIGKILL,
+ *  OS shutdown, power loss), and after a reboot its pid usually belongs to some unrelated
+ *  process — which `taskkill /T` would take down with its whole tree. So, like
+ *  reapStaleEngines (which checks the engine's port first), this kills only with positive
+ *  evidence the pid is still OUR shell: the process started when the pidfile says it did.
+ *  Anything that can't be verified, including a pidfile from before `startedAt` was recorded,
+ *  is left running and only its stale file is cleared. */
 export function reapStaleTerminals(dataDir: string): number {
+  const orphans = readTerminalPidFiles(dataDir).filter(({ owner }) => !(owner && pidAlive(owner))) // else still managed by a live daemon
+  const started = processStartTimes(orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid))
   let killed = 0
-  for (const { pid, owner, file } of readTerminalPidFiles(dataDir)) {
-    if (owner && pidAlive(owner)) continue // still managed by a live daemon
-    try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      else process.kill(pid, 'SIGKILL')
-      killed++
-    } catch {
-      /* already gone */
+  for (const { pid, startedAt, file } of orphans) {
+    const actual = started.get(pid)
+    if (startedAt !== undefined && actual !== undefined && Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
+      try {
+        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
+        else process.kill(pid, 'SIGKILL')
+        killed++
+      } catch {
+        /* already gone */
+      }
     }
     try { rmSync(file, { force: true }) } catch { /* best-effort */ }
   }
