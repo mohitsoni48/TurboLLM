@@ -7,7 +7,7 @@
 // with no address bar, so a phishing page looks like TurboLLM, and would grant that page every
 // permission it asks for (camera, microphone, location) without any prompt. So only the app's own
 // pages stay in the app, web links go to the system browser, and permissions are denied unless the
-// UI itself needs them.
+// UI itself needs them. It also says which port a (re)spawned daemon binds: the one the window is on.
 
 // Everything the web UI asks for: copy buttons (navigator.clipboard.writeText, web/src/lib/clipboard.ts)
 // and routine-finished notifications (web/src/lib/notify-routine.ts). Anything else is denied.
@@ -37,6 +37,19 @@ function isAppUrl (url, appOrigin) {
   }
 }
 
+/** The port a daemon this app spawns must listen on: the port of the app page the window shows, else
+ *  the launch port (no window yet, or not on an app page). After a port change in Settings the
+ *  window is on the new port (see isAppUrl), and so is the live daemon; the daemon's --port is only
+ *  read at boot. A respawn on the launch port would leave the window, and the restart overlay that
+ *  polls and reloads the window's own origin, on a port nothing listens on. */
+function daemonPortFor (windowUrl, appOrigin, launchPort) {
+  if (isAppUrl(windowUrl, appOrigin)) {
+    const { port } = new URL(windowUrl)
+    if (port) return port
+  }
+  return String(launchPort)
+}
+
 /** http(s) only: the one kind of link worth handing to the system browser. Never file:, javascript:
  *  or a custom scheme that would launch some other app. */
 function isWebUrl (url) {
@@ -54,4 +67,4 @@ function allowPermission (permission, requestingUrl, appOrigin) {
   return ALLOWED_PERMISSIONS.has(permission) && isAppUrl(requestingUrl, appOrigin)
 }
 
-module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, isAppUrl, isWebUrl }
+module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl }

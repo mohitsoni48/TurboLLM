@@ -3,8 +3,10 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const { readFileSync } = require('node:fs')
 const { join } = require('node:path')
+const Module = require('node:module')
+const { EventEmitter } = require('node:events')
 
-const { allowPermission, appOriginFor, isAppUrl, isWebUrl } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 
 const APP = appOriginFor(6996)
 
@@ -26,6 +28,18 @@ test('isAppUrl: only the app host stays in the window', () => {
   assert.equal(isAppUrl('file:///etc/passwd', APP), false)
   assert.equal(isAppUrl('not a url', APP), false)
   assert.equal(isAppUrl(undefined, APP), false)
+})
+
+test('daemonPortFor: a spawned daemon binds the port of the app page the window shows, else the launch port', () => {
+  assert.equal(daemonPortFor('', APP, 6996), '6996', 'no window yet: the first launch')
+  assert.equal(daemonPortFor('http://127.0.0.1:6996/chat/42', APP, 6996), '6996')
+  // After a port change in Settings the daemon and then the window are on the new port.
+  assert.equal(daemonPortFor('http://127.0.0.1:7001/settings', APP, 6996), '7001')
+
+  assert.equal(daemonPortFor('about:blank', APP, 6996), '6996')
+  assert.equal(daemonPortFor('https://evil.example:7001/', APP, 6996), '6996')
+  assert.equal(daemonPortFor('http://localhost:7001/', APP, 6996), '6996')
+  assert.equal(daemonPortFor('http://127.0.0.1/', APP, '7002'), '7002', 'no explicit port: keep the launch port')
 })
 
 test('isWebUrl: only http(s) is handed to the system browser', () => {
@@ -90,4 +104,92 @@ test('main.js takes the single-instance lock before it starts a daemon', () => {
 test('main.js does not run electron-updater on macOS (no zip, unsigned: it cannot install there)', () => {
   const body = mainSource.slice(mainSource.indexOf('function setupAutoUpdate'), mainSource.indexOf("require('electron-updater')"))
   assert.match(body, /process\.platform === 'darwin'\) return/)
+})
+
+// Runs the real main.js against a stand-in for electron (and for child_process and http, so no
+// daemon or window is started), to check how it wires the daemon's port to the window's.
+function loadMain () {
+  const spawned = []
+  let windowUrl = ''
+  let ready = null
+  class FakeWindow {
+    constructor () {
+      this.webContents = { setWindowOpenHandler () {}, on () {}, openDevTools () {}, getURL: () => windowUrl }
+    }
+
+    loadURL (url) { windowUrl = url }
+    isDestroyed () { return false }
+    static getAllWindows () { return [] }
+  }
+  const electron = {
+    app: {
+      isPackaged: false,
+      on () {},
+      quit () {},
+      requestSingleInstanceLock: () => true,
+      whenReady: () => ({ then (f) { ready = f } }),
+    },
+    BrowserWindow: FakeWindow,
+    session: { defaultSession: { setPermissionRequestHandler () {}, setPermissionCheckHandler () {} } },
+    shell: { openExternal () {} },
+  }
+  const childProcess = {
+    spawn (_node, args) {
+      const child = new EventEmitter()
+      Object.assign(child, { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, kill () {} })
+      spawned.push({ args, child })
+      return child
+    },
+  }
+  // /healthz answers at once, so main.js opens its window.
+  const http = {
+    get (_url, _opts, onResponse) {
+      const req = new EventEmitter()
+      req.end = () => setImmediate(() => onResponse({ statusCode: 200 }))
+      return req
+    },
+  }
+  const stubs = { electron, child_process: childProcess, http }
+  const load = Module._load
+  Module._load = function (request, ...rest) {
+    return Object.prototype.hasOwnProperty.call(stubs, request) ? stubs[request] : load.call(this, request, ...rest)
+  }
+  const port = process.env.TURBOLLM_PORT
+  delete process.env.TURBOLLM_PORT
+  try {
+    delete require.cache[require.resolve('./main')]
+    require('./main')
+  } finally {
+    Module._load = load
+    if (port !== undefined) process.env.TURBOLLM_PORT = port
+  }
+  return { spawned, ready: () => ready(), windowUrl: () => windowUrl, setWindowUrl: (url) => { windowUrl = url } }
+}
+
+const portArgs = (args) => args.slice(args.indexOf('--port'), args.indexOf('--port') + 4)
+
+// A port change in Settings moves the live daemon and then the window. The daemon's --port is read
+// only at boot, so a respawn on the launch port left the window (and the restart overlay polling its
+// own origin) on a port nothing listened on.
+test('main.js: a respawn after a requested restart binds the port the window is on now', async () => {
+  const main = loadMain()
+  const log = console.log
+  console.log = () => {} // the supervisor's "restarting" line
+  try {
+    main.ready()
+    assert.equal(main.spawned.length, 1)
+    assert.deepEqual(portArgs(main.spawned[0].args), ['--port', '6996', '--addr', '127.0.0.1:6996'])
+    await new Promise((resolve) => setImmediate(resolve)) // /healthz answers; the window opens
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.equal(main.windowUrl(), 'http://127.0.0.1:6996')
+
+    main.setWindowUrl('http://127.0.0.1:7001/settings') // the UI followed a port change
+    main.spawned[0].child.exitCode = 75
+    main.spawned[0].child.emit('exit', 75, null) // the daemon asks for a restart
+    assert.equal(main.spawned.length, 2)
+    assert.deepEqual(portArgs(main.spawned[1].args), ['--port', '7001', '--addr', '127.0.0.1:7001'])
+    assert.ok(main.spawned[1].args.includes('--no-open'))
+  } finally {
+    console.log = log
+  }
 })

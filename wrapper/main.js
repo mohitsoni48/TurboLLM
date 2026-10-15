@@ -7,7 +7,7 @@ const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
 const { createDaemonSupervisor } = require('./daemon-supervisor')
-const { allowPermission, appOriginFor, isAppUrl, isWebUrl } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
 const APP_ORIGIN = appOriginFor(PORT)
@@ -130,9 +130,10 @@ function waitForDaemon (retryMs = 500, timeoutMs = 45000) {
 }
 
 // ── Spawn the daemon ──────────────────────────────────────────────────────────
-// Resolved once at startup, so every respawn after a requested restart is launched
-// exactly like the first launch: same node, argv, cwd and env.
-function daemonLaunchSpec () {
+// Built for every spawn, so a respawn after a requested restart is launched exactly like
+// the first launch: same node, argv, cwd and env, except the port, which is the one the
+// window is on (daemonPort below).
+function daemonLaunchSpec (port) {
   const node = getDaemonNode()
   const daemonDir = getDaemonDir()
 
@@ -151,7 +152,7 @@ function daemonLaunchSpec () {
     // --no-open: this window IS the UI. Without it the daemon also opens the system browser on
     // every launch and on every respawn after a requested restart. Passed even though the daemon
     // has its own openBrowserOnStart setting, which a user may have left on for CLI use.
-    args: [cliPath, '--port', String(PORT), '--addr', `127.0.0.1:${PORT}`, '--no-open'],
+    args: [cliPath, '--port', String(port), '--addr', `127.0.0.1:${port}`, '--no-open'],
     options: {
       cwd: daemonDir,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -172,6 +173,13 @@ function spawnDaemonFrom (spec) {
   child.stdout.on('data', (data) => { process.stdout.write(data) })
   child.stderr.on('data', (data) => { process.stderr.write(data) })
   return child
+}
+
+// PORT until a port change in Settings moves the live daemon and then the window (window-guards.js
+// daemonPortFor); from then on the window's port, so a respawn comes back where the window is.
+function daemonPort () {
+  const url = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : ''
+  return daemonPortFor(url, APP_ORIGIN, PORT)
 }
 
 function onDaemonLost (reason) {
@@ -223,8 +231,7 @@ app.whenReady().then(() => {
     allowPermission(permission, requestingOrigin, APP_ORIGIN))
 
   try {
-    const spec = daemonLaunchSpec()
-    supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(spec), onDaemonLost })
+    supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(daemonLaunchSpec(daemonPort())), onDaemonLost })
     supervisor.start()
   }
   catch (err) {
