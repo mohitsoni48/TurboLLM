@@ -29,9 +29,13 @@ export function isArtifactLang(lang: string): string | null {
  *  `<script>` placed before `<head>` run unrestricted, and a `<head>` inside a leading comment
  *  swallowed the meta entirely. Leading meta/style/script go into the implied <head>; the
  *  author's own later <html>/<head> tags merge into it or are ignored by the parser. The doctype
- *  may be preceded only by HTML's own whitespace (not JS `\s`, which also takes NBSP, U+2028, VT
- *  and U+FEFF): any other leading character opens <body>, where a meta CSP is ignored — same
- *  rule as the daemon's `withArtifactCsp` (src/artifacts/screenshot.ts). */
+ *  may be preceded only by HTML's own whitespace (not JS `\s`, which also takes NBSP, U+2028 and
+ *  VT): any other leading character opens <body>, where a meta CSP is ignored — same rule as the
+ *  daemon's `withArtifactCsp` (src/artifacts/screenshot.ts). U+FEFF (also in `\s`) is a special
+ *  case: a browser decodes srcdoc as UTF-8 and strips a leading one as a BOM, so here it never
+ *  opened <body>; it is still not treated as whitespace, because the daemon's export loads the
+ *  same HTML with page.setContent, which keeps it as a character. The meta then simply goes
+ *  first, and the doctype after it is dropped, which is harmless: srcdoc is always no-quirks. */
 function injectAtDocStart(code: string, head: string): string {
   const m = /^[\t\n\f\r ]*<!doctype[^>]*>/i.exec(code)
   return m ? `${m[0]}\n${head}\n${code.slice(m[0].length)}` : `${head}\n${code}`
@@ -350,6 +354,14 @@ function buildCaptureDoc(code: string): string {
 const CAPTURE_FREEZE_CSS =
   '*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;animation-fill-mode:forwards!important;transition:none!important}'
 
+/** html2canvas loads every <img> src and CSS url() itself, with `new Image()` in the APP's
+ *  window, so the frame's CSP (img-src data: blob:) does not cover those requests. With
+ *  useCORS on, a model-written remote image URL (an attacker's `?d=<data>`, a LAN admin page)
+ *  was fetched on Download PNG/JPEG although the preview blocks it. Off (and allowTaint off,
+ *  its default), html2canvas skips cross-origin images, so no third party is contacted: the
+ *  export loads only data:, blob: and app-origin (relative) image URLs. */
+const H2C_USE_CORS = false
+
 /** Render the HTML in an isolated, same-origin, SCRIPT-DISABLED iframe and rasterize
  *  it with html2canvas. Unlike the foreignObject trick, html2canvas performs real
  *  layout — so 100vh, position:fixed, flex and overflow render correctly. The iframe
@@ -401,7 +413,7 @@ async function html2canvasCapture(code: string, vw: number, vh: number): Promise
     const { default: html2canvas } = await import('html2canvas')
     const canvas = await html2canvas(doc.body, {
       width: w, height: realH, windowWidth: w, windowHeight: h,
-      scale, backgroundColor: bg, useCORS: true, logging: false, scrollX: 0, scrollY: 0,
+      scale, backgroundColor: bg, useCORS: H2C_USE_CORS, logging: false, scrollX: 0, scrollY: 0,
       onclone: (cloned: Document) => {
         const s = cloned.createElement('style')
         s.textContent = CAPTURE_FREEZE_CSS
@@ -509,7 +521,7 @@ async function rasterizeStaticFrozen(
     const { default: html2canvas } = await import('html2canvas')
     const canvas = await html2canvas(doc.body, {
       width: dims.w, height: dims.h, windowWidth: dims.w, windowHeight: dims.h,
-      scale, backgroundColor: bg, useCORS: true, logging: false, scrollX: 0, scrollY: 0,
+      scale, backgroundColor: bg, useCORS: H2C_USE_CORS, logging: false, scrollX: 0, scrollY: 0,
       onclone: (cloned: Document) => {
         const s = cloned.createElement('style')
         s.textContent = CAPTURE_FREEZE_CSS

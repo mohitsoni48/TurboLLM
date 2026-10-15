@@ -108,7 +108,8 @@ describe('ArtifactCard — HTML artifact CSP', () => {
 
   // JS `\s` also matches these, HTML's parser does not: each one before the doctype opens <body>
   // as text, so a meta spliced after that doctype lands in <body>, where a meta CSP is ignored.
-  it.each([['NBSP', '\u00a0'], ['U+2028', '\u2028'], ['VT', '\v'], ['U+FEFF', '\ufeff']])(
+  // (U+FEFF is not one of them in a browser: see the next test.)
+  it.each([['NBSP', '\u00a0'], ['U+2028', '\u2028'], ['VT', '\v']])(
     'keeps the CSP in <head> when %s precedes the doctype',
     (_name, ch) => {
       const code = `${ch}<!doctype html><html><head></head><body><img src="https://attacker.example/p.gif"><script>beacon()</script></body></html>`
@@ -122,6 +123,19 @@ describe('ArtifactCard — HTML artifact CSP', () => {
       }
     },
   )
+
+  // A browser strips a leading U+FEFF from srcdoc as a BOM, so it never opened <body> there; jsdom's
+  // DOMParser keeps it, so a parse here cannot model that case either way. What holds for every
+  // parser is where the meta goes: first, before the U+FEFF (which is not whitespace to the
+  // daemon's setContent export, so the shared rule does not skip it).
+  it('puts the CSP first when U+FEFF precedes the doctype', () => {
+    const code = String.fromCharCode(0xfeff) + '<!doctype html><html><head></head><body><script>beacon()</script></body></html>'
+    const { container } = render(<ArtifactCard lang="html" code={code} />)
+    const { scripted, staticDoc } = frames(container)
+    for (const srcdoc of [scripted, staticDoc]) {
+      expect(srcdoc.startsWith('<meta http-equiv="Content-Security-Policy"')).toBe(true)
+    }
+  })
 
   it('still keeps a doctype preceded only by HTML whitespace first', () => {
     const code = '\n\t <!doctype html><html><head></head><body>hi</body></html>'
