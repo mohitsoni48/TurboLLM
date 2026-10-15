@@ -2149,9 +2149,11 @@ export class ConversationStore {
   }
 
   /** Chat branching (GitHub #52): deactivate a message instead of deleting it, and
-   *  establish its variant_group (its own id) if this is its first regeneration. */
+   *  establish its variant_group (its own id) if this is its first regeneration. Also drops
+   *  any branch_of tag: only freezeTail's rows may carry one, and a row restored before
+   *  restoreTail cleared tags still has its old one (see restoreTail). */
   deactivateMessage(id: string): void {
-    this.db.prepare(`UPDATE messages SET is_active = 0, variant_group = COALESCE(variant_group, id) WHERE id = $id`).run({ $id: id } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 0, branch_of = NULL, variant_group = COALESCE(variant_group, id) WHERE id = $id`).run({ $id: id } as P)
   }
 
   /** All siblings sharing a variant_group (active + inactive), oldest first — the full
@@ -2161,11 +2163,12 @@ export class ConversationStore {
   }
 
   /** Switches which sibling in a variant group is the active/shown one. No-op (returns
-   *  false) if targetId isn't actually a member of that group. */
+   *  false) if targetId isn't actually a member of that group. The sibling it turns off
+   *  loses any branch_of tag, as in deactivateMessage. */
   setActiveVariant(variantGroup: string, targetId: string): boolean {
     const target = this.getMessage(targetId)
     if (!target || target.variantGroup !== variantGroup) return false
-    this.db.prepare(`UPDATE messages SET is_active = 0 WHERE variant_group = $vg`).run({ $vg: variantGroup } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 0, branch_of = NULL WHERE variant_group = $vg AND is_active = 1`).run({ $vg: variantGroup } as P)
     this.db.prepare(`UPDATE messages SET is_active = 1 WHERE id = $id`).run({ $id: targetId } as P)
     return true
   }
@@ -2180,9 +2183,13 @@ export class ConversationStore {
   }
 
   /** Chat branching: reactivate every message previously frozen under `anchorId` — the
-   *  inverse of freezeTail, used when switching back to that message version. */
+   *  inverse of freezeTail, used when switching back to that message version. The tag is
+   *  cleared as the rows come back: an active row must not carry one, or a reply regenerated
+   *  away inside this tail later would still read as "frozen under anchorId" and come back
+   *  next to its replacement. freezeTail re-tags whatever is active when the
+   *  user switches away again. */
   restoreTail(anchorId: string): void {
-    this.db.prepare(`UPDATE messages SET is_active = 1 WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 1, branch_of = NULL WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
   }
 
   // ── Folder methods (v10 migration) ────────────────────────────────────────

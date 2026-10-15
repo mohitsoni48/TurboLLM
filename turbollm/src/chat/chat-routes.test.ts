@@ -446,6 +446,80 @@ test('switching an older assistant reply\'s variant swaps its downstream turns t
   }
 })
 
+// A restored tail kept its branch_of tag, so a reply that /regenerate later replaced
+// inside it was frozen-and-restored along with its replacement — two assistant turns in a row.
+test('switching an older reply away and back after regenerating a later reply in its tail restores only the current version', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'a1 again', 'a2', 'a2 again']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+    const activate = async (id: string) => (await h.app.request(`${base}/messages/${id}/activate`, { method: 'POST' })).status
+    const regenerate = async () => {
+      await h.app.request(`${base}/regenerate`, { method: 'POST' })
+      await (await h.app.request(`${base}/continue`, json({}))).text()
+    }
+    const idOf = (content: string) => h.store.getMessages(conv.id).find((m) => m.content === content)!.id
+
+    await (await h.app.request(`${base}/messages`, json({ content: 'u1' }))).text()
+    const a1 = idOf('a1')
+    await regenerate()
+    const a1b = idOf('a1 again')
+    await (await h.app.request(`${base}/messages`, json({ content: 'u2' }))).text()
+    assert.equal(await activate(a1), 200)
+    assert.equal(await activate(a1b), 200)
+    assert.deepEqual(active(), ['u1', 'a1 again', 'u2', 'a2'])
+    await regenerate()
+    const a2b = idOf('a2 again')
+    assert.equal(await activate(a1), 200)
+    assert.deepEqual(active(), ['u1', 'a1'])
+    assert.equal(await activate(a1b), 200)
+    assert.deepEqual(active(), ['u1', 'a1 again', 'u2', 'a2 again'])
+
+    // The a2 switcher still works within the restored tail, and another round trip keeps it.
+    const a2 = h.store.getMessageVariants(h.store.getMessage(a2b)!.variantGroup!).find((m) => m.content === 'a2')!.id
+    assert.equal(await activate(a2), 200)
+    assert.deepEqual(active(), ['u1', 'a1 again', 'u2', 'a2'])
+    assert.equal(await activate(a1), 200)
+    assert.equal(await activate(a1b), 200)
+    assert.deepEqual(active(), ['u1', 'a1 again', 'u2', 'a2'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('the same holds for an edited question: regenerating its restored reply, then switching away and back, shows one reply', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'reply to the edit', 'a1 again']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+    const activate = async (id: string) => (await h.app.request(`${base}/messages/${id}/activate`, { method: 'POST' })).status
+
+    await (await h.app.request(`${base}/messages`, json({ content: 'u1' }))).text()
+    const u1 = h.store.getMessages(conv.id)[0].id
+    await h.app.request(`${base}/messages/${u1}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'u1 edited' }) })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    const u1b = h.store.getMessages(conv.id)[0].id
+    assert.equal(await activate(u1), 200)
+    assert.deepEqual(active(), ['u1', 'a1'])
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.equal(await activate(u1b), 200)
+    assert.deepEqual(active(), ['u1 edited', 'reply to the edit'])
+    assert.equal(await activate(u1), 200)
+    assert.deepEqual(active(), ['u1', 'a1 again'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()
