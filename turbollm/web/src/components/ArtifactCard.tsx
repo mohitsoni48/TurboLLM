@@ -28,9 +28,12 @@ export function isArtifactLang(lang: string): string | null {
  *  only governs what the parser sees after it, so splicing at the author's `<head` let a
  *  `<script>` placed before `<head>` run unrestricted, and a `<head>` inside a leading comment
  *  swallowed the meta entirely. Leading meta/style/script go into the implied <head>; the
- *  author's own later <html>/<head> tags merge into it or are ignored by the parser. */
+ *  author's own later <html>/<head> tags merge into it or are ignored by the parser. The doctype
+ *  may be preceded only by HTML's own whitespace (not JS `\s`, which also takes NBSP, U+2028, VT
+ *  and U+FEFF): any other leading character opens <body>, where a meta CSP is ignored — same
+ *  rule as the daemon's `withArtifactCsp` (src/artifacts/screenshot.ts). */
 function injectAtDocStart(code: string, head: string): string {
-  const m = /^\s*<!doctype[^>]*>/i.exec(code)
+  const m = /^[\t\n\f\r ]*<!doctype[^>]*>/i.exec(code)
   return m ? `${m[0]}\n${head}\n${code.slice(m[0].length)}` : `${head}\n${code}`
 }
 

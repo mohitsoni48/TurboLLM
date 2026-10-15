@@ -106,6 +106,34 @@ describe('ArtifactCard — HTML artifact CSP', () => {
     }
   })
 
+  // JS `\s` also matches these, HTML's parser does not: each one before the doctype opens <body>
+  // as text, so a meta spliced after that doctype lands in <body>, where a meta CSP is ignored.
+  it.each([['NBSP', '\u00a0'], ['U+2028', '\u2028'], ['VT', '\v'], ['U+FEFF', '\ufeff']])(
+    'keeps the CSP in <head> when %s precedes the doctype',
+    (_name, ch) => {
+      const code = `${ch}<!doctype html><html><head></head><body><img src="https://attacker.example/p.gif"><script>beacon()</script></body></html>`
+      const { container } = render(<ArtifactCard lang="html" code={code} />)
+      const { scripted, staticDoc } = frames(container)
+      for (const srcdoc of [scripted, staticDoc]) {
+        const { doc, meta, scriptsBeforeMeta } = parseSrcdoc(srcdoc)
+        expect(meta).not.toBeNull()
+        expect(meta!.parentElement).toBe(doc.head)
+        expect(scriptsBeforeMeta).toHaveLength(0)
+      }
+    },
+  )
+
+  it('still keeps a doctype preceded only by HTML whitespace first', () => {
+    const code = '\n\t <!doctype html><html><head></head><body>hi</body></html>'
+    const { container } = render(<ArtifactCard lang="html" code={code} />)
+    const { scripted, staticDoc } = frames(container)
+    for (const srcdoc of [scripted, staticDoc]) {
+      expect(srcdoc.startsWith('\n\t <!doctype html>')).toBe(true)
+      const { doc, meta } = parseSrcdoc(srcdoc)
+      expect(meta!.parentElement).toBe(doc.head)
+    }
+  })
+
   it('still renders an ordinary full document as written (its <html> attributes, head and body)', () => {
     const code = '<html lang="en" class="dark"><head><title>Pricing</title><style>body{color:red}</style></head><body><h1>Plans</h1></body></html>'
     const { container } = render(<ArtifactCard lang="html" code={code} />)
