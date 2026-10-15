@@ -4,7 +4,8 @@
 //
 //   POST /api/v1/comfyui/acquire → guard.acquire(): force-unload the model (freeing
 //     VRAM before ComfyUI executes) and BLOCK new loads. Returns once VRAM is free.
-//   POST /api/v1/comfyui/release → guard.release(): reload the exact model we unloaded.
+//   POST /api/v1/comfyui/release → guard.release(): reload the exact model we unloaded (or,
+//     if the render paused a load, start that load instead).
 //
 // That FORWARD direction (ComfyUI → TurboLLM) is mirrored by the REVERSE direction
 // (TurboLLM → ComfyUI, F-011): before TurboLLM loads a model it calls ComfyUI's native
@@ -57,7 +58,8 @@ export interface ComfyStatus {
   held: boolean
   /** Model loads are currently blocked (enabled && held). */
   blocked: boolean
-  /** Key of the model we unloaded for ComfyUI and will reload on release. */
+  /** Key of the model we unloaded for ComfyUI. Release reloads it, unless a load the render paused takes its place
+   *  (see release() and modelKeyLoadedOnRelease()). */
   suspendedModelKey: string | null
   /** ms since the last acquire/heartbeat signal from ComfyUI, or null if none yet. */
   lastSignalAgoMs: number | null
@@ -65,7 +67,8 @@ export interface ComfyStatus {
 
 export class ComfyGuard {
   private held = false
-  // The model we unloaded because ComfyUI started — reloaded on release.
+  // The model we unloaded because ComfyUI started: release() reloads it unless a load the render
+  // paused takes its place.
   private suspended: StartOpts | null = null
   private leaseTimer: ReturnType<typeof setTimeout> | null = null
   private lastSignalAt = 0
@@ -169,7 +172,8 @@ export class ComfyGuard {
     }
   }
 
-  /** ComfyUI's queue drained: unblock loads and reload the model we unloaded for it. */
+  /** ComfyUI's queue drained: unblock loads and start the load the render paused, else reload the
+   *  model we unloaded for it. */
   async release(): Promise<void> {
     this.clearLease()
     this.lastSignalAt = Date.now()
@@ -182,8 +186,7 @@ export class ComfyGuard {
     // loading resumes when the queue finishes. Keep that promise. That load is the user's latest choice, so it
     // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
     // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
-    const st = this.manager.status()
-    if (st.state === 'error' && st.err?.message === LOAD_PAUSED) {
+    if (this.hasPausedLoad()) {
       console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
       try {
         await this.manager.restart()
@@ -209,6 +212,21 @@ export class ComfyGuard {
       }
     }
     this.cachedFile = null
+  }
+
+  /** The primary is in 'error' with our pre-start hook's refusal: release() resumes that load. */
+  private hasPausedLoad(): boolean {
+    const st = this.manager.status()
+    return st.state === 'error' && st.err?.message === LOAD_PAUSED
+  }
+
+  /** Key of the model release() loads when this render ends, as release() decides it: the load it paused, else the
+   *  model it unloaded. null when it loads none, or no render claims the GPU. The gateway uses it to tell a caller that
+   *  may not load models whether waiting brings its model up. */
+  modelKeyLoadedOnRelease(): string | null {
+    if (!this.gpuClaimed()) return null
+    if (this.hasPausedLoad()) return this.manager.restartOpts()?.model.key ?? null
+    return this.suspended?.model.key ?? null
   }
 
   /** Wait for the just-reloaded engine to reach 'running', then restore the saved KV cache

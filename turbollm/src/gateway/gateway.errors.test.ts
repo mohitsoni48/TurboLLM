@@ -14,7 +14,8 @@ import { registerGateway } from './gateway'
 import { ModelRouter } from './model-router'
 import { lanAuth, provisionRemoteApiKey } from '../auth'
 import { defaultConfig, type Engine } from '../config/config'
-import type { Manager, Status } from '../engines/manager'
+import type { Manager, StartOpts, Status } from '../engines/manager'
+import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 
 const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
@@ -489,6 +490,7 @@ function restrictedDeps(opts: {
   keepN?: number
   slot?: ReturnType<typeof managerIn>
   comfySuspended?: string | null
+  comfy?: ComfyGuard
 }): { d: Deps; router: ModelRouter; token: string } {
   const cfg = defaultConfig()
   cfg.gateway.keepN = opts.keepN ?? 1
@@ -496,9 +498,9 @@ function restrictedDeps(opts: {
   const scanner = { list: () => ({ models: [MODEL, OTHER], scanning: false, lastScanAt: '' }), get: () => undefined }
   const engine = { id: 'llama', kind: 'llama-server', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
   const registry = { active: () => engine, layaEngine: () => undefined }
-  const comfy = opts.comfySuspended === undefined
+  const comfy = opts.comfy ?? (opts.comfySuspended === undefined
     ? undefined
-    : { isBlocked: () => true, snapshot: () => ({ suspendedModelKey: opts.comfySuspended }) }
+    : { modelKeyLoadedOnRelease: () => opts.comfySuspended })
   const router = new ModelRouter(
     store as never, registry as never, opts.primary as unknown as Manager, scanner as never, comfy as never, undefined,
     () => (opts.slot ?? managerIn('stopped')) as unknown as Manager,
@@ -511,14 +513,14 @@ function restrictedDeps(opts: {
   return { d, router, token: provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] }) }
 }
 
-async function askAsRemoteToken(d: Deps, token: string, path: '/v1/messages' | '/v1/chat/completions'): Promise<Response> {
+async function askAsRemoteToken(d: Deps, token: string, path: '/v1/messages' | '/v1/chat/completions', model = MODEL.key): Promise<Response> {
   const app = new Hono()
   app.use('*', lanAuth(d))
   registerGateway(app, d)
   return app.request(`http://local.test${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-TurboLLM-Auth': token },
-    body: JSON.stringify({ model: MODEL.key, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
   }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
 }
 
@@ -569,4 +571,47 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
       assert.equal(res.headers.get('x-should-retry'), 'false')
     })
   }
+}
+
+// A render that starts while OTHER runs, and a load of MODEL that reaches its start during it: acquire unloaded OTHER
+// and keeps it for release(), the guard's pre-start hook refused MODEL's load (the primary is in 'error' with that
+// refusal), and release() then loads MODEL, which wins over OTHER. So the token may retry MODEL, and OTHER does not come
+// back. Composed with a real ComfyGuard, so the router's answer follows what release() does.
+for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
+  test(`${path}: during a render that paused a load, a models:use token may retry that model, not the unloaded one`, async () => {
+    const optsFor = (entry: typeof MODEL) => ({ model: { key: entry.key, name: entry.name } }) as unknown as StartOpts
+    let state: Status['state'] = 'running'
+    let err: Status['err'] = null
+    let recorded = optsFor(OTHER)
+    const primary = {
+      ...managerIn('running'),
+      status: (): Status => ({ state, err, port: 0, pid: 0, loadElapsedMs: 0, model: state === 'running' ? recorded.model : null }),
+      currentOpts: () => (state === 'running' || state === 'starting' ? recorded : null),
+      restartOpts: () => recorded,
+      stopAndWait: async () => { state = 'stopped' },
+    }
+    const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' } }), dir: () => '/tmp/turbollm-test-data' }
+    const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
+    try {
+      await guard.acquire() // suspends OTHER, which was running
+      // The swap to MODEL reaches its start mid-render: Manager.load recorded MODEL, then the hook refused it.
+      recorded = optsFor(MODEL)
+      const refusal = await guard.freeComfyUIBeforeLoad().then(() => '', (e: Error) => e.message)
+      state = 'error'
+      err = { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }
+
+      const { d, token } = restrictedDeps({ primary: primary as unknown as ReturnType<typeof managerIn>, comfy: guard })
+      const paused = await askAsRemoteToken(d, token, path, MODEL.key)
+      assert.equal(paused.status, 503)
+      assert.match(await paused.text(), /ComfyUI is rendering/)
+      assert.equal(paused.headers.get('x-should-retry'), null)
+
+      const unloaded = await askAsRemoteToken(d, token, path, OTHER.key)
+      assert.equal(unloaded.status, 503)
+      assert.match(await unloaded.text(), /may not load models/)
+      assert.equal(unloaded.headers.get('x-should-retry'), 'false')
+    } finally {
+      guard.stop()
+    }
+  })
 }

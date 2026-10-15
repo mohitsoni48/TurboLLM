@@ -483,6 +483,41 @@ test('route: a load that ran and failed is permanent; a ComfyUI-blocked load is 
   assert.deepEqual(blocked, { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
 })
 
+// A render that starts while the gateway loads into the primary: acquire force-stops the starting engine (Manager.load
+// then resolves with it stopped) and release() reloads that model, so the refusal clears by itself, as it does for a
+// pool slot. A load that failed on its own during the render ('error') is still permanent.
+for (const [label, endState, expected] of [
+  ['it kills is retryable', 'stopped', { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }],
+  ['fails on its own stays permanent', 'error', { status: 503, message: 'Model failed to become ready.', permanent: true }],
+] as const) {
+  test(`route: during a ComfyUI acquire, a primary load that ${label}`, async () => {
+    let state = 'stopped' as Status['state']
+    let claimed = false
+    const primary = {
+      status: (): Status => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+      load: async (_opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+        await hooks?.beforeStart?.()
+        claimed = true // the render's acquire, while the engine starts
+        state = endState
+      },
+      target: () => null,
+      touch: () => {},
+    } as unknown as Manager
+    const comfy = {
+      isBlocked: () => false,
+      gpuClaimed: () => claimed,
+      freeComfyUIBeforeLoad: async () => {},
+    } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+    const entry = fakeEntry('model-a')
+    const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+    const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+
+    const result = await new ModelRouter(fakeFullStore(), registry, primary, scanner, comfy).route('model-a')
+
+    assert.deepEqual(result, expected)
+  })
+}
+
 test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {
   const scanner = { get: () => undefined, list: () => ({ models: [] }) } as unknown as import('../models/scanner').Scanner
   let loadCalled = false

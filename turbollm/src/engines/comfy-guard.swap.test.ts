@@ -56,6 +56,7 @@ test('a render that starts while a swap is stopping the old model kills it, and 
   assert.equal(manager.status().state, 'error')
   assert.match(manager.status().err?.message ?? '', /ComfyUI is rendering/)
   assert.equal(guard.isBlocked(), true)
+  assert.equal(guard.modelKeyLoadedOnRelease(), 'B', 'the gateway is told B comes up when the render ends')
 
   // The error says loading resumes when the queue finishes: release() loads B (A was killed, not suspended).
   await guard.release()

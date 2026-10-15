@@ -238,6 +238,48 @@ test('release resumes a load the guard refused mid-render, over the model the re
   assert.equal(g.isBlocked(), false)
 })
 
+// The gateway answers a caller that may not load models from this: it must name the model release() loads.
+test('modelKeyLoadedOnRelease names what release() loads: the paused load over the unloaded model, none outside a render', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'no render')
+  await g.acquire()
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a', 'the model the render unloaded')
+
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restartOpts: () => OPTS('b'),
+    restart: async () => {},
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), 'b', 'the load the render paused wins')
+
+  await g.release()
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the render is over')
+})
+
+// Not only once the GPU is held: while acquire is still freeing VRAM, release() will already reload the model.
+test('modelKeyLoadedOnRelease already names the unloaded model while acquire is still stopping it', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  let finishStop = () => {}
+  Object.assign(mgr, {
+    stopAndWait: async () => {
+      Object.assign(mgr, { currentOpts: () => null })
+      await new Promise<void>((resolve) => { finishStop = resolve })
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+
+  const acq = g.acquire()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(g.isBlocked(), false, 'the GPU is not held yet')
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a')
+
+  finishStop()
+  await acq
+  await g.release()
+})
+
 test('acquire also stops the gateway pool slots, before it reports the GPU free', async () => {
   const { mgr } = fakeManager({ state: 'running', opts: OPTS('m') })
   const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)

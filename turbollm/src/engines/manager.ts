@@ -609,6 +609,12 @@ export class Manager {
     return (this.state === 'running' || this.state === 'starting') ? this.opts : null
   }
 
+  /** The StartOpts restart() retries: the last load attempted, also one that failed or was refused (status() and
+   *  currentOpts() name no model then). The ComfyUI guard reads it to tell which model its release() loads. */
+  restartOpts(): StartOpts | null {
+    return this.opts
+  }
+
   touch(): void {
     this.lastActivity = Date.now()
   }

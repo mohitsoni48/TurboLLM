@@ -301,9 +301,9 @@ export class ModelRouter {
       this.extraSlots.delete(key)
       stopping.push(slot.manager.stopAndWait(opts))
     }
-    // A slot still loading: one that is starting, or stopping the model it evicted, is killed now rather than left to
-    // come up and serve. One that has not spawned yet (waiting for the load gate, or in its pre-start hook) is still
-    // 'stopped', so this does nothing to it: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
+    // A slot still loading is stopped now, whatever it still runs: the model it evicted (as LRU, still running while
+    // its load waits for the load gate, or being stopped), or the engine it is starting. A load that has not spawned
+    // its engine yet is not cancelled by this: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
     // drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load.
     const loading = this.loadingSlot
     if (loading?.engineId === engineId) stopping.push(loading.manager.stopAndWait(opts))
@@ -375,15 +375,16 @@ export class ModelRouter {
   /** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused) when `entry` is not
    *  running: the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. It is permanent
    *  for this caller only when nothing under way brings the model up. A model that is loading, or the one ComfyUI's
-   *  guard unloaded and reloads when the render ends, is served to this caller once it runs, so its client may retry. */
+   *  guard loads when the render ends (a load the render paused, else the model it unloaded), is served to this caller
+   *  once it runs, so its client may retry. */
   private notLoadedForCaller(entry: ModelEntry): RouteResult {
     const ms = this.manager.status()
     if ((ms.state === 'starting' && ms.model && this.keysMatch(ms.model.key, entry)) || this.loadingKey === entry.key) {
       return { status: 503, message: `'${entry.name}' is still loading. Try again shortly.` }
     }
-    const suspended = this.comfy?.isBlocked() ? this.comfy.snapshot().suspendedModelKey : null
-    if (suspended && this.keysMatch(suspended, entry)) {
-      return { status: 503, message: `ComfyUI is rendering — '${entry.name}' is reloaded when its queue finishes.` }
+    const comfyLoads = this.comfy?.modelKeyLoadedOnRelease() ?? null
+    if (comfyLoads && this.keysMatch(comfyLoads, entry)) {
+      return { status: 503, message: `ComfyUI is rendering — '${entry.name}' is loaded when its queue finishes.` }
     }
     return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
   }
@@ -504,6 +505,12 @@ export class ModelRouter {
 
     const s = targetManager.status()
     if (s.state !== 'running') {
+      // The primary's load, when ComfyUI's acquire killed it: acquire force-stops a starting primary itself and keeps
+      // its model for release() to reload, so it is stopped, not failed, and like the pool slot above the client may
+      // retry. A load that failed on its own leaves the engine in 'error' and stays permanent.
+      if (s.state !== 'error' && this.comfy?.gpuClaimed()) {
+        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
+      }
       return { status: 503, message: s.err?.message ?? 'Model failed to become ready.', permanent: true }
     }
 
