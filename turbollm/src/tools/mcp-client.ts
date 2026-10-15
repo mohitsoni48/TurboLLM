@@ -79,15 +79,22 @@ export class StdioMcpClient implements IMcpClient {
     const isWin = process.platform === 'win32'
     const file = isWin ? 'cmd.exe' : this.command
     const args = isWin ? ['/c', this.command, ...this.args] : this.args
-    this.proc = spawn(file, args, {
+    const proc = spawn(file, args, {
       env: { ...process.env, ...this.env },
       // stderr is discarded, not piped: nothing reads it, and once an unread pipe fills (~128 KB of
       // logging — the Python MCP SDK logs every request at INFO) the server blocks on its next
       // stderr write and every later request times out.
       stdio: ['pipe', 'pipe', 'ignore'],
     })
+    this.proc = proc
+    this.buf = ''
 
-    this.proc.stdout?.on('data', (chunk: Buffer) => {
+    // Every handler below acts only while `proc` is still THE process. After a failed initialize
+    // or a disconnect the old process is killed, not awaited, and the next call lazily spawns a
+    // replacement: the old one's late 'exit'/'error' would otherwise kill that replacement and
+    // fail its pending requests, and its last buffered stdout would splice into the new stream.
+    proc.stdout?.on('data', (chunk: Buffer) => {
+      if (this.proc !== proc) return
       this.buf += chunk.toString('utf8')
       const lines = this.buf.split('\n')
       this.buf = lines.pop() ?? ''
@@ -107,8 +114,8 @@ export class StdioMcpClient implements IMcpClient {
       }
     })
 
-    this.proc.on('error', () => this.cleanup())
-    this.proc.on('exit', () => this.cleanup())
+    proc.on('error', () => { if (this.proc === proc) this.cleanup() })
+    proc.on('exit', () => { if (this.proc === proc) this.cleanup() })
 
     try {
       await this.sendRequest('initialize', {
@@ -119,8 +126,9 @@ export class StdioMcpClient implements IMcpClient {
     } catch (e) {
       // A rejected or timed-out initialize (a first-run `npx -y`/`uvx` download easily outlasts
       // the 30 s timeout) must not leave the child running: the caller drops this client, so
-      // nothing else would ever kill it, and the next sync spawns another.
-      this.cleanup()
+      // nothing else would ever kill it, and the next sync spawns another. (Unless `proc` is
+      // already gone and cleaned up — then this.proc may be a replacement that is not ours to kill.)
+      if (this.proc === proc) this.cleanup()
       throw e
     }
     await this.sendNotification('notifications/initialized', {})
