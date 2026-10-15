@@ -25,14 +25,15 @@ const isWin = process.platform === 'win32'
 
 // ── normForCompare ───────────────────────────────────────────────────────────────
 
+// `\` is a separator only on Windows; on POSIX it is an ordinary filename character.
 test('normForCompare: unifies mixed separators to the OS separator', () => {
   const out = normForCompare('a/b\\c/d')
-  assert.equal(out, ['a', 'b', 'c', 'd'].join(sep))
+  assert.equal(out, isWin ? ['a', 'b', 'c', 'd'].join(sep) : 'a/b\\c/d')
 })
 
 test('normForCompare: collapses repeated separators', () => {
   const out = normForCompare('a//b\\\\c')
-  assert.equal(out, ['a', 'b', 'c'].join(sep))
+  assert.equal(out, isWin ? ['a', 'b', 'c'].join(sep) : 'a/b\\\\c')
 })
 
 test('normForCompare: case-folds on Windows only', () => {
@@ -444,6 +445,21 @@ test('REGRESSION: a link target that is not UTF-8 fails closed', fileLinks, (t) 
     assert.ok(!isContainedFromRoot('L', root))
     writeFileSync(join(root, 'L'), 'w')
     assert.equal(readFileSync(join(base, 'out', 'x'), 'utf8'), 'w', 'sanity: the write landed outside')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: on POSIX `<repo>\\x` is a sibling of the repo, not inside it', { skip: isWin }, () => {
+  const base = tmpDir('kbslash-')
+  const root = join(base, 'repo')
+  try {
+    mkdirSync(root)
+    // pi would create the directory `<base>/repo\evil`, next to the repo.
+    assert.ok(!isContainedFromRoot('../repo\\evil/x.txt', root))
+    assert.ok(!isInsideAny(`${root}\\evil/x.txt`, [root]))
+    // A `\` in a name inside the repo is still inside.
+    assert.ok(isContainedFromRoot('src\\x.ts', root))
   } finally {
     rmSync(base, { recursive: true, force: true })
   }

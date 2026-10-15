@@ -111,9 +111,11 @@ function readLinkOrNull(p: string): string | null {
 }
 
 /** Normalize for containment comparison: unify separators to the OS sep and case-fold
- *  on Windows (NTFS is case-insensitive; 8.3 short names are already expanded by realpath). */
+ *  on Windows (NTFS is case-insensitive; 8.3 short names are already expanded by realpath).
+ *  On POSIX `\` is an ordinary filename character: the sibling `<parent>/repo\x` is not inside
+ *  `<parent>/repo`. */
 export function normForCompare(p: string): string {
-  const unified = p.split(/[\\/]+/).join(sep)
+  const unified = p.split(isWin ? /[\\/]+/ : /\/+/).join(sep)
   return isWin ? unified.toLowerCase() : unified
 }
 
