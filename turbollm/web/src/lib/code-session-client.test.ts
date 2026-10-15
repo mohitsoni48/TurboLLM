@@ -172,6 +172,37 @@ describe('CodeSessionClient', () => {
     expect(liveStates.some((s) => s?.assistantId === 'a2' && s.content === 'backlog')).toBe(true)
   })
 
+  it('starts the next turn from seq 0 after giving up on reconnecting (a daemon down past the budget renumbers from 0)', async () => {
+    vi.useFakeTimers()
+    const { handlers, liveStates } = makeHandlers()
+    const seenFromSeq: number[] = []
+    let restarted = false
+    const fn: CodeStreamFn = async function* (_sid, fromSeq) {
+      seenFromSeq.push(fromSeq)
+      if (seenFromSeq.length === 1) {
+        // Turn 1 runs up to seq 41, then the daemon goes away mid-run.
+        yield { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 40 } as CodeStreamEvent
+        yield { event: 'delta', data: { delta: 'x' }, seq: 41 } as CodeStreamEvent
+        throw new TypeError('fetch failed')
+      }
+      if (!restarted) throw new TypeError('fetch failed') // still down: every reconnect fails
+      // The restarted daemon's turn begins at seq 0 and (like subscribeToBuffer) replays only
+      // seq >= fromSeq.
+      const frames = [{ event: 'meta', data: { userMessageId: 'u2', assistantMessageId: 'a2' }, seq: 0 }, { event: 'delta', data: { delta: 'backlog' }, seq: 1 }]
+      for (const f of frames as CodeStreamEvent[]) if (f.seq! >= fromSeq) yield f
+    }
+    const client = new CodeSessionClient('s1', handlers, fn)
+    client.connect()
+    await vi.advanceTimersByTimeAsync(30_000) // drain all reconnect backoffs
+    expect(handlers.onLostConnection).toHaveBeenCalledWith(false)
+    expect(client.isActive).toBe(false)
+    restarted = true
+    client.connect() // the user's next message on the same client
+    await vi.advanceTimersByTimeAsync(0)
+    expect(seenFromSeq[seenFromSeq.length - 1]).toBe(0)
+    expect(liveStates.some((s) => s?.assistantId === 'a2' && s.content === 'backlog')).toBe(true)
+  })
+
   it('reports a silent lost-connection for a 404 (run is gone)', async () => {
     vi.useFakeTimers()
     const { handlers } = makeHandlers()

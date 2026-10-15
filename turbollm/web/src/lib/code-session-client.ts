@@ -87,8 +87,8 @@ export type CodeStreamFn = (sessionId: string, fromSeq: number, signal: AbortSig
 
 /** One reconnectable GET /stream subscription for a single Code session. Create one per session;
  *  discard (after abort()) and make a fresh one on session change — that's what resets the
- *  active-assistant id (the seq cursor also resets whenever the session goes idle), so there's
- *  no explicit reset method. */
+ *  active-assistant id (the seq cursor also resets whenever the session goes idle or the client
+ *  gives up reconnecting), so there's no explicit reset method. */
 export class CodeSessionClient {
   private static readonly RECONNECT_MAX = 6
 
@@ -207,6 +207,11 @@ export class CodeSessionClient {
         if (attempt <= CodeSessionClient.RECONNECT_MAX && this.ac === ac) {
           setTimeout(() => { if (this.ac === ac && !ac.signal.aborted) void run() }, Math.min(500 * attempt, 3000))
         } else {
+          // Giving up ends this run's subscription like the idle end above: the daemon may have
+          // restarted (renumbering from 0) while it was unreachable, so the host's next connect()
+          // on this client starts from 0 too. A still-running run replays from its turn's meta,
+          // as on a fresh page load (live was just cleared, so nothing is duplicated).
+          this.lastSeq = 0
           this.active = false
           this.emitLive(null)
           this.handlers.onLostConnection(e instanceof ApiError && e.status === 404)
