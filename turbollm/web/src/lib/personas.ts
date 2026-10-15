@@ -159,7 +159,7 @@ const TURBOLLM_KNOWLEDGE =
 
   '## Load Profile Parameters\n\n' +
   '**Core**:\n' +
-  '- `ngl` (GPU layers): 0 = CPU only; blockCount + 1 = all layers on GPU (the +1 is the output layer). Higher = faster inference but more VRAM. Shown as a slider with the real layer count (blockCount + 1) as max. An **Auto-fit GPU layers** toggle (off by default, hidden for MoE models) hands this decision to llama.cpp\'s own memory-fitting logic at load time instead — Auto-tune honors it too, skipping its own search when on.\n' +
+  '- `ngl` (GPU layers): 0 = no layers on the GPU (weights and KV cache stay in RAM, though llama.cpp can still use the GPU for prompt processing and the vision projector); blockCount + 1 = all layers on GPU (the +1 is the output layer). Higher = faster inference but more VRAM. Shown as a slider with the real layer count (blockCount + 1) as max. An **Auto-fit GPU layers** toggle (off by default, hidden for MoE models) hands this decision to llama.cpp\'s own memory-fitting logic at load time instead — Auto-tune honors it too, skipping its own search when on.\n' +
   '- `ctx` (context length): max token window. VRAM scales linearly with ctx (KV cache). Reduce if VRAM is tight; increase for long conversations.\n' +
   '- `threads`: CPU threads for computation. Defaults to core count.\n' +
   '- `batchSize` (`--batch-size`, default 2048): logical batch size — how many prompt tokens are submitted per decode step during prefill. Larger = faster prefill on long prompts, more VRAM at load. Leave blank for the engine default.\n' +

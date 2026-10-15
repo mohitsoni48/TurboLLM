@@ -82,8 +82,8 @@ test('profileToArgs: nCpuMoe=0 stays omitted when ngl=0 on a box with no detecte
 
 test('profileToArgs: ngl=0 on a GPU box emits an explicit -ngl 0 — an absent -ngl means "auto" (GPU) to llama.cpp', () => {
   // Current llama.cpp defaults n_gpu_layers to -1 ("auto") with -fit on, so omitting -ngl
-  // auto-fits the model onto the GPU: a user who set GPU layers to 0 (to keep the GPU free, or
-  // to dodge a broken GPU backend) got a GPU load while the UI said "0 layers".
+  // auto-fits the model onto the GPU: a user who set GPU layers to 0 (to keep the model's weights
+  // and KV cache off the GPU) got a GPU load while the UI said "0 layers".
   const dense = profileToArgs({ ...deriveDefault(denseModel, sys), ngl: 0 }, denseModel, caps, 16, sys)
   assert.deepEqual(dense.slice(dense.indexOf('-ngl'), dense.indexOf('-ngl') + 2), ['-ngl', '0'])
   // MoE: -ngl is explicit now, so --n-cpu-moe follows it (the BeeLlama fit-abort rule above).

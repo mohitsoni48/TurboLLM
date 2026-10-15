@@ -844,7 +844,10 @@ export function profileToArgs(
   // -fit aborts, and the engine falls through to loading -ngl layers — every expert included —
   // with zero MoE offload, an instant CUDA OOM on a VRAM-constrained card.
   const moeAutoFit = m.moe && p.nCpuMoeFit
-  // ngl 0 means CPU only (the slider, Settings' default, auto-tune's verdict) and must be sent
+  // ngl 0 means no layers on the GPU (the slider, Settings' default, auto-tune's verdict): weights
+  // and KV cache stay in RAM. It is not "no GPU at all": llama.cpp still sets up the device (a
+  // compute buffer in VRAM), offloads large-batch work such as prompt processing to it (unless
+  // --no-op-offload), and loads the mmproj there (unless mmproj offload is off). It must be sent
   // as an explicit `-ngl 0`: current llama.cpp reads an ABSENT -ngl as "auto" and fits the model
   // onto the GPU anyway. Only where a GPU is detected, though: there a 0 is always a deliberate
   // choice, since deriveDefault and the global defaults give 99 / the user's own value. With no
