@@ -148,6 +148,43 @@ test('llama.cpp update whose policy copy cannot be saved still ends in done(), a
   assert.equal(installedBackendBuild(root, backend.id)?.tag, 'b200')
 })
 
+// The scheduler passes workBusy: an auto-update must not start while another engine job (a download, build, zip upload
+// or manual update) holds the engine-work slot. It would take over that job's progress and Cancel, and could write the
+// same build folder. It returns quietly, as the release branch does; the next scheduler pass retries.
+test('an auto-update with the engine-work slot taken starts nothing, whatever the update source', async (t) => {
+  const fetched: string[] = []
+  stubFetch(t, (url) => { fetched.push(url); return new Response(null, { status: 500 }) })
+  const cases: Array<[string, (root: string) => Engine]> = [
+    ['llama.cpp', (root) => engine({ id: 'llama', binPath: join(root, 'llama.cpp-b100-cpu', 'llama-server') })],
+    ['turboquant', (root) => engine({ id: 'turboquant', binPath: join(root, 'turboquant', 'llama-server') })],
+    ['koboldcpp', (root) => engine({ id: 'koboldcpp', kind: 'koboldcpp', binPath: koboldcppBinPath(root), version: 'v1.0.0' })],
+    ['llamafile', (root) => engine({ id: 'llamafile', kind: 'llamafile', binPath: llamafileBinPath(root), version: '0.9.0' })],
+    ['vllm', (root) => engine({ id: 'vllm', kind: 'vllm', binPath: join(root, 'vllm', 'venv', 'bin', 'python') })],
+  ]
+  for (const [id, make] of cases) {
+    const { d } = setup((root) => [make(root)])
+    const starts: string[] = []
+    d.provision = { start: (b: string) => { starts.push(b) }, progress() {}, done() {}, fail() {} } as unknown as UpdateApplyDeps['provision']
+    await applyEngineUpdate({ ...d, workBusy: () => 'A build is in progress — wait for it to finish.' }, d.registry.list().engines.find((e) => e.id !== 'cuda')!)
+    assert.deepEqual(starts, [], id)
+  }
+  assert.deepEqual(fetched, [], 'not even the GitHub lookup runs')
+})
+
+test('a llama.cpp auto-update whose GitHub lookup let another engine job take the slot starts nothing', { skip: posixOnly }, async (t) => {
+  const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  let busy: string | null = null
+  stubFetch(t, () => {
+    busy = 'An engine download is in progress — wait for it to finish.'
+    return new Response(JSON.stringify([{ tag_name: 'b200' }, { tag_name: 'b100' }]))
+  })
+  const starts: string[] = []
+  d.provision = { start: (b: string) => { starts.push(b) }, progress() {}, done() {}, fail() {} } as unknown as UpdateApplyDeps['provision']
+  await applyEngineUpdate({ ...d, workBusy: () => busy }, oldEngine)
+  assert.deepEqual(starts, [])
+  assert.ok(d.registry.get('old'), 'the installed build is untouched')
+})
+
 const ALL_KOBOLD_ASSETS = ['koboldcpp.exe', 'koboldcpp-nocuda.exe', 'koboldcpp-linux-x64', 'koboldcpp-linux-x64-nocuda', 'koboldcpp-mac-arm64']
   .map((name) => ({ name, browser_download_url: `https://dl.test/${name}` }))
 

@@ -17,7 +17,7 @@ import { tmpDir } from '../test-support/tmp'
 function appWithChecker(
   fetcher: (src: { source: string; ref: string }) => Promise<string>,
   installedVersion = '0.17.1',
-  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string } = {},
+  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string; downloadActive?: () => boolean } = {},
 ) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
@@ -83,7 +83,7 @@ function appWithChecker(
       progress: () => {},
       done: () => provisionCalls.push('done'),
       fail: (e: string) => provisionCalls.push(`fail:${e}`),
-      get: () => ({ active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }),
+      get: () => ({ active: opts.downloadActive?.() ?? false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }),
     },
     build: { isActive: () => false },
     // `noUpdates`: a Deps with no daemon UpdateChecker (the wiring in main.ts always builds
@@ -159,6 +159,17 @@ test('an update leaves a running model of ANOTHER engine alone, even when LiteRT
   const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
   assert.equal(res.status, 202)
   assert.equal(provisionCalls.includes('stop'), false)
+})
+
+test('?update=1 whose upstream check let another engine job take the slot is a 409 and provisions nothing', async () => {
+  // A scheduler auto-update can start during the (up to 15 s) check; a second `uv pip install -U` into the same venv
+  // would run on top of it, sharing one progress/Cancel channel.
+  let busy = false
+  const { app, provisionCalls } = appWithChecker(async () => { busy = true; return '0.18.0' }, '0.17.1', { downloadActive: () => busy })
+  const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'engine_already_running')
+  assert.deepEqual(provisionCalls, [])
 })
 
 test('?update=1 without a daemon UpdateChecker falls back to computeUpdateStatus and is just as honest', async () => {

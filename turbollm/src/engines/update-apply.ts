@@ -52,7 +52,8 @@ export interface UpdateApplyDeps {
   /** Test seams, read only by the release branch. */
   fetchImpl?: typeof fetch
   probeFn?: (bin: string) => Promise<ProbeResult>
-  /** Reason the engine-work slot is taken, or null. Read only by the release branch. */
+  /** Reason the engine-work slot is taken, or null: an update then returns without starting (the scheduler passes it;
+   *  the manual update route checked the slot itself, and holds it). */
   workBusy?: () => string | null
   /** Cached update statuses; a finished release update drops its engine's entry. */
   updates?: UpdateChecker
@@ -70,6 +71,9 @@ const isTurboquant = (binPath: string) => /[\\/]engines[\\/]turboquant[\\/]/.tes
 /** Apply a rollback-safe update for one engine. Throws on failure (callers surface it);
  *  on the llama.cpp path the existing install is guaranteed untouched when it throws. */
 export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, signal?: AbortSignal): Promise<void> {
+  // Another engine job (a download, build, zip upload or manual update) owns the slot: starting would take over its
+  // progress and Cancel, and could write the same build folder. The next scheduler pass retries.
+  if (d.workBusy?.()) return
   const root = join(d.store.dir(), 'engines')
   if (engine.release) return applyReleaseUpdate(d, engine, engine.release, root, signal)
   if (engine.kind === 'mlx') return applyPipUpdate(d, 'mlx', engine, root)
@@ -91,7 +95,6 @@ export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, sign
 async function applyReleaseUpdate(
   d: UpdateApplyDeps, engine: Engine, installed: ReleaseProvenance, root: string, signal?: AbortSignal,
 ): Promise<void> {
-  if (d.workBusy?.()) return // another engine job owns the slot; the next scheduler tick retries
   const poolBlock = poolSlotBlockReason(d, engine)
   if (poolBlock) throw new Error(poolBlock)
   const newer = await newestMatchingRelease(installed, signal, d.fetchImpl)
@@ -179,6 +182,7 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   if (installedTag && installedTag === latestTag) return // already latest — nothing to do
   const newDef = backendDefAt(backendId, latestTag)
   if (!newDef) throw new Error('No upstream build of this backend for your platform.')
+  if (d.workBusy?.()) return // the lookup await let another engine job take the slot; the next pass retries
 
   d.provision.start(backendId, d.trigger ?? 'auto_update')
   try {

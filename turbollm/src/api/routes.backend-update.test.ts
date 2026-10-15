@@ -57,17 +57,18 @@ function harness(t: { after: (fn: () => void) => void }, newServer: string, opts
   let settle: (failure: string | null) => void = () => {}
   const finished = new Promise<string | null>((r) => { settle = r })
   const registry = new Registry(store)
+  const provision = { get: () => ({ active: false }), start() {}, progress() {}, done: () => settle(null), fail: (m: string) => settle(m) }
   const d = {
     version: 'test',
     store,
     registry,
     manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null, stopAndWait: async () => {}, logPath: () => '' },
-    provision: { get: () => ({ active: false }), start() {}, progress() {}, done: () => settle(null), fail: (m: string) => settle(m) },
+    provision,
     build: { isActive: () => false },
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, registry, newBin: join(newDir, 'llama-server'), newDir, finished }
+  return { app, registry, provision, newBin: join(newDir, 'llama-server'), newDir, finished }
 }
 
 test('POST /backends/:id/update of a backend that is not the active engine keeps the active engine and the update policy', { skip: posixOnly }, async (t) => {
@@ -127,6 +128,25 @@ test('POST /backends/:id/update whose policy copy cannot be saved still reports 
   assert.ok(h.registry.list().engines.some((e) => e.binPath === h.newBin), 'the new build is registered')
   assert.equal(h.registry.get('old'), undefined, 'the old build is unregistered')
   assert.equal(existsSync(oldDir), false, 'the old build is deleted')
+})
+
+// The route checks the engine-work slot before its GitHub lookup; a scheduler auto-update (or another tab) can take the
+// slot during that lookup. Starting anyway would run two jobs into the same tag dir on one progress/Cancel channel.
+test('POST /backends/:id/update whose GitHub lookup let another engine job take the slot is a 409 and starts nothing', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  let active = false
+  t.mock.method(h.provision, 'get', () => ({ active }))
+  const start = t.mock.method(h.provision, 'start')
+  const lookup = globalThis.fetch
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    active = true // the scheduler's auto-update started meanwhile
+    return lookup(...args)
+  }) as typeof fetch
+  const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'engine_already_running')
+  assert.equal(start.mock.callCount(), 0)
+  assert.ok(h.registry.get('old'), 'the installed build is untouched')
 })
 
 test('POST /backends/:id/enable on a build that no longer runs is a 400 with the probe error, not a 500', { skip: posixOnly }, async (t) => {

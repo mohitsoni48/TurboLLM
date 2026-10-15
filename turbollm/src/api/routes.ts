@@ -432,6 +432,9 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     const newDef = backendDefAt(def.id as BackendId, latestTag)
     if (!newDef) return err(c, 500, 'internal', 'No upstream build of this backend for your platform.')
+    // The lookup above let another engine job start (a scheduler auto-update, another tab); re-check before taking the
+    // slot, or both would provision the same tag dir and share one progress/Cancel channel.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const ac = new AbortController()
     provisionAbort = ac
     void (async () => {
@@ -1116,6 +1119,8 @@ export function registerApi(app: Hono, d: Deps): void {
       if (status && status.latest !== null && status.comparable && !status.hasUpdate) {
         return c.json({ accepted: false, alreadyLatest: true, version: status.latest, engine: 'litert-lm' })
       }
+      // The check above let another engine job start (a scheduler auto-update): re-check, or two pip installs share the venv.
+      { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     }
     const ac = new AbortController()
     provisionAbort = ac
