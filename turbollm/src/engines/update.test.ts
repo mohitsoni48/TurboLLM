@@ -163,6 +163,19 @@ test('resolveUpdateSource: managed official llama.cpp → ggml-org repo + tag fr
   assert.deepEqual(src, { source: 'github-release', ref: 'ggml-org/llama.cpp', installed: 'b9608' })
 })
 
+// On Android (Termux) the managed build is TurboLLM's own cross-compile, one pinned file on Hugging Face: upstream's
+// newer tags have no Android asset there, so an update offered against them could only fail with HTTP 404.
+test('resolveUpdateSource: a managed llama.cpp build on Android has no update source', async (t) => {
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actualPlatform }))
+  const engine = eng({ binPath: '/data/data/com.termux/files/home/.turbollm/engines/llama.cpp-b9608-cpu/llama-server' })
+  assert.equal(resolveUpdateSource(engine), null)
+  const st = await computeUpdateStatus(engine, async () => 'b10818')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
+})
+
 test('resolveUpdateSource: turboquant fork → fork repo + tag from version', () => {
   const src = resolveUpdateSource(
     eng({ binPath: '/root/engines/turboquant/llama-server', version: 'build b9000' }),

@@ -102,6 +102,7 @@ export interface UpdateStatus {
  *
  *  - kind 'llama-server' whose binPath is an official managed build → GitHub `ggml-org/
  *    llama.cpp`, installed tag parsed from the tag-keyed dir name (`llama.cpp-{tag}-{id}`).
+ *    None on Android, whose build is TurboLLM's own pinned one.
  *  - kind 'llama-server' under engines/turboquant/ → the fork's GitHub repo; installed
  *    tag parsed from the probed version string.
  *  - kind 'mlx' / 'rapid-mlx' / 'mlx-vlm' / 'vllm' / 'litert-lm' → PyPI `mlx-lm` / `rapid-mlx` /
@@ -206,6 +207,10 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   if (engine.kind === 'llamafile') return { source: 'github-release', ref: LLAMAFILE_REPO, installed: engine.version }
   if (engine.kind === 'llama-server') {
     if (isManagedLlama(engine.binPath)) {
+      // On Android (Termux) this build is TurboLLM's own cross-compile, one pinned file on Hugging Face (see
+      // availableBackends), not a ggml-org release: upstream's newer tags have no Android asset there, so comparing
+      // against them offered an update whose download always failed with HTTP 404.
+      if (process.platform === 'android') return null
       return { source: 'github-release', ref: OFFICIAL_LLAMA_REPO, installed: tagFromManagedBinPath(engine.binPath) }
     }
     if (isTurboquant(engine.binPath)) {

@@ -149,6 +149,24 @@ test('POST /backends/:id/update whose GitHub lookup let another engine job take 
   assert.ok(h.registry.get('old'), 'the installed build is untouched')
 })
 
+// On Android (Termux) the build is TurboLLM's own, one pinned file on Hugging Face: upstream's newer tags have no
+// Android asset there, so the update resolved one from GitHub and then always failed with HTTP 404.
+test('POST /backends/:id/update on Android is a 409 no_update_source and looks nothing up', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  writeServer(join(dirname(h.newDir), 'llama.cpp-b9608-cpu'), WORKING_SERVER)
+  let fetches = 0
+  const stagedFetch = globalThis.fetch
+  globalThis.fetch = ((...args: Parameters<typeof fetch>) => (fetches++, stagedFetch(...args))) as typeof fetch
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actualPlatform }))
+  const res = await h.app.request('/api/v1/engines/backends/cpu/update', { method: 'POST' })
+  Object.defineProperty(process, 'platform', { value: actualPlatform })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'no_update_source')
+  assert.equal(fetches, 0)
+})
+
 test('POST /backends/:id/enable on a build that no longer runs is a 400 with the probe error, not a 500', { skip: posixOnly }, async (t) => {
   const h = harness(t, BROKEN_SERVER, { stageNow: true })
   h.registry.remove('old') // Disabled: Enable re-registers the newest build on disk, the broken b200

@@ -413,6 +413,10 @@ export function registerApi(app: Hono, d: Deps): void {
     // prior update (ADR-085), so resolve the newest build on disk rather than the pinned tag.
     const oldBin = installedBackendBuild(root, def.id)?.bin ?? null
     if (!oldBin) return err(c, 409, 'not_installed', 'Backend is not installed — download it first.')
+    // Android's build is TurboLLM's own, one pinned file at downloadBaseUrl (see availableBackends): upstream's newer
+    // tags have no Android asset there, so updating to one always failed with HTTP 404.
+    if (def.downloadBaseUrl)
+      return err(c, 409, 'no_update_source', 'This build has no automatic update source: upstream llama.cpp publishes no Android build.')
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Honest upstream check FIRST: resolve the real latest tag. Offline → clear 503.
     // Resolved in the INSTALLED tag's own format via the shared resolver: `releases/latest`
