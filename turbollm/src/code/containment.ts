@@ -162,8 +162,8 @@ export function isContainedFromRoot(input: string | null | undefined, root: stri
   if (typeof input !== 'string' || input.length === 0) return false
   if (input.includes('\0')) return false
   // Both readings of the string must stay inside: the one pi's write/edit tools act on
-  // (normalizePiToolPath) and the raw one, which git-actions, revert and persona resolve
-  // themselves with a plain resolve/join.
+  // (normalizePiToolPath) and the raw one, which revert and persona resolve themselves with a
+  // plain resolve/join.
   const normalized = normalizePiToolPath(input)
   if (normalized === null) return false
   for (const candidate of normalized === input ? [input] : [input, normalized]) {

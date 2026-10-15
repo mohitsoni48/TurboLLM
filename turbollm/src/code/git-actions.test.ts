@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { writeFileSync, appendFileSync, rmSync } from 'node:fs'
+import { writeFileSync, appendFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   buildGithubCompareUrl,
@@ -193,6 +193,204 @@ test('commitGitChanges: refuses a path outside the repo root (containment), with
   const status = await getGitStatus(dir)
   // a.txt is still untracked — the rejected call never ran `git add`.
   assert.deepEqual(status.files, [{ code: '??', path: 'a.txt' }])
+})
+
+// git stages a symlink as a link and reads '~/x' as a literal in-repo path, so neither is "outside
+// the repo". The write-tool guard (which follows links and applies pi's '~' expansion) refused both.
+test('REGRESSION: a selective commit of an in-repo symlink to an outside or missing target, or of a path under a directory named "~", works', async () => {
+  const dir = initRepo()
+  mkdirSync(join(dir, '~'))
+  writeFileSync(join(dir, '~', 'notes.md'), 'n\n')
+  writeFileSync(join(dir, 'a.txt'), 'a\n')
+  const links = process.platform !== 'win32' // creating symlinks needs a privilege on Windows
+  if (links) {
+    symlinkSync(join('..', 'shared', 'config.json'), join(dir, 'shared.json')) // dangling
+    symlinkSync(tmpDir('tllm-git-actions-outside-'), join(dir, 'outside-dir')) // existing, outside
+  }
+  const status = await getGitStatus(dir)
+  assert.ok(status.files.some((f) => f.path === '~/'), JSON.stringify(status.files))
+  await commitGitChanges(dir, 'the tilde dir', ['~/'])
+  assert.equal(gitSync(['ls-files', '--', '~'], dir), '~/notes.md')
+  if (links) {
+    await commitGitChanges(dir, 'the links', ['shared.json', 'outside-dir'])
+    assert.equal(gitSync(['ls-files', '-s', '--', 'shared.json'], dir).split(' ')[0], '120000', 'staged as a link')
+  }
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: '??', path: 'a.txt' }])
+})
+
+// Porcelain prints paths relative to the repository's top level whatever the cwd, while `git add`
+// reads them relative to the cwd. A session opened at a repo subfolder (a monorepo package) could
+// not commit selectively at all, and commit-all committed the whole repository.
+test('REGRESSION: a session at a repo subfolder lists, stages and commits only that folder', async () => {
+  const dir = initRepo()
+  const sub = join(dir, 'packages', 'web')
+  mkdirSync(sub, { recursive: true })
+  mkdirSync(join(dir, 'secret'))
+  writeFileSync(join(sub, 'a.ts'), 'a\n')
+  writeFileSync(join(sub, 'c.ts'), 'c\n')
+  writeFileSync(join(dir, 'secret', 'b.txt'), 'b\n')
+  gitSync(['add', '-A'], dir)
+  gitSync(['commit', '-q', '-m', 'files'], dir)
+  for (const f of [join(sub, 'a.ts'), join(sub, 'c.ts'), join(dir, 'secret', 'b.txt')]) appendFileSync(f, 'more\n')
+
+  const status = await getGitStatus(sub)
+  assert.deepEqual(status.files, [{ code: ' M', path: 'a.ts' }, { code: ' M', path: 'c.ts' }])
+  // A path in the repo but outside the session's folder is still refused.
+  await assert.rejects(() => commitGitChanges(sub, 'escape', [join('..', '..', 'secret', 'b.txt')]), /outside the repo/)
+
+  const selective = await commitGitChanges(sub, 'only a', ['a.ts'])
+  assert.equal(selective.filesCommitted, 1)
+  assert.equal(gitSync(['show', '--name-only', '--format=', 'HEAD'], dir), 'packages/web/a.ts')
+
+  const all = await commitGitChanges(sub, 'the rest of the package')
+  assert.equal(all.filesCommitted, 1)
+  assert.equal(gitSync(['show', '--name-only', '--format=', 'HEAD'], dir), 'packages/web/c.ts')
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: ' M', path: 'secret/b.txt' }], 'outside the folder: untouched')
+})
+
+test('REGRESSION: a session at a repo subfolder refuses to commit while changes outside the folder are staged', async () => {
+  const dir = initRepo()
+  const sub = join(dir, 'packages', 'web')
+  mkdirSync(sub, { recursive: true })
+  mkdirSync(join(dir, 'secret'))
+  writeFileSync(join(sub, 'a.ts'), 'a\n')
+  writeFileSync(join(dir, 'secret', 'b.txt'), 'b\n')
+  writeFileSync(join(dir, 'secret', 'moved.txt'), 'moved\n')
+  gitSync(['add', '-A'], dir)
+  gitSync(['commit', '-q', '-m', 'files'], dir)
+  const head = gitSync(['rev-parse', 'HEAD'], dir)
+  appendFileSync(join(sub, 'a.ts'), 'more\n')
+  appendFileSync(join(dir, 'secret', 'b.txt'), 'more\n')
+  gitSync(['add', '-A'], sub) // what an agent's `git add -A` in the package does: stages the whole repo
+
+  assert.deepEqual((await getGitStatus(sub)).files, [{ code: 'M ', path: 'a.ts' }], 'the dialog lists only the folder')
+  await assert.rejects(() => commitGitChanges(sub, 'all'), /outside this folder are already staged \(secret\/b\.txt\)/)
+  await assert.rejects(() => commitGitChanges(sub, 'only a', ['a.ts']), /secret\/b\.txt/)
+  assert.equal(gitSync(['rev-parse', 'HEAD'], dir), head, 'nothing committed')
+
+  // A staged move into the folder takes a file away from outside it: refused by its old path.
+  gitSync(['reset', '-q', '--', join(dir, 'secret', 'b.txt')], dir)
+  gitSync(['mv', join(dir, 'secret', 'moved.txt'), join(sub, 'moved.txt')], dir)
+  await assert.rejects(() => commitGitChanges(sub, 'all'), /\(secret\/moved\.txt\)/)
+  gitSync(['mv', join(sub, 'moved.txt'), join(dir, 'secret', 'moved.txt')], dir)
+
+  const result = await commitGitChanges(sub, 'only the package')
+  assert.equal(result.filesCommitted, 1)
+  assert.equal(gitSync(['show', '--name-only', '--format=', 'HEAD'], dir), 'packages/web/a.ts')
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: ' M', path: 'secret/b.txt' }])
+})
+
+test('REGRESSION: a subfolder session in a merge with changes staged outside the folder is told to finish it from the top level, not to unstage them', async () => {
+  const dir = initRepo()
+  const sub = join(dir, 'packages', 'web')
+  mkdirSync(sub, { recursive: true })
+  mkdirSync(join(dir, 'secret'))
+  writeFileSync(join(sub, 'a.ts'), 'a\n')
+  writeFileSync(join(dir, 'secret', 'b.txt'), 'b\n')
+  gitSync(['add', '-A'], dir)
+  gitSync(['commit', '-q', '-m', 'files'], dir)
+  gitSync(['checkout', '-q', '-b', 'other'], dir)
+  appendFileSync(join(sub, 'a.ts'), 'other\n')
+  appendFileSync(join(dir, 'secret', 'b.txt'), 'other-b\n')
+  gitSync(['commit', '-q', '-a', '-m', 'other'], dir)
+  gitSync(['checkout', '-q', 'main'], dir)
+  appendFileSync(join(sub, 'a.ts'), 'main\n')
+  gitSync(['commit', '-q', '-a', '-m', 'main'], dir)
+  const head = gitSync(['rev-parse', 'HEAD'], dir)
+  // The agent merges from its package and hits a conflict there; the change outside merges cleanly
+  // and is staged by the merge itself.
+  assert.throws(() => gitSync(['merge', 'other'], sub)) // exit 1: conflict in a.ts
+  assert.equal(gitSync(['status', '--porcelain', '--', 'secret'], dir), 'M  secret/b.txt')
+  writeFileSync(join(sub, 'a.ts'), 'a\nresolved\n')
+
+  for (const files of [undefined, ['a.ts']]) {
+    const e = await commitGitChanges(sub, 'merge', files).then(() => null, (err: Error) => err)
+    assert.match(e?.message ?? '', /^A merge is in progress, .*\(secret\/b\.txt\)\. .*top level/)
+    assert.doesNotMatch(e?.message ?? '', /[Uu]nstage|reset|restore/)
+    assert.match(e?.message ?? '', /outside this folder are already staged/, 'POST /git/commit maps this to 409')
+  }
+  assert.equal(gitSync(['rev-parse', 'HEAD'], dir), head, 'nothing committed')
+  assert.equal(gitSync(['diff', '--cached', '--name-only', '--', 'secret'], dir), 'secret/b.txt', 'the merge result is left staged')
+})
+
+test('REGRESSION: a subfolder session is told about a rebase only while one is stopped, not after its conflicted last pick was continued', async () => {
+  for (const backend of ['--merge', '--apply']) {
+    const dir = initRepo()
+    const sub = join(dir, 'packages', 'web')
+    mkdirSync(sub, { recursive: true })
+    mkdirSync(join(dir, 'secret'))
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    writeFileSync(join(dir, 'secret', 'b.txt'), 'b\n')
+    gitSync(['add', '-A'], dir)
+    gitSync(['commit', '-q', '-m', 'files'], dir)
+    gitSync(['checkout', '-q', '-b', 'upstream'], dir)
+    appendFileSync(join(sub, 'a.ts'), 'upstream\n')
+    gitSync(['commit', '-q', '-a', '-m', 'upstream'], dir)
+    gitSync(['checkout', '-q', 'main'], dir)
+    appendFileSync(join(sub, 'a.ts'), 'main\n')
+    appendFileSync(join(dir, 'secret', 'b.txt'), 'main\n')
+    gitSync(['commit', '-q', '-a', '-m', 'main'], dir)
+    gitSync(['format-patch', '-q', '-1', '-o', join(dir, '.git', 'patches')], dir)
+    // The same package opened through a symlink: git prints '../../.git/...' counted from the real folder.
+    const sessions = [sub]
+    if (process.platform !== 'win32') { // creating symlinks needs a privilege on Windows
+      sessions.push(join(tmpDir('tllm-git-actions-link-'), 'proj'))
+      symlinkSync(sub, sessions[1])
+    }
+
+    // A `pull --rebase` whose one local commit conflicts in the package; its change outside the
+    // package applies cleanly and is staged by the rebase.
+    assert.throws(() => gitSync(['rebase', backend, 'upstream'], sub))
+    const head = gitSync(['rev-parse', 'HEAD'], dir)
+    writeFileSync(join(sub, 'a.ts'), 'a\nresolved\n')
+    for (const session of sessions) {
+      const stopped = await commitGitChanges(session, 'x').then(() => null, (err: Error) => err)
+      assert.match(stopped?.message ?? '', /^A rebase is in progress, .*\(secret\/b\.txt\)\. .*top level/, `${backend} ${session}`)
+    }
+    assert.equal(gitSync(['rev-parse', 'HEAD'], dir), head, 'nothing committed')
+
+    // Continued to the end: git keeps REBASE_HEAD, but no rebase is in progress any more.
+    gitSync(['add', 'a.ts'], sub)
+    execFileSync('git', ['rebase', '--continue'], { cwd: sub, stdio: 'pipe', windowsHide: true, env: { ...process.env, GIT_EDITOR: ':' } })
+    appendFileSync(join(sub, 'a.ts'), 'agent\n')
+    appendFileSync(join(dir, 'secret', 'b.txt'), 'agent\n')
+    gitSync(['add', '-A'], sub)
+    const plain = /^Changes outside this folder are already staged \(secret\/b\.txt\) .*git reset --/
+    const after = await commitGitChanges(sub, 'x').then(() => null, (err: Error) => err)
+    assert.match(after?.message ?? '', plain, backend)
+
+    // A stopped `git am` also uses rebase-apply; it is not a rebase, but its patch's change outside
+    // the package is staged the same way, so unstaging it is not advised either.
+    gitSync(['reset', '-q', '--hard', 'upstream'], dir)
+    assert.throws(() => gitSync(['am', '-q', '--3way', join(dir, '.git', 'patches', '0001-main.patch')], sub))
+    writeFileSync(join(sub, 'a.ts'), 'a\nresolved\n')
+    for (const session of sessions) {
+      const am = await commitGitChanges(session, 'x').then(() => null, (err: Error) => err)
+      assert.match(am?.message ?? '', /^A patch application \(git am\) is in progress, .*\(secret\/b\.txt\)\. .*top level/, `${backend} ${session}, git am`)
+      assert.doesNotMatch(am?.message ?? '', /rebase|[Uu]nstage|reset|restore/, `${backend} ${session}, git am`)
+    }
+  }
+})
+
+test('REGRESSION: the advice for changes staged outside a subfolder session works before the first commit', async () => {
+  const dir = tmpDir('tllm-git-actions-unborn-')
+  gitSync(['init', '-q', '-b', 'main'], dir)
+  gitSync(['config', 'user.email', 'test@example.com'], dir)
+  gitSync(['config', 'user.name', 'Test'], dir)
+  const sub = join(dir, 'packages', 'web')
+  mkdirSync(sub, { recursive: true })
+  mkdirSync(join(dir, 'secret'))
+  writeFileSync(join(sub, 'a.ts'), 'a\n')
+  writeFileSync(join(dir, 'secret', 'b.txt'), 'b\n')
+  gitSync(['add', '-A'], sub)
+
+  const e = await commitGitChanges(sub, 'first', ['a.ts']).then(() => null, (err: Error) => err)
+  const advised = /\((git [^)<]*?)(?: -- <path>)?\)/.exec(e?.message ?? '')
+  assert.ok(advised, `names an unstage command: ${e?.message}`)
+  gitSync([...advised[1].split(' ').slice(1), '-q', '--', join('..', '..', 'secret', 'b.txt')], sub) // as advised
+  const result = await commitGitChanges(sub, 'first', ['a.ts'])
+  assert.equal(result.filesCommitted, 1)
+  assert.equal(gitSync(['show', '--name-only', '--format=', 'HEAD'], dir), 'packages/web/a.ts')
 })
 
 test('pushGitBranch: no remote configured reports the no_remote reason, not a thrown error', async () => {
