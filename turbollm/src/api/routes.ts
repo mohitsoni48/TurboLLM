@@ -3202,7 +3202,8 @@ export function registerApi(app: Hono, d: Deps): void {
   // lanBind is on, with no action beyond loading the page (ConnectSection queries it eagerly for
   // the default-selected CLI). Ungated, a non-host viewer on an open, unauthenticated LAN could
   // get a real credential just by opening Developer — worse than the list/create case, since it
-  // requires no explicit "create" click at all.
+  // requires no explicit "create" click at all. lanAuth (auth.ts) also refuses it cross-site and
+  // without the `X-TurboLLM-UI` header the web UI sends, as it replaces a key on a plain GET.
   app.get('/api/v1/connect/:cli', (c) => {
     if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'Connect setup is only available from this machine until "Require an API key" is turned on.')
     const cli = c.req.param('cli')

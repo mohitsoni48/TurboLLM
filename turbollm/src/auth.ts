@@ -156,7 +156,9 @@ export function isLanExposed(d: Deps): boolean {
  *  macOS), but only 127/8 and `[::1]` are "potentially trustworthy" URLs, so browsers send no
  *  Fetch Metadata to these, and a page on any site that targets them looks exactly like the UI
  *  (lanAuth's cross-site check can't see it on a GET). The daemon's own clients never use them:
- *  the banner, the browser it opens and the snippets say 127.0.0.1 (or the LAN address). */
+ *  the banner, the browser it opens and the snippets say 127.0.0.1 (or the LAN address). Some
+ *  names kept below get no Fetch Metadata in some browser either (WebKit's `localhost.`, a
+ *  container name), which is why the one GET that changes state also needs the UI's header. */
 function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
   if (!host) return true
   const name = hostHeaderName(host)
@@ -240,6 +242,9 @@ function localProcessesTrusted(d: Deps): boolean {
 /** The cookie and header that carry {@link appSecretPresented}'s secret. */
 const APP_SECRET_COOKIE = 'turbollm_app'
 const APP_SECRET_HEADER = 'x-turbollm-app'
+/** Sent by the web UI on the one state-changing GET, `/api/v1/connect/:cli` (see lanAuth). Not a
+ *  secret: only proof that the request is not a simple cross-site one. */
+const UI_HEADER = 'x-turbollm-ui'
 
 /** Does a loopback caller prove it is the app that started this daemon? Only asked when
  *  `TURBOLLM_APP_SECRET` is set, which only TurboLLM-Android does (a fresh random value per
@@ -784,11 +789,28 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // routes. Refuse anything a browser marks as coming from another site (see isCrossSite; the
     // engine-zip upload guard in routes.ts applies the Fetch Metadata half of this). The app's
     // own UI is same-origin, and CLIs/SDKs send neither Sec-Fetch-Site nor Origin.
+    //
+    // GET /api/v1/connect/:cli counts as a write: on a LAN-bound daemon it replaces the stored
+    // `cli-<name>` key (routes.ts), and a GET needs no preflight, so an <img> on any site would
+    // otherwise revoke a CLI's key or pile up `cli-<anything>` keys. Any method, as Hono serves
+    // HEAD from the GET handler.
     const write = c.req.method !== 'GET' && c.req.method !== 'HEAD' && c.req.method !== 'OPTIONS'
-    if (c.req.path.startsWith('/api/') && write && isCrossSite(c)) {
+    const connect = c.req.path.startsWith('/api/v1/connect/')
+    if (c.req.path.startsWith('/api/') && (write || connect) && isCrossSite(c)) {
       // Refused on Origin alone (no Fetch Metadata): what a plain-http proxy that rewrites Host looks like.
       const hint = c.req.header('sec-fetch-site') ? '' : " Behind a reverse proxy, have it pass the browser's Host header through."
       return c.json({ error: { code: 'forbidden', message: `Cross-site request refused.${hint}` } }, 403)
+    }
+    // That check can't see every cross-site GET: a GET carries no Origin, and a browser sends no
+    // Fetch Metadata to some URLs that still get loopback trust (an old browser to 127.0.0.1,
+    // WebKit to `localhost.`, any browser to a container host name the hosts file maps to
+    // 127.0.0.1). So the route also needs the header the web UI sends (api.ts getConnect): a page
+    // on another site can only add a custom header after a CORS preflight, which /api's origin
+    // allowlist refuses as long as server.ts's allowHeaders leaves it out.
+    if (connect && !c.req.header(UI_HEADER)) {
+      const message =
+        'Connect setup can only be requested from the TurboLLM app. If it was just updated, reload the page.'
+      return c.json({ error: { code: 'forbidden', message } }, 403)
     }
 
     const daemon = d.store.snapshot().daemon

@@ -1127,8 +1127,10 @@ export function createApiKey(name: string): Promise<ApiKeyCreated> {
 export function deleteApiKey(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
+/** The daemon refuses this GET without `X-TurboLLM-UI` (auth.ts lanAuth): it can replace a CLI
+ *  key, and a page on another site cannot add a custom header without a CORS preflight. */
 export function getConnect(cli: string): Promise<ConnectInfo> {
-  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}`)
+  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}`, { headers: { 'X-TurboLLM-UI': '1' } })
 }
 
 // ── System info (spec 05 §6) ─────────────────────────────────────────────────
