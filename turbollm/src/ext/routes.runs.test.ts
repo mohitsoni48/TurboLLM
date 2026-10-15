@@ -34,6 +34,8 @@ function harness(
   bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>,
   ext?: ExtRouteDeps,
   managerStatus?: () => Status,
+  /** When given, the body waits for it before emitting its first frame. */
+  beforeFirstFrame?: Promise<void>,
 ) {
   const dir = tmpDir('turbollm-ext-runs-')
   const conv = new ConversationStore(dir)
@@ -64,6 +66,7 @@ function harness(
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, {
     makeBody: () => async ({ emit }) => {
+      if (beforeFirstFrame) await beforeFirstFrame
       await emit({ event: 'delta', data: { content: 'hello' } })
       await emit({ event: 'delta', data: { content: ' world' } })
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
@@ -219,12 +222,37 @@ test('reattaching with ?after replays only later frames', async () => {
 
     const ids = (text: string) => [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]))
     const full = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?owner=u1`, { headers: { Authorization: ACME } })).text()
-    assert.deepEqual(ids(full), [0, 1, 2], 'no ?after replays every frame: delta, delta, done')
+    assert.deepEqual(ids(full), [1, 2, 3], 'no ?after replays every frame: delta, delta, done')
     // `after` is the last id the client already HAS (exclusive) — `?after=N` used to resend
     // frame N, duplicating the last rendered delta on every resume.
-    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=0&owner=u1`, { headers: { Authorization: ACME } })).text()
-    assert.deepEqual(ids(tail), [1, 2], '?after=0 must not resend frame 0')
+    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=1&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.deepEqual(ids(tail), [2, 3], '?after=1 must not resend frame 1')
     assert.match(tail, /event: done/, 'a late reattach still receives the terminal frame')
+  } finally {
+    cleanup()
+  }
+})
+
+// The 202 body and an early GET /runs/{id} report event_seq 0 before any frame exists. Frames
+// used to be numbered from 0 as well, so a client that attached later with ?after=<that
+// event_seq> (once frame 0 had been sent) lost the run's first frame.
+test('?after=<the event_seq reported before any frame> still gets the first frame', async () => {
+  let start: () => void
+  const firstFrame = new Promise<void>((r) => { start = r })
+  const { app, runs, cleanup } = harness(undefined, undefined, undefined, firstFrame)
+  try {
+    const chatId = await newChat(app)
+    const created = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string; event_seq: number }
+    const early = await (await app.request(`/api/ext/v1/runs/${created.id}?owner=u1`, { headers: { Authorization: ACME } })).json() as { event_seq: number }
+    assert.equal(created.event_seq, 0)
+    assert.equal(early.event_seq, 0)
+    start!()
+    await runs.settled(created.id)
+
+    const text = await (await app.request(`/api/ext/v1/runs/${created.id}/stream?after=${early.event_seq}&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.match(text, /"content":"hello"/, 'the first frame, sent after event_seq 0 was reported, must not be skipped')
+    assert.deepEqual([...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1])), [1, 2, 3])
   } finally {
     cleanup()
   }

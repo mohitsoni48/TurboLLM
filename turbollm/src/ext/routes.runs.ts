@@ -64,7 +64,7 @@ function toRunDTO(r: PublicRun): Record<string, unknown> {
 /** Emits the same `run` frame + live/replayed event stream a fresh SSE request gets, or the same
  *  202 JSON envelope — shared by both the just-created path and the idempotent-replay path so
  *  a retry that reattaches is indistinguishable on the wire from a client that reconnected on
- *  its own via GET .../stream. `fromSeq` lets a replay attempt a full-history replay (seq 0);
+ *  its own via GET .../stream. `fromSeq` 0 asks for a full-history replay (frames start at 1);
  *  `runs.canReplayFrom` is checked first so a replay that has aged out of the ring buffer fails
  *  with the same documented `replay_window_exceeded` conflict the dedicated reconnect endpoint
  *  already uses, instead of silently starting mid-stream or hanging. */
@@ -384,7 +384,8 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     const run = runs.get(c.req.param('id'))
     if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
     // `after` is EXCLUSIVE: it is the last SSE `id` (event_seq) the client already has, so the
-    // replay starts at the next frame. Absent ⇒ replay from the first frame (seq 0).
+    // replay starts at the next frame. Frames are numbered from 1, so absent or 0 (the event_seq
+    // of a run with no frame yet) ⇒ replay from the first frame (run-manager.ts FIRST_EVENT_SEQ).
     const afterParam = c.req.query('after')
     const from = afterParam ? Number(afterParam) + 1 : 0
     if (!runs.canReplayFrom(run.id, from)) {

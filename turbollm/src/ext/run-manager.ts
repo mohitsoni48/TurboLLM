@@ -81,6 +81,10 @@ interface RunState {
 
 const DEFAULT_BUFFER_CAP = 5000
 const DEFAULT_ORPHAN_TIMEOUT_MS = 5 * 60_000
+/** Frames are numbered from 1, so an `event_seq` of 0 (what a run reports before its first
+ *  frame) can only mean "nothing yet", and `?after=0` replays the whole run. Numbered from 0,
+ *  a client that got event_seq 0 and attached with it once frame 0 had gone out lost that frame. */
+const FIRST_EVENT_SEQ = 1
 
 export class PublicRunManager {
   private runs = new Map<string, RunState>()
@@ -149,7 +153,7 @@ export class PublicRunManager {
 
   start(params: { scope: Scope; chatId: string; messageId: string; body: RunBody }): PublicRun {
     const id = `run_${randomUUID()}`
-    const buffer = new RingBuffer(this.bufferCap)
+    const buffer = new RingBuffer(this.bufferCap, FIRST_EVENT_SEQ)
     const emitter = new EventEmitter()
     emitter.setMaxListeners(0) // unbounded: many clients may reconnect/poll one run
     const ac = new AbortController()
@@ -277,9 +281,11 @@ export class PublicRunManager {
   canReplayFrom(id: string, fromSeq: number): boolean {
     const s = this.runs.get(id)
     if (!s) return false
-    const retained = s.buffer.since(fromSeq)
-    if (retained.length === 0) return fromSeq >= s.buffer.head()
-    return retained[0].seq === fromSeq
+    // A cursor before the first frame (0 = "from the start") asks for the whole run.
+    const from = Math.max(fromSeq, FIRST_EVENT_SEQ)
+    const retained = s.buffer.since(from)
+    if (retained.length === 0) return from >= s.buffer.head()
+    return retained[0].seq === from
   }
 
   subscribe(id: string, fromSeq: number): Subscription {

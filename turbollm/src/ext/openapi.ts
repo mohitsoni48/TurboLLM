@@ -206,9 +206,9 @@ export const EXT_ROUTES: RouteSpec[] = [
   },
   {
     method: 'GET', path: '/runs/:id/stream',
-    summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it to replay from the first frame.",
+    summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it (or pass 0) to replay from the first frame.",
     scope: 'chats:read', sse: true, errors: [...CHAT_ERRORS, 'conflict'],
-    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit to replay from the first frame.' }],
+    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit it (or pass 0) to replay from the first frame.' }],
   },
   {
     method: 'POST', path: '/runs/:id/cancel',
@@ -296,7 +296,7 @@ function buildSchemas(): Record<string, JsonSchema> {
       chat_id: { type: 'string' },
       message_id: { type: 'string' },
       status: { type: 'string', enum: ['queued', 'streaming', 'complete', 'failed', 'aborted'] },
-      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event, 0 before the first one — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received.' },
+      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event; frames are numbered from 1, so 0 means none yet — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received.' },
       error: { type: ['object', 'null'], additionalProperties: true },
       created_at: { type: 'string', format: 'date-time' },
       ended_at: { type: ['string', 'null'], format: 'date-time' },

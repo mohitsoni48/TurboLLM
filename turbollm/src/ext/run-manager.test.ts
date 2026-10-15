@@ -59,7 +59,7 @@ test('reattaching from a cursor replays only what was missed', async () => {
   const resumed = await collect(runs.subscribe(run.id, 3))
 
   assert.ok(all.length > resumed.length)
-  assert.deepEqual(resumed.map((e) => e.seq), all.slice(3).map((e) => e.seq))
+  assert.deepEqual(resumed.map((e) => e.seq), all.filter((e) => e.seq >= 3).map((e) => e.seq))
   assert.equal(resumed[0].seq, 3, 'replay starts exactly at the requested cursor')
 })
 
@@ -68,7 +68,7 @@ test('reattaching past the retained window reports replay_window_exceeded', asyn
   const run = runs.start({ scope: SCOPE, chatId: 'c1', messageId: 'm1', body: fakeBody(20) })
   await runs.settled(run.id)
 
-  assert.equal(runs.canReplayFrom(run.id, 0), false, 'seq 0 has been evicted')
+  assert.equal(runs.canReplayFrom(run.id, 0), false, 'the first frames have been evicted')
   assert.equal(runs.canReplayFrom(run.id, 19), true)
 })
 
