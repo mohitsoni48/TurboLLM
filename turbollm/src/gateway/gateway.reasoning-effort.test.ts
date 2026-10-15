@@ -150,6 +150,46 @@ test("a Code-session override to 'off' clears a client-sent real effort cleanly 
   assert.equal(kwargs?.reasoning_effort, undefined, "no stale reasoning_effort:'medium' left over from the client's value")
 })
 
+// The same precedence on /v1/messages, where Claude Code says "off" as thinking {type:'disabled'}: mapped to off it
+// sent budget 0 and enable_thinking false beside the session's reasoning_effort, so the session's effort produced no
+// reasoning at all.
+async function postMessagesAs(app: Hono, token: string, body: Record<string, unknown>) {
+  const capture = captureOutboundFetch()
+  try {
+    await app.request('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ model: 'qwen3-8b|Q4|123', max_tokens: 32000, stream: false, messages: [], ...body }),
+    })
+  } finally { capture.restore() }
+  return capture.calls[0]?.body
+}
+
+test("/v1/messages: a Code-session override to a real effort clears a client's thinking 'disabled' cleanly", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-conflict-messages')
+  sessionAuth.setReasoningEffort('sess-conflict-messages', 'low')
+
+  const outbound = await postMessagesAs(app, token, { thinking: { type: 'disabled' } })
+
+  const kwargs = outbound?.chat_template_kwargs as Record<string, unknown> | undefined
+  assert.equal(kwargs?.reasoning_effort, 'low', "the session's override must win")
+  assert.equal(kwargs?.enable_thinking, undefined, "no stale enable_thinking:false left over from the client's 'disabled'")
+  assert.equal(outbound?.thinking_budget_tokens, 16000, "no stale budget 0: the default budget of a thinking request with none (half of max_tokens)")
+})
+
+test("/v1/messages: a client's thinking 'disabled' still turns thinking off in a Code session with no effort override", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-disabled-no-effort')
+
+  const outbound = await postMessagesAs(app, token, { thinking: { type: 'disabled' } })
+
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.deepEqual(outbound?.chat_template_kwargs, { enable_thinking: false })
+})
+
 test('a Code session with no reasoning-effort override set still gets the client value translated', async () => {
   const app = new Hono()
   registerGateway(app, fakeDeps())

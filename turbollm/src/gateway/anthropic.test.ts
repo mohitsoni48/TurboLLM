@@ -114,6 +114,15 @@ test('mapToOpenAI leaves thinking_budget_tokens unset when thinking is enabled b
   assert.equal('thinking_budget_tokens' in oai, false)
 })
 
+// thinking:{type:'disabled'} is the Anthropic API's explicit off switch. It used to fall into the
+// budget-less default above (half of max_tokens, no enable_thinking:false), so a model that thinks
+// by default kept reasoning on 4000 of 8000 tokens after the client had turned thinking off.
+test("mapToOpenAI maps thinking {type:'disabled'} to off: budget 0 plus enable_thinking false", () => {
+  const oai = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 8000, thinking: { type: 'disabled' } })
+  assert.equal(oai.thinking_budget_tokens, 0)
+  assert.deepEqual(oai.chat_template_kwargs, { enable_thinking: false })
+})
+
 // ── mapToOpenAI maps a `role:'system'` entry inside `messages` correctly ────
 // Regression coverage for a real bug (found + fully root-caused live 2026-07-23, via a
 // captured real Claude Code request): Claude Code injects hook context (e.g. a

@@ -243,6 +243,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const anthropicHarness = resolveHarness(c, d, 'anthropic')
     /** The session's slider is at "Off" (0) — applied to the mapped body below, see there. */
     let thinkingOff = false
+    /** The session's reasoning-effort override — applied to the mapped body below, see there. */
+    let effortOverride: ReturnType<typeof sessionAuth.getReasoningEffortForToken> = null
     if (anthropicCodeSessionId) {
       // Coding-activity attribution, confirm half (see commitConfirmedCodeToolCalls): this
       // request's own history is what tells the daemon whether the edits it watched the engine
@@ -255,6 +257,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         req.thinking = override > 0 ? { type: 'enabled', budget_tokens: override } : undefined
         thinkingOff = override === 0
       }
+      effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
+      // A real effort replaces a client's thinking off, as on the OpenAI passthrough (a session effort there clears a
+      // client's 'off'): mapped to off, {type:'disabled'} would send budget 0 and enable_thinking false beside
+      // reasoning_effort. It is read as thinking with no budget, so it gets mapToOpenAI's default (half of max_tokens).
+      if (req.thinking?.type === 'disabled' && effortOverride !== null && effortOverride !== 'off') req.thinking = { type: 'enabled' }
     }
 
     if (!req.max_tokens) {
@@ -327,16 +334,13 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // Terminal-agent reasoning-effort override (same mechanism as the thinking-budget one
     // above) — no equivalent field exists on the Anthropic-shaped `req`/mapToOpenAI, so this
     // is injected into the already-mapped OpenAI-shaped body's chat_template_kwargs instead.
-    if (anthropicCodeSessionId) {
-      const effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
-      // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
-      // string "off" — see reasoning-effort.ts.
-      if (effortOverride === 'off') {
-        oaiBody.thinking_budget_tokens = 0
-        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-      } else if (effortOverride !== null) {
-        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
-      }
+    // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
+    // string "off" — see reasoning-effort.ts.
+    if (effortOverride === 'off') {
+      oaiBody.thinking_budget_tokens = 0
+      oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+    } else if (effortOverride !== null) {
+      oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
     }
     // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is
     // not in an external CLI's execution path, so the equivalent lever is denying tool calls for

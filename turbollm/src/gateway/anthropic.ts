@@ -36,8 +36,9 @@ export interface AnthropicRequest {
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string }
   // 'enabled' with an explicit budget_tokens is the documented shape; 'adaptive' (no
   // budget_tokens, plus a display field) is a real shape confirmed live from Claude
-  // Code (2026-07-23) — the type value isn't branched on below, only budget_tokens'
-  // presence/validity, so any thinking-enabled type string is accepted.
+  // Code (2026-07-23) — apart from 'disabled' (the explicit off switch), the type value isn't
+  // branched on below, only budget_tokens' presence/validity, so any thinking-enabled type
+  // string is accepted.
   thinking?: { type: string; budget_tokens?: number; display?: string }
   metadata?: unknown
 }
@@ -276,7 +277,13 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   //    budget_tokens gets a conservative default: half of max_tokens, guaranteeing the
   //    other half survives for the actual answer regardless of how verbose the model's
   //    reasoning is.
-  if (req.thinking) {
+  // {type:'disabled'} is the protocol's explicit off switch, not a budget-less "on": say off the
+  // way every other off in the daemon does (budget 0 plus enable_thinking false, as gateway.ts's
+  // thinkingOff branch), or a model that thinks by default keeps reasoning on half of max_tokens.
+  if (req.thinking?.type === 'disabled') {
+    oai.thinking_budget_tokens = 0
+    oai.chat_template_kwargs = { enable_thinking: false }
+  } else if (req.thinking) {
     const requested = req.thinking.budget_tokens
     const hasMaxTokens = Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0
     if (Number.isFinite(requested) && (requested ?? 0) > 0) {
