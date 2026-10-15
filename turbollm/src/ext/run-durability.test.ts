@@ -31,6 +31,31 @@ test('a completed run is readable after the manager is rebuilt', async () => {
   }
 })
 
+// The final write ran before the done frame was emitted, so once the run left memory its row
+// reported one frame fewer than the run had while it was live (2 here instead of 3).
+test('a completed run read back from the DB reports the event_seq of its done frame', async () => {
+  const dir = tmpDir('turbollm-run-durable-seq-')
+  const db = new ConversationStore(dir)
+  try {
+    const first = new PublicRunManager({ db })
+    const run = first.start({
+      scope: SCOPE, chatId: 'c1', messageId: 'm1',
+      body: async ({ emit }) => {
+        await emit({ event: 'delta', data: { delta: 'a' } })
+        await emit({ event: 'delta', data: { delta: 'b' } })
+        return { status: 'complete' }
+      },
+    })
+    await first.settled(run.id)
+    assert.equal(first.get(run.id)?.eventSeq, 3, 'two deltas and the done frame, numbered from 1')
+
+    const second = new PublicRunManager({ db })
+    assert.equal(second.get(run.id)?.eventSeq, 3)
+  } finally {
+    db.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a run still streaming at restart is reconciled to failed/daemon_restarted', async () => {
   const dir = tmpDir('turbollm-run-orphan-')
   const db = new ConversationStore(dir)

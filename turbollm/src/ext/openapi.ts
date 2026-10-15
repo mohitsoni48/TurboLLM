@@ -58,6 +58,9 @@ export interface RouteSpec {
    *  NO_OWNER_PARAM_PATHS). openapi.test.ts scans the route files' `c.req.query(...)` calls and
    *  fails when a route reads one this list does not name, or names one it never reads. */
   query?: QueryParam[]
+  /** Optional request headers the handler reads (beyond auth, `Accept` and `X-Request-Id`):
+   *  `Idempotency-Key`. openapi.test.ts checks every handler reading one documents it. */
+  headers?: QueryParam[]
   /** Error `type`s this route can answer with, each documented at that type's usual status
    *  (`errorResponses`). `type:status` documents a type a route sends with a different status
    *  — e.g. `auth:403` (insufficient_scope / tenant_not_supported, auth.ts) next to the plain
@@ -71,11 +74,13 @@ export interface RouteSpec {
 // `capacity` belongs in the shared read-error set, not just the write one.
 // `auth:403`: every scoped route refuses a key lacking the scope, or resolving to the local
 // tenant, with 403 (auth.ts) — 401 alone undersold it.
-const CHAT_ERRORS = ['auth', 'auth:403', 'not_found', 'invalid_request', 'capacity']
+// `internal` (500): extErrorHandler's backstop, and mapStoreError's fallback, can answer any route.
+const CHAT_ERRORS = ['auth', 'auth:403', 'not_found', 'invalid_request', 'capacity', 'internal']
 const WRITE_ERRORS = [...CHAT_ERRORS, 'conflict', 'storage']
 // Routes that call the chat store also surface mapStoreError's 501 `not_supported` (errors.ts) —
-// the answer for every such call when no adapter serves the key's tenant.
-const STORE_READ_ERRORS = [...CHAT_ERRORS, 'unsupported']
+// the answer for every such call when no adapter serves the key's tenant — and its `storage`
+// (an adapter returning malformed data), on reads as much as writes.
+const STORE_READ_ERRORS = [...CHAT_ERRORS, 'unsupported', 'storage']
 const STORE_WRITE_ERRORS = [...WRITE_ERRORS, 'unsupported']
 // Body caps (limits.ts) are `invalid_request` sent as 413 payload_too_large; the context-window
 // refusal is `engine` sent as 409 context_overflow (routes.runs.ts), never the type's 502.
@@ -90,6 +95,10 @@ export interface QueryParam {
 // The chat store's cursor pagination (sqlite-chat-store.ts's clampLimit) and dto.ts's include=.
 const CURSOR_PARAM: QueryParam = { name: 'cursor', description: "Opaque cursor: the previous page's `next_cursor`. Omit for the first page." }
 const LIMIT_PARAM: QueryParam = { name: 'limit', type: 'integer', description: 'Page size. The built-in store takes 1-200 (larger values are clamped to 200) and defaults to 50; a configured store adapter applies its own bounds.' }
+// idempotency.ts: kept 24 h, in memory only, scoped to tenant + owner + operation.
+const IDEMPOTENCY_KEY = 'Optional client-chosen key that makes a retry safe: a repeat with the same key (and owner) within 24 hours'
+const IDEMPOTENCY_TAIL = 'Keys are held in memory, so a daemon restart forgets them. Reusing a key for a different request is refused with 409 idempotency_key_reused.'
+const IDEMPOTENCY_GENERATE = `${IDEMPOTENCY_KEY} reattaches to the original run instead of appending the message again. ${IDEMPOTENCY_TAIL} Once that run has left memory (about an hour after it ends), a JSON repeat returns its stored record and a streaming repeat is refused with 409 replay_window_exceeded; a run that can no longer be found at all is refused with 409 idempotency_replay_expired.`
 const INCLUDE_PARAM: QueryParam = {
   name: 'include',
   description: 'Comma-separated heavy fields to return on each message: reasoning, attachments, tool_calls, usage, metadata. Omitted fields are left out of the response.',
@@ -102,7 +111,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Store capabilities, limits, and model info.',
     // No `requireScope` call, but still behind the blanket extAuth (401) and per-tenant rate
     // limiter (429) middleware routes.chats.ts registers ahead of every route on this surface.
-    responseSchema: 'Capabilities', errors: ['auth', 'capacity'],
+    responseSchema: 'Capabilities', errors: ['auth', 'capacity', 'internal'],
   },
   {
     method: 'GET', path: '/chats',
@@ -115,6 +124,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Create a chat.',
     scope: 'chats:write', audited: 'chat.create',
     requestSchema: 'ChatInput', responseSchema: 'Chat', errors: STORE_WRITE_ERRORS,
+    headers: [{ name: 'Idempotency-Key', description: `${IDEMPOTENCY_KEY} returns the chat it created instead of creating another. ${IDEMPOTENCY_TAIL}` }],
   },
   {
     method: 'GET', path: '/chats/:id',
@@ -156,6 +166,8 @@ export const EXT_ROUTES: RouteSpec[] = [
     errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
     // Read only on the generate:false path, which answers with a Message.
     query: [{ ...INCLUDE_PARAM, description: `generate:false only. ${INCLUDE_PARAM.description}` }],
+    // Read by the forwarded generate route; generate:false ignores it.
+    headers: [{ name: 'Idempotency-Key', description: `generate omitted or true only. ${IDEMPOTENCY_GENERATE}` }],
   },
   {
     method: 'GET', path: '/messages/:id',
@@ -181,7 +193,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     scope: 'chats:read', responseSchema: 'AuditPage', errors: CHAT_ERRORS,
     query: [
       { name: 'limit', type: 'integer', description: 'Page size, a positive integer (larger values are clamped to 200). Default 200.' },
-      { name: 'since', description: 'ISO timestamp: only rows at or after it.' },
+      { name: 'since', description: 'ISO 8601 timestamp, e.g. 2026-10-15T10:00:00Z or 2026-10-15T12:00:00.250+02:00 (milliseconds optional; a date-time with neither Z nor an offset is read in the daemon\'s local time zone): only rows at or after that instant. An unparseable value is refused with 400 invalid_input.' },
       { name: 'before', description: 'The `id` of the oldest row a previous page returned: only rows older than it.' },
     ],
   },
@@ -193,6 +205,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     scope: 'runs:write', audited: 'run.start',
     requestSchema: 'MessageInput', responseSchema: 'Run', sse: true,
     successStatus: '202', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
+    headers: [{ name: 'Idempotency-Key', description: IDEMPOTENCY_GENERATE }],
   },
   {
     method: 'GET', path: '/runs',
@@ -226,7 +239,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     // today — NOT keyless. (Whether it should eventually be made keyless, so an integrator can
     // read the schema before it has a key, is a real but separate product decision — see this
     // task's report — not something this manifest entry should misrepresent in the meantime.)
-    responseSchema: 'OpenApiDocument', errors: ['auth', 'capacity'],
+    responseSchema: 'OpenApiDocument', errors: ['auth', 'capacity', 'internal'],
   },
 ]
 
@@ -296,7 +309,7 @@ function buildSchemas(): Record<string, JsonSchema> {
       chat_id: { type: 'string' },
       message_id: { type: 'string' },
       status: { type: 'string', enum: ['queued', 'streaming', 'complete', 'failed', 'aborted'] },
-      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event; frames are numbered from 1, so 0 means none yet — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received.' },
+      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event; frames are numbered from 1, so 0 means none yet — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received. Stored only when the status changes, so for a run the daemon no longer holds in memory (about an hour after it ends, or after a restart) it is informational: an ended run reads the seq of its done frame, but a run that was streaming when the daemon stopped reads 0.' },
       error: { type: ['object', 'null'], additionalProperties: true },
       created_at: { type: 'string', format: 'date-time' },
       ended_at: { type: ['string', 'null'], format: 'date-time' },
@@ -495,7 +508,9 @@ const NO_OWNER_PARAM_PATHS = new Set(['/capabilities', '/openapi.json'])
 function errorResponses(codes: string[]): Record<string, JsonSchema> {
   const statusFor: Record<string, number> = {
     auth: 401, not_found: 404, invalid_request: 400, conflict: 409,
-    capacity: 429, engine: 502, storage: 503, unsupported: 501, internal: 500,
+    // `storage` is 500, not errors.ts's defaultStatus 503: its only producer, mapStoreError's
+    // storage_contract_violation, sends it with 500.
+    capacity: 429, engine: 502, storage: 500, unsupported: 501, internal: 500,
   }
   // Grouped by status: two types can share one (`conflict` and `engine:409`), and the response
   // must name both rather than the last one overwriting the first.
@@ -594,7 +609,10 @@ function buildOperation(route: RouteSpec): JsonSchema {
   const queryParams = (route.query ?? []).map((q) => ({
     name: q.name, in: 'query', required: false, schema: { type: q.type ?? 'string' }, description: q.description,
   }))
-  const parameters = [...pathParams, ...ownerParam, ...queryParams]
+  const headerParams = (route.headers ?? []).map((h) => ({
+    name: h.name, in: 'header', required: false, schema: { type: h.type ?? 'string' }, description: h.description,
+  }))
+  const parameters = [...pathParams, ...ownerParam, ...queryParams, ...headerParams]
 
   const operation: JsonSchema = {
     operationId: operationIdFor(route),

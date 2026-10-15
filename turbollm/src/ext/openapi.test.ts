@@ -10,6 +10,7 @@ import { registerExtRunRoutes } from './routes.runs.js'
 import { PublicRunManager } from './run-manager.js'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
+import { StoreError, type ChatStore } from '../chat/store/chat-store.js'
 import { hashKey } from '../auth.js'
 import { tmpDir } from '../test-support/tmp'
 
@@ -124,6 +125,33 @@ test('every query parameter a route handler reads is documented on that route, a
     assert.deepEqual(documented, [...handlerReads].sort(), `query parameters of ${key}`)
   }
   assert.ok(read.get('GET /chats')?.has('cursor'), 'the scan itself works')
+})
+
+// The document declared no header parameters, so a client generated from it had no way to send
+// Idempotency-Key, the routes' retry-safety mechanism. Every handler that reads it documents it,
+// as does POST .../messages, whose default path forwards its headers to .../generate.
+test('every route that honours Idempotency-Key documents it as an optional header parameter', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const here = dirname(fileURLToPath(import.meta.url))
+  const reading: string[] = []
+  for (const file of ['routes.chats.ts', 'routes.runs.ts']) {
+    const src = readFileSync(join(here, file), 'utf8')
+    const regs = [...src.matchAll(/app\.(get|post|patch|delete)\(`\$\{BASE\}([^`]*)`/g)]
+    regs.forEach((m, i) => {
+      const body = src.slice(m.index, regs[i + 1]?.index ?? src.length)
+      if (body.includes("c.req.header('Idempotency-Key')")) reading.push(`${m[1]} ${m[2]}`)
+    })
+  }
+  assert.deepEqual(reading.sort(), ['post /chats', 'post /chats/:id/messages/generate'], 'the scan itself works')
+  for (const [method, path] of [...reading.map((r) => r.split(' ')), ['post', '/chats/:id/messages']]) {
+    const op = doc.paths[`/api/ext/v1${path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`][method] as {
+      parameters?: Array<{ name: string; in: string; required: boolean; description?: string }>
+    }
+    const header = op.parameters?.find((p) => p.in === 'header' && p.name === 'Idempotency-Key')
+    assert.ok(header, `${method} ${path} must document the Idempotency-Key header`)
+    assert.equal(header.required, false)
+    assert.ok(header.description?.includes('idempotency_key_reused'), `${method} ${path}: ${header.description}`)
+  }
 })
 
 test('every documented error type is one of the nine frozen types', () => {
@@ -281,13 +309,14 @@ const KEY_READONLY = 'tllm-ext-openapi-readonly'
 const KEY_LOCAL = 'tllm-ext-openapi-local'
 
 /** A real chat + run route set over a temp store. `adapter: false` leaves the chat store with no
- *  adapter, which is how every non-local tenant's store call gets 501 not_supported. */
-function statusHarness(opts: { adapter: boolean }) {
+ *  adapter, which is how every non-local tenant's store call gets 501 not_supported. `wrap`
+ *  stands in for a third-party adapter around the temp store. */
+function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatStore }) {
   const dir = tmpDir('turbollm-ext-openapi-status-')
   const conv = new ConversationStore(dir)
   const d = {
     db: conv,
-    chatStore: new ChatStoreRouter(conv.chatStore, opts.adapter ? conv.chatStore : null),
+    chatStore: new ChatStoreRouter(conv.chatStore, opts.adapter ? (opts.wrap?.(conv.chatStore) ?? conv.chatStore) : null),
     store: { snapshot: () => ({ apiKeys: [
       { hash: hashKey(KEY_FULL), tenant: 'acme' },
       { hash: hashKey(KEY_READONLY), tenant: 'acme', scopes: ['chats:read'] },
@@ -350,6 +379,32 @@ test('every error status a route really sends is documented on that route, with 
     await check(await call(noAdapter.app, 'POST', '/chats', KEY_FULL, { title: 'T' }), 501, 'POST', '/chats')
   } finally {
     noAdapter.cleanup()
+  }
+
+  // An adapter returning malformed data: mapStoreError sends `storage` with 500 (the document
+  // said 503), on reads too (which documented no `storage` at all), and an unexpected throw is
+  // `internal` 500 (which no route documented).
+  const broken = statusHarness({
+    adapter: true,
+    wrap: (s) => new Proxy(s, {
+      get(target, prop, receiver) {
+        if (prop === 'listChats' || prop === 'createChat') return async () => { throw new StoreError('contract_violation', 'malformed row') }
+        if (prop === 'getChat') return async () => { throw new Error('adapter bug') }
+        return Reflect.get(target, prop, receiver)
+      },
+    }),
+  })
+  try {
+    await check(await call(broken.app, 'GET', '/chats', KEY_FULL), 500, 'GET', '/chats')
+    await check(await call(broken.app, 'POST', '/chats', KEY_FULL, { title: 'T', owner: 'u1' }), 500, 'POST', '/chats')
+    await check(await call(broken.app, 'GET', '/chats/c1', KEY_FULL), 500, 'GET', '/chats/{id}')
+  } finally {
+    broken.cleanup()
+  }
+  for (const [path, methods] of Object.entries(doc.paths)) {
+    for (const [method, op] of Object.entries(methods)) {
+      assert.ok((op as { responses: Record<string, unknown> }).responses['500'], `${method} ${path}: the error backstop can answer any route with 500 internal`)
+    }
   }
 })
 

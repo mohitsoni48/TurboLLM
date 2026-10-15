@@ -201,12 +201,14 @@ export class PublicRunManager {
         this.db?.upsertExtRun(run)
       } finally {
         run.endedAt = new Date().toISOString()
-        // eventSeq is flushed with the status transitions only, matching the checkpointing
-        // discipline the adapter path uses — not per event, which would be one write per token.
-        this.db?.upsertExtRun(run)
         // The terminal frame is pushed to the buffer BEFORE 'idle', so subscribeToBuffer's
         // documented invariant delivers it to every attached client before ending them.
         emit({ event: 'done', data: { run_id: run.id, status: run.status, message_id: run.messageId } })
+        // eventSeq is flushed with the status transitions only, matching the checkpointing
+        // discipline the adapter path uses — not per event, which would be one write per token.
+        // After the done frame, so the row read back once the run leaves memory reports the
+        // same event_seq (the done frame's) the in-memory run did.
+        this.db?.upsertExtRun(run)
         emitter.emit('idle')
       }
     })()

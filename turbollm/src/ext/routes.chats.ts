@@ -534,8 +534,19 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
         return extError(c, 'invalid_request', 'invalid_input', '`limit` must be a positive integer.', { param: 'limit' })
       }
     }
+    // Rows store `at` as toISOString() and audit.list compares it as text, so any other ISO form
+    // ('...T10:00:00Z' with no milliseconds, or an offset) would cut at the wrong instant.
+    const sinceParam = c.req.query('since') || undefined
+    let since: string | undefined
+    if (sinceParam !== undefined) {
+      const ms = Date.parse(sinceParam)
+      if (Number.isNaN(ms)) {
+        return extError(c, 'invalid_request', 'invalid_input', '`since` must be an ISO 8601 timestamp.', { param: 'since' })
+      }
+      since = new Date(ms).toISOString()
+    }
     try {
-      const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since'), before: c.req.query('before') || undefined })
+      const rows = audit.list(scope.tenant, scope.owner, { limit, since, before: c.req.query('before') || undefined })
       return c.json({ data: rows.map(toAuditDTO) })
     } catch (e) {
       const m = mapStoreError(e)

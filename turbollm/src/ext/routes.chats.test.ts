@@ -557,6 +557,36 @@ test('GET /audit pages backward with before=<oldest id received>', async () => {
   }
 })
 
+// `since` was compared as text against toISOString() values, so the same instant written without
+// milliseconds or with an offset cut in the wrong place ('.' sorts before 'Z'; '11' after '10').
+test('GET /audit `since` is compared as an instant, whatever ISO form it is written in', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'A', owner: 'u1' }))
+    const get = async (since: string) => {
+      const res = await app.request(`/api/ext/v1/audit?owner=u1&since=${encodeURIComponent(since)}`, { headers: { Authorization: ACME } })
+      return { status: res.status, body: await res.json() as { data: Array<{ at: string }>; error?: { code: string } } }
+    }
+    const at = (await get('1970-01-01T00:00:00Z')).body.data[0].at
+    const ms = Date.parse(at)
+    // The same wall-clock instant shifted into a UTC offset: '+01:00' reads one hour later.
+    const withOffset = (t: number, minutes: number) => {
+      const sign = minutes < 0 ? '-' : '+'
+      const hhmm = `${String(Math.floor(Math.abs(minutes) / 60)).padStart(2, '0')}:${String(Math.abs(minutes) % 60).padStart(2, '0')}`
+      return new Date(t + minutes * 60_000).toISOString().replace('Z', `${sign}${hhmm}`)
+    }
+    const secondFloor = new Date(Math.floor(ms / 1000) * 1000).toISOString().replace('.000Z', 'Z')
+    assert.equal((await get(secondFloor)).body.data.length, 1, `${secondFloor} (no milliseconds) is at or before ${at}`)
+    assert.equal((await get(withOffset(ms, 60))).body.data.length, 1, 'the row\'s own instant, written +01:00')
+    assert.equal((await get(withOffset(ms + 1000, -60))).body.data.length, 0, 'one second after the row, written -01:00')
+    const bad = await get('not-a-date')
+    assert.equal(bad.status, 400)
+    assert.equal(bad.body.error?.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
 test('a rate-limited mutation (the blanket per-tenant budget) still produces an audit row', async () => {
   const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
   const { app, db, cleanup } = harness(ext)
