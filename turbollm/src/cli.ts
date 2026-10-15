@@ -54,7 +54,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removeOwnPidfile, findRunningDaemon, stopDaemon, resolveDaemonPort } from './daemon-pid'
+import { writePidfile, removeOwnPidfile, findRunningDaemon, stopDaemon, resolveDaemonPort, daemonReachHost } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -339,7 +339,7 @@ if (hasFlag('--stop')) {
 const runningDaemon = await findRunningDaemon(store.dir())
 if (runningDaemon) {
   console.error(
-    `TurboLLM is already running for ${store.dir()} (pid ${runningDaemon.pid}, http://127.0.0.1:${runningDaemon.port}).\n` +
+    `TurboLLM is already running for ${store.dir()} (pid ${runningDaemon.pid}, http://${daemonReachHost(runningDaemon.host)}:${runningDaemon.port}).\n` +
       `Use that one, stop it first with \`turbollm --stop\`, or start this one with its own --config.`,
   )
   process.exit(1)
@@ -1130,8 +1130,10 @@ function listen(attempt = 0): void {
     // on every successful bind: the PID is constant, but an in-place rebind changes the
     // port, so refreshing it keeps the stored port accurate (used by --stop's identity
     // probe + the "stopped (port N)" message). `rebinding` is already reset to false above,
-    // so this runs for both the initial bind and a rebind. Best-effort.
-    try { writePidfile(store.dir(), process.pid, info.port) } catch { /* best-effort */ }
+    // so this runs for both the initial bind and a rebind. The bound address goes in too: a
+    // daemon bound to one interface (--addr 192.168.1.5:…) never answers on 127.0.0.1, and the
+    // one-daemon-per-data-dir guard above must probe where it really listens. Best-effort.
+    try { writePidfile(store.dir(), process.pid, info.port, info.address) } catch { /* best-effort */ }
   })
   // The terminal WebSocket upgrade handler goes on EVERY listener instance: a bind retry, a
   // rebind and a revert each create a new server, and one without it hands the handshake to

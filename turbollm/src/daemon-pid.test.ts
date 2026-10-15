@@ -10,6 +10,7 @@ import {
   removePidfile,
   removeOwnPidfile,
   findRunningDaemon,
+  daemonReachHost,
   resolveDaemonPort,
   stopDaemon,
   type StopHooks,
@@ -267,4 +268,39 @@ test('findRunningDaemon: a live, answering daemon blocks a start; stale/recycled
   } finally {
     cleanup()
   }
+})
+
+// A daemon bound to one interface (--addr 192.168.1.5:…, daemon.host) never answers on
+// 127.0.0.1, so the pidfile records the bound address and both the start guard and --stop probe
+// THERE. The real-socket version of this is daemon-pid.bound-host.test.ts.
+test('pidfile records the bound host; the start guard and --stop probe it', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    writePidfile(dir, 42, 6996, '192.168.1.5')
+    assert.deepEqual(readPidfile(dir), { pid: 42, port: 6996, host: '192.168.1.5' })
+    const probed: Array<[number, string | undefined]> = []
+    const hooks = makeHooks(true, { platform: 'linux' })
+    hooks.confirmTurbollm = async (port, host) => {
+      probed.push([port, host])
+      return true
+    }
+    assert.deepEqual(await findRunningDaemon(dir, hooks, 43), { pid: 42, port: 6996, host: '192.168.1.5' })
+    assert.equal((await stopDaemon(dir, hooks)).stopped, true)
+    assert.deepEqual(probed, [[6996, '192.168.1.5'], [6996, '192.168.1.5']])
+
+    // A malformed host is dropped rather than put into the probe URL.
+    writeFileSync(join(dir, 'daemon.pid'), JSON.stringify({ pid: 42, port: 6996, host: 7 }))
+    assert.deepEqual(readPidfile(dir), { pid: 42, port: 6996 })
+  } finally {
+    cleanup()
+  }
+})
+
+test('daemonReachHost: the bound address, loopback for a wildcard or unrecorded bind, IPv6 bracketed', () => {
+  assert.equal(daemonReachHost(undefined), '127.0.0.1')
+  assert.equal(daemonReachHost('0.0.0.0'), '127.0.0.1')
+  assert.equal(daemonReachHost('::'), '127.0.0.1')
+  assert.equal(daemonReachHost('127.0.0.1'), '127.0.0.1')
+  assert.equal(daemonReachHost('192.168.1.5'), '192.168.1.5')
+  assert.equal(daemonReachHost('::1'), '[::1]')
 })
