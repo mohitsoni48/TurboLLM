@@ -54,6 +54,9 @@ function stubJwksEndpoint(teamDomain: string): () => void {
 }
 
 const INGRESS_PORT = 6997
+/** The MagicDNS name Tailscale Serve serves this daemon under; Serve passes the browser's Host
+ *  through, so genuine Serve traffic carries it. */
+const SERVE_HOST = 'box.tail1234.ts.net'
 
 function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void): { d: Deps; cfg: ReturnType<typeof defaultConfig> } {
   const cfg = defaultConfig()
@@ -64,7 +67,11 @@ function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void): { d:
       update: (fn: (c: typeof cfg) => void) => fn(cfg),
     },
     // The running provider mirrors the saved one unless a test says otherwise (they can differ).
-    remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider },
+    remote: {
+      ingressPort: () => INGRESS_PORT,
+      activeProvider: () => cfg.remoteAccess.provider,
+      url: (): string | null => `https://${SERVE_HOST}`,
+    },
   } as unknown as Deps
   return { d, cfg }
 }
@@ -190,7 +197,7 @@ test('C1: Tailscale identity with no token reaches an ordinary chat route', asyn
   })
   const res = await tunneledRequest(buildApp(d), '/api/v1/conversations/abc/messages', {
     method: 'POST',
-    headers: { 'Tailscale-User-Login': 'bob@example.com' },
+    headers: { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' },
   })
   assert.equal(res.status, 200)
 })
@@ -207,7 +214,7 @@ test('C1: the SAME identity-only caller is REFUSED minting a durable key at POST
   const app = buildApp(d)
   const res = await tunneledRequest(app, '/api/v1/keys', {
     method: 'POST',
-    headers: { 'Tailscale-User-Login': 'bob@example.com' },
+    headers: { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' },
   })
   assert.equal(res.status, 403)
   assert.equal(cfg.apiKeys.length, 0, 'no key may have been minted')
@@ -355,7 +362,7 @@ test('I6: Tailscale Serve identity still wins over an unrelated requireAccess=tr
   const app = buildApp(d)
   const res = await tunneledRequest(app, '/api/v1/conversations/abc/messages', {
     method: 'POST',
-    headers: { 'Tailscale-User-Login': 'sam@example.com' },
+    headers: { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' },
   })
   assert.equal(res.status, 200, 'Access is genuinely not in a Serve request\'s path — this is intended, not a bypass')
 })
@@ -543,9 +550,81 @@ test('a forged Tailscale identity is refused when the saved provider is Serve bu
   ;(d.remote as unknown as { activeProvider: () => string }).activeProvider = () => 'cloudflare-quick'
   const res = await tunneledRequest(buildApp(d), '/api/v1/conversations/abc/messages', {
     method: 'POST',
-    headers: { 'Tailscale-User-Login': 'forged@example.com' },
+    headers: { Host: SERVE_HOST, 'Tailscale-User-Login': 'forged@example.com' },
   })
   assert.equal(res.status, 401)
+})
+
+// ── On the ingress port the Host check is skipped (a tunnel's Host is its public name), so
+// the Tailscale identity header must be tied to the name Serve actually serves. Otherwise a
+// DNS-rebinding page on 127.0.0.1:<ingress> sets the header itself and gets full API access.
+
+test('a DNS-rebinding page on the ingress port cannot forge a Tailscale identity', async () => {
+  const { d, cfg } = makeDeps((cfg) => {
+    cfg.remoteAccess.provider = 'tailscale-serve'
+  })
+  const app = buildApp(d)
+  const send = (req: typeof tunneledRequest, headers: Record<string, string>) =>
+    req(app, '/api/v1/conversations/abc/messages', { method: 'POST', headers: { 'Sec-Fetch-Site': 'same-origin', ...headers } })
+  const forged = { Host: 'rebind.attacker.example:6997', 'Tailscale-User-Login': 'forged@example.com' }
+  assert.equal((await send(loopbackRequest, forged)).status, 401, 'main port')
+  assert.equal((await send(tunneledRequest, forged)).status, 401, 'ingress port')
+  assert.equal((await send(tunneledRequest, { 'Tailscale-User-Login': 'forged@example.com' })).status, 401, 'no Host is no proof')
+  // Genuine Serve traffic carries the served name, in any case, with the served port (none for 443).
+  for (const host of [SERVE_HOST, 'BOX.Tail1234.TS.NET', `${SERVE_HOST}.`, `${SERVE_HOST}:443`]) {
+    assert.equal((await send(tunneledRequest, { Host: host, 'Tailscale-User-Login': 'sam@example.com' })).status, 200, host)
+  }
+  // The served name on another port is not Serve: a page whose own name resolves (via a hostile
+  // resolver, with MagicDNS off) to 127.0.0.1 reaches the ingress only with the ingress port in its URL.
+  for (const host of [`${SERVE_HOST}:${INGRESS_PORT}`, `${SERVE_HOST}:80`, `${SERVE_HOST}:8443`, `evil@${SERVE_HOST}`]) {
+    assert.equal((await send(tunneledRequest, { Host: host, 'Tailscale-User-Login': 'forged@example.com' })).status, 401, host)
+  }
+  // Served on `--https=8443`: the Host carries that port.
+  ;(d.remote as unknown as { url: () => string | null }).url = () => `https://${SERVE_HOST}:8443`
+  assert.equal((await send(tunneledRequest, { Host: `${SERVE_HOST}:8443`, 'Tailscale-User-Login': 'sam@example.com' })).status, 200)
+  assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 401)
+  // A reconnect's backoff (url() is null) falls back to the persisted URL instead of locking
+  // every tailnet user out; with neither, nothing is trusted.
+  ;(d.remote as unknown as { url: () => string | null }).url = () => null
+  assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 401)
+  cfg.remoteAccess.lastUrl = `https://${SERVE_HOST}`
+  assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 200)
+  assert.equal((await send(tunneledRequest, forged)).status, 401)
+})
+
+// The ingress is a plain 127.0.0.1 listener, so any process on this machine can send the
+// identity header and the served Host. That gives it nothing new while it already has keyless
+// loopback trust on the main listener. Bound to one specific LAN address there is no loopback
+// listener: the box's other users are LAN peers that need a key, and the header would hand them
+// keyless access (MCP stdio servers, builds) instead.
+test('on a specific non-loopback bind, a Tailscale identity sent to the ingress is not trusted', async () => {
+  const { d } = makeDeps((cfg) => {
+    cfg.remoteAccess.provider = 'tailscale-serve'
+  })
+  const app = buildApp(d)
+  const identity = { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com', 'Sec-Fetch-Site': 'same-origin' }
+  const run = () => tunneledRequest(app, '/api/v1/build/run', { method: 'POST', headers: identity })
+  d.bindHost = '192.168.1.10'
+  // What the same local process gets on the main listener: it arrives from the bound address.
+  const main = await app.request('/api/v1/build/run', { method: 'POST', headers: { Host: '192.168.1.10:6996' } }, {
+    incoming: { socket: { localPort: 6996, remoteAddress: '192.168.1.10', remotePort: 55555, remoteFamily: 'IPv4' } },
+  } as never)
+  assert.equal(main.status, 401)
+  assert.equal((await run()).status, 401, 'the ingress gives it no more')
+  for (const bindHost of [undefined, '127.0.0.1', 'localhost', '0.0.0.0', '::', '[::]']) {
+    d.bindHost = bindHost
+    assert.equal((await run()).status, 200, `bound ${bindHost}: a local process already has loopback trust`)
+  }
+  // On Android, loopback trust needs the app's secret; the header must not stand in for it.
+  d.bindHost = undefined
+  const prev = process.env.TURBOLLM_APP_SECRET
+  process.env.TURBOLLM_APP_SECRET = 'test-secret'
+  try {
+    assert.equal((await run()).status, 401)
+  } finally {
+    if (prev === undefined) delete process.env.TURBOLLM_APP_SECRET
+    else process.env.TURBOLLM_APP_SECRET = prev
+  }
 })
 
 // ── A remote token without models:load must not load (and evict) models via /v1/* ──────────

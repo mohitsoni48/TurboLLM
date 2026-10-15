@@ -201,6 +201,42 @@ function hostHeaderName(host: string): string {
   return (h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '')).replace(/\.$/, '')
 }
 
+/** Is a request's Host the MagicDNS name and port Tailscale Serve serves this daemon under?
+ *  Serve's proxy passes the browser's Host through to the ingress, so genuine tailnet traffic
+ *  carries `<machine>.<tailnet>.ts.net` plus Serve's public port when it isn't 443 (exactly the
+ *  host of the URL the provider started). A page that DNS-rebinds its own name to 127.0.0.1 can
+ *  reach the ingress port too, and set any header it likes there, but its Host is its own name
+ *  with the ingress port: it would need to answer DNS for the served name (MagicDNS off, a
+ *  hostile resolver) AND the ingress port would have to equal Serve's public port. Read from the
+ *  live URL, else the one persisted on the last connect (cli.ts): the URL is null during a
+ *  reconnect's backoff, while Serve's entry, which outlives our process, keeps serving. No URL,
+ *  no trust. */
+function namesServedHost(host: string | undefined, d: Deps): boolean {
+  const url = d.remote?.url?.() || d.store.snapshot().remoteAccess?.lastUrl
+  // A DNS name and an optional port, nothing the URL parser would read as userinfo or a path.
+  if (!host || !url || !/^[a-z0-9.-]+(:\d+)?$/i.test(host.trim())) return false
+  try {
+    const served = new URL(url)
+    const got = new URL(`${served.protocol}//${host.trim()}`) // so `:443` reads as the default port
+    return served.hostname !== '' && hostHeaderName(got.hostname) === hostHeaderName(served.hostname) && got.port === served.port
+  } catch {
+    return false
+  }
+}
+
+/** Does a process on this machine already get keyless loopback trust on the main listener?
+ *  Only then may lanAuth honour a Tailscale Serve identity: the ingress is a plain 127.0.0.1
+ *  listener, so any local process can send that header and the served Host (see identity.ts),
+ *  and it must not get more that way than it already has. True on desktop (no app secret) when
+ *  the main listener can be reached over loopback: the default bind, a loopback one or a
+ *  wildcard. Bound to one specific address (`--addr 192.168.1.10:6996`, `daemon.host`), the
+ *  box's own processes are LAN peers that need a key, so tailnet users need the remote token. */
+function localProcessesTrusted(d: Deps): boolean {
+  if (process.env.TURBOLLM_APP_SECRET) return false // Android: loopback trust needs the app's secret
+  const h = d.bindHost?.trim().toLowerCase()
+  return h === undefined || isLoopbackBindHost(h) || h === '0.0.0.0' || h === '::' || h === '[::]'
+}
+
 /** The cookie and header that carry {@link appSecretPresented}'s secret. */
 const APP_SECRET_COOKIE = 'turbollm_app'
 const APP_SECRET_HEADER = 'x-turbollm-app'
@@ -779,8 +815,17 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // secret. Gated on BOTH the ingress socket and the provider actually RUNNING being Serve —
     // Funnel and every public tunnel send no identity headers, so anything claiming one there is
     // a forgery attempt. The running provider, not the saved one: the saved one can name Serve
-    // while a public tunnel started under another provider is still serving.
-    if (isTunneled(c, d) && d.remote?.activeProvider?.() === 'tailscale-serve' && tailscaleIdentity(c)) {
+    // while a public tunnel started under another provider is still serving. And only for the
+    // Host Serve serves (namesServedHost): the ingress port skips the Host check above, so a
+    // DNS-rebinding page on 127.0.0.1:<ingress> could otherwise set the header itself. And only
+    // while a local process, which can always forge it, already has as much (localProcessesTrusted).
+    if (
+      isTunneled(c, d) &&
+      d.remote?.activeProvider?.() === 'tailscale-serve' &&
+      namesServedHost(c.req.header('host'), d) &&
+      localProcessesTrusted(d) &&
+      tailscaleIdentity(c)
+    ) {
       return next()
     }
 
