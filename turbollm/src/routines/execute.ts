@@ -17,7 +17,7 @@
 // RoutineRunStatus it wrote, satisfying the caller's contract either way.
 import type { Deps } from '../deps'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
-import { withPinnedModel, type ModelSwapOutcome } from './model-swap'
+import { withPinnedModel, type ModelSwapOutcome, type SwapGate } from './model-swap'
 import { createRunDeadline, ROUTINE_RUN_TIMEOUT_MS } from './runaway-guard'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
@@ -31,7 +31,7 @@ import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
-import { runCliInteractiveRoutine, terminalLookupsBySession, type CliInteractiveDeps } from './cli-interactive-runner'
+import { runCliInteractiveRoutine, terminalLookupsBySession, agentLabel, CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, type CliInteractiveDeps } from './cli-interactive-runner'
 import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
 
 /** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
@@ -90,6 +90,15 @@ function finalizeSwapOutcome(d: Deps, runId: string, swap: ModelSwapOutcome, ran
   }
   d.db.updateRoutineRun(runId, { status: 'errored', error: swap.message, endedAt })
   return 'errored'
+}
+
+/** How withPinnedModel treats the gate this run took (see executeRoutine): a chat routine keeps it
+ *  for the whole run (undefined); a pi Code routine lets go of it before its session runs and takes
+ *  it again for the restore, without the run's deadline: a run that hit it must still restore. */
+function pinnedGate(d: Deps, routine: Routine, release: () => void): SwapGate | undefined {
+  if (!d.gate || routine.flavor === 'chat') return undefined
+  const gate = d.gate
+  return { release, reacquire: () => gate.acquire('bg') }
 }
 
 /** The gate snapshot used by the CLI branch when no GenerationGate is wired at all (`Deps.gate` is
@@ -184,9 +193,9 @@ export async function runCliRoutineBranch(
     // finished in the same tick the timer fired, and its own more specific outcome wins.
     const timedOutStatus = d.db.getRoutineRun(run.id)?.status
     if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
-    // Same race as the interactive kickoff below: a model swap can outlast this bound, and the
-    // scheduler releases the routine once this returns — stop the run from spawning the CLI later
-    // (or kill the one it already spawned) and from overwriting this row.
+    // A model swap can outlast this bound, and the scheduler releases the routine once this
+    // returns — stop the run from spawning the CLI later (or kill the one it already spawned) and
+    // from overwriting this row.
     abandon.abort()
     d.db.updateRoutineRun(run.id, { status: 'errored', error: `claude CLI routine exceeded the ${_timeoutMs}ms wall-clock limit before reporting a result.`, endedAt: new Date().toISOString() })
     return 'errored'
@@ -207,8 +216,14 @@ export async function runCliRoutineBranch(
  *  a separate, later event (the agent-exited callback or `sweepInteractiveCliRuns`). If THIS
  *  bound fires, kickoff itself is genuinely stuck (the same class of unbounded-await risk
  *  `runCliRoutineBranch`'s own comment documents for its pre-spawn probes), not a routine still
- *  legitimately awaiting a human. */
+ *  legitimately awaiting a human. The model swap does not count against it (see
+ *  runCliInteractiveBranch). */
 const CLI_INTERACTIVE_KICKOFF_TIMEOUT_MS = 60_000
+
+/** The idle TTL of an interactive routine's terminal: the run's own bound plus TerminalManager's
+ *  default 5 minutes. The run's bound is measured from the run's start, which precedes the
+ *  terminal's creation, so the sweep always reaches a parked run first. */
+const ROUTINE_TERMINAL_IDLE_TTL_MS = CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS + 5 * 60_000
 
 /** Interactive (ask/plan) half of CLI-flavor Code Routine execution — see
  *  cli-interactive-runner.ts's module header for why this is a separate path from
@@ -227,18 +242,38 @@ export async function runCliInteractiveBranch(
 ): Promise<RoutineRunStatus> {
   const tm = getTerminalManager(d)
   const kickoff = new AbortController()
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let timeOut = () => {}
+  let kickoffSettled = false
+  const armTimer = () => { clearTimeout(timer); timer = setTimeout(() => timeOut(), _timeoutMs) }
   const interactiveDeps: CliInteractiveDeps = {
     store: d.db,
     gate: d.gate ?? ABSENT_GATE,
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
     getEngineIdle: () => engineIsIdle(d.manager),
-    loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
+    // The kickoff bound is paused while a model loads, then re-armed in full for the steps after
+    // it. A healthy load can take far longer than the bound (manager.ts allows each load
+    // READINESS_TIMEOUT_MS, 600 s, and has seen a 65 GB model take over 120 s); counting it made
+    // every fire of a routine pinned to such a model load it, throw it away, reload the previous
+    // one and never start the CLI. The load is bounded by the manager itself.
+    loadExplicit: async (modelKey) => {
+      clearTimeout(timer)
+      try {
+        return await d.modelRouter.loadExplicit(modelKey)
+      } finally {
+        if (!kickoffSettled) armTimer()
+      }
+    },
     now: () => new Date(),
     // Probe the binary THIS routine actually needs — the interactive path now serves every terminal
     // harness, so a hardcoded `claude --version` would report "not installed" for a machine that has
     // opencode but no claude (and vice versa).
     isAvailable: () => isCliAvailable(terminalHarnessBin(routine)),
-    createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, { ...opts, signal: kickoff.signal }),
+    // Nobody may ever open this terminal, so TerminalManager's 5-minute idle reaper would kill it
+    // (and its CLI) long before the run's own CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, which the sweep
+    // enforces. Its idle TTL outlasts that bound, so the sweep decides; once the run has ended, the
+    // shell left behind still ages out.
+    createTerminal: (agentRun, opts) => createAgentTerminal(d, agentRun, { ...opts, signal: kickoff.signal, idleTtlMs: ROUTINE_TERMINAL_IDLE_TTL_MS }),
     // TerminalManager is keyed by its own terminal id, not the Code session id — the shared
     // helper maps every lookup first (the same wiring as cli.ts's sweep), or the abandoned-kickoff
     // kill in runCliInteractiveRoutine would be a silent no-op.
@@ -246,28 +281,28 @@ export async function runCliInteractiveBranch(
     releaseParked: d.routineScheduler ? (routineId, runId) => d.routineScheduler!.releaseParked(routineId, runId) : undefined,
     kickoffSignal: kickoff.signal,
   }
-  let timer: ReturnType<typeof setTimeout> | undefined
   const TIMED_OUT = Symbol('cli_interactive_kickoff_timeout')
+  // Deliberately NOT `.unref()`'d — see runCliRoutineBranch's identical timer above for why:
+  // unref'ing the one thing that can rescue a genuinely wedged kickoff risks it never firing
+  // at all if nothing else is keeping the event loop alive at that moment, which is exactly
+  // the failure this timeout exists to prevent. Bounded by `_timeoutMs` (paused during a
+  // model load, see loadExplicit above). Armed before the kickoff starts, so a load can pause it.
+  const timedOut = new Promise<symbol>((resolve) => { timeOut = () => resolve(TIMED_OUT) })
   let raced: unknown
   try {
-    raced = await Promise.race([
-      _runInteractive(routine, run, interactiveDeps),
-      // Deliberately NOT `.unref()`'d — see runCliRoutineBranch's identical timer above for why:
-      // unref'ing the one thing that can rescue a genuinely wedged kickoff risks it never firing
-      // at all if nothing else is keeping the event loop alive at that moment, which is exactly
-      // the failure this timeout exists to prevent. Bounded by `_timeoutMs`.
-      new Promise<symbol>((resolve) => { timer = setTimeout(() => resolve(TIMED_OUT), _timeoutMs) }),
-    ])
+    armTimer()
+    raced = await Promise.race([_runInteractive(routine, run, interactiveDeps), timedOut])
   } finally {
-    if (timer) clearTimeout(timer)
+    kickoffSettled = true
+    clearTimeout(timer)
   }
   if (raced === TIMED_OUT) {
     const timedOutStatus = d.db.getRoutineRun(run.id)?.status
     if (timedOutStatus && timedOutStatus !== 'running') return timedOutStatus
-    // Kickoff is still in flight (a model swap can outlast this bound) — stop it from launching
-    // the CLI later, after this row is 'errored' and the scheduler has released the routine.
+    // Kickoff is still in flight — stop it from launching the CLI later, after this row is
+    // 'errored' and the scheduler has released the routine.
     kickoff.abort()
-    d.db.updateRoutineRun(run.id, { status: 'errored', error: `Starting the interactive claude CLI session exceeded the ${_timeoutMs}ms kickoff limit.`, endedAt: new Date().toISOString() })
+    d.db.updateRoutineRun(run.id, { status: 'errored', error: `Starting the interactive ${agentLabel(routine)} CLI session exceeded the ${_timeoutMs}ms kickoff limit.`, endedAt: new Date().toISOString() })
     return 'errored'
   }
   return raced as RoutineRunStatus
@@ -278,10 +313,11 @@ export async function runCliInteractiveBranch(
  *  'running') before calling this; this function only decides which terminal RoutineRunStatus
  *  the fire reached (writing its own more-specific fields — skipReason, result, error,
  *  pendingToolCall — along the way) and returns it, matching scheduler.ts's own doc comment on
- *  `RoutineSchedulerDeps.runRoutine` exactly. For a chat routine, acquires GenerationGate at 'bg'
- *  priority (spec 20 §5: a routine never preempts foreground chat/Code; a pi Code routine's session
- *  gates each request itself — see below), resolves the model-conflict decision, and dispatches to
- *  the flavor-specific runner.
+ *  `RoutineSchedulerDeps.runRoutine` exactly. Acquires GenerationGate at 'bg' priority (spec 20 §5:
+ *  a routine never preempts foreground chat/Code), held for the whole run by a chat routine and only
+ *  around the model swap and the restore by a pi Code routine, whose session gates each request
+ *  itself (see pinnedGate); resolves the model-conflict decision, and dispatches to the
+ *  flavor-specific runner.
  *
  *  `_runCliBranch` is a default-parameter seam (I1), same pattern as `runCliRoutineBranch`'s own
  *  `_runCli` and cli-process.ts's `_spawn`/`_killTree`. It exists so the DISPATCH CONDITION itself
@@ -328,10 +364,14 @@ export async function executeRoutine(
   try {
     let release: (() => void) | undefined
     try {
-      // Chat only: an in-app pi Code session acquires this same gate itself before EVERY provider
-      // request (code-session.ts's before_provider_request hook), so holding it here too would
-      // self-deadlock against a single-slot engine — the same hazard cli-routine.ts documents.
-      if (d.gate && routine.flavor === 'chat') release = await d.gate.acquire('bg', { signal: deadline.signal })
+      // A chat routine holds the gate for its whole run. An in-app pi Code session acquires this
+      // same gate itself before EVERY provider request (code-session.ts's before_provider_request
+      // hook), so holding it across the run would self-deadlock against a single-slot engine (the
+      // same hazard cli-routine.ts documents): a pi routine holds it only for the swap decision and
+      // load, and again for the restore (pinnedGate). Without it, a swap would not wait for a chat
+      // routine, compaction, title or memory call, which hold the gate without raising the
+      // activeRequests engineIsIdle() reads, and would stop the engine under them.
+      if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
     } catch {
       d.db.updateRoutineRun(run.id, { status: 'skipped', skipReason: 'gate_timeout', endedAt: new Date().toISOString() })
       return 'skipped'
@@ -341,7 +381,7 @@ export async function executeRoutine(
       const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async () => {
         const outcome = await dispatchRoutine(d, routine, run, deadline.signal)
         ranStatus = finalizeOutcome(d, run.id, outcome)
-      })
+      }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
       return finalizeSwapOutcome(d, run.id, swap, ranStatus)
     } finally {
       release?.()
@@ -401,8 +441,9 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
   try {
     let release: (() => void) | undefined
     try {
-      // Chat only — see executeRoutine: a pi Code resume gates each provider request itself.
-      if (d.gate && routine.flavor === 'chat') release = await d.gate.acquire('bg', { signal: deadline.signal })
+      // See executeRoutine: a pi Code resume gates each provider request itself, so it holds the
+      // gate only for the swap and the restore (pinnedGate).
+      if (d.gate) release = await d.gate.acquire('bg', { signal: deadline.signal })
     } catch {
       revertClaim()
       return { ok: false, code: 'gate_timeout', message: 'Timed out waiting for the model server.' }
@@ -411,7 +452,7 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async () => {
         const outcome = await dispatchResume(d, routine, current, pending, decision, deadline.signal)
         finalizeOutcome(d, current.id, outcome)
-      })
+      }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
       if (swap.outcome === 'skip-busy') { revertClaim(); return { ok: false, code: 'model_busy', message: 'The model server is busy — try approving again shortly.' } }
       if (swap.outcome === 'skip-load-failed') { revertClaim(); return { ok: false, code: 'model_unavailable', message: swap.message } }
       // fn never ran here either, so nothing wrote a terminal state — without the revert the run

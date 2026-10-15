@@ -127,6 +127,22 @@ test('cleanupIdle: a terminal idle for LESS than maxAgeMs is left alone', () => 
   assert.ok(m.infoMap.has('t4'))
 })
 
+test('cleanupIdle: a terminal created with its own idle TTL (a routine run) uses it instead of maxAgeMs', () => {
+  const m = seededManager()
+  const ttl = (m as unknown as { idleTtl: Map<string, number> }).idleTtl
+  const session = seedTerminal(m, 't5')
+  ttl.set('t5', 35 * 60_000)
+  m.idleSince.set('t5', Date.now() - 6 * 60_000) // never viewed, six minutes old
+
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), false, 'its owner, not the 5-minute default, decides when it ends')
+
+  m.idleSince.set('t5', Date.now() - 36 * 60_000)
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), true, 'past its own TTL it still ages out')
+  assert.equal(ttl.has('t5'), false)
+})
+
 test('registerWsListener: two listeners on the same id both receive broadcast data', () => {
   const m = new TerminalManager()
   const received1: string[] = []

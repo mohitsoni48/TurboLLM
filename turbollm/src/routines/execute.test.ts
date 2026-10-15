@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { executeRoutine, resumeRoutineRun, runCliRoutineBranch, runCliInteractiveBranch } from './execute'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
-import { runCliInteractiveRoutine, type CliInteractiveDeps } from './cli-interactive-runner'
+import { runCliInteractiveRoutine, sweepInteractiveCliRuns, terminalLookupsBySession, type CliInteractiveDeps } from './cli-interactive-runner'
 import { parsePendingToolCall, stallRoutineRun } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
@@ -14,7 +14,8 @@ import { CodeRunManager, type CodeSessionRunner } from '../code/code-run-manager
 import type { RoutineRunStatus } from './schema'
 import { tmpDir } from '../test-support/tmp'
 import { TerminalManager } from '../terminal/terminal-manager'
-import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
+import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-routes'
+import { PTYSession } from '../terminal/pty-session'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
@@ -354,36 +355,89 @@ test('a hung interactive kickoff still drives the run to a terminal state within
   assert.ok(finalRun.endedAt)
 })
 
-// The kickoff bound covers the model swap, which can outlast it. Once the bound has written
-// 'errored' (and the scheduler has released the routine), the still-running kickoff used to go on
-// to spawn the CLI and flip the row back to 'needs_approval' — a live CLI behind a failed run.
-test('an interactive kickoff that outlasts its bound never launches the CLI afterwards', async () => {
-  const { d, db } = fakeDeps({ loadedKey: 'm' })
-  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
-  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
-  let terminalsSpawned = 0
+// A model swap can take far longer than the kickoff bound (each load may take up to the manager's
+// 600 s readiness limit). Counting it against the bound made every fire of a routine pinned to a
+// slow-loading model load it, abandon the run, reload the previous model and never start the CLI.
+function slowSwapKickoff(): { d: Deps; db: ConversationStore; loads: string[]; routine: ReturnType<ConversationStore['createRoutine']>; run: ReturnType<ConversationStore['createRoutineRun']> } {
+  const { d, db } = fakeDeps({ loadedKey: 'small-model' })
   const loads: string[] = []
+  // The production wiring's own loadExplicit (d.modelRouter), slower than the 25 ms bound below.
+  ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async (key: string) => { loads.push(key); await new Promise((res) => setTimeout(res, 150)); return { target: 'x' } }
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'opencode_cli', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  return { d, db, loads, routine, run }
+}
+
+test('a model swap slower than the interactive kickoff bound still launches the CLI', async () => {
+  let terminalsSpawned = 0
+  const createTerminal: CliInteractiveDeps['createTerminal'] = async () => { terminalsSpawned++; return { ok: true, terminalId: 't' } }
+  const { d, db, loads, routine, run } = slowSwapKickoff()
+  const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) =>
+    runCliInteractiveRoutine(r, rr, { ...deps, isAvailable: async () => true, createTerminal }), 25)
+  assert.equal(status, 'needs_approval')
+  assert.equal(terminalsSpawned, 1)
+  assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval')
+  assert.deepEqual(loads, ['big-model'], 'the pinned model stays loaded for the run')
+})
+
+// The bound is only paused for the swap: a step after it that hangs is still cut off, the CLI never
+// starts afterwards, and the swap is undone.
+test('the interactive kickoff bound is re-armed after the model swap', async () => {
+  let terminalsSpawned = 0
+  const createTerminal: CliInteractiveDeps['createTerminal'] = async () => { await new Promise((res) => setTimeout(res, 150)); terminalsSpawned++; return { ok: true, terminalId: 't' } }
+  const { d, db, loads, routine, run } = slowSwapKickoff()
   let kickoffDone!: Promise<RoutineRunStatus>
   const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => {
-    kickoffDone = runCliInteractiveRoutine(r, rr, {
-      ...deps,
-      isAvailable: async () => true,
-      getLoadedModelKey: () => 'small-model',
-      getEngineIdle: () => true,
-      gate: { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate,
-      // A model swap slower than the kickoff bound.
-      loadExplicit: async (key) => { loads.push(key); await new Promise((res) => setTimeout(res, 150)); return { target: 'x' } },
-      createTerminal: async () => { terminalsSpawned++; return { ok: true, terminalId: 't' } },
-    })
+    kickoffDone = runCliInteractiveRoutine(r, rr, { ...deps, isAvailable: async () => true, createTerminal, killTerminal: () => {} })
     return kickoffDone
   }, 25)
   assert.equal(status, 'errored')
-  await kickoffDone
+  assert.equal(await kickoffDone, 'errored')
   const finalRun = db.getRoutineRun(run.id)!
-  assert.equal(terminalsSpawned, 0, 'a timed-out kickoff must not spawn the CLI')
-  assert.equal(finalRun.status, 'errored')
+  assert.equal(finalRun.status, 'errored', 'must not flip back to needs_approval')
+  assert.match(finalRun.error ?? '', /interactive opencode CLI session exceeded the 25ms kickoff limit/)
   assert.ok(finalRun.endedAt)
   assert.deepEqual(loads, ['big-model', 'small-model'], 'the swap made for the abandoned run is undone')
+})
+
+// A routine's terminal is created server-side and nobody may ever open it. TerminalManager's own
+// idle reaper (every 60 s, 5 min without a viewer) used to kill it, CLI and all, after about 5-6
+// minutes, and the next routine sweep then finalized the run as 'ended unexpectedly'. The routine
+// sweep owns its lifetime up to the 30-minute bound. Real TerminalManager and createAgentTerminal;
+// only the PTY itself is faked.
+test('an unattended interactive routine terminal outlives the 5-minute idle reaper, up to the routine bound', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  t.mock.method(PTYSession, 'spawn', () => {
+    let exited = false
+    return {
+      onData: () => {}, onExit: () => {}, getPid: () => 0, write: () => {}, resize: () => {}, getScrollback: () => '',
+      dispose: () => { exited = true }, isExited: () => exited,
+    }
+  })
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: tmpDir('execute-routine-terminal-'), codingAgent: 'opencode_cli', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => runCliInteractiveRoutine(r, rr, { ...deps, isAvailable: async () => true }))
+  assert.equal(status, 'needs_approval')
+  const tm = getTerminalManager(d)
+  const codeSessionId = db.getRoutineRun(run.id)!.codeSessionId!
+  const terminalId = tm.findByCodeSessionId(codeSessionId)
+  assert.ok(terminalId)
+  try {
+    // What the manager's own 60 s sweep sees six minutes later, with no viewer ever attached.
+    ;(tm as unknown as { idleSince: Map<string, number> }).idleSince.set(terminalId, Date.now() - 6 * 60_000)
+    tm.cleanupIdle()
+    const sweepDeps = { store: db, loadExplicit: d.modelRouter.loadExplicit, ...terminalLookupsBySession(() => tm) }
+    sweepInteractiveCliRuns({ ...sweepDeps, now: () => new Date(Date.now() + 6 * 60_000) })
+    assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval', 'the run is still in progress')
+    assert.equal(tm.isActive(terminalId), true)
+    // The routine's own 30-minute bound still ends it.
+    sweepInteractiveCliRuns({ ...sweepDeps, now: () => new Date(Date.now() + 31 * 60_000) })
+    assert.equal(db.getRoutineRun(run.id)!.status, 'errored')
+    assert.match(db.getRoutineRun(run.id)!.error ?? '', /No approval decision was made/)
+    assert.equal(tm.findByCodeSessionId(codeSessionId), null)
+  } finally {
+    tm.kill(terminalId)
+  }
 })
 
 test('an interactive kickoff abandoned while its terminal is being started closes that terminal again', async () => {
@@ -783,18 +837,91 @@ test('pi Code routine does not deadlock against its own per-request gate acquire
   assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 })
 })
 
-test('resumeRoutineRun does not take the routine-level gate for a pi Code run', async () => {
-  let acquires = 0
-  const gate = { acquire: async () => { acquires++; return () => {} } } as unknown as GenerationGate
+test('resumeRoutineRun does not hold the routine-level gate while a pi Code run is dispatched', async () => {
+  let held = 0
+  const gate = { acquire: async () => { held++; let done = false; return () => { if (!done) { done = true; held-- } } } } as unknown as GenerationGate
   const { d, db } = fakeDeps({ loadedKey: 'm', gate })
   const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'm', workspacePath: tmpDir('execute-pi-gate-'), codingAgent: 'pi', permissionMode: 'ask' })
   const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
   const conv = db.createConversation({ kind: 'code', modelKey: 'm' })
   stallRoutineRun(db, run.id, { convId: conv.id, assistantContent: '', precedingCalls: [], call: { id: 'c1', name: 'bash', args: {} }, sessionId: conv.id })
+  // The deny dispatch writes the run's terminal state; record whether the gate was held then.
+  let heldAtDispatch: number | undefined
+  const update = db.updateRoutineRun.bind(db)
+  db.updateRoutineRun = ((id, patch) => { if (patch.status === 'errored') heldAtDispatch = held; return update(id, patch) }) as typeof db.updateRoutineRun
   const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'deny')
   assert.equal(res.ok, true)
-  assert.equal(acquires, 0)
+  assert.equal(heldAtDispatch, 0)
+  assert.equal(held, 0)
   assert.equal(db.getRoutineRun(run.id)!.status, 'errored')
+})
+
+// A pi Code routine does not hold the gate for its whole run (see above), but its model swap and
+// its restore must still wait for whoever holds the only slot: a chat routine, auto-compaction, a
+// title or memory call take the gate without raising activeRequests, so engineIsIdle() alone
+// reports the engine idle while they generate, and the swap would stop the engine under them.
+function piGateHarness(): { gate: GenerationGate; d: Deps; db: ConversationStore; events: string[]; holdGate: (label: string, ms: number) => Promise<void>; sessionStarted: Promise<void> } {
+  const gate = new GenerationGate(() => 1)
+  const { d, db } = fakeDeps({ loadedKey: 'user-model', gate })
+  ;(d.store as unknown as { snapshot: () => unknown }).snapshot = () => ({ daemon: { autoGenerateTitles: false } })
+  const events: string[] = []
+  const router = d.modelRouter as unknown as { loadExplicit: (key: string) => Promise<unknown> }
+  const load = router.loadExplicit
+  router.loadExplicit = (key: string) => { events.push(`load ${key} (gate inFlight=${gate.stats().inFlight})`); return load(key) }
+  const holdGate = async (label: string, ms: number) => {
+    const release = await gate.acquire('bg')
+    events.push(`${label} takes gate`)
+    await new Promise((r) => setTimeout(r, ms))
+    events.push(`${label} releases gate`)
+    release()
+  }
+  let started!: () => void
+  const sessionStarted = new Promise<void>((r) => { started = r })
+  const runner: CodeSessionRunner = (async (params) => {
+    started()
+    const release = await gate.acquire('fg', { signal: params.signal, timeoutMs: 2000 })
+    events.push('pi session request')
+    release()
+    // Leave room for another gate holder to start while the routine's model is loaded.
+    await new Promise((r) => setTimeout(r, 30))
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+  d.codeRuns = new CodeRunManager(d, { runner })
+  return { gate, d, db, events, holdGate, sessionStarted }
+}
+
+test('a pi Code routine waits for another gate holder before swapping its model in', async () => {
+  const { gate, d, db, events, holdGate } = piGateHarness()
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'routine-model', workspacePath: tmpDir('execute-pi-swap-'), codingAgent: 'pi', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const other = holdGate('chat routine', 150)
+  await new Promise((r) => setImmediate(r))
+  const status = await executeRoutine(d, routine, run)
+  await other
+  assert.equal(status, 'ok')
+  assert.deepEqual(events, [
+    'chat routine takes gate',
+    'chat routine releases gate',
+    'load routine-model (gate inFlight=1)',
+    'pi session request',
+    'load user-model (gate inFlight=1)',
+  ])
+  assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 })
+})
+
+test("a pi Code routine's model restore waits for a gate holder that started during its run", async () => {
+  const { gate, d, db, events, holdGate, sessionStarted } = piGateHarness()
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'routine-model', workspacePath: tmpDir('execute-pi-restore-'), codingAgent: 'pi', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const running = executeRoutine(d, routine, run)
+  await sessionStarted
+  const other = holdGate('chat routine', 150)
+  const status = await running
+  await other
+  assert.equal(status, 'ok')
+  const restore = events.indexOf('load user-model (gate inFlight=1)')
+  assert.ok(restore > events.indexOf('chat routine releases gate'), `restore must wait for the other holder: ${JSON.stringify(events)}`)
+  assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 })
 })
 
 // withPinnedModel can report 'skip-comfyui-busy' without ever running fn. resumeRoutineRun

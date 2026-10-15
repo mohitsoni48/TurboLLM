@@ -319,7 +319,7 @@ export type CreateAgentTerminalResult =
 export async function createAgentTerminal(
   d: Deps,
   run: AgentRun,
-  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string; signal?: AbortSignal } = {},
+  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string; signal?: AbortSignal; idleTtlMs?: number } = {},
 ): Promise<CreateAgentTerminalResult> {
   if (!run.repoRoot) return { ok: false, status: 400, code: 'invalid_input', message: 'Session has no repo root.' }
   const agent = run.codeAgent ?? 'turbollm'
@@ -364,7 +364,7 @@ export async function createAgentTerminal(
       sessionAuth.revoke(run.id)
       return { ok: false, status: 409, code: 'aborted', message: 'Starting the terminal was cancelled.' }
     }
-    const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
+    const terminalId = m.create(cwd, run.id, cols, rows, launchCommand, opts.idleTtlMs)
     if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
     return { ok: true, terminalId }
   } catch (e) {

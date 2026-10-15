@@ -175,6 +175,8 @@ export class TerminalManager {
    *  (a client-side failure right after the create() response) still starts its idle clock
    *  rather than living forever untracked. */
   private idleSince = new Map<string, number>()
+  /** A terminal's own idle TTL, used by cleanupIdle instead of its default; see create(). */
+  private idleTtl = new Map<string, number>()
 
   /** `dataDir` — the daemon's own data directory (ConfigStore.dir()), for the orphan-safety
    *  pidfile tracking above. Terminal-manager unit tests never spawn a real PTY (see
@@ -196,6 +198,9 @@ export class TerminalManager {
    * @param launchCommand Optional command the shell runs at startup (see pty-session.ts) —
    *   e.g. `turbollm launch claude`, built server-side (terminal-routes.ts), never sent by
    *   the client. Absent for a plain interactive shell.
+   * @param idleTtlMs How long this terminal may go without a viewer before cleanupIdle kills it,
+   *   instead of cleanupIdle's default. A routine's terminal is started server-side and nobody may
+   *   ever open it: its run's own bound decides when it ends (cli-interactive-runner.ts).
    * @returns The session ID
    */
   create(
@@ -204,6 +209,7 @@ export class TerminalManager {
     cols = 80,
     rows = 24,
     launchCommand?: string,
+    idleTtlMs?: number,
   ): string {
     const id = crypto.randomUUID()
     const session = PTYSession.spawn(repoRoot, rows, cols, launchCommand)
@@ -227,6 +233,7 @@ export class TerminalManager {
       this.sessions.delete(id)
       this.infoMap.delete(id)
       this.idleSince.delete(id)
+      this.idleTtl.delete(id)
       if (shellPid) clearTerminalPid(this.dataDir, shellPid)
       // The CLI subprocess exited on its own (e.g. `exit` typed in-shell) rather than via the
       // kill endpoint below — revoke its session-scoped auth token here too, otherwise it only
@@ -247,6 +254,7 @@ export class TerminalManager {
     // (registerWsListener). If nothing ever connects (a client-side failure right after this
     // call returns), the terminal still ages out via cleanupIdle rather than living forever.
     this.idleSince.set(id, Date.now())
+    if (idleTtlMs !== undefined) this.idleTtl.set(id, idleTtlMs)
 
     return id
   }
@@ -283,6 +291,7 @@ export class TerminalManager {
       this.sessions.delete(id)
       this.infoMap.delete(id)
       this.idleSince.delete(id)
+      this.idleTtl.delete(id)
       // Also cleared by the onExit handler in create() once the process actually exits —
       // idempotent (force:true), so clearing eagerly here too just closes the window between
       // "we told it to die" and "it actually did" a little sooner.
@@ -356,7 +365,8 @@ export class TerminalManager {
    * came back. Deliberately NOT based on the terminal's age since creation: switching between
    * Chat and Code sessions (or between two Code sessions) must never kill a still-open CLI —
    * only genuine, sustained abandonment does. A terminal with at least one listener currently
-   * attached is never a candidate, no matter how long it's been running.
+   * attached is never a candidate, no matter how long it's been running. A terminal created
+   * with its own `idleTtlMs` (see create()) uses that instead of `maxAgeMs`.
    */
   cleanupIdle(maxAgeMs = 300_000): void {
     const now = Date.now()
@@ -366,7 +376,7 @@ export class TerminalManager {
       // "never kill something being watched" invariant doesn't depend on that bookkeeping
       // staying perfectly in sync everywhere it's touched.
       if ((this.listeners.get(id)?.size ?? 0) > 0) continue
-      if (now - since > maxAgeMs) this.kill(id)
+      if (now - since > (this.idleTtl.get(id) ?? maxAgeMs)) this.kill(id)
     }
   }
 

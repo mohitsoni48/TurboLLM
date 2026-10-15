@@ -32,8 +32,9 @@
 //      already fires when the CLI itself exits, and terminal-manager.ts's `isAgentExited`/
 //      `getExitCode` already record that — zero new plumbing needed for the signal itself.
 //   2. SAFETY NET — `sweepInteractiveCliRuns`, a periodic watchdog (wired in cli.ts alongside the
-//      scheduler), catches every case the fast path can miss: the terminal got idle-killed
-//      (TerminalManager.cleanupIdle — nobody ever opened it) before the CLI reported, the daemon
+//      scheduler), catches every case the fast path can miss: the terminal is gone before the CLI
+//      reported (a human closed it; TerminalManager.cleanupIdle cannot be the cause while the run
+//      is parked, as execute.ts gives the terminal an idle TTL past this module's bound), the daemon
 //      restarted (the PTY is unconditionally dead; nothing else will ever call agent-exited for
 //      it again), or the CLI has been sitting at a prompt for too long even WITH a live terminal
 //      (the hard wall-clock cap spec 20 §6 requires on every execution path).
@@ -85,7 +86,7 @@ export interface CliInteractiveDeps {
   releaseParked?: (routineId: string, runId: string) => void
   /** Aborted by execute.ts's kickoff bound when it gives up on this start. By then it has already
    *  written the run's terminal state and the scheduler has released the routine, so a start that
-   *  is still mid-swap must not go on to launch a CLI behind that 'errored' row (a second fire
+   *  is still in flight must not go on to launch a CLI behind that 'errored' row (a second fire
    *  could then run in the same workspace). Undefined under tests that call this directly. */
   kickoffSignal?: AbortSignal
 }
@@ -99,7 +100,7 @@ const pendingRestore = new Map<string, string>()
 
 /** The harness name to use in a user-facing error. This runner now drives claude, opencode and pi,
  *  so a hardcoded "claude" sent the user to debug a CLI that was never involved. */
-function agentLabel(routine: Routine): string {
+export function agentLabel(routine: Routine): string {
   return isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude'
 }
 
@@ -298,7 +299,7 @@ export function sweepInteractiveCliRuns(deps: CliInteractiveSweepDeps): void {
       continue
     }
     if (!deps.isTerminalActive(run.codeSessionId)) {
-      // Terminal is gone with no agent-exited report — idle-killed before finishing, or a daemon
+      // Terminal is gone with no agent-exited report — closed before finishing, or a daemon
       // restart (the PTY cannot have survived that either way).
       finalizeInteractiveRun(deps, run, { status: 'errored', error: 'The interactive session ended unexpectedly before completing (its terminal is no longer running).' })
       continue
