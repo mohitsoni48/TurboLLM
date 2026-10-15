@@ -9,7 +9,8 @@
 // with its completion marker (after the route picked the installed build), so provisionBackend's
 // fast path returns it as if just downloaded. The binaries are shell scripts, so POSIX only.
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
@@ -87,6 +88,45 @@ test('POST /backends/:id/update whose new build fails its probe removes it, so E
   assert.match((await h.finished) ?? '', /existing build is unchanged/)
   assert.equal(existsSync(h.newDir), false)
   assert.ok(h.registry.get('old'), 'the working build is still registered')
+})
+
+// The new build is registered by then: a Windows AV/indexer lock on the replaced build's folder must not report the
+// finished update as failed ("your existing build is unchanged"). routes.ts imports rmSync by name:
+// syncBuiltinESMExports carries the patch to that binding.
+test('POST /backends/:id/update whose old build folder is locked still reports a finished update', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  const oldDir = dirname(h.registry.get('old')!.binPath)
+  const realRmSync = fs.rmSync
+  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p) === oldDir) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+    assert.equal(res.status, 202)
+    assert.equal(await h.finished, null)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.ok(h.registry.list().engines.some((e) => e.binPath === h.newBin), 'the new build is registered')
+  assert.ok(existsSync(oldDir), 'the locked old build is left behind')
+  const oldDirDelete = locked.mock.calls.find((c) => String(c.arguments[0]) === oldDir)
+  assert.ok((oldDirDelete?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+})
+
+// Same, for the update policy the new build inherits: its config.json save can be refused by a Windows lock too.
+test('POST /backends/:id/update whose policy copy cannot be saved still reports a finished update', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  const oldDir = dirname(h.registry.get('old')!.binPath)
+  t.mock.method(h.registry, 'setUpdatePolicy', () => { throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' }) })
+  const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.equal(await h.finished, null)
+  assert.ok(h.registry.list().engines.some((e) => e.binPath === h.newBin), 'the new build is registered')
+  assert.equal(h.registry.get('old'), undefined, 'the old build is unregistered')
+  assert.equal(existsSync(oldDir), false, 'the old build is deleted')
 })
 
 test('POST /backends/:id/enable on a build that no longer runs is a 400 with the probe error, not a 500', { skip: posixOnly }, async (t) => {

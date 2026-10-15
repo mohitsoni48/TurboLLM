@@ -209,12 +209,19 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
     const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
     if (oldEng) await stopEngineUsers(d, oldEng.id)
     if (wasActive) d.registry.activate(newEng.id)
-    if (oldEng?.updatePolicy && oldEng.id !== newEng.id) d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy)
+    // From here the new build has replaced the old one: what follows is best effort, never a failed update (that would
+    // say the existing build is unchanged). If a Windows lock refuses the config.json save, the policy stays in memory
+    // for the next save to write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
+    if (oldEng?.updatePolicy && oldEng.id !== newEng.id) {
+      try { d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy) } catch { /* best effort */ }
+    }
     if (oldEng && oldEng.id !== newEng.id) {
       try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
     }
     if (installedTag && installedTag !== latestTag) {
-      rmSync(backendDir(root, backendId, installedTag), { recursive: true, force: true })
+      // Retries: a Windows AV/indexer lock is brief. A leftover is an older tag, so the newest-tag-wins lookups never
+      // pick it, and deleting the backend removes it.
+      try { rmSync(backendDir(root, backendId, installedTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
     }
     d.provision.done()
   } catch (e) {

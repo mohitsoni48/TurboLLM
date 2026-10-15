@@ -469,13 +469,20 @@ export function registerApi(app: Hono, d: Deps): void {
         const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
         if (oldEng) await stopEngineUsers(d, oldEng.id)
         if (wasActive) d.registry.activate(newEng.id)
-        if (oldEng?.updatePolicy && oldEng.id !== newEng.id) d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy)
+        // From here the new build has replaced the old one: what follows is best effort, never "your existing build is
+        // unchanged". If a Windows lock refuses the config.json save, the policy stays in memory for the next save to
+        // write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
+        if (oldEng?.updatePolicy && oldEng.id !== newEng.id) {
+          try { d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy) } catch { /* best effort */ }
+        }
         // GC the old install: unregister its engine entry + delete its tag-keyed dir.
         if (oldEng && oldEng.id !== newEng.id) {
           try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
         }
         if (installedTag && installedTag !== latestTag) {
-          rmSync(backendDir(root, def.id as BackendId, installedTag), { recursive: true, force: true })
+          // Best effort, as in update-apply.ts: a Windows lock on the old build (retried here, as it is brief) must not
+          // report the finished update as failed.
+          try { rmSync(backendDir(root, def.id as BackendId, installedTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
         }
         d.provision.done()
       } catch (e) {

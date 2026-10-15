@@ -8,7 +8,8 @@
 // Also: the dispatch for engines without an automatic update source. The release branch is
 // covered in update-apply.release.test.ts.
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
@@ -101,6 +102,50 @@ test('llama.cpp update whose new build fails its probe: the new build is removed
   assert.equal(existsSync(newDir), false)
   assert.equal(installedBackendBuild(root, backend.id)?.tag, 'b100')
   assert.ok(d.registry.get('old'))
+})
+
+// Once the new build is registered (and active, if the old one was), the update has happened: a Windows AV/indexer
+// lock on the replaced build's folder must not report it as failed with "your existing build is unchanged".
+// update-apply.ts imports rmSync by name: syncBuiltinESMExports carries the patch to that binding.
+test('llama.cpp update whose old build folder is locked still ends in done(); the folder is left behind', { skip: posixOnly }, async (t) => {
+  const { d, root, newDir, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  d.registry.activate('old')
+  const log: string[] = []
+  d.provision = { start() {}, progress() {}, done: () => { log.push('done') }, fail: (m: string) => { log.push(`fail:${m}`) } } as unknown as UpdateApplyDeps['provision']
+  const oldDir = dirname(oldEngine.binPath)
+  const realRmSync = fs.rmSync
+  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p) === oldDir) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    await applyEngineUpdate(d, oldEngine)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.deepEqual(log, ['done'])
+  assert.equal(d.registry.active()?.binPath, join(newDir, 'llama-server'))
+  assert.equal(installedBackendBuild(root, backend.id)?.tag, 'b200')
+  assert.ok(existsSync(oldDir), 'the locked old build is left behind')
+  const oldDirDelete = locked.mock.calls.find((c) => String(c.arguments[0]) === oldDir)
+  assert.ok((oldDirDelete?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+})
+
+// Same, for the update policy the new build inherits: its config.json save can be refused by a Windows lock too.
+test('llama.cpp update whose policy copy cannot be saved still ends in done(), and the old build is still removed', { skip: posixOnly }, async (t) => {
+  const { d, root, newDir, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  d.registry.activate('old')
+  const log: string[] = []
+  d.provision = { start() {}, progress() {}, done: () => { log.push('done') }, fail: (m: string) => { log.push(`fail:${m}`) } } as unknown as UpdateApplyDeps['provision']
+  t.mock.method(d.registry, 'setUpdatePolicy', () => { throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' }) })
+  await applyEngineUpdate(d, oldEngine)
+  assert.deepEqual(log, ['done'])
+  assert.equal(d.registry.active()?.binPath, join(newDir, 'llama-server'))
+  assert.equal(d.registry.get('old'), undefined, 'the old build is unregistered')
+  assert.equal(existsSync(dirname(oldEngine.binPath)), false, 'the old build is deleted')
+  assert.equal(installedBackendBuild(root, backend.id)?.tag, 'b200')
 })
 
 const ALL_KOBOLD_ASSETS = ['koboldcpp.exe', 'koboldcpp-nocuda.exe', 'koboldcpp-linux-x64', 'koboldcpp-linux-x64-nocuda', 'koboldcpp-mac-arm64']
