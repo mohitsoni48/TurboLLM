@@ -180,6 +180,52 @@ describe('ReleaseSourcePanel', () => {
     expect(vi.mocked(discardReleaseInstall).mock.calls[0]).toEqual([])
   })
 
+  // The job can finish between two polls (1 s apart). Its build then never reached the dialog's confirm step, whose
+  // dismissal discards it, and the abort alone does nothing to a finished job: the build would stay on disk until the
+  // daemon's 24 h GC.
+  const FINISHED: ReleaseJobView = { state: 'ready', plan: { repo: LISTING.repo, tag: LISTING.tag, asset: CUDA }, result: FOUND }
+
+  it('dismissed after the job finished but before the poll saw it: the finished build is discarded', async () => {
+    const { unmount } = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    unmount()
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(vi.mocked(discardReleaseInstall).mock.calls[0]).toEqual([])
+  })
+
+  it('Cancel after the job finished but before the poll saw it discards the finished build', async () => {
+    const { onReady } = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(onReady).not.toHaveBeenCalled()
+  })
+
+  it('dismissed while installing: a finished job of another install, or an in-place update, is not discarded', async () => {
+    for (const view of [
+      { ...FINISHED, plan: { ...FINISHED.plan!, asset: CPU } },
+      { ...FINISHED, state: 'updated', updated: { id: 'e1', name: 'Prism' } },
+    ] as ReleaseJobView[]) {
+      vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
+      const { unmount } = wrap({ initialRepo: 'a/b' })
+      await screen.findByText(CUDA)
+      await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+      await screen.findByText(/part 2\/2/)
+      vi.mocked(getReleaseInstall).mockResolvedValue(view)
+      const polls = vi.mocked(getReleaseInstall).mock.calls.length
+      unmount()
+      await waitFor(() => expect(vi.mocked(getReleaseInstall).mock.calls.length).toBe(polls + 1))
+      await new Promise((r) => setTimeout(r, 20))
+      expect(discardReleaseInstall).not.toHaveBeenCalledWith(FOUND.binPath)
+    }
+  })
+
   it('a ready job hands its result to onReady', async () => {
     vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: FOUND })
     const { onReady } = wrap({ initialRepo: 'a/b' })

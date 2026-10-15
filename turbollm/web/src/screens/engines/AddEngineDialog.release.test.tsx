@@ -167,6 +167,20 @@ describe('AddEngineDialog: GitHub release source', () => {
     await userEvent.keyboard('{Escape}')
     await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
   })
+
+  // The job finished after the last poll (1 s apart): its build never reached the confirm step, and the abort does
+  // nothing to a finished job, so it would stay on disk until the daemon's 24 h GC.
+  it('dismissing after the install finished but before the poll saw it discards the build', async () => {
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await within(dialog).findByText(/Downloading/)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', plan: { repo: LISTING.repo, tag: LISTING.tag, asset: ASSET }, result: FOUND })
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+  })
 })
 
 describe('AddEngineDialog: release installs supersede an unconfirmed install', () => {

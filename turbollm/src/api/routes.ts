@@ -1586,6 +1586,13 @@ export function registerApi(app: Hono, d: Deps): void {
         })
         if (!result.found) throw noServerBinaryError()
         const prior = d.registry.list().engines.find((e) => claims(e.binPath))
+        // A Cancel or a dismissed dialog that landed after the install's last cancel check (a rename waiting out a
+        // Windows AV lock on the just-probed exe) stopped nothing, and no client is left to confirm or discard the new,
+        // unclaimed build: discard it here, as the dialog would. A dir a remembered source claims is left, as DELETE does.
+        if (ac.signal.aborted && !prior && !d.registry.customSources().some((s) => claims(s.binPath))) {
+          try { rmSync(join(enginesRoot, 'build', basename(installDir)), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* the GC sweeps it */ }
+          throw new DOMException('The install was cancelled.', 'AbortError')
+        }
         d.provision.done()
         if (!prior) return { kind: 'ready', result }
         recordReleaseUpdate(d.registry, d.updates, prior.id, result)

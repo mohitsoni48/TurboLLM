@@ -2,9 +2,9 @@ import { useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { ArrowLeft, Download, Loader2, X } from 'lucide-react'
-import { ApiError, discardReleaseInstall, track } from '../../lib/api'
+import { ApiError, discardReleaseInstall, getReleaseInstall, track } from '../../lib/api'
 import { queryKeys, useReleaseAssets, useReleaseInstall, useStatus } from '../../lib/queries'
-import type { EngineScanResult, RankedReleaseAsset, ReleaseAssetListing } from '../../lib/types'
+import type { EngineScanResult, RankedReleaseAsset, ReleaseAssetListing, ReleaseInstallPlan } from '../../lib/types'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
 import { fmtSize } from '../models/HfRepoDialog'
@@ -43,15 +43,17 @@ export function ReleaseSourcePanel({
   const { start, job } = useReleaseInstall(step === 'installing')
   const qc = useQueryClient()
 
-  // A job still running when the panel goes away (dialog dismissed) is aborted. `unmounted` is
-  // re-cleared on every mount so StrictMode's dev mount -> cleanup -> mount cannot leave it true.
+  // A job still running when the panel goes away (dialog dismissed) is aborted, and one that finished unseen is
+  // discarded (abortInstall). `unmounted` is re-cleared on every mount so StrictMode's dev mount -> cleanup -> mount
+  // cannot leave it true.
   const installing = useRef(false)
+  const installPlan = useRef<ReleaseInstallPlan | null>(null)
   const unmounted = useRef(false)
   useEffect(() => {
     unmounted.current = false
     return () => {
       unmounted.current = true
-      if (installing.current) void discardReleaseInstall().catch(() => {})
+      if (installing.current) abortInstall(installPlan.current)
     }
   }, [])
 
@@ -116,16 +118,18 @@ export function ReleaseSourcePanel({
     }
     setError(null)
     track('engines', 'install_release_asset')
+    const plan = { repo: data.repo, tag: data.tag, asset: chosenAsset.name }
     // mutateAsync, not per-call mutate callbacks: those are skipped once the panel unmounts, so a
     // dialog dismissed before the 202 would leave the job running headless. The abort sent here
     // goes out after the 202, when the daemon has registered the job's abort handle.
-    void start.mutateAsync({ repo: data.repo, tag: data.tag, asset: chosenAsset.name }).then(
+    void start.mutateAsync(plan).then(
       () => {
         if (unmounted.current) {
           void discardReleaseInstall().catch(() => {})
           return
         }
         installing.current = true
+        installPlan.current = plan
         setStep('installing')
       },
       (e: unknown) => {
@@ -136,7 +140,7 @@ export function ReleaseSourcePanel({
 
   const cancelInstall = () => {
     leaveInstalling()
-    void discardReleaseInstall().catch(() => {})
+    abortInstall(installPlan.current)
   }
 
   if (step === 'installing') {
@@ -213,6 +217,21 @@ export function ReleaseSourcePanel({
       </div>
     </div>
   )
+}
+
+/** Abort this panel's install job, then discard its build if the job had already finished. A job that ended after the
+ *  last poll never reached the dialog's confirm step (whose dismissal discards the build), and the abort does nothing to
+ *  a finished job: the build would stay on disk until the daemon's GC, a day later at the earliest. Only a `ready`
+ *  result of this same plan is discarded (`updated` replaced a registered engine's build in place). */
+function abortInstall(plan: ReleaseInstallPlan | null): void {
+  void discardReleaseInstall()
+    .then(() => getReleaseInstall())
+    .then((view) => {
+      if (view.state !== 'ready' || !view.result?.found || !plan) return
+      if (view.plan?.tag !== plan.tag || view.plan.asset !== plan.asset) return
+      return discardReleaseInstall(view.result.binPath)
+    })
+    .catch(() => {})
 }
 
 function toPanelError(e: unknown, fallback: string): PanelError {

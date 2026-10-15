@@ -5,7 +5,8 @@
 // runs a shell script as the "binary", so it is POSIX only, as in the zip tests.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
@@ -435,6 +436,37 @@ test('install: 202, running, then ready with the scan-result shape', posixOnly, 
     assert.equal(view.result?.found, true)
     assert.equal(view.result?.binPath, join(h.buildDir, SLUG, serverBinName))
   })
+})
+
+// The install's last cancel check runs before the promote's renames. On Windows a rename can wait out an AV lock on the
+// just-probed exe for seconds; a Cancel (or the dialog's dismissal) landing then stopped nothing, and the finished build
+// stayed on disk, unclaimed, until the GC a day later. Here the cancel lands inside that rename. download.ts imports
+// renameSync by name: syncBuiltinESMExports carries the patch to that binding.
+test('install: a Cancel that lands after the last cancel check still ends cancelled, and the build is discarded', posixOnly, async (t) => {
+  const h = harness()
+  const target = join(h.buildDir, SLUG)
+  const realRenameSync = fs.renameSync
+  const cancels: Array<Response | Promise<Response>> = []
+  const renames = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    realRenameSync(from, to)
+    if (String(to) === target) cancels.push(h.app.request('/api/v1/engines/backends/cancel', { method: 'POST' }))
+  })
+  syncBuiltinESMExports()
+  try {
+    await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET, bytes: scriptZip() }] }, async () => {
+      assert.equal((await postInstall(h)).status, 202)
+      const view = await jobState(h)
+      assert.equal(cancels.length, 1, 'the cancel was sent from inside the promote')
+      assert.deepEqual(await (await cancels[0]!).json(), { ok: true }, 'it reached the job while it was running')
+      assert.equal(view.state, 'error')
+      assert.equal(view.error?.code, 'cancelled')
+    })
+  } finally {
+    renames.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(target), false, 'the finished build is discarded')
+  assert.deepEqual(h.provisionLog.slice(-1), ['done'], 'a quiet cancel, not a failure')
 })
 
 test('N-1: DELETE of the ready result resets the job; DELETE of another path does not', posixOnly, async () => {
