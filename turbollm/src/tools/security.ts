@@ -82,6 +82,22 @@ export async function checkSsrf(url: string): Promise<string | null> {
 const MAX_REDIRECTS = 5
 
 /**
+ * fetch() hands header values over one char per byte (latin1), so a server sending a raw UTF-8
+ * Location (`/café` as the bytes C3 A9) reads as `/cafÃ©`, which new URL() would percent-encode
+ * into a different path. fetch()'s own follow re-decodes such a value as UTF-8, as browsers do;
+ * this does the same. A value that isn't a valid UTF-8 byte string that way (a runtime that already
+ * decoded it, or a latin1 Location) is kept as it is.
+ */
+function decodeLocation(location: string): string {
+  if (!/[^\x20-\x7e]/.test(location) || /[^\x00-\xff]/.test(location)) return location
+  const bytes = Buffer.from(location, 'latin1')
+  const utf8 = bytes.toString('utf8')
+  // Invalid UTF-8 decodes to U+FFFD, which doesn't encode back to the same bytes. (Not
+  // TextDecoder's `fatal`, which a Node built without ICU refuses.)
+  return Buffer.from(utf8, 'utf8').equals(bytes) ? utf8 : location
+}
+
+/**
  * `fetch()` with the SSRF check applied to EVERY hop. fetch's default `redirect: 'follow'` checks
  * nothing after the first URL, so a public page answering `302 Location: http://127.0.0.1:<port>/…`
  * (or a cloud metadata address) would have that internal response fetched and returned. Redirects
@@ -99,7 +115,7 @@ export async function fetchWithSsrfCheck(url: string, init: RequestInit): Promis
     if (!location) return resp
     await resp.body?.cancel().catch(() => {})
     if (hop >= MAX_REDIRECTS) throw new Error(`more than ${MAX_REDIRECTS} redirects`)
-    current = new URL(location, current).toString()
+    current = new URL(decodeLocation(location), current).toString()
     // fetch() would happily read a data: URL; the automatic follow only ever allowed http(s).
     if (!/^https?:$/.test(new URL(current).protocol)) throw new Error('redirected to a non-HTTP URL')
   }

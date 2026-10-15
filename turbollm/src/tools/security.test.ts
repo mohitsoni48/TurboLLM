@@ -2,6 +2,8 @@
 // handled upstream by the tool-call approval gate (execute-with-approval.ts) —
 // execRunCode itself always executes.
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { test } from 'node:test'
 import { checkSsrf, isPrivateIp } from './security'
 import { execFetchUrl, execRunCode, backfillPublishedDates, FETCH_URL_MAX_CHARS } from './builtin'
@@ -128,6 +130,38 @@ test('backfillPublishedDates never follows a search result redirecting to an int
     assert.deepEqual(stub.requested, ['http://result.invalid/post'])
     assert.equal(results[0].publishedDate, undefined)
   } finally { stub.restore() }
+})
+
+// A real server, so the Location bytes go through fetch()'s own header parsing (which hands them
+// over as latin1). Requests are addressed to a .invalid host, which passes the SSRF check, and
+// forwarded to the loopback server underneath it.
+test('execFetchUrl follows a raw UTF-8 Location header to the UTF-8 path, as fetch() itself does', async () => {
+  const server = createServer((req, res) => {
+    if (req.url === '/start') {
+      // setHeader writes a string as latin1, so this puts the raw UTF-8 bytes on the wire.
+      res.writeHead(302, { location: Buffer.from('/café/ü?q=日本', 'utf8').toString('latin1') }).end()
+    } else if (req.url === '/start-latin1') {
+      // Not valid UTF-8 (a lone E9 byte): followed as before, with é percent-encoded as UTF-8.
+      res.writeHead(302, { location: '/caf\xe9' }).end()
+    } else {
+      res.writeHead(200, { 'content-type': 'text/plain' }).end(`reached ${req.url}`)
+    }
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  const original = globalThis.fetch
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => {
+    const u = new URL(String(input))
+    return original(`http://127.0.0.1:${port}${u.pathname}${u.search}`, init)
+  }) as typeof fetch
+  try {
+    const result = await execFetchUrl({ url: 'http://utf8-redirect.invalid/start' })
+    assert.match(result, /reached \/caf%C3%A9\/%C3%BC\?q=%E6%97%A5%E6%9C%AC$/)
+    assert.match(await execFetchUrl({ url: 'http://utf8-redirect.invalid/start-latin1' }), /reached \/caf%C3%A9$/)
+  } finally {
+    globalThis.fetch = original
+    server.close()
+  }
 })
 
 // fetch_url used to buffer the whole body (resp.text()) before cutting it to FETCH_URL_MAX_CHARS.
