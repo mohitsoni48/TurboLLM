@@ -380,6 +380,17 @@ export class UpdateChecker {
       if (!liveIds.has(id)) this.cache.delete(id)
     }
   }
+
+  /** Drop the cached status of an engine whose installed version changed since it was checked. An update that
+   *  keeps the engine id (KoboldCpp, llamafile, TurboQuant, the pip engines, here or through ?update=1) would
+   *  otherwise keep offering the update it just applied until the next check. */
+  forgetChanged(engines: Engine[]): void {
+    for (const e of engines) {
+      const cached = this.cache.get(e.id)
+      // The same `installed` computeUpdateStatus records: the source's, or the bare version when there is none.
+      if (cached && cached.installed !== (resolveUpdateSource(e)?.installed ?? (e.version || ''))) this.cache.delete(e.id)
+    }
+  }
 }
 
 /** How often the background checker re-checks installed engines (ADR-085). */

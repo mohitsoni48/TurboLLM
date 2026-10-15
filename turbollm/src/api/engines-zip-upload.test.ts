@@ -25,6 +25,8 @@ interface FakeOverrides {
   busy?: 'download' | 'build'
   /** A live registered engine whose binary lives under the upload's target dir. */
   runningEngine?: { name: string; binPath: string }
+  /** The engine the loaded model was started on, while another engine (or none) is active. */
+  servingEngine?: { name: string; binPath: string }
   /** Registered (stopped or running) engines the occupant check must see. */
   engines?: Array<{ id: string; name: string; binPath: string }>
   /** Remembered custom sources (a Disabled engine's Enable path) the occupant check must see. */
@@ -44,7 +46,10 @@ function zipApp(o: FakeOverrides, dataDir: string): Hono {
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
-    manager: { status: () => ({ state: o.runningEngine ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }) },
+    manager: {
+      status: () => ({ state: o.runningEngine || o.servingEngine ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => (o.servingEngine ? { engine: { id: 'e-serving', kind: 'llama-server', ...o.servingEngine } } : null),
+    },
     provision: { get: () => ({ active: o.busy === 'download' }) },
     build: { isActive: () => o.busy === 'build' },
     registry: {
@@ -230,6 +235,20 @@ test('POST /api/v1/engines/zip: 409 when the upload would replace the RUNNING en
   try {
     const running = { name: 'My Fork', binPath: join(dir, 'engines', 'build', 'myfork', serverBinName) }
     const res = await postZip(zipApp({ runningEngine: running }, dir), Buffer.from('x'))
+    assert.equal(res.status, 409)
+    const e = await errorBody(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /My Fork/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('POST /api/v1/engines/zip: 409 when the loaded model runs on the target dir\'s engine though it is not the active one', async () => {
+  const dir = tmpDir('tllm-zip-route-')
+  try {
+    const serving = { name: 'My Fork', binPath: join(dir, 'engines', 'build', 'myfork', serverBinName) }
+    const res = await postZip(zipApp({ servingEngine: serving }, dir), Buffer.from('x'))
     assert.equal(res.status, 409)
     const e = await errorBody(res)
     assert.equal(e.code, 'engine_in_use')

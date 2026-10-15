@@ -9,6 +9,7 @@
 // covered in update-apply.release.test.ts.
 import assert from 'node:assert/strict'
 import fs, { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -204,6 +205,34 @@ test('KoboldCpp update: a failed download keeps the binary; an update never acti
   assert.equal(readFileSync(bin, 'utf8'), 'kobold v2')
   assert.equal(d.registry.get('kobold')?.version, 'v2.0.0')
   assert.equal(d.registry.active()?.id, 'cuda')
+})
+
+/** A TurboQuant release listing for this OS whose one asset is `archive` (a tar.gz holding a llama-server script). */
+function stubTurboquantRelease(t: { after: (fn: () => void) => void }, archive: string): void {
+  const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+  const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
+  stubFetch(t, (url) =>
+    url.includes('api.github.com')
+      ? new Response(JSON.stringify([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }]))
+      : new Response(readFileSync(archive)),
+  )
+}
+
+test('TurboQuant update re-probes the engine it keeps: the new build\'s version replaces the old one', {
+  skip: process.platform === 'win32' && 'TurboQuant has no Windows prebuilt; shell-script binaries',
+}, async (t) => {
+  const bin = (root: string) => join(root, 'turboquant', 'llama-server')
+  const { d, root } = setup((root) => [engine({ id: 'tq', binPath: bin(root), version: '100 (old1234)' })])
+  writeExe(bin(root), '#!/bin/sh\necho "version: 100 (old1234)"\n')
+  const src = tmpDir('tllm-tq-src-')
+  writeExe(join(src, 'llama-server'), WORKING_SERVER)
+  const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
+  execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
+  stubTurboquantRelease(t, archive)
+  await applyEngineUpdate(d, d.registry.get('tq')!)
+  assert.equal(readFileSync(bin(root), 'utf8'), WORKING_SERVER)
+  assert.equal(d.registry.get('tq')?.version, '200 (abcdef1)')
+  assert.deepEqual(d.registry.list().engines.filter((e) => e.binPath === bin(root)).map((e) => e.id), ['tq'])
 })
 
 // POST /engines/:id/update reaches these branches with the user's trigger and a Cancel signal (the scheduler passes

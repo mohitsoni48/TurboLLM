@@ -855,8 +855,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const engines = d.registry.list().engines
     const conflict = findNameConflict(engines, name, { buildRoot, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
     if (conflict) return err(c, 400, 'name_already_taken', nameTakenMessage(conflict, { sourceRepo: repoUrl, sourceBranch: branch }))
-    const running = d.registry.active()
-    if (running && engineBusy(d) && isEngineInBuildDir(running.binPath, buildRoot))
+    // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+    const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, buildRoot))
+    if (running && engineBusy(d))
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before rebuilding it — the rebuild replaces its files.`)
     // Reserve the build slot SYNCHRONOUSLY (before returning 202) so two near-simultaneous
     // POSTs can't both pass the busy-check and race on the same buildRoot / clobber buildAbort.
@@ -1194,6 +1195,9 @@ export function registerApi(app: Hono, d: Deps): void {
           ac.signal, { replace: upgrade },
         )
         let eng = d.registry.list().engines.find((e) => e.binPath === bin)
+        // An update lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version
+        // and capabilities (flags and KV types the new build added stay gated off).
+        if (eng && upgrade) eng = await d.registry.reprobe(eng.id)
         if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
         if (!upgrade || wasActive) d.registry.activate(eng.id)
         d.provision.done()
@@ -1448,8 +1452,9 @@ export function registerApi(app: Hono, d: Deps): void {
     // The replace guard runs before the install AND again at the swap (blockSwap): an
     // engine can be started onto the target files mid-upload.
     const replaceBlocked = (): string | null => {
-      const r = d.registry.active()
-      return r && engineBusy(d) && isEngineInBuildDir(r.binPath, targetDir)
+      // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+      const r = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, targetDir))
+      return r && engineBusy(d)
         ? `Stop "${r.name}" before replacing its files — the upload extracts over its build folder.`
         : null
     }
@@ -1749,8 +1754,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const busy = engineWorkBusy(d)
     if (busy) return err(c, 409, 'engine_already_running', busy)
     const id = c.req.param('id')
-    const running = d.registry.active()
-    if (engineBusy(d) && running?.id === id)
+    // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+    const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e?.id === id)
+    if (engineBusy(d) && running)
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
     const engine = d.registry.get(id)
     if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
@@ -1797,6 +1803,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const engines = d.registry.list().engines
     const refresh = c.req.query('refresh') === '1'
     d.updates.prune(new Set(engines.map((e) => e.id)))
+    d.updates.forgetChanged(engines)
     if (refresh) {
       await d.updates.checkAll(engines, AbortSignal.timeout(20_000)).catch(() => {})
     } else {

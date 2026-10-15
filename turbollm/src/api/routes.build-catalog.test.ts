@@ -32,6 +32,8 @@ interface HarnessOpts {
   engines?: Array<Partial<Engine>> | ((enginesRoot: string) => Array<Partial<Engine>>)
   activeId?: string
   managerState?: string
+  /** The engine the loaded model was started on (may differ from the active one). */
+  servingId?: string
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
@@ -54,11 +56,16 @@ function harness(opts: HarnessOpts = {}): Harness {
     if (opts.activeId) c.activeEngineId = opts.activeId
   })
   const buildStarts: string[] = []
+  const registry = new Registry(store)
   const d = {
     version: 'test',
     store,
-    registry: new Registry(store),
-    manager: { status: () => ({ state: opts.managerState ?? 'stopped', model: null }), logPath: () => '' },
+    registry,
+    manager: {
+      status: () => ({ state: opts.managerState ?? 'stopped', model: null }),
+      logPath: () => '',
+      currentOpts: () => (opts.servingId ? { engine: registry.get(opts.servingId) } : null),
+    },
     provision: { get: () => ({ active: false }) },
     build: { isActive: () => false, start: (name: string) => void buildStarts.push(name) },
   } as unknown as Deps
@@ -120,6 +127,33 @@ test('POST /build/run refuses to rebuild an engine that is running out of that b
       },
     ],
     activeId: 'live',
+    managerState: 'running',
+  })
+  try {
+    const { status, json } = await postBuild(h.app, { ...PRISM, name: 'Prism live' })
+    assert.equal(status, 409)
+    assert.equal(json.error?.code, 'engine_in_use')
+    assert.match(json.error?.message ?? '', /Stop "Prism live"/)
+    assert.deepEqual(h.buildStarts, [])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('POST /build/run refuses to rebuild the engine the loaded model runs on, even when another engine is active', async () => {
+  const h = harness({
+    engines: (enginesRoot) => [
+      {
+        id: 'live',
+        name: 'Prism live',
+        binPath: join(enginesRoot, 'build', 'prismml-eng-llama.cpp-prism', 'build', 'bin', serverExe),
+        sourceRepo: PRISM.repoUrl,
+        sourceBranch: 'prism',
+      },
+      { id: 'cpu', name: 'llama.cpp cpu', binPath: join(enginesRoot, 'llama.cpp-b1-cpu', serverExe) },
+    ],
+    activeId: 'cpu',
+    servingId: 'live',
     managerState: 'running',
   })
   try {

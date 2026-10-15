@@ -377,6 +377,23 @@ test('UpdateChecker: forget drops the cached status of one engine only', async (
   assert.equal(checker.get('b')?.latest, 'b9761')
 })
 
+test('UpdateChecker: forgetChanged drops a status whose engine was updated in place, and keeps the rest', async () => {
+  const kobold = eng({ id: 'k', kind: 'koboldcpp', binPath: '/root/engines/koboldcpp/koboldcpp', version: 'v1.70' })
+  const mlx = eng({ id: 'm', kind: 'mlx', version: 'mlx-lm 0.31.2' })
+  const plain = eng({ id: 'p', binPath: '/opt/custom/llama-server', version: 'b1' })
+  const checker = new UpdateChecker(async (src) => (src.ref === 'mlx-lm' ? '0.32.0' : 'v1.80'))
+  for (const e of [kobold, mlx, plain]) await checker.check(e)
+  assert.equal(checker.get('k')?.hasUpdate, true)
+  // The update re-registered the same id with the new version (addKoboldcpp keeps the id).
+  checker.forgetChanged([{ ...kobold, version: 'v1.80' }, mlx, plain])
+  assert.equal(checker.get('k'), undefined)
+  assert.equal(checker.get('m')?.hasUpdate, true)
+  assert.equal(checker.get('p')?.error, 'no_source')
+  // A pip version string compares by its stripped version, as the check recorded it.
+  checker.forgetChanged([{ ...mlx, version: 'mlx-lm 0.32.0' }])
+  assert.equal(checker.get('m'), undefined)
+})
+
 test('UpdateChecker: offline with no prior success caches the offline state', async () => {
   const e = eng({ kind: 'mlx', version: 'mlx-lm 0.31.2' })
   const checker = new UpdateChecker(async () => {

@@ -103,7 +103,7 @@ async function applyReleaseUpdate(
 
   d.provision.start('github-release', d.trigger ?? 'auto_update')
   try {
-    if (d.registry.active()?.id === engine.id) await d.manager.stopAndWait()
+    if (primaryOnEngine(d, engine.id)) await d.manager.stopAndWait()
     const result = await installReleaseAsset(
       root,
       { repo: installed.repo, tag: newer.tag, asset: newer.asset },
@@ -156,8 +156,14 @@ export function releaseSwapBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'i
 function primarySlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
   const state = d.manager.status().state
   const running = state === 'running' || state === 'starting' || state === 'stopping'
-  if (!running || d.registry.active()?.id !== engine.id) return null
+  if (!running || !primaryOnEngine(d, engine.id)) return null
   return stopBeforeReplacingMessage(engine)
+}
+
+/** The primary model runs on `engineId`: it is the active engine, or the one the loaded model was started on (an
+ *  install or Enable activates another engine without stopping what is loaded, so the two can differ). */
+function primaryOnEngine(d: SwapGuardDeps, engineId: string): boolean {
+  return d.registry.active()?.id === engineId || d.manager.currentOpts()?.engine.id === engineId
 }
 
 function poolSlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
@@ -249,7 +255,10 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
       signal, { replace: true },
     )
     let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-    if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
+    // The new build lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version and
+    // capabilities (flags and KV types the new build added stay gated off).
+    if (eng) eng = await d.registry.reprobe(eng.id)
+    else eng = (await d.registry.add('TurboQuant', bin)).engine
     if (wasActive) d.registry.activate(eng.id)
     d.provision.done()
   } catch (e) {

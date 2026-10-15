@@ -92,7 +92,7 @@ function appWithChecker(
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, provisionCalls, managerCalls, activateCalls }
+  return { app, provisionCalls, managerCalls, activateCalls, engines }
 }
 
 test('?update=1 with the installed version already latest refuses without provisioning', async () => {
@@ -268,4 +268,14 @@ test('?update=1 leaves another active engine active; an update of the active Lit
   assert.deepEqual(await provision('?update=1', 'other-1'), [], 'an update must not make LiteRT-LM the active engine')
   assert.deepEqual(await provision('?update=1', 'litert-1'), ['litert-2'])
   assert.deepEqual(await provision('', 'other-1'), ['litert-2'], 'an install activates it')
+})
+
+test('GET /engines/updates stops offering an update the engine already took in place (same id, new version)', async () => {
+  const { app, engines } = appWithChecker(async () => '0.18.0')
+  const updates = async (q = '') =>
+    ((await (await app.request(`/api/v1/engines/updates${q}`)).json()) as { updates: Record<string, { hasUpdate: boolean }> }).updates
+  assert.equal((await updates('?refresh=1'))['litert-1']?.hasUpdate, true)
+  // A pip upgrade (here or through ?update=1) re-registers the same engine id with the new version.
+  engines[0]!.version = 'litert-lm 0.18.0'
+  assert.notEqual((await updates())['litert-1']?.hasUpdate, true)
 })

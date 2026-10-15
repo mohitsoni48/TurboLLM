@@ -31,6 +31,8 @@ interface Opts {
   lanBind?: boolean
   busy?: 'download' | 'build'
   runningBinPath?: string
+  /** The engine the loaded model was started on, while another engine (or none) is active. */
+  serving?: { id: string; name: string; binPath: string }
   /** Engine id an extra pool slot is running on (the primary is stopped). */
   poolEngineId?: string
   engines?: Array<{ id: string; name: string; binPath: string; release?: ReleaseProvenance; kind?: string; version?: string; sourceRepo?: string }>
@@ -66,8 +68,8 @@ function harness(o: Opts = {}): Harness {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
     manager: {
-      status: () => ({ state: o.runningBinPath ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
-      currentOpts: () => null,
+      status: () => ({ state: o.runningBinPath || o.serving ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => (o.serving ? { engine: o.serving } : null),
     },
     provision: {
       get: () => ({ ...realProvision.get(), active: realProvision.get().active || o.busy === 'download' }),
@@ -361,6 +363,18 @@ test('POST install: 409 engine_in_use when the occupant is the running engine', 
   })
 })
 
+test('POST install: 409 engine_in_use when the loaded model runs on the occupant though it is not the active engine', async () => {
+  const dataDir = tmpDir('tllm-rel-route-')
+  const occupant = { id: 'e1', name: 'Rel', binPath: join(seededDir(dataDir, RELEASE_INSTALL_MARKER), serverBinName), release: PROVENANCE }
+  const h = harness({ dataDir, serving: occupant, engines: [occupant] })
+  await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET }] }, async () => {
+    const res = await postInstall(h)
+    assert.equal(res.status, 409)
+    assert.equal((await errorOf(res)).code, 'engine_in_use')
+  })
+  assert.deepEqual(h.provisionLog, [])
+})
+
 test('DELETE with binPath removes an unclaimed release-marked dir', async () => {
   const h = harness()
   const dir = seedMarkedDir(h, RELEASE_INSTALL_MARKER, PROVENANCE)
@@ -575,6 +589,17 @@ test('POST /engines/:id/update: 409 engine_in_use when that engine is running', 
   const res = await postUpdate(h, 'e-run')
   assert.equal(res.status, 409)
   assert.equal((await errorOf(res)).code, 'engine_in_use')
+})
+
+test('POST /engines/:id/update: 409 engine_in_use when the loaded model runs on that engine though it is not the active one', async () => {
+  const dataDir = tmpDir('tllm-rel-route-')
+  const engine = RELEASE_ENGINE(seededDir(dataDir, RELEASE_INSTALL_MARKER))
+  const h = harness({ dataDir, serving: engine, engines: [engine] })
+  // Stubbed GitHub: a regression that accepts the update must not reach the network.
+  const res = await withGithub('missing', async () => postUpdate(h, 'e1'))
+  assert.equal(res.status, 409)
+  assert.match((await errorOf(res)).message, /Stop "Rel"/)
+  assert.deepEqual(h.provisionLog, [])
 })
 
 test('POST /engines/:id/update: 404 engine_not_found, 409 no_update_source', async () => {

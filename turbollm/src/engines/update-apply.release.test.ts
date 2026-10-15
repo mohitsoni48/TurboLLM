@@ -48,7 +48,7 @@ function fakeGithub(releases: ReturnType<typeof release>[]) {
   return { fetchImpl, requests }
 }
 
-function harness(opts: { activeId?: string; probe?: () => Promise<ProbeResult> } = {}) {
+function harness(opts: { activeId?: string; servingId?: string; probe?: () => Promise<ProbeResult> } = {}) {
   let managerState = 'stopped'
   const dataDir = tmpDir('upd-rel-')
   const slugDir = join(dataDir, 'engines', 'build', SLUG)
@@ -70,6 +70,8 @@ function harness(opts: { activeId?: string; probe?: () => Promise<ProbeResult> }
     manager: {
       stopAndWait: async () => { calls.push('stop'); managerState = 'stopped' },
       status: () => ({ state: managerState }),
+      // The engine the loaded model was started on, which need not be the active one.
+      currentOpts: () => (managerState === 'running' && opts.servingId ? { engine: { id: opts.servingId } } : null),
     } as unknown as UpdateApplyDeps['manager'],
     provision: {
       start: (backend: string, trigger?: string) => { calls.push(`start:${backend}:${trigger}`) },
@@ -165,6 +167,22 @@ test('a user starting the engine during the download blocks the swap and keeps t
   const h = harness({ activeId: 'e1' })
   const probe = async () => { h.startEngine(); return PROBE_OK }
   await assert.rejects(applyEngineUpdate({ ...h.deps, probeFn: probe, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine), /Stop/)
+  assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
+  assert.deepEqual(h.refreshed, [])
+})
+
+test('the engine the loaded model runs on is stopped before the install, even when another engine is active', async () => {
+  const h = harness({ activeId: 'cpu', servingId: 'e1' })
+  h.startEngine()
+  await applyEngineUpdate({ ...h.deps, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine)
+  assert.deepEqual(h.calls.slice(0, 2), ['start:github-release:auto_update', 'stop'])
+  assert.equal(h.refreshed.length, 1)
+})
+
+test('a model started on the engine during the download blocks the swap, even when another engine is active', async () => {
+  const h = harness({ activeId: 'cpu', servingId: 'e1' })
+  const probe = async () => { h.startEngine(); return PROBE_OK }
+  await assert.rejects(applyEngineUpdate({ ...h.deps, probeFn: probe, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine), /Stop "Rel"/)
   assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
   assert.deepEqual(h.refreshed, [])
 })
