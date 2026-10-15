@@ -27,6 +27,9 @@ export interface JevHttpError {
   code: string
   type: 'invalid_request_error' | 'api_error'
   message: string
+  /** A retry cannot help (a `permanent` route refusal): answered with `x-should-retry: false`, as the gateway's chat
+   *  endpoints do. */
+  permanent?: true
 }
 
 /** A failed engine call, carrying the refusal the gateway answers with. */
@@ -89,6 +92,7 @@ export async function callEngineClassify(
 }
 
 export function jevErrorResponse(c: Context, error: JevHttpError): Response {
+  if (error.permanent) c.header('x-should-retry', 'false')
   return c.json({ error: { message: error.message, type: error.type, code: error.code } }, error.status)
 }
 
@@ -145,7 +149,13 @@ function isJevModel(entry: ModelEntry): entry is ModelEntry & JevModel {
 export async function routeToJevModel(d: Deps, entry: ModelEntry): Promise<string> {
   const route = await d.modelRouter.routeTo(entry)
   if ('status' in route) {
-    throw new JevEndpointError({ status: 503, code: 'model_not_loaded', type: 'api_error', message: route.message })
+    throw new JevEndpointError({
+      status: 503,
+      code: 'model_not_loaded',
+      type: 'api_error',
+      message: route.message,
+      ...(route.permanent ? { permanent: true } : {}),
+    })
   }
   return route.target
 }
