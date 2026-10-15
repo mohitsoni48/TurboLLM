@@ -11,7 +11,11 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager } from './terminal-routes'
+import http from 'node:http'
+import { createRequire } from 'node:module'
+import type { AddressInfo } from 'node:net'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets } from './terminal-routes'
+import { TerminalManager } from './terminal-manager'
 import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
 import { tmpDir } from '../test-support/tmp'
@@ -357,4 +361,38 @@ test('createAgentTerminal: an aborted signal never spawns the terminal', async (
   // stub manager's create() throws, so an unfixed build also fails with no terminal (501).
   assert.equal((result as { code?: string }).code, 'aborted')
   assert.equal(spawned, null)
+})
+
+// Shutdown (cli.ts) drops the HTTP connections with closeAllConnections() and then awaits
+// server.close(). A Code terminal's WebSocket is an upgraded socket, which that leaves open: one
+// open terminal held the close until the 12 s fallback, and `--stop` SIGKILLed the daemon at 10 s.
+test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutdown\'s server.close()', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  // A live terminal without spawning a PTY: the handshake only asks the manager these.
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const client = new WebSocket(`ws://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1/code/terminal/ws?terminalId=t1`)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise((resolve, reject) => { client.once('open', resolve); client.once('error', reject) })
+    const closed = await new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), 2_000)
+      // The shutdown's own sequence.
+      server.closeAllConnections()
+      closeTerminalSockets()
+      server.close(() => resolve(true))
+    })
+    assert.equal(closed, true, 'server.close() completed promptly')
+  } finally {
+    clearTimeout(timer)
+    client.terminate()
+    server.close()
+  }
 })

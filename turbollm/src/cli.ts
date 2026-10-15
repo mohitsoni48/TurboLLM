@@ -58,7 +58,7 @@ import { writePidfile, removeOwnPidfile, findRunningDaemon, stopDaemon, resolveD
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
-import { registerTerminalWs } from './terminal/terminal-routes'
+import { registerTerminalWs, closeTerminalSockets } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
@@ -1310,6 +1310,8 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
       } catch {
         /* best-effort */
       }
+      // Same for an open Code terminal's WebSocket, which closeAllConnections() leaves open.
+      try { closeTerminalSockets() } catch { /* best-effort */ }
       server.close(() => {
         clearTimeout(watchdog)
         finish()
@@ -1368,6 +1370,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
       } catch {
         /* best-effort */
       }
+      // An open Code terminal's WebSocket is no longer one of the server's connections, so
+      // closeAllConnections() leaves it, and it holds close() the same way.
+      try { closeTerminalSockets() } catch { /* best-effort */ }
       server.close(() => process.exit(0))
     })
     setTimeout(() => process.exit(0), 12_000).unref()

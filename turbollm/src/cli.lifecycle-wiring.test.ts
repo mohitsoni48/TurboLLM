@@ -67,6 +67,18 @@ test('signal shutdown drops open connections before close() (an SSE stream other
   assert.ok(drop < signals.indexOf('server.close(() => process.exit(0))'))
 })
 
+// The behaviour itself is terminal-routes.test.ts's "closeTerminalSockets" test.
+test('signal shutdown and restart drop open terminal WebSockets before close() (one held it past --stop\'s 10 s)', () => {
+  const signals = blockFrom(SIGNALS)
+  const drop = signals.indexOf('closeTerminalSockets()')
+  assert.ok(drop >= 0, 'the signal path must call closeTerminalSockets')
+  assert.ok(drop < signals.indexOf('server.close(() => process.exit(0))'))
+  const restart = blockFrom('if (!packagedAndroidApp()) deps.requestRestart = (')
+  const restartDrop = restart.indexOf('closeTerminalSockets()')
+  assert.ok(restartDrop >= 0, 'the restart path must call closeTerminalSockets')
+  assert.ok(restartDrop < restart.indexOf('server.close(() => {'))
+})
+
 test('pidfile removal is owner-scoped and a second daemon on the data dir is refused before boot side effects', () => {
   assert.ok(!CLI.includes('removePidfile('), "only removeOwnPidfile — never delete another daemon's pidfile")
   const guard = CLI.indexOf('const runningDaemon = await findRunningDaemon(store.dir())')

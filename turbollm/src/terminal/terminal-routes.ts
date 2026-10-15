@@ -528,11 +528,24 @@ interface WS {
   readyState: number
   send(data: string): void
   close(code?: number, reason?: string): void
+  terminate(): void
   on(event: string, listener: (...args: any[]) => void): void
 }
 
 /** OPEN constant from ws library */
 const WS_OPEN = 1
+
+/** Every open terminal WebSocket, on any listener registerTerminalWs was given. */
+const openTerminalSockets = new Set<WS>()
+
+/** Drop every open Code-terminal WebSocket at once; the daemon's shutdown calls this beside
+ *  closeAllConnections(). An upgraded socket is no longer one of the HTTP server's connections,
+ *  so closeAllConnections() leaves it open and server.close() waits for it: one open terminal
+ *  held the shutdown until its fallback timer, and `--stop` SIGKILLs at 10 s. terminate(), not
+ *  close(): a close handshake waits on the peer (up to 30 s for one that went away). */
+export function closeTerminalSockets(): void {
+  for (const ws of openTerminalSockets) ws.terminate()
+}
 
 /**
  * Register the WebSocket upgrade handler directly with the Node server.
@@ -573,6 +586,8 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
   })
 
   wss.on('connection', (ws: WS, _request: import('http').IncomingMessage) => {
+    openTerminalSockets.add(ws)
+    ws.on('close', () => { openTerminalSockets.delete(ws) })
     const url = new URL(_request.url ?? '', 'http://localhost')
     const terminalId = url.searchParams.get('terminalId') ?? ''
     const m = getManager(_d)
