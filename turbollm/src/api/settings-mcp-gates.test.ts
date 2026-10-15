@@ -93,6 +93,23 @@ test('PATCH /api/v1/settings: 409 for a provider change while remote access is e
   }
 })
 
+// `off` with `enabled` still set (a Start that raced a Stop from another client, or the moment at
+// boot before the auto-start): the UI shows remote access off and lets a provider be picked, and
+// the 409 left no way out but Start then Stop.
+test('PATCH /api/v1/settings: in `off` with enabled still set, a provider change is taken and clears enabled', async () => {
+  const cfg = defaultConfig()
+  cfg.remoteAccess.provider = 'cloudflare-quick'
+  cfg.remoteAccess.enabled = true
+  const app = fakeApp(cfg, { kind: 'off' })
+  const patch = (provider: string) =>
+    app.request('/api/v1/settings', { method: 'PATCH', body: JSON.stringify({ remoteAccess: { provider } }) })
+  assert.notEqual((await patch('cloudflare-quick')).status, 409)
+  assert.equal(cfg.remoteAccess.enabled, true, 're-saving the same provider changes nothing')
+  assert.notEqual((await patch('ngrok')).status, 409)
+  assert.equal(cfg.remoteAccess.provider, 'ngrok')
+  assert.equal(cfg.remoteAccess.enabled, false, 'nothing may start the new provider unconfirmed')
+})
+
 test('PATCH /api/v1/settings: a provider change is accepted while remote access is off', async () => {
   for (const kind of ['off', 'failed', 'needs-setup'] as const) {
     const cfg = defaultConfig()

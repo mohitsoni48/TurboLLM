@@ -67,7 +67,7 @@ import { reconcileTailscale } from './remote/providers/tailscale'
 import { RemoteAccessManager } from './remote/manager'
 import { makeProvider } from './remote/providers/factory'
 import { probeUrl } from './remote/health'
-import { isRemoteAccessEnabled } from './remote/gate'
+import { clearEnabledWhileFlagOff, isRemoteAccessEnabled } from './remote/gate'
 import type { RemoteState } from './remote/types'
 import { LinkManager } from './link/link-manager'
 import { RemoteCatalog } from './link/remote-catalog'
@@ -373,9 +373,18 @@ try {
 // un-exposing a tunnel the UI still reports as connected. If config genuinely still wants this
 // exact provider, enable() re-issues the identical serve/funnel command right after this
 // resolves, so the sequencing is at worst a harmless off-then-on, never a lost update.
-const reconcileTailscalePromise = reconcileTailscale(
-  resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
-).then((acted) => {
+//
+// The ingress port is resolved against the port the main listener binds this boot (--port, else
+// --addr's port, else daemon.port: the parse in "Resolve listen address" below), not daemon.port.
+// Under `--port 6997` the configured 6996 left the default ingress on 6997 as well: remote access
+// then failed with EADDRINUSE, and this reconcile turned off a user's own `tailscale serve 6997`
+// pointing at this daemon. The manager is constructed with the same value.
+const bootIngressPort = (() => {
+  const portFlag = argValue('--port', '')
+  const addr = portFlag ? `:${portFlag}` : argValue('--addr', `:${store.snapshot().daemon.port}`)
+  return resolveIngressPort(store.snapshot().remoteAccess.ingressPort, Number(addr.slice(addr.lastIndexOf(':') + 1)) || 6996)
+})()
+const reconcileTailscalePromise = reconcileTailscale(bootIngressPort).then((acted) => {
   if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
 }).catch(() => { /* best-effort, same posture as the other startup reaps above */ })
 // Same idea for terminal-agent CLI processes (claude/pi/opencode) orphaned by an unclean
@@ -816,6 +825,8 @@ const tunnelFlag = hasFlag('--tunnel')
 // off). `--tunnel` remains the one ungated override (§8.3) — it bypasses BOTH the flag and
 // the persisted `enabled` field entirely, exactly as it does today.
 const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapshot().remoteAccess.enabled)
+// With the flag off, a leftover `enabled: true` is cleared rather than kept for later (see the helper).
+clearEnabledWhileFlagOff(deps)
 
 // Fires on EVERY transition into 'connected' — the very first connect and every automatic
 // reconnect after a restart (ADR-422 Phase 2 final review, Critical finding C2). Without this,
@@ -893,7 +904,7 @@ function onRemoteState(s: RemoteState): void {
 
 const remote = new RemoteAccessManager({
   app,
-  ingressPort: resolveIngressPort(store.snapshot().remoteAccess.ingressPort, store.snapshot().daemon.port),
+  ingressPort: bootIngressPort, // resolved against the bound port, see the Tailscale reconcile above
   // `--tunnel` is a per-run override meaning cloudflare-quick, don't persist (spec 30 §8.3).
   makeProvider: () => makeProvider(tunnelFlag ? 'cloudflare-quick' : store.snapshot().remoteAccess.provider, deps),
   probe: (url) => probeUrl(url),
@@ -957,7 +968,8 @@ updateScheduler.start()
 const cfg = store.snapshot()
 const defaultHost = cfg.daemon.lanBind ? '0.0.0.0' : (cfg.daemon.host || '127.0.0.1')
 
-// --port <n> is a convenience shorthand; --addr <h:p> is the full override.
+// --port <n> is a convenience shorthand; --addr <h:p> is the full override. (bootIngressPort,
+// above, reads the port the same way; keep the two in step.)
 const portFlag = argValue('--port', '')
 let addr: string
 if (portFlag) {
@@ -1126,7 +1138,10 @@ function listen(attempt = 0): void {
       // one. The promise never rejects (it swallows its own errors), so this never delays
       // startup on a failure path, only on genuine in-flight `tailscale` CLI work.
       await reconcileTailscalePromise
-      void remote.enable()
+      // Re-read after that wait: a provider change taken meanwhile (the UI shows `off` until this
+      // runs) or the experimental flag switched off clears `enabled`, and must not be overridden
+      // by a start decided before it, which would publish through a provider nobody confirmed.
+      if (tunnelFlag || store.snapshot().remoteAccess.enabled) void remote.enable()
     }
 
     // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written

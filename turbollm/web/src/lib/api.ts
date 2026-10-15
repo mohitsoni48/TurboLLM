@@ -1129,8 +1129,11 @@ export function deleteApiKey(id: string): Promise<{ ok: true }> {
 }
 /** The daemon refuses this GET without `X-TurboLLM-UI` (auth.ts lanAuth): it can replace a CLI
  *  key, and a page on another site cannot add a custom header without a CORS preflight. */
-export function getConnect(cli: string): Promise<ConnectInfo> {
-  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}`, { headers: { 'X-TurboLLM-UI': '1' } })
+/** `mint: false` is a fetch the user did not click for: a LAN-bound daemon then answers 409
+ *  `lan_bound` instead of minting a new `cli-<name>` key (which revokes the previous one). */
+export function getConnect(cli: string, opts: { mint?: boolean } = {}): Promise<ConnectInfo> {
+  const query = opts.mint === false ? '?mint=0' : ''
+  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}${query}`, { headers: { 'X-TurboLLM-UI': '1' } })
 }
 
 // ── System info (spec 05 §6) ─────────────────────────────────────────────────

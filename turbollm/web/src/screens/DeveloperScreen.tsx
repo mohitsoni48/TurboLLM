@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import type { LucideIcon } from 'lucide-react'
 import { Bot, ChevronRight, Code2, Globe, Key, Loader2, Lock, Plug, Plus, Sparkles, Terminal, Trash2, Workflow, Wrench } from 'lucide-react'
@@ -324,7 +324,19 @@ function SetupPanel({ cli, lanBind }: { cli: Cli; lanBind: boolean | undefined }
   // Fetches on its own only for a loopback-only daemon (no key minted — see ConnectSection).
   // Keyed on lanBind too, so a loopback snippet cached before LAN was switched on is never
   // shown in place of the LAN one; a generated LAN snippet stays cached across card switches.
-  const q = useQuery({ queryKey: ['connect', cli.id, lanBind], queryFn: () => getConnect(cli.id), enabled: lanBind === false })
+  // That automatic fetch says it must not mint (`mint: false`): the lanBind:false it rests on is
+  // only as fresh as the last network read, and LAN can be switched on from another window
+  // while this page stays open. The daemon then answers 409 lan_bound instead of replacing the
+  // CLI's key; re-reading the network info flips this panel to the explicit Generate below.
+  const q = useQuery({
+    queryKey: ['connect', cli.id, lanBind],
+    queryFn: () => getConnect(cli.id, { mint: lanBind === true }),
+    enabled: lanBind === false,
+  })
+  const lanBound = q.error instanceof ApiError && q.error.code === 'lan_bound'
+  useEffect(() => {
+    if (lanBound) void qc.invalidateQueries({ queryKey: ['network'] })
+  }, [lanBound, qc])
   const generate = () => {
     void q.refetch().then(() => qc.invalidateQueries({ queryKey: ['apiKeys'] }))
   }
@@ -334,12 +346,12 @@ function SetupPanel({ cli, lanBind }: { cli: Cli; lanBind: boolean | undefined }
       style={{ borderColor: 'color-mix(in srgb, var(--accent) 45%, var(--border))' }}
     >
       <div className="mb-3 text-[13px] font-medium text-ink">{cli.name} — setup</div>
-      {(q.isLoading || lanBind === undefined) && (
+      {(q.isLoading || lanBind === undefined || lanBound) && (
         <div className="flex items-center gap-2 text-[13px] text-muted">
           <Loader2 size={14} className="animate-spin" /> Loading…
         </div>
       )}
-      {q.isError && <p className="text-[13px]" style={{ color: 'var(--err)' }}>Could not fetch setup snippets.</p>}
+      {q.isError && !lanBound && <p className="text-[13px]" style={{ color: 'var(--err)' }}>Could not fetch setup snippets.</p>}
       {lanBind && !q.data && !q.isFetching && (
         <div className="flex flex-col items-start gap-2">
           <p className="text-[13px] text-muted">

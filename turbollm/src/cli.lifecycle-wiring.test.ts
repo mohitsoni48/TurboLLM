@@ -95,6 +95,38 @@ test('the harness resync after a model load uses the bound port, not daemon.port
   assert.ok(!CLI.slice(call, call + 400).includes('store.snapshot().daemon.port'))
 })
 
+// `--port 6997` with the default ingress 6997: resolved against daemon.port (6996) the ingress
+// stayed on 6997, so remote access failed with EADDRINUSE and the boot reconcile turned off a
+// user's own `tailscale serve 6997`. Both must use the port the main listener binds.
+test('the remote-access ingress port is resolved against the bound port, not daemon.port', () => {
+  assert.ok(!/resolveIngressPort\([^)]*daemon\.port\)/.test(CLI), 'no ingress port resolved against the configured daemon.port')
+  assert.ok(CLI.includes('const reconcileTailscalePromise = reconcileTailscale(bootIngressPort)'))
+  assert.match(blockFrom('const remote = new RemoteAccessManager({'), /ingressPort: bootIngressPort\b/)
+  // The boot port the ingress is resolved against is parsed like the listen address below.
+  const def = CLI.slice(CLI.indexOf('const bootIngressPort = (() => {'), CLI.indexOf('const reconcileTailscalePromise'))
+  assert.ok(def.includes("const portFlag = argValue('--port', '')"))
+  assert.ok(def.includes("argValue('--addr', `:${store.snapshot().daemon.port}`)"))
+  assert.ok(CLI.includes("addr = argValue('--addr', `${defaultHost}:${cfg.daemon.port}`)"))
+})
+
+// Until the boot start runs, remote access reads `off`, so the UI lets a provider be picked; the
+// settings route takes that change and clears `enabled`. A start decided before it must not run.
+test('the boot-time remote-access start re-reads `enabled` after the Tailscale reconcile wait', () => {
+  const listen = blockFrom(LISTEN)
+  const wait = listen.indexOf('await reconcileTailscalePromise')
+  const start = listen.indexOf('if (tunnelFlag || store.snapshot().remoteAccess.enabled) void remote.enable()')
+  assert.ok(wait > 0 && start > wait)
+  assert.equal(listen.split('remote.enable()').length, 2, 'the only boot start is the re-checked one')
+})
+
+test('a leftover remoteAccess.enabled is cleared at boot when the experimental flag is off', () => {
+  const wanted = CLI.indexOf('const remoteWanted = tunnelFlag || (isRemoteAccessEnabled(deps) && store.snapshot().remoteAccess.enabled)')
+  const clear = CLI.indexOf('clearEnabledWhileFlagOff(deps)')
+  assert.ok(wanted > 0 && clear > wanted, 'cleared after remoteWanted reads it (flag off: only --tunnel starts anything)')
+  const bootListen = CLI.indexOf('\nlisten()\n') // the top-level boot call, not a comment's mention
+  assert.ok(bootListen > 0 && clear < bootListen, 'before the listener serves its first request')
+})
+
 test('the packaged Android app never wires a restart (exiting its in-process Node closes the app)', () => {
   assert.ok(CLI.includes('if (!packagedAndroidApp()) deps.requestRestart = ('))
 })

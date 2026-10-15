@@ -2678,15 +2678,24 @@ export function registerApi(app: Hono, d: Deps): void {
     // provider is what the next crash/health restart (or boot) starts — publishing the box
     // through a provider whose exposure was never confirmed — while the UI already labels the
     // still-running old tunnel with it.
+    let providerChangeClearsEnabled = false
     if (b.remoteAccess?.provider !== undefined && d.remote) {
       const kind = d.remote.state().kind
       const running = kind === 'starting' || kind === 'connected' || kind === 'reconnecting'
+      const enabled = d.store.snapshot().remoteAccess.enabled
+      const changed = normalizeProvider(b.remoteAccess.provider) !== d.store.snapshot().remoteAccess.provider
       // `enabled` as well: it stays true through failed / needs-setup / unavailable, and the next
-      // boot auto-starts whatever provider is saved — the UI's own rule is "any state but off".
-      const on = running || d.store.snapshot().remoteAccess.enabled
-      if (on && normalizeProvider(b.remoteAccess.provider) !== d.store.snapshot().remoteAccess.provider) {
+      // boot auto-starts whatever provider is saved. Not in `off`, though, where the UI shows
+      // remote access off and lets a provider be picked (its rule is "any state but off"), so a 409
+      // there was a dead end. `enabled` can be set in `off`: a Start that raced a Stop from another
+      // client, or the moment at boot before the auto-start runs (a config booted with the
+      // experimental flag off has it cleared at boot, see clearEnabledWhileFlagOff). The change is
+      // taken and clears `enabled`, so nothing starts the new provider unconfirmed: not a later
+      // boot, and not this boot's pending start (cli.ts re-checks).
+      if (changed && (running || (kind !== 'off' && enabled))) {
         return err(c, 409, 'remote_access_running', 'Turn remote access off before changing its provider.')
       }
+      providerChangeClearsEnabled = changed && enabled
     }
 
     const before = d.store.snapshot().daemon
@@ -2728,6 +2737,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // provider must not wipe a stored tunnel token, and vice versa.
       const ra = b.remoteAccess
       if (ra?.provider !== undefined) cfg.remoteAccess.provider = normalizeProvider(ra.provider)
+      if (providerChangeClearsEnabled) cfg.remoteAccess.enabled = false // see the provider-change guard above
       if (ra?.ingressPort !== undefined) cfg.remoteAccess.ingressPort = resolveIngressPort(Number(ra.ingressPort), cfg.daemon.port)
       if (ra?.cloudflare?.tunnelToken !== undefined) cfg.remoteAccess.cloudflare.tunnelToken = String(ra.cloudflare.tunnelToken).trim()
       if (ra?.cloudflare?.hostname !== undefined) cfg.remoteAccess.cloudflare.hostname = String(ra.cloudflare.hostname).trim()
@@ -3237,6 +3247,11 @@ export function registerApi(app: Hono, d: Deps): void {
 
     let apiKey = 'not-needed-on-localhost'
     if (lanBind) {
+      // `?mint=0`: the Connect page fetching on its own because it last read the daemon as
+      // loopback-only. That read can be stale (LAN switched on from another window while the page
+      // stayed open), and minting here would revoke the key a CLI is already using. Refuse; the
+      // page re-reads the network info and offers its explicit "Generate" instead.
+      if (c.req.query('mint') === '0') return err(c, 409, 'lan_bound', 'LAN sharing is on, so setup snippets carry a new key: generate them explicitly.')
       const keyName = `cli-${cli}`
       const { full, hash, prefix } = generateApiKey()
       const fresh: ApiKey = {

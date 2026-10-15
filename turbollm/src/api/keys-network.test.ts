@@ -202,3 +202,25 @@ test('GET /api/v1/connect/:cli: a cross-site request is refused before it can re
   assert.equal(cfg.apiKeys.length, 1)
   assert.notEqual(cfg.apiKeys[0].id, 'k0', 'an explicit, same-origin request still replaces the key, as the UI warns')
 })
+
+// The Connect page fetches on its own whenever its last network read said loopback-only. That read
+// goes stale when LAN is switched on from another window while the page stays open, and each card
+// click then minted a new cli-<name> key and revoked the one a CLI was using. Such a fetch says
+// `?mint=0`, and a LAN-bound daemon refuses it instead of minting.
+test('GET /api/v1/connect/:cli?mint=0: a LAN-bound daemon answers 409 lan_bound and keeps the CLI key', async () => {
+  const RAW = 'tllm-nomintnomintnomintnomintnomintnomin1'
+  const cfg = baseConfig({ lanBind: true, requireApiKey: true })
+  cfg.apiKeys.push({ id: 'k1', name: 'self', hash: hashKey(RAW), prefix: RAW.slice(0, 12), createdAt: '', lastUsedAt: null })
+  cfg.apiKeys.push({ id: 'k0', name: 'cli-claude-code', hash: 'h0', prefix: 'tllm-old', createdAt: '', lastUsedAt: null })
+  const { app } = fakeApp(cfg)
+  const res = await app.request('/api/v1/connect/claude-code?mint=0', { headers: { 'X-TurboLLM-Auth': RAW } })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'lan_bound')
+  assert.deepEqual(cfg.apiKeys.map((k) => k.id), ['k1', 'k0'], 'nothing minted, nothing revoked')
+  // The explicit Generate (no mint=0) still replaces it.
+  assert.equal((await app.request('/api/v1/connect/claude-code', { headers: { 'X-TurboLLM-Auth': RAW } })).status, 200)
+  assert.ok(!cfg.apiKeys.some((k) => k.id === 'k0'))
+  // Loopback-only: no key is involved, so the snippet comes back as before.
+  const loop = fakeApp(baseConfig({ lanBind: false }))
+  assert.equal((await loop.app.request('/api/v1/connect/claude-code?mint=0')).status, 200)
+})

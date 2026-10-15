@@ -23,4 +23,10 @@ describe('getConnect', () => {
     expect(calls[0].method).toBeUndefined()
     expect(calls[0].headers['X-TurboLLM-UI']).toBe('1')
   })
+
+  it('asks the daemon not to mint for a fetch nobody clicked (mint: false)', async () => {
+    await getConnect('opencode', { mint: false })
+    await getConnect('opencode', { mint: true })
+    expect(calls.map((c) => c.url)).toEqual(['/api/v1/connect/opencode?mint=0', '/api/v1/connect/opencode'])
+  })
 })
