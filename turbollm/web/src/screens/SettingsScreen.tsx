@@ -33,7 +33,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
-import { ApiError, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
+import { ApiError, authHeaders, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import { toast } from '../components/ui/sonner'
@@ -1544,7 +1544,9 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
     const poll = async () => {
       if (cancelled) return
       try {
-        const res = await fetch('/api/v1/status', { headers: { Accept: 'application/json' } })
+        // With this client's key, like every other API call: a LAN client's unauthenticated poll
+        // gets 401 from the new daemon too, and the overlay would only ever end on "failed".
+        const res = await fetch('/api/v1/status', { headers: { Accept: 'application/json', ...authHeaders() } })
         if (res.ok) {
           // Daemon is back — full reload so the SPA reconnects on the (possibly new) port.
           if (!cancelled) window.location.reload()

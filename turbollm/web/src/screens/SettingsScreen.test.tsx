@@ -1,8 +1,8 @@
 import { describe, it, expect, vi } from 'vitest'
-import { act, render, screen, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
-import type { DaemonSettings } from '../lib/api'
+import { setAuthToken, type DaemonSettings } from '../lib/api'
 import { SettingsScreen } from './SettingsScreen'
 
 type SaveCall = { payload: unknown; opts: { onSuccess?: (res: DaemonSettings) => void } }
@@ -22,7 +22,9 @@ vi.mock('../lib/queries', () => ({
     save: { ...mut(), mutate: (payload: unknown, opts: SaveCall['opts']) => { state.saveCalls.push({ payload, opts }) } },
   }),
   useComfyGate: () => ({ install: mut(), uninstall: mut() }),
-  useDaemonRestart: () => mut(), useHfTokenTest: () => mut(),
+  // Settles at once, so the restart overlay goes straight to polling for the new daemon.
+  useDaemonRestart: () => ({ ...mut(), mutate: (_: unknown, o?: { onSuccess?: () => void }) => o?.onSuccess?.() }),
+  useHfTokenTest: () => mut(),
   useModelDirs: () => ({ data: { dirs: [], primaryDir: '' } }), useModelMutations: () => ({}),
   useNetworkInfo: () => ({ data: undefined }), useStatus: () => ({ data: undefined }),
   useTelemetryPreview: () => ({ data: undefined }), useTelemetryLog: () => ({ data: undefined }),
@@ -105,6 +107,33 @@ describe('SettingsScreen — Restart daemon', () => {
     await openSystem()
     expect(screen.getByRole('button', { name: /Restart daemon/ })).toBeTruthy()
     state.sysInfo = undefined
+  })
+
+  // /api/v1/status needs the key for a non-loopback caller, so an unauthenticated poll from a LAN
+  // client got 401 until the 20s give-up, and the overlay always ended on "taking a while".
+  it("polls for the restarted daemon with this client's key", async () => {
+    state.settings = mk()
+    state.saveCalls = []
+    state.sysInfo = { bundledEnginesOnly: false }
+    setAuthToken('lan-key')
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const { unmount } = render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+      await openSystem()
+      await userEvent.click(screen.getByRole('button', { name: /Restart daemon/ }))
+      act(() => state.saveCalls[0].opts.onSuccess!(mk())) // pending changes saved first
+      expect(screen.getByText('Restarting daemon…')).toBeTruthy()
+      const statusCall = () => fetchMock.mock.calls.find((c) => String((c as unknown[])[0]) === '/api/v1/status') as unknown[] | undefined
+      await waitFor(() => expect(statusCall()).toBeTruthy(), { timeout: 3000 })
+      const headers = (statusCall()![1] as RequestInit).headers as Record<string, string>
+      expect(headers['X-TurboLLM-Auth']).toBe('lan-key')
+      unmount()
+    } finally {
+      vi.unstubAllGlobals()
+      setAuthToken('')
+      state.sysInfo = undefined
+    }
   })
 })
 
