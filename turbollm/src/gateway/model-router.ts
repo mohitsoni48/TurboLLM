@@ -77,10 +77,16 @@ export class ModelRouter {
   /** The model doLoad is loading right now (one at a time: it runs under the swap lock). A pool slot's load is
    *  otherwise visible nowhere until it has succeeded. */
   private loadingKey: string | undefined
-  /** The pool-slot manager that load runs in, and its engine (unset for a load into the primary). It is in no
-   *  extraSlots entry until it has loaded, yet it already holds VRAM and runs on that engine, so poolEngineIds and
-   *  stopPoolSlotsOnEngine (a ComfyUI render's pool stopper, an engine update) count it too. */
+  /** The pool-slot manager that load runs in, and the engine it loads on (unset for a load into the primary). It is in
+   *  no extraSlots entry until it has loaded, yet it already holds VRAM, so poolEngineIds and stopPoolSlotsOnEngine (a
+   *  ComfyUI render's pool stopper, an engine update) count it too: on that engine, and, while it still runs or stops
+   *  the LRU model it evicted (until Manager.load gets the load gate and that model has exited), on that model's. */
   private loadingSlot: { manager: Manager; engineId: string } | undefined
+  /** Pool-slot managers dropped from extraSlots (dropSlot) while their engine may still exit: tracked nowhere else, yet
+   *  the process keeps its VRAM and its engine's files until it is gone (a graceful stop, on Windows a full 8 s).
+   *  Exited ones are pruned on every drop and every pool read, so it holds at most the slots that were still exiting
+   *  at the last of those. */
+  private stoppingSlots = new Set<Manager>()
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -264,50 +270,84 @@ export class ModelRouter {
     const slot = this.extraSlots.get(modelKey)
     if (!slot) return false
     slot.manager.stop()
-    this.extraSlots.delete(modelKey)
+    this.dropSlot(modelKey)
     return true
+  }
+
+  /** Drop the pool slot `modelKey` from extraSlots, keeping its manager in stoppingSlots until its process has exited:
+   *  an eject, its idle watchdog or an engine stop may still be stopping it. Every removal of a slot whose process may
+   *  be alive goes through here, except evictChatLru's, whose manager the load takes over (loadingSlot). */
+  private dropSlot(modelKey: string): void {
+    const slot = this.extraSlots.get(modelKey)
+    if (!slot) return
+    this.extraSlots.delete(modelKey)
+    // Pruned here too: pool reads are rare (an engine update or delete, a ComfyUI render), and ejects and idle
+    // reloads alone must not keep every stopped manager for the daemon's lifetime.
+    for (const m of this.stoppingSlots) if (!this.slotEngineId(m)) this.stoppingSlots.delete(m)
+    if (this.slotEngineId(slot.manager)) this.stoppingSlots.add(slot.manager) // an exited one ('stopped', 'error') is not
   }
 
   /** Ids of the engines the extra pool slots run on (not the primary). A .litertlm model auto-swapped into a slot
    *  runs on LiteRT-LM whatever engine is active, so an engine can be in use without being active or primary. */
   poolEngineIds(): Set<string> {
     const ids = new Set<string>()
-    for (const slot of this.extraSlots.values()) {
-      const id = slot.manager.currentOpts()?.engine.id
-      if (id) ids.add(id)
-    }
-    if (this.loadingSlot) ids.add(this.loadingSlot.engineId)
+    for (const p of this.poolProcesses()) for (const id of p.engineIds) ids.add(id)
     return ids
   }
 
   /** How many extra pool slots run on `engineId` (read-only). A release update refuses to replace that engine's
    *  files while this is above zero, rather than stopping a model the user is using. */
   poolSlotsOnEngine(engineId: string): number {
-    let count = 0
-    for (const slot of this.extraSlots.values()) {
-      if (slot.manager.currentOpts()?.engine.id === engineId) count++
-    }
-    return count
+    return this.poolProcesses().filter((p) => p.engineIds.has(engineId)).length
   }
 
   /** Stop and drop every extra pool slot running on `engineId`, resolving once they have exited — before that
    *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers).
    *  `force` kills at once, as ComfyUI's acquire does the primary: a render must not wait out the graceful stop
-   *  (on Windows its full 8 s timer, which a windowless llama-server never cuts short). */
+   *  (on Windows its full 8 s timer, which a windowless llama-server never cuts short). A slot already stopping (an
+   *  eject, or its idle watchdog) is waited for, and with `force` killed now.
+   *  A slot still loading is stopped now, whatever it still runs: the model it evicted (as LRU, still running while
+   *  its load waits for the load gate, or being stopped), or the engine it is starting. A load that has not spawned
+   *  its engine yet is not cancelled by this: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
+   *  drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load. */
   async stopPoolSlotsOnEngine(engineId: string, opts?: { force?: boolean }): Promise<void> {
     const stopping: Promise<unknown>[] = []
-    for (const [key, slot] of this.extraSlots) {
-      if (slot.manager.currentOpts()?.engine.id !== engineId) continue
-      this.extraSlots.delete(key)
-      stopping.push(slot.manager.stopAndWait(opts))
+    for (const p of this.poolProcesses()) {
+      if (!p.engineIds.has(engineId)) continue
+      if (p.slotKey !== undefined) this.dropSlot(p.slotKey)
+      stopping.push(p.manager.stopAndWait(opts))
     }
-    // A slot still loading is stopped now, whatever it still runs: the model it evicted (as LRU, still running while
-    // its load waits for the load gate, or being stopped), or the engine it is starting. A load that has not spawned
-    // its engine yet is not cancelled by this: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
-    // drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load.
-    const loading = this.loadingSlot
-    if (loading?.engineId === engineId) stopping.push(loading.manager.stopAndWait(opts))
     await Promise.all(stopping)
+  }
+
+  /** Every pool-slot manager whose engine process may be alive, with the engine ids it holds: the registered slots
+   *  (`slotKey`), the ejected ones still exiting, and the slot a load runs in (see loadingSlot: on its new engine, and
+   *  on its evicted model's while that model still runs or stops). */
+  private poolProcesses(): Array<{ manager: Manager; engineIds: Set<string>; slotKey?: string }> {
+    const engineIds = (manager: Manager, also?: string): Set<string> => {
+      const ids = new Set<string>()
+      const id = this.slotEngineId(manager)
+      if (id) ids.add(id)
+      if (also) ids.add(also)
+      return ids
+    }
+    const out: Array<{ manager: Manager; engineIds: Set<string>; slotKey?: string }> = []
+    for (const [key, slot] of this.extraSlots) out.push({ manager: slot.manager, engineIds: engineIds(slot.manager), slotKey: key })
+    for (const manager of this.stoppingSlots) {
+      const ids = engineIds(manager)
+      if (ids.size) out.push({ manager, engineIds: ids })
+      else this.stoppingSlots.delete(manager) // exited
+    }
+    const loading = this.loadingSlot
+    if (loading) out.push({ manager: loading.manager, engineIds: engineIds(loading.manager, loading.engineId) })
+    return out
+  }
+
+  /** The engine a pool-slot manager's process runs on, while there is one. currentOpts() names it while the model runs
+   *  or starts; while it stops, currentOpts() is null but the process still holds its VRAM and its engine's files,
+   *  and restartOpts() still names the opts it was started with (Manager.load replaces them only once it has exited). */
+  private slotEngineId(manager: Manager): string | undefined {
+    return (manager.currentOpts() ?? (manager.status().state === 'stopping' ? manager.restartOpts() : null))?.engine.id
   }
 
   /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
@@ -340,6 +380,11 @@ export class ModelRouter {
       if (isAlive(slot.manager.status().state)) add(slot.modelKey)
     }
     for (const load of this.layaLoads.values()) add(load.modelKey)
+    // A load in flight: the model it loads, for the whole load (a pool slot is registered only once it has loaded),
+    // and the LRU model its pool slot still runs while that load waits for the load gate (evictChatLru dropped it).
+    if (this.loadingKey) add(this.loadingKey)
+    const loading = this.loadingSlot?.manager.status()
+    if (loading && isAlive(loading.state) && loading.model) add(loading.model.key)
     return keys
   }
 
@@ -367,7 +412,7 @@ export class ModelRouter {
         slot.manager.touch()
         return this.served(slot.manager, slot.manager.target()!)
       }
-      this.extraSlots.delete(entry.key) // dead slot — clean up
+      this.dropSlot(entry.key) // dead or stopping slot (its idle watchdog) — clean up
     }
     return undefined
   }
@@ -520,6 +565,8 @@ export class ModelRouter {
     if (targetManager === this.manager) {
       this.primaryLastUsed = Date.now()
     } else {
+      // A slot still listed for this key (loadExplicit skips routeResolved's cleanup) is dead or still stopping.
+      this.dropSlot(entry.key)
       this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
@@ -557,7 +604,7 @@ export class ModelRouter {
   private trackLayaLoad(modelKey: string, manager: Manager): LayaLoad {
     // Whatever slot the router still holds for this key is dead or going away: doLoad found no running one under the
     // swap lock. Dropping it means the model is reported once, and an eject reaches the load and not a stale entry.
-    this.extraSlots.delete(modelKey)
+    this.dropSlot(modelKey)
     const load: LayaLoad = { manager, modelKey, startedMs: Date.now(), cancelled: false }
     this.layaLoads.set(modelKey, load)
     return load
@@ -627,7 +674,7 @@ export class ModelRouter {
       }
     }
 
-    if (lruKey !== null) this.extraSlots.delete(lruKey)
+    if (lruKey !== null) this.extraSlots.delete(lruKey) // not dropSlot: the load takes this manager over (loadingSlot)
     return lruManager
   }
 

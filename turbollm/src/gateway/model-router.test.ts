@@ -26,6 +26,9 @@ function fakeManager(state: Status['state'], modelKey: string | null): Manager {
     : null
   return {
     status: (): Status => ({ state, err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    // No engine behind it: the pool helpers (and dropSlot) see no process to track.
+    currentOpts: () => null,
+    restartOpts: () => null,
   } as unknown as Manager
 }
 
@@ -809,4 +812,246 @@ test('poolSlotsOnEngine: counts the extra pool slots running on that engine only
   assert.equal(r.poolSlotsOnEngine('litert'), 2)
   assert.equal(r.poolSlotsOnEngine('llama'), 1)
   assert.equal(r.poolSlotsOnEngine('absent'), 0)
+})
+
+// ── A pool slot whose engine is still exiting, or still running the model its load evicted ──────────
+// The pool helpers read currentOpts(), which Manager leaves null while a slot stops, and a loading slot was tracked
+// only under the engine it loads. So an ejected slot (stopExplicit drops it, then it stops gracefully: on Windows a
+// full 8 s), a slot its idle watchdog is stopping, and a slot still running the LRU model it evicted on another engine
+// were invisible: ComfyUI's acquire let a render start while they held VRAM, an engine update or delete went ahead
+// under them, and the Models page / delete guard missed the models they run and load.
+
+/** A pool-slot Manager double with Manager's opts semantics: currentOpts() only while running or starting,
+ *  restartOpts() always; stop() is graceful (stays 'stopping'), stopAndWait() settles it. */
+function slotProcess(key: string, engineId: string) {
+  let state: Status['state'] = 'running'
+  const opts = { engine: { id: engineId }, model: { key } }
+  const stops: Array<boolean | undefined> = []
+  const manager = {
+    status: (): Status => ({
+      state, err: null, port: 0, pid: 0, loadElapsedMs: 0,
+      model: state === 'running' || state === 'starting' ? { key, name: key, quant: 'Q4', ctx: 4096, vision: false } : null,
+    }),
+    currentOpts: () => (state === 'running' || state === 'starting' ? opts : null),
+    restartOpts: () => opts,
+    stop: () => { if (state === 'running' || state === 'starting') state = 'stopping' },
+    stopAndWait: async (o?: { force?: boolean }) => { stops.push(o?.force); state = 'stopped' },
+  } as unknown as Manager
+  return { manager, stops, setState: (s: Status['state']) => { state = s } }
+}
+
+const comfyPoolStopper = (r: ModelRouter) =>
+  Promise.all([...r.poolEngineIds()].map((id) => r.stopPoolSlotsOnEngine(id, { force: true })))
+
+test('the ComfyUI pool stopper kills a slot the user just ejected that is still stopping', async () => {
+  const emb = slotProcess('bge-m3', 'cuda')
+  const r = router(fakeManager('stopped', null), STORE, [{ manager: emb.manager, modelKey: 'bge-m3', lastUsedMs: 0 }])
+
+  assert.equal(r.stopExplicit('bge-m3'), true)
+  assert.equal(emb.manager.status().state, 'stopping', 'a graceful stop is still in flight')
+  assert.deepEqual([...r.poolEngineIds()], ['cuda'], 'its engine still holds VRAM and files')
+  assert.equal(r.poolSlotsOnEngine('cuda'), 1)
+
+  await comfyPoolStopper(r)
+  assert.deepEqual(emb.stops, [true], 'force-stopped and waited for')
+  assert.deepEqual([...r.poolEngineIds()], [], 'dropped once it has exited')
+})
+
+test('the ComfyUI pool stopper kills a slot its idle watchdog is stopping', async () => {
+  const chat = slotProcess('qwen', 'vulkan')
+  const r = router(fakeManager('stopped', null), STORE, [{ manager: chat.manager, modelKey: 'qwen', lastUsedMs: 0 }])
+  chat.setState('stopping') // Manager.watchdogTick -> stop()
+
+  assert.deepEqual([...r.poolEngineIds()], ['vulkan'])
+  await comfyPoolStopper(r)
+  assert.deepEqual(chat.stops, [true])
+  assert.deepEqual([...r.poolEngineIds()], [])
+})
+
+test('dropped pool slots that have exited are not kept: ejects and idle reloads alone do not grow the stopping set', () => {
+  const r = router(fakeManager('stopped', null), STORE, [])
+  const slots = (r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots
+  const stoppingSlots = (r as unknown as { stoppingSlots: Set<Manager> }).stoppingSlots
+  for (let i = 0; i < 50; i++) {
+    const p = slotProcess(`m${i}`, 'cuda')
+    slots.set(`m${i}`, { manager: p.manager, modelKey: `m${i}`, lastUsedMs: 0 })
+    if (i % 2) p.setState('stopped') // a slot its idle watchdog already unloaded: nothing left to track
+    assert.equal(r.stopExplicit(`m${i}`), true)
+    p.setState('stopped') // the graceful stop has finished
+  }
+  // No pool read (poolEngineIds etc.) in between, as for a user who never renders or updates an engine.
+  assert.ok(stoppingSlots.size <= 1, `only the last eject may still be exiting, got ${stoppingSlots.size}`)
+
+  const live = slotProcess('still', 'cuda')
+  slots.set('still', { manager: live.manager, modelKey: 'still', lastUsedMs: 0 })
+  assert.equal(r.stopExplicit('still'), true)
+  assert.deepEqual([...r.poolEngineIds()], ['cuda'], 'a slot still exiting is tracked')
+  live.setState('stopped')
+  assert.deepEqual([...r.poolEngineIds()], [])
+  assert.equal(stoppingSlots.size, 0)
+})
+
+/** A new pool-slot manager whose load waits (as for the global load gate) until open(), then ends in `endState`. */
+function gatedNewSlot(endState: Status['state']) {
+  let state: Status['state'] = 'stopped'
+  let opts: StartOpts | null = null
+  let open!: () => void
+  const gate = new Promise<void>((res) => { open = res })
+  let called!: () => void
+  const loadCalled = new Promise<void>((res) => { called = res })
+  const manager = {
+    status: (): Status => ({
+      state, err: null, port: 0, pid: 0, loadElapsedMs: 0,
+      model: state === 'running' && opts ? { key: opts.model.key, name: opts.model.key, quant: 'Q4', ctx: 4096, vision: false } : null,
+    }),
+    currentOpts: () => (state === 'running' || state === 'starting' ? opts : null),
+    restartOpts: () => opts,
+    target: () => 'http://127.0.0.1:8082',
+    touch: () => {},
+    load: async (o: StartOpts) => { called(); await gate; opts = o; state = endState },
+    stopAndWait: async () => { state = 'stopped' },
+  } as unknown as Manager
+  return { manager, loadCalled, open }
+}
+
+/** keepN 3, model-p in the primary, `slots` registered, new pool slots from `newSlot`, active engine 'eng1'. */
+function poolRouter(slots: PoolSlotShape[], newSlot: () => Manager): ModelRouter {
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as ConfigStore
+  const entries = slots.map((s) => fakeEntry(s.modelKey))
+  const scanner = { list: () => ({ models: entries }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, fakeManager('running', 'model-p'), scanner, undefined, undefined, newSlot)
+  ;(r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots = new Map(slots.map((s) => [s.modelKey, s]))
+  return r
+}
+
+test('a request for a model its idle watchdog is still stopping keeps the exiting slot under the pool stopper', async () => {
+  // routeResolved drops the stopping slot and loads qwen into a new one (on 'eng1', waiting for the load gate); the old
+  // process (on 'vulkan') still exits, gracefully: on Windows up to 8 s.
+  const old = slotProcess('qwen', 'vulkan')
+  old.setState('stopping') // Manager.watchdogTick -> stop()
+  const fresh = gatedNewSlot('error')
+  const r = poolRouter([{ manager: old.manager, modelKey: 'qwen', lastUsedMs: 0 }], () => fresh.manager)
+
+  const routed = r.route('qwen')
+  await fresh.loadCalled
+  assert.deepEqual([...r.poolEngineIds()].sort(), ['eng1', 'vulkan'])
+  assert.equal(r.poolSlotsOnEngine('vulkan'), 1, 'an engine update/delete still waits for it')
+
+  await comfyPoolStopper(r)
+  assert.deepEqual(old.stops, [true], 'force-killed and waited for')
+  fresh.open()
+  await routed
+  assert.deepEqual([...r.poolEngineIds()], [], 'dropped once it has exited')
+})
+
+test('loadExplicit over a slot its idle watchdog is still stopping keeps the exiting slot tracked', async () => {
+  // loadExplicit (a Routine's pinned model) skips routeResolved: the stopping slot stays listed while the new one loads,
+  // and registering the new slot under the same key must not drop the old process from view.
+  const old = slotProcess('qwen', 'vulkan')
+  old.setState('stopping')
+  const fresh = gatedNewSlot('running')
+  const r = poolRouter([{ manager: old.manager, modelKey: 'qwen', lastUsedMs: 0 }], () => fresh.manager)
+
+  const loaded = r.loadExplicit('qwen')
+  await fresh.loadCalled
+  fresh.open()
+  assert.equal('target' in (await loaded), true)
+  assert.deepEqual([...r.poolEngineIds()].sort(), ['eng1', 'vulkan'])
+
+  await comfyPoolStopper(r)
+  assert.deepEqual(old.stops, [true])
+})
+
+test('a ComfyUI render force-kills a pool slot an engine update is still stopping gracefully', async () => {
+  const chat = slotProcess('qwen', 'vulkan')
+  const r = router(fakeManager('stopped', null), STORE, [{ manager: chat.manager, modelKey: 'qwen', lastUsedMs: 0 }])
+  const stops: Array<boolean | undefined> = []
+  let exit!: () => void
+  const exited = new Promise<void>((res) => { exit = res })
+  // Manager.stopAndWait: a graceful stop waits for the process (on Windows up to 8 s); a forced one kills it now.
+  ;(chat.manager as unknown as { stopAndWait: (o?: { force?: boolean }) => Promise<void> }).stopAndWait = async (o) => {
+    stops.push(o?.force)
+    chat.setState('stopping')
+    if (o?.force) { chat.setState('stopped'); exit() }
+    await exited
+  }
+
+  const update = r.stopPoolSlotsOnEngine('vulkan') // stopEngineUsers, before an engine update replaces its files
+  assert.deepEqual([...r.poolEngineIds()], ['vulkan'], 'still exiting')
+  await comfyPoolStopper(r)
+  assert.deepEqual(stops, [undefined, true])
+  await update
+  assert.deepEqual([...r.poolEngineIds()], [])
+})
+
+test('a slot loading over the LRU model it evicted counts on both engines, and for both models', async () => {
+  // keepN 2: the primary runs model-p; slot A runs model-a on LiteRT-LM and is LRU. A request for model-b (on the
+  // active engine 'eng1') evicts slot A, whose load then waits for the global load gate while model-a still runs.
+  const a = slotProcess('model-a', 'litert')
+  let enterGate: (() => void) | undefined
+  const gate = new Promise<void>((res) => { enterGate = res })
+  let loadCalled = false
+  ;(a.manager as unknown as { load: () => Promise<void> }).load = async () => {
+    loadCalled = true
+    await gate // Manager.runExclusive: another load holds the gate
+  }
+  const entry = fakeEntry('model-b')
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as ConfigStore
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, fakeManager('running', 'model-p'), scanner, undefined)
+  ;(r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots = new Map([
+    ['model-a', { manager: a.manager, modelKey: 'model-a', lastUsedMs: 0 }],
+  ])
+  ;(r as unknown as { primaryLastUsed: number }).primaryLastUsed = Date.now()
+
+  const routed = r.route('model-b')
+  while (!loadCalled) await tick()
+
+  assert.deepEqual([...r.poolEngineIds()].sort(), ['eng1', 'litert'])
+  assert.equal(r.poolSlotsOnEngine('litert'), 1)
+  assert.equal(r.poolSlotsOnEngine('eng1'), 1)
+  assert.deepEqual([...r.loadedModelKeys()].sort(), ['model-a', 'model-b', 'model-p'])
+
+  // An update or delete of LiteRT-LM (stopEngineUsers) stops the process still running on it.
+  await r.stopPoolSlotsOnEngine('litert')
+  assert.deepEqual(a.stops, [undefined])
+  enterGate?.()
+  await routed
+})
+
+test('a model waiting to load into a new pool slot is loaded for the delete guard and the Models page', async () => {
+  let state = 'stopped' as Status['state']
+  let enterGate: (() => void) | undefined
+  const gate = new Promise<void>((res) => { enterGate = res })
+  let loadCalled = false
+  const slot = {
+    status: (): Status => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => null,
+    target: () => null,
+    load: async () => { loadCalled = true; await gate; state = 'error' },
+  } as unknown as Manager
+  const entry = fakeEntry('model-b')
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as ConfigStore
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, fakeManager('running', 'model-p'), scanner, undefined, undefined, () => slot)
+
+  const routed = r.route('model-b')
+  while (!loadCalled) await tick()
+  assert.equal(r.loadedModelKeys().has('model-b'), true, 'DELETE /models/model-b must be refused mid-load')
+
+  enterGate?.()
+  await routed
+  assert.equal(r.loadedModelKeys().has('model-b'), false, 'a failed load is no longer reported')
 })
