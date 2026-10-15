@@ -421,21 +421,89 @@ test('a loopback request with a foreign Host header is judged like a LAN request
     assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: host } })).status, 200, host)
     assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), true, host)
   }
-  // ...and so does the exact address the daemon is bound to.
-  d.bindHost = '0.0.0.0'
-  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: '0.0.0.0:6996' } })).status, 200)
+  // ...and so does the exact name the daemon is bound to (`daemon.host` / `--addr`).
+  d.bindHost = 'mybox.lan'
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: 'mybox.lan:6996' } })).status, 200)
+})
+
+// A browser sends no Fetch Metadata to a URL that is not "potentially trustworthy", and
+// http://0.0.0.0 (or [::]) is one that still lands on this machine's loopback. So is an
+// IPv4-mapped literal such as http://[::ffff:127.0.0.1] (only 127/8 and ::1 are trustworthy). A
+// page on any site can target them, and the request is indistinguishable from the UI's. The box's
+// own clients use 127.0.0.1 / localhost (the banner, the browser it opens, every snippet).
+test('an unspecified or IPv4-mapped address in Host (0.0.0.0, [::], [::ffff:127.0.0.1]) gets no loopback trust', async () => {
+  const { d } = makeDeps(() => {})
+  const app = buildApp(d)
+  for (const bindHost of [undefined, '0.0.0.0']) {
+    d.bindHost = bindHost
+    for (const host of [
+      '0.0.0.0:6996', '0.0.0.0', '0.1.2.3:6996', '[::]:6996', '[::ffff:0:0]:6996', '[0::0]',
+      // How a browser writes http://[::ffff:127.0.0.1]/, and other spellings of the same address.
+      '[::ffff:7f00:1]:6996', '[::ffff:127.0.0.1]:6996', '[0:0:0:0:0:ffff:7f00:1]:6996', '[::FFFF:7F00:1]',
+    ]) {
+      assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: host } })).status, 401, `${host} (bound ${bindHost})`)
+      assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), false, host)
+    }
+    assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: '127.0.0.1:6996' } })).status, 200)
+  }
+})
+
+// Sec-Fetch-Site is absent for such a target and in older browsers, but every current browser
+// attaches Origin to a non-GET request: compare it with the Host the request was sent to.
+test('without Fetch Metadata, a write whose Origin is another site is refused', async () => {
+  const { d } = makeDeps(() => {})
+  const app = buildApp(d)
+  const post = (headers: Record<string, string>) =>
+    loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers: { 'Content-Type': 'text/plain', ...headers }, body: '{}' })
+  for (const origin of ['https://evil.example', 'http://127.0.0.1:7777', 'null']) {
+    assert.equal((await post({ Host: '127.0.0.1:6996', Origin: origin })).status, 403, origin)
+  }
+  // A plain-http reverse proxy that rewrites Host trips this too: the refusal says what to fix.
+  const proxied = await post({ Host: '127.0.0.1:6996', Origin: 'http://mybox.lan' })
+  assert.match(((await proxied.json()) as { error: { message: string } }).error.message, /reverse proxy.*Host header/)
+  // Same-origin UI writes (whatever name the UI was opened under), and CLIs (no Origin) still work.
+  for (const [host, origin] of [
+    ['127.0.0.1:6996', 'http://127.0.0.1:6996'],
+    ['localhost:6996', 'http://LOCALHOST:6996'],
+    ['[::1]:6996', 'http://[::1]:6996'],
+    ['127.0.0.1', 'http://127.0.0.1:80'],
+  ]) {
+    assert.equal((await post({ Host: host, Origin: origin })).status, 200, origin)
+  }
+  assert.equal((await post({ Host: '127.0.0.1:6996' })).status, 200, 'CLI / SDK')
+  // When Fetch Metadata IS present it decides, as before (Vite's dev proxy forwards Origin as-is).
+  assert.equal((await post({ Host: '127.0.0.1:6996', Origin: 'http://localhost:5173', 'Sec-Fetch-Site': 'same-origin' })).status, 200)
+})
+
+// `.internal` has no public zone, but whoever controls the victim's resolver (a hostile
+// Wi-Fi, a compromised router) can answer for any name in it and rebind it to 127.0.0.1. Only the
+// names container runtimes give the host are needed.
+test('only the container-runtime host names are trusted, not every .internal name', async () => {
+  const { d } = makeDeps(() => {})
+  const app = buildApp(d)
+  for (const host of [
+    'host.docker.internal:6996', 'gateway.docker.internal', 'host.containers.internal:6996', 'host.lima.internal:6996',
+    'host.orb.internal:6996', 'host.rancher-desktop.internal', 'HOST.DOCKER.INTERNAL.',
+  ]) {
+    assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: host } })).status, 200, host)
+  }
+  for (const host of ['rebind.internal:6996', 'evil.corp.internal', 'docker.internal', 'x.host.docker.internal', 'internal']) {
+    assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: host } })).status, 401, host)
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), false, host)
+  }
 })
 
 // Docker Desktop delivers a container's `host.docker.internal` connection on the host's own
-// loopback, which is how Open WebUI (README) reaches a default, loopback-bound daemon. Neither a
-// `.internal` name (no public zone) nor an IP literal (nothing to re-resolve) can be rebound.
+// loopback, which is how Open WebUI (README) reaches a default, loopback-bound daemon. An IP
+// literal has nothing to re-resolve, so it can't be rebound (the IPv4-mapped ones are refused
+// for another reason, see the IPv4-mapped Host test above).
 test('a loopback request whose Host is a .internal name or an IP literal keeps loopback trust', async () => {
   const { d } = makeDeps(() => {}) // loopback-only bind, requireApiKey on (the defaults)
   const app = buildApp(d)
   assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: 'host.docker.internal:6996' } })).status, 200)
   for (const host of [
     'host.docker.internal', 'gateway.docker.internal:6996', 'host.containers.internal:6996',
-    '192.168.1.20:6996', '10.0.0.5', '[fe80::1]:6996', '[2001:db8::7]', '[::ffff:7f00:1]:6996',
+    '192.168.1.20:6996', '10.0.0.5', '[fe80::1]:6996', '[2001:db8::7]',
   ]) {
     assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: host } })).status, 200, host)
     assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), true, host)

@@ -148,21 +148,57 @@ export function isLanExposed(d: Deps): boolean {
  *  in browsers and has no public zone, so no attacker can serve a page under it. An absent Host
  *  (HTTP/1.0, Node test harnesses) passes: every browser sends one.
  *
- *  Also passed, because none of them can be rebound: `*.internal` (reserved for private use, no
- *  public zone) — Docker Desktop's `host.docker.internal` reaches a loopback-bound daemon over
- *  the host's own loopback, which is how a containerised client such as Open WebUI talks to
- *  it — and any IP literal: rebinding needs a DNS name to re-resolve, and a page served from an
- *  IP is same-origin only with that IP, never with 127.0.0.1. */
+ *  Also passed: the names container runtimes give the host ({@link CONTAINER_HOST_NAMES}) and any
+ *  IP literal: rebinding needs a DNS name to re-resolve, and a page served from an IP is
+ *  same-origin only with that IP, never with 127.0.0.1. Except the unspecified address
+ *  (`0.0.0.0`, `[::]`) and the IPv4-mapped ones (`[::ffff:127.0.0.1]`, which a browser writes
+ *  `[::ffff:7f00:1]`): they reach this machine's loopback (the unspecified one on Linux and
+ *  macOS), but only 127/8 and `[::1]` are "potentially trustworthy" URLs, so browsers send no
+ *  Fetch Metadata to these, and a page on any site that targets them looks exactly like the UI
+ *  (lanAuth's cross-site check can't see it on a GET). The daemon's own clients never use them:
+ *  the banner, the browser it opens and the snippets say 127.0.0.1 (or the LAN address). */
 function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
   if (!host) return true
-  const h = host.trim().toLowerCase()
-  // Drop the port: `[v6]:port` keeps its brackets, `name:port` loses everything after the colon.
-  const name = (h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '')).replace(/\.$/, '')
+  const name = hostHeaderName(host)
+  if (/^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name)) return false // 0/8, as tools/security.ts treats it
+  if (name.startsWith('[')) {
+    // Any spelling of [::] or of an IPv4-mapped address: the URL parser writes both one way.
+    let v6 = name
+    try {
+      v6 = new URL(`http://${name}`).hostname
+    } catch {
+      // Not an IPv6 literal; judged below like any other name.
+    }
+    if (v6 === '[::]' || v6.startsWith('[::ffff:')) return false
+  }
   if (isLoopbackBindHost(name) || name.endsWith('.localhost')) return true
-  if (name.endsWith('.internal')) return true
+  if (CONTAINER_HOST_NAMES.has(name)) return true
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name) || /^\[[0-9a-f:.]*:[0-9a-f:.]*\]$/.test(name)) return true
   const unbracket = (s: string) => s.replace(/^\[|\]$/g, '')
   return d.bindHost !== undefined && unbracket(name) === unbracket(d.bindHost.trim().toLowerCase())
+}
+
+/** The names container runtimes give the host, whose connections arrive on the host's own
+ *  loopback, so a containerised client such as Open WebUI reaches a loopback-bound daemon through
+ *  them: Docker Desktop (and Colima, OrbStack, Rancher Desktop) `host.docker.internal` /
+ *  `gateway.docker.internal`, Podman `host.containers.internal`, Lima `host.lima.internal`,
+ *  OrbStack's own `host.orb.internal`, Rancher Desktop's own `host.rancher-desktop.internal`.
+ *  Exactly these, not every `*.internal`: the zone has no public DNS, but whoever answers the
+ *  victim's DNS queries (a hostile Wi-Fi or router) can answer for any name in it and rebind it. */
+const CONTAINER_HOST_NAMES = new Set([
+  'host.docker.internal',
+  'gateway.docker.internal',
+  'host.containers.internal',
+  'host.lima.internal',
+  'host.orb.internal',
+  'host.rancher-desktop.internal',
+])
+
+/** The name a Host header carries: lowercased, the port and a trailing dot dropped. `[v6]:port`
+ *  keeps its brackets, `name:port` loses everything after the colon. */
+function hostHeaderName(host: string): string {
+  const h = host.trim().toLowerCase()
+  return (h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.replace(/:\d*$/, '')).replace(/\.$/, '')
 }
 
 /** The cookie and header that carry {@link appSecretPresented}'s secret. */
@@ -670,6 +706,28 @@ export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boole
   return verifyKeyValue(presentedKey(c), d, opts)
 }
 
+/** Did a browser send this request from another site? Fetch Metadata says so when present, but a
+ *  browser sends it only to a "potentially trustworthy" URL (https, 127.0.0.1, localhost) and
+ *  older ones not at all. Without it, the Origin header, which every current browser attaches
+ *  to a non-GET request, is compared with the Host the request was sent to: "null" (a
+ *  sandboxed frame, a file: page) or another host:port is another site. Neither header (a CLI
+ *  or SDK, or a plain GET) is not a cross-site browser request. Behind a reverse proxy on plain
+ *  http that rewrites Host (nginx's default sends `Host: 127.0.0.1`), the UI's own writes look
+ *  exactly like that attack and are refused: such a proxy must pass the browser's Host through. */
+function isCrossSite(c: Context): boolean {
+  const site = c.req.header('sec-fetch-site')
+  if (site) return site !== 'same-origin' && site !== 'none'
+  const origin = c.req.header('origin')
+  const host = c.req.header('host')
+  if (!origin || !host) return false
+  try {
+    const o = new URL(origin)
+    return o.host !== new URL(`${o.protocol}//${host.trim()}`).host
+  } catch {
+    return true
+  }
+}
+
 /** LAN auth middleware (spec 06 §5). Register AFTER cors + the Server header and
  *  BEFORE the API/chat/gateway routes. LAN peers need a key once the daemon is
  *  LAN-exposed (see isLanExposed) and requireApiKey is on (the default). The default
@@ -687,14 +745,14 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // Cross-site writes. A "simple" POST (text/plain, form) needs no CORS preflight, so the
     // /api/* origin allowlist stops a hostile page from READING the answer but not the request
     // from running, and the loopback trust below would wave it straight into the local-admin
-    // routes. Same rule as the engine-zip upload guard (routes.ts): refuse anything a browser
-    // marks as coming from another site. The app's own UI is same-origin, and CLIs/SDKs send
-    // no Sec-Fetch-Site at all.
-    if (c.req.path.startsWith('/api/') && c.req.method !== 'GET' && c.req.method !== 'HEAD' && c.req.method !== 'OPTIONS') {
-      const site = c.req.header('sec-fetch-site')
-      if (site && site !== 'same-origin' && site !== 'none') {
-        return c.json({ error: { code: 'forbidden', message: 'Cross-site request refused.' } }, 403)
-      }
+    // routes. Refuse anything a browser marks as coming from another site (see isCrossSite; the
+    // engine-zip upload guard in routes.ts applies the Fetch Metadata half of this). The app's
+    // own UI is same-origin, and CLIs/SDKs send neither Sec-Fetch-Site nor Origin.
+    const write = c.req.method !== 'GET' && c.req.method !== 'HEAD' && c.req.method !== 'OPTIONS'
+    if (c.req.path.startsWith('/api/') && write && isCrossSite(c)) {
+      // Refused on Origin alone (no Fetch Metadata): what a plain-http proxy that rewrites Host looks like.
+      const hint = c.req.header('sec-fetch-site') ? '' : " Behind a reverse proxy, have it pass the browser's Host header through."
+      return c.json({ error: { code: 'forbidden', message: `Cross-site request refused.${hint}` } }, 403)
     }
 
     const daemon = d.store.snapshot().daemon
