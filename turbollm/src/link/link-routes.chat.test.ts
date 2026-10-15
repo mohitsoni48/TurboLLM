@@ -151,6 +151,49 @@ test('a token without models:use at all is 403 from requireCapability', async ()
   assert.deepEqual(h.routed, [])
 })
 
+// ── A request whose caller on the peer may not load models (link-proxy.ts LINK_NO_LOAD_HEADER) ──────────────────
+// The link may hold models:load or models:wake; the person behind this request may not. The peer checks its catalog
+// first, but that can be a refresh behind an owner's switch, so the façade decides on its live state: the request is
+// served only what is loaded, like a models:use-only link.
+
+function postNoLoad(d: Deps, token: string, model: string) {
+  return app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': token, 'content-type': 'application/json', 'X-TurboLLM-Link-No-Load': '1' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+  })
+}
+
+for (const caps of [['models:use', 'models:load'], ['models:use', 'models:wake']]) {
+  test(`a no-load request on a ${caps[1]} link is model_not_loaded for a COLD model, and never swaps`, async () => {
+    const { d, h } = mkDeps([key('tllm-a', caps)])
+    const res = await postNoLoad(d, 'tllm-a', COLD)
+    assert.equal(res.status, 503)
+    assert.equal(await errorCode(res), 'model_not_loaded')
+    assert.deepEqual(h.routed, [], 'the request never reached the router')
+  })
+}
+
+// The peer refuses the same request itself when its catalog is current (model-router.ts resolveRemote): with
+// x-should-retry: false and gatewayV1Handler's typed body. The façade's refusal must read the same, or a client retries
+// (and, on /v1/messages, reads an overloaded host) only because the peer's catalog was a refresh behind.
+test('a no-load refusal says a retry cannot help, typed like the gateway refusal the peer gives', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use', 'models:load'])])
+  const res = await postNoLoad(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), 'false')
+  const error = ((await res.json()) as { error?: { type?: string; code?: string } }).error
+  assert.equal(error?.type, 'model_not_loaded')
+  assert.equal(error?.code, 'model_not_loaded')
+})
+
+test('a no-load request is still served the model that IS loaded', async () => {
+  const { d, h } = mkDeps([key('tllm-a', ['models:use', 'models:load'])])
+  const res = await postNoLoad(d, 'tllm-a', LOADED)
+  assert.equal(res.status, 200)
+  assert.deepEqual(h.routed, [LOADED])
+})
+
 test("a peer's own request does NOT count as the owner's local activity", async () => {
   // Otherwise one peer's chat would block the next wake for the whole idle grace window.
   const { d } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])])

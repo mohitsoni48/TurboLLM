@@ -23,6 +23,7 @@ import { SINGLE_FILE_MODEL_RE } from '../downloads/downloads'
 import { allowsModel, hasCapability } from './capabilities'
 import { applyScopedPatch, scrubConfigForRead } from './config-scope'
 import { canWake, hostIdleState } from './host-idle'
+import { LINK_NO_LOAD_HEADER } from './link-proxy'
 import { FALLBACK_MACHINE_NAME, sanitizeMachineName } from './machine-name'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, redactDownload, type HelloResponse } from './types'
@@ -524,6 +525,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     // past the gate and reach the swap machinery anyway.
     const loaded = d.manager.status().model?.key ?? null
     if (requested && requested !== loaded) {
+      // The peer marks a request whose own caller may not load models (link-proxy.ts
+      // LINK_NO_LOAD_HEADER). The link may hold models:load or models:wake, but this request
+      // gets what a link holding neither gets, decided here on the live state: the peer's own
+      // check reads its catalog, which can be a refresh behind an owner's switch. Refused as
+      // that check refuses it: final (a retry is refused the same way), and with the type
+      // gatewayV1Handler gives a route refusal.
+      if (c.req.header(LINK_NO_LOAD_HEADER) !== undefined) {
+        c.header('x-should-retry', 'false')
+        return c.json(
+          {
+            error: {
+              code: 'model_not_loaded',
+              type: 'model_not_loaded',
+              message:
+                `'${requested}' is not loaded on this machine, and the access token ` +
+                `this request came with may not load models.`,
+            },
+          },
+          503,
+        )
+      }
       if (hasCapability(key, 'models:load')) {
         // Unconditional by design: models:load IS the "you may take the machine" grant.
         // Fall through to the normal auto-swap path.

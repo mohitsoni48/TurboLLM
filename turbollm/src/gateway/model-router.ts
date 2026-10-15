@@ -22,7 +22,7 @@ export type RouteResult =
       /** Present only for a Turbo Link remote model. The gateway uses this to build the
        *  upstream URL and to present the LINK token instead of the caller's credential.
        *  Absent = an ordinary local engine target, unchanged. */
-      remote?: { linkId: string; baseUrl: string; token: string; modelKey: string }
+      remote?: { linkId: string; baseUrl: string; token: string; modelKey: string; noLoad?: true }
       /** The engine serving `target` when it is an extra pool slot, read from that slot's manager: a `.litertlm` model
        *  there runs on LiteRT-LM whatever the primary runs. The gateway shapes the outbound request (model alias or path,
        *  token-limit key) and labels the reply from these; absent (the primary, remote) it reads the primary, as before. */
@@ -649,9 +649,27 @@ export class ModelRouter {
     if (!model) {
       return { status: 503, message: `'${parsed.machine}' does not have a model '${parsed.model}'.` }
     }
+    // A caller that may not load models (auth.ts modelLoadsRefused) gets a linked machine's model only while it is
+    // already loaded there, as it does locally. The request goes out with THIS daemon's link token, so a link granted
+    // models:load would otherwise have the host swap models for a caller this machine never let load one. `loaded` is
+    // what the host reported on the last catalog refresh (true while its engine runs or starts the model), so this
+    // refuses early and covers a host too old to read the marker below. The host itself decides on its live state:
+    // `noLoad` puts the marker on the request (link-proxy.ts linkHeaders) and on every later request built from this
+    // target, such as the tool rounds of an in-app chat turn.
+    const noLoad = modelLoadsRefused()
+    if (!model.loaded && noLoad) {
+      return {
+        status: 503,
+        message: `'${parsed.machine}/${model.key}' is not loaded, and this access token may not load models.`,
+        permanent: true,
+      }
+    }
     return {
       target: link.baseUrl,
-      remote: { linkId: link.id, baseUrl: link.baseUrl, token: link.token, modelKey: model.key },
+      remote: {
+        linkId: link.id, baseUrl: link.baseUrl, token: link.token, modelKey: model.key,
+        ...(noLoad ? { noLoad: true as const } : {}),
+      },
     }
   }
 
