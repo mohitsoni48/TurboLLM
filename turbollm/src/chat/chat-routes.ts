@@ -455,7 +455,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // role === 'user': edit-and-resend now BRANCHES instead of destroying the downstream
     // history (GitHub #52) — the old message and everything after it is frozen, not deleted,
     // the same way /regenerate keeps a deactivated reply instead of deleting it.
-    if (trimmed === msg.content) return c.json({ messages: db.getMessages(convId) }) // no-op
+    // Unchanged text branches too: the client follows every user-message edit with /continue
+    // ("Save & Resend"), and an early return here let that answer the same turn a second time —
+    // two replies in a row, which Regenerate can't undo and alternating-role templates reject.
     db.freezeTail(convId, msg.seq, msg.id)
     db.deactivateMessage(msg.id)
     const variantGroup = db.getMessage(msg.id)!.variantGroup!

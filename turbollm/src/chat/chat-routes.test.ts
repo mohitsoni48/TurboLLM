@@ -520,6 +520,42 @@ test('the same holds for an edited question: regenerating its restored reply, th
   }
 })
 
+// "Save & Resend" with the question left as it was: the PUT returned early for unchanged text, so
+// the client's /continue answered the same turn a second time — two replies in a row that
+// Regenerate could not undo, and a history that alternating-role templates (Gemma) reject.
+test('Save & Resend with unchanged text branches like any edit: one reply per turn, the first one kept', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'a1 resent', 'a1 regenerated', 'a2']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+
+    await (await h.app.request(`${base}/messages`, json({ content: 'u1' }))).text()
+    const u1 = h.store.getMessages(conv.id)[0].id
+    const put = await h.app.request(`${base}/messages/${u1}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'u1' }) })
+    assert.equal(put.status, 200)
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(active(), ['u1', 'a1 resent'])
+    assert.deepEqual(engine.bodies[1].messages, [{ role: 'user', content: 'u1' }])
+
+    // Regenerate replaces that reply instead of stacking another, and the next turn alternates.
+    await h.app.request(`${base}/regenerate`, { method: 'POST' })
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(active(), ['u1', 'a1 regenerated'])
+    await (await h.app.request(`${base}/messages`, json({ content: 'u2' }))).text()
+    assert.deepEqual(engine.bodies[3].messages.map((m) => m.role), ['user', 'assistant', 'user'])
+
+    // The first reply is kept, as the other version of the question.
+    assert.equal((await h.app.request(`${base}/messages/${u1}/activate`, { method: 'POST' })).status, 200)
+    assert.deepEqual(active(), ['u1', 'a1'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()
