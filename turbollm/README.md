@@ -615,7 +615,11 @@ untouched:
 turbollm --addr 0.0.0.0:6996    # bind all interfaces, then open http://<your-ip>:6996
 ```
 
-Turn on **Require API key** in Settings → Network & sharing when you expose it.
+Other devices need an API key: it is required by default on any address other than loopback.
+On the first such start with no key yet, one is generated and printed once in the startup
+banner; otherwise create one under **Developer → API keys** on the host machine. Paste it when
+the other device asks. To let any device on your network in without a key, turn on **Expose on
+local network (LAN)** in Settings → Network & sharing, then turn **Require an API key** off there.
 
 ---
 
