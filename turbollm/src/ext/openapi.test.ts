@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { rmSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Hono } from 'hono'
 import { EXT_ROUTES, buildOpenApiDocument } from './openapi.js'
 import { registerExtChatRoutes } from './routes.chats.js'
@@ -90,6 +92,38 @@ test('every route without a request body documents owner as an optional query pa
     assert.equal(owner!.in, 'query')
     assert.equal(owner!.required, false, "owner defaults to 'default' server-side, so it must not be required")
   }
+})
+
+// The document used to declare no query parameter but `owner`, so pagination (cursor/limit),
+// search (q), include=, the audit window (limit/since/before) and the stream's resume cursor
+// (after) were invisible to any client generated from it. Hono handlers carry no inspectable
+// schema, so this reads the route files themselves: each `app.<verb>(`${BASE}<path>`` handler's
+// `c.req.query('<name>')` calls (up to the next registration) must be exactly the query
+// parameters documented for that route.
+test('every query parameter a route handler reads is documented on that route, and nothing else', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const here = dirname(fileURLToPath(import.meta.url))
+  const read = new Map<string, Set<string>>()
+  for (const file of ['routes.chats.ts', 'routes.runs.ts']) {
+    const src = readFileSync(join(here, file), 'utf8')
+    const regs = [...src.matchAll(/app\.(get|post|patch|delete)\(`\$\{BASE\}([^`]*)`/g)]
+    regs.forEach((m, i) => {
+      const body = src.slice(m.index, regs[i + 1]?.index ?? src.length)
+      read.set(`${m[1].toUpperCase()} ${m[2]}`, new Set([...body.matchAll(/c\.req\.query\('([^']+)'\)/g)].map((q) => q[1])))
+    })
+  }
+  for (const r of EXT_ROUTES) {
+    if (r.path === '/openapi.json') continue // mount.ts; reads nothing
+    const key = `${r.method} ${r.path}`
+    const handlerReads = read.get(key)
+    assert.ok(handlerReads, `no handler found for ${key}`)
+    const op = doc.paths[`/api/ext/v1${r.path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`][r.method.toLowerCase()] as {
+      parameters?: Array<{ name: string; in: string }>
+    }
+    const documented = (op.parameters ?? []).filter((p) => p.in === 'query').map((p) => p.name).sort()
+    assert.deepEqual(documented, [...handlerReads].sort(), `query parameters of ${key}`)
+  }
+  assert.ok(read.get('GET /chats')?.has('cursor'), 'the scan itself works')
 })
 
 test('every documented error type is one of the nine frozen types', () => {

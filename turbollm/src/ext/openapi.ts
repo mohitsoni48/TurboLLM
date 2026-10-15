@@ -54,6 +54,10 @@ export interface RouteSpec {
    *  inference function, so the NEXT route that doesn't fit the convention fails loudly (a
    *  missing successStatus falls back to the wrong default) instead of silently drifting again. */
   successStatus?: string
+  /** Query parameters the handler reads, other than `owner` (derived separately — see
+   *  NO_OWNER_PARAM_PATHS). openapi.test.ts scans the route files' `c.req.query(...)` calls and
+   *  fails when a route reads one this list does not name, or names one it never reads. */
+  query?: QueryParam[]
   /** Error `type`s this route can answer with, each documented at that type's usual status
    *  (`errorResponses`). `type:status` documents a type a route sends with a different status
    *  — e.g. `auth:403` (insufficient_scope / tenant_not_supported, auth.ts) next to the plain
@@ -77,6 +81,20 @@ const STORE_WRITE_ERRORS = [...WRITE_ERRORS, 'unsupported']
 // refusal is `engine` sent as 409 context_overflow (routes.runs.ts), never the type's 502.
 const BODY_CAP_ERRORS = ['invalid_request:413']
 
+export interface QueryParam {
+  name: string
+  description: string
+  /** Defaults to 'string'. */
+  type?: 'string' | 'integer'
+}
+// The chat store's cursor pagination (sqlite-chat-store.ts's clampLimit) and dto.ts's include=.
+const CURSOR_PARAM: QueryParam = { name: 'cursor', description: "Opaque cursor: the previous page's `next_cursor`. Omit for the first page." }
+const LIMIT_PARAM: QueryParam = { name: 'limit', type: 'integer', description: 'Page size. The built-in store takes 1-200 (larger values are clamped to 200) and defaults to 50; a configured store adapter applies its own bounds.' }
+const INCLUDE_PARAM: QueryParam = {
+  name: 'include',
+  description: 'Comma-separated heavy fields to return on each message: reasoning, attachments, tool_calls, usage, metadata. Omitted fields are left out of the response.',
+}
+
 export const EXT_ROUTES: RouteSpec[] = [
   // ── routes.chats.ts ───────────────────────────────────────────────────────────────────────
   {
@@ -90,6 +108,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     method: 'GET', path: '/chats',
     summary: 'List chats, cursor-paginated.',
     scope: 'chats:read', responseSchema: 'ChatPage', errors: STORE_READ_ERRORS,
+    query: [CURSOR_PARAM, LIMIT_PARAM, { name: 'q', description: 'Search text. The built-in store matches it as a substring of chat titles (message content is not searched); a configured store adapter applies its own matching. Honoured only when GET /capabilities reports `search: true`.' }],
   },
   {
     method: 'POST', path: '/chats',
@@ -117,6 +136,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     method: 'GET', path: '/chats/:id/messages',
     summary: 'List messages in a chat, cursor-paginated.',
     scope: 'chats:read', responseSchema: 'MessagePage', errors: STORE_READ_ERRORS,
+    query: [CURSOR_PARAM, LIMIT_PARAM, INCLUDE_PARAM],
   },
   {
     method: 'POST', path: '/chats/:id/messages',
@@ -134,17 +154,21 @@ export const EXT_ROUTES: RouteSpec[] = [
       description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON) or an SSE stream, per Accept (spec §5.1).',
     },
     errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
+    // Read only on the generate:false path, which answers with a Message.
+    query: [{ ...INCLUDE_PARAM, description: `generate:false only. ${INCLUDE_PARAM.description}` }],
   },
   {
     method: 'GET', path: '/messages/:id',
     summary: 'Fetch one message.',
     scope: 'chats:read', responseSchema: 'Message', errors: STORE_READ_ERRORS,
+    query: [INCLUDE_PARAM],
   },
   {
     method: 'PATCH', path: '/messages/:id',
     summary: 'Edit message content.',
     scope: 'chats:write', audited: 'message.update',
     requestSchema: 'MessagePatch', responseSchema: 'Message', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS],
+    query: [INCLUDE_PARAM],
   },
   {
     method: 'DELETE', path: '/messages/:id',
@@ -155,6 +179,11 @@ export const EXT_ROUTES: RouteSpec[] = [
     method: 'GET', path: '/audit',
     summary: "The tenant's own audit trail of mutations.",
     scope: 'chats:read', responseSchema: 'AuditPage', errors: CHAT_ERRORS,
+    query: [
+      { name: 'limit', type: 'integer', description: 'Page size, a positive integer (larger values are clamped to 200). Default 200.' },
+      { name: 'since', description: 'ISO timestamp: only rows at or after it.' },
+      { name: 'before', description: 'The `id` of the oldest row a previous page returned: only rows older than it.' },
+    ],
   },
 
   // ── routes.runs.ts ────────────────────────────────────────────────────────────────────────
@@ -179,6 +208,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     method: 'GET', path: '/runs/:id/stream',
     summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it to replay from the first frame.",
     scope: 'chats:read', sse: true, errors: [...CHAT_ERRORS, 'conflict'],
+    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit to replay from the first frame.' }],
   },
   {
     method: 'POST', path: '/runs/:id/cancel',
@@ -561,7 +591,10 @@ function buildOperation(route: RouteSpec): JsonSchema {
   const ownerParam = (!route.requestSchema && !NO_OWNER_PARAM_PATHS.has(route.path))
     ? [{ name: 'owner', in: 'query', required: false, schema: { type: 'string' }, description: "The integrator's end user. Defaults to 'default'." }]
     : []
-  const parameters = [...pathParams, ...ownerParam]
+  const queryParams = (route.query ?? []).map((q) => ({
+    name: q.name, in: 'query', required: false, schema: { type: q.type ?? 'string' }, description: q.description,
+  }))
+  const parameters = [...pathParams, ...ownerParam, ...queryParams]
 
   const operation: JsonSchema = {
     operationId: operationIdFor(route),
