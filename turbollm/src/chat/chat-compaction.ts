@@ -120,7 +120,8 @@ export function resolveCompactionCut(
  *  as uncompacted — every active message is replayed. Only this call's copy is cleared; the
  *  stored fields are untouched, so switching back to that branch applies the summary again
  *  (unless a compaction on this branch has replaced it — compaction never deletes a message,
- *  so that branch is then simply replayed uncompacted). */
+ *  so that branch is then replayed in full, which can exceed the context: maybeAutoCompact
+ *  judges it by that full size, not by a reading taken under its replaced summary). */
 export function setAsideFrozenCut(db: Pick<ConversationStore, 'getMessage'>, conv: Conversation): Conversation {
   if (!conv.compactionUpToMessageId || db.getMessage(conv.compactionUpToMessageId)?.isActive !== false) return conv
   return { ...conv, compactionSummary: undefined, compactionUpToMessageId: undefined, compactionTokensBefore: undefined }
@@ -417,17 +418,28 @@ export async function maybeAutoCompact(
   fetchImpl?: typeof fetch,
 ): Promise<void> {
   const messages = conv.messages ?? []
-  const { ctxUsed, ctxMax } = lastCtxUsage(messages)
+  const measured = lastMeasuredReply(messages)
+  const compactedSinceReading = !!conv.compactionAppliedAt && !!measured && conv.compactionAppliedAt > measured.createdAt
+  const shown = setAsideFrozenCut(d.db, conv)
+  let { ctxUsed, ctxMax } = lastCtxUsage(messages)
+  // A newer compaction set aside for this branch was stored over whatever compaction this
+  // reading was taken under: this branch's own (replaced by another branch's) or one it shared.
+  // Either way the branch is now replayed in full, which can be several times the reading, and
+  // a turn the engine refuses records no new one, so the reading alone never opens the gate.
+  // The estimated size of that full history is a floor the reading must not undercut.
+  if (compactedSinceReading && shown !== conv) {
+    ctxUsed = Math.max(ctxUsed, estimateTokens(buildEngineMessages(shown, messages) as Array<{ role: string; content: string }>))
+  }
   if (!shouldAutoCompact(ctxUsed, ctxMax)) return
   // ctxUsed is a measurement compaction never rewrites. A compaction applied after that reply
   // was measured (typically a manual Compact) has already acted on this reading — compacting
   // again would summarize the very tail it chose to keep. Same comparison as the context
   // meter's compactionIsNewerThanMeasurement (ChatScreen.tsx). Not when that compaction is set
-  // aside for this branch (setAsideFrozenCut): it acts on nothing here, so the reading stands.
+  // aside for this branch (setAsideFrozenCut): it acts on nothing here, so the gate above (the
+  // reading, raised to the full history's estimate) decides.
   // Known, accepted cost: `createdAt` is a reply's turn START, so after an auto-compaction INSIDE
   // a turn, that turn's (post-compaction) reading is skipped too — at most a one-turn delay.
-  const measured = lastMeasuredReply(messages)
-  if (conv.compactionAppliedAt && measured && conv.compactionAppliedAt > measured.createdAt && setAsideFrozenCut(d.db, conv) === conv) return
+  if (compactedSinceReading && shown === conv) return
   try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
   try {
     // The caller's snapshot, never a re-read — see compactConversation's `activeMessages`.

@@ -938,3 +938,49 @@ test('maybeAutoCompact: a compaction set aside for this branch (frozen cut) does
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+// One compaction per conversation: branch A's was replaced by branch B's, so A is replayed in full,
+// while A's last reading was taken on A's compacted prompt. Gated on that reading alone, A was
+// never compacted again and every turn sent its whole history, well past the context.
+test('maybeAutoCompact: a branch whose own compaction another branch replaced is judged by its full history, not the reading taken under that compaction', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const ctxMax = 8192
+    const conv = db.createConversation({ title: 'T', modelKey: 'm' })
+    const u1 = db.addMessage(conv.id, 'user', 'Write a web scraper in Python')
+    for (let i = 0; i < 29; i++) db.addMessage(conv.id, i % 2 === 0 ? 'assistant' : 'user', `python m${i} ` + 'x'.repeat(1000))
+    const cutA = db.getMessages(conv.id).at(-6)!
+    db.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper.', upToMessageId: cutA.id, tokensBefore: 6000 })
+    await new Promise((r) => setTimeout(r, 5))
+    db.addMessage(conv.id, 'user', 'Add a CLI')
+    db.addMessage(conv.id, 'assistant', 'argparse CLI ...', { stats: { ctxUsed: 2500, ctxMax } }) // measured on A's compacted prompt
+    // Edit the first question (branch B), which compacts on its own, replacing A's compaction...
+    db.freezeTail(conv.id, u1.seq, u1.id)
+    db.deactivateMessage(u1.id)
+    const u1b = db.addMessage(conv.id, 'user', 'Write a web scraper in Go', { variantGroup: db.getMessage(u1.id)!.variantGroup! })
+    const cutB = db.addMessage(conv.id, 'assistant', 'Here is a Go scraper ...')
+    await new Promise((r) => setTimeout(r, 5))
+    db.setConversationCompaction(conv.id, { summary: 'User wants a GO scraper.', upToMessageId: cutB.id, tokensBefore: 500 })
+    // ...then switch back to A (the /activate route's steps).
+    db.freezeTail(conv.id, u1b.seq, u1b.id)
+    db.restoreTail(u1.id)
+    db.setActiveVariant(db.getMessage(u1.id)!.variantGroup!, u1.id)
+
+    const snapshot = db.getConversation(conv.id, true)!
+    assert.equal(snapshot.messages!.length, 32)
+    assert.equal(setAsideFrozenCut(db, snapshot).compactionSummary, undefined, 'A is replayed without any summary')
+    const prompts: string[] = []
+    const events: string[] = []
+    await maybeAutoCompact(fakeDeps(db, ctxMax), conv.id, snapshot, localUpstream(ctxMax), new AbortController().signal, async (p) => { events.push(p) }, recordingFetch(prompts))
+    assert.equal(prompts.length, 1, 'A\'s full history (~9k estimated tokens of an 8192 context) must be compacted')
+    assert.deepEqual(events, ['start', 'end'])
+    assert.ok(!prompts[0].includes('GO scraper'), 'B\'s summary is not folded into A\'s')
+    const after = db.getConversation(conv.id)!.compactionUpToMessageId
+    assert.ok(snapshot.messages!.some((m) => m.id === after), 'the new cut lands on A')
+    assert.ok(snapshot.compactionSummary, 'the turn builds on the fresh compaction')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
