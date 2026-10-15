@@ -11,6 +11,10 @@ import { createServer, type Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { Hono } from 'hono'
 import { registerGateway } from './gateway'
+import { ModelRouter } from './model-router'
+import { lanAuth, provisionRemoteApiKey } from '../auth'
+import { defaultConfig, type Engine } from '../config/config'
+import type { Manager, Status } from '../engines/manager'
 import type { Deps } from '../deps'
 
 const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
@@ -390,12 +394,12 @@ test('POST /v1/chat/completions does not hand TurboLLM\'s own credentials to the
 })
 
 // ── Route failures: every one is a 503, and Claude Code retries any 5xx up to 10 times unless told not to —
-// re-running a model load that fails (evicting whatever was loaded) on every attempt. Only a refusal that clears by
-// itself (ComfyUI's queue) is left retryable. The status codes are unchanged.
+// re-running a model load that fails (evicting whatever was loaded) on every attempt. Only a refusal the router marks
+// permanent says not to; one that clears by itself (ComfyUI's queue) is left retryable. The status codes are unchanged.
 
 for (const [label, result, retry] of [
-  ['a failed model load', { status: 503, message: 'Engine start failed: out of memory' }, 'false'],
-  ['ComfyUI holding the GPU', { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }, null],
+  ['a failed model load', { status: 503, message: 'Engine start failed: out of memory', permanent: true }, 'false'],
+  ['ComfyUI holding the GPU', { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }, null],
 ] as const) {
   for (const [path, body] of [
     ['/v1/messages', { model: 'big', max_tokens: 100, messages: [] }],
@@ -413,6 +417,156 @@ for (const [label, result, retry] of [
       })
       assert.equal(res.status, 503)
       assert.equal(res.headers.get('x-should-retry'), retry)
+    })
+  }
+}
+
+// The same, with the REAL router deciding: an SDK told `x-should-retry: false` gives up at once, so a refusal that
+// clears by itself must not carry it. Auto-swap off answers with whatever the primary holds — nothing while a model is
+// still loading (or while ComfyUI holds the GPU, which unloads it until the render ends) — and a link not probed yet
+// reads 'unknown'. A revoked link stays down until it is re-paired, so that one is still final.
+function realRouterDeps(opts: { primary?: Status['state']; linkStatus?: string }): Deps {
+  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
+  const primary = {
+    status: () => ({ state: opts.primary ?? 'stopped', model: opts.primary === 'starting' ? { key: LIBRARY[0].key } : null }),
+    target: () => null,
+  }
+  const scanner = { list: () => ({ models: LIBRARY }), get: () => undefined }
+  const link = { id: 'l1', name: 'rig', status: opts.linkStatus ?? 'online', baseUrl: 'https://rig.example', token: 't' }
+  const catalog = { linkByName: (n: string) => (n === 'rig' ? link : undefined), modelOn: () => undefined }
+  const router = new ModelRouter(store as never, {} as never, primary as never, scanner as never, undefined, catalog as never)
+  return { ...fakeDeps(), modelRouter: router } as unknown as Deps
+}
+
+for (const [label, deps, model, retry] of [
+  ['a model still loading (auto-swap off)', () => realRouterDeps({ primary: 'starting' }), 'qwen3-8b|Q4|123', null],
+  ['a linked machine not probed yet', () => realRouterDeps({ linkStatus: 'unknown' }), 'rig/Qwen3', null],
+  ['a linked machine that revoked the link', () => realRouterDeps({ linkStatus: 'revoked' }), 'rig/Qwen3', 'false'],
+] as const) {
+  for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
+    test(`${path}: ${label} → 503 with x-should-retry ${retry ?? 'unset'} (real router)`, async () => {
+      const app = new Hono()
+      registerGateway(app, deps())
+      const res = await app.request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, max_tokens: 100, messages: [] }),
+      })
+      assert.equal(res.status, 503, await res.clone().text())
+      assert.equal(res.headers.get('x-should-retry'), retry)
+    })
+  }
+}
+
+// ── A remote-access token without models:load (auth.ts modelLoadsRefused) is answered "not loaded" instead of
+// auto-swapping. That is final for the token only when nothing is bringing the model up: a model still loading (in the
+// primary or into a pool slot), or the one ComfyUI's guard unloaded and reloads when its render ends, is served to the
+// same token seconds later, so an SDK must not be told to give up on it. Composed for real: lanAuth marks the request
+// and the real router decides.
+
+const INGRESS_PORT = 6997
+const MODEL = {
+  key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B', path: '/m/qwen3-8b.gguf', format: 'gguf', quant: 'Q4', nativeCtx: 4096,
+  vision: false, embedding: false, incomplete: false, parseError: null,
+}
+const OTHER = { ...MODEL, key: 'gemma-4b|Q4|456', name: 'Gemma 4B', path: '/m/gemma-4b.gguf' }
+
+function managerIn(state: Status['state'], modelKey?: string, load?: () => Promise<void>) {
+  let current = state
+  return {
+    status: () => ({ state: current, err: null, port: 0, pid: 0, loadElapsedMs: 0, model: modelKey ? { key: modelKey } : null }),
+    target: () => (current === 'running' ? 'http://127.0.0.1:1' : null),
+    load: async () => { await load?.(); current = 'running' },
+    touch: () => {},
+    currentOpts: () => null,
+    generationStart: () => {},
+    generationEnd: () => {},
+  }
+}
+
+function restrictedDeps(opts: {
+  primary: ReturnType<typeof managerIn>
+  keepN?: number
+  slot?: ReturnType<typeof managerIn>
+  comfySuspended?: string | null
+}): { d: Deps; router: ModelRouter; token: string } {
+  const cfg = defaultConfig()
+  cfg.gateway.keepN = opts.keepN ?? 1
+  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/tmp/turbollm-test-data' }
+  const scanner = { list: () => ({ models: [MODEL, OTHER], scanning: false, lastScanAt: '' }), get: () => undefined }
+  const engine = { id: 'llama', kind: 'llama-server', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
+  const registry = { active: () => engine, layaEngine: () => undefined }
+  const comfy = opts.comfySuspended === undefined
+    ? undefined
+    : { isBlocked: () => true, snapshot: () => ({ suspendedModelKey: opts.comfySuspended }) }
+  const router = new ModelRouter(
+    store as never, registry as never, opts.primary as unknown as Manager, scanner as never, comfy as never, undefined,
+    () => (opts.slot ?? managerIn('stopped')) as unknown as Manager,
+  )
+  const d = {
+    ...fakeDeps(),
+    store, scanner, registry, manager: opts.primary, modelRouter: router,
+    remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider },
+  } as unknown as Deps
+  return { d, router, token: provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] }) }
+}
+
+async function askAsRemoteToken(d: Deps, token: string, path: '/v1/messages' | '/v1/chat/completions'): Promise<Response> {
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerGateway(app, d)
+  return app.request(`http://local.test${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-TurboLLM-Auth': token },
+    body: JSON.stringify({ model: MODEL.key, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+  }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+}
+
+for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
+  test(`${path}: a models:use token asking for a model the primary is still loading may retry`, async () => {
+    const { d, token } = restrictedDeps({ primary: managerIn('starting', MODEL.key) })
+    const res = await askAsRemoteToken(d, token, path)
+    assert.equal(res.status, 503)
+    assert.match(await res.text(), /still loading/)
+    assert.equal(res.headers.get('x-should-retry'), null)
+  })
+
+  test(`${path}: a models:use token asking for a model loading into a pool slot may retry`, async () => {
+    let finish!: () => void
+    const slotLoaded = new Promise<void>((r) => { finish = r })
+    const { d, router, token } = restrictedDeps({
+      primary: managerIn('running', OTHER.key), keepN: 2, slot: managerIn('stopped', MODEL.key, () => slotLoaded),
+    })
+    const ownersLoad = router.route(MODEL.key) // an ordinary caller's auto-swap, still loading
+    try {
+      const res = await askAsRemoteToken(d, token, path)
+      assert.equal(res.status, 503)
+      assert.match(await res.text(), /still loading/)
+      assert.equal(res.headers.get('x-should-retry'), null)
+    } finally {
+      finish()
+      await ownersLoad
+    }
+  })
+
+  test(`${path}: a models:use token asking for the model ComfyUI's render unloaded may retry`, async () => {
+    const { d, token } = restrictedDeps({ primary: managerIn('stopped'), comfySuspended: MODEL.key })
+    const res = await askAsRemoteToken(d, token, path)
+    assert.equal(res.status, 503)
+    assert.match(await res.text(), /ComfyUI is rendering/)
+    assert.equal(res.headers.get('x-should-retry'), null)
+  })
+
+  for (const [label, deps] of [
+    ['nothing is loading', () => restrictedDeps({ primary: managerIn('running', OTHER.key) })],
+    ['ComfyUI will reload a different model', () => restrictedDeps({ primary: managerIn('stopped'), comfySuspended: OTHER.key })],
+  ] as const) {
+    test(`${path}: a models:use token asking for a model that is not loaded, when ${label}, is told not to retry`, async () => {
+      const { d, token } = deps()
+      const res = await askAsRemoteToken(d, token, path)
+      assert.equal(res.status, 503)
+      assert.match(await res.text(), /may not load models/)
+      assert.equal(res.headers.get('x-should-retry'), 'false')
     })
   }
 }

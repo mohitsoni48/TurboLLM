@@ -278,8 +278,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const routeResult = await d.modelRouter.route(req.model ?? '')
     if ('status' in routeResult) {
       // Claude Code retries any 5xx up to 10 times unless told not to, and each retry of a model that fails to load
-      // evicts what was loaded and runs the whole failing load again. Only a refusal that clears by itself is retried.
-      if (!routeResult.transient) c.header('x-should-retry', 'false')
+      // evicts what was loaded and runs the whole failing load again. Only a refusal a retry cannot help says so: one
+      // that clears by itself (a model still loading, ComfyUI's queue, a link still connecting) is left retryable.
+      if (routeResult.permanent) c.header('x-should-retry', 'false')
       return c.json(
         { type: 'error', error: { type: 'api_error', message: routeResult.message } },
         routeResult.status,
@@ -931,7 +932,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
-    if (!routeResult.transient) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
+    if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
     return c.json(
       { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
       503,

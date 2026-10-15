@@ -88,6 +88,7 @@ test('routeTo: a Laya model with no Laya engine installed is refused with the re
   assert.deepEqual(result, {
     status: 503,
     message: 'This is a Laya model — it runs only on the Laya engine. Install Laya from Engines to load it.',
+    permanent: true,
   })
   assert.deepEqual(loads, [])
 })

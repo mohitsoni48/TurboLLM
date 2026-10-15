@@ -335,7 +335,8 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
 
 // ── doLoad: the shared modelIncompatibility() rule (ADR-434 (g)) ──
 // An auto-swap to a model the active engine cannot load answers 503 with the same message the
-// manual load guard uses, before anything is evicted or loaded. That includes the audio check.
+// manual load guard uses, before anything is evicted or loaded. That includes the audio check. It is permanent (the
+// gateway sends `x-should-retry: false`): only the owner changing engines clears it, so a retry only delays the message.
 function recordingPrimary() {
   const loads: unknown[] = []
   const manager = {
@@ -364,6 +365,7 @@ test('route: an audio-tower model on Rapid-MLX is refused with the audio message
     status: 503,
     message:
       'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+    permanent: true,
   })
   assert.deepEqual(loads, [])
 })
@@ -386,13 +388,14 @@ test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and
   assert.deepEqual(result, {
     status: 503,
     message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+    permanent: true,
   })
   assert.deepEqual(loads, [])
 })
 
 // A load that an acquire overtook while it waited (for the load gate or ComfyUI's /free) is refused by the guard's
-// pre-start hook. That clears by itself, like doLoad's isBlocked() refusal, so it is a transient (retryable) 503.
-test('route: a load refused by the ComfyUI pre-start hook is a transient 503', async () => {
+// pre-start hook. That clears by itself, like doLoad's isBlocked() refusal, so it is a retryable (not permanent) 503.
+test('route: a load refused by the ComfyUI pre-start hook is a retryable 503', async () => {
   const entry = fakeEntry('model-a')
   const primary = {
     status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
@@ -410,7 +413,21 @@ test('route: a load refused by the ComfyUI pre-start hook is a transient 503', a
 
   const result = await r.route('model-a')
 
-  assert.equal('status' in result && result.transient, true, JSON.stringify(result))
+  assert.ok('status' in result, JSON.stringify(result))
+  assert.equal(result.permanent, undefined, JSON.stringify(result))
+})
+
+// The gateway tells clients not to retry only a `permanent` refusal. A load that ran and failed is one (a retry evicts
+// the loaded model and runs the same failing load again); doLoad's own ComfyUI refusal clears when the render ends.
+test('route: a load that ran and failed is permanent; a ComfyUI-blocked load is not', async () => {
+  const entry = fakeEntry('model-a')
+  const failed = await autoSwapRouter('mlx', entry, recordingPrimary().manager).route('model-a')
+  assert.deepEqual(failed, { status: 503, message: 'Model failed to become ready.', permanent: true })
+
+  const comfy = { isBlocked: () => true } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const blocked = await new ModelRouter(fakeFullStore(), {} as never, recordingPrimary().manager, scanner, comfy).route('model-a')
+  assert.deepEqual(blocked, { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
 })
 
 test('loadExplicit reports 503 for an unknown model key without touching the manager', async () => {

@@ -33,21 +33,18 @@ export type RouteResult =
   | {
       status: 503
       message: string
-      /** Clears by itself (ComfyUI's queue drains), so a client may retry. Every other refusal repeats until the user
-       *  acts, and a retry of a failed load re-runs that load — the gateway tells clients not to retry those. */
-      transient?: true
+      /** A retry cannot help this caller: its token may not load models and nothing is bringing the model up, the
+       *  active engine cannot run the model, its link needs re-pairing or an update, or the retry would re-run a load
+       *  that just failed or was cancelled (evicting what is loaded each time). The gateway tells clients not to retry
+       *  these. Absent, the refusal may clear by itself (a load in progress, ComfyUI's queue, a link still connecting)
+       *  or costs nothing to repeat, so the client's own retry policy applies. */
+      permanent?: true
     }
 
 interface PoolSlot {
   manager: Manager
   modelKey: string
   lastUsedMs: number
-}
-
-/** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused):
- *  the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. */
-function notLoadedForCaller(entry: ModelEntry): RouteResult {
-  return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.` }
 }
 
 const UNLOADED_WHILE_LOADING = 'The model was unloaded while it was loading.'
@@ -77,6 +74,9 @@ export class ModelRouter {
   /** Laya loads in flight, by model key. Separate from extraSlots on purpose: a slot is registered only once its
    *  load has succeeded, so a request can never be routed to a manager that is still loading. */
   private layaLoads = new Map<string, LayaLoad>()
+  /** The model doLoad is loading right now (one at a time: it runs under the swap lock). A pool slot's load is
+   *  otherwise visible nowhere until it has succeeded. */
+  private loadingKey: string | undefined
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -138,7 +138,7 @@ export class ModelRouter {
 
     const alive = this.routeResolved(entry)
     if (alive) return alive
-    if (modelLoadsRefused()) return notLoadedForCaller(entry)
+    if (modelLoadsRefused()) return this.notLoadedForCaller(entry)
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
@@ -154,7 +154,7 @@ export class ModelRouter {
     if (!this.store.snapshot().gateway.autoSwap) {
       return { status: 503, message: `'${entry.name}' is not loaded. Load it from Models, or turn on auto-swap.` }
     }
-    if (modelLoadsRefused()) return notLoadedForCaller(entry)
+    if (modelLoadsRefused()) return this.notLoadedForCaller(entry)
     return this.withSwapLock(() => this.doLoad(entry))
   }
 
@@ -361,6 +361,22 @@ export class ModelRouter {
     return undefined
   }
 
+  /** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused) when `entry` is not
+   *  running: the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. It is permanent
+   *  for this caller only when nothing under way brings the model up. A model that is loading, or the one ComfyUI's
+   *  guard unloaded and reloads when the render ends, is served to this caller once it runs, so its client may retry. */
+  private notLoadedForCaller(entry: ModelEntry): RouteResult {
+    const ms = this.manager.status()
+    if ((ms.state === 'starting' && ms.model && this.keysMatch(ms.model.key, entry)) || this.loadingKey === entry.key) {
+      return { status: 503, message: `'${entry.name}' is still loading. Try again shortly.` }
+    }
+    const suspended = this.comfy?.isBlocked() ? this.comfy.snapshot().suspendedModelKey : null
+    if (suspended && this.keysMatch(suspended, entry)) {
+      return { status: 503, message: `ComfyUI is rendering — '${entry.name}' is reloaded when its queue finishes.` }
+    }
+    return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
+  }
+
   private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
     // Re-check after acquiring the lock — another queued request may have already
     // loaded this model while we were waiting.
@@ -380,13 +396,14 @@ export class ModelRouter {
     }
 
     if (this.comfy?.isBlocked()) {
-      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }
+      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
     const inc = modelIncompatibility(engine.kind, entry)
-    if (inc) return { status: 503, message: inc.message }
+    // Stays so until the owner installs or switches to an engine that runs it; a retry only delays the message.
+    if (inc) return { status: 503, message: inc.message, permanent: true }
 
     const opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
@@ -409,9 +426,11 @@ export class ModelRouter {
     // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
     // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
     const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
+    this.loadingKey = entry.key
     try {
       return await this.loadInto(entry, engine, opts, targetManager, inFlight)
     } finally {
+      this.loadingKey = undefined
       if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
   }
@@ -445,30 +464,30 @@ export class ModelRouter {
     } catch (e) {
       if (inFlight?.cancelled) {
         await this.stopCancelled(targetManager)
-        return { status: 503, message: UNLOADED_WHILE_LOADING }
+        return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
       }
       // The hook throws only when a ComfyUI render started while this load waited (for the gate or for /free):
       // the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client may retry.
       if (comfyRefused) {
-        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.', transient: true }
+        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
       }
-      return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
+      return { status: 503, message: `Engine start failed: ${(e as Error).message}`, permanent: true }
     }
 
     // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, and waited for,
     // so nothing is left running that the router no longer tracks and a load queued behind this one never overlaps it.
     if (inFlight?.cancelled) {
       await this.stopCancelled(targetManager)
-      return { status: 503, message: UNLOADED_WHILE_LOADING }
+      return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
     }
 
     const s = targetManager.status()
     if (s.state !== 'running') {
-      return { status: 503, message: s.err?.message ?? 'Model failed to become ready.' }
+      return { status: 503, message: s.err?.message ?? 'Model failed to become ready.', permanent: true }
     }
 
     const target = targetManager.target()
-    if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.' }
+    if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.', permanent: true }
 
     if (targetManager === this.manager) {
       this.primaryLastUsed = Date.now()
@@ -621,6 +640,9 @@ export class ModelRouter {
         message:
           `'${parsed.machine}' is not connected (${link.status}). ` +
           `Reconnect it in Settings → Turbo Link.`,
+        // 'unknown' (not probed yet) and 'unreachable' can come back on the next probe; a revoked or incompatible
+        // link stays down until someone re-pairs or updates it.
+        ...(link.status === 'revoked' || link.status === 'incompatible' ? { permanent: true as const } : {}),
       }
     }
     const model = this.catalog.modelOn(link.id, parsed.model)
