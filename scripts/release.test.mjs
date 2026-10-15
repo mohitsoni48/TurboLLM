@@ -305,6 +305,22 @@ test('publish waits only for the npm-publish.yml run of its own tag', async () =
   assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([{ databaseId: 9, event: 'workflow_dispatch', headBranch: 'main', ...later }]), 1), 9);
 });
 
+// A release's createdAt is the tagged commit's date, not when the release was made, so it never
+// excluded an earlier attempt's run for the same tag: after the release was deleted and recreated,
+// the first poll (before GitHub lists the new run) returned the old failed run and publish failed on it.
+test('publish does not take an earlier attempt\'s run for a recreated release', async () => {
+  const release = { createdAt: '2026-10-04T12:00:00Z', publishedAt: '2026-10-04T13:00:00Z' };
+  const oldRun = { databaseId: 111, event: 'release', headBranch: 'v1.0.1', createdAt: '2026-10-04T12:10:00Z' };
+  const newRun = { databaseId: 222, event: 'release', headBranch: 'v1.0.1', createdAt: '2026-10-04T13:00:02Z' };
+  const ghWith = (runs) => (...args) => {
+    const stdout = args[0] === 'release' ? (release[args[args.indexOf('--json') + 1]] ?? '') : JSON.stringify(runs);
+    return { code: 0, stdout, stderr: '', out: stdout };
+  };
+
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([oldRun]), 1), null);
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([newRun, oldRun]), 1), 222);
+});
+
 // ── the real CLI, against stub `gh` / `npm` ──────────────────────────────────
 // The stubs are sh scripts, and spawnSync without a shell finds only .exe files on Windows.
 const POSIX_ONLY = { skip: process.platform === 'win32' && 'the gh/npm stubs are sh scripts' };
@@ -407,7 +423,7 @@ test('publish leaves npm to the OIDC workflow it triggered, even when a local to
     phases: BEFORE_PUBLISH,
     rules: [
       { when: '--json tagName', code: 1 },
-      { when: '--json createdAt', out: '2026-01-01T00:00:00Z' },
+      { when: '--json publishedAt', out: '2026-01-01T00:00:00Z' },
       { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","headBranch":"v1.0.1","createdAt":"2026-01-01T00:00:05Z"}]' },
       { when: 'run view 42', out: 'completed success' },
       { when: 'npm view turbollm version', out: ['1.0.0', '1.0.1'] },
@@ -423,6 +439,67 @@ test('publish leaves npm to the OIDC workflow it triggered, even when a local to
     assert.ok(s.calls().some((c) => c.startsWith('gh release create v1.0.1')));
     assert.deepEqual(s.calls().filter((c) => /^npm (publish|whoami)/.test(c)), [], 'a local publish races npm-publish.yml for the same version');
     assert.ok(s.calls().some((c) => c.startsWith('gh run view 42')), 'the workflow run is what gets waited on');
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// A failed tag push was only noted. `gh release create` then made the missing tag itself, from the
+// default branch's tip, which is not this commit if main moved during the post-merge CI wait, and
+// npm-publish.yml published from that tag while the phase recorded ok.
+test('publish stops when the tag push fails, and the release never creates its own tag', POSIX_ONLY, () => {
+  const s = cliSandbox({
+    version: '1.0.1',
+    phases: BEFORE_PUBLISH,
+    rules: [
+      { when: '--json tagName', code: 1 },
+      { when: '--json publishedAt', out: '2026-01-01T00:00:00Z' },
+      { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","headBranch":"v1.0.1","createdAt":"2026-01-01T00:00:05Z"}]' },
+      { when: 'run view 42', out: 'completed success' },
+      { when: 'npm view turbollm version', out: ['1.0.0', '1.0.1'] },
+    ],
+  });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    must(s.g, 'remote', 'set-url', 'origin', join(s.root, 'unreachable.git'));
+
+    const r = s.release(['publish', '--approved', '--skip-desktop']);
+
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /could not push tag v1\.0\.1/);
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('gh release create')), []);
+    assert.equal(JSON.parse(readFileSync(join(s.work, '.omc', 'release', '1.0.1.json'), 'utf8')).phases.publish.status, 'failed');
+
+    // And with the push working, the release is told to use the pushed tag, never to make one.
+    must(s.g, 'remote', 'set-url', 'origin', s.origin);
+    const again = s.release(['publish', '--approved', '--skip-desktop']);
+    assert.equal(again.code, 0, again.out);
+    assert.equal(must(s.g, 'ls-remote', '--tags', 'origin', 'v1.0.1').stdout.split(/\s+/)[0], must(s.g, 'rev-parse', 'HEAD').stdout);
+    assert.ok(s.calls().some((c) => c.startsWith('gh release create v1.0.1') && c.split(' ').includes('--verify-tag')));
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// On a drifted telemetry schema, --approved redeployed the production Worker whether or not --dry-run
+// was also given, and the phase was then recorded as a dry run.
+test('preflight --dry-run --approved does not redeploy the telemetry Worker', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: [], rules: [{ when: 'npm view turbollm version', out: '1.0.0' }] });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    put(s.work, 'telemetry-worker/scripts/schema-hash.mjs', "process.exit(process.argv[2] === 'check' ? 1 : 0);\n");
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'drift');
+    const deploys = () => s.calls().filter((c) => c.startsWith('npm run deploy'));
+
+    const dry = s.release(['preflight', '--dry-run', '--approved']);
+
+    assert.equal(dry.code, 0, dry.out);
+    assert.match(dry.out, /\[dry-run\] .*would redeploy/);
+    assert.deepEqual(deploys(), []);
+
+    const real = s.release(['preflight', '--approved']);
+    assert.equal(deploys().length, 1, real.out);
   } finally {
     cleanup(s.root);
   }

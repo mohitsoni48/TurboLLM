@@ -322,12 +322,15 @@ async function phasePreflight(state, flags) {
   //    proves the live pipe accepts every real event name) rather than just
   //    telling a human to go run that command by hand. Without --approved it
   //    still only reports — a Worker deploy is production infra, so the same
-  //    approval bar as merge/publish/announce applies.
+  //    approval bar as merge/publish/announce applies — and a --dry-run only
+  //    says it would deploy, like every other gated side effect.
   const hashScript = join(REPO, 'telemetry-worker', 'scripts', 'schema-hash.mjs');
   if (existsSync(hashScript)) {
     let h = run(process.execPath, [hashScript, 'check']);
     if (h.code !== 0) {
-      if (flags.approved) {
+      if (flags.approved && flags['dry-run']) {
+        note('[dry-run] telemetry schema drifted from the deployed Worker — would redeploy it now (`cd telemetry-worker && npm run deploy`) and re-check the hash');
+      } else if (flags.approved) {
         step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
         const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
         if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
@@ -786,9 +789,13 @@ async function phasePublish(state, flags) {
     mustGit('tag', tag);
     note(`tagged ${tag}`);
   }
+  // Fatal, and the release below gets --verify-tag: with the tag missing on origin, `gh release
+  // create` makes it itself from the default branch's tip, which is not this commit once main has
+  // moved (another merge during the post-merge CI wait), and npm-publish.yml publishes that tag.
   if (!flags['dry-run']) {
     const push = git('push', 'origin', tag);
-    note(push.code === 0 ? `pushed ${tag}` : `push ${tag}: ${tailOf(push.out, 5)}`);
+    if (push.code !== 0) fail(`could not push tag ${tag} to origin; stopped before the GitHub Release step. Fix the push (\`git push origin ${tag}\`) and re-run publish.\n${tailOf(push.out, 5)}`);
+    note(`pushed ${tag}`);
   }
 
   // GitHub release (idempotent) — publishing it is what triggers desktop-release.yml
@@ -801,7 +808,7 @@ async function phasePublish(state, flags) {
     const notesFile = join(mkdtempSync(join(tmpdir(), 'turbollm-notes-')), 'notes.md');
     writeFileSync(notesFile, `${section.notes}\n`);
     try {
-      mustGh('release', 'create', tag, '--title', tag, '--notes-file', notesFile);
+      mustGh('release', 'create', tag, '--verify-tag', '--title', tag, '--notes-file', notesFile);
     } finally {
       rmSync(dirname(notesFile), { recursive: true, force: true });
     }
@@ -832,7 +839,7 @@ async function phasePublish(state, flags) {
         fail(
           `no npm-publish.yml run found for ${tag} after 5 minutes.\n`
           + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
-          + `  or the Trusted Publisher isn't configured yet on npmjs.com (package turbollm → Settings → Trusted Publisher → GitHub Actions → this repo + npm-publish.yml).\n`
+          + `  or this release never fired it (one published before npm-publish.yml was added does not).\n`
           + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
         );
       }
@@ -842,7 +849,12 @@ async function phasePublish(state, flags) {
     } else {
       const conclusion = await waitForRun(runId, 10 * 60_000);
       if (conclusion !== 'success') {
-        fail(`npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}`);
+        // The workflow fires on `release: published` whatever npm's settings are, so a missing
+        // Trusted Publisher shows up here, as a failed run, not as a run that never started.
+        fail(
+          `npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}\n`
+          + `  If \`npm publish\` failed on authentication, the Trusted Publisher may not be configured on npmjs.com (package turbollm → Settings → Trusted Publisher → GitHub Actions → this repo + npm-publish.yml).`,
+        );
       }
       note(`npm-publish.yml run ${runId} succeeded`);
     }
@@ -869,14 +881,15 @@ async function phasePublish(state, flags) {
 
 // Finds the most recent run of a given workflow file whose event was `release`
 // for `tag` (or `workflow_dispatch`, for a manual re-run) and that started after
-// `tag`'s GitHub Release was created — so another tag's release run is not
+// `tag`'s GitHub Release was published — so another tag's release run is not
 // mistaken for this one, though a manual dispatch for another tag can be.
+// Published, not created: a release's createdAt is the tagged commit's date, so
+// it never excluded an earlier attempt's failed run for a recreated release.
 // Returns the run id, or null if none shows up before the timeout (e.g. the
-// Trusted Publisher isn't configured yet, so the workflow never got dispatched
-// to begin with).
+// release was published before npm-publish.yml existed, so it never fired it).
 export async function waitForWorkflowRun(workflowFile, tag, timeoutMs, ghRun = gh, pollMs = 15_000) {
-  const releaseAt = ghRun('release', 'view', tag, '--json', 'createdAt', '-q', '.createdAt').stdout;
-  const since = releaseAt ? Date.parse(releaseAt) : 0;
+  const releaseAt = ghRun('release', 'view', tag, '--json', 'publishedAt', '-q', '.publishedAt').stdout;
+  const since = Date.parse(releaseAt) || 0;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const r = ghRun(
