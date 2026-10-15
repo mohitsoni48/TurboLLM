@@ -275,8 +275,12 @@ export class RunStream implements AsyncIterable<ExtEvent> {
 
   private readonly body: Promise<Response>
 
-  constructor(body: Promise<Response>) {
+  /** `after` is the cursor the stream was attached from: `lastEventSeq` starts there, so a
+   *  stream that drops before its first frame still hands the next resume that cursor instead
+   *  of `undefined`, which would replay the run from the start. */
+  constructor(body: Promise<Response>, after?: number) {
     this.body = body
+    this.lastEventSeq = after
   }
 
   /** Turns one `\n\n`-delimited block into an `ExtEvent`, updating the running bookkeeping
@@ -510,7 +514,7 @@ export class TurboLLMChat {
       new RunStream(this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
         query: { after, owner: opts.owner },
         accept: 'text/event-stream',
-      })),
+      }), after),
   }
 
   /** Appends a message and starts a run, returning a `RunStream` of typed events (spec 27
@@ -573,6 +577,6 @@ export class TurboLLMChat {
       }
       throw new ApiError(409, ((await probe.json().catch(() => undefined)) as { error?: ExtErrorBody } | undefined)?.error)
     }
-    return new RunStream(Promise.resolve(probe))
+    return new RunStream(Promise.resolve(probe), afterSeq)
   }
 }

@@ -59,7 +59,8 @@ also exposes, once the stream has been consumed:
 - `stream.runId` — the run's id, from the `run` frame.
 - `stream.lastEventSeq` — the highest `event_seq` seen (the SSE `id:` field), the resume token
   for `?after=` reconnects. `after` is exclusive: the server sends only the frames after it, so
-  nothing you already rendered is sent twice. It is `undefined` until the first frame arrives.
+  nothing you already rendered is sent twice. It is `undefined` until the first frame arrives (a
+  stream from `resume()` or `runs.stream(id, after)` starts at the cursor it was attached from).
 - `stream.outcome` — `'complete' | 'failed' | 'aborted'` from the `done` frame's `status`, or
   `'unknown'` if the connection closed before a `done` frame ever arrived. **`'unknown'` is not
   an error** — it means "ask the run", not "it failed." A connection that drops mid-stream ends

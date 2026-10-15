@@ -228,6 +228,30 @@ test('resume() within the window streams directly and leaves resyncMessage unset
   assert.ok(!seenUrls[1].includes('after='), `no cursor yet means replay from the start: ${seenUrls[1]}`)
 })
 
+// A resumed stream started with lastEventSeq undefined, so one that dropped before its first
+// frame handed the next resume() no cursor, and that resume replayed the run from the start.
+test('a resumed stream that drops before its first frame keeps the cursor it resumed from', async () => {
+  const seenUrls: string[] = []
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async (url: string) => {
+      seenUrls.push(String(url))
+      return new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }) as unknown as typeof fetch,
+  })
+  const resumed = await client.resume('run_1', 5)
+  for await (const _ of resumed) { /* dropped: no frame at all */ }
+  assert.equal(resumed.outcome, 'unknown')
+  assert.equal(resumed.lastEventSeq, 5)
+  const again = await client.resume('run_1', resumed.lastEventSeq)
+  for await (const _ of again) { /* drain */ }
+  assert.ok(seenUrls[1].includes('after=5'), `the chained resume must not replay from the start: ${seenUrls[1]}`)
+
+  const attached = client.runs.stream('run_1', 7)
+  for await (const _ of attached) { /* drain */ }
+  assert.equal(attached.lastEventSeq, 7, 'runs.stream(id, after) starts from its cursor too')
+})
+
 /** A fetch stub whose SSE body is a real ReadableStream the test controls. */
 function controlledSse(): { fetch: typeof fetch; ctrl: Promise<ReadableStreamDefaultController<Uint8Array>>; cancelled: Promise<void> } {
   let resolveCtrl!: (c: ReadableStreamDefaultController<Uint8Array>) => void
