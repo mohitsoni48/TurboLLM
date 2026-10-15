@@ -21,6 +21,7 @@ import {
   stageReleasePaths,
   syncMainFastForward,
   waitForCommitRun,
+  waitForWorkflowRun,
 } from './release.mjs';
 
 const RELEASE_URL = new URL('./release.mjs', import.meta.url).href;
@@ -286,6 +287,24 @@ test('merge gives up on the post-merge run at the deadline instead of picking an
   assert.equal(await waitForCommitRun('ci.yml', 'b'.repeat(40), 0, none, 1), null);
 });
 
+// A GitHub Release older than npm-publish.yml never fires it, so every later release's run passed
+// the "created after this release" check: publish waited on another tag's run (which succeeded)
+// instead of reaching the local-token fallback, then failed polling npm for its own version.
+test('publish waits only for the npm-publish.yml run of its own tag', async () => {
+  const ghWith = (runs) => (...args) => {
+    const stdout = args[0] === 'release' ? '2025-01-01T00:00:00Z' : JSON.stringify(runs);
+    return { code: 0, stdout, stderr: '', out: stdout };
+  };
+  const later = { createdAt: '2026-06-01T00:00:00Z' };
+  const otherTag = { databaseId: 7, event: 'release', headBranch: 'v1.2.0', ...later };
+
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([otherTag]), 1), null,
+    'no run for v1.0.1 is what lets publish fall back to the local token');
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([otherTag, { databaseId: 8, event: 'release', headBranch: 'v1.0.1', ...later }]), 1), 8);
+  // A dispatched run carries the branch it was dispatched from, not the tag; it still counts.
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([{ databaseId: 9, event: 'workflow_dispatch', headBranch: 'main', ...later }]), 1), 9);
+});
+
 // ── the real CLI, against stub `gh` / `npm` ──────────────────────────────────
 // The stubs are sh scripts, and spawnSync without a shell finds only .exe files on Windows.
 const POSIX_ONLY = { skip: process.platform === 'win32' && 'the gh/npm stubs are sh scripts' };
@@ -389,7 +408,7 @@ test('publish leaves npm to the OIDC workflow it triggered, even when a local to
     rules: [
       { when: '--json tagName', code: 1 },
       { when: '--json createdAt', out: '2026-01-01T00:00:00Z' },
-      { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","createdAt":"2026-01-01T00:00:05Z"}]' },
+      { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","headBranch":"v1.0.1","createdAt":"2026-01-01T00:00:05Z"}]' },
       { when: 'run view 42', out: 'completed success' },
       { when: 'npm view turbollm version', out: ['1.0.0', '1.0.1'] },
       { when: '--json assets', out: 'TurboLLM-Setup-x64.exe\nTurboLLM-x86_64.AppImage\nTurboLLM-arm64.dmg' },

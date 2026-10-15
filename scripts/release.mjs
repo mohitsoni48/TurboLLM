@@ -868,33 +868,38 @@ async function phasePublish(state, flags) {
 }
 
 // Finds the most recent run of a given workflow file whose event was `release`
-// (or `workflow_dispatch`, for a manual re-run) and that started after `tag`'s
-// GitHub Release was created — so an unrelated older run for the same workflow
-// file never gets mistaken for this release's run. Returns the run id, or null
-// if none shows up before the timeout (e.g. the Trusted Publisher isn't
-// configured yet, so the workflow never got dispatched to begin with).
-async function waitForWorkflowRun(workflowFile, tag, timeoutMs) {
-  const releaseAt = gh('release', 'view', tag, '--json', 'createdAt', '-q', '.createdAt').stdout;
+// for `tag` (or `workflow_dispatch`, for a manual re-run) and that started after
+// `tag`'s GitHub Release was created — so another tag's release run is not
+// mistaken for this one, though a manual dispatch for another tag can be.
+// Returns the run id, or null if none shows up before the timeout (e.g. the
+// Trusted Publisher isn't configured yet, so the workflow never got dispatched
+// to begin with).
+export async function waitForWorkflowRun(workflowFile, tag, timeoutMs, ghRun = gh, pollMs = 15_000) {
+  const releaseAt = ghRun('release', 'view', tag, '--json', 'createdAt', '-q', '.createdAt').stdout;
   const since = releaseAt ? Date.parse(releaseAt) : 0;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const r = gh(
+    const r = ghRun(
       'run', 'list', '--workflow', workflowFile, '--limit', '5',
-      '--json', 'databaseId,event,createdAt',
+      '--json', 'databaseId,event,createdAt,headBranch',
     );
     if (r.code === 0) {
       try {
         const runs = JSON.parse(r.stdout || '[]');
-        // 60s clock-skew grace on the lower bound only.
+        // 60s clock-skew grace on the lower bound only. A `release` run's headBranch is its tag:
+        // for a release older than the workflow, every later release's run is "after" it too, and
+        // taking one of those skipped the token fallback. A dispatched run's headBranch is the
+        // branch it was dispatched from (a tag older than the workflow has no workflow file to
+        // dispatch on), so nothing here ties it to a tag and it matches on time alone.
         const match = runs.find((x) =>
-          (x.event === 'release' || x.event === 'workflow_dispatch')
+          ((x.event === 'release' && x.headBranch === tag) || x.event === 'workflow_dispatch')
           && Date.parse(x.createdAt) >= since - 60_000);
         if (match) return match.databaseId;
       } catch { /* fall through to retry */ }
     }
     if (Date.now() > deadline) return null;
     step(`waiting for ${workflowFile} to start for ${tag}…`);
-    await sleep(15_000);
+    await sleep(pollMs);
   }
 }
 
