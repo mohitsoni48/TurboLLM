@@ -11,6 +11,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { join } from 'node:path'
 import { PTYSession } from './pty-session'
 import { sessionAuth } from '../code/session-auth'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 
 // ── Orphan-safety pidfile (mirrors tunnel/manager.ts's tunnel-<pid>.pid pattern, which
 // itself mirrors engines/manager.ts) ──────────────────────────────────────────────────
@@ -80,40 +81,6 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
     }
-  }
-  return out
-}
-
-/** How far apart the pidfile's `startedAt` and the process's own start time may be for the pid
- *  to still count as the shell we spawned. `ps` reports elapsed time in whole seconds. */
-const START_TIME_TOLERANCE_MS = 5_000
-
-/** The start time (epoch ms) of each of `pids` that is running and readable, from ONE `ps` /
- *  PowerShell call (PowerShell alone takes about a second to start). A pid missing from the
- *  result could not be checked. */
-function processStartTimes(pids: number[]): Map<number, number> {
-  const out = new Map<number, number>()
-  if (pids.length === 0) return out
-  try {
-    if (process.platform === 'win32') {
-      const script =
-        `Get-Process -Id ${pids.join(',')} -ErrorAction SilentlyContinue | ForEach-Object { ` +
-        `try { if ($_.StartTime) { '{0} {1}' -f $_.Id, ([DateTimeOffset]$_.StartTime).ToUnixTimeMilliseconds() } } catch {} }`
-      const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
-        encoding: 'utf8', timeout: 15_000, windowsHide: true,
-      })
-      for (const m of String(r.stdout ?? '').matchAll(/^\s*(\d+)\s+(\d+)\s*$/gm)) out.set(Number(m[1]), Number(m[2]))
-    } else {
-      // etime is [[dd-]hh:]mm:ss on procps, BSD/macOS and toybox ps alike.
-      const now = Date.now()
-      const r = spawnSync('ps', ['-o', 'pid=,etime=', '-p', pids.join(',')], { encoding: 'utf8', timeout: 5_000 })
-      for (const m of String(r.stdout ?? '').matchAll(/^\s*(\d+)\s+(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)\s*$/gm)) {
-        const secs = ((Number(m[2] ?? 0) * 24 + Number(m[3] ?? 0)) * 60 + Number(m[4])) * 60 + Number(m[5])
-        out.set(Number(m[1]), now - secs * 1000)
-      }
-    }
-  } catch {
-    /* no way to check — nothing is verified, so nothing gets killed */
   }
   return out
 }
