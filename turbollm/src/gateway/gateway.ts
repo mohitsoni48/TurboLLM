@@ -1329,22 +1329,61 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   return new Response(res.body, { status: res.status, headers: res.headers })
 }
 
-/** The client's copy of a streamed chat completion, minus the `choices: []` usage chunk the engine sends only because
- *  the gateway injected `stream_options.include_usage` (see there). Every other line passes through unchanged, as soon
- *  as it is complete. `content-length` is dropped since the body may now be shorter than the one it described, and
- *  `content-encoding` since fetch already decoded the body it applied to (see the remote relay above). */
+/** The client's copy of a streamed chat completion as it would have been without the `stream_options.include_usage`
+ *  the gateway injected (see there): the `choices: []` usage chunk the engine sends only because of it is removed, and
+ *  anything else that chunk carried goes back on the finish chunk before it. llama.cpp puts its final `timings` on the
+ *  LAST chunk it sends (to_json_oaicompat_chat_stream), which is the usage chunk when one was asked for and the finish
+ *  chunk otherwise; dropping the usage chunk whole took the timings with it. Every other line passes through unchanged
+ *  as soon as it is complete; a finish chunk waits for the next line (the engine writes the two together), to see
+ *  whether a usage chunk follows it. `content-length` is dropped since the body may now differ from the one it
+ *  described, and `content-encoding` since fetch already decoded the body it applied to (see the remote relay above). */
 function withoutInjectedUsage(body: ReadableStream<Uint8Array>, res: Response): Response {
-  const isUsageOnly = (line: string): boolean => {
-    if (!line.startsWith('data:') || !line.includes('"usage"')) return false
+  const parse = (line: string): Record<string, unknown> | undefined => {
+    if (!line.startsWith('data:')) return undefined
     try {
-      const chunk = JSON.parse(line.slice(5).trim()) as { choices?: unknown; usage?: unknown }
-      return Array.isArray(chunk.choices) && chunk.choices.length === 0 && chunk.usage != null
-    } catch { return false }
+      const chunk = JSON.parse(line.slice(5).trim()) as unknown
+      return chunk !== null && typeof chunk === 'object' && !Array.isArray(chunk) ? chunk as Record<string, unknown> : undefined
+    } catch { return undefined }
+  }
+  const usageOnly = (line: string): Record<string, unknown> | undefined => {
+    const chunk = line.includes('"usage"') ? parse(line) : undefined
+    return chunk && Array.isArray(chunk.choices) && chunk.choices.length === 0 && chunk.usage != null ? chunk : undefined
+  }
+  const finishChunk = (line: string): Record<string, unknown> | undefined => {
+    const chunk = /"finish_reason"\s*:\s*"/.test(line) ? parse(line) : undefined
+    return chunk && Array.isArray(chunk.choices) && chunk.choices.some((ch) => (ch as { finish_reason?: unknown } | null)?.finish_reason != null)
+      ? chunk
+      : undefined
   }
   const dec = new TextDecoder()
   const enc = new TextEncoder()
   let buf = ''
   let dropBlank = false // the blank line that terminated a dropped event goes with it
+  let held: { chunk: Record<string, unknown>; raw: string } | undefined // a finish chunk (and its blank line), unsent
+  const take = (line: string): string => {
+    if (dropBlank && line.trim() === '') { dropBlank = false; return '' }
+    dropBlank = false
+    if (held) {
+      if (line.trim() === '') { held.raw += line; return '' }
+      const { chunk, raw } = held
+      held = undefined
+      const usage = usageOnly(line)
+      if (!usage) return raw + take(line)
+      dropBlank = true
+      // Only what the request would not have produced comes off: `usage` itself. The fields both chunks carry (id,
+      // model, created, ...) are the finish chunk's already.
+      const extra = Object.keys(usage).filter((k) => k !== 'usage' && !(k in chunk))
+      if (extra.length === 0) return raw
+      for (const k of extra) chunk[k] = usage[k]
+      const nl = raw.indexOf('\n')
+      const head = nl === -1 ? raw : raw.slice(0, nl + 1)
+      return `data: ${JSON.stringify(chunk)}${head.slice(head.trimEnd().length)}${raw.slice(head.length)}`
+    }
+    const finish = finishChunk(line)
+    if (finish) { held = { chunk: finish, raw: line }; return '' }
+    if (usageOnly(line)) { dropBlank = true; return '' }
+    return line
+  }
   const filtered = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(bytes, controller) {
       buf += dec.decode(bytes, { stream: true })
@@ -1353,16 +1392,15 @@ function withoutInjectedUsage(body: ReadableStream<Uint8Array>, res: Response): 
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl + 1)
         buf = buf.slice(nl + 1)
-        if (dropBlank && line.trim() === '') { dropBlank = false; continue }
-        dropBlank = false
-        if (isUsageOnly(line)) { dropBlank = true; continue }
-        out += line
+        out += take(line)
       }
       if (out) controller.enqueue(enc.encode(out))
     },
     flush(controller) {
       const rest = buf + dec.decode()
-      if (rest && !isUsageOnly(rest)) controller.enqueue(enc.encode(rest))
+      let out = rest ? take(rest) : ''
+      if (held) out += held.raw
+      if (out) controller.enqueue(enc.encode(out))
     },
   }))
   const headers = new Headers(res.headers)

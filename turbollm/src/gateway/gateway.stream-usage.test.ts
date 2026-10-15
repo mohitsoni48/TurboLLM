@@ -23,11 +23,16 @@ async function withLlamaLikeEngine(): Promise<{ url: string; requests: Array<Rec
       res.writeHead(200, { 'Content-Type': 'text/event-stream' })
       res.write('data: {"choices":[{"index":0,"delta":{"content":"Hel"}}]}\n\n')
       res.write('data: {"choices":[{"index":0,"delta":{"content":"lo"}}]}\n\n')
-      res.write('data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}]}\n\n')
+      // llama.cpp hangs its final `timings` on the LAST chunk it sends: the usage chunk when one was asked for, the
+      // finish chunk otherwise.
+      const timings = '"timings":{"prompt_per_second":100,"predicted_per_second":50}'
       if ((body.stream_options as { include_usage?: boolean } | undefined)?.include_usage) {
+        res.write('data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}]}\n\n')
         res.write('data: {"choices":[],"usage":{"prompt_tok')
-        res.write('ens":7,"completion_tokens":2,"total_tokens":9},"timings":{"prompt_per_second":100,"predicted_per_second":50}}\n')
+        res.write(`ens":7,"completion_tokens":2,"total_tokens":9},${timings}}\n`)
         res.write('\n')
+      } else {
+        res.write(`data: {"choices":[{"index":0,"finish_reason":"stop","delta":{}}],${timings}}\n\n`)
       }
       res.end('data: [DONE]\n\n')
     })
@@ -93,6 +98,30 @@ test('a streaming client that did not ask for usage never sees the injected `cho
     await waitUntil(() => usage.length === 1)
     assert.equal(usage[0].promptTokens, 7)
     assert.equal(usage[0].genTokens, 2)
+  } finally { await engine.close() }
+})
+
+test('a streaming client that did not ask for usage gets the stream the engine would have sent it, timings included', async () => {
+  // Dropping the usage chunk whole dropped llama.cpp's final `timings` with it: without the injected option they ride
+  // on the finish chunk, which is where the client must find them.
+  const engine = await withLlamaLikeEngine()
+  try {
+    const app = new Hono()
+    registerGateway(app, fakeDeps(engine.url, []))
+    const body = { model: 'qwen3-8b|Q4|123', messages: [{ role: 'user', content: 'hi' }], stream: true }
+    const viaGateway = await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).text()
+    const direct = await (await fetch(`${engine.url}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })).text()
+    assert.deepEqual(engine.requests.map((r) => r.stream_options), [{ include_usage: true }, undefined])
+    assert.match(direct, /"finish_reason":"stop".*"timings"/)
+    assert.equal(viaGateway, direct)
   } finally { await engine.close() }
 })
 
