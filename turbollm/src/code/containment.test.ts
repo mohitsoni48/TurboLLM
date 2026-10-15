@@ -8,7 +8,7 @@
 // calls canonicalized to a path OUTSIDE the root and were falsely rejected in every mode.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
 import { join, parse, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createWriteToolDefinition } from '@earendil-works/pi-coding-agent'
@@ -327,6 +327,125 @@ test('REGRESSION: a dangling symlink inside the root is judged by its target, no
   } finally {
     rmSync(root, { recursive: true, force: true })
     rmSync(outside, { recursive: true, force: true })
+  }
+})
+
+// The kernel follows each link in a target BEFORE applying a later `..`; resolve() and Node's JS
+// realpathSync collapse `sub/..` first. With `a/b/sub -> ../..` (the repo itself), the target
+// `a/b/sub/../x` is <repo>/../x, not <repo>/a/b/x. POSIX only: Windows keeps lexical resolution.
+test('REGRESSION: a `..` after a link in a link target is judged where the kernel lands it', fileLinks, () => {
+  const base = tmpDir('kdotdot-')
+  const root = join(base, 'repo')
+  try {
+    mkdirSync(join(root, 'a', 'b'), { recursive: true })
+    symlinkSync(join('..', '..'), join(root, 'a', 'b', 'sub'))
+    symlinkSync(join('a', 'b'), join(root, 'deep'))
+    const link = (name: string, target: string) => symlinkSync(target, join(root, name))
+    // Dangling targets outside, directly, through a chain, and as an absolute target.
+    link('notes.md', 'a/b/sub/../x')
+    link('chain.md', 'notes.md')
+    link('abs.md', `${root}/a/b/sub/../y`) // not join(): it would collapse the `..` itself
+    // An EXISTING outside file, with an in-repo decoy where the lexical reading points: the JS
+    // realpath succeeds there and reported <repo>/a/b/existing.txt.
+    writeFileSync(join(base, 'existing.txt'), 'outside')
+    writeFileSync(join(root, 'a', 'b', 'existing.txt'), 'decoy')
+    link('edit.md', 'a/b/sub/../existing.txt')
+    // Targets the kernel keeps inside, although a lexical reading of the second one leaves the repo.
+    link('ok.md', 'deep/../c.txt')
+    link('up.md', 'deep/../../d.txt')
+    // A `..` after a missing component can't be walked (the write fails ENOENT): fail closed.
+    link('gap.md', 'missing/../e.txt')
+
+    const verdicts = new Map<string, boolean>()
+    for (const name of ['notes.md', 'chain.md', 'abs.md', 'edit.md', 'ok.md', 'up.md', 'gap.md']) {
+      verdicts.set(name, isContainedFromRoot(name, root))
+    }
+    assert.deepEqual(Object.fromEntries(verdicts), {
+      'notes.md': false, 'chain.md': false, 'abs.md': false, 'edit.md': false,
+      'ok.md': true, 'up.md': true, 'gap.md': false,
+    })
+    // Every verdict matches where a real write through the link lands.
+    const realRoot = realpathSync.native(root)
+    for (const [name, verdict] of verdicts) {
+      try { writeFileSync(join(root, name), 'w') } catch { assert.equal(name, 'gap.md'); continue } // ENOENT
+      assert.equal(isInsideAny(realpathSync.native(join(root, name)), [realRoot]), verdict, name)
+    }
+    assert.equal(readFileSync(join(base, 'existing.txt'), 'utf8'), 'w', 'sanity: edit.md wrote outside')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// Repo content alone reaches this check: persona.ts looks for AGENTS.md / CLAUDE.md on every
+// session view and turn, synchronously on the daemon's event loop. Link cycles, long chains and
+// link texts that dive deep and climb back out must be judged in milliseconds (earlier versions of
+// this code took seconds to minutes on some of them). Link texts stay under macOS's 1023-byte
+// limit, except in the Linux-only deep case.
+test('REGRESSION: hostile link layouts are judged quickly', fileLinks, () => {
+  const base = realpathSync.native(tmpDir('khostile-')) // no link above the repo: exact link counts
+  const root = join(base, 'repo')
+  try {
+    mkdirSync(join(root, 'r'), { recursive: true })
+    const link = (name: string, target: string) => symlinkSync(target, join(root, name))
+    link('d', '.')
+    link('loop-a', `${'d/'.repeat(500)}loop-b`)
+    link('loop-b', `${'d/'.repeat(500)}loop-a`)
+    link('AGENTS.md', `${'d/'.repeat(500)}AGENTS.md`)
+    link('cycle-a', `${'r/../'.repeat(200)}cycle-b`)
+    link('cycle-b', `${'r/../'.repeat(200)}cycle-a`)
+    // A dangling chain: `c1` takes 40 links (the kernel's limit) to reach end.txt, `c0` takes 41.
+    for (let i = 0; i <= 40; i++) link(`c${i}`, i === 40 ? 'end.txt' : `c${i + 1}`)
+    const expected: Record<string, boolean> = {
+      'loop-a': false, 'AGENTS.md': false, 'cycle-a': false, c1: true, c0: false,
+    }
+    if (process.platform === 'linux') {
+      // 30 links into a tree 780 deep and back out (Linux allows 4 KB link texts): each lookup
+      // re-walks its path, so following them all costs most of a second. Refused past MAX_LOOKED.
+      mkdirSync(join(root, ...Array<string>(780).fill('a')), { recursive: true })
+      for (let i = 0; i < 30; i++) link(`deep${i}`, `${'a/'.repeat(780)}${'../'.repeat(780)}deep${i + 1}`)
+      expected.deep0 = false
+    }
+    for (const [name, verdict] of Object.entries(expected)) {
+      const start = performance.now()
+      assert.equal(isContainedFromRoot(name, root), verdict, name)
+      const ms = performance.now() - start
+      // Under 60 ms on an idle machine; the walks this bound catches took 8 s and more. The
+      // headroom is for a machine under load.
+      assert.ok(ms < 2000, `${name} took ${ms.toFixed(0)} ms`)
+    }
+    if (process.platform === 'linux') {
+      // MAX_LINKS is the kernel's own limit: the 40-link write lands, the 41-link one fails ELOOP.
+      writeFileSync(join(root, 'c1'), 'w')
+      assert.equal(readFileSync(join(root, 'end.txt'), 'utf8'), 'w')
+      assert.throws(() => writeFileSync(join(root, 'c0'), 'w'), { code: 'ELOOP' })
+    }
+  } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// The walk reads a link's target back as a JS string: bytes that aren't UTF-8 become U+FFFD and
+// name a different (missing, in-repo) entry than the one the kernel follows.
+test('REGRESSION: a link target that is not UTF-8 fails closed', fileLinks, (t) => {
+  const base = tmpDir('kutf8-')
+  const root = join(base, 'repo')
+  try {
+    mkdirSync(join(base, 'out'), { recursive: true })
+    mkdirSync(root)
+    const name = Buffer.from([0xff, 0x64]) // "\xffd"
+    try {
+      // `<repo>/\xffd -> <base>/out`, and `L -> \xffd/x`: a write through L lands in <base>/out/x.
+      symlinkSync(join(base, 'out'), Buffer.concat([Buffer.from(root + sep), name]))
+      symlinkSync(Buffer.concat([name, Buffer.from('/x')]), join(root, 'L'))
+    } catch (e) {
+      t.skip(`this filesystem refuses non-UTF-8 names: ${(e as NodeJS.ErrnoException).code}`)
+      return
+    }
+    assert.ok(!isContainedFromRoot('L', root))
+    writeFileSync(join(root, 'L'), 'w')
+    assert.equal(readFileSync(join(base, 'out', 'x'), 'utf8'), 'w', 'sanity: the write landed outside')
+  } finally {
+    rmSync(base, { recursive: true, force: true })
   }
 })
 
