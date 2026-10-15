@@ -398,6 +398,39 @@ const DATE_META_KEYS = new Set([
 ])
 
 /**
+ * The page cut after its last `>`. A tag pattern (`<meta\s[^>]*>`, `<[^>]+>`) can only match before
+ * that point, but run on the whole page it is quadratic: at each `<` with no `>` anywhere after it,
+ * it scans to the end of the page before giving up, so a crafted page of `<meta `s or `<`s blocked
+ * the event loop (about 80 minutes for one 2 MiB fetch_url page, seconds per search result in the
+ * date backfill). On the cut page every start finds its `>`, so the same patterns find the same
+ * matches in linear time.
+ */
+function upToLastTag(html: string): string {
+  return html.slice(0, html.lastIndexOf('>') + 1)
+}
+
+/**
+ * The bodies of the page's JSON-LD `<script>` blocks, in page order: exactly what
+ * /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi captures, without
+ * that pattern's quadratic backtracking (over every `type=` in a tag, and to the end of the page
+ * for a `</script>` that never comes).
+ */
+function* jsonLdBlocks(html: string): Generator<string> {
+  const page = upToLastTag(html)
+  const open = /<script[^>]*>/gi
+  const close = /<\/script>/gi
+  for (let tag = open.exec(page); tag; tag = open.exec(page)) {
+    if (!/type=["']application\/ld\+json["']/i.test(tag[0])) continue
+    close.lastIndex = open.lastIndex
+    const end = close.exec(page)
+    // No `</script>` after this tag means none after any later tag either.
+    if (!end) return
+    yield page.slice(open.lastIndex, end.index)
+    open.lastIndex = close.lastIndex
+  }
+}
+
+/**
  * PURE: best-effort publication date from raw HTML, in priority order:
  * JSON-LD `datePublished` → publication-date `<meta>` → `<time datetime>`.
  * Returns 'YYYY-MM-DD' or undefined.
@@ -409,20 +442,21 @@ const DATE_META_KEYS = new Set([
 export function extractPublishedDate(html: string): string | undefined {
   // Matched by regex rather than JSON.parse — the page is untrusted and we only ever want a
   // date-shaped substring out of it, never a parsed object graph.
-  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    const iso = normalizeIsoDate(/"datePublished"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+  for (const block of jsonLdBlocks(html)) {
+    const iso = normalizeIsoDate(/"datePublished"\s*:\s*"([^"]{1,64})"/i.exec(block)?.[1])
     if (iso) return iso
   }
 
+  const tags = upToLastTag(html)
   // Attribute order varies across sites, so match the whole tag and pick the pieces out of it.
-  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+  for (const tag of tags.matchAll(/<meta\s[^>]*>/gi)) {
     const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
     if (!key || !DATE_META_KEYS.has(key.trim().toLowerCase())) continue
     const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
     if (iso) return iso
   }
 
-  for (const tag of html.matchAll(/<time\s[^>]*>/gi)) {
+  for (const tag of tags.matchAll(/<time\s[^>]*>/gi)) {
     const iso = normalizeIsoDate(/\bdatetime\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
     if (iso) return iso
   }
@@ -444,11 +478,11 @@ const MODIFIED_META_KEYS = new Set(['article:modified_time', 'og:updated_time', 
  * set exists to fix, just inverted. Both dates are reported so the model can judge.
  */
 export function extractModifiedDate(html: string): string | undefined {
-  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    const iso = normalizeIsoDate(/"dateModified"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+  for (const block of jsonLdBlocks(html)) {
+    const iso = normalizeIsoDate(/"dateModified"\s*:\s*"([^"]{1,64})"/i.exec(block)?.[1])
     if (iso) return iso
   }
-  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+  for (const tag of upToLastTag(html).matchAll(/<meta\s[^>]*>/gi)) {
     const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
     if (!key || !MODIFIED_META_KEYS.has(key.trim().toLowerCase())) continue
     const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
@@ -534,11 +568,16 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   if (contentType.includes('text/html')) {
     published = extractPublishedDate(text)
     modified = extractModifiedDate(text)
-    // Strip HTML tags and collapse whitespace
-    content = text
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
+    // Strip HTML tags and collapse whitespace, in linear time and with the output the plain
+    // patterns gave. `<script[\s\S]*?<\/script>` rescanned to the end of the page from every
+    // unclosed `<script` (quadratic), so the scan now runs to the end once and puts that unclosed
+    // tail back unchanged, as the plain pattern never removed it. `<[^>]+>`: see upToLastTag.
+    const keepUnclosed = (match: string, close: string) => (close ? '' : match)
+    const code = text
+      .replace(/<script[\s\S]*?(<\/script>|$)/gi, keepUnclosed)
+      .replace(/<style[\s\S]*?(<\/style>|$)/gi, keepUnclosed)
+    const tagsEnd = upToLastTag(code).length
+    content = (code.slice(0, tagsEnd).replace(/<[^>]+>/g, ' ') + code.slice(tagsEnd))
       .replace(/&nbsp;/g, ' ')
       .replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<')
