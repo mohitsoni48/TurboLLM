@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { writeFileSync, appendFileSync } from 'node:fs'
+import { writeFileSync, appendFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   buildGithubCompareUrl,
@@ -81,6 +81,45 @@ test('REGRESSION: getGitStatus keeps the leading space of the FIRST entry (an un
   // The listed path is what the Git dialog sends back for a selective commit — git must accept it.
   const result = await commitGitChanges(dir, 'update readme', status.files.map((f) => f.path))
   assert.equal(result.filesCommitted, 1)
+})
+
+// The Git dialog sends the listed paths back for a selective commit. Plain `--porcelain=v1`
+// C-quoted these ('"my notes.txt"', '"caf\303\251.txt"') and printed a rename as 'old -> new',
+// none of which `git add` accepts.
+test('REGRESSION: paths with spaces or non-ASCII characters are listed as-is, and a selective commit of them works', async () => {
+  const dir = initRepo()
+  writeFileSync(join(dir, 'my notes.txt'), 'n\n')
+  writeFileSync(join(dir, 'café.txt'), 'c\n')
+  writeFileSync(join(dir, 'other.txt'), 'o\n')
+  const status = await getGitStatus(dir)
+  assert.deepEqual(status.files.map((f) => f.path).sort(), ['café.txt', 'my notes.txt', 'other.txt'])
+  const result = await commitGitChanges(dir, 'add two', status.files.map((f) => f.path).filter((p) => p !== 'other.txt'))
+  assert.equal(result.filesCommitted, 2)
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: '??', path: 'other.txt' }])
+})
+
+test('REGRESSION: a staged rename is listed under its new path, and a selective commit of it works', async () => {
+  const dir = initRepo()
+  gitSync(['mv', 'README.md', 'GUIDE.md'], dir)
+  writeFileSync(join(dir, 'other.txt'), 'o\n')
+  const status = await getGitStatus(dir)
+  assert.deepEqual(status.files, [{ code: 'R ', path: 'GUIDE.md' }, { code: '??', path: 'other.txt' }])
+  await commitGitChanges(dir, 'rename the readme', ['GUIDE.md'])
+  assert.equal(gitSync(['ls-files'], dir), 'GUIDE.md')
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: '??', path: 'other.txt' }])
+})
+
+test('REGRESSION: a selective commit takes each path literally, not as a glob', async () => {
+  const dir = initRepo()
+  writeFileSync(join(dir, '[ab].txt'), 'g\n')
+  writeFileSync(join(dir, 'a.txt'), 'a\n')
+  gitSync(['add', '-A'], dir)
+  gitSync(['commit', '-q', '-m', 'two files'], dir)
+  rmSync(join(dir, '[ab].txt'))
+  appendFileSync(join(dir, 'a.txt'), 'more\n')
+  await commitGitChanges(dir, 'remove the bracket file', ['[ab].txt'])
+  // As a glob, '[ab].txt' also matched a.txt and committed a change that was never selected.
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: ' M', path: 'a.txt' }])
 })
 
 test('getGitStatus: a configured remote is reflected in hasRemote', async () => {

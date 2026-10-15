@@ -123,10 +123,19 @@ export async function getGitStatus(repoRoot: string): Promise<GitStatusResult> {
     } catch { /* branch has no upstream tracking configured yet */ }
   }
 
-  const raw = await git(['status', '--porcelain=v1'], repoRoot)
-  const files: GitFileStatus[] = raw
-    ? raw.split('\n').filter(Boolean).map((line) => ({ code: line.slice(0, 2), path: line.slice(3) }))
-    : []
+  // -z: these paths go back to `git add` for a selective commit, and without it git C-quotes any
+  // path with a space or non-ASCII character ('"caf\303\251.txt"') and prints a rename as
+  // 'old -> new' — none of which git accepts back. With -z each entry is 'XY path' NUL-terminated,
+  // unquoted, and a rename/copy is followed by one more NUL-terminated field: its original path.
+  const raw = (await git(['status', '--porcelain=v1', '-z'], repoRoot)).split('\0')
+  const files: GitFileStatus[] = []
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i]
+    if (!entry) continue
+    const code = entry.slice(0, 2)
+    files.push({ code, path: entry.slice(3) })
+    if (/[RC]/.test(code)) i++ // skip the original path; the new one is what gets staged
+  }
 
   return { isRepo: true, branch, detached, files, hasRemote, hasUpstream, ahead, behind }
 }
@@ -155,7 +164,9 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
     for (const f of files) {
       if (!isContainedFromRoot(f, repoRoot)) throw new GitError(`Refusing to stage a path outside the repo: ${f}`, '', null)
     }
-    await git(['add', '--', ...files], repoRoot)
+    // Literal: these are file names (from getGitStatus), so '[ab].txt' must not also match a.txt
+    // as a glob, nor a leading ':' read as pathspec magic.
+    await git(['--literal-pathspecs', 'add', '--', ...files], repoRoot)
   } else {
     await git(['add', '-A'], repoRoot)
   }
