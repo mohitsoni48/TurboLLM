@@ -3,8 +3,9 @@
 // faithful alternative to the client-side html2canvas path (which reimplements CSS layout and
 // can't match the live render). Uses the user's INSTALLED browser (no bundled Chromium), and
 // returns null whenever a browser isn't found or anything fails, so the caller falls back to
-// the html2canvas export. Self-contained artifacts only: all external network is blocked — the
-// page carries the on-screen iframe's own `default-src 'none'` CSP (see ARTIFACT_CSP).
+// the html2canvas export. Self-contained artifacts only: the page carries the on-screen iframe's
+// own `default-src 'none'` CSP (see ARTIFACT_CSP), and the browser is launched with no network at
+// all (see NO_NETWORK_ARGS), since the artifact's scripts run here too.
 import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -76,6 +77,19 @@ export function withArtifactCsp(html: string): string {
   return doctype ? doctype[0] + ARTIFACT_CSP + html.slice(doctype[0].length) : ARTIFACT_CSP + html
 }
 
+/** Takes the export browser off the network. Request interception and the CSP only cover the
+ *  artifact's own page: a popup it opens (window.open, a target=_blank form or link; puppeteer
+ *  turns the popup blocker off, and page.evaluate grants a user gesture anyway) loaded loopback,
+ *  LAN and internet URLs, and WebRTC sent STUN/TURN traffic from either. So every request goes to
+ *  a proxy on the discard port, where nothing listens; `<-loopback>` drops Chrome's built-in
+ *  bypass for localhost/127.0.0.1, and WebRTC may only use UDP through that proxy (none). The page
+ *  itself loads with setContent and data:/blob: URLs, which never touch the network. */
+const NO_NETWORK_ARGS = [
+  '--proxy-server=http://127.0.0.1:9',
+  '--proxy-bypass-list=<-loopback>',
+  '--webrtc-ip-handling-policy=disable_non_proxied_udp',
+]
+
 export interface ShotOpts {
   /** CSS-px width of the render viewport (a stable desktop width, e.g. 360–1280). */
   width: number
@@ -99,7 +113,7 @@ export async function screenshotArtifact(html: string, opts: ShotOpts): Promise<
     browser = await puppeteer.launch({
       executablePath: exe,
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars'],
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars', ...NO_NETWORK_ARGS],
     })
     const page = await browser.newPage()
     await page.setViewport({
@@ -107,8 +121,9 @@ export async function screenshotArtifact(html: string, opts: ShotOpts): Promise<
       height: Math.max(480, Math.round(opts.height)),
       deviceScaleFactor: 2,
     })
-    // Block all external network so the render matches the on-screen iframe (CSP default-src none)
-    // and never phones out. Inline styles/scripts and data:/blob: URLs still work.
+    // Fail this page's network requests at once, as the on-screen iframe (CSP default-src none)
+    // does, rather than waiting on the dead proxy. Popups are not covered here: NO_NETWORK_ARGS is
+    // what keeps them (and WebRTC) off the network. Inline styles/scripts and data:/blob: URLs work.
     await page.setRequestInterception(true)
     page.on('request', (req) => {
       const u = req.url()
