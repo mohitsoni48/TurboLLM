@@ -7,7 +7,7 @@
 // of test that passes while the feature is broken.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   agentCwd,
@@ -359,4 +359,72 @@ test('removeSessionWorktree: a DIRTY worktree is still refused — the guard did
       rmSync(root, { recursive: true, force: true })
     }
   })()
+})
+
+test('REGRESSION: a worktree session started at a repo subfolder works in that subfolder of a worktree at the repo top level', async () => {
+  // `git worktree add` checks out the whole repository and the exclude line is anchored at its top
+  // level: placed under the picked subfolder, the agent worked across the whole repo and the base
+  // repo listed `?? packages/web/.turbollm/` (which a commit-all then staged as an embedded repo).
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'packages', 'web')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.ok(existsSync(join(r.path, 'a.ts')), 'the session works in the package folder')
+    assert.equal((await runGit(r.path, ['rev-parse', '--show-prefix'])).stdout.trim(), 'packages/web/')
+    assert.equal((await runGit(r.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim(), 'feat')
+    assert.ok(!existsSync(join(sub, '.turbollm')), 'nothing created inside the base package')
+    assert.equal((await runGit(root, ['status', '--porcelain'])).stdout.trim(), '', 'base repo stays clean')
+
+    const removed = await removeSessionWorktree(sub, r.path)
+    assert.equal(removed.ok, true, JSON.stringify(removed))
+    assert.ok(!existsSync(r.path), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: removing a subfolder session\'s worktree whose folder is gone from it, or one in the old layout', async () => {
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'web')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    const worktreeCount = async () => (await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length
+
+    // The session's folder is gone from the worktree (the agent removed the package): the worktree
+    // itself is still removed, or reported dirty while the removal is uncommitted.
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'drop-web' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    const top = join(root, '.turbollm', 'worktrees', 'drop-web')
+    rmSync(r.path, { recursive: true })
+    const dirty = await removeSessionWorktree(sub, r.path)
+    assert.equal(dirty.ok, false, 'an uncommitted removal is work: left in place')
+    if (!dirty.ok) assert.match(dirty.message, /drop-web" *$/)
+    await runGit(top, ['commit', '-qam', 'remove the package'])
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(top), 'worktree removed')
+    assert.equal(await worktreeCount(), 1)
+
+    // Created before worktrees moved to the top level, on a branch named like the folder: its
+    // stored path ends with the folder's prefix but is itself the worktree.
+    const old = join(sub, '.turbollm', 'worktrees', 'web')
+    assert.ok((await runGit(sub, ['worktree', 'add', '-q', '-b', 'web', old])).ok)
+    assert.deepEqual(await removeSessionWorktree(sub, old), { ok: true })
+    assert.ok(!existsSync(old), 'old-layout worktree removed')
+    assert.equal(await worktreeCount(), 1)
+    assert.deepEqual(await removeSessionWorktree(sub, old), { ok: true }, 'already gone')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })

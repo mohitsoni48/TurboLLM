@@ -10,6 +10,8 @@
 // exact outcome someone ticks the box to avoid, and it failed silently.
 //
 // ── Layout: <repoRoot>/.turbollm/worktrees/<branch> (founder's choice) ──────────────────────
+// (<repoRoot> being the repository's top level: a session started at a subfolder of a repo works
+// in the same subfolder of the worktree; see createSessionWorktree.)
 // Self-contained and always writable when the repo is. The two hazards that come with living
 // inside the repo are handled rather than assumed away, both verified against real git first:
 //   • The directory shows up as `?? .turbollm/` in the BASE repo. Suppressed via
@@ -21,7 +23,7 @@
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { appendFile, readFile, mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 
 /** Where a repo's session worktrees live, relative to the repo root. */
 export const WORKTREES_SUBDIR = join('.turbollm', 'worktrees')
@@ -203,11 +205,22 @@ export async function createSessionWorktree(params: {
 
   await ensureLocalExclude(repoRoot)
 
-  const path = join(repoRoot, WORKTREES_SUBDIR, branch)
+  // A session started at a SUBFOLDER of a repo (a monorepo package): `git worktree add` checks out
+  // the whole repository, and the exclude line is anchored at its top level. So the worktree goes
+  // under the repository's top level, and the session works in the same subfolder of it (the
+  // returned path, which agentCwd uses; created if the base commit lacks it).
+  let prefix = (await runGit(repoRoot, ['rev-parse', '--show-prefix'])).stdout.replace(/\r?\n$/, '')
+  let top = repoRoot
+  if (prefix) {
+    const t = (await runGit(repoRoot, ['rev-parse', '--show-toplevel'])).stdout.replace(/\r?\n$/, '')
+    if (t) top = t
+    else prefix = ''
+  }
+  const worktreeTop = join(top, WORKTREES_SUBDIR, branch)
   // Only pass a base when it actually resolves — `git worktree add -b x <path> nope` is a hard
   // failure, and a session that won't start is a worse answer than one branched off HEAD.
   const baseArgs = base && (await refExists(repoRoot, base)) ? [base] : []
-  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, path, ...baseArgs], 120_000)
+  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, worktreeTop, ...baseArgs], 120_000)
   if (!r.ok) {
     return {
       ok: false,
@@ -215,6 +228,8 @@ export async function createSessionWorktree(params: {
       message: `Cannot create a worktree: ${(r.stderr || r.stdout).trim().slice(0, 400)}`,
     }
   }
+  const path = join(worktreeTop, ...prefix.split('/').filter(Boolean))
+  if (prefix) await mkdir(path, { recursive: true }).catch(() => { /* the agent then reports the missing folder */ })
   return { ok: true, path, branch }
 }
 
@@ -236,20 +251,40 @@ export async function removeSessionWorktree(repoRoot: string, worktreePath: stri
   // project moved or deleted, an external drive unplugged. Reporting that as an error produced a
   // raw `spawn git ENOENT` on the delete response (git cannot even start when its cwd is missing),
   // which told the user nothing and made a perfectly successful delete look like it had failed.
-  if (!existsSync(worktreePath) || !existsSync(repoRoot)) return { ok: true }
+  if (!existsSync(repoRoot)) return { ok: true }
 
-  const r = await runGit(repoRoot, ['worktree', 'remove', worktreePath], 60_000)
-  if (r.ok) return { ok: true }
+  // A session started at a repo subfolder works in that subfolder of its worktree
+  // (createSessionWorktree), but `git worktree remove` takes the worktree's own top level: the
+  // stored path without that folder's prefix, tried first. The prefix is asked of the BASE repo,
+  // never of the worktree: a broken one (its .git file gone) would answer for the repository around
+  // it, which may itself be a linked worktree that a remove would then delete. A path that only
+  // ends the same way (a subfolder session created before worktrees moved to the top level, whose
+  // branch is named like the folder) is no worktree, which git says, so the stored path is tried
+  // next. Each is tried only if it is still there: the session's folder inside the worktree can be
+  // gone (deleted by the agent) while the worktree is not.
+  const prefix = (await runGit(repoRoot, ['rev-parse', '--show-prefix'])).stdout.replace(/\r?\n$/, '')
+  const parts = prefix.split('/').filter(Boolean)
+  const tail = worktreePath.split(/[\\/]+/).filter(Boolean).slice(-parts.length)
+  const targets = parts.length > 0 && tail.join('/') === parts.join('/')
+    ? [resolve(worktreePath, ...parts.map(() => '..')), worktreePath]
+    : [worktreePath]
+  for (const [i, target] of targets.entries()) {
+    if (!existsSync(target)) continue
+    const r = await runGit(repoRoot, ['worktree', 'remove', target], 60_000)
+    if (r.ok) return { ok: true }
 
-  const err = (r.stderr || r.stdout).trim()
-  if (/contains modified or untracked files|use --force/i.test(err)) {
-    return {
-      ok: false,
-      code: 'dirty',
-      message:
-        `The worktree at ${worktreePath} still has uncommitted changes, so it was left in place. ` +
-        `Commit or discard them, then remove it with: git worktree remove "${worktreePath}"`,
+    const err = (r.stderr || r.stdout).trim()
+    if (i < targets.length - 1 && /is not a working tree/i.test(err)) continue
+    if (/contains modified or untracked files|use --force/i.test(err)) {
+      return {
+        ok: false,
+        code: 'dirty',
+        message:
+          `The worktree at ${target} still has uncommitted changes, so it was left in place. ` +
+          `Commit or discard them, then remove it with: git worktree remove "${target}"`,
+      }
     }
+    return { ok: false, code: 'git_failed', message: err.slice(0, 400) }
   }
-  return { ok: false, code: 'git_failed', message: err.slice(0, 400) }
+  return { ok: true } // nothing of it left on disk
 }
