@@ -271,3 +271,116 @@ describe('ArtifactCard — SVG artifact script never runs', () => {
     }
   })
 })
+
+describe('ArtifactCard — an SVG that is not well-formed XML', () => {
+  // A browser shows such an SVG inline in an HTML page, but refuses it as an <img> (what the
+  // rasterizer loads): no xmlns, a bare `&`, an HTML entity such as `&nbsp;`. Its preview used to
+  // fail, leaving the unscripted pre-preview frame, whose sizer can't run: a cropped strip.
+  beforeEach(() => {
+    vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(800)
+  })
+
+  /** Like stubRaster, but the <img> loads only a well-formed SVG document, as a browser's does. */
+  function stubStrictRaster() {
+    const blobs = new Map<string, Blob>()
+    const loaded: string[] = []
+    let n = 0
+    URL.createObjectURL = (b: Blob | MediaSource) => { const u = `blob:artifact-${n++}`; blobs.set(u, b as Blob); return u }
+    URL.revokeObjectURL = () => {}
+    vi.stubGlobal('Image', class {
+      naturalWidth = 400
+      naturalHeight = 300
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      set src(u: string) {
+        const r = new FileReader()
+        r.onload = () => {
+          const text = String(r.result)
+          const root = new DOMParser().parseFromString(text, 'image/svg+xml').documentElement
+          const ok = root.localName === 'svg' && root.namespaceURI === 'http://www.w3.org/2000/svg'
+          if (ok) loaded.push(text)
+          if (ok) this.onload?.()
+          else this.onerror?.()
+        }
+        r.readAsText(blobs.get(u)!)
+      }
+    })
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () => ({ fillRect() {}, scale() {}, drawImage() {}, fillStyle: '' }) as unknown as CanvasRenderingContext2D,
+    )
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,AAAA')
+    return { loaded }
+  }
+
+  it.each([
+    ['no xmlns', '<svg width="400" height="300" viewBox="0 0 400 300"><rect width="10" height="10"/></svg>'],
+    ['a bare & and &nbsp;', '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><text x="5" y="20">R&D&nbsp;costs</text></svg>'],
+  ])('is still rasterized to the fitted preview image (%s)', async (_label, svg) => {
+    const { loaded } = stubStrictRaster()
+    const { container } = render(<ArtifactCard lang="svg" code={svg} />)
+    // Until the preview lands, the raw SVG still shows in a frame that runs nothing.
+    expect(container.querySelector('iframe')?.getAttribute('sandbox')).toBe('')
+    expect(await screen.findByRole('img', { name: 'Artifact' })).toHaveAttribute('src', 'data:image/png;base64,AAAA')
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(loaded).toHaveLength(1)
+    expect(loaded[0]).toContain('xmlns="http://www.w3.org/2000/svg"')
+  })
+
+  it('drops comments, which never render and are not XML when they hold "--"', async () => {
+    const { loaded } = stubStrictRaster()
+    const svg = '<svg width="400" height="300"><!-- -- labels -- --><rect width="10" height="10"/></svg>'
+    render(<ArtifactCard lang="svg" code={svg} />)
+    expect(await screen.findByRole('img', { name: 'Artifact' })).toHaveAttribute('src', 'data:image/png;base64,AAAA')
+    expect(loaded[0]).not.toContain('<!--')
+  })
+})
+
+describe('ArtifactCard — an SVG whose raster taints the canvas (<foreignObject>)', () => {
+  // A browser taints the canvas when it draws an SVG image holding a <foreignObject> (Chromium for
+  // a blob: image but not a data: one, Safari for both), and toDataURL then throws. That used to
+  // escape the preview's onload: the preview never settled and the card kept the unscripted
+  // pre-preview frame, a cropped strip.
+  beforeEach(() => {
+    vi.spyOn(Element.prototype, 'clientWidth', 'get').mockReturnValue(800)
+  })
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="400" height="300"><foreignObject width="400" height="300"><div xmlns="http://www.w3.org/1999/xhtml">wrapped text</div></foreignObject></svg>'
+
+  /** The canvas taints once it has drawn an image whose URL `taints` matches. */
+  function stubTaint(taints: (src: string) => boolean) {
+    let drawn = ''
+    vi.stubGlobal('Image', class {
+      naturalWidth = 400
+      naturalHeight = 300
+      url = ''
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      get src() { return this.url }
+      set src(u: string) { this.url = u; setTimeout(() => this.onload?.(), 0) }
+    })
+    URL.createObjectURL = () => 'blob:artifact'
+    URL.revokeObjectURL = () => {}
+    vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockImplementation(
+      () => ({ fillRect() {}, scale() {}, drawImage(img: { src: string }) { drawn = img.src }, fillStyle: '' }) as unknown as CanvasRenderingContext2D,
+    )
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(() => {
+      if (taints(drawn)) throw new DOMException('Tainted canvases may not be exported.', 'SecurityError')
+      return 'data:image/png;base64,AAAA'
+    })
+  }
+
+  it('is rasterized from a data: URL where only a blob: image taints (Chromium)', async () => {
+    stubTaint((src) => src.startsWith('blob:'))
+    const { container } = render(<ArtifactCard lang="svg" code={svg} />)
+    expect(container.querySelector('iframe')?.getAttribute('sandbox')).toBe('')
+    expect(await screen.findByRole('img', { name: 'Artifact' })).toHaveAttribute('src', 'data:image/png;base64,AAAA')
+    expect(container.querySelector('iframe')).toBeNull()
+  })
+
+  it('becomes the preview image itself where every SVG image taints (Safari)', async () => {
+    stubTaint(() => true)
+    const { container } = render(<ArtifactCard lang="svg" code={svg} />)
+    expect(await screen.findByRole('img', { name: 'Artifact' }))
+      .toHaveAttribute('src', 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg))
+    expect(container.querySelector('iframe')).toBeNull()
+  })
+})

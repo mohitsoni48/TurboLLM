@@ -45,7 +45,7 @@ function injectAtDocStart(code: string, head: string): string {
  *  needs the live page), never just because a message rendered. The raw SVG document IS
  *  mounted on render (it shows until the rasterized preview replaces it), but in a `sandbox=""`
  *  frame: neither the SVG's own <script> nor the sizer runs there, so it shows unfitted until
- *  then, and stays that way only when the SVG can't be rasterized (e.g. no xmlns). */
+ *  then, and stays that way only when the SVG can't be rasterized even after `wellFormedSvg`. */
 function buildSrcdoc(type: string, code: string): string {
   const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:;">`
   const resizeHtml = `<script>(function(){function r(){var h=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);var w=Math.max(document.documentElement.scrollWidth,document.body?document.body.scrollWidth:0);parent.postMessage({type:'tllm-size',w:w,h:h},'*')}window.addEventListener('load',r);if(document.readyState!=='loading')r();try{new ResizeObserver(r).observe(document.documentElement)}catch(e){}})()</script>`
@@ -235,12 +235,31 @@ function captureGif(iframe: HTMLIFrameElement | null): Promise<Blob | null> {
   })
 }
 
+/** An SVG that isn't well-formed XML (no xmlns, a bare `&`, an HTML entity like `&nbsp;`) shows
+ *  inline in an HTML page but fails to load as an <img>, so it could never be rasterized. Parse it
+ *  the way the page does (an inert DOMParser document: nothing runs or loads) and serialize its
+ *  <svg> back as XML, minus its comments (they never render, and one holding `--` is not XML).
+ *  Null when there is no <svg>. */
+function wellFormedSvg(svg: string): string | null {
+  const doc = new DOMParser().parseFromString(svg, 'text/html')
+  const el = doc.querySelector('svg')
+  if (!el) return null
+  const comments = doc.createNodeIterator(el, NodeFilter.SHOW_COMMENT)
+  for (let c = comments.nextNode(); c; c = comments.nextNode()) c.parentNode?.removeChild(c)
+  return new XMLSerializer().serializeToString(el)
+}
+
 /** Rasterize an SVG string to a PNG data URL (2048px minimum on shortest side, but the
- *  longest side is capped at 4096px). Returns null on failure. */
-function svgToPreview(svg: string): Promise<string | null> {
+ *  longest side is capped at 4096px). Returns null on failure. A failed load is retried once
+ *  with `wellFormedSvg`; the raw string goes first so a valid SVG renders exactly as written.
+ *  An SVG with a <foreignObject> taints the canvas, so it can't be encoded: Chromium does that
+ *  only for an image loaded from a blob: URL, so it is retried from a data: URL, and where that
+ *  taints too (Safari) the SVG itself is the preview (an <img> runs no script, loads nothing). */
+function svgToPreview(svg: string, retry = true, asData = false): Promise<string | null> {
   return new Promise((resolve) => {
-    const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
+    const url = asData
+      ? 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
+      : URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }))
     const img = new Image()
     img.onload = () => {
       let w = img.naturalWidth, h = img.naturalHeight
@@ -262,12 +281,21 @@ function svgToPreview(svg: string): Promise<string | null> {
       ctx.fillRect(0, 0, canvas.width, canvas.height)
       ctx.scale(scale, scale); ctx.drawImage(img, 0, 0, w, h)
       URL.revokeObjectURL(url)
+      let png: string
+      try {
+        png = canvas.toDataURL('image/png')
+      } catch { // SecurityError: the canvas is tainted (see above).
+        return resolve(asData ? url : svgToPreview(svg, false, true))
+      }
       // A canvas the browser couldn't allocate encodes as the empty "data:," (truthy) — that's
       // a failure, not a preview.
-      const png = canvas.toDataURL('image/png')
       resolve(png === 'data:,' ? null : png)
     }
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(null) }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      const fixed = retry ? wellFormedSvg(svg) : null
+      resolve(fixed && fixed !== svg ? svgToPreview(fixed, false) : null)
+    }
     img.src = url
   })
 }
