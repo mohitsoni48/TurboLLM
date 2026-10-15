@@ -266,6 +266,11 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const convQ = useConversation(activeId)
   const conv = convQ.data
   const messages = conv?.messages ?? []
+  // A version switch on an earlier message freezes everything after it, the message being
+  // edited included: its Save and Cancel leave with it, and nothing else re-enables the composer.
+  useEffect(() => {
+    if (editingId && conv?.messages && !conv.messages.some((m) => m.id === editingId)) setEditingId(null)
+  }, [editingId, conv?.messages])
 
   // Skills enabled before a conversation exists yet (first message hasn't been sent).
   // Once activeId exists, conv.skillIds is the source of truth instead.
@@ -960,17 +965,33 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
         }
       },
-      onError: () => toast.error('Could not edit message.'),
+      onError: (e) => {
+        if (!(e instanceof ApiError && e.code === 'stale_message')) { toast.error('Could not edit message.'); return }
+        // A question this view still showed after it left the branch (switched in another tab
+        // or device): catch the view up now rather than on the next poll, and keep the typed
+        // text. Its bubble is gone after the refetch, so it goes to the composer (this chat's
+        // only, and after anything typed there meanwhile, never over it).
+        void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
+        void qc.invalidateQueries({ queryKey: ['message-variants'] })
+        toast.error(e.message)
+        if (activeIdRef.current !== activeId) return
+        setInput((cur) => (cur.trim() ? `${cur}\n\n${content}` : content))
+        setTimeout(autoResize, 0)
+      },
     })
   }
 
   const handleRegenerate = async () => {
     if (!activeId || live) return
     if (!ready) { toast.error('Load a model first.'); return }
-    await mut.regenerate.mutateAsync(activeId).catch(() => {})
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
-    void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
+    // One request: the daemon sets the old reply aside only once the turn can run. A separate
+    // /regenerate first lost the reply (no switcher, history ending on the question) whenever
+    // /continue was then refused.
+    await streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, true))
+    // The new reply joined the old one's version group, whose switcher list is cached.
+    void qc.invalidateQueries({ queryKey: ['message-variants'] })
   }
 
   const handleDelete = (m: Message) => {

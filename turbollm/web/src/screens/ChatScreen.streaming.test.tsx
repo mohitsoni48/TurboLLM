@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../lib/api'
+import { toast } from '../components/ui/sonner'
 import type { ChatSseEvent } from '../lib/chat-types'
 
 beforeEach(() => {
@@ -19,7 +20,10 @@ beforeEach(() => {
   })
   Object.defineProperty(Element.prototype, 'scrollTo', { configurable: true, writable: true, value: () => {} })
   stopSpy.mockClear()
+  regenerateSpy.mockClear()
+  editMsgMutate.mockReset()
   sendCalls.length = 0
+  continueCalls.length = 0
   convs.clear()
 })
 
@@ -40,6 +44,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
 })
 
 const stopSpy = vi.fn((_id: string) => Promise.resolve())
+const regenerateSpy = vi.fn((_id: string) => Promise.resolve())
+const editMsgMutate = vi.fn()
 // Every ConvItem (and the sidebar itself, the screen and the settings dialog) calls this once per
 // render — counting calls is counting re-renders.
 let mutationHookCalls = 0
@@ -75,7 +81,7 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
       const idle = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false })
       return {
         create: { ...idle(), mutateAsync: vi.fn(() => Promise.resolve({ id: 'new1' })) },
-        update: idle(), compact: idle(), deleteMsg: idle(), editMsg: idle(), regenerate: idle(),
+        update: idle(), compact: idle(), deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
         stop: { ...idle(), mutateAsync: stopSpy }, undoCompaction: idle(), remove: idle(), moveToFolder: idle(),
         createFolder: idle(), deleteFolder: idle(), renameFolder: idle(),
       }
@@ -86,11 +92,13 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
 type Gen = (signal: AbortSignal) => AsyncGenerator<ChatSseEvent>
 let nextGen: Gen
 const sendCalls: unknown[][] = []
+const continueCalls: unknown[][] = []
 vi.mock('../lib/chat-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/chat-api')>()
   return {
     ...actual,
     sendMessage: (...args: unknown[]) => { sendCalls.push(args); return nextGen(args[2] as AbortSignal) },
+    continueConversation: (...args: unknown[]) => { continueCalls.push(args); return nextGen(args[1] as AbortSignal) },
   }
 })
 vi.mock('../lib/link-queries', async (importOriginal) => {
@@ -150,7 +158,7 @@ function steppedStream() {
 async function renderScreen(path: string, props: { embedded?: boolean; convIdOverride?: string } = {}) {
   const { ChatScreen } = await import('./ChatScreen')
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={[path]}>
         <Routes>
@@ -158,9 +166,17 @@ async function renderScreen(path: string, props: { embedded?: boolean; convIdOve
           <Route path="/chat" element={<ChatScreen {...props} />} />
         </Routes>
       </MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
+  const view = render(tree())
+  // The stubbed useConversation is not a live query: this re-renders the screen after a test
+  // swaps the conversation, as a refetch would.
+  return { ...view, qc, refetched: () => view.rerender(tree()) }
 }
+function message(id: string, seq: number, role: 'user' | 'assistant', content: string) {
+  return { id, convId: 'c1', seq, role, content, reasoning: '', attachments: [], textAttachments: [], toolCalls: [], stats: {}, createdAt: '', variantGroup: null, isActive: true, edited: false }
+}
+const showMessages = (messages: unknown[]) => { convs.set('c1', { ...(conv('c1') as object), messages }) }
 
 const composer = () => screen.findByPlaceholderText(/^Message /) as Promise<HTMLTextAreaElement>
 async function sendText(text: string) {
@@ -311,6 +327,59 @@ describe('ChatScreen — Ctrl/Cmd+N', () => {
     expect(await screen.findByText('hi')).toBeInTheDocument()
     await pressCtrlN()
     expect(screen.getByText('hi')).toBeInTheDocument()
+  })
+})
+
+describe('ChatScreen — editing a message', () => {
+  it('a version switch that takes the message being edited off the shown branch leaves the composer usable', async () => {
+    const before = [message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python'), message('u2', 4, 'user', 'How do I install it?'), message('a2', 5, 'assistant', 'pip ...')]
+    showMessages(before)
+    const view = await renderScreen('/chat/c1')
+    await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) }) // edit the last question
+    expect(await composer()).toBeDisabled()
+    // Switching the first reply to its other version froze u2 (and its reply); the refetch shows
+    // the branch without it, so its Save and Cancel are gone.
+    showMessages([before[0], message('a1b', 3, 'assistant', 'Use Rust')])
+    await act(async () => { view.refetched() })
+    expect(screen.queryByText('How do I install it?')).toBeNull()
+    await waitFor(async () => expect(await composer()).not.toBeDisabled())
+  })
+
+  it('a Save & Resend refused as stale (409) refetches, shows why and keeps the typed text in the composer', async () => {
+    const stale = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    editMsgMutate.mockImplementation((_v: unknown, opts: { onError: (e: unknown) => void }) => opts.onError(new ApiError('stale_message', stale, 409)))
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      const view = await renderScreen('/chat/c1')
+      const invalidate = vi.spyOn(view.qc, 'invalidateQueries')
+      await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
+      fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language, carefully' } })
+      await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+      expect(toastError).toHaveBeenCalledWith(stale)
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['conversation', 'c1'] })
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['message-variants'] })
+      await waitFor(async () => expect(await composer()).toHaveValue('Recommend a typed language, carefully'))
+      expect(await composer()).not.toBeDisabled()
+      expect(continueCalls).toHaveLength(0)
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+})
+
+describe('ChatScreen — Regenerate', () => {
+  // /regenerate (deactivate the reply) and then /continue: a /continue the daemon refused (a
+  // Turbo Link machine asleep, the model gone) left the reply deactivated with no way back.
+  it('is one /continue that sets the old reply aside itself, with no /regenerate before it', async () => {
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    nextGen = quickStream()
+    await renderScreen('/chat/c1')
+    fireEvent.click(await screen.findByTitle('Regenerate'))
+    await waitFor(() => expect(continueCalls).toHaveLength(1))
+    expect(continueCalls[0][0]).toBe('c1')
+    expect(continueCalls[0][5]).toBe(true)
+    expect(regenerateSpy).not.toHaveBeenCalled()
   })
 })
 

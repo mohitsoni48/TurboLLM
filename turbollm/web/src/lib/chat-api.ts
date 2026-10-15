@@ -187,11 +187,14 @@ export async function* continueConversation(
   reasoningEffort?: ReasoningEffort,
   /** See {@link sendMessage}. */
   model?: string,
+  /** Regenerate: the daemon sets the last reply aside as a sibling version, and only once the
+   *  turn can run (a refused turn leaves it in place). */
+  regenerate?: boolean,
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined, regenerate: regenerate || undefined }),
     signal,
   })
   if (!res.ok || !res.body) {

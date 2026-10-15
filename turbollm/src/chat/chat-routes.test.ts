@@ -247,7 +247,7 @@ function inFlightHarness(tools?: unknown) {
   } as unknown as Deps
   const app = new Hono()
   registerChatRoutes(app, d)
-  return { app, store, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return { app, store, d, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 /** Holds the engine's reply until `finish()` — the chat stays in flight until then. */
@@ -412,14 +412,48 @@ test('a turn that throws before generating releases its in-flight entry (no stuc
   try {
     const conv = h.store.createConversation()
     const url = `/api/v1/conversations/${conv.id}/messages`
-    const bad = await h.app.request(url, json({ content: 'hi', images: 'not-an-array' }))
+    // A malformed body is now refused before the turn starts (below), so the throw comes from a
+    // history that fails to read inside the callback (maybeAutoCompact is its first reader).
+    const getConversation = h.store.getConversation.bind(h.store)
+    h.store.getConversation = ((id: string, inc?: boolean) => {
+      const real = getConversation(id, inc)
+      return real && { ...real, get messages(): never { throw new Error('history unreadable') } }
+    }) as typeof h.store.getConversation
+    const bad = await h.app.request(url, json({ content: 'hi' }))
+    assert.equal(bad.status, 200, 'the throw must come from inside the turn')
     await bad.text() // ends only after the callback (and its release) settles: Hono closes the stream in run()'s finally
     assert.deepEqual(inFlightChatIds(), [])
+    h.store.getConversation = getConversation
     const ok = await h.app.request(url, json({ content: 'hi again' }))
     assert.equal(ok.status, 200)
     await ok.text()
   } finally {
     console.error = originalError
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('POST /messages refuses non-array images or textAttachments (and a non-string docContext) before storing anything', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const conv = h.store.createConversation()
+    const url = `/api/v1/conversations/${conv.id}/messages`
+    for (const bad of [{ images: 'data:image/png;base64,AAAA' }, { textAttachments: 'file.txt' }, { images: [1] }, { docContext: { text: 'x' } }]) {
+      const res = await h.app.request(url, json({ content: 'hi', ...bad }))
+      assert.equal(res.status, 400, JSON.stringify(bad))
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'invalid_input')
+    }
+    assert.deepEqual(h.store.getMessages(conv.id), [], 'nothing stored')
+    assert.deepEqual(inFlightChatIds(), [])
+    assert.equal(engine.bodies.length, 0)
+    // Arrays of strings (and null for an absent field) still go through.
+    const ok = await h.app.request(url, json({ content: 'hi', images: ['data:image/png;base64,AAAA'], textAttachments: null, docContext: null }))
+    assert.equal(ok.status, 200)
+    await ok.text()
+    assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.role), ['user', 'assistant'])
+  } finally {
     engine.restore()
     h.cleanup()
   }
@@ -442,6 +476,79 @@ test('switching an older assistant reply\'s variant swaps its downstream turns t
     const toRust = await (await h.app.request(`${base}/messages/${a2.id}/activate`, { method: 'POST' })).json() as { messages: Array<{ content: string }> }
     assert.deepEqual(toRust.messages.map((m) => m.content), ['Recommend a language', 'Use Rust', 'How do I install cargo?', 'Run rustup ...'])
   } finally {
+    h.cleanup()
+  }
+})
+
+// Regenerate used to be /regenerate (deactivate the reply) and then /continue. When /continue was
+// refused (a Turbo Link machine asleep, the model gone), the reply stayed deactivated with no
+// switcher to bring it back, and the next send went out as user, user.
+test('a Regenerate the upstream refuses keeps the reply it would have replaced', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'a1 again']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => `${m.role}:${m.content}`)
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+
+    const manager = h.d.manager as unknown as { status: () => unknown }
+    const running = manager.status
+    manager.status = () => ({ state: 'stopped', model: null }) // the engine went away
+    const refused = await h.app.request(`${base}/continue`, json({ regenerate: true }))
+    assert.equal(refused.status, 409)
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1'])
+
+    manager.status = running
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1 again'])
+    assert.deepEqual(engine.bodies[1].messages.map((m) => m.role), ['user'], 'the replaced reply is not sent')
+    const reply = h.store.getMessages(conv.id)[1]
+    assert.deepEqual(h.store.getMessageVariants(reply.variantGroup!).map((m) => m.content), ['a1', 'a1 again'], 'both versions on one switcher')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// A stale tab or another device still showing a version that was switched away from: acting on it
+// froze this branch's rows under the stale one (two replies in a row on switching back), or
+// spliced a reply into the middle of an unrelated branch.
+test('PUT and /activate on a message no longer on the shown branch are refused and change nothing', async () => {
+  const h = inFlightHarness()
+  const replies = ['reply1', 'reply2', 'reply3', 'reply4']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+    const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+    const activate = (id: string) => h.app.request(`${base}/messages/${id}/activate`, { method: 'POST' })
+
+    await (await h.app.request(`${base}/messages`, json({ content: 'u1' }))).text()
+    const u1 = h.store.getMessages(conv.id)[0].id
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    const reply1 = h.store.getMessageVariants(h.store.getMessages(conv.id)[1].variantGroup!)[0].id
+    // Tab B edits u1 and gets a reply; tab A still shows u1 with its reply2 (switcher 2/2).
+    assert.equal((await put(u1, 'u1 B')).status, 200)
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(active(), ['u1 B', 'reply3'])
+
+    const staleEdit = await put(u1, 'u1 A')
+    assert.equal(staleEdit.status, 409)
+    assert.equal(((await staleEdit.json()) as { error: { code: string } }).error.code, 'stale_message')
+    const staleSwitch = await activate(reply1)
+    assert.equal(staleSwitch.status, 409)
+    assert.deepEqual(active(), ['u1 B', 'reply3'])
+
+    // The branches are intact: switching back shows u1 with the one reply it had.
+    assert.equal((await activate(u1)).status, 200)
+    assert.deepEqual(active(), ['u1', 'reply2'])
+    assert.equal((await activate(reply1)).status, 200, 'its switcher works again once it is shown')
+    assert.deepEqual(active(), ['u1', 'reply1'])
+  } finally {
+    engine.restore()
     h.cleanup()
   }
 })

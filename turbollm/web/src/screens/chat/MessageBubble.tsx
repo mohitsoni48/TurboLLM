@@ -12,7 +12,8 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
 import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
-import { track } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
+import { toast } from '../../components/ui/sonner'
 import { saveThinkingBlockHeight, useThinkingBlockHeight } from '../../lib/thinking-block-size'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
@@ -1034,6 +1035,12 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       await activateVariant(convId, targetId)
       await qc.invalidateQueries({ queryKey: ['message-variants', group] })
       await qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    } catch (e) {
+      // Refused, e.g. 409 stale_message: this group left the shown branch (switched in another
+      // tab or device). Say why and catch the view up now rather than on the next poll.
+      toast.error(e instanceof ApiError ? e.message : 'Could not switch version.')
+      void qc.invalidateQueries({ queryKey: ['message-variants'] })
+      void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } finally {
       setSwitching(false)
     }

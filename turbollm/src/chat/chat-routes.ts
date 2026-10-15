@@ -184,7 +184,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/conversations/:id', (c) => {
     const conv = db.getConversation(c.req.param('id'), true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
-    return c.json(conv)
+    // The compaction as the turns see it: one cut on a branch the user left is not this
+    // branch's, so the chat shows no divider, summary or Undo for it (Undo would delete the
+    // other branch's compaction) and the meter shows its measured reading, no projection. (The
+    // daemon's auto-compaction gate can judge this branch larger than that reading: see
+    // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
+    return c.json(setAsideFrozenCut(db, conv))
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -290,6 +295,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
+    // Checked before anything is stored: a string passed the emptiness check below on its own
+    // .length and was saved on the user row, which then broke the chat's view and every resend.
+    const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string')
+    if (!isStrings(images) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
+      return err(c, 400, 'invalid_input', 'images and textAttachments must be arrays of strings, and docContext a string.')
     // A message is valid if it has typed text OR carries an image or file
     // attachment — image-only / file-only sends are allowed.
     if (!content && images.length === 0 && textAttachments.length === 0)
@@ -360,7 +370,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -375,12 +385,23 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
 
-    // Chat branching (GitHub #52): if /regenerate just deactivated the prior reply, the new
-    // placeholder joins its variant_group so the client can render a ‹ 1/2 › sibling switcher
-    // instead of the old reply simply having vanished. Must look specifically at the message
-    // immediately after the current active tail (getNextMessageAfterSeq), NOT "whatever has
-    // the globally highest seq" — a conversation with more than one branch point can have
-    // unrelated, higher-seq messages sitting inactive in a completely different branch.
+    // Regenerate (`regenerate: true`, what the web UI sends): the reply it replaces is set aside
+    // only here, once nothing above refused the turn. Sent first as its own request
+    // (/regenerate), a refusal here (a Turbo Link machine asleep, the model gone) left that reply
+    // deactivated with no switcher to bring it back, and the history ending on a user turn.
+    const replaced = b.regenerate ? (conv.messages ?? []).at(-1) : undefined
+    if (replaced?.role === 'assistant') {
+      db.deactivateMessage(replaced.id)
+      conv.messages = conv.messages!.filter((m) => m.id !== replaced.id)
+    }
+
+    // Chat branching (GitHub #52): if the prior reply was just deactivated (just above, or by an
+    // earlier POST /regenerate), the new placeholder joins its variant_group so the client can
+    // render a ‹ 1/2 › sibling switcher instead of the old reply simply having vanished. Must
+    // look specifically at the message immediately after the current active tail
+    // (getNextMessageAfterSeq), NOT "whatever has the globally highest seq" — a conversation
+    // with more than one branch point can have unrelated, higher-seq messages sitting inactive
+    // in a completely different branch.
     const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
     const variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
       ? (priorVariant.variantGroup ?? priorVariant.id)
@@ -458,6 +479,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Unchanged text branches too: the client follows every user-message edit with /continue
     // ("Save & Resend"), and an early return here let that answer the same turn a second time —
     // two replies in a row, which Regenerate can't undo and alternating-role templates reject.
+    // Only a question on the shown branch: one a stale tab or another device still shows after
+    // it was switched away would freeze THIS branch's newer version and its reply under it, and
+    // switching back would then show two replies in a row.
+    if (!msg.isActive) return err(c, 409, 'stale_message', 'This message is no longer on the shown branch: the chat changed in another tab or device.')
     db.freezeTail(convId, msg.seq, msg.id)
     db.deactivateMessage(msg.id)
     const variantGroup = db.getMessage(msg.id)!.variantGroup!
@@ -520,7 +545,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const last = db.getLastMessage(convId)
     // Chat branching (GitHub #52): deactivate rather than delete — the old reply is kept
     // as a sibling variant, not destroyed. /continue (called next by the client) creates
-    // the new reply and joins it to the same variant_group.
+    // the new reply and joins it to the same variant_group. The web UI no longer calls this:
+    // it sends /continue { regenerate: true }, which deactivates only once the turn can run.
     if (last?.role === 'assistant') db.deactivateMessage(last.id)
     return c.json({ ok: true })
   })
@@ -547,7 +573,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
 
     const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
-    if (currentActive) db.freezeTail(convId, currentActive.seq, currentActive.id)
+    // A group with no active member is not on the shown branch (a stale tab or another device
+    // still shows it): activating one would splice it, and its frozen tail, into this branch.
+    if (!currentActive) return err(c, 409, 'stale_message', 'This message is no longer on the shown branch: the chat changed in another tab or device.')
+    db.freezeTail(convId, currentActive.seq, currentActive.id)
     db.restoreTail(msgId)
     const ok = db.setActiveVariant(msg.variantGroup, msgId)
     if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
