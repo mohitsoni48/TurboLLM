@@ -251,7 +251,7 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
 
   // Check if the process is actually still alive before attempting to stop it.
   if (!hooks.processExists(pid)) {
-    removePidfile(dir)
+    removeOwnPidfile(dir, pid)
     return { stopped: false, message: 'No running TurboLLM daemon found.' }
   }
 
@@ -295,6 +295,10 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
     return { stopped: false, message: `Failed to stop daemon (pid ${pid}): ${e instanceof Error ? e.message : e}` }
   }
 
-  removePidfile(dir)
+  // Only the stopped daemon's own record: it removes its pidfile as soon as shutdown starts,
+  // so a daemon started while this one was still stopping can bind and write its own before
+  // the poll above sees the old pid gone — deleting that would hide the new daemon from
+  // --stop and from the one-daemon-per-data-dir start guard.
+  removeOwnPidfile(dir, pid)
   return { stopped: true, port, message: `TurboLLM daemon stopped (port ${port})` }
 }

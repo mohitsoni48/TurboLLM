@@ -256,6 +256,38 @@ test('removeOwnPidfile: leaves another daemon\'s pidfile alone, removes its own'
   }
 })
 
+// The stopped daemon removes its own pidfile as soon as its shutdown starts, so a daemon started
+// during that shutdown passes the start guard, binds once the old listener closes and writes its
+// own pidfile — possibly before --stop's exit poll sees the old pid gone. --stop must leave it.
+test('stopDaemon keeps a pidfile a newer daemon wrote while the old one was stopping', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    writePidfile(dir, 42, 6996)
+    const hooks = makeHooks(true, { platform: 'linux' })
+    hooks.kill = (_pid, signal) => {
+      hooks.signals.push(signal)
+      if (signal !== 'SIGTERM') return
+      // Old daemon (42) exits; the new one (200) has already written its pidfile.
+      writePidfile(dir, 200, 6996)
+      hooks.alive = false
+    }
+    assert.equal((await stopDaemon(dir, hooks)).stopped, true)
+    assert.deepEqual(readPidfile(dir), { pid: 200, port: 6996 })
+
+    // Same for a pidfile whose pid is already gone: only that pid's record is removed.
+    writePidfile(dir, 42, 6996)
+    const dead = makeHooks(false)
+    dead.processExists = () => {
+      writePidfile(dir, 200, 6996) // replaced between the read and the clean-up
+      return false
+    }
+    assert.equal((await stopDaemon(dir, dead)).stopped, false)
+    assert.deepEqual(readPidfile(dir), { pid: 200, port: 6996 })
+  } finally {
+    cleanup()
+  }
+})
+
 test('findRunningDaemon: a live, answering daemon blocks a start; stale/recycled/own pidfiles do not', async () => {
   const { dir, cleanup } = makeTmpDir()
   try {
