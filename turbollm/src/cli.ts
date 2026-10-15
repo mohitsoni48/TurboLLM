@@ -1142,6 +1142,17 @@ function listen(attempt = 0): void {
   ;(s as unknown as { on?: (ev: 'error', cb: (e: NodeJS.ErrnoException) => void) => void }).on?.(
     'error',
     (e) => {
+      // TurboLLM-Android (TURBOLLM_APP_SECRET, see appSecretProof in auth.ts): an in-place rebind on
+      // the same port (a LAN toggle, or the revert to the old address) leaves that port free for a
+      // moment, and the app's WebView sends its secret cookie to whatever answers there. Our old
+      // listener let go of the port in close() (a same-process rebind is never refused on Linux), so
+      // busy means another app took it in that moment and may have the secret, which stays valid as
+      // long as this process runs. Stop instead of retrying until that app lets go: the app's process
+      // ends with the daemon, and the secret with it.
+      if (e?.code === 'EADDRINUSE' && (rebinding || reverting) && port === prevPort && process.env.TURBOLLM_APP_SECRET) {
+        console.error(`Port ${port} was taken by another app during the rebind; stopping, as the app secret may have reached it.`)
+        process.exit(1)
+      }
       if (e?.code === 'EADDRINUSE' && attempt < 20) {
         if (attempt === 0) console.log(`  Port ${port} busy (previous listener releasing) — retrying…`)
         setTimeout(() => listen(attempt + 1), 500)

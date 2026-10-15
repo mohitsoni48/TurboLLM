@@ -16,7 +16,7 @@ import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
-import { lanAuth, codeAuth } from './auth'
+import { lanAuth, codeAuth, appSecretProof } from './auth'
 import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
@@ -85,6 +85,20 @@ export function createApp(d: Deps): Hono {
   // loopback-only either: it admits keyless only loopback callers whose Host names this machine
   // (and, on Android, that carry the app secret), and refuses browser cross-site writes to
   // /api/* — see lanAuth's doc comment.
+  //
+  // GET /api/v1/app-proof: TurboLLM-Android asks it before it sends its app secret anywhere (see
+  // appSecretProof), so it is answered ahead of lanAuth: the app holds no credential it may send
+  // yet, and the answer is only an HMAC of the caller's own nonce. Without the secret (desktop,
+  // npm, Docker) the route does not exist: the request goes on exactly as before.
+  app.get('/api/v1/app-proof', async (c, next) => {
+    if (!process.env.TURBOLLM_APP_SECRET) return next()
+    const proof = appSecretProof(c)
+    if (!proof) {
+      const message = 'nonce must be 32-128 lowercase hex characters.'
+      return c.json({ error: { code: 'bad_request', message } }, 400)
+    }
+    return c.json({ proof })
+  })
   app.use('*', lanAuth(d))
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.

@@ -22,7 +22,7 @@
 // unlike a header, which only worked for Cloudflare because its edge (not the client)
 // controlled it.
 import { AsyncLocalStorage } from 'node:async_hooks'
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
 import type { ApiKey } from './config/config'
@@ -192,6 +192,34 @@ function appSecretPresented(cookie: string | undefined, header: string | undefin
 
 function hasAppSecret(c: Context): boolean {
   return appSecretPresented(c.req.header('cookie'), c.req.header(APP_SECRET_HEADER))
+}
+
+/** The answer to the app's `GET /api/v1/app-proof?nonce=` (server.ts), or null when there is none
+ *  to give: no secret set, a nonce that is not 32-128 lowercase hex characters, or a socket whose
+ *  local end can't be read. Any app on the phone can listen on the daemon's port while the daemon
+ *  does not (before it binds at launch, or for a moment while a LAN toggle rebinds), and the
+ *  secret stays valid for the daemon's whole life, so the app asks for this before it sends the
+ *  secret anywhere. HMAC-SHA256 under the secret: only the daemon it was given to can answer the
+ *  app's fresh nonce, and the answer is no use as the secret. The local address and port it was
+ *  asked on are part of the message, so another app holding 127.0.0.1:7000 cannot relay the
+ *  app's nonce to this daemon on some other socket (the remote-access ingress port) and pass the
+ *  answer back. Same binding lookup as {@link localPort}. */
+export function appSecretProof(c: Context): string | null {
+  const secret = process.env.TURBOLLM_APP_SECRET
+  const nonce = c.req.query('nonce')
+  if (!secret || !nonce || !/^[0-9a-f]{32,128}$/.test(nonce)) return null
+  let socket: { localAddress?: string; localPort?: number } | undefined
+  try {
+    type Bindings = { incoming?: { socket?: { localAddress?: string; localPort?: number } } }
+    const env = c.env as Bindings & { server?: Bindings }
+    socket = (env?.server ? env.server : env)?.incoming?.socket
+  } catch {
+    socket = undefined
+  }
+  if (!socket?.localAddress || !socket.localPort) return null
+  // A dual-stack listener reports IPv4 loopback as ::ffff:127.0.0.1.
+  const at = `${socket.localAddress.replace(/^::ffff:/i, '')}:${socket.localPort}`
+  return createHmac('sha256', secret).update(`turbollm-app-proof\n${at}\n${nonce}`).digest('hex')
 }
 
 /** Mint the ONE bootstrap API key a headless install needs, or return null if it isn't
