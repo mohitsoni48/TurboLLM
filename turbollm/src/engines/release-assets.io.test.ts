@@ -313,6 +313,53 @@ test('newestMatchingRelease: commit-SHA tags keep the publish-time rule, not an 
   }
 })
 
+const INSTALLED_ZIP: ReleaseProvenance = {
+  ...INSTALLED,
+  asset: 'llama-b100-bin-ubuntu-x64.zip',
+  assetKey: assetKey('llama-b100-bin-ubuntu-x64.zip', 'b100'),
+}
+
+test('newestMatchingRelease: a .zip install still sees the newer release once upstream ships .tar.gz', async () => {
+  const gh = listing(
+    release('b300', ['llama-b300-bin-ubuntu-x64.tar.gz', 'llama-b300-bin-ubuntu-vulkan-x64.tar.gz'], {
+      published_at: '2026-09-03T00:00:00Z',
+    }),
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('b100', ['llama-b100-bin-ubuntu-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, gh.fetchImpl))?.asset, 'llama-b300-bin-ubuntu-x64.tar.gz')
+  // The same with the installed release gone from the listing (it is no longer what comes back).
+  const later = listing(
+    release('b300', ['llama-b300-bin-ubuntu-x64.tar.gz'], { published_at: '2026-09-03T00:00:00Z' }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, later.fetchImpl))?.tag, 'b300')
+})
+
+test('newestMatchingRelease: a release shipping both archive kinds keeps the installed one', async () => {
+  const gh = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-x64.zip'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, gh.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.zip')
+})
+
+test('newestMatchingRelease: the classification fallback also crosses a .zip to .tar.gz switch, keeping the installed kind on a tie', async () => {
+  const installed = { ...INSTALLED_ZIP, asset: 'llama-b100-bin-ubuntu-x64.zip', assetKey: 'old-name-ubuntu-x64.zip' }
+  const switched = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-vulkan-x64.tar.gz'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(installed, undefined, switched.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.tar.gz')
+  const both = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-x64.zip'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(installed, undefined, both.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.zip')
+})
+
 test('newestMatchingRelease: refuses the classification fallback when two assets qualify', async () => {
   const gh = listing(
     release('b200', ['a-b200-win-x64-cuda-13.3.zip', 'b-b200-win-x64-cuda-13.3.zip'], {

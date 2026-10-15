@@ -432,11 +432,15 @@ function versionLike(tag: string): boolean {
   return parseBuildTag(tag) !== null || /^v?\d+(?:\.\d+|$)/.test(tag.trim())
 }
 
+// The archive kind is not part of the build: a fork that moves from .zip to .tar.gz (as llama.cpp
+// itself did) ships the same build under the other extension. The installed kind only breaks ties.
 function findByAssetKey(releases: GithubRelease[], key: string): MatchingRelease | null {
   for (const release of releases) {
-    const asset = (release.assets ?? []).find(
-      (a) => archiveKindOf(a.name) !== null && assetKey(a.name, release.tag_name ?? '') === key,
+    const keyOf = (a: ReleaseAsset) => assetKey(a.name, release.tag_name ?? '')
+    const keyed = (release.assets ?? []).filter(
+      (a) => archiveKindOf(a.name) !== null && stripArchiveExtension(keyOf(a)) === stripArchiveExtension(key),
     )
+    const asset = keyed.find((a) => keyOf(a) === key) ?? keyed[0]
     if (asset) return toMatch(release, asset)
   }
   return null
@@ -446,7 +450,9 @@ function findByIdenticalClassification(releases: GithubRelease[], installedAsset
   const wanted = classifyReleaseAsset({ name: installedAssetName, browser_download_url: '' })
   for (const release of releases) {
     const twins = (release.assets ?? []).filter((a) => sameBuildVariant(classifyReleaseAsset(a), wanted))
-    if (twins.length > 0) return twins.length === 1 ? toMatch(release, twins[0]!) : null
+    const sameArchive = twins.filter((a) => archiveKindOf(a.name) === wanted.archive)
+    const pick = sameArchive.length > 0 ? sameArchive : twins
+    if (pick.length > 0) return pick.length === 1 ? toMatch(release, pick[0]!) : null
   }
   return null
 }
@@ -458,8 +464,7 @@ function sameBuildVariant(a: ClassifiedAsset, b: ClassifiedAsset): boolean {
     a.os === b.os &&
     a.arch === b.arch &&
     a.backend === b.backend &&
-    a.cudaVersion === b.cudaVersion &&
-    a.archive === b.archive
+    a.cudaVersion === b.cudaVersion
   )
 }
 
