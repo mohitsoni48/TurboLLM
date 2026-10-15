@@ -10,7 +10,7 @@
 //
 // Windows + x86_64 only, matching the guided build's scope (Linux/macOS build is parked).
 import { execFile } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -42,6 +42,11 @@ export const CUDA_OPTIONAL_COMPONENTS = ['libnvvm', 'cuda_crt']
  *  major.minor the installed driver supports. 12.8+ is required for Blackwell (sm_120);
  *  13.0 for the very newest. Older entries keep things working on older drivers. */
 export const KNOWN_CUDA_VERSIONS = ['13.0.1', '13.0.0', '12.8.1', '12.6.3', '12.4.1']
+
+/** Written into the assembled toolkit just before it is swapped into place, so it is there only in a toolkit this flow
+ *  completed. bin/nvcc.exe alone is no proof: older versions copied the toolkit into place, and an interrupted or
+ *  failed copy left bin/ without the rest of include/ and lib/. */
+const CUDA_COMPLETE_MARKER = '.turbollm-provisioned'
 
 export interface CudaProvisionProgress {
   phase: 'resolving' | 'downloading' | 'extracting' | 'assembling'
@@ -147,8 +152,8 @@ export async function swapInStagedDir(stage: string, dest: string): Promise<void
 }
 
 /** Download the build component set for a resolved version, extract each, and merge them
- *  into one toolkit root. Idempotent: if `<dataDir>/cuda/<version>/bin/nvcc.exe` already
- *  exists we reuse it. Returns the toolkit (its `bin` dir is a ready build toolchain dir). */
+ *  into one toolkit root. Idempotent: a `<dataDir>/cuda/<version>` this flow completed is
+ *  reused. Returns the toolkit (its `bin` dir is a ready build toolchain dir). */
 export async function provisionCuda(
   dataDir: string,
   onProgress: (p: CudaProvisionProgress) => void,
@@ -167,8 +172,9 @@ export async function provisionCuda(
 
   const root = join(dataDir, 'cuda', version)
   const binDir = join(root, 'bin')
-  // Reuse a complete prior install.
-  if (existsSync(join(binDir, 'nvcc.exe'))) {
+  // Reuse a complete prior install. One without the marker (a copy an older version left half done, or a complete
+  // one from before the marker, which is then downloaded once more) is rebuilt and swapped in over it.
+  if (existsSync(join(root, CUDA_COMPLETE_MARKER)) && existsSync(join(binDir, 'nvcc.exe'))) {
     onProgress({ phase: 'assembling', message: `CUDA ${version} already downloaded — reusing it.` })
     return { root, binDir, version }
   }
@@ -216,6 +222,7 @@ export async function provisionCuda(
     if (!existsSync(join(stageRoot, 'bin', 'nvcc.exe'))) {
       throw new Error('Assembled CUDA toolkit is missing bin/nvcc.exe — the component set may have changed.')
     }
+    writeFileSync(join(stageRoot, CUDA_COMPLETE_MARKER), '')
     // Swap staged → final.
     mkdirSync(join(dataDir, 'cuda'), { recursive: true })
     await swapInStagedDir(stageRoot, root)

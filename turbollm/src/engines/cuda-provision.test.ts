@@ -3,8 +3,9 @@ import assert from 'node:assert/strict'
 import fs, { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
-import { majorMinor, cmpMajorMinor, pickCudaVersion, swapInStagedDir } from './cuda-provision'
+import { majorMinor, cmpMajorMinor, pickCudaVersion, provisionCuda, swapInStagedDir, type CudaProvisionProgress } from './cuda-provision'
 import { tmpDir } from '../test-support/tmp'
+import { buildZipArchive } from '../test-support/zip-archive'
 
 test('majorMinor: takes the first two components', () => {
   assert.equal(majorMinor('13.0.1'), '13.0')
@@ -140,4 +141,63 @@ test('swapInStagedDir: a staged toolkit that Windows briefly refuses to rename i
   assert.equal(existsSync(join(dest, 'bin', 'stale.dll')), false)
   assert.deepEqual(readdirSync(dir), ['13.0'])
   assert.equal(locked.mock.calls.filter((c) => String(c.arguments[0]) === stage).length, 3)
+})
+
+// Older versions copied the assembled toolkit into place, and a copy interrupted or failed partway (a quit, a crash, an
+// AV lock, a full disk) left bin/nvcc.exe without the rest of include/ and lib/. That dir must not be reused as a
+// complete toolkit: it is downloaded again and swapped in, and only a toolkit this flow finished is reused after that.
+test('provisionCuda: a toolkit an older copy left half done is downloaded again; a finished one is reused', async (t) => {
+  const dataDir = tmpDir('tllm-cuda-provision-')
+  const version = '12.4.1' // the only manifest served below, whatever the driver here prefers
+  const root = join(dataDir, 'cuda', version)
+  mkdirSync(join(root, 'bin'), { recursive: true })
+  writeFileSync(join(root, 'bin', 'nvcc.exe'), 'left by an interrupted copy')
+
+  const files: Record<string, string[]> = {
+    cuda_nvcc: ['bin/nvcc.exe'],
+    cuda_cudart: ['include/cuda_runtime.h', 'lib/x64/cudart.lib'],
+    libcublas: ['include/cublas_v2.h', 'lib/x64/cublas.lib'],
+    cuda_cccl: ['include/cub/cub.cuh'],
+  }
+  const manifest = Object.fromEntries(
+    Object.keys(files).map((id) => [id, { 'windows-x86_64': { relative_path: `${id}/${id}.zip` } }]),
+  )
+  const actualPlatform = process.platform
+  const componentFetches: string[] = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input)
+    if (url.endsWith('.json')) return url.endsWith(`redistrib_${version}.json`) ? Response.json(manifest) : new Response('', { status: 404 })
+    // provisionCuda refuses anything but Windows; the extraction then runs with this machine's own extractor.
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    const id = url.slice(url.lastIndexOf('/') + 1, -'.zip'.length)
+    componentFetches.push(id)
+    return new Response(buildZipArchive(files[id].map((f) => ({ name: `${id}-windows-x86_64-1.0-archive/${f}` }))))
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+  })
+  const provision = async () => {
+    const progress: string[] = []
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    const tk = await provisionCuda(dataDir, (p: CudaProvisionProgress) => progress.push(p.message), new AbortController().signal)
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    return { tk, progress }
+  }
+
+  const first = await provision()
+  assert.equal(first.tk.root, root)
+  assert.ok(!first.progress.some((m) => m.includes('reusing')), first.progress.join('\n'))
+  assert.deepEqual(componentFetches, Object.keys(files))
+  assert.equal(readFileSync(join(root, 'bin', 'nvcc.exe'), 'utf8'), 'content of cuda_nvcc-windows-x86_64-1.0-archive/bin/nvcc.exe')
+  assert.ok(existsSync(join(root, 'include', 'cuda_runtime.h')))
+  assert.ok(existsSync(join(root, 'lib', 'x64', 'cublas.lib')))
+  assert.deepEqual(readdirSync(join(dataDir, 'cuda')), [version])
+
+  componentFetches.length = 0
+  const second = await provision()
+  assert.equal(second.tk.binDir, join(root, 'bin'))
+  assert.ok(second.progress.some((m) => m.includes(`CUDA ${version} already downloaded`)), second.progress.join('\n'))
+  assert.deepEqual(componentFetches, [])
 })
