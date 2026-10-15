@@ -39,6 +39,13 @@ import { toast } from '../../components/ui/sonner'
  *  whole output and one at it may have lost its oldest lines. */
 const DAEMON_REPLAY_CAP = 512 * 1024
 
+/** A clicked OSC 8 link: the same confirm xterm's own default shows, then window.open with the URL
+ *  itself and no opener (see the linkHandler in the mount effect). */
+function openTerminalLink(uri: string): void {
+  if (!confirm(`Do you want to navigate to ${uri}?\n\nWARNING: This link could potentially be dangerous`)) return
+  window.open(uri, '_blank', 'noopener,noreferrer')
+}
+
 /** Reads the app's --term-* design tokens (index.css) as ACTUAL resolved colors — xterm's theme
  *  option needs real values (hex/rgb/color-mix() output as computed by the browser), not the
  *  var()/color-mix() source strings, which its own internal color parser doesn't understand.
@@ -193,6 +200,11 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
       fontFamily: '"Cascadia Code", "JetBrains Mono", "Fira Code", menlo, monospace',
       theme: resolveTerminalTheme(),
       allowProposedApi: true,
+      // OSC 8 hyperlinks (xterm hands only http(s) ones to a linkHandler). xterm's default opens a
+      // blank window and then points it at the link, which the desktop app's window-open handler
+      // (wrapper/main.js) sees as about:blank and denies, so a click did nothing. Opening the URL
+      // itself lets the desktop app send it to the system browser; a browser opens a tab as before.
+      linkHandler: { activate: (_event, uri) => openTerminalLink(uri) },
     })
 
     const fitAddon = new FitAddon()
