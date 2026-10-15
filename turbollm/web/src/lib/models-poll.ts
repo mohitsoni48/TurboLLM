@@ -46,8 +46,9 @@ export function modelsRefetchInterval(
   // HuggingFace got stuck on "Loading your model" forever — the download genuinely finished and the file scanned
   // fine server-side minutes later, but this query's first poll (fired right after clicking "Download this,"
   // before the download even began) had already disabled itself, so LoadStep's `matchedEntry` never resolved and
-  // `loadModel()` never fired. `useDownloads()`'s own poll noticing the download finish doesn't invalidate this
-  // query — nothing else did either.
+  // `loadModel()` never fired. Nothing invalidated this query then; `useDownloads()` now does when it sees a
+  // download newly finish, which covers a finished file this rule counts as already in the library (a split's
+  // later shards, by its still-incomplete row), but it only sees what its own poll catches, so this rule stays.
   const models = data?.models ?? []
   const hasUnmatchedFinishedDownload = downloads?.downloads.some(
     (d) => d.status === 'done' && !downloadInLibrary(d.dest, models),
