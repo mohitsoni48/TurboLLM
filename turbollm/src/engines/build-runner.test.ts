@@ -2,11 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
 import { basename, delimiter, join, relative } from 'node:path'
-import { lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpDir } from '../test-support/tmp'
-import { copyCudaRuntimeLibs, runBuild, runStep } from './build-runner'
+import { copyCudaRuntimeLibs, runBuild, runPrereqInstall, runStep } from './build-runner'
 import { checkBuildPrereqs } from './build-prereqs'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -823,6 +823,70 @@ test('runStep on Windows: aborting runs taskkill /PID <pid> /T /F and rejects wi
   } finally {
     process.env.PATH = actualPath
   }
+})
+
+// ── Linux/macOS Cancel kills the whole step, not just cmake ─────────────────────────────────────
+// spawn's `signal` SIGTERMs only the direct child (cmake); ninja and the compiler jobs under it kept compiling into
+// the tree that the cancelled build is about to remove. The background subshell stands in for them.
+test('runStep on Linux/macOS: aborting kills the processes under the step too, and leaves no exit listener', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX process groups')
+  const dir = tmpDir('tllm-groupkill-')
+  const compiled = join(dir, 'still-compiling')
+  const exitListeners = process.listenerCount('exit')
+  const ac = new AbortController()
+  let started = false
+  const step = runStep('sh', ['-c', `(sleep 1; touch '${compiled}') & echo started; wait`], {
+    env: { ...process.env }, signal: ac.signal, onLine: () => { started = true },
+  })
+  while (!started) await new Promise((r) => setTimeout(r, 10))
+  ac.abort()
+  await assert.rejects(step, { name: 'AbortError' })
+  await new Promise((r) => setTimeout(r, 1500))
+  assert.equal(existsSync(compiled), false, 'the job under the step was killed with it')
+  assert.equal(process.listenerCount('exit'), exitListeners)
+})
+
+// The group SIGKILL is for the build steps only. runPrereqInstall runs the host package manager (as root, or under
+// sudo -n): dnf/zypper (librpm) and brew stop their transaction at a safe point on SIGTERM, a SIGKILL mid-install can
+// leave a half-installed package. Cancel keeps asking it to stop, and the daemon's exit does not kill it either.
+test('runPrereqInstall: Cancel sends the package manager SIGTERM, not a group SIGKILL, and adds no exit listener', async (t) => {
+  if (process.platform !== 'linux' && process.platform !== 'darwin') return t.skip('prerequisites install on Linux/macOS only')
+  const dir = tmpDir('tllm-prereq-cancel-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  const cleanedUp = join(dir, 'cleaned-up')
+  const pm = [
+    '#!/bin/sh',
+    'PATH=/usr/bin:/bin',
+    'case "$1" in --version|update) exit 0 ;; esac',
+    `trap 'kill $! 2>/dev/null; touch "${cleanedUp}"; exit 1' TERM`,
+    'sleep 30 & echo installing; wait',
+    '',
+  ].join('\n')
+  for (const name of ['apt-get', 'brew']) writeFileSync(join(fakeBin, name), pm, { mode: 0o755 })
+  writeFileSync(join(fakeBin, 'sudo'), '#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n', { mode: 0o755 })
+  const exitListeners = process.listenerCount('exit')
+  const ac = new AbortController()
+  let installing = false
+  const actualPath = process.env.PATH
+  process.env.PATH = fakeBin // no real cmake is found, so its install command runs (on the fake package manager)
+  let install: Promise<void>
+  try {
+    install = runPrereqInstall(
+      { tool: 'cmake', toolchainDirs: [] },
+      { phase: () => {}, log: (l) => { if (l === 'installing') installing = true } },
+      ac.signal,
+    )
+    for (let i = 0; !installing && i < 500; i++) await new Promise((r) => setTimeout(r, 10))
+  } finally {
+    process.env.PATH = actualPath
+  }
+  assert.ok(installing, 'the fake package manager was reached')
+  assert.equal(process.listenerCount('exit'), exitListeners, 'the daemon exit does not SIGKILL the install')
+  ac.abort()
+  await assert.rejects(install, { name: 'AbortError' })
+  for (let i = 0; !existsSync(cleanedUp) && i < 300; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.ok(existsSync(cleanedUp), 'the package manager got SIGTERM and could stop cleanly')
 })
 
 // ── Linux CUDA bundling keeps the toolkit's symlinks as symlinks ────────────────────────────────

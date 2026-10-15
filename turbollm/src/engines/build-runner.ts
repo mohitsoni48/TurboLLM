@@ -759,33 +759,62 @@ function winComSpec(): string {
 
 /** Run one child process, streaming combined stdout+stderr line-by-line to `onLine` and
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
- *  spawn error; aborting `signal` kills the child (Node throws AbortError, name preserved).
+ *  spawn error; aborting `signal` kills the child and everything under it (rejects with an AbortError).
  *  Exported for tests. */
 export function runStep(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLine: (line: string) => void },
+  opts: {
+    cwd?: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLine: (line: string) => void
+    /** false (Linux/macOS): the step stays in the daemon's process group and aborting sends SIGTERM to the direct
+     *  child only, as spawn's own `signal` does. For the package manager runPrereqInstall runs: dnf/zypper (librpm)
+     *  and brew stop their transaction at a safe point on SIGTERM, while a SIGKILL of the group mid-install can
+     *  leave a half-installed package every later install trips over. */
+    killTree?: boolean
+  },
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    // On Windows, spawn's `signal` terminates only the direct child — for the vcvars steps that is
-    // cmd.exe, while cmake → ninja → cl/nvcc under it keep compiling (and writing into these pipes)
-    // long after "Build cancelled.". Kill the whole tree there instead, as manager.ts does for
-    // engines, and settle only once taskkill is done so cleanup doesn't race the dying compilers.
-    const treeKill = process.platform === 'win32'
+    // spawn's `signal` terminates only the direct child, while the compile under it keeps going (and writing into
+    // these pipes and the build tree) long after "Build cancelled.": on Windows the vcvars steps' child is cmd.exe,
+    // with cmake → ninja → cl/nvcc under it; elsewhere cmake, with ninja and its compiler jobs. Kill the whole tree
+    // instead, and settle only once that is done so cleanup doesn't race the dying compilers: taskkill /T on
+    // Windows, as manager.ts does for engines; elsewhere the step runs in a process group of its own (detached),
+    // which kill(-pid) ends at once.
+    const isWindows = process.platform === 'win32'
+    const killGroupOnAbort = !isWindows && opts.killTree !== false
     const aborted = () => Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
-    if (treeKill && opts.signal.aborted) return reject(aborted())
+    if (opts.signal.aborted) return reject(aborted())
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      signal: treeKill ? undefined : opts.signal,
+      detached: killGroupOnAbort,
+      // A step that opts out of the group kill keeps spawn's own abort: SIGTERM to the direct child, then AbortError.
+      signal: isWindows || killGroupOnAbort ? undefined : opts.signal,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
+    const killGroup = () => {
+      try {
+        process.kill(-child.pid!, 'SIGKILL')
+      } catch {
+        /* the group is already gone */
+      }
+    }
     const onAbort = () => {
       if (!child.pid) return reject(aborted())
+      if (killGroupOnAbort) {
+        killGroup()
+        return reject(aborted())
+      }
       execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => reject(aborted()))
     }
-    if (treeKill) opts.signal.addEventListener('abort', onAbort, { once: true })
+    if (isWindows || killGroupOnAbort) opts.signal.addEventListener('abort', onAbort, { once: true })
+    // In a group of its own the step no longer gets the Ctrl+C of the daemon's terminal: the daemon's exit ends it.
+    const killOnExit = killGroupOnAbort && child.pid !== undefined
+    if (killOnExit) process.once('exit', killGroup)
     let stdout = ''
     let outBuf = ''
     let errBuf = ''
@@ -804,12 +833,13 @@ export function runStep(
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (c: string) => pump(c, false))
     child.stderr.on('data', (c: string) => pump(c, true))
-    child.on('error', (e) => reject(e)) // includes AbortError when signal fires
+    child.on('error', (e) => reject(e))
     child.on('close', (code) => {
       opts.signal.removeEventListener('abort', onAbort)
+      if (killOnExit) process.removeListener('exit', killGroup)
       if (outBuf) opts.onLine(outBuf.replace(/\r$/, ''))
       if (errBuf) opts.onLine(errBuf.replace(/\r$/, ''))
-      if (treeKill && opts.signal.aborted) reject(aborted())
+      if (opts.signal.aborted) reject(aborted())
       else if (code === 0) resolve(stdout)
       else reject(new Error(`${cmd} exited with code ${code}`))
     })
@@ -946,7 +976,8 @@ export async function runPrereqInstall(
   const env = { ...buildEnv(req.toolchainDirs), DEBIAN_FRONTEND: 'noninteractive' }
   for (const [cmd, ...args] of tool.installCommands!) {
     hooks.log(`$ ${[cmd, ...args].join(' ')}`)
-    await runStep(cmd, args, { env, signal, onLine: hooks.log })
+    // killTree false: Cancel asks the package manager to stop (SIGTERM) rather than SIGKILLing it mid-transaction.
+    await runStep(cmd, args, { env, signal, onLine: hooks.log, killTree: false })
   }
 
   // Re-probe rather than trusting a zero exit code: a manager can "succeed" while leaving the
