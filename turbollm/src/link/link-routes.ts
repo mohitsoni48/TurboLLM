@@ -557,10 +557,14 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
           )
         }
       } else {
+        // Final and typed, like the marked refusal above: untyped, a peer's /v1/messages reads
+        // this 503 as an overloaded host, and its client retries a refusal no retry can change.
+        c.header('x-should-retry', 'false')
         return c.json(
           {
             error: {
               code: 'model_not_loaded',
+              type: 'model_not_loaded',
               message: `'${requested}' is not loaded on this machine, and this link may not load it.`,
             },
           },

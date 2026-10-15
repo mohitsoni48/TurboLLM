@@ -113,6 +113,25 @@ test('models:use on a COLD model is a typed model_not_loaded 503, and never swap
   assert.deepEqual(h.routed, [], 'the request never reached the router')
 })
 
+// Same shape as the marked no-load refusal below: untyped and without x-should-retry, a peer's
+// /v1/messages turned it into overloaded_error and Claude Code retried a final refusal ~10 times.
+test('a models:use-only refusal is final and typed, like the no-load one', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use'])])
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), 'false')
+  const error = ((await res.json()) as { error?: { type?: string; code?: string } }).error
+  assert.equal(error?.type, 'model_not_loaded')
+  assert.equal(error?.code, 'model_not_loaded')
+})
+
+test('a busy-host refusal on a models:wake link stays retryable', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])], { busy: true })
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), null)
+})
+
 test('models:wake on a COLD model with an IDLE host swaps', async () => {
   const { d, h } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])])
   const res = await post(d, 'tllm-a', COLD)
