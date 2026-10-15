@@ -288,6 +288,16 @@ export function SettingsScreen() {
     gateway: { autoSwap: gatewayAutoSwap, keepN: clampN(gatewayKeepN, 1, 4) },
   })
 
+  // The listener moved to a new port — hop the browser over once it's up.
+  const followPort = (newPort: number, message: string) => {
+    toast.success(message)
+    setTimeout(() => {
+      const u = new URL(window.location.href)
+      u.port = String(newPort)
+      window.location.href = u.toString()
+    }, 1300)
+  }
+
   const handleSave = () => {
     const sent: ReturnType<typeof draftsFrom> = {
       ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
@@ -298,13 +308,7 @@ export function SettingsScreen() {
         seedDrafts(res, sent)
         const rb = res.rebind
         if (rb?.portChanged) {
-          // The listener moved to a new port — hop the browser over once it's up.
-          toast.success(`Port changed to ${rb.port} — reconnecting…`)
-          setTimeout(() => {
-            const u = new URL(window.location.href)
-            u.port = String(rb.port)
-            window.location.href = u.toString()
-          }, 1300)
+          followPort(rb.port, `Port changed to ${rb.port} — reconnecting…`)
         } else if (rb) {
           // LAN-only change: applied in place, no restart, model stays loaded.
           toast.success(rb.lanBind ? 'LAN access enabled — applied (no restart needed)' : 'LAN access disabled — applied')
@@ -318,9 +322,18 @@ export function SettingsScreen() {
 
   // Restart must persist pending changes FIRST — otherwise a port/LAN toggle the user
   // just flipped is lost and the re-exec'd daemon comes back on the old config.
+  // Except a port change: that save already moves the live daemon to the new port, in place, as
+  // Save does. The restart overlay polls and reloads this page's own origin, which nothing listens
+  // on any more, and it cannot poll the new port instead (another port is another origin, and
+  // /api/* answers no cross-origin read from it). A restart would also race that move. So the page
+  // follows the port like Save, and the daemon is not restarted: the change needed none.
   const requestRestart = () => {
     save.mutate(settingsPayload(), {
-      onSuccess: () => setRestartOverlay(true),
+      onSuccess: (res) => {
+        const rb = res.rebind
+        if (rb?.portChanged) followPort(rb.port, `Port changed to ${rb.port}: applied without a restart. Reconnecting…`)
+        else setRestartOverlay(true)
+      },
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save settings before restart.'),
     })
   }
@@ -1540,6 +1553,13 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
     let cancelled = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
     let giveUpTimer: ReturnType<typeof setTimeout> | undefined
+    // When the 202 arrived (monotonic clock). The OLD daemon keeps answering /status until its
+    // teardown ends (cli.ts requestRestart: stopping a loaded engine alone can take ~8 s on
+    // Windows), so an OK is only the new daemon's when its uptime is shorter than the time since
+    // then: the replacement starts after the restart was accepted (at least the route's 200 ms
+    // later), the old daemon before it. uptimeSec is whole seconds, rounded down, so this tells
+    // them apart for any old daemon that had been up over a second when the restart was clicked.
+    let acceptedAt = 0
 
     const poll = async () => {
       if (cancelled) return
@@ -1547,8 +1567,11 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
         // With this client's key, like every other API call: a LAN client's unauthenticated poll
         // gets 401 from the new daemon too, and the overlay would only ever end on "failed".
         const res = await fetch('/api/v1/status', { headers: { Accept: 'application/json', ...authHeaders() } })
-        if (res.ok) {
-          // Daemon is back — full reload so the SPA reconnects on the (possibly new) port.
+        // A body cut off by the old daemon closing its connections has no uptime: keep polling.
+        const status = res.ok ? ((await res.json().catch(() => null)) as { uptimeSec?: unknown } | null) : null
+        const uptimeSec = status?.uptimeSec
+        if (typeof uptimeSec === 'number' && uptimeSec * 1000 < performance.now() - acceptedAt) {
+          // The new daemon is up — full reload so the SPA reconnects to it.
           if (!cancelled) window.location.reload()
           return
         }
@@ -1560,6 +1583,7 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
 
     restart.mutate(undefined, {
       onSuccess: () => {
+        acceptedAt = performance.now()
         // Give the old process a beat to release the socket, then poll for the new one.
         pollTimer = setTimeout(poll, 700)
         // If it hasn't come back in 20s, surface a manual fallback.

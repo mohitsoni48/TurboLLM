@@ -5,8 +5,8 @@ import { MemoryRouter } from 'react-router-dom'
 import { setAuthToken, type DaemonSettings } from '../lib/api'
 import { SettingsScreen } from './SettingsScreen'
 
-type SaveCall = { payload: unknown; opts: { onSuccess?: (res: DaemonSettings) => void } }
-const state: { settings: DaemonSettings | null; sysInfo: unknown; saveCalls: SaveCall[] } = { settings: null, sysInfo: undefined, saveCalls: [] }
+type SaveCall = { payload: unknown; opts: { onSuccess?: (res: DaemonSettings & { rebind?: unknown }) => void } }
+const state: { settings: DaemonSettings | null; sysInfo: unknown; saveCalls: SaveCall[]; restarts: number } = { settings: null, sysInfo: undefined, saveCalls: [], restarts: 0 }
 const mk = (over: Partial<DaemonSettings> = {}) => ({
   idleTtlMinutes: 60, vramHeadroomMb: 1024, port: 6996, autoGenerateTitles: true, openBrowserOnStart: true,
   autoLoadOnStart: false, modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 }, telemetryLevel: 'off',
@@ -23,7 +23,7 @@ vi.mock('../lib/queries', () => ({
   }),
   useComfyGate: () => ({ install: mut(), uninstall: mut() }),
   // Settles at once, so the restart overlay goes straight to polling for the new daemon.
-  useDaemonRestart: () => ({ ...mut(), mutate: (_: unknown, o?: { onSuccess?: () => void }) => o?.onSuccess?.() }),
+  useDaemonRestart: () => ({ ...mut(), mutate: (_: unknown, o?: { onSuccess?: () => void }) => { state.restarts++; o?.onSuccess?.() } }),
   useHfTokenTest: () => mut(),
   useModelDirs: () => ({ data: { dirs: [], primaryDir: '' } }), useModelMutations: () => ({}),
   useNetworkInfo: () => ({ data: undefined }), useStatus: () => ({ data: undefined }),
@@ -132,6 +132,60 @@ describe('SettingsScreen — Restart daemon', () => {
     } finally {
       vi.unstubAllGlobals()
       setAuthToken('')
+      state.sysInfo = undefined
+    }
+  })
+
+  // The old daemon keeps serving /status while it stops its engine (seconds on Windows); reloading
+  // on its OK put the page on a daemon about to vanish. Only the new one (shorter uptime) counts.
+  it('reloads only once the NEW daemon answers, not on an OK from the old one still tearing down', async () => {
+    state.settings = mk()
+    state.saveCalls = []
+    state.sysInfo = { bundledEnginesOnly: false }
+    const replies = [{ uptimeSec: 3600 }, { uptimeSec: 3601 }, { uptimeSec: 0 }] // old, old, then new
+    let polls = 0
+    let reloadedAtPoll = 0
+    const reload = vi.fn(() => { reloadedAtPoll = polls })
+    vi.stubGlobal('location', { ...window.location, href: 'http://127.0.0.1:6996/settings', reload })
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      polls++
+      return new Response(JSON.stringify(replies.shift() ?? { uptimeSec: 0 }), { status: 200 })
+    }))
+    try {
+      const { unmount } = render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+      await openSystem()
+      await userEvent.click(screen.getByRole('button', { name: /Restart daemon/ }))
+      act(() => state.saveCalls[0].opts.onSuccess!(mk()))
+      await waitFor(() => expect(reload).toHaveBeenCalledOnce(), { timeout: 4000 })
+      expect(reloadedAtPoll).toBe(3)
+      unmount()
+    } finally {
+      vi.unstubAllGlobals()
+      state.sysInfo = undefined
+    }
+  }, 10_000) // about 2 s of real poll intervals, more on a loaded runner
+
+  // A pending port change: the save already moves the daemon in place, and the overlay could only
+  // ever poll this page's own (now dead) port. So the page follows the port and nothing restarts.
+  it('with a pending port change, follows the daemon to its new port instead of polling the old one', async () => {
+    state.settings = mk()
+    state.saveCalls = []
+    state.restarts = 0
+    state.sysInfo = { bundledEnginesOnly: false }
+    const location = { ...window.location, href: 'http://127.0.0.1:6996/settings', reload: vi.fn() }
+    vi.stubGlobal('location', location)
+    try {
+      const { unmount } = render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+      await openSystem()
+      await userEvent.click(screen.getByRole('button', { name: /Restart daemon/ }))
+      act(() => state.saveCalls[0].opts.onSuccess!({ ...mk({ port: 7100 }), rebind: { portChanged: true, port: 7100, lanBind: false } }))
+      expect(screen.queryByText('Restarting daemon…')).toBeNull()
+      expect(state.restarts).toBe(0)
+      await waitFor(() => expect(location.href).toBe('http://127.0.0.1:7100/settings'), { timeout: 3000 })
+      expect(location.reload).not.toHaveBeenCalled()
+      unmount()
+    } finally {
+      vi.unstubAllGlobals()
       state.sysInfo = undefined
     }
   })
