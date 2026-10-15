@@ -706,6 +706,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         status: res.status, error: { code: type ?? anthropicErrorType(res.status), message },
         durationMs: Date.now() - requestStart,
       })
+      // A linked host marks a refusal no retry can help with x-should-retry: false, as this route
+      // does above. Pass it on, as gatewayV1Handler's relay does, or Claude Code runs the host's
+      // failing load again on every retry.
+      const shouldRetry = remote ? res.headers.get('x-should-retry') : null
+      if (shouldRetry) c.header('x-should-retry', shouldRetry)
       return c.json(
         { type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } },
         asClientStatus(res.status),

@@ -592,6 +592,34 @@ test('a models:use token cannot switch a linked machine back to the model its ca
   }
 })
 
+// A refusal the host marks final (x-should-retry: false: a permanent route refusal such as a failed engine start, or
+// the no-load refusal above) must reach a /v1/messages client as it reaches a /v1/chat/completions one. Claude Code
+// retries a 5xx up to 10 times otherwise, and on a link granted models:load each retry runs the failing load again.
+test("the host's x-should-retry: false reaches the client on /v1/messages, as on /v1/chat/completions", async () => {
+  const d = fakeDeps()
+  const app = new Hono()
+  // /v1/messages reads a failed reply through redactLocalPaths, which asks the store for the data dir.
+  registerGateway(app, { ...d, store: { ...d.store, dir: () => '/data' } } as unknown as Deps)
+  const f = captureFetch(async () => new Response(
+    JSON.stringify({ error: { message: 'Engine start failed: boom', type: 'model_not_loaded', code: 'model_not_loaded' } }),
+    { status: 503, headers: { 'content-type': 'application/json', 'x-should-retry': 'false' } },
+  ))
+  try {
+    for (const path of ['/v1/chat/completions', '/v1/messages']) {
+      const res = await app.request(`http://local.test${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'Rig/Qwen3', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      assert.equal(res.status, 503, path)
+      assert.equal(res.headers.get('x-should-retry'), 'false', path)
+    }
+  } finally {
+    f.restore()
+  }
+  assert.deepEqual(f.calls.map((cap) => cap.url), Array(2).fill('https://rig.trycloudflare.com/api/link/v1/chat/completions'))
+})
+
 // The same check covers in-app chat: /api/v1/conversations/* is models:use for a remote token, and the turn resolves
 // its remote target through the same router. Every request of the turn is built from that target, so the marker
 // travels on all of them.
