@@ -149,6 +149,59 @@ test('stopPoolSlotsOnEngine: passes force through to the slot, and stops only sl
   assert.deepEqual(stops, [{ key: 'bge-m3', force: true }, { key: 'qwen', force: undefined }])
 })
 
+// A pool slot is registered only once it has loaded, so the stopper used to miss one still starting: that model then
+// came up and served requests during the render.
+test('the ComfyUI pool stopper reaches a pool slot that is still loading, and that model never serves', async () => {
+  let slotState = 'stopped' as Status['state']
+  let settle: (() => void) | undefined
+  const stops: Array<boolean | undefined> = []
+  const slot = {
+    status: (): Status => ({ state: slotState, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => null,
+    target: () => (slotState === 'running' ? 'http://slot.invalid' : null),
+    touch: () => {},
+    load: async (_opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await hooks?.beforeStart?.()
+      slotState = 'starting'
+      await new Promise<void>((res) => { settle = res })
+    },
+    stopAndWait: async (o?: { force?: boolean }) => {
+      stops.push(o?.force)
+      slotState = 'stopped'
+      settle?.()
+    },
+  } as unknown as Manager
+  let claimed = false
+  const comfy = {
+    isBlocked: () => false,
+    gpuClaimed: () => claimed,
+    freeComfyUIBeforeLoad: async () => {},
+  } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+  const entry = fakeEntry('model-b')
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
+  } as unknown as ConfigStore
+  const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(store, registry, fakeManager('running', 'model-a'), scanner, comfy, undefined, () => slot)
+
+  const routed = r.route('model-b')
+  while (slot.status().state !== 'starting') await new Promise((res) => setImmediate(res))
+  assert.deepEqual([...r.poolEngineIds()], ['eng1'], 'the loading slot is on its engine')
+
+  // ComfyUI's acquire: cli.ts's pool stopper, then the slot's load runs on (it settles once its engine is gone).
+  claimed = true
+  await Promise.all([...r.poolEngineIds()].map((id) => r.stopPoolSlotsOnEngine(id, { force: true })))
+  if (slot.status().state === 'starting') { slotState = 'running'; settle?.() } // missed by the stopper: it comes up
+  const result = await routed
+
+  assert.equal(stops[0], true, 'force-stopped by the pool stopper')
+  assert.equal(slot.status().state, 'stopped')
+  assert.deepEqual(result, { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
+  assert.equal(r.loadedModelKeys().has('model-b'), false, 'not registered as a pool slot')
+})
+
 // ── chatSlotCount / evictChatLru: 'stopping' must count as occupied ──────────────
 // Regression for a real, live bug: a manual model swap (routes.ts's /api/v1/engine/start,
 // which calls the PRIMARY manager directly, bypassing this router) passes the primary

@@ -216,6 +216,28 @@ test('acquire during a model swap force-stops the model that is still stopping',
   assert.equal(g.isBlocked(), true)
 })
 
+test('release resumes a load the guard refused mid-render, over the model the render displaced, without its cache', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // suspends A and saves its KV cache
+  // A swap to B, queued behind the render, reaches its start: the hook refuses it and Manager.load stores
+  // the refusal as the engine's error (restart() would retry B, the opts it recorded before the hook).
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let restarts = 0
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restart: async () => { restarts++ },
+  })
+
+  await g.release()
+
+  assert.equal(restarts, 1, 'the refused load is retried')
+  assert.equal(calls.starts.length, 0, 'A, which the user had already swapped away from, is not reloaded')
+  assert.equal(f.calls.filter((c) => c.url.includes('action=restore')).length, 0, "A's KV cache is not restored into B")
+  assert.equal(g.isBlocked(), false)
+})
+
 test('acquire also stops the gateway pool slots, before it reports the GPU free', async () => {
   const { mgr } = fakeManager({ state: 'running', opts: OPTS('m') })
   const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)

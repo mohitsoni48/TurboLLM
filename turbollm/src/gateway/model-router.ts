@@ -77,6 +77,10 @@ export class ModelRouter {
   /** The model doLoad is loading right now (one at a time: it runs under the swap lock). A pool slot's load is
    *  otherwise visible nowhere until it has succeeded. */
   private loadingKey: string | undefined
+  /** The pool-slot manager that load runs in, and its engine (unset for a load into the primary). It is in no
+   *  extraSlots entry until it has loaded, yet it already holds VRAM and runs on that engine, so poolEngineIds and
+   *  stopPoolSlotsOnEngine (a ComfyUI render's pool stopper, an engine update) count it too. */
+  private loadingSlot: { manager: Manager; engineId: string } | undefined
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -272,6 +276,7 @@ export class ModelRouter {
       const id = slot.manager.currentOpts()?.engine.id
       if (id) ids.add(id)
     }
+    if (this.loadingSlot) ids.add(this.loadingSlot.engineId)
     return ids
   }
 
@@ -296,6 +301,12 @@ export class ModelRouter {
       this.extraSlots.delete(key)
       stopping.push(slot.manager.stopAndWait(opts))
     }
+    // A slot still loading: one that is starting, or stopping the model it evicted, is killed now rather than left to
+    // come up and serve. One that has not spawned yet (waiting for the load gate, or in its pre-start hook) is still
+    // 'stopped', so this does nothing to it: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
+    // drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load.
+    const loading = this.loadingSlot
+    if (loading?.engineId === engineId) stopping.push(loading.manager.stopAndWait(opts))
     await Promise.all(stopping)
   }
 
@@ -427,10 +438,12 @@ export class ModelRouter {
     // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
     const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
     this.loadingKey = entry.key
+    this.loadingSlot = targetManager === this.manager ? undefined : { manager: targetManager, engineId: opts.engine.id }
     try {
       return await this.loadInto(entry, engine, opts, targetManager, inFlight)
     } finally {
       this.loadingKey = undefined
+      this.loadingSlot = undefined
       if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
   }
@@ -479,6 +492,14 @@ export class ModelRouter {
     if (inFlight?.cancelled) {
       await this.stopCancelled(targetManager)
       return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
+    }
+
+    // ComfyUI acquired the GPU while this pool slot loaded: its pool stopper killed the load, or the engine came up
+    // anyway (an acquire landing between the pre-start hook and the spawn). Either way nothing may serve during the
+    // render, so it is stopped and not registered, and like doLoad's isBlocked() refusal the client may retry.
+    if (targetManager !== this.manager && this.comfy?.gpuClaimed()) {
+      await targetManager.stopAndWait({ force: true })
+      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
 
     const s = targetManager.status()

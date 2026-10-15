@@ -36,6 +36,10 @@ export type FetchImpl = (input: string, init?: RequestInit) => Promise<{ ok: boo
  *  load anyway (the gate node treats an unreachable TurboLLM the same way). */
 const FREE_TIMEOUT_MS = 10_000
 
+/** The refusal freeComfyUIBeforeLoad throws; Manager.load stores it as the engine's error, and release()
+ *  recognises it there to resume that load. */
+const LOAD_PAUSED = 'ComfyUI is rendering — model loading is paused until its queue finishes.'
+
 /** Backstop: if `release` never arrives (ComfyUI crashed mid-render), auto-release
  *  after this long so the model doesn't stay unloaded forever. Each acquire re-arms
  *  it. Must exceed the longest single render; override with TURBOLLM_COMFY_LEASE_MIN. */
@@ -173,6 +177,22 @@ export class ComfyGuard {
     this.held = false
     const opts = this.suspended
     this.suspended = null
+    // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
+    // model was still stopping, which acquire() kills without suspending) left the engine in 'error' saying
+    // loading resumes when the queue finishes. Keep that promise. That load is the user's latest choice, so it
+    // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
+    // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
+    const st = this.manager.status()
+    if (st.state === 'error' && st.err?.message === LOAD_PAUSED) {
+      console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
+      try {
+        await this.manager.restart()
+      } catch (e) {
+        console.warn(`[comfy-guard] reload after ComfyUI failed: ${e instanceof Error ? e.message : e}`)
+      }
+      this.cachedFile = null
+      return
+    }
     if (opts) {
       console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
       try {
@@ -228,9 +248,15 @@ export class ComfyGuard {
   }
 
   private refuseLoadWhileHeld(): void {
-    if (this.enabled() && (this.held || this.acquiring)) {
-      throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.')
+    if (this.gpuClaimed()) {
+      throw new Error(LOAD_PAUSED)
     }
+  }
+
+  /** True from the moment an acquire begins until release. isBlocked() turns true only once the acquire has freed
+   *  VRAM; a load that comes up in between (the gateway's pool slots) must not serve during the render either. */
+  gpuClaimed(): boolean {
+    return this.enabled() && (this.held || this.acquiring !== null)
   }
 
   /** REVERSE gate (F-011): TurboLLM is about to load a model — ask ComfyUI to drop its
