@@ -9,6 +9,7 @@
 
 import { defineEvent, f } from '../core/define'
 import { FAIL_REASONS, OUTCOMES } from '../core/enums'
+import { toSafeIdent } from '../core/validate'
 import type { PayloadOf } from '../core/types'
 import type { LoadProfile } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -190,17 +191,21 @@ export function buildModelLoadConfig(
   vram: VramFit,
 ): Pick<PayloadOf<NonNullable<(typeof modelLoad)['payload']>>, 'model' | 'engine' | 'params' | 'fit'> {
   const gpuCount = profile.gpu.tensorSplit.length > 0 ? profile.gpu.tensorSplit.length : 1
+  // Identifier fields go through toSafeIdent, as bench_result's do: a GGUF's general.name
+  // ('Mistral-7B-Instruct [v0.3]', 'meta-llama/Llama-3.1-8B') or the scanner's '?' quant
+  // fallback fails isSafeIdent, and validateEvent then drops the whole event before it is
+  // queued. Already-valid values come back untouched, so existing join keys keep matching.
   return {
     model: {
-      name: entry.name,
-      quant: entry.quant,
-      arch: entry.arch,
+      name: toSafeIdent(entry.name),
+      quant: toSafeIdent(entry.quant),
+      arch: toSafeIdent(entry.arch),
       sizeBytes: entry.sizeBytes,
       moe: entry.moe,
       nativeCtx: entry.nativeCtx,
     },
     engine: {
-      kind: engine.kind,
+      kind: toSafeIdent(engine.kind),
       isCustom: Boolean(engine.sourceRepo),
     },
     params: {

@@ -131,3 +131,23 @@ test('buildModelLoadConfig: model identity comes from the scanner entry, quant i
     nativeCtx: 8192,
   })
 })
+
+test('buildModelLoadConfig: a GGUF name or quant that breaks the identifier charset is normalized, not dropped', () => {
+  // general.name is whatever the file's author wrote, and the scanner's quant falls back to '?'.
+  // Raw, either one made validateEvent reject the whole model_load, so it was never queued.
+  for (const entry of [
+    { ...denseModel, name: 'Mistral-7B-Instruct [v0.3]' },
+    { ...denseModel, name: 'meta-llama/Llama-3.1-8B' },
+    { ...denseModel, quant: '?' },
+  ]) {
+    const profile = deriveDefault(entry, sys)
+    const vram = estimateVram(profile, entry, sys)
+    const config = buildModelLoadConfig(entry, profile, engine, vram)
+    const r = validateEvent(envelope({ outcome: 'ok', trigger: 'manual', ...config }))
+    assert.equal(r.ok, true, r.ok === false ? `${entry.name}/${entry.quant}: ${r.reason}` : '')
+  }
+  const profile = deriveDefault(denseModel, sys)
+  const vram = estimateVram(profile, denseModel, sys)
+  const bracketed = buildModelLoadConfig({ ...denseModel, name: 'Mistral-7B-Instruct [v0.3]' }, profile, engine, vram)
+  assert.equal(bracketed.model?.name, 'Mistral-7B-Instruct v0.3')
+})
