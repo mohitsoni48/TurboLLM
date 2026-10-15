@@ -75,3 +75,41 @@ test("an old server process's late exit/error/stdout never touches its lazily sp
     client.disconnect()
   }
 })
+
+// Answers tools/call with 3 000 '€' (E2 82 AC), written in two parts with a pause between them and
+// the split falling inside one '€', so the client's stdout handler gets the character in two chunks.
+const SPLIT_SERVER = `
+const send = (s) => process.stdout.write(s)
+let buf = ''
+process.stdin.on('end', () => process.exit(0))
+process.stdin.on('data', (c) => {
+  buf += c
+  const lines = buf.split('\\n')
+  buf = lines.pop()
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const m = JSON.parse(line)
+    if (m.id == null) continue
+    if (m.method !== 'tools/call') { send(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: {} }) + '\\n'); continue }
+    const out = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: '€'.repeat(3000) }] } }) + '\\n')
+    const cut = out.indexOf(Buffer.from('€')) + 3 * 1500 + 1
+    send(out.subarray(0, cut))
+    setTimeout(() => send(out.subarray(cut)), 100)
+  }
+})
+`
+
+test('a tool result whose multibyte characters straddle stdout chunks reaches the caller unaltered', async () => {
+  const dir = tmpDir('turbollm-mcp-client-')
+  const script = join(dir, 'split-server.cjs')
+  writeFileSync(script, SPLIT_SERVER)
+  const command = process.platform === 'win32' ? 'node' : process.execPath
+  const client = new StdioMcpClient({ id: 's', name: 's', command, args: [script] })
+  try {
+    const text = await client.callTool('t', {})
+    assert.equal(text.includes('�'), false, 'no U+FFFD where a chunk boundary split a character')
+    assert.equal(text, '€'.repeat(3000))
+  } finally {
+    client.disconnect()
+  }
+})

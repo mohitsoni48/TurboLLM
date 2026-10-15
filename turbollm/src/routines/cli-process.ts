@@ -339,8 +339,12 @@ export function runClaudeCliProcess(
     }
     opts.signal?.addEventListener('abort', onAbort, { once: true })
 
-    child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
-    child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8'); if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
+    // Decoded by the stream, not chunk by chunk: a multibyte character split across two pipe reads
+    // would otherwise become U+FFFD on both sides of the boundary in the recorded result.
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', (s: string) => { stdout += s; if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
+    child.stderr?.on('data', (s: string) => { stderr += s; if (exited) armGrace(EXIT_STDIO_GRACE_MS) })
     child.stdout?.once('end', () => { stdoutEnded = true; finishIfDrained() })
     child.stderr?.once('end', () => { stderrEnded = true; finishIfDrained() })
     // A stream-level error (EPIPE on a killed child is the common one) would otherwise throw out

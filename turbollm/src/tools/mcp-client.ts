@@ -93,9 +93,13 @@ export class StdioMcpClient implements IMcpClient {
     // or a disconnect the old process is killed, not awaited, and the next call lazily spawns a
     // replacement: the old one's late 'exit'/'error' would otherwise kill that replacement and
     // fail its pending requests, and its last buffered stdout would splice into the new stream.
-    proc.stdout?.on('data', (chunk: Buffer) => {
+    // Decoded by the stream, not chunk by chunk: a multibyte character split across two pipe
+    // reads (~64 KB each) would otherwise become U+FFFD on both sides, inside a JSON string that
+    // still parses, so a large tool result reached the model silently altered.
+    proc.stdout?.setEncoding('utf8')
+    proc.stdout?.on('data', (chunk: string) => {
       if (this.proc !== proc) return
-      this.buf += chunk.toString('utf8')
+      this.buf += chunk
       const lines = this.buf.split('\n')
       this.buf = lines.pop() ?? ''
       for (const line of lines) {

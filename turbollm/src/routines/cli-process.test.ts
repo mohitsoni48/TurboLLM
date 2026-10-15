@@ -606,3 +606,21 @@ test('a stream-level error (EPIPE) is recorded rather than thrown out of band', 
   assert.equal(result.exitCode, 0)
   assert.match(result.stderr, /EPIPE/)
 })
+
+test('a multibyte character split across two stdout/stderr chunks is decoded whole, not as U+FFFD', async () => {
+  const child = fakeChild()
+  const { spy } = killSpy()
+  const resultPromise = runClaudeCliProcess(['-p'], { cwd: '/repo', env: {}, timeoutMs: 5000 }, () => child, spy)
+  // '€' is E2 82 AC: a pipe read boundary can fall anywhere inside it.
+  const euro = Buffer.from('€')
+  child.stdout.write(Buffer.concat([Buffer.from('{"result":"5 '), euro.subarray(0, 1)]))
+  child.stdout.write(Buffer.concat([euro.subarray(1), Buffer.from('"}\n')]))
+  child.stdout.end()
+  child.stderr.write(euro.subarray(0, 2))
+  child.stderr.end(euro.subarray(2))
+  child.emit('exit', 0, null)
+
+  const result = await resultPromise
+  assert.equal(result.stdout, '{"result":"5 €"}\n')
+  assert.equal(result.stderr, '€')
+})
