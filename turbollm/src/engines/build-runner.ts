@@ -759,7 +759,8 @@ function winComSpec(): string {
 
 /** Run one child process, streaming combined stdout+stderr line-by-line to `onLine` and
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
- *  spawn error; aborting `signal` kills the child and everything under it (rejects with an AbortError).
+ *  spawn error; aborting `signal` kills the child and everything under it (on Linux/macOS with `killTree: false`,
+ *  only the child, with SIGTERM) and rejects with an AbortError.
  *  Exported for tests. */
 export function runStep(
   cmd: string,
