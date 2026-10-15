@@ -409,6 +409,9 @@ export interface RemoteAccessConfig {
   tokenGrant: { capabilities: string[]; models?: string[] }
   /** Last known public URL, shown immediately after a daemon restart, stale until probed. */
   lastUrl: string
+  /** The provider that was serving lastUrl (absent in configs saved before it was recorded).
+   *  auth.ts trusts lastUrl as Serve's name only when Serve saved it. */
+  lastUrlProvider?: RemoteProviderId
 }
 
 /** Coerce anything unrecognized to the zero-setup default rather than leaving a broken id
@@ -1257,6 +1260,7 @@ function normalize(c: Config): void {
         : undefined,
     },
     lastUrl: str(ra.lastUrl),
+    lastUrlProvider: (REMOTE_PROVIDERS as readonly string[]).includes(ra.lastUrlProvider as string) ? ra.lastUrlProvider : undefined,
   }
   // App auto-update settings (spec 29 B.4): absent in pre-this-feature configs → the
   // 'notify' default. The policy string is NOT validated here — `normalizeUpdatePolicy`

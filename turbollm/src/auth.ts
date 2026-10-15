@@ -211,10 +211,13 @@ function hostHeaderName(host: string): string {
  *  with the ingress port: it would need to answer DNS for the served name (MagicDNS off, a
  *  hostile resolver) AND the ingress port would have to equal Serve's public port. Read from the
  *  live URL, else the one persisted on the last connect (cli.ts): the URL is null during a
- *  reconnect's backoff, while Serve's entry, which outlives our process, keeps serving. No URL,
- *  no trust. */
+ *  reconnect's backoff, while Serve's entry, which outlives our process, keeps serving. The
+ *  persisted one only if Serve saved it: saved by another provider, it is that tunnel's own
+ *  name, which a custom tunnel the user still runs into the ingress carries on every request.
+ *  No URL, no trust. */
 function namesServedHost(host: string | undefined, d: Deps): boolean {
-  const url = d.remote?.url?.() || d.store.snapshot().remoteAccess?.lastUrl
+  const ra = d.store.snapshot().remoteAccess
+  const url = d.remote?.url?.() || (ra?.lastUrlProvider === 'tailscale-serve' ? ra.lastUrl : '')
   // A DNS name and an optional port, nothing the URL parser would read as userinfo or a path.
   if (!host || !url || !/^[a-z0-9.-]+(:\d+)?$/i.test(host.trim())) return false
   try {

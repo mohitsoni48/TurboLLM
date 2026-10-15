@@ -882,6 +882,9 @@ function onRemoteState(s: RemoteState): void {
   try {
     store.update((cfg) => {
       cfg.remoteAccess.lastUrl = s.url
+      // The provider actually running, which `--tunnel` can make differ from the saved one:
+      // auth.ts's served-host check falls back to lastUrl only when Serve saved it.
+      cfg.remoteAccess.lastUrlProvider = remote.activeProvider()
     })
   } catch {
     /* best-effort — never fail a connect over a persistence hiccup */

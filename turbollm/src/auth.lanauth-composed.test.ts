@@ -588,8 +588,35 @@ test('a DNS-rebinding page on the ingress port cannot forge a Tailscale identity
   ;(d.remote as unknown as { url: () => string | null }).url = () => null
   assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 401)
   cfg.remoteAccess.lastUrl = `https://${SERVE_HOST}`
+  cfg.remoteAccess.lastUrlProvider = 'tailscale-serve'
   assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 200)
   assert.equal((await send(tunneledRequest, forged)).status, 401)
+})
+
+// The persisted URL is whatever the last provider to connect served. Saved by another one (a
+// custom tunnel the user still runs, pointed at the ingress), it is that tunnel's own name, so
+// until Serve first connects every request through that tunnel would carry the "served" Host
+// and could set the identity header itself.
+test('before Serve first connects, a URL another provider saved does not stand in for the served name', async () => {
+  const { d, cfg } = makeDeps((cfg) => {
+    cfg.remoteAccess.provider = 'tailscale-serve'
+    cfg.remoteAccess.lastUrl = 'https://tunnel.example.com'
+    cfg.remoteAccess.lastUrlProvider = 'custom'
+  })
+  ;(d.remote as unknown as { url: () => string | null }).url = () => null // Serve still starting
+  const app = buildApp(d)
+  const run = (host: string) =>
+    tunneledRequest(app, '/api/v1/build/run', {
+      method: 'POST',
+      headers: { Host: host, 'Tailscale-User-Login': 'forged@example.com', 'Sec-Fetch-Site': 'same-origin' },
+    })
+  assert.equal((await run('tunnel.example.com')).status, 401)
+  delete cfg.remoteAccess.lastUrlProvider // saved before the provider was recorded
+  assert.equal((await run('tunnel.example.com')).status, 401)
+  // Saved by Serve itself, it is the name Serve serves.
+  cfg.remoteAccess.lastUrl = `https://${SERVE_HOST}`
+  cfg.remoteAccess.lastUrlProvider = 'tailscale-serve'
+  assert.equal((await run(SERVE_HOST)).status, 200)
 })
 
 // The ingress is a plain 127.0.0.1 listener, so any process on this machine can send the
