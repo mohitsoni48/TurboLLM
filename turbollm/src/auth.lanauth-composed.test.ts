@@ -24,6 +24,13 @@ import { ModelRouter } from './gateway/model-router'
 import type { Manager, Status } from './engines/manager'
 import type { Registry } from './engines/registry'
 import type { Scanner, ModelEntry } from './models/scanner'
+import { ToolRegistry } from './tools/tool-registry'
+import type { RoutineToolsStore } from './routines/routine-tools'
+import type { Routine } from './routines/schema'
+import { rmSync } from 'node:fs'
+import { registerChatRoutes } from './chat/chat-routes'
+import { ConversationStore } from './chat/db'
+import { tmpDir } from './test-support/tmp'
 
 // N3 (Phase 5 final-review-fix re-review): a GENUINELY valid, properly-signed Access assertion
 // — the same RS256 keypair machinery access-jwt.test.ts uses — so the C3(b) test below proves
@@ -699,4 +706,154 @@ test('a remote token WITH models:load still auto-swaps through the router', asyn
   // The fake registry has no engine, so the load itself fails — but past the capability refusal.
   const body = (await res.json()) as { error?: { message: string } }
   assert.doesNotMatch(body.error?.message ?? '', /may not load models/)
+})
+
+// ── A remote token must not reach the routines through the chat tools either ───────────────
+// Every /api/v1/routines route maps to no capability, so a remote token is refused there. The
+// chat tool loop runs inside the token's own /api/v1/conversations request (models:use), and its
+// update_routine/run_routine_now/delete_routine/list_routines reach the same routines: a token
+// without models:load could repoint an active routine's modelKey and let the scheduler load it.
+
+const ROUTINE_TOOLS = ['create_routine', 'list_routines', 'update_routine', 'delete_routine', 'run_routine_now']
+
+function routineToolsApp(d: Deps, reg: ToolRegistry): Hono {
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  // Stands in for chat-routes.ts's runGeneration: it builds the tool list and runs each (approved)
+  // tool call inside this request's own async context.
+  app.post('/api/v1/conversations/:id/messages', async (c) => {
+    const { name, args } = (await c.req.json()) as { name: string; args: Record<string, unknown> }
+    const offered = (await reg.buildToolDefinitions({ forGeneration: true })).map((t) => t.function.name)
+    return c.json({ offered, result: await reg.executeTool({ id: 't1', name, args }) })
+  })
+  return app
+}
+
+test('a remote token cannot create, list, update, delete or run routines through the chat tools', async () => {
+  const { d } = makeDeps(() => {})
+  const routine = {
+    id: 'r1', flavor: 'chat', status: 'active', prompt: 'owner prompt', scheduleDisplay: 'daily',
+    scheduleRule: { kind: 'daily', hour: 9, minute: 0 }, nextFireAt: null, modelKey: 'owner-model',
+    createdAt: 'now', updatedAt: 'now',
+  } as unknown as Routine
+  const touched: string[] = []
+  const store = {
+    createRoutine: () => { touched.push('create'); return routine },
+    getRoutine: () => routine,
+    listRoutines: () => { touched.push('list'); return [routine] },
+    updateRoutine: () => { touched.push('update'); return routine },
+    deleteRoutine: () => { touched.push('delete'); return true },
+    listRoutineRuns: () => [],
+  } as unknown as RoutineToolsStore
+  const reg = new ToolRegistry({} as never, store, async () => { touched.push('run'); return { ok: true } })
+  const app = routineToolsApp(d, reg)
+  const calls: Array<[string, Record<string, unknown>]> = [
+    ['update_routine', { routineId: 'r1', modelKey: 'huge-70b', scheduleRule: { kind: 'interval', everyMs: 60_000 }, confirm: true }],
+    ['run_routine_now', { routineId: 'r1' }],
+    ['delete_routine', { routineId: 'r1', confirm: true }],
+    ['list_routines', {}],
+    ['create_routine', { flavor: 'chat', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'huge-70b', agentId: 'a' }],
+  ]
+  for (const capabilities of [['models:use'], ['models:use', 'models:load']] as const) {
+    const raw = provisionRemoteApiKey(d, { kind: 'remote', capabilities: [...capabilities] })
+    for (const [name, args] of calls) {
+      const res = await tunneledRequest(app, '/api/v1/conversations/c1/messages', {
+        method: 'POST',
+        headers: { 'X-TurboLLM-Auth': raw, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, args }),
+      })
+      assert.equal(res.status, 200)
+      const body = (await res.json()) as { offered: string[]; result: string }
+      assert.match(body.result, /^Error: .*not allowed/, `${name} with ${capabilities.join('+')}`)
+      assert.deepEqual(body.offered.filter((n) => ROUTINE_TOOLS.includes(n)), [], 'routine tools are not offered to the model')
+    }
+  }
+  assert.deepEqual(touched, [], 'no routine may be read, written or run')
+
+  // The host's own chat is unchanged.
+  const res = await loopbackRequest(app, '/api/v1/conversations/c1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'run_routine_now', args: { routineId: 'r1' } }),
+  })
+  const body = (await res.json()) as { offered: string[]; result: string }
+  assert.match(body.result, /is running now/)
+  assert.deepEqual(body.offered.filter((n) => ROUTINE_TOOLS.includes(n)).sort(), [...ROUTINE_TOOLS].sort())
+})
+
+// GET /api/v1/tools is also the catalog an agent's allow-list is saved from (AgentEditPage saves
+// every listed tool for a new agent), so it must list the routine tools whoever asks: a remote
+// config:write token saving an agent would otherwise strip them from the host's chats with it.
+// Only the remote token's own generation leaves them out. Real lanAuth + real chat routes.
+test("a remote token's tool catalog still lists the routine tools; its chat generation is not offered them", async () => {
+  const { d, cfg } = makeDeps(() => {})
+  cfg.daemon.autoGenerateTitles = false
+  const dir = tmpDir('tllm-lanauth-tools-')
+  const db = new ConversationStore(dir)
+  const store = { listRoutines: () => [], getRoutine: () => undefined, listRoutineRuns: () => [] } as unknown as RoutineToolsStore
+  Object.assign(d, {
+    db,
+    tools: new ToolRegistry({} as never, store, async () => ({ ok: true })),
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
+    registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
+    gate: { acquire: async () => () => {} },
+    modelRouter: { route: async () => ({ target: 'http://127.0.0.1:8081' }), resolveRemoteTarget: () => undefined },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'M', ctx: 8192 } }),
+      target: () => 'http://127.0.0.1:8081',
+      currentOpts: () => null,
+      generationStart: () => {},
+      generationEnd: () => {},
+      setLiveGen: () => {},
+      recordCompletion: () => {},
+    },
+  })
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerChatRoutes(app, d)
+  // The tool names each chat turn sent to the engine.
+  const sentTools: string[][] = []
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (String(input).endsWith('/chat/completions')) {
+      const sent = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as { tools?: Array<{ function: { name: string } }> }
+      sentTools.push((sent.tools ?? []).map((t) => t.function.name))
+    }
+    const sse = [
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'ok' } }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }] })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join('')
+    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  const routineTools = (names: string[]) => names.filter((n) => ROUTINE_TOOLS.includes(n)).sort()
+  const send = async (request: typeof tunneledRequest, headers: Record<string, string>) => {
+    const conv = db.createConversation()
+    const res = await request(app, `/api/v1/conversations/${conv.id}/messages`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'hi' }),
+    })
+    assert.equal(res.status, 200)
+    assert.match(await res.text(), /event: done|"ok"/)
+  }
+  try {
+    const raw = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'config:write'] })
+    const auth = { 'X-TurboLLM-Auth': raw }
+    const catalog = await tunneledRequest(app, '/api/v1/tools', { headers: auth })
+    assert.equal(catalog.status, 200)
+    const listed = ((await catalog.json()) as { tools: Array<{ name: string }> }).tools.map((t) => t.name)
+    assert.deepEqual(routineTools(listed), [...ROUTINE_TOOLS].sort(), 'the catalog lists the routine tools for a remote token')
+
+    await send(tunneledRequest, auth)
+    await send(loopbackRequest, {})
+    assert.equal(sentTools.length, 2)
+    assert.ok(sentTools[0].includes('run_code'), 'the remote turn is still offered the other tools')
+    assert.deepEqual(routineTools(sentTools[0]), [], "the remote token's generation is not offered the routine tools")
+    assert.deepEqual(routineTools(sentTools[1]), [...ROUTINE_TOOLS].sort(), "the host's generation is")
+  } finally {
+    globalThis.fetch = originalFetch
+    db.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

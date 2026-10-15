@@ -920,10 +920,22 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       // names, evicting the owner's — the exact ADR-376 defect (see isFacadeOnlyKey) that
       // made "models:load" advice for link tokens. Without models:load, this request may use
       // only what is already loaded; ModelRouter refuses the load (see modelLoadsRefused).
-      if (!hasCapability(resolved, 'models:load')) return noModelLoads.run(true, next)
+      if (!hasCapability(resolved, 'models:load')) return remoteGrant.run(true, () => noModelLoads.run(true, next))
+      return remoteGrant.run(true, next)
     }
     return next()
   }
+}
+
+/** Marks the async context of a request made with a remote-access token, whatever its
+ *  capabilities. The chat tool loop runs inside that request, and its routine tools reach the
+ *  same routines that /api/v1/routines guards (no capability maps there, so a remote token is
+ *  refused): the tool registry refuses those tools too. */
+const remoteGrant = new AsyncLocalStorage<boolean>()
+
+/** True while serving a request made with a remote-access token (ADR-422). */
+export function remoteGrantRequest(): boolean {
+  return remoteGrant.getStore() === true
 }
 
 /** Marks the async context of a request that must not load a model (a remote-access token

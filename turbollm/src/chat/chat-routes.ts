@@ -1060,7 +1060,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   if (localAccounting) d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
-    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true }) : []
     // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
     // registry (every other skill is instructions text only). No-op unless enabled.
     const skillTools = enabledSkillIds.has('skill-creator')
