@@ -17,10 +17,12 @@
 // access is merely active" — that would also break the daemon's own local CLI tooling
 // (`--stop`, `launch claude`), which has no way to hold a usable key (only hashes are ever
 // stored). `isTunneled` below instead keys off which LOCAL TCP port the connection arrived
-// on: the ingress listener binds a dedicated loopback port that only a provider's local leg
-// ever connects to, and a client cannot choose which of the daemon's sockets it lands on —
-// unlike a header, which only worked for Cloudflare because its edge (not the client)
-// controlled it.
+// on: every provider's local leg targets a dedicated loopback ingress port, and a remote client
+// cannot choose which of the daemon's sockets it lands on — unlike a header, which only worked
+// for Cloudflare because its edge (not the client) controlled it. Arriving on the ingress only
+// ever makes a request STRICTER (tunneled, never local); it says nothing about who sent it, since
+// any local process or a DNS-rebinding page can connect to that 127.0.0.1 port too, so no header
+// is trusted for arriving there alone (see remote/identity.ts).
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
@@ -419,7 +421,9 @@ export function localPort(c: Context): number | undefined {
 
 /** True when THIS request actually arrived over remote access, as opposed to "remote access
  *  merely happens to be on". Keyed off the dedicated loopback ingress socket (ADR-422,
- *  spec 30 §2.2), which every provider's local leg connects to and nothing else does.
+ *  spec 30 §2.2), which every provider's local leg connects to. Other local processes (and a
+ *  DNS-rebinding page) can connect there too, so this marks a request as tunneled, never as
+ *  coming from a provider: it may only make a request stricter.
  *
  *  Replaces ADR-153's cf-ray/cf-connecting-ip check. That check was only ever safe because
  *  Cloudflare's edge controlled the header; Tailscale Funnel, ngrok and a user-run frp inject
@@ -844,11 +848,19 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // Host Serve serves (namesServedHost): the ingress port skips the Host check above, so a
     // DNS-rebinding page on 127.0.0.1:<ingress> could otherwise set the header itself. And only
     // while a local process, which can always forge it, already has as much (localProcessesTrusted).
+    // And never for a request a browser marks as cross-site (isCrossSite, on every path and
+    // method): Serve adds the header to everything it proxies from a tailnet device, a browser's
+    // requests included, so it is ambient like a cookie, and with /v1's CORS '*' a page on any
+    // site the user visits could run inference (and auto-swap models), list the library and read
+    // the answers. Serve is https, so browsers always send Fetch Metadata there; the served UI is
+    // same-origin, and CLIs, SDKs and server-side clients send neither header. A cross-site
+    // browser client falls through to the key check below, like any other remote caller.
     if (
       isTunneled(c, d) &&
       d.remote?.activeProvider?.() === 'tailscale-serve' &&
       namesServedHost(c.req.header('host'), d) &&
       localProcessesTrusted(d) &&
+      !isCrossSite(c) &&
       tailscaleIdentity(c)
     ) {
       return next()
@@ -869,9 +881,19 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // this block's `next()` skips the capability check too). It also made `requireAccess`
     // silently unenforced on Tailscale Serve (I6): Task 20's own provider-gated block ran
     // first and won, so an operator who believed "Access is mandatory" got an unauthenticated
-    // pass-through instead.
+    // pass-through instead. Keyed on the provider actually RUNNING, like the Serve block above,
+    // not the saved one: `--tunnel` runs cloudflare-quick whatever is saved, and a saved
+    // cloudflare-named with Access would otherwise refuse the token `--tunnel` printed
+    // (requireAccess on) or take an Access JWT in its place on the quick tunnel (off). The saved
+    // one only while no provider is recorded on a live ingress (disable() drops it before the
+    // tunnel has stopped), so `requireAccess` never lapses in that moment.
     const ra = d.store.snapshot().remoteAccess
-    if (isTunneled(c, d) && ra.provider === 'cloudflare-named' && ra.cloudflare.accessTeamDomain && ra.cloudflare.accessAud) {
+    if (
+      isTunneled(c, d) &&
+      (d.remote?.activeProvider?.() ?? ra.provider) === 'cloudflare-named' &&
+      ra.cloudflare.accessTeamDomain &&
+      ra.cloudflare.accessAud
+    ) {
       const assertion = c.req.header('Cf-Access-Jwt-Assertion') ?? ''
       let verified = false
       if (assertion) {

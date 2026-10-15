@@ -275,6 +275,40 @@ test('C3/I6: a GENUINELY VALID, replayed Access assertion does not bypass auth o
   }
 })
 
+// `turbollm --tunnel` runs cloudflare-quick whatever provider is saved, so the Access block must
+// follow the RUNNING provider: keyed on a saved cloudflare-named, it refused the token --tunnel
+// printed (requireAccess on) and took an Access JWT in its place on the quick tunnel (off).
+test('a saved cloudflare-named Access config neither locks out nor admits by JWT a --tunnel quick tunnel', async () => {
+  const teamDomain = 'https://tunnel-flag.cloudflareaccess.com'
+  const restoreFetch = stubJwksEndpoint(teamDomain)
+  try {
+    const { d, cfg } = makeDeps((cfg) => {
+      cfg.remoteAccess.provider = 'cloudflare-named'
+      cfg.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+      cfg.remoteAccess.cloudflare.accessAud = 'aud-tunnel-flag'
+      cfg.remoteAccess.cloudflare.requireAccess = true
+    })
+    ;(d.remote as unknown as { activeProvider: () => string }).activeProvider = () => 'cloudflare-quick'
+    const raw = 'tllm-tunnelflagtunnelflagtunnelflagtunnel1' // what --tunnel prints (a full-access key)
+    cfg.apiKeys.push({ id: 'k1', name: 'tunnel-x', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+    const app = buildApp(d)
+    assert.equal((await tunneledRequest(app, '/api/v1/status', { headers: { Authorization: `Bearer ${raw}` } })).status, 200)
+    cfg.remoteAccess.cloudflare.requireAccess = false
+    const jwt = makeValidAccessJwt(teamDomain, 'aud-tunnel-flag')
+    assert.equal((await tunneledRequest(app, '/api/v1/status', { headers: { 'Cf-Access-Jwt-Assertion': jwt } })).status, 401)
+    // The same JWT still works once the named tunnel is the one running.
+    ;(d.remote as unknown as { activeProvider: () => string }).activeProvider = () => 'cloudflare-named'
+    assert.equal((await tunneledRequest(app, '/api/v1/status', { headers: { 'Cf-Access-Jwt-Assertion': jwt } })).status, 200)
+    // No provider recorded on a live ingress (disable() drops it before the tunnel has stopped):
+    // the saved provider decides, so requireAccess does not lapse in that moment.
+    ;(d.remote as unknown as { activeProvider: () => string | undefined }).activeProvider = () => undefined
+    cfg.remoteAccess.cloudflare.requireAccess = true
+    assert.equal((await tunneledRequest(app, '/api/v1/status', { headers: { Authorization: `Bearer ${raw}` } })).status, 401)
+  } finally {
+    restoreFetch()
+  }
+})
+
 // ── C2: a real models:use-scoped remote token must reach the actual chat surface. ──────────
 
 test('C2: a models:use remote token reaches POST /api/v1/conversations/:id/messages', async () => {
@@ -598,6 +632,29 @@ test('a DNS-rebinding page on the ingress port cannot forge a Tailscale identity
   cfg.remoteAccess.lastUrlProvider = 'tailscale-serve'
   assert.equal((await send(tunneledRequest, { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' })).status, 200)
   assert.equal((await send(tunneledRequest, forged)).status, 401)
+})
+
+// Serve adds the identity to everything it proxies from a tailnet device, a browser's requests
+// included, so the browser cannot leave it off: with /v1's CORS '*', a page on any site a tailnet
+// user visits could use the served daemon's /v1 (inference, auto-swap loads) and read the answers.
+test('a Tailscale Serve identity is no credential for a cross-site browser request', async () => {
+  const raw = 'tllm-crosssiteservecrosssiteservecrosssi1'
+  const { d, cfg } = makeDeps((cfg) => {
+    cfg.remoteAccess.provider = 'tailscale-serve'
+  })
+  cfg.apiKeys.push({ id: 'k1', name: 'x', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+  const app = buildApp(d)
+  const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com' }
+  const get = (headers: Record<string, string>) => tunneledRequest(app, '/v1/models', { headers: { ...serve, ...headers } })
+  assert.equal((await get({ 'Sec-Fetch-Site': 'cross-site', Origin: 'https://evil.example' })).status, 401)
+  assert.equal((await get({ 'Sec-Fetch-Site': 'same-site' })).status, 401, 'another app on the same site is not this one')
+  assert.equal((await get({ Origin: 'https://evil.example' })).status, 401, 'no Fetch Metadata: Origin vs Host')
+  // The served UI itself, a typed URL, and a CLI/SDK (no browser headers) keep keyless access.
+  assert.equal((await get({ 'Sec-Fetch-Site': 'same-origin', Origin: `https://${SERVE_HOST}` })).status, 200)
+  assert.equal((await get({ 'Sec-Fetch-Site': 'none' })).status, 200)
+  assert.equal((await get({})).status, 200)
+  // A cross-site browser client with a key still gets in, through the ordinary key check.
+  assert.equal((await get({ 'Sec-Fetch-Site': 'cross-site', Authorization: `Bearer ${raw}` })).status, 200)
 })
 
 // The persisted URL is whatever the last provider to connect served. Saved by another one (a
