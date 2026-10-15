@@ -49,9 +49,20 @@ export function modelsRefetchInterval(
   // `loadModel()` never fired. Nothing invalidated this query then; `useDownloads()` now does when it sees a
   // download newly finish, which covers a finished file this rule counts as already in the library (a split's
   // later shards, by its still-incomplete row), but it only sees what its own poll catches, so this rule stays.
+  //
+  // It waits only until a scan has run since the download finished (`scanning` is false here, so the lastScanAt
+  // of this very list is from a pass that started after any rescan request, including the one made as the record
+  // turned done). A file still without a row then never gets one: its model was deleted (done records live until
+  // dismissed), or it is an mmproj left behind by that delete. Without this, either kept the list polling every
+  // 1.5 s for the daemon's lifetime. Strictly later: a pass that ended in the record's own millisecond may not
+  // have seen the file.
   const models = data?.models ?? []
+  const lastScanAt = data?.lastScanAt ?? ''
   const hasUnmatchedFinishedDownload = downloads?.downloads.some(
-    (d) => d.status === 'done' && !downloadInLibrary(d.dest, models),
+    (d) =>
+      d.status === 'done' &&
+      !(d.finishedAt && lastScanAt > d.finishedAt) &&
+      !downloadInLibrary(d.dest, models),
   )
   return hasUnmatchedFinishedDownload ? 1500 : false
 }

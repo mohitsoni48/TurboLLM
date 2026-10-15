@@ -98,7 +98,7 @@ import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
-import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
+import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
@@ -3170,7 +3170,14 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/downloads/:id/resume', (c) => {
-    const ok = d.downloads.resume(c.req.param('id'))
+    let ok: boolean
+    try {
+      ok = d.downloads.resume(c.req.param('id'))
+    } catch (e) {
+      // The row exists but another one is writing its file: 409, not "no such download".
+      const f = toDownloadFailure(e)
+      return err(c, f.status, f.code, f.message)
+    }
     if (!ok) return err(c, 404, 'no_such_download', 'No paused or errored download with that id.')
     return c.json({ ok: true })
   })

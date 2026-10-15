@@ -40,7 +40,14 @@ export interface DownloadRecord {
   bytesPerSec: number
   /** HF LFS sha256 to verify against when known (spec 10 §5). */
   sha256?: string
+  /** The server's strong validator (ETag, else Last-Modified) for the version of the file the
+   *  .part holds — sent as If-Range on resume. */
+  validator?: string
   createdAt: string
+  /** When the record became 'done' (ISO), set in the same tick that requests the rescan. A
+   *  models list whose lastScanAt is later has scanned this file: the web stops waiting for it
+   *  to get a row then (a deleted model, an orphaned mmproj never will). */
+  finishedAt?: string
 }
 
 /** Persisted manifest shape (spec 10 §5). Live runtime fields (controller, timers)
@@ -53,6 +60,7 @@ interface ManifestEntry {
   dest: string
   total: number
   sha256?: string
+  validator?: string
   createdAt: string
 }
 
@@ -370,12 +378,15 @@ export class DownloadManager {
    *  up. run() already resumes from the .part file's byte offset via a Range request —
    *  this just flips the status so the queue actually starts it again. A restart-
    *  restored job comes back as 'paused' with no automatic way back to 'downloading'
-   *  until this is called. */
+   *  until this is called. False when there is no paused or errored row with that id; throws
+   *  DownloadError('download_in_progress') when the row exists but cannot start. */
   resume(id: string): boolean {
     const rec = this.records.get(id)
     if (!rec || (rec.status !== 'paused' && rec.status !== 'error')) return false
     // Another row is already (about to be) writing this .part — a second writer would interleave.
-    if (this.sharesDest(rec, ['queued', 'downloading'])) return false
+    if (this.sharesDest(rec, ['queued', 'downloading'])) {
+      throw new DownloadError('download_in_progress', 'Another download is already writing this file.')
+    }
     rec.status = 'queued'
     rec.error = null
     this.persist()
@@ -471,7 +482,14 @@ export class DownloadManager {
       // The HF token is for Hugging Face alone: a raw-URL import can name any host, even over
       // plain http://, so only a request to the HF origin may carry it.
       if (!isHfOrigin(rec.url)) delete headers.Authorization
-      if (startAt > 0) headers.Range = `bytes=${startAt}-`
+      if (startAt > 0) {
+        headers.Range = `bytes=${startAt}-`
+        // Only the rest of the SAME file: a server whose file changed since the .part was
+        // written answers 200 with the whole new file, which the "ignored Range" path below
+        // restarts from, instead of a 206 tail spliced onto the old prefix. A raw URL usually
+        // has no sha256 to catch that splice.
+        if (rec.validator) headers['If-Range'] = rec.validator
+      }
 
       const res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
       if (res.status === 401) throw new DownloadError('hf_unauthorized', 'Your Hugging Face token was rejected.')
@@ -487,9 +505,42 @@ export class DownloadManager {
         rec.received = 0
         if (hash) hash = createHash('sha256') // the hashed prefix is gone with the .part
       }
+      // A server that ignores If-Range (Hugging Face's own CDN does), or a row with no validator
+      // to send, can still return another file's tail as a 206. It shows when the 206 names
+      // another strong validator than the one the .part was written under, or when its
+      // Content-Range starts elsewhere, stops before the end of the file or names another full
+      // length. Checked before rec.total is overwritten with this reply's length, which would
+      // make the size check below pass for any splice or truncation.
+      const got = strongValidator(res.headers)
+      if (
+        resuming &&
+        ((rec.validator !== undefined && validatorChanged(rec.validator, res.headers)) ||
+          !rangeContinues(res.headers.get('content-range'), startAt, rec.total))
+      ) {
+        await res.body.cancel().catch(() => {})
+        rmSync(part, { force: true })
+        rec.received = 0
+        throw new DownloadError(
+          'download_failed',
+          "The server's reply does not continue the partial file (the file may have changed on the server since this download started). Removed the partial file: resume to download it again.",
+        )
+      }
 
       const clen = Number(res.headers.get('content-length') ?? 0)
-      if (clen > 0) rec.total = resuming ? startAt + clen : clen
+      // A 206 names the full length itself; offset + content-length would take a body shorter
+      // than its own Content-Range for the whole file.
+      const rangeFull = resuming ? contentRangeFull(res.headers.get('content-range')) : 0
+      const total = rangeFull > 0 ? rangeFull : clen > 0 ? (resuming ? startAt + clen : clen) : rec.total
+      // Remember which version of the file the .part now holds (for If-Range and the check
+      // above) and its full length (for the Content-Range check), persisted at once: a daemon
+      // restart mid-download is exactly when they are needed, and nothing else writes the
+      // manifest until this run ends. A raw URL is enqueued with total 0.
+      const validator = got ?? (resuming ? rec.validator : undefined)
+      if (validator !== rec.validator || total !== rec.total) {
+        rec.validator = validator
+        rec.total = total
+        this.persist()
+      }
 
       // Disk guard at download time (spec 10 §6): content-length is often the FIRST real
       // size we see — a raw URL, or an HF expansion where the tree metadata was
@@ -533,6 +584,7 @@ export class DownloadManager {
 
       renameSync(part, rec.dest) // atomic within the same dir
       rec.status = 'done'
+      rec.finishedAt = new Date().toISOString()
       rec.bytesPerSec = 0
       this.controllers.delete(rec.id)
       this.recordProvenance(rec)
@@ -612,6 +664,7 @@ export class DownloadManager {
         dest: r.dest,
         total: r.total,
         sha256: r.sha256,
+        validator: r.validator,
         createdAt: r.createdAt,
       })
     }
@@ -651,6 +704,7 @@ export class DownloadManager {
         error: null,
         bytesPerSec: 0,
         sha256: e.sha256,
+        validator: e.validator,
         createdAt: e.createdAt,
       })
     }
@@ -659,6 +713,53 @@ export class DownloadManager {
 
 function gb(bytes: number): string {
   return (bytes / 1e9).toFixed(1)
+}
+
+/** The response's strong validator, usable in If-Range (RFC 9110 §13.1.5): a strong ETag, or
+ *  Last-Modified when there is no ETag at all. A weak ETag may not be sent there, and with one
+ *  present a date may not stand in for it, so that case yields none. */
+function strongValidator(h: Headers): string | undefined {
+  const etag = h.get('etag')?.trim()
+  if (etag) return etag.startsWith('W/') ? undefined : etag
+  return h.get('last-modified')?.trim() || undefined
+}
+
+/** True when a 206 names another version of the file than `stored` (the strongValidator the
+ *  .part was written under). Only like is compared with like: a stored date with the 206's
+ *  Last-Modified, a stored ETag with its strong ETag. A 206 that carries only the other kind (an
+ *  ETag on the 200 and only a date on the 206, or the reverse) says nothing either way and is
+ *  left to the Content-Range check. */
+function validatorChanged(stored: string, h: Headers): boolean {
+  let theirs: string | undefined
+  // An HTTP-date (any of RFC 9110's three forms) starts with a day name and has a time; an
+  // ETag, quoted or not, has no space.
+  if (/^[A-Za-z]{3,9},? .*\d{2}:\d{2}:\d{2}/.test(stored)) theirs = h.get('last-modified')?.trim()
+  else {
+    const etag = h.get('etag')?.trim()
+    theirs = etag?.startsWith('W/') ? undefined : etag
+  }
+  return !!theirs && theirs !== stored
+}
+
+/** True when a 206's Content-Range continues the .part to the end of the file: it starts at
+ *  `startAt`, names the full length the row expects when both sides know it, and ends at the
+ *  last byte when the full length is known (a server capping open-ended ranges sends less,
+ *  which startAt + content-length would then take for the whole file). A 206 without the header
+ *  (which the spec requires), or with one this cannot read, cannot be checked and is let
+ *  through, as before: refusing it would throw away the .part on a merely sloppy server. */
+function rangeContinues(contentRange: string | null, startAt: number, total: number): boolean {
+  const m = contentRange === null ? null : /^bytes[\s=]+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange.trim())
+  if (!m) return true
+  if (Number(m[1]) !== startAt) return false
+  const full = m[3] === '*' ? total : Number(m[3])
+  if (total > 0 && full !== total) return false
+  return full <= 0 || Number(m[2]) === full - 1
+}
+
+/** The full length a Content-Range names (`bytes a-b/N`), or 0 for `/*` or an unreadable header. */
+function contentRangeFull(contentRange: string | null): number {
+  const m = contentRange === null ? null : /^bytes[\s=]+\d+-\d+\/(\d+)$/i.exec(contentRange.trim())
+  return m ? Number(m[1]) : 0
 }
 
 /** Rewrite HF blob viewer URLs to the direct-download resolve URL so raw HTTP

@@ -9,7 +9,10 @@ import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { DownloadManager } from './downloads'
+import { Hono } from 'hono'
+import { DownloadManager, type DownloadError } from './downloads'
+import { registerApi } from '../api/routes'
+import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
@@ -168,8 +171,20 @@ test('resume: an errored row cannot start a second writer while another row is d
   try {
     const { dm, a, b } = await staleAndLive()
     assert.equal(dm.list().find((r) => r.id === b.id)!.status, 'downloading')
-    assert.equal(dm.resume(a.id), false)
+    // A distinct refusal, not `false`: the row exists, so "no such download" would be wrong.
+    assert.throws(() => dm.resume(a.id), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
     assert.equal(dm.list().find((r) => r.id === a.id)!.status, 'error', 'the stale row stays put')
+
+    // Over HTTP that is a 409 the UI can show, not the 404 'No paused or errored download'.
+    const app = new Hono()
+    registerApi(app, { downloads: dm } as unknown as Deps)
+    const res = await app.request(`/api/v1/downloads/${a.id}/resume`, { method: 'POST', body: '{}' })
+    assert.equal(res.status, 409)
+    const body = (await res.json()) as { error: { code: string; message: string } }
+    assert.equal(body.error.code, 'download_in_progress')
+    assert.match(body.error.message, /Another download is already writing this file/)
+    const missing = await app.request('/api/v1/downloads/no-such-id/resume', { method: 'POST', body: '{}' })
+    assert.equal(missing.status, 404, 'an unknown id is still a 404')
   } finally {
     restore()
   }
@@ -227,4 +242,281 @@ test('resume: a good .part prefix plus the ranged remainder verifies and complet
   const { rec, dest } = await resumeAgainst(full.subarray(0, 55), full)
   assert.equal(rec.status, 'done', rec.error ?? '')
   assert.deepEqual(readFileSync(dest), full)
+})
+
+/** A raw-URL import (no sha256, enqueued with total 0) whose first attempt got `prefix` of
+ *  `oldFile` (served with `etag`, or with these validator headers), followed by a daemon
+ *  restart: the second DownloadManager restores the row from the manifest exactly as a real
+ *  restart does. `how` is how the first attempt ended: 'error' (the connection dropped, so
+ *  run()'s catch path wrote the manifest) or 'killed' (the daemon died mid-body: no error path
+ *  ran, the manifest holds only what run() persisted on its way). */
+async function interruptedRawDownload(
+  oldFile: Buffer,
+  prefixLen: number,
+  etag: string | Record<string, string>,
+  how: 'error' | 'killed' = 'error',
+) {
+  const validatorHeaders = typeof etag === 'string' ? { etag } : etag
+  const { modelDir, stateDir } = newDirs()
+  const real = globalThis.fetch
+  globalThis.fetch = (async () => {
+    let pulls = 0
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        if (pulls++ === 0) return c.enqueue(new Uint8Array(oldFile.subarray(0, prefixLen)))
+        if (how === 'killed') return new Promise<void>(() => {}) // the process is gone: nothing more happens
+        await new Promise((r) => setTimeout(r, 30)) // let the prefix reach the .part first
+        c.error(new Error('ECONNRESET'))
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-length': String(oldFile.length), ...validatorHeaders } })
+  }) as unknown as typeof fetch
+  try {
+    const first = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await first.enqueue({ url: 'https://mirror.example/model.gguf' })
+    const part = `${rec.dest}.part`
+    if (how === 'error') {
+      await waitSettled(first, rec.id)
+      assert.equal(first.list()[0].status, 'error')
+    } else {
+      for (let i = 0; i < 400 && (!existsSync(part) || readFileSync(part).length < prefixLen); i++) {
+        await new Promise((r) => setTimeout(r, 5))
+      }
+      assert.equal(first.list()[0].status, 'downloading', 'killed mid-body, before any error path')
+    }
+    assert.equal(readFileSync(part).length, prefixLen, 'the first attempt left its prefix in the .part')
+    return { modelDir, stateDir, id: rec.id, dest: rec.dest }
+  } finally {
+    globalThis.fetch = real
+  }
+}
+
+async function waitSettled(dm: DownloadManager, id: string) {
+  for (let i = 0; i < 400; i++) {
+    const r = dm.list().find((x) => x.id === id)!
+    if (r.status === 'done' || r.status === 'error') return r
+    await new Promise((res) => setTimeout(res, 5))
+  }
+  throw new Error('timed out waiting for the download to settle')
+}
+
+/** A server holding `file` under `etag` that implements Range and If-Range like a real one
+ *  (a stale If-Range gets the whole file as a 200), unless `ignoreIfRange` (Hugging Face's
+ *  CDN answers a stale If-Range with a 206 of the current file). `etagOn206: false` leaves the
+ *  ETag off its 206 responses; `lastModified` is sent on every response; `rangeCap` caps an
+ *  open-ended range at that many bytes (the 206 then ends before the end of the file). */
+function serve(
+  file: Buffer,
+  etag: string,
+  seen: Array<Record<string, string>>,
+  {
+    ignoreIfRange = false,
+    etagOn206 = true,
+    lastModified,
+    rangeCap,
+    shortBody,
+  }: { ignoreIfRange?: boolean; etagOn206?: boolean; lastModified?: string; rangeCap?: number; shortBody?: number } = {},
+) {
+  const lm: Record<string, string> = lastModified ? { 'last-modified': lastModified } : {}
+  return (async (_url: string, init: { headers: Record<string, string> }) => {
+    seen.push(init.headers)
+    const from = Number(/bytes=(\d+)-/.exec(init.headers.Range ?? '')?.[1] ?? 0)
+    const ifRange = init.headers['If-Range']
+    if (from > 0 && (ignoreIfRange || !ifRange || ifRange === etag)) {
+      const end = rangeCap ? Math.min(file.length, from + rangeCap) : file.length
+      // shortBody: a malformed reply whose body (and Content-Length) is shorter than its own range.
+      const rest = file.subarray(from, end - (shortBody ?? 0))
+      return new Response(rest, {
+        status: 206,
+        headers: {
+          'content-length': String(rest.length),
+          'content-range': `bytes ${from}-${end - 1}/${file.length}`,
+          ...(etagOn206 ? { etag } : {}),
+          ...lm,
+        },
+      })
+    }
+    return new Response(file, { status: 200, headers: { 'content-length': String(file.length), etag, ...lm } })
+  }) as unknown as typeof fetch
+}
+
+async function resumeAfterRestart(stateDir: string, modelDir: string, id: string, fetchImpl: typeof fetch) {
+  const real = globalThis.fetch
+  globalThis.fetch = fetchImpl
+  try {
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    assert.equal(dm.list().find((r) => r.id === id)?.status, 'paused')
+    assert.equal(dm.resume(id), true)
+    return await waitSettled(dm, id)
+  } finally {
+    globalThis.fetch = real
+  }
+}
+
+const OLD_FILE = Buffer.from('GGUF-OLD-UPLOAD:'.repeat(8)) // 128 bytes
+const NEW_FILE = Buffer.from('GGUF-NEW-REQUANT:'.repeat(10)) // 170 bytes
+
+test('resume without a sha256: the upstream file changed, so If-Range gets the whole new file instead of a spliced one', async () => {
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(NEW_FILE, '"new"', seen))
+  assert.equal(seen[0]['If-Range'], '"old"', 'the validator of the first attempt survived the restart')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(dest), NEW_FILE, 'the library gets the new file, not old prefix + new tail')
+})
+
+test('resume without a sha256: the same file still resumes from the .part offset', async () => {
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen))
+  assert.equal(seen[0].Range, 'bytes=60-')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+test('resume without a sha256: a server that ignores If-Range and sends another file\'s tail is refused, not spliced', async () => {
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(NEW_FILE, '"new"', [], { ignoreIfRange: true }))
+  assert.equal(rec.status, 'error')
+  assert.match(rec.error ?? '', /changed on the server/)
+  assert.equal(existsSync(dest), false, 'the spliced file never reaches the library')
+  assert.equal(existsSync(`${dest}.part`), false, 'the stale .part is dropped so the next try starts clean')
+})
+
+// The restart case: the daemon dies mid-download (no error path writes the manifest),
+// the file changes upstream, then Resume, against a server that ignores If-Range.
+const NEW_SAME_SIZE = Buffer.from('GGUF-NEW-UPLOAD:'.repeat(8)) // 128 bytes, like OLD_FILE
+
+test('resume after the daemon was killed mid-download: the validator and the full length were already persisted', async () => {
+  const { stateDir } = await interruptedRawDownload(OLD_FILE, 60, '"old"', 'killed')
+  const manifest = JSON.parse(readFileSync(join(stateDir, 'downloads', 'manifest.json'), 'utf8')) as {
+    entries: Array<{ total: number; validator?: string }>
+  }
+  assert.deepEqual(
+    manifest.entries.map((e) => ({ total: e.total, validator: e.validator })),
+    [{ total: OLD_FILE.length, validator: '"old"' }],
+  )
+})
+
+test('resume after the daemon was killed mid-download: a same-size new file whose 206 names another ETag is refused, not spliced', async () => {
+  // Same size, Content-Range right: only the 206's own validator tells the files apart.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"', 'killed')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(NEW_SAME_SIZE, '"new"', seen, { ignoreIfRange: true }))
+  assert.equal(seen[0]['If-Range'], '"old"')
+  assert.equal(rec.status, 'error', 'not done with old prefix + new tail')
+  assert.match(rec.error ?? '', /changed on the server/)
+  assert.equal(existsSync(dest), false)
+  assert.equal(existsSync(`${dest}.part`), false)
+})
+
+test('resume after the daemon was killed mid-download: a 206 with no validator but another full length is refused, not spliced', async () => {
+  // No ETag on the 206: only the full length persisted before the kill tells the files apart.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"', 'killed')
+  const rec = await resumeAfterRestart(
+    stateDir,
+    modelDir,
+    id,
+    serve(NEW_FILE, '"new"', [], { ignoreIfRange: true, etagOn206: false }),
+  )
+  assert.equal(rec.status, 'error', 'not done with old prefix + new tail')
+  assert.match(rec.error ?? '', /changed on the server/)
+  assert.equal(existsSync(dest), false)
+  assert.equal(existsSync(`${dest}.part`), false)
+})
+
+test('resume after the daemon was killed mid-download: the same file resumes from the .part offset', async () => {
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"', 'killed')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen, { ignoreIfRange: true }))
+  assert.equal(seen[0].Range, 'bytes=60-')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+test('resume: a 206 that stops short of the end of the file is refused, not marked done truncated', async () => {
+  // A server capping open-ended ranges answers `bytes=60-` with `bytes 60-99/128`: right start,
+  // right full length, but taking the total as offset + content-length would pass the size
+  // check on a 100-byte file.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen, { rangeCap: 40 }))
+  assert.equal(seen[0].Range, 'bytes=60-')
+  assert.equal(rec.status, 'error', 'not done with 100 of 128 bytes')
+  assert.match(rec.error ?? '', /does not continue the partial file/)
+  assert.equal(existsSync(dest), false, 'the truncated file never reaches the library')
+  assert.equal(existsSync(`${dest}.part`), false, 'the next try starts clean (a 200 of the whole file)')
+})
+
+test('resume: a 206 whose body is shorter than its own Content-Range is refused, not marked done truncated', async () => {
+  // `bytes 60-127/128` with a 40-byte body and Content-Length: offset + content-length (100)
+  // would pass the size check; the range's own full length (128) does not.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen, { shortBody: 28 }))
+  assert.equal(rec.status, 'error', 'not done with 100 of 128 bytes')
+  assert.match(rec.error ?? '', /size did not match/)
+  assert.equal(existsSync(dest), false, 'the truncated file never reaches the library')
+  assert.equal(existsSync(`${dest}.part`), false, 'the next try starts clean')
+})
+
+const LM_OLD = 'Wed, 21 Oct 2015 07:28:00 GMT'
+const LM_NEW = 'Thu, 22 Oct 2015 07:28:00 GMT'
+
+test('resume: a 206 with only a Last-Modified still continues a .part written under an ETag (like is compared with like)', async () => {
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, { etag: '"old"', 'last-modified': LM_OLD })
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(
+    stateDir,
+    modelDir,
+    id,
+    serve(OLD_FILE, '"old"', seen, { etagOn206: false, lastModified: LM_OLD }),
+  )
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 1, 'resumed from the .part, not restarted')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+test('resume: a 206 that adds an ETag still continues a .part written under a Last-Modified; another Last-Modified is refused', async () => {
+  const first = await interruptedRawDownload(OLD_FILE, 60, { 'last-modified': LM_OLD })
+  const seen: Array<Record<string, string>> = []
+  const same = await resumeAfterRestart(
+    first.stateDir,
+    first.modelDir,
+    first.id,
+    serve(OLD_FILE, '"etag-on-206"', seen, { ignoreIfRange: true, lastModified: LM_OLD }),
+  )
+  assert.equal(seen[0]['If-Range'], LM_OLD)
+  assert.equal(same.status, 'done', same.error ?? '')
+  assert.equal(seen.length, 1, 'resumed from the .part, not restarted')
+  assert.deepEqual(readFileSync(first.dest), OLD_FILE)
+
+  const changed = await interruptedRawDownload(OLD_FILE, 60, { 'last-modified': LM_OLD })
+  const rec = await resumeAfterRestart(
+    changed.stateDir,
+    changed.modelDir,
+    changed.id,
+    serve(NEW_SAME_SIZE, '"etag-on-206"', [], { ignoreIfRange: true, lastModified: LM_NEW }),
+  )
+  assert.equal(rec.status, 'error', 'not done with old prefix + new tail')
+  assert.equal(existsSync(changed.dest), false)
+})
+
+test('a finished download carries finishedAt, already set when the rescan is requested', async () => {
+  // The web's models poll stops waiting for a row once the list's lastScanAt is later than this
+  // (models-poll.ts), so it must exist before onComplete() asks for that scan.
+  const { modelDir, stateDir } = newDirs()
+  const real = globalThis.fetch
+  globalThis.fetch = serve(OLD_FILE, '"old"', [])
+  try {
+    let atRescan: string | undefined
+    const dm: DownloadManager = new DownloadManager(fakeStore(modelDir, stateDir), () => { atRescan = dm.list()[0].finishedAt }, () => ({}))
+    const [rec] = await dm.enqueue({ url: 'https://mirror.example/model.gguf' })
+    const done = await waitSettled(dm, rec.id)
+    assert.equal(done.status, 'done', done.error ?? '')
+    assert.ok(atRescan && !Number.isNaN(Date.parse(atRescan)), 'finishedAt is an ISO time set before onComplete')
+    assert.equal(done.finishedAt, atRescan)
+  } finally {
+    globalThis.fetch = real
+  }
 })

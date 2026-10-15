@@ -64,6 +64,32 @@ describe('modelsRefetchInterval', () => {
     })
   })
 
+  // Done records live until dismissed. After the user deletes a downloaded model, its file (and an mmproj that the
+  // delete leaves behind in an otherwise empty folder) never gets a row, and this used to poll every 1.5 s for the
+  // daemon's lifetime. A scan that ran after the download finished is the end of the wait.
+  describe('a finished download with no row, once a scan has run since it finished', () => {
+    const finished = (finishedAt: string | undefined, ...dests: string[]) =>
+      ({ downloads: dests.map((dest) => ({ status: 'done', dest, finishedAt })) }) as unknown as DownloadsList
+
+    it('stops the poll: a deleted model, and the mmproj its delete left behind', () => {
+      const after = list({ lastScanAt: '2026-10-15T10:05:00.000Z' })
+      const dl = finished('2026-10-15T10:00:00.000Z', '/m/g/gemma-3-12b-it-Q4_K_M.gguf', '/m/g/mmproj-F16.gguf')
+      expect(modelsRefetchInterval(after, IDLE_STATUS, dl)).toBe(false)
+    })
+
+    it('keeps polling while the list is older than the download, or from the same millisecond', () => {
+      const dl = finished('2026-10-15T10:00:00.000Z', '/m/new.gguf')
+      expect(modelsRefetchInterval(list({ lastScanAt: '2026-10-15T09:59:59.000Z' }), IDLE_STATUS, dl)).toBe(1500)
+      expect(modelsRefetchInterval(list({ lastScanAt: '2026-10-15T10:00:00.000Z' }), IDLE_STATUS, dl)).toBe(1500)
+      expect(modelsRefetchInterval(list({ lastScanAt: '' }), IDLE_STATUS, dl)).toBe(1500)
+    })
+
+    it('keeps polling for a record without finishedAt (as before)', () => {
+      const dl = finished(undefined, '/m/new.gguf')
+      expect(modelsRefetchInterval(list({ lastScanAt: '2026-10-15T10:05:00.000Z' }), IDLE_STATUS, dl)).toBe(1500)
+    })
+  })
+
   it('stops polling when nothing is scanning, loaded, loading or downloading', () => {
     expect(modelsRefetchInterval(list(), IDLE_STATUS, undefined)).toBe(false)
   })

@@ -49,6 +49,13 @@ export function DownloadsPanel() {
    *  ids are only unique per machine — would show one machine's refusal on the other
    *  machine's row. */
   const [failures, setFailures] = useState<Record<string, RemoteFailure>>({})
+  /** A local Resume the daemon refused (another row is writing the same file), by download id. */
+  const [resumeErrors, setResumeErrors] = useState<Record<string, string>>({})
+  const onResume = (id: string) =>
+    mut.resume.mutate(id, {
+      onError: (e) => setResumeErrors((m) => ({ ...m, [id]: e instanceof Error ? e.message : String(e) })),
+      onSuccess: () => setResumeErrors((m) => { const n = { ...m }; delete n[id]; return n }),
+    })
 
   const local = dlQ.data?.downloads ?? []
   const sources = sourcesByLink(links, remote.rows, (r) => r.linkId).map((s) => ({
@@ -198,7 +205,8 @@ export function DownloadsPanel() {
             failure={failures[rowKey(r.origin, r.row.id)]}
             onCancel={() => onCancel(r)}
             onRemove={() => mut.remove.mutate(r.row.id)}
-            onResume={() => mut.resume.mutate(r.row.id)}
+            onResume={() => onResume(r.row.id)}
+            resumeError={r.origin.kind === 'local' ? resumeErrors[r.row.id] : undefined}
             cancelling={isCancelling(r)}
             resuming={mut.resume.isPending}
           />
@@ -216,6 +224,7 @@ function DownloadRow({
   onCancel,
   onRemove,
   onResume,
+  resumeError,
   cancelling,
   resuming,
 }: {
@@ -226,6 +235,7 @@ function DownloadRow({
   onCancel: () => void
   onRemove: () => void
   onResume: () => void
+  resumeError: string | undefined
   cancelling: boolean
   resuming: boolean
 }) {
@@ -303,6 +313,10 @@ function DownloadRow({
 
       {/* A refusal from the host, inline on the row that caused it. */}
       {failure && <FleetFailure failure={failure} onRetry={onCancel} />}
+      {/* A refused local Resume, e.g. "Another download is already writing this file." */}
+      {canResume && resumeError && (
+        <div role="alert" className="mt-1.5 text-[11px]" style={{ color: 'var(--err)' }}>{resumeError}</div>
+      )}
     </div>
   )
 }

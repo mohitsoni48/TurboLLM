@@ -1238,6 +1238,8 @@ export type DownloadRecord = {
   bytesPerSec: number
   sha256?: string
   createdAt: string
+  /** When it became 'done' (ISO; absent before that). */
+  finishedAt?: string
 }
 
 export type DownloadsList = {
