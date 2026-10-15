@@ -347,7 +347,13 @@ export async function downloadFile(
     await pipeline(body, createWriteStream(part), { signal })
     await renameWithRetry(part, dest)
   } catch (e) {
-    rmSync(part, { force: true })
+    // Best effort: AV/the indexer can hold the fresh .part on Windows, and a throw here would replace e
+    // (a Cancel's AbortError would become a failure). A leftover .part is truncated by the next download.
+    try {
+      rmSync(part, { force: true })
+    } catch {
+      /* best effort */
+    }
     throw e
   }
 }
