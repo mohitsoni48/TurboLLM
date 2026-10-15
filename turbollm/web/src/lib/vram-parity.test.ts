@@ -31,7 +31,15 @@ const cases: Array<[name: string, m: ModelEntry, p: LoadProfile, vramMb: number,
     model({ sizeBytes: 16.5e9, blockCount: 62, headCountKv: 16, headDim: 128, slidingWindow: 1024, slidingWindowPattern: swa(62), vision: true, mmprojPath: '/mmproj.gguf', mmprojSizeBytes: 858e6 }),
     profile({}), 24564, { estMb: 21625, verdict: 'tight' }],
   ['Qwen3.6-27B-like hybrid: every 4th layer full attention + SSM state, parallel 2 non-unified',
-    model(hybrid), profile({ ctx: 65536, kvTypeK: 'q8_0', kvTypeV: 'q8_0', kvUnified: false, parallel: 2 }), 24564, { estMb: 22204, verdict: 'tight' }],
+    model(hybrid), profile({ ctx: 65536, kvTypeK: 'q8_0', kvTypeV: 'q8_0', kvUnified: false, parallel: 2 }), 24564, { estMb: 20057, verdict: 'tight' }],
+  // A non-unified cache is `parallel` streams of pad256(ctx / parallel) cells (llama.cpp's n_ctx_seq), not `parallel`
+  // full contexts: the 8B reads the same as with a unified cache (it used to read 22880, 'tight'), and Gemma's
+  // 4 streams hold 5120 cells each, with their own 2048-cell sliding window.
+  ['dense 8B, 4 slots, non-unified cache: full attention holds ctx cells in total',
+    model({ sizeBytes: 4.9e9, blockCount: 32, headCountKv: 8, headDim: 128 }), profile({ parallel: 4, kvUnified: false }), 24564, { estMb: 9995, verdict: 'fits' }],
+  ['sliding window under a non-unified cache: each stream pads ctx / parallel and keeps its own window',
+    model({ sizeBytes: 16.5e9, blockCount: 62, headCountKv: 16, headDim: 128, slidingWindow: 1024, slidingWindowPattern: swa(62) }),
+    profile({ ctx: 20000, parallel: 4, uBatchSize: 1024, kvUnified: false }), 24564, { estMb: 22467, verdict: 'tight' }],
   ['Gemma-4-like MoE: per-layer KV heads + a separate sliding head dim',
     model({ sizeBytes: 15.6e9, moe: true, expertCount: 128, blockCount: 30, headCountKv: 8, headDim: 512, headDimSwa: 256, slidingWindow: 1024, slidingWindowPattern: swa(30), headCountKvPerLayer: swa(30).map((s) => (s ? 8 : 2)) }),
     profile({ ctx: 131072, nCpuMoe: 10 }), 16303, { estMb: 14979, verdict: 'tight' }],

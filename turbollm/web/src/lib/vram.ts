@@ -213,6 +213,15 @@ function kvCacheElems(m: ModelEntry, ctx: number, swaSeqs: number, ubatch: numbe
   return elems
 }
 
+/** K+V elements across all sequences (mirror of the daemon's `profileKvElems`): a non-unified
+ *  cache is `parallel` streams of pad256(ctx / parallel) cells, not `parallel` full contexts. */
+function profileKvElems(m: ModelEntry, p: LoadProfile): number {
+  const seqs = Math.max(1, p.parallel)
+  const ubatch = p.uBatchSize || 512
+  if (p.kvUnified || seqs === 1) return kvCacheElems(m, p.ctx, seqs, ubatch)
+  return kvCacheElems(m, Math.ceil(Math.floor(p.ctx / seqs) / 256) * 256, 1, ubatch) * seqs
+}
+
 /** Elements in the linear/SSM layers' constant recurrent state (mirror of `ssmStateElems`). */
 function ssmStateElems(m: ModelEntry): number {
   const layers = linearLayerCount(m)
@@ -233,8 +242,8 @@ export function estimateVram(
   const blocks = m.blockCount || 1
   const gpuFrac = m.moe ? 1 - 0.85 * (p.nCpuMoe / blocks) : Math.min(p.ngl, blocks) / blocks
   const weightsMb = sizeMb * Math.max(0, Math.min(1, gpuFrac))
-  // A unified cache holds every sequence's sliding window; a non-unified one is multiplied below.
-  const kvElems = kvCacheElems(m, p.ctx, p.kvUnified ? Math.max(1, p.parallel) : 1, p.uBatchSize || 512)
+  // Every sequence's cells, unified or not — see profileKvElems.
+  const kvElems = profileKvElems(m, p)
   // Recurrent state at f32, not scaled by the KV quant or ctx (llama.cpp keeps it unquantized).
   const ssmMb = (ssmStateElems(m) * 4) / 1e6
   // KV cache only weighs on VRAM when offloaded to the GPU; in RAM mode (--no-kv-offload) it
@@ -246,7 +255,7 @@ export function estimateVram(
   // The recurrent state is one cell per sequence whether or not the KV cache is unified.
   const kvMb = p.kvOffload === false
     ? 0
-    : kvBytesMb * (p.kvUnified ? 1 : Math.max(1, p.parallel)) + ssmMb * Math.max(1, p.parallel)
+    : kvBytesMb + ssmMb * Math.max(1, p.parallel)
   // The mmproj's real on-disk size plus ~15% for the vision encoder's buffers, as the daemon does.
   const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? ((m.mmprojSizeBytes ?? 0) / 1e6) * 1.15 : 0
   const estMb = Math.round(weightsMb + kvMb + 800 + mmprojMb)

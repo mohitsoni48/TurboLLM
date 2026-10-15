@@ -323,8 +323,9 @@ function linearLayerCount(m: ModelEntry): number {
  *  `GGML_PAD(min(ctx, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256)`
  *  (llama-kv-cache-iswa.cpp) — room for the in-flight ubatch, and for every sequence's window
  *  when the cache is unified. `swaSeqs` is that sequence factor (the parallel count under a
- *  unified cache, else 1: a non-unified cache is one stream per sequence, which the callers
- *  already multiply in) and `ubatch` is --ubatch-size (llama.cpp's default 512).
+ *  unified cache, else 1: a non-unified cache is one stream per sequence, which
+ *  {@link profileKvElems} sizes and multiplies itself) and `ubatch` is --ubatch-size
+ *  (llama.cpp's default 512).
  *
  *  Pure and exported for unit testing against the measured ground truth in
  *  profile.kv.test.ts. */
@@ -368,6 +369,18 @@ export function kvCacheElems(m: ModelEntry, ctx: number, swaSeqs = 1, ubatch = 5
     elems += 2 * tokens * heads * dim // ×2 for the K and V caches
   }
   return elems
+}
+
+/** Combined K+V cache elements a profile allocates, across all its sequences. A non-unified
+ *  cache (llama.cpp without --kv-unified) is NOT `parallel` full-context caches: llama.cpp gives
+ *  each of the `parallel` streams n_ctx_seq = pad256(ctx / parallel) cells (llama-context.cpp),
+ *  so full-attention layers hold ctx cells in total, as with a unified cache, and only the
+ *  per-stream sliding window is held once per stream. One sequence is one stream either way. */
+export function profileKvElems(m: ModelEntry, p: Pick<LoadProfile, 'ctx' | 'parallel' | 'kvUnified' | 'uBatchSize'>): number {
+  const seqs = Math.max(1, p.parallel)
+  const ubatch = p.uBatchSize || 512
+  if (p.kvUnified || seqs === 1) return kvCacheElems(m, p.ctx, seqs, ubatch)
+  return kvCacheElems(m, Math.ceil(Math.floor(p.ctx / seqs) / 256) * 256, 1, ubatch) * seqs
 }
 
 /** Elements in the CONSTANT recurrent state held by linear/SSM layers — roughly
@@ -418,7 +431,8 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // Attention-layout-aware KV sizing (ADR-223): counts each layer for what it actually
   // caches instead of assuming every layer holds full context. Falls back to exactly the
   // old all-layer formula for any model that doesn't declare its layout — see kvCacheElems.
-  const kvElems = kvCacheElems(m, p.ctx, p.kvUnified ? Math.max(1, p.parallel) : 1, p.uBatchSize || 512)
+  // Already counts every sequence, unified or not — see profileKvElems.
+  const kvElems = profileKvElems(m, p)
   // The linear/SSM layers' constant recurrent state. Sized at f32 (4 bytes) and NOT scaled by
   // --cache-type-k: llama.cpp keeps recurrent state unquantized, so applying the user's KV quant
   // here would under-count it. f32 rather than f16 is the deliberate, safer reading — this
@@ -438,7 +452,7 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // (llama.cpp's recurrent_rs_size = max(1, n_seq_max)), so it always scales with parallel.
   const kvMb = p.kvOffload === false
     ? 0
-    : kvBytesMb * (p.kvUnified ? 1 : Math.max(1, p.parallel)) + ssmMb * Math.max(1, p.parallel)
+    : kvBytesMb + ssmMb * Math.max(1, p.parallel)
 
   // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
   // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead
@@ -528,11 +542,10 @@ export function estimateVramPerGpu(p: LoadProfile, m: ModelEntry, sys: SysInfo):
 
   // KV rides along with the layer that owns it (llama.cpp allocates it per-layer on that device),
   // so it follows the same distribution as the weights and needs no placement of its own.
-  const kvElems = kvCacheElems(m, p.ctx, p.kvUnified ? Math.max(1, p.parallel) : 1, p.uBatchSize || 512)
+  const kvElems = profileKvElems(m, p)
   const kvTotalMb = p.kvOffload === false
     ? 0
     : (((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
-        * (p.kvUnified ? 1 : Math.max(1, p.parallel))
       + ((ssmStateElems(m) * 4) / 1e6) * Math.max(1, p.parallel) // per sequence either way, as in estimateVram
   const kvPerLayerMb = kvTotalMb / Math.max(1, residentLayers)
 

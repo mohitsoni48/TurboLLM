@@ -211,6 +211,24 @@ test('estimateVram: parallel slots grow the sliding cache (unified) and the recu
   assert.equal(estimateVram(q, qwen36_27b, sys).estMb, Math.round(1000 + qKvMb + 4 * ssmMb + 800))
 })
 
+// Without --kv-unified llama.cpp makes `parallel` streams of n_ctx_seq = pad256(ctx / parallel)
+// cells each (llama-context.cpp, llama-kv-cache.cpp), not `parallel` full-context caches: full
+// attention holds ctx cells in total either way, and only the sliding window is held per stream.
+// The estimate used to multiply the whole full-context cache by `parallel` (8B at 32k, 4 slots:
+// ~12.9 GB too high), so switching the toggle off read "tight"/"overflow" for the same allocation.
+test('estimateVram: a non-unified cache is parallel streams of ctx/parallel cells, not parallel × ctx', () => {
+  const unified = { ...deriveDefault(dense, sys), ctx: CTX, ngl: 99, parallel: 4, kvUnified: true }
+  const split = { ...unified, kvUnified: false }
+  const kvMb = (legacyElems(dense, CTX) * 2) / 1e6
+  assert.equal(estimateVram(split, dense, sys).estMb, Math.round(1000 + kvMb + 800))
+  assert.equal(estimateVram(split, dense, sys).estMb, estimateVram(unified, dense, sys).estMb)
+  // Gemma: each of the 4 streams holds its own pad256(min(CTX / 4, 1024 + 512)) = 1536 sliding cells.
+  const sliding = (cells: number) => 2 * 25 * cells * 8 * 256
+  const globals = 2 * 5 * CTX * 2 * 512
+  const g = { ...deriveDefault(gemma4_26b, sys), ctx: CTX, ngl: 99, nCpuMoe: 0, parallel: 4, kvUnified: false }
+  assert.equal(estimateVram(g, gemma4_26b, sys).estMb, Math.round(1000 + ((globals + 4 * sliding(1536)) * 2) / 1e6 + 800))
+})
+
 test('estimateVram: --no-kv-offload still zeroes the KV term, recurrent state included', () => {
   const p = { ...deriveDefault(qwen36_27b, sys), ctx: CTX, ngl: 99, kvOffload: false }
   assert.equal(estimateVram(p, qwen36_27b, sys).estMb, Math.round(1000 + 800))
