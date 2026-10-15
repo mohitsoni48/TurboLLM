@@ -535,9 +535,11 @@ export class TurboLLMChat {
    *  `409 replay_window_exceeded` (the cursor aged out of the run's replay buffer), this does
    *  what the server asks — re-reads the message, then attaches at the run's current
    *  `event_seq` — and returns that stream with `resyncMessage` set: the caller must re-render
-   *  from it rather than append, since the frames in between are gone. `owner` must match
-   *  whatever the run was created under (`send()`'s own `owner` param) — omitting it defaults
-   *  to `'default'` server-side, same as every other call in this client (release-gate I5). */
+   *  from it rather than append, since the frames in between are gone. A run that has already
+   *  ended has nothing left to attach to: the stream is then empty, with `outcome` read from the
+   *  run record. `owner` must match whatever the run was created under (`send()`'s own `owner`
+   *  param) — omitting it defaults to `'default'` server-side, same as every other call in this
+   *  client (release-gate I5). */
   async resume(runId: string, afterSeq?: number, opts: { owner?: string } = {}): Promise<RunStream> {
     const probe = await this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
       query: { after: afterSeq, owner: opts.owner },
@@ -555,7 +557,16 @@ export class TurboLLMChat {
         const run = await this.runs.get(runId, opts)
         // Ended in between: no later frame will carry the tail, but the message is final now (the
         // server writes it before ending the run), so read it once more.
-        if (run.ended_at !== null) message = await this.messages.get(messageId, { owner: opts.owner })
+        if (run.ended_at !== null) {
+          message = await this.messages.get(messageId, { owner: opts.owner })
+          // Nor is there a `done` frame left to attach for: the run's own event_seq already
+          // covers it, and a run the daemon has dropped (pruned, or a restart) only 409s again.
+          // So no attach: an empty stream whose outcome is the run record's.
+          const ended = new RunStream(Promise.resolve(new Response(null, { status: 200 })))
+          if (run.status === 'complete' || run.status === 'failed' || run.status === 'aborted') ended.outcome = run.status
+          ended.resyncMessage = message
+          return ended
+        }
         const stream = this.runs.stream(runId, run.event_seq, opts)
         stream.resyncMessage = message
         return stream

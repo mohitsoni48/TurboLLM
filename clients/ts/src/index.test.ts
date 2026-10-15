@@ -175,6 +175,41 @@ test('resume() past the replay window re-reads the final message when the run en
   assert.equal(resumed.resyncMessage?.content, 'text so far, all of it')
 })
 
+// No `done` frame follows an ended run's event_seq, so the outcome has to come from the run record
+// resume() already read: the in-memory run's stream is empty, and once the daemon has dropped the
+// run (pruned after an hour, or restarted) attaching only 409s again.
+for (const [label, afterAttach] of [
+  ['still in memory', () => new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } })],
+  ['dropped by the daemon', () => new Response(
+    JSON.stringify({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }),
+    { status: 409, headers: { 'Content-Type': 'application/json' } },
+  )],
+] as const) {
+  test(`resume() past the replay window of a run that already ended (${label}) reports the run's outcome`, async () => {
+    const fakeFetch: typeof fetch = (async (url: string) => {
+      const u = String(url)
+      const json = (body: unknown, status = 200) =>
+        new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+      if (u.includes('/stream?')) {
+        if (u.includes('after=5')) return json({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }, 409)
+        return afterAttach()
+      }
+      if (u.includes('/messages/')) {
+        return json({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content: 'partial', status: 'failed', version: 3, created_at: 't', edited: false })
+      }
+      return json({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'failed', event_seq: 120, error: { type: 'engine', code: 'daemon_restarted', message: 'restarted' }, created_at: 't', ended_at: 't2' })
+    }) as unknown as typeof fetch
+
+    const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
+    const resumed = await client.resume('run_1', 5)
+    const seen: string[] = []
+    for await (const ev of resumed) seen.push(ev.event)
+    assert.deepEqual(seen, [])
+    assert.equal(resumed.outcome, 'failed', 'the run record is the source of truth once no done frame can arrive')
+    assert.equal(resumed.resyncMessage?.content, 'partial')
+  })
+}
+
 test('resume() within the window streams directly and leaves resyncMessage unset; no afterSeq omits after', async () => {
   const seenUrls: string[] = []
   const client = new TurboLLMChat({

@@ -98,7 +98,9 @@ for await (const ev of resumed) { /* continue rendering */ }
 ```
 
 The message is checkpointed periodically while it streams, so `resyncMessage` can trail the
-reattach point slightly. Once the run has ended, `messages.get` returns the final text.
+reattach point slightly. Once the run has ended, `messages.get` returns the final text. If the
+run had already ended by then, `resyncMessage` is that final text, the returned stream yields no
+frames, and its `outcome` is the run's own status.
 
 ## Handling errors
 
