@@ -127,8 +127,11 @@ const defaultHooks: StopHooks = {
     try {
       process.kill(pid, 0)
       return true
-    } catch {
-      return false
+    } catch (e) {
+      // EPERM: it exists but this user may not signal it (a daemon run elevated or as another
+      // user) — alive, so a start beside it is refused and --stop keeps its pidfile. A recycled
+      // PID is still caught by the identity probe that follows every use of this.
+      return (e as NodeJS.ErrnoException).code === 'EPERM'
     }
   },
   kill(pid, signal) {

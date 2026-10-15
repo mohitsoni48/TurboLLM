@@ -4,6 +4,8 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import http from 'node:http'
+import type { AddressInfo } from 'node:net'
 import {
   writePidfile,
   readPidfile,
@@ -267,6 +269,37 @@ test('findRunningDaemon: a live, answering daemon blocks a start; stale/recycled
     assert.equal(own.confirmCalled, false)
   } finally {
     cleanup()
+  }
+})
+
+// A daemon run elevated or as another user exists, but this user may not signal it: even the
+// signal-0 liveness probe fails with EPERM. The default check read that as "gone", so a second
+// start beside it was not refused and --stop deleted its pidfile. Real default hooks here, with
+// only process.kill faked for a pid that stands in for that daemon (odd: no Windows pid is).
+test('a live daemon this user may not signal (EPERM) blocks a start, and --stop keeps its pidfile', async (t) => {
+  const standIn = http.createServer((_req, res) => {
+    res.writeHead(200, { server: 'TurboLLM/9.9.9', 'content-type': 'application/json' })
+    res.end(JSON.stringify({ ok: true, version: '9.9.9' }))
+  })
+  await new Promise<void>((resolve) => standIn.listen(0, '127.0.0.1', resolve))
+  const port = (standIn.address() as AddressInfo).port
+  const pid = 4_194_289
+  const realKill = process.kill.bind(process)
+  t.mock.method(process, 'kill', (target: number, signal?: string | number) => {
+    if (target === pid) throw Object.assign(new Error('kill EPERM'), { code: 'EPERM', errno: -1, syscall: 'kill' })
+    return realKill(target, signal)
+  })
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    writePidfile(dir, pid, port)
+    assert.deepEqual(await findRunningDaemon(dir, undefined, 0), { pid, port }, 'start guard')
+    const res = await stopDaemon(dir)
+    assert.equal(res.stopped, false)
+    assert.doesNotMatch(res.message, /No running TurboLLM daemon/)
+    assert.deepEqual(readPidfile(dir), { pid, port }, 'the running daemon keeps its pidfile')
+  } finally {
+    cleanup()
+    await new Promise<void>((resolve) => standIn.close(() => resolve()))
   }
 })
 
