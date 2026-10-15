@@ -6,8 +6,10 @@ import fs, { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } f
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
-import { promoteProbedInstall, SwapBlockedError } from './zip-install'
-import type { ProbeResult } from './probe'
+import { buildZipArchive } from '../test-support/zip-archive'
+import { installZipEngine, promoteProbedInstall, SwapBlockedError } from './zip-install'
+import { ProbeError, type ProbeResult } from './probe'
+import { serverBinName } from './scan'
 
 const BIN = 'llama-server'
 const PROBE_OK: ProbeResult = { version: 'b1', capabilities: { kvTypes: ['f16'], flags: [], flagInfo: [] } }
@@ -141,4 +143,28 @@ test('promoteProbedInstall: a briefly locked restore still puts the working buil
   )
   assert.equal(readFileSync(join(prior, BIN), 'utf8'), 'old')
   assert.deepEqual(readdirSync(join(root, 'build')).filter((d) => d.endsWith('.old')), [], 'no parked build for the GC sweep to delete')
+})
+
+// The same rule installReleaseAsset follows (99b2915): the work-dir cleanup is best effort, with retries. A just-probed
+// binary still held by AV/the indexer made the bare rmSync throw, and its EBUSY replaced the probe's reason (the
+// route then answered 500 internal instead of 400 with what was wrong with the build).
+test('installZipEngine: a locked work dir after a failed probe still reports the probe error', async (t) => {
+  const root = tmpDir('promote-')
+  const realRmSync = fs.rmSync
+  const rm = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p).endsWith('.tmp')) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    rm.mock.restore()
+    syncBuiltinESMExports()
+  })
+  const zip = buildZipArchive([{ name: serverBinName, data: Buffer.from('bin') }])
+  const probeFn = async (): Promise<ProbeResult> => {
+    throw new ProbeError('probe_failed', 'missing ggml-cuda.dll')
+  }
+  await assert.rejects(installZipEngine(root, 'myfork.zip', zip, { probeFn }), (e: Error) => e instanceof ProbeError && /ggml-cuda/.test(e.message))
+  const cleanup = rm.mock.calls.find((c) => String(c.arguments[0]).endsWith('.tmp'))
+  assert.ok((cleanup?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the cleanup retries, as a Windows lock is brief')
 })

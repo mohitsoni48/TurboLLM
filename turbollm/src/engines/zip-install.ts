@@ -391,7 +391,13 @@ export async function installZipEngine(
       ...(warning ? { warning } : {}),
     }
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true }) // no-op once renamed into place
+    // Best effort, with retries (as in installReleaseAsset): AV/the indexer can still hold the just-probed files, and
+    // a throw here would mask the real error (a probe failure became a 500). gcAbandonedZipInstalls sweeps leftovers.
+    try {
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) // no-op once renamed into place
+    } catch {
+      /* best effort */
+    }
   }
 }
 
