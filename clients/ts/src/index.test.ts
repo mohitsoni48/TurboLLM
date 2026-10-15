@@ -145,6 +145,8 @@ test('resume() past the replay window re-reads the message and hands it back as 
   // the event_seq read AFTER the message.
   assert.equal(seenUrls.length, 5, `expected probe, runs.get, messages.get, runs.get, stream; got ${seenUrls.join(' | ')}`)
   assert.ok(seenUrls[2].includes('/messages/m1'), `the run's own message is re-read: ${seenUrls[2]}`)
+  // The lost frames include reasoning and tool calls; without include= the server leaves them out.
+  assert.ok(seenUrls[2].includes(`include=${encodeURIComponent('reasoning,tool_calls')}`), `heavy fields are asked for: ${seenUrls[2]}`)
   assert.ok(/\/runs\/run_1\?/.test(seenUrls[3]), `the run is re-read after the message: ${seenUrls[3]}`)
   assert.ok(seenUrls[4].includes('/stream') && seenUrls[4].includes('after=100'), `reattaches after the event_seq read last: ${seenUrls[4]}`)
   // Release-gate I5: every one of these is owner-scoped server-side.
@@ -165,7 +167,8 @@ test('resume() past the replay window re-reads the final message when the run en
     }
     if (u.includes('/messages/')) {
       const content = ++messageGets === 1 ? 'text so' : 'text so far, all of it'
-      return json({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content, status: 'complete', version: 3, created_at: 't', edited: false })
+      const heavy = u.includes(`include=${encodeURIComponent('reasoning,tool_calls')}`) ? { reasoning: `thought ${messageGets}`, tool_calls: [] } : {}
+      return json({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content, status: 'complete', version: 3, created_at: 't', edited: false, ...heavy })
     }
     return json({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'complete', event_seq: 120, error: null, created_at: 't', ended_at: 't2' })
   }) as unknown as typeof fetch
@@ -173,6 +176,7 @@ test('resume() past the replay window re-reads the final message when the run en
   const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
   const resumed = await client.resume('run_1', 5)
   assert.equal(resumed.resyncMessage?.content, 'text so far, all of it')
+  assert.equal(resumed.resyncMessage?.reasoning, 'thought 2', 'the final re-read carries the reasoning too')
 })
 
 // No `done` frame follows an ended run's event_seq, so the outcome has to come from the run record
@@ -350,6 +354,65 @@ test('messages.append() forwards attachments and metadata, matching send()/SendP
   assert.deepEqual(seenBody!.attachments, ['data:text/plain;base64,aGk='], 'append() must forward attachments, not silently drop them')
   assert.deepEqual(seenBody!.metadata, { source: 'import' }, 'append() must forward metadata, not silently drop it')
   assert.equal(seenBody!.generate, false)
+})
+
+// The fetch promise was awaited only by the iterator, so a fetch that failed (daemon down) while
+// the caller awaited something else before its `for await` was an unhandled rejection: Node kills
+// the process (node:test fails the file) and the caller's try/catch around the loop never runs.
+test('a fetch that fails before the caller starts iterating is thrown by the loop, not left unhandled', async () => {
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async () => { throw new TypeError('fetch failed') }) as unknown as typeof fetch,
+  })
+  const sent = client.send('c1', { content: 'hi', owner: 'u1' })
+  const attached = client.runs.stream('run_1', 3)
+  await new Promise((r) => setTimeout(r, 50))   // e.g. recording the pending send
+  for (const stream of [sent, attached]) {
+    await assert.rejects(async () => { for await (const _ of stream) { /* never */ } }, /fetch failed/)
+  }
+})
+
+// Only send()'s stream gets a `run` frame, so a stream from resume()/runs.stream() had runId
+// undefined and the second resume of a reconnect loop asked for /runs/undefined/stream (404).
+test('streams from resume() and runs.stream() carry the run id, so resume() can be chained', async () => {
+  const seenUrls: string[] = []
+  let call = 0
+  const client = new TurboLLMChat({
+    baseUrl: 'http://x/api/ext/v1', apiKey: 'k',
+    fetch: (async (url: string) => {
+      const u = String(url)
+      seenUrls.push(u)
+      if (!u.includes('/stream') && !u.includes('/chats/')) {
+        return new Response(
+          JSON.stringify({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'complete', event_seq: 9, error: null, created_at: 't', ended_at: 't2' }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      if (u.includes('after=99')) {
+        return new Response(
+          JSON.stringify({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }),
+          { status: 409, headers: { 'Content-Type': 'application/json' } },
+        )
+      }
+      // Each attach drops after one frame (send's stream also gets its run frame).
+      call++
+      const run = u.includes('/chats/') ? 'event: run\ndata: {"run_id":"run_1","message_id":"m1"}\n\n' : ''
+      return new Response(`${run}id: ${call}\nevent: delta\ndata: {"delta":"x"}\n\n`, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
+    }) as unknown as typeof fetch,
+  })
+  let stream = client.send('c1', { content: 'hi', owner: 'u1' })
+  for (let round = 0; round < 3; round++) {
+    for await (const _ of stream) { /* drain */ }
+    assert.equal(stream.runId, 'run_1', `round ${round}: runId`)
+    stream = await client.resume(stream.runId!, stream.lastEventSeq, { owner: 'u1' })
+  }
+  assert.ok(!seenUrls.some((u) => u.includes('undefined')), seenUrls.join(' | '))
+  assert.equal(stream.runId, 'run_1', 'the within-window resume() stream')
+  assert.equal(client.runs.stream('run_1', 2).runId, 'run_1')
+  // resume() past the window, run already ended: the empty stream keeps the id as well.
+  const ended = await client.resume('run_1', 99, { owner: 'u1' })
+  assert.equal(ended.outcome, 'complete')
+  assert.equal(ended.runId, 'run_1')
 })
 
 // Type-level check (this suite has no dedicated compile-time-assertion harness, so a runtime

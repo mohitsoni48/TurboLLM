@@ -267,7 +267,8 @@ export class RunStream implements AsyncIterable<ExtEvent> {
   outcome: RunOutcome = 'unknown'
   /** Set only by `resume()` when the cursor had aged out of the replay buffer
    *  (`409 replay_window_exceeded`): the frames between your cursor and this stream's first
-   *  frame are gone, so REPLACE what you rendered with `resyncMessage.content` and append this
+   *  frame are gone, so REPLACE what you rendered with `resyncMessage.content` (and, if you
+   *  render them, `.reasoning` and `.tool_calls`, which it carries too) and append this
    *  stream's frames to that. The message is checkpointed periodically while it streams, so it
    *  can trail the reattach point slightly; once `outcome` is known, `messages.get` returns the
    *  final text. */
@@ -277,10 +278,17 @@ export class RunStream implements AsyncIterable<ExtEvent> {
 
   /** `after` is the cursor the stream was attached from: `lastEventSeq` starts there, so a
    *  stream that drops before its first frame still hands the next resume that cursor instead
-   *  of `undefined`, which would replay the run from the start. */
-  constructor(body: Promise<Response>, after?: number) {
+   *  of `undefined`, which would replay the run from the start. `runId` is the run being
+   *  attached to: only `send()`'s stream gets a `run` frame, so without it a chained
+   *  `resume(stream.runId, stream.lastEventSeq)` asks for `/runs/undefined/stream`. */
+  constructor(body: Promise<Response>, after?: number, runId?: string) {
     this.body = body
+    // Only the iterator awaits the fetch. A caller that awaits something else before its
+    // `for await` would otherwise leave a failed fetch (daemon down) unhandled, which kills a
+    // Node process; the iterator still awaits the original promise and throws the error.
+    body.catch(() => { /* surfaced by the iterator */ })
     this.lastEventSeq = after
+    this.runId = runId
   }
 
   /** Turns one `\n\n`-delimited block into an `ExtEvent`, updating the running bookkeeping
@@ -514,7 +522,7 @@ export class TurboLLMChat {
       new RunStream(this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
         query: { after, owner: opts.owner },
         accept: 'text/event-stream',
-      }), after),
+      }), after, runId),
   }
 
   /** Appends a message and starts a run, returning a `RunStream` of typed events (spec 27
@@ -557,16 +565,19 @@ export class TurboLLMChat {
         // other way round, a checkpoint landing between the two reads would already hold frames
         // the stream then sends again, rendered twice. The first runs.get only finds the message.
         const { message_id: messageId } = await this.runs.get(runId, opts)
-        let message = await this.messages.get(messageId, { owner: opts.owner })
+        // The lost frames include `reasoning` and `tool_call` ones, and the checkpoint persists
+        // both, but they are heavy fields: left out unless asked for.
+        const read = { owner: opts.owner, include: ['reasoning', 'tool_calls'] as HeavyField[] }
+        let message = await this.messages.get(messageId, read)
         const run = await this.runs.get(runId, opts)
         // Ended in between: no later frame will carry the tail, but the message is final now (the
         // server writes it before ending the run), so read it once more.
         if (run.ended_at !== null) {
-          message = await this.messages.get(messageId, { owner: opts.owner })
+          message = await this.messages.get(messageId, read)
           // Nor is there a `done` frame left to attach for: the run's own event_seq already
           // covers it, and a run the daemon has dropped (pruned, or a restart) only 409s again.
           // So no attach: an empty stream whose outcome is the run record's.
-          const ended = new RunStream(Promise.resolve(new Response(null, { status: 200 })))
+          const ended = new RunStream(Promise.resolve(new Response(null, { status: 200 })), undefined, runId)
           if (run.status === 'complete' || run.status === 'failed' || run.status === 'aborted') ended.outcome = run.status
           ended.resyncMessage = message
           return ended
@@ -577,6 +588,6 @@ export class TurboLLMChat {
       }
       throw new ApiError(409, ((await probe.json().catch(() => undefined)) as { error?: ExtErrorBody } | undefined)?.error)
     }
-    return new RunStream(Promise.resolve(probe), afterSeq)
+    return new RunStream(Promise.resolve(probe), afterSeq, runId)
   }
 }

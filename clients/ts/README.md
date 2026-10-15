@@ -44,7 +44,7 @@ for await (const ev of client.send(chat.id, { owner: 'user_123', content: 'Summa
       console.log('run started', ev.data)
       break
     case 'delta':
-      process.stdout.write((ev.data as { content: string }).content)
+      process.stdout.write((ev.data as { delta: string }).delta)
       break
     case 'done':
       console.log('\ndone:', (ev.data as { status: string }).status)
@@ -56,7 +56,8 @@ for await (const ev of client.send(chat.id, { owner: 'user_123', content: 'Summa
 `send()` returns a `RunStream` — an `AsyncIterable<ExtEvent>` you can `for await` directly. It
 also exposes, once the stream has been consumed:
 
-- `stream.runId` — the run's id, from the `run` frame.
+- `stream.runId` — the run's id, from the `run` frame (a stream from `resume()` or
+  `runs.stream()` carries the id it was attached to).
 - `stream.lastEventSeq` — the highest `event_seq` seen (the SSE `id:` field), the resume token
   for `?after=` reconnects. `after` is exclusive: the server sends only the frames after it, so
   nothing you already rendered is sent twice. It is `undefined` until the first frame arrives (a
@@ -90,7 +91,8 @@ Or skip the manual reconciliation and use `resume()`, which reattaches after the
 in-memory replay buffer), the frames in between are gone. `resume()` then does what the server
 asks: it re-reads the message, attaches at the run's current `event_seq`, and sets
 `resyncMessage` on the returned stream. When it is set, replace your rendered text with it
-instead of appending:
+instead of appending. It is read with `include: ['reasoning', 'tool_calls']`, so replace a
+rendered reasoning view or tool calls from it too:
 
 ```ts
 const resumed = await client.resume(stream.runId!, stream.lastEventSeq, { owner: 'user_123' })
