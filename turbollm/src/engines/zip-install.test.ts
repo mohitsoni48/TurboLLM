@@ -25,6 +25,7 @@ import {
   zipBuildDirName,
   ZipError,
 } from './zip-install'
+import { isInstallMarkerName } from './zip-reader'
 import type { ProbeResult } from './probe'
 import { sourceBuildDirOf } from './build-runner'
 
@@ -164,6 +165,24 @@ test('pickZipFiles: a marker in another letter case is not selected either (on N
   const sel = pickZipFiles(entries, 'linux', 'llama-server')
   assert.ok(sel)
   assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
+})
+
+// On NTFS a stream suffix still names the marker file ('::$DATA' is its contents), as does a trailing dot or space.
+test('pickZipFiles: a marker spelled as an NTFS alias is not selected either', () => {
+  const aliases = [
+    '.turbollm-release-install::$DATA',
+    '.TurboLLM-Release-Install:x',
+    '.turbollm-zip-install::$INDEX_ALLOCATION',
+    '.turbollm-release-install. .',
+    '.turbollm-zip-install ',
+  ]
+  const entries = readZipEntries(buildZipArchive([member('llama-server'), ...aliases.map((n) => member(n, '{}')), member('libggml.so')]))
+  const sel = pickZipFiles(entries, 'linux', 'llama-server')
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
+  // A longer name that only starts with a marker's is an ordinary file.
+  assert.equal(isInstallMarkerName('.turbollm-release-install.bak'), false)
+  assert.equal(isInstallMarkerName('dir/.turbollm-zip-installer'), false)
 })
 
 test('pickZipFiles: multiple binaries → shallowest wins, deterministically', () => {

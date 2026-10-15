@@ -247,9 +247,15 @@ export const RELEASE_INSTALL_MARKER = '.turbollm-release-install'
 /** True for a member whose basename is one of this app's own install markers. An archive or
  *  scanned folder must never supply one: the marker is trusted as proof of how a dir was made. */
 export function isInstallMarkerName(memberName: string): boolean {
-  // Case-insensitive: on NTFS and default APFS '.TurboLLM-Release-Install' IS the marker file.
-  const base = posix.basename(memberName.replaceAll('\\', '/')).toLowerCase()
-  return base === ZIP_BUILD_MARKER || base === RELEASE_INSTALL_MARKER
+  // Compared the way NTFS resolves a name, on every platform (skipping one member too many elsewhere costs nothing):
+  // everything from the first ':' names a stream of the file before it ('<marker>::$DATA' writes the marker itself,
+  // '<marker>:x' creates it, '<marker>::$INDEX_ALLOCATION' makes it a folder); Win32 drops trailing dots and spaces;
+  // and case is ignored there and on default APFS. Upcased, so look-alikes that upcase to ASCII ('ı', 'ſ') match too.
+  const file = posix.basename(memberName.replaceAll('\\', '/')).split(':')[0]!.toUpperCase()
+  return [ZIP_BUILD_MARKER, RELEASE_INSTALL_MARKER].some((marker) => {
+    const name = marker.toUpperCase()
+    return file.startsWith(name) && /^[. ]*$/.test(file.slice(name.length))
+  })
 }
 
 const MAX_LINK_CHAIN = 8
