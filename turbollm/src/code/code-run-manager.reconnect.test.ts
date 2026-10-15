@@ -495,6 +495,38 @@ test('steer() falls back to the queue (tagged kind:steer) when the live turn is 
   await collect(mgr.subscribe(sessionId, 0), () => false)
 })
 
+// After Stop, pi is still streaming while the stopped turn winds down (a tool being killed), so
+// its handle accepted the steer into a run whose every next model request is aborted: the message
+// was stored and reported steered:true, and never answered.
+test('steer() after Stop does not go into the stopped turn: it runs as the next turn', async () => {
+  const { d, store } = makeDeps()
+  const steerLog: string[] = []
+  const tasks: string[] = []
+  const runner = (async (params) => {
+    tasks.push(params.task)
+    params.onSteerable?.(async (text: string) => { steerLog.push(text); return true }) // still "streaming"
+    while (!params.signal.aborted && tasks.length === 1) await delay(10)
+    await delay(30) // the stopped turn winds down (e.g. its bash tool is being killed)
+    params.onSteerable?.(null)
+    return { finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: params.signal.aborted }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await delay(40)
+  assert.equal(mgr.stop(sessionId), true)
+  const u2 = store.addMessage(convId, 'user', 'actually do Y instead')
+  const res = await mgr.steer(sessionId, { convId, repoRoot, task: 'actually do Y instead', userMsgId: u2.id })
+  assert.equal(res.steered, false, 'not injected into the stopped turn')
+  assert.equal(res.queued, true, 'queued behind the turn that is winding down')
+  assert.deepEqual(steerLog, [])
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(tasks, ['first', 'actually do Y instead'], 'the steer ran as its own turn')
+})
+
 // ── todo/step checklist live state (ADR-255) ───────────────────────────────────────────
 
 /** A runner that emits one `todos` frame (the update_todos tool's SSE shape) then completes. */
@@ -582,8 +614,9 @@ test('seqs keep rising after an idle session\'s state is dropped, so a reconnect
   const repoRoot = tmpDir('tllm-code-repo-')
   const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 't1')
 
-  // Turn 1, watched to the end. The web client keeps lastSeq = last seen seq + 1 for the life of
-  // the page (code-session-client.ts) — it never resets between turns.
+  // Turn 1, watched to the end. This client keeps lastSeq = last seen seq + 1 across turns, as a
+  // stream client that missed the idle end does (the web client resets its cursor at an idle end
+  // it sees, code-session-client.ts).
   mgr.enqueue(sessionId, { convId, repoRoot, task: 't1', userMsgId })
   let lastSeq = 0
   for await (const ev of mgr.subscribe(sessionId, lastSeq)) lastSeq = Math.max(lastSeq, ev.seq + 1)

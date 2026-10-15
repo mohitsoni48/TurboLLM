@@ -111,9 +111,11 @@ export class CodeRunManager {
   private runner: CodeSessionRunner
   private sessions = new Map<string, SessionState>()
   /** At least every seq any idle-GC'd session buffer handed out. A session's buffer is dropped
-   *  IDLE_RETAIN_MS after it goes idle, but its web client keeps its seq cursor for the life of the
-   *  page — a replacement buffer restarting at 0 would sit below that cursor, so a mid-turn
-   *  reconnect (?fromSeq=<old cursor>) would replay nothing. New buffers start here instead. */
+   *  IDLE_RETAIN_MS after it goes idle. The web client resets its seq cursor when its stream ends
+   *  idle or it gives up reconnecting, but a stream client that missed that idle end (or any
+   *  GET /stream consumer that keeps its cursor across turns) still holds the old cursor — a
+   *  replacement buffer restarting at 0 would sit below it, so a mid-turn reconnect
+   *  (?fromSeq=<old cursor>) would replay nothing. New buffers start here instead. */
   private seqFloor = 0
 
   constructor(d: Deps, opts?: { runner?: CodeSessionRunner }) {
@@ -224,7 +226,10 @@ export class CodeRunManager {
     params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
-    if (active?.steer) {
+    // Not into a turn that was stopped (Stop, Send now): pi still reports it streaming while it
+    // winds down (a tool being killed) and takes the steer, but every model request left in that
+    // run is aborted, so the message would be stored and never answered. It runs next instead.
+    if (active?.steer && !active.ac.signal.aborted) {
       try {
         if (await active.steer(params.task)) return { steered: true, queued: false }
       } catch {
