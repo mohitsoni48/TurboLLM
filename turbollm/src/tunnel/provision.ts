@@ -61,13 +61,42 @@ export interface CloudflaredRuntime {
   version: string
 }
 
+const provisioning = new Map<string, Promise<unknown>>()
+
+/** Run `start` unless a provision of the same `key` (the binary it installs) is already running
+ *  in this process, in which case join that one. Two flows at once shared one fixed
+ *  `<dest>.part` (downloadFile) or archive path: a Stop then a Start during the first download
+ *  leaves the superseded flow running (the manager undoes it only once it ends), so the live
+ *  flow's rename failed with ENOENT, a download dying part-way could leave a zeroed binary that
+ *  the cache check then takes as installed, and ngrok's cleanup deleted the other flow's binary.
+ *  A joining caller shares the first call's progress callback and AbortSignal (the providers
+ *  pass neither). */
+export function provisionOnce<T>(key: string, start: () => Promise<T>): Promise<T> {
+  const running = provisioning.get(key) as Promise<T> | undefined
+  if (running) return running
+  const p = start().finally(() => provisioning.delete(key))
+  provisioning.set(key, p)
+  return p
+}
+
 /**
  * Provision cloudflared: resolve the latest GitHub release, pick the asset for this
  * OS/arch, download it, and (macOS) extract the .tgz — or (Windows/Linux) use the
  * raw executable directly — then (POSIX) mark it executable. Cache-checked: a
- * prior successful provision is reused as-is.
+ * prior successful provision is reused as-is. Concurrent first-time calls share one
+ * download (provisionOnce).
  */
 export async function ensureCloudflared(
+  dataDir: string,
+  onProgress?: (p: ProvisionProgress) => void,
+  signal?: AbortSignal,
+): Promise<CloudflaredRuntime> {
+  const binPath = cloudflaredBinPath(dataDir)
+  if (existsSync(binPath)) return { binPath, version: '' } // see the cache-check comment below
+  return provisionOnce(binPath, () => provisionCloudflared(dataDir, onProgress, signal))
+}
+
+async function provisionCloudflared(
   dataDir: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,

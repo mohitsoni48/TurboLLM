@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { cloudflaredAssetName, cloudflaredBinName, cloudflaredBinPath, ensureCloudflared, pickCloudflaredAsset } from './provision'
@@ -124,4 +124,52 @@ test('ensureCloudflared: a download that dies mid-stream leaves nothing that rea
   calls = 0
   await assert.rejects(ensureCloudflared(dataDir), /socket hang up/)
   assert.equal(calls, 2, 'release lookup + download attempted again')
+})
+
+// A Stop then a Start during the first download leaves the superseded flow still provisioning, so
+// two first-time provisions overlap. Both streamed into the same fixed `<binPath>.part`: the first
+// renamed it, and the second's rename failed with ENOENT (or a download dying part-way left a
+// zeroed binary the cache check took as installed). The second call must join the first.
+test('ensureCloudflared: two concurrent first-time provisions share one download', async (t) => {
+  const assetName = cloudflaredAssetName()
+  if (!assetName || assetName.endsWith('.tgz')) {
+    t.skip('needs the raw-executable asset (Windows/Linux)')
+    return
+  }
+  const dataDir = tmpDir('cf-provision-')
+  const payload = new Uint8Array(20 * 1024).map((_, i) => (i % 251) + 1)
+  const realFetch = globalThis.fetch
+  let downloads = 0
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes('api.github.com')) {
+      return new Response(
+        JSON.stringify({ tag_name: '2026.6.1', assets: [{ name: assetName, browser_download_url: 'https://dl.test/cf' }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    downloads++
+    let off = 0
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        await new Promise((r) => setTimeout(r, 10))
+        if (off >= payload.length) return c.close()
+        c.enqueue(payload.slice(off, off + 1024))
+        off += 1024
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-length': String(payload.length) } })
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+  })
+  const first = ensureCloudflared(dataDir)
+  await new Promise((r) => setTimeout(r, 60)) // the first download is under way
+  const second = ensureCloudflared(dataDir)
+  const [a, b] = await Promise.all([first, second])
+  assert.equal(a.binPath, cloudflaredBinPath(dataDir))
+  assert.equal(b.binPath, a.binPath)
+  assert.equal(downloads, 1, 'the second call joined the first download')
+  assert.deepEqual(new Uint8Array(readFileSync(a.binPath)), payload)
+  assert.equal(existsSync(`${a.binPath}.part`), false)
 })
