@@ -283,9 +283,11 @@ export class Manager {
   /** Start a model assuming nothing is loaded (throws BusyError otherwise). Held by
    *  the global load gate through readiness so concurrent loads can't spin up two
    *  engines at once. Most callers want load() (which stops first); this exists for
-   *  paths that have already ensured the engine is free (bench, ComfyUI reload). */
-  async start(opts: StartOpts): Promise<void> {
+   *  paths that have already ensured the engine is free (bench, ComfyUI reload). `beforeStart` runs inside the
+   *  gate, as load()'s does: a throw there starts nothing and rejects the start. */
+  async start(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
     await Manager.runExclusive(async () => {
+      if (hooks?.beforeStart) await hooks.beforeStart()
       await this.startInternal(opts)
       await this.awaitNotStarting()
     })

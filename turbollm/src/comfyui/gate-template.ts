@@ -7,10 +7,13 @@
 // Contract with the daemon (see chat ../engines/comfy-guard.ts):
 //   • rising edge (idle → first job enqueued): blocking POST {base}/api/v1/comfyui/acquire
 //     BEFORE the job is enqueued, so TurboLLM frees VRAM before ComfyUI executes.
+//   • a prompt finished with more still queued (task_done): POST acquire again. While TurboLLM
+//     holds the GPU that only refreshes its crash-recovery lease, which otherwise ran out LEASE
+//     minutes after a long queue's FIRST prompt and reloaded the LLM mid-render (v4).
 //   • queue drained (last task_done): POST {base}/api/v1/comfyui/release → reload.
 
 /** Version stamp written into the node so the installer can detect/upgrade it. */
-export const GATE_VERSION = 3
+export const GATE_VERSION = 4
 
 /** Render the Python source for the gate node, with TurboLLM's base URL baked in.
  *  `baseUrl` is TurboLLM's own origin (e.g. http://127.0.0.1:6996), reachable from
@@ -133,6 +136,12 @@ def _install_hooks() -> None:
                 _busy = False
                 _free_self()
                 _release()
+            elif _busy:
+                # More prompts to run: acquire again. While TurboLLM holds the GPU this only
+                # refreshes its crash-recovery lease, which must otherwise outlast the whole
+                # queue (it reloads the LLM when it runs out). If TurboLLM no longer holds it
+                # (it restarted, or the lease ran out), it frees VRAM before the next prompt.
+                _acquire_blocking()
         return result
 
     PromptQueue.put = put

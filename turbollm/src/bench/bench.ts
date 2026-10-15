@@ -302,6 +302,18 @@ export class BenchRunner {
     await this.manager.stopAndWait({ force: this.cancelled }).catch(() => {})
   }
 
+  /** Every engine start in this file. A cancelled run starts nothing more, checked inside the load gate: a ComfyUI
+   *  render cancels auto-tune (ComfyGuard.acquire), since Manager.start runs no ComfyUI pre-start hook, and a probe
+   *  that was waiting for the gate would otherwise load gigabytes under that render. Callers read the throw as the
+   *  start failing. */
+  private startEngine(opts: StartOpts): Promise<void> {
+    return this.manager.start(opts, {
+      beforeStart: async () => {
+        if (this.cancelled) throw new Error('Auto-tune was cancelled.')
+      },
+    })
+  }
+
   /** Persist the finished run's winning profile (the user clicked Save). Returns false if there is
    *  nothing to save (no completed run, or it was already saved / discarded). */
   saveResult(): boolean {
@@ -837,7 +849,7 @@ export class BenchRunner {
     // a dedicated card, far higher with a display attached).
     const sharedBefore = await readGpuSharedMb(sys)
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     }
@@ -961,7 +973,7 @@ export class BenchRunner {
     const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return fail('crash')
     }
@@ -1282,7 +1294,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return undefined
     }

@@ -124,6 +124,37 @@ test('disabled guard is fully inert (never blocks, never touches the engine)', a
   assert.equal(g.isBlocked(), false, 'disabled guard never blocks loads')
 })
 
+// Auto-tune starts its probes with Manager.start, which runs no pre-start hook: a render used to kill the running probe,
+// keep that probe's opts as the model to reload, and let the sweep start its next probes under the render. release()
+// then loaded the probe configuration as the user's model, although nothing had been loaded before the run.
+test('acquire during auto-tune cancels the run, and keeps no probe as the model to reload', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('probe-ngl17') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+  let running = true
+  let cancels = 0
+  g.setAutoTune({ isRunning: () => running, cancel: () => { cancels++; running = false } })
+
+  await g.acquire()
+  assert.equal(cancels, 1, 'auto-tune cancelled')
+  assert.equal(calls.forceStops, 1, 'the probe is killed for the render')
+  assert.equal(g.snapshot().suspendedModelKey, null, 'a probe is not the model to reload')
+
+  await g.release()
+  assert.deepEqual(calls.starts, [], 'release loads no probe configuration')
+})
+
+test('acquire with no auto-tune running cancels nothing and still keeps the model to reload', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+  let cancels = 0
+  g.setAutoTune({ isRunning: () => false, cancel: () => { cancels++ } })
+
+  await g.acquire()
+  assert.equal(cancels, 0)
+  assert.equal(g.snapshot().suspendedModelKey, 'llama-8b')
+  await g.release()
+})
+
 test('lease backstop auto-reloads if release never arrives', async () => {
   const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('m') })
   // Tiny lease (~60ms) via the injectable constructor param.

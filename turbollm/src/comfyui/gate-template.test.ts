@@ -111,3 +111,58 @@ test('a prompt queued while the queue drains is enqueued only after TurboLLM unl
   assert.deepEqual(calls, ['acquire', 'release', 'acquire'])
   assert.equal(held, true, "job2 is queued with TurboLLM's model unloaded")
 })
+
+// Three prompts queued at once and rendered one after another. The node used to acquire only on the queue's first
+// prompt, so TurboLLM's crash-recovery lease (30 min by default) ran out mid-queue on a long batch and reloaded the LLM
+// under a render. It now acquires again after every prompt that leaves more queued, which re-arms the lease.
+const BATCH_DRIVER_PY = `
+import sys
+sys.path.insert(0, sys.argv[1])
+import execution
+import turbollm_gate
+
+q = execution.PromptQueue()
+for job in ("job1", "job2", "job3"):
+    q.put(job)
+for _ in range(3):
+    job = q.get()
+    q.task_done(job)
+`
+
+test('a long queue refreshes the lease after every prompt that leaves more queued, then releases once', {
+  skip: !HAS_PYTHON && `needs ${PYTHON}`,
+}, async (t) => {
+  let held = false
+  const calls: string[] = []
+  const turbollm = createServer((req, res) => {
+    if (req.url === '/api/v1/comfyui/acquire') {
+      calls.push(held ? 'acquire (already held: answered at once)' : 'acquire')
+      held = true
+    } else if (req.url === '/api/v1/comfyui/release') {
+      calls.push('release')
+      held = false
+    }
+    req.resume()
+    res.end('{}')
+  })
+  await new Promise<void>((r) => turbollm.listen(0, '127.0.0.1', r))
+  t.after(() => turbollm.close())
+  const dir = tmpDir('tllm-gate-')
+  mkdirSync(join(dir, 'comfy'))
+  writeFileSync(join(dir, 'comfy', '__init__.py'), '')
+  writeFileSync(join(dir, 'comfy', 'model_management.py'), 'def unload_all_models():\n    pass\n\ndef soft_empty_cache():\n    pass\n')
+  writeFileSync(join(dir, 'execution.py'), FAKE_EXECUTION_PY)
+  writeFileSync(join(dir, 'turbollm_gate.py'), gateNodeSource(`http://127.0.0.1:${(turbollm.address() as AddressInfo).port}`))
+  writeFileSync(join(dir, 'drive.py'), BATCH_DRIVER_PY)
+
+  await promisify(execFile)(PYTHON, [join(dir, 'drive.py'), dir], {
+    env: { ...process.env, NO_PROXY: '127.0.0.1', no_proxy: '127.0.0.1' },
+  })
+
+  assert.deepEqual(calls, [
+    'acquire',
+    'acquire (already held: answered at once)',
+    'acquire (already held: answered at once)',
+    'release',
+  ])
+})

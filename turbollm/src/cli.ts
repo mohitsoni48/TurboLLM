@@ -440,6 +440,8 @@ const bench = new BenchRunner(manager, store, scanner, registry, version, hf)
 // /api/v1/comfyui/acquire|release to unload/reload the model around renders. Event-
 // driven — no polling. No-op until enabled in Settings + the node is installed.
 const comfy = new ComfyGuard(store, manager)
+// Auto-tune's probes bypass the pre-start hook, so a render cancels a running auto-tune.
+comfy.setAutoTune(bench)
 // Gateway intelligence (v0.6.0): auto model-swap router. Resolves the `model`
 // field in /v1/* requests and loads the matching model if not already running.
 // Turbo Link (ADR-376): the peer's cache of what each linked host currently has. Handed to

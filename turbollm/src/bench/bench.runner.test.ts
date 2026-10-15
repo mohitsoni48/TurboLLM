@@ -7,6 +7,7 @@ import { rmSync } from 'node:fs'
 import { BenchRunner, type BenchCandidate } from './bench'
 import { readQueue } from '../telemetry/queue'
 import { tmpDir } from '../test-support/tmp'
+import { ComfyGuard } from '../engines/comfy-guard'
 import { deriveDefault, type LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
@@ -79,6 +80,54 @@ test('measure: a cancelled run never starts another engine load', async () => {
 
   assert.equal(started.length, 0, 'manager.start must not be called once cancelled')
   assert.notEqual(cand.outcome, 'ok')
+})
+
+// A ComfyUI render during auto-tune: Manager.start runs no ComfyUI pre-start hook, so the sweep used to keep starting
+// probes under the render (each one loading gigabytes into VRAM ComfyUI is sampling in) and release() then loaded the
+// killed probe's configuration as the user's model. Driven with a real ComfyGuard wired to the runner, as cli.ts does,
+// and a probe start already waiting for the global load gate when the render begins.
+test('a ComfyUI render cancels auto-tune: a probe waiting for the load gate starts nothing, and release loads no probe', async () => {
+  let state = 'running' // the previous probe is up
+  const spawned: unknown[] = []
+  let waiting = false
+  let openGate!: () => void
+  const gate = new Promise<void>((res) => { openGate = res })
+  const manager = {
+    status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => (state === 'running' ? { model: { key: 'm|q4|1' } } : null),
+    target: () => null,
+    logPath: () => null,
+    stopAndWait: async () => { state = 'stopped' },
+    // Manager.start's shape: wait for the gate, run beforeStart inside it, then spawn.
+    start: async (opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+      waiting = true
+      await gate
+      await hooks?.beforeStart?.()
+      spawned.push(opts)
+      state = 'running'
+    },
+  }
+  const registry = { active: () => ({ id: 'llama-cpp', binPath: '', version: 'b1', capabilities: CAPS }) }
+  const bench = new BenchRunner(manager as never, {} as never, {} as never, registry as never, 'test', {} as never)
+  const r = bench as unknown as RunnerInternals & { state: { running: boolean } }
+  r.deadline = Date.now() + 60_000
+  r.state = { running: true }
+  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
+  const comfy = new ComfyGuard(comfyStore as never, manager as never)
+  comfy.setAutoTune(bench)
+
+  const m = model()
+  const probing = r.probeVram(m, SYS, deriveDefault(m, SYS), CAPS)
+  while (!waiting) await new Promise((res) => setImmediate(res))
+  await comfy.acquire()
+  openGate()
+  const probe = await probing
+
+  assert.deepEqual(spawned, [], 'no probe starts under the render')
+  assert.notEqual(probe.outcome, 'ok')
+  assert.equal(comfy.snapshot().suspendedModelKey, null, 'the killed probe is not the model to reload')
+  await comfy.release()
+  assert.deepEqual(spawned, [], 'release loads no probe configuration')
 })
 
 test('saved auto-tune result is queued even when the CPU/GPU names are not identifier-safe', () => {

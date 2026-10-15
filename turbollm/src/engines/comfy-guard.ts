@@ -43,7 +43,10 @@ const LOAD_PAUSED = 'ComfyUI is rendering — model loading is paused until its 
 
 /** Backstop: if `release` never arrives (ComfyUI crashed mid-render), auto-release
  *  after this long so the model doesn't stay unloaded forever. Each acquire re-arms
- *  it. Must exceed the longest single render; override with TURBOLLM_COMFY_LEASE_MIN. */
+ *  it: the gate node (v4+) acquires again after every prompt that leaves more queued,
+ *  so it must exceed the longest single render. An older node acquires only on a
+ *  queue's first prompt, so there it must outlast the whole queue (update the node).
+ *  Override with TURBOLLM_COMFY_LEASE_MIN. */
 const LEASE_MINUTES = (() => {
   const v = Number(process.env.TURBOLLM_COMFY_LEASE_MIN)
   return Number.isFinite(v) && v > 0 ? v : 30
@@ -61,7 +64,8 @@ export interface ComfyStatus {
   /** Key of the model we unloaded for ComfyUI. Release reloads it, unless a load the render paused takes its place
    *  (see release() and modelKeyLoadedOnRelease()). */
   suspendedModelKey: string | null
-  /** ms since the last acquire/heartbeat signal from ComfyUI, or null if none yet. */
+  /** ms since the last acquire (a queue's first prompt, or the gate's per-prompt heartbeat) or release from
+   *  ComfyUI, or null if none yet. */
   lastSignalAgoMs: number | null
 }
 
@@ -84,6 +88,8 @@ export class ComfyGuard {
   // Stops the gateway's extra pool slots (keep-N chat models, embedding / Laya side models), which
   // hold VRAM beside the primary. Set by setPoolStopper once the router exists (cli.ts).
   private stopPoolSlots: (() => Promise<void>) | null = null
+  // Auto-tune (BenchRunner), which starts its probes itself. Set by setAutoTune (cli.ts).
+  private autoTune: { isRunning(): boolean; cancel(): void } | null = null
 
   private readonly leaseMs: number
   private readonly fetchImpl: FetchImpl
@@ -110,6 +116,11 @@ export class ComfyGuard {
     this.stopPoolSlots = stop
   }
 
+  /** Wire auto-tune, which acquire() cancels (see there). */
+  setAutoTune(autoTune: { isRunning(): boolean; cancel(): void }): void {
+    this.autoTune = autoTune
+  }
+
   /** True when a model load should be refused right now (ComfyUI holds the GPU). The
    *  HTTP load route, bench route, and startup auto-load all consult this. */
   isBlocked(): boolean {
@@ -126,12 +137,18 @@ export class ComfyGuard {
     if (this.held) return
     if (this.acquiring) return this.acquiring
     this.acquiring = (async () => {
+      // Auto-tune starts its probes with Manager.start, which runs no pre-start hook, so nothing would refuse its next
+      // probe mid-render: the run is cancelled, as a model load or an engine stop cancels it (its next start is then
+      // refused inside the load gate). Its probe is never the model to reload either: a run starts only with nothing
+      // loaded, and ends with the engine stopped.
+      const tuning = this.autoTune?.isRunning() ?? false
+      if (tuning) this.autoTune?.cancel()
       const st = this.manager.status()
       this.cachedFile = null
       // 'stopping' too: a model swap stopping the previous model (gracefully, up to 8 s) is killed
       // now, and the incoming model's load is refused while we hold the GPU (freeComfyUIBeforeLoad).
       if (st.state === 'running' || st.state === 'starting' || st.state === 'stopping') {
-        const opts = this.manager.currentOpts()
+        const opts = tuning ? null : this.manager.currentOpts()
         if (opts && !this.suspended) this.suspended = opts
         // KV prompt-cache persistence (F-014): only a RUNNING engine has a real cache and a
         // reachable port to save it from. When eligible, try the CAPPED save BEFORE the
@@ -254,8 +271,10 @@ export class ComfyGuard {
     return new Promise((r) => setTimeout(r, ms))
   }
 
-  /** The pre-start hook every model-load path runs inside the global load gate (Manager.load's
+  /** The pre-start hook the model-load paths run inside the global load gate (Manager.load's
    *  beforeStart): the reverse gate below, bracketed by a refusal while ComfyUI holds the GPU.
+   *  Auto-tune's probes do not run it (the bench route awaits it once, before the run): acquire()
+   *  cancels a running auto-tune instead.
    *  The routes check isBlocked() before queuing a load, but a load that then waited for the gate
    *  (a swap stopping the previous model) or for the /free call (up to 10 s) can meet an acquire
    *  that arrived meanwhile — it must not spawn mid-render. The throw becomes the load's error. */
@@ -279,8 +298,9 @@ export class ComfyGuard {
 
   /** REVERSE gate (F-011): TurboLLM is about to load a model — ask ComfyUI to drop its
    *  VRAM first by calling its native `POST {url}/free`. Symmetric counterpart of the
-   *  forward acquire/release gate. Every model-load entry point (the HTTP load route,
-   *  the bench load, the startup auto-load) awaits this before `manager.start(...)`.
+   *  forward acquire/release gate. The model-load entry points (the HTTP load route,
+   *  the startup auto-load, a gateway swap) await this before their engine starts, and
+   *  the bench route once before an auto-tune run (not before each of its probes).
    *
    *  Fires ONLY when ComfyUI is idle from our side (`!held`): if WE currently hold the
    *  GPU for ComfyUI a render is in flight, and the forward block already kept this load
