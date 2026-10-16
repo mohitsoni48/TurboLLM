@@ -353,10 +353,6 @@ export function presentedKey(c: Context): string {
   return m ? m[1].trim() : ''
 }
 
-/** True for requests we cannot tie to a credential surface and so let through
- *  even when enforcing: the SPA shell + its static assets (any path NOT under
- *  /api/ or /v1/) and the always-open health probe. A user must be able to load
- *  the page on the LAN to paste a key (spec 06 §5: `/healthz` always open). */
 /** The Turbo Link façade's path prefix. Duplicated as a literal here rather than imported
  *  from link/ because link/link-auth.ts imports THIS module — the import would be a cycle.
  *  Pinned by link-auth.test.ts, which composes both middlewares in server.ts's real order. */
@@ -379,11 +375,19 @@ function isLinkFacade(c: Context): boolean {
   return c.req.path.startsWith(LINK_API_PREFIX)
 }
 
+/** True for requests we cannot tie to a credential surface and so let through
+ *  even when enforcing: the SPA shell + its static assets (any GET whose path is
+ *  neither /api nor /v1 nor under them) and the always-open health probe. A user
+ *  must be able to load the page on the LAN to paste a key (spec 06 §5: `/healthz`
+ *  always open). */
 function isExempt(c: Context): boolean {
   if (c.req.path === '/healthz') return true
   if (c.req.method !== 'GET') return false
   const p = c.req.path
-  return !p.startsWith('/api/') && !p.startsWith('/v1/')
+  // The bare prefixes too: the gateway's app.all('/v1/*') also matches '/v1', so a keyless
+  // GET /v1?<query> reached gatewayV1Handler and proxied to the engine.
+  const under = (prefix: string) => p === prefix || p.startsWith(`${prefix}/`)
+  return !under('/api') && !under('/v1')
 }
 
 /** Best-effort: is the request from loopback? Returns `null` when the address

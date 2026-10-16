@@ -425,6 +425,26 @@ test('a non-loopback bind with lanBind OFF still enforces the key for a LAN call
   assert.equal((await loopbackRequest(app, '/api/v1/status')).status, 200)
 })
 
+// Hono's '/v1/*' also matches the bare '/v1', so the gateway's app.all('/v1/*') answered a GET
+// that lanAuth took for an SPA page: a keyless GET /v1?<query> reached gatewayV1Handler.
+test('a keyless LAN GET of the bare /v1 or /api prefix is not an exempt SPA page', async () => {
+  const raw = 'tllm-barev1prefixbarev1prefixbarev1prefi1'
+  const { d, cfg } = makeDeps((cfg) => { cfg.daemon.lanBind = true })
+  cfg.apiKeys.push({ id: 'k1', name: 'x', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  app.all('/v1/*', (c) => c.json({ reached: 'gateway' })) // mirrors gateway.ts
+  app.get('/*', (c) => c.json({ reached: 'spa' })) // mirrors registerSpaFallback
+  for (const path of ['/v1', '/v1?x=1', '/api', '/api?x=1']) {
+    assert.equal((await lanRequest(app, path)).status, 401, path)
+    assert.equal((await lanRequest(app, path, { headers: { Authorization: `Bearer ${raw}` } })).status, 200, `${path} with a key`)
+  }
+  // The SPA shell and its routes stay open, so a LAN user can load the page and paste a key.
+  for (const path of ['/', '/index.html', '/assets/app.js', '/settings', '/v1abc', '/apidocs']) {
+    assert.equal((await lanRequest(app, path)).status, 200, path)
+  }
+})
+
 test('the same daemon bound to loopback is unchanged — nothing to enforce', async () => {
   const { d } = makeDeps(() => {})
   d.bindHost = '127.0.0.1'
