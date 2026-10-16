@@ -400,6 +400,19 @@ test('DELETE with binPath: 404 without a marker, 409 when an engine claims the d
   assert.ok(existsSync(dir))
 })
 
+test('DELETE with binPath: refuses the hidden folder a purge renamed a release install to, marker and all', async () => {
+  const h = harness()
+  // The purge's background delete owns this folder; an rmSync here would race it on the daemon's thread.
+  const trash = join(h.buildDir, `.${SLUG}.purge-${Date.now()}`)
+  mkdirSync(trash, { recursive: true })
+  writeFileSync(join(trash, serverBinName), 'x')
+  writeReleaseMarker(trash, PROVENANCE)
+  const res = await deleteInstall(h, join(trash, serverBinName))
+  assert.equal(res.status, 404)
+  assert.equal((await errorOf(res)).code, 'engine_not_found')
+  assert.ok(existsSync(join(trash, serverBinName)))
+})
+
 test('DELETE without binPath aborts a running job; so does the engine-download cancel route', async () => {
   for (const abort of [
     (h: Harness) => deleteInstall(h),

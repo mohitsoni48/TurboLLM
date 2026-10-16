@@ -3,6 +3,7 @@ import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
@@ -1504,7 +1505,9 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Uploading an engine zip requires a valid API key from a non-host device.')
     const enginesRoot = join(d.store.dir(), 'engines')
     const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
-    if (!dir || !existsSync(join(dir, ZIP_BUILD_MARKER)))
+    // Never a hidden folder: a purged zip install's `.<slug>.purge-<ms>` trash still holds the marker, and an rmSync
+    // here would race the purge's own background delete of it (discardPurgeTrash) on the daemon's thread.
+    if (!dir || basename(dir).startsWith('.') || !existsSync(join(dir, ZIP_BUILD_MARKER)))
       return err(c, 404, 'engine_not_found', 'No unconfirmed zip install at that path.')
     const claims = (p: string) => isEngineInBuildDir(p, dir)
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
@@ -1533,16 +1536,21 @@ export function registerApi(app: Hono, d: Deps): void {
     const claims = (p: string) => isEngineInBuildDir(p, dir)
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
       return err(c, 409, 'build_dir_taken', 'That build is in use by an engine — delete the engine instead.')
+    // As the purge: renamed aside first, then deleted in the background after the reply (discardPurgeTrash). A
+    // recursive rmSync here held the daemon's only thread for the whole multi-GB tree, plus up to 1.5 s of blocking
+    // retry back-off per locked entry: every request, /status poll and token stream stalled meanwhile. The rename
+    // also makes the Delete all or nothing.
+    sweepPurgeTrash(dirname(dir))
+    const trash = join(dirname(dir), `.${basename(dir)}.purge-${Date.now()}`)
     try {
-      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+      renameSync(dir, trash)
     } catch (e) {
-      // A Windows AV or indexer lock past the retries (Windows reports a lock as EBUSY, EPERM or EACCES, the codes a
-      // permission error has too, so the OS error goes along). Nothing is registered, so nothing points at the
-      // half-deleted folder. A repeated Delete finishes it while the card still finds its llama-server
-      // (findCatalogBuildOnDisk); once that file is gone too the card no longer offers the build, and a later build
-      // of this folder sets what is left aside and sweeps it.
+      // A Windows AV or indexer lock: Windows refuses the rename while any file under the folder is open, and reports
+      // a lock as EBUSY, EPERM or EACCES, the codes a permission error has too, so the OS error goes along. Nothing
+      // has changed: the folder is whole and the card still offers the Delete.
       return err(c, 409, 'engine_files_locked', `Some of the build's files are still in use — try again in a moment. (${(e as Error).message})`)
     }
+    void discardPurgeTrash(trash)
     return c.json({ ok: true })
   })
 
@@ -1674,7 +1682,10 @@ export function registerApi(app: Hono, d: Deps): void {
       return c.json({ ok: true })
     }
     const dir = sourceBuildDirOf(binPath, join(d.store.dir(), 'engines'))
-    if (!dir || !existsSync(join(dir, RELEASE_INSTALL_MARKER)))
+    // Never a hidden folder, as DELETE /engines/zip: a purged release install's `.<slug>.purge-<ms>` trash still holds
+    // the marker, and an rmSync here would race the purge's own background delete of it (discardPurgeTrash) on the
+    // daemon's thread.
+    if (!dir || basename(dir).startsWith('.') || !existsSync(join(dir, RELEASE_INSTALL_MARKER)))
       return err(c, 404, 'engine_not_found', 'No unconfirmed release install at that path.')
     const claims = (p: string) => isEngineInBuildDir(p, dir)
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
@@ -1791,9 +1802,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // now-broken Enable (its files are gone). A plain Disable (no purge) leaves this
         // record alone; that's the whole point of recordCustomSource.
         d.registry.forgetCustomSource(customSourceKey(eng))
-        // Best effort, as the engine is gone either way: a lock that outlasts the retries leaves a hidden folder that
-        // nothing points at, and the next purge in the same folder sweeps it (sweepPurgeTrash).
-        if (trash) try { rmSync(trash, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* swept later */ }
+        // Best effort, as the engine is gone either way, and in the background after the reply (discardPurgeTrash): a
+        // lock that outlasts the retries, or a daemon exit mid-delete, leaves a hidden folder that nothing points at,
+        // and the next purge or delete in the same folder sweeps it (sweepPurgeTrash).
+        if (trash) void discardPurgeTrash(trash)
       }
       return c.json({ ok: true })
     } catch (e) {
@@ -4002,8 +4014,10 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
   return null
 }
 
-/** Remove the hidden `.<name>.purge-<ms>` folders a purge renamed aside in `parent` but could not delete (a Windows
- *  lock that outlasted the retries). Best effort; DELETE /engines/:id?purge=1 runs it before each purge there. */
+/** Remove the hidden `.<name>.purge-<ms>` folders a purge or DELETE /engines/build renamed aside in `parent` but
+ *  could not delete (a Windows lock that outlasted the retries). Best effort and in the background
+ *  (discardPurgeTrash); a folder whose delete is still running is left to it. Both routes run it before their own
+ *  rename there. */
 function sweepPurgeTrash(parent: string): void {
   let names: string[]
   try {
@@ -4012,9 +4026,33 @@ function sweepPurgeTrash(parent: string): void {
     return
   }
   for (const name of names) {
-    if (!/^\..+\.purge-\d+$/.test(name)) continue
-    try { rmSync(join(parent, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* still locked: the next purge tries again */ }
+    if (/^\..+\.purge-\d+$/.test(name)) void discardPurgeTrash(join(parent, name))
   }
+}
+
+/** The purge-trash deletes still running, by folder. */
+const purgeTrashDeletes = new Map<string, Promise<void>>()
+
+/** Delete a folder a purge or DELETE /engines/build renamed aside, in the background with fs/promises rm, as
+ *  discardParkedBuild does for the build a rebuild replaced. Both routes deleted it with a recursive rmSync, which
+ *  held the daemon's only thread for as long as a multi-GB build tree took to delete, and with maxRetries also slept
+ *  on that thread between retries (up to 1.5 s per locked entry). Now the routes reply first, and the waits on the
+ *  disk (seconds with Windows Defender scanning each file) and the retry back-off leave the thread free. The rm's own
+ *  callbacks still run on it: on a fast disk, a tree of tens of thousands of small files can hold it for about 0.3 s
+ *  at a time, about as long as the rmSync took; only a worker thread would avoid that. It retries, as a Windows lock
+ *  right after a Stop is brief. A folder already being deleted gets no second delete (a sweep finds it before its
+ *  delete has ended): the running one is returned. Never rejects; whatever stays locked, or a daemon exit cut short,
+ *  is swept by the next purge or delete in that folder. */
+function discardPurgeTrash(trash: string): Promise<void> {
+  const running = purgeTrashDeletes.get(trash)
+  if (running) return running
+  const deleting: Promise<void> = rm(trash, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    .catch(() => {
+      /* still locked: swept later */
+    })
+    .finally(() => purgeTrashDeletes.delete(trash))
+  purgeTrashDeletes.set(trash, deleting)
+  return deleting
 }
 
 function readTail(path: string, n: number): string[] {

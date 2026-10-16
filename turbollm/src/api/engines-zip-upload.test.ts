@@ -437,3 +437,19 @@ test('DELETE /api/v1/engines/zip: refuses a dir a registered engine still uses, 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('DELETE /api/v1/engines/zip: refuses the hidden folder a purge renamed a zip install to, marker and all', async () => {
+  const dir = tmpDir('tllm-zip-route-')
+  try {
+    // The purge's background delete owns this folder; an rmSync here would race it on the daemon's thread.
+    const trash = join(dir, 'engines', 'build', `.myfork.purge-${Date.now()}`)
+    mkdirSync(trash, { recursive: true })
+    writeFileSync(join(trash, serverBinName), 'binary')
+    writeFileSync(join(trash, ZIP_BUILD_MARKER), 'myfork.zip\n')
+    const res = await deleteZipInstall(zipApp({}, dir), join(trash, serverBinName))
+    assert.equal(res.status, 404)
+    assert.equal(existsSync(join(trash, serverBinName)), true)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

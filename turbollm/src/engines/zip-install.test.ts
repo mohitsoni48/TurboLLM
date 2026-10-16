@@ -740,6 +740,15 @@ test('gcAbandonedZipInstalls: a zip-marked dir is still removed by default', () 
   assert.deepEqual(readdirSync(buildRoot), [])
 })
 
+test('gcAbandonedZipInstalls: a removed install a purge renamed aside is left to the purge\'s own delete', () => {
+  const { enginesRoot, buildRoot } = buildDirs([
+    { name: '.rel.purge-1700000000000', marker: RELEASE_INSTALL_MARKER, ageMs: THIRTY_HOURS },
+    { name: '.zipped.purge-1700000000000', marker: ZIP_BUILD_MARKER, ageMs: THIRTY_HOURS },
+  ])
+  gcAbandonedZipInstalls(enginesRoot, [])
+  assert.deepEqual(readdirSync(buildRoot).sort(), ['.rel.purge-1700000000000', '.zipped.purge-1700000000000'])
+})
+
 test('gcAbandonedZipInstalls: opts.markers restricts which marker counts', () => {
   const { enginesRoot, buildRoot } = buildDirs([
     { name: 'rel', marker: RELEASE_INSTALL_MARKER },

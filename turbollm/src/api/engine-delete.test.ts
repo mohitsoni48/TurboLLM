@@ -8,6 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import fs, { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
@@ -266,28 +267,85 @@ test('DELETE /engines/build refuses a folder an engine or a remembered source cl
   assert.deepEqual(h.removed, [])
 })
 
-test('DELETE /engines/build whose folder stays locked past the retries is 409 engine_files_locked, and can be repeated', async (t) => {
+test('DELETE /engines/build whose folder is locked is 409 engine_files_locked, keeps the build whole, and can be repeated', async (t) => {
   const h = harness(null)
   const bin = disabledBuild(h.dataDir, 'prismml-eng-llama.cpp-prism')
   const dir = join(h.dataDir, 'engines', 'build', 'prismml-eng-llama.cpp-prism')
-  const realRmSync = fs.rmSync
-  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
-    if (String(p) === dir) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
-    return realRmSync(p, o)
-  })
-  syncBuiltinESMExports()
+  const lock = lockPaths(t, 'renameSync', (p) => p === dir)
+  let res: Response
   try {
-    const res = await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
-    assert.equal(res.status, 409)
-    assert.equal(await errorCode(res), 'engine_files_locked')
+    res = await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
   } finally {
-    locked.mock.restore()
-    syncBuiltinESMExports()
+    lock.restore()
   }
-  assert.ok((locked.mock.calls[0]?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+  assert.equal(res.status, 409)
+  assert.equal(await errorCode(res), 'engine_files_locked')
+  assert.equal(existsSync(bin), true, 'nothing is deleted')
   const again = await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
   assert.equal(again.status, 200)
   assert.equal(existsSync(dir), false)
+  await eventually(() => assert.deepEqual(fs.readdirSync(join(h.dataDir, 'engines', 'build')).sort(), ['myfork', 'otherfork']))
+})
+
+// Both deletes ran a recursive rmSync of the whole build tree on the daemon's only thread, and with maxRetries also
+// slept on it between retries: every request, /status poll and token stream stalled until the delete ended. The
+// folder is now renamed aside, the route replies, and the trash is deleted in the background with fs/promises rm.
+// (Its callbacks still run on the thread; a fast disk's many small files can still hold it for a few hundred ms.)
+// syncBuiltinESMExports carries the spies to routes.ts, which imports rm and rmSync by name.
+test('DELETE /engines/build and DELETE /engines/:id?purge=1 reply first and delete the folder in the background', async (t) => {
+  const h = harness(null)
+  const bin = disabledBuild(h.dataDir, 'prismml-eng-llama.cpp-prism')
+  const buildRoot = join(h.dataDir, 'engines', 'build')
+  const deletedAsync = t.mock.method(fsp, 'rm')
+  const deletedSync = t.mock.method(fs, 'rmSync')
+  syncBuiltinESMExports()
+  const trashOf = (name: string) => fs.readdirSync(buildRoot).filter((n) => n.startsWith(`.${name}.purge-`))
+  let trash: string[]
+  try {
+    assert.equal((await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })).status, 200)
+    assert.equal(existsSync(join(buildRoot, 'prismml-eng-llama.cpp-prism')), false, 'the build is gone from its place at once')
+    assert.equal((await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
+    assert.equal(existsSync(h.forkDir), false)
+    trash = [...trashOf('prismml-eng-llama.cpp-prism'), ...trashOf('myfork')]
+    assert.equal(trash.length, 2, 'both replies came before their delete ran')
+  } finally {
+    deletedAsync.mock.restore()
+    deletedSync.mock.restore()
+    syncBuiltinESMExports()
+  }
+  const isTrash = (c: { arguments: unknown[] }) => trash.some((n) => String(c.arguments[0]) === join(buildRoot, n))
+  const deletes = deletedAsync.mock.calls.filter(isTrash)
+  assert.equal(deletes.length, 2, 'each folder is deleted with fs/promises rm')
+  for (const call of deletes) assert.ok((call.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+  assert.equal(deletedSync.mock.calls.filter((c) => isTrash(c) || String(c.arguments[0]).startsWith(h.forkDir)).length, 0, 'and not with rmSync')
+  await Promise.all(deletes.map((c) => c.result))
+  assert.deepEqual(fs.readdirSync(buildRoot), ['otherfork'])
+})
+
+test('a purge leaves a folder whose delete is still running to that delete, rather than delete it twice', async (t) => {
+  const h = harness(null)
+  const buildRoot = join(h.dataDir, 'engines', 'build')
+  const realRm = fsp.rm
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  // The first purge's delete is held, as a multi-GB tree takes seconds to delete; the second purge's sweep finds it.
+  const deletes = t.mock.method(fsp, 'rm', async (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p).startsWith(join(buildRoot, '.myfork.purge-'))) await held
+    return realRm(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.equal((await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
+    assert.equal((await h.app.request('/api/v1/engines/other?purge=1', { method: 'DELETE' })).status, 200)
+  } finally {
+    deletes.mock.restore()
+    syncBuiltinESMExports()
+  }
+  const ofFork = deletes.mock.calls.filter((c) => String(c.arguments[0]).startsWith(join(buildRoot, '.myfork.purge-')))
+  assert.equal(ofFork.length, 1, 'the sweep did not start a second delete of it')
+  release()
+  await Promise.all(deletes.mock.calls.map((c) => c.result))
+  assert.deepEqual(fs.readdirSync(buildRoot), [])
 })
 
 // DELETE /engines/:id?purge=1 used to unregister the engine and then delete its folder with one recursive rmSync. A
@@ -331,12 +389,19 @@ test('DELETE /engines/:id?purge=1 whose folder is locked is 409 engine_files_loc
 test('DELETE /engines/:id?purge=1 whose renamed-aside folder stays locked still finishes the purge, and the next purge there sweeps it', async (t) => {
   const h = harness(null)
   const buildRoot = join(h.dataDir, 'engines', 'build')
-  const lock = lockPaths(t, 'rmSync', (p) => p.startsWith(h.forkDir) || p.startsWith(join(buildRoot, '.myfork.')))
+  const realRm = fsp.rm
+  // fs/promises rm rejects as it does once its retries are spent on a Windows lock.
+  const lock = t.mock.method(fsp, 'rm', (p: fs.PathLike, o?: fs.RmOptions) =>
+    String(p).startsWith(join(buildRoot, '.myfork.'))
+      ? Promise.reject(Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' }))
+      : realRm(p, o))
+  syncBuiltinESMExports()
   let res: Response
   try {
     res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
   } finally {
-    lock.restore()
+    lock.mock.restore()
+    syncBuiltinESMExports()
   }
   assert.equal(res.status, 200)
   assert.deepEqual(h.removed, ['fork'])
@@ -344,11 +409,12 @@ test('DELETE /engines/:id?purge=1 whose renamed-aside folder stays locked still 
   assert.equal(existsSync(h.forkDir), false, 'nothing is left where the engine pointed')
   const leftover = fs.readdirSync(buildRoot).filter((n) => n.startsWith('.myfork.purge-'))
   assert.equal(leftover.length, 1, 'a hidden leftover')
-  const trashDelete = lock.calls().find((c) => String(c.arguments[0]) === join(buildRoot, leftover[0]!))
+  const trashDelete = lock.mock.calls.find((c) => String(c.arguments[0]) === join(buildRoot, leftover[0]!))
   assert.ok((trashDelete?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+  await (trashDelete!.result as Promise<void>).catch(() => {})
 
   assert.equal((await h.app.request('/api/v1/engines/other?purge=1', { method: 'DELETE' })).status, 200)
-  assert.deepEqual(fs.readdirSync(buildRoot), [], 'the leftover is swept with the next purge')
+  await eventually(() => assert.deepEqual(fs.readdirSync(buildRoot), [], 'the leftover is swept with the next purge'))
 })
 
 test('DELETE /engines/:id?purge=1 whose unregister fails puts the folder back', async () => {
@@ -360,3 +426,16 @@ test('DELETE /engines/:id?purge=1 whose unregister fails puts the folder back', 
   assert.deepEqual(fs.readdirSync(join(h.dataDir, 'engines', 'build')).sort(), ['myfork', 'otherfork'])
   assert.deepEqual(h.forgotten, [])
 })
+
+/** Retries `check` until it passes, for up to 5 s: the folder a delete renamed aside is deleted in the background. */
+async function eventually(check: () => void): Promise<void> {
+  const deadline = Date.now() + 5000
+  for (;;) {
+    try {
+      return check()
+    } catch (e) {
+      if (Date.now() > deadline) throw e
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}

@@ -280,6 +280,11 @@ export function gcAbandonedZipInstalls(
   restoreParkedInstalls(enginesRoot, claimedBinPaths, markers)
   try {
     for (const d of readdirSync(buildRoot)) {
+      // A folder a purge or DELETE /engines/build renamed aside (`.<name>.purge-<ms>`, a removed release or zip
+      // install still holds its marker) is theirs to delete, in the background: an rmSync here raced that delete and
+      // held the daemon's thread while it ran. One that stays locked, or whose delete a daemon exit cut short, is
+      // swept only by the next purge or delete in this folder.
+      if (/^\..+\.purge-\d+$/.test(d)) continue
       const dir = join(buildRoot, d)
       if (!existsSync(dir) || !statSync(dir).isDirectory()) continue
       // Marked and unclaimed (no binPath points into a parked dir), and as old as the install it holds — so without
