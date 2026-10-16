@@ -10,7 +10,9 @@
 // nvcc and g++ are shell-script stand-ins on build.toolchainDirs (ahead of PATH), so the whole
 // clone → configure → compile → register flow runs with no network and no compiler. POSIX only.
 import assert from 'node:assert/strict'
-import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import fsp from 'node:fs/promises'
+import { syncBuiltinESMExports } from 'node:module'
 import { basename, dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
@@ -117,6 +119,19 @@ function harness(toolchain: Toolchain) {
   return { registry, build, binPath, rebuild, leftBeside }
 }
 
+/** Retries `check` until it passes, for up to 5 s: the build a rebuild replaced is deleted in the background. */
+async function eventually(check: () => void): Promise<void> {
+  const deadline = Date.now() + 5000
+  for (;;) {
+    try {
+      return check()
+    } catch (e) {
+      if (Date.now() > deadline) throw e
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+}
+
 test('POST /build/run: a rebuild that fails on a missing prerequisite keeps the registered build', { skip: posixOnly }, async () => {
   const h = harness('no-cmake')
   assert.equal(await h.rebuild(), 'fail')
@@ -144,5 +159,29 @@ test('POST /build/run: a successful rebuild replaces the engine and deletes the 
   assert.equal(eng?.name, 'Fork')
   assert.equal(eng?.version, '200 (4567def)', 'the new build is registered')
   assert.equal(h.registry.list().engines.length, 1, 'it replaced the old registration')
-  assert.deepEqual(h.leftBeside(), [], 'the parked previous build is deleted')
+  await eventually(() => assert.deepEqual(h.leftBeside(), [], 'the parked previous build is deleted'))
+})
+
+// The route deleted the parked build with a recursive rmSync, on the daemon's only thread: for a multi-GB CUDA build
+// (seconds with Windows Defender scanning) every request, /status poll and token stream stalled until it ended.
+// syncBuiltinESMExports carries the spies to the modules that import rm and rmSync by name.
+test('POST /build/run: a successful rebuild deletes the build it replaced off the event loop', { skip: posixOnly }, async (t) => {
+  const h = harness('builds')
+  const deletedAsync = t.mock.method(fsp, 'rm')
+  const deletedSync = t.mock.method(fs, 'rmSync')
+  syncBuiltinESMExports()
+  try {
+    assert.equal(await h.rebuild(), 'ok')
+  } finally {
+    deletedAsync.mock.restore()
+    deletedSync.mock.restore()
+    syncBuiltinESMExports()
+  }
+  const isParked = (c: { arguments: unknown[] }) => /\.prev$/.test(String(c.arguments[0]))
+  const deletes = deletedAsync.mock.calls.filter(isParked)
+  assert.equal(deletes.length, 1, 'the parked build is deleted with fs/promises rm')
+  assert.ok((deletes[0].arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+  assert.equal(deletedSync.mock.calls.filter(isParked).length, 0, 'and not with rmSync')
+  await deletes[0].result
+  assert.deepEqual(h.leftBeside(), [])
 })

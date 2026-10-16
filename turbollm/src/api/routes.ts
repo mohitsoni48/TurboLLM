@@ -74,7 +74,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, discardParkedBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
 import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroidApp, SwapBlockedError, ZipError, ZIP_BUILD_MARKER, zipBuildDirName } from '../engines/zip-install'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
@@ -945,7 +945,8 @@ export function registerApi(app: Hono, d: Deps): void {
         if (buildAbort === ac) buildAbort = null
         // The build this one replaced, parked by runBuild. Once a new binary exists it is gone
         // either way — as before the parking, a registration failure keeps only the new build.
-        if (out?.prevBuildRoot) try { rmSync(out.prevBuildRoot, { recursive: true, force: true }) } catch { /* best effort */ }
+        // Deleted in the background: an rmSync of the multi-GB tree stalled the whole daemon.
+        if (out?.prevBuildRoot) void discardParkedBuild(out.prevBuildRoot)
       }
     })()
     return c.json({ accepted: true }, 202)

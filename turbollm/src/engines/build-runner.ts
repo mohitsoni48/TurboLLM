@@ -1002,7 +1002,7 @@ export async function runPrereqInstall(
  *  the previous build is PARKED beside it instead of deleted. A failed or cancelled build (an
  *  unreachable remote, an upstream tip that no longer compiles) drops its partial tree and puts
  *  the previous build back, so the user still has a working engine; a successful one returns the
- *  parked dir as `prevBuildRoot` for the caller to delete once the new build is registered. */
+ *  parked dir as `prevBuildRoot` for the caller to delete (discardParkedBuild) once the new build is registered. */
 export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: AbortSignal): Promise<BuildOutput> {
   const dirs: { buildRoot?: string; prevBuildRoot?: string } = {}
   try {
@@ -1038,23 +1038,44 @@ function couldNotPutBackMessage(e: unknown, parked: string, buildRoot: string): 
   return `Could not put the previous build back (${e instanceof Error ? e.message : String(e)}) — it is kept at ${parked} until a build of this engine succeeds; move it back to ${buildRoot} to use it now.`
 }
 
+/** The discardParkedBuild deletes still running. The next build waits for them before its sweep, so it never deletes
+ *  a tree another delete is working through, nor puts one back as the last working copy. */
+const parkedBuildDeletes = new Set<Promise<void>>()
+
+/** Delete the build a successful rebuild replaced (runBuild's `prevBuildRoot`), off the event loop. The route did it
+ *  with a recursive rmSync, which held the daemon's only thread for as long as a multi-GB CUDA build tree took to
+ *  delete (seconds with Windows Defender scanning): every request, status poll and token stream stalled meanwhile.
+ *  It retries, as a Windows lock on just-replaced files is brief; whatever still stays is swept by the next build of
+ *  that directory. Never rejects. */
+export function discardParkedBuild(prevBuildRoot: string): Promise<void> {
+  const deleting: Promise<void> = rm(prevBuildRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
+    .catch(() => {
+      /* best effort */
+    })
+    .finally(() => parkedBuildDeletes.delete(deleting))
+  parkedBuildDeletes.add(deleting)
+  return deleting
+}
+
 /** Delete what earlier runs left beside `buildRoot`: a parked previous build that was never deleted (the daemon died
  *  mid-build, or the delete after a successful one failed) and failed trees restorePreviousBuild moved aside. Only
  *  this directory's own `.<name>-<ms>.prev` / `.failed` siblings: another build's name can start with this one's.
- *  Best effort — whatever stays locked is tried again by the next build.
+ *  Best effort — whatever stays locked is tried again by the next build. The deletes run off the event loop (each tree
+ *  is a whole build, often several GB, see discardParkedBuild) and the returned promise settles once all have ended;
+ *  the put-back below is synchronous and done by the time this returns.
  *
  *  When `buildRoot` holds no server binary (the daemon died mid-build, or restorePreviousBuild could not move the
  *  parked build back), the newest parked build that has one is the only working copy: it is put back first (the
  *  partial tree moved aside and swept with the rest), or kept if that fails — never swept. `sweep: false` only puts
  *  it back and deletes nothing (restoreInterruptedBuilds). */
-function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { sweep?: boolean } = {}): void {
+function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { sweep?: boolean } = {}): Promise<void> {
   const parent = dirname(buildRoot)
   const prefix = `.${basename(buildRoot)}-`
   let names: string[]
   try {
     names = readdirSync(parent)
   } catch {
-    return
+    return Promise.resolve()
   }
   const parked = names.filter((name) => name.startsWith(prefix) && /^\d+\.(prev|failed)$/.test(name.slice(prefix.length)))
   const hasServerBinary = (root: string) => (resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)) !== null
@@ -1079,14 +1100,13 @@ function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { 
       }
     }
   }
-  if (opts.sweep === false) return
-  for (const name of parked) {
-    try {
-      rmSync(join(parent, name), { recursive: true, force: true })
-    } catch {
+  if (opts.sweep === false) return Promise.resolve()
+  const deletes = parked.map((name) =>
+    rm(join(parent, name), { recursive: true, force: true }).catch(() => {
       /* best effort */
-    }
-  }
+    }),
+  )
+  return Promise.all(deletes).then(() => undefined)
 }
 
 /** At boot: put the previous build back for every registered (or remembered) source build whose directory has no
@@ -1109,7 +1129,8 @@ export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: s
     if (m) roots.add(join(buildDir, m[1]))
   }
   for (const buildRoot of roots) {
-    if (claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))) sweepParkedBuilds(buildRoot, log, { sweep: false })
+    // Puts back synchronously; with sweep false nothing is deleted, so there is nothing to wait for.
+    if (claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))) void sweepParkedBuilds(buildRoot, log, { sweep: false })
   }
 }
 
@@ -1166,8 +1187,13 @@ async function buildFromSource(
   const srcDir = join(buildRoot, 'src')
   const buildSubdir = join(buildRoot, 'build')
   // Start clean so a rebuild never mixes old + new objects — by parking the previous build (see
-  // runBuild), not deleting it. A hidden sibling name, like zip-install's parked dirs.
-  sweepParkedBuilds(buildRoot, hooks.log)
+  // runBuild), not deleting it. A hidden sibling name, like zip-install's parked dirs. The sweep
+  // waits for the delete of a build an earlier rebuild replaced, which may still be running.
+  if (parkedBuildDeletes.size > 0) {
+    hooks.log('Waiting for the delete of a replaced build to finish…')
+    await Promise.all(parkedBuildDeletes)
+  }
+  await sweepParkedBuilds(buildRoot, hooks.log)
   const prevBuildRoot = existsSync(buildRoot) ? join(dirname(buildRoot), `.${basename(buildRoot)}-${Date.now()}.prev`) : undefined
   if (prevBuildRoot) renameSync(buildRoot, prevBuildRoot)
   dirs.buildRoot = buildRoot

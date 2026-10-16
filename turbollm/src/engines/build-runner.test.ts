@@ -2,11 +2,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildDirName, chooseEngineName, CMAKE_CONFIGURE_ARGS, isIncompleteMetalBackendError, pickGenerator, vcvarsBatch, stripGenericAsmLanguage, sameRepo, normRepoUrl, sourceBuildDirOf, notCmakeProjectError, missingPatchShaError, sha256Hex, patchChecksumMismatchError, findPriorEngine, parseDefaultBranch, findEngineForCatalogEntry, catalogBranchesToScan, legacyBuildDirName, findCatalogBuildOnDisk, findNameConflict, isEngineInBuildDir } from './build-runner'
 import { basename, delimiter, join, relative } from 'node:path'
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpDir } from '../test-support/tmp'
-import { copyCudaRuntimeLibs, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
+import { copyCudaRuntimeLibs, discardParkedBuild, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
 import { checkBuildPrereqs } from './build-prereqs'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -793,6 +793,111 @@ test('runBuild: a failed tree that cannot be deleted is moved aside and the prev
   await assert.rejects(build())
   assert.equal(readFileSync(bin, 'utf8'), 'previous working build')
   assert.deepEqual(readdirSync(join(enginesRoot, 'build')), [basename(root)])
+})
+
+// Each leftover is a whole build tree, often several GB. The sweep deleted them with a recursive rmSync, which held the
+// daemon's only thread until the delete ended (seconds with Windows Defender scanning): every request, status poll and
+// token stream stalled meanwhile. build-runner imports rm by name: syncBuiltinESMExports carries the spy to that binding.
+test('runBuild: the sweep deletes what earlier runs left parked off the event loop', async (t) => {
+  if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+  const dir = tmpDir('tllm-rebuild-sweep-async-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+  const prereqs = await checkBuildPrereqs([fakeBin])
+  if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+    return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+  const enginesRoot = join(dir, 'engines')
+  const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+  const name = buildDirName(repoUrl, 'main')
+  const buildDir = join(enginesRoot, 'build')
+  mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  const leftovers = [`.${name}-1700000000000.prev`, `.${name}-1700000000001.failed`]
+  for (const left of leftovers) mkdirSync(join(buildDir, left, 'build', 'bin'), { recursive: true })
+  const deletedAsync = t.mock.method(fsp, 'rm')
+  const deletedSync = t.mock.method(fs, 'rmSync')
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, { phase: () => {}, log: () => {} }, new AbortController().signal))
+  } finally {
+    deletedAsync.mock.restore()
+    deletedSync.mock.restore()
+    syncBuiltinESMExports()
+  }
+  for (const left of leftovers) {
+    const path = join(buildDir, left)
+    assert.ok(deletedAsync.mock.calls.some((c) => String(c.arguments[0]) === path), `${left} is deleted with fs/promises rm`)
+    assert.ok(!deletedSync.mock.calls.some((c) => String(c.arguments[0]) === path), `${left} is not deleted with rmSync`)
+  }
+  assert.deepEqual(readdirSync(buildDir), [name])
+})
+
+// The route deletes the build a successful rebuild replaced in the background (discardParkedBuild). A rebuild started
+// before that delete ends must not sweep the same tree alongside it, or put it back half-deleted as the last working
+// copy: it waits for the delete first.
+test('runBuild: a rebuild waits for the delete of a build an earlier rebuild replaced before it sweeps', async (t) => {
+  if (process.platform === 'win32') return t.skip('the Windows build needs the MSVC environment')
+  const dir = tmpDir('tllm-rebuild-discard-')
+  const fakeBin = join(dir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'nvcc'), '#!/bin/sh\necho "Cuda compilation tools, release 12.6, V12.6.20"\n', { mode: 0o755 })
+  const prereqs = await checkBuildPrereqs([fakeBin])
+  if (!prereqs.supported || prereqs.tools.some((x) => ['git', 'cmake', 'gcc'].includes(x.id) && !x.found))
+    return t.skip('git, cmake and a C++ compiler are needed to reach the clone step')
+  const enginesRoot = join(dir, 'engines')
+  const repoUrl = 'https://127.0.0.1:9/owner/fork.git' // nothing listens on port 9, so the clone fails at once
+  const name = buildDirName(repoUrl, 'main')
+  const buildDir = join(enginesRoot, 'build')
+  mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'current build')
+  const replaced = join(buildDir, `.${name}-1700000000000.prev`)
+  mkdirSync(join(replaced, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(replaced, 'build', 'bin', 'llama-server'), 'replaced build')
+  // Hold the background delete (the first rm of the replaced tree) until the test lets it go.
+  let letGo = () => {}
+  const held = new Promise<void>((resolve) => { letGo = resolve })
+  const realRm = fsp.rm
+  let holding = true
+  const rmCalls = t.mock.method(fsp, 'rm', async (p: Parameters<typeof fsp.rm>[0], o?: Parameters<typeof fsp.rm>[1]) => {
+    if (holding && String(p) === replaced) {
+      holding = false
+      await held
+    }
+    return realRm(p, o)
+  })
+  syncBuiltinESMExports()
+  const phases: string[] = []
+  let waiting = false
+  let sawWait = () => {}
+  const waited = new Promise<void>((resolve) => { sawWait = resolve })
+  try {
+    const discarded = discardParkedBuild(replaced)
+    const build = runBuild({ repoUrl, branch: 'main', enginesRoot, toolchainDirs: [fakeBin] }, {
+      phase: (p) => phases.push(p),
+      log: (l) => {
+        if (l.startsWith('Waiting for the delete of a replaced build')) {
+          waiting = true
+          sawWait()
+        }
+      },
+    }, new AbortController().signal)
+    const ended = build.then(() => {}, () => {})
+    await Promise.race([waited, ended])
+    assert.ok(waiting, 'the build waits for the delete')
+    assert.ok(!phases.includes('cloning'), 'nothing past the sweep has run yet')
+    assert.equal(rmCalls.mock.calls.filter((c) => String(c.arguments[0]) === replaced).length, 1, 'the sweep has not touched the tree')
+    letGo()
+    await discarded
+    await assert.rejects(build)
+  } finally {
+    letGo()
+    rmCalls.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.ok(phases.includes('cloning'), 'the build went on once the delete ended')
+  assert.deepEqual(readdirSync(buildDir), [name])
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
 })
 
 // The daemon's exit kills a running rebuild's compile, but runBuild's restorePreviousBuild never runs: the partial tree
