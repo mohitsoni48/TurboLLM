@@ -635,9 +635,12 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   const [interactive, setInteractive] = useState(false)
   // HTML only: the hidden scripted iframe that GIF/canvas export reads from. It runs the model's
   // JS, and the CSP can't stop that JS navigating the frame to any URL, so it is mounted only
-  // when the user asks for an export that needs it (`liveFrame`), never on render.
+  // when the user asks for an export that needs it (`liveFrame`), never on render, and unmounted
+  // again once the last export that asked for it is done (`releaseLiveFrame`).
   const [liveWanted, setLiveWanted] = useState(false)
   const liveLoad = useRef<{ loaded: boolean; waiters: Array<() => void> }>({ loaded: false, waiters: [] })
+  // Exports still running that took the live frame (the Download menu stays usable while one runs).
+  const liveUsers = useRef(0)
   // Frozen-vh dimensions of the static HTML render: once the static iframe has loaded, the
   // parent rewrites its vh units to px and measures the true full-page size here, so the
   // iframe can be shown at full height (no clip) without the height feeding back into vh.
@@ -833,6 +836,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   /** Mount the hidden scripted HTML iframe (a user action asked for it) and resolve with it once
    *  its document has loaded — or after a bound, so an export never hangs on it. */
   function liveFrame(): Promise<HTMLIFrameElement | null> {
+    liveUsers.current++
     setLiveWanted(true)
     const l = liveLoad.current
     if (l.loaded) return Promise.resolve(iframeRef.current)
@@ -843,8 +847,21 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     })
   }
 
+  /** An export that called liveFrame() is done with the frame. Once no other export still needs
+   *  it, unmount it: left mounted, the model's JS kept running unseen in the 0-height frame for
+   *  the rest of the card's life (timers, animation loops, a delayed self-navigation). The load
+   *  state goes with it, so the next export mounts a fresh frame and waits for that one to load
+   *  instead of reading the gone frame as ready. */
+  function releaseLiveFrame() {
+    if (--liveUsers.current > 0) return
+    setLiveWanted(false)
+    liveLoad.current = { loaded: false, waiters: [] }
+  }
+
   async function download(fmt: Fmt) {
     setBusy(true)
+    let tookLive = false
+    const takeLive = () => { tookLive = true; return liveFrame() }
     try {
       if (fmt === 'svg') {
         const svg = type === 'application/vnd.mermaid' ? (mermaid.svg ?? '') : stableCode
@@ -852,7 +869,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
       } else if (fmt === 'html') {
         downloadBlob(new Blob([stableCode], { type: 'text/html' }), 'artifact.html')
       } else if (fmt === 'gif') {
-        const live = await liveFrame()
+        const live = await takeLive()
         const blob = await captureGif(live)
         if (blob) downloadBlob(blob, 'artifact.gif')
         else {
@@ -873,7 +890,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
           if (!blob) blob = await rasterizeStaticFrozen(staticRef.current, staticDims, mime)
           if (!blob) {
             const vw = staticMeasureW(availW)
-            const url = await captureHtmlPreview(stableCode, await liveFrame(), vw, captureViewportH(vw))
+            const url = await captureHtmlPreview(stableCode, await takeLive(), vw, captureViewportH(vw))
             const png = url ? await (await fetch(url)).blob() : null
             blob = png ? (fmt === 'jpeg' ? await blobToJpeg(png) : png) : null
           }
@@ -882,6 +899,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
         else toast.error('Couldn’t export this artifact as an image — try GIF or HTML.')
       }
     } finally {
+      if (tookLive) releaseLiveFrame()
       setBusy(false)
     }
   }
@@ -913,7 +931,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     //  · interactive: a REAL viewport — scale 1, full card width, fixed 60vh height, natively
     //    scrollable, scripts on. Fixed height = no collapse / no runaway-expand.
     // A hidden scripted iframe (iframeRef) powers GIF/canvas + the last-resort image export. It
-    // is mounted only once one of those exports asks for it (`liveFrame`), never on render.
+    // is mounted only while one of those exports needs it (`liveFrame`), never on render.
     const measureW = staticMeasureW(availW)
     const refH = captureViewportH(measureW)
     body = (

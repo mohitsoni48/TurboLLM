@@ -71,6 +71,49 @@ describe('ArtifactCard — HTML artifact script only on user action', () => {
     await userEvent.click(await screen.findByRole('menuitem', { name: /GIF/ }))
     await waitFor(() => expect(scriptedFrames(container)).toHaveLength(1))
   })
+
+  it('unmounts the hidden scripted page once the GIF export is done, and mounts a fresh one for the next', async () => {
+    // jsdom runs no srcdoc script, so stand in for the frame's export script: answer the GIF
+    // request with no frames (no canvas animation) and the PNG fallback with no image, the way
+    // a page that cannot be captured does. Every request the parent sends is recorded.
+    const asked: string[] = []
+    const answer = (frame: HTMLIFrameElement) => {
+      const win = frame.contentWindow!
+      win.addEventListener('message', (e: MessageEvent) => {
+        asked.push(e.data?.type)
+        const reply = e.data?.type === 'tllm-gif' ? { type: 'tllm-gif-result', frames: null }
+          : e.data?.type === 'tllm-shot' ? { type: 'tllm-shot-result', png: null } : null
+        if (reply) window.dispatchEvent(new MessageEvent('message', { data: reply, source: win }))
+      })
+    }
+    const seen = new Set<HTMLIFrameElement>()
+    const watch = new MutationObserver(() => {
+      scriptedFrames(document.body).forEach((f) => {
+        if (seen.has(f as HTMLIFrameElement)) return
+        seen.add(f as HTMLIFrameElement)
+        answer(f as HTMLIFrameElement)
+      })
+    })
+    watch.observe(document.body, { childList: true, subtree: true })
+    try {
+      const { container } = render(<ArtifactCard lang="html" code={code} />)
+      const exportGif = async () => {
+        await userEvent.click(screen.getByTitle('Download'))
+        await userEvent.click(await screen.findByRole('menuitem', { name: /GIF/ }))
+      }
+      await exportGif()
+      await waitFor(() => expect(asked).toEqual(['tllm-gif', 'tllm-shot']))
+      // The export is over: its script must not keep running unseen in the 0-height frame.
+      await waitFor(() => expect(scriptedFrames(container)).toHaveLength(0))
+      // The next export mounts (and waits for) a new frame instead of reusing the gone one.
+      await exportGif()
+      await waitFor(() => expect(asked).toEqual(['tllm-gif', 'tllm-shot', 'tllm-gif', 'tllm-shot']))
+      await waitFor(() => expect(scriptedFrames(container)).toHaveLength(0))
+      expect(seen.size).toBe(2)
+    } finally {
+      watch.disconnect()
+    }
+  })
 })
 
 describe('ArtifactCard — HTML artifact CSP', () => {
