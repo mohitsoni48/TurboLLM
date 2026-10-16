@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { delimiter, join } from 'node:path'
+import { tmpDir } from '../../test-support/tmp'
 import { NgrokProvider, NGROK_URL_RE, ngrokAssetUrl } from './ngrok'
+import { ensureNgrok, ngrokBinPath } from './ngrok-provision'
 
 const cfg = { authtoken: '2abcDEF', domain: '' }
 
@@ -84,4 +88,66 @@ test('ngrok: the asset URL matches what the live archive publishes', () => {
     ngrokAssetUrl('linux', 'arm64'),
     'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.tgz',
   )
+})
+
+// --- ensureNgrok: a provision still extracting (stubbed download and tar, real temp dir) ---
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// A Stop then a Start while the first provision is still extracting. tar writes the archive's
+// `ngrok` straight to its final path, so the binary exists, half-written, before the provision
+// ends: the second call took it as installed and spawned it (ETXTBSY on Linux). It must join the
+// running provision instead. The extraction is a stand-in `tar` first on PATH, invoked as
+// `tar -xzf <archive> -C <dir>`: it writes part of the binary, waits for the test, then the rest.
+test('ensureNgrok: a call while the archive is still being extracted waits for the extraction', async (t) => {
+  if (process.platform === 'win32' || !ngrokAssetUrl()) {
+    t.skip('needs the tar extraction (Linux, macOS)')
+    return
+  }
+  const dataDir = tmpDir('ngrok-provision-')
+  const toolDir = tmpDir('ngrok-fake-tar-')
+  const finish = join(toolDir, 'finish')
+  writeFileSync(join(toolDir, 'tar'), [
+    '#!/bin/sh',
+    'printf "partial" > "$4/ngrok"',
+    `i=0; while [ ! -e '${finish}' ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done`,
+    'printf "complete ngrok" > "$4/ngrok"',
+    '',
+  ].join('\n'), { mode: 0o755 })
+  const realPath = process.env.PATH
+  const realFetch = globalThis.fetch
+  let downloads = 0
+  process.env.PATH = `${toolDir}${delimiter}${realPath ?? ''}`
+  globalThis.fetch = (async () => {
+    downloads++
+    return new Response(new Uint8Array([0x1f, 0x8b, 0x08]), { status: 200 })
+  }) as typeof fetch
+  t.after(() => {
+    if (realPath === undefined) delete process.env.PATH
+    else process.env.PATH = realPath
+    globalThis.fetch = realFetch
+  })
+
+  const binPath = ngrokBinPath(dataDir)
+  const first = ensureNgrok(dataDir)
+  try {
+    for (let waited = 0; !existsSync(binPath); waited += 10) {
+      assert.ok(waited < 10_000, 'the extraction never started')
+      await sleep(10)
+    }
+    let secondSettled = false
+    const second = ensureNgrok(dataDir).finally(() => { secondSettled = true })
+    await sleep(100)
+    assert.equal(secondSettled, false, 'a half-written binary must not be returned as installed')
+    writeFileSync(finish, '')
+    const [a, b] = await Promise.all([first, second])
+    assert.equal(a.binPath, binPath)
+    assert.equal(b.binPath, binPath)
+    assert.equal(readFileSync(binPath, 'utf8'), 'complete ngrok')
+    assert.equal(downloads, 1, 'the second call joined the first provision')
+  } finally {
+    // On a failure too: let the stand-in tar finish and the provision end inside the test.
+    writeFileSync(finish, '')
+    await first.catch(() => {})
+  }
 })

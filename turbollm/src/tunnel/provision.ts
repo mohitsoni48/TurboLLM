@@ -91,9 +91,12 @@ export async function ensureCloudflared(
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
 ): Promise<CloudflaredRuntime> {
-  const binPath = cloudflaredBinPath(dataDir)
-  if (existsSync(binPath)) return { binPath, version: '' } // see the cache-check comment below
-  return provisionOnce(binPath, () => provisionCloudflared(dataDir, onProgress, signal))
+  // No cache check ahead of provisionOnce (provisionCloudflared's own runs inside it): on macOS
+  // the .tgz is extracted straight into cloudflaredDir, so binPath exists while a provision is
+  // still writing it, and a Stop then Start in that window got the half-written binary back at
+  // once instead of joining the provision. The raw executables (Windows/Linux) appear only
+  // through downloadFile's rename, complete.
+  return provisionOnce(cloudflaredBinPath(dataDir), () => provisionCloudflared(dataDir, onProgress, signal))
 }
 
 async function provisionCloudflared(
@@ -107,6 +110,8 @@ async function provisionCloudflared(
   // Cache-check BEFORE the release lookup: every tunnel start and restart lands here, and an
   // unreachable or rate-limited GitHub API must not stop an already-downloaded cloudflared
   // from starting. The cached copy is never updated, so the latest tag would not describe it.
+  // It runs under provisionOnce (see ensureCloudflared), so a provision still writing binPath
+  // is joined, not taken as installed.
   if (existsSync(binPath)) return { binPath, version: '' }
 
   const rel = await latestGithubRelease(CLOUDFLARED_REPO, signal)

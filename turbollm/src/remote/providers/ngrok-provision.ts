@@ -72,8 +72,14 @@ export async function ensureNgrok(
   signal?: AbortSignal,
 ): Promise<NgrokRuntime> {
   const binPath = ngrokBinPath(dataDir)
-  if (existsSync(binPath)) return { binPath } // cache-check first, same as ensureCloudflared
-  return provisionOnce(binPath, () => provisionNgrok(dataDir, onProgress, signal))
+  // The cache check runs inside provisionOnce, never ahead of it: the archive is extracted
+  // straight into ngrokDir (tar, or Expand-Archive on Windows), so binPath exists while a
+  // provision is still writing it. Checked ahead, a Stop then Start in that window got the
+  // half-written binary back at once, and its spawn failed (ETXTBSY on Linux). Checked here,
+  // that call joins the running provision and gets the binary once it is complete.
+  return provisionOnce(binPath, async () =>
+    existsSync(binPath) ? { binPath } : provisionNgrok(dataDir, onProgress, signal),
+  )
 }
 
 async function provisionNgrok(

@@ -1,7 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { cloudflaredAssetName, cloudflaredBinName, cloudflaredBinPath, ensureCloudflared, pickCloudflaredAsset } from './provision'
 
@@ -173,3 +174,78 @@ test('ensureCloudflared: two concurrent first-time provisions share one download
   assert.deepEqual(new Uint8Array(readFileSync(a.binPath)), payload)
   assert.equal(existsSync(`${a.binPath}.part`), false)
 })
+
+// On macOS the .tgz is extracted straight into cloudflaredDir, so binPath exists while a provision
+// is still writing it: a Stop then a Start in that window got the half-written binary back as
+// installed instead of joining the provision. A call made while a provision runs must join it,
+// whatever is at binPath already. The window is held open here by holding the download and writing
+// a partial binary at binPath meanwhile, as tar does mid-extraction; that runs on every platform
+// cloudflared publishes for (the raw executables of Windows/Linux reach binPath only through the
+// rename, complete).
+test('ensureCloudflared: a call while a provision is still writing the binary joins it', async (t) => {
+  const assetName = cloudflaredAssetName()
+  if (!assetName) {
+    t.skip('cloudflared publishes no asset for this platform')
+    return
+  }
+  const dataDir = tmpDir('cf-provision-')
+  const binPath = cloudflaredBinPath(dataDir)
+  const binary = new TextEncoder().encode('complete cloudflared')
+  const payload = assetName.endsWith('.tgz') ? tgzHolding('cloudflared', binary) : binary
+  let finishDownload!: () => void
+  const downloadHeld = new Promise<void>((r) => { finishDownload = r })
+  const realFetch = globalThis.fetch
+  let downloads = 0
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input instanceof Request ? input.url : input)
+    if (url.includes('api.github.com')) {
+      return new Response(
+        JSON.stringify({ tag_name: '2026.6.1', assets: [{ name: assetName, browser_download_url: 'https://dl.test/cf' }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      )
+    }
+    downloads++
+    const body = new ReadableStream<Uint8Array>({
+      async start(c) {
+        await downloadHeld
+        c.enqueue(payload)
+        c.close()
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'content-length': String(payload.length) } })
+  }) as typeof fetch
+  t.after(() => {
+    globalThis.fetch = realFetch
+  })
+
+  const first = ensureCloudflared(dataDir)
+  try {
+    for (let waited = 0; downloads === 0; waited += 10) {
+      assert.ok(waited < 10_000, 'the download never started')
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    writeFileSync(binPath, 'partial') // what tar has written of it so far
+    let secondSettled = false
+    const second = ensureCloudflared(dataDir).finally(() => { secondSettled = true })
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(secondSettled, false, 'a half-written binary must not be returned as installed')
+    finishDownload()
+    const [a, b] = await Promise.all([first, second])
+    assert.equal(a.binPath, binPath)
+    assert.equal(b.binPath, binPath)
+    assert.equal(readFileSync(binPath, 'utf8'), 'complete cloudflared')
+    assert.equal(downloads, 1, 'the second call joined the first provision')
+  } finally {
+    finishDownload()
+    await first.catch(() => {})
+  }
+})
+
+/** A .tgz holding one file `name`, as the macOS release asset holds `cloudflared`. */
+function tgzHolding(name: string, content: Uint8Array): Uint8Array {
+  const dir = tmpDir('cf-tgz-')
+  mkdirSync(join(dir, 'src'))
+  writeFileSync(join(dir, 'src', name), content)
+  execFileSync('tar', ['-czf', join(dir, 'asset.tgz'), '-C', join(dir, 'src'), name])
+  return new Uint8Array(readFileSync(join(dir, 'asset.tgz')))
+}
