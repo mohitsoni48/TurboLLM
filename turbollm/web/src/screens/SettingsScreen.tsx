@@ -1556,22 +1556,45 @@ function AdvancedSection({ onRestart }: { onRestart: () => void }) {
 function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
   const restart = useDaemonRestart()
   const [phase, setPhase] = useState<'restarting' | 'failed'>('restarting')
+  // When the 202 arrived (monotonic clock); null until then. The OLD daemon keeps answering
+  // /status until its teardown ends (cli.ts requestRestart: stopping a loaded engine alone can take
+  // ~8 s on Windows), so an OK is only the new daemon's when its uptime is shorter than the time
+  // since then: the replacement starts after the restart was accepted (at least the route's 200 ms
+  // later), the old daemon before it. uptimeSec is whole seconds, rounded down, so this tells
+  // them apart for any old daemon that had been up over a second when the restart was clicked.
+  const [acceptedAt, setAcceptedAt] = useState<number | null>(null)
   const started = useRef(false)
+  const mounted = useRef(false)
+
+  // Split up so React StrictMode (npm run dev) works: it mounts, unmounts and remounts every
+  // effect. One effect that both fired the restart (once, behind `started`) and owned the poll
+  // timers had its first run's cleanup set `cancelled`, and the remount returned early at
+  // `started`: the overlay never polled, never reloaded and never gave up. Now the restart fires
+  // once, and the poll effect below starts its own timers whenever it runs after the 202.
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   useEffect(() => {
     if (started.current) return
     started.current = true
+    restart.mutate(undefined, {
+      onSuccess: () => setAcceptedAt(performance.now()),
+      onError: (e) => {
+        if (!mounted.current) return
+        setPhase('failed')
+        toast.error(e instanceof ApiError ? e.message : 'Could not restart the daemon.')
+      },
+    })
+    // Intentionally run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
+  useEffect(() => {
+    if (acceptedAt === null) return
     let cancelled = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
-    let giveUpTimer: ReturnType<typeof setTimeout> | undefined
-    // When the 202 arrived (monotonic clock). The OLD daemon keeps answering /status until its
-    // teardown ends (cli.ts requestRestart: stopping a loaded engine alone can take ~8 s on
-    // Windows), so an OK is only the new daemon's when its uptime is shorter than the time since
-    // then: the replacement starts after the restart was accepted (at least the route's 200 ms
-    // later), the old daemon before it. uptimeSec is whole seconds, rounded down, so this tells
-    // them apart for any old daemon that had been up over a second when the restart was clicked.
-    let acceptedAt = 0
 
     const poll = async () => {
       if (cancelled) return
@@ -1593,32 +1616,19 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
       if (!cancelled) pollTimer = setTimeout(poll, 700)
     }
 
-    restart.mutate(undefined, {
-      onSuccess: () => {
-        acceptedAt = performance.now()
-        // Give the old process a beat to release the socket, then poll for the new one.
-        pollTimer = setTimeout(poll, 700)
-        // If it hasn't come back in 20s, surface a manual fallback.
-        giveUpTimer = setTimeout(() => {
-          if (!cancelled) setPhase('failed')
-        }, 20_000)
-      },
-      onError: (e) => {
-        if (!cancelled) {
-          setPhase('failed')
-          toast.error(e instanceof ApiError ? e.message : 'Could not restart the daemon.')
-        }
-      },
-    })
+    // Give the old process a beat to release the socket, then poll for the new one.
+    pollTimer = setTimeout(poll, 700)
+    // If it hasn't come back in 20s, surface a manual fallback.
+    const giveUpTimer = setTimeout(() => {
+      if (!cancelled) setPhase('failed')
+    }, 20_000)
 
     return () => {
       cancelled = true
       if (pollTimer) clearTimeout(pollTimer)
-      if (giveUpTimer) clearTimeout(giveUpTimer)
+      clearTimeout(giveUpTimer)
     }
-    // Intentionally run once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [acceptedAt])
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/90 backdrop-blur-sm">

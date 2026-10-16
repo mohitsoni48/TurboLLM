@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { describe, it, expect, vi } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -165,6 +166,32 @@ describe('SettingsScreen — Restart daemon', () => {
       state.sysInfo = undefined
     }
   }, 10_000) // about 2 s of real poll intervals, more on a loaded runner
+
+  // StrictMode (npm run dev) mounts, unmounts and remounts effects. The first cleanup cancelled the
+  // poll, and the remount's run-once guard returned early: no poll, no reload, no give-up, ever.
+  it('under StrictMode, restarts once, then polls and reloads like a production build', async () => {
+    state.settings = mk()
+    state.saveCalls = []
+    state.restarts = 0
+    state.sysInfo = { bundledEnginesOnly: false }
+    const reload = vi.fn()
+    vi.stubGlobal('location', { ...window.location, href: 'http://127.0.0.1:6996/settings', reload })
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ uptimeSec: 0 }), { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    try {
+      const { unmount } = render(<StrictMode><MemoryRouter><SettingsScreen /></MemoryRouter></StrictMode>)
+      await openSystem()
+      await userEvent.click(screen.getByRole('button', { name: /Restart daemon/ }))
+      act(() => state.saveCalls[0].opts.onSuccess!(mk()))
+      await waitFor(() => expect(reload).toHaveBeenCalledOnce(), { timeout: 3000 })
+      expect(state.restarts).toBe(1)
+      expect(fetchMock.mock.calls.filter((c) => String((c as unknown[])[0]) === '/api/v1/status')).toHaveLength(1)
+      unmount()
+    } finally {
+      vi.unstubAllGlobals()
+      state.sysInfo = undefined
+    }
+  })
 
   // A pending port change: the save already moves the daemon in place, and the overlay could only
   // ever poll this page's own (now dead) port. So the page follows the port and nothing restarts.
