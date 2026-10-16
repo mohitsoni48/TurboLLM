@@ -40,6 +40,7 @@ import type {
   TokenUsageStats,
   TokenUsageRange,
 } from './types'
+import { markHostKeyNeeded } from './auth-signal'
 
 const AUTH_KEY = 'tllm.authToken'
 
@@ -107,6 +108,8 @@ async function request<T>(
     const rescued = init?.rescue?.(res.status, data)
     if (rescued !== undefined) return rescued
     const env = data as { error?: { code?: string; message?: string } } | undefined
+    // A host-only setting refused for want of a valid key: ask for one (auth-signal.ts).
+    if (res.status === 403 && env?.error?.code === 'api_key_required') markHostKeyNeeded()
     throw new ApiError(
       env?.error?.code ?? 'http_error',
       env?.error?.message ?? `Request failed with status ${res.status}.`,

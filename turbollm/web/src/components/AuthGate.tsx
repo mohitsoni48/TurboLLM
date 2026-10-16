@@ -6,8 +6,10 @@ import { track } from '../lib/api'
 
 /** Shown when the daemon answers 401 — i.e. it's exposed on the LAN and this client
  *  has no (or a stale) API key. Lets the user paste a key; the parent stores it and
- *  refetches. Replaces the misleading "lost connection" overlay for the auth case. */
-export function AuthGate({ onConnect }: { onConnect: (key: string) => void }) {
+ *  refetches. Replaces the misleading "lost connection" overlay for the auth case.
+ *  `onDismiss` adds a "Not now", for when only a host-only setting asked for the key
+ *  (auth-signal.ts's host-key signal) and the rest of the app works without one. */
+export function AuthGate({ onConnect, onDismiss }: { onConnect: (key: string) => void; onDismiss?: () => void }) {
   const [key, setKey] = useState('')
   const [submitted, setSubmitted] = useState(false)
 
@@ -53,6 +55,11 @@ export function AuthGate({ onConnect }: { onConnect: (key: string) => void }) {
         <Button className="mt-3 w-full" onClick={submit} disabled={!key.trim()}>
           Connect
         </Button>
+        {onDismiss && (
+          <Button variant="ghost" className="mt-2 w-full" onClick={onDismiss}>
+            Not now
+          </Button>
+        )}
       </div>
     </div>
   )

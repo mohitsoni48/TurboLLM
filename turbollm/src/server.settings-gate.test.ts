@@ -129,22 +129,29 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['requestLog.enabled', (cfg) => ({ requestLog: { enabled: !cfg.requestLog.enabled } })],
 ]
 
-/** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not. */
+/** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not.
+ *  The refusals carry api_key_required, on which the web client opens its key prompt, and name
+ *  the setting as the Settings screen does (`field` keeps the config path for API clients). */
 async function assertGated(d: Deps, cfg: Config, socket: Socket, headers: Record<string, string>) {
   for (const [field, body] of HOST_ONLY) {
     const saved = JSON.stringify(cfg)
     const res = await patch(d, socket, headers, body(cfg))
     assert.equal(res.status, 403, field)
-    const { error } = (await res.json()) as { error: { code: string; message: string } }
-    assert.equal(error.code, 'forbidden')
-    assert.match(error.message, new RegExp(`^Changing ${field.replace('.', '\\.')} requires a valid API key`), field)
+    const { error } = (await res.json()) as { error: { code: string; message: string; field: string } }
+    assert.equal(error.code, 'api_key_required', field)
+    assert.equal(error.field, field)
+    assert.match(error.message, /^Changing .+ requires a valid API key\.$/, field)
     assert.equal(JSON.stringify(cfg), saved, `${field}: nothing may be stored`)
   }
+  const hf = (await (await patch(d, socket, headers, { hfToken: 'hf_attacker' })).json()) as { error: { message: string } }
+  assert.equal(hf.error.message, 'Changing the Hugging Face token requires a valid API key.')
   // "Always Allow" writes toolPolicies too; "Allow for this chat" is the chat action, still open.
   const saved = JSON.stringify(cfg)
   const always = await approve(d, socket, headers, 'always_allow')
   assert.equal(always.status, 403, 'always_allow')
-  assert.match(((await always.json()) as { error: { message: string } }).error.message, /requires a valid API key/)
+  const refused = ((await always.json()) as { error: { code: string; message: string } }).error
+  assert.equal(refused.code, 'api_key_required', 'always_allow')
+  assert.match(refused.message, /requires a valid API key — use "Allow for this chat" instead\.$/)
   assert.equal(JSON.stringify(cfg), saved, 'always_allow: nothing may be stored')
   assert.equal((await approve(d, socket, headers, 'allow_chat')).status, 404)
   // Bodies already captured are host-only to read; the metadata list stays open.
@@ -232,4 +239,25 @@ test('a keyless peer on an open LAN cannot change host-only settings; with a key
   const host = await send(d, LOOPBACK, { Host: '127.0.0.1:6996' }, 'GET', '/api/v1/requests?bodies=1', undefined)
   assert.equal(host.status, 200)
   assert.match(await host.text(), /settings-gate-secret/)
+})
+
+test('Docker with the key requirement off: a browser holding no valid key gets api_key_required, and with its key it saves', async () => {
+  // As the shipped image runs once the owner has turned "Require an API key" off: bound to
+  // 0.0.0.0 without lanBind, the owner's browser at http://localhost:6996 arriving from the
+  // bridge address. lanAuth admits it with any key or none, so nothing 401s; the refusal's code
+  // is what lets the client ask for the key.
+  const { d, cfg } = mkDeps((c) => { c.daemon.requireApiKey = false })
+  d.bindHost = '0.0.0.0'
+  const bridge: Socket = { localPort: 6996, remoteAddress: '172.17.0.1' }
+  const browser = { Host: 'localhost:6996' }
+  for (const headers of [browser, { ...browser, 'X-TurboLLM-Auth': 'tllm-revokedrevokedrevokedrevokedrevoke1' }]) {
+    assert.equal((await send(d, bridge, headers, 'GET', '/api/v1/settings', undefined)).status, 200)
+    for (const body of [{ hfToken: 'hf_mine' }, { requireApiKey: true }]) {
+      const res = await patch(d, bridge, headers, body)
+      assert.equal(res.status, 403)
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required')
+    }
+  }
+  assert.equal((await patch(d, bridge, { ...browser, 'X-TurboLLM-Auth': RAW_KEY }, { hfToken: 'hf_mine' })).status, 200)
+  assert.equal(cfg.hf.token, 'hf_mine')
 })

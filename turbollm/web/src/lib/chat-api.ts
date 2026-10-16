@@ -1,5 +1,6 @@
 import type { Conversation, Folder, Message, ChatSseEvent, MemoryFact } from './chat-types'
 import { ApiError, authHeaders } from './api'
+import { markHostKeyNeeded } from './auth-signal'
 import { readSseStream } from './sse'
 import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
@@ -13,6 +14,8 @@ async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Pr
   const data = text ? (() => { try { return JSON.parse(text) } catch { return undefined } })() : undefined
   if (!res.ok) {
     const env = data as { error?: { code?: string; message?: string } } | undefined
+    // "Always Allow" refused for want of a valid key: ask for one (auth-signal.ts).
+    if (res.status === 403 && env?.error?.code === 'api_key_required') markHostKeyNeeded()
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
   return data as T

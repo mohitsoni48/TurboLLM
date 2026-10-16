@@ -2898,12 +2898,22 @@ export function registerApi(app: Hono, d: Deps): void {
     // switch the request log off). Judged on the outcome rather than on which fields the body
     // names: the change is applied to a copy first, so the served UI's own Save, which echoes
     // lanBind/requireApiKey/port unchanged with every general setting, still works.
+    //
+    // The refusal's code is api_key_required, not forbidden: the web client opens its key prompt
+    // on it (auth-signal.ts). With requireApiKey off nothing 401s, so nothing else asks a browser
+    // without a valid stored key for one, and a non-loopback bind's owner is such a browser:
+    // Docker with a published port (the owner arrives from the bridge address) after turning
+    // the requirement off, in a private window, from another origin, or with a revoked key.
+    // `field` names the setting for API clients; the message uses the Settings screen's words.
     if (!hostGate(c, d)) {
       const now = d.store.snapshot()
       const trial = structuredClone(now)
       apply(trial)
-      const field = hostOnlySettingChanged(now, trial)
-      if (field) return err(c, 403, 'forbidden', `Changing ${field} requires a valid API key from a non-host device.`)
+      const changed = hostOnlySettingChanged(now, trial)
+      if (changed) {
+        const message = `Changing ${changed.label} requires a valid API key.`
+        return c.json({ error: { code: 'api_key_required', message, field: changed.field } }, 403)
+      }
     }
 
     const before = d.store.snapshot().daemon
@@ -3525,35 +3535,36 @@ function tunnelStatusSnapshot(d: Deps): { active: boolean; url: string | null; e
 }
 
 /** The first PATCH /api/v1/settings field that `after` changes from `before` and only a caller
- *  passing hostGate may change, or null. Everything else (theme, titles, model defaults, the
- *  gateway pool, ...) stays open to any caller lanAuth admits. */
-function hostOnlySettingChanged(before: Config, after: Config): string | null {
+ *  passing hostGate may change, with its name as the Settings screen words it, or null.
+ *  Everything else (theme, titles, model defaults, the gateway pool, ...) stays open to any
+ *  caller lanAuth admits. */
+function hostOnlySettingChanged(before: Config, after: Config): { field: string; label: string } | null {
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
-  const fields: [string, (c: Config) => unknown][] = [
-    ['lanBind', (c) => c.daemon.lanBind],
-    ['requireApiKey', (c) => c.daemon.requireApiKey],
-    ['port', (c) => c.daemon.port],
-    ['experimental.remoteAccess', (c) => c.daemon.experimental.remoteAccess],
-    ['remoteAccess', (c) => c.remoteAccess],
+  const fields: [string, string, (c: Config) => unknown][] = [
+    ['lanBind', 'LAN access', (c) => c.daemon.lanBind],
+    ['requireApiKey', '"Require an API key"', (c) => c.daemon.requireApiKey],
+    ['port', 'the port', (c) => c.daemon.port],
+    ['experimental.remoteAccess', 'remote access', (c) => c.daemon.experimental.remoteAccess],
+    ['remoteAccess', 'remote access', (c) => c.remoteAccess],
     // First on PATH for the prereq probe (GET /api/v1/build/prereqs, ungated) and every build,
     // which run git/cmake/nvcc/the compiler from there: a directory of the caller's own, or a
     // UNC share on Windows (it passes the absolute-path check), is command execution.
-    ['build.toolchainDirs', (c) => c.build.toolchainDirs],
-    ['toolPolicies', (c) => c.tools.toolPolicies],
-    ['autoAllowAll', (c) => c.tools.autoAllowAll],
+    ['build.toolchainDirs', 'the build toolchain folders', (c) => c.build.toolchainDirs],
+    ['toolPolicies', 'tool permissions', (c) => c.tools.toolPolicies],
+    ['autoAllowAll', '"Auto-allow all"', (c) => c.tools.autoAllowAll],
     // Body capture records Code sessions' and `turbollm launch` agents' full prompts, which only
     // a hostGate caller may read back (REQUEST_BODIES_HOST_ONLY); switching it on from here was
     // the way to start that capture. Turning the log off hides from the owner what was sent.
-    ['requestLog.enabled', (c) => c.requestLog.enabled],
-    ['requestLog.captureBodies', (c) => c.requestLog.captureBodies],
-    ['hfToken', (c) => c.hf.token],
-    ['ghToken', (c) => c.gh?.token ?? ''],
+    ['requestLog.enabled', 'the request log', (c) => c.requestLog.enabled],
+    ['requestLog.captureBodies', '"Log prompts and responses"', (c) => c.requestLog.captureBodies],
+    ['hfToken', 'the Hugging Face token', (c) => c.hf.token],
+    ['ghToken', 'the GitHub token', (c) => c.gh?.token ?? ''],
     // Field by field: the handler creates an empty `search` block on every save.
-    ['search.tavilyApiKey', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]],
-    ['search.kagiApiKey', (c) => c.tools.search?.kagiApiKey],
-    ['search.searxngUrl', (c) => c.tools.search?.searxngUrl],
+    ['search.tavilyApiKey', 'the Tavily API key', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]],
+    ['search.kagiApiKey', 'the Kagi API key', (c) => c.tools.search?.kagiApiKey],
+    ['search.searxngUrl', 'the SearXNG URL', (c) => c.tools.search?.searxngUrl],
   ]
-  for (const [name, get] of fields) if (!same(get(before), get(after))) return name
+  for (const [field, label, get] of fields) if (!same(get(before), get(after))) return { field, label }
   return null
 }
 
