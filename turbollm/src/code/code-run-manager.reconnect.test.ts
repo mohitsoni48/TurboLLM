@@ -634,6 +634,31 @@ test('seqs keep rising after an idle session\'s state is dropped, so a reconnect
   assert.deepEqual(deltas, ['t2-0', 't2-1', 't2-2', 't2-3', 't2-4'])
 })
 
+test('a reconnect whose cursor is past the buffer\'s head (from before a daemon restart) replays the in-flight turn from its start', async () => {
+  // The web client keeps its cursor across a reconnect that succeeds. When the daemon restarted in
+  // between, the new process's seqs start at 0 again, so the old cursor (here 42) sits above
+  // everything the new turn has streamed, and its replay skipped all of it.
+  const { d, store } = makeDeps()
+  let release: (() => void) | undefined
+  const runner = (async (params) => {
+    params.sink({ event: 'delta', data: { delta: 'early-0' } })
+    params.sink({ event: 'delta', data: { delta: 'early-1' } })
+    await new Promise<void>((r) => { release = r })
+    params.sink({ event: 'delta', data: { delta: 'live' } })
+    return { finalText: 'ok', contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner }) // the restarted daemon: a fresh manager
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'after restart')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'after restart', userMsgId })
+  const sub = mgr.subscribe(sessionId, 42)
+  assert.ok(release, 'the turn started')
+  release()
+  const deltas: string[] = []
+  for await (const ev of sub) if (ev.event === 'delta') deltas.push((ev.data as { delta: string }).delta)
+  assert.deepEqual(deltas, ['early-0', 'early-1', 'live'])
+})
+
 test('replay keeps only the latest tool_progress snapshot per tool call; everything else is untouched', async () => {
   const { d, store } = makeDeps()
   let release: (() => void) | undefined

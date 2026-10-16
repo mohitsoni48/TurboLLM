@@ -538,6 +538,13 @@ export class CodeRunManager {
   subscribe(sessionId: string, fromSeq: number): Subscription {
     const s = this.sessions.get(sessionId)
     if (!s) return subscribeToBuffer(new RingBuffer(), new EventEmitter(), { fromSeq: 0, replayFloor: 0, idleAtStart: true })
+    // A cursor PAST this buffer's head is not one this buffer handed out (buffers of one daemon
+    // only ever continue past each other, see seqFloor): it is from a daemon that has since
+    // restarted, kept by a client whose reconnect succeeded within its retry budget. Replaying from
+    // it skipped every frame the new daemon's turn had already streamed below it, so the live view
+    // lacked that text until the turn's end reloaded the transcript. Such a cursor reads as "from
+    // the start"; replayFloor still limits the replay to the in-flight turn.
+    if (fromSeq > s.buffer.head()) fromSeq = 0
     return subscribeToBuffer(s.buffer, s.emitter, {
       fromSeq,
       replayFloor: s.replayFloor,

@@ -203,6 +203,41 @@ describe('CodeSessionClient', () => {
     expect(liveStates.some((s) => s?.assistantId === 'a2' && s.content === 'backlog')).toBe(true)
   })
 
+  it('follows a restarted daemon\'s numbering after it replays a turn from its start, so a second drop does not replay it twice', async () => {
+    vi.useFakeTimers()
+    const { handlers, liveStates } = makeHandlers()
+    const seenFromSeq: number[] = []
+    // The restarted daemon's turn, numbered from 0. Like CodeRunManager.subscribe, it treats a
+    // cursor past its buffer's head as stale and replays from the start, else seq >= fromSeq.
+    const turn2 = [
+      { event: 'meta', data: { userMessageId: 'u2', assistantMessageId: 'a2' }, seq: 0 },
+      { event: 'delta', data: { delta: 'early' }, seq: 1 },
+      { event: 'delta', data: { delta: '+live' }, seq: 2 },
+      { event: 'done', data: { contextUsed: 1, contextMax: 2, aborted: false }, seq: 3 },
+    ] as CodeStreamEvent[]
+    const fn: CodeStreamFn = async function* (_sid, fromSeq) {
+      seenFromSeq.push(fromSeq)
+      if (seenFromSeq.length === 1) {
+        // Turn 1 runs up to seq 41 on the old daemon, then the connection drops.
+        yield { event: 'meta', data: { userMessageId: 'u1', assistantMessageId: 'a1' }, seq: 40 } as CodeStreamEvent
+        yield { event: 'delta', data: { delta: 'x' }, seq: 41 } as CodeStreamEvent
+        throw new TypeError('fetch failed')
+      }
+      // The second connection reaches the restarted daemon two frames into turn 2, then drops again.
+      const head = seenFromSeq.length === 2 ? 2 : turn2.length
+      const from = fromSeq > head ? 0 : fromSeq
+      for (const f of turn2.slice(0, head)) if (f.seq! >= from) yield f
+      if (seenFromSeq.length === 2) throw new TypeError('fetch failed')
+    }
+    new CodeSessionClient('s1', handlers, fn).connect()
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(seenFromSeq).toEqual([0, 42, 2])
+    expect(handlers.onTurnDone).toHaveBeenCalledTimes(1)
+    const a2 = liveStates.filter((st) => st?.assistantId === 'a2')
+    expect(a2.at(-1)?.content).toBe('early+live')
+    expect(a2.some((st) => st!.content.includes('earlyearly'))).toBe(false)
+  })
+
   it('reports a silent lost-connection for a 404 (run is gone)', async () => {
     vi.useFakeTimers()
     const { handlers } = makeHandlers()

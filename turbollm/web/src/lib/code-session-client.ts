@@ -131,9 +131,19 @@ export class CodeSessionClient {
     let attempt = 0
 
     const run = async (): Promise<void> => {
+      let sawSeq = false // whether this connection has delivered a seq-numbered frame yet
       try {
         for await (const evt of this.streamFn(this.sessionId, this.lastSeq, ac.signal)) {
-          if (typeof evt.seq === 'number') this.lastSeq = Math.max(this.lastSeq, evt.seq + 1)
+          if (typeof evt.seq === 'number') {
+            // The daemon replays seq >= our cursor, so a connection whose FIRST numbered frame is
+            // below it got a stale cursor reset: one from before a daemon restart, past the new
+            // buffer's head, which the daemon answers by replaying the in-flight turn from its
+            // start (code-run-manager.ts's subscribe). Follow the new numbering from there. Kept,
+            // the higher old cursor would still be past the head on the next drop, and that
+            // reconnect would replay the whole turn again on top of the text already shown.
+            this.lastSeq = !sawSeq && evt.seq < this.lastSeq ? evt.seq + 1 : Math.max(this.lastSeq, evt.seq + 1)
+            sawSeq = true
+          }
           if (evt.event === 'meta') {
             attempt = 0 // a real frame means the connection is healthy again
             this.activeAssistantId = evt.data.assistantMessageId
