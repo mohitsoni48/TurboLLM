@@ -366,6 +366,65 @@ for (const [name, value] of [['expect', '100-continue'], ['transfer-encoding', '
   })
 }
 
+// A header the client's Connection value names is hop-by-hop as well (RFC 9110 §7.6.1); it reached the engine.
+test('POST /v1/chat/completions does not forward a header the client\'s Connection value names', async () => {
+  const engineSaw: Record<string, string | undefined> = {}
+  const engine = await withFakeEngine((req, res) => {
+    for (const h of ['x-secret-hop', 'x-custom']) engineSaw[h] = req.headers[h] as string | undefined
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ choices: [{ message: { content: 'hi' }, finish_reason: 'stop' }] }))
+    })
+  })
+  try {
+    const app = new Hono()
+    registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', connection: 'keep-alive, X-Secret-Hop, bad name', 'x-secret-hop': '1', 'x-custom': 'kept' },
+      body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false }),
+    })
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.deepEqual(engineSaw, { 'x-secret-hop': undefined, 'x-custom': 'kept' })
+  } finally {
+    await engine.close()
+  }
+})
+
+// The engine's own connection headers describe its socket to the gateway. Relayed, llama-server's `Connection: close`
+// closed the client's keep-alive connection to the gateway after every reply.
+for (const [path, body] of [
+  ['/v1/chat/completions', { model: 'qwen3-8b|Q4|123', messages: [], stream: false }],
+  ['/v1/completions', { model: 'qwen3-8b|Q4|123', prompt: 'hi' }],
+] as const) {
+  test(`${path}: the engine's hop-by-hop response headers are not relayed to the client`, async () => {
+    const engine = await withFakeEngine((req, res) => {
+      req.resume()
+      req.on('end', () => {
+        const json = JSON.stringify({ choices: [{ message: { content: 'hi' }, text: 'hi', finish_reason: 'stop' }] })
+        res.writeHead(200, {
+          'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(json),
+          Connection: 'close', 'Keep-Alive': 'timeout=5, max=5', 'X-Engine': 'kept',
+        })
+        res.end(json)
+      })
+    })
+    try {
+      const app = new Hono()
+      registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+      const res = await app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      assert.equal(res.status, 200, await res.clone().text())
+      assert.equal(res.headers.get('connection'), null)
+      assert.equal(res.headers.get('keep-alive'), null)
+      assert.equal(res.headers.get('x-engine'), 'kept')
+      assert.equal(res.headers.get('content-length'), String(Buffer.byteLength(await res.text())), 'content-length still relayed')
+    } finally {
+      await engine.close()
+    }
+  })
+}
+
 test('POST /v1/chat/completions does not hand TurboLLM\'s own credentials to the engine port', async () => {
   const engineSaw: Record<string, string | undefined> = {}
   const engine = await withFakeEngine((req, res) => {

@@ -818,6 +818,25 @@ export interface GatewayV1Options {
   origin?: 'local' | 'link'
 }
 
+/** Hop-by-hop headers (RFC 9110 §7.6.1): each describes one connection, the client's to us or ours to the engine,
+ *  so the pass-through forwards none of them in either direction. */
+const HOP_BY_HOP = ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection']
+
+/** The header names a Connection value lists, which are hop-by-hop too (RFC 9110 §7.6.1). Only valid names: Headers
+ *  throws on any other, and a garbled value must not turn the request into a 500. */
+function connectionNamed(headers: Headers): string[] {
+  return (headers.get('connection') ?? '').split(',').map((t) => t.trim().toLowerCase()).filter((t) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(t))
+}
+
+/** An engine response's headers as relayed to the client: without its hop-by-hop headers. llama-server's
+ *  `Connection: close` and `Keep-Alive` described its socket to us, and relayed they closed the client's own
+ *  keep-alive connection to the gateway. */
+function relayedHeaders(res: Response): Headers {
+  const headers = new Headers(res.headers)
+  for (const h of HOP_BY_HOP) headers.delete(h)
+  return headers
+}
+
 /** The whole /v1/* surface: GET /v1/models synthesis, POST /v1/chat/completions (body
  *  rewrite, auto-swap routing, engine gate, usage accounting), and plain pass-through for
  *  everything else. Extracted verbatim from the inline registration above so the Turbo Link
@@ -1025,7 +1044,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // outright (`expect`, `transfer-encoding`, `keep-alive`, `upgrade`): fetch throws before any I/O and the client
   // gets a 500. curl adds `Expect: 100-continue` to any body over 1 MB (a base64 vision request), and every client
   // that streams its request body sends `Transfer-Encoding: chunked`.
-  if (!remote) for (const h of ['host', 'connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'expect', 'proxy-connection']) headers.delete(h)
+  // So is any header the client's Connection value names (read before `connection` itself goes).
+  if (!remote) for (const h of [...connectionNamed(headers), 'host', 'expect', ...HOP_BY_HOP]) headers.delete(h)
   // TurboLLM's own credentials (the Android WebView's app-secret cookie and header, and X-TurboLLM-Auth, which also
   // carries Turbo Link tokens) are for this daemon only — the engine never reads them, and whatever answers on the
   // engine's internal port must not see them. `authorization` and `x-api-key` are left alone even when they carry the
@@ -1281,11 +1301,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       logFinalized = true // the drain above owns finalizing this entry now, not the fallback below
       void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
       if (injectedUsage) return withoutInjectedUsage(a, res)
-      return new Response(a, { status: res.status, headers: res.headers })
+      return new Response(a, { status: res.status, headers: relayedHeaders(res) })
     } catch (e) {
       finalizeLog({ status: res.status, error: { code: 'tee_error', message: (e as Error)?.message || 'Failed to tee the response body.' } })
       chatGateRelease?.()
-      return new Response(res.body, { status: res.status, headers: res.headers })
+      return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
     }
   }
 
@@ -1330,12 +1350,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     // fetch has already decoded whatever the host's side compressed (Cloudflare's edge gzips JSON for a client that
     // accepts it, and fetch always asks), but keeps the `content-encoding` header: relayed as-is, the client tries
     // to gunzip plain JSON and every non-streamed remote reply and error body is unreadable.
-    const relayed = new Headers(res.headers)
+    const relayed = relayedHeaders(res)
     relayed.delete('content-encoding')
     relayed.delete('content-length')
     return new Response(res.body, { status: res.status, headers: relayed })
   }
-  return new Response(res.body, { status: res.status, headers: res.headers })
+  return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
 }
 
 /** The client's copy of a streamed chat completion as it would have been without the `stream_options.include_usage`
@@ -1412,7 +1432,7 @@ function withoutInjectedUsage(body: ReadableStream<Uint8Array>, res: Response): 
       if (out) controller.enqueue(enc.encode(out))
     },
   }))
-  const headers = new Headers(res.headers)
+  const headers = relayedHeaders(res)
   headers.delete('content-length')
   headers.delete('content-encoding')
   return new Response(filtered, { status: res.status, headers })
