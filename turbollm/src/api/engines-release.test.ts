@@ -81,6 +81,7 @@ function harness(o: Opts = {}): Harness {
     },
     build: { isActive: () => o.busy === 'build' },
     modelRouter: {
+      poolEngineIds: () => new Set(o.poolEngineId ? [o.poolEngineId] : []),
       poolSlotsOnEngine: (id: string) => (id === o.poolEngineId ? 1 : 0),
       stopPoolSlotsOnEngine: o.stopPoolSlots ?? (async () => {}),
     },
@@ -737,16 +738,39 @@ test('POST install: 409 engine_in_use when only an extra pool slot runs on the o
   assert.deepEqual(h.provisionLog, [])
 })
 
-test('POST /engines/:id/update: an extra pool slot on the engine ends the update as a refusal, never a swap', async () => {
+test('POST /engines/:id/update: an extra pool slot on the engine is a 409 refusal, never a swap', async () => {
   const dataDir = tmpDir('tllm-rel-route-')
   const dir = seededDir(dataDir, RELEASE_INSTALL_MARKER)
   const h = harness({ dataDir, poolEngineId: 'e1', engines: [RELEASE_ENGINE(dir)] })
   await withGithub({ tag: 'b9', assets: [{ name: ZIP_ASSET, bytes: Buffer.alloc(64, 7) }] }, async (requests) => {
-    assert.equal((await postUpdate(h, 'e1')).status, 202)
-    await waitUntil(() => settled(h))
-    assert.equal(requests.some((u) => u.startsWith('https://cdn.test/')), false)
+    const res = await postUpdate(h, 'e1')
+    assert.equal(res.status, 409)
+    const e = await errorOf(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /Stop "Rel"/)
+    assert.deepEqual(requests, [])
   })
-  assert.match(h.provisionLog.find((l) => l.startsWith('fail:')) ?? '', /Stop "Rel"/)
+  assert.deepEqual(h.provisionLog, [])
+})
+
+test('POST /engines/:id/update: an extra pool slot on a KoboldCpp engine blocks its update, primary stopped or on another engine', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const kc = { id: 'kc', name: 'KoboldCpp', kind: 'koboldcpp', binPath: join(dir, 'koboldcpp', 'koboldcpp'), version: 'v1.70' }
+  const other = { id: 'other', name: 'llama.cpp', binPath: join(dir, 'other', serverBinName) }
+  let stoppedSlots = 0
+  // Before the fix the update's first step stopped the slot; failing it there keeps a regression off the network.
+  const stopPoolSlots = async () => { stoppedSlots++; throw new Error('stopped by the test') }
+  for (const serving of [undefined, other]) {
+    const h = harness({ poolEngineId: 'kc', serving, stopPoolSlots, engines: [kc, other] })
+    // Stubbed GitHub: a regression that accepts the update must not reach the network.
+    const res = await withGithub('missing', async () => postUpdate(h, 'kc'))
+    assert.equal(res.status, 409, serving ? 'primary on another engine' : 'primary stopped')
+    const e = await errorOf(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /Stop "KoboldCpp"/)
+    assert.deepEqual(h.provisionLog, [])
+  }
+  assert.equal(stoppedSlots, 0, 'the pool slot is never stopped')
 })
 
 // The route keeps its "any engine with an automatic update source" contract (ADR-085): every branch it reaches records

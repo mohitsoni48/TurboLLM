@@ -1138,6 +1138,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // with the same guard keyed on the registry's active engine; main's v1.14.5 refinement is kept —
         // it is the stricter of the two and covers the PR's case.)
         if (d.manager.currentOpts()?.engine.kind === 'litert-lm') await d.manager.stopAndWait()
+        // A .litertlm model auto-swapped into an extra pool slot holds the same library open while the primary runs
+        // something else (or nothing), so it is stopped too, as this route already stops the primary. Not
+        // stopEngineUsers: it also stops a primary that merely has LiteRT-LM active, which never held the library.
+        for (const e of d.registry.list().engines) if (e.kind === 'litert-lm') await d.modelRouter.stopPoolSlotsOnEngine(e.id)
         // An update keeps the active engine (see MLX) — for LiteRT-LM especially: an active LiteRT-LM is sent every GGUF.
         const wasActive = upgrade && d.registry.active()?.kind === 'litert-lm'
         const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade, ac.signal)
@@ -1760,6 +1764,11 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
     const engine = d.registry.get(id)
     if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
+    // So does an extra pool slot on it, whatever the primary is doing, as for delete (engineDeleteBlocked): every
+    // non-release branch starts with stopEngineUsers, which stopped that slot's model without a word, and it stayed
+    // gone when the update then failed. (A release update refused only later, as a failed job.)
+    if (d.modelRouter.poolEngineIds().has(id))
+      return err(c, 409, 'engine_in_use', `Stop "${engine.name}" before updating it.`)
     const source = resolveUpdateSource(engine)
     // applyEngineUpdate has no branch for a source-built engine (notify-only "rebuild") or for SGLang.
     if (!source || source.source === 'source' || engine.kind === 'sglang')

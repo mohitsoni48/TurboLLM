@@ -17,7 +17,11 @@ import { tmpDir } from '../test-support/tmp'
 function appWithChecker(
   fetcher: (src: { source: string; ref: string }) => Promise<string>,
   installedVersion = '0.17.1',
-  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string; downloadActive?: () => boolean } = {},
+  opts: {
+    noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string; downloadActive?: () => boolean
+    /** What stopping an engine's extra pool slots does; resolves at once by default. */
+    stopPoolSlots?: (engineId: string) => Promise<void>
+  } = {},
 ) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
@@ -51,6 +55,7 @@ function appWithChecker(
   const provisionCalls: string[] = []
   const managerCalls: string[] = []
   const activateCalls: string[] = []
+  const poolStops: string[] = []
   // The route's stop-guard keys on the engine that is RUNNING (manager currentOpts), not the
   // registry's active engine — an install activates without stopping what is loaded, so the
   // two can differ (v1.14.5). Both knobs stay mockable so every combination can be expressed;
@@ -67,7 +72,10 @@ function appWithChecker(
       stopAndWait: async () => { managerCalls.push('stopAndWait'); provisionCalls.push('stop') },
       currentOpts: () => (runningKind ? { engine: { kind: runningKind } } : undefined),
     },
-    modelRouter: { loadedModelKeys: () => new Set<string>() },
+    modelRouter: {
+      loadedModelKeys: () => new Set<string>(),
+      stopPoolSlotsOnEngine: async (engineId: string) => { poolStops.push(engineId); await opts.stopPoolSlots?.(engineId) },
+    },
     db: { lastGenTpsByModel: () => new Map<string, number>() },
     registry: {
       engines,
@@ -92,7 +100,7 @@ function appWithChecker(
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, provisionCalls, managerCalls, activateCalls, engines }
+  return { app, provisionCalls, managerCalls, activateCalls, poolStops, engines }
 }
 
 test('?update=1 with the installed version already latest refuses without provisioning', async () => {
@@ -241,6 +249,19 @@ test('nothing is stopped when nothing is running, or when a DIFFERENT engine is 
   const r2 = await other.app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
   assert.equal(r2.status, 202)
   assert.deepEqual(other.managerCalls, [], 'a running non-LiteRT-LM engine must not be stopped')
+})
+
+test('an update also stops a .litertlm model in an extra pool slot, while the primary runs another engine', async () => {
+  // The primary check above keys on the primary alone, so `uv pip install -U` ran under a pool slot that still held
+  // the native library (file-locked on Windows). The slot stop is held open here, so the venv is never touched.
+  const { app, managerCalls, poolStops, provisionCalls } = appWithChecker(async () => '0.18.0', '0.17.1', {
+    activeEngineId: 'other-1', runningKind: 'llama-server', stopPoolSlots: () => new Promise<void>(() => {}),
+  })
+  const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.deepEqual(poolStops, ['litert-1'], 'only the LiteRT-LM engine\'s pool slots are stopped')
+  assert.deepEqual(managerCalls, [], 'the primary on another engine is left alone')
+  assert.deepEqual(provisionCalls, ['start:litert-lm'])
 })
 
 // ── An update keeps the active engine, as the scheduler's applyPipUpdate does: the route behind the card's Update
