@@ -23,6 +23,10 @@ const LOG_TAIL = 200
 
 export class BuildState {
   private s: BuildStatus = { active: false, phase: 'preparing', engine: '', log: [], error: null }
+  /** The run installs a build tool instead of building an engine: the Windows CUDA Toolkit download (into
+   *  <dataDir>/cuda) or a build guide prerequisite install (the host's package manager). Named after the tool, which
+   *  the web UI tells apart by label; the daemon is told by the route, since a build's name is the user's to pick. */
+  private toolInstall = false
 
   get(): BuildStatus {
     return { ...this.s, log: [...this.s.log] }
@@ -33,8 +37,15 @@ export class BuildState {
     return this.s.active
   }
 
-  start(engine: string): void {
+  /** True while a run that builds an engine is running: isActive() minus a CUDA Toolkit download or a prerequisite
+   *  install, which write into no engine folder and register nothing. */
+  isEngineBuildActive(): boolean {
+    return this.s.active && !this.toolInstall
+  }
+
+  start(engine: string, opts: { toolInstall?: boolean } = {}): void {
     this.s = { active: true, phase: 'preparing', engine, log: [], error: null }
+    this.toolInstall = opts.toolInstall === true
   }
 
   phase(phase: BuildPhase): void {

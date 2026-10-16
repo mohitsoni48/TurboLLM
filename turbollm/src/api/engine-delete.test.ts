@@ -7,13 +7,14 @@
 // style as engines-release.test.ts.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import fs, { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import type { Deps } from '../deps'
 import { availableBackends } from '../engines/download'
+import { BuildState } from '../engines/build-state'
 import { tmpDir } from '../test-support/tmp'
 
 function harness(busy: 'download' | 'build' | null) {
@@ -41,13 +42,18 @@ function harness(busy: 'download' | 'build' | null) {
   const cfg = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [], links: [], telemetry: { level: 'off', machineId: 'm' },
+    build: { toolchainDirs: [] as string[] },
   }
+  // A real BuildState: a source build counts as engine work here, a CUDA Toolkit download or a prerequisite install
+  // (started with toolInstall) does not.
+  const build = new BuildState()
+  if (busy === 'build') build.start('My fork')
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
     manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), currentOpts: () => null, stopAndWait: async () => {} },
     provision: { get: () => ({ active: busy === 'download', phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }) },
-    build: { isActive: () => busy === 'build' },
+    build,
     modelRouter: { poolEngineIds: () => new Set<string>(), stopPoolSlotsOnEngine: async () => {} },
     registry: {
       active: () => undefined,
@@ -68,7 +74,7 @@ function harness(busy: 'download' | 'build' | null) {
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
+  return { app, cfg, build, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
 }
 
 async function errorCode(res: Response): Promise<string> {
@@ -130,6 +136,82 @@ test('with no engine work running, a re-register, a purge and a backend delete s
   assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
   assert.equal(existsSync(h.backendDir), false)
   assert.deepEqual(h.removed, ['fork', 'be'])
+})
+
+// The Windows CUDA Toolkit download (POST /build/cuda) and a build guide prerequisite install (POST
+// /build/install-prereq: git, cmake, gcc, cuda) run through BuildState for their live log, but build no engine: they
+// install into <dataDir>/cuda or through the host's package manager. They counted as a build here, so for as long as
+// one ran every Enable, Disable, Add and Delete was refused with "A build is in progress".
+for (const tool of ['CUDA Toolkit', 'git']) {
+  test(`a ${tool} install leaves Disable, Enable, Purge, backend Delete and a Disabled build's Delete open`, async () => {
+    const h = harness(null)
+    h.build.start(tool, { toolInstall: true }) // as the routes start it
+    h.build.phase('provisioning')
+    const disable = await h.app.request('/api/v1/engines/other', { method: 'DELETE' })
+    assert.equal(disable.status, 200)
+    const enable = await h.app.request('/api/v1/engines', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Other fork', binPath: join(h.otherForkDir, 'llama-server') }),
+    })
+    assert.equal(enable.status, 201)
+    assert.equal((await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
+    assert.equal(existsSync(h.forkDir), false)
+    assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
+    assert.equal(existsSync(h.backendDir), false)
+    const bin = disabledBuild(h.dataDir, 'prismml-eng-llama.cpp-prism')
+    assert.equal((await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })).status, 200)
+    assert.equal(existsSync(bin), false)
+    assert.deepEqual(h.removed, ['other', 'fork', 'be'])
+    assert.equal(h.build.isActive(), true, 'the install runs on')
+  })
+}
+
+test('POST /build/install-prereq starts a run that leaves Disable open while it runs', { skip: process.platform !== 'linux' && process.platform !== 'darwin' && 'the route is Linux and macOS only' }, async () => {
+  const h = harness(null)
+  // git is found on build.toolchainDirs, so the install has nothing to do and no package manager ever runs.
+  const fakeBin = join(h.dataDir, 'fakebin')
+  mkdirSync(fakeBin)
+  writeFileSync(join(fakeBin, 'git'), '#!/bin/sh\necho "git version 2.43.0"\n')
+  chmodSync(join(fakeBin, 'git'), 0o755)
+  h.cfg.build.toolchainDirs = [fakeBin]
+  const settled = new Promise<string>((resolve) => { h.build.onSettled = resolve })
+  const res = await h.app.request('/api/v1/build/install-prereq', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool: 'git' }),
+  })
+  assert.equal(res.status, 202)
+  const disable = await h.app.request('/api/v1/engines/other', { method: 'DELETE' })
+  assert.equal(h.build.isActive(), true, 'the prerequisite check was still running')
+  assert.equal(disable.status, 200)
+  assert.deepEqual(h.removed, ['other'])
+  assert.equal(await settled, 'ok')
+})
+
+test('POST /build/cuda starts a run that leaves Disable open while it downloads', async (t) => {
+  const h = harness(null)
+  // The route and provisionCuda are Windows-only, so the request claims win32 (provisionCuda checks it before its
+  // first await). NVIDIA's manifest is never fetched: the fetch waits for the Cancel below, so nothing is downloaded.
+  t.mock.method(globalThis, 'fetch', ((_url: string | URL | Request, init?: RequestInit) =>
+    new Promise<Response>((_resolve, reject) => {
+      const signal = init!.signal!
+      if (signal.aborted) reject(signal.reason)
+      else signal.addEventListener('abort', () => reject(signal.reason))
+    })) as typeof fetch)
+  const platform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  let res: Response
+  try {
+    res = await h.app.request('/api/v1/build/cuda', { method: 'POST' })
+  } finally {
+    Object.defineProperty(process, 'platform', { value: platform })
+  }
+  assert.equal(res.status, 202)
+  const settled = new Promise<string>((resolve) => { h.build.onSettled = resolve })
+  const disable = await h.app.request('/api/v1/engines/other', { method: 'DELETE' })
+  assert.equal(h.build.isActive(), true, 'the CUDA download was still running')
+  assert.equal(disable.status, 200)
+  assert.deepEqual(h.removed, ['other'])
+  assert.equal((await h.app.request('/api/v1/build/cancel', { method: 'POST' })).status, 200)
+  assert.equal(await settled, 'cancelled')
 })
 
 // DELETE /api/v1/engines/build: the Engines screen's Delete on a Disabled source-built catalog card. That Delete used to

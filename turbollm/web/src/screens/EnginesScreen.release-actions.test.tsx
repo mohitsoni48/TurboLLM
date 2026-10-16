@@ -57,8 +57,8 @@ const DISABLED_SOURCE: CustomEngineSource = {
 
 const state: {
   engines: Engine[]; customDisabled: CustomEngineSource[]; catalog: CatalogEngine[]; fits: EngineFit[]
-  updates: Record<string, unknown>; provisioning: boolean
-} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {}, provisioning: false }
+  updates: Record<string, unknown>; provisioning: boolean; building: boolean
+} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {}, provisioning: false, building: false }
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
@@ -73,7 +73,11 @@ vi.mock('../lib/queries', async (importOriginal) => {
     }),
     useEngineUpdates: () => ({ data: { updates: state.updates, policies: {} } }),
     useSysInfo: () => ({ data: { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
-    useStatus: () => ({ data: state.provisioning ? { engine: { state: 'stopped' }, engineProvision: { active: true } } : undefined }),
+    useStatus: () => ({
+      data: state.provisioning ? { engine: { state: 'stopped' }, engineProvision: { active: true } }
+        : state.building ? { engine: { state: 'stopped' }, engineBuild: { active: true, phase: 'compiling', engine: 'ik_llama.cpp', log: [], error: null } }
+          : undefined,
+    }),
     useBuild: () => ({
       start: { mutate: vi.fn(), isPending: false }, cancel: { mutate: vi.fn() },
       cuda: { mutate: vi.fn() }, installPrereq: { mutate: vi.fn() }, refresh: vi.fn(),
@@ -168,6 +172,7 @@ beforeEach(() => {
   state.fits = [fitFor(PRISM_CATALOG)]
   state.updates = {}
   state.provisioning = false
+  state.building = false
 })
 
 describe('N-1: deleting a disabled release engine from its card', () => {
@@ -214,6 +219,21 @@ describe('N-1: deleting a disabled release engine from its card', () => {
     expect(toast.error).toHaveBeenCalledWith("Could not find Prism's files — refresh the page.")
     expect(screen.queryByRole('alertdialog')).toBeNull()
     expect(toast.error).not.toHaveBeenCalledWith(expect.stringContaining('Could not find the installed'))
+  })
+
+  it('keeps Delete open while a build from source runs, which the daemon lets it through, but not Enable', async () => {
+    // The Delete only forgets the source and removes the unclaimed install, neither refused during a build; the
+    // Enable re-registers it (POST /engines), which is.
+    showDisabledRelease()
+    state.building = true
+    renderScreen()
+    const menu = await openPrismMenu()
+    expect(within(menu).getByRole('menuitem', { name: 'Enable' })).toHaveAttribute('data-disabled')
+    const del = within(menu).getByRole('menuitem', { name: 'Delete' })
+    expect(del).not.toHaveAttribute('data-disabled')
+    await userEvent.click(del)
+    await confirmDelete()
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(DISABLED_SOURCE)}`, `discard:${PRISM_BIN}`]))
   })
 
   it('regression: Delete on an enabled release card still purges releaseEngineId', async () => {

@@ -97,6 +97,7 @@ import { BuildGuideDialog } from './engines/BuildGuideDialog'
 import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
 import { branchOptions } from '../lib/branch-options'
 import { branchLabel, defaultBuildName } from '../lib/engine-build-name'
+import { NOT_AN_ENGINE_BUILD, engineBuildRunning } from '../lib/engine-build-run'
 import { enableRequestFor } from '../lib/engine-enable-request'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
@@ -599,10 +600,6 @@ function EngineGalleryTab() {
 
 // ─── Zone 1 — hardware + running-engine selector ──────────────────────────────
 
-// engineBuild runs that built no engine: the CUDA Toolkit download and the build guide's
-// package-manager prereq installs (the daemon names those after the tool it installs).
-const NOT_AN_ENGINE_BUILD = new Set(['CUDA Toolkit', 'git', 'cmake', 'gcc', 'cuda'])
-
 function EngineHeaderBar({
   rec,
   list,
@@ -844,6 +841,7 @@ function EngineGallery({
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
   const releaseUpdate = useEngineUpdate()
+  const { data: status } = useStatus()
   const qc = useQueryClient()
   // A release update (card Update, or a dialog install that refreshed a registered engine) changes
   // the engine in place and settles long after its 202, so refetch when the provision run ends.
@@ -906,6 +904,11 @@ function EngineGallery({
     engineMut.purge.isPending ||
     engineMut.deleteBuild.isPending ||
     releaseUpdate.isPending
+  // A build from source: the daemon refuses an install, Enable, Disable or Delete meanwhile, so
+  // those are disabled. Not part of anyPending, which also closes the cards' menus: a build runs
+  // for many minutes, the daemon still takes a Rename, Re-probe or Auto-update meanwhile, and
+  // Rebuild is how a closed build guide is reopened onto the build's progress and Cancel.
+  const buildRunning = engineBuildRunning(status?.engineBuild)
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
   const installFor = (e: CatalogEngine) => {
@@ -1273,6 +1276,7 @@ function EngineGallery({
               catalog={catalogById.get(fit.engine.id)}
               isActive={activeCatalogId === fit.engine.id}
               anyPending={anyPending}
+              buildRunning={buildRunning}
               provisioning={provisioning}
               updateStatus={regId ? updates?.updates[regId] : undefined}
               policy={(regId ? updates?.policies[regId] : undefined) ?? 'notify'}
@@ -1307,6 +1311,7 @@ function EngineGallery({
               disabled={false}
               binPathExists
               anyPending={anyPending}
+              buildRunning={buildRunning}
               enabling={false}
               onUpdate={() => updateReleaseEngine(eng.id, eng.name)}
               onDisable={() => doDisableCustom(eng)}
@@ -1324,6 +1329,7 @@ function EngineGallery({
               disabled
               binPathExists={source.binPathExists}
               anyPending={anyPending}
+              buildRunning={buildRunning}
               enabling={enablingKey === customSourceKey(source)}
               onDisable={() => {}}
               onEnable={() => doEnableCustom(source)}
@@ -1388,6 +1394,7 @@ function EngineCard({
   catalog,
   isActive,
   anyPending,
+  buildRunning,
   provisioning,
   updateStatus,
   policy,
@@ -1404,6 +1411,8 @@ function EngineCard({
   catalog: CatalogEngine | undefined
   isActive: boolean
   anyPending: boolean
+  /** A build from source runs: install, Enable, Disable and Delete are refused meanwhile. */
+  buildRunning: boolean
   provisioning: boolean
   updateStatus: EngineUpdateStatus | undefined
   policy: UpdatePolicy
@@ -1672,9 +1681,9 @@ function EngineCard({
                     </DropdownMenuItem>
                   )}
                   {isEnabled ? (
-                    <DropdownMenuItem onSelect={() => onDisable(catalog)}>Disable</DropdownMenuItem>
+                    <DropdownMenuItem disabled={buildRunning} onSelect={() => onDisable(catalog)}>Disable</DropdownMenuItem>
                   ) : (
-                    <DropdownMenuItem onSelect={() => onEnable(catalog)}>Enable</DropdownMenuItem>
+                    <DropdownMenuItem disabled={buildRunning} onSelect={() => onEnable(catalog)}>Enable</DropdownMenuItem>
                   )}
                   {isEnabled && (
                     <>
@@ -1699,8 +1708,10 @@ function EngineCard({
                   <DropdownMenuSeparator />
                   {/* A Disabled engine has no registry entry to purge; only a source-built one or
                       a release install can be found again without re-installing it (see
-                      requestDelete). */}
-                  <DropdownMenuItem destructive disabled={isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled} onSelect={() => onDelete(catalog)}>
+                      requestDelete). A Disabled release install's Delete stays open during a
+                      build from source: it forgets the source and removes the unclaimed install
+                      (DELETE /engines/release/install), neither of which the daemon refuses then. */}
+                  <DropdownMenuItem destructive disabled={(buildRunning && !releaseDisabled) || (isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled)} onSelect={() => onDelete(catalog)}>
                     Delete
                   </DropdownMenuItem>
                   {isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled && (
@@ -1749,7 +1760,7 @@ function EngineCard({
           ) : (
             <Button
               size="sm"
-              disabled={anyPending || incompatible || !installFor(catalog)}
+              disabled={anyPending || buildRunning || incompatible || !installFor(catalog)}
               onClick={() => onInstall(catalog)}
               title={incompatible ? fit.incompatibleReason ?? 'Not supported on this hardware' : `Install ${e.name}`}
             >
@@ -1804,6 +1815,7 @@ function CustomEngineCard({
   disabled,
   binPathExists,
   anyPending,
+  buildRunning,
   enabling,
   onUpdate,
   onDisable,
@@ -1825,6 +1837,8 @@ function CustomEngineCard({
   disabled: boolean
   binPathExists: boolean
   anyPending: boolean
+  /** A build from source runs: Enable, Disable and Delete are refused meanwhile. */
+  buildRunning: boolean
   enabling: boolean
   /** Starts the release update; owned by the gallery so `anyPending` sees it. */
   onUpdate?: () => void
@@ -1919,12 +1933,12 @@ function CustomEngineCard({
         )}
         {disabled ? (
           binPathExists && (
-            <Button size="sm" disabled={anyPending || enabling} onClick={onEnable}>
+            <Button size="sm" disabled={anyPending || buildRunning || enabling} onClick={onEnable}>
               {enabling ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Enable
             </Button>
           )
         ) : (
-          <Button variant="outline" size="sm" disabled={anyPending} onClick={onDisable}>
+          <Button variant="outline" size="sm" disabled={anyPending || buildRunning} onClick={onDisable}>
             Disable
           </Button>
         )}
@@ -1963,7 +1977,9 @@ function CustomEngineCard({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Button variant="outline" size="sm" onClick={onDelete}>
+        {/* A registered engine's Delete is a purge, which the daemon refuses during engine work like
+            Disable; a remembered (Disabled) source's Remove only forgets it, which it does not. */}
+        <Button variant="outline" size="sm" disabled={!disabled && (anyPending || buildRunning)} onClick={onDelete}>
           {disabled ? 'Remove' : 'Delete'}
         </Button>
       </div>

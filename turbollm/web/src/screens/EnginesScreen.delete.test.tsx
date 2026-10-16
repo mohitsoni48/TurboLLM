@@ -6,6 +6,9 @@
 //    starts could not be deleted. Any other Disabled card says it must be enabled first instead.
 //  - The global "<x> built and added" toast after a prereq install from the build guide (cmake,
 //    git…), which streams through the same engineBuild channel but builds nothing.
+//  - The card actions while a build from source runs: the daemon refuses an Enable, Disable or Delete
+//    then, so they are disabled, but the menus (Rename, Auto-update) and Rebuild stay open; a CUDA
+//    Toolkit download or a prereq install leaves them all open.
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
@@ -13,10 +16,12 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
 import { ApiError } from '../lib/api'
-import type { CatalogEngine, EngineFit, EngineVariant } from '../lib/types'
+import type { BackendInfo, CatalogEngine, Engine, EngineFit, EngineVariant } from '../lib/types'
 
 const h = vi.hoisted(() => ({
   catalog: [] as unknown[],
+  backends: [] as unknown[],
+  engines: [] as unknown[],
   status: undefined as unknown,
   add: vi.fn(),
   purge: vi.fn(),
@@ -32,8 +37,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
     (h.catalog as CatalogEngine[]).map((engine): EngineFit => ({ engine, variants: [VARIANT], compatible: [VARIANT], recommended: false }))
   return {
     ...actual,
-    useEngines: () => ({ data: { engines: [], activeEngineId: '', customDisabled: [] }, isError: false, refetch: vi.fn() }),
-    useEngineBackends: () => ({ data: { backends: [] } }),
+    useEngines: () => ({ data: { engines: h.engines, activeEngineId: '', customDisabled: [] }, isError: false, refetch: vi.fn() }),
+    useEngineBackends: () => ({ data: { backends: h.backends, gpus: [] } }),
     useEngineCatalog: () => ({ data: { engines: h.catalog }, isLoading: false, refetch: vi.fn() }),
     useEngineRecommendation: () => ({
       data: { hardware: { platform: 'linux', arch: 'x64', gpuVendor: 'nvidia', hasGpu: true, vramMb: 16000 }, recommendation: { recommended: null, fits: fits() } },
@@ -91,6 +96,8 @@ const tree = () => (
 
 beforeEach(() => {
   h.catalog = []
+  h.backends = []
+  h.engines = []
   h.status = undefined
   h.add.mockReset()
   h.purge.mockReset()
@@ -161,4 +168,67 @@ describe('EnginesScreen — the build-settled toast', () => {
     view.rerender(tree())
     expect(h.toastSuccess).toHaveBeenCalledWith("ik_llama.cpp built and added — it's now your active engine.")
   })
+})
+
+describe('EnginesScreen — card actions while engine work runs', () => {
+  const LLAMA: CatalogEngine = {
+    id: 'llama.cpp', name: 'llama.cpp', kind: 'llama-server', description: '', provision: 'github-release',
+    homepage: 'https://github.com/ggml-org/llama.cpp', platforms: ['linux'], support: 'stable', installEndpoint: '',
+    supportedHere: true, installed: true, enabled: true,
+  }
+  const CUDA_BACKEND: BackendInfo = { id: 'cuda', label: 'CUDA', installed: true, enabled: true, recommended: true, active: false, engineId: 'be' }
+  // A registered engine no catalog card claims: its own card, with a visible Delete (a purge).
+  const FORK: Engine = {
+    id: 'fork', name: 'My fork', binPath: '/opt/fork/bin/llama-server', kind: 'llama-server', version: 'b1',
+    capabilities: { kvTypes: [], flags: [] }, sourceRepo: 'https://github.com/me/fork',
+  }
+  const running = (engine: string, phase: string) => ({
+    engine: { state: 'stopped' },
+    engineBuild: { active: true, phase, engine, log: [], error: null },
+  })
+  const off = (el: HTMLElement) => el.hasAttribute('data-disabled')
+  // For each card and the backend row: which of their actions are disabled (true) and which are open.
+  const actions = async () => {
+    const button = (name: string) => screen.getByRole('button', { name })
+    const fork = { disable: button('Disable').hasAttribute('disabled'), del: button('Delete').hasAttribute('disabled'),
+      rebuild: button('Rebuild').hasAttribute('disabled'), menu: button('More actions for My fork').hasAttribute('disabled') }
+    await userEvent.click(button('Actions for Prism (llama.cpp fork)'))
+    const prism = { enable: off(await screen.findByRole('menuitem', { name: 'Enable' })),
+      del: off(screen.getByRole('menuitem', { name: 'Delete' })), rebuild: off(screen.getByRole('menuitem', { name: /Rebuild/ })) }
+    await userEvent.keyboard('{Escape}')
+    await userEvent.click(screen.getByRole('button', { name: /Manage GPU builds/ }))
+    await userEvent.click(button('Actions for CUDA'))
+    const cuda = { disable: off(await screen.findByRole('menuitem', { name: 'Disable' })),
+      del: off(screen.getByRole('menuitem', { name: 'Delete' })),
+      policy: off(screen.getByRole('menuitem', { name: 'Auto' })) }
+    return { fork, prism, cuda }
+  }
+
+  it('disables Enable, Disable and Delete on the cards while a build from source runs, and keeps their menus open', async () => {
+    h.catalog = [PRISM_DISABLED, LLAMA]
+    h.backends = [CUDA_BACKEND]
+    h.engines = [FORK]
+    h.status = running('ik_llama.cpp', 'compiling')
+    render(tree())
+    expect(await actions()).toEqual({
+      fork: { disable: true, del: true, rebuild: false, menu: false },
+      prism: { enable: true, del: true, rebuild: false },
+      cuda: { disable: true, del: true, policy: false },
+    })
+  })
+
+  for (const engine of ['CUDA Toolkit', 'cmake']) {
+    it(`leaves them open during a ${engine} install, which the daemon lets them through`, async () => {
+      h.catalog = [PRISM_DISABLED, LLAMA]
+      h.backends = [CUDA_BACKEND]
+      h.engines = [FORK]
+      h.status = running(engine, 'provisioning')
+      render(tree())
+      expect(await actions()).toEqual({
+        fork: { disable: false, del: false, rebuild: false, menu: false },
+        prism: { enable: false, del: false, rebuild: false },
+        cuda: { disable: false, del: false, policy: false },
+      })
+    })
+  }
 })

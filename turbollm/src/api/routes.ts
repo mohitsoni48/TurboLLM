@@ -538,7 +538,7 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!def) return err(c, 400, 'invalid_config_value', 'Unknown backend for this platform.')
     // Never under an update or download (see DELETE /engines/:id): an update of this backend would register the build
     // it swaps in again right after the delete.
-    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     // Tag-agnostic: unregister + delete EVERY build of this backend (an update may have left
     // more than one tag-keyed dir / registry entry). Stop first if the active engine is one of them.
@@ -989,7 +989,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const toolchainDirs = d.store.snapshot().build.toolchainDirs
     const ac = new AbortController()
     buildAbort = ac
-    d.build.start(tool)
+    d.build.start(tool, { toolInstall: true })
     d.build.phase('provisioning')
     void (async () => {
       try {
@@ -1024,7 +1024,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const dataDir = d.store.dir()
     const ac = new AbortController()
     buildAbort = ac
-    d.build.start('CUDA Toolkit')
+    d.build.start('CUDA Toolkit', { toolInstall: true })
     d.build.phase('provisioning')
     void (async () => {
       try {
@@ -1317,7 +1317,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // Not while an update, download, upload or rebuild runs, like DELETE /engines/:id below (an Enable is the undo of
     // a Disable, refused then too). A Disabled source-built card's Delete no longer comes through here: it used to
     // re-register the engine (a probe) and then purge it, and DELETE /engines/build now removes the folder directly.
-    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Provenance comes from the marker this flow wrote on disk, never from the request body.
     const release = readReleaseMarker(sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines')))
     // A release install is identified by its marker, never by a source repo (ADR-088, ADR-388):
@@ -1525,7 +1525,7 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Deleting an engine build requires a valid API key from a non-host device.')
     // As DELETE /engines/:id: a rebuild or update may be writing into this very folder.
-    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const enginesRoot = join(d.store.dir(), 'engines')
     const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
     if (!dir || basename(dir).startsWith('.') || !existsSync(dir))
@@ -1734,7 +1734,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // under an update made its swap hit a missing folder and report "your existing build is unchanged" while leaving
     // an orphan folder; under a rebuild it deleted build/<slug> but not the parked previous build, which the failing
     // build then moved back; a removed engine was registered again when the update finished.
-    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const purge = c.req.query('purge') === '1'
     // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
     // added before customEngineSources tracking existed has no recorded identity, so a plain
@@ -3805,12 +3805,18 @@ function localCountFor(d: Deps, repo: string): number {
 /** A download (engine provision), a 1-click build, or a .zip upload writes under
  * `<dataDir>/engines` and ends by mutating the registry + flipping the active engine. They
  * must not run at once (ADR-100). Returns a user-facing message when either is in flight,
- * else null. */
-export function engineWorkBusy(d: Deps): string | null {
+ * else null.
+ *
+ * `engineChange`: for the routes that only add, disable or delete an engine (POST /engines, DELETE /engines/:id,
+ * /engines/backends/:id and /engines/build). A CUDA Toolkit download or a build guide prerequisite install does not
+ * count there: it writes into no engine folder and registers nothing, yet it refused every Enable, Disable, Add and
+ * Delete for as long as it ran, with "A build is in progress". A source build still counts, as it may be writing
+ * into the very folder being deleted. */
+export function engineWorkBusy(d: Deps, opts: { engineChange?: boolean } = {}): string | null {
   if (zipUploadInFlight) return 'An engine zip upload is in progress — wait for it to finish.'
   if (engineUpdateInFlight) return 'An engine update is in progress — wait for it to finish.'
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
-  if (d.build.isActive()) return 'A build is in progress — wait for it to finish.'
+  if (d.build.isActive() && (!opts.engineChange || d.build.isEngineBuildActive())) return 'A build is in progress — wait for it to finish.'
   return null
 }
 
