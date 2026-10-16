@@ -54,7 +54,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removeOwnPidfile, findRunningDaemon, stopDaemon, resolveDaemonPort, daemonReachHost } from './daemon-pid'
+import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -336,6 +336,23 @@ if (hasFlag('--stop')) {
 // errored, start a second scheduler and auto-load a second engine — and then, failing to bind,
 // exit. Refused only when a TurboLLM really answers on the pidfile's port (findRunningDaemon), so a
 // stale pidfile, a recycled PID or a self-restart handing over never blocks a start.
+//
+// The pidfile is written only once a daemon has bound, so two daemons started together both
+// found none here and both booted on one database. The data dir is therefore claimed first
+// (daemon.lock, claimDataDir): of two starts at once only one gets past this point. The claim is
+// released once this daemon's pidfile is written (the listen callback), and it is taken BEFORE
+// the pidfile is read, so a start that gets it after that release sees this daemon's pidfile.
+const claimHolder = claimDataDir(store.dir())
+if (claimHolder) {
+  console.error(
+    `TurboLLM is already starting for ${store.dir()}${claimHolder.pid ? ` (pid ${claimHolder.pid})` : ''}.\n` +
+      `Use that one once it is up, or start this one with its own --config.`,
+  )
+  process.exit(1)
+}
+// Also released on any exit that comes before the listen callback's release: a refused start
+// just below, a failed bind, a crash during boot. Owner-scoped: never another start's claim.
+process.on('exit', () => releaseDataDirClaim(store.dir()))
 const runningDaemon = await findRunningDaemon(store.dir())
 if (runningDaemon) {
   console.error(
@@ -1154,6 +1171,8 @@ function listen(attempt = 0): void {
     // daemon bound to one interface (--addr 192.168.1.5:…) never answers on 127.0.0.1, and the
     // one-daemon-per-data-dir guard above must probe where it really listens. Best-effort.
     try { writePidfile(store.dir(), process.pid, info.port, info.address) } catch { /* best-effort */ }
+    // The pidfile guards this data dir from here on: give up the start claim (see the guard).
+    releaseDataDirClaim(store.dir())
   })
   // The terminal WebSocket upgrade handler goes on EVERY listener instance: a bind retry, a
   // rebind and a revert each create a new server, and one without it hands the handshake to
@@ -1293,6 +1312,10 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   const finish = () => {
     if (finished) return
     finished = true
+    // Normally given up at the first bind, but a restart can come while the boot's listen
+    // callback still waits (the Tailscale reconcile) to write the pidfile: the replacement must
+    // not find this process's start claim.
+    releaseDataDirClaim(store.dir())
     if (plan.kind === 'self-respawn') {
       try {
         spawnReplacement()

@@ -1,11 +1,12 @@
 // Pidfile utilities for F-035: write/read/remove the daemon's PID file and
 // implement `turbollm --stop`. Isolated here so it can be unit-tested without
 // touching cli.ts (which is the entrypoint and spins up a full daemon).
-import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
+import { readFileSync, writeFileSync, unlinkSync, existsSync, openSync, writeSync, closeSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { execFileSync } from 'node:child_process'
 import http from 'node:http'
 import { isIP } from 'node:net'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from './util/process-start-time'
 
 export interface PidfileData {
   pid: number
@@ -103,6 +104,130 @@ export async function findRunningDaemon(
   const data = readPidfile(dir)
   if (!data || data.pid === selfPid || !hooks.processExists(data.pid)) return null
   return (await hooks.confirmTurbollm(data.port, data.host)) ? data : null
+}
+
+// ── Start claim (<dir>/daemon.lock) ───────────────────────────────────────────
+// The pidfile is written only once a daemon has bound, a second or more after its start guard
+// (engine/tunnel reaps, sql.js, the DB open and migrations, the schedulers). Two daemons started
+// together therefore both found no pidfile, both booted on one database (on a fresh data dir one
+// could crash in a migration the other was running) and both kept running on their own ports,
+// with only one of them in daemon.pid for --stop. So a start first claims the data dir: it
+// creates daemon.lock with O_EXCL ('wx'), which of two starts at once only one can do, and keeps
+// it until its pidfile is written; from then on the pidfile guards on its own (findRunningDaemon).
+
+/** How far a claim with no readable record (a start between the 'wx' create and its write, or
+ *  junk) is honoured: only while it is this fresh. */
+const CLAIM_UNWRITTEN_GRACE_MS = 5_000
+/** A claim whose holder's start time cannot be read (no `ps`, a process this user may not inspect)
+ *  is honoured only this long: longer than any boot to the bind, so a live start is never cut off,
+ *  and a claim left by a boot that was killed, with its pid since reused, still expires. */
+const CLAIM_UNVERIFIED_MAX_AGE_MS = 120_000
+
+export interface ClaimHooks {
+  /** Returns true when the process is still alive (EPERM counts as alive, as for --stop). */
+  processExists: (pid: number) => boolean
+  /** When `pid` started (epoch ms), or undefined when that cannot be read. */
+  startTime: (pid: number) => number | undefined
+  now: () => number
+}
+
+/** A claim's record: the claiming process and when it started (epoch ms), so a claim left by a
+ *  boot that was killed (SIGKILL, Ctrl+C before the signal handlers exist, power loss) is told
+ *  apart from a live one even after its pid has gone to another process. */
+export interface ClaimRecord {
+  pid: number
+  startedAt: number
+}
+
+const defaultClaimHooks: ClaimHooks = {
+  processExists: (pid) => defaultHooks.processExists(pid),
+  startTime: (pid) => processStartTimes([pid]).get(pid),
+  now: () => Date.now(),
+}
+
+function ownClaimRecord(): ClaimRecord {
+  return { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) }
+}
+
+/** The live start holding the claim at `path`, or null when it is stale or gone. */
+function liveClaimHolder(path: string, hooks: ClaimHooks, self: ClaimRecord): { pid: number | null } | null {
+  let rec: unknown
+  try {
+    rec = JSON.parse(readFileSync(path, 'utf8'))
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return null // released meanwhile
+    try {
+      return hooks.now() - statSync(path).mtimeMs < CLAIM_UNWRITTEN_GRACE_MS ? { pid: null } : null
+    } catch {
+      return null
+    }
+  }
+  const { pid, startedAt } = (rec ?? {}) as { pid?: unknown; startedAt?: unknown }
+  // Every writer records both, in one write: anything else is junk. A record with our own pid
+  // was left by an earlier process that had it (ours is not written yet).
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || typeof startedAt !== 'number') return null
+  if (pid === self.pid || !hooks.processExists(pid)) return null
+  const actual = hooks.startTime(pid)
+  if (actual !== undefined) return Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS ? { pid } : null
+  return hooks.now() - startedAt < CLAIM_UNVERIFIED_MAX_AGE_MS ? { pid } : null
+}
+
+/**
+ * Claim <dir> for this starting daemon (see the section comment). Returns the start that already
+ * holds the claim and so blocks this one (`pid` null when its record is not written yet), or null
+ * when this process may start: it now holds the claim, or the data dir cannot hold one (read-only,
+ * missing), in which case the pidfile guard alone applies, as before the claim existed.
+ *
+ * Call it BEFORE {@link findRunningDaemon}: the holder writes its pidfile before it releases the
+ * claim, so a start that gets the claim after that release always sees the holder's pidfile.
+ * A stale claim (holder dead, pid reused, junk) is removed and the claim retried once. Two starts
+ * that both find the same stale claim can both take it; that needs a boot killed inside its own
+ * claim window and then two starts at once.
+ */
+export function claimDataDir(
+  dir: string,
+  hooks: ClaimHooks = defaultClaimHooks,
+  self: ClaimRecord = ownClaimRecord(),
+): { pid: number | null } | null {
+  const path = join(dir, 'daemon.lock')
+  for (let attempt = 0; attempt < 2; attempt++) {
+    let fd: number
+    try {
+      fd = openSync(path, 'wx')
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') return null
+      const holder = liveClaimHolder(path, hooks, self)
+      if (holder || attempt === 1) return holder
+      try {
+        unlinkSync(path)
+      } catch (e2) {
+        if ((e2 as NodeJS.ErrnoException).code !== 'ENOENT') return null
+      }
+      continue
+    }
+    try {
+      writeSync(fd, JSON.stringify({ pid: self.pid, startedAt: self.startedAt } satisfies ClaimRecord))
+    } catch {
+      // Unwritten, the claim would block others for its grace period and never be released.
+      try { closeSync(fd) } catch { /* best-effort */ }
+      try { unlinkSync(path) } catch { /* best-effort */ }
+      return null
+    }
+    closeSync(fd)
+    return null
+  }
+  return null
+}
+
+/** Remove <dir>/daemon.lock when it is `pid`'s own claim (once its pidfile is written, or on its
+ *  way out) — never another start's. Best-effort — never throws. */
+export function releaseDataDirClaim(dir: string, pid: number = process.pid): void {
+  const path = join(dir, 'daemon.lock')
+  try {
+    if ((JSON.parse(readFileSync(path, 'utf8')) as { pid?: unknown } | null)?.pid === pid) unlinkSync(path)
+  } catch {
+    /* absent, unreadable or already gone */
+  }
 }
 
 // Injection hook types so unit tests can replace the real OS calls.

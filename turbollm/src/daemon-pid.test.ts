@@ -2,9 +2,10 @@
 // All OS interactions are injected via hooks so no real processes are touched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import http from 'node:http'
+import { spawn } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
 import {
   writePidfile,
@@ -12,9 +13,13 @@ import {
   removePidfile,
   removeOwnPidfile,
   findRunningDaemon,
+  claimDataDir,
+  releaseDataDirClaim,
   daemonReachHost,
   resolveDaemonPort,
   stopDaemon,
+  type ClaimHooks,
+  type ClaimRecord,
   type StopHooks,
 } from './daemon-pid.js'
 import { tmpDir } from './test-support/tmp'
@@ -368,4 +373,126 @@ test('daemonReachHost: the bound address, loopback for a wildcard or unrecorded 
   assert.equal(daemonReachHost('127.0.0.1'), '127.0.0.1')
   assert.equal(daemonReachHost('192.168.1.5'), '192.168.1.5')
   assert.equal(daemonReachHost('::1'), '[::1]')
+})
+
+// ── Start claim (daemon.lock): two daemons started at once ────────────────────
+
+/** ClaimHooks over a fake process table: pid → its start time (epoch ms). */
+function claimHooks(procs: Map<number, number>, now = 1_000_000): ClaimHooks {
+  return {
+    processExists: (pid) => procs.has(pid),
+    startTime: (pid) => procs.get(pid),
+    now: () => now,
+  }
+}
+
+// The pidfile is written only once a daemon has bound, a second or more after its guard, so two
+// daemons started together both found no pidfile and both booted on one data dir (a fresh one
+// could crash in a concurrent migration; otherwise both kept running and --stop saw only one).
+// The guard as cli.ts runs it: claimDataDir, then findRunningDaemon.
+test('two daemons starting at once on one data dir: only one gets past the start guard', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    const a: ClaimRecord = { pid: 42, startedAt: 999_000 }
+    const b: ClaimRecord = { pid: 43, startedAt: 999_500 }
+    const procs = new Map([[a.pid, a.startedAt], [b.pid, b.startedAt]])
+    const hooks = claimHooks(procs)
+    const guard = async (self: ClaimRecord): Promise<string> => {
+      const holder = claimDataDir(dir, hooks, self)
+      if (holder) return `starting:${holder.pid}`
+      return (await findRunningDaemon(dir, makeHooks(true), self.pid)) ? 'running' : 'start'
+    }
+    // Both booting before either has bound: no pidfile yet.
+    assert.deepEqual(await Promise.all([guard(a), guard(b)]), ['start', 'starting:42'])
+
+    // A binds, writes its pidfile, then gives up the claim: B is now refused by the pidfile.
+    writePidfile(dir, a.pid, 6996)
+    releaseDataDirClaim(dir, b.pid) // not B's claim: kept
+    assert.ok(existsSync(join(dir, 'daemon.lock')), "another start's claim is never released")
+    releaseDataDirClaim(dir, a.pid)
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false)
+    assert.equal(await guard(b), 'running')
+    releaseDataDirClaim(dir, b.pid) // B's exit gives up the claim it took for that check
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false)
+  } finally {
+    cleanup()
+  }
+})
+
+test('a stale start claim is reclaimed; a live one, or one still being written, is not', () => {
+  const { dir, cleanup } = makeTmpDir()
+  const lock = join(dir, 'daemon.lock')
+  const self: ClaimRecord = { pid: 50, startedAt: 999_900 }
+  const claim = (procs: Map<number, number>, opts: { now?: number; unverifiable?: boolean } = {}) => {
+    const hooks = claimHooks(procs, opts.now)
+    if (opts.unverifiable) hooks.startTime = () => undefined
+    return claimDataDir(dir, hooks, self)
+  }
+  const owner = (): number => (JSON.parse(readFileSync(lock, 'utf8')) as { pid: number }).pid
+  try {
+    const left = (rec: unknown) => writeFileSync(lock, typeof rec === 'string' ? rec : JSON.stringify(rec))
+
+    left({ pid: 42, startedAt: 990_000 })
+    assert.deepEqual(claim(new Map([[42, 990_000]])), { pid: 42 }, 'live holder')
+    assert.deepEqual(claim(new Map([[42, 992_000]])), { pid: 42 }, 'start time within the ps tolerance')
+    assert.deepEqual(claim(new Map([[42, 990_000]]), { now: 990_000 + 600_000 }), { pid: 42 }, 'a verified holder never expires')
+
+    assert.equal(claim(new Map()), null, 'holder dead (a boot killed before its handlers existed)')
+    assert.equal(owner(), 50, 'reclaimed: the claim is now ours')
+
+    left({ pid: 42, startedAt: 990_000 })
+    assert.equal(claim(new Map([[42, 500_000]])), null, 'pid reused by a process that started at another time')
+    assert.equal(owner(), 50)
+
+    // Start time unreadable (no ps, a process this user may not inspect): honoured while young.
+    left({ pid: 42, startedAt: 990_000 })
+    assert.deepEqual(claim(new Map([[42, 0]]), { unverifiable: true }), { pid: 42 })
+    assert.equal(claim(new Map([[42, 0]]), { now: 990_000 + 121_000, unverifiable: true }), null)
+    assert.equal(owner(), 50)
+
+    left({ pid: 50, startedAt: 1 })
+    assert.equal(claim(new Map([[50, 999_900]])), null, 'a record with our own pid is an earlier process\'s')
+    assert.equal(owner(), 50)
+
+    // Empty: a start between its 'wx' create and its write. Honoured only while fresh.
+    left('')
+    assert.deepEqual(claimDataDir(dir, claimHooks(new Map(), Date.now()), self), { pid: null })
+    utimesSync(lock, new Date(Date.now() - 60_000), new Date(Date.now() - 60_000))
+    assert.equal(claimDataDir(dir, claimHooks(new Map(), Date.now()), self), null)
+    assert.equal(owner(), 50)
+
+    left({ pid: -1, startedAt: 990_000 })
+    assert.equal(claim(new Map([[-1, 990_000]])), null, 'junk record')
+    assert.equal(owner(), 50)
+  } finally {
+    cleanup()
+  }
+})
+
+// Real processes and the default hooks (signal-0 probe, ps / PowerShell start time).
+test('a live process holding the start claim blocks a start until it exits', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })
+  const spawnedAt = Date.now()
+  try {
+    const pid = holder.pid as number
+    writeFileSync(join(dir, 'daemon.lock'), JSON.stringify({ pid, startedAt: spawnedAt }))
+    assert.deepEqual(claimDataDir(dir), { pid })
+    // The same pid recorded with another start time: a pid reused since the claim was left.
+    writeFileSync(join(dir, 'daemon.lock'), JSON.stringify({ pid, startedAt: spawnedAt - 3_600_000 }))
+    assert.equal(claimDataDir(dir), null)
+    releaseDataDirClaim(dir)
+
+    writeFileSync(join(dir, 'daemon.lock'), JSON.stringify({ pid, startedAt: spawnedAt }))
+    const exited = new Promise<void>((resolve) => holder.once('exit', () => resolve()))
+    holder.kill('SIGKILL')
+    await exited
+    assert.equal(claimDataDir(dir), null, 'holder gone: stale')
+    assert.equal((JSON.parse(readFileSync(join(dir, 'daemon.lock'), 'utf8')) as { pid: number }).pid, process.pid)
+    releaseDataDirClaim(dir)
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false)
+  } finally {
+    holder.kill('SIGKILL')
+    cleanup()
+  }
 })
