@@ -176,9 +176,9 @@ test('POST /backends/:id/enable on a build that no longer runs is a 400 with the
   assert.ok(existsSync(dirname(h.newBin)))
 })
 
-// The same rule on the single-binary cards (TurboQuant, KoboldCpp, llamafile share it): Update leaves the active engine
-// as it was, and only an engine that was active is active afterwards. An install still activates. llamafile is the one
-// exercised here: no probe, and its download is a single stubbed file.
+// The same rule on the llamafile card: Update leaves the active engine as it was, and only an engine that was active is
+// active afterwards. An install still activates. Each install route has its own copy of the rule, so this covers
+// llamafile only; routes.update-activation.test.ts covers TurboQuant, KoboldCpp, vLLM, SGLang and the MLX family.
 function llamafileHarness(t: { after: (fn: () => void) => void }) {
   const store = ConfigStore.load(join(tmpDir('tllm-llamafile-update-'), 'config.json'))
   const registry = new Registry(store)
