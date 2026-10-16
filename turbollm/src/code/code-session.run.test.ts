@@ -4,10 +4,13 @@
 // handling across pi's run lifecycle, plan mode's real toolset, and what history the model gets.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { join } from 'node:path'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { runCodeSession, type CodeSseSink } from './code-session'
+import { resolveToolApproval } from '../tools/approval-gate'
 import type { CodeMode } from './persona'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
@@ -81,7 +84,7 @@ function harness(base: string, mode: CodeMode, extraDeps: Record<string, unknown
     const a = store.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
     return runCodeSession({ d, convId: conv.id, sessionId: run.id, repoRoot, mode, thinkingBudget: -1, reasoningEffort: undefined, task, excludeFromHistory: [u.id, a.id], signal, sink })
   }
-  return { store, convId: conv.id, frames, turn }
+  return { store, convId: conv.id, repoRoot, frames, turn }
 }
 
 const toolNames = (b: Body) => (b.tools ?? []).map((t) => t.function.name)
@@ -201,4 +204,57 @@ test('the skill sub-agent\'s tool frames are tagged `subagent`; the parent\'s ow
     assert.ok(calls.some((f) => f.data.name === 'read'), 'the skill made its call')
     for (const f of calls) assert.equal(f.data.subagent === true, f.data.name === 'read', `${f.data.name} ${f.data.status}`)
   } finally { await engine.close() }
+})
+
+// ── ask mode: write containment is checked again once the approval wait ends ──────────────────
+
+/** Runs an ask-mode turn whose engine script makes a `write` to sub/a.txt (inside the repo when it
+ *  is asked for), and while that call awaits approval replaces the folder `sub` with a link to a
+ *  folder outside the repo, then approves. Returns whether the write landed outside, and the
+ *  call's final frame. */
+async function approveAfterSwap(script: (write: Reply) => Reply[]) {
+  const write = toolCall('write', { path: 'sub/a.txt', content: 'approved write\n' })
+  const engine = await stubEngine(script(write))
+  try {
+    const h = harness(engine.base, 'ask')
+    const outside = tmpDir('tllm-code-run-outside-')
+    mkdirSync(join(h.repoRoot, 'sub'))
+    const settled = h.turn('write it', new AbortController().signal)
+    const awaiting = async () => {
+      for (;;) {
+        const f = h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval')
+        if (f) return f
+        await new Promise((r) => setTimeout(r, 10))
+      }
+    }
+    const f = await within(awaiting(), 10_000)
+    if (f === 'timeout') assert.fail('the write is awaiting approval')
+    rmSync(join(h.repoRoot, 'sub'), { recursive: true })
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(outside, join(h.repoRoot, 'sub'), 'junction')
+    assert.ok(resolveToolApproval(`${h.convId}:${String(f.data.id)}`, 'allow'))
+    assert.notEqual(await within(settled, 10_000), 'timeout', 'the turn settled')
+    const last = h.frames.filter((x) => x.event === 'tool_call' && x.data.name === 'write').at(-1)
+    return { landedOutside: existsSync(join(outside, 'a.txt')), last }
+  } finally { await engine.close() }
+}
+
+test('ask mode: an approved write is refused when its folder became a link out of the repo during the wait', { timeout: 30_000 }, async () => {
+  const { landedOutside, last } = await approveAfterSwap((write) => [write, text('done')])
+  assert.equal(landedOutside, false, 'nothing written outside the repo')
+  assert.equal(last?.data.status, 'error')
+  assert.match(String(last?.data.result), /outside the allowed repo root/)
+})
+
+test('ask mode: the same re-check holds for a skill\'s write and for a delegate_task sub-agent\'s', { timeout: 30_000 }, async () => {
+  const skill = await approveAfterSwap((write) => [
+    toolCall('invoke_skill', { skillId: 'filesystem', task: 'write it' }), write, text('skill done'), text('all done'),
+  ])
+  assert.equal(skill.landedOutside, false, 'skill: nothing written outside the repo')
+  assert.match(String(skill.last?.data.result), /outside the allowed repo root/)
+  const delegated = await approveAfterSwap((write) => [
+    toolCall('delegate_task', { task: 'Write the text "approved write" to sub/a.txt in this repository.' }), write, text('sub-agent done'), text('all done'),
+  ])
+  assert.equal(delegated.landedOutside, false, 'delegate_task: nothing written outside the repo')
+  assert.match(String(delegated.last?.data.result), /outside the allowed repo root/)
 })

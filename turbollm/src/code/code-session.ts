@@ -906,6 +906,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
             await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
+          // Containment again after the wait, as in the outer session's hook (see there).
+          if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+            const reason = 'path is outside the allowed repo root'
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
         }
         return
       })
@@ -1090,6 +1096,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal)
           if (decision === 'deny') {
             const reason = 'denied by user'
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+          // Containment again after the wait, as in the outer session's hook (see there).
+          if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+            const reason = 'path is outside the allowed repo root'
             await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
@@ -1417,6 +1429,15 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
         if (decision === 'deny') {
           const reason = 'denied by user'
+          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+          return { block: true, reason }
+        }
+        // Containment (step 1) again, now that the user has answered. It ran before the wait, which
+        // can last minutes: a folder on the path replaced meanwhile by a link to somewhere outside
+        // the repo (by a bash the user approved, or any other local writer) would otherwise take the
+        // approved edit/write out of it.
+        if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+          const reason = 'path is outside the allowed repo root'
           await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
           return { block: true, reason }
         }
