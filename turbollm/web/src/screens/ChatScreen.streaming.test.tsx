@@ -25,13 +25,14 @@ beforeEach(() => {
   sendCalls.length = 0
   continueCalls.length = 0
   convs.clear()
+  engineState = 'running'
 })
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
   return {
     ...actual,
-    useStatus: () => ({ data: { engine: { state: 'running' }, model: { key: 'm1', name: 'M1', ctx: 8192 } } }),
+    useStatus: () => ({ data: { engine: { state: engineState }, model: { key: 'm1', name: 'M1', ctx: 8192 } } }),
     useModels: () => ({ data: { models: [{ key: 'm1', name: 'M1', compatibleWithActiveEngine: true }] } }),
     useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false }, eject: { mutate: vi.fn(), isPending: false } }),
     useModelDetail: () => ({ data: undefined }),
@@ -43,6 +44,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
   }
 })
 
+/** 'stopped' = no model ready to answer. */
+let engineState = 'running'
 const stopSpy = vi.fn((_id: string) => Promise.resolve())
 const regenerateSpy = vi.fn((_id: string) => Promise.resolve())
 const editMsgMutate = vi.fn()
@@ -348,7 +351,7 @@ describe('ChatScreen — editing a message', () => {
   it('a Save & Resend refused as stale (409) refetches, shows why and keeps the typed text in the composer', async () => {
     const stale = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
     showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
-    editMsgMutate.mockImplementation((_v: unknown, opts: { onError: (e: unknown) => void }) => opts.onError(new ApiError('stale_message', stale, 409)))
+    nextGen = async function* () { throw new ApiError('stale_message', stale, 409) }
     const toastError = vi.spyOn(toast, 'error')
     try {
       const view = await renderScreen('/chat/c1')
@@ -356,12 +359,13 @@ describe('ChatScreen — editing a message', () => {
       await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
       fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language, carefully' } })
       await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
-      expect(toastError).toHaveBeenCalledWith(stale)
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(stale))
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ['conversation', 'c1'] })
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ['message-variants'] })
       await waitFor(async () => expect(await composer()).toHaveValue('Recommend a typed language, carefully'))
       expect(await composer()).not.toBeDisabled()
-      expect(continueCalls).toHaveLength(0)
+      expect(continueCalls).toHaveLength(1)
+      expect(editMsgMutate).not.toHaveBeenCalled()
     } finally {
       toastError.mockRestore()
     }
@@ -370,26 +374,98 @@ describe('ChatScreen — editing a message', () => {
   // The edit closed before the request, so any refusal but stale_message lost the typed text:
   // reopening the edit starts again from the message.
   it('a Save & Resend refused for another reason (409 generation_in_flight) keeps the edit open with the typed text and says why', async () => {
-    const busy = 'Stop generation first.'
+    const busy = 'A generation is already running for this conversation.'
     showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
-    editMsgMutate.mockImplementation((_v: unknown, opts: { onError: (e: unknown) => void }) => opts.onError(new ApiError('generation_in_flight', busy, 409)))
+    nextGen = async function* () { throw new ApiError('generation_in_flight', busy, 409) }
     const toastError = vi.spyOn(toast, 'error')
     try {
       await renderScreen('/chat/c1')
       await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
       fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language, carefully' } })
       await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
-      expect(toastError).toHaveBeenCalledWith(busy)
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(busy))
       expect(screen.getByDisplayValue('Recommend a typed language, carefully')).toBeInTheDocument()
-      expect(continueCalls).toHaveLength(0)
+      expect(await composer()).toHaveValue('')
 
       // Saved again once the daemon takes it, the edit closes and the question is answered.
-      editMsgMutate.mockImplementation((_v: unknown, opts: { onSuccess: () => void }) => opts.onSuccess())
       nextGen = quickStream()
       await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
-      expect(editMsgMutate).toHaveBeenLastCalledWith({ convId: 'c1', msgId: 'u1', content: 'Recommend a typed language, carefully' }, expect.anything())
-      expect(screen.queryByText('Save & Resend')).toBeNull()
-      await waitFor(() => expect(continueCalls).toHaveLength(1))
+      await waitFor(() => expect(continueCalls).toHaveLength(2))
+      expect(continueCalls[1][6]).toEqual({ messageId: 'u1', content: 'Recommend a typed language, carefully' })
+      await waitFor(() => expect(screen.queryByText('Save & Resend')).toBeNull())
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  it('a reply edit the daemon refuses keeps the edit open with the typed text and says why', async () => {
+    const busy = 'Stop generation first.'
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    editMsgMutate.mockImplementation((_v: unknown, opts: { onError: (e: unknown) => void }) => opts.onError(new ApiError('generation_in_flight', busy, 409)))
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      await act(async () => { fireEvent.click((await screen.findAllByTitle('Edit'))[1]) })
+      fireEvent.change(screen.getByDisplayValue('Use Python'), { target: { value: 'Use Python 3.13' } })
+      await act(async () => { fireEvent.click(screen.getByText('Save')) })
+      expect(editMsgMutate).toHaveBeenCalledWith({ convId: 'c1', msgId: 'a1', content: 'Use Python 3.13' }, expect.anything())
+      expect(toastError).toHaveBeenCalledWith(busy)
+      expect(screen.getByDisplayValue('Use Python 3.13')).toBeInTheDocument()
+      expect(continueCalls).toHaveLength(0)
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  // Save & Resend was a PUT and then /continue: with no model ready the /continue was skipped, and
+  // a refused one (a Turbo Link machine asleep) left the new question unanswered — the next send
+  // then went out as user, user.
+  it('Save & Resend is one /continue that names the question and its new text, with no PUT', async () => {
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    nextGen = quickStream()
+    await renderScreen('/chat/c1')
+    await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
+    fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language' } })
+    await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+    await waitFor(() => expect(continueCalls).toHaveLength(1))
+    expect(continueCalls[0][0]).toBe('c1')
+    expect(continueCalls[0][5]).toBeUndefined()
+    expect(continueCalls[0][6]).toEqual({ messageId: 'u1', content: 'Recommend a typed language' })
+    expect(editMsgMutate).not.toHaveBeenCalled()
+    await waitFor(() => expect(screen.queryByText('Save & Resend')).toBeNull())
+  })
+
+  it('a Save & Resend the daemon refuses (503) keeps the edit open with the typed text', async () => {
+    const offline = "'rig' is not connected (unreachable)."
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    nextGen = async function* () { throw new ApiError('remote_unavailable', offline, 503) }
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
+      fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language' } })
+      await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(offline))
+      expect(screen.getByDisplayValue('Recommend a typed language')).toBeInTheDocument()
+      expect(editMsgMutate).not.toHaveBeenCalled()
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  it('a Save & Resend with no model loaded sends nothing, says so, and keeps the edit open', async () => {
+    engineState = 'stopped'
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      fireEvent.click(screen.getAllByTitle('Edit')[0])
+      fireEvent.change(await screen.findByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language' } })
+      await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+      expect(toastError).toHaveBeenCalledWith('Load a model first.')
+      expect(screen.getByDisplayValue('Recommend a typed language')).toBeInTheDocument()
+      expect(editMsgMutate).not.toHaveBeenCalled()
+      expect(continueCalls).toHaveLength(0)
     } finally {
       toastError.mockRestore()
     }

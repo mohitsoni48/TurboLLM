@@ -722,6 +722,48 @@ test('Save & Resend with unchanged text branches like any edit: one reply per tu
   }
 })
 
+// Save & Resend was a PUT (the new question version, the old tail frozen) and then /continue. A
+// /continue the client skipped (no model ready) or the daemon refused left the branch ending on
+// the new question, unanswered, and the next send went out as user, user.
+test('Save & Resend as one /continue { edit }: a refused turn changes nothing, an accepted one branches and answers', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'a1 to the edit', 'a2']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => `${m.role}:${m.content}`)
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+    const q1 = h.store.getMessages(conv.id)[0].id
+
+    const manager = h.d.manager as unknown as { status: () => unknown }
+    const running = manager.status
+    manager.status = () => ({ state: 'stopped', model: null }) // no model loaded
+    const refused = await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited' } }))
+    assert.equal(refused.status, 409)
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1'])
+    assert.equal(h.store.getMessage(q1)!.variantGroup, null, 'no new version of the question')
+
+    manager.status = running
+    await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited' } }))).text()
+    assert.deepEqual(active(), ['user:q1 edited', 'assistant:a1 to the edit'])
+    assert.deepEqual(engine.bodies[1].messages, [{ role: 'user', content: 'q1 edited' }])
+    await (await h.app.request(`${base}/messages`, json({ content: 'q2' }))).text()
+    assert.deepEqual(engine.bodies[2].messages.map((m) => m.role), ['user', 'assistant', 'user'])
+
+    // The first version keeps its reply, and a stale tab's edit of it is refused.
+    const stale = await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 from a stale tab' } }))
+    assert.equal(stale.status, 409)
+    assert.equal(((await stale.json()) as { error: { code: string } }).error.code, 'stale_message')
+    assert.equal((await h.app.request(`${base}/messages/${q1}/activate`, { method: 'POST' })).status, 200)
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1'])
+    assert.equal(engine.bodies.length, 3)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()

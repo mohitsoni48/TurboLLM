@@ -721,12 +721,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // different conversation while this generation keeps running in the background.
   // Resolves to whether the turn STARTED (a `meta` frame arrived): the daemon sends meta only
   // after it has stored the user message, so `false` means the message exists nowhere.
-  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>): Promise<boolean> => {
+  // `on.start` runs when the turn starts; `on.refused` when it fails before it started, with the
+  // error (not for an abort).
+  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>, on?: { start?: () => void; refused?: (e: unknown) => void }): Promise<boolean> => {
     let started = false
     try {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
           started = true
+          on?.start?.()
           deltaTimestamps.current[convId] = []
           setLiveByConv((prev) => ({
             ...prev,
@@ -793,6 +796,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
+        if (!started) on?.refused?.(e)
       }
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } finally {
@@ -953,41 +957,52 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     if (!activeId || mut.editMsg.isPending) return
     // GitHub #52: editing the model's own reply just fixes its text in place — no reason
     // to trigger ANOTHER reply after it. Only a user-message edit resends (branching the
-    // downstream history, per ADR — see chat-routes.ts's PUT /messages/:msgId).
+    // downstream history, per ADR — see chat-routes.ts's /continue { edit }).
     const isUserMessage = messages.find((m) => m.id === msgId)?.role === 'user'
     // The edit stays open, typed text and all, until the daemon has taken it. Closed before the
     // request, any refusal but stale_message (a 409 generation_in_flight — the pencil on a
     // question stays clickable while a reply streams — a network error, a 500) lost the text:
     // reopening the edit starts again from the message.
     const closeEdit = () => setEditingId((cur) => (cur === msgId ? null : cur))
+    if (isUserMessage) { void resendEdit(activeId, msgId, content, closeEdit); return }
     mut.editMsg.mutate({ convId: activeId, msgId, content }, {
-      onSuccess: () => {
-        closeEdit()
-        userScrolledUp.current = false
-        if (isUserMessage && ready) {
-          const ac = new AbortController()
-          abortRefs.current[activeId] = ac
-          void streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
-        }
-      },
-      onError: (e) => {
-        if (!(e instanceof ApiError && e.code === 'stale_message')) {
-          toast.error(e instanceof ApiError ? e.message : 'Could not edit message.')
-          return
-        }
-        // A question this view still showed after it left the branch (switched in another tab
-        // or device): catch the view up now rather than on the next poll, and keep the typed
-        // text. Its bubble is gone after the refetch, so it goes to the composer (this chat's
-        // only, and after anything typed there meanwhile, never over it).
-        closeEdit()
-        void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
-        void qc.invalidateQueries({ queryKey: ['message-variants'] })
-        toast.error(e.message)
-        if (activeIdRef.current !== activeId) return
-        setInput((cur) => (cur.trim() ? `${cur}\n\n${content}` : content))
-        setTimeout(autoResize, 0)
-      },
+      onSuccess: closeEdit,
+      onError: (e) => { toast.error(e instanceof ApiError ? e.message : 'Could not edit message.') },
     })
+  }
+
+  // Save & Resend: one /continue { edit }, so the daemon gives the question its new version only
+  // once the turn can run. A PUT and then /continue left the branch ending on the new question,
+  // unanswered, whenever that /continue was skipped (no model ready) or refused (a Turbo Link
+  // machine asleep, the model gone): the next send went out as user, user, which
+  // alternating-role templates reject on every later turn of that branch.
+  const resendEdit = async (convId: string, msgId: string, content: string, closeEdit: () => void) => {
+    // Refused here, the edit stays open with the typed text. A turn already running or starting
+    // from this view (a second click) owns its live state and Stop, which another stream would
+    // take over.
+    if (live) { toast.error('Stop generation first.'); return }
+    if (abortRefs.current[convId]) return
+    if (!ready) { toast.error('Load a model first.'); return }
+    const ac = new AbortController()
+    abortRefs.current[convId] = ac
+    userScrolledUp.current = false
+    let refusal: unknown
+    const started = await streamFrom(
+      convId,
+      continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }),
+      { start: closeEdit, refused: (e) => { refusal = e } },
+    )
+    // The question's version switcher gained an entry (or, on a stale refusal, changed elsewhere).
+    void qc.invalidateQueries({ queryKey: ['message-variants'] })
+    if (started || !(refusal instanceof ApiError && refusal.code === 'stale_message')) return
+    // A question this view still showed after it left the branch (switched in another tab or
+    // device): streamFrom has shown why and refetched the chat. Its bubble is gone after the
+    // refetch, so the typed text goes to the composer (this chat's only, and after anything
+    // typed there meanwhile, never over it).
+    closeEdit()
+    if (activeIdRef.current !== convId) return
+    setInput((cur) => (cur.trim() ? `${cur}\n\n${content}` : content))
+    setTimeout(autoResize, 0)
   }
 
   const handleRegenerate = async (replyId: string) => {

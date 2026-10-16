@@ -11,7 +11,7 @@ import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent } from './chat-compaction.js'
 
-import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
+import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
@@ -95,6 +95,18 @@ function releasingInflight<T>(convId: string, ac: AbortController, cb: (stream: 
 type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
+
+const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
+
+/** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
+ *  not deleted, and `content` becomes the question's newest version, with the same images and
+ *  documents. Shared by PUT /messages/:msgId and /continue { edit }. */
+function branchEditedQuestion(db: ConversationStore, convId: string, msg: Message, content: string): void {
+  db.freezeTail(convId, msg.seq, msg.id)
+  db.deactivateMessage(msg.id)
+  const variantGroup = db.getMessage(msg.id)!.variantGroup!
+  db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+}
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
@@ -381,7 +393,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
     // `messageId` (with `regenerate`): the reply the client shows last, the one it means to replace.
-    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean; messageId?: string }>(c)
+    // `edit` (Save & Resend, what the web UI sends): the question to give a new version and answer.
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean; messageId?: string; edit?: { messageId?: string; content?: string } }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -392,6 +405,25 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const upstream = resolved.upstream
 
     if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
+
+    // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
+    // turn, as Regenerate sets its reply aside below. Sent first as its own request (PUT), a
+    // /continue the client then skipped (no model ready) or the daemon refused (a Turbo Link
+    // machine asleep, the model gone) left the branch ending on the new question, unanswered: the
+    // next send went out as user, user, which alternating-role templates reject on every later
+    // turn of that branch.
+    if (b.edit) {
+      if (b.regenerate) return err(c, 400, 'invalid_input', 'edit and regenerate cannot be combined.')
+      const content = typeof b.edit.content === 'string' ? b.edit.content.trim() : ''
+      if (!content) return err(c, 400, 'invalid_input', 'content required.')
+      const msg = typeof b.edit.messageId === 'string' ? db.getMessage(b.edit.messageId) : null
+      if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
+      if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Only a question can be edited and resent.')
+      // As in PUT: only a question on the shown branch.
+      if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+      branchEditedQuestion(db, convId, msg, content)
+      conv.messages = db.getMessages(convId)
+    }
 
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
@@ -507,11 +539,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Only a question on the shown branch: one a stale tab or another device still shows after
     // it was switched away would freeze THIS branch's newer version and its reply under it, and
     // switching back would then show two replies in a row.
-    if (!msg.isActive) return err(c, 409, 'stale_message', 'This message is no longer on the shown branch: the chat changed in another tab or device.')
-    db.freezeTail(convId, msg.seq, msg.id)
-    db.deactivateMessage(msg.id)
-    const variantGroup = db.getMessage(msg.id)!.variantGroup!
-    db.addMessage(convId, 'user', trimmed, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+    // The web UI's Save & Resend goes through /continue { edit } instead, which branches only once
+    // the turn can run; a client that follows this PUT with /continue can still be left with the
+    // new question unanswered when that /continue is refused.
+    if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+    branchEditedQuestion(db, convId, msg, trimmed)
     return c.json({ messages: db.getMessages(convId) })
   })
 
@@ -600,7 +632,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
     // A group with no active member is not on the shown branch (a stale tab or another device
     // still shows it): activating one would splice it, and its frozen tail, into this branch.
-    if (!currentActive) return err(c, 409, 'stale_message', 'This message is no longer on the shown branch: the chat changed in another tab or device.')
+    if (!currentActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
     db.freezeTail(convId, currentActive.seq, currentActive.id)
     db.restoreTail(msgId)
     const ok = db.setActiveVariant(msg.variantGroup, msgId)

@@ -192,11 +192,16 @@ export async function* continueConversation(
    *  answers 409 stale_message when that reply is no longer the last one (the chat changed in
    *  another tab or device), rather than replacing a reply this view never showed. */
   regenerateId?: string,
+  /** Save & Resend: give this question a new version (its later turns kept on the old one) and
+   *  answer it, in this one request, so the daemon branches only once the turn can run. A
+   *  refused turn changes nothing; a question no longer on the shown branch is 409
+   *  stale_message. */
+  edit?: { messageId: string; content: string },
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined, regenerate: regenerateId ? true : undefined, messageId: regenerateId || undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined, regenerate: regenerateId ? true : undefined, messageId: regenerateId || undefined, edit }),
     signal,
   })
   if (!res.ok || !res.body) {
