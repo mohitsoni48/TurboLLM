@@ -307,12 +307,12 @@ export class DownloadManager {
     )
   }
 
-  /** True when a queued/downloading/paused record already targets this exact dest — the
-   *  guard against two concurrent writers corrupting one file. Terminal records
-   *  (done/cancelled/error) don't block a fresh attempt. */
+  /** True when a queued/downloading/paused record already targets this dest (as the file
+   *  system compares names, {@link sameDest}) — the guard against two concurrent writers
+   *  corrupting one file. Terminal records (done/cancelled/error) don't block a fresh attempt. */
   private hasLiveDest(dest: string): boolean {
     for (const r of this.records.values()) {
-      if (r.dest === dest && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
+      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
     }
     return false
   }
@@ -323,7 +323,7 @@ export class DownloadManager {
    *  remove) nor start a second writer on it (resume). */
   private sharesDest(rec: DownloadRecord, statuses: DownloadStatus[]): boolean {
     for (const r of this.records.values()) {
-      if (r.id !== rec.id && r.dest === rec.dest && statuses.includes(r.status)) return true
+      if (r.id !== rec.id && sameDest(r.dest, rec.dest) && statuses.includes(r.status)) return true
     }
     return false
   }
@@ -738,6 +738,19 @@ export class DownloadManager {
       })
     }
   }
+}
+
+/** True when two destinations name one file on this platform's file system. Windows and
+ *  (by default) macOS ignore letter case, and Hugging Face serves a repo id in any casing
+ *  (`GGML-ORG/MODELS/resolve/...` redirects to `ggml-org/models`), so a pasted URL can build a
+ *  dest that differs from a live row's only in case yet opens the same .part. Compared exactly,
+ *  both rows wrote it at once: one ended 'done' with a corrupt file in the library (its size and
+ *  sha256 checks cover the bytes it streamed, not the file on disk), the other failed on the
+ *  rename. Elsewhere case is significant and names compare exactly. The platform is read per
+ *  call, not at load, so a test can stand in for another one. */
+function sameDest(a: string, b: string): boolean {
+  if (process.platform === 'win32' || process.platform === 'darwin') return a.toLowerCase() === b.toLowerCase()
+  return a === b
 }
 
 function gb(bytes: number): string {

@@ -6,7 +6,7 @@
 //  - a degenerate repo id is rejected rather than silently mis-placed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DownloadManager, DownloadError } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
@@ -249,6 +249,62 @@ test('enqueue: a concurrent duplicate (same dest) is not enqueued twice', async 
     // No two live records share a dest.
     const dests = dm.list().map((r) => r.dest)
     assert.equal(new Set(dests).size, dests.length)
+  } finally {
+    restore()
+  }
+})
+
+/** Stand in for another platform for one test (restored after it). */
+function asPlatform(t: { after: (fn: () => void) => void }, platform: NodeJS.Platform) {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: platform })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actual }))
+}
+
+// Hugging Face serves a repo id in any letter case, so a pasted URL in another casing names the
+// same file as a live Discover download. On a case-insensitive file system (Windows, default
+// macOS) the two dests open one .part, so a second row would be a second writer on it.
+const CANONICAL = { repo: 'ggml-org/models', rfilename: 'x.gguf' }
+const OTHER_CASE = { url: 'https://huggingface.co/GGML-ORG/MODELS/resolve/main/x.gguf' }
+
+for (const platform of ['win32', 'darwin'] as const) {
+  test(`enqueue on ${platform}: the same file under another letter case is not a second writer on its .part`, async (t) => {
+    asPlatform(t, platform)
+    const restore = stubFetch()
+    try {
+      const { modelDir, stateDir } = newDirs()
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+      const [a] = await dm.enqueue(CANONICAL)
+      assert.ok(a)
+      assert.deepEqual(await dm.enqueue(OTHER_CASE), [], 'a live row already owns that file')
+      assert.equal(dm.list().length, 1)
+
+      // A stale errored row next to a live one in another case: no second writer on resume.
+      const asAny = dm as unknown as { records: Map<string, { status: string }> }
+      asAny.records.get(a.id)!.status = 'error'
+      const [b] = await dm.enqueue(OTHER_CASE)
+      assert.ok(b, 'an errored row does not block a fresh attempt')
+      assert.notEqual(a.dest, b.dest)
+      assert.equal(a.dest.toLowerCase(), b.dest.toLowerCase())
+      assert.throws(() => dm.resume(a.id), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
+      // Nor may the stale row delete the live row's .part.
+      writeFileSync(`${b.dest}.part`, Buffer.alloc(16, 1))
+      assert.equal(dm.remove(a.id), true)
+      assert.ok(existsSync(`${b.dest}.part`))
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('enqueue on linux: dests that differ only in letter case are different files', async (t) => {
+  asPlatform(t, 'linux')
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    assert.equal((await dm.enqueue(CANONICAL)).length, 1)
+    assert.equal((await dm.enqueue(OTHER_CASE)).length, 1, 'a case-sensitive file system holds both')
   } finally {
     restore()
   }
