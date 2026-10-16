@@ -89,6 +89,17 @@ test('llama.cpp update of the active engine: the new build becomes active', { sk
   assert.equal(d.registry.active()?.binPath, join(newDir, 'llama-server'))
 })
 
+// The llama.cpp branch read "was the old build active" before stopping what runs on it. Stopping a pool slot leaves
+// the manager idle, so the activate route allows a switch meanwhile; that switch must survive the update.
+test('llama.cpp update of the active engine keeps a switch the user made while its pool slots stopped', { skip: posixOnly }, async (t) => {
+  const { d, newDir, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  d.registry.activate('old')
+  d.modelRouter = { stopPoolSlotsOnEngine: async () => { d.registry.activate('cuda') }, poolSlotsOnEngine: () => 0 }
+  await applyEngineUpdate(d, oldEngine)
+  assert.equal(d.registry.active()?.id, 'cuda')
+  assert.ok(d.registry.list().engines.some((e) => e.binPath === join(newDir, 'llama-server')), 'the update still happened')
+})
+
 test('llama.cpp update started by the user is recorded as user_update', { skip: posixOnly }, async (t) => {
   const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
   const starts: string[] = []
@@ -233,6 +244,71 @@ test('TurboQuant update re-probes the engine it keeps: the new build\'s version 
   assert.equal(readFileSync(bin(root), 'utf8'), WORKING_SERVER)
   assert.equal(d.registry.get('tq')?.version, '200 (abcdef1)')
   assert.deepEqual(d.registry.list().engines.filter((e) => e.binPath === bin(root)).map((e) => e.id), ['tq'])
+})
+
+// The KoboldCpp, llamafile, TurboQuant and pip branches read "is it the active engine" before the download or pip
+// upgrade (minutes), and re-activated the updated engine from that snapshot afterwards. The activate route allows a
+// switch while no model runs, so a switch the user made during the update was silently undone. Here the switch is made
+// from the update's own progress callback, i.e. mid-download. vLLM stands for the pip kinds (MLX and its siblings need
+// macOS): its uv and venv python are shell scripts, so `uv pip install -U` and the version probe run instantly.
+function switchableUpdates(t: { after: (fn: () => void) => void }): Array<[string, (root: string) => Engine, (root: string) => void]> {
+  const cases: Array<[string, (root: string) => Engine, (root: string) => void]> = []
+  if (process.platform === 'win32') return cases // shell-script binaries
+  if (koboldcppAssetName(false) || koboldcppAssetName(true)) {
+    cases.push(['kobold', (root) => engine({ id: 'kobold', kind: 'koboldcpp', binPath: koboldcppBinPath(root), version: 'v1.0.0' }), (root) => {
+      writeExe(koboldcppBinPath(root), 'kobold v1')
+      stubFetch(t, (url) => (url.includes('api.github.com') ? new Response(JSON.stringify({ tag_name: 'v2.0.0', assets: ALL_KOBOLD_ASSETS })) : new Response('kobold v2')))
+    }])
+  }
+  cases.push(['llamafile', (root) => engine({ id: 'llamafile', kind: 'llamafile', binPath: llamafileBinPath(root), version: '0.9.0' }), (root) => {
+    writeExe(llamafileBinPath(root), 'llamafile v1')
+    const assets = [{ name: 'llamafile-0.9.3', browser_download_url: 'https://dl.test/llamafile-0.9.3' }]
+    stubFetch(t, (url) => (url.includes('api.github.com') ? new Response(JSON.stringify({ tag_name: '0.9.3', assets })) : new Response('llamafile v2')))
+  }])
+  cases.push(['tq', (root) => engine({ id: 'tq', binPath: join(root, 'turboquant', 'llama-server'), version: '100 (old1234)' }), (root) => {
+    writeExe(join(root, 'turboquant', 'llama-server'), '#!/bin/sh\necho "version: 100 (old1234)"\n')
+    const src = tmpDir('tllm-tq-src-')
+    writeExe(join(src, 'llama-server'), WORKING_SERVER)
+    const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
+    execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
+    stubTurboquantRelease(t, archive)
+  }])
+  cases.push(['vllm', (root) => engine({ id: 'vllm', kind: 'vllm', binPath: join(root, 'vllm', 'venv', 'bin', 'python'), version: 'vllm 0.9.0' }), (root) => {
+    writeExe(join(root, 'uv', 'uv'), '#!/bin/sh\nexit 0\n')
+    writeExe(join(root, 'vllm', 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.9.1\n')
+  }])
+  return cases
+}
+
+test('an update keeps an engine switch the user made while it downloaded (KoboldCpp, llamafile, TurboQuant, pip)', { skip: posixOnly }, async (t) => {
+  const cases = switchableUpdates(t)
+  assert.ok(cases.length >= 3)
+  for (const [id, make, stage] of cases) {
+    const { d, root } = setup((root) => [make(root)])
+    stage(root)
+    d.registry.activate(id) // active when the update starts
+    let switched = false
+    d.provision = {
+      start() {},
+      progress: () => { if (!switched) { switched = true; d.registry.activate('cuda') } }, // the user picks another engine
+      done() {},
+      fail: (m: string) => { throw new Error(m) },
+    } as unknown as UpdateApplyDeps['provision']
+    await applyEngineUpdate(d, d.registry.get(id)!)
+    assert.ok(switched, `${id}: the switch happened during the update`)
+    assert.equal(d.registry.active()?.id, 'cuda', `${id}: the engine the user switched to stays active`)
+  }
+})
+
+test('an update of the active KoboldCpp, llamafile, TurboQuant or pip engine keeps it active', { skip: posixOnly }, async (t) => {
+  for (const [id, make, stage] of switchableUpdates(t)) {
+    const { d, root } = setup((root) => [make(root)])
+    stage(root)
+    d.registry.activate(id)
+    await applyEngineUpdate(d, d.registry.get(id)!)
+    assert.equal(d.registry.active()?.id, id, id)
+    assert.notEqual(d.registry.get(id)?.version, make(root).version, `${id}: it was updated`)
+  }
 })
 
 // POST /engines/:id/update reaches these branches with the user's trigger and a Cancel signal (the scheduler passes

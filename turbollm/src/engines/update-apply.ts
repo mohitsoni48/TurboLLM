@@ -214,11 +214,10 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
     // Stop the running engine only if it's the OLD build of this backend.
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     // The scheduler also auto-updates engines that are merely installed: the new build takes the
-    // old one's place — active only if the old one was, and with its update policy (it is a new
+    // old one's place — active only if the old one still is, and with its update policy (it is a new
     // engine id, so the policy would otherwise fall back to notify and `auto` apply only once).
-    const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
     if (oldEng) await stopEngineUsers(d, oldEng.id)
-    if (wasActive) d.registry.activate(newEng.id)
+    if (oldEng) keepActiveAfterUpdate(d, oldEng.id, newEng.id)
     // From here the new build has replaced the old one: what follows is best effort, never a failed update (that would
     // say the existing build is unchanged). If a Windows lock refuses the config.json save, the policy stays in memory
     // for the next save to write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
@@ -247,7 +246,6 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
   d.provision.start('turboquant', d.trigger ?? 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
-    const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
     if (oldEng) await stopEngineUsers(d, oldEng.id)
     const bin = await provisionTurboquant(
       root, 'AtomicBot-ai/atomic-llama-cpp-turboquant',
@@ -259,7 +257,7 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
     // capabilities (flags and KV types the new build added stay gated off).
     if (eng) eng = await d.registry.reprobe(eng.id)
     else eng = (await d.registry.add('TurboQuant', bin)).engine
-    if (wasActive) d.registry.activate(eng.id)
+    if (oldEng) keepActiveAfterUpdate(d, oldEng.id, eng.id)
     d.provision.done()
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') d.provision.done()
@@ -272,13 +270,12 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
  *  once the download completed). Mirrors the fork path. */
 async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('koboldcpp', d.trigger ?? 'auto_update')
-  const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
     const hasNvidia = primaryVendor() === 'nvidia'
     const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
     const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
-    if (wasActive) d.registry.activate(eng.id)
+    keepActiveAfterUpdate(d, engine.id, eng.id)
     d.provision.done()
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') d.provision.done()
@@ -291,12 +288,11 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
  *  once the download completed). */
 async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('llamafile', d.trigger ?? 'auto_update')
-  const wasActive = d.registry.active()?.id === engine.id
   try {
     await stopEngineUsers(d, engine.id)
     const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
     const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
-    if (wasActive) d.registry.activate(eng.id)
+    keepActiveAfterUpdate(d, engine.id, eng.id)
     d.provision.done()
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') d.provision.done()
@@ -313,38 +309,46 @@ const PIP_ENGINE_LABEL: Record<PipEngineKind, string> =
 /** vLLM / MLX / Rapid-MLX / MLX-VLM / LiteRT-LM: upgrade the package in place (uv pip install -U/--upgrade). */
 async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: Engine, root: string): Promise<void> {
   d.provision.start(kind, d.trigger ?? 'auto_update')
-  // An update re-activates an engine only when it was the active engine already: the scheduler also updates engines
-  // that are merely installed. (For LiteRT-LM it matters twice — it serves .litertlm models without being active
-  // (engineForModel), and activating it sends every GGUF to it.)
-  const wasActive = d.registry.active()?.id === engine.id
+  // An update keeps an engine active only when it still is the active engine (keepActiveAfterUpdate): the scheduler
+  // also updates engines that are merely installed. (For LiteRT-LM it matters twice — it serves .litertlm models
+  // without being active (engineForModel), and activating it sends every GGUF to it.)
   try {
     await stopEngineUsers(d, engine.id)
     if (kind === 'mlx') {
       const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
-      if (wasActive) d.registry.activate(eng.id)
+      keepActiveAfterUpdate(d, engine.id, eng.id)
     } else if (kind === 'rapid-mlx') {
       const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
-      if (wasActive) d.registry.activate(eng.id)
+      keepActiveAfterUpdate(d, engine.id, eng.id)
     } else if (kind === 'mlx-vlm') {
       const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
-      if (wasActive) d.registry.activate(eng.id)
+      keepActiveAfterUpdate(d, engine.id, eng.id)
     } else if (kind === 'litert-lm') {
       const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
-      if (wasActive) d.registry.activate(eng.id)
+      keepActiveAfterUpdate(d, engine.id, eng.id)
     } else {
       const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), true)
       const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
-      if (wasActive) d.registry.activate(eng.id)
+      keepActiveAfterUpdate(d, engine.id, eng.id)
     }
     d.provision.done()
   } catch (e) {
     d.provision.fail(`Could not update ${PIP_ENGINE_LABEL[kind]}: ${msg(e)}`)
     throw e
   }
+}
+
+/** After an update, the entry that replaces `updatedId` becomes the active engine only if `updatedId` is STILL the
+ *  active one, read here at the point of use. A snapshot taken before the download or pip upgrade (minutes earlier)
+ *  undid a switch the user made meanwhile: the activate route allows one while no model runs, and an update's own
+ *  stopEngineUsers has stopped the model. An update that keeps the engine's id (replaced in place at the same path)
+ *  then has nothing to do, so the engine the user picked stays active. */
+function keepActiveAfterUpdate(d: UpdateApplyDeps, updatedId: string, replacementId: string): void {
+  if (replacementId !== updatedId && d.registry.active()?.id === updatedId) d.registry.activate(replacementId)
 }
 
 function msg(e: unknown): string {

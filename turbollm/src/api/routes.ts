@@ -470,12 +470,13 @@ export function registerApi(app: Hono, d: Deps): void {
         // Stop the engine if the OLD build of this backend is the running active one, so the
         // swap doesn't leave a stale process pointing at a dir we're about to delete.
         const oldEng = d.registry.list().engines.find((e) => e.binPath === oldBin)
-        // The new build takes the old one's place: active only if the old one was (updating a
+        // The new build takes the old one's place: active only if the old one still is (updating a
         // fallback backend must not switch the user's engine), and with its update policy (a new
-        // engine id would otherwise fall back to notify).
-        const wasActive = !!oldEng && d.registry.active()?.id === oldEng.id
+        // engine id would otherwise fall back to notify). Read after stopEngineUsers: stopping a
+        // pool slot leaves the manager idle, so the activate route allows a switch meanwhile, and a
+        // check read before it undid that switch.
         if (oldEng) await stopEngineUsers(d, oldEng.id)
-        if (wasActive) d.registry.activate(newEng.id)
+        if (oldEng && d.registry.active()?.id === oldEng.id) d.registry.activate(newEng.id)
         // From here the new build has replaced the old one: what follows is best effort, never "your existing build is
         // unchanged". If a Windows lock refuses the config.json save, the policy stays in memory for the next save to
         // write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
@@ -561,13 +562,13 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('mlx', 'runtime_env')
-        // An update leaves the active engine as it was (as update-apply.ts does): activating it would switch engines
-        // under a model running on another. An install activates it. Each pip engine has one registration, replaced
-        // in place by its venv path, so its kind identifies it.
-        const wasActive = upgrade && d.registry.active()?.kind === 'mlx'
         const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        // An update leaves the active engine as it was (as update-apply.ts does): activating it would switch engines
+        // under a model running on another. An install activates it. Each pip engine has one registration, replaced
+        // in place by its venv path, so its kind identifies it. Read now, not before the upgrade: that takes minutes,
+        // the activate route allows a switch meanwhile whenever no model is loaded, and a check read before undid it.
+        if (!upgrade || d.registry.active()?.kind === 'mlx') d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX: ${e instanceof Error ? e.message : e}`)
@@ -589,10 +590,9 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('rapid-mlx', 'runtime_env')
-        const wasActive = upgrade && d.registry.active()?.kind === 'rapid-mlx' // an update keeps the active engine (see MLX)
         const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'rapid-mlx') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install Rapid-MLX: ${e instanceof Error ? e.message : e}`)
@@ -614,10 +614,9 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('mlx-vlm', 'runtime_env')
-        const wasActive = upgrade && d.registry.active()?.kind === 'mlx-vlm' // an update keeps the active engine (see MLX)
         const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'mlx-vlm') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX-VLM: ${e instanceof Error ? e.message : e}`)
@@ -1062,10 +1061,9 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('vllm', 'runtime_env')
-        const wasActive = upgrade && d.registry.active()?.kind === 'vllm' // an update keeps the active engine (see MLX)
         const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'vllm') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install vLLM: ${e instanceof Error ? e.message : e}`)
@@ -1084,10 +1082,9 @@ export function registerApi(app: Hono, d: Deps): void {
     void (async () => {
       try {
         d.provision.start('sglang', 'runtime_env')
-        const wasActive = upgrade && d.registry.active()?.kind === 'sglang' // an update keeps the active engine (see MLX)
         const rt = await ensureSglangEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addSglang(`SGLang (${rt.version})`, rt.python, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'sglang') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install SGLang: ${e instanceof Error ? e.message : e}`)
@@ -1146,11 +1143,11 @@ export function registerApi(app: Hono, d: Deps): void {
         // something else (or nothing), so it is stopped too, as this route already stops the primary. Not
         // stopEngineUsers: it also stops a primary that merely has LiteRT-LM active, which never held the library.
         for (const e of d.registry.list().engines) if (e.kind === 'litert-lm') await d.modelRouter.stopPoolSlotsOnEngine(e.id)
-        // An update keeps the active engine (see MLX) — for LiteRT-LM especially: an active LiteRT-LM is sent every GGUF.
-        const wasActive = upgrade && d.registry.active()?.kind === 'litert-lm'
         const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade, ac.signal)
         const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        // An update keeps the active engine, read now (see MLX) — for LiteRT-LM especially: an active LiteRT-LM is sent
+        // every GGUF.
+        if (!upgrade || d.registry.active()?.kind === 'litert-lm') d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') d.provision.done() // user cancelled — nothing failed
@@ -1187,15 +1184,8 @@ export function registerApi(app: Hono, d: Deps): void {
         // Update: stop what runs on the install, then let provisionTurboquant stage the latest
         // beside it and swap only on success. Deleting the dir first left the engine pointing at
         // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
-        // An update leaves the active engine as it was (as update-apply.ts and the backend update
-        // do): activating it would switch engines under a model running on another. An install
-        // activates it.
-        let wasActive = false
-        if (upgrade) {
-          const cur = d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant')))
-          wasActive = !!cur && d.registry.active()?.id === cur.id
-          if (cur) await stopEngineUsers(d, cur.id)
-        }
+        const cur = upgrade ? d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant'))) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
         // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
         const bin = await provisionTurboquant(
           root, entry.repo!,
@@ -1207,7 +1197,12 @@ export function registerApi(app: Hono, d: Deps): void {
         // and capabilities (flags and KV types the new build added stay gated off).
         if (eng && upgrade) eng = await d.registry.reprobe(eng.id)
         if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        // An update leaves the active engine as it was (as update-apply.ts and the backend update
+        // do): activating it would switch engines under a model running on another. An install
+        // activates it. Read now, not before the download: that takes minutes, the activate route
+        // allows a switch meanwhile (the stop above left no model running), and a check read
+        // before undid it.
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
@@ -1244,17 +1239,13 @@ export function registerApi(app: Hono, d: Deps): void {
       try {
         d.provision.start('koboldcpp', upgrade ? 'user_update' : 'user_install')
         // Update: stop what runs on the binary (Windows can't replace a running .exe), then
-        // re-download over it — never delete it first. Active afterwards only if it was (see the
-        // TurboQuant route above).
-        let wasActive = false
-        if (upgrade) {
-          const cur = d.registry.list().engines.find((e) => e.kind === 'koboldcpp' && e.binPath === koboldcppBinPath(root))
-          wasActive = !!cur && d.registry.active()?.id === cur.id
-          if (cur) await stopEngineUsers(d, cur.id)
-        }
+        // re-download over it — never delete it first. Active afterwards only if it still is (see
+        // the TurboQuant route above).
+        const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'koboldcpp' && e.binPath === koboldcppBinPath(root)) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
         const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
@@ -1289,16 +1280,12 @@ export function registerApi(app: Hono, d: Deps): void {
       try {
         d.provision.start('llamafile', upgrade ? 'user_update' : 'user_install')
         // Update: stop, then re-download over the binary — never delete it first; active
-        // afterwards only if it was (as above).
-        let wasActive = false
-        if (upgrade) {
-          const cur = d.registry.list().engines.find((e) => e.kind === 'llamafile' && e.binPath === llamafileBinPath(root))
-          wasActive = !!cur && d.registry.active()?.id === cur.id
-          if (cur) await stopEngineUsers(d, cur.id)
-        }
+        // afterwards only if it still is (as above).
+        const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'llamafile' && e.binPath === llamafileBinPath(root)) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
         const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
-        if (!upgrade || wasActive) d.registry.activate(eng.id)
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled

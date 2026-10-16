@@ -9,13 +9,15 @@
 // with its completion marker (after the route picked the installed build), so provisionBackend's
 // fast path returns it as if just downloaded. The binaries are shell scripts, so POSIX only.
 import assert from 'node:assert/strict'
-import fs, { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
+import fs, { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { ConfigStore, type Engine } from '../config/config'
 import { availableBackends } from '../engines/download'
+import { koboldcppAssetName, koboldcppBinPath } from '../engines/koboldcpp'
 import { llamafileBinPath } from '../engines/llamafile'
 import { Registry } from '../engines/registry'
 import type { Deps } from '../deps'
@@ -68,7 +70,7 @@ function harness(t: { after: (fn: () => void) => void }, newServer: string, opts
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, registry, provision, newBin: join(newDir, 'llama-server'), newDir, finished }
+  return { app, d, registry, provision, newBin: join(newDir, 'llama-server'), newDir, finished }
 }
 
 test('POST /backends/:id/update of a backend that is not the active engine keeps the active engine and the update policy', { skip: posixOnly }, async (t) => {
@@ -115,6 +117,19 @@ test('POST /backends/:id/update whose old build folder is locked still reports a
   assert.ok(existsSync(oldDir), 'the locked old build is left behind')
   const oldDirDelete = locked.mock.calls.find((c) => String(c.arguments[0]) === oldDir)
   assert.ok((oldDirDelete?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+})
+
+// The route read "was the old build active" before stopping what ran on it. Stopping a pool slot leaves the manager
+// idle, so the activate route allows a switch meanwhile; that switch must survive the update.
+test('POST /backends/:id/update of the active backend keeps a switch the user made while its pool slots stopped', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  h.registry.activate('old')
+  h.d.modelRouter = { stopPoolSlotsOnEngine: async () => { h.registry.activate('cuda') } } as unknown as Deps['modelRouter']
+  const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.equal(await h.finished, null)
+  assert.equal(h.registry.active()?.id, 'cuda')
+  assert.ok(h.registry.list().engines.some((e) => e.binPath === h.newBin), 'the update still happened')
 })
 
 // Same, for the update policy the new build inherits: its config.json save can be refused by a Windows lock too.
@@ -235,4 +250,118 @@ test('POST /engines/llamafile?update=1 keeps the active engine unless the update
   h.registry.remove(lf.id) // Disabled: Install registers it again
   assert.equal(await h.run(''), null)
   assert.equal(h.registry.active()?.binPath, h.bin, 'an install activates the engine')
+})
+
+// Each catalog card's Update (POST /engines/<kind>?update=1) read "is it the active engine" before the download or pip
+// upgrade (minutes), and re-activated the updated engine from that snapshot afterwards. The activate route allows a
+// switch whenever no model is loaded (the update stopped what ran on the engine), so a switch the user made meanwhile
+// was silently undone. The switch is made from the route's own progress callback, i.e. mid-download. vLLM and SGLang
+// stand for the pip routes (MLX and its siblings need macOS, and LiteRT-LM asks PyPI first): their uv and venv python
+// are shell scripts, so `uv pip install -U` and the version probe run instantly.
+const ALL_KOBOLD_ASSETS = ['koboldcpp.exe', 'koboldcpp-nocuda.exe', 'koboldcpp-linux-x64', 'koboldcpp-linux-x64-nocuda', 'koboldcpp-mac-arm64']
+  .map((name) => ({ name, browser_download_url: `https://dl.test/${name}` }))
+
+type SwitchCase = { route: string; engine: (root: string) => Engine; stage: (root: string) => void }
+
+function switchCases(t: { after: (fn: () => void) => void }): SwitchCase[] {
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  const serve = (release: unknown, download: () => Response) => {
+    globalThis.fetch = (async (url: string | URL | Request) =>
+      (url instanceof Request ? url.url : String(url)).includes('api.github.com') ? new Response(JSON.stringify(release)) : download()) as typeof fetch
+  }
+  const exe = (path: string, text: string) => {
+    mkdirSync(dirname(path), { recursive: true })
+    writeFileSync(path, text)
+    chmodSync(path, 0o755)
+  }
+  const eng = (id: string, kind: Engine['kind'], binPath: string, version: string): Engine =>
+    ({ id, name: id, binPath, kind, version, capabilities: { kvTypes: [], flags: [] }, addedAt: '' }) as Engine
+  const cases: SwitchCase[] = [{
+    route: 'llamafile',
+    engine: (root) => eng('llamafile', 'llamafile', llamafileBinPath(root), '0.10.2'),
+    stage: (root) => {
+      exe(llamafileBinPath(root), 'llamafile 0.10.2')
+      serve({ tag_name: '0.10.3', assets: [{ name: 'llamafile-0.10.3', browser_download_url: 'https://dl.test/llamafile' }] }, () => new Response('llamafile 0.10.3'))
+    },
+  }]
+  if (koboldcppAssetName(false) || koboldcppAssetName(true)) {
+    cases.push({
+      route: 'koboldcpp',
+      engine: (root) => eng('kobold', 'koboldcpp', koboldcppBinPath(root), 'v1.0.0'),
+      stage: (root) => {
+        exe(koboldcppBinPath(root), 'kobold v1')
+        serve({ tag_name: 'v2.0.0', assets: ALL_KOBOLD_ASSETS }, () => new Response('kobold v2'))
+      },
+    })
+  }
+  if (process.platform !== 'win32') {
+    cases.push({
+      route: 'turboquant',
+      engine: (root) => eng('tq', 'llama-server', join(root, 'turboquant', 'llama-server'), '100 (old1234)'),
+      stage: (root) => {
+        exe(join(root, 'turboquant', 'llama-server'), '#!/bin/sh\necho "version: 100 (old1234)"\n')
+        const src = tmpDir('tllm-tq-src-')
+        exe(join(src, 'llama-server'), WORKING_SERVER)
+        const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
+        execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
+        const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+        const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
+        serve([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }], () => new Response(readFileSync(archive)))
+      },
+    })
+  }
+  for (const kind of ['vllm', 'sglang'] as const) {
+    cases.push({
+      route: kind,
+      engine: (root) => eng(kind, kind, join(root, kind, 'venv', 'bin', 'python'), `${kind} 0.9.0`),
+      stage: (root) => {
+        exe(join(root, 'uv', 'uv'), '#!/bin/sh\nexit 0\n')
+        exe(join(root, kind, 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.9.1\n')
+      },
+    })
+  }
+  return cases
+}
+
+test('POST /engines/<kind>?update=1 keeps an engine switch the user made while it downloaded (llamafile, KoboldCpp, TurboQuant, pip)', {
+  skip: process.platform === 'win32' && 'shell-script engine binaries',
+}, async (t) => {
+  const cases = switchCases(t)
+  assert.ok(cases.length >= 4)
+  for (const { route, engine, stage } of cases) {
+    const store = ConfigStore.load(join(tmpDir('tllm-update-switch-'), 'config.json'))
+    const root = join(store.dir(), 'engines')
+    const updated = engine(root)
+    store.update((c) => {
+      c.engines.push({ id: 'cuda', name: 'cuda', binPath: '/opt/cuda/llama-server', kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }, updated)
+      c.activeEngineId = updated.id // active when the update starts
+    })
+    stage(root)
+    const registry = new Registry(store)
+    let switched = false
+    let settle: (failure: string | null) => void = () => {}
+    const finished = new Promise<string | null>((r) => { settle = r })
+    const d = {
+      version: 'test',
+      store,
+      registry,
+      manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null, stopAndWait: async () => {}, logPath: () => '' },
+      provision: {
+        get: () => ({ active: false }),
+        start() {},
+        progress: () => { if (!switched) { switched = true; registry.activate('cuda') } }, // the user picks another engine
+        done: () => settle(null),
+        fail: (m: string) => settle(m),
+      },
+      build: { isActive: () => false },
+    } as unknown as Deps
+    const app = new Hono()
+    registerApi(app, d)
+    assert.equal((await app.request(`/api/v1/engines/${route}?update=1`, { method: 'POST' })).status, 202, route)
+    assert.equal(await finished, null, route)
+    assert.ok(switched, `${route}: the switch happened during the update`)
+    assert.notEqual(registry.get(updated.id)?.version, updated.version, `${route}: it was updated`)
+    assert.equal(registry.active()?.id, 'cuda', `${route}: the engine the user switched to stays active`)
+  }
 })
