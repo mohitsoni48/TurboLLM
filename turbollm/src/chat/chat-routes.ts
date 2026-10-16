@@ -435,7 +435,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // Regenerate (`regenerate: true`, what the web UI sends): the reply it replaces is set aside
     // only here, once nothing above refused the turn. Sent first as its own request
     // (/regenerate), a refusal here (a Turbo Link machine asleep, the model gone) left that reply
-    // deactivated with no switcher to bring it back, and the history ending on a user turn.
+    // deactivated with no switcher to bring it back, and the history ending on a user turn. One the
+    // engine or the host gives once the turn has started puts it back in runGeneration (replacedId).
     const replaced = b.regenerate ? (conv.messages ?? []).at(-1) : undefined
     // A stale tab or another device still showing an older last reply (a turn was added since)
     // would otherwise replace one it never showed. Without `messageId` (API clients), the last
@@ -499,7 +500,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, isCodeAuthorized })
     }))
   })
 
@@ -884,6 +885,9 @@ interface GenerationCtx {
    *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
    *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
   userText?: string
+  /** Regenerate (/continue { regenerate: true }): the reply this turn set aside, which a turn the
+   *  engine or linked host refuses before producing anything shows again (see restoreReplaced). */
+  replacedId?: string
   /** Phase 4 / C1: whether THIS request's caller cleared the code-execution bar (host-local or a
    *  valid API key), computed by the route handler — the only place a Hono `Context` exists — and
    *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
@@ -1157,6 +1161,33 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
    *  progress at all (e.g. `return_progress` unsupported), which is exactly today's behavior. */
   let lastPromptTotal = 0
 
+  /** Regenerate (`ctx.replacedId`): /continue sets the old reply aside only once the turn can run,
+   *  but the engine or a linked host can still refuse it after that: an HTTP error (a 503 while a
+   *  model loads, a host that unloaded it), a fetch that throws (a host asleep since its last probe,
+   *  an engine that died), an error chunk in the stream. Such a turn left the old reply behind the
+   *  version switcher and an empty reply shown in its place. When the turn produced nothing (no
+   *  text, reasoning or tool call, nothing still held back by the parser), the empty placeholder is
+   *  deleted and the old reply shown again, before the error is sent, so the client's refetch on it
+   *  already sees the reply back. Only while both rows are as this turn left them (a DELETE of
+   *  either during the turn stands). Never throws: the catch below calls it, where nothing may. */
+  let restored = false
+  const restoreReplaced = (): boolean => {
+    if (!ctx.replacedId || fullContent || fullReasoning || allToolCalls.length > 0 || pendingParse?.buf) return false
+    try {
+      const replaced = db.getMessage(ctx.replacedId)
+      const placeholder = db.getMessage(assistantMsg.id)
+      const group = replaced?.variantGroup
+      if (!group || !placeholder?.isActive || placeholder.variantGroup !== group) return false
+      db.transaction(() => {
+        db.deleteMessage(assistantMsg.id)
+        db.setActiveVariant(group, replaced.id)
+      })
+      return true
+    } catch {
+      return false // rolled back: the turn ends as before, its empty reply shown
+    }
+  }
+
   // In-app chat is the owner using their own machine — the signal Turbo Link's wake
   // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
   // the terminal-agent paths; this is the only local path that never goes through it.
@@ -1286,6 +1317,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           reason = (msg ?? text).trim().slice(0, 500)
         } catch { /* no body */ }
         if (reason) reason = engineErrorText(d, engineKind, reason)
+        restoreReplaced()
         await emit({ event: 'error', data: { code: 'engine_error', message: reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}` } })
         return
       }
@@ -1716,6 +1748,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
+      restored = restoreReplaced() // a Stop (isAbort) keeps what it stopped
       // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
       // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
       // the whole function and skipped the `db.updateMessage` below, discarding everything the
@@ -1729,6 +1762,9 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     if (localAccounting) d.manager.generationEnd()
     releaseInflight(convId, ac)
   }
+  // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
+  // count, as on the refused-response return above.
+  if (restored) return
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
   // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own

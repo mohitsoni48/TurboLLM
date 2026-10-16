@@ -230,7 +230,8 @@ function inFlightHarness(tools?: unknown) {
   }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    // `dir`: an engine's error text is path-redacted against it (engineErrorText).
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },
@@ -506,6 +507,79 @@ test('a Regenerate the upstream refuses keeps the reply it would have replaced',
     assert.deepEqual(engine.bodies[1].messages.map((m) => m.role), ['user'], 'the replaced reply is not sent')
     const reply = h.store.getMessages(conv.id)[1]
     assert.deepEqual(h.store.getMessageVariants(reply.variantGroup!).map((m) => m.content), ['a1', 'a1 again'], 'both versions on one switcher')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// The test above covers a refusal before the turn starts. The engine or a linked host can still
+// refuse once it has: a 503 while a model loads, a fetch that throws because the host went to sleep
+// after its last probe or the engine died, an error chunk in the stream. The old reply then stayed
+// set aside behind the version switcher, with an empty reply shown in its place.
+test('a Regenerate the engine or linked host refuses once the turn has started keeps the reply it would have replaced', async () => {
+  const h = inFlightHarness()
+  const failures: Array<[string, () => Response]> = [
+    ['engine_error', () => new Response(JSON.stringify({ error: { message: 'Loading model' } }), { status: 503 })],
+    ['engine_stopped', () => { throw new TypeError('fetch failed') }],
+    ['engine_error', () => new Response(`data: ${JSON.stringify({ error: { message: 'out of memory' } })}\n\n`, { status: 200 })],
+  ]
+  const engine = fakeEngine((_init, n) => n === 1 ? sseReply('a1') : n <= failures.length + 1 ? failures[n - 2][1]() : sseReply('a1 again'))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => `${m.role}:${m.content}`)
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+    const a1 = h.store.getMessages(conv.id)[1].id
+
+    for (const [code] of failures) {
+      const sse = await (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a1 }))).text()
+      assert.match(sse, new RegExp(`"code":"${code}"`), 'the error still reaches the chat')
+      assert.deepEqual(active(), ['user:q1', 'assistant:a1'], code)
+      const group = h.store.getMessage(a1)!.variantGroup!
+      assert.deepEqual(h.store.getMessageVariants(group).map((m) => `${m.content}:${m.isActive}`), ['a1:true'], 'no empty version left on its switcher')
+      assert.deepEqual(inFlightChatIds(), [])
+    }
+
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a1 }))).text()
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1 again'])
+    assert.deepEqual(h.store.getMessageVariants(h.store.getMessage(a1)!.variantGroup!).map((m) => `${m.content}:${m.isActive}`), ['a1:false', 'a1 again:true'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a Regenerate that streamed text before the engine failed, or that was stopped, keeps its new reply', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine((init, n) => {
+    if (n === 1) return sseReply('a1')
+    // Shorter than the parser's lookahead, so it is still held back when the error chunk arrives.
+    if (n === 2) return new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'a2 partial' } }] })}\n\n`,
+      `data: ${JSON.stringify({ error: { message: 'out of memory' } })}\n\n`,
+    ].join(''), { status: 200 })
+    const signal = init?.signal // held open until Stop aborts it
+    return new Response(new ReadableStream({
+      start(c) { signal?.addEventListener('abort', () => c.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))) },
+    }), { status: 200 })
+  })
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => `${m.role}:${m.content}`)
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    assert.deepEqual(active(), ['user:q1', 'assistant:a2 partial'])
+
+    const stopped = (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    await waitFor(() => engine.bodies.length === 3, 'the regenerate to reach the engine')
+    await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id }))
+    await stopped
+    assert.deepEqual(active(), ['user:q1', 'assistant:'], 'a Stop keeps what it stopped, as before')
+    const group = h.store.getMessages(conv.id)[1].variantGroup!
+    assert.deepEqual(h.store.getMessageVariants(group).map((m) => `${m.content}:${m.isActive}`), ['a1:false', 'a2 partial:false', ':true'])
   } finally {
     engine.restore()
     h.cleanup()
