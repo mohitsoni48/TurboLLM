@@ -33,7 +33,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
-import { ApiError, authHeaders, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
+import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import { toast } from '../components/ui/sonner'
@@ -113,6 +113,9 @@ function NumberField({
 }
 
 const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(n)))
+
+/** window.location.hostname of a page the daemon trusts as the host itself (no key needed). */
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 /** Settings categories for the two-pane layout. Each maps to one pane of sections. */
 type CatId = 'general' | 'models' | 'tools' | 'network' | 'experimental' | 'system'
@@ -289,13 +292,22 @@ export function SettingsScreen() {
   })
 
   // The listener moved to a new port — hop the browser over once it's up.
+  // Another port is another origin, with its own localStorage: a client off the host that sends a
+  // saved API key lands there without it, and the new port asks for the key again (AuthGate). It
+  // was not told so before the hop. Say it in the toast and leave time to read it. The key itself
+  // is never carried over in the URL. A loopback page needs no key, so it hops as before.
   const followPort = (newPort: number, message: string) => {
-    toast.success(message)
+    const keyStaysBehind = !!getAuthToken() && !LOOPBACK_HOSTNAMES.has(window.location.hostname)
+    if (keyStaysBehind) {
+      toast.success(`${message} This browser keeps the API key per port: paste it again on port ${newPort}.`, { duration: 6000 })
+    } else {
+      toast.success(message)
+    }
     setTimeout(() => {
       const u = new URL(window.location.href)
       u.port = String(newPort)
       window.location.href = u.toString()
-    }, 1300)
+    }, keyStaysBehind ? 4500 : 1300)
   }
 
   const handleSave = () => {

@@ -3,6 +3,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { setAuthToken, type DaemonSettings } from '../lib/api'
+import { toast } from '../components/ui/sonner'
 import { SettingsScreen } from './SettingsScreen'
 
 type SaveCall = { payload: unknown; opts: { onSuccess?: (res: DaemonSettings & { rebind?: unknown }) => void } }
@@ -186,6 +187,50 @@ describe('SettingsScreen — Restart daemon', () => {
       unmount()
     } finally {
       vi.unstubAllGlobals()
+      state.sysInfo = undefined
+    }
+  })
+
+  // Another port is another origin with its own localStorage, so a LAN client's saved API key
+  // stays behind and the new port asks for it again. The hop used to come with no word of that.
+  it('tells a LAN client with a saved key to paste it again on the new port, and gives it time to read that', async () => {
+    const success = vi.spyOn(toast, 'success')
+    const followFrom = async (href: string, hostname: string) => {
+      state.settings = mk()
+      state.saveCalls = []
+      const location = { ...window.location, href, hostname, reload: vi.fn() }
+      vi.stubGlobal('location', location)
+      const { unmount } = render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+      await openSystem()
+      await userEvent.click(screen.getByRole('button', { name: /Restart daemon/ }))
+      vi.useFakeTimers()
+      act(() => state.saveCalls[0].opts.onSuccess!({ ...mk({ port: 7100 }), rebind: { portChanged: true, port: 7100, lanBind: true } }))
+      return { location, unmount }
+    }
+    state.sysInfo = { bundledEnginesOnly: false }
+    setAuthToken('lan-key')
+    try {
+      const lan = await followFrom('http://192.168.1.5:6996/settings', '192.168.1.5')
+      expect(success).toHaveBeenLastCalledWith(expect.stringMatching(/paste it again on port 7100\.$/), { duration: 6000 })
+      act(() => { vi.advanceTimersByTime(1300) })
+      expect(lan.location.href).toBe('http://192.168.1.5:6996/settings') // still readable
+      act(() => { vi.advanceTimersByTime(3200) })
+      expect(lan.location.href).toBe('http://192.168.1.5:7100/settings')
+      lan.unmount()
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+
+      // On the host itself the daemon needs no key: the plain message and the quick hop, as before.
+      const host = await followFrom('http://127.0.0.1:6996/settings', '127.0.0.1')
+      expect(success).toHaveBeenLastCalledWith('Port changed to 7100: applied without a restart. Reconnecting…')
+      act(() => { vi.advanceTimersByTime(1300) })
+      expect(host.location.href).toBe('http://127.0.0.1:7100/settings')
+      host.unmount()
+    } finally {
+      vi.useRealTimers()
+      vi.unstubAllGlobals()
+      success.mockRestore()
+      setAuthToken('')
       state.sysInfo = undefined
     }
   })
