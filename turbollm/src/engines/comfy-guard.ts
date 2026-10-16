@@ -4,8 +4,8 @@
 //
 //   POST /api/v1/comfyui/acquire → guard.acquire(): force-unload the model (freeing
 //     VRAM before ComfyUI executes) and BLOCK new loads. Returns once VRAM is free.
-//   POST /api/v1/comfyui/release → guard.release(): reload the exact model we unloaded (or,
-//     if the render paused a load, start that load instead).
+//   POST /api/v1/comfyui/release → guard.release(): unblock loads and answer, then reload the exact model we
+//     unloaded (or, if the render paused a load, start that load instead).
 //
 // That FORWARD direction (ComfyUI → TurboLLM) is mirrored by the REVERSE direction
 // (TurboLLM → ComfyUI, F-011): before TurboLLM loads a model it calls ComfyUI's native
@@ -85,6 +85,8 @@ export class ComfyGuard {
   // cycle (or null if the save was skipped/failed/ineligible). Gates the restore in
   // release() — we only restore a cache we actually wrote this acquire.
   private cachedFile: string | null = null
+  // Counts acquire() calls. A reload started by release() compares it to tell that a new render began meanwhile.
+  private acquires = 0
   // Stops the gateway's extra pool slots (keep-N chat models, embedding / Laya side models), which
   // hold VRAM beside the primary. Set by setPoolStopper once the router exists (cli.ts).
   private stopPoolSlots: (() => Promise<void>) | null = null
@@ -132,6 +134,7 @@ export class ComfyGuard {
    *  Idempotent — repeated calls just refresh the crash-recovery lease. */
   async acquire(): Promise<void> {
     if (!this.enabled()) return
+    this.acquires++
     this.lastSignalAt = Date.now()
     this.armLease()
     if (this.held) return
@@ -189,46 +192,77 @@ export class ComfyGuard {
     }
   }
 
-  /** ComfyUI's queue drained: unblock loads and start the load the render paused, else reload the
-   *  model we unloaded for it. */
-  async release(): Promise<void> {
+  /** ComfyUI's queue drained: unblock loads at once (before the first await), then start the load the render paused,
+   *  else reload the model we unloaded for it. The promise settles once that reload has, and never rejects (a failed
+   *  reload is logged). The release route does not wait for it: the gate node (v3+) holds its lock across the release
+   *  call, and a prompt ComfyUI queues meanwhile (every "Run (Instant)" auto-queue iteration) waits for that lock on
+   *  ComfyUI's server thread, so answering only after the LLM reloaded froze ComfyUI for up to the node's 10 s
+   *  timeout, after which that prompt's acquire killed the reload anyway. */
+  release(): Promise<void> {
     this.clearLease()
     this.lastSignalAt = Date.now()
-    if (!this.held && !this.suspended) return
+    if (!this.held && !this.suspended) return Promise.resolve()
     this.held = false
     const opts = this.suspended
     this.suspended = null
-    // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
-    // model was still stopping, which acquire() kills without suspending) left the engine in 'error' saying
-    // loading resumes when the queue finishes. Keep that promise. That load is the user's latest choice, so it
-    // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
-    // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
-    if (this.hasPausedLoad()) {
-      console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
-      try {
-        await this.manager.restart()
-      } catch (e) {
-        console.warn(`[comfy-guard] reload after ComfyUI failed: ${e instanceof Error ? e.message : e}`)
-      }
-      this.cachedFile = null
-      return
+    // Taken now, not read after the reload: an acquire landing during it saves the cache of the engine it stops, and
+    // that file is the next release's to restore.
+    const cachedFile = this.cachedFile
+    this.cachedFile = null
+    return this.reload(opts, cachedFile)
+  }
+
+  /** release()'s reload. A render that acquires while it runs (the route has already answered, so the next prompt's
+   *  acquire can come at once) stops it as it stops any load: a reload already spawned is suspended and killed by
+   *  acquire() itself. One not spawned yet (waiting for the load gate, or in the engine's preflight) gives that acquire
+   *  nothing to suspend: it is refused, never spawned under the render, and stays the model to reload when that render
+   *  ends. */
+  private async reload(opts: StartOpts | null, cachedFile: string | null): Promise<void> {
+    const render = this.acquires
+    let refused = false
+    const refuse = () => {
+      refused = this.gpuClaimed()
+      this.refuseLoadWhileHeld()
     }
-    if (opts) {
-      console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
-      try {
-        await this.manager.start(opts)
+    // Checked inside the load gate and again right before the spawn. Between the two the start awaits its preflight
+    // (vLLM and SGLang import uvloop first, about 1 s) and a port: an acquire landing there found the engine stopped,
+    // and the reload then brought the LLM up under that render with nothing tracking it.
+    const hooks = { beforeStart: async () => refuse(), beforeSpawn: refuse }
+    let paused = false
+    try {
+      // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
+      // model was still stopping, which acquire() kills without suspending) left the engine in 'error' saying
+      // loading resumes when the queue finishes. Keep that promise. That load is the user's latest choice, so it
+      // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
+      // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
+      paused = this.hasPausedLoad()
+      if (paused) {
+        console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
+        await this.manager.restart(hooks)
+      } else if (opts) {
+        console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
+        await this.manager.start(opts, hooks)
         // KV prompt-cache persistence (F-014): if we saved a cache on the way in, restore it
         // now — but only once the reloaded engine is actually ready (the slot endpoint needs
         // the model loaded). Poll readiness up to a generous timeout; a stall or an 'error'
-        // state simply skips the restore (the prefix re-prefills normally). Non-fatal.
-        if (this.cachedFile) {
-          await this.restoreAfterReady(this.cachedFile)
+        // state simply skips the restore (the prefix re-prefills normally), as does a new render. Non-fatal.
+        if (cachedFile) {
+          await this.restoreAfterReady(opts, cachedFile, render)
         }
-      } catch (e) {
+      }
+    } catch (e) {
+      if (!refused) {
         console.warn(`[comfy-guard] reload after ComfyUI failed: ${e instanceof Error ? e.message : e}`)
+        return
+      }
+      // Refused by a new render. A paused load: Manager.load stored the same refusal as the engine's error, so that
+      // render's release resumes it. A reload: that render's acquire found nothing running to suspend, so this model is
+      // the one its release reloads, unless that acquire suspended a model loaded since (the user's newer choice).
+      if (!paused && opts && !this.suspended) {
+        this.suspended = opts
+        this.cachedFile = cachedFile
       }
     }
-    this.cachedFile = null
   }
 
   /** The primary is in 'error' with our pre-start hook's refusal: release() resumes that load. */
@@ -246,13 +280,21 @@ export class ComfyGuard {
     return this.suspended?.model.key ?? null
   }
 
-  /** Wait for the just-reloaded engine to reach 'running', then restore the saved KV cache
+  /** Wait for the just-reloaded engine (`opts`) to reach 'running', then restore the saved KV cache
    *  (F-014). Bounded poll: bails on 'error' or after ~130s (just over the manager's 120s
-   *  readiness window). The restore itself is non-fatal — any failure leaves the prefix to
-   *  re-prefill normally. */
-  private async restoreAfterReady(filename: string): Promise<void> {
+   *  readiness window), or once `render` is no longer the latest acquire. The restore itself is
+   *  non-fatal — any failure leaves the prefix to re-prefill normally. */
+  private async restoreAfterReady(opts: StartOpts, filename: string, render: number): Promise<void> {
     const deadline = Date.now() + 130_000
     for (;;) {
+      if (this.acquires !== render) {
+        // A new render acquired meanwhile and stopped the engine. Its acquire saved the cache itself if the engine was
+        // up; one that caught it still starting saved none, and this file, never restored, stays the one its release
+        // restores. Dropped, the cache was gone for good, and an auto-queued prompt usually catches the reload
+        // starting. (An acquire still saving overwrites this with its own result.)
+        if (this.suspended === opts && this.cachedFile === null) this.cachedFile = filename
+        return
+      }
       const state = this.manager.status().state
       if (state === 'running') break
       if (state === 'error' || Date.now() > deadline) return

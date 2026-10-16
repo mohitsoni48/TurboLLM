@@ -140,6 +140,15 @@ function posNum(v: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
+/** Hooks a load or start runs inside the global load gate. `beforeStart` runs first, before the start's own awaits
+ *  (the vLLM/SGLang/LiteRT-LM preflight, the port allocation). `beforeSpawn` runs after the last of them, in the same
+ *  tick as the spawn, so whatever it checks still holds when the engine starts. A throw from either starts nothing and
+ *  rejects the load. */
+export interface LoadHooks {
+  beforeStart?: () => Promise<void>
+  beforeSpawn?: () => void
+}
+
 export class BusyError extends Error {
   constructor() {
     super('engine_already_running')
@@ -214,7 +223,7 @@ export class Manager {
    *  are one indivisible operation; no other load can interleave. Never throws on a
    *  model that simply fails to load — callers read status() for the running/error
    *  outcome. */
-  async load(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
+  async load(opts: StartOpts, hooks?: LoadHooks): Promise<void> {
     // Declared outside the try so the catch block below also reports whichever opts were
     // actually last attempted — a throw from the fallback's own startInternal() must not
     // fall back to reporting the original (mmproj-attached) opts, same defect class this
@@ -230,7 +239,7 @@ export class Manager {
         this.opts = opts
         this.lastCommand = null
         if (hooks?.beforeStart) await hooks.beforeStart()
-        await this.startInternal(opts)
+        await this.startInternal(opts, undefined, hooks?.beforeSpawn)
         await this.awaitNotStarting()
         // GitHub report (Qwen3.6-35B-A3B): the multimodal projector can fail to load even with
         // the model's own correct, official mmproj — see mmprojFallbackOpts's doc comment. Retry
@@ -255,7 +264,7 @@ export class Manager {
             // Set BEFORE the spawn (not after) so a throw out of startInternal() below is
             // still attributed to the config that actually threw, not the original one.
             effectiveOpts = fallback
-            await this.startInternal(fallback, note)
+            await this.startInternal(fallback, note, hooks?.beforeSpawn)
             await this.awaitNotStarting()
           }
         }
@@ -283,12 +292,12 @@ export class Manager {
   /** Start a model assuming nothing is loaded (throws BusyError otherwise). Held by
    *  the global load gate through readiness so concurrent loads can't spin up two
    *  engines at once. Most callers want load() (which stops first); this exists for
-   *  paths that have already ensured the engine is free (bench, ComfyUI reload). `beforeStart` runs inside the
-   *  gate, as load()'s does: a throw there starts nothing and rejects the start. */
-  async start(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
+   *  paths that have already ensured the engine is free (bench, ComfyUI reload). `hooks` run inside the gate, as
+   *  load()'s do: a throw from one starts nothing and rejects the start. */
+  async start(opts: StartOpts, hooks?: LoadHooks): Promise<void> {
     await Manager.runExclusive(async () => {
       if (hooks?.beforeStart) await hooks.beforeStart()
-      await this.startInternal(opts)
+      await this.startInternal(opts, undefined, hooks?.beforeSpawn)
       await this.awaitNotStarting()
     })
   }
@@ -315,7 +324,7 @@ export class Manager {
     while (this.state === 'starting' && Date.now() < deadline) await sleep(200)
   }
 
-  private async startInternal(opts: StartOpts, retryNote?: string): Promise<void> {
+  private async startInternal(opts: StartOpts, retryNote?: string, beforeSpawn?: () => void): Promise<void> {
     if (this.state === 'starting' || this.state === 'running' || this.state === 'stopping') {
       throw new BusyError()
     }
@@ -364,6 +373,9 @@ export class Manager {
     }
 
     const port = await allocPort(opts.preferredPort)
+    // The last await before the spawn: from here to `state = 'starting'` nothing yields, so a check made here (the
+    // ComfyUI guard's, against a render that began during the preflight above) still holds when the engine starts.
+    beforeSpawn?.()
     // A pool slot often runs on the same engine as the primary, so it logs to a file named by its port (unique
     // among live engines): sharing the primary's file truncated it and interleaved both engines' output, and every
     // reader of logPath() (logs route, error banner, mmproj fallback, load-failure checks) saw the other's lines.
@@ -515,12 +527,14 @@ export class Manager {
     }
   }
 
-  async restart(): Promise<void> {
+  /** `hooks` as for load(): the ComfyUI guard's reload of a load a render paused refuses it in there when a new
+   *  render has begun. */
+  async restart(hooks?: LoadHooks): Promise<void> {
     const opts = this.opts
     if (!opts?.modelPath) throw new Error('no_such_model')
     // load() stops the current engine (if any) and starts the same opts again, all
     // under the global load gate — so a restart can't race a concurrent swap.
-    await this.load(opts)
+    await this.load(opts, hooks)
   }
 
   /** The exact command last spawned, formatted for copy-paste into a terminal

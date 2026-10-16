@@ -269,6 +269,40 @@ test('release resumes a load the guard refused mid-render, over the model the re
   assert.equal(g.isBlocked(), false)
 })
 
+// The release route answers before the reload (the gate node waits for it holding its lock), so the next prompt's
+// acquire can land while the reload still waits for the load gate, with nothing running yet for acquire() to suspend.
+// That reload used to start with no pre-start check: the LLM loaded under the new render, and nothing reloaded it after.
+test('an acquire while the reload waits for the load gate: nothing starts under the render, and its release reloads the model', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const start = mgr.start
+  let openGate = () => {}
+  // Manager.start's shape: wait for the load gate, run beforeStart inside it, then spawn.
+  Object.assign(mgr, {
+    start: async (o: StartOpts, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await new Promise<void>((resolve) => { openGate = resolve })
+      await hooks?.beforeStart?.()
+      await start(o)
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+
+  const reload = g.release()
+  await g.acquire() // the next prompt
+  openGate()
+  await reload
+
+  assert.equal(calls.starts.length, 0, 'nothing loads under the new render')
+  assert.equal(g.isBlocked(), true)
+  assert.equal(g.snapshot().suspendedModelKey, 'llama-8b', 'still the model to reload')
+  assert.equal(g.modelKeyLoadedOnRelease(), 'llama-8b')
+
+  const second = g.release()
+  openGate()
+  await second
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['llama-8b'], 'reloaded once that render ends')
+})
+
 // The gateway answers a caller that may not load models from this: it must name the model release() loads.
 test('modelKeyLoadedOnRelease names what release() loads: the paused load over the unloaded model, none outside a render', async () => {
   const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
@@ -395,6 +429,71 @@ test('cachePersist off → neither save nor restore is attempted', async () => {
   assert.equal(restores(f.calls).length, 0, 'no restore when the opt-in is off')
   assert.equal(calls.forceStops, 1, 'the unload/reload cycle is otherwise unchanged')
   assert.equal(calls.starts.length, 1)
+})
+
+// The next prompt's acquire can also land while the reload is restoring the cache. That acquire saves the cache of the
+// engine it stops, for its own release to restore; the reload used to clear it once its restore returned, so the model
+// came back after that render without it.
+test('cachePersist: an acquire landing during the reload\'s restore keeps the cache it saved for its own release', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const slotCalls: string[] = []
+  let finishRestore = () => {}
+  const http: FetchImpl = async (url) => {
+    slotCalls.push(url)
+    // The first restore stays in flight until the next prompt has acquired.
+    if (slotCalls.filter((u) => u.includes('action=restore')).length === 1 && url.includes('action=restore')) {
+      await new Promise<void>((resolve) => { finishRestore = resolve })
+    }
+    return { ok: true, status: 200 }
+  }
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, http)
+  await g.acquire()
+
+  const reload = g.release()
+  while (!slotCalls.some((u) => u.includes('action=restore'))) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt: the reloaded engine is up, so its cache is saved again
+  finishRestore()
+  await reload
+  await g.release()
+
+  assert.deepEqual(slotCalls.map((u) => /action=(\w+)/.exec(u)?.[1]), ['save', 'restore', 'save', 'restore'])
+})
+
+// More often the next prompt's acquire catches the reload still starting (the release route answers at once, so an
+// auto-queued prompt lands within milliseconds). That acquire has no running engine to save a cache from, and the
+// reload then skips its restore: the cache saved on the way in was dropped, so the model came back without it.
+test('cachePersist: an acquire that catches the reload still starting keeps the unrestored cache for its own release', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const f = fakeFetch({ ok: true })
+  const { status, currentOpts, stopAndWait, start } = mgr
+  let starting: StartOpts | null = null
+  let leftStarting = () => {}
+  // The reload's start, as Manager.start behaves when an acquire stops the engine it spawned: 'starting' until then,
+  // and it resolves once the engine has left 'starting'. Later starts come up at once.
+  Object.assign(mgr, {
+    start: async (o: StartOpts) => {
+      Object.assign(mgr, { start })
+      starting = o
+      await new Promise<void>((resolve) => { leftStarting = resolve })
+    },
+    status: () => (starting ? { ...status(), state: 'starting' as const } : status()),
+    currentOpts: () => starting ?? currentOpts(),
+    stopAndWait: async (o?: { force?: boolean }) => {
+      if (!starting) return stopAndWait(o)
+      starting = null
+      leftStarting()
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire()
+
+  const reload = g.release()
+  while (!starting) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt
+  await reload
+  await g.release()
+
+  assert.deepEqual(f.calls.map((c) => /action=(\w+)/.exec(c.url)?.[1]), ['save', 'restore'])
 })
 
 test('cachePersist: a failed save means release skips the restore', async () => {

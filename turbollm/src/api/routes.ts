@@ -2115,8 +2115,12 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true, ...d.comfy.snapshot() })
   })
 
-  app.post('/api/v1/comfyui/release', async (c) => {
-    if (d.comfy) await d.comfy.release()
+  app.post('/api/v1/comfyui/release', (c) => {
+    // Answered once loads are unblocked, not after the reload: the gate node (v3+) holds its lock across this call,
+    // and a prompt queued meanwhile waits for that lock on ComfyUI's server thread, so every "Run (Instant)" iteration
+    // froze ComfyUI until the LLM had reloaded (up to the node's 10 s timeout). release() logs a failed reload itself
+    // and never rejects.
+    if (d.comfy) void d.comfy.release()
     return c.json({ ok: true })
   })
 

@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
+import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
@@ -459,4 +460,46 @@ test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook
   assert.equal(res.status, 409)
   assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'comfyui_busy')
   assert.equal(started, false)
+})
+
+// The gate node (v3+) holds its lock across the release call, and a prompt ComfyUI queues meanwhile waits for that lock
+// on ComfyUI's server thread. The route used to answer only once the LLM had reloaded, so every "Run (Instant)"
+// auto-queue iteration froze ComfyUI for up to the node's 10 s timeout.
+test('POST /api/v1/comfyui/release answers once loads are unblocked, before the model has reloaded', async () => {
+  let state = 'running'
+  let finishLoad = () => {}
+  const loading = new Promise<void>((resolve) => { finishLoad = resolve })
+  const starts: unknown[] = []
+  const manager = {
+    status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => (state === 'running' || state === 'starting' ? { model: { key: 'llama-8b' } } : null),
+    target: () => null,
+    stopAndWait: async () => { state = 'stopped' },
+    start: async (opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await hooks?.beforeStart?.()
+      starts.push(opts)
+      state = 'starting'
+      await loading // the model takes a while to load
+      state = 'running'
+    },
+  }
+  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
+  const comfy = new ComfyGuard(comfyStore as never, manager as never)
+  await comfy.acquire()
+  const app = new Hono()
+  registerApi(app, { store: { snapshot: () => ({}) }, comfy } as unknown as Deps)
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const res = await Promise.race([
+    app.request('/api/v1/comfyui/release', { method: 'POST' }),
+    new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 2000) }),
+  ])
+  clearTimeout(timer)
+  finishLoad()
+
+  assert.ok(res, 'answered while the model was still loading')
+  assert.equal(res.status, 200)
+  assert.equal(comfy.isBlocked(), false, 'loads are unblocked')
+  assert.equal(starts.length, 1, 'the reload is under way')
+  comfy.stop()
 })
