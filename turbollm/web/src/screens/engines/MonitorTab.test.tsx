@@ -63,10 +63,13 @@ vi.mock('../../lib/api', async (importOriginal) => {
 
 // `useEngineLog` / `useRequestLog` tail their streams through `subscribeSse` (an authenticated
 // fetch, retried every 3 s). Stub it so nothing here opens a real request — nothing here needs
-// a live frame.
+// a live frame. It reports the stream as open, since `useRequestLog` loads its history then.
 vi.mock('../../lib/sse', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/sse')>()),
-  subscribeSse: () => () => {},
+  subscribeSse: (_url: string, _onMessage: unknown, opts?: { onOpen?: () => void }) => {
+    opts?.onOpen?.()
+    return () => {}
+  },
 }))
 
 function engine(over: Partial<Engine> = {}): Engine {

@@ -130,6 +130,24 @@ describe('subscribeSse', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
+  it('calls onOpen each time a stream opens, before its first message, and not for an error response', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(ok(['event: entry\ndata: 1\n\n']))
+      .mockResolvedValueOnce(ok(['event: entry\ndata: 2\n\n']))
+      .mockImplementation(async () => new Response('{}', { status: 401 }))
+    vi.stubGlobal('fetch', fetchMock)
+    const seen: string[] = []
+    const close = subscribeSse('/s', (m) => seen.push(m.data), { onOpen: () => seen.push('open') })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(seen).toEqual(['open', '1'])
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(seen).toEqual(['open', '1', 'open', '2'])
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(seen).toEqual(['open', '1', 'open', '2'])
+    close()
+  })
+
   it('gives up for good on an HTTP error, as EventSource does on a non-200', async () => {
     const fetchMock = vi.fn(async () => new Response('{"error":{"code":"unauthorized"}}', { status: 401 }))
     vi.stubGlobal('fetch', fetchMock)

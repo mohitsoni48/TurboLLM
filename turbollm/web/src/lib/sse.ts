@@ -74,8 +74,15 @@ const SSE_RETRY_MS = 3000
  *  headers. This sends `authHeaders()` like every other API call, and keeps EventSource's reconnect
  *  behaviour: a stream that ends or drops is reopened after {@link SSE_RETRY_MS}; an HTTP error
  *  response, or a 200 that isn't `text/event-stream`, fails it for good (as EventSource does).
+ *  `onOpen` runs each time a stream's response arrives, before its first message (EventSource's
+ *  `open` event): the daemon's tails send live events only, with no replay, so a caller that also
+ *  loads a snapshot loads it from there, the first time and after every reconnect.
  *  Returns the close function. */
-export function subscribeSse(url: string, onMessage: (msg: SseMessage) => void): () => void {
+export function subscribeSse(
+  url: string,
+  onMessage: (msg: SseMessage) => void,
+  opts: { onOpen?: () => void } = {},
+): () => void {
   const ac = new AbortController()
   const { signal } = ac
   void (async () => {
@@ -85,6 +92,7 @@ export function subscribeSse(url: string, onMessage: (msg: SseMessage) => void):
         // Like EventSource, a 200 that isn't an event stream (a proxy's HTML login/interstitial
         // page) fails for good too, rather than being re-downloaded every few seconds.
         if (!res.ok || !res.body || !/^text\/event-stream/i.test(res.headers.get('content-type') ?? '')) return
+        opts.onOpen?.()
         for await (const msg of readSseStream(res.body)) onMessage(msg)
       } catch {
         /* network drop, daemon restart, or our own abort — the loop condition sorts out which */
