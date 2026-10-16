@@ -6,7 +6,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSy
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpDir } from '../test-support/tmp'
-import { copyCudaRuntimeLibs, runBuild, runPrereqInstall, runStep } from './build-runner'
+import { copyCudaRuntimeLibs, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
 import { checkBuildPrereqs } from './build-prereqs'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -793,6 +793,46 @@ test('runBuild: a failed tree that cannot be deleted is moved aside and the prev
   await assert.rejects(build())
   assert.equal(readFileSync(bin, 'utf8'), 'previous working build')
   assert.deepEqual(readdirSync(join(enginesRoot, 'build')), [basename(root)])
+})
+
+// The daemon's exit kills a running rebuild's compile, but runBuild's restorePreviousBuild never runs: the partial tree
+// stays in the build directory and the previous build stays parked, so the registered engine pointed at a missing
+// binary until the next build of that same directory. Boot puts it back now, and deletes nothing.
+test('restoreInterruptedBuilds: a rebuild the daemon exit cut short gets its previous build back at boot', () => {
+  const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
+  const name = 'owner-fork-main'
+  mkdirSync(join(buildDir, name, 'src'), { recursive: true }) // the partial tree: cloned, never compiled
+  for (const [ms, content] of [['1700000000000', 'older build'], ['1700000000001', 'last working build']]) {
+    mkdirSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin'), { recursive: true })
+    writeFileSync(join(buildDir, `.${name}-${ms}.prev`, 'build', 'bin', 'llama-server'), content)
+  }
+  const bin = join(buildDir, name, 'build', 'bin', 'llama-server')
+  const logs: string[] = []
+  restoreInterruptedBuilds(join(buildDir, '..'), [bin], (l) => logs.push(l))
+  assert.equal(readFileSync(bin, 'utf8'), 'last working build')
+  assert.ok(logs.some((l) => l.startsWith('Put back the previous build')), logs.join('\n'))
+  const left = readdirSync(buildDir).filter((n) => n !== name)
+  assert.equal(left.length, 2, 'the older parked build and the partial tree are left for the next build to sweep')
+  assert.ok(left.includes(`.${name}-1700000000000.prev`), left.join(', '))
+  assert.ok(left.some((n) => /^\.owner-fork-main-\d+\.failed$/.test(n)), left.join(', '))
+})
+
+test('restoreInterruptedBuilds: a working build, or a directory no engine claims, is left as it is', () => {
+  const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
+  mkdirSync(join(buildDir, 'working', 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, 'working', 'build', 'bin', 'llama-server'), 'current build')
+  mkdirSync(join(buildDir, 'unclaimed', 'src'), { recursive: true })
+  for (const name of ['working', 'unclaimed']) {
+    mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
+    writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'parked build')
+  }
+  const before = readdirSync(buildDir).sort()
+  restoreInterruptedBuilds(join(buildDir, '..'), [join(buildDir, 'working', 'build', 'bin', 'llama-server')], () => {})
+  assert.deepEqual(readdirSync(buildDir).sort(), before)
+  assert.equal(readFileSync(join(buildDir, 'working', 'build', 'bin', 'llama-server'), 'utf8'), 'current build')
+  assert.equal(existsSync(join(buildDir, 'unclaimed', 'build')), false)
+  // A missing build directory is a no-op, not a throw.
+  restoreInterruptedBuilds(join(buildDir, 'nope'), [], () => {})
 })
 
 // ── Windows Cancel kills the compiler tree, not just cmd.exe ─────────────────────────────────────

@@ -1045,8 +1045,9 @@ function couldNotPutBackMessage(e: unknown, parked: string, buildRoot: string): 
  *
  *  When `buildRoot` holds no server binary (the daemon died mid-build, or restorePreviousBuild could not move the
  *  parked build back), the newest parked build that has one is the only working copy: it is put back first (the
- *  partial tree moved aside and swept with the rest), or kept if that fails — never swept. */
-function sweepParkedBuilds(buildRoot: string, log: (l: string) => void): void {
+ *  partial tree moved aside and swept with the rest), or kept if that fails — never swept. `sweep: false` only puts
+ *  it back and deletes nothing (restoreInterruptedBuilds). */
+function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { sweep?: boolean } = {}): void {
   const parent = dirname(buildRoot)
   const prefix = `.${basename(buildRoot)}-`
   let names: string[]
@@ -1078,12 +1079,37 @@ function sweepParkedBuilds(buildRoot: string, log: (l: string) => void): void {
       }
     }
   }
+  if (opts.sweep === false) return
   for (const name of parked) {
     try {
       rmSync(join(parent, name), { recursive: true, force: true })
     } catch {
       /* best effort */
     }
+  }
+}
+
+/** At boot: put the previous build back for every registered (or remembered) source build whose directory has no
+ *  server binary while a `.<name>-<ms>.prev` beside it has one. A daemon that exits mid-rebuild kills the compile, but
+ *  runBuild's restorePreviousBuild never runs, so the engine pointed at a missing binary until the next build of that
+ *  same directory put it back (sweepParkedBuilds), which a SIGKILL or crash mid-build left the same way. Only puts
+ *  back: the partial tree is moved aside, and it and other leftovers are swept by that directory's next build, so a
+ *  multi-GB delete does not hold up startup. A directory nothing claims is left to its next build too. */
+export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: string[], log: (l: string) => void): void {
+  const buildDir = join(enginesRoot, 'build')
+  let names: string[]
+  try {
+    names = readdirSync(buildDir)
+  } catch {
+    return
+  }
+  const roots = new Set<string>()
+  for (const name of names) {
+    const m = /^\.(.+)-\d+\.prev$/.exec(name)
+    if (m) roots.add(join(buildDir, m[1]))
+  }
+  for (const buildRoot of roots) {
+    if (claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))) sweepParkedBuilds(buildRoot, log, { sweep: false })
   }
 }
 
