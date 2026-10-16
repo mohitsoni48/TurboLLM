@@ -828,8 +828,11 @@ export type McpServer = {
   args?: string[]
   env?: Record<string, string>
   url?: string
-  /** sse only — Bearer token for Authorization header (ADR-124) */
+  /** sse only — Bearer token for Authorization header (ADR-124). Write-only: sent on add/edit,
+   *  never returned ('' on edit removes it). */
   apiKey?: string
+  /** Read-only, from the settings payload: whether a Bearer key is stored. */
+  apiKeySet?: boolean
   enabled: boolean
 }
 

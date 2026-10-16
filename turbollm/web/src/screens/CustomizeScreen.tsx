@@ -98,10 +98,15 @@ type McpFormState = {
   name: string; transport: 'stdio' | 'sse'
   command: string; argsStr: string; envStr: string
   url: string; apiKey: string; enabled: boolean
+  // The Bearer key is write-only (never in the settings payload), so the field always opens
+  // blank. apiKeySet says a key is stored, so the form can say so; clearApiKey is the Clear
+  // control, which sends apiKey '' (the only value the PUT route takes as "remove the key").
+  apiKeySet: boolean; clearApiKey: boolean
 }
 
 const emptyMcpForm = (): McpFormState => ({
   name: '', transport: 'stdio', command: '', argsStr: '', envStr: '', url: '', apiKey: '', enabled: true,
+  apiKeySet: false, clearApiKey: false,
 })
 
 function serverToForm(s: McpServer): McpFormState {
@@ -109,7 +114,8 @@ function serverToForm(s: McpServer): McpFormState {
     name: s.name, transport: s.transport,
     command: s.command ?? '', argsStr: (s.args ?? []).join(', '),
     envStr: Object.entries(s.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
-    url: s.url ?? '', apiKey: s.apiKey ?? '', enabled: s.enabled,
+    url: s.url ?? '', apiKey: '', enabled: s.enabled,
+    apiKeySet: !!s.apiKeySet, clearApiKey: false,
   }
 }
 
@@ -129,7 +135,9 @@ function formToPayload(f: McpFormState): Omit<McpServer, 'id'> {
     args: f.transport === 'stdio' ? args : undefined,
     env: f.transport === 'stdio' ? env : undefined,
     url: f.transport === 'sse' ? f.url.trim() || undefined : undefined,
-    apiKey: f.transport === 'sse' && f.apiKey.trim() ? f.apiKey.trim() : undefined,
+    // A typed key replaces the stored one; Clear sends '' to remove it; a blank field sends
+    // nothing and keeps it (the route still drops it if the URL moves to another origin).
+    apiKey: f.transport !== 'sse' ? undefined : f.apiKey.trim() ? f.apiKey.trim() : f.clearApiKey ? '' : undefined,
     enabled: f.enabled,
   }
 }
@@ -524,9 +532,21 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-[12px] text-muted">API Key <span className="text-faint">(optional — Bearer token)</span></label>
-            <input type="password" value={f.apiKey} onChange={(e) => set({ apiKey: e.target.value })}
-              placeholder="sk-…" autoComplete="off"
-              className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+            <div className="flex gap-2">
+              <input type="password" value={f.apiKey} onChange={(e) => set({ apiKey: e.target.value })}
+                placeholder={f.apiKeySet && !f.clearApiKey ? 'Key set — leave blank to keep' : 'sk-…'} autoComplete="off"
+                className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+              {f.apiKeySet && !f.clearApiKey && (
+                <Button variant="outline" size="sm" onClick={() => set({ apiKey: '', clearApiKey: true })}>Clear key</Button>
+              )}
+            </div>
+            {f.apiKeySet && (
+              <span className="text-[11px] text-faint">
+                {f.clearApiKey
+                  ? 'The saved key is removed on Update.'
+                  : 'Moving the URL to another host drops the saved key.'}
+              </span>
+            )}
           </div>
         </>
       )}
