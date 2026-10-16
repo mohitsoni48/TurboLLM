@@ -485,6 +485,9 @@ const modelRouter = new ModelRouter(store, registry, manager, scanner, comfy, re
 comfy.setPoolStopper(async () => {
   await Promise.all([...modelRouter.poolEngineIds()].map((id) => modelRouter.stopPoolSlotsOnEngine(id, { force: true })))
 })
+// The reload when a render ends runs under the gateway's swap lock, so a gateway request for that model waits for it
+// instead of evicting it or loading a second copy.
+comfy.setSwapLock((fn) => modelRouter.withSwapLock(fn))
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
