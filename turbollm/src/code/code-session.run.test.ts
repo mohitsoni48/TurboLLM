@@ -4,7 +4,7 @@
 // handling across pi's run lifecycle, plan mode's real toolset, and what history the model gets.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
@@ -204,6 +204,56 @@ test('the skill sub-agent\'s tool frames are tagged `subagent`; the parent\'s ow
     assert.ok(calls.some((f) => f.data.name === 'read'), 'the skill made its call')
     for (const f of calls) assert.equal(f.data.subagent === true, f.data.name === 'read', `${f.data.name} ${f.data.status}`)
   } finally { await engine.close() }
+})
+
+// ── an edit/write outside the repo is blocked before it runs, in each tool_call hook ───────────
+
+/** Runs an auto-mode turn, where no approval wait follows the containment check, so that check is
+ *  all that keeps the call off the disk. The script makes a `write` of a new file and an `edit`
+ *  of an existing one, both named by absolute paths in a folder outside the repo. Returns what
+ *  changed out there, and each call's final frame. */
+async function writeAndEditOutside(script: (write: Reply, edit: Reply) => Reply[]) {
+  const outside = tmpDir('tllm-code-run-outside-')
+  writeFileSync(join(outside, 'kept.txt'), 'before\n')
+  const write = toolCall('write', { path: join(outside, 'new.txt'), content: 'written\n' })
+  const edit = toolCall('edit', { path: join(outside, 'kept.txt'), edits: [{ oldText: 'before', newText: 'after' }] })
+  const engine = await stubEngine(script(write, edit))
+  try {
+    const h = harness(engine.base, 'auto')
+    assert.notEqual(await within(h.turn('change the files', new AbortController().signal), 20_000), 'timeout', 'the turn settled')
+    const last = (name: string) => h.frames.filter((x) => x.event === 'tool_call' && x.data.name === name).at(-1)
+    return {
+      written: existsSync(join(outside, 'new.txt')),
+      edited: readFileSync(join(outside, 'kept.txt'), 'utf8') !== 'before\n',
+      frames: [last('write'), last('edit')],
+    }
+  } finally { await engine.close() }
+}
+
+function assertBlocked(r: Awaited<ReturnType<typeof writeAndEditOutside>>, subagent: boolean) {
+  assert.equal(r.written, false, 'no file created outside the repo')
+  assert.equal(r.edited, false, 'the file outside the repo is unchanged')
+  for (const f of r.frames) {
+    assert.equal(f?.data.status, 'error', `${f?.data.name} refused`)
+    assert.match(String(f?.data.result), /outside the allowed repo root/)
+    assert.equal(f?.data.subagent === true, subagent, `${f?.data.name} was made by the hook under test`)
+  }
+}
+
+test('an edit or write outside the repo is blocked by the session\'s own tool_call hook', { timeout: 30_000 }, async () => {
+  assertBlocked(await writeAndEditOutside((write, edit) => [write, edit, text('done')]), false)
+})
+
+test('an edit or write outside the repo is blocked in a skill\'s sub-session', { timeout: 30_000 }, async () => {
+  assertBlocked(await writeAndEditOutside((write, edit) => [
+    toolCall('invoke_skill', { skillId: 'filesystem', task: 'change the files' }), write, edit, text('skill done'), text('all done'),
+  ]), true)
+})
+
+test('an edit or write outside the repo is blocked in a delegate_task sub-agent', { timeout: 30_000 }, async () => {
+  assertBlocked(await writeAndEditOutside((write, edit) => [
+    toolCall('delegate_task', { task: 'Change the files.' }), write, edit, text('sub-agent done'), text('all done'),
+  ]), true)
 })
 
 // ── ask mode: write containment is checked again once the approval wait ends ──────────────────

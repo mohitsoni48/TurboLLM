@@ -8,7 +8,7 @@
 // calls canonicalized to a path OUTSIDE the root and were falsely rejected in every mode.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
+import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
 import { join, parse, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createWriteToolDefinition } from '@earendil-works/pi-coding-agent'
@@ -421,6 +421,37 @@ test('REGRESSION: hostile link layouts are judged quickly', fileLinks, () => {
       assert.throws(() => writeFileSync(join(root, 'c0'), 'w'), { code: 'ELOOP' })
     }
   } finally {
+    rmSync(base, { recursive: true, force: true })
+  }
+})
+
+// walk() looks each component up by the real path walked so far, which can grow past PATH_MAX
+// while the kernel still walks the write's own short spelling: it splices in one link text at a
+// time, and only each text has to fit. So a lookup that fails ENAMETOOLONG must refuse, not take
+// the rest as a missing, in-repo tail. Here `s1` leads 15 folders of 200 characters deep, `s2` 10
+// more, and `esc` (real path over 5 KB) leads outside. Linux only: macOS caps a link text at
+// 1023 bytes. The `b` folders can only be made, and removed, through `s1`: their real paths are
+// too long for mkdir, and for rmSync's recursive walk.
+test('REGRESSION: a lookup too long for the walk is refused, though the kernel follows the links', { skip: process.platform !== 'linux' }, () => {
+  const base = realpathSync.native(tmpDir('klong-'))
+  const root = join(base, 'repo')
+  const outside = join(base, 'out')
+  const chain = (c: string, n: number) => Array<string>(n).fill(c.repeat(200)).join('/')
+  try {
+    mkdirSync(join(root, chain('a', 15)), { recursive: true })
+    mkdirSync(outside)
+    symlinkSync(chain('a', 15), join(root, 's1'))
+    mkdirSync(join(root, 's1', chain('b', 10)), { recursive: true })
+    symlinkSync(chain('b', 10), join(root, 's1', 's2'))
+    symlinkSync(outside, join(root, 's1', 's2', 'esc'))
+    // The real path of `esc` is too long to look up, so the walk does hit ENAMETOOLONG.
+    assert.throws(() => lstatSync(join(root, chain('a', 15), chain('b', 10), 'esc')), { code: 'ENAMETOOLONG' })
+
+    assert.equal(isContainedFromRoot('s1/s2/esc/pwned.txt', root), false)
+    writeFileSync(join(root, 's1', 's2', 'esc', 'pwned.txt'), 'w')
+    assert.equal(readFileSync(join(outside, 'pwned.txt'), 'utf8'), 'w', 'sanity: the write landed outside')
+  } finally {
+    rmSync(join(root, 's1', 'b'.repeat(200)), { recursive: true, force: true })
     rmSync(base, { recursive: true, force: true })
   }
 })
