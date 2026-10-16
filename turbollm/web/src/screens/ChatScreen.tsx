@@ -950,14 +950,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }
 
   const handleEditSave = (msgId: string, content: string) => {
-    if (!activeId) return
+    if (!activeId || mut.editMsg.isPending) return
     // GitHub #52: editing the model's own reply just fixes its text in place — no reason
     // to trigger ANOTHER reply after it. Only a user-message edit resends (branching the
     // downstream history, per ADR — see chat-routes.ts's PUT /messages/:msgId).
     const isUserMessage = messages.find((m) => m.id === msgId)?.role === 'user'
-    setEditingId(null)
+    // The edit stays open, typed text and all, until the daemon has taken it. Closed before the
+    // request, any refusal but stale_message (a 409 generation_in_flight — the pencil on a
+    // question stays clickable while a reply streams — a network error, a 500) lost the text:
+    // reopening the edit starts again from the message.
+    const closeEdit = () => setEditingId((cur) => (cur === msgId ? null : cur))
     mut.editMsg.mutate({ convId: activeId, msgId, content }, {
       onSuccess: () => {
+        closeEdit()
         userScrolledUp.current = false
         if (isUserMessage && ready) {
           const ac = new AbortController()
@@ -966,11 +971,15 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         }
       },
       onError: (e) => {
-        if (!(e instanceof ApiError && e.code === 'stale_message')) { toast.error('Could not edit message.'); return }
+        if (!(e instanceof ApiError && e.code === 'stale_message')) {
+          toast.error(e instanceof ApiError ? e.message : 'Could not edit message.')
+          return
+        }
         // A question this view still showed after it left the branch (switched in another tab
         // or device): catch the view up now rather than on the next poll, and keep the typed
         // text. Its bubble is gone after the refetch, so it goes to the composer (this chat's
         // only, and after anything typed there meanwhile, never over it).
+        closeEdit()
         void qc.invalidateQueries({ queryKey: ['conversation', activeId] })
         void qc.invalidateQueries({ queryKey: ['message-variants'] })
         toast.error(e.message)

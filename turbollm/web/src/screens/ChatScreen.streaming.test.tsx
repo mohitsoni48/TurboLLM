@@ -366,6 +366,34 @@ describe('ChatScreen — editing a message', () => {
       toastError.mockRestore()
     }
   })
+
+  // The edit closed before the request, so any refusal but stale_message lost the typed text:
+  // reopening the edit starts again from the message.
+  it('a Save & Resend refused for another reason (409 generation_in_flight) keeps the edit open with the typed text and says why', async () => {
+    const busy = 'Stop generation first.'
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), message('a1', 2, 'assistant', 'Use Python')])
+    editMsgMutate.mockImplementation((_v: unknown, opts: { onError: (e: unknown) => void }) => opts.onError(new ApiError('generation_in_flight', busy, 409)))
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      await act(async () => { fireEvent.keyDown(await composer(), { key: 'ArrowUp' }) })
+      fireEvent.change(screen.getByDisplayValue('Recommend a language'), { target: { value: 'Recommend a typed language, carefully' } })
+      await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+      expect(toastError).toHaveBeenCalledWith(busy)
+      expect(screen.getByDisplayValue('Recommend a typed language, carefully')).toBeInTheDocument()
+      expect(continueCalls).toHaveLength(0)
+
+      // Saved again once the daemon takes it, the edit closes and the question is answered.
+      editMsgMutate.mockImplementation((_v: unknown, opts: { onSuccess: () => void }) => opts.onSuccess())
+      nextGen = quickStream()
+      await act(async () => { fireEvent.click(screen.getByText('Save & Resend')) })
+      expect(editMsgMutate).toHaveBeenLastCalledWith({ convId: 'c1', msgId: 'u1', content: 'Recommend a typed language, carefully' }, expect.anything())
+      expect(screen.queryByText('Save & Resend')).toBeNull()
+      await waitFor(() => expect(continueCalls).toHaveLength(1))
+    } finally {
+      toastError.mockRestore()
+    }
+  })
 })
 
 describe('ChatScreen — Regenerate', () => {
