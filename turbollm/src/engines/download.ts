@@ -12,6 +12,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { promisify } from 'node:util'
 import type { GpuVendor } from '../sysinfo/sysinfo'
+import { quotePowerShellArg } from '../util/shell-command'
 import { extractZipAll } from './zip-reader'
 
 const execFileP = promisify(execFile)
@@ -462,8 +463,12 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   stripMacOsQuarantine(destDir)
 }
 
-function powershellExpandArgs(archive: string, destDir: string): string[] {
-  const ps = `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`
+/** PURE: the `powershell -Command` arguments that run Expand-Archive. The paths go through quotePowerShellArg:
+ *  escaping only the ASCII ' left a typographic one (U+2018-U+201B, which PowerShell also reads as a single quote)
+ *  to end the string early, so a data dir under a profile such as C:\Users\O’Brien failed every .zip extraction
+ *  with "The path '...\O' either does not exist". Exported for its test, which needs no Windows. */
+export function powershellExpandArgs(archive: string, destDir: string): string[] {
+  const ps = `Expand-Archive -LiteralPath ${quotePowerShellArg(archive)} -DestinationPath ${quotePowerShellArg(destDir)} -Force`
   return ['-NoProfile', '-NonInteractive', '-Command', ps]
 }
 
