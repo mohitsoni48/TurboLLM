@@ -287,6 +287,23 @@ test('merge gives up on the post-merge run at the deadline instead of picking an
   assert.equal(await waitForCommitRun('ci.yml', 'b'.repeat(40), 0, none, 1), null);
 });
 
+// gh exits non-zero with nothing on stdout on any error, which read as "the run does not exist
+// yet": a gh without `run list --commit` polled the full 5 minutes after every merge, then warned
+// that the run was not found.
+test('merge stops at once when gh run list fails instead of polling it as a missing run', async () => {
+  const calls = [];
+  const oldGh = (...args) => {
+    calls.push(args);
+    const stderr = 'unknown flag: --commit\n\nUsage:  gh run list [flags]';
+    return { code: 1, stdout: '', stderr, out: stderr };
+  };
+  await assert.rejects(waitForCommitRun('ci.yml', 'c'.repeat(40), 60_000, oldGh, 1), /no `run list --commit`: update gh/);
+  assert.equal(calls.length, 1, 'no second poll');
+
+  const loggedOut = () => ({ code: 4, stdout: '', stderr: 'To get started with GitHub CLI, please run:  gh auth login', out: 'To get started with GitHub CLI, please run:  gh auth login' });
+  await assert.rejects(waitForCommitRun('ci.yml', 'c'.repeat(40), 60_000, loggedOut, 1), (e) => /failed \(exit 4\)/.test(e.message) && /gh auth login/.test(e.message));
+});
+
 // A GitHub Release older than npm-publish.yml never fires it, so every later release's run passed
 // the "created after this release" check: publish waited on another tag's run (which succeeded)
 // instead of reaching the local-token fallback, then failed polling npm for its own version.

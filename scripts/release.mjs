@@ -575,7 +575,10 @@ function latestPrRunId(pr) {
 }
 
 // The id of `workflowFile`'s run for exactly `sha`, polled until GitHub has created it (a push run
-// appears a few seconds after the push), or null at the deadline.
+// appears a few seconds after the push), or null at the deadline. A gh that fails is not "no run
+// yet": a gh too old for `run list --commit` ("unknown flag: --commit"), a lost login or a network
+// error exits non-zero with nothing on stdout, and this loop used to poll that for the whole
+// deadline (5 minutes after a merge) and then report the run as not found. It stops at once.
 export async function waitForCommitRun(workflowFile, sha, timeoutMs, ghRun = gh, pollMs = 15_000) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
@@ -584,6 +587,15 @@ export async function waitForCommitRun(workflowFile, sha, timeoutMs, ghRun = gh,
       '--json', 'databaseId', '-q', '.[0].databaseId',
     );
     if (/^\d+$/.test(r.stdout)) return Number(r.stdout);
+    if (r.code !== 0) {
+      fail(
+        `\`gh run list --workflow ${workflowFile} --commit ${sha}\` failed (exit ${r.code}), so its run cannot be checked.\n`
+        + (/unknown flag:? --commit/i.test(r.out)
+          ? 'This gh has no `run list --commit`: update gh, then re-run this phase.\n'
+          : 'Fix gh (`gh auth status`), then re-run this phase.\n')
+        + tailOf(r.out, 20),
+      );
+    }
     if (Date.now() > deadline) return null;
     step(`waiting for the ${workflowFile} run on ${sha.slice(0, 7)} to start…`);
     await sleep(pollMs);
