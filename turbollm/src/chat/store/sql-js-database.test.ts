@@ -79,3 +79,23 @@ test('the periodic flush writes only when something changed', (t) => {
   assert.notEqual(statSync(path).ino, ino, 'a new write is flushed on the next interval')
   db.close()
 })
+
+// ConversationStore.transaction (chat branching's multi-statement edits and version switches)
+// runs BEGIN IMMEDIATE / COMMIT / ROLLBACK through exec(), on Android too.
+test('a transaction through exec() rolls back or commits, and a committed one is flushed', () => {
+  const path = join(tmpDir('turbollm-sqljs-'), 'chat.db')
+  const db = openSqlJsDatabaseSync(path)
+  db.exec('CREATE TABLE t (v TEXT)')
+  db.exec('BEGIN IMMEDIATE')
+  db.prepare('INSERT INTO t (v) VALUES (?)').run('rolled back')
+  db.exec('ROLLBACK')
+  db.exec('BEGIN IMMEDIATE')
+  db.prepare('INSERT INTO t (v) VALUES (?)').run('committed')
+  db.exec('COMMIT')
+  assert.deepEqual(db.prepare('SELECT v FROM t').all(), [{ v: 'committed' }])
+  db.close()
+
+  const again = openSqlJsDatabaseSync(path)
+  assert.deepEqual(again.prepare('SELECT v FROM t').all(), [{ v: 'committed' }])
+  again.close()
+})

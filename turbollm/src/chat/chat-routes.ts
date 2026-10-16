@@ -102,10 +102,14 @@ const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat c
  *  not deleted, and `content` becomes the question's newest version, with the same images and
  *  documents. Shared by PUT /messages/:msgId and /continue { edit }. */
 function branchEditedQuestion(db: ConversationStore, convId: string, msg: Message, content: string): void {
-  db.freezeTail(convId, msg.seq, msg.id)
-  db.deactivateMessage(msg.id)
-  const variantGroup = db.getMessage(msg.id)!.variantGroup!
-  db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+  // One transaction: an addMessage that failed after the freeze (disk full, an I/O error) left
+  // the question and its tail deactivated with no new version shown in their place.
+  db.transaction(() => {
+    db.freezeTail(convId, msg.seq, msg.id)
+    db.deactivateMessage(msg.id)
+    const variantGroup = db.getMessage(msg.id)!.variantGroup!
+    db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+  })
 }
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
@@ -643,9 +647,15 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // A group with no active member is not on the shown branch (a stale tab or another device
     // still shows it): activating one would splice it, and its frozen tail, into this branch.
     if (!currentActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
-    db.freezeTail(convId, currentActive.seq, currentActive.id)
-    db.restoreTail(msgId)
-    const ok = db.setActiveVariant(msg.variantGroup, msgId)
+    // One transaction: a switch that failed partway (disk full, an I/O error) left this branch's
+    // tail frozen with the version it belongs to still shown, or the other version's tail restored
+    // next to it.
+    const group = msg.variantGroup
+    const ok = db.transaction(() => {
+      db.freezeTail(convId, currentActive.seq, currentActive.id)
+      db.restoreTail(msgId)
+      return db.setActiveVariant(group, msgId)
+    })
     if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
     return c.json({ messages: db.getMessages(convId) })
   })

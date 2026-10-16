@@ -612,6 +612,50 @@ test('a Regenerate of a reply that is no longer the last one is refused as stale
   }
 })
 
+// PUT and /activate each ran several statements with no transaction: one that failed partway (disk
+// full, an I/O error) left a question and its tail deactivated with nothing in their place, or a
+// frozen tail next to the version still shown.
+test('an edit or a version switch whose last statement fails changes nothing', async () => {
+  const h = inFlightHarness()
+  const originalError = console.error
+  console.error = () => {} // Hono logs the handler's throw
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+    const u1 = h.store.addMessage(conv.id, 'user', 'u1')
+    const a1 = h.store.addMessage(conv.id, 'assistant', 'a1')
+    h.store.deactivateMessage(a1.id)
+    h.store.addMessage(conv.id, 'assistant', 'a1 again', { variantGroup: a1.id })
+    h.store.addMessage(conv.id, 'user', 'u2')
+    h.store.addMessage(conv.id, 'assistant', 'a2')
+    const before = active()
+    const diskFull = () => { throw new Error('database or disk is full') }
+
+    const addMessage = h.store.addMessage
+    h.store.addMessage = diskFull
+    const edit = await h.app.request(`${base}/messages/${u1.id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'u1 edited' }) })
+    h.store.addMessage = addMessage
+    assert.equal(edit.status, 500)
+    assert.deepEqual(active(), before, 'the question and its tail are still shown')
+    assert.equal(h.store.getMessage(u1.id)!.variantGroup, null)
+
+    const setActiveVariant = h.store.setActiveVariant
+    h.store.setActiveVariant = diskFull
+    const sw = await h.app.request(`${base}/messages/${a1.id}/activate`, { method: 'POST' })
+    h.store.setActiveVariant = setActiveVariant
+    assert.equal(sw.status, 500)
+    assert.deepEqual(active(), before, 'the tail is not frozen, nor the other version\'s restored')
+
+    // Both work once the statements do.
+    assert.equal((await h.app.request(`${base}/messages/${a1.id}/activate`, { method: 'POST' })).status, 200)
+    assert.deepEqual(active(), ['u1', 'a1'])
+  } finally {
+    console.error = originalError
+    h.cleanup()
+  }
+})
+
 // A restored tail kept its branch_of tag, so a reply that /regenerate later replaced
 // inside it was frozen-and-restored along with its replacement — two assistant turns in a row.
 test('switching an older reply away and back after regenerating a later reply in its tail restores only the current version', async () => {

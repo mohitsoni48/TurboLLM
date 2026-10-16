@@ -2192,6 +2192,28 @@ export class ConversationStore {
     this.db.prepare(`UPDATE messages SET is_active = 1, branch_of = NULL WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
   }
 
+  /** Runs `fn` as one transaction: every statement it makes lands, or (when it throws) none do.
+   *  For the branch operations that take several statements (an edit's freezeTail +
+   *  deactivateMessage + addMessage, a version switch's freezeTail + restoreTail +
+   *  setActiveVariant): a statement that failed partway (disk full, an I/O error) left a group
+   *  with no active member, or a frozen tail with nothing shown in its place. `fn` must be
+   *  synchronous, so nothing else on this connection can run inside it; sql.js (Android) takes
+   *  BEGIN/COMMIT/ROLLBACK like node:sqlite, and its periodic flush is a timer, which cannot fire
+   *  in the middle either. */
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const out = fn()
+      this.db.exec('COMMIT')
+      return out
+    } catch (e) {
+      // SQLite has already rolled back after some errors (SQLITE_FULL, SQLITE_IOERR); a second
+      // ROLLBACK would then throw and hide the error that failed the operation.
+      try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ }
+      throw e
+    }
+  }
+
   // ── Folder methods (v10 migration) ────────────────────────────────────────
 
   /** All folders in insertion order (sort_order asc, then created_at). */
