@@ -508,7 +508,10 @@ test('resume: a 206 that adds an ETag still continues a .part written under a La
 
 /** A row restored from the manifest exactly as a restart leaves it, with `part` already in its
  *  .part and these manifest fields (a raw-URL import unless the entry says otherwise). */
-function seedRestored(part: Buffer, entry: { total: number; sha256?: string; validator?: string }) {
+function seedRestored(
+  part: Buffer,
+  entry: { total: number; sha256?: string; validator?: string; repo?: string; url?: string },
+) {
   const { modelDir, stateDir } = newDirs()
   const dest = join(modelDir, 'model.gguf')
   writeFileSync(`${dest}.part`, part)
@@ -575,6 +578,102 @@ test('resume: a server that answers 416 even to the plain request restarts once,
   assert.equal(seen.length, 2, 'one retry from byte 0, not a loop')
   assert.equal(seen[1].Range, undefined)
   assert.equal(existsSync(`${dest}.part`), false, 'the next Resume starts from byte 0, not the same 416 range')
+})
+
+const FILE_4K = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 7) % 251))
+
+test('resume: a server that ignores Range sends the whole file as a 200, and the sha256 covers that file alone', async () => {
+  // run() hashes the 1 KiB .part prefix before the request; the 200 then replaces that prefix,
+  // so the hash must start over with it. Kept, the file's own bytes hashed after the old prefix
+  // failed the checksum and the good download was deleted.
+  const { modelDir, stateDir, id, dest } = seedRestored(FILE_4K.subarray(0, 1024), {
+    total: FILE_4K.length,
+    sha256: sha(FILE_4K),
+    repo: 'owner/repo',
+    url: 'https://huggingface.co/owner/repo/resolve/main/model.gguf',
+  })
+  const seen: Array<Record<string, string>> = []
+  const ignoresRange = (async (_url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ ...init.headers })
+    return new Response(FILE_4K, { status: 200, headers: { 'content-length': String(FILE_4K.length) } })
+  }) as unknown as typeof fetch
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, ignoresRange)
+  assert.equal(seen[0].Range, 'bytes=1024-', 'a resume, so the prefix was hashed first')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 1)
+  assert.deepEqual(readFileSync(dest), FILE_4K)
+})
+
+/** The manifest's entries as the last persist() wrote them. */
+function manifestEntries(stateDir: string) {
+  return (
+    JSON.parse(readFileSync(join(stateDir, 'downloads', 'manifest.json'), 'utf8')) as {
+      entries: Array<{ total: number; validator?: string }>
+    }
+  ).entries
+}
+
+test('resume: a weak ETag is never stored as the validator, so a resume sends no If-Range', async () => {
+  // RFC 9110 §13.1.5: If-Range takes only a strong validator, and with a weak ETag present a
+  // Last-Modified may not stand in for it. A server must not honour a weak one there, so a
+  // stored W/ ETag made every resume from such a host start again from byte 0.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, { etag: 'W/"weak1"', 'last-modified': LM_OLD })
+  assert.deepEqual(manifestEntries(stateDir).map((e) => e.validator), [undefined])
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, 'W/"weak1"', seen, { lastModified: LM_OLD }))
+  assert.equal(seen[0].Range, 'bytes=60-')
+  assert.equal(seen[0]['If-Range'], undefined)
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+test('resume: a 206 with a weak ETag still continues a .part written under the strong one', async () => {
+  // A weak ETag on the 206 says nothing about which bytes it holds; only a strong one may
+  // refuse the reply. The Content-Range is right, so the resume completes.
+  const { modelDir, stateDir, id, dest } = await interruptedRawDownload(OLD_FILE, 60, '"strong1"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, 'W/"strong1"', seen, { ignoreIfRange: true }))
+  assert.equal(seen[0]['If-Range'], '"strong1"')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 1, 'resumed from the .part, not refused and restarted')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+/** A server whose replies carry no ETag or Last-Modified: it answers `status` (a 206 of the rest
+ *  of `file` from the Range offset, or a 200 of all of it), sends `n` bytes of that and then
+ *  drops the connection. */
+function noValidatorThenDrops(file: Buffer, status: 200 | 206, n: number) {
+  return (async (_url: string, init: { headers: Record<string, string> }) => {
+    const from = status === 206 ? Number(/bytes=(\d+)-/.exec(init.headers.Range ?? '')?.[1] ?? 0) : 0
+    const rest = file.subarray(from)
+    let pulls = 0
+    const body = new ReadableStream<Uint8Array>({
+      async pull(c) {
+        if (pulls++ === 0) return c.enqueue(new Uint8Array(rest.subarray(0, n)))
+        await new Promise((r) => setTimeout(r, 30)) // let the bytes reach the .part first
+        c.error(new Error('ECONNRESET'))
+      },
+    })
+    const range: Record<string, string> = status === 206 ? { 'content-range': `bytes ${from}-${file.length - 1}/${file.length}` } : {}
+    return new Response(body, { status, headers: { 'content-length': String(rest.length), ...range } })
+  }) as unknown as typeof fetch
+}
+
+test('resume: a reply with no validator keeps the stored one on a 206 and drops it on a 200', async () => {
+  // A 206 continues the bytes the stored validator names, so the next resume must still send
+  // it. A 200 replaces the .part with a version nothing names: keeping the old validator would
+  // vouch for bytes it never described.
+  const ranged = await interruptedRawDownload(OLD_FILE, 60, '"strong1"')
+  const partial = await resumeAfterRestart(ranged.stateDir, ranged.modelDir, ranged.id, noValidatorThenDrops(OLD_FILE, 206, 20))
+  assert.equal(partial.status, 'error')
+  assert.equal(readFileSync(`${ranged.dest}.part`).length, 80, 'the 206 continued the .part')
+  assert.deepEqual(manifestEntries(ranged.stateDir).map((e) => e.validator), ['"strong1"'])
+
+  const whole = await interruptedRawDownload(OLD_FILE, 60, '"strong1"')
+  const restarted = await resumeAfterRestart(whole.stateDir, whole.modelDir, whole.id, noValidatorThenDrops(OLD_FILE, 200, 20))
+  assert.equal(restarted.status, 'error')
+  assert.equal(readFileSync(`${whole.dest}.part`).length, 20, 'the 200 started the .part again')
+  assert.deepEqual(manifestEntries(whole.stateDir).map((e) => e.validator), [undefined])
 })
 
 test('a finished download carries finishedAt, already set when the rescan is requested', async () => {
