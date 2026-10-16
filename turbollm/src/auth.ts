@@ -515,6 +515,13 @@ export function hostGate(c: Context, d: Deps): boolean {
  *  (registerTerminalWs). Takes the socket's remote address and LOCAL port directly instead
  *  of pulling them off a Context — the local port is the ingress signal (ADR-422).
  *
+ *  Unlike a REST call, a WebSocket handshake gets no CORS check: a page on any site can open
+ *  ws://127.0.0.1:<port>/… and its Host header is genuine, so the checks above pass it. So a
+ *  handshake a browser marks as cross-site (Fetch Metadata, else its Origin against its Host,
+ *  the same {@link isCrossSite} rule as lanAuth's cross-site writes) gets no loopback trust
+ *  either: it needs a `key`. Otherwise the secrecy of a terminal id was the only thing between
+ *  any website and a live shell, and https://turbollm.dev could list those ids.
+ *
  *  Same fail-closed discipline as {@link isTunneled}: when remote access is live (`ingress`
  *  is defined) but the socket's local port is somehow undetermined, this must NOT read as
  *  "not tunneled" — that would let a tunneled connection (loopback by construction on its
@@ -533,6 +540,8 @@ export function isLocalUpgrade(
   // DNS rebinding — see hostNamesThisMachine. A refused handshake still gets in with a `key`.
   const host = headers.host
   if (!hostNamesThisMachine(typeof host === 'string' ? host : undefined, d)) return false
+  const one = (v: string | string[] | undefined) => (typeof v === 'string' ? v : undefined)
+  if (crossSite(one(headers['sec-fetch-site']), one(headers.origin), one(host))) return false
   // Another app on the phone — see appSecretPresented. The WebView's handshake carries the cookie.
   const cookie = headers.cookie
   const app = headers[APP_SECRET_HEADER]
@@ -763,10 +772,12 @@ export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boole
  *  http that rewrites Host (nginx's default sends `Host: 127.0.0.1`), the UI's own writes look
  *  exactly like that attack and are refused: such a proxy must pass the browser's Host through. */
 function isCrossSite(c: Context): boolean {
-  const site = c.req.header('sec-fetch-site')
+  return crossSite(c.req.header('sec-fetch-site'), c.req.header('origin'), c.req.header('host'))
+}
+
+/** {@link isCrossSite} on raw header values, for the WebSocket upgrade (isLocalUpgrade). */
+function crossSite(site: string | undefined, origin: string | undefined, host: string | undefined): boolean {
   if (site) return site !== 'same-origin' && site !== 'none'
-  const origin = c.req.header('origin')
-  const host = c.req.header('host')
   if (!origin || !host) return false
   try {
     const o = new URL(origin)

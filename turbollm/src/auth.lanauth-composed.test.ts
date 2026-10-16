@@ -524,6 +524,33 @@ test('without Fetch Metadata, a write whose Origin is another site is refused', 
   assert.equal((await post({ Host: '127.0.0.1:6996', Origin: 'http://localhost:5173', 'Sec-Fetch-Site': 'same-origin' })).status, 200)
 })
 
+// A WebSocket handshake gets no CORS check, and a page on another site that opens
+// ws://127.0.0.1:<port> sends a genuine Host. Same cross-site rule as the writes above.
+test('the terminal WebSocket gives no loopback trust to a handshake from another site', () => {
+  const { d } = makeDeps(() => {})
+  const host = '127.0.0.1:6996'
+  for (const headers of [
+    { host, origin: 'https://turbollm.dev' },
+    { host, origin: 'http://127.0.0.1:7777' },
+    { host, origin: 'null' },
+    { host, origin: 'http://127.0.0.1:6996', 'sec-fetch-site': 'cross-site' },
+    { host, 'sec-fetch-site': 'same-site' },
+  ]) {
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, headers, d), false, JSON.stringify(headers))
+  }
+  for (const headers of [
+    { host, origin: 'http://127.0.0.1:6996' },
+    { host: 'localhost:6996', origin: 'http://LOCALHOST:6996' },
+    { host: '127.0.0.1', origin: 'http://127.0.0.1:80' },
+    // Vite's dev proxy keeps the browser's Host and Origin (localhost:5173) for the upgrade.
+    { host: 'localhost:5173', origin: 'http://localhost:5173' },
+    { host, origin: 'https://proxy.example', 'sec-fetch-site': 'same-origin' },
+    { host }, // a CLI or script: no Origin
+  ]) {
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, headers, d), true, JSON.stringify(headers))
+  }
+})
+
 // `.internal` has no public zone, but whoever controls the victim's resolver (a hostile
 // Wi-Fi, a compromised router) can answer for any name in it and rebind it to 127.0.0.1. Only the
 // names container runtimes give the host are needed.

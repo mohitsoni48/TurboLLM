@@ -572,7 +572,8 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
     // sibling REST endpoint demands a key. Browsers can't set custom headers on a
     // WebSocket handshake, so the key travels as a `key` query param instead of the
     // `X-TurboLLM-Auth` header the REST client uses (verifyKeyValue is the same
-    // credential check either way).
+    // credential check either way). No CORS applies to a handshake, so isLocalUpgrade also
+    // refuses loopback trust to one a browser sends from another site's page.
     const local = isLocalUpgrade(socket.remoteAddress, socket.localPort, request.headers, _d)
     if (!local && !verifyKeyValue(url.searchParams.get('key') ?? '', _d)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')

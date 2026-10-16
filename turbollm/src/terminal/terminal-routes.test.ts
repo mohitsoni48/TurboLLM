@@ -20,6 +20,7 @@ import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
 import { tmpDir } from '../test-support/tmp'
 import { quotePtyShellArg } from '../util/shell-command'
+import { hashKey } from '../auth'
 import { enforcesPlanMode, permissionModeArgs } from './agent-modes'
 
 test('buildTerminalLaunchCommand: a genuinely first-ever launch registers this session\'s own id', () => {
@@ -393,6 +394,53 @@ test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutd
   } finally {
     clearTimeout(timer)
     client.terminate()
+    server.close()
+  }
+})
+
+// The handshake gets no CORS check, and a page on another site that opens ws://127.0.0.1:<port>
+// sends a genuine Host, so loopback trust let any website attach to a live terminal whose id it
+// had (https://turbollm.dev could list them through /api's CORS). Its Origin gives it away.
+test('a terminal WebSocket handshake from another site needs a key; the app\'s own page does not', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const raw = 'tllm-terminalwsoriginterminalwsoriginter1'
+  const cfg = {
+    daemon: { port: 6996 },
+    apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null }],
+  }
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const handshake = (headers: Record<string, string>, query = '') =>
+    new Promise<number | 'open'>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/code/terminal/ws?terminalId=t1${query}`, { headers })
+      ws.once('open', () => { ws.terminate(); resolve('open') })
+      ws.once('unexpected-response', (_req: unknown, res: { statusCode: number }) => { ws.terminate(); resolve(res.statusCode) })
+      ws.once('error', () => resolve(-1))
+    })
+  try {
+    for (const headers of [
+      { Origin: 'https://turbollm.dev' },
+      { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' },
+      { Origin: 'null' },
+      { Origin: `http://127.0.0.1:${port + 1}` },
+    ] as Record<string, string>[]) {
+      assert.equal(await handshake(headers), 401, JSON.stringify(headers))
+    }
+    // The app's own page (Electron, the browser, the Android WebView), a CLI with no Origin.
+    assert.equal(await handshake({ Origin: `http://127.0.0.1:${port}` }), 'open')
+    assert.equal(await handshake({ Origin: `http://LOCALHOST:${port}`, Host: `localhost:${port}` }), 'open')
+    assert.equal(await handshake({}), 'open')
+    // Another site's page holding a real key still connects, as a LAN client would.
+    assert.equal(await handshake({ Origin: 'https://evil.example' }, `&key=${raw}`), 'open')
+  } finally {
     server.close()
   }
 })
