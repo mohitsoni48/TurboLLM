@@ -207,12 +207,14 @@ function settingsApp(opts: { uiEnabled: boolean }) {
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
+  // From this machine, on the main listener: the flag is a host-only setting, and with an ingress
+  // live a request whose local port can't be read counts as tunneled (auth.ts isTunneled).
   const patch = (b: unknown) =>
     app.request('/api/v1/settings', {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(b),
-    })
+    }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
   return { patch, cfg, disabled: () => disabled }
 }
 

@@ -18,6 +18,8 @@ import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
 
 interface FakeConfig {
+  // hostGate reads it: loopback-only bind, so a caller with no socket is this machine.
+  daemon: { lanBind: boolean }
   tools: { toolPolicies: Record<string, string>; autoAllowAll: boolean }
   apiKeys: Array<{ id: string; name: string; hash: string; prefix: string; createdAt: string; lastUsedAt: string | null; grant?: unknown }>
 }
@@ -25,7 +27,7 @@ interface FakeConfig {
 function mkApp(): { app: Hono; store: ConversationStore; cfg: FakeConfig; cleanup: () => void } {
   const dir = tmpDir('tllm-chat-approve-')
   const store = new ConversationStore(dir)
-  const cfg: FakeConfig = { tools: { toolPolicies: {}, autoAllowAll: false }, apiKeys: [] }
+  const cfg: FakeConfig = { daemon: { lanBind: false }, tools: { toolPolicies: {}, autoAllowAll: false }, apiKeys: [] }
   const d = {
     db: store,
     store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },

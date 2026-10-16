@@ -2709,8 +2709,7 @@ export function registerApi(app: Hono, d: Deps): void {
       providerChangeClearsEnabled = changed && enabled
     }
 
-    const before = d.store.snapshot().daemon
-    d.store.update((cfg) => {
+    const apply = (cfg: Config): void => {
       Object.assign(cfg.daemon, updates)
       Object.assign(cfg.modelDefaults, mdUpdates)
       Object.assign(cfg.comfyui, cuUpdates)
@@ -2795,7 +2794,29 @@ export function registerApi(app: Hono, d: Deps): void {
         cfg.tools.tavily = key ? { apiKey: key } : undefined
         s.tavilyApiKey = key || undefined
       }
-    })
+    }
+    // Some of these settings are credential management or decide who may reach the daemon at
+    // all, so they carry hostGate, like /api/v1/keys and every /api/v1/remote/* route.
+    // lanAuth alone let three callers that hostGate refuses rewrite them: a keyless Tailscale
+    // Serve identity, a verified Cloudflare Access JWT, and any peer on an open LAN (lanBind on,
+    // requireApiKey off). They could turn requireApiKey off or lanBind on (rebinding in place),
+    // swap the tunnel/ngrok tokens or the Access team/aud (a new team/aud takes effect at once on
+    // a running named tunnel, so whoever set it signs their own JWTs from then on, even after
+    // requireApiKey is back on), widen the remote token grant, set every tool to allow, put a
+    // directory of their own first on the build PATH, or replace the stored HF/GitHub/search
+    // credentials. Judged on the outcome rather than on which fields the body names: the change
+    // is applied to a copy first, so the served UI's own Save, which echoes
+    // lanBind/requireApiKey/port unchanged with every general setting, still works.
+    if (!hostGate(c, d)) {
+      const now = d.store.snapshot()
+      const trial = structuredClone(now)
+      apply(trial)
+      const field = hostOnlySettingChanged(now, trial)
+      if (field) return err(c, 403, 'forbidden', `Changing ${field} requires a valid API key from a non-host device.`)
+    }
+
+    const before = d.store.snapshot().daemon
+    d.store.update(apply)
     // Keep ToolRegistry in sync when tools config changes.
     if (b.tavilyApiKey !== undefined || b.search !== undefined) {
       d.tools?.updateConfig(d.store.snapshot().tools)
@@ -3399,6 +3420,34 @@ function tunnelStatusSnapshot(d: Deps): { active: boolean; url: string | null; e
   const active = s.kind === 'connected' || s.kind === 'starting' || s.kind === 'reconnecting'
   const error = s.kind === 'failed' ? s.reason : s.kind === 'reconnecting' ? s.lastError : null
   return { active, url: d.remote.url(), error }
+}
+
+/** The first PATCH /api/v1/settings field that `after` changes from `before` and only a caller
+ *  passing hostGate may change, or null. Everything else (theme, titles, model defaults, the
+ *  gateway pool, ...) stays open to any caller lanAuth admits. */
+function hostOnlySettingChanged(before: Config, after: Config): string | null {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  const fields: [string, (c: Config) => unknown][] = [
+    ['lanBind', (c) => c.daemon.lanBind],
+    ['requireApiKey', (c) => c.daemon.requireApiKey],
+    ['port', (c) => c.daemon.port],
+    ['experimental.remoteAccess', (c) => c.daemon.experimental.remoteAccess],
+    ['remoteAccess', (c) => c.remoteAccess],
+    // First on PATH for the prereq probe (GET /api/v1/build/prereqs, ungated) and every build,
+    // which run git/cmake/nvcc/the compiler from there: a directory of the caller's own, or a
+    // UNC share on Windows (it passes the absolute-path check), is command execution.
+    ['build.toolchainDirs', (c) => c.build.toolchainDirs],
+    ['toolPolicies', (c) => c.tools.toolPolicies],
+    ['autoAllowAll', (c) => c.tools.autoAllowAll],
+    ['hfToken', (c) => c.hf.token],
+    ['ghToken', (c) => c.gh?.token ?? ''],
+    // Field by field: the handler creates an empty `search` block on every save.
+    ['search.tavilyApiKey', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]],
+    ['search.kagiApiKey', (c) => c.tools.search?.kagiApiKey],
+    ['search.searxngUrl', (c) => c.tools.search?.searxngUrl],
+  ]
+  for (const [name, get] of fields) if (!same(get(before), get(after))) return name
+  return null
 }
 
 /** The UI-exposed settings subset. Telemetry is surfaced as the 3-option enum. */

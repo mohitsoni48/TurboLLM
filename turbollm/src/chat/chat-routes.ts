@@ -2,7 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import { resolveKey, grantKind } from '../auth'
+import { resolveKey, grantKind, hostGate } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
@@ -263,6 +263,16 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // persist-for-everyone effect is refused.
       if (grantKind(resolveKey(c, d) ?? { grant: undefined }) === 'remote') {
         return err(c, 403, 'forbidden', 'A remote access token cannot change tool permissions for every future chat — use "Allow for this chat" instead.')
+      }
+      // The same write as toolPolicies on PATCH /api/v1/settings, so the same hostGate. lanAuth
+      // lets three callers through here with no key and no capability check (a Tailscale Serve
+      // identity, a verified Cloudflare Access JWT, a peer on an open LAN), and the settings
+      // route refuses them that field; this one let them set any tool to allow for every chat.
+      // Every caller that passes may set toolPolicies through the settings route anyway, so the
+      // write running before the pending-approval lookup (the invariant below) gives none of
+      // them anything new.
+      if (!hostGate(c, d)) {
+        return err(c, 403, 'forbidden', 'Allowing a tool for every future chat requires a valid API key from a non-host device — use "Allow for this chat" instead.')
       }
       d.store.update((cfg) => {
         cfg.tools.toolPolicies = { ...(cfg.tools.toolPolicies ?? {}), [toolName]: 'allow' }
