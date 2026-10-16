@@ -491,7 +491,28 @@ export class DownloadManager {
         if (rec.validator) headers['If-Range'] = rec.validator
       }
 
-      const res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      let res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      // A 416 to a resume: the .part is as long as the server's file or longer, so no byte of
+      // `bytes=<.part size>-` exists (the file shrank on the server while paused, or the daemon
+      // died after the last write but before the rename below). Thrown as a plain HTTP error with
+      // the .part kept, every later Resume asked for the same range and got the same 416. A .part
+      // that passes the same size and sha256 checks as a finished stream IS the file: finish it.
+      // Anything else is dropped and fetched again from byte 0, once, without Range or If-Range;
+      // a 416 to that request fails below like any other HTTP error, with no .part left behind.
+      if (res.status === 416 && startAt > 0) {
+        await res.body?.cancel().catch(() => {})
+        if (hash && (rec.total <= 0 || startAt === rec.total) && hash.digest('hex') === rec.sha256) {
+          this.finish(rec, part)
+          return
+        }
+        rmSync(part, { force: true })
+        startAt = 0
+        rec.received = 0
+        if (hash) hash = createHash('sha256')
+        delete headers.Range
+        delete headers['If-Range']
+        res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      }
       if (res.status === 401) throw new DownloadError('hf_unauthorized', 'Your Hugging Face token was rejected.')
       if (res.status === 403) throw new DownloadError('hf_gated', 'This repository is gated — accept its license and add your token.')
       if (!res.ok && res.status !== 206) throw new DownloadError('download_failed', `Download failed (HTTP ${res.status}).`)
@@ -582,19 +603,7 @@ export class DownloadManager {
         }
       }
 
-      renameSync(part, rec.dest) // atomic within the same dir
-      rec.status = 'done'
-      rec.finishedAt = new Date().toISOString()
-      rec.bytesPerSec = 0
-      this.controllers.delete(rec.id)
-      this.recordProvenance(rec)
-      this.persist()
-      try {
-        this.onComplete()
-      } catch {
-        /* scan trigger is best-effort */
-      }
-      this.settle('ok')
+      this.finish(rec, part)
     } catch (e) {
       this.controllers.delete(rec.id)
       rec.bytesPerSec = 0
@@ -602,7 +611,9 @@ export class DownloadManager {
       // record) — never clobber it back to 'error'. Aborts land here too.
       const terminal: DownloadStatus[] = ['cancelled', 'done']
       if (terminal.includes(rec.status) || (e as Error)?.name === 'AbortError') {
-        if (rec.status !== 'done') rec.status = 'cancelled'
+        // Widened: finish(), cancel() and remove() set the status where the narrowing from
+        // run()'s own 'downloading' cannot see it.
+        if ((rec.status as DownloadStatus) !== 'done') rec.status = 'cancelled'
       } else {
         rec.status = 'error'
         rec.error = e instanceof Error ? e.message : String(e)
@@ -615,6 +626,24 @@ export class DownloadManager {
     } finally {
       this.pump()
     }
+  }
+
+  /** Move a verified .part into place and mark its row done: the end of a streamed download,
+   *  and of a resume whose .part already held the whole file (run()'s 416 path). */
+  private finish(rec: DownloadRecord, part: string): void {
+    renameSync(part, rec.dest) // atomic within the same dir
+    rec.status = 'done'
+    rec.finishedAt = new Date().toISOString()
+    rec.bytesPerSec = 0
+    this.controllers.delete(rec.id)
+    this.recordProvenance(rec)
+    this.persist()
+    try {
+      this.onComplete()
+    } catch {
+      /* scan trigger is best-effort */
+    }
+    this.settle('ok')
   }
 
   /** Append a completed download to the permanent provenance list, keyed by dest

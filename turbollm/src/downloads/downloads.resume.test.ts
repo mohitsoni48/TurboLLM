@@ -302,9 +302,10 @@ async function waitSettled(dm: DownloadManager, id: string) {
 
 /** A server holding `file` under `etag` that implements Range and If-Range like a real one
  *  (a stale If-Range gets the whole file as a 200), unless `ignoreIfRange` (Hugging Face's
- *  CDN answers a stale If-Range with a 206 of the current file). `etagOn206: false` leaves the
- *  ETag off its 206 responses; `lastModified` is sent on every response; `rangeCap` caps an
- *  open-ended range at that many bytes (the 206 then ends before the end of the file). */
+ *  CDN answers a stale If-Range with a 206 of the current file). A range starting at or past
+ *  the end of the file gets a 416 whatever the If-Range, as on that CDN. `etagOn206: false`
+ *  leaves the ETag off its 206 responses; `lastModified` is sent on every response; `rangeCap`
+ *  caps an open-ended range at that many bytes (the 206 then ends before the end of the file). */
 function serve(
   file: Buffer,
   etag: string,
@@ -319,9 +320,12 @@ function serve(
 ) {
   const lm: Record<string, string> = lastModified ? { 'last-modified': lastModified } : {}
   return (async (_url: string, init: { headers: Record<string, string> }) => {
-    seen.push(init.headers)
+    seen.push({ ...init.headers })
     const from = Number(/bytes=(\d+)-/.exec(init.headers.Range ?? '')?.[1] ?? 0)
     const ifRange = init.headers['If-Range']
+    if (from > 0 && from >= file.length) {
+      return new Response(null, { status: 416, headers: { 'content-range': `bytes */${file.length}`, etag, ...lm } })
+    }
     if (from > 0 && (ignoreIfRange || !ifRange || ifRange === etag)) {
       const end = rangeCap ? Math.min(file.length, from + rangeCap) : file.length
       // shortBody: a malformed reply whose body (and Content-Length) is shorter than its own range.
@@ -500,6 +504,77 @@ test('resume: a 206 that adds an ETag still continues a .part written under a La
   )
   assert.equal(rec.status, 'error', 'not done with old prefix + new tail')
   assert.equal(existsSync(changed.dest), false)
+})
+
+/** A row restored from the manifest exactly as a restart leaves it, with `part` already in its
+ *  .part and these manifest fields (a raw-URL import unless the entry says otherwise). */
+function seedRestored(part: Buffer, entry: { total: number; sha256?: string; validator?: string }) {
+  const { modelDir, stateDir } = newDirs()
+  const dest = join(modelDir, 'model.gguf')
+  writeFileSync(`${dest}.part`, part)
+  writeFileSync(
+    join(stateDir, 'downloads', 'manifest.json'),
+    JSON.stringify({
+      version: 1,
+      entries: [{
+        id: 'dl-416', name: 'model.gguf', repo: '', url: 'https://mirror.example/model.gguf', dest,
+        createdAt: new Date().toISOString(), ...entry,
+      }],
+    }),
+  )
+  return { modelDir, stateDir, id: 'dl-416', dest }
+}
+
+const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex')
+
+test('resume: a .part longer than a file that shrank on the server gets a 416, then downloads the file again', async () => {
+  // Paused at 170 bytes of a former upload; the server now holds a 128-byte file, so
+  // `bytes=170-` is unsatisfiable. Before the fix every Resume failed with "HTTP 416".
+  const { modelDir, stateDir, id, dest } = seedRestored(NEW_FILE, { total: NEW_FILE.length, validator: '"new"' })
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen))
+  assert.equal(seen[0].Range, `bytes=${NEW_FILE.length}-`)
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 2, 'one fresh request after the 416')
+  assert.equal(seen[1].Range, undefined, 'the fresh request asks for the whole file')
+  assert.equal(seen[1]['If-Range'], undefined)
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+  assert.equal(existsSync(`${dest}.part`), false)
+})
+
+test('resume: a complete .part (the daemon died before the rename) is verified by its sha256 and finished on a 416', async () => {
+  const { modelDir, stateDir, id, dest } = seedRestored(OLD_FILE, { total: OLD_FILE.length, sha256: sha(OLD_FILE), validator: '"old"' })
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, serve(OLD_FILE, '"old"', seen))
+  assert.equal(seen[0].Range, `bytes=${OLD_FILE.length}-`)
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 1, 'nothing downloaded again: the .part already was the file')
+  assert.equal(rec.received, OLD_FILE.length)
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+  assert.equal(existsSync(`${dest}.part`), false)
+
+  // Same length, wrong bytes: the sha256 rules it out, so it is dropped and fetched again.
+  const bad = seedRestored(NEW_SAME_SIZE, { total: OLD_FILE.length, sha256: sha(OLD_FILE), validator: '"old"' })
+  const seen2: Array<Record<string, string>> = []
+  const again = await resumeAfterRestart(bad.stateDir, bad.modelDir, bad.id, serve(OLD_FILE, '"old"', seen2))
+  assert.equal(again.status, 'done', again.error ?? '')
+  assert.equal(seen2.length, 2)
+  assert.deepEqual(readFileSync(bad.dest), OLD_FILE)
+})
+
+test('resume: a server that answers 416 even to the plain request restarts once, then fails with no .part left', async () => {
+  const { modelDir, stateDir, id, dest } = seedRestored(OLD_FILE, { total: OLD_FILE.length, validator: '"old"' })
+  const seen: Array<Record<string, string>> = []
+  const always416 = (async (_url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ ...init.headers })
+    return new Response(null, { status: 416 })
+  }) as unknown as typeof fetch
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, always416)
+  assert.equal(rec.status, 'error')
+  assert.match(rec.error ?? '', /HTTP 416/)
+  assert.equal(seen.length, 2, 'one retry from byte 0, not a loop')
+  assert.equal(seen[1].Range, undefined)
+  assert.equal(existsSync(`${dest}.part`), false, 'the next Resume starts from byte 0, not the same 416 range')
 })
 
 test('a finished download carries finishedAt, already set when the rescan is requested', async () => {
