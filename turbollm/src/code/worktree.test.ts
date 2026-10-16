@@ -320,6 +320,18 @@ test('runGit: a failing command resolves rather than throwing', async () => {
 //
 // Asserted against `git check-ref-format` rather than a regex of my own: the authority on what git
 // accepts is git, and a hand-written expectation is exactly what missed this the first time.
+
+/** Tasks and typed branch names that used to come out as names Git for Windows cannot create. */
+const WINDOWS_UNSAFE_TASKS = [
+  'Rename "foo" to "bar"',
+  'Make <Button> accept a | separator',
+  'con', 'NUL', 'aux', 'prn', 'com1', 'LPT9', 'com¹', 'conin$', 'CONOUT$',
+  'con.txt', 'nul.tar.gz', 'turbo/con', 'turbo/aux/fix', 'con/con',
+  'con -', 'con.lock', 'aux.lock/b',
+  'a'.repeat(76) + '/console window',
+  'v2./fix', 'x.lock./y',
+]
+
 test('sanitizeBranchName: output always passes git check-ref-format', async () => {
   const cases = [
     'a'.repeat(79) + '. and then some more words to push past the cap',
@@ -340,6 +352,8 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
     'a.lock/b',
     'a/x.lock.lock/.b',
     'tab\there\u0001bell\u007f',
+    // The Windows-safe rewrites (next test) must keep the name valid for git too.
+    ...WINDOWS_UNSAFE_TASKS,
   ]
   const root = await makeRepo()
   try {
@@ -351,6 +365,43 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// The branch is a loose ref file under .git/refs/heads/ and the folder .turbollm/worktrees/<branch>,
+// and Git for Windows refuses ("Invalid argument") to create either when a path part holds `"<>|`,
+// ends in `.`, or is a reserved device name. `git check-ref-format` accepts all of these, so the
+// fuzz above could not catch it, and on Windows a session started from such a task (or a typed
+// branch `con`) failed with git_failed. This mirrors Git for Windows' is_valid_win32_path
+// (compat/mingw.c) for the characters the sanitizer can let through; on Linux and macOS git
+// accepts every one of these names, so this is asserted on every platform, in pure code.
+function windowsRefusal(name: string): string | null {
+  if (/[<>:"|?*\\\x00-\x1f]/.test(name)) return 'a character Windows forbids'
+  for (const part of name.split('/')) {
+    if (/[. ]$/.test(part)) return `part ${JSON.stringify(part)} ends in a dot or space`
+    if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(?=[. :]|$)/i.test(part)) {
+      return `part ${JSON.stringify(part)} is a reserved device name`
+    }
+  }
+  return null
+}
+
+test('REGRESSION: sanitizeBranchName: output is a name Git for Windows can create', () => {
+  for (const raw of WINDOWS_UNSAFE_TASKS) {
+    const name = sanitizeBranchName(raw)
+    assert.equal(windowsRefusal(name), null, `${JSON.stringify(name)} (from ${JSON.stringify(raw.slice(0, 40))})`)
+  }
+  // The rewrite keeps the words: a separator becomes `-`, a device name gets a `-` after it.
+  assert.equal(sanitizeBranchName('Rename "foo" to "bar"'), 'rename-foo-to-bar')
+  assert.equal(sanitizeBranchName('Make <Button> accept a | separator'), 'make-button-accept-a-separator')
+  assert.equal(sanitizeBranchName('con'), 'con-')
+  assert.equal(sanitizeBranchName('NUL'), 'nul-')
+  assert.equal(sanitizeBranchName('con.txt'), 'con-.txt')
+  assert.equal(sanitizeBranchName('turbo/con'), 'turbo/con-')
+  assert.equal(sanitizeBranchName('v2./fix'), 'v2/fix')
+  // Not device names: only the whole part (or the part before its extension) is reserved.
+  assert.equal(sanitizeBranchName('console/connect'), 'console/connect')
+  assert.equal(sanitizeBranchName('com10'), 'com10')
+  assert.equal(sanitizeBranchName('icon'), 'icon')
 })
 
 test('sanitizeBranchName: a long name is capped without ending in a separator', () => {

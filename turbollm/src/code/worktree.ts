@@ -76,20 +76,40 @@ export async function isGitRepo(root: string): Promise<boolean> {
   return r.ok && r.stdout.trim() === 'true'
 }
 
+/** A branch path part Windows reads as a device: the names Git for Windows' is_valid_win32_path
+ *  (compat/mingw.c) refuses, alone or followed by an extension, plus COM¹-³ and LPT¹-³, which
+ *  Windows reserves too. The sanitizer lower-cases first and lets `$` and `¹²³` through, so the
+ *  lower-case CONIN$/CONOUT$/COM¹ forms are what can reach it. */
+const WINDOWS_RESERVED_PART = /(^|\/)(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(?=[./]|$)/g
+
 /** Turn arbitrary user text into something `git branch` will accept: git refuses spaces, control
  *  characters, `~^:?*[\`, `..`, `@{`, a leading `-`, a leading/trailing `/` or `.`, a path
  *  component starting with `.` or ending in `.lock`, and a trailing `.lock`. Falls back to a fixed
  *  stem rather than returning '' so a name made entirely of illegal characters still produces a
- *  usable branch. Pure. */
+ *  usable branch.
+ *
+ *  The name must also be one Git for Windows can create, and is made so on every platform, so a
+ *  branch stays usable wherever the repo is checked out. It is both a loose ref file under
+ *  .git/refs/heads/ and the folder .turbollm/worktrees/<branch>, and Git for Windows refuses
+ *  ("Invalid argument") any path part that contains `"<>|` (`:?*\` are stripped anyway), ends in
+ *  `.`, or names a reserved device (WINDOWS_RESERVED_PART). `git check-ref-format` accepts all
+ *  three, so on Windows a session whose task was `Rename "foo" to "bar"`, or whose typed branch was
+ *  `con`, failed with git_failed and never started. Pure. */
 export function sanitizeBranchName(raw: string): string {
   const cleaned = raw
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '-')
+    // `|` and the quote/angle brackets read as separators in a task (`a | b`, `<Button>`), so they
+    // become a `-` rather than vanishing and gluing two words together.
+    .replace(/["<>|]/g, '-')
     .replace(/[\x00-\x1f\x7f~^:?*[\]\\]/g, '')
     .replace(/@\{/g, '-')
     .replace(/\.\.+/g, '-')
     .replace(/\/\.+/g, '/')
+    // A part ending in `.` (`v2./fix`): git allows it, Git for Windows can't create the folder.
+    // Before the `.lock` strip, so `x.lock./y` can't come out as `x.lock/y`.
+    .replace(/\.+(?=\/)/g, '')
     .replace(/(?:\.lock)+(?=\/)/g, '')
     .replace(/\/+/g, '/')
     // A leading `-` matters beyond validity: `git worktree add -b` runs `git branch <name>`, which
@@ -104,6 +124,11 @@ export function sanitizeBranchName(raw: string): string {
     // session failed outright for nothing more than a long description. A trailing `.lock` is part
     // of the same run, so stripping one can't re-expose another (`x.lock-` → `x.lock` → `x`).
     .replace(/(?:\.lock|[-./])+$/, '')
+    // A reserved device name gets a `-` after it (`con` → `con-`, `nul.txt` → `nul-.txt`), which
+    // Windows no longer reads as the device. Last, because both the cap and the trailing strip can
+    // expose one (`console` cut to `con`, `con -` stripped to `con`); so this one case may come
+    // out a few characters over the cap, which only bounds the name's length loosely anyway.
+    .replace(WINDOWS_RESERVED_PART, '$1$2-')
   return cleaned || 'turbollm-session'
 }
 
