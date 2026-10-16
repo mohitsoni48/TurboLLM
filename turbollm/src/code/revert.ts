@@ -10,7 +10,7 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { applyPatch, parsePatch, reversePatch } from 'diff'
-import { isContainedFromRoot } from './containment'
+import { isContainedFromRoot, normalizePiToolPath } from './containment'
 import type { Message } from '../chat/db'
 
 export interface RevertFilesResult {
@@ -30,23 +30,36 @@ export interface RevertFilesResult {
  *  ENTIRE chain succeeds — so a file is never left in a half-reverted state that matches
  *  neither the old nor the new content. */
 export function revertFileEdits(messages: Message[], repoRoot: string): RevertFilesResult {
-  const patchesByPath = new Map<string, string[]>() // chronological order, per file
+  // Grouped by the file pi's edit tool actually edited, not by the raw string. Its resolveToCwd
+  // strips one leading `@` and maps Unicode spaces to ' ' (normalizePiToolPath), and does NOT trim.
+  // Keying and resolving by the trimmed raw `args.path` failed a revert of `@src/a.ts` (no such
+  // file), and applied the reverse of an edit made through ` src/c.ts` to src/c.ts, a file pi
+  // never touched, leaving the edited one as it was. A file is reported under the `args.path` of
+  // its first edit in the range. A path pi could not convert (null) is never contained: failed.
+  // Containment is checked on that raw `args.path` (isContainedFromRoot reads it both ways itself),
+  // never on the absolute path: run through pi's normalisation again, a Unicode space in the
+  // session folder's own name (a CJK full-width space, a pasted no-break space) became ' ', so the
+  // path no longer sat under the root and every revert in that folder failed. pi resolves only
+  // the argument, never its cwd.
+  const editsByFile = new Map<string, { path: string; absPath: string | null; patches: string[] }>() // chronological order, per file
   for (const m of messages) {
     for (const tc of m.toolCalls) {
       if (tc.name !== 'edit' || !tc.patch) continue
-      const path = typeof tc.args.path === 'string' ? tc.args.path.trim() : ''
+      const path = typeof tc.args.path === 'string' ? tc.args.path : ''
       if (!path) continue
-      const list = patchesByPath.get(path) ?? []
-      list.push(tc.patch)
-      patchesByPath.set(path, list)
+      const normalized = normalizePiToolPath(path)
+      const absPath = normalized === null ? null : resolve(repoRoot, normalized)
+      const key = absPath ?? `\0${path}`
+      const entry = editsByFile.get(key) ?? { path, absPath, patches: [] }
+      entry.patches.push(tc.patch)
+      editsByFile.set(key, entry)
     }
   }
 
   const reverted: string[] = []
   const failed: string[] = []
-  for (const [path, patches] of patchesByPath) {
-    if (!isContainedFromRoot(path, repoRoot)) { failed.push(path); continue }
-    const absPath = resolve(repoRoot, path)
+  for (const { path, absPath, patches } of editsByFile.values()) {
+    if (absPath === null || !isContainedFromRoot(path, repoRoot)) { failed.push(path); continue }
     if (!existsSync(absPath)) { failed.push(path); continue }
 
     let content: string

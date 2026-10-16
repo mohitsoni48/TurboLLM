@@ -162,8 +162,7 @@ export function isContainedFromRoot(input: string | null | undefined, root: stri
   if (typeof input !== 'string' || input.length === 0) return false
   if (input.includes('\0')) return false
   // Both readings of the string must stay inside: the one pi's write/edit tools act on
-  // (normalizePiToolPath) and the raw one, which revert and persona resolve themselves with a
-  // plain resolve/join.
+  // (normalizePiToolPath) and the raw one, which persona resolves itself with a plain join.
   const normalized = normalizePiToolPath(input)
   if (normalized === null) return false
   for (const candidate of normalized === input ? [input] : [input, normalized]) {
@@ -183,8 +182,9 @@ const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g
  *  `@/etc/passwd` and `file:///etc/passwd` pass as in-repo names while pi wrote outside the repo.
  *  pi doesn't export this from its package entry point, so it is mirrored here (pi 0.80.6; the
  *  parity test in containment.test.ts drives pi's real write tool to catch drift). Returns null
- *  when pi's own conversion would throw (an unconvertible file:// URL) — the write fails anyway. */
-function normalizePiToolPath(input: string): string | null {
+ *  when pi's own conversion would throw (an unconvertible file:// URL) — the write fails anyway.
+ *  Exported for revert.ts, which must undo an edit on the file pi actually edited. */
+export function normalizePiToolPath(input: string): string | null {
   let normalized = input.replace(UNICODE_SPACES, ' ')
   if (normalized.startsWith('@')) normalized = normalized.slice(1)
   if (normalized === '~') return homedir()
