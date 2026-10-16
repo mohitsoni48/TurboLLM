@@ -2956,7 +2956,15 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.command !== undefined) s.command = b.command
       if (b.args !== undefined) s.args = b.args
       if (b.env !== undefined) s.env = b.env
-      if (b.url !== undefined) s.url = b.url
+      if (b.url !== undefined) {
+        // A stored Bearer key belongs to the service it was issued by. The key is write-only, so
+        // the edit form always opens with a blank key field, and pointing the URL at another host
+        // without typing a new key sent apiKey undefined, which kept the old key: the old service's
+        // token then went to the new host as Authorization: Bearer (mcp-client.ts). A move to
+        // another origin with no new key now drops it; a new path on the same origin keeps it.
+        if (b.apiKey === undefined && s.apiKey && !sameUrlOrigin(s.url, b.url)) s.apiKey = undefined
+        s.url = b.url
+      }
       if (b.apiKey !== undefined) s.apiKey = b.apiKey || undefined
     })
     await d.tools?.syncMcpServers(d.store.snapshot().mcp.servers).catch(() => {})
@@ -3526,7 +3534,8 @@ function settingsPayload(d: Deps) {
       searxngUrl: cfg.tools.search?.searxngUrl ?? '',
     },
     // apiKey is write-only: strip before echoing so Bearer tokens never reach the frontend.
-    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: _k, ...s }) => s) },
+    // apiKeySet says only whether one is stored, so the edit form can show it and offer a clear.
+    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: k, ...s }) => ({ ...s, apiKeySet: !!k })) },
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
@@ -3783,6 +3792,17 @@ function engineBusy(d: Deps): boolean {
 function isCatalogRepo(repoUrl: string | undefined): boolean {
   if (!repoUrl) return false
   return catalogForPlatform().some((e) => sameRepo(repoUrl, e.homepage))
+}
+
+/** True when an MCP server's new URL is on the same origin (scheme, host, port) as its old one,
+ *  so its stored Bearer key may stay. A URL that does not parse counts as the same origin only
+ *  when it is the same string. */
+function sameUrlOrigin(oldUrl: string | undefined, newUrl: string): boolean {
+  try {
+    return new URL(oldUrl ?? '').origin === new URL(newUrl).origin
+  } catch {
+    return oldUrl === newUrl
+  }
 }
 
 function regErr(c: Context, e: unknown) {

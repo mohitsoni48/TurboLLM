@@ -60,6 +60,52 @@ test('POST /api/v1/mcp/servers: still works for the host itself (loopback-only b
   assert.equal(cfg.mcp.servers.length, 1)
 })
 
+// ── An SSE server's Bearer key is write-only, so the edit form opens with a blank key field and
+// sends no apiKey when it is left blank. That kept the key across a URL change, and the old
+// service's token went to whatever host the URL now named. ───────────────────────────────────────
+
+test('PUT /api/v1/mcp/servers/:id: a URL moved to another origin with no new key drops the stored key', async () => {
+  const cfg = defaultConfig()
+  cfg.mcp.servers.push({ id: 's1', name: 'svc', transport: 'sse', enabled: true, url: 'https://mcp.one.example/sse', apiKey: 'tok-one' })
+  const app = fakeApp(cfg)
+  const put = (patch: object) =>
+    app.request('/api/v1/mcp/servers/s1', { method: 'PUT', body: JSON.stringify(patch) })
+
+  // A new path (or the same URL re-sent by the form) on the same origin keeps the key.
+  assert.equal((await put({ url: 'https://MCP.one.example:443/v2/sse' })).status, 200)
+  assert.equal(cfg.mcp.servers[0].apiKey, 'tok-one')
+  assert.equal((await put({ name: 'svc', url: 'https://MCP.one.example:443/v2/sse' })).status, 200)
+  assert.equal(cfg.mcp.servers[0].apiKey, 'tok-one')
+
+  // Another host, scheme or port, with no new key: the old token must not follow it there.
+  for (const url of ['https://mcp.two.example/sse', 'http://mcp.one.example/v2/sse', 'https://mcp.one.example:8443/sse']) {
+    cfg.mcp.servers[0].url = 'https://mcp.one.example/sse'
+    cfg.mcp.servers[0].apiKey = 'tok-one'
+    assert.equal((await put({ url })).status, 200, url)
+    assert.equal(cfg.mcp.servers[0].url, url)
+    assert.equal(cfg.mcp.servers[0].apiKey, undefined, url)
+  }
+
+  // A key sent with the move is the new service's key and is stored.
+  cfg.mcp.servers[0].apiKey = 'tok-one'
+  assert.equal((await put({ url: 'https://mcp.three.example/sse', apiKey: 'tok-three' })).status, 200)
+  assert.equal(cfg.mcp.servers[0].apiKey, 'tok-three')
+})
+
+test('GET /api/v1/settings: each MCP server says whether a key is stored, never the key', async () => {
+  const cfg = defaultConfig()
+  cfg.mcp.servers.push(
+    { id: 's1', name: 'keyed', transport: 'sse', enabled: true, url: 'https://mcp.one.example/sse', apiKey: 'tok-one' },
+    { id: 's2', name: 'open', transport: 'sse', enabled: true, url: 'https://mcp.two.example/sse' },
+  )
+  const res = await fakeApp(cfg).request('/api/v1/settings')
+  assert.equal(res.status, 200)
+  const text = await res.text()
+  assert.equal(text.includes('tok-one'), false)
+  const { mcp } = JSON.parse(text) as { mcp: { servers: { id: string; apiKeySet?: boolean }[] } }
+  assert.deepEqual(mcp.servers.map((s) => [s.id, s.apiKeySet]), [['s1', true], ['s2', false]])
+})
+
 // ── The remote-access provider must not change under a running tunnel. Saved mid-session it
 // is what the next crash/health restart starts (skipping the exposure confirmation), and the UI
 // labels the still-running old tunnel with it. ──────────────────────────────────────────────────
