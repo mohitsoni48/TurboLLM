@@ -59,19 +59,23 @@ export function createApp(d: Deps): Hono {
       allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
     }),
   )
-  // /api/* origin-allowlisted (ADR-216 open question, resolved): wildcard CORS here let
-  // ANY website silently read a loopback user's GPU/CPU/RAM via unauthenticated
-  // /api/v1/sysinfo while the daemon runs — a fingerprinting surface, not just the
-  // turbollm.dev "Suggest for my hardware" integration it was added to support. Compat
-  // swept 2026-07-22: that page (docs/site-build/pages/what-can-i-run.html) is the ONLY
-  // real cross-origin /api/* caller in the codebase, running from the production origin.
-  // A same-origin request (the app's own served UI) is unaffected either way — the
-  // browser never applies CORS to it.
+  // /api/v1/sysinfo alone answers one other origin (ADR-216 open question, resolved): wildcard
+  // CORS on /api/* let ANY website silently read a loopback user's GPU/CPU/RAM via
+  // unauthenticated /api/v1/sysinfo while the daemon runs — a fingerprinting surface, not just
+  // the turbollm.dev "Suggest for my hardware" integration it was added to support. Compat
+  // swept 2026-07-22: that page (docs/site-build/pages/what-can-i-run.html) is the ONLY real
+  // cross-origin /api/* caller, running from the production origin, and it reads sysinfo and
+  // nothing else. The allowlist used to cover all of /api/*, so a script on turbollm.dev (a
+  // compromised deploy, an XSS) could read every keyless loopback GET: conversations, settings
+  // (stdio MCP env values included), the live Code terminal ids. Every other /api route
+  // answers no cross-origin read, and a preflight to one gets no CORS headers, so it fails. A
+  // same-origin request (the app's own served UI) is unaffected either way — the browser never
+  // applies CORS to it.
   app.use(
-    '/api/*',
+    '/api/v1/sysinfo',
     cors({
       origin: 'https://turbollm.dev',
-      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowMethods: ['GET', 'OPTIONS'],
       allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
     }),
   )

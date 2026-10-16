@@ -258,7 +258,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // machine through. A `fetch(url,{method:'POST'})` with no body sets no Content-Type, making it
     // a CORS-SIMPLE request — no preflight — so any website the user happened to be visiting could
     // fire `npm install -g <pkg>` (and its postinstall scripts) with no interaction. Requiring a
-    // JSON content-type forces a preflight, which the origin allowlist then fails.
+    // JSON content-type forces a preflight, which then fails: /api answers no other origin's
+    // preflight outside /api/v1/sysinfo (server.ts).
     if (!(c.req.header('content-type') ?? '').toLowerCase().includes('application/json')) {
       return err(c, 400, 'unsupported_media_type', 'This endpoint requires Content-Type: application/json.')
     }

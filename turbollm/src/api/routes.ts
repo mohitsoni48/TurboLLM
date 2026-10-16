@@ -1387,8 +1387,8 @@ export function registerApi(app: Hono, d: Deps): void {
   // reserved, before up to MAX_ZIP_BYTES of a body nobody validated is held in memory —
   // and so the slot also covers the time the body itself spends streaming in.
   const zipUploadGuard: MiddlewareHandler = async (c, next) => {
-    // multipart/form-data needs no CORS preflight, so the /api/* allowlist doesn't stop a
-    // cross-site POST — refuse anything a browser marks as coming from another site.
+    // multipart/form-data needs no CORS preflight, so /api's CORS policy (server.ts) doesn't
+    // stop a cross-site POST — refuse anything a browser marks as coming from another site.
     const site = c.req.header('sec-fetch-site')
     if (site && site !== 'same-origin' && site !== 'none')
       return err(c, 403, 'forbidden', 'Engine uploads must come from the TurboLLM app itself.')

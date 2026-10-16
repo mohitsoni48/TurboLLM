@@ -790,8 +790,8 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // applies"; the opposite is true here, a STRICTER one does.
     if (isLinkFacade(c)) return next()
 
-    // Cross-site writes. A "simple" POST (text/plain, form) needs no CORS preflight, so the
-    // /api/* origin allowlist stops a hostile page from READING the answer but not the request
+    // Cross-site writes. A "simple" POST (text/plain, form) needs no CORS preflight, so /api's
+    // CORS policy (server.ts) stops a hostile page from READING the answer but not the request
     // from running, and the loopback trust below would wave it straight into the local-admin
     // routes. Refuse anything a browser marks as coming from another site (see isCrossSite; the
     // engine-zip upload guard in routes.ts applies the Fetch Metadata half of this). The app's
@@ -812,8 +812,8 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // Fetch Metadata to some URLs that still get loopback trust (an old browser to 127.0.0.1,
     // WebKit to `localhost.`, any browser to a container host name the hosts file maps to
     // 127.0.0.1). So the route also needs the header the web UI sends (api.ts getConnect): a page
-    // on another site can only add a custom header after a CORS preflight, which /api's origin
-    // allowlist refuses as long as server.ts's allowHeaders leaves it out.
+    // on another site can only add a custom header after a CORS preflight, which /api refuses: it
+    // answers no other origin outside /api/v1/sysinfo (server.ts).
     if (connect && !c.req.header(UI_HEADER)) {
       const message =
         'Connect setup can only be requested from the TurboLLM app. If it was just updated, reload the page.'
