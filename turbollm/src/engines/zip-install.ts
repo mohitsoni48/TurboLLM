@@ -415,19 +415,21 @@ export async function promoteProbedInstall(o: {
  *  result reports (and suggestEngineName sees) the FINAL path, which is where the engine
  *  will actually run from. Returns the same shape as POST /engines/scan so the Add-engine
  *  dialog's confirm step works unchanged; registration still goes through POST /engines
- *  (which records the custom-source identity). */
+ *  (which records the custom-source identity). `slug` overrides the folder name derived from
+ *  the zip's name: the route passes the spelling an existing install has on disk when the two
+ *  differ only in letter case. */
 export async function installZipEngine(
   enginesRoot: string,
   zipFileName: string,
   bytes: Buffer,
-  opts: { probeFn?: (bin: string) => Promise<ProbeResult>; blockSwap?: () => string | null } = {},
+  opts: { probeFn?: (bin: string) => Promise<ProbeResult>; blockSwap?: () => string | null; slug?: string } = {},
 ): Promise<ZipScanResult> {
   if (bytes.length > MAX_ZIP_BYTES)
     throw new ZipError('zip_too_large', `Engine zips are capped at ${MAX_ZIP_BYTES / (1024 * 1024 * 1024)} GiB.`)
   const entries = readZipEntries(bytes)
   const selection = pickZipFiles(entries)
   if (!selection) return { found: false }
-  const slug = zipBuildDirName(zipFileName)
+  const slug = opts.slug ?? zipBuildDirName(zipFileName)
   const tmpDir = join(enginesRoot, 'build', `.${slug}-${randomUUID().slice(0, 8)}.tmp`)
   try {
     const binPath = extractZipFiles(bytes, selection, tmpDir)

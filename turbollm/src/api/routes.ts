@@ -1459,8 +1459,13 @@ export function registerApi(app: Hono, d: Deps): void {
     const occupant =
       d.registry.list().engines.find((e) => claims(e.binPath)) ??
       d.registry.customSources().find((s) => claims(s.binPath))
-    if (occupant && !existsSync(join(targetDir, ZIP_BUILD_MARKER)))
-      return err(c, 409, 'build_dir_taken', `The build folder "${zipBuildDirName(file.name)}" already belongs to "${occupant.name}" — rename the zip or delete that engine first.`)
+    // The occupant's folder as spelled on disk, as for a release install: claims() ignores case, but a case-sensitive
+    // file system (Linux) would not find the marker under the upload's spelling, so re-uploading 'mybuild.zip' over an
+    // install from 'MyBuild.zip' was refused as someone else's folder instead of replacing it in place.
+    const occupantDir = occupant ? sourceBuildDirOf(occupant.binPath, enginesRoot) : null
+    const installDir = occupantDir && occupantDir.toLowerCase() === targetDir.toLowerCase() ? occupantDir : targetDir
+    if (occupant && !existsSync(join(installDir, ZIP_BUILD_MARKER)))
+      return err(c, 409, 'build_dir_taken', `The build folder "${basename(installDir)}" already belongs to "${occupant.name}" — rename the zip or delete that engine first.`)
     // The replace guard runs before the install AND again at the swap (blockSwap): an
     // engine can be started onto the target files mid-upload.
     const replaceBlocked = (): string | null => {
@@ -1473,7 +1478,10 @@ export function registerApi(app: Hono, d: Deps): void {
     const early = replaceBlocked()
     if (early) return err(c, 409, 'engine_in_use', early)
     try {
-      const res = await installZipEngine(enginesRoot, file.name, Buffer.from(await file.arrayBuffer()), { blockSwap: replaceBlocked })
+      const res = await installZipEngine(enginesRoot, file.name, Buffer.from(await file.arrayBuffer()), {
+        blockSwap: replaceBlocked,
+        slug: basename(installDir),
+      })
       // The swap already happened. If a registered engine lives in the target dir this
       // was the same-named re-upload — the "update my custom build" case — so refresh
       // THAT engine's probed identity in place (id and name kept; a plain POST /engines

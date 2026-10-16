@@ -347,6 +347,30 @@ test('POST /api/v1/engines/zip: a same-named re-upload UPDATES the existing engi
   }
 })
 
+test('POST /api/v1/engines/zip: a re-upload whose name differs only in letter case updates the engine in its own folder', async () => {
+  // On a case-sensitive file system (Linux) the marker was looked up under the upload's spelling, so this was a 409
+  // build_dir_taken telling the user to delete their own engine (release installs already used the on-disk spelling).
+  if (process.platform === 'win32') return // the probeable fixture is a POSIX script
+  const dir = tmpDir('tllm-zip-route-')
+  const refreshLog: Array<{ id: string; version: string; binPath?: string }> = []
+  try {
+    const buildDir = join(dir, 'engines', 'build', 'MyFork')
+    mkdirSync(buildDir, { recursive: true })
+    writeFileSync(join(buildDir, serverBinName), 'old working binary')
+    writeFileSync(join(buildDir, ZIP_BUILD_MARKER), 'MyFork.zip\n')
+    const engines = [{ id: 'e1', name: 'My Fork', binPath: join(buildDir, serverBinName) }]
+    const res = await postZip(zipApp({ engines, refreshLog }, dir), scriptZip('b5000'), 'myfork.zip')
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as Extract<ZipScanResult, { found: true }> & { updated?: { id: string; name: string } }
+    assert.equal(body.binPath, join(buildDir, serverBinName))
+    assert.deepEqual(body.updated, { id: 'e1', name: 'My Fork' })
+    assert.equal(refreshLog[0]?.binPath, join(buildDir, serverBinName))
+    assert.deepEqual(readdirSync(join(dir, 'engines', 'build')), ['MyFork'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /api/v1/engines/zip: a fresh upload lands in engines/build/<slug> and reports the final path', async () => {
   if (process.platform === 'win32') return // the probeable fixture is a POSIX script
   const dir = tmpDir('tllm-zip-route-')
