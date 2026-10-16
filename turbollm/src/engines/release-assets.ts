@@ -79,23 +79,34 @@ const BACKEND_BY_TOKEN: Record<string, AssetBackend> = {
 }
 
 // Also the older llama.cpp spellings `cuda-cu12.4`, `cudart-...-cu12.4` and `cublas-cu12.2.0`, plus
-// a patch component (`cuda-12.4.1`); only major.minor is kept.
-const CUDA_VERSION = /(?:^|[-_])cu(?:da)?[-_]?(\d+\.\d+)(?:\.\d+)?(?=$|[-_])/
+// a patch component (`cuda-12.4.1`); only major.minor is kept. Forks also write it undotted, PyTorch
+// style: `cu124` / `cuda-118` is 12.4 / 11.8, two digits of major and one of minor (every CUDA since
+// 10.0). Such a build used to read as `cpu`: no cudart pairing, and ranked below Vulkan on NVIDIA.
+const CUDA_VERSION = /(?:^|[-_])cu(?:da)?[-_]?(?:(\d+)\.(\d+)(?:\.\d+)?|(\d{2})(\d))(?=$|[-_])/
+
+// `cuda12` / `cu12`: a CUDA build, but its minor version is unknown (and `cu92` was 9.2), so it gets no
+// cudaVersion: it ranks as CUDA, and no cudart is paired with it, since one of the wrong minor version
+// could lack what the build was linked against.
+const CUDA_MAJOR_ONLY = /^cu(?:da)?\d{1,2}$/
 
 export function classifyReleaseAsset(asset: ReleaseAsset & { size?: number }): ClassifiedAsset {
   const archive = archiveKindOf(asset.name)
   const stem = stripArchiveExtension(asset.name.toLowerCase())
   const tokens = nameTokens(stem)
   const os = firstMapped(tokens, OS_BY_TOKEN)
-  const cudaVersion = CUDA_VERSION.exec(stem)?.[1] ?? null
+  const cuda = CUDA_VERSION.exec(stem)
+  const cudaVersion = cuda ? `${cuda[1] ?? cuda[3]}.${cuda[2] ?? cuda[4]}` : null
   return {
     name: asset.name,
     url: asset.browser_download_url,
     size: asset.size ?? null,
     os,
     arch: firstMapped(tokens, ARCH_BY_TOKEN),
-    // A CUDA version with no backend token (`cublas-cu12.2.0`, `cuda12.4`, a `cu12.4` cudart) is a CUDA build.
-    backend: firstMapped(tokens, BACKEND_BY_TOKEN) ?? (cudaVersion ? 'cuda' : os === 'macos' ? 'metal' : 'cpu'),
+    // A CUDA version with no backend token (`cublas-cu12.2.0`, `cuda12.4`, a `cu12.4` cudart, `cu124`, `cuda12`) is a
+    // CUDA build.
+    backend:
+      firstMapped(tokens, BACKEND_BY_TOKEN) ??
+      (cudaVersion || tokens.some((t) => CUDA_MAJOR_ONLY.test(t)) ? 'cuda' : os === 'macos' ? 'metal' : 'cpu'),
     cudaVersion,
     archive,
     companion: tokens.includes('cudart') ? 'cudart' : null,

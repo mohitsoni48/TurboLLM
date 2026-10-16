@@ -61,6 +61,30 @@ test('classify: the older cuNN.N spelling and a patch component still carry the 
   assert.deepEqual([cudart.backend, cudart.cudaVersion, cudart.companion], ['cuda', '12.4', 'cudart'])
 })
 
+test('classify: an undotted cuNNN is major.minor and a CUDA build; the dotted forms are unchanged', () => {
+  const cases: [string, string][] = [
+    ['llama-b1-bin-win-cu124-x64.zip', '12.4'],
+    ['llama-b1-bin-win-cuda-118-x64.zip', '11.8'],
+    ['llama-b1-bin-win-cuda_cu130-x64.zip', '13.0'],
+    ['llama-b1-bin-win-cuda-12.4-x64.zip', '12.4'],
+  ]
+  for (const [name, version] of cases) {
+    const c = classify(name)
+    assert.deepEqual([c.backend, c.cudaVersion, c.companion], ['cuda', version, null], name)
+  }
+  const cudart = classify('cudart-llama-bin-win-cu124-x64.zip')
+  assert.deepEqual([cudart.backend, cudart.cudaVersion, cudart.companion], ['cuda', '12.4', 'cudart'])
+  // A build number or a longer run of digits is not a CUDA version.
+  assert.deepEqual([classify('llama-cuda-4600-bin-win-x64.zip').cudaVersion], [null])
+})
+
+test('classify: a major-only cuda12 / cu12 is a CUDA build with no version', () => {
+  for (const name of ['llama-b1-bin-win-cuda12-x64.zip', 'llama-b1-bin-win-cu12-x64.zip']) {
+    const c = classify(name)
+    assert.deepEqual([c.backend, c.cudaVersion], ['cuda', null], name)
+  }
+})
+
 test('classify: cudart alone is not read as a cu version', () => {
   const c = classify('llama-bin-win-cudart-x64.zip')
   assert.deepEqual([c.backend, c.cudaVersion], ['cpu', null])
@@ -267,6 +291,20 @@ test('rank: the older cuNN.N naming recommends the newest CUDA the driver runs a
   const pick = recommended(rank(names, host({ gpuVendor: 'nvidia', hasGpu: true, driverMaxCuda: '12.8' })))
   assert.equal(pick?.name, 'llama-b4600-bin-win-cuda-cu12.4-x64.zip')
   assert.deepEqual(pick?.companions.map((c) => c.name), ['cudart-llama-bin-win-cu12.4-x64.zip'])
+})
+
+test('rank: an undotted cu124 build is recommended on NVIDIA over Vulkan and pairs its cudart', () => {
+  const names = ['cudart-llama-bin-win-cu124-x64.zip', 'llama-b1-bin-win-cu124-x64.zip', 'llama-b1-bin-win-vulkan-x64.zip']
+  const pick = recommended(rank(names, host({ gpuVendor: 'nvidia', hasGpu: true, driverMaxCuda: '12.8' })))
+  assert.equal(pick?.name, 'llama-b1-bin-win-cu124-x64.zip')
+  assert.deepEqual(pick?.companions.map((c) => c.name), ['cudart-llama-bin-win-cu124-x64.zip'])
+})
+
+test('rank: a major-only cuda12 build ranks as CUDA but is paired with no cudart of a guessed minor version', () => {
+  const names = ['cudart-llama-bin-win-cuda-12.4-x64.zip', 'llama-b1-bin-win-cuda12-x64.zip', 'llama-b1-bin-win-vulkan-x64.zip']
+  const pick = recommended(rank(names, host({ gpuVendor: 'nvidia', hasGpu: true, driverMaxCuda: '12.8' })))
+  assert.equal(pick?.name, 'llama-b1-bin-win-cuda12-x64.zip')
+  assert.deepEqual(pick?.companions, [])
 })
 
 test('rank: an unknown driver recommends the highest CUDA', () => {
