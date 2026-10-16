@@ -21,6 +21,9 @@ function harness(busy: 'download' | 'build' | null) {
   const forkDir = join(dataDir, 'engines', 'build', 'myfork')
   mkdirSync(forkDir, { recursive: true })
   writeFileSync(join(forkDir, 'llama-server'), 'bin')
+  const otherForkDir = join(dataDir, 'engines', 'build', 'otherfork')
+  mkdirSync(otherForkDir, { recursive: true })
+  writeFileSync(join(otherForkDir, 'llama-server'), 'bin')
   const backend = availableBackends()[0]!
   const backendDir = join(dataDir, 'engines', `llama.cpp-b1-${backend.id}`)
   mkdirSync(backendDir, { recursive: true })
@@ -28,10 +31,13 @@ function harness(busy: 'download' | 'build' | null) {
   const engines = [
     { id: 'fork', name: 'My fork', kind: 'llama-server', binPath: join(forkDir, 'llama-server') },
     { id: 'be', name: 'llama.cpp', kind: 'llama-server', binPath: join(backendDir, 'llama-server') },
+    { id: 'other', name: 'Other fork', kind: 'llama-server', binPath: join(otherForkDir, 'llama-server') },
   ]
   const removed: string[] = []
   const added: string[] = []
   const sources: { binPath: string }[] = []
+  const forgotten: string[] = []
+  const failRemove = { on: false }
   const cfg = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [], links: [], telemetry: { level: 'off', machineId: 'm' },
@@ -47,8 +53,11 @@ function harness(busy: 'download' | 'build' | null) {
       active: () => undefined,
       list: () => ({ engines: engines.filter((e) => !removed.includes(e.id)), activeEngineId: '' }),
       get: (id: string) => engines.find((e) => e.id === id && !removed.includes(id)),
-      remove: (id: string) => { removed.push(id) },
-      forgetCustomSource: () => {},
+      remove: (id: string) => {
+        if (failRemove.on) throw Object.assign(new Error('EPERM: operation not permitted, rename config.json'), { code: 'EPERM' })
+        removed.push(id)
+      },
+      forgetCustomSource: (key: string) => { forgotten.push(key) },
       add: async (name: string, binPath: string) => {
         added.push(binPath)
         return { engine: { id: 'fork2', name, binPath, kind: 'llama-server' }, warning: null }
@@ -59,7 +68,7 @@ function harness(busy: 'download' | 'build' | null) {
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, removed, added, sources, dataDir, forkDir, backendDir, backendId: backend.id }
+  return { app, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
 }
 
 async function errorCode(res: Response): Promise<string> {
@@ -197,4 +206,75 @@ test('DELETE /engines/build whose folder stays locked past the retries is 409 en
   const again = await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
   assert.equal(again.status, 200)
   assert.equal(existsSync(dir), false)
+})
+
+// DELETE /engines/:id?purge=1 used to unregister the engine and then delete its folder with one recursive rmSync. A
+// Windows AV or indexer lock (right after a Stop) made that throw part-way: a 500, the engine gone from the registry,
+// its folder half deleted, its custom source kept, and a repeated purge a 404. The folder is now renamed aside first.
+
+/** Make `fs[method]` throw EBUSY for every path `locked` matches, until `restore()`. routes.ts imports these by name:
+ *  syncBuiltinESMExports carries the patch to that binding. */
+function lockPaths(t: { mock: { method: typeof import('node:test').mock.method } }, method: 'renameSync' | 'rmSync', locked: (p: string) => boolean) {
+  const real = fs[method] as (...args: unknown[]) => unknown
+  const m = t.mock.method(fs, method, (...args: unknown[]) => {
+    if (locked(String(args[0]))) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return real(...args)
+  })
+  syncBuiltinESMExports()
+  return { calls: () => m.mock.calls, restore: () => { m.mock.restore(); syncBuiltinESMExports() } }
+}
+
+test('DELETE /engines/:id?purge=1 whose folder is locked is 409 engine_files_locked, keeps the engine registered and its files whole, and can be repeated', async (t) => {
+  const h = harness(null)
+  const lock = lockPaths(t, 'renameSync', (p) => p === h.forkDir)
+  let res: Response
+  try {
+    res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  } finally {
+    lock.restore()
+  }
+  assert.equal(res.status, 409)
+  assert.equal(await errorCode(res), 'engine_files_locked')
+  assert.deepEqual(h.removed, [], 'still registered')
+  assert.deepEqual(h.forgotten, [])
+  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true)
+
+  const again = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  assert.equal(again.status, 200)
+  assert.deepEqual(h.removed, ['fork'])
+  assert.equal(h.forgotten.length, 1)
+  assert.equal(existsSync(h.forkDir), false)
+})
+
+test('DELETE /engines/:id?purge=1 whose renamed-aside folder stays locked still finishes the purge, and the next purge there sweeps it', async (t) => {
+  const h = harness(null)
+  const buildRoot = join(h.dataDir, 'engines', 'build')
+  const lock = lockPaths(t, 'rmSync', (p) => p.startsWith(h.forkDir) || p.startsWith(join(buildRoot, '.myfork.')))
+  let res: Response
+  try {
+    res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  } finally {
+    lock.restore()
+  }
+  assert.equal(res.status, 200)
+  assert.deepEqual(h.removed, ['fork'])
+  assert.equal(h.forgotten.length, 1, 'the remembered source is dropped')
+  assert.equal(existsSync(h.forkDir), false, 'nothing is left where the engine pointed')
+  const leftover = fs.readdirSync(buildRoot).filter((n) => n.startsWith('.myfork.purge-'))
+  assert.equal(leftover.length, 1, 'a hidden leftover')
+  const trashDelete = lock.calls().find((c) => String(c.arguments[0]) === join(buildRoot, leftover[0]!))
+  assert.ok((trashDelete?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the delete retries, as a Windows lock is brief')
+
+  assert.equal((await h.app.request('/api/v1/engines/other?purge=1', { method: 'DELETE' })).status, 200)
+  assert.deepEqual(fs.readdirSync(buildRoot), [], 'the leftover is swept with the next purge')
+})
+
+test('DELETE /engines/:id?purge=1 whose unregister fails puts the folder back', async () => {
+  const h = harness(null)
+  h.failRemove.on = true // the config write behind registry.remove is refused
+  const res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  assert.equal(res.status, 500)
+  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true, 'the still-registered engine keeps its files')
+  assert.deepEqual(fs.readdirSync(join(h.dataDir, 'engines', 'build')).sort(), ['myfork', 'otherfork'])
+  assert.deepEqual(h.forgotten, [])
 })

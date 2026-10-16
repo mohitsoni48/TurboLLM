@@ -2,7 +2,7 @@
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
@@ -1758,15 +1758,34 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit, sourcePatchUrl: eng.sourcePatchUrl,
         })
       }
-      d.registry.remove(id)
       // ?purge=1: also delete the engine's installed files from disk.
       // Only removes dirs under {dataDir}/engines/ — never touches model dirs.
-      if (purge && eng) {
-        const enginesRoot = join(d.store.dir(), 'engines')
-        const purgeDir = engineInstallDir(eng, enginesRoot)
-        if (purgeDir && existsSync(purgeDir)) {
-          rmSync(purgeDir, { recursive: true, force: true })
+      const enginesRoot = join(d.store.dir(), 'engines')
+      const purgeDir = purge && eng ? engineInstallDir(eng, enginesRoot) : null
+      // All or nothing: the folder is first renamed to a hidden sibling, which Windows refuses while any file under it
+      // is open (Defender or the indexer still reading llama-server.exe or ggml-cuda.dll right after a Stop). The
+      // recursive delete this replaces threw part-way instead, AFTER the engine was unregistered: the folder stayed
+      // half deleted, the remembered custom source and LiteRT-LM configs were kept, the client got a 500, and with no
+      // registry entry left the purge could not be repeated (a half-deleted official llama.cpp build was even taken
+      // for an install later). A refused rename now answers 409 with the engine still registered and its files whole.
+      let trash: string | null = null
+      if (eng && purgeDir && existsSync(purgeDir)) {
+        sweepPurgeTrash(dirname(purgeDir))
+        trash = join(dirname(purgeDir), `.${basename(purgeDir)}.purge-${Date.now()}`)
+        try {
+          renameSync(purgeDir, trash)
+        } catch (e) {
+          return err(c, 409, 'engine_files_locked', `Some of ${eng.name}'s files are still in use — try again in a moment. (${(e as Error).message})`)
         }
+      }
+      try {
+        d.registry.remove(id)
+      } catch (e) {
+        // Still registered (a config write failed): its files go back where its binPath points.
+        if (trash && purgeDir) try { renameSync(trash, purgeDir) } catch { /* the error below already reports the failure */ }
+        throw e
+      }
+      if (purge && eng) {
         // LiteRT-LM keeps one launch-config file per port next to its venv (engines/litert-lm/config-<port>.json).
         if (eng.kind === 'litert-lm') {
           const cfgDir = join(enginesRoot, 'litert-lm')
@@ -1781,6 +1800,9 @@ export function registerApi(app: Hono, d: Deps): void {
         // now-broken Enable (its files are gone). A plain Disable (no purge) leaves this
         // record alone; that's the whole point of recordCustomSource.
         d.registry.forgetCustomSource(customSourceKey(eng))
+        // Best effort, as the engine is gone either way: a lock that outlasts the retries leaves a hidden folder that
+        // nothing points at, and the next purge in the same folder sweeps it (sweepPurgeTrash).
+        if (trash) try { rmSync(trash, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* swept later */ }
       }
       return c.json({ ok: true })
     } catch (e) {
@@ -3955,6 +3977,21 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
     return inside(d) ? d : null
   }
   return null
+}
+
+/** Remove the hidden `.<name>.purge-<ms>` folders a purge renamed aside in `parent` but could not delete (a Windows
+ *  lock that outlasted the retries). Best effort; DELETE /engines/:id?purge=1 runs it before each purge there. */
+function sweepPurgeTrash(parent: string): void {
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!/^\..+\.purge-\d+$/.test(name)) continue
+    try { rmSync(join(parent, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* still locked: the next purge tries again */ }
+  }
 }
 
 function readTail(path: string, n: number): string[] {
