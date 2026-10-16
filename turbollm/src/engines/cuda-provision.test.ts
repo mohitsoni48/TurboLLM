@@ -201,3 +201,40 @@ test('provisionCuda: a toolkit an older copy left half done is downloaded again;
   assert.ok(second.progress.some((m) => m.includes(`CUDA ${version} already downloaded`)), second.progress.join('\n'))
   assert.deepEqual(componentFetches, [])
 })
+
+// A Cancel (or a failed download) deletes the stage on the way out, and its files, extracted moments ago, can still be
+// locked by AV past the delete's retries. That throw from the finally replaced the AbortError, so the route reported
+// "Could not install the cuda engine: EBUSY" instead of a quiet cancel.
+test('provisionCuda: a Cancel whose stage delete is locked is still an AbortError, not EBUSY', async (t) => {
+  const dataDir = tmpDir('tllm-cuda-cancel-')
+  const version = '12.4.1'
+  const stageRoot = `${join(dataDir, 'cuda', version)}.partial`
+  const manifest = Object.fromEntries(
+    ['cuda_nvcc', 'cuda_cudart', 'libcublas', 'cuda_cccl'].map((id) => [id, { 'windows-x86_64': { relative_path: `${id}/${id}.zip` } }]),
+  )
+  const ac = new AbortController()
+  const actualPlatform = process.platform
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request) => {
+    const url = String(input)
+    if (url.endsWith('.json')) return url.endsWith(`redistrib_${version}.json`) ? Response.json(manifest) : new Response('', { status: 404 })
+    ac.abort() // the user's Cancel, during the first component's download
+    throw new DOMException('This operation was aborted', 'AbortError')
+  }) as typeof fetch
+  const realRmSync = fs.rmSync
+  // cuda-provision.ts imports rmSync by name: syncBuiltinESMExports carries the patched function to that binding.
+  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p) === stageRoot && existsSync(p)) throw Object.assign(new Error('EBUSY: resource busy or locked, rmdir'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    globalThis.fetch = realFetch
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  })
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  await assert.rejects(provisionCuda(dataDir, () => {}, ac.signal), (e: Error) => e.name === 'AbortError')
+  assert.ok(locked.mock.calls.some((c) => String(c.arguments[0]) === stageRoot && existsSync(stageRoot)), 'the stage delete ran and was refused')
+})

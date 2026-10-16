@@ -304,6 +304,42 @@ test('provisionBackend: resolves the real asset name from the release when asset
   )
 })
 
+// A Cancel (or a failed extraction) cleans up files extracted moments ago, which Windows AV/the indexer can still hold
+// open. That delete threw EBUSY from the catch, replacing the AbortError: the route then reported "Could not install
+// the cuda engine: EBUSY" instead of a quiet cancel. download.ts imports rmSync by name: syncBuiltinESMExports carries
+// the patch to it.
+function lockRecursiveDeletes(t: TestContext, locked: (p: string) => boolean) {
+  const realRmSync = fs.rmSync
+  const rm = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (locked(String(p)) && existsSync(p)) throw Object.assign(new Error('EBUSY: resource busy or locked, rmdir'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    rm.mock.restore()
+    syncBuiltinESMExports()
+  })
+  return rm
+}
+
+test('provisionBackend: a Cancel whose cleanup is locked is still an AbortError, not EBUSY', async (t) => {
+  const root = tmpDir('tllm-dl-cancel-')
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError')
+    return new Response('', { status: 500 })
+  }) as typeof fetch
+  const destDir = join(root, 'llama.cpp-b1-cpu')
+  const rm = lockRecursiveDeletes(t, (p) => p === destDir)
+  const ac = new AbortController()
+  ac.abort()
+  const backend = { id: 'cpu' as const, label: 'CPU', assets: ['llama-b1-bin.zip'], downloadBaseUrl: 'https://dl.test' }
+  await assert.rejects(provisionBackend(root, backend, 'b1', undefined, ac.signal), (e: Error) => e.name === 'AbortError')
+  const cleanup = rm.mock.calls.find((c) => String(c.arguments[0]) === destDir)
+  assert.ok((cleanup?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the cleanup retries, as a Windows lock is brief')
+})
+
 test('isRateLimited: only a 403/429 WITH x-ratelimit-remaining 0 counts', () => {
   const mk = (status: number, remaining: string | null) =>
     new Response('', { status, headers: remaining === null ? {} : { 'x-ratelimit-remaining': remaining } })
@@ -399,6 +435,25 @@ test('provisionTurboquant replace: a failed update leaves the working install; a
   assert.equal(busy.mock.calls.filter((c) => String(c.arguments[0]) === stagedDir).length, 3)
   assert.equal(readFileSync(bin, 'utf8'), 'tq new')
   assert.deepEqual(readdirSync(root), ['turboquant'])
+})
+
+test('provisionTurboquant replace: a failed download whose stage cleanup is locked reports the download error', { skip: tqSkip }, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  mkdirSync(join(root, 'turboquant'))
+  writeFileSync(join(root, 'turboquant', 'llama-server'), 'tq old')
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return new Response(null, { status: 503 })
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+  // Both deletes on the way out: the staged install dir (the inner provision's catch) and the stage root (the finally).
+  const stageRoot = join(root, '.turboquant-update')
+  lockRecursiveDeletes(t, (p) => p === stageRoot || p === join(stageRoot, 'turboquant'))
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }), /HTTP 503/)
+  assert.equal(readFileSync(join(root, 'turboquant', 'llama-server'), 'utf8'), 'tq old')
 })
 
 // ─── renameWithRetry: Windows briefly refuses to rename what AV/the indexer holds open ─────────

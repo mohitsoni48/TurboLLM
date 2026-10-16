@@ -232,7 +232,9 @@ export async function provisionCuda(
     // Best effort, with retries: AV can still hold the just-extracted temp files, and a throw here would fail a completed
     // install (or mask the swap's error) and skip the stage delete below. The next provision clears `work` first.
     try { rmSync(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* temp leftover is harmless */ }
-    // Retries: after a failed swap the stage's fresh files can still be locked, and a throw here would mask that error.
-    rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    // Best effort too: after a failed swap or download the stage's fresh files can still be locked past the retries,
+    // and a throw here would mask that error (a Cancel's AbortError became "Could not install the cuda engine:
+    // EBUSY"). The next provision clears the stage first.
+    try { rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
   }
 }

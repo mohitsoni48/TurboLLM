@@ -519,6 +519,21 @@ function isFullyProvisioned(dir: string): boolean {
   return true
 }
 
+/** Delete what a failed or cancelled install left (a partial archive, a half-extracted dir, a stage) on the way out
+ *  of a catch or finally. With retries, since on Windows AV/the indexer briefly holds files that were extracted
+ *  moments ago, and never throwing: a throw there replaces the error in flight, so a Cancel's AbortError (a quiet
+ *  cancel) or the extraction's own error was reported as "Could not install …: EBUSY". A leftover archive or stage
+ *  is replaced or cleared by the next install (downloadFile's own .part cleanup works the same way). A leftover
+ *  install dir may not be: provisionBackend takes a markerless non-CUDA dir that holds llama-server for an older
+ *  install, and provisionTurboquant any dir that holds one. That gap is older; the delete that threw left it too. */
+function removeAfterFailure(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
+}
+
 /**
  * Ensure a backend is downloaded + extracted; return the llama-server path.
  * Multi-asset backends (CUDA = binary + cudart) extract into the same dir so the
@@ -575,9 +590,10 @@ export async function provisionBackend(
     }
   } catch (e) {
     // Cancelled or failed mid-download: remove partial archives + the half-built
-    // backend dir so it isn't mistaken for an installed backend.
-    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    // backend dir so it isn't mistaken for an installed backend. Best effort, as
+    // removeAfterFailure says: a throw here replaced e, so a Cancel became a failure.
+    for (const tmp of tmpPaths) removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 
@@ -858,9 +874,8 @@ export async function provisionTurboquant(
       }
       return join(destDir, relative(stagedDir, stagedBin))
     } finally {
-      // Retries as above: after a failed swap the stage still holds those fresh files, and a throw here would mask
-      // the real error.
-      rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+      // After a failed swap the stage still holds those fresh files, and a throw here would mask the real error.
+      removeAfterFailure(stageRoot)
     }
   }
   if (existsSync(destDir)) {
@@ -885,8 +900,8 @@ export async function provisionTurboquant(
     await extractArchive(tmp, destDir)
     rmSync(tmp, { force: true })
   } catch (e) {
-    rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 
