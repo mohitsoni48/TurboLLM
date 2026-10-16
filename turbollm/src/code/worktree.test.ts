@@ -7,7 +7,7 @@
 // of test that passes while the feature is broken.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   agentCwd,
@@ -137,6 +137,53 @@ test('ensureLocalExclude: idempotent — never appends the same line twice', asy
     assert.equal(hits, 1)
   } finally {
     rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: ensureLocalExclude: a base folder that is itself a linked worktree hides .turbollm/ too', async () => {
+  // A linked worktree's own gitdir is <main>/.git/worktrees/<name>, whose info/exclude git never
+  // reads: the line went there, the base checkout listed `?? .turbollm/`, and `git add -A` (the Git
+  // dialog's commit-all) staged the session worktree as an embedded repo.
+  const root = await makeRepo()
+  const linked = join(root, '..', 'linked')
+  try {
+    assert.ok((await runGit(root, ['worktree', 'add', '-q', '-b', 'linked', linked])).ok)
+    const r = await createSessionWorktree({ repoRoot: linked, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.equal(r.path, join(linked, WORKTREES_SUBDIR, 'feat'))
+    assert.equal((await runGit(linked, ['status', '--porcelain'])).stdout.trim(), '', 'no `?? .turbollm/` in the linked base')
+    await runGit(linked, ['add', '-A', '--', '.'])
+    assert.equal((await runGit(linked, ['diff', '--cached', '--name-only'])).stdout.trim(), '', 'commit-all stages no gitlink')
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\/\.turbollm\/$/m, 'written to the common dir')
+  } finally {
+    rmSync(join(root, '..'), { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: ensureLocalExclude: a base folder reached through a symlink into a repo subfolder hides .turbollm/ too', async () => {
+  // <tmp>/home/web -> <tmp>/repo/packages/web. git prints `--git-path info/exclude` relative to its
+  // PHYSICAL cwd (../../.git/info/exclude); resolved against the symlink's own path it named
+  // <tmp>/.git/info/exclude, outside any repo, and the base checkout listed `?? .turbollm/`.
+  const root = await makeRepo()
+  const tmp = join(root, '..')
+  try {
+    mkdirSync(join(root, 'packages', 'web'), { recursive: true })
+    writeFileSync(join(root, 'packages', 'web', 'index.ts'), 'export {}\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'web'])
+    mkdirSync(join(tmp, 'home'))
+    const link = join(tmp, 'home', 'web')
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(join(root, 'packages', 'web'), link, 'junction')
+
+    const r = await createSessionWorktree({ repoRoot: link, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    assert.equal((await runGit(root, ['status', '--porcelain'])).stdout.trim(), '', 'no `?? .turbollm/` in the base checkout')
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\/\.turbollm\/$/m)
+    assert.ok(!existsSync(join(tmp, '.git')), 'no stray .git/info/exclude above the symlink')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
   }
 })
 

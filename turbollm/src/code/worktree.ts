@@ -22,8 +22,8 @@
 //     never materialises it. Verified empirically, not reasoned about.
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { appendFile, readFile, mkdir } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { appendFile, readFile, mkdir, realpath } from 'node:fs/promises'
+import { dirname, join, resolve } from 'node:path'
 
 /** Where a repo's session worktrees live, relative to the repo root. */
 export const WORKTREES_SUBDIR = join('.turbollm', 'worktrees')
@@ -132,27 +132,36 @@ export async function findFreeBranchName(repoRoot: string, desired: string): Pro
  *  repo untidy, never broken, so it must not abort a session launch. */
 export async function ensureLocalExclude(repoRoot: string): Promise<void> {
   try {
-    const gitDir = await resolveGitDir(repoRoot)
-    if (!gitDir) return
-    const infoDir = join(gitDir, 'info')
-    const excludePath = join(infoDir, 'exclude')
+    const excludePath = await resolveExcludePath(repoRoot)
+    if (!excludePath) return
     let current = ''
     try { current = await readFile(excludePath, 'utf8') } catch { /* absent — created below */ }
     if (current.split(/\r?\n/).some((l) => l.trim() === EXCLUDE_LINE)) return
-    await mkdir(infoDir, { recursive: true })
+    await mkdir(dirname(excludePath), { recursive: true })
     await appendFile(excludePath, `${current.endsWith('\n') || current === '' ? '' : '\n'}${EXCLUDE_LINE}\n`, 'utf8')
   } catch {
     /* best-effort */
   }
 }
 
-/** Absolute path to the repo's .git directory (`git rev-parse --absolute-git-dir`), or null.
- *  Asked of git rather than assumed to be `<root>/.git`: it is a FILE, not a directory, when the
- *  repo is itself a worktree or a submodule. */
-async function resolveGitDir(repoRoot: string): Promise<string | null> {
-  const r = await runGit(repoRoot, ['rev-parse', '--absolute-git-dir'])
-  const p = r.stdout.trim()
-  return r.ok && p ? p : null
+/** Absolute path to the exclude file git actually reads for this repo, or null. Asked of git
+ *  rather than assumed to be `<root>/.git/info/exclude`: .git is a FILE, not a directory, when the
+ *  repo is itself a worktree or a submodule. And for a LINKED worktree (a base folder made with
+ *  `git worktree add`), the repo's own gitdir, which `--absolute-git-dir` returns, is
+ *  `<main>/.git/worktrees/<name>`, where git never reads an info/exclude: it reads the common
+ *  dir's. Writing the line there left `?? .turbollm/` in the base checkout, and the Git dialog's
+ *  commit-all (`git add -A`) then staged the session worktree as an embedded repo (a 160000
+ *  gitlink). `--git-path info/exclude` answers with the file git reads in every layout. It prints
+ *  a path relative to the cwd for a plain repo, hence the resolve; `--path-format=absolute` would
+ *  avoid that but needs git 2.31. That cwd is the PHYSICAL one (git's getcwd), so the path is
+ *  resolved against the base folder's realpath, not the name it was opened by: a base reached
+ *  through a symlink into a repo subfolder (~/web -> ~/code/mono/packages/web) gets
+ *  `../../.git/info/exclude`, which resolved against the symlink's own path would name a file two
+ *  levels above it, outside any repo, instead of mono/.git/info/exclude. */
+async function resolveExcludePath(repoRoot: string): Promise<string | null> {
+  const r = await runGit(repoRoot, ['rev-parse', '--git-path', 'info/exclude'])
+  const p = r.stdout.replace(/\r?\n$/, '')
+  return r.ok && p ? resolve(await realpath(repoRoot), p) : null
 }
 
 /** The directory a session's agent — and every operation on the files it edits — should act in.
