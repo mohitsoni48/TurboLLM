@@ -15,7 +15,8 @@
 // passes `agent.tools` as `allowedTools`, intersected against the real registry), never a grant of
 // new capability. Creating one has exactly the same risk profile as the model composing a longer
 // system-prompt string in its own reply — it cannot reach the filesystem/shell gate that makes
-// code-flavor routines sensitive.
+// code-flavor routines sensitive. A remote-access token is refused create_agent, though
+// (tool-registry.ts), as it is refused POST /api/v1/chat-agents.
 import { randomUUID } from 'node:crypto'
 import type { CustomChatAgent } from '../config/config'
 

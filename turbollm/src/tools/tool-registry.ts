@@ -37,6 +37,7 @@ export interface ToolCall {
 
 const ROUTINE_TOOL_NAMES = new Set(['create_routine', 'list_routines', 'update_routine', 'delete_routine', 'run_routine_now'])
 const REMOTE_GRANT_ROUTINES_MESSAGE = 'This access token is not allowed to manage routines. Use TurboLLM on the host.'
+const REMOTE_GRANT_AGENTS_MESSAGE = 'This access token is not allowed to create chat agents. Use TurboLLM on the host.'
 
 /** Everything a live MCP client is built from — a change to any of it needs a new client. */
 function mcpFingerprint(srv: McpServer): string {
@@ -145,9 +146,9 @@ export class ToolRegistry {
 
   /** Build the full tools array to send to the engine. Returns [] when no tools are available.
    *  `forGeneration`: the list offered to the model in THIS request's generation, so tools its
-   *  caller may not run are left out (a remote-access token's routine tools; executeTool refuses
-   *  them). Without it this is also the tool catalog (GET /api/v1/tools) an agent's saved
-   *  allow-list is picked from, which must not depend on who asks. */
+   *  caller may not run are left out (a remote-access token's routine tools and create_agent;
+   *  executeTool refuses them). Without it this is also the tool catalog (GET /api/v1/tools) an
+   *  agent's saved allow-list is picked from, which must not depend on who asks. */
   async buildToolDefinitions(opts: { forGeneration?: boolean } = {}): Promise<ToolDefinition[]> {
     const defs: ToolDefinition[] = []
 
@@ -172,8 +173,10 @@ export class ToolRegistry {
     }
     // Agent tools (Customize -> Agents) — lets a chat-flavor create_routine call be preceded by
     // list_agents/create_agent in the SAME turn, with no human needing to open Customize first.
+    // A remote-access token's generation is offered list_agents only (see executeTool).
     if (this.agents) {
-      defs.push(LIST_AGENTS_TOOL, CREATE_AGENT_TOOL)
+      defs.push(LIST_AGENTS_TOOL)
+      if (!(opts.forGeneration && remoteGrantRequest())) defs.push(CREATE_AGENT_TOOL)
     }
     // Model tool — lets create_routine's modelKey be looked up instead of guessed. Real modelKeys
     // are compound ids (e.g. "gemma 4 26b a4b qat|Q4_0|14439362752"); without this, a model has no
@@ -269,12 +272,20 @@ export class ToolRegistry {
       }
     }
 
-    // Agent tools (Customize -> Agents) — unlike the routine tools, ungated: see
-    // chat-agent-tools.ts's module header for why a CustomChatAgent carries no more risk than the
-    // model composing a longer reply.
+    // Agent tools (Customize -> Agents) — unlike the routine tools, not gated on Code
+    // authorization: see chat-agent-tools.ts's module header for why a CustomChatAgent carries no
+    // more risk than the model composing a longer reply.
     if (this.agents) {
       if (name === 'list_agents') return execListAgents(args, this.agents)
-      if (name === 'create_agent') return execCreateAgent(args, this.agents)
+      if (name === 'create_agent') {
+        // A remote-access token may read the agents (GET /api/v1/chat-agents is models:use) but
+        // not write one: POST /api/v1/chat-agents needs config:write (auth.ts requiredCapability),
+        // which no token the remote-access UI mints carries (remote/routes.ts sanitizeTokenGrant).
+        // The chat tool loop runs inside that token's own request, so without this a models:use
+        // token, approving its own call, added agents with any system prompt and tool list.
+        if (remoteGrantRequest()) return `Error: ${REMOTE_GRANT_AGENTS_MESSAGE}`
+        return execCreateAgent(args, this.agents)
+      }
     }
 
     // Model tool — read-only, no gating needed (same reasoning as list_agents: it only ever

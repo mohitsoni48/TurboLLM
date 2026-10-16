@@ -27,6 +27,7 @@ import type { Scanner, ModelEntry } from './models/scanner'
 import { ToolRegistry } from './tools/tool-registry'
 import type { RoutineToolsStore } from './routines/routine-tools'
 import type { Routine } from './routines/schema'
+import type { CustomChatAgent } from './config/config'
 import { rmSync } from 'node:fs'
 import { registerChatRoutes } from './chat/chat-routes'
 import { ConversationStore } from './chat/db'
@@ -842,6 +843,40 @@ test('a remote token cannot create, list, update, delete or run routines through
   const body = (await res.json()) as { offered: string[]; result: string }
   assert.match(body.result, /is running now/)
   assert.deepEqual(body.offered.filter((n) => ROUTINE_TOOLS.includes(n)).sort(), [...ROUTINE_TOOLS].sort())
+})
+
+// POST /api/v1/chat-agents needs config:write, which a remote token never carries; the chat tool
+// loop runs inside the token's own request, and its create_agent wrote the same agents list.
+test('a remote token cannot create a chat agent through the chat tools; it can still list them', async () => {
+  const { d } = makeDeps(() => {})
+  const agents = { customAgents: [] as CustomChatAgent[] }
+  const agentStore = { snapshot: () => agents, update: (fn: (c: typeof agents) => void) => fn(agents) }
+  const reg = new ToolRegistry({} as never, undefined, undefined, agentStore)
+  const app = routineToolsApp(d, reg)
+  const call = async (req: typeof tunneledRequest, headers: Record<string, string>, name: string) => {
+    const res = await req(app, '/api/v1/conversations/c1/messages', {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, args: { name: 'Helper', systemPrompt: 'attacker prompt', tools: ['run_code'] } }),
+    })
+    assert.equal(res.status, 200)
+    return (await res.json()) as { offered: string[]; result: string }
+  }
+  for (const capabilities of [['models:use'], ['models:use', 'models:load']] as const) {
+    const auth = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: [...capabilities] }) }
+    const created = await call(tunneledRequest, auth, 'create_agent')
+    assert.match(created.result, /^Error: .*not allowed to create chat agents/, capabilities.join('+'))
+    assert.ok(!created.offered.includes('create_agent'), 'create_agent is not offered to the model')
+    assert.ok(created.offered.includes('list_agents'), 'list_agents still is')
+    assert.match((await call(tunneledRequest, auth, 'list_agents')).result, /No custom agents/)
+  }
+  assert.equal(agents.customAgents.length, 0, 'no agent may be created')
+
+  // The host's own chat is unchanged.
+  const host = await call(loopbackRequest, {}, 'create_agent')
+  assert.match(host.result, /^Created agent /)
+  assert.ok(host.offered.includes('create_agent'))
+  assert.equal(agents.customAgents.length, 1)
 })
 
 // GET /api/v1/tools is also the catalog an agent's allow-list is saved from (AgentEditPage saves
