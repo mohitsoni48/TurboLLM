@@ -13,6 +13,7 @@ import { Hono } from 'hono'
 import { registerGateway } from './gateway'
 import { ModelRouter } from './model-router'
 import { lanAuth, provisionRemoteApiKey } from '../auth'
+import type { LinkCapability } from '../link/types'
 import { defaultConfig, type Engine } from '../config/config'
 import type { Manager, StartOpts, Status } from '../engines/manager'
 import { ComfyGuard } from '../engines/comfy-guard'
@@ -550,12 +551,18 @@ function restrictedDeps(opts: {
   slot?: ReturnType<typeof managerIn>
   comfySuspended?: string | null
   comfy?: ComfyGuard
+  /** More library entries beside MODEL and OTHER. */
+  library?: object[]
+  /** The active engine's kind; llama-server when absent. */
+  engineKind?: string
+  /** The remote token's grant; models:use only when absent. */
+  capabilities?: LinkCapability[]
 }): { d: Deps; router: ModelRouter; token: string } {
   const cfg = defaultConfig()
   cfg.gateway.keepN = opts.keepN ?? 1
   const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/tmp/turbollm-test-data' }
-  const scanner = { list: () => ({ models: [MODEL, OTHER], scanning: false, lastScanAt: '' }), get: () => undefined }
-  const engine = { id: 'llama', kind: 'llama-server', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
+  const scanner = { list: () => ({ models: [MODEL, OTHER, ...(opts.library ?? [])], scanning: false, lastScanAt: '' }), get: () => undefined }
+  const engine = { id: 'llama', kind: opts.engineKind ?? 'llama-server', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
   const registry = { active: () => engine, layaEngine: () => undefined }
   const comfy = opts.comfy ?? (opts.comfySuspended === undefined
     ? undefined
@@ -569,17 +576,22 @@ function restrictedDeps(opts: {
     store, scanner, registry, manager: opts.primary, modelRouter: router,
     remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider },
   } as unknown as Deps
-  return { d, router, token: provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] }) }
+  return { d, router, token: provisionRemoteApiKey(d, { kind: 'remote', capabilities: opts.capabilities ?? ['models:use'] }) }
 }
 
 async function askAsRemoteToken(d: Deps, token: string, path: '/v1/messages' | '/v1/chat/completions', model = MODEL.key): Promise<Response> {
+  return postAsRemoteToken(d, token, path, { model, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] })
+}
+
+/** `body` POSTed to `path` over the remote-access ingress port, with `token`, through lanAuth and the gateway. */
+async function postAsRemoteToken(d: Deps, token: string, path: string, body: unknown): Promise<Response> {
   const app = new Hono()
   app.use('*', lanAuth(d))
   registerGateway(app, d)
   return app.request(`http://local.test${path}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-TurboLLM-Auth': token },
-    body: JSON.stringify({ model, max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+    body: JSON.stringify(body),
   }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
 }
 
@@ -671,6 +683,81 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
       assert.equal(unloaded.headers.get('x-should-retry'), 'false')
     } finally {
       guard.stop()
+    }
+  })
+}
+
+// ── The Jev endpoints route through routeTo(), never route(), so routeTo() needs the same refusal. Without it a
+// models:use-only remote token's /v1/classify, /v1/rerank or /v1/systemone naming a Jev model that is not loaded
+// would auto-swap it in and evict the owner's model, the defect the refusal closes for the chat endpoints. Composed
+// for real: lanAuth marks the request, the gateway dispatches the Jev endpoint, the real router decides, and the
+// primary counts what it is asked to load. The active engine is vLLM, so nothing but the refusal stands between the
+// token and the load.
+
+const JEV = {
+  ...MODEL, key: 'qwen3.5 4b nli v2|mlx-fp16|9012345678', name: 'qwen3.5 4b nli v2', path: '/m/qwen3.5-4b-nli-v2',
+  format: 'mlx', quant: 'fp16',
+  jev: {
+    labels: ['contradiction', 'entailment', 'neutral'],
+    nliTemplate: 'Premise: {premise}\nHypothesis: {hypothesis}',
+    architecture: 'Qwen3_5ForSequenceClassification',
+    verified: true,
+  },
+}
+
+const JEV_REQUESTS: Array<[string, unknown]> = [
+  ['/v1/classify', { model: JEV.key, premise: 'A chef is chopping onions.', hypotheses: ['Someone is cooking.', 'The kitchen is empty.'] }],
+  ['/v1/rerank', { model: JEV.key, query: 'What is the capital of France?', documents: ['Berlin', 'Paris'] }],
+  ['/v1/systemone', { model: JEV.key, state: 's', questions: { q: { type: 'noul', instructions: 'Q?' } } }],
+]
+
+/** A primary running OTHER that records each model it is asked to load, and serves `engineUrl` once loaded. */
+function recordingPrimary(engineUrl = 'http://127.0.0.1:1') {
+  const loads: string[] = []
+  let loaded = OTHER.key
+  const primary = {
+    ...managerIn('running', OTHER.key),
+    status: (): Status => ({ state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0, model: { key: loaded } as Status['model'] }),
+    target: () => engineUrl,
+    load: async (opts: StartOpts) => { loads.push(opts.model.key); loaded = opts.model.key },
+  }
+  return { primary: primary as unknown as ReturnType<typeof managerIn>, loads }
+}
+
+/** A vLLM /classify double: one entailment row per input. */
+function classifyEngine(): ReturnType<typeof withFakeEngine> {
+  return withFakeEngine((req, res) => {
+    let raw = ''
+    req.on('data', (chunk) => { raw += chunk })
+    req.on('end', () => {
+      const { input } = JSON.parse(raw) as { input: string[] }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ data: input.map((_, index) => ({ index, probs: [0, 1, 0] })), usage: { prompt_tokens: 1, total_tokens: 1 } }))
+    })
+  })
+}
+
+for (const [path, body] of JEV_REQUESTS) {
+  test(`${path}: a models:use token naming a Jev model that is not loaded is refused, and nothing loads`, async () => {
+    const { primary, loads } = recordingPrimary()
+    const { d, token } = restrictedDeps({ primary, library: [JEV], engineKind: 'vllm' })
+    const res = await postAsRemoteToken(d, token, path, body)
+    assert.deepEqual(loads, [], 'the owner\'s model must not be swapped out')
+    assert.equal(res.status, 503)
+    assert.match(await res.text(), /may not load models/)
+    assert.equal(res.headers.get('x-should-retry'), 'false')
+  })
+
+  test(`${path}: a token with models:load still auto-swaps the Jev model in`, async () => {
+    const engine = await classifyEngine()
+    try {
+      const { primary, loads } = recordingPrimary(engine.url)
+      const { d, token } = restrictedDeps({ primary, library: [JEV], engineKind: 'vllm', capabilities: ['models:use', 'models:load'] })
+      const res = await postAsRemoteToken(d, token, path, body)
+      assert.equal(res.status, 200, await res.clone().text())
+      assert.deepEqual(loads, [JEV.key])
+    } finally {
+      await engine.close()
     }
   })
 }
