@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   ConfigStore,
-  defaultConfig,
+  configuredDaemonPort,
   defaultConfigPath,
   resolveConfiguredCtx,
   migrateLegacyDataDir,
@@ -151,17 +151,6 @@ function argValue(name: string, fallback: string): string {
 // so the flag and TURBOLLM_TELEMETRY can never disagree (ADR-299). Set before
 // anything reads it. One-way by design: it can only turn telemetry off.
 if (hasFlag('--no-telemetry')) process.env[TELEMETRY_ENV] = 'off'
-
-/** The daemon's configured port from config.json, falling back to the shipped
- *  default. Best-effort — a missing/invalid config yields the shipped default.
- *  Keeps the literal default in ONE place (defaultConfig) rather than hardcoded. */
-function configuredDaemonPort(configPath: string): number {
-  try {
-    const cfg = JSON.parse(readFileSync(configPath, 'utf8')) as { daemon?: { port?: number } }
-    if (typeof cfg.daemon?.port === 'number' && cfg.daemon.port > 0) return cfg.daemon.port
-  } catch { /* missing or invalid config — use the shipped default below */ }
-  return defaultConfig().daemon.port
-}
 
 // ── `turbollm launch <cli>` — start a coding CLI wired to TurboLLM ──────────────
 // Handled before --help so `turbollm launch claude --help` forwards --help to the

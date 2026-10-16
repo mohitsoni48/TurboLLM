@@ -789,6 +789,32 @@ export function defaultConfig(): Config {
   }
 }
 
+/** config.json's text, in whatever encoding a Windows tool saved it. PowerShell 5.1's `>` and
+ *  `Out-File` write UTF-16LE with a BOM (FF FE); `Set-Content -Encoding UTF8` and many editors
+ *  put a UTF-8 BOM first. JSON.parse rejects each of these as read, so load() reset the whole
+ *  config to defaults (API keys, engines, model dirs). A UTF-16BE BOM (FE FF) is decoded too. */
+export function decodeConfigText(bytes: Buffer): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le')
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // No 'utf16be' Buffer encoding: swap to LE (swap16 needs an even length; drop a stray byte).
+    return Buffer.from(bytes.subarray(2, bytes.length - (bytes.length % 2))).swap16().toString('utf16le')
+  }
+  return bytes.toString('utf8').replace(/^\uFEFF/, '')
+}
+
+/** The daemon's configured port from config.json, falling back to the shipped default — what
+ *  `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+ *  Best-effort — a missing/invalid config yields the shipped default. Keeps the literal default
+ *  in ONE place (defaultConfig) rather than hardcoded. Decoded like load() does, so a BOM a
+ *  Windows tool added does not read as "invalid" and silently put the shipped port in its place. */
+export function configuredDaemonPort(configPath: string): number {
+  try {
+    const cfg = JSON.parse(decodeConfigText(readFileSync(configPath))) as { daemon?: { port?: number } }
+    if (typeof cfg.daemon?.port === 'number' && cfg.daemon.port > 0) return cfg.daemon.port
+  } catch { /* missing or invalid config — use the shipped default below */ }
+  return defaultConfig().daemon.port
+}
+
 export class ConfigStore {
   private constructor(
     private data: Config,
@@ -803,14 +829,16 @@ export class ConfigStore {
       return store
     }
     let raw: Record<string, unknown>
-    // Strip a UTF-8 BOM: Windows editors and PowerShell 5.1's `Set-Content -Encoding UTF8` add
-    // one, JSON.parse rejects it, and the catch below would then reset the whole config.
-    const text = readFileSync(path, 'utf8').replace(/^\uFEFF/, '')
+    // Decoded first: a BOM (UTF-8 or UTF-16, see decodeConfigText) would otherwise send a valid
+    // hand-edited config to the reset below.
+    const bytes = readFileSync(path)
+    const text = decodeConfigText(bytes)
     try {
       raw = JSON.parse(text) as Record<string, unknown>
     } catch {
       const backup = `${path}.broken-${Math.floor(Date.now() / 1000)}`
-      writeFileSync(backup, text)
+      // The file's own bytes: a decoded copy of a file in another encoding mangles its non-ASCII text.
+      writeFileSync(backup, bytes)
       const store = new ConfigStore(defaultConfig(), path, backup)
       store.save()
       return store

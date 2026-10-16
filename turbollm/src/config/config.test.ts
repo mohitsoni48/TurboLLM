@@ -20,6 +20,7 @@ import {
   ConfigStore,
   MODEL_PRESET_CAP,
   SCHEMA_VERSION,
+  configuredDaemonPort,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
@@ -719,6 +720,66 @@ test('ConfigStore.load: a UTF-8 BOM before the JSON is ignored, not treated as a
 
     assert.equal(store.brokenBackup(), '', 'no .broken-* backup may be written')
     assert.deepEqual(store.snapshot().modelDirs, ['/models/bom-test'])
+  } finally {
+    cleanup(path)
+  }
+})
+
+// PowerShell 5.1's `>` and `Out-File` write UTF-16LE with a BOM. Read as UTF-8 that is not JSON,
+// so load() reset the whole config to defaults and kept a backup decoded as UTF-8, mangling any
+// non-ASCII text in it.
+test('ConfigStore.load: a UTF-16 (LE or BE) config with a BOM is read, not reset to defaults', () => {
+  for (const [label, encode] of [
+    ['UTF-16LE', (t: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(t, 'utf16le')])],
+    ['UTF-16BE', (t: string) => Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(t, 'utf16le').swap16()])],
+  ] as const) {
+    const path = tmpConfigPath()
+    try {
+      const cfg = defaultConfig()
+      cfg.daemon.port = 7123
+      cfg.modelDirs = ['C:\\Modèles\\日本']
+      writeFileSync(path, encode(JSON.stringify(cfg)))
+
+      const store = ConfigStore.load(path)
+
+      assert.equal(store.brokenBackup(), '', `${label}: no .broken-* backup may be written`)
+      assert.equal(store.snapshot().daemon.port, 7123, label)
+      assert.deepEqual(store.snapshot().modelDirs, ['C:\\Modèles\\日本'], label)
+    } finally {
+      cleanup(path)
+    }
+  }
+})
+
+test('ConfigStore.load: the .broken-* backup of an unreadable config is its exact bytes', () => {
+  const path = tmpConfigPath()
+  try {
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"modelDirs": ["Modèles"', 'utf16le')])
+    writeFileSync(path, bytes)
+
+    const store = ConfigStore.load(path)
+
+    assert.ok(store.brokenBackup(), 'a truncated file is still reset')
+    assert.deepEqual(readFileSync(store.brokenBackup()), bytes)
+  } finally {
+    cleanup(path)
+  }
+})
+
+// What `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+test('configuredDaemonPort: reads the port through a UTF-8 or UTF-16 BOM; shipped default otherwise', () => {
+  const path = tmpConfigPath()
+  try {
+    const json = JSON.stringify({ daemon: { port: 7123 } })
+    writeFileSync(path, '\uFEFF' + json)
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-8 BOM')
+    writeFileSync(path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, 'utf16le')]))
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-16LE BOM')
+    writeFileSync(path, json)
+    assert.equal(configuredDaemonPort(path), 7123)
+    writeFileSync(path, '{ not json')
+    assert.equal(configuredDaemonPort(path), defaultConfig().daemon.port)
+    assert.equal(configuredDaemonPort(join(path, '..', 'absent.json')), defaultConfig().daemon.port)
   } finally {
     cleanup(path)
   }
