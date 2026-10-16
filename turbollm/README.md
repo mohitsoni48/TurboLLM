@@ -620,6 +620,8 @@ On the first such start with no key yet, one is generated and printed once in th
 banner; otherwise create one under **Developer → API keys** on the host machine. Paste it when
 the other device asks. To let any device on your network in without a key, turn on **Expose on
 local network (LAN)** in Settings → Network & sharing, then turn **Require an API key** off there.
+Any website opened in a browser on that network can then use it without a key too (through DNS
+rebinding).
 
 ---
 

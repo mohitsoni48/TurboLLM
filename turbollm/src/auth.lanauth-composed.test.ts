@@ -625,7 +625,9 @@ test('a foreign Host still needs a key when requireApiKey is off and nothing is 
   assert.equal((await loopbackRequest(app, '/v1/models', { headers: evil })).status, 401)
   // The box's own clients are untouched by the key setting.
   assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: { Host: '127.0.0.1:6996' } })).status, 200)
-  // Once LAN access really is open without a key, a foreign Host is no worse than any LAN peer.
+  // Once LAN access really is open without a key, a foreign Host gets in keyless like any LAN
+  // peer. That is not a protection: it is how a DNS-rebinding page from any website reaches an
+  // open-LAN daemon, which the Settings and README copy now say. Only the key closes it.
   d.bindHost = '0.0.0.0'
   assert.equal((await loopbackRequest(app, '/api/v1/status', { headers: evil })).status, 200)
 })

@@ -1142,8 +1142,11 @@ function NetworkSection({
           <label className="flex cursor-pointer items-center justify-between">
             <div>
               <div className="text-[14px] font-medium text-ink">Require an API key</div>
+              {/* "Any website": with the key off, a foreign Host is let in like a LAN peer, so a
+                  page that re-points (DNS-rebinds) its own name at this machine gets in keyless. */}
               <div className="text-[12px] text-muted">
-                When off, any device on your network can use this TurboLLM with no key
+                When off, any device on your network, and any website opened in a browser on it,
+                can use this TurboLLM with no key
               </div>
             </div>
             <input
@@ -1177,7 +1180,8 @@ function NetworkSection({
               ) : (
                 <>
                   <span className="font-medium text-ink">Open access:</span> any device on your
-                  network can use this TurboLLM with no key. Only enable this on a network you trust.
+                  network, and any website opened in a browser on it, can use this TurboLLM with no
+                  key. Only enable this on a network you trust.
                 </>
               )}
             </div>

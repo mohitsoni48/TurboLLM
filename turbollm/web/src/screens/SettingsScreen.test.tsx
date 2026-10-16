@@ -289,3 +289,16 @@ describe('SettingsScreen — Network port', () => {
     state.sysInfo = undefined
   })
 })
+
+describe('SettingsScreen — open LAN access', () => {
+  // With the key off, lanAuth lets a request with a foreign Host in like a LAN peer, so a web page
+  // that DNS-rebinds its own name to this machine (or its LAN address) gets in keyless as well.
+  // The copy named only "any device on your network".
+  it('says that a website opened in a browser on the network can use it with no key, not only a device', async () => {
+    state.settings = mk({ lanBind: true, requireApiKey: false })
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /Network/ }))
+    // The "Require an API key" switch's own line, and the Open access warning under it.
+    expect(screen.getAllByText(/any website opened in a browser on it,\s+can use this TurboLLM with no\s+key/)).toHaveLength(2)
+  })
+})
