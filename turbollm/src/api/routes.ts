@@ -2935,8 +2935,9 @@ export function registerApi(app: Hono, d: Deps): void {
       await d.tools?.buildToolDefinitions()
     }
     // apiKey is write-only: never echo the Bearer token back, even on the create response.
+    // Env values are write-only too (maskMcpEnv).
     const { apiKey: _created, ...safeServer } = server
-    return c.json(safeServer, 201)
+    return c.json(maskMcpEnv(safeServer), 201)
   })
 
   app.put('/api/v1/mcp/servers/:id', async (c) => {
@@ -2956,7 +2957,9 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.enabled !== undefined) s.enabled = !!b.enabled
       if (b.command !== undefined) s.command = b.command
       if (b.args !== undefined) s.args = b.args
-      if (b.env !== undefined) s.env = b.env
+      // Env values go out masked (maskMcpEnv), so the edit form sends a value it never saw as
+      // MCP_ENV_MASK: that keeps the stored one. A key left out is removed, as before.
+      if (b.env !== undefined) s.env = mergeMcpEnv(s.env, b.env)
       if (b.url !== undefined) {
         // A stored Bearer key belongs to the service it was issued by. The key is write-only, so
         // the edit form always opens with a blank key field, and pointing the URL at another host
@@ -2970,10 +2973,10 @@ export function registerApi(app: Hono, d: Deps): void {
     })
     await d.tools?.syncMcpServers(d.store.snapshot().mcp.servers).catch(() => {})
     await d.tools?.buildToolDefinitions()
-    // apiKey is write-only: strip the Bearer token from the update response too.
+    // apiKey is write-only: strip the Bearer token from the update response too, and mask env.
     const updated = d.store.snapshot().mcp.servers.find((s) => s.id === id)!
     const { apiKey: _updated, ...safeUpdated } = updated
-    return c.json(safeUpdated)
+    return c.json(maskMcpEnv(safeUpdated))
   })
 
   app.delete('/api/v1/mcp/servers/:id', async (c) => {
@@ -3536,7 +3539,8 @@ function settingsPayload(d: Deps) {
     },
     // apiKey is write-only: strip before echoing so Bearer tokens never reach the frontend.
     // apiKeySet says only whether one is stored, so the edit form can show it and offer a clear.
-    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: k, ...s }) => ({ ...s, apiKeySet: !!k })) },
+    // A stdio server's env values are write-only as well: key names only (maskMcpEnv).
+    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: k, ...s }) => ({ ...maskMcpEnv(s), apiKeySet: !!k })) },
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
@@ -3793,6 +3797,30 @@ function engineBusy(d: Deps): boolean {
 function isCatalogRepo(repoUrl: string | undefined): boolean {
   if (!repoUrl) return false
   return catalogForPlatform().some((e) => sameRepo(repoUrl, e.homepage))
+}
+
+/** What every value of an MCP stdio server's env reads as over the wire (settings payload, the
+ *  POST/PUT /mcp/servers responses). Env is where MCP servers take their credentials (the
+ *  catalog's BRAVE_API_KEY, MYSQL_PASSWORD, HUGGINGFACE_TOKEN, …), and it went out in clear text,
+ *  while every other secret in the payload is write-only: even a keyless open-LAN peer, which may
+ *  not edit or spawn MCP servers, read them from GET /settings. The key names stay, so the edit
+ *  form can list them. web/src/lib/api.ts has the same string. */
+export const MCP_ENV_MASK = '••••••••'
+
+function maskMcpEnv<T extends { env?: Record<string, string> }>(s: T): T {
+  return s.env ? { ...s, env: Object.fromEntries(Object.keys(s.env).map((k) => [k, MCP_ENV_MASK])) } : s
+}
+
+/** PUT /mcp/servers/:id's env: the sent map replaces the stored one (a key left out is removed),
+ *  except that a key sent with MCP_ENV_MASK keeps its stored value; with none stored, it is
+ *  dropped (there is nothing to keep). */
+function mergeMcpEnv(stored: Record<string, string> | undefined, sent: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(sent ?? {})) {
+    if (v !== MCP_ENV_MASK) out[k] = v
+    else if (stored && Object.hasOwn(stored, k)) out[k] = stored[k]
+  }
+  return out
 }
 
 /** True when an MCP server's new URL is on the same origin (scheme, host, port) as its old one,

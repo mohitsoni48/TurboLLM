@@ -820,12 +820,18 @@ export function uninstallComfyGate(): Promise<{ ok: boolean }> {
   return request('/api/v1/comfyui/uninstall', { method: 'POST', json: {} })
 }
 
+/** What the daemon sends for every MCP stdio env value (routes.ts's MCP_ENV_MASK, same string):
+ *  env holds the servers' credentials, so its values are write-only. Sent back unchanged in a
+ *  PUT, a masked value keeps the stored one. */
+export const MCP_ENV_MASK = '••••••••'
+
 export type McpServer = {
   id: string
   name: string
   transport: 'stdio' | 'sse'
   command?: string
   args?: string[]
+  /** stdio only. Read back with each value as MCP_ENV_MASK, never the value itself. */
   env?: Record<string, string>
   url?: string
   /** sse only — Bearer token for Authorization header (ADR-124). Write-only: sent on add/edit,

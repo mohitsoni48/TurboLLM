@@ -5,7 +5,7 @@ import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
 import { useMcpMutations, useSettings, useSysInfo } from '../lib/queries'
-import { ApiError, track } from '../lib/api'
+import { ApiError, MCP_ENV_MASK, track } from '../lib/api'
 import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import { useDocumentScroll } from '../lib/scroll-mode'
@@ -113,6 +113,8 @@ function serverToForm(s: McpServer): McpFormState {
   return {
     name: s.name, transport: s.transport,
     command: s.command ?? '', argsStr: (s.args ?? []).join(', '),
+    // The daemon never sends env values, only MCP_ENV_MASK for each. A line left as it is sends
+    // the mask back, and the daemon keeps the stored value for it.
     envStr: Object.entries(s.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
     url: s.url ?? '', apiKey: '', enabled: s.enabled,
     apiKeySet: !!s.apiKeySet, clearApiKey: false,
@@ -520,6 +522,11 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
             <textarea rows={2} value={f.envStr} onChange={(e) => set({ envStr: e.target.value })}
               placeholder={"API_KEY=abc123\nDEBUG=true"}
               className="resize-none rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+            {f.envStr.includes(MCP_ENV_MASK) && (
+              <span className="text-[11px] text-faint">
+                Saved values are hidden. Leave {MCP_ENV_MASK} as it is to keep a value, or type a new one.
+              </span>
+            )}
           </div>
         </>
       ) : (

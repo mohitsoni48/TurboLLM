@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
-import { registerApi } from './routes'
+import { MCP_ENV_MASK, registerApi } from './routes'
 import { defaultConfig, type Config } from '../config/config'
 import type { Deps } from '../deps'
 import type { RemoteState } from '../remote/types'
@@ -104,6 +104,60 @@ test('GET /api/v1/settings: each MCP server says whether a key is stored, never 
   assert.equal(text.includes('tok-one'), false)
   const { mcp } = JSON.parse(text) as { mcp: { servers: { id: string; apiKeySet?: boolean }[] } }
   assert.deepEqual(mcp.servers.map((s) => [s.id, s.apiKeySet]), [['s1', true], ['s2', false]])
+})
+
+// ── A stdio server's env is where MCP servers take their credentials (BRAVE_API_KEY,
+// MYSQL_PASSWORD, …). It went out in clear text, to any caller of GET /settings — a keyless
+// open-LAN peer included, which may not edit or spawn MCP servers — while every other secret in
+// the payload is write-only. ─────────────────────────────────────────────────────────────────────
+
+test('GET /api/v1/settings: an MCP stdio server\'s env keeps its key names, never its values (keyless open-LAN caller)', async () => {
+  const cfg = defaultConfig()
+  cfg.daemon.lanBind = true
+  cfg.daemon.requireApiKey = false
+  cfg.mcp.servers.push(
+    { id: 's1', name: 'brave', transport: 'stdio', enabled: true, command: 'npx', args: [], env: { BRAVE_API_KEY: 'BSA_SECRET_TOKEN', DEBUG: '1' } },
+    { id: 's2', name: 'plain', transport: 'stdio', enabled: true, command: 'npx', args: [], env: {} },
+  )
+  const res = await fakeApp(cfg).request('/api/v1/settings')
+  assert.equal(res.status, 200)
+  const text = await res.text()
+  assert.equal(text.includes('BSA_SECRET_TOKEN'), false)
+  const { mcp } = JSON.parse(text) as { mcp: { servers: { env?: Record<string, string> }[] } }
+  assert.deepEqual(mcp.servers.map((s) => s.env), [{ BRAVE_API_KEY: MCP_ENV_MASK, DEBUG: MCP_ENV_MASK }, {}])
+  assert.equal(cfg.mcp.servers[0].env?.BRAVE_API_KEY, 'BSA_SECRET_TOKEN', 'the stored value is untouched')
+})
+
+test('PUT /api/v1/mcp/servers/:id: a key sent back masked keeps its value, a typed one replaces it, a key left out goes', async () => {
+  const cfg = defaultConfig()
+  cfg.mcp.servers.push({ id: 's1', name: 'db', transport: 'stdio', enabled: true, command: 'npx', args: [], env: { A: 'a-secret', B: 'b-old', C: 'c-gone' } })
+  const res = await fakeApp(cfg).request('/api/v1/mcp/servers/s1', {
+    method: 'PUT',
+    // D comes masked with nothing stored under it: there is no value to keep, so it is dropped.
+    body: JSON.stringify({ env: { A: MCP_ENV_MASK, B: 'b-new', D: MCP_ENV_MASK } }),
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(cfg.mcp.servers[0].env, { A: 'a-secret', B: 'b-new' })
+  const text = await res.text()
+  assert.equal(text.includes('a-secret') || text.includes('b-new'), false)
+  assert.deepEqual((JSON.parse(text) as { env: Record<string, string> }).env, { A: MCP_ENV_MASK, B: MCP_ENV_MASK })
+
+  // A PUT without env (the enable toggle) leaves the stored values alone.
+  assert.equal((await fakeApp(cfg).request('/api/v1/mcp/servers/s1', { method: 'PUT', body: JSON.stringify({ enabled: false }) })).status, 200)
+  assert.deepEqual(cfg.mcp.servers[0].env, { A: 'a-secret', B: 'b-new' })
+})
+
+test('POST /api/v1/mcp/servers: the create response masks env values; the stored ones are as sent', async () => {
+  const cfg = defaultConfig()
+  const res = await fakeApp(cfg).request('/api/v1/mcp/servers', {
+    method: 'POST',
+    body: JSON.stringify({ name: 'gh', command: 'npx', env: { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_secret' } }),
+  })
+  assert.equal(res.status, 201)
+  const text = await res.text()
+  assert.equal(text.includes('ghp_secret'), false)
+  assert.deepEqual((JSON.parse(text) as { env: Record<string, string> }).env, { GITHUB_PERSONAL_ACCESS_TOKEN: MCP_ENV_MASK })
+  assert.deepEqual(cfg.mcp.servers[0].env, { GITHUB_PERSONAL_ACCESS_TOKEN: 'ghp_secret' })
 })
 
 // ── The remote-access provider must not change under a running tunnel. Saved mid-session it

@@ -3,6 +3,7 @@ import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { CustomizeScreen } from './CustomizeScreen'
+import { MCP_ENV_MASK } from '../lib/api'
 
 const updateMutate = vi.fn()
 const mut = () => ({ mutate: vi.fn(), isPending: false })
@@ -36,6 +37,29 @@ describe('CustomizeScreen — MCP server edit', () => {
     // The PUT route only assigns args/env when present — undefined (dropped from JSON) kept the old ones.
     expect(patch.args).toEqual([])
     expect(patch.env).toEqual({})
+  })
+})
+
+describe('CustomizeScreen — MCP server edit, saved env values', () => {
+  // The settings payload no longer carries env values (they hold the servers' API keys and
+  // passwords), only the key names with MCP_ENV_MASK for each value.
+  beforeEach(() => {
+    mcpServers = [{ id: 'br', name: 'Brave', transport: 'stdio', command: 'npx', args: [], env: { BRAVE_API_KEY: MCP_ENV_MASK, DEBUG: MCP_ENV_MASK }, enabled: true }]
+    updateMutate.mockClear()
+  })
+
+  it('says the saved values are hidden and kept, and sends a hidden one back as it came', async () => {
+    render(<MemoryRouter initialEntries={['/customize?tab=mcp']}><CustomizeScreen /></MemoryRouter>)
+    await userEvent.click(screen.getByRole('button', { name: /Connected/ }))
+    await userEvent.click(screen.getByTitle('Edit'))
+    expect(screen.getByText(/Saved values are hidden/)).toBeInTheDocument()
+    const env = screen.getByDisplayValue(`BRAVE_API_KEY=${MCP_ENV_MASK} DEBUG=${MCP_ENV_MASK}`, { normalizer: (t) => t.replace(/\s+/g, ' ') })
+    await userEvent.clear(env)
+    await userEvent.type(env, `BRAVE_API_KEY=${MCP_ENV_MASK}{Enter}DEBUG=2`)
+    await userEvent.click(screen.getByRole('button', { name: 'Update' }))
+    expect(updateMutate).toHaveBeenCalledTimes(1)
+    // The daemon keeps the stored BRAVE_API_KEY for the mask and stores the typed DEBUG value.
+    expect(updateMutate.mock.calls[0][0].patch.env).toEqual({ BRAVE_API_KEY: MCP_ENV_MASK, DEBUG: '2' })
   })
 })
 
