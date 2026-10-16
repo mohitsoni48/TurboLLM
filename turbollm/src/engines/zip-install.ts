@@ -148,9 +148,14 @@ export const pickZipFiles = (entries: ZipEntry[], platform?: NodeJS.Platform, bi
 /** The install dir slug under {enginesRoot}/build/ — the uploaded zip's filename stem,
  *  collapsed to a safe single path step by build-runner's asDirName (the one path-safety
  *  rule every other build dir follows), with this flow's own fallback for a stem that
- *  reduces to a path step ("..", "." — or empty). */
+ *  reduces to a path step ("..", "." — or empty). Never a hidden name: leading dots (and
+ *  the dashes asDirName leaves between them) are dropped, because `.<name>.stage`,
+ *  `.<slug>-<id>.tmp` / `.old` and `.<name>-<ms>.prev` are the installs' and builds' own
+ *  work dirs. '.my-build.stage.zip' installed into build/.my-build.stage, which
+ *  gcAbandonedZipInstalls sweeps by age alone, so the registered engine's files were
+ *  deleted a day after the install. */
 export function zipBuildDirName(fileName: string): string {
-  return asDirName(basename(fileName.trim()).replace(/\.zip$/i, ''), 'zip-build')
+  return asDirName(basename(fileName.trim()).replace(/\.zip$/i, ''), '').replace(/^[.-]+/, '') || 'zip-build'
 }
 
 /** Resolve a symlink member to the real member its (validated) link text points at within

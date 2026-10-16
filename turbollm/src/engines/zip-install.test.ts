@@ -265,6 +265,14 @@ test('zipBuildDirName: stem of the zip name, collapsed to one safe path step', (
   assert.equal(zipBuildDirName('---.zip'), 'zip-build')
 })
 
+test('zipBuildDirName: never a hidden name, so an install cannot pass for a staging or parked dir', () => {
+  assert.equal(zipBuildDirName('.my-build.stage.zip'), 'my-build.stage')
+  assert.equal(zipBuildDirName('.fork-1234abcd.old.zip'), 'fork-1234abcd.old')
+  assert.equal(zipBuildDirName('.-. fork.zip'), 'fork')
+  assert.equal(zipBuildDirName('.zip'), 'zip-build')
+  assert.equal(zipBuildDirName('....zip'), 'zip-build')
+})
+
 // ── extraction ───────────────────────────────────────────────────────────────
 
 test('extractZipFiles: CRC-verified flat extraction; the binary and libs land in ONE dir (the LD_LIBRARY_PATH dir), with the exec bit on POSIX', () => {
@@ -576,6 +584,21 @@ test('installZipEngine: writes the marker and reports the FINAL path with a name
     assert.equal(existsSync(join(root, 'build', 'myfork', ZIP_BUILD_MARKER)), true)
     assert.equal(res.suggestedName, 'myfork (b4242)', 'the suggested name must come from the final dir, not the temp dir')
     assert.deepEqual(readdirSync(join(root, 'build')), ['myfork'])
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('installZipEngine: a zip named like a staging dir installs where the sweep leaves a registered engine alone', async () => {
+  const root = tmpDir('tllm-zip-')
+  try {
+    const res = await installZipEngine(root, '.my-build.stage.zip', buildZipArchive([member('llama-server', 'elf')]), { probeFn: STUB_PROBE })
+    assert.ok(res.found)
+    const dir = dirname(res.binPath)
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000)
+    utimesSync(dir, old, old)
+    gcAbandonedZipInstalls(root, [res.binPath])
+    assert.equal(readFileSync(res.binPath, 'utf8'), 'elf', 'the registered engine keeps its files')
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
