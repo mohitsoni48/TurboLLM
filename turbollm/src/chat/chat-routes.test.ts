@@ -580,6 +580,38 @@ test('PUT and /activate on a message no longer on the shown branch are refused a
   }
 })
 
+// /continue { regenerate } named no reply and always set aside the last row, so a tab that still
+// showed a2 last, after another tab added q3 and a3, regenerated a3, a reply it never showed.
+test('a Regenerate of a reply that is no longer the last one is refused as stale and changes nothing', async () => {
+  const h = inFlightHarness()
+  const replies = ['a1', 'a2', 'a3', 'a3 again']
+  const engine = fakeEngine((_init, n) => sseReply(replies[n - 1]))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => m.content)
+    const idOf = (content: string) => h.store.getMessages(conv.id).find((m) => m.content === content)!.id
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+    await (await h.app.request(`${base}/messages`, json({ content: 'q2' }))).text()
+    const a2 = idOf('a2')
+    await (await h.app.request(`${base}/messages`, json({ content: 'q3' }))).text() // tab B
+
+    const stale = await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a2 })) // tab A
+    assert.equal(stale.status, 409)
+    assert.equal(((await stale.json()) as { error: { code: string } }).error.code, 'stale_message')
+    assert.deepEqual(active(), ['q1', 'a1', 'q2', 'a2', 'q3', 'a3'])
+    assert.equal(engine.bodies.length, 3, 'nothing sent to the engine')
+    assert.equal(h.store.getMessage(idOf('a3'))!.variantGroup, null, 'a3 was not set aside')
+
+    // Naming the reply shown last regenerates it.
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: idOf('a3') }))).text()
+    assert.deepEqual(active(), ['q1', 'a1', 'q2', 'a2', 'q3', 'a3 again'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 // A restored tail kept its branch_of tag, so a reply that /regenerate later replaced
 // inside it was frozen-and-restored along with its replacement — two assistant turns in a row.
 test('switching an older reply away and back after regenerating a later reply in its tail restores only the current version', async () => {

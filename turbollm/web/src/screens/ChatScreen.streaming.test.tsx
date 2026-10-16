@@ -378,8 +378,29 @@ describe('ChatScreen — Regenerate', () => {
     fireEvent.click(await screen.findByTitle('Regenerate'))
     await waitFor(() => expect(continueCalls).toHaveLength(1))
     expect(continueCalls[0][0]).toBe('c1')
-    expect(continueCalls[0][5]).toBe(true)
+    expect(continueCalls[0][5]).toBe('a1')
     expect(regenerateSpy).not.toHaveBeenCalled()
+  })
+
+  // /continue { regenerate } named no reply, so a tab still showing a1 last, after another tab
+  // added a turn, replaced that turn's reply, one it never showed.
+  it('names the reply clicked, and a stale refusal (409) refetches and shows why', async () => {
+    const stale = 'This reply is no longer the last message on the shown branch: the chat changed in another tab or device.'
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    nextGen = async function* () { throw new ApiError('stale_message', stale, 409) }
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      const view = await renderScreen('/chat/c1')
+      const invalidate = vi.spyOn(view.qc, 'invalidateQueries')
+      await act(async () => { fireEvent.click(await screen.findByTitle('Regenerate')) })
+      expect(continueCalls).toHaveLength(1)
+      expect(continueCalls[0][5]).toBe('a1')
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith(stale))
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['conversation', 'c1'] })
+      expect(invalidate).toHaveBeenCalledWith({ queryKey: ['message-variants'] })
+    } finally {
+      toastError.mockRestore()
+    }
   })
 })
 

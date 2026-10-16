@@ -380,7 +380,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean }>(c)
+    // `messageId` (with `regenerate`): the reply the client shows last, the one it means to replace.
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean; messageId?: string }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -400,6 +401,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // (/regenerate), a refusal here (a Turbo Link machine asleep, the model gone) left that reply
     // deactivated with no switcher to bring it back, and the history ending on a user turn.
     const replaced = b.regenerate ? (conv.messages ?? []).at(-1) : undefined
+    // A stale tab or another device still showing an older last reply (a turn was added since)
+    // would otherwise replace one it never showed. Without `messageId` (API clients), the last
+    // row is replaced, as before.
+    if (b.regenerate && b.messageId != null && b.messageId !== replaced?.id)
+      return err(c, 409, 'stale_message', 'This reply is no longer the last message on the shown branch: the chat changed in another tab or device.')
 
     // Chat branching (GitHub #52): the new placeholder joins the variant_group of the reply it
     // replaces, so the client can render a ‹ 1/2 › sibling switcher instead of the old reply

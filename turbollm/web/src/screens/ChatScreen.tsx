@@ -981,16 +981,19 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     })
   }
 
-  const handleRegenerate = async () => {
+  const handleRegenerate = async (replyId: string) => {
     if (!activeId || live) return
     if (!ready) { toast.error('Load a model first.'); return }
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
     // One request: the daemon sets the old reply aside only once the turn can run. A separate
     // /regenerate first lost the reply (no switcher, history ending on the question) whenever
-    // /continue was then refused.
-    await streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, true))
-    // The new reply joined the old one's version group, whose switcher list is cached.
+    // /continue was then refused. It names the reply clicked: when another tab or device has
+    // added a turn since, the daemon refuses it as stale_message instead of replacing a reply
+    // this view never showed, and streamFrom shows why and refetches the chat.
+    await streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId))
+    // The new reply joined the old one's version group, whose switcher list is cached (and a
+    // stale refusal means it may have changed elsewhere).
     void qc.invalidateQueries({ queryKey: ['message-variants'] })
   }
 
@@ -1387,7 +1390,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                       daemonGenerating={daemonGenerating}
                       onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
                       onDelete={readonly ? undefined : handleDelete}
-                      onRegenerate={readonly ? undefined : handleRegenerate}
+                      onRegenerate={readonly ? undefined : () => handleRegenerate(m.id)}
                       editingId={editingId}
                       onEditSave={(content) => handleEditSave(m.id, content)}
                       onEditCancel={() => setEditingId(null)}
