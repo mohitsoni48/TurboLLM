@@ -563,24 +563,24 @@ export function bypassesAuth(opts: {
   return false
 }
 
-/** Like {@link isLocalRequest}, but ALSO permits a remote client when the daemon requires
- *  an API key — `lanAuth` has already verified that key before the handler runs, so the
- *  caller is authenticated. Use for agent actions (which execute on the host) so a user can
- *  drive their own box from another device, while an OPEN (keyless) LAN still can't trigger
- *  remote code execution. Fails closed when the address is undetermined, and — like
- *  {@link isLocalRequest} — never treats a genuinely tunneled request (see isTunneled) as
- *  local by address alone: a Cloud Launch tunnel's local leg looks loopback too (ADR-152),
- *  so a tunneled caller must always go through the requireApiKey check below, never the
- *  bare loopback shortcut. */
+/** The gate on the routes that EXECUTE something on the host (agent actions: MCP servers,
+ *  builds, engine add/scan/zip/release/update, skills). Like {@link isLocalRequest},
+ *  but ALSO open to a non-host caller that has presented a real, stored, ungranted API key on
+ *  THIS request, so a user can drive their own box from another device while an OPEN (keyless)
+ *  LAN still can't trigger remote code execution. The same bar as {@link hostGate} and
+ *  {@link codeAuth}: whoever may not mint a key or open Code may not spawn a command either.
+ *
+ *  It used to answer `daemon.requireApiKey === true` for every non-local caller, on the premise
+ *  that lanAuth had then already verified a key. lanAuth has two exits that let a request through
+ *  with NO key at all: a Tailscale Serve identity and a verified Cloudflare Access JWT. So a
+ *  tailnet member or Access-policy member, refused a key by hostGate and Code by codeAuth, could
+ *  still add a stdio MCP server (a command the daemon spawns at once) or run a build: command
+ *  execution as the daemon user. The key check here runs without the `ingress` flag, so a
+ *  remote-access token is refused as well (see verifyKeyValue), as it is on Code. A tunneled
+ *  request is never local by address (isLocalRequest, ADR-152/ADR-422), and an undetermined
+ *  address while LAN-exposed is remote, so both still need the key. */
 export function isLocalOrAuthenticated(c: Context, d: Deps): boolean {
-  const daemon = d.store.snapshot().daemon
-  // Loopback trust needs a Host naming this machine (DNS rebinding — see hostNamesThisMachine),
-  // and on Android the app's secret (see appSecretPresented). Without them the request is judged
-  // like a LAN one, which lanAuth has already held to a key.
-  const trusted = !isTunneled(c, d) && hostNamesThisMachine(c.req.header('host'), d) && hasAppSecret(c)
-  if (!isLanExposed(d) && trusted) return true // loopback-only bind, not tunneled → always local
-  if (isLoopback(c) === true && trusted) return true // local client
-  return daemon.requireApiKey === true    // remote (or tunneled) allowed only behind required (verified) API key
+  return isLocalRequest(c, d) || verifyPresentedKey(c, d)
 }
 
 /** Resolve the presented raw key to its stored ApiKey record, bumping lastUsedAt
@@ -660,8 +660,8 @@ export function grantKind(key: Pick<ApiKey, 'grant'>): 'none' | 'link' | 'remote
  *  Null is DENY, never "no check required" — an unmapped path is one nobody has reasoned
  *  about for a remote caller, and defaulting those open is how ADR-376's `/v1/*` defect
  *  happened. Engine add/scan/build appear nowhere here on purpose: ADR-139 settled that no
- *  remote caller executes a caller-supplied binary, valid token or not, and isLocalRequest
- *  already refuses them independently. */
+ *  remote-access token executes a caller-supplied binary, whatever its capabilities, and
+ *  isLocalOrAuthenticated refuses one independently (it accepts only an ungranted key). */
 export function requiredCapability(method: string, path: string): LinkCapability | null {
   const m = method.toUpperCase()
   const read = m === 'GET' || m === 'HEAD'

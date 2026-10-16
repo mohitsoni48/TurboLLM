@@ -670,7 +670,7 @@ test('before Serve first connects, a URL another provider saved does not stand i
   ;(d.remote as unknown as { url: () => string | null }).url = () => null // Serve still starting
   const app = buildApp(d)
   const run = (host: string) =>
-    tunneledRequest(app, '/api/v1/build/run', {
+    tunneledRequest(app, '/api/v1/conversations/abc/messages', {
       method: 'POST',
       headers: { Host: host, 'Tailscale-User-Login': 'forged@example.com', 'Sec-Fetch-Site': 'same-origin' },
     })
@@ -681,23 +681,29 @@ test('before Serve first connects, a URL another provider saved does not stand i
   cfg.remoteAccess.lastUrl = `https://${SERVE_HOST}`
   cfg.remoteAccess.lastUrlProvider = 'tailscale-serve'
   assert.equal((await run(SERVE_HOST)).status, 200)
+  // The identity is no API key: a host-side action still needs one (isLocalOrAuthenticated).
+  const build = await tunneledRequest(app, '/api/v1/build/run', {
+    method: 'POST',
+    headers: { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com', 'Sec-Fetch-Site': 'same-origin' },
+  })
+  assert.equal(build.status, 403)
 })
 
 // The ingress is a plain 127.0.0.1 listener, so any process on this machine can send the
 // identity header and the served Host. That gives it nothing new while it already has keyless
 // loopback trust on the main listener. Bound to one specific LAN address there is no loopback
 // listener: the box's other users are LAN peers that need a key, and the header would hand them
-// keyless access (MCP stdio servers, builds) instead.
+// keyless API access instead.
 test('on a specific non-loopback bind, a Tailscale identity sent to the ingress is not trusted', async () => {
   const { d } = makeDeps((cfg) => {
     cfg.remoteAccess.provider = 'tailscale-serve'
   })
   const app = buildApp(d)
   const identity = { Host: SERVE_HOST, 'Tailscale-User-Login': 'sam@example.com', 'Sec-Fetch-Site': 'same-origin' }
-  const run = () => tunneledRequest(app, '/api/v1/build/run', { method: 'POST', headers: identity })
+  const run = () => tunneledRequest(app, '/api/v1/conversations/abc/messages', { method: 'POST', headers: identity })
   d.bindHost = '192.168.1.10'
   // What the same local process gets on the main listener: it arrives from the bound address.
-  const main = await app.request('/api/v1/build/run', { method: 'POST', headers: { Host: '192.168.1.10:6996' } }, {
+  const main = await app.request('/api/v1/conversations/abc/messages', { method: 'POST', headers: { Host: '192.168.1.10:6996' } }, {
     incoming: { socket: { localPort: 6996, remoteAddress: '192.168.1.10', remotePort: 55555, remoteFamily: 'IPv4' } },
   } as never)
   assert.equal(main.status, 401)
