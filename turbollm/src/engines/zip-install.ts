@@ -27,7 +27,7 @@
 // user zip arrives as .zip on every platform, and GNU tar (plain Linux, Termux) cannot read
 // zip, while `unzip` is an optional package there.
 import { randomUUID } from 'node:crypto'
-import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, sep } from 'node:path'
 import { asDirName, isEngineInBuildDir } from './build-runner'
 import { renameWithRetry } from './download'
@@ -262,7 +262,8 @@ export function missingCudartWarning(fileNames: string[], platform: NodeJS.Platf
  *  staging dirs a crashed release install left behind; those never hold a registered binary
  *  (it only becomes visible after the final rename), so age alone decides. Runs at the start of
  *  every upload; a dir newer than the grace period survives, since another tab may still be
- *  sitting on its confirm step. */
+ *  sitting on its confirm step. A parked previous install that a registered engine still needs
+ *  is first put back (restoreParkedInstalls) and never swept. */
 export function gcAbandonedZipInstalls(
   enginesRoot: string,
   claimedBinPaths: string[],
@@ -271,10 +272,15 @@ export function gcAbandonedZipInstalls(
   const buildRoot = join(enginesRoot, 'build')
   const maxAgeMs = opts.maxAgeMs ?? ZIP_GC_GRACE_MS
   const markers = opts.markers ?? [ZIP_BUILD_MARKER, RELEASE_INSTALL_MARKER]
+  restoreParkedInstalls(enginesRoot, claimedBinPaths, markers)
   try {
     for (const d of readdirSync(buildRoot)) {
       const dir = join(buildRoot, d)
       if (!existsSync(dir) || !statSync(dir).isDirectory()) continue
+      // Marked and unclaimed (no binPath points into a parked dir), and as old as the install it holds — so without
+      // this the sweep deleted the only build of an engine whose restore just failed again.
+      const parkedFor = parkedSlugOf(d)
+      if (parkedFor !== null && parkedInstallNeeded(buildRoot, parkedFor, claimedBinPaths)) continue
       if (!isStagingDir(d) && !isMarkedUnclaimed(dir, markers, claimedBinPaths)) continue
       if (Date.now() - statSync(dir).mtimeMs < maxAgeMs) continue
       rmSync(dir, { recursive: true, force: true })
@@ -282,6 +288,54 @@ export function gcAbandonedZipInstalls(
   } catch {
     /* unreadable build root or a dir vanished mid-sweep — the next upload tries again */
   }
+}
+
+/** Put a parked previous install (`.<slug>-<id>.old`, promoteProbedInstall's) back as build/<slug> when that folder
+ *  is gone while a registered engine or a remembered custom source still points into it. That is the state a swap
+ *  leaves when both its rename and the move back fail (Windows: both locked past renameWithRetry's ~3 s), or when the
+ *  daemon dies between the park and the swap: the engine points at a missing binary, and its only build sits in a
+ *  hidden folder no binPath claims. The newest parked install (by its marker's time; deleting files from an older
+ *  one bumps that folder's own mtime) wins. A rename that fails leaves it for the next call. Runs at boot and
+ *  before every sweep. */
+export function restoreParkedInstalls(
+  enginesRoot: string,
+  claimedBinPaths: string[],
+  markers: string[] = [ZIP_BUILD_MARKER, RELEASE_INSTALL_MARKER],
+): void {
+  const buildRoot = join(enginesRoot, 'build')
+  const newest = new Map<string, { dir: string; at: number }>()
+  try {
+    for (const d of readdirSync(buildRoot)) {
+      const slug = parkedSlugOf(d)
+      if (slug === null || !parkedInstallNeeded(buildRoot, slug, claimedBinPaths)) continue
+      const dir = join(buildRoot, d)
+      const marker = markers.find((m) => existsSync(join(dir, m)))
+      if (!marker) continue
+      const at = statSync(join(dir, marker)).mtimeMs
+      const best = newest.get(slug)
+      if (!best || at > best.at) newest.set(slug, { dir, at })
+    }
+  } catch {
+    return /* unreadable build root or a dir vanished mid-scan — the next call tries again */
+  }
+  for (const [slug, { dir }] of newest) {
+    try {
+      renameSync(dir, join(buildRoot, slug))
+    } catch {
+      /* still locked — the sweep keeps it (parkedInstallNeeded) and the next call retries */
+    }
+  }
+}
+
+/** The slug of a parked previous install's dir name (`.<slug>-<8 hex>.old`, promoteProbedInstall), else null. */
+function parkedSlugOf(dirName: string): string | null {
+  return /^\.(.+)-[0-9a-f]{8}\.old$/.exec(dirName)?.[1] ?? null
+}
+
+/** build/<slug> is missing although an engine or custom source points into it: its parked install is its only build. */
+function parkedInstallNeeded(buildRoot: string, slug: string, claimedBinPaths: string[]): boolean {
+  const live = join(buildRoot, slug)
+  return !existsSync(live) && claimedBinPaths.some((p) => isEngineInBuildDir(p, live))
 }
 
 function isStagingDir(dirName: string): boolean {

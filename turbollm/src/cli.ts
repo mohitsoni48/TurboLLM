@@ -35,7 +35,7 @@ import {
 import { applyEngineUpdate } from './engines/update-apply'
 import { engineWorkBusy } from './api/routes'
 import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir } from './engines/seed'
-import { packagedAndroidApp } from './engines/zip-install'
+import { packagedAndroidApp, restoreParkedInstalls } from './engines/zip-install'
 import { runAutoLoad } from './engines/auto-load'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
@@ -402,6 +402,9 @@ try {
 } catch { /* best-effort */ }
 
 const registry = new Registry(store)
+// A zip or release install whose swap died half-way (the daemon exited between parking the old build and moving the
+// new one in) left the engine's only build parked under a hidden name: put it back before anything looks for it.
+restoreParkedInstalls(join(store.dir(), 'engines'), [...registry.list().engines, ...registry.customSources()].map((e) => e.binPath))
 const pruned = registry.pruneDeadManagedBuilds()
 if (pruned > 0) console.log(`pruned ${pruned} dangling engine build(s)`)
 const provision = new ProvisionState()

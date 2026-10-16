@@ -4,7 +4,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { inflateRawSync } from 'node:zlib'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { buildZipArchive, type ZipMember } from '../test-support/zip-archive'
@@ -723,4 +724,57 @@ test('gcAbandonedZipInstalls: opts.markers restricts which marker counts', () =>
   ])
   gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0, markers: [ZIP_BUILD_MARKER] })
   assert.deepEqual(readdirSync(buildRoot), ['rel'])
+})
+
+// A parked previous install (`.<slug>-<id>.old`) is the only build of its engine when the swap's rename and the move
+// back both failed, or the daemon died between them: build/<slug> is gone, no binPath points into the parked dir, and
+// it is as old as the install it holds. The sweep deleted it after 24 h.
+
+/** A parked install of build/<slug> holding `content`, its marker written `markerAgeMs` ago, the dir itself 30 h old. */
+function parkedInstall(buildRoot: string, name: string, content: string, markerAgeMs: number): void {
+  const dir = join(buildRoot, name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'llama-server'), content)
+  writeFileSync(join(dir, ZIP_BUILD_MARKER), 'myfork.zip\n')
+  const markerTime = new Date(Date.now() - markerAgeMs)
+  utimesSync(join(dir, ZIP_BUILD_MARKER), markerTime, markerTime)
+  const dirTime = new Date(Date.now() - THIRTY_HOURS)
+  utimesSync(dir, dirTime, dirTime)
+}
+
+test('gcAbandonedZipInstalls: the parked build of an engine whose build dir is gone is moved back, the newest one', () => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  // An older leftover (its delete failed after an earlier swap) and the build parked by the swap that died.
+  parkedInstall(buildRoot, '.myfork-1111aaaa.old', 'older', 3 * THIRTY_HOURS)
+  parkedInstall(buildRoot, '.myfork-2222bbbb.old', 'newer', 2 * THIRTY_HOURS)
+  gcAbandonedZipInstalls(enginesRoot, [join(buildRoot, 'myfork', 'llama-server')])
+  assert.deepEqual(readdirSync(buildRoot), ['myfork'], 'the newest is back in place and the older leftover swept')
+  assert.equal(readFileSync(join(buildRoot, 'myfork', 'llama-server'), 'utf8'), 'newer')
+})
+
+test('gcAbandonedZipInstalls: a parked build that cannot be moved back yet is kept for the next call, not swept', (t) => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  parkedInstall(buildRoot, '.myfork-2222bbbb.old', 'only-build', THIRTY_HOURS)
+  const claimed = [join(buildRoot, 'myfork', 'llama-server')]
+  const locked = t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('EPERM: rename'), { code: 'EPERM' }) })
+  syncBuiltinESMExports()
+  try {
+    gcAbandonedZipInstalls(enginesRoot, claimed)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.deepEqual(readdirSync(buildRoot), ['.myfork-2222bbbb.old'])
+  gcAbandonedZipInstalls(enginesRoot, claimed)
+  assert.equal(readFileSync(join(buildRoot, 'myfork', 'llama-server'), 'utf8'), 'only-build')
+})
+
+test('gcAbandonedZipInstalls: a parked build nothing claims (its engine was purged) is not moved back, and is swept', () => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  parkedInstall(buildRoot, '.gone-2222bbbb.old', 'orphan', THIRTY_HOURS)
+  gcAbandonedZipInstalls(enginesRoot, [])
+  assert.deepEqual(readdirSync(buildRoot), [])
 })
