@@ -86,6 +86,32 @@ test('readPidfile returns null when file is absent', () => {
   }
 })
 
+// process.kill(-1, …) signals every process this user owns and process.kill(0, …) our own
+// process group, and both pass the signal-0 liveness probe. With a TurboLLM answering on the
+// recorded port, --stop then SIGTERMed (and after 10 s SIGKILLed) all of them.
+test('readPidfile rejects pid -1 or 0 and an out-of-range port, so --stop signals no process group', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    const write = (rec: unknown) => writeFileSync(join(dir, 'daemon.pid'), JSON.stringify(rec))
+    for (const pid of [-1, 0, 1.5, -42]) {
+      write({ pid, port: 6996 })
+      assert.equal(readPidfile(dir), null, `pid ${pid}`)
+      const hooks = makeHooks(true, { platform: 'linux' }) // alive + a TurboLLM answers
+      const res = await stopDaemon(dir, hooks)
+      assert.equal(res.stopped, false, `pid ${pid}`)
+      assert.deepEqual(hooks.signals, [], `pid ${pid}: nothing signalled`)
+    }
+    for (const port of [0, -1, 65536, 6996.5]) {
+      write({ pid: 42, port })
+      assert.equal(readPidfile(dir), null, `port ${port}`)
+    }
+    write({ pid: 1, port: 65535 }) // a daemon that is pid 1 (a container's init) is still read
+    assert.deepEqual(readPidfile(dir), { pid: 1, port: 65535 })
+  } finally {
+    cleanup()
+  }
+})
+
 test('readPidfile returns null for invalid JSON', () => {
   const { dir, cleanup } = makeTmpDir()
   try {

@@ -23,20 +23,22 @@ export function writePidfile(dir: string, pid: number, port: number, host?: stri
   writeFileSync(path, JSON.stringify({ pid, port, ...(host ? { host } : {}) } satisfies PidfileData))
 }
 
-/** Read and parse <dir>/daemon.pid. Returns null if absent or unparseable. */
+/** Read and parse <dir>/daemon.pid. Returns null if absent, unparseable or out of range. */
 export function readPidfile(dir: string): PidfileData | null {
   const path = join(dir, 'daemon.pid')
   if (!existsSync(path)) return null
   try {
     const raw = readFileSync(path, 'utf8')
     const parsed = JSON.parse(raw) as unknown
+    // A real pid and port only. `process.kill(-1, …)` signals every process this user owns and
+    // `process.kill(0, …)` our own process group, and both pass the signal-0 liveness probe: a
+    // hand-edited pidfile with pid -1 or 0 next to a live TurboLLM on its port would have had
+    // --stop SIGTERM (then SIGKILL) all of them. The daemon only ever writes process.pid.
+    const { pid, port, host } = (parsed ?? {}) as { pid?: unknown; port?: unknown; host?: unknown }
     if (
-      parsed !== null &&
-      typeof parsed === 'object' &&
-      typeof (parsed as Record<string, unknown>).pid === 'number' &&
-      typeof (parsed as Record<string, unknown>).port === 'number'
+      typeof pid === 'number' && Number.isInteger(pid) && pid > 0 &&
+      typeof port === 'number' && Number.isInteger(port) && port >= 1 && port <= 65535
     ) {
-      const { pid, port, host } = parsed as { pid: number; port: number; host?: unknown }
       // A malformed host is dropped (probe loopback), never put into a URL.
       return typeof host === 'string' && host ? { pid, port, host } : { pid, port }
     }
