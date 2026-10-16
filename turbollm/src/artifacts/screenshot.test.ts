@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { createSocket } from 'node:dgram'
 import { createServer, type AddressInfo } from 'node:net'
 import { networkInterfaces } from 'node:os'
-import { findChrome, screenshotArtifact, withArtifactCsp } from './screenshot'
+import { findChrome, launchSandboxedFirst, RENDER_DEADLINE_MS, screenshotArtifact, withArtifactCsp } from './screenshot'
 
 const CSP_START = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\';'
 
@@ -76,4 +76,48 @@ test('screenshotArtifact: neither the artifact nor a popup it opens reaches loop
   } finally {
     for (const close of closers) close()
   }
+})
+
+test('launchSandboxedFirst: the sandboxed launch goes first; --no-sandbox only as root or as the one retry', async () => {
+  const calls: boolean[] = []
+  const ok = async (noSandbox: boolean) => { calls.push(noSandbox); return 'browser' }
+  assert.equal(await launchSandboxedFirst(ok, false), 'browser')
+  assert.deepEqual(calls, [false], 'a user that can sandbox never gets --no-sandbox')
+
+  calls.length = 0
+  const noUserns = async (noSandbox: boolean) => {
+    calls.push(noSandbox)
+    if (!noSandbox) throw new Error('No usable sandbox!')
+    return 'browser'
+  }
+  assert.equal(await launchSandboxedFirst(noUserns, false), 'browser')
+  assert.deepEqual(calls, [false, true], 'a failed sandboxed launch is retried once without it')
+
+  calls.length = 0
+  await launchSandboxedFirst(ok, true)
+  assert.deepEqual(calls, [true], 'root: Chrome refuses a sandboxed start, so no first try')
+
+  calls.length = 0
+  const broken = async (noSandbox: boolean) => { calls.push(noSandbox); throw new Error('no browser') }
+  await assert.rejects(launchSandboxedFirst(broken, false), /no browser/)
+  assert.deepEqual(calls, [false, true], 'no more than one retry')
+})
+
+// An artifact whose script never yields held every CDP step (setContent, the fonts wait, the
+// screenshot) for puppeteer's 180 s default protocol timeout: about 9 minutes per export click,
+// with the renderer pegging a core throughout. A deadline shorter than RENDER_DEADLINE_MS keeps
+// this test quick.
+test('screenshotArtifact: a script that never yields ends within the render deadline', {
+  skip: findChrome() ? false : 'no Chrome/Chromium/Edge found',
+  timeout: RENDER_DEADLINE_MS + 30_000,
+}, async () => {
+  const deadline = 6_000
+  const started = Date.now()
+  const png = await screenshotArtifact('<html><body>hi<script>for(;;){}</script></body></html>', { width: 800, height: 600 }, deadline)
+  const took = Date.now() - started
+  assert.equal(png, null, 'falls back like any other failed export')
+  assert.ok(took < deadline + 2_000, `took ${took} ms`)
+  // A normal export right after still renders.
+  const again = await screenshotArtifact('<!doctype html><body><h1>ok</h1></body>', { width: 800, height: 600 })
+  assert.ok(again && again.subarray(1, 4).toString() === 'PNG')
 })
