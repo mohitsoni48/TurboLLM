@@ -400,22 +400,31 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // (/regenerate), a refusal here (a Turbo Link machine asleep, the model gone) left that reply
     // deactivated with no switcher to bring it back, and the history ending on a user turn.
     const replaced = b.regenerate ? (conv.messages ?? []).at(-1) : undefined
+
+    // Chat branching (GitHub #52): the new placeholder joins the variant_group of the reply it
+    // replaces, so the client can render a ‹ 1/2 › sibling switcher instead of the old reply
+    // simply having vanished.
+    let variantGroup: string | undefined
     if (replaced?.role === 'assistant') {
       db.deactivateMessage(replaced.id)
       conv.messages = conv.messages!.filter((m) => m.id !== replaced.id)
+      // The group of the reply just set aside (deactivateMessage creates it if it had none) —
+      // not the row right after the question: with two replies in a row (a chat routine's
+      // tool-call round, then its answer; an OpenAI import's tool-call turn), that row is the
+      // first one, still active, so the new reply got no group and the one it replaced sat
+      // alone in a group with no active member, which no switcher can reach.
+      variantGroup = db.getMessage(replaced.id)!.variantGroup!
+    } else {
+      // Otherwise, a reply an earlier POST /regenerate deactivated (API clients), if any. Must
+      // look specifically at the message immediately after the current active tail
+      // (getNextMessageAfterSeq), NOT "whatever has the globally highest seq" — a conversation
+      // with more than one branch point can have unrelated, higher-seq messages sitting inactive
+      // in a completely different branch.
+      const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
+      variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
+        ? (priorVariant.variantGroup ?? priorVariant.id)
+        : undefined
     }
-
-    // Chat branching (GitHub #52): if the prior reply was just deactivated (just above, or by an
-    // earlier POST /regenerate), the new placeholder joins its variant_group so the client can
-    // render a ‹ 1/2 › sibling switcher instead of the old reply simply having vanished. Must
-    // look specifically at the message immediately after the current active tail
-    // (getNextMessageAfterSeq), NOT "whatever has the globally highest seq" — a conversation
-    // with more than one branch point can have unrelated, higher-seq messages sitting inactive
-    // in a completely different branch.
-    const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
-    const variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
-      ? (priorVariant.variantGroup ?? priorVariant.id)
-      : undefined
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false }, variantGroup })

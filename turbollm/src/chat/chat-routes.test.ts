@@ -512,6 +512,33 @@ test('a Regenerate the upstream refuses keeps the reply it would have replaced',
   }
 })
 
+// Two replies in a row (a chat routine's tool-call round and its answer, or an OpenAI import's
+// tool-call turn): the new reply took its group from the row right after the question, the first
+// reply, still active, so it got none, and the reply it replaced was left alone in a group with no
+// active member, where no switcher could reach it.
+test('Regenerate after two replies in a row keeps the replaced reply on the new reply\'s switcher', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine(() => sseReply('It is 19C'))
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    h.store.addMessage(conv.id, 'user', 'weather?')
+    h.store.addMessage(conv.id, 'assistant', '', { toolCalls: [{ id: 'tc1', name: 'get_weather', args: {}, result: '18C' }] })
+    h.store.addMessage(conv.id, 'assistant', 'It is 18C')
+
+    await (await h.app.request(`${base}/continue`, json({ regenerate: true }))).text()
+    const active = h.store.getMessages(conv.id)
+    assert.deepEqual(active.map((m) => `${m.role}:${m.content}`), ['user:weather?', 'assistant:', 'assistant:It is 19C'])
+    const reply = active[2]
+    assert.ok(reply.variantGroup, 'the new reply joins a group')
+    assert.deepEqual(h.store.getMessageVariants(reply.variantGroup!).map((m) => `${m.content}:${m.isActive}`), ['It is 18C:false', 'It is 19C:true'])
+    assert.equal(active[1].variantGroup, null, 'the tool-call round is left as it was')
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 // A stale tab or another device still showing a version that was switched away from: acting on it
 // froze this branch's rows under the stale one (two replies in a row on switching back), or
 // spliced a reply into the middle of an unrelated branch.
