@@ -1068,6 +1068,15 @@ let prevPort = port
 // win over it at boot, so a rebind moves ports only when the CONFIGURED port changes — a LAN
 // toggle must not drag the daemon off the port its launcher (and the app's WebView) uses.
 let appliedCfgPort = cfg.daemon.port
+// The same for the host: the lanBind and daemon.host the listener last applied. --addr's host
+// wins over them at boot, and a rebind took the host from config alone, so a port change moved
+// `--addr 192.168.1.5:…` onto 127.0.0.1 (nothing then answered where the page hops to) and
+// `--addr 127.0.0.1:…` under daemon.host 0.0.0.0 onto every interface. The host moves only when
+// lanBind or daemon.host changes, to the one they ask for. The two settings are compared, not the
+// host they work out to: under daemon.host 0.0.0.0 both lanBind values give 0.0.0.0, so turning
+// LAN on would leave `--addr 127.0.0.1:…` on loopback while Settings shows LAN on.
+let appliedLanBind = cfg.daemon.lanBind
+let appliedCfgHost = cfg.daemon.host
 // The boot-time remote-access start is one-shot (see the listen callback).
 let bootRemoteStarted = false
 function listen(attempt = 0): void {
@@ -1223,8 +1232,11 @@ listen()
 // schedules this AFTER its response flushes (closing the socket drops in-flight reqs).
 deps.rebind = () => {
   const c = store.snapshot()
-  const want = c.daemon.lanBind ? '0.0.0.0' : (c.daemon.host || '127.0.0.1')
+  const hostChanged = c.daemon.lanBind !== appliedLanBind || c.daemon.host !== appliedCfgHost // see appliedCfgHost
+  const want = hostChanged ? (c.daemon.lanBind ? '0.0.0.0' : (c.daemon.host || '127.0.0.1')) : host
   const wantPort = c.daemon.port !== appliedCfgPort ? c.daemon.port : port // see appliedCfgPort
+  appliedLanBind = c.daemon.lanBind
+  appliedCfgHost = c.daemon.host
   appliedCfgPort = c.daemon.port
   if (want === host && wantPort === port) return // nothing changed
   prevHost = host
