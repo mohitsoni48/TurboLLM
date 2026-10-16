@@ -142,15 +142,20 @@ export function lspGuidance(): string {
  *  text is the soft, first line of defense; the hook is the backstop for when the model doesn't
  *  follow it. Only added when web_search/fetch_url are actually registered (code-session.ts,
  *  gated on `d.tools`), since telling the model to call tools that don't exist would be worse
- *  than saying nothing. */
-export function antiFallbackGuidance(): string {
+ *  than saying nothing. For the same reason `canFetch` is false in plan mode, which has
+ *  web_search but not fetch_url (see PLAN_MODE_EXTENSION_TOOLS), and drops the fetch_url step,
+ *  in the words gateway/agent-guidance.ts's standingGuidance uses for a client with no fetch tool
+ *  (the two texts are kept in lockstep). */
+export function antiFallbackGuidance(canFetch = true): string {
   return [
     'When you fail at a task twice in a row (a build error, a failing test, an API that doesn\'t',
     'behave as expected), do NOT quietly substitute an easier or different feature than what was',
     'actually requested — that is a critical failure even if the substitute "works". Instead, call',
     'web_search for the official documentation (and Stack Overflow or similar as a secondary',
-    'source, weighting official docs higher) on the exact error or API you are stuck on, use',
-    'fetch_url to read the most relevant result, and retry the ORIGINAL task with what you learned.',
+    'source, weighting official docs higher) on the exact error or API you are stuck on,',
+    canFetch
+      ? 'use fetch_url to read the most relevant result, and retry the ORIGINAL task with what you learned.'
+      : 'read the most relevant result, and retry the ORIGINAL task with what you learned.',
   ].join(' ')
 }
 
@@ -162,13 +167,16 @@ export function antiFallbackGuidance(): string {
  *  first — that backstop only covers CLI installs (a precise, well-defined signal); manifest edits
  *  made by hand (e.g. Gradle's `dependencies {}` block) have no equally precise mechanical signal
  *  without false-positiving on unrelated edits to the same file, so those rely on this prompt text
- *  alone. Only added when web_search/fetch_url are actually registered, same as antiFallbackGuidance. */
-export function dependencyDisciplineGuidance(): string {
+ *  alone. Only added when web_search/fetch_url are actually registered, same as antiFallbackGuidance,
+ *  and with `canFetch` false (plan mode) it asks for web_search alone, same as there. */
+export function dependencyDisciplineGuidance(canFetch = true): string {
   return [
     'STRICT RULE, no exceptions: before adding ANY new dependency — a library, package, or SDK, on',
     'ANY platform (npm/yarn/pnpm, pip/poetry, Gradle/Android, cargo, go modules, gems, composer,',
     'anything) — you MUST first call web_search to find its current LATEST version (never assume a',
-    'version from memory, it may be outdated), then use fetch_url to read that version\'s real',
+    canFetch
+      ? 'version from memory, it may be outdated), then use fetch_url to read that version\'s real'
+      : 'version from memory, it may be outdated), then read that version\'s real',
     'official documentation. Only after doing both should you write the dependency declaration or',
     'install command, and implement against what you actually just read rather than remembered',
     'training knowledge, which is frequently stale for fast-moving libraries.',
@@ -194,14 +202,21 @@ export function todoTrackerGuidance(): string {
 
 /** TurboLLM's own registered tools (code-session.ts) that plan mode keeps. pi applies the `tools`
  *  allowlist to extension tools too, so anything not named here is silently gone in plan mode.
- *  Only tools that change nothing: web_search/fetch_url (lookups), run_code (sandboxed: no fs,
- *  network or process access), lookback_history (a tool-less Q&A over saved history),
- *  list_routines, and invoke_skill/delegate_task, whose sub-agents a plan run starts in plan mode
- *  (read-only) too. Left out on purpose: bash/edit/write, install_lsp (downloads and spawns a
- *  server), update_todos (plan's deliverable already IS the step list — see todoTrackerGuidance),
- *  the routine tools that create/change/run routines, and every mcp__* tool. A name that isn't
- *  registered in a given session (no ToolRegistry, a sub-agent) is simply ignored by pi. */
-const PLAN_MODE_EXTENSION_TOOLS = ['web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']
+ *  Only tools that change nothing: web_search (a lookup at the configured search provider),
+ *  run_code (sandboxed: no fs, network or process access), lookback_history (a tool-less Q&A over
+ *  saved history), list_routines, and invoke_skill/delegate_task, whose sub-agents a plan run
+ *  starts in plan mode (read-only) too. Left out on purpose: bash/edit/write, install_lsp
+ *  (downloads and spawns a server), update_todos (plan's deliverable already IS the step list —
+ *  see todoTrackerGuidance), the routine tools that create/change/run routines, every mcp__* tool,
+ *  and fetch_url. fetch_url changes nothing locally but sends a GET to any public URL the model
+ *  picks, with no approval in plan mode, and `read` is not confined to the repo (code-session.ts's
+ *  containment covers only edit/write). A prompt injection in a README, an AGENTS.md or a search
+ *  result could therefore have a plan run read a host file (~/.ssh/...) and put its contents in a
+ *  fetch_url query string, with no click from the user. So plan mode keeps the search but not the
+ *  fetch (ask and auto still offer fetch_url, as before plan mode had any TurboLLM tool). A name
+ *  that isn't registered in a given session (no ToolRegistry, a sub-agent) is simply ignored by
+ *  pi. */
+const PLAN_MODE_EXTENSION_TOOLS = ['web_search', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']
 
 /** The pi tool set for a Code mode. plan is READ-ONLY (its real safety mechanism): mutating
  *  tools simply aren't in the toolset, so nothing reaches the containment/approval hook to gate.
@@ -345,9 +360,10 @@ export function buildAppendPrompt(
     blocks.push(todoTrackerGuidance())
   }
   // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
+  // Plan mode has web_search but no fetch_url, so its copy never tells the model to fetch a page.
   if (hasWebTools) {
-    blocks.push(antiFallbackGuidance())
-    blocks.push(dependencyDisciplineGuidance())
+    blocks.push(antiFallbackGuidance(mode !== 'plan'))
+    blocks.push(dependencyDisciplineGuidance(mode !== 'plan'))
   }
   const catalog = skillCatalogBlock(skills)
   if (catalog) blocks.push(catalog)

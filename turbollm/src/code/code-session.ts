@@ -1696,8 +1696,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // the EXACT SAME implementation chat's own tools use (ToolRegistry.executeTool) — same
     // provider config, same SSRF checks — not a second, divergent implementation. Neither is a
     // path-taking or mutating tool (not in PATH_TOOLS/MUTATING_TOOLS above), so they're never
-    // containment-checked or ask-mode-gated, in every mode including plan — researching before
-    // touching files is exactly what plan mode is for.
+    // containment-checked or ask-mode-gated. Plan mode offers web_search but not fetch_url: an
+    // unapproved GET to any URL plus an unconfined `read` is a zero-click way out for a host file
+    // (see persona.ts's PLAN_MODE_EXTENSION_TOOLS).
     if (d.tools) {
       const tools = d.tools
       pi.registerTool({

@@ -52,7 +52,7 @@ async function stubEngine(script: Reply[]) {
   return { base, bodies, close }
 }
 
-function harness(base: string, mode: CodeMode) {
+function harness(base: string, mode: CodeMode, extraDeps: Record<string, unknown> = {}) {
   const dataDir = tmpDir('tllm-code-run-')
   const repoRoot = tmpDir('tllm-code-run-repo-')
   const store = new ConversationStore(IN_MEMORY_DATA_DIR)
@@ -71,6 +71,7 @@ function harness(base: string, mode: CodeMode) {
     },
     registry: { active: () => undefined },
     scanner: { get: () => undefined },
+    ...extraDeps,
   } as unknown as Deps
   const frames: { event: string; data: Record<string, unknown> }[] = []
   const sink: CodeSseSink = (ev) => { frames.push(ev as { event: string; data: Record<string, unknown> }) }
@@ -129,6 +130,19 @@ test('plan mode offers the read-only TurboLLM tools to the model, and none that 
     const names = toolNames(engine.bodies[0])
     for (const t of ['read', 'grep', 'find', 'ls', 'invoke_skill', 'delegate_task', 'lookback_history']) assert.ok(names.includes(t), `${t} offered`)
     for (const t of ['bash', 'edit', 'write', 'update_todos', 'install_lsp']) assert.ok(!names.includes(t), `${t} not offered`)
+  } finally { await engine.close() }
+})
+
+test('plan mode offers web_search but not fetch_url, even with the web tools registered', { timeout: 30_000 }, async () => {
+  const engine = await stubEngine([text('the plan')])
+  try {
+    // A ToolRegistry stand-in: runCodeSession registers web_search/fetch_url only when d.tools is set.
+    const tools = { buildToolDefinitions: async () => [], executeTool: async () => 'unused' }
+    const h = harness(engine.base, 'plan', { tools })
+    await h.turn('plan it', new AbortController().signal)
+    const names = toolNames(engine.bodies[0])
+    assert.ok(names.includes('web_search'), 'web_search offered')
+    assert.ok(!names.includes('fetch_url'), 'fetch_url not offered in plan mode')
   } finally { await engine.close() }
 })
 

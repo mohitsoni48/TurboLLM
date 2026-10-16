@@ -21,20 +21,28 @@ import { SessionManager, type AgentSessionEvent } from '@earendil-works/pi-codin
 test('toolsForMode: plan is read-only (read/grep/find/ls, no mutating tools)', () => {
   const tools = toolsForMode('plan')
   // The exact list: anything appended to it (e.g. a mutating tool) must fail here and be reviewed.
-  assert.deepEqual(tools, ['read', 'grep', 'find', 'ls', 'web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task'])
+  assert.deepEqual(tools, ['read', 'grep', 'find', 'ls', 'web_search', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task'])
   // The safety invariant: plan mode never exposes a mutating tool.
   for (const t of ['edit', 'write', 'bash']) assert.ok(!tools!.includes(t))
 })
 
 test('toolsForMode: plan keeps TurboLLM\'s read-only tools (pi filters registered tools by this list too) and nothing that changes state', () => {
   const tools = toolsForMode('plan')!
-  for (const t of ['web_search', 'fetch_url', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']) {
+  for (const t of ['web_search', 'run_code', 'lookback_history', 'list_routines', 'invoke_skill', 'delegate_task']) {
     assert.ok(tools.includes(t), `${t} available in plan mode`)
   }
   for (const t of ['install_lsp', 'update_todos', 'create_routine', 'update_routine', 'delete_routine', 'run_routine_now']) {
     assert.ok(!tools.includes(t), `${t} not available in plan mode`)
   }
   assert.ok(!tools.some((t) => t.startsWith('mcp__')))
+})
+
+test('toolsForMode: plan mode has no fetch_url (an unapproved GET to any URL plus an unconfined read lets an injected plan run send a host file out)', () => {
+  // read may open any host path and nothing in plan mode asks for approval, so fetch_url there
+  // would be a zero-click way to put a file's contents in a URL. web_search stays.
+  const tools = toolsForMode('plan')!
+  assert.ok(!tools.includes('fetch_url'))
+  assert.ok(tools.includes('web_search'))
 })
 
 test('subAgentMode: a plan run\'s skills/sub-agents stay in plan even after a live switch away from plan', () => {
