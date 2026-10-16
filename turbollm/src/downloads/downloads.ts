@@ -508,6 +508,15 @@ export class DownloadManager {
         rmSync(part, { force: true })
         startAt = 0
         rec.received = 0
+        // The row's total is the length of the file the .part was written against, which this 416
+        // says the server may no longer hold. Kept, a restart whose 200 has no Content-Length was
+        // size-checked against it and failed "size did not match", removing the .part, and every
+        // later Resume did the same. A 416 names the current length as `bytes */N` (RFC 9110
+        // §15.5.17); without one it is unknown until the reply says it. Persisted at once: the
+        // persist below runs only when the reply brings a validator or length other than the row's,
+        // so a daemon killed during a restart that brings neither came back with the old length.
+        rec.total = unsatisfiedRangeLength(res.headers.get('content-range'))
+        this.persist()
         if (hash) hash = createHash('sha256')
         delete headers.Range
         delete headers['If-Range']
@@ -801,6 +810,14 @@ function rangeContinues(contentRange: string | null, startAt: number, total: num
 /** The full length a Content-Range names (`bytes a-b/N`), or 0 for `/*` or an unreadable header. */
 function contentRangeFull(contentRange: string | null): number {
   const m = contentRange === null ? null : /^bytes[\s=]+\d+-\d+\/(\d+)$/i.exec(contentRange.trim())
+  return m ? Number(m[1]) : 0
+}
+
+/** The current length a 416 names (`bytes *\/N`, RFC 9110 §14.4), or 0 when it names none. Apart
+ *  from contentRangeFull: a 206 must not carry that form, and one that does stays unreadable
+ *  there, as rangeContinues already treats it. */
+function unsatisfiedRangeLength(contentRange: string | null): number {
+  const m = contentRange === null ? null : /^bytes[\s=]+\*\/(\d+)$/i.exec(contentRange.trim())
   return m ? Number(m[1]) : 0
 }
 

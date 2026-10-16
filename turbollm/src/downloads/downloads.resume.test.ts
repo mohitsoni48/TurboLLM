@@ -580,6 +580,75 @@ test('resume: a server that answers 416 even to the plain request restarts once,
   assert.equal(existsSync(`${dest}.part`), false, 'the next Resume starts from byte 0, not the same 416 range')
 })
 
+/** A server holding `file` that answers a Range request with a 416 (naming the file's length as
+ *  `bytes *\/N` unless `bare`) and the plain request with a 200 of `file` sent without a
+ *  Content-Length (a chunked reply) or any validator. `hangAfter` stops the 200 after that many
+ *  bytes with the connection left open: the daemon is killed during it. */
+function shrunkNoLength(
+  file: Buffer,
+  seen: Array<Record<string, string>>,
+  { bare = false, hangAfter }: { bare?: boolean; hangAfter?: number } = {},
+) {
+  return (async (_url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ ...init.headers })
+    if (init.headers.Range) {
+      return new Response(null, { status: 416, headers: bare ? {} : { 'content-range': `bytes */${file.length}` } })
+    }
+    if (hangAfter === undefined) return new Response(file, { status: 200 })
+    let pulls = 0
+    const body = new ReadableStream<Uint8Array>({
+      pull(c) {
+        if (pulls++ === 0) return c.enqueue(new Uint8Array(file.subarray(0, hangAfter)))
+        return new Promise<void>(() => {}) // the process is gone: nothing more happens
+      },
+    })
+    return new Response(body, { status: 200 })
+  }) as unknown as typeof fetch
+}
+
+test('resume: after a 416, a restart whose 200 has no Content-Length is checked against the length the 416 names', async () => {
+  // Paused at 170 bytes of a former upload; the server now holds 128 and streams it chunked.
+  // Before the fix the restart kept the old total of 170, failed "size did not match" and
+  // removed the .part, and every later Resume did the same.
+  const { modelDir, stateDir, id, dest } = seedRestored(NEW_FILE, { total: NEW_FILE.length, validator: '"new"' })
+  const seen: Array<Record<string, string>> = []
+  const rec = await resumeAfterRestart(stateDir, modelDir, id, shrunkNoLength(OLD_FILE, seen))
+  assert.equal(seen.length, 2, 'the 416, then the plain request')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(rec.total, OLD_FILE.length, 'the length from the 416, not the old total')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+
+  // A 416 that names no length: the old total is dropped and the length is unknown, as for a
+  // raw URL enqueued with no size.
+  const bare = seedRestored(NEW_FILE, { total: NEW_FILE.length, validator: '"new"' })
+  const again = await resumeAfterRestart(bare.stateDir, bare.modelDir, bare.id, shrunkNoLength(OLD_FILE, [], { bare: true }))
+  assert.equal(again.status, 'done', again.error ?? '')
+  assert.deepEqual(readFileSync(bare.dest), OLD_FILE)
+})
+
+test('resume: the length a 416 names is persisted before the restart\'s body arrives', async () => {
+  // A daemon killed during the restart must not come back with the old total: a 200 without a
+  // Content-Length on the next Resume would be checked against it. No validator on either side,
+  // so nothing else in run() writes the manifest before the body ends.
+  const { modelDir, stateDir, id, dest } = seedRestored(NEW_FILE, { total: NEW_FILE.length })
+  const real = globalThis.fetch
+  globalThis.fetch = shrunkNoLength(OLD_FILE, [], { hangAfter: 50 })
+  try {
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    assert.equal(dm.resume(id), true)
+    const part = `${dest}.part`
+    // The seeded .part holds 170 bytes: wait for the restart's 50 to replace them.
+    for (let i = 0; i < 400 && (!existsSync(part) || readFileSync(part).length !== 50); i++) {
+      await new Promise((r) => setTimeout(r, 5))
+    }
+    assert.equal(readFileSync(part).length, 50, 'killed mid-body of the restart')
+    assert.equal(dm.list()[0].status, 'downloading')
+    assert.deepEqual(manifestEntries(stateDir).map((e) => e.total), [OLD_FILE.length])
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
 const FILE_4K = Buffer.from(Array.from({ length: 4096 }, (_, i) => (i * 7) % 251))
 
 test('resume: a server that ignores Range sends the whole file as a 200, and the sha256 covers that file alone', async () => {
