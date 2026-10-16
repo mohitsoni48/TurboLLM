@@ -1,8 +1,9 @@
 // Two Engines-screen behaviours around engines that are on disk but not what they seem:
 //  - "Delete" on a Disabled catalog card. Disable unregisters the engine, and the purge route only
 //    deletes a REGISTERED engine's files, so the old Delete always failed with "Could not find the
-//    installed … engine". A source-built card is re-registered the way its Enable does it, then
-//    purged; any other Disabled card says it must be enabled first instead of failing.
+//    installed … engine". A source-built card's build folder is deleted directly (DELETE
+//    /engines/build), never re-registered first: that probed the binary, so a build that no longer
+//    starts could not be deleted. Any other Disabled card says it must be enabled first instead.
 //  - The global "<x> built and added" toast after a prereq install from the build guide (cmake,
 //    git…), which streams through the same engineBuild channel but builds nothing.
 import { render, screen, waitFor } from '@testing-library/react'
@@ -11,6 +12,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
+import { ApiError } from '../lib/api'
 import type { CatalogEngine, EngineFit, EngineVariant } from '../lib/types'
 
 const h = vi.hoisted(() => ({
@@ -18,6 +20,7 @@ const h = vi.hoisted(() => ({
   status: undefined as unknown,
   add: vi.fn(),
   purge: vi.fn(),
+  deleteBuild: vi.fn(),
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
 }))
@@ -43,7 +46,11 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useGitBranches: () => ({ data: undefined, isLoading: false, error: null }),
     useUpdatePolicyMutation: () => noop,
     useEngineMutations: () => new Proxy({}, {
-      get: (_t, k) => (k === 'add' ? { mutate: h.add, isPending: false } : k === 'purge' ? { mutate: h.purge, isPending: false } : noop),
+      get: (_t, k) =>
+        k === 'add' ? { mutate: h.add, isPending: false }
+          : k === 'purge' ? { mutate: h.purge, isPending: false }
+            : k === 'deleteBuild' ? { mutate: h.deleteBuild, isPending: false }
+              : noop,
     }),
     useBackendInstall: () => new Proxy({}, { get: () => noop }),
   }
@@ -87,15 +94,15 @@ beforeEach(() => {
   h.status = undefined
   h.add.mockReset()
   h.purge.mockReset()
+  h.deleteBuild.mockReset()
   h.toastSuccess.mockClear()
   h.toastError.mockClear()
 })
 
 describe('EnginesScreen — Delete on a Disabled catalog engine', () => {
-  it('re-registers a source-built engine the way Enable does, then purges it', async () => {
+  it('deletes a source-built engine\'s build folder directly, without re-registering (probing) it', async () => {
     h.catalog = [PRISM_DISABLED]
-    h.add.mockImplementation((_input, opts: { onSuccess: (eng: { id: string }) => void }) => opts.onSuccess({ id: 'prism-1' }))
-    h.purge.mockImplementation((_id, opts: { onSuccess: () => void }) => opts.onSuccess())
+    h.deleteBuild.mockImplementation((_binPath, opts: { onSuccess: () => void }) => opts.onSuccess())
     render(tree())
     await userEvent.click(screen.getByRole('button', { name: 'Actions for Prism (llama.cpp fork)' }))
     await userEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
@@ -103,16 +110,24 @@ describe('EnginesScreen — Delete on a Disabled catalog engine', () => {
     expect(screen.getByText(PRISM_DISABLED.sourceBinPath!)).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: 'Delete' }))
 
-    expect(h.add.mock.calls[0][0]).toEqual({
-      binPath: PRISM_DISABLED.sourceBinPath,
-      name: 'Prism (llama.cpp fork)',
-      sourceRepo: 'https://github.com/PrismML-Eng/llama.cpp',
-      sourceBranch: 'prism',
-      sourceCommit: undefined,
-      sourcePatchUrl: undefined,
-    })
-    expect(h.purge.mock.calls[0][0]).toBe('prism-1')
+    expect(h.deleteBuild.mock.calls.map((c) => c[0])).toEqual([PRISM_DISABLED.sourceBinPath])
+    expect(h.add).not.toHaveBeenCalled()
+    expect(h.purge).not.toHaveBeenCalled()
     await waitFor(() => expect(h.toastSuccess).toHaveBeenCalledWith('Prism (llama.cpp fork) deleted'))
+  })
+
+  it('reports a refused build delete and registers nothing', async () => {
+    h.catalog = [PRISM_DISABLED]
+    h.deleteBuild.mockImplementation((_binPath, opts: { onError: (err: unknown) => void }) =>
+      opts.onError(new ApiError('build_dir_taken', 'That build is in use by an engine — delete the engine instead.', 409)))
+    render(tree())
+    await userEvent.click(screen.getByRole('button', { name: 'Actions for Prism (llama.cpp fork)' }))
+    await userEvent.click(await screen.findByRole('menuitem', { name: 'Delete' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Delete' }))
+
+    await waitFor(() => expect(h.toastError).toHaveBeenCalledWith('That build is in use by an engine — delete the engine instead.'))
+    expect(h.add).not.toHaveBeenCalled()
+    expect(h.toastSuccess).not.toHaveBeenCalled()
   })
 
   it('says to enable a Disabled pip engine first, rather than offering a Delete that cannot work', async () => {

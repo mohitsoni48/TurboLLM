@@ -38,6 +38,7 @@ import {
   deleteEngineBackend,
   enableBackend,
   purgeEngine,
+  deleteEngineBuild,
   forgetCustomEngineSource,
   updateBackend,
   updateVllm,
@@ -570,6 +571,11 @@ export function useEngineMutations() {
     /** Purge: unregister + delete files from disk (catalog engines only, never models). */
     purge: useMutation({
       mutationFn: (id: string) => purgeEngine(id),
+      onSuccess: invalidate,
+    }),
+    /** Delete a DISABLED source build's folder: no live engine to purge, and nothing is probed. */
+    deleteBuild: useMutation({
+      mutationFn: (binPath: string) => deleteEngineBuild(binPath),
       onSuccess: invalidate,
     }),
     /** Forget a DISABLED custom engine's remembered identity — no live engine to purge. */

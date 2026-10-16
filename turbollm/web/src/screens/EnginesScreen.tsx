@@ -48,7 +48,7 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, discardReleaseInstall, getEngineUpdates, track, type AddEngineInput } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, track } from '../lib/api'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -855,8 +855,8 @@ function EngineGallery({
     void qc.invalidateQueries({ queryKey: queryKeys.engines })
     void qc.invalidateQueries({ queryKey: queryKeys.engineCatalog })
   }, [provisioning, qc])
-  // `reregister`: a Disabled source-built card's delete (see requestDelete).
-  const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { reregister?: AddEngineInput }) | null>(null)
+  // `disabledBuildBinPath`: a Disabled source-built card's delete (see requestDelete).
+  const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { disabledBuildBinPath?: string }) | null>(null)
   const customDisabled = registry?.customDisabled ?? []
 
   const catalogById = useMemo(() => {
@@ -904,6 +904,7 @@ function EngineGallery({
     engineMut.remove.isPending ||
     engineMut.disableCustom.isPending ||
     engineMut.purge.isPending ||
+    engineMut.deleteBuild.isPending ||
     releaseUpdate.isPending
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
@@ -1103,11 +1104,13 @@ function EngineGallery({
     const registryId = registryEngineId(e)
     // Disable unregisters an engine, and the purge route only deletes a REGISTERED engine's
     // files — so a Disabled card has no id to purge. A source-built one is found the way its
-    // Enable finds it (its still-built binary): re-register it with that same request, then
-    // purge the new entry. A Disabled pip/TurboQuant/KoboldCpp/llamafile engine has no such
-    // path (its Enable is a re-install that also activates it); its card disables Delete.
+    // Enable finds it (its still-built binary), and DELETE /engines/build removes that folder
+    // without running the binary. Re-registering it first (Enable's request, then a purge) probed
+    // the binary, so a build that no longer starts (a driver change, another arch) failed the
+    // probe and could never be deleted. A Disabled pip/TurboQuant/KoboldCpp/llamafile engine has
+    // no such path (its Enable is a re-install that also activates it); its card disables Delete.
     if (!registryId && e.sourceBuilt && e.sourceBinPath) {
-      setDeleteTarget({ name: e.name, registryId: '', binPath: e.sourceBinPath, reregister: enableRequestFor(e) })
+      setDeleteTarget({ name: e.name, registryId: '', binPath: e.sourceBinPath, disabledBuildBinPath: e.sourceBinPath })
       return
     }
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
@@ -1205,8 +1208,14 @@ function EngineGallery({
         },
         onError,
       })
-    if (deleteTarget.reregister) {
-      engineMut.add.mutate(deleteTarget.reregister, { onSuccess: (eng) => purge(eng.id), onError })
+    if (deleteTarget.disabledBuildBinPath) {
+      engineMut.deleteBuild.mutate(deleteTarget.disabledBuildBinPath, {
+        onSuccess: () => {
+          toast.success(`${deleteTarget.name} deleted`)
+          setDeleteTarget(null)
+        },
+        onError,
+      })
       return
     }
     purge(deleteTarget.registryId)
@@ -1360,7 +1369,7 @@ function EngineGallery({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={doDelete} disabled={engineMut.purge.isPending}>
+            <AlertDialogAction onClick={doDelete} disabled={engineMut.purge.isPending || engineMut.deleteBuild.isPending}>
               Delete
             </AlertDialogAction>
           </AlertDialogFooter>

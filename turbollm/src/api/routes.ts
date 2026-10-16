@@ -1324,9 +1324,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
     // Not while an update, download, upload or rebuild runs, like DELETE /engines/:id below (an Enable is the undo of
-    // a Disable, refused then too). A Disabled source-built card's Delete re-registers the engine here and only then
-    // purges it: with this open, a build or another tab's zip upload left the engine registered (Enabled) again and
-    // the purge refused, the opposite of the Delete the user asked for.
+    // a Disable, refused then too). A Disabled source-built card's Delete no longer comes through here: it used to
+    // re-register the engine (a probe) and then purge it, and DELETE /engines/build now removes the folder directly.
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Provenance comes from the marker this flow wrote on disk, never from the request body.
     const release = readReleaseMarker(sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines')))
@@ -1520,6 +1519,39 @@ export function registerApi(app: Hono, d: Deps): void {
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
       return err(c, 409, 'build_dir_taken', 'That install is in use by an engine — delete the engine instead.')
     rmSync(dir, { recursive: true, force: true })
+    return c.json({ ok: true })
+  })
+
+  // Delete a DISABLED source build (build/<slug>, no registry entry): the Engines screen's Delete on a Disabled
+  // source-built catalog card. The purge route only deletes a registered engine's files, so that Delete used to
+  // re-register the build through POST /engines first, which probes (runs) the binary: a build whose binary no
+  // longer starts (a driver or toolkit change left it unable to load libcuda, a build for another arch) failed the
+  // probe or its timeout, and the one build most worth deleting could not be deleted from the UI. Nothing is run
+  // here. Only a build/<slug> folder is removed (never a hidden staging or parked one), and only while no registered
+  // engine and no remembered custom source points into it and no engine work runs, so a stray call can never delete
+  // a live engine's files. Registered before DELETE /engines/:id below, which would swallow "build".
+  app.delete('/api/v1/engines/build', (c) => {
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Deleting an engine build requires a valid API key from a non-host device.')
+    // As DELETE /engines/:id: a rebuild or update may be writing into this very folder.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    const enginesRoot = join(d.store.dir(), 'engines')
+    const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
+    if (!dir || basename(dir).startsWith('.') || !existsSync(dir))
+      return err(c, 404, 'engine_not_found', 'No engine build at that path.')
+    const claims = (p: string) => isEngineInBuildDir(p, dir)
+    if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
+      return err(c, 409, 'build_dir_taken', 'That build is in use by an engine — delete the engine instead.')
+    try {
+      rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch (e) {
+      // A Windows AV or indexer lock past the retries (Windows reports a lock as EBUSY, EPERM or EACCES, the codes a
+      // permission error has too, so the OS error goes along). Nothing is registered, so nothing points at the
+      // half-deleted folder. A repeated Delete finishes it while the card still finds its llama-server
+      // (findCatalogBuildOnDisk); once that file is gone too the card no longer offers the build, and a later build
+      // of this folder sets what is left aside and sweeps it.
+      return err(c, 409, 'engine_files_locked', `Some of the build's files are still in use — try again in a moment. (${(e as Error).message})`)
+    }
     return c.json({ ok: true })
   })
 

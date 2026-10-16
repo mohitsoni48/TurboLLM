@@ -72,7 +72,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useUpdatePolicyMutation: () => ({ mutate: vi.fn() }),
     useEngineMutations: () => {
       const noop = { mutate: vi.fn(), isPending: false }
-      return { add: noop, rename: noop, remove: noop, disableCustom: noop, purge: noop, forgetCustomSource: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop }
+      return { add: noop, rename: noop, remove: noop, disableCustom: noop, purge: noop, deleteBuild: noop, forgetCustomSource: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop }
     },
     useBackendInstall: () => {
       const noop = { mutate: vi.fn(), isPending: false }

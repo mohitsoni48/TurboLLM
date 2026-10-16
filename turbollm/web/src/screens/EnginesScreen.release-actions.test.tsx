@@ -83,7 +83,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useEngineMutations: () => {
       const noop = { mutate: vi.fn(), isPending: false }
       return {
-        add: noop, rename: noop, remove: noop, disableCustom: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop,
+        add: noop, rename: noop, remove: noop, disableCustom: noop, deleteBuild: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop,
         purge: { mutate: purgeMutate, isPending: false },
         forgetCustomSource: { mutate: forgetMutate, isPending: false },
       }

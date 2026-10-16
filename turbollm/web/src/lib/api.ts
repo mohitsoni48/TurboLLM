@@ -495,6 +495,15 @@ export function purgeEngine(id: string): Promise<{ ok: true }> {
   })
 }
 
+/** Delete a DISABLED source build's folder (engines/build/<slug>, no registered engine) without
+ *  running its binary, so a build that no longer starts can still be deleted. The daemon refuses
+ *  a folder any engine or remembered source still points into. */
+export function deleteEngineBuild(binPath: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/build?binPath=${encodeURIComponent(binPath)}`, {
+    method: 'DELETE',
+  })
+}
+
 /** Enable an installed llama.cpp backend without re-downloading (register + activate). */
 export function enableBackend(id: string): Promise<{ ok: true; engineId: string }> {
   return request<{ ok: true; engineId: string }>(
