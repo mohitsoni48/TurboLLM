@@ -32,4 +32,13 @@ describe('AuthGate', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Connect' }))
     expect(onConnect).toHaveBeenCalledWith('tllm-mine')
   })
+
+  // The nav has had no Developer screen for a while (/developer only redirects); the API keys
+  // panel a LAN client is sent to is on the host's Customize → Connect tab.
+  it('points to Customize → Connect → API keys on the host, not the Developer screen', () => {
+    render(<AuthGate onConnect={() => {}} />)
+    const dialog = screen.getByRole('alertdialog', { name: 'API key required' })
+    expect(dialog.textContent).toContain('Create one under Customize → Connect → API keys on the host machine')
+    expect(dialog.textContent).not.toContain('Developer')
+  })
 })

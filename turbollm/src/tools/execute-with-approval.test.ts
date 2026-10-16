@@ -74,6 +74,26 @@ test('background agent run blocks every tool when agentAllowedTools is omitted (
   assert.match(result, /Blocked.*background agent/)
 })
 
+test('the background-run block names where Tool permissions really are (Settings → Tools & safety), not the Developer screen', async () => {
+  // The web UI's nav has had no Developer screen for a while: the per-tool Ask/Allow/Deny list
+  // is under Settings → Tools & safety. The model relays this text, so a stale path misleads.
+  const { result } = await executeToolCallWithApproval({
+    tools: fakeTools(),
+    sink: () => {},
+    convId: 'c1',
+    id: 't3b',
+    name: 'web_search',
+    args: {},
+    globalPolicies: {},
+    convOverrides: {},
+    signal: new AbortController().signal,
+    interactive: false,
+  })
+
+  assert.match(result, /set it to Allow in Settings → Tools & safety → Tool permissions\./)
+  assert.doesNotMatch(result, /Developer/)
+})
+
 test('explicit global "deny" wins even if the tool is in agentAllowedTools', async () => {
   const { result } = await executeToolCallWithApproval({
     tools: fakeTools(),

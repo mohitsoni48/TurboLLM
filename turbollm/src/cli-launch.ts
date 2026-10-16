@@ -640,7 +640,7 @@ function commentedConfigError(path: string, label: string): PrepareResult {
       `Found an existing ${label} config at ${path} that uses comments and isn't yet ` +
       `pointed at TurboLLM — auto-merging would delete your comments when rewriting the file, ` +
       `so this is left to you.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 
@@ -654,13 +654,13 @@ function asObject(v: unknown): Record<string, unknown> | null {
 }
 
 /** Standard "can't safely touch your config" failure — points at the same info the
- *  web UI's Connect screen shows (Developer → Connect a tool). */
+ *  web UI's Connect tab shows (Customize → Connect → Connect an app). */
 function corruptConfigError(path: string, label: string): PrepareResult {
   return {
     ok: false,
     message:
       `Found an existing ${label} config at ${path} that doesn't parse as JSON — not overwriting it.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 

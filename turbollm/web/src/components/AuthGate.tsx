@@ -35,7 +35,7 @@ export function AuthGate({ onConnect, onDismiss }: { onConnect: (key: string) =>
         </div>
         <p className="mb-3 text-[13px] text-muted">
           This TurboLLM is exposed on the network, so it needs an API key. Create one under{' '}
-          <span className="text-ink">Developer</span> on the host machine, then paste it here.
+          <span className="text-ink">Customize → Connect → API keys</span> on the host machine, then paste it here.
         </p>
         <Input
           type="password"

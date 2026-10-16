@@ -352,6 +352,27 @@ describe('RemoteAccessSection', () => {
     await waitFor(() => expect(vi.mocked(stopRemote)).toHaveBeenCalled())
   })
 
+  it('the token shown once after a start points to Customize → Connect → API keys, not the Developer screen', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // Tailscale Serve both locally and on the server: no exposure confirmation, no provider
+    // save, so the click goes straight to startRemote. All Once: nothing leaks into the last test.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({ remoteAccess: { provider: 'tailscale-serve' } } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'tailscale-serve',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+    })
+    vi.mocked(startRemote).mockResolvedValueOnce({ state: { kind: 'starting' }, token: 'tllm-remote-once' })
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('switch', { name: /remote access/i }))
+    expect(await screen.findByText('tllm-remote-once')).toBeTruthy()
+    expect(screen.getByText(/Manage or revoke it in Customize → Connect → API keys\./)).toBeTruthy()
+    expect(screen.queryByText(/Developer/)).toBeNull()
+  })
+
   it('turning on Tailscale Serve does NOT show an internet-exposure confirmation', async () => {
     const api = await import('../../lib/remote-api')
     // C3 (final-review.md) made the toggle also consult server truth (status.provider), and

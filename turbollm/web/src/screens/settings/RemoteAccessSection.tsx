@@ -387,7 +387,7 @@ export function RemoteAccessSection() {
               <CopyButton text={revealedToken} screen="settings" />
             </div>
             <p className="mt-2 text-[11px] text-faint">
-              Shown once — it cannot be recovered. Manage or revoke it in Developer → API Keys.
+              Shown once — it cannot be recovered. Manage or revoke it in Customize → Connect → API keys.
             </p>
           </div>
         )}

@@ -55,7 +55,7 @@ export async function executeToolCallWithApproval(params: {
       if (agentAllowedTools?.includes(name)) {
         cameFromApprovedAsk = true
       } else {
-        const result = "Blocked: this tool requires interactive approval, which is not available for background agent runs. Add it to this agent's allowed tools, or set it to Allow in Developer → Tool permissions."
+        const result = "Blocked: this tool requires interactive approval, which is not available for background agent runs. Add it to this agent's allowed tools, or set it to Allow in Settings → Tools & safety → Tool permissions."
         await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
         return { result }
       }
