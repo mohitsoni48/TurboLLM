@@ -79,6 +79,22 @@ function releaseInflight(convId: string, ac: AbortController): void {
   if (inflight.get(convId) === ac) inflight.delete(convId)
 }
 
+/** The in-flight entries POST /compact took. A manual compaction holds the chat's slot as a turn
+ *  does, so every route refuses meanwhile, but with a turn's text ('Stop generation first.', 'A
+ *  generation is already running') the web UI toasted it over a chat showing only its Compacting
+ *  banner and no Stop. Keyed by the entry itself, not the chat, so the tag goes with it. */
+const compactions = new WeakSet<AbortController>()
+const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
+
+/** The 409 for a chat whose in-flight slot is taken, or null when it is free: compaction_in_progress
+ *  while a manual compaction holds it, otherwise generation_in_flight with the route's own text. */
+function inflightRefusal(c: Context, convId: string, turnMessage: string) {
+  const held = inflight.get(convId)
+  if (!held) return null
+  if (compactions.has(held)) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
+  return err(c, 409, 'generation_in_flight', turnMessage)
+}
+
 /** A turn route's streamSSE callback, releasing its in-flight entry however the callback
  *  exits: runGeneration's own finally only covers a turn that reached it, and a throw before
  *  that (e.g. a malformed request body) left the chat answering 409 until a restart. */
@@ -344,7 +360,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
 
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    if (busy) return busy
 
     // Persist user message — only the typed text is stored as content; images are
     // kept in attachments (the full doc context is folded into the engine prompt below,
@@ -409,7 +426,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
 
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    if (busy) return busy
 
     // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
     // turn, as Regenerate sets its reply aside below. Sent first as its own request (PUT), a
@@ -525,7 +543,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!trimmed) return err(c, 400, 'invalid_input', 'content required.')
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
 
     if (msg.role === 'assistant') {
       // GitHub #52: edit the model's own reply in place — just fixing text, not resending,
@@ -582,14 +601,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const b = await body<{ model?: string }>(c)
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
     // The compaction holds the conversation's in-flight slot, as a turn does, until it ends: up to
     // a 60 s gate wait plus a 60 s summary call. Only checked before, a version switch, an edit or
     // a Regenerate (from this tab or another) still ran meanwhile; the cut, picked from the branch
     // shown at the start, was then stored on a branch the chat had left, or a turn started a
     // second summarization. Registered like a turn, Stop, the engine kill switches and deleting
-    // the chat abort it too.
+    // the chat abort it too. Tagged, so what it holds back answers compaction_in_progress rather
+    // than a running turn's text (inflightRefusal).
     const ac = new AbortController()
+    compactions.add(ac)
     inflight.set(convId, ac)
     try {
       await compactConversation(d, convId, { upstream: resolved.upstream, signal: ac.signal })
@@ -614,7 +636,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/regenerate', (c) => {
     const convId = c.req.param('id')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
     const last = db.getLastMessage(convId)
     // Chat branching (GitHub #52): deactivate rather than delete — the old reply is kept
     // as a sibling variant, not destroyed. /continue (called next by the client) creates
@@ -642,7 +665,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
     if (!msg.variantGroup) return err(c, 400, 'invalid_input', 'Message has no alternate versions.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
     if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
 
     const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)

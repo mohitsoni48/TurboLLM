@@ -905,7 +905,8 @@ test('after an edit freezes the compaction cut, the next turn does not send the 
 
 // POST /compact only checked the in-flight slot, never took it: for the whole summary call a
 // version switch, an edit or a Regenerate still ran, so the cut picked at the start was stored on
-// a branch the chat had left, or a turn started a second summarization.
+// a branch the chat had left, or a turn started a second summarization. Once it took the slot, the
+// refusals read as a running turn's ('Stop generation first.') over a chat showing no Stop.
 test('a manual compaction holds the in-flight slot: turns, edits and switches are refused until it ends', async () => {
   const h = inFlightHarness()
   let finish!: () => void
@@ -935,11 +936,13 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
       edit: await put(u1.id, 'edited'),
       switch: await h.app.request(`${base}/messages/${a2.id}/activate`, { method: 'POST' }),
       compact: await h.app.request(`${base}/compact`, json({})),
+      legacyRegenerate: await h.app.request(`${base}/regenerate`, { method: 'POST' }),
     }
     for (const [what, res] of Object.entries(refused)) {
       assert.equal(res.status, 409, what)
-      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'generation_in_flight', what)
+      assert.deepEqual(((await res.json()) as { error: unknown }).error, { code: 'compaction_in_progress', message: 'This chat is being compacted. Try again when it finishes.' }, what)
     }
+    assert.equal(h.store.getMessage(a2b.id)!.isActive, true, 'the legacy /regenerate set no reply aside')
     assert.equal(engine.bodies.length, 1, 'nothing else reached the engine')
 
     finish()

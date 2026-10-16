@@ -676,7 +676,7 @@ function EditTextarea({
  *   - `daemonGenerating` — /api/v1/status reports a `liveGeneration`. That is the DAEMON's view of
  *     the world and it survives reloads, which is precisely what the local state cannot do.
  *   - `isLast` — only the newest bubble can be the one being written into (ChatScreen passes
- *     `isLast={i === arr.length - 1 && !live}`).
+ *     `isLast={i === arr.length - 1 && !live && !compactingHere}`).
  *   - the row is an UNFINALIZED placeholder — finalization always writes `totalMs`
  *     (chat-routes.ts's stats object sets it unconditionally), so its ABSENCE is the durable
  *     marker for "nothing has finalized this message yet". This is the condition that keeps a
@@ -706,6 +706,7 @@ export function MessageBubble({
   onEditCancel,
   showThinking = true,
   daemonGenerating = false,
+  compacting = false,
 }: {
   message: Message
   /** Needed for the chat-branching variant switcher (GitHub #52); optional so read-only
@@ -723,6 +724,10 @@ export function MessageBubble({
   /** GitHub #177: the DAEMON reports a generation in flight (`/api/v1/status` → `liveGeneration`).
    *  Defaults to false so every other caller (read-only share view, tests) is unchanged. */
   daemonGenerating?: boolean
+  /** A manual Compact of this chat is running: the daemon refuses a version switch and an edit's
+   *  Save until it ends (409 compaction_in_progress), so the switcher's arrows and Save are
+   *  disabled rather than left to toast that refusal. */
+  compacting?: boolean
 }) {
   const [editDraft, setEditDraft] = useState(message.content)
   const isEditing = editingId === message.id
@@ -859,7 +864,7 @@ export function MessageBubble({
               />
               <div className="mt-1.5 flex gap-1.5 justify-end">
                 <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
-                <Button size="sm" onClick={() => { track('chat', 'save_edited_message'); onEditSave(editDraft) }}>Save & Resend</Button>
+                <Button size="sm" disabled={compacting} onClick={() => { track('chat', 'save_edited_message'); onEditSave(editDraft) }}>Save & Resend</Button>
               </div>
             </div>
           ) : (
@@ -884,7 +889,7 @@ export function MessageBubble({
           )}
           {!isEditing && (
             <div className="flex items-center gap-0.5">
-              {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+              {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} disabled={compacting} />}
               <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />
                 {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
@@ -953,7 +958,7 @@ export function MessageBubble({
             <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
             {/* GitHub #52: unlike a user-message edit, this only fixes the reply's own
                 text in place — it doesn't resend or trigger a new generation. */}
-            <Button size="sm" onClick={() => { track('chat', 'save_edited_reply'); onEditSave(editDraft) }}>Save</Button>
+            <Button size="sm" disabled={compacting} onClick={() => { track('chat', 'save_edited_reply'); onEditSave(editDraft) }}>Save</Button>
           </div>
         </div>
       ) : hasError ? (
@@ -992,7 +997,7 @@ export function MessageBubble({
       </div>
       {!isEditing && (
         <div className="mt-1 flex items-center gap-0.5">
-          {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+          {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} disabled={compacting} />}
           <div className="hover-actions flex items-center gap-0.5">
             {/* GitHub #52 (v1.7.5 fix was incomplete): Copy/Edit make no sense on a message
                 with no content to copy or edit — hasError already replaces the content area
@@ -1015,7 +1020,7 @@ export function MessageBubble({
 
 // ── Chat branching (GitHub #52): ‹ 2/3 › switcher for regenerated sibling replies ──
 
-function VariantSwitcher({ convId, message }: { convId: string; message: Message }) {
+function VariantSwitcher({ convId, message, disabled }: { convId: string; message: Message; disabled: boolean }) {
   const qc = useQueryClient()
   const group = message.variantGroup!
   const variantsQ = useQuery({
@@ -1050,7 +1055,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
     <div className="flex items-center gap-0.5 text-[11px] text-faint">
       <button
         type="button"
-        disabled={switching || index <= 0}
+        disabled={disabled || switching || index <= 0}
         onClick={() => { track('chat', 'switch_message_variant'); go(variants[index - 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Previous version"
@@ -1060,7 +1065,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       <span className="tabular-nums">{index + 1}/{variants.length}</span>
       <button
         type="button"
-        disabled={switching || index >= variants.length - 1}
+        disabled={disabled || switching || index >= variants.length - 1}
         onClick={() => { track('chat', 'switch_message_variant'); go(variants[index + 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Next version"

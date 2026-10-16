@@ -24,6 +24,9 @@ beforeEach(() => {
   editMsgMutate.mockReset()
   sendCalls.length = 0
   continueCalls.length = 0
+  activateCalls.length = 0
+  variants = []
+  compactingConv = null
   convs.clear()
   engineState = 'running'
 })
@@ -46,6 +49,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
 
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
+/** The chat a manual Compact is running for (mut.compact pending with it), or null. */
+let compactingConv: string | null = null
 const stopSpy = vi.fn((_id: string) => Promise.resolve())
 const regenerateSpy = vi.fn((_id: string) => Promise.resolve())
 const editMsgMutate = vi.fn()
@@ -84,7 +89,7 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
       const idle = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false })
       return {
         create: { ...idle(), mutateAsync: vi.fn(() => Promise.resolve({ id: 'new1' })) },
-        update: idle(), compact: idle(), deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
+        update: idle(), compact: { ...idle(), isPending: compactingConv !== null, variables: compactingConv ? { convId: compactingConv } : undefined }, deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
         stop: { ...idle(), mutateAsync: stopSpy }, undoCompaction: idle(), remove: idle(), moveToFolder: idle(),
         createFolder: idle(), deleteFolder: idle(), renameFolder: idle(),
       }
@@ -96,12 +101,17 @@ type Gen = (signal: AbortSignal) => AsyncGenerator<ChatSseEvent>
 let nextGen: Gen
 const sendCalls: unknown[][] = []
 const continueCalls: unknown[][] = []
+const activateCalls: unknown[][] = []
+/** What the version switcher lists for any group. */
+let variants: unknown[] = []
 vi.mock('../lib/chat-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/chat-api')>()
   return {
     ...actual,
     sendMessage: (...args: unknown[]) => { sendCalls.push(args); return nextGen(args[2] as AbortSignal) },
     continueConversation: (...args: unknown[]) => { continueCalls.push(args); return nextGen(args[1] as AbortSignal) },
+    getMessageVariants: () => Promise.resolve({ variants }),
+    activateVariant: (...args: unknown[]) => { activateCalls.push(args); return Promise.resolve({ messages: [] }) },
   }
 })
 vi.mock('../lib/link-queries', async (importOriginal) => {
@@ -505,6 +515,66 @@ describe('ChatScreen — Regenerate', () => {
     } finally {
       toastError.mockRestore()
     }
+  })
+})
+
+describe('ChatScreen — while a manual Compact runs', () => {
+  // The daemon holds the chat's in-flight slot for the whole compaction and refuses every message
+  // action meanwhile. Only the composer was held back: Regenerate, the version switcher and an
+  // edit's Save stayed enabled, and each click toasted the refusal ('A generation is already
+  // running…', 'Stop generation first.') over a chat showing the Compacting banner and no Stop.
+  function twoVersionReply() {
+    const reply = { ...message('a1', 2, 'assistant', 'Use Python'), variantGroup: 'a0' }
+    variants = [{ ...message('a0', 2, 'assistant', 'Use Rust'), variantGroup: 'a0', isActive: false }, reply]
+    showMessages([message('u1', 1, 'user', 'Recommend a language'), reply])
+  }
+
+  it('hides Regenerate and disables the version switcher and the edits\' Save until it ends', async () => {
+    twoVersionReply()
+    compactingConv = 'c1'
+    nextGen = quickStream()
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      const view = await renderScreen('/chat/c1')
+      expect(await screen.findByText('2/2')).toBeInTheDocument()
+      expect(screen.getByText('Compacting conversation…')).toBeInTheDocument()
+      expect(screen.queryByTitle('Regenerate')).toBeNull()
+      expect(screen.getByTitle('Previous version')).toBeDisabled()
+
+      fireEvent.click(screen.getAllByTitle('Edit')[1]) // the reply
+      expect(screen.getByText('Save')).toBeDisabled()
+      // Ctrl/Cmd+Enter in the box still reaches the Save handler: refused there, the edit stays open.
+      fireEvent.keyDown(screen.getByDisplayValue('Use Python'), { key: 'Enter', ctrlKey: true })
+      expect(toastError).toHaveBeenCalledWith('This chat is being compacted. Try again when it finishes.')
+      expect(screen.getByDisplayValue('Use Python')).toBeInTheDocument()
+      fireEvent.click(screen.getByText('Cancel'))
+
+      fireEvent.click(screen.getAllByTitle('Edit')[0]) // the question
+      expect(screen.getByText('Save & Resend')).toBeDisabled()
+      await act(async () => { fireEvent.keyDown(screen.getByDisplayValue('Recommend a language'), { key: 'Enter', ctrlKey: true }) })
+      expect(screen.getByDisplayValue('Recommend a language')).toBeInTheDocument()
+      fireEvent.click(screen.getByText('Cancel'))
+
+      expect(continueCalls).toHaveLength(0)
+      expect(activateCalls).toHaveLength(0)
+      expect(editMsgMutate).not.toHaveBeenCalled()
+
+      compactingConv = null // it ended
+      await act(async () => { view.refetched() })
+      expect(await screen.findByTitle('Regenerate')).toBeInTheDocument()
+      expect(screen.getByTitle('Previous version')).not.toBeDisabled()
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  it('a Compact of another chat leaves this chat\'s Regenerate and version switcher alone', async () => {
+    twoVersionReply()
+    compactingConv = 'c2'
+    await renderScreen('/chat/c1')
+    expect(await screen.findByText('2/2')).toBeInTheDocument()
+    expect(screen.getByTitle('Regenerate')).toBeInTheDocument()
+    expect(screen.getByTitle('Previous version')).not.toBeDisabled()
   })
 })
 

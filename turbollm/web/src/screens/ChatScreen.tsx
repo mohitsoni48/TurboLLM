@@ -78,6 +78,10 @@ function truncateName(name: string): string {
 
 const onMac = () => /Mac/i.test(navigator.platform)
 
+/** The daemon's own text for its 409 compaction_in_progress (chat-routes.ts), for a Save refused
+ *  here before it is sent. */
+const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
+
 // Ctrl+F is "forward one character" in a Mac text field, so on a Mac only Cmd+F opens find.
 function isFindShortcut(e: KeyboardEvent): boolean {
   // `key` is undefined on the keydown events browser autofill fires, so it cannot be assumed a string.
@@ -814,6 +818,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     track('chat', 'manual_compact')
     mut.compact.mutate({ convId: activeId, model: activeRemoteId ?? undefined }, { onError: () => toast.error('Could not compact this conversation.') })
   }
+  // A manual compaction holds this chat's in-flight slot on the daemon (POST /compact) for up to
+  // two minutes, and it refuses Regenerate, a version switch and an edit's Save meanwhile. Only the
+  // composer was held back: those stayed clickable, and each click toasted the refusal over a chat
+  // showing the Compacting banner and no Stop. Treated like `live` for them. Scoped to the chat
+  // being compacted, as the daemon's refusal is: another chat opened meanwhile takes all of it.
+  const compactingHere = !!activeId && mut.compact.isPending && mut.compact.variables?.convId === activeId
 
   const send = async (overrideInput?: string) => {
     const rawText = (overrideInput ?? input).trim()
@@ -955,6 +965,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const handleEditSave = (msgId: string, content: string) => {
     if (!activeId || mut.editMsg.isPending) return
+    // Save is disabled while this chat compacts; Ctrl/Cmd+Enter in the edit box still lands here.
+    // The edit stays open with the typed text.
+    if (compactingHere) { toast.error(COMPACTING_MESSAGE); return }
     // GitHub #52: editing the model's own reply just fixes its text in place — no reason
     // to trigger ANOTHER reply after it. Only a user-message edit resends (branching the
     // downstream history, per ADR — see chat-routes.ts's /continue { edit }).
@@ -1006,7 +1019,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }
 
   const handleRegenerate = async (replyId: string) => {
-    if (!activeId || live) return
+    if (!activeId || live || compactingHere) return
     if (!ready) { toast.error('Load a model first.'); return }
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
@@ -1410,8 +1423,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     <MessageBubble
                       message={m}
                       convId={readonly ? undefined : activeId ?? undefined}
-                      isLast={i === arr.length - 1 && !live}
+                      isLast={i === arr.length - 1 && !live && !compactingHere}
                       daemonGenerating={daemonGenerating}
+                      compacting={compactingHere}
                       onEdit={readonly ? undefined : (msg) => setEditingId(msg.id)}
                       onDelete={readonly ? undefined : handleDelete}
                       onRegenerate={readonly ? undefined : () => handleRegenerate(m.id)}
