@@ -22,7 +22,7 @@ import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
 import { enqueue } from '../telemetry/queue'
-import { toSafeIdent } from '../telemetry/core/validate'
+import { toSafeIdent, toSafeNameIdent } from '../telemetry/core/validate'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyBenchFailure } from '../telemetry/classify'
 import { telemetryDisabled } from '../telemetry/disabled'
@@ -1411,7 +1411,8 @@ export class BenchRunner {
         machineId,
         app: { version: appVersion, os: sys.os },
         // Identifier fields go through toSafeIdent — a raw CPU/GPU name with `@`, `/` or `[...]`
-        // fails validation and the whole result is dropped before it is queued.
+        // fails validation and the whole result is dropped before it is queued. The model name
+        // and engine version use toSafeNameIdent, so a path-shaped one is sent as 'unknown'.
         hw: {
           cpu: toSafeIdent(sys.cpu),
           ramMb: sys.ramMB,
@@ -1419,8 +1420,8 @@ export class BenchRunner {
         },
         payload: {
           source: 'autotune',
-          model: { name: toSafeIdent(entry.name), quant: toSafeIdent(entry.quant), sizeBytes: entry.sizeBytes, arch: toSafeIdent(entry.arch), moe: entry.moe },
-          engine: { version: toSafeIdent(engineVersion) },
+          model: { name: toSafeNameIdent(entry.name), quant: toSafeIdent(entry.quant), sizeBytes: entry.sizeBytes, arch: toSafeIdent(entry.arch), moe: entry.moe },
+          engine: { version: toSafeNameIdent(engineVersion) },
           params: record.params,
           result: { tps: record.tps, ttftMs: record.ttftMs, vramMb: record.vramMb, outcome: 'ok' },
         },

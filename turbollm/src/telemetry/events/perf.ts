@@ -16,7 +16,7 @@
 
 import { defineEvent, f } from '../core/define'
 import { OUTCOMES } from '../core/enums'
-import { toSafeIdent } from '../core/validate'
+import { toSafeIdent, toSafeNameIdent } from '../core/validate'
 import type { PayloadOf } from '../core/types'
 import type { LoadProfile } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -93,10 +93,12 @@ export function buildBenchResultConfig(
   hw: { cpu: string; ramMb: number; gpus: { name: string; vramMb: number }[] }
 } {
   // Raw names go through toSafeIdent: a CPU/GPU name with `@`, `/` or `[...]` would otherwise
-  // fail the identifier check and drop the whole event before it is queued.
+  // fail the identifier check and drop the whole event before it is queued. The model name and
+  // engine version use toSafeNameIdent, which reports a path-shaped one as 'unknown' rather than
+  // as its directory names.
   return {
-    model: { name: toSafeIdent(entry.name), quant: toSafeIdent(entry.quant), arch: toSafeIdent(entry.arch), sizeBytes: entry.sizeBytes, moe: entry.moe },
-    engine: { version: toSafeIdent(engineVersion) },
+    model: { name: toSafeNameIdent(entry.name), quant: toSafeIdent(entry.quant), arch: toSafeIdent(entry.arch), sizeBytes: entry.sizeBytes, moe: entry.moe },
+    engine: { version: toSafeNameIdent(engineVersion) },
     params: {
       ctx: profile.ctx,
       ngl: profile.ngl,

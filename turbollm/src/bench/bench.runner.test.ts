@@ -152,3 +152,23 @@ test('saved auto-tune result is queued even when the CPU/GPU names are not ident
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('auto-tune telemetry sends a path-shaped model name and engine version as unknown', () => {
+  const dir = tmpDir('turbollm-bench-telemetry-')
+  try {
+    const cfg = { telemetry: { level: 'anon', machineId: '00000000-0000-0000-0000-000000000000' } }
+    const { r } = runner({ snapshot: () => cfg, update: () => {}, dir: () => dir })
+    const sys: SysInfo = { os: 'win32/x64', cpu: 'Test CPU', cores: 12, ramMB: 32000, gpus: [{ name: 'Test GPU', vramMb: 16000, vendor: 'nvidia' }] }
+    const record = { modelKey: 'm|q4|1', tps: 40, ttftMs: 200, vramMb: 9000, ts: '2026-10-13T00:00:00.000Z', params: { ctx: 8192, ngl: 33, nCpuMoe: 0, parallel: 1, kvTypeK: 'f16', flashAttn: 'auto' } }
+
+    r.queueTelemetry(record, model({ name: 'C:\\Users\\alice\\acme-secret-project\\merged-7b' }), sys, '1.0.0', 'C:\\Users\\alice\\llama\\llama-server.exe: unknown option')
+
+    const queued = readQueue(dir)
+    assert.equal(queued.length, 1)
+    const payload = queued[0].event.payload as { model: { name: string }; engine: { version: string } }
+    assert.equal(payload.model.name, 'unknown')
+    assert.equal(payload.engine.version, 'unknown')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

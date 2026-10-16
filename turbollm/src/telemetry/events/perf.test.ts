@@ -4,7 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { buildBenchResultConfig } from './perf'
-import { toSafeIdent } from '../core/validate'
+import { toSafeIdent, toSafeNameIdent } from '../core/validate'
 import { validateEvent, TELEMETRY_SCHEMA_VERSION } from '../schema'
 import { deriveDefault } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -54,4 +54,40 @@ test('toSafeIdent: normalizes the rest — readable, capped, never empty', () =>
   assert.equal(toSafeIdent(''), 'unknown')
   assert.equal(toSafeIdent('@@@'), 'unknown')
   assert.ok(toSafeIdent(`${'x'.repeat(200)}@`).length <= 96)
+})
+
+test('toSafeNameIdent: a path-shaped model name or engine version is sent as unknown, not as its directory names', () => {
+  // A Windows convert run can write the local checkpoint path as general.name, and an engine that
+  // does not know --version prints its own path first. toSafeIdent alone made these valid as
+  // 'home alice acme-secret-project checkpoints merged-7b' and 'C: Users alice models'.
+  for (const v of [
+    '/home/alice/acme-secret-project/checkpoints/merged-7b',
+    'C:\\Users\\alice\\models',
+    'C:\\Users\\alice\\llama\\llama-server.exe: unknown option',
+    'C:/Users/alice/merged',
+    '~/models/merged-7b',
+    '\\\\nas\\share\\merged',
+    'checkpoints\\merged-7b',
+    'home/alice/merged-7b',
+    'error: cannot open /home/alice/models/x.gguf',
+    '../../etc/passwd',
+  ]) {
+    assert.equal(toSafeNameIdent(v), 'unknown', v)
+  }
+  // The Hugging Face org/name form keeps its single slash mapped to a space, as before; valid
+  // names and versions come back untouched.
+  assert.equal(toSafeNameIdent('meta-llama/Llama-3.1-8B'), 'meta-llama Llama-3.1-8B')
+  assert.equal(toSafeNameIdent('Mistral-7B-Instruct [v0.3]'), 'Mistral-7B-Instruct v0.3')
+  for (const v of ['Qwen3 8B', 'b6123', '6123 (abc1234)', 'llamafile v0.8.13']) assert.equal(toSafeNameIdent(v), v)
+})
+
+test('bench_result built from a path-shaped model name and engine version sends unknown for both', () => {
+  const sys: SysInfo = { os: 'win32/x64', cpu: 'AMD Ryzen 7 7840HS w/ Radeon 780M Graphics', cores: 8, ramMB: 32000, gpus: [{ name: 'Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]', vramMb: 20000, vendor: 'amd' }] }
+  const entry = { ...ENTRY, name: 'C:\\Users\\alice\\acme-secret-project\\merged-7b' } as ModelEntry
+  const config = buildBenchResultConfig(entry, deriveDefault(entry, sys), '/home/alice/llama/llama-server: unknown option', sys)
+  assert.equal(config.model.name, 'unknown')
+  assert.equal(config.engine.version, 'unknown')
+  // Hardware names are no paths: their slashes still become spaces.
+  assert.equal(config.hw.cpu, 'AMD Ryzen 7 7840HS w Radeon 780M Graphics')
+  assert.equal(config.hw.gpus[0].name, 'Navi 31 Radeon RX 7900 XT 7900 XTX 7900M')
 })

@@ -151,3 +151,12 @@ test('buildModelLoadConfig: a GGUF name or quant that breaks the identifier char
   const bracketed = buildModelLoadConfig({ ...denseModel, name: 'Mistral-7B-Instruct [v0.3]' }, profile, engine, vram)
   assert.equal(bracketed.model?.name, 'Mistral-7B-Instruct v0.3')
 })
+
+test('buildModelLoadConfig: a path-shaped general.name is sent as unknown, not as its directory names', () => {
+  const pathNamed = { ...denseModel, name: '/home/alice/acme-secret-project/checkpoints/merged-7b' }
+  const profile = deriveDefault(pathNamed, sys)
+  const config = buildModelLoadConfig(pathNamed, profile, engine, estimateVram(profile, pathNamed, sys))
+  assert.equal(config.model?.name, 'unknown')
+  const hf = { ...denseModel, name: 'meta-llama/Llama-3.1-8B' }
+  assert.equal(buildModelLoadConfig(hf, profile, engine, estimateVram(profile, hf, sys)).model?.name, 'meta-llama Llama-3.1-8B')
+})

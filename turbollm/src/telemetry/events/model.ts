@@ -9,7 +9,7 @@
 
 import { defineEvent, f } from '../core/define'
 import { FAIL_REASONS, OUTCOMES } from '../core/enums'
-import { toSafeIdent } from '../core/validate'
+import { toSafeIdent, toSafeNameIdent } from '../core/validate'
 import type { PayloadOf } from '../core/types'
 import type { LoadProfile } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -194,10 +194,12 @@ export function buildModelLoadConfig(
   // Identifier fields go through toSafeIdent, as bench_result's do: a GGUF's general.name
   // ('Mistral-7B-Instruct [v0.3]', 'meta-llama/Llama-3.1-8B') or the scanner's '?' quant
   // fallback fails isSafeIdent, and validateEvent then drops the whole event before it is
-  // queued. Already-valid values come back untouched, so existing join keys keep matching.
+  // queued. Already-valid values come back untouched, so existing join keys keep matching. The
+  // name uses toSafeNameIdent: a path-shaped general.name is sent as 'unknown', not as its
+  // directory names.
   return {
     model: {
-      name: toSafeIdent(entry.name),
+      name: toSafeNameIdent(entry.name),
       quant: toSafeIdent(entry.quant),
       arch: toSafeIdent(entry.arch),
       sizeBytes: entry.sizeBytes,
