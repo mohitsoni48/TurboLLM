@@ -22,8 +22,8 @@
 //     never materialises it. Verified empirically, not reasoned about.
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { appendFile, readFile, mkdir, realpath } from 'node:fs/promises'
-import { dirname, join, resolve } from 'node:path'
+import { appendFile, readFile, readlink, mkdir, realpath } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
 
 /** Where a repo's session worktrees live, relative to the repo root. */
 export const WORKTREES_SUBDIR = join('.turbollm', 'worktrees')
@@ -260,7 +260,37 @@ export async function removeSessionWorktree(repoRoot: string, worktreePath: stri
   // project moved or deleted, an external drive unplugged. Reporting that as an error produced a
   // raw `spawn git ENOENT` on the delete response (git cannot even start when its cwd is missing),
   // which told the user nothing and made a perfectly successful delete look like it had failed.
-  if (!existsSync(repoRoot)) return { ok: true }
+  //
+  // A missing base folder is not "nothing to remove", though. A subfolder session's worktree lives
+  // under the repository's TOP level, so it outlives the folder: deleted, renamed, or absent from
+  // the branch now checked out in the base. Returning success then left the worktree registered,
+  // its branch checked out there ("already used by worktree" on any other checkout of it), with no
+  // note to the user. So git runs from the nearest folder above the base that still exists, and
+  // the base's prefix is that folder's plus the missing path below it. When the repository itself
+  // is gone, so is every worktree in it, and the loop below finds nothing left on disk.
+  //
+  // The first missing name can be a link whose target is gone: a base opened through a symlink
+  // (or junction) into a repo subfolder, ~/web -> ~/code/mono/packages/web, after the checkout
+  // dropped packages/web. The folder above the link (~) is in no repository, so git failed there
+  // ("not a git repository") and the worktree stayed registered. The walk goes on from where the
+  // link points instead, the way the base itself was reached.
+  let gitCwd = resolve(repoRoot)
+  let missing: string[] = []
+  for (let hops = 0; ; hops++) {
+    while (!existsSync(gitCwd)) {
+      const up = dirname(gitCwd)
+      if (up === gitCwd) return { ok: true }
+      missing.unshift(basename(gitCwd))
+      gitCwd = up
+    }
+    // 40: the kernel's own limit on links followed in one lookup, so a link loop ends here.
+    const link = missing.length > 0 && hops < 40 ? await readlink(join(gitCwd, missing[0])).catch(() => null) : null
+    if (link === null) break
+    // A relative target is relative to the link's PHYSICAL folder, as the kernel resolves it.
+    const from = await realpath(gitCwd).catch(() => gitCwd)
+    gitCwd = resolve(from, link, ...missing.slice(1))
+    missing = []
+  }
 
   // A session started at a repo subfolder works in that subfolder of its worktree
   // (createSessionWorktree), but `git worktree remove` takes the worktree's own top level: the
@@ -271,15 +301,17 @@ export async function removeSessionWorktree(repoRoot: string, worktreePath: stri
   // branch is named like the folder) is no worktree, which git says, so the stored path is tried
   // next. Each is tried only if it is still there: the session's folder inside the worktree can be
   // gone (deleted by the agent) while the worktree is not.
-  const prefix = (await runGit(repoRoot, ['rev-parse', '--show-prefix'])).stdout.replace(/\r?\n$/, '')
-  const parts = prefix.split('/').filter(Boolean)
+  const asked = await runGit(gitCwd, ['rev-parse', '--show-prefix'])
+  const prefix = asked.stdout.replace(/\r?\n$/, '')
+  // Outside any repository (rev-parse fails) the missing path is no prefix of anything.
+  const parts = [...prefix.split('/').filter(Boolean), ...(asked.ok ? missing : [])]
   const tail = worktreePath.split(/[\\/]+/).filter(Boolean).slice(-parts.length)
   const targets = parts.length > 0 && tail.join('/') === parts.join('/')
     ? [resolve(worktreePath, ...parts.map(() => '..')), worktreePath]
     : [worktreePath]
   for (const [i, target] of targets.entries()) {
     if (!existsSync(target)) continue
-    const r = await runGit(repoRoot, ['worktree', 'remove', target], 60_000)
+    const r = await runGit(gitCwd, ['worktree', 'remove', target], 60_000)
     if (r.ok) return { ok: true }
 
     const err = (r.stderr || r.stdout).trim()

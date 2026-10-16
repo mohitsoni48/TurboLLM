@@ -475,3 +475,72 @@ test('REGRESSION: removing a subfolder session\'s worktree whose folder is gone 
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test('REGRESSION: a subfolder session\'s worktree is removed even when its folder is gone from the base checkout', async () => {
+  // The worktree lives under the repository's top level, so it outlives the base subfolder (here:
+  // the base checks out a branch without it). Deleting the session reported success and left the
+  // worktree registered, its branch checked out there and unusable anywhere else.
+  const root = await makeRepo()
+  try {
+    assert.ok((await runGit(root, ['branch', 'old'])).ok, 'a branch without the package')
+    const sub = join(root, 'packages', 'web')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    const worktreeCount = async () => (await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    const top = join(root, WORKTREES_SUBDIR, 'feat')
+    assert.ok((await runGit(root, ['checkout', '-q', 'old'])).ok)
+    assert.ok(!existsSync(sub), 'the base folder is gone')
+
+    // Uncommitted work in it is still refused, not silently kept as "done".
+    writeFileSync(join(r.path, 'a.ts'), 'unmerged work\n')
+    const dirty = await removeSessionWorktree(sub, r.path)
+    assert.equal(dirty.ok, false, JSON.stringify(dirty))
+    if (!dirty.ok) assert.equal(dirty.code, 'dirty')
+    await runGit(r.path, ['checkout', '--', 'a.ts'])
+
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(top), 'worktree removed')
+    assert.equal(await worktreeCount(), 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: a worktree is removed when the base was a link into a subfolder the base checkout no longer has', async () => {
+  // <tmp>/home/web -> <tmp>/repo/packages/web, and the base checks out a branch without it: the link
+  // dangles. Walking up from the link's own name stopped at <tmp>/home, in no repository, so
+  // `git worktree remove` failed with "not a git repository" and the worktree stayed registered.
+  const root = await makeRepo()
+  const tmp = join(root, '..')
+  try {
+    assert.ok((await runGit(root, ['branch', 'old'])).ok, 'a branch without the package')
+    mkdirSync(join(root, 'packages', 'web'), { recursive: true })
+    writeFileSync(join(root, 'packages', 'web', 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    mkdirSync(join(tmp, 'home'))
+    const link = join(tmp, 'home', 'web')
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(join(root, 'packages', 'web'), link, 'junction')
+
+    const r = await createSessionWorktree({ repoRoot: link, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.ok((await runGit(root, ['checkout', '-q', 'old'])).ok)
+    assert.ok(!existsSync(link), 'the link dangles')
+
+    assert.deepEqual(await removeSessionWorktree(link, r.path), { ok: true })
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR, 'feat')), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
