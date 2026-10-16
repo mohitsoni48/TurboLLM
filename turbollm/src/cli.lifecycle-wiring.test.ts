@@ -60,6 +60,22 @@ test('a LAN toggle keeps the bound port; only a configured-port change moves it'
   assert.ok(blockFrom(LISTEN).includes('deps.bindPort = info.port'), 'routes report the real bound port from deps.bindPort')
 })
 
+// isLanExposed (auth.ts) keys the key enforcement off deps.bindHost, and this is the only line that
+// sets it: without it `--addr 0.0.0.0:6996` or a daemon.host bind with lanBind off reads as
+// loopback, and every LAN peer gets the API keyless.
+test('every successful bind records the bound host for the auth gates before the listener awaits or announces anything', () => {
+  const listen = blockFrom(LISTEN)
+  const callback = listen.indexOf('async (info) => {')
+  const set = listen.indexOf('deps.bindHost = host', callback)
+  assert.ok(callback >= 0 && set > callback, 'the serve callback must record the bound host in deps.bindHost')
+  // The callback runs ahead of the listener's first request only up to its first await; the
+  // banner and the remote-access start must also see the gate set.
+  for (const later of ['await ', '  TurboLLM ${version} is ready!', 'Re-bound to ', 'void remote.enable()']) {
+    const at = listen.indexOf(later, callback)
+    assert.ok(at > set, `deps.bindHost must be set before "${later}"`)
+  }
+})
+
 test('signal shutdown drops open connections before close() (an SSE stream otherwise holds it 12 s)', () => {
   const signals = blockFrom(SIGNALS)
   const drop = signals.indexOf('closeAllConnections?.()')
