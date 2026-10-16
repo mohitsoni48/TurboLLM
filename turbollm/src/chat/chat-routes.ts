@@ -562,7 +562,6 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const convId = c.req.param('id')
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
     // Resolved HERE, like the two turn routes, rather than left to compactConversation to
     // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
     // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
@@ -577,12 +576,23 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const b = await body<{ model?: string }>(c)
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
+    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    // The compaction holds the conversation's in-flight slot, as a turn does, until it ends: up to
+    // a 60 s gate wait plus a 60 s summary call. Only checked before, a version switch, an edit or
+    // a Regenerate (from this tab or another) still ran meanwhile; the cut, picked from the branch
+    // shown at the start, was then stored on a branch the chat had left, or a turn started a
+    // second summarization. Registered like a turn, Stop, the engine kill switches and deleting
+    // the chat abort it too.
+    const ac = new AbortController()
+    inflight.set(convId, ac)
     try {
-      await compactConversation(d, convId, { upstream: resolved.upstream })
+      await compactConversation(d, convId, { upstream: resolved.upstream, signal: ac.signal })
     } catch (e) {
       const code = e instanceof Error ? e.message : 'compaction_failed'
       if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
       return err(c, 500, 'compaction_failed', 'Could not summarize this conversation.')
+    } finally {
+      releaseInflight(convId, ac)
     }
     return c.json(db.getConversation(convId)!)
   })

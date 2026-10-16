@@ -785,6 +785,57 @@ test('after an edit freezes the compaction cut, the next turn does not send the 
   }
 })
 
+// POST /compact only checked the in-flight slot, never took it: for the whole summary call a
+// version switch, an edit or a Regenerate still ran, so the cut picked at the start was stored on
+// a branch the chat had left, or a turn started a second summarization.
+test('a manual compaction holds the in-flight slot: turns, edits and switches are refused until it ends', async () => {
+  const h = inFlightHarness()
+  let finish!: () => void
+  const held = new Promise<void>((r) => { finish = r })
+  const engine = fakeEngine(async () => {
+    await held
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'The user asked twice about x.' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  })
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const long = 'x'.repeat(6000)
+    const u1 = h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long)
+    h.store.addMessage(conv.id, 'user', long)
+    const a2 = h.store.addMessage(conv.id, 'assistant', long)
+    h.store.deactivateMessage(a2.id) // a2 has a regenerated sibling, so /activate reaches its checks
+    const a2b = h.store.addMessage(conv.id, 'assistant', `${long} again`, { variantGroup: a2.id })
+
+    const compacting = h.app.request(`${base}/compact`, json({}))
+    await waitFor(() => engine.bodies.length === 1, 'the summary call to start')
+    assert.deepEqual(inFlightChatIds(), [conv.id])
+    const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+    const refused = {
+      regenerate: await h.app.request(`${base}/continue`, json({ regenerate: true })),
+      send: await h.app.request(`${base}/messages`, json({ content: 'q3' })),
+      edit: await put(u1.id, 'edited'),
+      switch: await h.app.request(`${base}/messages/${a2.id}/activate`, { method: 'POST' }),
+      compact: await h.app.request(`${base}/compact`, json({})),
+    }
+    for (const [what, res] of Object.entries(refused)) {
+      assert.equal(res.status, 409, what)
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'generation_in_flight', what)
+    }
+    assert.equal(engine.bodies.length, 1, 'nothing else reached the engine')
+
+    finish()
+    assert.equal((await compacting).status, 200)
+    assert.deepEqual(inFlightChatIds(), [], 'released when it ends')
+    assert.equal(h.store.getConversation(conv.id)!.compactionSummary, 'The user asked twice about x.')
+    assert.equal((await put(a2b.id, 'fixed reply')).status, 200, 'the chat takes edits again')
+  } finally {
+    finish()
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('deleting a conversation aborts its in-flight generation', async () => {
   const h = inFlightHarness()
   let engineSignal: AbortSignal | undefined
