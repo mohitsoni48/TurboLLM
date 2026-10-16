@@ -1080,6 +1080,7 @@ let appliedCfgHost = cfg.daemon.host
 // The boot-time remote-access start is one-shot (see the listen callback).
 let bootRemoteStarted = false
 function listen(attempt = 0): void {
+  const tried = `${host}:${port}` // see the bind retry below
   const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
     // What auth.ts's gates key off (isLanExposed): the address really bound, so a non-loopback
     // --addr/daemon.host enforces keys like lanBind does. Set here, on every successful bind
@@ -1206,7 +1207,9 @@ function listen(attempt = 0): void {
       }
       if (e?.code === 'EADDRINUSE' && attempt < 20) {
         if (attempt === 0) console.log(`  Port ${port} busy (previous listener releasing) — retrying…`)
-        setTimeout(() => listen(attempt + 1), 500)
+        // A rebind that re-points this bind meanwhile (see deps.rebind) starts the count over: the
+        // new address gets its own 20 tries, and its own "busy" line, rather than what is left.
+        setTimeout(() => listen(`${host}:${port}` === tried ? attempt + 1 : 0), 500)
       } else if (rebinding) {
         // A rebind couldn't bind the new address — revert so the daemon stays reachable.
         console.error(`Could not bind ${host}:${port} (${e?.message ?? e}); reverting to ${prevHost}:${prevPort}.`)
@@ -1239,6 +1242,21 @@ deps.rebind = () => {
   appliedCfgHost = c.daemon.host
   appliedCfgPort = c.daemon.port
   if (want === host && wantPort === port) return // nothing changed
+  // One rebind at a time. One that came while another was still in flight (the old listener
+  // draining, which an open Code terminal's WebSocket stretches to the 3 s fallback below, or the
+  // new bind retrying; the remote-access ingress stays up meanwhile) closed the same old listener
+  // again and armed a second reopen: the second bind then hit EADDRINUSE from this process's own
+  // new listener, retried for 10 s and exit(1)ed. listen() reads host/port when it runs (every
+  // retry too, which then starts its count over), so re-pointing them is all this one needs.
+  // prevHost/prevPort stay the last address that served, and a revert in flight becomes this
+  // rebind (it reverts there too).
+  if (rebinding || reverting) {
+    host = want
+    port = wantPort
+    rebinding = true
+    reverting = false
+    return
+  }
   prevHost = host
   prevPort = port
   host = want
