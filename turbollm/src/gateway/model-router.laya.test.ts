@@ -114,6 +114,9 @@ test('a chat model in the primary still takes the chat slot', () => {
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 
+/** What a load an eject cancelled answers. Permanent: a retry would load the model the owner just ejected. */
+const UNLOADED_WHILE_LOADING = { status: 503, message: 'The model was unloaded while it was loading.', permanent: true }
+
 function deferred() {
   let resolve!: () => void
   const promise = new Promise<void>((r) => { resolve = r })
@@ -250,7 +253,7 @@ test('ejecting a Laya model before its engine has spawned cancels the load: noth
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].manager.status().state, 'stopped', 'the engine that spawned after the eject is stopped again')
   assert.deepEqual(r.aliveSlots(), [])
   assert.equal(r.loadedModelKeys().has(LAYA_MODEL.key), false)
@@ -264,7 +267,7 @@ test('ejecting a Laya model while its engine is starting stops it', async () => 
   await tick()
   assert.equal(made[0].manager.status().state, 'starting', 'precondition')
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
-  await loading
+  assert.deepEqual(await loading, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].manager.status().state, 'stopped')
   assert.deepEqual(r.aliveSlots(), [])
 })
@@ -298,7 +301,7 @@ test('ejecting a Laya model before its engine has spawned aborts the load, so no
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].startedEngines(), 0, 'the cancelled load never spawned an engine')
 })
 
@@ -346,7 +349,7 @@ test('ejecting a Laya model whose earlier slot died still cancels the load in fl
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.deepEqual(r.aliveSlots(), [])
   assert.equal(made[0].startedEngines(), 0)
 })

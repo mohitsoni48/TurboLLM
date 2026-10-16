@@ -486,6 +486,21 @@ test('route: a load that ran and failed is permanent; a ComfyUI-blocked load is 
   assert.deepEqual(blocked, { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' })
 })
 
+// Manager.load() rethrows what the engine start threw (no active engine, a model it cannot find, a spawn or port error)
+// once it has set 'error'. A retry runs the same start again, evicting the loaded model first, so it is permanent too.
+test('route: a load whose engine start throws is permanent', async () => {
+  const primary = {
+    status: (): Status => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    load: async () => { throw new Error('no_such_model') },
+    target: () => null,
+    touch: () => {},
+  } as unknown as Manager
+
+  const result = await autoSwapRouter('mlx', fakeEntry('model-a'), primary).route('model-a')
+
+  assert.deepEqual(result, { status: 503, message: 'Engine start failed: no_such_model', permanent: true })
+})
+
 // A render that starts while the gateway loads into the primary: acquire force-stops the starting engine (Manager.load
 // then resolves with it stopped) and release() reloads that model, so the refusal clears by itself, as it does for a
 // pool slot. A load that failed on its own during the render ('error') is still permanent.
