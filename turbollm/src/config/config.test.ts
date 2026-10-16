@@ -12,7 +12,8 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import fs, { readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import {
   ANY_ENGINE,
@@ -719,6 +720,51 @@ test('ConfigStore.load: a UTF-8 BOM before the JSON is ignored, not treated as a
     assert.equal(store.brokenBackup(), '', 'no .broken-* backup may be written')
     assert.deepEqual(store.snapshot().modelDirs, ['/models/bom-test'])
   } finally {
+    cleanup(path)
+  }
+})
+
+// Every process that loads the config saves it (load() persists its migration), so
+// `turbollm --stop` and a refused second start write the running daemon's config.json too. With
+// one shared `config.json.tmp`, such a load landing between a daemon save's write and its rename
+// overwrote the daemon's tmp with its own snapshot and renamed it away: the daemon's rename then
+// threw ENOENT and its change never reached disk.
+test("ConfigStore: another process's load during a save leaves that save's tmp file alone", (t) => {
+  const path = tmpConfigPath()
+  const realRename = fs.renameSync
+  const realPid = process.pid
+  const setPid = (pid: number) =>
+    Object.defineProperty(process, 'pid', { value: pid, writable: false, enumerable: true, configurable: true })
+  try {
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    const daemon = ConfigStore.load(path)
+    let interleaved = false
+    t.mock.method(fs, 'renameSync', (from: string, to: string) => {
+      if (!interleaved) {
+        // The daemon's tmp is written, its rename not yet done: `turbollm --stop` loads now.
+        interleaved = true
+        setPid(realPid + 1)
+        try {
+          ConfigStore.load(path)
+        } finally {
+          setPid(realPid)
+        }
+      }
+      return realRename(from, to)
+    })
+    syncBuiltinESMExports()
+
+    daemon.update((c) => {
+      c.modelDirs = ['/models/saved-by-daemon']
+    })
+
+    assert.equal(interleaved, true)
+    assert.deepEqual((JSON.parse(readFileSync(path, 'utf8')) as Config).modelDirs, ['/models/saved-by-daemon'])
+    assert.deepEqual(readdirSync(join(path, '..')).filter((n) => n.endsWith('.tmp')), [], 'no tmp file left behind')
+  } finally {
+    setPid(realPid)
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
     cleanup(path)
   }
 })

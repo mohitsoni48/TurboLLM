@@ -3,7 +3,7 @@
 // so no locking is needed. Unknown JSON fields ride along on `data` and are
 // preserved across round-trips for free.
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
@@ -848,9 +848,20 @@ export class ConfigStore {
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    const tmp = `${this.filePath}.tmp`
+    // A tmp file of this process's own. Every process that loads the config saves it (load()
+    // persists its migration), so `turbollm --stop` or a refused second start writes the RUNNING
+    // daemon's config.json too; with one shared `config.json.tmp`, a Settings save interleaving
+    // with that had its tmp overwritten with the other process's older snapshot (which then
+    // became config.json), or found it already renamed away and threw ENOENT.
+    const tmp = `${this.filePath}.${process.pid}.tmp`
     writeFileSync(tmp, JSON.stringify(this.data, null, 2))
-    renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    try {
+      renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    } catch (e) {
+      // Per-process names are never overwritten by a later save: don't leave this one behind.
+      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
+      throw e
+    }
   }
 }
 
