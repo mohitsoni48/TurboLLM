@@ -302,3 +302,14 @@ describe('SettingsScreen — open LAN access', () => {
     expect(screen.getAllByText(/any website opened in a browser on it,\s+can use this TurboLLM with no\s+key/)).toHaveLength(2)
   })
 })
+
+describe('SettingsScreen — LAN access with a key required', () => {
+  // The nav has had no Developer screen for a while; the API keys panel is on Customize's Connect tab.
+  it('with no key yet, points to Customize → Connect → API keys, not the Developer screen', async () => {
+    state.settings = mk({ lanBind: true, requireApiKey: true })
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /Network/ }))
+    expect(screen.getByText('Customize → Connect → API keys')).toBeTruthy()
+    expect(screen.queryByText('Developer')).toBeNull()
+  })
+})

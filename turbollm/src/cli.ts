@@ -1124,7 +1124,7 @@ function listen(attempt = 0): void {
         console.log(`  SAVE IT NOW — it is shown once and cannot be recovered.`)
         console.log(`  Send it as 'X-TurboLLM-Auth: <key>' (or 'Authorization:`)
         console.log(`  Bearer <key>'), or paste it into the web UI. Manage or`)
-        console.log(`  revoke it later under Developer -> API Keys.`)
+        console.log(`  revoke it later under Customize -> Connect -> API keys.`)
         console.log(`  ============================================================`)
         console.log(``)
       }

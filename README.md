@@ -342,7 +342,7 @@ there. Entirely local; nothing leaves your machine.
 - **Expose it to other tools over MCP** — `turbollm mcp-server` runs a stdio MCP server so any
   MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
   delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
-  in the Developer tab.
+  under Customize → Connect.
 - **Or run Claude Code, `pi` or `opencode` itself, inside Code** — set Settings → Code agent and a session
   opens the real CLI in a full-screen terminal, on your local model, in your project folder. The
   model picker, context ring, thinking-budget slider and stats row stay right where they are: the
@@ -600,8 +600,8 @@ Other coding CLIs work too — `turbollm launch opencode`, `turbollm launch kilo
 be parsed, TurboLLM refuses to overwrite it and prints how to add the provider by hand.
 `turbollm launch hermes` does the equivalent for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 via its own `hermes config set` command (its config is YAML, so we drive its CLI instead of
-hand-editing that file). The in-app **Developer** screen also shows copy-paste snippets for
-any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
+hand-editing that file). The in-app **Customize → Connect** tab also shows copy-paste snippets
+for any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
 
 ---
 
@@ -617,11 +617,11 @@ turbollm --addr 0.0.0.0:6996    # bind all interfaces, then open http://<your-ip
 
 Other devices need an API key: it is required by default on any address other than loopback.
 On the first such start with no key yet, one is generated and printed once in the startup
-banner; otherwise create one under **Developer → API keys** on the host machine. Paste it when
-the other device asks. To let any device on your network in without a key, turn on **Expose on
-local network (LAN)** in Settings → Network & sharing, then turn **Require an API key** off there.
-Any website opened in a browser on that network can then use it without a key too (through DNS
-rebinding).
+banner; otherwise create one under **Customize → Connect → API keys** on the host machine.
+Paste it when the other device asks. To let any device on your network in without a key, turn on
+**Expose on local network (LAN)** in Settings → Network & sharing, then turn
+**Require an API key** off there. Any website opened in a browser on that network can then use
+it without a key too (through DNS rebinding).
 
 ---
 
@@ -807,7 +807,7 @@ docker compose -f docker-compose-nvidia.yaml logs | grep 'Token:'   # or docker-
 Grab the value after `Token:` and either paste it into the web UI's login prompt, or send
 it yourself as `X-TurboLLM-Auth: <key>` (or `Authorization: Bearer <key>`). Each restart
 mints a new one, so re-run the command above after a restart rather than reusing an old
-value — old keys keep working too and can be revoked from Developer → API Keys once
+value — old keys keep working too and can be revoked from Customize → Connect → API keys once
 you're in.
 
 ---

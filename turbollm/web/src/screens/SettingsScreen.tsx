@@ -1172,8 +1172,8 @@ function NetworkSection({
                   {!hasApiKey && (
                     <>
                       {' '}
-                      No API key exists yet — create one on the{' '}
-                      <span className="font-medium text-ink">Developer</span> screen.
+                      No API key exists yet — create one under{' '}
+                      <span className="font-medium text-ink">Customize → Connect → API keys</span>.
                     </>
                   )}
                 </>
