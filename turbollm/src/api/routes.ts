@@ -531,6 +531,9 @@ export function registerApi(app: Hono, d: Deps): void {
   app.delete('/api/v1/engines/backends/:id', async (c) => {
     const def = availableBackends().find((x) => x.id === c.req.param('id'))
     if (!def) return err(c, 400, 'invalid_config_value', 'Unknown backend for this platform.')
+    // Never under an update or download (see DELETE /engines/:id): an update of this backend would register the build
+    // it swaps in again right after the delete.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     // Tag-agnostic: unregister + delete EVERY build of this backend (an update may have left
     // more than one tag-keyed dir / registry entry). Stop first if the active engine is one of them.
@@ -1319,6 +1322,11 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
     const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
+    // Not while an update, download, upload or rebuild runs, like DELETE /engines/:id below (an Enable is the undo of
+    // a Disable, refused then too). A Disabled source-built card's Delete re-registers the engine here and only then
+    // purges it: with this open, a build or another tab's zip upload left the engine registered (Enabled) again and
+    // the purge refused, the opposite of the Delete the user asked for.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Provenance comes from the marker this flow wrote on disk, never from the request body.
     const release = readReleaseMarker(sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines')))
     // A release install is identified by its marker, never by a source repo (ADR-088, ADR-388):
@@ -1689,6 +1697,12 @@ export function registerApi(app: Hono, d: Deps): void {
     if (target && engineDeleteBlocked(d, target)) {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
+    // Not while an update, download, upload or rebuild runs (a second tab, an API client, or the auto-update scheduler
+    // starting while the confirm dialog was open; the Engines screen does not disable Purge during a rebuild). A purge
+    // under an update made its swap hit a missing folder and report "your existing build is unchanged" while leaving
+    // an orphan folder; under a rebuild it deleted build/<slug> but not the parked previous build, which the failing
+    // build then moved back; a removed engine was registered again when the update finished.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const purge = c.req.query('purge') === '1'
     // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
     // added before customEngineSources tracking existed has no recorded identity, so a plain
