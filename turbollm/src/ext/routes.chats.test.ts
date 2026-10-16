@@ -587,6 +587,39 @@ test('GET /audit `since` is compared as an instant, whatever ISO form it is writ
   }
 })
 
+// `since` went through a bare Date.parse, which also takes V8's legacy formats: '1' and 'foo 1'
+// both read as 2001-01-01 and returned every row since then instead of the documented 400.
+test('GET /audit refuses a `since` that is not in ISO 8601 extended format', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'A', owner: 'u1' }))
+    const get = async (since: string) => {
+      const res = await app.request(`/api/ext/v1/audit?owner=u1&since=${encodeURIComponent(since)}`, { headers: { Authorization: ACME } })
+      return { status: res.status, body: await res.json() as { data?: unknown[]; error?: { code: string; param?: string } } }
+    }
+    for (const since of [
+      '1', 'foo 1', '10/15/2026', 'Thu, 15 Oct 2026 10:00:00 GMT', '2026-10-15 10:00:00', '2026-10-15T10:00:00+0200',
+      '20261015T100000Z', '+002026-10-15', '2026-10T10:00Z', '2026-02-30', '2026-13-01', '0001-02-29',
+    ]) {
+      const r = await get(since)
+      assert.equal(r.status, 400, since)
+      assert.equal(r.body.error?.code, 'invalid_input', since)
+    }
+    // Every ISO 8601 extended form still works: a year or month alone, a date, minutes only, a long
+    // fraction, local time, a lowercase t/z (RFC 3339), a leap day in year 0.
+    for (const since of [
+      '1970', '1970-01', '1970-01-01', '1970-01-01T00:00Z', '1970-01-01T00:00:00.123456Z', '1970-01-02T00:00:00',
+      '1970-01-01t00:00z', '2026-02-28', '0000-02-29',
+    ]) {
+      const r = await get(since)
+      assert.equal(r.status, 200, since)
+    }
+    assert.equal((await get('1970-01-01T00:00Z')).body.data?.length, 1)
+  } finally {
+    cleanup()
+  }
+})
+
 test('a rate-limited mutation (the blanket per-tenant budget) still produces an audit row', async () => {
   const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
   const { app, db, cleanup } = harness(ext)

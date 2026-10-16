@@ -60,6 +60,28 @@ function hasActiveRun(runs: PublicRunManager | undefined, scope: Scope, chatId: 
   return runs.isChatActive(scope, chatId)
 }
 
+/** ISO 8601 extended format: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, and after a full date optionally
+ *  `THH:mm[:ss[.fraction]]` with `Z` or `±HH:mm`. `t` and `z` may be lowercase, as RFC 3339 allows. */
+const ISO_8601 = /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?)?)?$/i
+
+/** GET /audit's `since` as epoch ms, or NaN when it is not in the ISO 8601 extended format above.
+ *  A bare Date.parse also takes V8's legacy formats: `since=1` or `since=foo 1` read as 2001-01-01
+ *  and returned every row from 2001 on instead of the documented 400. The form is checked first,
+ *  and Date.parse then reads it as before (a date-time with neither Z nor an offset in local time),
+ *  upper-cased so a lowercase `t`/`z` takes the standard path too. Date.parse rolls an impossible
+ *  day over ('2026-02-30' is 2 March), so the day is checked as well; setUTCFullYear, unlike
+ *  Date.UTC, keeps years 0-99 as they are. */
+function parseIsoInstant(v: string): number {
+  const m = ISO_8601.exec(v)
+  if (!m) return NaN
+  if (m[3] !== undefined) {
+    const d = new Date(0)
+    d.setUTCFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    if (d.getUTCDate() !== Number(m[3])) return NaN
+  }
+  return Date.parse(v.toUpperCase())
+}
+
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
  *  it (mount.ts always supplies a shared instance in production; only ad-hoc test harnesses
  *  omit it) keeps compiling and behaving exactly as before — a private, generously-capped
@@ -539,7 +561,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     const sinceParam = c.req.query('since') || undefined
     let since: string | undefined
     if (sinceParam !== undefined) {
-      const ms = Date.parse(sinceParam)
+      const ms = parseIsoInstant(sinceParam)
       if (Number.isNaN(ms)) {
         return extError(c, 'invalid_request', 'invalid_input', '`since` must be an ISO 8601 timestamp.', { param: 'since' })
       }
