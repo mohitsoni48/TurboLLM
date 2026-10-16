@@ -115,6 +115,10 @@ function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
 }
 
+/** The refusal for a caller failing hostGate that asks the request log for captured bodies —
+ *  see the request log's route comment. */
+const REQUEST_BODIES_HOST_ONLY = 'Captured prompts and responses can only be read on this machine or with a valid API key.'
+
 async function body<T>(c: Context): Promise<T> {
   try {
     return (await c.req.json()) as T
@@ -2317,7 +2321,12 @@ export function registerApi(app: Hono, d: Deps): void {
   // Chat) — LM Studio-style: params, timings, tokens, and (opt-in) full request/response
   // bodies. In-memory only (`RequestLog`, observability/request-log.ts); nothing here is ever
   // persisted or sent to telemetry. Same auth treatment as `/api/v1/engine/logs` above — no
-  // per-route middleware, covered by the global `lanAuth` mounted in server.ts.
+  // per-route middleware, covered by the global `lanAuth` mounted in server.ts — except the
+  // captured bodies, which carry hostGate (REQUEST_BODIES_HOST_ONLY): they hold Code sessions'
+  // and `turbollm launch` agents' full prompts (files the agent read, `.env` included, and tool
+  // output), which codeAuth keeps from a keyless Tailscale Serve identity, a verified Cloudflare
+  // Access JWT and an open-LAN peer. lanAuth admits all three, so with capture on they read
+  // every agent turn through `?bodies=1` and `/:id` while `/api/v1/code/*` refused them.
   //
   // `/stream` is registered BEFORE `/:id` so it can never be shadowed by the param route —
   // Hono resolves a literal segment over a param one regardless of registration order, but
@@ -2358,6 +2367,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // rendering hundreds of entries has no business pulling every captured prompt/response
     // over the wire just to show a time/status/tokens table.
     const bodies = q.bodies === '1' || q.bodies === 'true'
+    if (bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entries: d.requestLog.list({ limit, since, source, modelKey: q.model, status, bodies }) })
   })
 
@@ -2365,6 +2375,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!d.requestLog) return err(c, 404, 'not_found', 'No request log entry with that id.')
     const entry = d.requestLog.get(c.req.param('id'))
     if (!entry) return err(c, 404, 'not_found', 'No request log entry with that id.')
+    // An entry without bodies is what the list already shows; the detail drawer falls back to
+    // the row's own copy on a refusal.
+    if (entry.bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entry })
   })
 
@@ -2880,9 +2893,10 @@ export function registerApi(app: Hono, d: Deps): void {
     // swap the tunnel/ngrok tokens or the Access team/aud (a new team/aud takes effect at once on
     // a running named tunnel, so whoever set it signs their own JWTs from then on, even after
     // requireApiKey is back on), widen the remote token grant, set every tool to allow, put a
-    // directory of their own first on the build PATH, or replace the stored HF/GitHub/search
-    // credentials. Judged on the outcome rather than on which fields the body names: the change
-    // is applied to a copy first, so the served UI's own Save, which echoes
+    // directory of their own first on the build PATH, replace the stored HF/GitHub/search
+    // credentials, or switch on request-body capture to record the host's Code prompts (or
+    // switch the request log off). Judged on the outcome rather than on which fields the body
+    // names: the change is applied to a copy first, so the served UI's own Save, which echoes
     // lanBind/requireApiKey/port unchanged with every general setting, still works.
     if (!hostGate(c, d)) {
       const now = d.store.snapshot()
@@ -3527,6 +3541,11 @@ function hostOnlySettingChanged(before: Config, after: Config): string | null {
     ['build.toolchainDirs', (c) => c.build.toolchainDirs],
     ['toolPolicies', (c) => c.tools.toolPolicies],
     ['autoAllowAll', (c) => c.tools.autoAllowAll],
+    // Body capture records Code sessions' and `turbollm launch` agents' full prompts, which only
+    // a hostGate caller may read back (REQUEST_BODIES_HOST_ONLY); switching it on from here was
+    // the way to start that capture. Turning the log off hides from the owner what was sent.
+    ['requestLog.enabled', (c) => c.requestLog.enabled],
+    ['requestLog.captureBodies', (c) => c.requestLog.captureBodies],
     ['hfToken', (c) => c.hf.token],
     ['ghToken', (c) => c.gh?.token ?? ''],
     // Field by field: the handler creates an empty `search` block on every save.

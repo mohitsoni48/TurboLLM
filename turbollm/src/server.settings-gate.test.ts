@@ -4,11 +4,14 @@
 // turn requireApiKey off, turn lanBind on, or rewrite the remote-access block (tunnel tokens,
 // Access team/aud, the remote token grant), while /api/v1/keys and /api/v1/remote/* refused them.
 // The tool-call approve route's "Always Allow" writes the same toolPolicies, so it is tried too.
+// So is the request log: its captured bodies hold the host's Code prompts, which codeAuth keeps
+// from all three, and they could switch capture on here and read it back.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto'
 import { createApp } from './server'
 import { hashKey } from './auth'
+import { RequestLog } from './observability/request-log'
 import { defaultConfig, type Config } from './config/config'
 import type { Deps } from './deps'
 import { tmpDir } from './test-support/tmp'
@@ -16,12 +19,21 @@ import { tmpDir } from './test-support/tmp'
 const INGRESS_PORT = 6997
 const SERVE_HOST = 'box.tail1234.ts.net'
 const RAW_KEY = 'tllm-settingsgatesettingsgatesettingsgat1'
+const AGENT_SECRET = 'AWS_SECRET_ACCESS_KEY=settings-gate-secret'
 
 function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Config } {
   const cfg = defaultConfig()
   cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(RAW_KEY), prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null })
   mutate(cfg)
   const dir = tmpDir('settings-gate-')
+  // One Code turn captured with its bodies, as the gateway logs it with capture on.
+  const requestLog = new RequestLog()
+  const id = requestLog.start({
+    source: 'anthropic', harness: 'claude_code', codeSessionId: 's1', modelKey: 'qwen3-8b', remote: null, stream: true,
+    params: {}, counts: { messages: 2, tools: 1, systemChars: 0 },
+    requestBody: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'tool_result', content: `cat .env\n${AGENT_SECRET}` }] }] }),
+  })
+  requestLog.finalize(id, { status: 200, responseBody: '{"content":"done"}' })
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
@@ -34,6 +46,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Confi
       url: () => `https://${SERVE_HOST}`,
       state: () => ({ kind: 'connected' }),
     },
+    requestLog,
   } as unknown as Deps
   return { d, cfg }
 }
@@ -78,7 +91,15 @@ function echo(cfg: Config) {
     tavilyApiKey: '',
     search: {},
     build: { toolchainDirs: cfg.build.toolchainDirs },
+    requestLog: { enabled: cfg.requestLog.enabled, captureBodies: cfg.requestLog.captureBodies },
   }
+}
+
+/** The captured Code turn's bodies: what GET /api/v1/requests/:id answers this caller. */
+async function readBodies(d: Deps, socket: Socket, headers: Record<string, string>) {
+  const [{ id }] = d.requestLog!.list()
+  const res = await send(d, socket, headers, 'GET', `/api/v1/requests/${id}`, undefined)
+  return { status: res.status, text: await res.text() }
 }
 
 /** Each flips or replaces the stored value. Either way round for the two toggles: turning the
@@ -103,6 +124,9 @@ const HOST_ONLY: [string, (cfg: Config) => unknown][] = [
   ['search.tavilyApiKey', () => ({ tavilyApiKey: 'tvly-attacker' })], // the legacy top-level alias
   ['search.kagiApiKey', () => ({ search: { kagiApiKey: 'kagi-attacker' } })],
   ['search.searxngUrl', () => ({ search: { provider: 'searxng', searxngUrl: 'https://evil.example' } })],
+  // Capture on records the host's Code prompts for the caller to read; the log off blinds the owner.
+  ['requestLog.captureBodies', (cfg) => ({ requestLog: { captureBodies: !cfg.requestLog.captureBodies } })],
+  ['requestLog.enabled', (cfg) => ({ requestLog: { enabled: !cfg.requestLog.enabled } })],
 ]
 
 /** Every host-only change is refused (and nothing changes); a cosmetic one and an echo are not. */
@@ -123,6 +147,17 @@ async function assertGated(d: Deps, cfg: Config, socket: Socket, headers: Record
   assert.match(((await always.json()) as { error: { message: string } }).error.message, /requires a valid API key/)
   assert.equal(JSON.stringify(cfg), saved, 'always_allow: nothing may be stored')
   assert.equal((await approve(d, socket, headers, 'allow_chat')).status, 404)
+  // Bodies already captured are host-only to read; the metadata list stays open.
+  const one = await readBodies(d, socket, headers)
+  assert.equal(one.status, 403, 'GET /requests/:id')
+  assert.doesNotMatch(one.text, /settings-gate-secret/)
+  const withBodies = await send(d, socket, headers, 'GET', '/api/v1/requests?bodies=1', undefined)
+  assert.equal(withBodies.status, 403, 'GET /requests?bodies=1')
+  assert.doesNotMatch(await withBodies.text(), /settings-gate-secret/)
+  const list = await send(d, socket, headers, 'GET', '/api/v1/requests', undefined)
+  assert.equal(list.status, 200)
+  const { entries } = (await list.json()) as { entries: { harness: string; bodies: unknown }[] }
+  assert.deepEqual(entries.map((e) => [e.harness, e.bodies]), [['claude_code', null]])
   const res = await patch(d, socket, headers, echo(cfg))
   assert.equal(res.status, 200, 'an unchanged echo of the host-only fields is no change')
   assert.equal(cfg.daemon.theme, 'dark')
@@ -139,6 +174,11 @@ test('a keyless Tailscale Serve identity cannot change requireApiKey, lanBind or
   assert.equal(cfg.daemon.requireApiKey, false)
   assert.equal((await approve(d, INGRESS, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, 'always_allow')).status, 404)
   assert.equal(cfg.tools.toolPolicies?.run_code, 'allow')
+  assert.equal((await patch(d, INGRESS, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, { requestLog: { captureBodies: true } })).status, 200)
+  assert.equal(cfg.requestLog.captureBodies, true)
+  const keyed = await readBodies(d, INGRESS, { ...serve, 'X-TurboLLM-Auth': RAW_KEY })
+  assert.equal(keyed.status, 200)
+  assert.match(keyed.text, /settings-gate-secret/)
 })
 
 // Same RS256 machinery as auth.lanauth-composed.test.ts: a correctly signed assertion whose JWKS a
@@ -184,4 +224,12 @@ test('a keyless peer on an open LAN cannot change host-only settings; with a key
   assert.equal(cfg.daemon.requireApiKey, true)
   assert.equal((await approve(d, LOOPBACK, { Host: '127.0.0.1:6996' }, 'always_allow')).status, 404)
   assert.equal(cfg.tools.toolPolicies?.run_code, 'allow')
+  assert.equal((await patch(d, LOOPBACK, { Host: '127.0.0.1:6996' }, { requestLog: { captureBodies: true } })).status, 200)
+  assert.equal(cfg.requestLog.captureBodies, true)
+  const keyed = await readBodies(d, LAN, { ...lanHost, Authorization: `Bearer ${RAW_KEY}` })
+  assert.equal(keyed.status, 200)
+  assert.match(keyed.text, /settings-gate-secret/)
+  const host = await send(d, LOOPBACK, { Host: '127.0.0.1:6996' }, 'GET', '/api/v1/requests?bodies=1', undefined)
+  assert.equal(host.status, 200)
+  assert.match(await host.text(), /settings-gate-secret/)
 })
