@@ -180,6 +180,14 @@ test('GET /api/v1/connect/:cli: a cross-site request is refused before it can re
     assert.equal(res.status, 403, site)
   }
   assert.equal((await get('/api/v1/connect/flood-1', { 'Sec-Fetch-Site': 'cross-site' })).status, 403)
+  // The same requests carrying the UI's header (below): the cross-site check refuses them on its
+  // own. Without the header the later header check refuses them as well, so only these pin it.
+  for (const site of ['cross-site', 'same-site']) {
+    const res = await get('/api/v1/connect/claude-code', { 'Sec-Fetch-Site': site, 'X-TurboLLM-UI': '1' })
+    assert.equal(res.status, 403, `${site} with the UI header`)
+  }
+  // No Fetch Metadata, but a foreign Origin: the Origin half of the same check.
+  assert.equal((await get('/api/v1/connect/claude-code', { Origin: 'https://evil.example', 'X-TurboLLM-UI': '1' })).status, 403)
   // An <img> GET carries no Origin, and a browser sends no Fetch Metadata to some URLs that
   // still land on loopback with loopback trust: an old browser to 127.0.0.1, WebKit to
   // `localhost.` (its potentially-trustworthy check takes no trailing dot), any browser to a
