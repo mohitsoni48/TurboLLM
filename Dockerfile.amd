@@ -50,11 +50,13 @@ COPY --from=build /src/node_modules ./node_modules
 RUN mkdir -p /root/.turbollm/models
 # Define the model path
 # lanBind is seeded true to match the 0.0.0.0 bind the container always uses (see CMD
-# below), so Settings shows LAN access as on and an in-place rebind (a port change in
-# Settings, src/cli.ts) keeps 0.0.0.0. With it false, a rebind (turning LAN off, or a port
-# change) moves the listener to 127.0.0.1 and the published port stops answering until the
-# next container start. Key enforcement does not depend on it: src/auth.ts's isLanExposed()
-# follows the address actually bound, so --addr 0.0.0.0 alone already requires the API key.
+# below), so Settings shows LAN access as on. Turning it off there re-binds the listener in
+# place to 127.0.0.1 (src/cli.ts), and the published port stops answering until the next
+# container start. A port change in Settings keeps 0.0.0.0, whatever lanBind says, but moves
+# the listener, and the page with it, to a port this container does not publish, so that
+# too stops answering until the next start, when CMD's --addr puts it back on 6996. Key
+# enforcement does not depend on lanBind: src/auth.ts's isLanExposed() follows the address
+# actually bound, so --addr 0.0.0.0 alone already requires the API key.
 RUN echo '{ \
       "modelDirs": [ \
         "/root/.turbollm/models" \
