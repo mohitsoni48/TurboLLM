@@ -1700,6 +1700,15 @@ export function registerApi(app: Hono, d: Deps): void {
   app.put('/api/v1/engines/:id', async (c) => {
     const b = await body<{ name?: string; sourceRepo?: string; sourceBranch?: string }>(c)
     const id = c.req.param('id')
+    // The source repo and branch are what the owner's next Rebuild clones and compiles: the update
+    // check compares that repo's head with the build and offers Rebuild, and its one click runs
+    // /build/run with them. So setting either is a host-side action, held to /build/run's own
+    // isLocalOrAuthenticated rule (ADR-394); without it a keyless Serve identity, Access JWT or
+    // open-LAN peer, refused /build/run itself, picked the repo the owner then built. Checked before
+    // anything is written, so a rename sent alongside is refused too. A rename alone stays open:
+    // the name is a label and executes nothing.
+    if ((b.sourceRepo !== undefined || b.sourceBranch !== undefined) && !isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', "Setting an engine's source repo requires a valid API key from a non-host device.")
     try {
       // Source-repo provenance (ADR-088): a user can attach the GitHub repo an existing
       // build came from so TurboLLM can detect "newer source available → rebuild". Set
