@@ -59,7 +59,7 @@ import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releas
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
-import { registerTerminalWs, closeTerminalSockets } from './terminal/terminal-routes'
+import { registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost } from './net'
@@ -876,6 +876,9 @@ function onRemoteState(s: RemoteState): void {
       state: s.kind,
     })
   }
+  // A terminal WebSocket that came over remote access outlives the ingress: once Stop (or a give-up)
+  // has taken the ingress down, drop it (see the function). A reconnect keeps the ingress up.
+  dropStaleTerminalSockets(deps)
   if (s.kind !== 'connected') return
   // cloudflared's local leg targets the INGRESS server, not the main one (Phase 1 Task 3's fix
   // round). A fresh server instance only appears after a disable()+enable() cycle — a
@@ -1087,6 +1090,9 @@ function listen(attempt = 0): void {
     // (initial, retry, rebind, revert), before this listener serves its first request.
     deps.bindHost = host
     deps.bindPort = info.port
+    // A terminal WebSocket from another machine outlives the listener it came in on: after LAN
+    // access is turned off, drop it once this bind is no longer LAN-exposed (see the function).
+    dropStaleTerminalSockets(deps)
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
     const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
 

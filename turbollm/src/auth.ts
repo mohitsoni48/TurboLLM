@@ -38,6 +38,11 @@ import { tailscaleIdentity } from './remote/identity'
  *  (IPv4, IPv6, and the IPv4-mapped-IPv6 form Windows/dual-stack sockets report). */
 const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1'])
 
+/** Is this a socket peer address on this machine's loopback, by the same rule as every gate here? */
+export function isLoopbackAddress(addr: string | undefined): boolean {
+  return !!addr && LOOPBACK.has(addr)
+}
+
 /** SHA-256 hex of the presented key — the SAME derivation used when keys are
  *  created (generateApiKey below). Stored config holds only this hash. Exported so the
  *  external API's auth path (ext/auth.ts) hashes a presented key with the IDENTICAL
@@ -758,6 +763,14 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean 
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   touchLastUsed(d, match)
   return true
+}
+
+/** Would {@link verifyKeyValue} (no `ingress` flag) still accept the key whose hash this is? For a
+ *  credential checked once and then held open (a Code terminal's WebSocket), so it can be dropped
+ *  once its key is revoked. No lastUsedAt bump: nothing is being used. */
+export function keyHashStillAccepted(hash: string, d: Deps): boolean {
+  const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
+  return !!match && !isFacadeOnlyKey(match)
 }
 
 /** Checks the presented key (any of the accepted headers, see presentedKey) against stored API

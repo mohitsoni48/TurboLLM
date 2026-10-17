@@ -14,7 +14,7 @@ import { test } from 'node:test'
 import http from 'node:http'
 import { createRequire } from 'node:module'
 import type { AddressInfo } from 'node:net'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets } from './terminal-routes'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
 import { TerminalManager } from './terminal-manager'
 import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
@@ -442,5 +442,125 @@ test('a terminal WebSocket handshake from another site needs a key; the app\'s o
     assert.equal(await handshake({ Origin: 'https://evil.example' }, `&key=${raw}`), 'open')
   } finally {
     server.close()
+  }
+})
+
+// ── An open terminal WebSocket whose way in is gone ─────────────────────────────────────────
+// The key and address checks run only at the handshake, and an upgraded socket is no HTTP
+// connection a listener's closeAllConnections() or close() ends: a LAN peer kept its shell after
+// LAN access was turned off, a remote client after remote access was stopped, and anyone after
+// the key that let them in was revoked.
+
+const STALE_RAW_A = 'tllm-stalesocketsAstalesocketsAstalesock1'
+const STALE_RAW_B = 'tllm-stalesocketsBstalesocketsBstalesock1'
+
+/** A live terminal (no PTY: the handshake only asks the manager these), a real key store and a
+ *  real listener, with `open` connecting a terminal WebSocket to it. */
+async function staleHarness(t: import('node:test').TestContext, opts: { listenHost?: string; ingress?: boolean } = {}) {
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const cfg = {
+    daemon: { port: 6996, lanBind: false },
+    apiKeys: [STALE_RAW_A, STALE_RAW_B].map((raw, i) => ({ id: `k${i}`, name: `key-${i}`, hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null })),
+  }
+  const server = http.createServer((_req, res) => res.end())
+  let ingressPort: number | undefined
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
+    remote: { ingressPort: () => ingressPort },
+    bindHost: opts.listenHost ?? '127.0.0.1',
+  } as unknown as Deps & { bindHost: string }
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, opts.listenHost ?? '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  if (opts.ingress) ingressPort = port
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const clients: Array<{ terminate(): void }> = []
+  /** Opens a terminal WebSocket; resolves with a probe for whether it is still open. */
+  const open = async (o: { key?: string; headers?: Record<string, string>; localAddress?: string } = {}) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/code/terminal/ws?terminalId=t1${o.key ? `&key=${o.key}` : ''}`, { headers: o.headers ?? {}, localAddress: o.localAddress })
+    clients.push(ws)
+    let closed = false
+    ws.on('close', () => { closed = true })
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+    return { closed: () => closed }
+  }
+  const settle = async (probe: () => boolean) => {
+    for (let i = 0; i < 100 && !probe(); i++) await new Promise((r) => setTimeout(r, 10))
+  }
+  /** Long enough for a terminate() to reach the client, for a check that nothing was closed. */
+  const pause = () => new Promise((r) => setTimeout(r, 100))
+  return {
+    cfg, d, open, settle, pause,
+    setIngressPort: (p: number | undefined) => { ingressPort = p },
+    cleanup: () => { for (const c of clients) c.terminate(); server.close() },
+  }
+}
+
+// 127.0.0.2 is this machine too, but not one of the loopback addresses the gates trust, so a
+// socket from it is judged exactly like a LAN peer's (Linux routes all of 127/8 to loopback).
+test('dropStaleTerminalSockets: a LAN peer\'s terminal is dropped once LAN access is off; the host\'s own stays', { skip: (!isTerminalBackendAvailable() && 'node-pty not installed') || (process.platform !== 'linux' && '127.0.0.2 is not loopback here') }, async (t) => {
+  const h = await staleHarness(t, { listenHost: '0.0.0.0' })
+  try {
+    h.cfg.daemon.lanBind = true
+    const lan = await h.open({ key: STALE_RAW_A, localAddress: '127.0.0.2' })
+    const host = await h.open()
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(lan.closed() || host.closed(), false, 'LAN access still on: nothing is dropped')
+    // LAN access off: the rebind's new listener is loopback-only.
+    h.cfg.daemon.lanBind = false
+    ;(h.d as { bindHost: string }).bindHost = '127.0.0.1'
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(lan.closed)
+    assert.equal(lan.closed(), true, 'the LAN peer\'s shell is closed')
+    assert.equal(host.closed(), false, 'the host\'s own terminal stays open')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('dropStaleTerminalSockets: a terminal that came over remote access is dropped once the ingress is down', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  const h = await staleHarness(t, { ingress: true })
+  try {
+    // Through the ingress nothing is local, so it needed a key.
+    const remote = await h.open({ key: STALE_RAW_A })
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(remote.closed(), false, 'remote access still up: nothing is dropped')
+    h.setIngressPort(undefined) // Stop: the ingress listener is closed
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(remote.closed)
+    assert.equal(remote.closed(), true)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('dropStaleTerminalSockets: a terminal let in on a key is dropped once that key is revoked; the others stay', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  const h = await staleHarness(t)
+  try {
+    // A handshake from another site's page needs a key even on loopback (isLocalUpgrade).
+    const crossSite = { Origin: 'https://evil.example' }
+    const withA = await h.open({ key: STALE_RAW_A, headers: crossSite })
+    const withB = await h.open({ key: STALE_RAW_B, headers: crossSite })
+    const local = await h.open({ key: STALE_RAW_A }) // local: the key it also sent is not what let it in
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(withA.closed() || withB.closed() || local.closed(), false, 'no key revoked: nothing is dropped')
+    h.cfg.apiKeys = h.cfg.apiKeys.filter((k) => k.id !== 'k0')
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(withA.closed)
+    assert.equal(withA.closed(), true, 'the terminal opened with the revoked key is closed')
+    assert.equal(withB.closed(), false)
+    assert.equal(local.closed(), false)
+    // A key turned into a link grant is no key here either (verifyKeyValue refuses it).
+    ;(h.cfg.apiKeys[0] as { grant?: unknown }).grant = { kind: 'link', capabilities: ['models:use'] }
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(withB.closed)
+    assert.equal(withB.closed(), true)
+  } finally {
+    h.cleanup()
   }
 })

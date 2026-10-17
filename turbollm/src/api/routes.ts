@@ -20,7 +20,7 @@ import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
-import { isTerminalBackendAvailable } from '../terminal/terminal-routes'
+import { dropStaleTerminalSockets, isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
   LLAMA_BUILD,
   availableBackends,
@@ -3397,6 +3397,8 @@ export function registerApi(app: Hono, d: Deps): void {
     d.store.update((cfg) => {
       cfg.apiKeys = cfg.apiKeys.filter((k) => k.id !== id)
     })
+    // A Code terminal opened with this key was checked only at its handshake: close it too.
+    dropStaleTerminalSockets(d)
     return c.json({ ok: true })
   })
 
@@ -3442,6 +3444,8 @@ export function registerApi(app: Hono, d: Deps): void {
         cfgMut.apiKeys = cfgMut.apiKeys.filter((k) => k.name !== keyName)
         cfgMut.apiKeys.push(fresh)
       })
+      // The replaced key is revoked: a Code terminal opened with it closes (see DELETE /keys/:id).
+      dropStaleTerminalSockets(d)
       apiKey = full
     }
 

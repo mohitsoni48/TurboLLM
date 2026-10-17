@@ -88,6 +88,7 @@ function bootDaemon(config: Config, args: string[]): Daemon {
     }),
     writePidfile: () => {},
     releaseDataDirClaim: () => {},
+    dropStaleTerminalSockets: () => {},
     console: {
       log: (...a: unknown[]) => logs.push(a.join(' ')),
       warn: (...a: unknown[]) => logs.push(a.join(' ')),

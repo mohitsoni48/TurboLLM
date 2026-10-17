@@ -23,7 +23,7 @@ import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
 import { existsSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { isLocalUpgrade, verifyKeyValue } from '../auth'
+import { hashKey, isLanExposed, isLocalUpgrade, isLoopbackAddress, keyHashStillAccepted, verifyKeyValue } from '../auth'
 import { sessionAuth } from '../code/session-auth'
 import { claudePermissionModeChoices, permissionModeArgs } from './agent-modes'
 import { TerminalManager } from './terminal-manager'
@@ -535,8 +535,19 @@ interface WS {
 /** OPEN constant from ws library */
 const WS_OPEN = 1
 
-/** Every open terminal WebSocket, on any listener registerTerminalWs was given. */
-const openTerminalSockets = new Set<WS>()
+/** What let an open terminal WebSocket in, recorded at its handshake: the key and address checks
+ *  run only then, so dropStaleTerminalSockets re-checks these when one of them may have gone. */
+interface TerminalSocketBasis {
+  /** The remote-access ingress port it arrived on, when it came over remote access. */
+  ingressPort?: number
+  /** Its peer is on this machine's loopback. */
+  loopback: boolean
+  /** The hash of the key that let it in; unset for one let in as local (isLocalUpgrade). */
+  keyHash?: string
+}
+
+/** Every open terminal WebSocket, on any listener registerTerminalWs was given, with its basis. */
+const openTerminalSockets = new Map<WS, TerminalSocketBasis>()
 
 /** Drop every open Code-terminal WebSocket at once; the daemon's shutdown calls this beside
  *  closeAllConnections(). An upgraded socket is no longer one of the HTTP server's connections,
@@ -544,7 +555,35 @@ const openTerminalSockets = new Set<WS>()
  *  held the shutdown until its fallback timer, and `--stop` SIGKILLs at 10 s. terminate(), not
  *  close(): a close handshake waits on the peer (up to 30 s for one that went away). */
 export function closeTerminalSockets(): void {
-  for (const ws of openTerminalSockets) ws.terminate()
+  for (const ws of openTerminalSockets.keys()) ws.terminate()
+}
+
+/** Drop each open terminal WebSocket whose way in is gone, and return how many. The upgraded
+ *  socket is no HTTP connection, so neither a listener's closeAllConnections() nor its close()
+ *  ends it, and its key was checked only at the handshake. So a LAN peer kept its live shell after
+ *  LAN access was turned off (the rebind's old listener let go of everything else), a remote
+ *  client after remote access was stopped (the ingress's close() leaves the socket to the
+ *  provider's own connection), and anyone after the key that let them in was revoked. Gone:
+ *  - came over remote access, and that ingress is no longer up on its port;
+ *  - came from another machine on the main listener, and the daemon is no longer LAN-exposed
+ *    (isLanExposed, which follows the address really bound);
+ *  - was let in on a key that would no longer be accepted (keyHashStillAccepted).
+ *  The daemon calls this after every bind (cli.ts listen()), on every remote-access state change
+ *  (onRemoteState) and after a key is removed (DELETE /api/v1/keys/:id, Connect's re-mint). A
+ *  socket of this machine's own let in as local is never dropped. */
+export function dropStaleTerminalSockets(d: Deps): number {
+  let dropped = 0
+  for (const [ws, b] of openTerminalSockets) {
+    const gone =
+      (b.ingressPort !== undefined && d.remote?.ingressPort() !== b.ingressPort) ||
+      (b.ingressPort === undefined && !b.loopback && !isLanExposed(d)) ||
+      (b.keyHash !== undefined && !keyHashStillAccepted(b.keyHash, d))
+    if (!gone) continue
+    openTerminalSockets.delete(ws)
+    ws.terminate()
+    dropped++
+  }
+  return dropped
 }
 
 /**
@@ -575,7 +614,8 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
     // credential check either way). No CORS applies to a handshake, so isLocalUpgrade also
     // refuses loopback trust to one a browser sends from another site's page.
     const local = isLocalUpgrade(socket.remoteAddress, socket.localPort, request.headers, _d)
-    if (!local && !verifyKeyValue(url.searchParams.get('key') ?? '', _d)) {
+    const key = url.searchParams.get('key') ?? ''
+    if (!local && !verifyKeyValue(key, _d)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
       socket.destroy()
       return
@@ -583,11 +623,19 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
 
     const m = getManager(_d)
     if (!m.isActive(terminalId)) { socket.destroy(); return }
-    wss.handleUpgrade(request, socket, head, (ws: WS) => { wss.emit('connection', ws, request) })
+    const ingress = _d.remote?.ingressPort()
+    const basis: TerminalSocketBasis = {
+      ingressPort: ingress !== undefined && socket.localPort === ingress ? ingress : undefined,
+      loopback: isLoopbackAddress(socket.remoteAddress),
+      keyHash: local ? undefined : hashKey(key),
+    }
+    wss.handleUpgrade(request, socket, head, (ws: WS) => {
+      openTerminalSockets.set(ws, basis)
+      wss.emit('connection', ws, request)
+    })
   })
 
   wss.on('connection', (ws: WS, _request: import('http').IncomingMessage) => {
-    openTerminalSockets.add(ws)
     ws.on('close', () => { openTerminalSockets.delete(ws) })
     const url = new URL(_request.url ?? '', 'http://localhost')
     const terminalId = url.searchParams.get('terminalId') ?? ''

@@ -83,6 +83,19 @@ test('signal shutdown drops open connections before close() (an SSE stream other
   assert.ok(drop < signals.indexOf('server.close(() => process.exit(0))'))
 })
 
+// The behaviour itself is terminal-routes.test.ts's "dropStaleTerminalSockets" tests. A terminal
+// WebSocket is no HTTP connection a listener's close ends: a LAN peer's stayed after LAN access
+// was turned off, and a remote client's after remote access was stopped.
+test('every bind and every remote-access state change drop terminal WebSockets whose way in is gone', () => {
+  const listen = blockFrom(LISTEN)
+  const bound = listen.indexOf('deps.bindHost = host')
+  const drop = listen.indexOf('dropStaleTerminalSockets(deps)')
+  assert.ok(bound >= 0 && drop > bound, 'listen() must drop them after recording the address it bound (isLanExposed reads it)')
+  const onState = blockFrom('function onRemoteState(s: RemoteState): void {')
+  const remoteDrop = onState.indexOf('dropStaleTerminalSockets(deps)')
+  assert.ok(remoteDrop >= 0 && remoteDrop < onState.indexOf("if (s.kind !== 'connected') return"), 'onRemoteState must drop them for every state, Stop\'s off included')
+})
+
 // The behaviour itself is terminal-routes.test.ts's "closeTerminalSockets" test.
 test('signal shutdown and restart drop open terminal WebSockets before close() (one held it past --stop\'s 10 s)', () => {
   const signals = blockFrom(SIGNALS)
