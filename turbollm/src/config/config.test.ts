@@ -12,7 +12,7 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import fs, { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
@@ -899,6 +899,49 @@ test('ConfigStore.load: removes a tmp file a killed process left, not one a live
       [`config.json.${live}.tmp`, 'other.json.123.tmp', 'config.json.1e9.tmp'].sort(),
     )
   } finally {
+    cleanup(path)
+  }
+})
+
+// config.json holds the tunnel, HF and GitHub tokens, the search keys, MCP env values and API keys
+// of MCP servers, and link peer tokens. save() wrote its tmp file with the default mode and renamed
+// it into place, so under the usual umask 022 config.json was 0644 in a 0755 ~/.turbollm (macOS
+// home folders, older Debian/Ubuntu): readable by every other local account, the daemon running or
+// not. A user's chmod 600 was undone by the next save. The .broken-* backup is a full copy too.
+test('ConfigStore: config.json and its .broken-* backup are readable by their owner only', { skip: process.platform === 'win32' && 'no POSIX file modes' }, () => {
+  const path = tmpConfigPath()
+  const mode = (p: string) => statSync(p).mode & 0o777
+  const umask = process.umask(0o022)
+  try {
+    const store = ConfigStore.load(path)
+    assert.equal(mode(path), 0o600, 'a new config.json')
+    store.update((c) => { c.hf.token = 'hf_SECRET' })
+    assert.equal(mode(path), 0o600, 'after a save')
+
+    // An existing install's 0644 file is tightened at its next load, and a chmod back is undone.
+    chmodSync(path, 0o644)
+    const existing = ConfigStore.load(path)
+    assert.equal(mode(path), 0o600, 'an existing 0644 config.json, at the next load')
+    chmodSync(path, 0o644)
+    existing.update((c) => { c.gh.token = 'ghp_SECRET' })
+    assert.equal(mode(path), 0o600, 'at the next save')
+
+    // A tmp file under this process's pid an earlier process left (pid reuse after a kill: the
+    // sweep keeps a live pid's): its 0644 mode must not carry over into config.json.
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, '{}')
+    chmodSync(tmp, 0o644)
+    existing.update((c) => { c.hf.token = 'hf_SECRET2' })
+    assert.equal(mode(path), 0o600, "a leftover tmp of this pid's")
+
+    // An unparsable file is copied to .broken-<ts>, its tokens included.
+    writeFileSync(path, '{"hf": {"token": "hf_SECRET"')
+    const reset = ConfigStore.load(path)
+    assert.ok(reset.brokenBackup())
+    assert.equal(mode(reset.brokenBackup()), 0o600, 'the .broken-* backup')
+    assert.equal(mode(path), 0o600, 'the reset config.json')
+  } finally {
+    process.umask(umask)
     cleanup(path)
   }
 })

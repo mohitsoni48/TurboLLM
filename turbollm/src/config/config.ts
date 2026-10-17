@@ -817,6 +817,15 @@ export function configuredDaemonPort(configPath: string): number {
   return defaultConfig().daemon.port
 }
 
+/** The mode config.json, its save tmp and its .broken-* backup are created with: read and write
+ *  for the owner only. The file holds the tunnel, HF and GitHub tokens, the search keys, MCP env
+ *  values and API keys, and link peer tokens; written with the default mode it was 0644 under the
+ *  usual umask 022, and in a 0755 ~/.turbollm (macOS home folders, older Debian/Ubuntu, many
+ *  servers) every other local account could read them, the daemon running or not. Windows keeps
+ *  only the write bit of a mode, so the file stays writable there and the profile's ACLs protect
+ *  it as before. */
+const CONFIG_FILE_MODE = 0o600
+
 /** Remove the `<config>.<pid>.tmp` files (see ConfigStore.save) whose process is gone. A save
  *  writes the whole config, the HF and GitHub tokens and tunnel tokens included, to its tmp and
  *  then renames it into place; a process killed in between left it, and no later save overwrites
@@ -875,7 +884,8 @@ export class ConfigStore {
     } catch {
       const backup = `${path}.broken-${Math.floor(Date.now() / 1000)}`
       // The file's own bytes: a decoded copy of a file in another encoding mangles its non-ASCII text.
-      writeFileSync(backup, bytes)
+      // Owner-only like config.json: it is a full copy, tokens included.
+      writeFileSync(backup, bytes, { mode: CONFIG_FILE_MODE })
       const store = new ConfigStore(defaultConfig(), path, backup)
       store.save()
       return store
@@ -919,7 +929,13 @@ export class ConfigStore {
     // with that had its tmp overwritten with the other process's older snapshot (which then
     // became config.json), or found it already renamed away and threw ENOENT.
     const tmp = `${this.filePath}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2))
+    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after
+    // every save, and load() always saves, so an existing install's 0644 file is 0600 from its next
+    // start (or `turbollm --stop`) on, with no separate chmod. A mode applies only to a file
+    // the write creates, so one left under this pid (pid reuse after a kill; the sweep keeps a
+    // live pid's) is removed first rather than written through with its old mode.
+    rmSync(tmp, { force: true })
+    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
     try {
       renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
     } catch (e) {
