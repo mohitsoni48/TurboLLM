@@ -516,14 +516,14 @@ export class Manager {
    *  rejection). Bypasses forceStop()'s running/starting-only guard by calling the
    *  module-level forceKill directly, since by this point state is already 'stopping'. */
   private async waitForExit(exited: Promise<void>): Promise<void> {
-    const result = await Promise.race([exited.then(() => 'exited' as const), sleep(10_000).then(() => 'timeout' as const)])
+    const result = await exitedWithin(exited, 10_000)
     if (result === 'timeout' && this.child) {
       forceKill(this.child)
       // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
       // unbounded await here on an unkillable/zombie process would wedge this forever —
       // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
       // future load(), which is worse than the 'stuck at stopping' bug this replaced.
-      await Promise.race([exited, sleep(5_000)])
+      await exitedWithin(exited, 5_000)
     }
   }
 
@@ -1091,18 +1091,38 @@ export async function probeReady(port: number): Promise<boolean> {
 
 async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
   signalTerm(child)
-  const forced = sleep(8000).then(() => 'timeout' as const)
-  const result = await Promise.race([exited.then(() => 'exited' as const), forced])
+  const result = await exitedWithin(exited, 8000)
   if (result === 'timeout') {
     forceKill(child)
     await exited
   }
 }
 
+/** 'exited' once `exited` resolves, or 'timeout' after `ms`. The timer is cleared once the race is decided: a bare
+ *  sleep() left its ref'd timer running after a prompt exit, which held the event loop (a test file, a CLI run) open
+ *  for the rest of it. A prompt exit left two per stopAndWait(): gracefulStop's 8 s grace and waitForExit's 10 s. */
+async function exitedWithin(exited: Promise<void>, ms: number): Promise<'exited' | 'timeout'> {
+  let grace: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      exited.then(() => 'exited' as const),
+      new Promise<'timeout'>((resolve) => { grace = setTimeout(() => resolve('timeout'), ms) }),
+    ])
+  } finally {
+    clearTimeout(grace)
+  }
+}
+
 function signalTerm(child: ChildProcess): void {
   if (!child.pid) return
   if (process.platform === 'win32') {
-    execFile('taskkill', ['/PID', String(child.pid), '/T'], () => {})
+    // Force the tree at once. A plain `taskkill /PID <pid> /T` (no /F) only posts WM_CLOSE to the process's windows,
+    // and the engines are console programs with none (spawned windowsHide with piped stdio), so Windows refuses it
+    // ("This process can only be terminated forcefully (with /F option)") and every Stop, model swap, pool eviction
+    // and update stop sat out the whole 8 s grace in 'stopping', with every load queued behind the gate waiting too,
+    // before forceKill ended it anyway. llama-server, KoboldCpp and llamafile exit cleanly only on a console
+    // Ctrl+C, which taskkill never sends, so there is no gentler request to make from here.
+    forceKill(child)
   } else {
     child.kill('SIGTERM')
   }

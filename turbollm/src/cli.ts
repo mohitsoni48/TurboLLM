@@ -1383,10 +1383,11 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
     process.exit(plan.exitCode)
   }
   // Watchdog: if graceful teardown truly stalls, restart anyway. MUST exceed the
-  // engine's own force-kill window (gracefulStop force-kills llama-server after ~8s —
-  // on Windows the graceful taskkill is usually ignored, so a loaded model takes the
-  // full 8s to die). A shorter watchdog would force-exit mid-shutdown and ORPHAN the
-  // engine child (it holds GPU VRAM, so the restarted daemon then can't load a model).
+  // engine's own force-kill window (gracefulStop force-kills llama-server after ~8s
+  // when SIGTERM has not ended it; on Windows it force-kills at once, and waits the
+  // same 8s before killing again). A shorter watchdog would force-exit mid-shutdown
+  // and ORPHAN the engine child (it holds GPU VRAM, so the restarted daemon then can't
+  // load a model).
   // 14s clears the 8s kill and stays under the UI's 20s recovery give-up.
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
