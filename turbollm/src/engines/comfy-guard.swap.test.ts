@@ -232,16 +232,19 @@ function fakeLlamaEngine(dir: string, port: number) {
     registered.delete(engine.id)
     rmSync(bin)
   }
-  // What a release engine's update or a same-named zip re-upload can do: the id is kept, but the new build folder
-  // puts the binary at another path (Registry.refresh records it) and the old one is gone.
-  const moveBinary = () => {
-    const moved = join(dir, 'llama-server-new')
-    writeFileSync(moved, readFileSync(bin))
-    chmodSync(moved, 0o755)
-    registered.set(engine.id, { ...engine, binPath: moved })
+  // What a release engine's update, a same-named zip re-upload or a TurboQuant release with a new archive layout can
+  // do: the id is kept, but the new build folder puts the binary at another path (Registry.refresh or repairBinPath
+  // records it) and the old one is gone. `missing`: nothing is at the new path (yet).
+  const moved = join(dir, 'llama-server-new')
+  const moveBinary = (o: { missing?: boolean } = {}) => {
+    if (!o.missing) {
+      writeFileSync(moved, readFileSync(bin))
+      chmodSync(moved, 0o755)
+    }
+    registered.set(engine.id, { ...engine, binPath: moved, version: 'new build' })
     rmSync(bin)
   }
-  return { opts, registered, spawns, purge, moveBinary }
+  return { opts, registered, spawns, purge, moveBinary, moved }
 }
 
 test('an engine purged during a render: release does not start its missing binary, and the model stays unloaded', {
@@ -301,7 +304,9 @@ test('a paused load whose engine was purged during the render is not started, an
   assert.equal(e.spawns(), 0)
 })
 
-test('an engine updated to a binary at a new path during a render: release does not start the old, deleted binary', {
+// It used to be refused like a purged one, so the model stayed unloaded after the render, while an update that kept the
+// binary's path was reloaded.
+test('an engine updated to a binary at a new path during a render: release reloads the model on the new binary', {
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-moved-')
@@ -317,6 +322,57 @@ test('an engine updated to a binary at a new path during a render: release does 
 
   await guard.acquire()
   e.moveBinary()
+  await guard.release()
+
+  assert.equal(manager.status().state, 'running')
+  assert.equal(manager.status().model?.key, 'A')
+  assert.equal(manager.currentOpts()?.engine.binPath, e.moved, 'started from the new binary')
+  assert.equal(manager.currentOpts()?.engine.version, 'new build', 'with the engine as registered now')
+  assert.equal(e.spawns(), 2)
+  assert.equal(guard.isBlocked(), false)
+  assert.equal(guard.snapshot().suspendedModelKey, null)
+})
+
+test('a paused load whose engine moved to a new path during the render is started on the new binary', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-moved-paused-')
+  const e = fakeLlamaEngine(dir, await freePort())
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  guard.setEngineLookup((id) => e.registered.get(id))
+  t.after(() => guard.stop())
+  await guard.acquire()
+  await assert.rejects(manager.load(e.opts('B'), { beforeStart: () => guard.freeComfyUIBeforeLoad() }), /ComfyUI is rendering/)
+
+  e.moveBinary()
+  await guard.release()
+
+  assert.equal(manager.status().state, 'running')
+  assert.equal(manager.status().model?.key, 'B')
+  assert.equal(manager.currentOpts()?.engine.binPath, e.moved)
+  assert.equal(e.spawns(), 1)
+})
+
+test('an engine moved to a binary that is missing during a render: release does not start the old, deleted binary', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-moved-missing-')
+  const e = fakeLlamaEngine(dir, await freePort())
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  guard.setEngineLookup((id) => e.registered.get(id))
+  t.after(() => guard.stop())
+  await manager.load(e.opts('A'))
+
+  await guard.acquire()
+  e.moveBinary({ missing: true })
   await guard.release()
 
   assert.equal(manager.status().state, 'stopped', 'nothing was started')

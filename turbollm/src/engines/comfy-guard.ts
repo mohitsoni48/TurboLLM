@@ -24,6 +24,7 @@
 // evict the model's prompt cache — so before unloading we SAVE the slot-0 KV to disk (a
 // capped POST that never delays ComfyUI past the cap) and after the reload we RESTORE it,
 // turning the slow re-prefill of a long prefix into a cheap memcpy. See ./slot-cache.
+import { existsSync } from 'node:fs'
 import type { ConfigStore, Engine } from '../config/config'
 import type { Manager, StartOpts } from './manager'
 import { cacheEligible, restoreSlot, SAVE_CAP_MS, saveSlot, slotCacheDir, slotCacheKey, TTL_MS } from './slot-cache'
@@ -41,7 +42,8 @@ const FREE_TIMEOUT_MS = 10_000
  *  recognises it there to resume that load. */
 const LOAD_PAUSED = 'ComfyUI is rendering — model loading is paused until its queue finishes.'
 
-/** The refusal of a reload whose engine was unregistered or moved to another binary during the render (see reload()). */
+/** The refusal of a reload whose engine was unregistered, or moved to a binary that is missing, during the render (see
+ *  reload()). */
 const engineGone = (name: string): string =>
   `${name} was updated or removed while ComfyUI was rendering, so the model was not loaded again. Load it from Models.`
 
@@ -248,12 +250,13 @@ export class ComfyGuard {
       this.refuseLoadWhileHeld()
       // An engine update, delete or purge does not wait for a render (the model is already unloaded). A delete or
       // purge unregisters the engine, and so does an update that registers its new build under a new id (an official
-      // llama.cpp backend); a purge and that update also delete its files. A release engine's update and a same-named
-      // zip re-upload keep the id but swap in a new build folder whose binary can be at another path (Registry.refresh
-      // records it). Starting the old opts then ran a binary that no longer exists (engine_spawn_failed, ENOENT). The
-      // model stays unloaded instead, as an update leaves a running model it stops; a paused load keeps this as its
-      // error. An update that replaces the binary at the same path (TurboQuant, KoboldCpp, llamafile, the pip engines,
-      // a re-upload of the same layout) is reloaded as before.
+      // llama.cpp backend); a purge and that update also delete its files. Starting the old opts then ran a binary that
+      // no longer exists (engine_spawn_failed, ENOENT). The model stays unloaded instead, as an update leaves a running
+      // model it stops; a paused load keeps this as its error. An update that keeps the id reloads the model: at the
+      // same path (KoboldCpp, llamafile, the pip engines, TurboQuant or a re-upload whose layout is unchanged) as
+      // before, and at a new one (a release engine's update, a zip re-upload or a TurboQuant release with a new
+      // layout) on the binary the registry now names (see onEngineNow()). Refused here: an engine gone, one whose new
+      // binary is missing, or one moved again after the reload picked it up.
       if (engine && this.engineLookup && this.engineLookup(engine.id)?.binPath !== engine.binPath) {
         throw new Error(engineGone(engine.name))
       }
@@ -282,19 +285,27 @@ export class ComfyGuard {
       // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
       // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
       paused = this.hasPausedLoad()
-      engine = (paused ? this.manager.restartOpts() : opts)?.engine
       if (paused) {
+        const recorded = this.manager.restartOpts()
+        const resume = recorded && this.onEngineNow(recorded)
+        engine = resume?.engine
         console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
-        await underSwapLock(this.manager.restartOpts()?.model.key, () => this.manager.restart(hooks))
+        // restart() retries the opts Manager.load recorded; on an engine that moved, those opts load on its new binary.
+        await underSwapLock(resume?.model.key, () =>
+          resume && resume !== recorded ? this.manager.load(resume, hooks) : this.manager.restart(hooks))
       } else if (opts) {
+        // A refusal below keeps `opts` for the next release, which looks the engine up again.
+        const start = this.onEngineNow(opts)
+        engine = start.engine
         console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
-        await underSwapLock(opts.model.key, () => this.manager.start(opts, hooks))
+        await underSwapLock(start.model.key, () => this.manager.start(start, hooks))
         // KV prompt-cache persistence (F-014): if we saved a cache on the way in, restore it
         // now — but only once the reloaded engine is actually ready (the slot endpoint needs
         // the model loaded). Poll readiness up to a generous timeout; a stall or an 'error'
         // state simply skips the restore (the prefix re-prefills normally), as does a new render. Non-fatal.
+        // A cache saved from the old build of a moved engine names its version, so a new build's is not restored.
         if (cachedFile) {
-          await this.restoreAfterReady(opts, cachedFile, render)
+          await this.restoreAfterReady(start, cachedFile, render)
         }
       }
     } catch (e) {
@@ -310,6 +321,18 @@ export class ComfyGuard {
         this.cachedFile = cachedFile
       }
     }
+  }
+
+  /** `o` on its engine as the registry has it now, when an update or a zip re-upload during the render kept the
+   *  engine's id but moved its binary to another path that exists (a release engine's new build folder, a TurboQuant
+   *  release whose archive puts llama-server elsewhere, which Registry.repairBinPath records). Starting `o` as it was
+   *  ran the old, deleted binary, so reload() refused it and the model stayed unloaded after the render, while an
+   *  update at the same path was reloaded. Otherwise `o` itself: refuse() then refuses an engine gone or moved to a
+   *  missing binary, and lets one at the same path start. */
+  private onEngineNow(o: StartOpts): StartOpts {
+    const now = this.engineLookup?.(o.engine.id)
+    if (!now || now.binPath === o.engine.binPath || !existsSync(now.binPath)) return o
+    return { ...o, engine: now }
   }
 
   /** A routine's restore of the model its swap displaced (`opts`, routines/model-swap.ts through

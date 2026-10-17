@@ -491,8 +491,8 @@ comfy.setPoolStopper(async () => {
 // The reload when a render ends runs under the gateway's swap lock, so a gateway request for that model waits for it
 // instead of evicting it or loading a second copy.
 comfy.setSwapLock((fn) => modelRouter.withSwapLock(fn))
-// That reload checks its engine is still registered on the same binary: an update or purge during the render can remove
-// it and its files, or move it to a new build folder.
+// That reload checks its engine is still registered: an update or purge during the render can remove it and its files,
+// or move it to a new build folder (the reload then starts the binary registered there).
 comfy.setEngineLookup((id) => registry.get(id))
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
