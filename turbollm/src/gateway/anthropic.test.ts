@@ -2,6 +2,8 @@
 // the Anthropic stream translator (prefill % + token count published to the engine
 // card, with prompt_progress chunks consumed rather than forwarded to the client).
 import assert from 'node:assert/strict'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { test } from 'node:test'
 import { clampMaxTokens } from '../config/config'
 import { mapToOpenAI, streamToAnthropic, waitOrPing, pingWhilePending, messageStartEvent, type LiveProgress } from './anthropic'
@@ -615,6 +617,64 @@ for (const [label, lines, expected] of [
     assert.equal(toolCallsFired, false)
   })
 }
+
+// ── streamToAnthropic: a stream the engine cut off ─────────────────────────
+// An engine that goes away mid-reply sends no final chunk (finish_reason) and no `[DONE]`. A chunked body cut off by a
+// closed socket rejects the read, which was already an error event; a body delimited by the connection's close
+// (Python's http.server, under mlx-lm's server) just ends, as does a chunked body the engine ended early, and both
+// ended as a clean end_turn: a truncated answer the client took as complete.
+
+const CUT_OFF = { type: 'error', error: { type: 'api_error', message: 'The engine closed the stream before the reply was complete.' } }
+
+test('streamToAnthropic turns a stream that ends with no final chunk and no [DONE] into an error event, not end_turn', async () => {
+  const upstream = sseStream(['data: {"choices":[{"delta":{"content":"Half an ans"}}]}'])
+  let usageFired = false
+  let toolCallsFired = false
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_cut', {
+    onUsage: () => { usageFired = true },
+    onToolCalls: () => { toolCallsFired = true },
+  })) events.push(evt)
+
+  assert.deepEqual(JSON.parse(events.at(-1)!.data), CUT_OFF)
+  assert.ok(!events.some((e) => e.event === 'message_delta' || e.event === 'message_stop'), 'no clean finish')
+  assert.equal(usageFired, false, 'a cut-off turn is not recorded as a completed one')
+  assert.equal(toolCallsFired, false)
+})
+
+test('streamToAnthropic: an engine that closes the connection mid-reply (a close-delimited body) gets an error event', async () => {
+  const server = createServer((_req, res) => {
+    // Python's http.server shape: no content-length and no chunked encoding, so the close is what ends the body.
+    res.useChunkedEncodingByDefault = false
+    res.shouldKeepAlive = false
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.write('data: {"choices":[{"delta":{"content":"Half an ans"}}]}\n\n')
+    setTimeout(() => res.socket?.destroy(), 20) // the engine process died
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  try {
+    const res = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/v1/chat/completions`)
+    const events: { event: string; data: string }[] = []
+    for await (const evt of streamToAnthropic(res.body!, 'test-model', 'msg_socket')) events.push(evt)
+
+    assert.deepEqual(JSON.parse(events.at(-1)!.data), CUT_OFF)
+    assert.ok(!events.some((e) => e.event === 'message_delta' || e.event === 'message_stop'), 'no clean finish')
+  } finally {
+    server.close()
+  }
+})
+
+test('streamToAnthropic: a final chunk with a finish_reason ends cleanly even without [DONE]', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"All of it."}}]}',
+    'data: {"choices":[{"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}',
+  ])
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_no_done')) events.push(evt)
+
+  assert.deepEqual(events.slice(-2).map((e) => e.event), ['message_delta', 'message_stop'])
+  assert.equal((JSON.parse(events.at(-2)!.data) as { delta: { stop_reason: string } }).delta.stop_reason, 'max_tokens')
+})
 
 // ── streamToAnthropic: content block indices stay well-formed ───────────────
 // One block open at a time, indices strictly sequential, every delta/stop on the open block. Claude Code's

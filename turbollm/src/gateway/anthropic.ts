@@ -533,6 +533,8 @@ export async function* streamToAnthropic(
   const dec = new TextDecoder()
   let buf = ''
   let failed = false
+  // The engine's final chunk (one with a finish_reason) or its `[DONE]` arrived: the reply is complete.
+  let finished = false
   // Fixed cadence from stream start, NOT reset on every `reader.read()` resolution — see the
   // ADR-342 postmortem below for why that distinction is load-bearing.
   let nextPingAt = Date.now() + pingIntervalMs
@@ -572,7 +574,18 @@ export async function* streamToAnthropic(
         break
       }
       const { done, value } = result
-      if (done) break
+      if (done) {
+        // The body ended with neither a finish_reason nor `[DONE]`: the engine went away mid-reply. A chunked body
+        // cut off by a closed socket rejects the read (the catch below), but a body delimited by the connection's
+        // close (Python's http.server, which mlx-lm's server is built on, sends one) just ends, and so does a chunked
+        // body the engine closed early. It used to end as a clean end_turn, a truncated answer the client took as
+        // complete, as an in-stream error did before (below).
+        if (!finished) {
+          failed = true
+          yield sse('error', { error: { type: 'api_error', message: 'The engine closed the stream before the reply was complete.' } })
+        }
+        break
+      }
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop() ?? ''
@@ -580,7 +593,10 @@ export async function* streamToAnthropic(
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue
         const raw = line.slice(6).trim()
-        if (raw === '[DONE]') break outer
+        if (raw === '[DONE]') {
+          finished = true
+          break outer
+        }
 
         let chunk: Record<string, unknown>
         try {
@@ -628,7 +644,10 @@ export async function* streamToAnthropic(
         const choices = chunk.choices as Array<{ delta?: OAIDelta; finish_reason?: string | null }> | undefined
         if (!choices?.length) continue
         const choice = choices[0]
-        if (choice.finish_reason) stopReason = FINISH[choice.finish_reason] ?? 'end_turn'
+        if (choice.finish_reason) {
+          stopReason = FINISH[choice.finish_reason] ?? 'end_turn'
+          finished = true
+        }
         const delta: OAIDelta = choice.delta ?? {}
 
         // At most one block is open at a time: whichever one is open is closed before another kind
