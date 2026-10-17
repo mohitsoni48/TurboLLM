@@ -400,15 +400,21 @@ export async function newestMatchingRelease(
 ): Promise<MatchingRelease | null> {
   const listed = (await listReleases(provenance.repo, signal, fetchImpl)) ?? []
   const candidates = listed.filter((r) => isUpdateCandidate(r, provenance))
-  // Newest first, key then classification inside each release. A key-only pass over every candidate
-  // would always stop at the installed release (it is listed, and its own asset has the key), so a
-  // newer release that renamed the asset would never be reached.
+  // Key then classification inside each release. A key-only pass over every candidate would always
+  // stop at the installed release (it is listed, and its own asset has the key), so a newer release
+  // that renamed the asset would never be reached. Of the releases that match, the highest version
+  // wins, not the first listed: GitHub lists by creation, so a backport cut after a new major (v1.9.5
+  // published after v2.0.0) came first and v2.0.0 was never offered. Tags with no version order keep
+  // the listing's newest-first order.
+  let best: MatchingRelease | null = null
   for (const release of candidates) {
     const match =
       findByAssetKey([release], provenance.assetKey) ?? findByIdenticalClassification([release], provenance.asset)
-    if (match) return match
+    if (!match) continue
+    if (!best) best = match
+    else if (versionLike(best.tag) && versionLike(match.tag) && compareBuildTags(best.tag, match.tag) === 'newer') best = match
   }
-  return null
+  return best
 }
 
 function toResolved(repo: string, release: GithubRelease, fellBack: boolean): ResolvedRelease {
@@ -431,7 +437,10 @@ function isUpdateCandidate(release: GithubRelease, installed: ReleaseProvenance)
   if (release.draft === true) return false
   if (release.prerelease === true && !installed.prerelease) return false
   // A backport on an older version line (v1.9.5 published after v2.0.0) is not an update. Tags with
-  // no version order (nightly, a commit SHA) keep the publish-time rule.
+  // no version order (nightly, a commit SHA) keep the publish-time rule, and so does a higher version
+  // published before the installed release: a repo that renumbered its tags downward (20240501 or a
+  // build number such as 4500, then v1.0.0) still lists its old releases, which outrank every v1.x, so
+  // an engine on `auto` would be moved to one and never offered a v1.x again.
   const tag = release.tag_name ?? ''
   if (versionLike(installed.tag) && versionLike(tag) && compareBuildTags(installed.tag, tag) === 'older') return false
   return (release.published_at ?? '') >= installed.publishedAt

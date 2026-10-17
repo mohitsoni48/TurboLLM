@@ -291,6 +291,48 @@ test('newestMatchingRelease: a newer version is still found behind a later backp
   assert.equal((await newestMatchingRelease(INSTALLED_V2, undefined, gh.fetchImpl))?.tag, 'v2.0.1')
 })
 
+// GitHub lists releases newest first by creation, and the first match won. A backport cut after a new major (v1.9.5
+// published after v2.0.0) is listed first, so an engine on v1.x was offered the backport, never v2.0.0; once on the
+// backport, v2.0.0 was published before the installed release and failed the publish-time rule for good.
+test('newestMatchingRelease: the highest version wins over a backport listed before it', async () => {
+  const gh = listing(
+    release('v1.9.5', ['app-v1.9.5-win-x64.zip'], { published_at: '2026-09-03T00:00:00Z' }),
+    release('v2.0.0', ['app-v2.0.0-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('v1.0.0', ['app-v1.0.0-win-x64.zip'], { published_at: T0 }),
+  )
+  const installed = { ...INSTALLED_V2, tag: 'v1.0.0', asset: 'app-v1.0.0-win-x64.zip' }
+  assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, 'v2.0.0')
+})
+
+// compareBuildTags ignores suffixes, so v2.0.0 and v2.0.0-hotfix compare equal. Ordering by version must not make the
+// plain v2.0.0, published before the hotfix the engine runs, an update: equal versions keep the publish-time rule.
+test('newestMatchingRelease: an equal version published before the installed release is not an update', async () => {
+  const gh = listing(
+    release('v2.0.0', ['app-v2.0.0-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('v2.0.0-hotfix', ['app-v2.0.0-hotfix-win-x64.zip'], { published_at: '2026-09-03T00:00:00Z' }),
+  )
+  const installed = { ...INSTALLED_V2, tag: 'v2.0.0-hotfix', asset: 'app-v2.0.0-hotfix-win-x64.zip', publishedAt: '2026-09-03T00:00:00Z' }
+  assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, 'v2.0.0-hotfix')
+})
+
+// A higher version published before the installed release is not an update by version alone. A repo that renumbered
+// its tags downward (a date tag or a plain build number, then semver) still lists its old releases, and they outrank
+// every new tag: an engine on v1.0.0 would be moved to the 2024 build and never be offered a v1.x again.
+test('newestMatchingRelease: an old release from before a downward renumbering is not an update', async () => {
+  for (const [oldTag, installedTag, newerTag] of [
+    ['20240501', 'v1.0.0', 'v1.0.1'],
+    ['4500', 'v0.1.0', 'v0.1.1'],
+  ]) {
+    const gh = listing(
+      release(newerTag, [`app-${newerTag}-win-x64.zip`], { published_at: '2026-10-01T00:00:00Z' }),
+      release(installedTag, [`app-${installedTag}-win-x64.zip`], { published_at: T0 }),
+      release(oldTag, [`app-${oldTag}-win-x64.zip`], { published_at: '2024-05-01T00:00:00Z' }),
+    )
+    const installed = { ...INSTALLED_V2, tag: installedTag, asset: `app-${installedTag}-win-x64.zip` }
+    assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, newerTag, oldTag)
+  }
+})
+
 test('newestMatchingRelease: a tag with no version order keeps the publish-time rule', async () => {
   const gh = listing(
     release('nightly', ['app-nightly-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
