@@ -1159,16 +1159,31 @@ function EngineGallery({
     )
   }
   // Not routed through the shared delete confirmation dialog: forgetting a "remembered but
-  // not registered" source leaves nothing the user can still reach (a release install's
-  // now-unclaimed folder is removed below) — still a real deletion of the remembered
+  // not registered" source leaves nothing the user can still reach (a release install's or a
+  // git build's now-unclaimed folder is removed below) — still a real deletion of the remembered
   // engine, so it shares `delete_engine` rather than needing its own action.
   const doForgetCustom = (source: CustomEngineSource) => {
     track('engines', 'delete_engine')
     engineMut.forgetCustomSource.mutate(customSourceKey(source), {
       onSuccess: () => {
+        // A git build (sourceRepo) goes through the Disabled-build Delete (DELETE /engines/build), as a Disabled
+        // source-built catalog card's Delete does: only the release route was called here, which answers 404 for a
+        // git build, so its engines/build/<slug> folder (often several GB) stayed on disk with no card left to delete
+        // it from. That route answers 404 for a binary outside engines/build (the user's own build, left alone) and
+        // refuses during engine work, so the card disables this Remove then.
+        if (source.sourceRepo) {
+          engineMut.deleteBuild.mutate(source.binPath, {
+            onSuccess: () => toast.success(`${source.name} removed`),
+            onError: (err) => {
+              if (err instanceof ApiError && err.status === 404) toast.success(`${source.name} removed`)
+              else toast.error(`${source.name} removed, but its files could not be deleted: ${err instanceof Error ? err.message : 'unknown error'}`)
+            },
+          })
+          return
+        }
         toast.success(`${source.name} removed`)
         // A forgotten release install's dir is now unclaimed: remove it. The route answers 404
-        // for any other dir (git build, zip install) and 409 if something still claims it.
+        // for any other dir (zip install) and 409 if something still claims it.
         void discardReleaseInstall(source.binPath).catch(() => {})
       },
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
@@ -1980,8 +1995,10 @@ function CustomEngineCard({
           </DropdownMenu>
         )}
         {/* A registered engine's Delete is a purge, which the daemon refuses during engine work like
-            Disable; a remembered (Disabled) source's Remove only forgets it, which it does not. */}
-        <Button variant="outline" size="sm" disabled={!disabled && (anyPending || buildRunning)} onClick={onDelete}>
+            Disable; so is a remembered (Disabled) git build's Remove, which deletes its build folder.
+            Any other remembered source's Remove only forgets it (and discards a release install),
+            which the daemon takes then. */}
+        <Button variant="outline" size="sm" disabled={(!disabled || !!sourceRepo) && (anyPending || buildRunning)} onClick={onDelete}>
           {disabled ? 'Remove' : 'Delete'}
         </Button>
       </div>

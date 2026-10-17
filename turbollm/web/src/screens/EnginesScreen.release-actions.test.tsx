@@ -19,6 +19,10 @@ const forgetMutate = vi.fn((key: string, opts?: { onSuccess?: () => void }) => {
   calls.push(`forget:${key}`)
   opts?.onSuccess?.()
 })
+const deleteBuildMutate = vi.fn((binPath: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) => {
+  calls.push(`deleteBuild:${binPath}`)
+  opts?.onSuccess?.()
+})
 
 function engine(over: Partial<Engine> & { id: string; name: string }): Engine {
   return { binPath: '', version: '', capabilities: { kvTypes: [], flags: [] }, ...over }
@@ -87,7 +91,8 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useEngineMutations: () => {
       const noop = { mutate: vi.fn(), isPending: false }
       return {
-        add: noop, rename: noop, remove: noop, disableCustom: noop, deleteBuild: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop,
+        add: noop, rename: noop, remove: noop, disableCustom: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop,
+        deleteBuild: { mutate: deleteBuildMutate, isPending: false },
         purge: { mutate: purgeMutate, isPending: false },
         forgetCustomSource: { mutate: forgetMutate, isPending: false },
       }
@@ -350,6 +355,58 @@ describe('Remove on a disabled custom release install (not shown on a catalog ca
     await new Promise((r) => setTimeout(r, 0))
     expect(toast.success).toHaveBeenCalledWith('someone/fork Vulkan (b100) removed')
     expect(toast.error).not.toHaveBeenCalled()
+  })
+})
+
+// A Disabled engine built from a git repo (a custom source with sourceRepo) lives in engines/build/<slug>. Its Remove
+// only forgot the source, and the release install route it then called answers 404 for a git build, so the folder,
+// often several GB, stayed on disk with no card left to delete it from.
+describe('Remove on a disabled custom git build', () => {
+  const GIT_BIN = '/e/build/me-fork-main/build/bin/llama-server'
+  const GIT_SOURCE: CustomEngineSource = {
+    name: 'My fork', binPath: GIT_BIN, sourceRepo: 'https://github.com/me/fork', sourceBranch: 'main',
+    addedAt: '2026-10-09T00:00:00Z', binPathExists: true,
+  }
+
+  it('forgets the source, THEN deletes its build folder through the Disabled-build Delete', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(GIT_SOURCE)}`, `deleteBuild:${GIT_BIN}`]))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+    expect(toast.success).toHaveBeenCalledWith('My fork removed')
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  it('a refused delete says the engine was removed but its files remain; a build folder already gone stays silent', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    deleteBuildMutate.mockImplementationOnce((_bin, opts) =>
+      opts?.onError?.(new ApiError('engine_files_locked', 'Some of the build\'s files are still in use — try again in a moment.', 409)))
+    const view = renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+      'My fork removed, but its files could not be deleted: Some of the build\'s files are still in use — try again in a moment.',
+    ))
+    expect(toast.success).not.toHaveBeenCalled()
+    view.unmount()
+
+    vi.mocked(toast.error).mockClear()
+    deleteBuildMutate.mockImplementationOnce((_bin, opts) =>
+      opts?.onError?.(new ApiError('engine_not_found', 'No engine build at that path.', 404)))
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('My fork removed'))
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  it('is disabled while a build from source runs, which refuses the delete, unlike a Remove that only forgets', async () => {
+    const OTHER: CustomEngineSource = { name: 'My own binary', binPath: '/opt/llama/llama-server', addedAt: '2026-10-09T00:00:00Z', binPathExists: true }
+    state.customDisabled = [GIT_SOURCE, OTHER]
+    state.building = true
+    renderScreen()
+    const [git, other] = await screen.findAllByRole('button', { name: 'Remove' })
+    expect(git).toBeDisabled()
+    expect(other).toBeEnabled()
   })
 })
 
