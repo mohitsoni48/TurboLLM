@@ -338,7 +338,10 @@ export class ComfyGuard {
     this.refuseLoadWhileHeld()
   }
 
-  private refuseLoadWhileHeld(): void {
+  /** The refusal itself, also the pre-spawn check (Manager's beforeSpawn hook) for a load that ran
+   *  freeComfyUIBeforeLoad first: after that hook a vLLM or SGLang start still awaits its preflight (about 1 s) and a
+   *  port, and a render acquiring there finds no engine to stop. Throws while a render claims the GPU. */
+  refuseLoadWhileHeld(): void {
     if (this.gpuClaimed()) {
       throw new Error(LOAD_PAUSED)
     }

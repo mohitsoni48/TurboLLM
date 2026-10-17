@@ -308,8 +308,8 @@ export class ModelRouter {
    *  eject, or its idle watchdog) is waited for, and with `force` killed now.
    *  A slot still loading is stopped now, whatever it still runs: the model it evicted (as LRU, still running while
    *  its load waits for the load gate, or being stopped), or the engine it is starting. A load that has not spawned
-   *  its engine yet is not cancelled by this: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
-   *  drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load. */
+   *  its engine yet is not cancelled by this: for ComfyUI loadInto's pre-start and pre-spawn hooks refuse it; an
+   *  engine update/delete (stopEngineUsers) does not stop such a load. */
   async stopPoolSlotsOnEngine(engineId: string, opts?: { force?: boolean }): Promise<void> {
     const stopping: Promise<unknown>[] = []
     for (const p of this.poolProcesses()) {
@@ -519,14 +519,28 @@ export class ModelRouter {
             throw e
           }
         },
+        // Checked again right before the spawn, as the guard's own reload is. Between the hook above and the spawn a
+        // vLLM or SGLang start awaits its preflight (about 1 s) and a port. A render acquiring there found no engine to
+        // stop, and the load spawned under it: a pool slot was stopped only once its model was up, and the primary
+        // served during the render. Refused, the primary is left in 'error' with the guard's refusal, so the render's
+        // release resumes this load, as for one the hook above refuses.
+        beforeSpawn: () => {
+          try {
+            this.comfy?.refuseLoadWhileHeld()
+          } catch (e) {
+            comfyRefused = true
+            throw e
+          }
+        },
       })
     } catch (e) {
       if (inFlight?.cancelled) {
         await this.stopCancelled(targetManager)
         return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
       }
-      // The hook throws only when a ComfyUI render started while this load waited (for the gate or for /free):
-      // the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client may retry.
+      // The hooks throw only when a ComfyUI render started while this load waited (for the gate, for /free, or in its
+      // engine preflight): the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client
+      // may retry.
       if (comfyRefused) {
         return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
       }
@@ -540,9 +554,9 @@ export class ModelRouter {
       return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
     }
 
-    // ComfyUI acquired the GPU while this pool slot loaded: its pool stopper killed the load, or the engine came up
-    // anyway (an acquire landing between the pre-start hook and the spawn). Either way nothing may serve during the
-    // render, so it is stopped and not registered, and like doLoad's isBlocked() refusal the client may retry.
+    // ComfyUI acquired the GPU while this pool slot loaded, after its spawn: its pool stopper killed the load, or the
+    // model came up before the stopper reached it (the acquire stops the primary first). Either way nothing may serve
+    // during the render, so it is stopped and not registered, and like doLoad's isBlocked() refusal the client may retry.
     if (targetManager !== this.manager && this.comfy?.gpuClaimed()) {
       await targetManager.stopAndWait({ force: true })
       return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
