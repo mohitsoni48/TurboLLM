@@ -336,9 +336,9 @@ export class ComfyGuard {
   }
 
   /** Wait for the just-reloaded engine (`opts`) to reach 'running', then restore the saved KV cache
-   *  (F-014). Bounded poll: bails on 'error' or after ~130s (just over the manager's 120s
-   *  readiness window), or once `render` is no longer the latest acquire. The restore itself is
-   *  non-fatal — any failure leaves the prefix to re-prefill normally. */
+   *  (F-014), if the model running then is the one it was saved from. Bounded poll: bails on 'error' or after ~130s
+   *  (just over the manager's 120s readiness window), or once `render` is no longer the latest acquire. The restore
+   *  itself is non-fatal — any failure leaves the prefix to re-prefill normally. */
   private async restoreAfterReady(opts: StartOpts, filename: string, render: number): Promise<void> {
     const deadline = Date.now() + 130_000
     for (;;) {
@@ -355,6 +355,11 @@ export class ComfyGuard {
       if (state === 'error' || Date.now() > deadline) return
       await this.sleep(500)
     }
+    // Only into the model it was saved from (the file is named by slotCacheKey: model path, launch args, engine
+    // version). The reload's start can end with that model not running (ejected while it loaded, or a swap took the
+    // primary), and the poll above then restored the cache into whatever model was running next.
+    const running = this.manager.currentOpts()
+    if (!running || slotCacheKey(running) !== filename) return
     const base = this.manager.target()
     if (!base) return
     try {

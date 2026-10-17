@@ -514,3 +514,28 @@ test('cachePersist: a failed save means release skips the restore', async () => 
   assert.equal(calls.starts.length, 1, 'still reloads the model')
   assert.equal(restores(f.calls).length, 0, 'no restore — nothing was saved this cycle')
 })
+
+// The reload's start can end with the model not running: the user ejected it while it loaded, or a swap took the
+// primary. The readiness poll then waited (up to 130 s) for any 'running' state and restored the saved cache into
+// whatever model was running by then, such as one the user loaded next.
+test('cachePersist: the saved cache is restored only into the model it was saved from', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // saves A's cache
+  assert.equal(saves(f.calls).length, 1)
+  let running: StartOpts | null = null
+  Object.assign(mgr, {
+    start: async () => {}, // A was ejected while it loaded
+    status: () => ({ state: running ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: running?.model ?? null, loadElapsedMs: 0 }),
+    currentOpts: () => running,
+    target: () => (running ? 'http://127.0.0.1:0' : null),
+  })
+
+  const reload = g.release()
+  await new Promise((r) => setTimeout(r, 100))
+  running = OPTS('b') // the user loads B meanwhile
+  await reload
+
+  assert.equal(restores(f.calls).length, 0, "A's cache is not restored into B")
+})
