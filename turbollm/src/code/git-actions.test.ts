@@ -172,6 +172,22 @@ test('commitGitChanges: default (no files given) stages and commits everything',
   assert.deepEqual(status.files, [])
 })
 
+// The staged list was read with execFile's default 1 MiB stdout buffer and any failure taken for
+// an empty list: committing a new folder of generated files (a build output, a vendored tree)
+// answered "Nothing staged" with every file staged, and no commit made.
+test('REGRESSION: committing everything works when the staged file list is over 1 MiB', { timeout: 120_000 }, async () => {
+  const dir = initRepo()
+  mkdirSync(join(dir, 'gen'))
+  // 14000 lines of `gen/<80 characters>` is about 1.19 MB. Many short names rather than fewer long
+  // ones: the full path stays well under Windows' 260-character limit, past which `git add` fails
+  // with "Filename too long" unless core.longpaths is set.
+  const count = 14_000
+  for (let i = 0; i < count; i++) writeFileSync(join(dir, 'gen', `${String(i).padStart(5, '0')}-${'x'.repeat(70)}.txt`), `${i}\n`)
+  const result = await commitGitChanges(dir, 'add the generated files')
+  assert.equal(result.filesCommitted, count)
+  assert.deepEqual((await getGitStatus(dir)).files, [])
+})
+
 test('commitGitChanges: an explicit file list stages ONLY those paths, leaving the rest untouched', async () => {
   const dir = initRepo()
   writeFileSync(join(dir, 'a.txt'), 'a\n')

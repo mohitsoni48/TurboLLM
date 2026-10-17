@@ -35,6 +35,11 @@ const GIT_TIMEOUT_MS = 15_000
 // for that case; this timeout is only the backstop if it doesn't work for the remote's exact auth
 // setup (e.g. a credential helper that itself hangs instead of erroring).
 const GIT_NETWORK_TIMEOUT_MS = 30_000
+// The most a git call may print. execFile's default, 1 MiB, is only a few thousand paths: after a
+// commit-all of a new folder of generated files (a build output, a vendored tree), `diff --cached
+// --name-only` printed more than that and the call failed. Still bounded, so a runaway output
+// can't take the daemon's memory; past it the call fails and the caller reports that failure.
+const GIT_MAX_BUFFER = 64 * 1024 * 1024
 
 export class GitError extends Error {
   readonly stderr: string
@@ -52,6 +57,7 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
     const { stdout } = await execFileAsync('git', args, {
       cwd,
       timeout: timeoutMs,
+      maxBuffer: GIT_MAX_BUFFER,
       windowsHide: true,
       // Never block on an interactive username/password/passphrase prompt — surface the auth
       // failure as a normal command error instead of hanging the request.
@@ -264,8 +270,10 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
 
   // Re-check what's actually staged rather than trusting `status.files` was non-empty for the
   // repo as a whole — a caller-supplied `files` list can point at paths with no real changes,
-  // which `git add` silently no-ops on, leaving nothing staged.
-  const staged = await git(['diff', '--cached', '--name-only', '--', '.'], repoRoot).catch(() => '')
+  // which `git add` silently no-ops on, leaving nothing staged. A failure of this call is its own
+  // error, not an empty list: read as one, an output past the buffer answered "Nothing staged"
+  // with every file staged.
+  const staged = await git(['diff', '--cached', '--name-only', '--', '.'], repoRoot)
   const stagedList = staged.split('\n').filter(Boolean)
   if (stagedList.length === 0) throw new GitError('Nothing staged — the selected file(s) have no changes.', '', null)
 
