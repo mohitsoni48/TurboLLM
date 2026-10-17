@@ -202,6 +202,25 @@ test('plan mode offers web_search but not fetch_url, even with the web tools reg
   } finally { await engine.close() }
 })
 
+// The sub-agent gets pi's file tools and bash only, but its prompt was built with the parent's
+// tool flags: with the web tools registered it was told to call web_search and fetch_url (and,
+// outside plan mode, install_lsp and update_todos), none of which it has.
+test('a delegate_task sub-agent\'s prompt names none of the tools only the parent has', { timeout: 30_000 }, async () => {
+  const engine = await stubEngine([toolCall('delegate_task', { task: 'Look around.' }), text('sub-agent done'), text('all done')])
+  try {
+    const tools = { buildToolDefinitions: async () => [], executeTool: async () => 'unused' }
+    const h = harness(engine.base, 'auto', { tools })
+    await h.turn('delegate it', new AbortController().signal)
+    const sub = engine.bodies[1]
+    assert.ok(JSON.stringify(sub.messages).includes('isolated sub-agent'), 'second request is the sub-agent\'s')
+    const parentOnly = toolNames(engine.bodies[0]).filter((t) => !toolNames(sub).includes(t))
+    for (const t of ['web_search', 'fetch_url', 'install_lsp', 'update_todos']) assert.ok(parentOnly.includes(t), `${t} is the parent's only`)
+    const system = JSON.stringify(sub.messages[0])
+    assert.match(system, /"role":"system"/)
+    for (const t of parentOnly) assert.ok(!system.includes(t), `${t} is not named to the sub-agent`)
+  } finally { await engine.close() }
+})
+
 test('a plan run\'s skill gets read-only tools, even after a live switch to auto', { timeout: 30_000 }, async () => {
   let store!: ConversationStore
   let convId!: string

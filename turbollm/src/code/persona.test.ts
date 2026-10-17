@@ -176,3 +176,12 @@ test('buildAppendPrompt: todo-tracker guidance (update_todos) appears in auto/as
   // Plan mode's deliverable is already a written step list, so no live checklist guidance there.
   assert.ok(!buildAppendPrompt('plan').some((b) => b.includes('call update_todos')))
 })
+
+test('buildAppendPrompt: hasSessionTools=false (a delegate_task sub-agent) names neither install_lsp nor update_todos', () => {
+  for (const m of ['auto', 'ask'] as const) {
+    const blocks = buildAppendPrompt(m, [], undefined, false, false)
+    assert.ok(!blocks.some((b) => b.includes('install_lsp') || b.includes('LSP diagnostics for')), `${m}: no LSP guidance`)
+    assert.ok(!blocks.some((b) => b.includes('update_todos')), `${m}: no todo-tracker guidance`)
+    assert.ok(blocks.some((b) => b.includes('first read the file, then copy')), `${m}: the edit guidance stays`)
+  }
+})

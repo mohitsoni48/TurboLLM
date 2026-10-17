@@ -344,20 +344,26 @@ export function agentsMdBlock(
  *  keeps today's exact output. `agentsMd.projectCandidates`/`globalCandidates` default to the
  *  built-in lists (DEFAULT_AGENTS_MD_*_CANDIDATES) when omitted — a caller that resolves them
  *  from config (code-session.ts) should read `d.store.snapshot().code` fresh at call time, not
- *  cache them, so a changed setting takes effect on the session's next turn. */
+ *  cache them, so a changed setting takes effect on the session's next turn. `hasWebTools`:
+ *  web_search/fetch_url are registered. `hasSessionTools`: the top-level session's own
+ *  install_lsp and update_todos tools, and the LSP diagnostics its hook appends to edits, are
+ *  there — false for a delegate_task sub-agent, which gets pi's file tools and bash only. */
 export function buildAppendPrompt(
   mode: CodeMode,
   skills: Skill[] = [],
   agentsMd?: { repoRoot: string; globalDir: string; projectCandidates?: string[]; globalCandidates?: string[] },
   hasWebTools = false,
+  hasSessionTools = true,
 ): string[] {
   const blocks = [basePersona(), modeGuidance(mode)]
   // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — and neither
   // install_lsp nor update_todos is in plan mode's toolset (see PLAN_MODE_EXTENSION_TOOLS).
   if (mode !== 'plan') {
     blocks.push(editReliabilityGuidance())
-    blocks.push(lspGuidance())
-    blocks.push(todoTrackerGuidance())
+    if (hasSessionTools) {
+      blocks.push(lspGuidance())
+      blocks.push(todoTrackerGuidance())
+    }
   }
   // Only when web_search/fetch_url are actually registered — see antiFallbackGuidance's comment.
   // Plan mode has web_search but no fetch_url, so its copy never tells the model to fetch a page.

@@ -1132,12 +1132,15 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       extensionFactories: [{ name: 'turbollm-delegate', factory: subExtension }],
       // The normal mode persona (no skill catalog — a delegated sub-agent can't invoke skills),
       // plus the delegation preamble that frames it as a focused, summary-returning worker.
+      // Without the guidance for tools only the parent has (web_search/fetch_url, install_lsp,
+      // update_todos — see createAgentSession below): passing the parent's `!!d.tools` told the
+      // sub-agent to call web_search and fetch_url whenever the web tools were registered.
       appendSystemPrompt: [...buildAppendPrompt(subMode, [], {
         repoRoot,
         globalDir: d.store.dir(),
         projectCandidates: d.store.snapshot().code.agentsMdProjectCandidates,
         globalCandidates: d.store.snapshot().code.agentsMdGlobalCandidates,
-      }, !!d.tools), DELEGATED_SUBAGENT_PREAMBLE],
+      }, false, false), DELEGATED_SUBAGENT_PREAMBLE],
       noSkills: true,
       // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
       // identical construction above for the full double-injection writeup.
