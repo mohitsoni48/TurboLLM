@@ -259,6 +259,12 @@ function parseFrame(block: string): { event: string; data: string; id?: string }
   return { event, data: dataLines.join('\n'), id }
 }
 
+/** The body of a stream with nothing left to send (resume() of a run that already ended): ok,
+ *  with no body, which RunStream reads as no frames. A plain object, not `new Response(null)`,
+ *  so the client still needs no global Response: in a runtime without one (an older Node given
+ *  a fetch polyfill as options.fetch) that threw ReferenceError out of resume(). */
+const NO_FRAMES = { ok: true, status: 200, body: null, text: async () => '' } as unknown as Response
+
 /** An `AsyncIterable<ExtEvent>` over a run's SSE stream, exposing the bookkeeping spec §7.3
  *  needs so a caller never has to reimplement it: `lastEventSeq` for `?after=` reconnects,
  *  `runId` once the `run` frame arrives, and `outcome` — set from a `done` frame's `status`,
@@ -585,7 +591,7 @@ export class TurboLLMChat {
           // Nor is there a `done` frame left to attach for: the run's own event_seq already
           // covers it, and a run the daemon has dropped (pruned, or a restart) only 409s again.
           // So no attach: an empty stream whose outcome is the run record's.
-          const ended = new RunStream(Promise.resolve(new Response(null, { status: 200 })), undefined, runId)
+          const ended = new RunStream(Promise.resolve(NO_FRAMES), undefined, runId)
           if (run.status === 'complete' || run.status === 'failed' || run.status === 'aborted') ended.outcome = run.status
           ended.resyncMessage = message
           return ended

@@ -214,6 +214,36 @@ for (const [label, afterAttach] of [
   })
 }
 
+// The empty stream for an ended run was built on `new Response(null)`, so in a runtime with no
+// global Response (Node 16 and older with a fetch polyfill passed as options.fetch, which is
+// what the option is for) resume() threw ReferenceError instead of reporting the run's outcome.
+test('resume() of a run that already ended needs no global Response', async () => {
+  const RealResponse = globalThis.Response
+  const json = (body: unknown, status = 200) =>
+    new RealResponse(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  const fakeFetch: typeof fetch = (async (url: string) => {
+    const u = String(url)
+    if (u.includes('/stream?')) return json({ error: { type: 'conflict', code: 'replay_window_exceeded', message: 'aged out', retryable: false } }, 409)
+    if (u.includes('/messages/')) {
+      return json({ id: 'm1', chat_id: 'c1', seq: 2, role: 'assistant', content: 'all of it', status: 'complete', version: 3, created_at: 't', edited: false })
+    }
+    return json({ id: 'run_1', chat_id: 'c1', message_id: 'm1', status: 'complete', event_seq: 120, error: null, created_at: 't', ended_at: 't2' })
+  }) as unknown as typeof fetch
+  const client = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: fakeFetch })
+  const g = globalThis as { Response?: typeof Response }
+  delete g.Response
+  try {
+    const resumed = await client.resume('run_1', 5)
+    const seen: string[] = []
+    for await (const ev of resumed) seen.push(ev.event)
+    assert.deepEqual(seen, [])
+    assert.equal(resumed.outcome, 'complete')
+    assert.equal(resumed.resyncMessage?.content, 'all of it')
+  } finally {
+    g.Response = RealResponse
+  }
+})
+
 test('resume() within the window streams directly and leaves resyncMessage unset; no afterSeq omits after', async () => {
   const seenUrls: string[] = []
   const client = new TurboLLMChat({
