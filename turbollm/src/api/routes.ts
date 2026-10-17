@@ -117,7 +117,10 @@ function err(c: Context, status: Status, code: string, message: string) {
 }
 
 /** The refusal for a caller failing hostGate that asks the request log for captured bodies —
- *  see the request log's route comment. */
+ *  see the request log's route comment. Sent as 403 api_key_required, like the host-only
+ *  settings' refusal, so the web client opens its key prompt (auth-signal.ts) and the detail
+ *  drawer says a key is needed: as `forbidden` it fell back to the bodyless row and read "No
+ *  body captured", and with requireApiKey off nothing else asks that browser for a key. */
 const REQUEST_BODIES_HOST_ONLY = 'Captured prompts and responses can only be read on this machine or with a valid API key.'
 
 async function body<T>(c: Context): Promise<T> {
@@ -2425,7 +2428,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // rendering hundreds of entries has no business pulling every captured prompt/response
     // over the wire just to show a time/status/tokens table.
     const bodies = q.bodies === '1' || q.bodies === 'true'
-    if (bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
+    if (bodies && !hostGate(c, d)) return err(c, 403, 'api_key_required', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entries: d.requestLog.list({ limit, since, source, modelKey: q.model, status, bodies }) })
   })
 
@@ -2433,9 +2436,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!d.requestLog) return err(c, 404, 'not_found', 'No request log entry with that id.')
     const entry = d.requestLog.get(c.req.param('id'))
     if (!entry) return err(c, 404, 'not_found', 'No request log entry with that id.')
-    // An entry without bodies is what the list already shows; the detail drawer falls back to
-    // the row's own copy on a refusal.
-    if (entry.bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
+    // An entry without bodies is what the list already shows; on a refusal the detail drawer
+    // shows the row's own copy and says a key is needed (REQUEST_BODIES_HOST_ONLY).
+    if (entry.bodies && !hostGate(c, d)) return err(c, 403, 'api_key_required', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entry })
   })
 

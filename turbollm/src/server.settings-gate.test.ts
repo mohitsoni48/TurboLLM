@@ -154,13 +154,17 @@ async function assertGated(d: Deps, cfg: Config, socket: Socket, headers: Record
   assert.match(refused.message, /requires a valid API key — use "Allow for this chat" instead\.$/)
   assert.equal(JSON.stringify(cfg), saved, 'always_allow: nothing may be stored')
   assert.equal((await approve(d, socket, headers, 'allow_chat')).status, 404)
-  // Bodies already captured are host-only to read; the metadata list stays open.
+  // Bodies already captured are host-only to read; the metadata list stays open. The refusal is
+  // api_key_required too, so the detail drawer can ask for the key instead of showing no body.
   const one = await readBodies(d, socket, headers)
   assert.equal(one.status, 403, 'GET /requests/:id')
   assert.doesNotMatch(one.text, /settings-gate-secret/)
+  assert.equal((JSON.parse(one.text) as { error: { code: string } }).error.code, 'api_key_required', 'GET /requests/:id')
   const withBodies = await send(d, socket, headers, 'GET', '/api/v1/requests?bodies=1', undefined)
   assert.equal(withBodies.status, 403, 'GET /requests?bodies=1')
-  assert.doesNotMatch(await withBodies.text(), /settings-gate-secret/)
+  const withBodiesText = await withBodies.text()
+  assert.doesNotMatch(withBodiesText, /settings-gate-secret/)
+  assert.equal((JSON.parse(withBodiesText) as { error: { code: string } }).error.code, 'api_key_required', 'GET /requests?bodies=1')
   const list = await send(d, socket, headers, 'GET', '/api/v1/requests', undefined)
   assert.equal(list.status, 200)
   const { entries } = (await list.json()) as { entries: { harness: string; bodies: unknown }[] }

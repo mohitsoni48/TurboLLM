@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '../../components/ui/sheet'
 import { CopyButton } from '../../components/ui/copy-button'
-import { getRequestDetail } from '../../lib/api'
+import { ApiError, getRequestDetail } from '../../lib/api'
 import { cn } from '../../lib/utils'
 import type { RequestLogEntry } from '../../lib/types'
 
@@ -43,8 +43,14 @@ export function RequestDetail({
 }) {
   const [detail, setDetail] = useState<RequestLogEntry | null>(null)
   const [tab, setTab] = useState<Tab>('params')
+  // The daemon's refusal to send this browser the captured bodies: they are host-only (routes.ts
+  // REQUEST_BODIES_HOST_ONLY), 403 api_key_required to a caller without a valid key, on which
+  // api.ts has already opened the key prompt. Shown in the Request/Response tabs, which read
+  // "No body captured" for it before, as if capture had been off.
+  const [bodiesRefused, setBodiesRefused] = useState<string | null>(null)
 
   useEffect(() => {
+    setBodiesRefused(null)
     if (!entry) {
       setDetail(null)
       return
@@ -53,7 +59,11 @@ export function RequestDetail({
     let cancelled = false
     void getRequestDetail(entry.id)
       .then((res) => { if (!cancelled) setDetail(res.entry) })
-      .catch(() => { if (!cancelled) setDetail(entry) }) // fall back to the row's own (bodyless) copy
+      .catch((e: unknown) => {
+        if (cancelled) return
+        setDetail(entry) // fall back to the row's own (bodyless) copy
+        if (e instanceof ApiError && e.code === 'api_key_required') setBodiesRefused(e.message)
+      })
     return () => { cancelled = true }
   }, [entry])
 
@@ -122,6 +132,7 @@ export function RequestDetail({
                 <BodyPane
                   text={tab === 'request' ? shown.bodies?.request : shown.bodies?.response}
                   captureBodies={captureBodies}
+                  refused={bodiesRefused}
                 />
               )}
             </div>
@@ -141,7 +152,15 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   )
 }
 
-function BodyPane({ text, captureBodies }: { text: string | undefined; captureBodies: boolean }) {
+function BodyPane({ text, captureBodies, refused }: { text: string | undefined; captureBodies: boolean; refused: string | null }) {
+  // First: the daemon refuses only an entry that holds bodies, whatever capture is set to now.
+  if (refused) {
+    return (
+      <div className="rounded-md border border-dashed border-border p-4 text-[12px] text-faint">
+        {refused} Enter your key in the API key prompt, then open this request again.
+      </div>
+    )
+  }
   if (!captureBodies) {
     return (
       <div className="rounded-md border border-dashed border-border p-4 text-[12px] text-faint">
