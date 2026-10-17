@@ -452,11 +452,17 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     const fwdHeaders = new Headers(c.req.raw.headers)
     fwdHeaders.set('X-Request-Id', c.get('requestId'))
     fwdHeaders.set(INTERNAL_FORWARD_HEADER, internalForwardToken)
-    const fwdRes = await app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
+    // The forward re-enters lanAuth, which judges a request by the socket it arrived on (auth.ts's
+    // isTunneled, isLoopback). With no bindings it has none, and while remote access is up
+    // isTunneled reads that as tunneled (it fails closed), so a backend on this machine or the LAN
+    // got the tunnel's 401 here once a named tunnel required an Access login. `c.env` gives it the
+    // caller's own socket: the forward is judged exactly as this request was. And `:id` arrives
+    // decoded, so it is encoded again: '..%2Fchats%3F' would otherwise forward to POST /chats.
+    const fwdRes = await app.fetch(new Request(new URL(`${BASE}/chats/${encodeURIComponent(c.req.param('id'))}/messages/generate`, c.req.url), {
       method: 'POST',
       headers: fwdHeaders,
       body: JSON.stringify({ ...b, content }),
-    }))
+    }), c.env)
     // N7: the forwarded call is a SEPARATE Hono dispatch with its own Context — the id of the
     // message it actually created (the USER turn, not the assistant placeholder the JSON body's
     // `message_id` field carries) never reaches THIS context on its own. Without this, the
