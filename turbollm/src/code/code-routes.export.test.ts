@@ -259,3 +259,46 @@ test('POST .../revert (superseding, revertFiles: true) reaches an edit patch fro
   assert.ok(!active.has(second.id))
   assert.ok(!active.has(third.id))
 })
+
+// A revert with revertFiles:true walked its range's edits back, and a later revert further back
+// (its range reaches the same edits again, through getMessagesFromIncludingInactive) reverse-
+// applied them a second time: the reverse of an edit already undone no longer applies, so the
+// whole file failed, and the earlier edit the new revert was for stayed on disk.
+test('POST .../revert (superseding, revertFiles: true) skips the edits the earlier revert already undid', async () => {
+  const repoRoot = tmpDir('tllm-revert-twice-')
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const { app } = makeApp(db)
+  const { conv, run } = seedSession(db, { repoRoot })
+
+  const v0 = 'line1\nzero\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nten\n'
+  const v1 = v0.replace('zero', 'one')
+  const v2 = v1.replace('ten', 'eleven')
+  writeFileSync(join(repoRoot, 'a.txt'), v2)
+  const editA: ToolCallRecord = { id: 'tc-a', name: 'edit', args: { path: 'a.txt' }, patch: createPatch('a.txt', v0, v1) }
+  const editB: ToolCallRecord = { id: 'tc-b', name: 'edit', args: { path: 'a.txt' }, patch: createPatch('a.txt', v1, v2) }
+
+  db.addMessage(conv.id, 'user', 'look around')
+  db.addMessage(conv.id, 'assistant', 'looked')
+  const first = db.addMessage(conv.id, 'user', 'first change')
+  db.addMessage(conv.id, 'assistant', 'made it', { toolCalls: [editA] })
+  const second = db.addMessage(conv.id, 'user', 'second change')
+  db.addMessage(conv.id, 'assistant', 'made that too', { toolCalls: [editB] })
+
+  const revert = async (messageId: string) => {
+    const res = await app.request(`/api/v1/code/sessions/${run.id}/revert`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messageId, revertFiles: true }),
+    })
+    assert.equal(res.status, 200)
+    return (await res.json()) as { revertedFiles: string[]; failedFiles: string[] }
+  }
+
+  const r1 = await revert(second.id)
+  assert.deepEqual(r1, { ...r1, revertedFiles: ['a.txt'], failedFiles: [] })
+  assert.equal(readFileSync(join(repoRoot, 'a.txt'), 'utf8'), v1, 'the second edit is undone')
+
+  const r2 = await revert(first.id)
+  assert.deepEqual(r2.failedFiles, [], 'the undone edit is not reversed again')
+  assert.deepEqual(r2.revertedFiles, ['a.txt'])
+  assert.equal(readFileSync(join(repoRoot, 'a.txt'), 'utf8'), v0, 'the first edit is undone too')
+})

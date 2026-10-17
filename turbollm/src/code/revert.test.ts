@@ -193,3 +193,29 @@ test('REGRESSION: a session folder with a Unicode space in its own name still re
     assert.equal(readFileSync(join(repoRoot, 'src', 'a.ts'), 'utf8'), 'old\n')
   }
 })
+
+test('REGRESSION: an edit already flagged `reverted` is skipped, and the edits walked back are reported flagged', () => {
+  // A revert further back than an earlier one reads that one's edits again: reversed a second
+  // time, the undone edit no longer applied and the whole file failed, the earlier edit kept.
+  const repoRoot = tmpDir('tllm-revert-')
+  const v0 = 'zero\nline2\nline3\nline4\nline5\nline6\nline7\nten\n'
+  const v1 = v0.replace('zero', 'one')
+  const v2 = v1.replace('ten', 'eleven')
+  writeFileSync(join(repoRoot, 'a.txt'), v1) // the edit to v2 was already reverted
+  const older = { id: 'm-1', toolCalls: [{ id: 'tc-1', name: 'edit', args: { path: 'a.txt' }, patch: editPatch('a.txt', v0, v1) }] } as unknown as Message
+  const undone = { id: 'm-2', toolCalls: [{ id: 'tc-2', name: 'edit', args: { path: 'a.txt' }, patch: editPatch('a.txt', v1, v2), reverted: true }] } as unknown as Message
+  const marked: { id: string; toolCalls: ToolCallRecord[] }[] = []
+  const result = revertFileEdits([older, undone], repoRoot, (id, toolCalls) => marked.push({ id, toolCalls }))
+  assert.deepEqual(result, { reverted: ['a.txt'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, 'a.txt'), 'utf8'), v0)
+  assert.deepEqual(marked, [{ id: 'm-1', toolCalls: [{ ...older.toolCalls[0], reverted: true }] }], 'only the edit undone now is reported')
+})
+
+test('revertFileEdits: the edits of a file that failed are not reported as undone', () => {
+  const repoRoot = tmpDir('tllm-revert-')
+  writeFileSync(join(repoRoot, 'a.txt'), 'drifted\n')
+  const marked: string[] = []
+  const result = revertFileEdits([msgWithEdits([{ path: 'a.txt', patch: editPatch('a.txt', 'old\n', 'new\n') }])], repoRoot, (id) => marked.push(id))
+  assert.deepEqual(result, { reverted: [], failed: ['a.txt'] })
+  assert.deepEqual(marked, [])
+})

@@ -674,7 +674,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       // real seq-ordered row range regardless of is_active — the same range deactivateMessagesFrom
       // itself operates on below.
       const rangeMessages = db.getMessagesFromIncludingInactive(run.convId, messageId)
-      const result = revertFileEdits(rangeMessages, agentCwd(run))
+      // Stores the edits it undid flagged `reverted`, so a later revert reaching them skips them.
+      const result = revertFileEdits(rangeMessages, agentCwd(run), (msgId, toolCalls) => { db.updateMessage(msgId, { toolCalls }) })
       revertedFiles = result.reverted
       failedFiles = result.failed
     }

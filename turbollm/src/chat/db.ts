@@ -450,6 +450,10 @@ export interface ToolCallRecord {
   /** Code mode only: made by a delegate_task/invoke_skill sub-agent, not the session's own model
    *  — shown and revertable like any call, but never replayed into the parent model's history. */
   subagent?: boolean
+  /** Code mode only, 'edit' calls: a revert-to-message with revertFiles already reverse-applied
+   *  this call's patch on disk (revert.ts). A later revert reaching the call again (one further
+   *  back, or one after /resume) skips it rather than reversing it a second time. */
+  reverted?: boolean
 }
 
 /** Code, item 6 (2026-07-13): an ordered text/tool-call timeline for an assistant message, in

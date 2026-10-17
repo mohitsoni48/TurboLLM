@@ -11,7 +11,7 @@ import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { applyPatch, parsePatch, reversePatch } from 'diff'
 import { isContainedFromRoot, normalizePiToolPath } from './containment'
-import type { Message } from '../chat/db'
+import type { Message, ToolCallRecord } from '../chat/db'
 
 export interface RevertFilesResult {
   /** Paths successfully walked back to their pre-edit state (relative, as pi's edit tool saw
@@ -24,12 +24,19 @@ export interface RevertFilesResult {
   failed: string[]
 }
 
+/** Told about each message holding an edit {@link revertFileEdits} walked back, with that
+ *  message's toolCalls as they should now be stored: those edits flagged `reverted`. The caller
+ *  saves them (updateMessage), so a later revert whose range reaches the same edits again skips
+ *  them rather than reversing them a second time. Edits of a file reported failed are not
+ *  flagged: nothing undid them. */
+export type MarkUndoneEdits = (messageId: string, toolCalls: ToolCallRecord[]) => void
+
 /** Reverse-applies every edit-tool patch found in `messages` (the messages about to be
  *  discarded by a revert), grouped by file. For a file edited more than once in that range,
  *  every step is computed IN MEMORY, most recent edit first, and only written to disk if the
  *  ENTIRE chain succeeds — so a file is never left in a half-reverted state that matches
  *  neither the old nor the new content. */
-export function revertFileEdits(messages: Message[], repoRoot: string): RevertFilesResult {
+export function revertFileEdits(messages: Message[], repoRoot: string, markUndone?: MarkUndoneEdits): RevertFilesResult {
   // Grouped by the file pi's edit tool actually edited, not by the raw string. Its resolveToCwd
   // strips one leading `@` and maps Unicode spaces to ' ' (normalizePiToolPath), and does NOT trim.
   // Keying and resolving by the trimmed raw `args.path` failed a revert of `@src/a.ts` (no such
@@ -41,24 +48,32 @@ export function revertFileEdits(messages: Message[], repoRoot: string): RevertFi
   // session folder's own name (a CJK full-width space, a pasted no-break space) became ' ', so the
   // path no longer sat under the root and every revert in that folder failed. pi resolves only
   // the argument, never its cwd.
-  const editsByFile = new Map<string, { path: string; absPath: string | null; patches: string[] }>() // chronological order, per file
+  //
+  // An edit an earlier revert already walked back (`reverted`, see MarkUndoneEdits) is skipped.
+  // A revert further back than a previous one reads that one's range again (the route's
+  // getMessagesFromIncludingInactive reaches rows it deactivated, which it must, for a chat-only
+  // revert's edits), as does a revert after /resume. Reversing an undone edit again no longer
+  // applies, so the whole file failed and the earlier edits the new revert was asked for stayed.
+  const editsByFile = new Map<string, { path: string; absPath: string | null; patches: string[]; calls: ToolCallRecord[] }>() // chronological order, per file
   for (const m of messages) {
     for (const tc of m.toolCalls) {
-      if (tc.name !== 'edit' || !tc.patch) continue
+      if (tc.name !== 'edit' || !tc.patch || tc.reverted) continue
       const path = typeof tc.args.path === 'string' ? tc.args.path : ''
       if (!path) continue
       const normalized = normalizePiToolPath(path)
       const absPath = normalized === null ? null : resolve(repoRoot, normalized)
       const key = absPath ?? `\0${path}`
-      const entry = editsByFile.get(key) ?? { path, absPath, patches: [] }
+      const entry = editsByFile.get(key) ?? { path, absPath, patches: [], calls: [] }
       entry.patches.push(tc.patch)
+      entry.calls.push(tc)
       editsByFile.set(key, entry)
     }
   }
 
   const reverted: string[] = []
   const failed: string[] = []
-  for (const { path, absPath, patches } of editsByFile.values()) {
+  const undone = new Set<ToolCallRecord>()
+  for (const { path, absPath, patches, calls } of editsByFile.values()) {
     if (absPath === null || !isContainedFromRoot(path, repoRoot)) { failed.push(path); continue }
     if (!existsSync(absPath)) { failed.push(path); continue }
 
@@ -92,9 +107,13 @@ export function revertFileEdits(messages: Message[], repoRoot: string): RevertFi
     try {
       writeFileSync(absPath, bom + content)
       reverted.push(path)
+      for (const tc of calls) undone.add(tc)
     } catch {
       failed.push(path)
     }
+  }
+  for (const m of messages) {
+    if (m.toolCalls.some((tc) => undone.has(tc))) markUndone?.(m.id, m.toolCalls.map((tc) => (undone.has(tc) ? { ...tc, reverted: true } : tc)))
   }
   return { reverted, failed }
 }
