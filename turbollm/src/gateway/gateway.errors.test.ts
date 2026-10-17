@@ -566,7 +566,7 @@ function restrictedDeps(opts: {
   const registry = { active: () => engine, layaEngine: () => undefined }
   const comfy = opts.comfy ?? (opts.comfySuspended === undefined
     ? undefined
-    : { modelKeyLoadedOnRelease: () => opts.comfySuspended })
+    : { modelKeyLoadedOnRelease: () => opts.comfySuspended, modelKeyReloading: () => null })
   const router = new ModelRouter(
     store as never, registry as never, opts.primary as unknown as Manager, scanner as never, comfy as never, undefined,
     () => (opts.slot ?? managerIn('stopped')) as unknown as Manager,
@@ -685,6 +685,62 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
       guard.stop()
     }
   })
+}
+
+// When the render ends, release() loads the model it unloaded (or the load it paused). Until that reload spawns the
+// engine (it waits for the swap lock and the load gate, then a vLLM or SGLang preflight) the primary is 'stopped' (or in
+// 'error' with the paused load's refusal) and no render claims the GPU, so a models:use token asking for that model was
+// told it is not loaded and not to retry, though it was being loaded. Composed with a real ComfyGuard.
+for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
+  for (const [label, paused] of [['the model a render unloaded', false], ['the load a render paused', true]] as const) {
+    test(`${path}: while release() reloads ${label}, a models:use token asking for it may retry`, async () => {
+      const opts = { model: { key: MODEL.key, name: MODEL.name } } as unknown as StartOpts
+      let state: Status['state'] = paused ? 'stopped' : 'running'
+      let err: Status['err'] = null
+      let spawn!: () => void
+      const spawned = new Promise<void>((r) => { spawn = r })
+      // The reload's start (or restart), not spawned yet: still waiting for the load gate, or in the engine preflight.
+      const reloadsAfterSpawn = async () => {
+        await spawned
+        state = 'running'
+        err = null
+      }
+      const primary = {
+        ...managerIn('running'),
+        status: (): Status => ({ state, err, port: 0, pid: 0, loadElapsedMs: 0, model: state === 'running' ? opts.model : null }),
+        currentOpts: () => (state === 'running' ? opts : null),
+        restartOpts: () => opts,
+        stopAndWait: async () => { state = 'stopped' },
+        start: reloadsAfterSpawn,
+        restart: reloadsAfterSpawn,
+      }
+      const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' } }), dir: () => '/tmp/turbollm-test-data' }
+      const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
+      try {
+        await guard.acquire()
+        if (paused) {
+          // A load of MODEL reached its start mid-render: Manager.load recorded it, then the guard's hook refused it.
+          const refusal = await guard.freeComfyUIBeforeLoad().then(() => '', (e: Error) => e.message)
+          state = 'error'
+          err = { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }
+        }
+        const reload = guard.release()
+
+        const { d, token } = restrictedDeps({ primary: primary as unknown as ReturnType<typeof managerIn>, comfy: guard })
+        const res = await askAsRemoteToken(d, token, path)
+        assert.equal(res.status, 503)
+        assert.match(await res.text(), /still loading/)
+        assert.equal(res.headers.get('x-should-retry'), null)
+
+        spawn()
+        await reload
+        assert.equal(state, 'running')
+        assert.equal(guard.modelKeyReloading(), null, 'named only until the reload settles')
+      } finally {
+        guard.stop()
+      }
+    })
+  }
 }
 
 // ── The Jev endpoints route through routeTo(), never route(), so routeTo() needs the same refusal. Without it a

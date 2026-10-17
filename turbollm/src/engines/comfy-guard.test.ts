@@ -35,6 +35,7 @@ function fakeManager(initial: { state: Status['state']; opts: StartOpts | null }
       status: () => ({ state, err: null, port: 0, pid: 0, model: opts?.model ?? null, loadElapsedMs: 0 }) as Status,
       target: () => (state === 'running' ? 'http://127.0.0.1:0' : null),
       currentOpts: () => ((state === 'running' || state === 'starting') ? opts : null),
+      restartOpts: () => opts,
       stopAndWait: async (o?: { force?: boolean }) => {
         calls.stops++
         if (o?.force) calls.forceStops++

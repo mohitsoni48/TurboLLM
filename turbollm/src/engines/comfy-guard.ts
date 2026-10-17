@@ -94,6 +94,8 @@ export class ComfyGuard {
   private autoTune: { isRunning(): boolean; cancel(): void } | null = null
   // The gateway's swap lock (ModelRouter.withSwapLock), which release()'s reload runs under. Set by setSwapLock (cli.ts).
   private swapLock: (<T>(fn: () => Promise<T>) => Promise<T>) | null = null
+  // The model release()'s reload is loading, until its start or restart settles (see modelKeyReloading()).
+  private reloading: { modelKey: string } | null = null
 
   private readonly leaseMs: number
   private readonly fetchImpl: FetchImpl
@@ -239,7 +241,14 @@ export class ComfyGuard {
     // gateway request for this model while it loads found no running target: doLoad evicted the starting primary as
     // LRU and loaded the same model again (keep-N 1), or loaded a second copy into a pool slot (keep-N > 1). Now that
     // request waits for the reload and finds the model running. The KV restore runs after the lock is released.
-    const underSwapLock = (fn: () => Promise<void>): Promise<void> => (this.swapLock ? this.swapLock(fn) : fn())
+    // `modelKey` is named by modelKeyReloading() from here until the start or restart settles.
+    const underSwapLock = (modelKey: string | undefined, fn: () => Promise<void>): Promise<void> => {
+      const mine = modelKey ? { modelKey } : null
+      if (mine) this.reloading = mine
+      return (this.swapLock ? this.swapLock(fn) : fn()).finally(() => {
+        if (mine && this.reloading === mine) this.reloading = null
+      })
+    }
     let paused = false
     try {
       // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
@@ -250,10 +259,10 @@ export class ComfyGuard {
       paused = this.hasPausedLoad()
       if (paused) {
         console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
-        await underSwapLock(() => this.manager.restart(hooks))
+        await underSwapLock(this.manager.restartOpts()?.model.key, () => this.manager.restart(hooks))
       } else if (opts) {
         console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
-        await underSwapLock(() => this.manager.start(opts, hooks))
+        await underSwapLock(opts.model.key, () => this.manager.start(opts, hooks))
         // KV prompt-cache persistence (F-014): if we saved a cache on the way in, restore it
         // now — but only once the reloaded engine is actually ready (the slot endpoint needs
         // the model loaded). Poll readiness up to a generous timeout; a stall or an 'error'
@@ -290,6 +299,14 @@ export class ComfyGuard {
     if (!this.gpuClaimed()) return null
     if (this.hasPausedLoad()) return this.manager.restartOpts()?.model.key ?? null
     return this.suspended?.model.key ?? null
+  }
+
+  /** Key of the model release()'s reload is loading right now (the model the render unloaded, or the load it paused),
+   *  from the release until that start or restart settles; else null. Until the engine spawns (the reload waits for the
+   *  swap lock and the load gate, then a vLLM or SGLang preflight) the primary is 'stopped', or in 'error' with the
+   *  paused load's refusal, and no render claims the GPU: the gateway learns from this that the model is on its way. */
+  modelKeyReloading(): string | null {
+    return this.reloading?.modelKey ?? null
   }
 
   /** Wait for the just-reloaded engine (`opts`) to reach 'running', then restore the saved KV cache

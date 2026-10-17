@@ -419,9 +419,9 @@ export class ModelRouter {
 
   /** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused) when `entry` is not
    *  running: the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. It is permanent
-   *  for this caller only when nothing under way brings the model up. A model that is loading, or the one ComfyUI's
-   *  guard loads when the render ends (a load the render paused, else the model it unloaded), is served to this caller
-   *  once it runs, so its client may retry. */
+   *  for this caller only when nothing under way brings the model up. A model that is loading, the one ComfyUI's
+   *  guard loads when the render ends (a load the render paused, else the model it unloaded), or the one its reload is
+   *  loading now that the render has ended, is served to this caller once it runs, so its client may retry. */
   private notLoadedForCaller(entry: ModelEntry): RouteResult {
     const ms = this.manager.status()
     if ((ms.state === 'starting' && ms.model && this.keysMatch(ms.model.key, entry)) || this.loadingKey === entry.key) {
@@ -430,6 +430,12 @@ export class ModelRouter {
     const comfyLoads = this.comfy?.modelKeyLoadedOnRelease() ?? null
     if (comfyLoads && this.keysMatch(comfyLoads, entry)) {
       return { status: 503, message: `ComfyUI is rendering — '${entry.name}' is loaded when its queue finishes.` }
+    }
+    // The guard's reload after the render, before its engine spawns: the primary is not 'starting' yet and no render
+    // claims the GPU, so neither check above sees it, and this refusal was permanent for a model on its way.
+    const comfyReloads = this.comfy?.modelKeyReloading() ?? null
+    if (comfyReloads && this.keysMatch(comfyReloads, entry)) {
+      return { status: 503, message: `'${entry.name}' is still loading. Try again shortly.` }
     }
     return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
   }
