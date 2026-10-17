@@ -900,7 +900,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
         if (skillMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
           await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal, toolName)
           if (decision === 'deny') {
             const reason = 'denied by user'
             await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
@@ -1093,7 +1093,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
 
         if (subMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
           await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal)
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal, toolName)
           if (decision === 'deny') {
             const reason = 'denied by user'
             await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
@@ -1429,7 +1429,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // resolved per-run from whatever MCP servers are currently connected).
       if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName))) {
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-        const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
+        // With the tool's name, which the approve route (chat-routes.ts) checks as well as the
+        // toolName its caller sends: an MCP call approved as "bash" is still an MCP call.
+        const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal, toolName)
         if (decision === 'deny') {
           const reason = 'denied by user'
           await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })

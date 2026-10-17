@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { LOOP_ABORT_AFTER, runCodeSession, type CodeSseSink, type RunCodeParams, type SteerHandle } from './code-session'
-import { resolveToolApproval } from '../tools/approval-gate'
+import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import type { CodeMode } from './persona'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
@@ -379,4 +379,46 @@ test('ask mode: the same re-check holds for a skill\'s write and for a delegate_
   ])
   assert.equal(delegated.landedOutside, false, 'delegate_task: nothing written outside the repo')
   assert.match(String(delegated.last?.data.result), /outside the allowed repo root/)
+})
+
+// ── ask mode: a pending call is registered with its tool's name ───────────────────────────────
+
+/** Runs an ask-mode turn whose engine script makes a `write` inside the repo and, while it awaits
+ *  approval, reads the name its pending approval was registered with, then stops the turn. */
+async function pendingNameOfWrite(script: (write: Reply) => Reply[]): Promise<string | undefined> {
+  const write = toolCall('write', { path: 'a.txt', content: 'x\n' })
+  const engine = await stubEngine(script(write))
+  try {
+    const h = harness(engine.base, 'ask')
+    const ac = new AbortController()
+    const settled = h.turn('write it', ac.signal)
+    const awaiting = async () => {
+      for (;;) {
+        const f = h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval')
+        if (f) return f
+        await new Promise((r) => setTimeout(r, 10))
+      }
+    }
+    const f = await within(awaiting(), 10_000)
+    if (f === 'timeout') assert.fail('the write is awaiting approval')
+    // The frame goes out just before the wait registers the call: give it a few ticks to.
+    const key = `${h.convId}:${String(f.data.id)}`
+    let name: string | undefined
+    for (let i = 0; i < 50 && (name = pendingToolApprovalName(key)) === undefined; i++) await new Promise((r) => setTimeout(r, 10))
+    // A Stop answers the pending call with a deny.
+    ac.abort()
+    assert.notEqual(await within(settled, 10_000), 'timeout', 'the turn settled')
+    return name
+  } finally { await engine.close() }
+}
+
+test('ask mode: a pending write is registered under its tool name, in the session, a skill and a delegate_task sub-agent', { timeout: 30_000 }, async () => {
+  // The approve route reads this name to tell an MCP call from the toolName its caller claims.
+  assert.equal(await pendingNameOfWrite((write) => [write, text('done')]), 'write', 'session')
+  assert.equal(await pendingNameOfWrite((write) => [
+    toolCall('invoke_skill', { skillId: 'filesystem', task: 'write it' }), write, text('skill done'), text('all done'),
+  ]), 'write', 'skill')
+  assert.equal(await pendingNameOfWrite((write) => [
+    toolCall('delegate_task', { task: 'Write x to a.txt in this repository.' }), write, text('sub-agent done'), text('all done'),
+  ]), 'write', 'delegate_task')
 })

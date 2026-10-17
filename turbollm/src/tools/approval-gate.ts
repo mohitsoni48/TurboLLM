@@ -45,8 +45,9 @@ export function waitForToolApproval(key: string, signal: AbortSignal, toolName?:
 }
 
 /** The tool name `key`'s pending approval was registered with, or undefined when none is pending
- *  or it was registered without one (a Code session's calls). The approve route decides on it as
- *  well as on the toolName its caller sends. */
+ *  or it was registered without one (a chat's calls, execute-with-approval.ts, and a Code
+ *  session's, code-session.ts, record it). The approve route decides on it as well as on the
+ *  toolName its caller sends. */
 export function pendingToolApprovalName(key: string): string | undefined {
   return pending.get(key)?.toolName
 }

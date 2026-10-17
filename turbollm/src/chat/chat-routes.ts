@@ -52,6 +52,10 @@ export function chatCodeAuthorization(c: Context, d: Deps): boolean {
   return !codeGateBlocks(c, d)
 }
 
+/** The approve route's refusal of a Code session's pending tool call to a caller codeAuth would
+ *  not let into Code. */
+const CODE_APPROVAL_REFUSED_MESSAGE = 'Allowing a Code tool call requires a valid API key from a non-host device.'
+
 // Track in-flight abort controllers per conversation id.
 const inflight = new Map<string, AbortController>()
 
@@ -319,17 +323,27 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
+    // A Code session's ask-mode approvals (bash/edit/write and the owner's MCP tools,
+    // code-session.ts) wait on the same gate under the Code conversation's id, and are answered
+    // here. Every /api/v1/code/* route is behind codeAuth (isLocalRequest or a real, ungranted
+    // key: isLocalOrAuthenticated), but this route is behind lanAuth only, so a keyless Serve
+    // identity, Access JWT, open-LAN peer or remote token that knew the conversation and call ids
+    // could let the host's pending Code bash/edit/write run. Approving one needs what opening Code
+    // does; a deny runs nothing and stays open. api_key_required: the web client opens its key
+    // prompt on it, as for the MCP refusal below.
+    if (conv.kind === 'code' && decision !== 'deny' && !isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', CODE_APPROVAL_REFUSED_MESSAGE)
+
     // An MCP server tool runs with the owner's credentials (a stdio server is a command on this
     // machine), so letting one run is a host-side action: the isLocalOrAuthenticated rule that
     // adding the server (POST /api/v1/mcp/servers) and a chat turn calling it (runGeneration's
     // refuseMcp) are held to. Without it a keyless Serve identity, Access JWT, open-LAN peer or
     // remote token could approve the host's own pending MCP call, or save "Allow for this chat"
     // for an MCP tool ahead of the host's later turns (that write runs before the pending lookup
-    // below). For a chat turn's pending call the name it was registered with decides as well as
-    // the body's toolName, which the caller picks (execute-with-approval.ts records it; a Code
-    // session's own waitForToolApproval calls record none, so for those only the body's toolName
-    // is checked). A deny runs nothing and stays open. api_key_required: the web client opens its
-    // key prompt on it, as for "Always Allow" below.
+    // below). The name the pending call was registered with decides as well as the body's
+    // toolName, which the caller picks (execute-with-approval.ts and code-session.ts record it).
+    // A deny runs nothing and stays open. api_key_required: the web client opens its key prompt
+    // on it, as for "Always Allow" below.
     if (decision !== 'deny' && !isLocalOrAuthenticated(c, d)) {
       const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
       if (isMcpToolName(toolName) || (pendingName !== undefined && isMcpToolName(pendingName)))

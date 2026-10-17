@@ -36,6 +36,7 @@ import type { AgentToolsStore } from './chat/chat-agent-tools'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { ConversationStore } from './chat/db'
 import { SkillStore } from './agents/skills'
+import { waitForToolApproval } from './tools/approval-gate'
 import { tmpDir } from './test-support/tmp'
 
 // N3 (Phase 5 final-review-fix re-review): a GENUINELY valid, properly-signed Access assertion
@@ -1434,6 +1435,93 @@ function request403(h: ReturnType<typeof toolChat>, caller: ReturnType<typeof ke
     body: JSON.stringify({ toolName: MCP_TOOL, decision: 'allow_chat' }),
   })
 }
+
+// ── A Code session's pending tool calls ─────────────────────────────────────────────────────
+// Code's ask-mode approvals (bash/edit/write, and the owner's MCP tools) wait on the same approval
+// gate as a chat's, under the Code conversation's id, and the web client answers them through this
+// same chat route. Code itself is behind codeAuth (server.ts), which refuses every caller below;
+// this route is behind lanAuth only, so it let them approve the host's pending Code call.
+
+/** POST .../tool-calls/<callId>/approve on `convId`. */
+function approveCall(h: ReturnType<typeof toolChat>, request: typeof tunneledRequest, headers: Record<string, string>, convId: string, callId: string, body: Record<string, string>) {
+  return request(h.app, `/api/v1/conversations/${convId}/tool-calls/${callId}/approve`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+test("approving a Code session's pending call needs what Code needs: a keyless Serve identity, Access JWT, open-LAN peer or remote token may only deny it", async () => {
+  for (const caller of keylessCallers()) {
+    const h = toolChat(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    const ac = new AbortController()
+    try {
+      const headers = caller.headers(h.d)
+      const conv = h.db.createConversation({ kind: 'code' })
+      // The host's ask-mode bash call and MCP call wait for the host, registered as
+      // code-session.ts's tool_call hook registers them.
+      const bash = waitForToolApproval(`${conv.id}:tc-bash`, ac.signal, 'bash')
+      const mcp = waitForToolApproval(`${conv.id}:tc-mcp`, ac.signal, MCP_TOOL)
+      for (const [callId, body] of [
+        ['tc-bash', { toolName: 'bash', decision: 'allow' }],
+        ['tc-bash', { toolName: 'bash', decision: 'allow_chat' }],
+        ['tc-bash', { toolName: 'bash', decision: 'always_allow' }],
+        // The body's toolName is the caller's word: claiming a non-MCP tool changes nothing.
+        ['tc-mcp', { toolName: 'web_search', decision: 'allow' }],
+        ['tc-mcp', { toolName: MCP_TOOL, decision: 'allow' }],
+      ] as const) {
+        const res = await approveCall(h, caller.request, headers, conv.id, callId, body)
+        assert.equal(res.status, 403, `${caller.name}: ${callId} ${JSON.stringify(body)}`)
+        assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required')
+      }
+      assert.deepEqual(h.db.getToolOverrides(conv.id), {}, `${caller.name}: no "Allow for this chat" may be saved`)
+      assert.equal(h.cfg.tools.toolPolicies?.bash, undefined, `${caller.name}: no tool policy may be saved`)
+      // Both calls are still pending: a deny, which runs nothing, stays open to the caller.
+      assert.equal((await approveCall(h, caller.request, headers, conv.id, 'tc-bash', { toolName: 'bash', decision: 'deny' })).status, 200)
+      assert.equal(await bash, 'deny')
+      assert.equal((await approveCall(h, caller.request, headers, conv.id, 'tc-mcp', { toolName: MCP_TOOL, decision: 'deny' })).status, 200)
+      assert.equal(await mcp, 'deny')
+    } finally {
+      ac.abort()
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+  // The host approves its own Code call, and so does a LAN caller with a real API key (one
+  // codeAuth lets into Code), on an open LAN too.
+  const raw = 'tllm-codekeyedcodekeyedcodekeyedcodekey1'
+  const h = toolChat((cfg) => {
+    cfg.daemon.lanBind = true
+    cfg.daemon.requireApiKey = false
+    cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+  })
+  const ac = new AbortController()
+  try {
+    const conv = h.db.createConversation({ kind: 'code' })
+    const host = waitForToolApproval(`${conv.id}:tc-host`, ac.signal, 'bash')
+    assert.equal((await approveCall(h, loopbackRequest, {}, conv.id, 'tc-host', { toolName: 'bash', decision: 'allow' })).status, 200)
+    assert.equal(await host, 'allow')
+    const keyed = waitForToolApproval(`${conv.id}:tc-keyed`, ac.signal, MCP_TOOL)
+    assert.equal((await approveCall(h, lanRequest, { 'X-TurboLLM-Auth': raw }, conv.id, 'tc-keyed', { toolName: MCP_TOOL, decision: 'allow' })).status, 200)
+    assert.equal(await keyed, 'allow')
+  } finally {
+    ac.abort()
+    h.cleanup()
+  }
+  // A chat's pending (non-MCP) call is unchanged: the open-LAN peer still approves its own chat's.
+  const open = toolChat((cfg) => { cfg.daemon.lanBind = true; cfg.daemon.requireApiKey = false })
+  const chatAc = new AbortController()
+  try {
+    const conv = open.db.createConversation()
+    const pending = waitForToolApproval(`${conv.id}:tc-chat`, chatAc.signal, 'web_search')
+    assert.equal((await approveCall(open, lanRequest, {}, conv.id, 'tc-chat', { toolName: 'web_search', decision: 'allow' })).status, 200)
+    assert.equal(await pending, 'allow')
+  } finally {
+    chatAc.abort()
+    open.cleanup()
+  }
+})
 
 // ── An agent that lists the owner's MCP tool, and a chat routine on one ─────────────────────
 // A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an agent
