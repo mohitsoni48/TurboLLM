@@ -6,6 +6,9 @@ import { registerRemoteApi, sanitizeTokenGrant } from './routes'
 import { defaultConfig, normalizeProvider } from '../config/config'
 import { isRemoteAccessEnabled } from './gate'
 import { registerApi } from '../api/routes'
+import { RemoteAccessManager } from './manager'
+import { verifyKeyValue } from '../auth'
+import type { PreflightState, RemoteProvider } from './types'
 
 test('sanitizeTokenGrant: strips config:*/downloads:* even if stored, keeps the four server capabilities', () => {
   const r = sanitizeTokenGrant({
@@ -93,6 +96,74 @@ test('remote routes: stop clears enabled in config and calls the manager', async
   assert.equal(res.status, 200)
   assert.equal(counts().disabled, 1)
   assert.equal(cfg.remoteAccess.enabled, false)
+})
+
+/** A child-process provider whose stop() hangs until released, as a cloudflared given up to
+ *  8 s to exit does; a stop() after the release resolves at once. */
+class SlowStopProvider implements RemoteProvider {
+  readonly id = 'cloudflare-quick' as const
+  readonly lifecycle = 'child-process' as const
+  starts = 0
+  private hang = true
+  private release: (() => void) | undefined
+  async preflight(): Promise<PreflightState> {
+    return { kind: 'off' }
+  }
+  async start(): Promise<{ url: string }> {
+    this.starts++
+    return { url: `https://tunnel-${this.starts}.trycloudflare.com` }
+  }
+  stop(): Promise<void> {
+    if (!this.hang) return Promise.resolve()
+    return new Promise((resolve) => {
+      this.release = () => {
+        this.hang = false
+        resolve()
+      }
+    })
+  }
+  alive(): boolean {
+    return true
+  }
+  onExit(): void {}
+  releaseStop(): void {
+    this.release?.()
+  }
+}
+
+test('remote routes: a Start sent during a Stop waits for it, then answers with a token the Stop did not revoke', async () => {
+  const cfg = defaultConfig()
+  cfg.daemon.experimental.remoteAccess = true
+  const p = new SlowStopProvider()
+  const remote = new RemoteAccessManager({ app: new Hono(), ingressPort: 0, makeProvider: () => p, probe: async () => true })
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    remote,
+  } as unknown as Deps
+  const app = new Hono()
+  registerRemoteApi(app, d)
+  const post = (path: string) => app.request(path, { method: 'POST' }, LOCAL_ENV)
+  try {
+    assert.equal(((await (await post('/api/v1/remote/start')).json()) as { state: { kind: string } }).state.kind, 'connected')
+
+    const stopping = post('/api/v1/remote/stop') // the provider's stop() hangs
+    await new Promise((r) => setTimeout(r, 20))
+    const starting = post('/api/v1/remote/start')
+    await new Promise((r) => setTimeout(r, 20))
+    p.releaseStop()
+    assert.equal((await stopping).status, 200)
+    const started = (await (await starting).json()) as { state: { kind: string; url?: string }; token?: string }
+
+    assert.equal(started.state.kind, 'connected')
+    assert.equal(started.state.url, 'https://tunnel-2.trycloudflare.com', 'started afresh after the Stop')
+    assert.equal(remote.state().kind, 'connected')
+    assert.equal(cfg.remoteAccess.enabled, true)
+    assert.ok(started.token, 'a token is shown')
+    // As a request over the tunnel presents it: a remote token is honoured only there.
+    assert.equal(verifyKeyValue(started.token, d, { ingress: true }), true, 'the token shown still works')
+  } finally {
+    await remote.disable()
+  }
 })
 
 test('settings: secrets are write-only — GET reports only whether one is stored', () => {

@@ -711,6 +711,82 @@ test('manager: disable() while a restart() is starting the replacement provider 
   assert.equal(m.state().kind, 'off')
 })
 
+// A Start sent while a Stop is still stopping the provider (a child gets up to 8 s to exit) used
+// to see the old 'connected', return as a no-op, and let /start hand out the remote token the
+// Stop then revoked, with the tunnel left off.
+test('manager: an enable() during a disable() waits for the stop to finish, then starts afresh', async () => {
+  const p = new SlowStopProvider()
+  const m = mgr(p)
+  await m.enable()
+  const disabling = m.disable() // its stop() hangs until released
+  try {
+    let enabled = false
+    const enabling = m.enable().then(() => {
+      enabled = true
+    })
+    await flush()
+    await flush()
+    assert.equal(enabled, false, 'the enable() waits rather than take the old connection for its own')
+    assert.equal(p.starts, 1)
+
+    p.releaseHungStop()
+    await disabling
+    await enabling
+    const s = m.state()
+    assert.equal(s.kind, 'connected')
+    assert.equal(s.kind === 'connected' && s.url, 'https://example-2.test', 'a new start, after the stop')
+    assert.equal(typeof m.ingressPort(), 'number')
+  } finally {
+    // Also after a failed assertion: a stop left hung keeps the ingress bound and the file
+    // never exits.
+    p.releaseHungStop()
+    await disabling
+    await m.disable()
+  }
+})
+
+test('manager: an enable() waits for every disable() still running, not only the latest', async () => {
+  const p = new SlowStopProvider()
+  const m = mgr(p)
+  await m.enable()
+  const first = m.disable() // hangs in the provider's stop()
+  try {
+    await m.disable() // finds the provider already taken, so it ends first
+    let enabled = false
+    const enabling = m.enable().then(() => {
+      enabled = true
+    })
+    await flush()
+    await flush()
+    assert.equal(enabled, false, 'the first stop is still running')
+
+    p.releaseHungStop()
+    await first
+    await enabling
+    assert.equal(m.state().kind, 'connected', 'the first stop did not take the new connection down')
+    assert.equal(p.starts, 2)
+    assert.equal(typeof m.ingressPort(), 'number')
+  } finally {
+    p.releaseHungStop() // as above
+    await first
+    await m.disable()
+  }
+})
+
+test('manager: a disable() while an enable() waits on an earlier one wins, so nothing starts', async () => {
+  const p = new SlowStopProvider()
+  const m = mgr(p)
+  await m.enable()
+  const first = m.disable()
+  const enabling = m.enable()
+  const second = m.disable() // the user's latest action
+  p.releaseHungStop()
+  await Promise.all([first, enabling, second])
+  assert.equal(m.state().kind, 'off')
+  assert.equal(p.starts, 1)
+  assert.equal(m.ingressPort(), undefined)
+})
+
 test('manager: disable() while the ingress is still binding never starts the provider and releases the listener', async () => {
   const p = new GatedProvider('child-process', 'cloudflare-quick', true)
   const m = mgr(p)

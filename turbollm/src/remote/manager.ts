@@ -57,6 +57,9 @@ export class RemoteAccessManager implements RemoteIngress {
    *  generation for) — something a generation number alone cannot distinguish. */
   private generation = 0
 
+  /** The disable() still taking the provider and the ingress down, if any — see enable(). */
+  private stopInFlight: Promise<void> | null = null
+
   constructor(private opts: RemoteAccessOptions) {}
 
   state(): RemoteState {
@@ -109,6 +112,17 @@ export class RemoteAccessManager implements RemoteIngress {
    *  mismatch once its timer fires and abandon a perfectly legitimate reconnection attempt,
    *  permanently stranding the manager in `reconnecting` with nothing left to retry it. */
   async enable(): Promise<void> {
+    // A disable() still stopping the provider (a child process gets up to 8 s to exit) leaves
+    // the state it is tearing down in place until it ends. An enable() landing then used to
+    // see that old 'connected', return as a no-op, and let /start answer 'connected' with the
+    // remote token the Stop revoked a moment later, leaving the tunnel off. So wait for the
+    // stop to finish and start afresh after it; a disable() called while this one waits is
+    // the newer request and wins, so this enable() then does nothing.
+    if (this.stopInFlight) {
+      const gen = this.generation
+      await this.stopInFlight
+      if (gen !== this.generation) return
+    }
     if (
       this.current.kind === 'connected' ||
       this.current.kind === 'starting' ||
@@ -182,6 +196,20 @@ export class RemoteAccessManager implements RemoteIngress {
    *  flow already in flight, including a pending restart() sitting in its backoff wait
    *  (ADR-422 final review, Important finding I1). */
   async disable(): Promise<void> {
+    const own = this.takeDown()
+    // What an enable() arriving meanwhile waits for (it never rejects). A disable() called
+    // while another still runs finds the provider already taken and can end first, so it
+    // covers the earlier one too.
+    const inFlight: Promise<void> = Promise.allSettled([this.stopInFlight, own]).then(() => {
+      if (this.stopInFlight === inFlight) this.stopInFlight = null
+    })
+    this.stopInFlight = inFlight
+    await own
+  }
+
+  /** disable()'s body. Its first statements, the generation bump included, run synchronously
+   *  when disable() is called. */
+  private async takeDown(): Promise<void> {
     this.generation++
     clearInterval(this.healthTimer)
     this.healthTimer = undefined
