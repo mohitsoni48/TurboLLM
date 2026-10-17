@@ -117,15 +117,15 @@ const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat c
 
 /** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
  *  not deleted, and `content` becomes the question's newest version, with the same images and
- *  documents. Shared by PUT /messages/:msgId and /continue { edit }. */
-function branchEditedQuestion(db: ConversationStore, convId: string, msg: Message, content: string): void {
+ *  documents. Shared by PUT /messages/:msgId and /continue { edit }. Returns the new version. */
+function branchEditedQuestion(db: ConversationStore, convId: string, msg: Message, content: string): Message {
   // One transaction: an addMessage that failed after the freeze (disk full, an I/O error) left
   // the question and its tail deactivated with no new version shown in their place.
-  db.transaction(() => {
+  return db.transaction(() => {
     db.freezeTail(convId, msg.seq, msg.id)
     db.deactivateMessage(msg.id)
     const variantGroup = db.getMessage(msg.id)!.variantGroup!
-    db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+    return db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
   })
 }
 
@@ -458,7 +458,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // /continue the client then skipped (no model ready) or the daemon refused (a Turbo Link
     // machine asleep, the model gone) left the branch ending on the new question, unanswered: the
     // next send went out as user, user, which alternating-role templates reject on every later
-    // turn of that branch.
+    // turn of that branch. One the engine or the host gives once the turn has started puts the old
+    // version and its tail back in runGeneration (edited).
+    let edited: GenerationCtx['edited']
     if (b.edit) {
       if (b.regenerate) return err(c, 400, 'invalid_input', 'edit and regenerate cannot be combined.')
       const content = typeof b.edit.content === 'string' ? b.edit.content.trim() : ''
@@ -468,7 +470,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Only a question can be edited and resent.')
       // As in PUT: only a question on the shown branch.
       if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
-      branchEditedQuestion(db, convId, msg, content)
+      edited = { from: msg.id, to: branchEditedQuestion(db, convId, msg, content).id }
       conv.messages = db.getMessages(convId)
     }
 
@@ -543,7 +545,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, isCodeAuthorized })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     }))
   })
 
@@ -937,6 +939,10 @@ interface GenerationCtx {
   /** Regenerate (/continue { regenerate: true }): the reply this turn set aside, which a turn the
    *  engine or linked host refuses before producing anything shows again (see restoreReplaced). */
   replacedId?: string
+  /** Save & Resend (/continue { edit }): the question version this turn set aside with its tail
+   *  (`from`) and the new version it answers (`to`). A turn the engine or linked host refuses
+   *  before producing anything drops `to` and shows `from` and its tail again (restoreReplaced). */
+  edited?: { from: string; to: string }
   /** Phase 4 / C1: whether THIS request's caller cleared the code-execution bar (host-local or a
    *  valid API key), computed by the route handler — the only place a Hono `Context` exists — and
    *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
@@ -1221,15 +1227,33 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
    *  text, reasoning or tool call, nothing still held back by the parser), the empty placeholder is
    *  deleted and the old reply shown again, before the error is sent, so the client's refetch on it
    *  already sees the reply back. Only while both rows are as this turn left them (a DELETE of
-   *  either during the turn stands). Never throws: the catch below calls it, where nothing may. */
+   *  either during the turn stands). Never throws: the catch below calls it, where nothing may.
+   *  Save & Resend (`ctx.edited`) the same: such a turn left the new question shown with an empty
+   *  reply, and the old version and its replies behind the question's switcher. The new version is
+   *  deleted with the placeholder, not kept beside the old one: switched to, it would show a
+   *  question with no reply, and the next send would go out as user, user. */
   let restored = false
   const restoreReplaced = (): boolean => {
-    if (!ctx.replacedId || fullContent || fullReasoning || allToolCalls.length > 0 || pendingParse?.buf) return false
+    if ((!ctx.replacedId && !ctx.edited) || fullContent || fullReasoning || allToolCalls.length > 0 || pendingParse?.buf) return false
     try {
-      const replaced = db.getMessage(ctx.replacedId)
       const placeholder = db.getMessage(assistantMsg.id)
+      if (!placeholder?.isActive) return false
+      if (ctx.edited) {
+        const from = db.getMessage(ctx.edited.from)
+        const to = db.getMessage(ctx.edited.to)
+        const group = from?.variantGroup
+        if (!group || from.isActive || !to?.isActive || to.variantGroup !== group) return false
+        db.transaction(() => {
+          db.deleteMessage(assistantMsg.id)
+          db.deleteMessage(to.id)
+          db.restoreTail(from.id)
+          db.setActiveVariant(group, from.id)
+        })
+        return true
+      }
+      const replaced = db.getMessage(ctx.replacedId!)
       const group = replaced?.variantGroup
-      if (!group || !placeholder?.isActive || placeholder.variantGroup !== group) return false
+      if (!group || placeholder.variantGroup !== group) return false
       db.transaction(() => {
         db.deleteMessage(assistantMsg.id)
         db.setActiveVariant(group, replaced.id)

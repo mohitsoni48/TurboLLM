@@ -882,6 +882,57 @@ test('Save & Resend as one /continue { edit }: a refused turn changes nothing, a
   }
 })
 
+// The test above covers a refusal before the turn starts. Once it had, a 503 while a model loads,
+// a fetch that throws (a host asleep, an engine that died) or an error chunk left the new question
+// shown with an empty reply, and the old version and its tail behind the switcher.
+test('a Save & Resend the engine or linked host refuses once the turn has started keeps the question and the replies it would have replaced', async () => {
+  const h = inFlightHarness()
+  const failures: Array<[string, () => Response]> = [
+    ['engine_error', () => new Response(JSON.stringify({ error: { message: 'Loading model' } }), { status: 503 })],
+    ['engine_stopped', () => { throw new TypeError('fetch failed') }],
+    ['engine_error', () => new Response(`data: ${JSON.stringify({ error: { message: 'out of memory' } })}\n\n`, { status: 200 })],
+  ]
+  const engine = fakeEngine((_init, n) => {
+    if (n <= 2) return sseReply(`a${n}`)
+    if (n <= failures.length + 2) return failures[n - 3][1]()
+    if (n === failures.length + 3) return new Response([
+      `data: ${JSON.stringify({ choices: [{ delta: { content: 'partial' } }] })}\n\n`,
+      `data: ${JSON.stringify({ error: { message: 'out of memory' } })}\n\n`,
+    ].join(''), { status: 200 })
+    return sseReply('a1 to the edit')
+  })
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const active = () => h.store.getMessages(conv.id).map((m) => `${m.role}:${m.content}`)
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+    await (await h.app.request(`${base}/messages`, json({ content: 'q2' }))).text()
+    const q1 = h.store.getMessages(conv.id)[0].id
+    const versions = () => h.store.getMessageVariants(h.store.getMessage(q1)!.variantGroup!).map((m) => `${m.content}:${m.isActive}`)
+
+    for (const [code] of failures) {
+      const sse = await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited' } }))).text()
+      assert.match(sse, new RegExp(`"code":"${code}"`), 'the error still reaches the chat')
+      assert.deepEqual(active(), ['user:q1', 'assistant:a1', 'user:q2', 'assistant:a2'], code)
+      assert.deepEqual(versions(), ['q1:true'], 'no unanswered version left on its switcher')
+      assert.deepEqual(inFlightChatIds(), [])
+    }
+
+    // A turn that streamed anything keeps the new version and its reply, as a Regenerate does.
+    await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited' } }))).text()
+    assert.deepEqual(active(), ['user:q1 edited', 'assistant:partial'])
+    assert.equal((await h.app.request(`${base}/messages/${q1}/activate`, { method: 'POST' })).status, 200)
+    assert.deepEqual(active(), ['user:q1', 'assistant:a1', 'user:q2', 'assistant:a2'])
+
+    await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited again' } }))).text()
+    assert.deepEqual(active(), ['user:q1 edited again', 'assistant:a1 to the edit'])
+    assert.deepEqual(versions(), ['q1:false', 'q1 edited:false', 'q1 edited again:true'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()
