@@ -3,9 +3,9 @@
 // so no locking is needed. Unknown JSON fields ride along on `data` and are
 // preserved across round-trips for free.
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
@@ -817,6 +817,40 @@ export function configuredDaemonPort(configPath: string): number {
   return defaultConfig().daemon.port
 }
 
+/** Remove the `<config>.<pid>.tmp` files (see ConfigStore.save) whose process is gone. A save
+ *  writes the whole config, the HF and GitHub tokens and tunnel tokens included, to its tmp and
+ *  then renames it into place; a process killed in between left it, and no later save overwrites
+ *  another pid's, so each kept a copy of those tokens for good, after the user rotated or removed
+ *  them. Run by every load (each daemon start, `--stop`). A live pid's is left: that process may
+ *  be between its write and its rename (EPERM counts as live). Best-effort — never throws. */
+function sweepDeadSaveTmps(configPath: string): void {
+  const dir = dirname(configPath)
+  const prefix = `${basename(configPath)}.`
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return // no data dir yet
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue
+    const middle = name.slice(prefix.length, -'.tmp'.length)
+    // Our own pid's is overwritten by our first save. No pid (an older version's shared
+    // `config.json.tmp`, which a daemon of that version may be writing), or anything but the
+    // decimal pid save writes (Number() would read `0x1F` or `1e3` as one): not ours to judge.
+    if (!/^[1-9]\d*$/.test(middle)) continue
+    const pid = Number(middle)
+    if (pid === process.pid) continue
+    try {
+      process.kill(pid, 0)
+      continue
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code === 'EPERM') continue
+    }
+    try { rmSync(join(dir, name), { force: true }) } catch { /* best-effort */ }
+  }
+}
+
 export class ConfigStore {
   private constructor(
     private data: Config,
@@ -825,6 +859,7 @@ export class ConfigStore {
   ) {}
 
   static load(path: string): ConfigStore {
+    sweepDeadSaveTmps(path)
     if (!existsSync(path)) {
       const store = new ConfigStore(defaultConfig(), path)
       store.save()

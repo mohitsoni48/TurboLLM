@@ -14,6 +14,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import fs, { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
+import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import {
   ANY_ENGINE,
@@ -870,6 +871,34 @@ test("ConfigStore: another process's load during a save leaves that save's tmp f
     setPid(realPid)
     t.mock.restoreAll()
     syncBuiltinESMExports()
+    cleanup(path)
+  }
+})
+
+// A save writes the whole config (the HF and GitHub tokens, tunnel tokens) to its tmp file, then
+// renames it into place. With the per-process name, a process killed between the two left
+// `config.json.<pid>.tmp` behind for good: no later save overwrites another pid's, so each kept a
+// copy of the tokens saved then, after the user rotated or removed them.
+test('ConfigStore.load: removes a tmp file a killed process left, not one a live process may be writing', () => {
+  const path = tmpConfigPath()
+  const dir = join(path, '..')
+  try {
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    const dead = spawnSync(process.execPath, ['-e', '']).pid as number // exited before spawnSync returns
+    const live = process.ppid // the test runner
+    writeFileSync(join(dir, `config.json.${dead}.tmp`), JSON.stringify({ hf: { token: 'hf_rotated_since' } }))
+    writeFileSync(join(dir, `config.json.${live}.tmp`), '{}')
+    writeFileSync(join(dir, 'other.json.123.tmp'), '{}')
+    // Not a name save writes, though Number() reads a pid (one no process can have) out of it.
+    writeFileSync(join(dir, 'config.json.1e9.tmp'), '{}')
+
+    ConfigStore.load(path)
+
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.endsWith('.tmp')).sort(),
+      [`config.json.${live}.tmp`, 'other.json.123.tmp', 'config.json.1e9.tmp'].sort(),
+    )
+  } finally {
     cleanup(path)
   }
 })
