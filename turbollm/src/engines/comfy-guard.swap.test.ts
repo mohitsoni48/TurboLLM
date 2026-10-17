@@ -2,7 +2,7 @@
 // on model B while A runs, and a render starts while A is still stopping (a graceful stop takes up to
 // 8 s). acquire() used to return at once with A still resident, and B then loaded during the render.
 import assert from 'node:assert/strict'
-import { chmodSync, existsSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore } from '../config/config'
@@ -198,4 +198,117 @@ test('a paused load the release resumes is refused right before its spawn by an 
   await guard.release()
   assert.equal(manager.status().state, 'running')
   assert.equal(manager.status().model?.key, 'B')
+})
+
+// An engine update, delete or purge does not wait for a render: the model is already unloaded, so nothing refuses it.
+// A purge (or an official llama.cpp backend's update, which registers the new build under a new id and deletes the old
+// one's folder) removed the engine and its binary, and the reload then started that binary: engine_spawn_failed, ENOENT.
+function fakeLlamaEngine(dir: string) {
+  writeFileSync(join(dir, 'fake-engine.js'), FAKE_ENGINE_JS)
+  const bin = join(dir, 'llama-server')
+  writeFileSync(bin, `#!/bin/sh\necho spawned >> "${join(dir, 'spawns')}"\nexec "${process.execPath}" "${join(dir, 'fake-engine.js')}" "$@"\n`)
+  chmodSync(bin, 0o755)
+  const engine: StartOpts['engine'] = { id: 'fake', name: 'Fake llama.cpp', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }
+  const opts = (key: string): StartOpts => ({
+    engine, model: { key, name: key, quant: '', ctx: 0, vision: false }, modelPath: join(dir, `${key}.gguf`), extraArgs: [],
+  })
+  const registered = new Map([[engine.id, engine]])
+  const spawns = () => (existsSync(join(dir, 'spawns')) ? readFileSync(join(dir, 'spawns'), 'utf8').split('\n').filter(Boolean).length : 0)
+  // What a purge does to it: unregistered, and its folder deleted.
+  const purge = () => {
+    registered.delete(engine.id)
+    rmSync(bin)
+  }
+  // What a release engine's update or a same-named zip re-upload can do: the id is kept, but the new build folder
+  // puts the binary at another path (Registry.refresh records it) and the old one is gone.
+  const moveBinary = () => {
+    const moved = join(dir, 'llama-server-new')
+    writeFileSync(moved, readFileSync(bin))
+    chmodSync(moved, 0o755)
+    registered.set(engine.id, { ...engine, binPath: moved })
+    rmSync(bin)
+  }
+  return { opts, registered, spawns, purge, moveBinary }
+}
+
+test('an engine purged during a render: release does not start its missing binary, and the model stays unloaded', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-purged-')
+  const e = fakeLlamaEngine(dir)
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  guard.setEngineLookup((id) => e.registered.get(id))
+  t.after(() => guard.stop())
+  await manager.load(e.opts('A'))
+
+  // A render while the engine is still registered on the same binary (as after an update in place): A is reloaded.
+  await guard.acquire()
+  await guard.release()
+  assert.equal(manager.status().state, 'running')
+  assert.equal(e.spawns(), 2)
+
+  await guard.acquire()
+  e.purge()
+  await guard.release()
+
+  assert.equal(manager.status().state, 'stopped', 'nothing was started')
+  assert.equal(manager.status().err, null)
+  assert.equal(e.spawns(), 2)
+  assert.equal(guard.isBlocked(), false)
+  assert.equal(guard.snapshot().suspendedModelKey, null)
+})
+
+test('a paused load whose engine was purged during the render is not started, and its error says why', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-purged-paused-')
+  const e = fakeLlamaEngine(dir)
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  guard.setEngineLookup((id) => e.registered.get(id))
+  t.after(() => guard.stop())
+  await guard.acquire()
+  await assert.rejects(manager.load(e.opts('B'), { beforeStart: () => guard.freeComfyUIBeforeLoad() }), /ComfyUI is rendering/)
+
+  e.purge()
+  await guard.release()
+
+  assert.equal(manager.status().state, 'error')
+  assert.equal(
+    manager.status().err?.message,
+    'Fake llama.cpp was updated or removed while ComfyUI was rendering, so the model was not loaded again. Load it from Models.',
+  )
+  assert.equal(e.spawns(), 0)
+})
+
+test('an engine updated to a binary at a new path during a render: release does not start the old, deleted binary', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-moved-')
+  const e = fakeLlamaEngine(dir)
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  guard.setEngineLookup((id) => e.registered.get(id))
+  t.after(() => guard.stop())
+  await manager.load(e.opts('A'))
+
+  await guard.acquire()
+  e.moveBinary()
+  await guard.release()
+
+  assert.equal(manager.status().state, 'stopped', 'nothing was started')
+  assert.equal(manager.status().err, null)
+  assert.equal(e.spawns(), 1)
+  assert.equal(guard.isBlocked(), false)
+  assert.equal(guard.snapshot().suspendedModelKey, null)
 })

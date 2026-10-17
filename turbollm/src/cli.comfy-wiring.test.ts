@@ -13,3 +13,7 @@ const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8')
 test("the ComfyUI guard's reload after a render runs under the gateway router's swap lock", () => {
   assert.ok(CLI.includes('comfy.setSwapLock((fn) => modelRouter.withSwapLock(fn))'))
 })
+
+test("the ComfyUI guard's reload after a render checks its engine is still in the registry", () => {
+  assert.ok(CLI.includes('comfy.setEngineLookup((id) => registry.get(id))'))
+})

@@ -24,7 +24,7 @@
 // evict the model's prompt cache — so before unloading we SAVE the slot-0 KV to disk (a
 // capped POST that never delays ComfyUI past the cap) and after the reload we RESTORE it,
 // turning the slow re-prefill of a long prefix into a cheap memcpy. See ./slot-cache.
-import type { ConfigStore } from '../config/config'
+import type { ConfigStore, Engine } from '../config/config'
 import type { Manager, StartOpts } from './manager'
 import { cacheEligible, restoreSlot, SAVE_CAP_MS, saveSlot, slotCacheDir, slotCacheKey, TTL_MS } from './slot-cache'
 
@@ -40,6 +40,10 @@ const FREE_TIMEOUT_MS = 10_000
 /** The refusal freeComfyUIBeforeLoad throws; Manager.load stores it as the engine's error, and release()
  *  recognises it there to resume that load. */
 const LOAD_PAUSED = 'ComfyUI is rendering — model loading is paused until its queue finishes.'
+
+/** The refusal of a reload whose engine was unregistered or moved to another binary during the render (see reload()). */
+const engineGone = (name: string): string =>
+  `${name} was updated or removed while ComfyUI was rendering, so the model was not loaded again. Load it from Models.`
 
 /** Backstop: if `release` never arrives (ComfyUI crashed mid-render), auto-release
  *  after this long so the model doesn't stay unloaded forever. Each acquire re-arms
@@ -96,6 +100,9 @@ export class ComfyGuard {
   private swapLock: (<T>(fn: () => Promise<T>) => Promise<T>) | null = null
   // The model release()'s reload is loading, until its start or restart settles (see modelKeyReloading()).
   private reloading: { modelKey: string } | null = null
+  // The registry's engine lookup (Registry.get), which release()'s reload checks its engine against. Set by
+  // setEngineLookup (cli.ts).
+  private engineLookup: ((id: string) => Engine | undefined) | null = null
 
   private readonly leaseMs: number
   private readonly fetchImpl: FetchImpl
@@ -130,6 +137,11 @@ export class ComfyGuard {
   /** Wire the gateway's swap lock, which release()'s reload runs under (see reload()). */
   setSwapLock(lock: <T>(fn: () => Promise<T>) => Promise<T>): void {
     this.swapLock = lock
+  }
+
+  /** Wire the registry's engine lookup, which release()'s reload checks its engine against (see reload()). */
+  setEngineLookup(lookup: (id: string) => Engine | undefined): void {
+    this.engineLookup = lookup
   }
 
   /** True when a model load should be refused right now (ComfyUI holds the GPU). The
@@ -229,9 +241,22 @@ export class ComfyGuard {
   private async reload(opts: StartOpts | null, cachedFile: string | null): Promise<void> {
     const render = this.acquires
     let refused = false
+    // The engine the reload starts on, set once it is known which load that is.
+    let engine: Engine | undefined
     const refuse = () => {
       refused = this.gpuClaimed()
       this.refuseLoadWhileHeld()
+      // An engine update, delete or purge does not wait for a render (the model is already unloaded). A delete or
+      // purge unregisters the engine, and so does an update that registers its new build under a new id (an official
+      // llama.cpp backend); a purge and that update also delete its files. A release engine's update and a same-named
+      // zip re-upload keep the id but swap in a new build folder whose binary can be at another path (Registry.refresh
+      // records it). Starting the old opts then ran a binary that no longer exists (engine_spawn_failed, ENOENT). The
+      // model stays unloaded instead, as an update leaves a running model it stops; a paused load keeps this as its
+      // error. An update that replaces the binary at the same path (TurboQuant, KoboldCpp, llamafile, the pip engines,
+      // a re-upload of the same layout) is reloaded as before.
+      if (engine && this.engineLookup && this.engineLookup(engine.id)?.binPath !== engine.binPath) {
+        throw new Error(engineGone(engine.name))
+      }
     }
     // Checked inside the load gate and again right before the spawn. Between the two the start awaits its preflight
     // (vLLM and SGLang import uvloop first, about 1 s) and a port: an acquire landing there found the engine stopped,
@@ -257,6 +282,7 @@ export class ComfyGuard {
       // also wins over a model the render displaced. Manager.load recorded its opts before our hook threw, so
       // restart() retries exactly it. A KV cache saved on the way in belongs to the displaced model: not restored.
       paused = this.hasPausedLoad()
+      engine = (paused ? this.manager.restartOpts() : opts)?.engine
       if (paused) {
         console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
         await underSwapLock(this.manager.restartOpts()?.model.key, () => this.manager.restart(hooks))
