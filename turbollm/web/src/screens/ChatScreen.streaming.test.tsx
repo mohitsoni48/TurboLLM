@@ -516,6 +516,64 @@ describe('ChatScreen — Regenerate', () => {
       toastError.mockRestore()
     }
   })
+
+  // Regenerate was held back only by `live`, which is set when the turn's meta arrives: a second
+  // click before that sent a second /continue, the daemon refused it (409), and the refusal
+  // cleared the first turn's live view, taking its streamed text and its Stop button with it.
+  it('a double-click sends one /continue, and the turn keeps its live view and Stop', async () => {
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    const stream = steppedStream()
+    let refuse!: () => void
+    const refused = new Promise<void>((r) => { refuse = r })
+    nextGen = (signal) => continueCalls.length === 1
+      ? stream.gen(signal)
+      : (async function* () { await refused; throw new ApiError('generation_in_flight', 'A generation is already running for this conversation.', 409) })()
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      const regenerate = await screen.findByTitle('Regenerate')
+      await act(async () => { fireEvent.click(regenerate); fireEvent.click(regenerate) })
+      await stream.push(meta)
+      await stream.push({ event: 'delta', data: { delta: 'Second answer' } } as ChatSseEvent)
+      await act(async () => { refuse(); await new Promise((r) => setTimeout(r, 0)) })
+      expect(continueCalls).toHaveLength(1)
+      expect(toastError).not.toHaveBeenCalled()
+      await stream.push({ event: 'delta', data: { delta: ' streams on' } } as ChatSseEvent)
+      expect(screen.getByText(/Second answer streams on/)).toBeInTheDocument()
+      await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
+      expect(stopSpy).toHaveBeenCalledWith('c1')
+      expect((continueCalls[0][1] as AbortSignal).aborted).toBe(true)
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  // The same refusal reached another way: a turn this view started but the daemon refused before
+  // it began (here a message sent while the Regenerate was still starting) cleared the live view
+  // of the turn that did begin, though it never had one of its own.
+  it('a turn refused before it began leaves the live view and Stop of the one that began', async () => {
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    const stream = steppedStream()
+    let refuse!: () => void
+    const refused = new Promise<void>((r) => { refuse = r })
+    nextGen = stream.gen
+    try {
+      await renderScreen('/chat/c1')
+      await act(async () => { fireEvent.click(await screen.findByTitle('Regenerate')) })
+      nextGen = async function* () { await refused; throw new ApiError('generation_in_flight', 'A generation is already running for this conversation.', 409) }
+      await sendText('meanwhile')
+      expect(sendCalls).toHaveLength(1)
+      await stream.push(meta)
+      await stream.push({ event: 'delta', data: { delta: 'Second answer' } } as ChatSseEvent)
+      await act(async () => { refuse(); await new Promise((r) => setTimeout(r, 0)) })
+      await stream.push({ event: 'delta', data: { delta: ' streams on' } } as ChatSseEvent)
+      expect(screen.getByText(/Second answer streams on/)).toBeInTheDocument()
+      await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
+      expect(stopSpy).toHaveBeenCalledWith('c1')
+    } finally {
+      refuse()
+    }
+  })
 })
 
 describe('ChatScreen — while a manual Compact runs', () => {

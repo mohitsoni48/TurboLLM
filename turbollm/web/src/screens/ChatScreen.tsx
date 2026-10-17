@@ -794,10 +794,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         }
       }
       // Stream ended without an explicit done/error (e.g. network cut, silent close)
-      clearLive(convId)
+      if (started) clearLive(convId)
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } catch (e) {
-      clearLive(convId)
+      // Only a turn that started has a live entry of its own (set at its meta). One refused before
+      // that (a 409 while another turn from this view runs) cleared THAT turn's: its streamed text
+      // and Stop vanished while it kept running.
+      if (started) clearLive(convId)
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
         if (!started) on?.refused?.(e)
@@ -1020,6 +1023,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const handleRegenerate = async (replyId: string) => {
     if (!activeId || live || compactingHere) return
+    // A turn already starting from this view: `live` is only set when its meta arrives, so a
+    // double-click sent a second /continue, which the daemon refused, and that refusal took the
+    // first turn's live view and Stop with it (streamFrom). As resendEdit does.
+    if (abortRefs.current[activeId]) return
     if (!ready) { toast.error('Load a model first.'); return }
     const ac = new AbortController()
     abortRefs.current[activeId] = ac
