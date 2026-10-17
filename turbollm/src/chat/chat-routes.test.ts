@@ -350,6 +350,45 @@ test('Regenerate and edit-and-resend send the answered turn WITH its image and d
   }
 })
 
+// The document text is stored for the resends above, but the chat polls GET /conversations/:id
+// every 4 s and shows a document by its name: each poll sent every attached document's full text.
+test('the chat routes return an attached document by name, without its stored text', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  const docText = '[Attached: report.txt]\nQ3 revenue was $4M'
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'Summarize the file.', docContext: docText, textAttachments: ['report.txt'] }))).text()
+    const [q1, a1] = h.store.getMessages(conv.id)
+    const singleVersion = await h.app.request(`${base}/messages/${q1.id}/variants`)
+    await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1.id, content: 'Only the totals.' } }))).text()
+    const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+
+    const responses = {
+      singleVersion,
+      conversation: await h.app.request(base),
+      variants: await h.app.request(`${base}/messages/${q1.id}/variants`),
+      activate: await h.app.request(`${base}/messages/${q1.id}/activate`, { method: 'POST' }),
+      replyEdit: await put(a1.id, 'fixed reply'),
+      questionEdit: await put(q1.id, 'Summarize it again.'),
+    }
+    for (const [what, res] of Object.entries(responses)) {
+      assert.equal(res.status, 200, what)
+      const text = await res.text()
+      assert.ok(!text.includes('Q3 revenue'), `${what} sent the document text`)
+      assert.ok(!text.includes('docContext'), what)
+      assert.ok(text.includes('"textAttachments":["report.txt"]'), `${what} still names the document`)
+    }
+    assert.equal(h.store.getMessage(q1.id)!.docContext, docText, 'still stored, for a resend')
+    await (await h.app.request(`${base}/continue`, json({}))).text()
+    assert.deepEqual(engine.bodies.at(-1)!.messages.at(-1), { role: 'user', content: `${docText}\n\nSummarize it again.` })
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight entry', async () => {
   let toolDone!: () => void
   const toolGate = new Promise<void>((r) => { toolDone = r })

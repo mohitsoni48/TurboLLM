@@ -115,6 +115,19 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 
 const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
 
+/** Messages as the chat routes return them: without `docContext`, the attached documents' full
+ *  text. It is stored so a Regenerate or a Save & Resend can send the turn again with its
+ *  documents, which the daemon reads from the store; no client reads it, and the chat shows a
+ *  document by its name (`textAttachments`). Returned, every GET /conversations/:id (which the web
+ *  UI polls every 4 s) sent the full text of every document attached in the chat. */
+function forClient(messages: Message[]): Message[] {
+  return messages.map((m) => {
+    if (m.docContext === undefined) return m
+    const { docContext: _docText, ...rest } = m
+    return rest
+  })
+}
+
 /** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
  *  not deleted, and `content` becomes the question's newest version, with the same images and
  *  documents. Shared by PUT /messages/:msgId and /continue { edit }. Returns the new version. */
@@ -228,7 +241,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // other branch's compaction) and the meter shows its measured reading, no projection. (The
     // daemon's auto-compaction gate can judge this branch larger than that reading: see
     // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
-    return c.json(setAsideFrozenCut(db, conv))
+    const shown = setAsideFrozenCut(db, conv)
+    return c.json({ ...shown, messages: forClient(shown.messages ?? []) })
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -578,7 +592,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Tag it "edited" so the UI can show that — this route is the ONLY place that ever
       // sets it, unlike the generation-completion save which writes content too.
       db.updateMessage(msgId, { content: trimmed, edited: true })
-      return c.json({ messages: db.getMessages(convId) })
+      return c.json({ messages: forClient(db.getMessages(convId)) })
     }
 
     // role === 'user': edit-and-resend now BRANCHES instead of destroying the downstream
@@ -595,7 +609,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // new question unanswered when that /continue is refused.
     if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
     branchEditedQuestion(db, convId, msg, trimmed)
-    return c.json({ messages: db.getMessages(convId) })
+    return c.json({ messages: forClient(db.getMessages(convId)) })
   })
 
   app.delete('/api/v1/conversations/:id/messages/:msgId', (c) => {
@@ -678,8 +692,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const { id: convId, msgId } = c.req.param()
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    if (!msg.variantGroup) return c.json({ variants: [msg] })
-    return c.json({ variants: db.getMessageVariants(msg.variantGroup) })
+    if (!msg.variantGroup) return c.json({ variants: forClient([msg]) })
+    return c.json({ variants: forClient(db.getMessageVariants(msg.variantGroup)) })
   })
 
   // Chat branching: switch which sibling in a variant group is the active one. This also
@@ -693,7 +707,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!msg.variantGroup) return err(c, 400, 'invalid_input', 'Message has no alternate versions.')
     const busy = inflightRefusal(c, convId, 'Stop generation first.')
     if (busy) return busy
-    if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
+    if (msg.isActive) return c.json({ messages: forClient(db.getMessages(convId)) }) // already active, no-op
 
     const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
     // A group with no active member is not on the shown branch (a stale tab or another device
@@ -709,7 +723,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       return db.setActiveVariant(group, msgId)
     })
     if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
-    return c.json({ messages: db.getMessages(convId) })
+    return c.json({ messages: forClient(db.getMessages(convId)) })
   })
 
   // ── F-023: export / debug snapshot ────────────────────────────────────────
