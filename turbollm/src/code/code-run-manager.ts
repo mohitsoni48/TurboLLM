@@ -229,6 +229,8 @@ export class CodeRunManager {
     // Not into a turn that was stopped (Stop, Send now): pi still reports it streaming while it
     // winds down (a tool being killed) and takes the steer, but every model request left in that
     // run is aborted, so the message would be stored and never answered. It runs next instead.
+    // The run's own stops (loop breaker, near-overflow) don't fire `ac`: runCodeSession's handle
+    // declines a steer for those itself (returns false), which lands in the same fallback.
     if (active?.steer && !active.ac.signal.aborted) {
       try {
         if (await active.steer(params.task)) return { steered: true, queued: false }

@@ -2041,8 +2041,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // and the one accumulating assistant message captures it all. Guarded on isStreaming: if the
   // turn has already settled by the time a steer lands (a race — it just finished), return false
   // so the manager falls back to follow-up/queue instead of dropping it into a dead session.
+  // Guarded on `aborted` too: a stopped run (the user's Stop, or this run's own loop breaker and
+  // near-overflow stop, which abort pi directly and never fire the manager's signal) is still
+  // streaming while it winds down, and pi would drain the steer into a round whose model request
+  // is already aborted — stored, never answered. Declined, it runs as the next turn instead.
   const steerHandle: SteerHandle = async (text) => {
-    if (!session.isStreaming) return false
+    if (aborted || !session.isStreaming) return false
     await session.steer(text)
     return true
   }

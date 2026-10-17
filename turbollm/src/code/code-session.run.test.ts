@@ -9,7 +9,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
-import { runCodeSession, type CodeSseSink } from './code-session'
+import { LOOP_ABORT_AFTER, runCodeSession, type CodeSseSink, type RunCodeParams, type SteerHandle } from './code-session'
 import { resolveToolApproval } from '../tools/approval-gate'
 import type { CodeMode } from './persona'
 import type { Deps } from '../deps'
@@ -28,9 +28,9 @@ const text = (t: string): Reply => (res) => sse(res, [
   { choices: [{ index: 0, delta: { role: 'assistant', content: t }, finish_reason: null }] },
   { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
 ])
-const toolCall = (name: string, args: Record<string, unknown>): Reply => (res) => sse(res, [
-  { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: `call_${name}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
-  { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+const toolCall = (name: string, args: Record<string, unknown>, opts: { id?: string; usage?: object } = {}): Reply => (res) => sse(res, [
+  { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [{ index: 0, id: opts.id ?? `call_${name}`, type: 'function', function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }] },
+  { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], ...(opts.usage ? { usage: opts.usage } : {}) },
 ])
 
 /** A loopback engine that answers each chat-completions request with the next scripted reply
@@ -78,11 +78,12 @@ function harness(base: string, mode: CodeMode, extraDeps: Record<string, unknown
   } as unknown as Deps
   const frames: { event: string; data: Record<string, unknown> }[] = []
   const sink: CodeSseSink = (ev) => { frames.push(ev as { event: string; data: Record<string, unknown> }) }
-  /** Store the user message + placeholder the way code-run-manager.ts does, then run the turn. */
-  const turn = (task: string, signal: AbortSignal) => {
+  /** Store the user message + placeholder the way code-run-manager.ts does, then run the turn.
+   *  `extra` stands in for what the run manager passes on top (its own sink, onSteerable). */
+  const turn = (task: string, signal: AbortSignal, extra: Partial<Pick<RunCodeParams, 'sink' | 'onSteerable'>> = {}) => {
     const u = store.addMessage(conv.id, 'user', task)
     const a = store.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
-    return runCodeSession({ d, convId: conv.id, sessionId: run.id, repoRoot, mode, thinkingBudget: -1, reasoningEffort: undefined, task, excludeFromHistory: [u.id, a.id], signal, sink })
+    return runCodeSession({ d, convId: conv.id, sessionId: run.id, repoRoot, mode, thinkingBudget: -1, reasoningEffort: undefined, task, excludeFromHistory: [u.id, a.id], signal, sink, ...extra })
   }
   return { store, convId: conv.id, repoRoot, frames, turn }
 }
@@ -123,6 +124,58 @@ test('Stop while invoke_skill is running aborts the skill\'s sub-agent and lets 
     assert.notEqual(result, 'timeout', 'the turn settled after the Stop')
     assert.equal((result as Awaited<typeof settled>).aborted, true)
   } finally { await engine.close() }
+})
+
+// ── a run's own automatic stops take no steer ─────────────────────────────────────────────────
+
+/** Runs an auto-mode turn the engine script stops on its own (never through the turn's signal),
+ *  and offers its steer handle a message on the first frame `steerOn` picks out after that stop,
+ *  as the run manager would for a steer POSTed while the stopped run winds down. Returns what the
+ *  handle answered, the turn's result, and how many model requests went out. */
+async function steerAfterAutoStop(script: Reply[], steerOn: (f: { event: string; data: Record<string, unknown> }) => boolean) {
+  const engine = await stubEngine(script)
+  try {
+    const h = harness(engine.base, 'auto')
+    let handle: SteerHandle | null = null
+    let answered: Promise<boolean> | undefined
+    const sink: CodeSseSink = (ev) => {
+      const f = ev as { event: string; data: Record<string, unknown> }
+      h.frames.push(f)
+      if (!answered && handle && steerOn(f)) answered = handle('do Y instead')
+    }
+    const settled = within(h.turn('do X', new AbortController().signal, { sink, onSteerable: (s) => { if (s) handle = s } }), 20_000)
+    const result = await settled
+    if (result === 'timeout') assert.fail('the turn settled')
+    assert.ok(answered, 'the steer was offered after the stop')
+    return { steered: await answered, result, requests: engine.bodies.length }
+  } finally { await engine.close() }
+}
+
+// The loop breaker and the near-overflow stop abort pi directly, not through the turn's signal, so
+// the run manager's "not into a stopped turn" check never saw them. pi still reports the run
+// streaming while it winds down, and its handle took the steer: pi drained it into a round whose
+// model request was already aborted, so the steer was reported delivered and never answered.
+test('the loop breaker\'s stop takes no steer: the handle declines it and no model request follows', { timeout: 30_000 }, async () => {
+  const same = Array.from({ length: LOOP_ABORT_AFTER + 1 }, (_, i) => toolCall('read', { path: 'missing.txt' }, { id: `call_read_${i}` }))
+  let stopped = false
+  const r = await steerAfterAutoStop([...same, text('should never be asked')], (f) => {
+    if (f.event === 'tool_call' && /stopped automatically/.test(String(f.data.result))) { stopped = true; return false }
+    return stopped
+  })
+  assert.equal(r.steered, false, 'declined, so the run manager queues it as the next turn')
+  assert.equal(r.result.aborted, true)
+  assert.equal(r.requests, LOOP_ABORT_AFTER + 1, 'no request after the stop')
+})
+
+test('the near-overflow stop takes no steer: the handle declines it and no model request follows', { timeout: 30_000 }, async () => {
+  // 8100 of the stub model's 8192 tokens used: past the near-overflow reserve once `read` returns.
+  const r = await steerAfterAutoStop([
+    toolCall('read', { path: 'missing.txt' }, { usage: { prompt_tokens: 8000, completion_tokens: 100, total_tokens: 8100 } }),
+    text('should never be asked'),
+  ], (f) => f.event === 'tool_call' && f.data.name === 'read' && f.data.status !== 'pending')
+  assert.equal(r.steered, false, 'declined, so the run manager queues it as the next turn')
+  assert.equal(r.result.aborted, true)
+  assert.equal(r.requests, 1, 'no request after the stop')
 })
 
 test('plan mode offers the read-only TurboLLM tools to the model, and none that change anything', { timeout: 30_000 }, async () => {
