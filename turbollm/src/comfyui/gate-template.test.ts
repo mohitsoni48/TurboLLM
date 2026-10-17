@@ -166,3 +166,44 @@ test('a long queue refreshes the lease after every prompt that leaves more queue
     'release',
   ])
 })
+
+// TurboLLM is on the same machine, but urllib.request.urlopen sends through whatever proxy the environment configures
+// (HTTP_PROXY, or the system settings on Windows and macOS) unless NO_PROXY lists the host. A ComfyUI started with a
+// proxy set (common behind a corporate proxy, or to download models) sent every acquire and release to that proxy,
+// which cannot reach this machine's loopback, so the gate did nothing.
+test('the node calls TurboLLM directly, never through a configured HTTP proxy', {
+  skip: !HAS_PYTHON && `needs ${PYTHON}`,
+}, async (t) => {
+  const calls: string[] = []
+  const turbollm = createServer((req, res) => {
+    calls.push(req.url ?? '')
+    req.resume()
+    res.end('{}')
+  })
+  const proxied: string[] = []
+  const proxy = createServer((req, res) => {
+    proxied.push(req.url ?? '')
+    req.resume()
+    res.end('{}')
+  })
+  await new Promise<void>((r) => turbollm.listen(0, '127.0.0.1', r))
+  await new Promise<void>((r) => proxy.listen(0, '127.0.0.1', r))
+  t.after(() => turbollm.close())
+  t.after(() => proxy.close())
+  const dir = tmpDir('tllm-gate-proxy-')
+  mkdirSync(join(dir, 'comfy'))
+  writeFileSync(join(dir, 'comfy', '__init__.py'), '')
+  writeFileSync(join(dir, 'comfy', 'model_management.py'), 'def unload_all_models():\n    pass\n\ndef soft_empty_cache():\n    pass\n')
+  writeFileSync(join(dir, 'execution.py'), FAKE_EXECUTION_PY)
+  writeFileSync(join(dir, 'turbollm_gate.py'), gateNodeSource(`http://127.0.0.1:${(turbollm.address() as AddressInfo).port}`))
+  writeFileSync(join(dir, 'drive.py'), BATCH_DRIVER_PY)
+
+  const proxyUrl = `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`
+  const env: NodeJS.ProcessEnv = { ...process.env, HTTP_PROXY: proxyUrl, http_proxy: proxyUrl }
+  delete env.NO_PROXY
+  delete env.no_proxy
+  await promisify(execFile)(PYTHON, [join(dir, 'drive.py'), dir], { env })
+
+  assert.deepEqual(proxied, [])
+  assert.deepEqual(calls, ['/api/v1/comfyui/acquire', '/api/v1/comfyui/acquire', '/api/v1/comfyui/acquire', '/api/v1/comfyui/release'])
+})

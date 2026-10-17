@@ -51,6 +51,11 @@ LOG_PREFIX = "[turbollm_gate]"
 _lock = threading.Lock()
 _busy = False  # True between the rising edge and the queue draining
 
+# TurboLLM runs on this machine, so its calls never go through a proxy. urlopen would use any the
+# environment sets (HTTP_PROXY, or the system settings on Windows and macOS) unless NO_PROXY lists
+# the host, and a proxy cannot reach this machine's loopback: every acquire and release failed.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def _log(msg: str) -> None:
     print(f"{LOG_PREFIX} {msg}", flush=True)
@@ -61,7 +66,7 @@ def _post(path: str, timeout: float) -> bool:
     req = urllib.request.Request(url, data=b"{}", method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             resp.read()
         return True
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
