@@ -3298,9 +3298,19 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ---- model directories (spec 02 §5; primary dir spec 01 §3 / ADR-035) ----
+  // Adding, removing or choosing a model folder is a host-side change held to
+  // isLocalOrAuthenticated, like MCP servers and builds. The primary folder is where every
+  // download is written, and a download with a subdir keeps the name its URL ends in, so a
+  // keyless Serve identity, Access JWT or open-LAN peer (or a DNS-rebinding page on an open LAN)
+  // could add any existing folder (the home folder), make it primary and download
+  // ~/.ssh/authorized_keys or ~/.bashrc over the owner's: code execution as the daemon user. The
+  // same reach let DELETE /models/:key remove whatever the scanner takes for a model anywhere on
+  // disk. api_key_required: the web client opens its key prompt on it. The list stays open.
+  const MODEL_DIRS_KEY_REQUIRED = 'Changing the model folders requires a valid API key.'
   app.get('/api/v1/modeldirs', (c) => c.json(modelDirsPayload(d)))
 
   app.post('/api/v1/modeldirs', async (c) => {
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'api_key_required', MODEL_DIRS_KEY_REQUIRED)
     const b = await body<{ dir?: string }>(c)
     const dir = (b.dir ?? '').trim()
     if (!dir || !/^([a-zA-Z]:[\\/]|[\\/])/.test(dir)) return err(c, 400, 'invalid_config_value', 'Path must be absolute.')
@@ -3317,6 +3327,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/modeldirs', async (c) => {
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'api_key_required', MODEL_DIRS_KEY_REQUIRED)
     const b = await body<{ dir?: string }>(c)
     d.store.update((cfg) => {
       cfg.modelDirs = cfg.modelDirs.filter((x) => x !== b.dir)
@@ -3330,6 +3341,7 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Set the primary download/import folder. Must be one of the configured dirs.
   app.post('/api/v1/modeldirs/primary', async (c) => {
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'api_key_required', MODEL_DIRS_KEY_REQUIRED)
     const b = await body<{ dir?: string }>(c)
     const dir = (b.dir ?? '').trim()
     if (!dir || !d.store.snapshot().modelDirs.includes(dir)) {

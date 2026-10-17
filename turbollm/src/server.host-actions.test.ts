@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto'
 import { createApp } from './server'
-import { hashKey } from './auth'
+import { hashKey, provisionRemoteApiKey } from './auth'
 import { defaultConfig, type Config } from './config/config'
 import type { Deps } from './deps'
 import { tmpDir } from './test-support/tmp'
@@ -252,5 +252,103 @@ test('a keyless Serve identity, Access JWT or open-LAN peer cannot delete an MCP
     assert.equal(cfg.mcp.servers.length, 1)
     assert.equal((await fromLan(d, '/api/v1/mcp/servers/srv-1', { 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE')).status, 200)
     assert.equal(cfg.mcp.servers.length, 0)
+  }
+})
+
+// POST /api/v1/modeldirs, POST /modeldirs/primary and DELETE /modeldirs choose where downloads are
+// written: a download with a subdir keeps the name its URL ends in, so a caller who could add the
+// home folder and make it primary could write ~/.ssh/authorized_keys. Refused to the same callers as
+// an MCP server, with api_key_required (the web client's key prompt). A remote token was already
+// refused (no capability maps /modeldirs).
+type Send = (path: string, body: unknown, method: string) => Response | Promise<Response>
+async function assertModelDirsRefused(send: Send, cfg: Config): Promise<void> {
+  const [a, b] = cfg.modelDirs
+  const home = tmpDir('host-actions-home-')
+  for (const [path, body, method] of [
+    ['/api/v1/modeldirs', { dir: home }, 'POST'],
+    ['/api/v1/modeldirs/primary', { dir: b }, 'POST'],
+    ['/api/v1/modeldirs', { dir: a }, 'DELETE'],
+  ] as const) {
+    const res = await send(path, body, method)
+    assert.equal(res.status, 403, `${method} ${path}`)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required', `${method} ${path}`)
+  }
+  assert.deepEqual(cfg.modelDirs, [a, b], 'no folder added or removed')
+  assert.equal(cfg.primaryModelDir, '', 'the primary folder is unchanged')
+}
+async function assertModelDirsAllowed(send: Send, cfg: Config): Promise<void> {
+  const [a, b] = cfg.modelDirs
+  const c = tmpDir('host-actions-more-models-')
+  assert.equal((await send('/api/v1/modeldirs', { dir: c }, 'POST')).status, 201)
+  assert.equal((await send('/api/v1/modeldirs/primary', { dir: b }, 'POST')).status, 200)
+  assert.equal((await send('/api/v1/modeldirs', { dir: a }, 'DELETE')).status, 200)
+  assert.deepEqual(cfg.modelDirs, [b, c])
+  assert.equal(cfg.primaryModelDir, b)
+}
+function withModelDirs(c: Config): void {
+  c.modelDirs = [tmpDir('host-actions-models-a-'), tmpDir('host-actions-models-b-')]
+  c.primaryModelDir = ''
+}
+function withScanner(d: Deps): Deps {
+  return Object.assign(d, { scanner: { rescan: async () => {} } })
+}
+
+test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot add, choose or remove a model folder; with a key it can', async () => {
+  // Tailscale Serve, no key.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve'; withModelDirs(c) })
+    withScanner(d)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertModelDirsRefused((p, b, m) => tunneled(d, p, serve, b, m), cfg)
+    await assertModelDirsAllowed((p, b, m) => tunneled(d, p, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, b, m), cfg)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-modeldirs.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d, cfg } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+        withModelDirs(c)
+      })
+      withScanner(d)
+      const access = () => ({ Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') })
+      await assertModelDirsRefused((p, b, m) => tunneled(d, p, access(), b, m), cfg)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false; withModelDirs(c) })
+    withScanner(d)
+    await assertModelDirsRefused((p, b, m) => fromLan(d, p, {}, b, m), cfg)
+    await assertModelDirsAllowed((p, b, m) => fromLan(d, p, { 'X-TurboLLM-Auth': RAW_KEY }, b, m), cfg)
+  }
+  // A remote-access token, whatever it may otherwise do: refused before the route.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick'; withModelDirs(c) })
+    withScanner(d)
+    const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load', 'config:write', 'downloads:write'] }) }
+    const [a, b] = cfg.modelDirs
+    assert.equal((await tunneled(d, '/api/v1/modeldirs', token, { dir: tmpDir('host-actions-home-') })).status, 403)
+    assert.equal((await tunneled(d, '/api/v1/modeldirs/primary', token, { dir: b })).status, 403)
+    assert.equal((await tunneled(d, '/api/v1/modeldirs', token, { dir: a }, 'DELETE')).status, 403)
+    assert.deepEqual(cfg.modelDirs, [a, b])
+    assert.equal(cfg.primaryModelDir, '')
+  }
+  // The host itself, unchanged.
+  {
+    const { d, cfg } = mkDeps(withModelDirs)
+    withScanner(d)
+    await assertModelDirsAllowed((p, b, m) => createApp(d).request(p, {
+      method: m,
+      headers: { 'Content-Type': 'application/json', Host: '127.0.0.1:6996' },
+      body: JSON.stringify(b),
+    }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never), cfg)
   }
 })
