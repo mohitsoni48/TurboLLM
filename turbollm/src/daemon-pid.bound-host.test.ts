@@ -138,6 +138,90 @@ test('the identity probe never counts an answer from an address this machine doe
   }
 })
 
+// A pidfile outlives a hard kill (SIGKILL, power loss) and its pid can then go to an unrelated
+// process, while another TurboLLM (another data dir's, a --config one) comes to answer on the
+// recorded port. Any TurboLLM answering passed the identity probe, and --stop SIGTERMed (after
+// 10 s SIGKILLed) the unrelated process. The real app here: /healthz reports the daemon's pid.
+test("--stop and the start guard take only the pidfile's own pid answering as the daemon", async () => {
+  const server = await new Promise<ReturnType<typeof serve>>((resolve, reject) => {
+    const s = serve({ fetch: createApp(mkDeps('127.0.0.1')).fetch, hostname: '127.0.0.1', port: 0 }, () => resolve(s))
+    ;(s as unknown as { once: (ev: 'error', cb: (e: Error) => void) => void }).once('error', reject)
+  })
+  // The unrelated local process that got the stale pidfile's pid.
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })
+  const dir = tmpDir('turbollm-pid-reused-')
+  try {
+    const port = (server.address() as { port: number }).port
+    writePidfile(dir, other.pid as number, port)
+    assert.equal(await findRunningDaemon(dir, undefined, 0), null, 'start guard: another daemon answers there')
+    const res = await stopDaemon(dir)
+    assert.equal(res.stopped, false, res.message)
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal(other.exitCode ?? other.signalCode, null, 'the unrelated process was killed')
+
+    // The pidfile's own daemon answering is still found (this process is that daemon here).
+    writePidfile(dir, process.pid, port)
+    assert.deepEqual(await findRunningDaemon(dir, undefined, 0), { pid: process.pid, port })
+  } finally {
+    other.kill('SIGKILL')
+    rmSync(dir, { recursive: true, force: true })
+    await new Promise<void>((r) => server.close(() => r()))
+  }
+})
+
+// The remote-access ingress serves the same app on a fixed loopback port (6997, or 6996 beside a
+// daemon on 6997): the ports a second TurboLLM uses. A pidfile that daemon left at a hard kill
+// names that port, and the first daemon's ingress answers there. With the pid left out it read as
+// an older TurboLLM and passed, and --stop killed the unrelated process that got the pid.
+test("--stop and the start guard do not take another daemon's remote-access ingress for the pidfile's", async () => {
+  let ingressPort = 0
+  const app = createApp({ ...mkDeps('127.0.0.1'), remote: { ingressPort: () => ingressPort } } as unknown as Deps)
+  const listen = () =>
+    new Promise<ReturnType<typeof serve>>((resolve, reject) => {
+      const s = serve({ fetch: app.fetch, hostname: '127.0.0.1', port: 0 }, () => resolve(s))
+      ;(s as unknown as { once: (ev: 'error', cb: (e: Error) => void) => void }).once('error', reject)
+    })
+  const main = await listen()
+  const ingress = await listen()
+  ingressPort = (ingress.address() as { port: number }).port
+  const other = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' })
+  const dir = tmpDir('turbollm-pid-ingress-')
+  try {
+    writePidfile(dir, other.pid as number, ingressPort)
+    assert.equal(await findRunningDaemon(dir, undefined, 0), null, 'start guard: another daemon answers there')
+    const res = await stopDaemon(dir)
+    assert.equal(res.stopped, false, res.message)
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal(other.exitCode ?? other.signalCode, null, 'the unrelated process was killed')
+
+    // The daemon itself (this process here) is still found at its own port.
+    const port = (main.address() as { port: number }).port
+    writePidfile(dir, process.pid, port)
+    assert.deepEqual(await findRunningDaemon(dir, undefined, 0), { pid: process.pid, port })
+  } finally {
+    other.kill('SIGKILL')
+    rmSync(dir, { recursive: true, force: true })
+    for (const s of [main, ingress]) await new Promise<void>((r) => s.close(() => r()))
+  }
+})
+
+// The pid is for that local probe. /healthz needs no key, so through remote access (a tunnel from
+// the internet) it handed the daemon's pid to anyone who asked; there it is null, which the probe
+// refuses (the test above). Where the local port cannot be read, the key is left out.
+test('/healthz tells a local caller its pid, and one through remote access null', async () => {
+  const INGRESS = 6997
+  const d = { ...mkDeps('127.0.0.1'), remote: { ingressPort: () => INGRESS } } as unknown as Deps
+  const healthz = async (localPort: number | undefined) => {
+    const socket = { localPort, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' }
+    const res = await createApp(d).request('/healthz', {}, { incoming: { socket } } as never)
+    assert.equal(res.status, 200)
+    return res.json()
+  }
+  assert.deepEqual(await healthz(6996), { status: 'ok', version: 'test', pid: process.pid })
+  assert.deepEqual(await healthz(INGRESS), { status: 'ok', version: 'test', pid: null })
+  assert.deepEqual(await healthz(undefined), { status: 'ok', version: 'test' })
+})
+
 // The start guard is awaited at the top level of cli.ts, so the default probe must never throw:
 // http.get throws synchronously on a port out of range, which a hand-edited pidfile can hold.
 test('the identity probe rejects a junk port instead of throwing', async () => {

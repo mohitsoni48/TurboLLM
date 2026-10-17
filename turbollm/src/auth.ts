@@ -451,7 +451,7 @@ export function localPort(c: Context): number | undefined {
  *  the box's own local-admin actions (add/scan engine, build-from-source — arbitrary binary
  *  execution). Reading "undetermined" as "tunneled" instead just asks an actually-local caller
  *  for a key it may not always have — a loud, debuggable failure instead of a silent one. */
-function isTunneled(c: Context, d: Deps): boolean {
+export function isTunneled(c: Context, d: Deps): boolean {
   const ingress = d.remote?.ingressPort()
   if (ingress === undefined) return false
   const port = localPort(c)

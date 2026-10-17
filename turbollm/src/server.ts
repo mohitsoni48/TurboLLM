@@ -16,7 +16,7 @@ import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
-import { lanAuth, codeAuth, appSecretProof } from './auth'
+import { lanAuth, codeAuth, appSecretProof, isTunneled, localPort } from './auth'
 import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
@@ -143,7 +143,19 @@ export function createApp(d: Deps): Hono {
   // inherits this ordering, so keep the registration here.
   registerLinkApi(app, d, { authAlreadyRegistered: true })
 
-  app.get('/healthz', (c) => c.json({ status: 'ok', version: d.version }))
+  // `pid`: `turbollm --stop` and the one-daemon start guard (daemon-pid.ts confirmTurbollm) take
+  // only the pidfile's own pid answering as the daemon. Any TurboLLM on a stale pidfile's port
+  // used to pass, and --stop then killed whatever unrelated process had since got that pid. That
+  // probe is local, and /healthz needs no key, so a request through remote access is not told:
+  // it gets `pid: null`, which that probe refuses. Not the key left out, which the probe reads as
+  // an older TurboLLM and accepts: the remote-access ingress serves this app on a loopback port
+  // (6997, or 6996 beside a daemon on 6997), so a stale pidfile naming that port, left by another
+  // daemon, passed there. Left out only where isTunneled cannot tell (remote access on, the local
+  // port unreadable): a local probe is then taken as from an older TurboLLM, as before.
+  app.get('/healthz', (c) => {
+    const pid = !isTunneled(c, d) ? process.pid : localPort(c) === undefined ? undefined : null
+    return c.json({ status: 'ok', version: d.version, ...(pid === undefined ? {} : { pid }) })
+  })
 
   registerApi(app, d)
   registerRemoteApi(app, d)

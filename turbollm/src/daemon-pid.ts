@@ -105,7 +105,7 @@ export async function findRunningDaemon(
 ): Promise<PidfileData | null> {
   const data = readPidfile(dir)
   if (!data || data.pid === selfPid || !hooks.processExists(data.pid)) return null
-  return (await hooks.confirmTurbollm(data.port, data.host)) ? data : null
+  return (await hooks.confirmTurbollm(data.port, data.host, data.pid)) ? data : null
 }
 
 // ── Start claim (<dir>/daemon.lock) ───────────────────────────────────────────
@@ -267,9 +267,9 @@ export interface StopHooks {
   /** Run taskkill on Windows. */
   taskkill: (pid: number) => void
   /** Confirm a TurboLLM daemon is actually answering on `port` of the bound `host` (see
-   *  {@link daemonReachHost}) — the identity check that guards against killing a recycled PID
-   *  (stale pidfile whose PID the OS reused). */
-  confirmTurbollm: (port: number, host?: string) => Promise<boolean>
+   *  {@link daemonReachHost}), and that it is process `pid` when it reports one — the identity
+   *  check that guards against killing a recycled PID (stale pidfile whose PID the OS reused). */
+  confirmTurbollm: (port: number, host?: string, pid?: number) => Promise<boolean>
   /** Platform — injectable so the Windows vs Unix branch is testable on any OS. */
   platform: NodeJS.Platform
 }
@@ -296,13 +296,20 @@ const defaultHooks: StopHooks = {
     // engine subprocess will be freed by the startup orphan-reaper on the next launch.
     execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore' })
   },
-  async confirmTurbollm(port, host) {
+  async confirmTurbollm(port, host, pid) {
     // Probe the recorded address and port. /healthz, not /api/v1/status: a daemon bound to a
     // non-loopback address is LAN-exposed, so with requireApiKey (the default) it answers
     // /api/v1/status 401 to this probe, which reaches it from that address, not from loopback;
     // /healthz is open on every bind (auth.ts isExempt). Identity: every TurboLLM response
     // carries `Server: TurboLLM/<version>` (server.ts) and /healthz's JSON body a `version`.
     // Anything else (refused, non-JSON, foreign app) → not ours. Short timeout; never throws.
+    //
+    // And it must be the pidfile's own process: a pidfile outlives a hard kill and its pid can go
+    // to an unrelated process while another TurboLLM (another data dir's) comes to answer on that
+    // port, which passed and had --stop kill the unrelated process. /healthz reports the daemon's
+    // `pid`; a body without one is a TurboLLM older than that, taken as before (the CLI is often
+    // updated while its daemon still runs). `pid: null` comes through remote access (server.ts):
+    // another daemon's ingress listener on that loopback port, never the pidfile's daemon.
     //
     // Only a listener on THIS machine may answer: a pidfile outlives an unclean exit (power
     // loss, SIGKILL), the recorded address may since have gone to another machine (a new DHCP
@@ -337,7 +344,10 @@ const defaultHooks: StopHooks = {
         res.on('end', () => {
           try {
             const body = JSON.parse(text) as unknown
-            done(typeof body === 'object' && body !== null && 'version' in body)
+            done(
+              typeof body === 'object' && body !== null && 'version' in body &&
+                (pid === undefined || !('pid' in body) || body.pid === pid),
+            )
           } catch {
             done(false)
           }
@@ -414,12 +424,12 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
   // (worse on Windows, where taskkill /T also kills the child tree). Confirm a TurboLLM
   // daemon is actually answering on the recorded port before we kill the PID. If it
   // isn't, refuse and hand the user the manual command rather than risk the wrong process.
-  if (!(await hooks.confirmTurbollm(port, data.host))) {
+  if (!(await hooks.confirmTurbollm(port, data.host, pid))) {
     const manual = hooks.platform === 'win32' ? `taskkill /PID ${pid} /T /F` : `kill -9 ${pid}`
     return {
       stopped: false,
       message:
-        `Found a pidfile (pid ${pid}, port ${port}), but no TurboLLM daemon is responding there — ` +
+        `Found a pidfile (pid ${pid}, port ${port}), but no TurboLLM daemon with that pid is responding there — ` +
         `it may be stale or the PID was reused by another process. Not killing it automatically.\n` +
         `If you're sure it's TurboLLM, stop it manually: ${manual}`,
     }
