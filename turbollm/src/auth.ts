@@ -27,8 +27,10 @@ import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { getConnInfo } from '@hono/node-server/conninfo'
 import type { Context, MiddlewareHandler } from 'hono'
+import { requestId as requestIdMiddleware } from 'hono/request-id'
 import type { ApiKey } from './config/config'
 import type { Deps } from './deps'
+import { extError, requestId as makeRequestId } from './ext/errors'
 import { hasCapability } from './link/capabilities'
 import type { LinkCapability, LinkGrant } from './link/types'
 import { fetchJwks, verifyAccessJwt } from './remote/access-jwt'
@@ -694,6 +696,26 @@ function isExtApi(c: Context): boolean {
   return c.req.path === EXT_API_PREFIX || c.req.path.startsWith(`${EXT_API_PREFIX}/`)
 }
 
+/** The ext API's request-id middleware (ext/routes.chats.ts mounts the same one on /api/ext/v1),
+ *  for {@link lanRefusal}. */
+const extRequestId = requestIdMiddleware({ generator: () => makeRequestId() })
+
+/** lanAuth's refusal, in the ext API's own error envelope on {@link isExtApi} (ext/errors.ts:
+ *  `type` 'auth', a `request_id` and `retryable`, all required by the OpenAPI document's Error
+ *  schema). lanAuth runs before the ext API's gate (extAuth), so a backend on the LAN or behind
+ *  a tunnel with a missing or revoked key got `{ code, message }` alone, which the TS client
+ *  reads as type 'internal' with no request id, while a same-machine caller got extAuth's 'auth'.
+ *  hono/request-id is mounted on /api/ext/v1 after lanAuth, so it is run here first: a caller's
+ *  own valid X-Request-Id names the refusal and comes back in the header, as it does for a
+ *  same-machine caller refused by extAuth; otherwise the id is a fresh req_ one. */
+async function lanRefusal(c: Context, status: 401 | 403, code: 'unauthorized' | 'forbidden', message: string): Promise<Response> {
+  if (isExtApi(c)) {
+    await extRequestId(c, async () => {})
+    return extError(c, 'auth', code, message, { status })
+  }
+  return c.json({ error: { code, message } }, status)
+}
+
 /** Which enforcement path a stored key's grant belongs to (ADR-422).
  *
  *  A grant with no `kind` is a LINK grant: every grant minted before ADR-422 was minted for
@@ -872,7 +894,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     if (c.req.path.startsWith('/api/') && (write || connect) && isCrossSite(c)) {
       // Refused on Origin alone (no Fetch Metadata): what a plain-http proxy that rewrites Host looks like.
       const hint = c.req.header('sec-fetch-site') ? '' : " Behind a reverse proxy, have it pass the browser's Host header through."
-      return c.json({ error: { code: 'forbidden', message: `Cross-site request refused.${hint}` } }, 403)
+      return lanRefusal(c, 403, 'forbidden', `Cross-site request refused.${hint}`)
     }
     // That check can't see every cross-site GET: a GET carries no Origin, and a browser sends no
     // Fetch Metadata to some URLs that still get loopback trust (an old browser to 127.0.0.1,
@@ -989,16 +1011,13 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       // "the bearer token is replaced, not supplemented" guarantee held for an attacker who
       // sent nothing and evaporated for one who sent garbage.
       if (ra.cloudflare.requireAccess && !verified) {
-        return c.json({ error: { code: 'unauthorized', message: 'Cloudflare Access sign-in is required.' } }, 401)
+        return lanRefusal(c, 401, 'unauthorized', 'Cloudflare Access sign-in is required.')
       }
     }
 
     const ingress = isTunneled(c, d)
     if (!verifyPresentedKey(c, d, { ingress, ext: isExtApi(c) })) {
-      return c.json(
-        { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
-        401,
-      )
+      return lanRefusal(c, 401, 'unauthorized', 'A valid API key is required for non-local access.')
     }
     // A scoped remote token is additionally held to its capability set. An ordinary
     // (ungranted) key skips this entirely and behaves exactly as it always has.
