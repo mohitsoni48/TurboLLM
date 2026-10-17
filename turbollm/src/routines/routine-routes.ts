@@ -202,6 +202,22 @@ function chatAgentUsesMcp(d: Deps, flavor: RoutineFlavor | undefined, agentId: s
   return !!agent && listsMcpTool(agent.tools)
 }
 
+/** A code-flavor run as a caller the code gate refuses is shown it. A stalled run's
+ *  pendingToolCall is code-runner.ts's resume point, naming the Code conversation; the run GETs
+ *  stay open, but that conversation id is what the chat conversation routes take, which is how
+ *  such a caller read, rewrote and deleted a Code transcript (pi replays it into the owner's next
+ *  Approve). Only that id goes: the call is what the approval card shows, and the session id is
+ *  on the run anyway as its codeSessionId (the session the routine page embeds, whose 401 opens
+ *  Code's key prompt) and on /api/v1/activity while the session runs, and it opens only
+ *  codeAuth's routes. A value that does not parse is dropped whole. */
+function withoutConvId(run: RoutineRun): RoutineRun {
+  if (!run.pendingToolCall) return run
+  const pending = parsePendingToolCall(run.pendingToolCall)
+  if (!pending) return { ...run, pendingToolCall: undefined }
+  const { convId: _convId, ...rest } = pending
+  return { ...run, pendingToolCall: JSON.stringify(rest) }
+}
+
 /** chatAgentUsesMcp's refusal: 401 unauthorized like the code gate beside it, which the routine
  *  UI already reports as an authorization error (web routine-api.ts describeRoutineError). */
 function mcpRoutineRefused(c: Context, message = MCP_ROUTINE_REFUSED_MESSAGE) {
@@ -231,7 +247,8 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/routines/:id/runs', (c) => {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
-    return c.json(d.db.listRoutineRuns(routine.id))
+    const runs = d.db.listRoutineRuns(routine.id)
+    return c.json(routine.flavor === 'code' && codeGateBlocks(c, d) ? runs.map(withoutConvId) : runs)
   })
 
   app.post('/api/v1/routines', async (c) => {

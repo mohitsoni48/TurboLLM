@@ -1,5 +1,5 @@
 // Chat API routes (spec 07). Conversations CRUD + SSE streaming send + message actions.
-import type { Context, Hono } from 'hono'
+import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
 import { resolveKey, grantKind, hostGate, isLocalOrAuthenticated } from '../auth'
@@ -134,6 +134,10 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 
 const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
 
+/** A Code session's conversation through the chat routes, to a caller codeAuth refuses (see
+ *  registerChatRoutes's codeConversationGate). Code's own refusal, in codeAuth's words. */
+const CODE_CONVERSATION_REFUSED = 'A valid API key is required to access Code from a non-host device.'
+
 /** Messages as the chat routes return them: without `docContext`, the attached documents' full
  *  text. It is stored so a Regenerate or a Save & Resend can send the turn again with its
  *  documents, which the daemon reads from the store; no client reads it, and the chat shows a
@@ -215,6 +219,28 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   // ── conversations CRUD ─────────────────────────────────────────────────────
+
+  // A Code session's conversation (kind 'code') is Code's own: its transcript holds the session's
+  // bash output and file contents, and pi replays it into the model on the next turn. So every
+  // route here that reads or changes one by id is held to codeAuth's bar (codeGateBlocks), as
+  // /api/v1/code/* is: these routes are behind lanAuth only, so a keyless Serve identity, Access
+  // JWT or open-LAN peer, or a remote token, that codeAuth refuses could read, export, rewrite and
+  // delete a Code transcript (the session's agent run with it) once it had the id, which a stalled
+  // ask-mode Code routine's run showed (routine-routes.ts withoutConvId). One gate for every
+  // route under the id, so a new one is covered too. Not the tool-call approve route: a Deny
+  // there must stay open to anyone, so what it lets a caller decide on a Code conversation is
+  // gated by decision in that route. api_key_required: the web client opens its key prompt on it.
+  const approveRoute = /^\/api\/v1\/conversations\/[^/]+\/tool-calls\/[^/]+\/approve$/
+  const codeConversationGate: MiddlewareHandler = async (c, next) => {
+    if (approveRoute.test(c.req.path)) return next()
+    const id = c.req.param('id')
+    if (id && db.getConversation(id)?.kind === 'code' && codeGateBlocks(c, d)) {
+      return err(c, 403, 'api_key_required', CODE_CONVERSATION_REFUSED)
+    }
+    return next()
+  }
+  app.use('/api/v1/conversations/:id', codeConversationGate)
+  app.use('/api/v1/conversations/:id/*', codeConversationGate)
 
   app.get('/api/v1/conversations', (c) => {
     const q = c.req.query('q')
