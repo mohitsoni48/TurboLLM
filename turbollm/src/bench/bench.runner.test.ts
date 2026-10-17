@@ -82,6 +82,39 @@ test('measure: a cancelled run never starts another engine load', async () => {
   assert.notEqual(cand.outcome, 'ok')
 })
 
+// Without --kv-unified, llama.cpp gives each of the `parallel` slots ctx / parallel cells (n_ctx_seq), and llama-server
+// refuses a prompt longer than its slot. The bench prompt was sized from the whole ctx (75% of it), so with parallel
+// above 1 every candidate's prefill was refused and auto-tune found nothing.
+test('measure: with parallel slots and no unified KV, the bench prompt fits one slot', async () => {
+  for (const [kvUnified, slotCtx] of [[false, 8192], [true, 32768]] as const) {
+    const manager = {
+      start: async () => {},
+      stopAndWait: async () => {},
+      status: () => ({ state: 'running' }),
+      logPath: () => null,
+      target: () => 'http://engine.invalid',
+    }
+    const registry = { active: () => ({ id: 'llama-cpp', binPath: '', version: 'b1', capabilities: CAPS }) }
+    const bench = new BenchRunner(manager as never, {} as never, {} as never, registry as never, 'test', {} as never)
+    const r = bench as unknown as RunnerInternals & { prefillProbe: (t: string, messages: { content: string }[]) => Promise<unknown> }
+    r.deadline = Date.now() + 60_000
+    let promptChars = 0
+    r.prefillProbe = async (_t, messages) => {
+      promptChars = messages.reduce((n, msg) => n + msg.content.length, 0)
+      return { fault: 'crash' } // the prompt is all this test needs
+    }
+    const m = model({ nativeCtx: 32768 })
+    const profile: LoadProfile = { ...deriveDefault(m, SYS), ctx: 32768, parallel: 4, kvUnified }
+
+    await r.measure(m, SYS, profile, CAPS, 'ngl=33', 'Measuring ngl=33')
+
+    const tokens = Math.ceil(promptChars / 4) // the bench builder's own 4 chars/token
+    assert.ok(tokens > 0, 'the prefill probe was reached')
+    assert.ok(tokens <= slotCtx * 0.75 + 64, `kvUnified ${kvUnified}: ~${tokens} prompt tokens for a ${slotCtx}-token slot`)
+    assert.ok(tokens > slotCtx * 0.5, `kvUnified ${kvUnified}: the prompt still fills most of the slot (~${tokens} tokens)`)
+  }
+})
+
 // A ComfyUI render during auto-tune: Manager.start runs no ComfyUI pre-start hook, so the sweep used to keep starting
 // probes under the render (each one loading gigabytes into VRAM ComfyUI is sampling in) and release() then loaded the
 // killed probe's configuration as the user's model. Driven with a real ComfyGuard wired to the runner, as cli.ts does,

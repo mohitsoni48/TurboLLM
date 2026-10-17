@@ -993,8 +993,8 @@ export class BenchRunner {
     const logPath = this.manager.logPath()
 
     // Bench request sized to this profile's configured ctx (ADR-217 round 2) — see
-    // buildBenchMessages for why depth matters here.
-    const benchMessages = buildBenchMessages(profile.ctx)
+    // buildBenchMessages for why depth matters here — as one request gets it (benchSlotCtx).
+    const benchMessages = buildBenchMessages(benchSlotCtx(profile, caps))
 
     // Prefill gate (doubles as warmup): stream the prompt and fail fast if it's spilling/crawling
     // or the engine faults — so a config that doesn't fit at this ctx is rejected in seconds and the
@@ -1523,6 +1523,17 @@ const BENCH_MAX_PROMPT_TOKENS = 32_000
  *  ctx still gets a minimally-realistic bench. */
 export function benchPromptTokens(ctx: number): number {
   return Math.max(256, Math.min(BENCH_MAX_PROMPT_TOKENS, Math.floor(ctx * BENCH_CTX_FRACTION)))
+}
+
+/** The context one bench request gets: the profile's ctx, or one slot's share of it. Without --kv-unified,
+ *  llama.cpp gives each of the `parallel` slots ctx / parallel cells (n_ctx_seq = pad256(n_ctx / n_seq_max),
+ *  llama-context.cpp), and llama-server refuses a prompt longer than its slot. A bench prompt sized from the whole
+ *  ctx then had every candidate's prefill refused with parallel above 1, and auto-tune found nothing. The flag is
+ *  passed as profileToArgs passes it; an engine without it splits the context per slot too. */
+export function benchSlotCtx(p: Pick<LoadProfile, 'ctx' | 'parallel' | 'kvUnified'>, caps: Pick<Engine['capabilities'], 'flags'>): number {
+  const seqs = Math.max(1, p.parallel)
+  const unified = p.kvUnified && (caps.flags.length === 0 || caps.flags.includes('--kv-unified'))
+  return seqs === 1 || unified ? p.ctx : Math.floor(p.ctx / seqs)
 }
 
 /** Deterministic filler topics used to pad the bench prompt out toward the target depth (ADR-217

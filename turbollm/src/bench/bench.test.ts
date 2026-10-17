@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, buildBenchMessages, parseNvidiaVramUsed, vramCardFor } from './bench'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor } from './bench'
 import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -424,6 +424,17 @@ test('benchPromptTokens: targets 75% of ctx, capped at 32k (ADR-217 round 3)', (
 test('benchPromptTokens: floors small ctx at 256', () => {
   assert.equal(benchPromptTokens(100), 256)
   assert.equal(benchPromptTokens(0), 256)
+})
+
+test('benchSlotCtx: one slot gets ctx / parallel without a unified KV cache, the whole ctx with one', () => {
+  const all = { flags: [] as string[] } // flags not probed: every flag is assumed, as profileToArgs does
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 1, kvUnified: false }, all), 32768)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, all), 32768)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: false }, all), 8192)
+  assert.equal(benchSlotCtx({ ctx: 10000, parallel: 3, kvUnified: false }, all), 3333)
+  // An engine without --kv-unified is never passed it, so its slots split the context too.
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, { flags: ['--parallel'] }), 8192)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, { flags: ['--parallel', '--kv-unified'] }), 32768)
 })
 
 test('buildBenchMessages: small ctx needs no filler — system + the fixed question only', () => {
