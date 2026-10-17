@@ -952,13 +952,14 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // A text classification model can neither chat nor embed (ADR-434 (f), ADR-444). Asked of targetEntry,
   // which loads nothing, so the refusal never swaps the model in first.
   if (isChat || isEmbeddings) {
-    const requestedEntry = d.modelRouter.targetEntry(requestedModel)
+    const requestedEntry = d.modelRouter.targetEntry(requestedModel, { embeddings: isEmbeddings })
     if (requestedEntry && isTextClassifier(requestedEntry)) {
       const { code, message } = wrongEndpointRefusal(requestedEntry, isChat ? 'chat' : 'embeddings')
       return c.json({ error: { type: 'invalid_request_error', code, message } }, 400)
     }
   }
-  const routeResult = await d.modelRouter.route(requestedModel)
+  // An embeddings request reaches a running embedding model's pool slot even with auto-swap off (see the router).
+  const routeResult = await d.modelRouter.route(requestedModel, { embeddings: isEmbeddings })
   if ('status' in routeResult) {
     if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
     return c.json(

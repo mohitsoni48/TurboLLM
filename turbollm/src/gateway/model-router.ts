@@ -108,10 +108,11 @@ export class ModelRouter {
   ) {}
 
   /** Route a request to the correct model target URL.
-   *  - If autoSwap is off: returns whatever the primary manager has loaded.
+   *  - If autoSwap is off: returns whatever the primary manager has loaded, except that an embeddings request
+   *    (`request.embeddings`) naming a model already running in a pool slot gets that slot.
    *  - If the requested model is already loaded: returns its target immediately.
    *  - Otherwise: loads the model (swapping / evicting LRU as needed) and waits. */
-  async route(requestedModel: string): Promise<RouteResult> {
+  async route(requestedModel: string, request?: { embeddings?: boolean }): Promise<RouteResult> {
     const cfg = this.store.snapshot()
 
     // Turbo Link (ADR-376). A qualified `<machine>/<model>` id is resolved here and
@@ -133,6 +134,9 @@ export class ModelRouter {
 
     // Auto-swap disabled or no model requested → fall back to current loaded model.
     if (!cfg.gateway.autoSwap || !requestedModel.trim()) {
+      const named = this.runningWithoutSwap(requestedModel, request)
+      const alive = named && this.routeResolved(named)
+      if (alive) return alive
       const t = this.manager.target()
       return t ? { target: t } : { status: 503, message: 'No model loaded. Load one in TurboLLM.' }
     }
@@ -174,13 +178,32 @@ export class ModelRouter {
     return this.resolveEntry(requested)
   }
 
-  /** Which local entry route(requested) would hit, WITHOUT loading anything. Mirrors route():
-   *  remote id → undefined; auto-swap off or no model named → the primary's entry; resolved → that
-   *  entry; unresolved → the primary's entry. */
-  targetEntry(requested: string): ModelEntry | undefined {
+  /** Which local entry route(requested, request) would hit, WITHOUT loading anything. Mirrors route():
+   *  remote id → undefined; auto-swap off or no model named → the primary's entry (with auto-swap off, an
+   *  embeddings request naming a running model → that entry); resolved → that entry; unresolved → the primary's
+   *  entry. */
+  targetEntry(requested: string, request?: { embeddings?: boolean }): ModelEntry | undefined {
     if (this.resolveRemote(requested)) return undefined
-    if (!this.store.snapshot().gateway.autoSwap || !requested.trim()) return this.primaryEntry()
+    if (!this.store.snapshot().gateway.autoSwap || !requested.trim()) {
+      return this.runningWithoutSwap(requested, request) ?? this.primaryEntry()
+    }
     return this.resolveEntry(requested) ?? this.primaryEntry()
+  }
+
+  /** With auto-swap off, the model an embeddings request names, when it is running (in the primary or a pool slot).
+   *  An embedding model loads into a pool slot of its own whenever a chat model holds the primary (doLoad's
+   *  needsNewSlot: only a stopped or failed primary takes it; a manual Load goes through loadExplicit), so answering an
+   *  embeddings request from the primary sent it to the chat engine, which was never started with --embeddings and
+   *  answers 501. Auto-swap off means no request loads a model; one already running still serves what names it. Only
+   *  embeddings: a chat request keeps getting the primary, as the user chose with auto-swap off, even when its name
+   *  (resolveEntry ends in a substring match) would match a model in a pool slot. */
+  private runningWithoutSwap(requested: string, request?: { embeddings?: boolean }): ModelEntry | undefined {
+    if (!request?.embeddings || !requested.trim()) return undefined
+    const entry = this.resolveEntry(requested)
+    if (!entry) return undefined
+    const ms = this.manager.status()
+    if (ms.state === 'running' && ms.model && this.keysMatch(ms.model.key, entry)) return entry
+    return this.extraSlots.get(entry.key)?.manager.status().state === 'running' ? entry : undefined
   }
 
   /** Every alive slot (running | starting | stopping), primary first. */

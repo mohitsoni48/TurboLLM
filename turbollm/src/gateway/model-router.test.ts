@@ -797,6 +797,25 @@ test('routeTo: with auto-swap off an entry that is not loaded is a 503, never th
   })
 })
 
+test('route: with auto-swap off an embeddings request naming a running pool slot gets that slot; chat still gets the primary', async () => {
+  const slot = { manager: slotManager('running', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false, slots: [slot] })
+
+  assert.deepEqual(await r.route('Beta', { embeddings: true }), { target: BETA_SLOT_TARGET })
+  assert.equal(r.targetEntry('Beta', { embeddings: true }), BETA)
+  assert.deepEqual(await r.route('Beta'), { target: PRIMARY_TARGET }, 'a chat request is answered by the primary, as before')
+  assert.equal(r.targetEntry('Beta'), ALPHA)
+})
+
+test('route: with auto-swap off an embeddings request naming a model that is not running gets the primary, and loads nothing', async () => {
+  const slot = { manager: slotManager('stopping', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
+  const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false, slots: [slot] })
+
+  assert.deepEqual(await r.route('Beta', { embeddings: true }), { target: PRIMARY_TARGET })
+  assert.equal(r.targetEntry('Beta', { embeddings: true }), ALPHA)
+  assert.deepEqual(await r.route('', { embeddings: true }), { target: PRIMARY_TARGET }, 'no model named: the primary')
+})
+
 test('aliveSlots: the primary first, then alive pool slots; stopped slots are left out', () => {
   const r = routingRouter({
     models: [ALPHA, BETA],
