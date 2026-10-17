@@ -67,11 +67,17 @@ function permissionModeText(r: Routine): string {
 }
 
 /** Old→new diff for an update_routine confirm card — spec 20 §3 item 4. Plain field list
- *  (short discrete values), not a text diff. */
+ *  (short discrete values), not a text diff.
+ *
+ *  A code routine's permission mode is compared as what runs (permissionModeText), not as stored:
+ *  with no stored mode that depends on the coding agent, so switching claude_cli (asks refused)
+ *  to pi (Auto) changes what the routine may do while the stored mode stays unset on both sides,
+ *  and the card listed only "Coding agent" for it. */
 function RoutineUpdateDiff({ previous, next }: { previous: Routine; next: Routine }) {
-  const changed = FIELD_LABELS.filter((f) => previous[f.key] !== next[f.key])
+  const value = (r: Routine, key: DiffKey) => (key === 'permissionMode' && r.flavor === 'code' ? permissionModeText(r) : r[key])
+  const changed = FIELD_LABELS.filter((f) => value(previous, f.key) !== value(next, f.key))
   if (changed.length === 0) return <p className="text-[12px] text-faint">No fields changed.</p>
-  const show = (r: Routine, key: DiffKey) => (key === 'permissionMode' && r.flavor === 'code' ? permissionModeText(r) : r[key] ?? '(none)')
+  const show = (r: Routine, key: DiffKey) => value(r, key) ?? '(none)'
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-border bg-panel-2 p-2.5 text-[12px]">
       {changed.map((f) => (
