@@ -258,3 +258,64 @@ describe('useTerminalConnection: auto-reconnect', () => {
     expect(unclosed()).toHaveLength(0)
   })
 })
+
+// ── useTerminalConnection: a socket the client closes itself ──
+// Closing a socket whose handshake has not finished makes a browser fire `error` and then `close`
+// 1006 on it, later, as tasks: not the 1000 the client passed. disconnect() (a session switch,
+// TerminalView unmounting) left the handlers on, so TerminalView toasted "Terminal connection
+// error." and "Terminal connection closed: 1006" for a close nobody but the client made, and the
+// late events set the hook's state to error/disconnected over the next socket's "connected".
+class LateEventsWs extends ReconnectWs {
+  static late: LateEventsWs[] = []
+  constructor(url: string) { super(url); LateEventsWs.late.push(this) }
+  /** Like a browser: close() only queues the events; `deliver()` dispatches them. */
+  override close(): void { this.readyState = ReconnectWs.CLOSING }
+  deliver(): void {
+    this.readyState = ReconnectWs.CLOSED
+    this.onerror?.()
+    this.onclose?.({ code: 1006, reason: '' })
+  }
+}
+
+describe('useTerminalConnection: a socket the client closes itself', () => {
+  beforeEach(() => {
+    LateEventsWs.late = []
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', LateEventsWs)
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('closed mid-handshake, it reports no error or close, and leaves the next socket connected', () => {
+    const onError = vi.fn()
+    const onClose = vi.fn()
+    const { result, rerender, unmount } = renderHook(
+      ({ id }) => useTerminalConnection(id, { onError, onClose }),
+      { initialProps: { id: 't1' } },
+    )
+    rerender({ id: 't2' }) // a session switch while t1's handshake is in flight
+    act(() => LateEventsWs.late[1].open())
+    act(() => LateEventsWs.late[0].deliver())
+    expect(onError).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(result.current.state).toBe('connected')
+    act(() => { vi.advanceTimersByTime(30_000) })
+    expect(LateEventsWs.late).toHaveLength(2)
+
+    unmount()
+    act(() => LateEventsWs.late[1].deliver())
+    expect(onError).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('a drop the client did not cause still reports its close and reconnects', () => {
+    const onClose = vi.fn()
+    renderHook(() => useTerminalConnection('t1', { onClose }))
+    act(() => LateEventsWs.late[0].open())
+    act(() => LateEventsWs.late[0].deliver())
+    expect(onClose).toHaveBeenCalledWith(1006, '')
+    act(() => { vi.advanceTimersByTime(600) })
+    expect(LateEventsWs.late).toHaveLength(2)
+  })
+})

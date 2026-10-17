@@ -126,9 +126,19 @@ export function useTerminalConnection(
     // reconnecting on nearly every parent re-render.
     // Detached BEFORE close(), so that socket's own onclose never treats this as an unexpected
     // drop of the current socket (closing mid-handshake reports 1006, not the 1000 we pass).
+    // Its handlers go too: closed mid-handshake, a browser fires `error` and then `close` 1006
+    // on it, later, which TerminalView toasted ("Terminal connection error.", "closed: 1006")
+    // on a session switch or unmount during a connect, and which set this hook's state over the
+    // next socket's. A socket this client closes reports nothing.
     const ws = wsRef.current
     wsRef.current = null
-    ws?.close(1000, 'client disconnect')
+    if (ws) {
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      ws.close(1000, 'client disconnect')
+    }
     reconnectAttemptsRef.current = 0
     setState('disconnected')
   }, [])
