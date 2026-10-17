@@ -396,7 +396,14 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // replay starts at the next frame. Frames are numbered from 1, so absent or 0 (the event_seq
     // of a run with no frame yet) ⇒ replay from the first frame (run-manager.ts FIRST_EVENT_SEQ).
     const afterParam = c.req.query('after')
-    const from = afterParam ? Number(afterParam) + 1 : 0
+    const after = afterParam ? Number(afterParam) : undefined
+    // A bare Number(...) let 'abc' (NaN) or '1.5' through, which matches no retained frame: the
+    // client got 409 replay_window_exceeded and was told to re-read the message and reattach,
+    // for a cursor that was never valid. Event seqs are integers.
+    if (after !== undefined && !Number.isInteger(after)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`after` must be an integer event_seq.', { param: 'after' })
+    }
+    const from = after !== undefined ? after + 1 : 0
     if (!runs.canReplayFrom(run.id, from)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
         'That cursor has aged out of the replay buffer. Re-read the message, then attach at the run current event_seq.')

@@ -222,7 +222,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     method: 'GET', path: '/runs/:id/stream',
     summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it (or pass 0) to replay from the first frame.",
     scope: 'chats:read', sse: true, errors: [...CHAT_ERRORS, 'conflict'],
-    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit it (or pass 0) to replay from the first frame.' }],
+    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit it (or pass 0) to replay from the first frame. A value that is not an integer gets 400 invalid_input.' }],
   },
   {
     method: 'POST', path: '/runs/:id/cancel',

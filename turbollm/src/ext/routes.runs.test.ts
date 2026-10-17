@@ -235,6 +235,35 @@ test('reattaching with ?after replays only later frames', async () => {
   }
 })
 
+// `after` went through a bare Number(...): 'abc' (NaN) or '1.5' matched no retained frame, so the
+// route answered 409 replay_window_exceeded and told the client to re-read the message and
+// reattach, for a cursor that was never valid in the first place.
+test('?after that is not an integer is a 400 invalid_input, not a 409 replay_window_exceeded', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const started = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await runs.settled(started.id)
+    for (const after of ['abc', '1.5', 'Infinity', '0x']) {
+      const res = await app.request(`/api/ext/v1/runs/${started.id}/stream?after=${after}&owner=u1`, { headers: { Authorization: ACME } })
+      assert.equal(res.status, 400, `after=${after}`)
+      const body = await res.json() as { error: { type: string; code: string; param?: string } }
+      assert.equal(body.error.type, 'invalid_request')
+      assert.equal(body.error.code, 'invalid_input')
+      assert.equal(body.error.param, 'after')
+    }
+    // An integer cursor, and an empty or absent one (from the first frame), still stream.
+    for (const q of ['after=2&', 'after=&', '']) {
+      const res = await app.request(`/api/ext/v1/runs/${started.id}/stream?${q}owner=u1`, { headers: { Authorization: ACME } })
+      assert.equal(res.status, 200, q)
+      assert.match(await res.text(), /event: done/)
+    }
+  } finally {
+    cleanup()
+  }
+})
+
 // The 202 body and an early GET /runs/{id} report event_seq 0 before any frame exists. Frames
 // used to be numbered from 0 as well, so a client that attached later with ?after=<that
 // event_seq> (once frame 0 had been sent) lost the run's first frame.
