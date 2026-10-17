@@ -415,6 +415,34 @@ test('streams from resume() and runs.stream() carry the run id, so resume() can 
   assert.equal(ended.runId, 'run_1')
 })
 
+// raw() called `this.doFetch(...)`, so fetch ran as a method of the client. A browser's
+// window.fetch and a Cloudflare Worker's fetch throw TypeError 'Illegal invocation' when `this`
+// is neither the global object nor undefined: every call of a client built without
+// options.fetch failed there, and so did one given `fetch: window.fetch`. The stub below
+// refuses the same way.
+test('fetch, the global one or options.fetch, is never called with the client as this', async () => {
+  const seenThis: unknown[] = []
+  const strictFetch = async function (this: unknown) {
+    seenThis.push(this)
+    if (this !== undefined && this !== globalThis) throw new TypeError('Illegal invocation')
+    return new Response(JSON.stringify({ data: [], has_more: false, next_cursor: null }), { status: 200 })
+  } as unknown as typeof fetch
+  const realFetch = globalThis.fetch
+  globalThis.fetch = strictFetch
+  try {
+    const byDefault = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k' })
+    assert.deepEqual(await byDefault.chats.list(), { data: [], has_more: false, next_cursor: null })
+    const events = byDefault.runs.stream('run_1', 0)
+    for await (const _ of events) { /* the JSON body has no frames */ }
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  const given = new TurboLLMChat({ baseUrl: 'http://x/api/ext/v1', apiKey: 'k', fetch: strictFetch })
+  await given.chats.list()
+  assert.equal(seenThis.length, 3)
+  assert.ok(seenThis.every((t) => !(t instanceof TurboLLMChat)), 'fetch was called as a method of the client')
+})
+
 // Type-level check (this suite has no dedicated compile-time-assertion harness, so a runtime
 // construction that the TypeScript compiler must accept without `content` stands in for one —
 // `npx tsc --noEmit` on this file is itself part of the type check: SendParams.content and

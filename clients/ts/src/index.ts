@@ -396,7 +396,12 @@ export class TurboLLMChat {
   constructor(options: TurboLLMChatOptions) {
     this.baseUrl = options.baseUrl.replace(/\/+$/, '')
     this.apiKey = options.apiKey
-    this.doFetch = options.fetch ?? fetch
+    // Wrapped so fetch is called as a plain function: stored as is, `this.doFetch(...)` ran it as
+    // a method of the client, and a browser's window.fetch or a Cloudflare Worker's fetch throws
+    // TypeError 'Illegal invocation' for any `this` but the global object or undefined. That
+    // failed every call of a client built without options.fetch, or given `fetch: window.fetch`.
+    const given = options.fetch
+    this.doFetch = (input, init) => (given ?? globalThis.fetch)(input, init)
   }
 
   /** Sends one authenticated request and returns the raw `Response` — used by `request()` for
