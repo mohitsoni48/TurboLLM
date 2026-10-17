@@ -5,7 +5,7 @@
 // toggle and body-capture switch, and opening a row's detail drawer. The live-tail SSE
 // mechanics are `useRequestLog`'s own concern (mocked away here, same as `useEngineLog` is
 // mocked in MonitorTab.test.tsx).
-import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -33,6 +33,8 @@ const state = vi.hoisted(() => ({
   /** The hook's own list was emptied — logged as `local` AFTER the daemon's clear (`daemon`). */
   clearOrder: [] as string[],
   detail: undefined as RequestLogEntry | undefined,
+  /** Holds every getRequestDetail answer back until it resolves. */
+  detailGate: Promise.resolve() as Promise<void>,
   clearFails: false,
   toastErrors: [] as string[],
   /** The daemon's own copy (`GET /requests`), and the `bodies` flag of every call to it. */
@@ -82,7 +84,10 @@ vi.mock('../../lib/api', async (importOriginal) => {
       state.listCalls.push(bodies)
       return state.listFails ? Promise.reject(new Error('503')) : Promise.resolve({ entries: state.listed })
     },
-    getRequestDetail: (id: string) => Promise.resolve({ entry: state.detail ?? state.entries.find((e) => e.id === id)! }),
+    getRequestDetail: async (id: string) => {
+      await state.detailGate
+      return { entry: state.detail ?? state.entries.find((e) => e.id === id)! }
+    },
   }
 })
 
@@ -105,6 +110,7 @@ beforeEach(() => {
   state.clearCalls = 0
   state.clearOrder = []
   state.detail = undefined
+  state.detailGate = Promise.resolve()
   state.clearFails = false
   state.toastErrors = []
   state.listed = []
@@ -151,6 +157,37 @@ describe('RequestsPanel', () => {
     // The Params tab is the drawer's default view.
     expect(await screen.findByText('Sampling params')).toBeInTheDocument()
     expect(screen.getByText(/"temperature": 0.7/)).toBeInTheDocument()
+  })
+
+  it('with the drawer open, a row beside it takes the click and opens in the drawer, without the last row\'s detail', async () => {
+    state.entries = [entry(), entry({ id: 'r2', modelKey: 'other-model', params: { temperature: 0.2 } })]
+    await renderPanel()
+    fireEvent.click(screen.getByText('qwen3-8b'))
+    expect(await screen.findByText(/"temperature": 0.7/)).toBeInTheDocument()
+
+    let release = () => {}
+    state.detailGate = new Promise((resolve) => { release = resolve })
+    // A modal drawer left the list inert (body pointer-events: none), so this click threw.
+    await userEvent.click(screen.getByText('other-model'))
+    // Before its own detail comes back, the drawer shows the clicked row's copy, not the last one's.
+    expect(screen.getByRole('dialog', { name: 'other-model' })).toBeInTheDocument()
+    expect(screen.getByText(/"temperature": 0.2/)).toBeInTheDocument()
+    expect(screen.queryByText(/"temperature": 0.7/)).toBeNull()
+    release()
+    expect(await screen.findByRole('dialog', { name: 'other-model' })).toBeInTheDocument()
+  })
+
+  it('with the drawer open, a click on its own row fetches that request again (the retry after a key prompt)', async () => {
+    state.entries = [entry()]
+    await renderPanel()
+    fireEvent.click(screen.getByText('qwen3-8b'))
+    expect(await screen.findByText(/"temperature": 0.7/)).toBeInTheDocument()
+
+    // What the daemon answers now (after the key was entered, the entry comes back with what it held).
+    state.detail = entry({ params: { temperature: 0.9 } })
+    await userEvent.click(within(screen.getByLabelText('Request log')).getByText('qwen3-8b'))
+    expect(await screen.findByText(/"temperature": 0.9/)).toBeInTheDocument()
+    expect(screen.queryByText(/"temperature": 0.7/)).toBeNull()
   })
 
   it('the gear menu\'s "Log prompts and responses" switch patches settings and is tracked', async () => {

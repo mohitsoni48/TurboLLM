@@ -121,6 +121,10 @@ export function RequestsPanel({ active }: { active: boolean }) {
   const { query: settingsQ, save } = useSettings()
   const [columns, setColumns] = useState(loadColumnPrefs)
   const [selected, setSelected] = useState<RequestLogEntry | null>(null)
+  // Bumped on every row click, so a click on the row the drawer already shows fetches it again: the drawer is
+  // non-modal, so after a refusal ("Enter your key in the API key prompt, then open this request again") the
+  // obvious retry is that same row beside it, and setSelected with the same row object changes nothing.
+  const [openCount, setOpenCount] = useState(0)
   const [sourceFilter, setSourceFilter] = useState<'all' | RequestLogSource>('all')
 
   const captureBodies = settingsQ.data?.requestLog?.captureBodies ?? false
@@ -235,7 +239,7 @@ export function RequestsPanel({ active }: { active: boolean }) {
               <button
                 key={entry.id}
                 type="button"
-                onClick={() => { track('monitor', 'open_request_detail'); setSelected(entry) }}
+                onClick={() => { track('monitor', 'open_request_detail'); setSelected(entry); setOpenCount((n) => n + 1) }}
                 className="flex w-full items-center gap-3 px-4 py-1.5 text-left font-mono text-[12px] transition-colors hover:bg-panel-2"
               >
                 <span className="w-20 shrink-0 text-faint">{formatTime(entry.ts)}</span>
@@ -260,7 +264,7 @@ export function RequestsPanel({ active }: { active: boolean }) {
         )}
       </div>
 
-      <RequestDetail entry={selected} onClose={() => setSelected(null)} captureBodies={captureBodies} />
+      <RequestDetail entry={selected} openCount={openCount} onClose={() => setSelected(null)} captureBodies={captureBodies} />
     </div>
   )
 }

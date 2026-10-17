@@ -34,10 +34,13 @@ function prettyBody(raw: string): string {
  *  place in the UI that actually asks for them. */
 export function RequestDetail({
   entry,
+  openCount,
   onClose,
   captureBodies,
 }: {
   entry: RequestLogEntry | null
+  /** How many times a row was opened; a new value fetches the entry again, even the same one. */
+  openCount?: number
   onClose: () => void
   captureBodies: boolean
 }) {
@@ -51,10 +54,11 @@ export function RequestDetail({
 
   useEffect(() => {
     setBodiesRefused(null)
-    if (!entry) {
-      setDetail(null)
-      return
-    }
+    // On every new entry, not only on close: a row clicked beside the open drawer opens in it, and
+    // it shows `detail ?? entry`, so the last row's fetched detail would keep it on that row,
+    // title, params and bodies, until the new row's answer comes.
+    setDetail(null)
+    if (!entry) return
     setTab('params')
     let cancelled = false
     void getRequestDetail(entry.id)
@@ -65,13 +69,22 @@ export function RequestDetail({
         if (e instanceof ApiError && e.code === 'api_key_required') setBodiesRefused(e.message)
       })
     return () => { cancelled = true }
-  }, [entry])
+  }, [entry, openCount])
 
   const shown = detail ?? entry
 
   return (
-    <Sheet open={!!entry} onOpenChange={(open) => { if (!open) onClose() }}>
-      <SheetContent className="flex w-full flex-col overflow-hidden sm:w-[520px]">
+    // Not modal, as sheet.tsx asks of every caller: the list beside it takes clicks (a row clicked
+    // there opens in it) rather than being inert while it is open. And kept open on an outside
+    // pointer or focus, as the other sheets are, so the key prompt its refused bodies open, which
+    // takes focus, sits over it rather than closing it: "Not now" leaves the row's own copy and
+    // the refusal shown here. Close is via the X, Esc or Back.
+    <Sheet open={!!entry} onOpenChange={(open) => { if (!open) onClose() }} modal={false}>
+      <SheetContent
+        className="flex w-full flex-col overflow-hidden sm:w-[520px]"
+        onPointerDownOutside={(e) => e.preventDefault()}
+        onInteractOutside={(e) => e.preventDefault()}
+      >
         <SheetHeader>
           <SheetTitle>{shown?.modelKey ?? 'Request'}</SheetTitle>
         </SheetHeader>
