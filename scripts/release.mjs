@@ -31,7 +31,7 @@ import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
@@ -457,6 +457,12 @@ async function phasePrepare(state, flags) {
   const base = state.notes.baseVersion || npmLatest();
   note(`base version from npm: ${base} → releasing ${version}`);
 
+  // A --dry-run writes none of the files below: it used to set the version and regenerate the
+  // README mirror in place, so the preview left the tree holding the release's own edits,
+  // uncommitted. It notes each change instead and adds it to the list a real run would commit.
+  const dryRun = !!flags['dry-run'];
+  const wouldChange = [];
+
   // package.json (+ wrapper in lockstep: the desktop app compares its OWN version
   // against the published release, so a drifted wrapper believes it is ahead)
   for (const p of [daemonPkgPath(), wrapperPkgPath()]) {
@@ -465,6 +471,11 @@ async function phasePrepare(state, flags) {
     const next = raw.replace(/("version"\s*:\s*")[^"]+(")/, `$1${version}$2`);
     if (next === raw && !new RegExp(`"version"\\s*:\\s*"${version.replace(/\./g, '\\.')}"`).test(raw)) {
       fail(`could not rewrite the "version" field in ${p}`);
+    }
+    if (next !== raw && dryRun) {
+      wouldChange.push(relative(REPO, p).replace(/\\/g, '/'));
+      note(`[dry-run] would set ${p.replace(REPO, '.')} → ${version}`);
+      continue;
     }
     if (next !== raw) writeFileSync(p, next);
     note(`${p.replace(REPO, '.')} → ${version}`);
@@ -492,10 +503,15 @@ async function phasePrepare(state, flags) {
   if (existsSync(canonical)) {
     const a = readFileSync(canonical);
     if (!existsSync(mirror) || !readFileSync(mirror).equals(a)) {
-      writeFileSync(mirror, a);
-      note('root README.md regenerated from turbollm/README.md');
+      if (dryRun) {
+        wouldChange.push('README.md');
+        note('[dry-run] would regenerate the root README.md from turbollm/README.md');
+      } else {
+        writeFileSync(mirror, a);
+        note('root README.md regenerated from turbollm/README.md');
+      }
     } else note('root README.md already byte-identical');
-    if (!readFileSync(mirror).equals(readFileSync(canonical))) fail('README mirror still differs after regeneration');
+    if (!dryRun && !readFileSync(mirror).equals(readFileSync(canonical))) fail('README mirror still differs after regeneration');
   }
 
   // web bundle — the persona KB and every UI change get baked into src/webdist here
@@ -509,7 +525,9 @@ async function phasePrepare(state, flags) {
   }
 
   // commit + push — only the release's own paths
-  const { release, unrelated } = splitDirtyPaths();
+  const dirty = splitDirtyPaths();
+  const { unrelated } = dirty;
+  const release = [...new Set([...dirty.release, ...wouldChange])].sort();
   if (unrelated.length) {
     warnLine(`left alone (not this release's to commit): ${unrelated.join(', ')}`);
     out.push(`WARN left alone: ${unrelated.join(', ')}`);

@@ -582,6 +582,31 @@ test('preflight --approved redeploys the telemetry Worker only once every blocki
   }
 });
 
+// A dry run set the new version in turbollm/package.json and wrapper/package.json and regenerated the
+// root README.md in place: the preview left the tree holding the release's own edits, uncommitted.
+test('prepare --dry-run writes nothing and lists what a real run would commit', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: ['preflight', 'review'], notes: { baseVersion: '1.0.0' } });
+  try {
+    put(s.work, 'turbollm/README.md', '# TurboLLM\n\nnew\n');
+    put(s.work, 'README.md', '# TurboLLM\n\nold\n');
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'readme');
+    must(s.g, 'push');
+    const head = must(s.g, 'rev-parse', 'HEAD').stdout;
+
+    const r = s.release(['prepare', '--dry-run']);
+
+    assert.equal(r.code, 0, r.out);
+    assert.equal(must(s.g, 'status', '--porcelain').stdout, '', 'the dry run edited tracked files');
+    assert.match(r.out, /\[dry-run\] would set \.\/turbollm\/package\.json → 1\.0\.1/);
+    assert.match(r.out, /\[dry-run\] would regenerate the root README\.md/);
+    assert.match(r.out, /\[dry-run\] would commit \+ push:\nREADME\.md\nturbollm\/package\.json\n/);
+    assert.equal(must(s.g, 'rev-parse', 'HEAD').stdout, head);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
 // A push that failed after the commit left nothing to commit on the re-run, which then recorded ok
 // without pushing: `verify` checked a PR head without the release commit, and `merge` merged it.
 test('prepare re-run after a failed push pushes the release commit', POSIX_ONLY, () => {
