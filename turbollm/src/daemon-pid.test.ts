@@ -270,6 +270,104 @@ test('stopDaemon refuses to kill when the PID is alive but not a TurboLLM daemon
   }
 })
 
+// `turbollm --stop` exited 0 whatever happened, so `turbollm --stop && …` carried on with the
+// daemon still running. `failed` is what cli.ts exits 1 on: the daemon the start guard counts as
+// running is still running. Nothing to stop (no pidfile, a dead pid, no TurboLLM with that pid
+// answering, which a start does not count either) is not a failure.
+test('stopDaemon: failed only when the running daemon it found is still running', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    assert.ok(!(await stopDaemon(dir, makeHooks(false))).failed, 'no pidfile')
+    writePidfile(dir, 42, 7000)
+    assert.ok(!(await stopDaemon(dir, makeHooks(true, { confirm: false, platform: 'linux' }))).failed, 'not confirmed')
+    const stopped = await stopDaemon(dir, makeHooks(true, { platform: 'linux' }))
+    assert.equal(stopped.stopped, true)
+    assert.ok(!stopped.failed)
+    assert.ok(!(await stopDaemon(dir, makeHooks(false))).failed, 'pidfile gone with it')
+
+    // The signal refused (a daemon run elevated or as another user).
+    writePidfile(dir, 42, 7000)
+    const refused = makeHooks(true, { platform: 'linux' })
+    refused.kill = () => {
+      throw Object.assign(new Error('kill EPERM'), { code: 'EPERM' })
+    }
+    const r1 = await stopDaemon(dir, refused)
+    assert.equal(r1.stopped, false)
+    assert.equal(r1.failed, true)
+    assert.match(r1.message, /Failed to stop daemon \(pid 42\): kill EPERM/)
+
+    // The signal or taskkill failed because the daemon had already gone: it exited between the
+    // probe and the SIGTERM (ESRCH), or taskkill /T /F found a process of its tree gone and exited
+    // non-zero. Stopped, not a failure.
+    for (const platform of ['linux', 'win32'] as const) {
+      writePidfile(dir, 42, 7000)
+      const gone = makeHooks(true, { platform })
+      gone.kill = gone.taskkill = () => {
+        gone.alive = false
+        throw Object.assign(new Error('gone'), { code: 'ESRCH' })
+      }
+      const r = await stopDaemon(dir, gone)
+      assert.equal(r.stopped, true, `${platform}: ${r.message}`)
+      assert.ok(!r.failed)
+      assert.equal(readPidfile(dir), null, `${platform}: the pidfile of a daemon that is gone is removed`)
+    }
+
+    // taskkill returned, but the process is still there (stuck in the kernel on a hung mount).
+    writePidfile(dir, 42, 7000)
+    const stuck = makeHooks(true, { platform: 'win32' })
+    stuck.taskkill = () => {
+      stuck.taskkillCalled = true
+    }
+    const r2 = await stopDaemon(dir, stuck)
+    assert.equal(r2.stopped, false, r2.message)
+    assert.equal(r2.failed, true)
+    assert.match(r2.message, /still running/)
+    assert.deepEqual(readPidfile(dir), { pid: 42, port: 7000 }, 'a daemon still running keeps its pidfile')
+  } finally {
+    cleanup()
+  }
+})
+
+// A daemon whose parent does not reap it (a Python Popen handle kept and never waited on, a
+// container PID 1 that is not an init) is a zombie once it exits, and signal 0 still reaches a
+// zombie. --stop waited out the 10 s SIGTERM grace, SIGKILLed it, then counted it as still running
+// and exited 1. Real default hooks: a stand-in daemon (Server: TurboLLM/, /healthz with its pid)
+// whose parent, `exec sleep`, never reaps.
+test('--stop counts a daemon that exited but was not reaped (a zombie) as stopped, at once', {
+  skip: process.platform === 'win32' && 'no zombie processes on Windows',
+}, async () => {
+  const parent = spawn('sh', ['-c', 'sleep 60 & echo $!; exec sleep 60'], { stdio: ['ignore', 'pipe', 'ignore'] })
+  const { dir, cleanup } = makeTmpDir()
+  let standIn: http.Server | undefined
+  try {
+    const pid = await new Promise<number>((resolve, reject) => {
+      parent.stdout!.once('data', (b: Buffer) => resolve(Number(String(b).trim())))
+      parent.once('error', reject)
+    })
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { server: 'TurboLLM/9.9.9', 'content-type': 'application/json' })
+      res.end(JSON.stringify({ status: 'ok', version: '9.9.9', pid }))
+    })
+    standIn = server
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    writePidfile(dir, pid, (server.address() as AddressInfo).port)
+
+    const t0 = Date.now()
+    const res = await stopDaemon(dir)
+    assert.equal(res.stopped, true, res.message)
+    assert.ok(Date.now() - t0 < 5_000, 'waited out the SIGTERM grace')
+    assert.equal(res.failed, false)
+    assert.equal(readPidfile(dir), null)
+    if (process.platform === 'linux') {
+      assert.match(readFileSync(`/proc/${pid}/stat`, 'utf8'), /\) Z /, 'the daemon is left a zombie')
+    }
+  } finally {
+    parent.kill('SIGKILL')
+    cleanup()
+    if (standIn) await new Promise<void>((resolve) => standIn!.close(() => resolve()))
+  }
+})
+
 // ── Second daemon on the same data dir (owner-scoped pidfile + start guard) ─────────
 
 test('removeOwnPidfile: leaves another daemon\'s pidfile alone, removes its own', () => {

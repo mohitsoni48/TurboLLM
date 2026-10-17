@@ -3,7 +3,7 @@
 // touching cli.ts (which is the entrypoint and spins up a full daemon).
 import { readFileSync, writeFileSync, unlinkSync, existsSync, openSync, writeSync, closeSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from './util/process-start-time'
@@ -260,7 +260,7 @@ export function releaseDataDirClaim(dir: string, pid: number = process.pid): voi
 
 // Injection hook types so unit tests can replace the real OS calls.
 export interface StopHooks {
-  /** Returns true when the process is still alive. */
+  /** Returns true when the process is still alive (an exited one not yet reaped is not). */
   processExists: (pid: number) => boolean
   /** Send a signal to the process (Unix only). */
   kill: (pid: number, signal: NodeJS.Signals) => void
@@ -274,18 +274,39 @@ export interface StopHooks {
   platform: NodeJS.Platform
 }
 
+/** Whether `pid` has exited and only waits for its parent to reap it (a zombie). Signal 0 still
+ *  reaches a zombie, so one read as running: a daemon whose parent does not reap (a Python Popen
+ *  handle kept and never waited on, a container PID 1 that is not an init) held --stop through the
+ *  whole SIGTERM grace, then still counted as running after SIGKILL, and --stop exited 1 with
+ *  nothing left running. False when it cannot be told. Windows has none to tell: libuv's signal 0
+ *  there checks the exit code. */
+function isZombie(pid: number): boolean {
+  if (process.platform === 'win32') return false
+  try {
+    if (process.platform === 'linux' || process.platform === 'android') {
+      // `<pid> (<comm>) <state> …`; the command name may hold spaces and parentheses.
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      return /^[ZX]/.test(stat.slice(stat.lastIndexOf(')') + 2))
+    }
+    const r = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 })
+    return /^\s*Z/.test(String(r.stdout ?? ''))
+  } catch {
+    return false
+  }
+}
+
 /** Default production hooks. */
 const defaultHooks: StopHooks = {
   processExists(pid) {
     try {
       process.kill(pid, 0)
-      return true
     } catch (e) {
       // EPERM: it exists but this user may not signal it (a daemon run elevated or as another
       // user) — alive, so a start beside it is refused and --stop keeps its pidfile. A recycled
       // PID is still caught by the identity probe that follows every use of this.
-      return (e as NodeJS.ErrnoException).code === 'EPERM'
+      if ((e as NodeJS.ErrnoException).code !== 'EPERM') return false
     }
+    return !isZombie(pid)
   },
   kill(pid, signal) {
     process.kill(pid, signal)
@@ -387,6 +408,10 @@ async function waitForExit(
 export interface StopResult {
   /** Whether a running daemon was found and stopped. */
   stopped: boolean
+  /** A running daemon was found (the pid alive and a TurboLLM with that pid answering, what the
+   *  start guard counts as running) and it is still running: `turbollm --stop` exits 1. False
+   *  when there was nothing to stop, as well as when it was stopped. */
+  failed: boolean
   /** The port the daemon was listening on (when stopped = true). */
   port?: number
   /** Human-readable message to print. */
@@ -407,7 +432,7 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
   const data = readPidfile(dir)
 
   if (!data) {
-    return { stopped: false, message: 'No running TurboLLM daemon found.' }
+    return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
   }
 
   const { pid, port } = data
@@ -415,7 +440,7 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
   // Check if the process is actually still alive before attempting to stop it.
   if (!hooks.processExists(pid)) {
     removeOwnPidfile(dir, pid)
-    return { stopped: false, message: 'No running TurboLLM daemon found.' }
+    return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
   }
 
   // Identity check (guards against a recycled PID): the pidfile is removed on every
@@ -428,6 +453,8 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
     const manual = hooks.platform === 'win32' ? `taskkill /PID ${pid} /T /F` : `kill -9 ${pid}`
     return {
       stopped: false,
+      // Not a failure: nothing the start guard counts as a running daemon was found.
+      failed: false,
       message:
         `Found a pidfile (pid ${pid}, port ${port}), but no TurboLLM daemon with that pid is responding there — ` +
         `it may be stale or the PID was reused by another process. Not killing it automatically.\n` +
@@ -435,12 +462,12 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
     }
   }
 
+  let refused: string | undefined
   try {
     if (hooks.platform === 'win32') {
-      hooks.taskkill(pid)
       // taskkill is synchronous and force-kills, so by the time it returns the
-      // process should be gone. Give it a short grace window just in case.
-      await waitForExit(pid, 2_000, hooks)
+      // process should be gone (the grace window below is just in case).
+      hooks.taskkill(pid)
     } else {
       // Unix: send SIGTERM and wait up to 10 s for a graceful shutdown.
       hooks.kill(pid, 'SIGTERM')
@@ -455,7 +482,19 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
       }
     }
   } catch (e) {
-    return { stopped: false, message: `Failed to stop daemon (pid ${pid}): ${e instanceof Error ? e.message : e}` }
+    // A failure only if the daemon is still there (below). It can be gone already: it exited
+    // between the /healthz probe and the SIGTERM (Ctrl+C in its terminal, a self-restart, a second
+    // --stop), which kill reports as ESRCH, and taskkill /T /F exits non-zero when a process of
+    // its tree had already gone ("There is no running instance of the task") although the daemon
+    // is dead.
+    refused = `Failed to stop daemon (pid ${pid}): ${e instanceof Error ? e.message : e}`
+  }
+  // taskkill /F and SIGKILL end a process at once, short of one stuck in the kernel (a hung disk
+  // or network mount). Reported as stopped, with its pidfile removed and --stop exiting 0, such a
+  // daemon went on holding its port and data dir with nothing left to find it by.
+  if (!(await waitForExit(pid, 2_000, hooks))) {
+    const how = hooks.platform === 'win32' ? 'taskkill' : 'SIGKILL'
+    return { stopped: false, failed: true, message: refused ?? `TurboLLM daemon (pid ${pid}) is still running after ${how}.` }
   }
 
   // Only the stopped daemon's own record: it removes its pidfile as soon as shutdown starts,
@@ -463,5 +502,5 @@ export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): 
   // the poll above sees the old pid gone — deleting that would hide the new daemon from
   // --stop and from the one-daemon-per-data-dir start guard.
   removeOwnPidfile(dir, pid)
-  return { stopped: true, port, message: `TurboLLM daemon stopped (port ${port})` }
+  return { stopped: true, failed: false, port, message: `TurboLLM daemon stopped (port ${port})` }
 }

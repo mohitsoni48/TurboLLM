@@ -317,7 +317,9 @@ setGithubTokenProvider(() => store.snapshot().gh?.token ?? '')
 if (hasFlag('--stop')) {
   const result = await stopDaemon(store.dir())
   process.stdout.write(result.message + '\n')
-  process.exit(0)
+  // 1 only when the daemon it found is still running (StopResult.failed), so `turbollm --stop &&
+  // …` does not carry on beside it; nothing to stop is still 0.
+  process.exit(result.failed ? 1 : 0)
 }
 
 // ── One daemon per data dir ───────────────────────────────────────────────────

@@ -108,6 +108,13 @@ test('signal shutdown and restart drop open terminal WebSockets before close() (
   assert.ok(restartDrop < restart.indexOf('server.close(() => {'))
 })
 
+// `turbollm --stop && …` must not carry on when the daemon is still running. Which results count
+// as a failure is daemon-pid.test.ts's "stopDaemon: failed only when …" test.
+test('--stop exits 1 when the daemon it found is still running, 0 otherwise', () => {
+  const stop = blockFrom("if (hasFlag('--stop')) {")
+  assert.match(stop, /const result = await stopDaemon\(store\.dir\(\)\)[\s\S]*process\.exit\(result\.failed \? 1 : 0\)/)
+})
+
 test('pidfile removal is owner-scoped and a second daemon on the data dir is refused before boot side effects', () => {
   assert.ok(!CLI.includes('removePidfile('), "only removeOwnPidfile — never delete another daemon's pidfile")
   const guard = CLI.indexOf('const runningDaemon = await findRunningDaemon(store.dir())')
