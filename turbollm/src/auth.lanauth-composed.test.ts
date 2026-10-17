@@ -712,6 +712,45 @@ test('a Tailscale Serve identity is no credential for a cross-site browser reque
   assert.equal((await get({ 'Sec-Fetch-Site': 'cross-site', Authorization: `Bearer ${raw}` })).status, 200)
 })
 
+// Cloudflare adds Cf-Access-Jwt-Assertion to every request it lets through once the browser holds
+// the Access cookie, cross-site ones included, so the Access login is as ambient as Serve's
+// identity header, and /v1 answers CORS '*': a page on any site could run inference and swap the
+// owner's model with no key.
+test('a Cloudflare Access login is no credential for a cross-site browser request', async () => {
+  const teamDomain = 'https://cross-site-access.cloudflareaccess.com'
+  const restoreFetch = stubJwksEndpoint(teamDomain)
+  try {
+    const raw = 'tllm-crosssiteaccesscrosssiteaccesscross1'
+    const { d, cfg } = makeDeps((cfg) => {
+      cfg.remoteAccess.provider = 'cloudflare-named'
+      cfg.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+      cfg.remoteAccess.cloudflare.accessAud = 'aud-cross-site'
+    })
+    cfg.apiKeys.push({ id: 'k1', name: 'x', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+    const app = buildApp(d)
+    const access = { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': makeValidAccessJwt(teamDomain, 'aud-cross-site') }
+    const get = (headers: Record<string, string>) => tunneledRequest(app, '/v1/models', { headers: { ...access, ...headers } })
+    for (const requireAccess of [false, true]) {
+      cfg.remoteAccess.cloudflare.requireAccess = requireAccess
+      const on = `requireAccess ${requireAccess}`
+      assert.equal((await get({ 'Sec-Fetch-Site': 'cross-site', Origin: 'https://evil.example' })).status, 401, on)
+      assert.equal((await get({ 'Sec-Fetch-Site': 'same-site' })).status, 401, `${on}: another app on the same site is not this one`)
+      assert.equal((await get({ Origin: 'https://evil.example' })).status, 401, `${on}: no Fetch Metadata: Origin vs Host`)
+      // The served UI itself, a typed URL, and a CLI/SDK (no browser headers) keep keyless access.
+      assert.equal((await get({ 'Sec-Fetch-Site': 'same-origin', Origin: 'https://llm.example.com' })).status, 200, on)
+      assert.equal((await get({ 'Sec-Fetch-Site': 'none' })).status, 200, on)
+      assert.equal((await get({})).status, 200, on)
+      // A cross-site browser client with a key still gets in, through the ordinary key check:
+      // with requireAccess on, only alongside a verified login.
+      assert.equal((await get({ 'Sec-Fetch-Site': 'cross-site', Authorization: `Bearer ${raw}` })).status, 200, on)
+    }
+    assert.equal((await tunneledRequest(app, '/v1/models', { headers: { Host: 'llm.example.com', 'Sec-Fetch-Site': 'cross-site', Authorization: `Bearer ${raw}` } })).status, 401,
+      'requireAccess on: a key without a verified login is still refused')
+  } finally {
+    restoreFetch()
+  }
+})
+
 // The persisted URL is whatever the last provider to connect served. Saved by another one (a
 // custom tunnel the user still runs, pointed at the ingress), it is that tunnel's own name, so
 // until Serve first connects every request through that tunnel would carry the "served" Host

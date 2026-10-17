@@ -922,7 +922,14 @@ export function lanAuth(d: Deps): MiddlewareHandler {
           verified = res.ok
         }
       }
-      if (verified) return next()
+      // Never for a request a browser marks as cross-site (isCrossSite), as for the Serve identity
+      // above: Cloudflare adds the assertion to everything it lets through once the browser holds
+      // the Access cookie, another site's requests included, so the login is ambient like a
+      // cookie, and with /v1's CORS '*' a page on any site the owner visits could run inference
+      // and auto-swap models with no key. Such a request goes on to the key check below; with
+      // requireAccess on it still needs the verified login as well, as that key check is then a
+      // supplement, not a replacement.
+      if (verified && !isCrossSite(c)) return next()
       // I2 (Phase 5 final review): `requireAccess: true` must refuse whenever control reaches
       // here WITHOUT a genuinely verified assertion, for ANY reason — none presented, one that
       // failed verification, or a JWKS fetch that itself failed. The previous structure only
@@ -930,7 +937,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       // neither branch and silently fell through to the ordinary bearer check instead, so the
       // "the bearer token is replaced, not supplemented" guarantee held for an attacker who
       // sent nothing and evaporated for one who sent garbage.
-      if (ra.cloudflare.requireAccess) {
+      if (ra.cloudflare.requireAccess && !verified) {
         return c.json({ error: { code: 'unauthorized', message: 'Cloudflare Access sign-in is required.' } }, 401)
       }
     }
