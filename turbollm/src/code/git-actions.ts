@@ -40,6 +40,13 @@ const GIT_NETWORK_TIMEOUT_MS = 30_000
 // --name-only` printed more than that and the call failed. Still bounded, so a runaway output
 // can't take the daemon's memory; past it the call fails and the caller reports that failure.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024
+// The most characters of paths one `git add` is given; a longer selection is staged in several
+// calls. Every path went on one command line, and past the OS limit the spawn failed before git
+// ran: Windows passes a program its arguments as one command line of at most 32,767 characters
+// (libuv fails the spawn with ENAMETOOLONG), a few hundred paths, and Linux and macOS refuse an
+// exec whose arguments pass ARG_MAX (E2BIG; 2 MiB and 1 MiB by default). Below Windows' limit with
+// room for the quotes and separators it adds per path and for the rest of the command line.
+const GIT_ADD_PATHS_BUDGET = 24_000
 
 export class GitError extends Error {
   readonly stderr: string
@@ -260,8 +267,22 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
       if (!isGitPathInside(f, repoRoot)) throw new GitError(`Refusing to stage a path outside the repo: ${f}`, '', null)
     }
     // Literal: these are file names (from getGitStatus), so '[ab].txt' must not also match a.txt
-    // as a glob, nor a leading ':' read as pathspec magic.
-    await git(['--literal-pathspecs', 'add', '--', ...files], repoRoot)
+    // as a glob, nor a leading ':' read as pathspec magic. In groups of GIT_ADD_PATHS_BUDGET
+    // characters, each counted with a separator and the quotes Windows may put around it: the
+    // Git dialog sends every path but the ones unticked, which after a formatter run over the
+    // tree is more than one command line holds.
+    let group: string[] = []
+    let size = 0
+    for (const f of files) {
+      if (group.length > 0 && size + f.length + 3 > GIT_ADD_PATHS_BUDGET) {
+        await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot)
+        group = []
+        size = 0
+      }
+      group.push(f)
+      size += f.length + 3
+    }
+    await git(['--literal-pathspecs', 'add', '--', ...group], repoRoot)
   } else {
     // `-- .`: without a pathspec `git add -A` stages the whole working tree, which for a session
     // opened at a repo subfolder includes changes outside the folder (getGitStatus lists only it).

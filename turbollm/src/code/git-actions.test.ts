@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { execFileSync } from 'node:child_process'
-import { writeFileSync, appendFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs'
+import { writeFileSync, appendFileSync, mkdirSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   buildGithubCompareUrl,
@@ -196,6 +196,38 @@ test('commitGitChanges: an explicit file list stages ONLY those paths, leaving t
   assert.equal(result.filesCommitted, 1)
   const status = await getGitStatus(dir)
   assert.deepEqual(status.files, [{ code: '??', path: 'b.txt' }])
+})
+
+// The Git dialog sends every path but the ones unticked, and they all went to one `git add`. Past
+// the OS limit on a command line the spawn failed before git ran, and nothing was committed:
+// ENAMETOOLONG on Windows at 32,767 characters (a few hundred paths, here 399 of 83 characters),
+// E2BIG on Linux at about 2 MB. GIT_TRACE logs each git call the commit makes, on any platform.
+test('REGRESSION: a selection longer than one command line holds is staged in several git add calls and committed', async () => {
+  const dir = initRepo()
+  mkdirSync(join(dir, 'src'))
+  const files = Array.from({ length: 400 }, (_, i) => `src/${String(i).padStart(5, '0')}-${'x'.repeat(70)}.ts`)
+  for (const f of files) writeFileSync(join(dir, f), 'let a\n')
+  gitSync(['add', '-A'], dir)
+  gitSync(['commit', '-q', '-m', 'the sources'], dir)
+  for (const f of files) writeFileSync(join(dir, f), 'let a = 1\n') // a formatter run over all of them
+  const [unticked, ...selected] = files
+  assert.ok(selected.join(' ').length > 32_767, 'one git add of the selection is past Windows\' limit')
+
+  const trace = join(tmpDir('tllm-git-actions-trace-'), 'trace.log')
+  const before = process.env.GIT_TRACE
+  process.env.GIT_TRACE = trace
+  let result
+  try {
+    result = await commitGitChanges(dir, 'format', selected)
+  } finally {
+    if (before === undefined) delete process.env.GIT_TRACE
+    else process.env.GIT_TRACE = before
+  }
+  const adds = readFileSync(trace, 'utf-8').split('\n').filter((l) => l.includes('trace: built-in: git add -- '))
+  assert.ok(adds.length > 1, `staged in ${adds.length} git add call(s)`)
+  for (const l of adds) assert.ok(l.length < 32_767, 'each one fits on a Windows command line')
+  assert.equal(result.filesCommitted, selected.length)
+  assert.deepEqual((await getGitStatus(dir)).files, [{ code: ' M', path: unticked }])
 })
 
 test('commitGitChanges: refuses a path outside the repo root (containment), without staging anything', async () => {
