@@ -58,6 +58,7 @@ function baseDeps(overrides: Partial<CliRoutineDeps> = {}): CliRoutineDeps {
     // === 0`. `fakeManagerIdle()` below models that counter the way the real one behaves.
     getEngineIdle: overrides.getEngineIdle ?? (() => true),
     loadExplicit: overrides.loadExplicit ?? (async () => ({ target: 'http://127.0.0.1:8081' })),
+    reloadAfterRender: overrides.reloadAfterRender ?? (() => {}),
     now: overrides.now ?? (() => new Date('2026-08-01T10:00:00.000Z')),
     port: overrides.port ?? 6996,
     isAvailable: overrides.isAvailable ?? (async () => true),
@@ -413,6 +414,96 @@ test('M6: a restore that RETURNS 503 is warned about, not silently discarded', a
   assert.match(warnings[0], /No model matching/)
   const runs = store.listRoutineRuns(routine.id)
   assert.equal(runs[0].status, 'ok', 'a failed restore must not overwrite the run outcome')
+})
+
+test('a restore a ComfyUI render refused is handed to that render, not warned about', async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const loadCalls: string[] = []
+  const handedOver: string[][] = []
+  const warnings: string[] = []
+  const realWarn = console.warn
+  console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')) }
+  try {
+    await runCliCodeRoutine(routine, baseDeps({
+      store,
+      getLoadedModelKey: () => 'some-other-model',
+      loadExplicit: async (k) => {
+        loadCalls.push(k)
+        return loadCalls.length === 1 ? { target: 'http://127.0.0.1:8081' } : { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
+      },
+      reloadAfterRender: (k, routineKey) => { handedOver.push([k, routineKey]) },
+    }))
+  } finally {
+    console.warn = realWarn
+  }
+
+  assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'])
+  assert.deepEqual(handedOver, [['some-other-model', 'pinned-model']], "the render's release reloads the previous model")
+  assert.deepEqual(warnings, [])
+  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
+})
+
+// A ComfyUI render that begins while the CLI runs unloads the routine's model and keeps it for its release() to
+// reload. The routine's restore of the user's model then met the render, was refused and only warned about: when the
+// render ended, the guard brought the routine's model back, and the user's model stayed unloaded.
+test("a restore refused by a ComfyUI render makes the render's release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store: config, manager, modelRouter, guard, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = codeRoutine(store, { modelKey: routineModel.key })
+
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k) => modelRouter.loadExplicit(k),
+    reloadAfterRender: (k, routineKey) => modelRouter.reloadAfterRender(k, routineKey),
+    runProcess: async () => {
+      assert.equal(manager.status().model?.key, routineModel.key, 'the CLI runs on the routine model')
+      await guard!.acquire() // a render starts mid-run
+      return { exitCode: 0, timedOut: false, stdout: OK_STDOUT, stderr: '' }
+    },
+  }))
+
+  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  assert.equal(config.snapshot().lastLoaded.modelKey, userModel.key, "the next start resumes the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+})
+
+// The same render, landing during the swap after Manager.load stopped the user's model (here during the reverse gate's
+// /free call): the routine's load is refused, and the run errored with no restore. The render's release then loaded
+// the routine's model for a CLI that never ran, and the user's stayed unloaded.
+test("a render that begins after the swap stopped the user model makes its release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, guard, comfyFree, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  comfyFree.hook = () => guard!.acquire()
+  const store = freshStore()
+  const routine = codeRoutine(store, { modelKey: routineModel.key })
+
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k) => modelRouter.loadExplicit(k),
+    reloadAfterRender: (k, routineKey) => modelRouter.reloadAfterRender(k, routineKey),
+    runProcess: neverSpawns(),
+  }))
+
+  assert.match(store.listRoutineRuns(routine.id)[0].error ?? '', /ComfyUI is rendering/)
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
 })
 
 // ── Subprocess outcomes ───────────────────────────────────────────────────────────────────────

@@ -312,6 +312,32 @@ export class ComfyGuard {
     }
   }
 
+  /** A routine's restore of the model its swap displaced (`opts`, routines/model-swap.ts through
+   *  ModelRouter.reloadAfterRender), refused because a render holds the GPU. That render's acquire unloaded the
+   *  routine's model (`routineModelKey`) and keeps it for release() to reload, and nothing else brings the user's
+   *  model back once the routine is over: release() reloads `opts` instead. Also when the render unloaded nothing (the
+   *  routine's model had stopped by then): the restore would have loaded `opts` had no render been running. A load the
+   *  render paused that names the routine's model is the routine's own swap, which the render refused, so the routine
+   *  never ran: it is dropped, and release() reloads `opts` in its place. Left alone when release() has the user's own
+   *  choice to load: another load the render paused, or another model it unloaded. Returns whether release() now
+   *  reloads `opts`. */
+  reloadOnReleaseInstead(routineModelKey: string, opts: StartOpts): boolean {
+    // Held, not just claimed: an acquire still running may yet suspend a model, and writes cachedFile when its save ends.
+    if (!this.isBlocked()) return false
+    if (this.hasPausedLoad()) {
+      // The render's acquire landed while that swap was stopping the user's model or waiting on the reverse gate's
+      // /free call, after the user's model was gone. Resumed, release() loaded the routine's model, which nothing uses
+      // now, and the user's stayed unloaded. clearError leaves the primary 'stopped', as an acquire that found nothing
+      // to unload does.
+      if (this.manager.restartOpts()?.model.key !== routineModelKey) return false
+      this.manager.clearError()
+    }
+    if (this.suspended && this.suspended.model.key !== routineModelKey) return false
+    this.suspended = opts
+    this.cachedFile = null // a KV cache saved on the way in is the routine model's
+    return true
+  }
+
   /** The primary is in 'error' with our pre-start hook's refusal: release() resumes that load. */
   private hasPausedLoad(): boolean {
     const st = this.manager.status()

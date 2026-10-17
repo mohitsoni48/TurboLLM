@@ -9,6 +9,7 @@ import { join } from 'node:path'
 import { Manager } from '../engines/manager'
 import { ModelRouter } from '../gateway/model-router'
 import { ConfigStore, type Engine } from '../config/config'
+import { ComfyGuard } from '../engines/comfy-guard'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { tmpDir } from './tmp'
@@ -45,9 +46,11 @@ async function freePort(): Promise<number> {
   return port
 }
 
-/** Two models on the stand-in: `userModel`, which starts, and `brokenModel`, whose engine exits at once. Every engine
- *  this starts is stopped when the test ends. */
-export async function realEngineSetUp(t: { after: (fn: () => unknown) => void }) {
+/** Three models on the stand-in: `userModel` and `routineModel`, which start, and `brokenModel`, whose engine exits at
+ *  once. Every engine this starts is stopped when the test ends.
+ *  `comfy`: a real ComfyGuard, wired as cli.ts wires it, with its reverse gate on: `comfyFree.hook`, when set, runs
+ *  once inside the next `POST /free` call. */
+export async function realEngineSetUp(t: { after: (fn: () => unknown) => void }, opts: { comfy?: boolean } = {}) {
   const dir = tmpDir('tllm-stand-in-engine-')
   writeFileSync(join(dir, 'fake-engine.js'), FAKE_ENGINE_JS)
   const bin = join(dir, 'llama-server')
@@ -56,23 +59,43 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void })
   const engine: Engine = { id: 'fake', name: 'Fake', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }
   const userModel = ggufEntry(dir, 'user-model')
   const brokenModel = ggufEntry(dir, 'broken-model')
-  const models = [userModel, brokenModel]
+  const routineModel = ggufEntry(dir, 'routine-model')
+  const models = [userModel, brokenModel, routineModel]
   const ports = await Promise.all(models.map(() => freePort()))
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => {
     c.gateway.autoSwap = false // a routine's swap does not depend on it (loadExplicit)
     c.gateway.keepN = 1
     models.forEach((m, i) => { c.modelProfiles[m.key] = { fake: { profile: { port: ports[i] }, updatedAt: '' } } })
+    c.comfyui.enabled = opts.comfy ?? false
+    c.comfyui.reverseGate = true
+    c.comfyui.url = 'http://comfyui.invalid'
   })
   const manager = new Manager(store)
+  const comfyFree: { hook: (() => Promise<void>) | null } = { hook: null }
+  const guard = opts.comfy
+    ? new ComfyGuard(store, manager, 30, async (url) => {
+      const hook = url.endsWith('/free') ? comfyFree.hook : null
+      comfyFree.hook = null
+      await hook?.()
+      return { ok: true, status: 200 }
+    })
+    : undefined
   const registry = { active: () => engine, layaEngine: () => undefined, litertLmEngine: () => undefined } as unknown as Registry
   const scanner = {
     list: () => ({ models, scanning: false, lastScanAt: '' }),
     get: (key: string) => models.find((m) => m.key === key),
   } as unknown as Scanner
-  const modelRouter = new ModelRouter(store, registry, manager, scanner, undefined)
+  const modelRouter = new ModelRouter(store, registry, manager, scanner, guard)
+  if (guard) {
+    guard.setPoolStopper(async () => {
+      await Promise.all([...modelRouter.poolEngineIds()].map((id) => modelRouter.stopPoolSlotsOnEngine(id, { force: true })))
+    })
+    guard.setSwapLock((fn) => modelRouter.withSwapLock(fn))
+  }
   t.after(async () => {
+    guard?.stop()
     await manager.stopAndWait({ force: true })
   })
-  return { manager, modelRouter, userModel, brokenModel }
+  return { store, manager, modelRouter, guard, comfyFree, userModel, brokenModel, routineModel }
 }

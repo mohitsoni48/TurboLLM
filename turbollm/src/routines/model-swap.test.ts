@@ -197,3 +197,87 @@ test('a pinned model that fails to load after the user model was stopped reloads
   assert.equal(st.state, 'running', `the user's model is loaded again, got ${st.state} (${st.err?.message ?? ''})`)
   assert.equal(st.model?.key, userModel.key)
 })
+
+// A ComfyUI render that begins while a routine runs unloads the routine's model and keeps it for its release() to
+// reload. The routine's restore of the user's model then meets the render and is refused, and nothing recorded it:
+// when the render ended, the guard brought the routine's model back, and the user's model stayed unloaded. The model
+// saved as last loaded, which the routine's swap set, named the routine's too.
+test("a routine's restore refused by a ComfyUI render makes the render's release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    assert.equal(manager.status().model?.key, routineModel.key, 'the routine runs on its own model')
+    await guard!.acquire() // a render starts mid-run
+  })
+
+  assert.equal(result.outcome, 'ran')
+  assert.equal(manager.status().state, 'stopped', 'nothing loads while the render holds the GPU')
+  assert.equal(guard!.snapshot().suspendedModelKey, userModel.key, "the render's release reloads the user's model")
+  assert.equal(store.snapshot().lastLoaded.modelKey, userModel.key, "the next start resumes the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+  assert.equal(store.snapshot().lastLoaded.modelKey, userModel.key)
+})
+
+// The same render, landing during the routine's swap: withPinnedModel answered skip-comfyui-busy and restored nothing,
+// though the user's model was already gone, and the render's release loaded the routine's model for a routine that
+// never ran. Its acquire either kills the routine's model while it starts and keeps it for release() to reload, or,
+// landing after Manager.load stopped the user's model (its graceful stop, or the reverse gate's /free call), refuses
+// the routine's load, which release() then resumes.
+test("a render that begins while the routine's model starts makes its release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, guard, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  // The stand-in engine answers /health 200 ms after it starts: the acquire lands while it is still 'starting'.
+  let acquired: Promise<void> | undefined
+  const watch = setInterval(() => {
+    const st = manager.status()
+    if (st.state === 'starting' && st.model?.key === routineModel.key) {
+      clearInterval(watch)
+      acquired = guard!.acquire()
+    }
+  }, 5)
+  t.after(() => clearInterval(watch))
+  let called = false
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => { called = true })
+  await acquired
+
+  assert.equal(result.outcome, 'skip-comfyui-busy')
+  assert.equal(called, false)
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+})
+
+test("a render that begins after the routine's swap stopped the user model makes its release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, guard, comfyFree, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  // The acquire lands during the swap's /free call: Manager.load has stopped the user's model, and the routine's
+  // load is refused by the pre-start hook once the call returns.
+  comfyFree.hook = () => guard!.acquire()
+  let called = false
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => { called = true })
+
+  assert.equal(result.outcome, 'skip-comfyui-busy')
+  assert.equal(called, false)
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+})

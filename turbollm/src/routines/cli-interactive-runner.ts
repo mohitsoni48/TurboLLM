@@ -71,6 +71,8 @@ export interface CliInteractiveDeps {
   getLoadedModelKey: () => string | null
   getEngineIdle: () => boolean
   loadExplicit: (modelKey: string) => Promise<RouteResult>
+  /** `ModelRouter.reloadAfterRender` (see restoreModel). */
+  reloadAfterRender: (modelKey: string, routineModelKey: string) => void
   now: () => Date
   isAvailable: () => Promise<boolean>
   /** Spawns the actual terminal for a freshly-created AgentRun — terminal-routes.ts's
@@ -92,11 +94,11 @@ export interface CliInteractiveDeps {
 }
 
 /** codeSessionId -> the model that was loaded before this run swapped it out, so it can be
- *  restored once the run finalizes (spec 20 §5). In-memory only, same acceptable gap
- *  cli-routine.ts's own restore logic documents for a cold daemon: after a restart there is
- *  nothing left in memory to restore FROM, so `finalizeInteractiveRun` simply skips it — no worse
- *  than the one-shot path's own documented behavior. */
-const pendingRestore = new Map<string, string>()
+ *  restored once the run finalizes (spec 20 §5), and the routine's model it swapped in. In-memory
+ *  only, same acceptable gap cli-routine.ts's own restore logic documents for a cold daemon: after
+ *  a restart there is nothing left in memory to restore FROM, so `finalizeInteractiveRun` simply
+ *  skips it — no worse than the one-shot path's own documented behavior. */
+const pendingRestore = new Map<string, { previousModel: string; pinnedModel: string }>()
 
 /** The harness name to use in a user-facing error. This runner now drives claude, opencode and pi,
  *  so a hardcoded "claude" sent the user to debug a CLI that was never involved. */
@@ -144,17 +146,17 @@ export async function runCliInteractiveRoutine(
   if (action === 'swap-then-run') {
     const swapResult = await deps.loadExplicit(pinnedModel)
     if ('status' in swapResult) {
-      // A load that failed may already have stopped the user's model (cli-routine.ts's swap
-      // explains when): it is restored, or every run of a routine whose model cannot start left
-      // the engine empty. ComfyUI's temporary refusal is not a load failure.
-      if (currentlyLoaded && !swapResult.message.includes('ComfyUI is rendering')) await restoreModel(deps, currentlyLoaded)
+      // A load that failed, or a swap a ComfyUI render refused, may already have stopped the
+      // user's model (cli-routine.ts's swap explains when): it is restored, or every run of a
+      // routine whose model cannot start left the engine empty.
+      if (currentlyLoaded) await restoreModel(deps, currentlyLoaded, pinnedModel)
       finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
       return 'errored'
     }
     previousModel = currentlyLoaded
   }
   if (abandoned()) {
-    if (previousModel) await restoreModel(deps, previousModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
     return 'errored'
   }
 
@@ -185,25 +187,31 @@ export async function runCliInteractiveRoutine(
     // Abandoned while the terminal was being started. execute.ts's createTerminal refuses to spawn
     // once the signal is aborted; anything that was spawned anyway is closed again right here.
     if (result.ok) deps.killTerminal(agentRun.id)
-    if (previousModel) await restoreModel(deps, previousModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
     return 'errored'
   }
   if (!result.ok) {
-    if (previousModel) await restoreModel(deps, previousModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
     finish({ status: 'errored', error: `Could not start the interactive ${agentLabel(routine)} CLI session: ${result.message}` })
     return 'errored'
   }
 
-  if (previousModel) pendingRestore.set(agentRun.id, previousModel)
+  if (previousModel) pendingRestore.set(agentRun.id, { previousModel, pinnedModel })
   // No endedAt: the run has not ended, it's parked. See this module's header comment.
   deps.store.updateRoutineRun(run.id, { status: 'needs_approval' })
   return 'needs_approval'
 }
 
-async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit'>, previousModel: string): Promise<void> {
+async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit' | 'reloadAfterRender'>, previousModel: string, pinnedModel: string): Promise<void> {
   try {
     const restoreResult = await deps.loadExplicit(previousModel)
-    if ('status' in restoreResult) {
+    // A ComfyUI render that began while the run was parked (or during its swap) keeps the routine's
+    // model for its release() to load, and refuses this restore until it ends. Dropped, the render's
+    // end brought the routine's model back and left the user's unloaded: the render's release reloads
+    // the previous model instead, as model-swap.ts's restore does.
+    if ('status' in restoreResult && restoreResult.message.includes('ComfyUI is rendering')) {
+      deps.reloadAfterRender(previousModel, pinnedModel)
+    } else if ('status' in restoreResult) {
       console.warn(`[routines] failed to restore the previously-loaded model '${previousModel}' after an interactive CLI routine run: ${restoreResult.message}`)
     }
   } catch (e) {
@@ -216,7 +224,7 @@ async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit'>, prev
  *  'needs_approval', since the fast path and the sweep can race (an agent-exited POST landing in
  *  the same tick the watchdog independently notices the same exit). */
 function finalizeInteractiveRun(
-  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'now' | 'releaseParked'>,
+  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'reloadAfterRender' | 'now' | 'releaseParked'>,
   run: RoutineRun,
   outcome: { status: 'ok' | 'errored'; result?: string; error?: string },
 ): void {
@@ -226,10 +234,10 @@ function finalizeInteractiveRun(
   deps.releaseParked?.(run.routineId, run.id)
   const codeSessionId = current.codeSessionId
   if (codeSessionId) {
-    const previousModel = pendingRestore.get(codeSessionId)
-    if (previousModel) {
+    const pending = pendingRestore.get(codeSessionId)
+    if (pending) {
       pendingRestore.delete(codeSessionId)
-      void restoreModel(deps, previousModel)
+      void restoreModel(deps, pending.previousModel, pending.pinnedModel)
     }
   }
 }
@@ -240,7 +248,7 @@ function finalizeInteractiveRun(
  *  `createTerminal`) just to run the watchdog. */
 export type CliInteractiveSweepDeps = Pick<
   CliInteractiveDeps,
-  'store' | 'now' | 'loadExplicit' | 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal' | 'releaseParked'
+  'store' | 'now' | 'loadExplicit' | 'reloadAfterRender' | 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal' | 'releaseParked'
 >
 
 /** The sweep's four terminal lookups over a TerminalManager (cli.ts wires these). The manager is

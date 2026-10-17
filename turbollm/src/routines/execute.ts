@@ -148,6 +148,7 @@ export async function runCliRoutineBranch(
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
     getEngineIdle: () => engineIsIdle(d.manager),
     loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
+    reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
     port: d.bindPort ?? d.store.snapshot().daemon.port, // the port really bound (`--port` wins over config)
     isAvailable: () => isClaudeCliAvailable(),
@@ -264,6 +265,7 @@ export async function runCliInteractiveBranch(
         if (!kickoffSettled) armTimer()
       }
     },
+    reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
     // Probe the binary THIS routine actually needs — the interactive path now serves every terminal
     // harness, so a hardcoded `claude --version` would report "not installed" for a machine that has

@@ -324,6 +324,86 @@ test('modelKeyLoadedOnRelease names what release() loads: the paused load over t
   assert.equal(g.modelKeyLoadedOnRelease(), null, 'the render is over')
 })
 
+// A routine's restore refused mid-render (routines/model-swap.ts): release() reloads the user's model the routine
+// displaced, not the routine's own, which the render unloaded. The user's own choice still wins.
+test("reloadOnReleaseInstead: release reloads the routine's displaced model, without the routine model's cache", async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('routine') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // suspends the routine's model and saves its KV cache
+  assert.equal(f.calls.filter((c) => c.url.includes('action=save')).length, 1)
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  assert.equal(g.modelKeyLoadedOnRelease(), 'user')
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+  assert.equal(f.calls.filter((c) => c.url.includes('action=restore')).length, 0, "the routine model's KV cache is not restored into the user's")
+})
+
+test('reloadOnReleaseInstead: a render that unloaded nothing reloads the displaced model too', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+})
+
+test('reloadOnReleaseInstead leaves another model the render unloaded, a load it paused, and a time with no render alone', async () => {
+  {
+    const { mgr } = fakeManager({ state: 'running', opts: OPTS('other') })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.snapshot().suspendedModelKey, null, 'no render: nothing recorded')
+    await g.acquire()
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.modelKeyLoadedOnRelease(), 'other', 'the model the render unloaded is not the routine one')
+  }
+  {
+    const { mgr } = fakeManager({ state: 'running', opts: OPTS('routine') })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+    await g.acquire()
+    const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+    Object.assign(mgr, {
+      status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+      restartOpts: () => OPTS('picked'),
+      restart: async () => {},
+    })
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.modelKeyLoadedOnRelease(), 'picked', 'the load the render paused wins')
+    assert.equal(g.snapshot().suspendedModelKey, 'routine')
+  }
+})
+
+// A render whose acquire landed after the routine's swap had stopped the user's model refuses the routine's load, and
+// release() resumes a paused load. That load is the routine's own, for a routine that never ran: it gives way.
+test("reloadOnReleaseInstead drops the routine's own load the render paused, and reloads the displaced model", async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let paused = true
+  const stopped = mgr.status
+  Object.assign(mgr, {
+    status: () => (paused
+      ? { state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }
+      : stopped()),
+    restartOpts: () => OPTS('routine'),
+    restart: async () => { calls.starts.push(OPTS('routine')) },
+    clearError: () => { paused = false },
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), 'routine')
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  assert.equal(g.modelKeyLoadedOnRelease(), 'user')
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+})
+
 // Not only once the GPU is held: while acquire is still freeing VRAM, release() will already reload the model.
 test('modelKeyLoadedOnRelease already names the unloaded model while acquire is still stopping it', async () => {
   const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })

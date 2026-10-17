@@ -19,9 +19,11 @@ import { PTYSession } from '../terminal/pty-session'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
-function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate }): { d: Deps; db: ConversationStore; loadCalls: string[] } {
+function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate }): { d: Deps; db: ConversationStore; loadCalls: string[]; reloadCalls: string[][] } {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const loadCalls: string[] = []
+  // withPinnedModel's restore hands a restore a ComfyUI render refused to reloadAfterRender (model-swap.ts).
+  const reloadCalls: string[][] = []
   let current = opts.loadedKey
   const manager = {
     status: () => ({ state: 'running', model: current ? { key: current } : null }),
@@ -29,7 +31,10 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
     target: () => 'http://engine.invalid.local:1',
     currentOpts: () => null,
   } as unknown as Manager
-  const modelRouter = { loadExplicit: async (key: string) => { loadCalls.push(key); current = key; return { target: 'http://x' } } } as unknown as ModelRouter
+  const modelRouter = {
+    loadExplicit: async (key: string) => { loadCalls.push(key); current = key; return { target: 'http://x' } },
+    reloadAfterRender: (modelKey: string, routineModelKey: string) => { reloadCalls.push([modelKey, routineModelKey]) },
+  } as unknown as ModelRouter
   const d = {
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
@@ -43,7 +48,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
     },
     gate: opts.gate,
   } as unknown as Deps
-  return { d, db, loadCalls }
+  return { d, db, loadCalls, reloadCalls }
 }
 
 function stubFetchOk(): { restore: () => void } {
@@ -95,7 +100,7 @@ test('different model loaded and busy: skips with skipReason model_busy, never c
 })
 
 test('ComfyUI busy on swap-in: skips with skipReason comfyui_busy, not errored (ADR-386)', async () => {
-  const { d, db } = fakeDeps({ loadedKey: 'other' })
+  const { d, db, reloadCalls } = fakeDeps({ loadedKey: 'other' })
   // Force the swap-in load itself to report ComfyUI's own busy refusal, the same shape
   // ModelRouter.loadExplicit returns when its ComfyUI-sharing guard is holding the model.
   ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async () =>
@@ -114,6 +119,7 @@ test('ComfyUI busy on swap-in: skips with skipReason comfyui_busy, not errored (
   assert.equal(runs[0].skipReason, 'comfyui_busy')
   assert.equal(status, 'skipped')
   assert.equal(fetchCalled, false)
+  assert.deepEqual(reloadCalls, [['other', 'm']], "the render's release reloads the user's model, not the routine's")
 })
 
 // Phase 3, Task 8: what used to be the 'not implemented yet' placeholder here is now a real call
@@ -426,7 +432,7 @@ test('an unattended interactive routine terminal outlives the 5-minute idle reap
     // What the manager's own 60 s sweep sees six minutes later, with no viewer ever attached.
     ;(tm as unknown as { idleSince: Map<string, number> }).idleSince.set(terminalId, Date.now() - 6 * 60_000)
     tm.cleanupIdle()
-    const sweepDeps = { store: db, loadExplicit: d.modelRouter.loadExplicit, ...terminalLookupsBySession(() => tm) }
+    const sweepDeps = { store: db, loadExplicit: d.modelRouter.loadExplicit, reloadAfterRender: () => {}, ...terminalLookupsBySession(() => tm) }
     sweepInteractiveCliRuns({ ...sweepDeps, now: () => new Date(Date.now() + 6 * 60_000) })
     assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval', 'the run is still in progress')
     assert.equal(tm.isActive(terminalId), true)
@@ -927,7 +933,7 @@ test("a pi Code routine's model restore waits for a gate holder that started dur
 // withPinnedModel can report 'skip-comfyui-busy' without ever running fn. resumeRoutineRun
 // used to fall through to {ok:true}, leaving its claim at 'running' forever (and every retry 409).
 test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', async () => {
-  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const { d, db, reloadCalls } = fakeDeps({ loadedKey: 'm' })
   const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
   const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
   const stallStub = stubFetchStall()
@@ -946,4 +952,5 @@ test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', as
   assert.equal(res.ok, false)
   assert.equal((res as { code: string }).code, 'model_busy')
   assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval', 'the claim must be reverted so Approve can be retried')
+  assert.deepEqual(reloadCalls, [['other', 'm']], "the render's release reloads the user's model, not the routine's")
 })

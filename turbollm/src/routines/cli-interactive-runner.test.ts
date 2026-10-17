@@ -56,6 +56,7 @@ function baseDeps(overrides: Partial<CliInteractiveDeps> = {}): CliInteractiveDe
     getLoadedModelKey: overrides.getLoadedModelKey ?? (() => 'pinned-model'),
     getEngineIdle: overrides.getEngineIdle ?? (() => true),
     loadExplicit: overrides.loadExplicit ?? (async () => ({ target: 'http://127.0.0.1:8081' })),
+    reloadAfterRender: overrides.reloadAfterRender ?? (() => {}),
     now: overrides.now ?? (() => new Date('2026-08-01T10:00:00.000Z')),
     isAvailable: overrides.isAvailable ?? (async () => true),
     createTerminal: overrides.createTerminal ?? recordingTerminal().createTerminal,
@@ -239,6 +240,7 @@ function sweepDeps(overrides: Partial<CliInteractiveSweepDeps> = {}): CliInterac
     store: overrides.store ?? freshStore(),
     now: overrides.now ?? (() => new Date('2026-08-01T10:00:00.000Z')),
     loadExplicit: overrides.loadExplicit ?? (async () => ({ target: 'http://127.0.0.1:8081' })),
+    reloadAfterRender: overrides.reloadAfterRender ?? (() => {}),
     isTerminalActive: overrides.isTerminalActive ?? (() => true),
     isAgentExited: overrides.isAgentExited ?? (() => false),
     getExitCode: overrides.getExitCode ?? (() => undefined),
@@ -416,6 +418,69 @@ function fakeTerminals(sessions: Record<string, { codeSessionId: string; agentEx
     kill: (id: string) => { if (live.delete(id)) killed.push(id) },
   }
 }
+
+// A ComfyUI render that begins while the run is parked unloads the routine's model and keeps it for its release() to
+// reload. The restore once the run finalized then met the render, was refused and only warned about: when the render
+// ended, the guard brought the routine's model back, and the user's model stayed unloaded.
+test("a restore refused by a ComfyUI render makes the render's release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, guard, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = interactiveRoutine(store, { modelKey: routineModel.key })
+  const run = schedulerRun(store, routine)
+  const loads: Promise<unknown>[] = []
+  const loadExplicit = (k: string) => { const p = modelRouter.loadExplicit(k); loads.push(p); return p }
+  const reloadAfterRender = (k: string, routineKey: string) => modelRouter.reloadAfterRender(k, routineKey)
+
+  assert.equal(await runCliInteractiveRoutine(routine, run, baseDeps({
+    store, getLoadedModelKey: () => manager.status().model?.key ?? null, loadExplicit, reloadAfterRender,
+  })), 'needs_approval')
+  assert.equal(manager.status().model?.key, routineModel.key, 'the CLI runs on the routine model')
+  await guard!.acquire() // a render starts while the run is parked
+  sweepInteractiveCliRuns(sweepDeps({ store, loadExplicit, reloadAfterRender, isAgentExited: () => true, getExitCode: () => 0 }))
+  await loads[loads.length - 1] // the restore, which the finalize does not wait for
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.equal(store.getRoutineRun(run.id)!.status, 'ok')
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+})
+
+// The same render, landing during the swap after Manager.load stopped the user's model (here during the reverse gate's
+// /free call): the routine's load is refused, and the run errored with no restore. The render's release then loaded
+// the routine's model for a CLI that never ran, and the user's stayed unloaded.
+test("a render that begins after the swap stopped the user model makes its release reload the user's model", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, guard, comfyFree, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  comfyFree.hook = () => guard!.acquire()
+  const store = freshStore()
+  const routine = interactiveRoutine(store, { modelKey: routineModel.key })
+  const run = schedulerRun(store, routine)
+
+  const status = await runCliInteractiveRoutine(routine, run, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k) => modelRouter.loadExplicit(k),
+    reloadAfterRender: (k, routineKey) => modelRouter.reloadAfterRender(k, routineKey),
+    createTerminal: neverCreatesTerminal(),
+  }))
+
+  assert.equal(status, 'errored')
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+})
 
 test('terminalLookupsBySession: a parked run whose CLI is still running stays parked (session id mapped to terminal id)', () => {
   const store = freshStore()

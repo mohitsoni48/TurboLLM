@@ -88,6 +88,9 @@ export interface CliRoutineDeps {
   /** `ModelRouter.loadExplicit`, or an equivalent. Returns `{ target }` on success and
    *  `{ status: 503, message }` on failure — it does not throw for a missing model. */
   loadExplicit: (modelKey: string) => Promise<RouteResult>
+  /** `ModelRouter.reloadAfterRender`: the restore below hands a refusal from a ComfyUI render to that render's
+   *  release, which otherwise reloads the routine's model. */
+  reloadAfterRender: (modelKey: string, routineModelKey: string) => void
   now: () => Date
   /** The daemon's OWN port (`d.bindPort ?? d.store.snapshot().daemon.port`: the bound one), for
    *  ANTHROPIC_BASE_URL — the same source `createAgentTerminal` uses and for the same reason: never
@@ -185,9 +188,11 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
         // new model. So it is restored in the finally below, as the Chat/pi path restores on its own
         // 'skip-load-failed' (model-swap.ts); without that every run of a routine whose model
         // cannot start left the engine empty. A failure that stopped nothing finds the user's model
-        // still running, and the restore is a no-op (doLoad's fast path). ComfyUI's temporary
-        // refusal is not a load failure.
-        if (!swapResult.message.includes('ComfyUI is rendering')) previousModel = currentlyLoaded
+        // still running, and the restore is a no-op (doLoad's fast path). A swap a ComfyUI render
+        // refused is restored too: that render may have met the user's model already stopped, or
+        // the routine's model starting, which it kills and keeps for its release() to reload
+        // (model-swap.ts explains both).
+        previousModel = currentlyLoaded
         finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
         return
       }
@@ -256,7 +261,14 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
         // gone missing is exactly the case `loadExplicit` signals by returning rather than throwing
         // (`model-router.ts:104`). Discarding it would leave the engine sitting on the routine's
         // pinned model with nothing anywhere in the log. Same warn as the throw path, deliberately.
-        if ('status' in restoreResult) {
+        //
+        // A ComfyUI render that began while the CLI ran (or during the swap) keeps the routine's
+        // model for its release() to load, and refuses this restore until it ends. Warned about and
+        // dropped, the render's end brought the routine's model back and left the user's unloaded:
+        // the render's release reloads the previous model instead, as model-swap.ts's restore does.
+        if ('status' in restoreResult && restoreResult.message.includes('ComfyUI is rendering')) {
+          deps.reloadAfterRender(previousModel, routine.modelKey)
+        } else if ('status' in restoreResult) {
           console.warn(`[routines] failed to restore the previously-loaded model '${previousModel}' after a CLI routine run: ${restoreResult.message}`)
         }
       } catch (e) {

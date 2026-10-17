@@ -242,6 +242,26 @@ export class ModelRouter {
     return this.withSwapLock(() => this.doLoad(entry, overrides))
   }
 
+  /** A routine's restore of `modelKey`, the model its swap displaced, that a ComfyUI render refused
+   *  (routines/model-swap.ts): that render's release() reloads it in place of the routine's own model
+   *  (`routineModelKey`), which the render unloaded or whose load it paused (ComfyGuard.reloadOnReleaseInstead). The
+   *  opts are built as doLoad builds them; a model that can no longer load on the active engine is left out, as doLoad
+   *  would refuse it. It is also recorded as the model last loaded, as doLoad records the restore it stands for. */
+  reloadAfterRender(modelKey: string, routineModelKey: string): void {
+    if (!this.comfy) return
+    const entry = this.resolveEntry(modelKey)
+    const routineEntry = this.resolveEntry(routineModelKey)
+    if (!entry || !routineEntry) return
+    const engine = engineForModel(this.registry, entry)
+    if (!engine || modelIncompatibility(engine.kind, entry)) return
+    const opts = this.buildOpts(entry, engine)
+    if (!opts || !this.comfy.reloadOnReleaseInstead(routineEntry.key, opts)) return
+    // The routine's swap recorded its own model as the one last loaded (doLoad), and release() starts this one on the
+    // Manager, which records nothing. Left that way, the next daemon start's resume (auto-load.ts), an Engines Start
+    // that names no model and the CLI launcher's last-used pick all brought the routine's model back.
+    if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
+  }
+
   /** Acquire the SAME swap-serialization queue `route()` uses, then run `fn` exclusively with
    *  respect to any other swap (manual or auto). `route()` itself is just this wrapping
    *  `doLoad()` — exposed publicly so a MANUAL model switch (routes.ts's `/api/v1/engine/start`,
