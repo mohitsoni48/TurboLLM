@@ -12,7 +12,7 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import fs, { readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import fs, { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import {
@@ -21,9 +21,11 @@ import {
   MODEL_PRESET_CAP,
   SCHEMA_VERSION,
   configuredDaemonPort,
+  decodeConfigText,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
+  migrateLegacyDataDir,
   migrateModelKey,
   prunePresets,
   setModelProfile,
@@ -782,6 +784,48 @@ test('configuredDaemonPort: reads the port through a UTF-8 or UTF-16 BOM; shippe
     assert.equal(configuredDaemonPort(join(path, '..', 'absent.json')), defaultConfig().daemon.port)
   } finally {
     cleanup(path)
+  }
+})
+
+// migrateLegacyDataDir moves the pre-0.x platform config dir to ~/.turbollm and repoints engine
+// binPaths that named the old dir. It read config.json as UTF-8, so a UTF-16 file (PowerShell
+// 5.1's `>`, which load() reads) failed JSON.parse there and every managed build was left
+// pointing into the folder that had just been moved away.
+test('migrateLegacyDataDir: repoints engine binPaths in a UTF-16 (LE or BE) config too', (t) => {
+  const envKeys = ['HOME', 'USERPROFILE', 'APPDATA', 'XDG_CONFIG_HOME'] as const
+  const saved = envKeys.map((k) => [k, process.env[k]] as const)
+  t.after(() => {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+  for (const [label, encode] of [
+    ['UTF-16LE', (s: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')])],
+    ['UTF-16BE', (s: string) => Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(s, 'utf16le').swap16()])],
+  ] as const) {
+    // homedir() follows HOME (USERPROFILE on Windows); the legacy dir follows APPDATA,
+    // ~/Library/Application Support or XDG_CONFIG_HOME, by platform.
+    const home = tmpDir('tllm-legacy-home-')
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    process.env.APPDATA = join(home, 'AppData', 'Roaming')
+    process.env.XDG_CONFIG_HOME = join(home, '.config')
+    const legacy =
+      process.platform === 'win32'
+        ? join(home, 'AppData', 'Roaming', 'turbollm')
+        : process.platform === 'darwin'
+          ? join(home, 'Library', 'Application Support', 'turbollm')
+          : join(home, '.config', 'turbollm')
+    mkdirSync(legacy, { recursive: true })
+    const cfg = defaultConfig()
+    cfg.engines = [{ binPath: join(legacy, 'engines', 'llama.cpp-b4000', 'llama-server') }] as unknown as Config['engines']
+    writeFileSync(join(legacy, 'config.json'), encode(JSON.stringify(cfg)))
+
+    migrateLegacyDataDir()
+
+    const moved = JSON.parse(decodeConfigText(readFileSync(join(home, '.turbollm', 'config.json')))) as Config
+    assert.equal(moved.engines[0].binPath, join(home, '.turbollm', 'engines', 'llama.cpp-b4000', 'llama-server'), label)
   }
 })
 

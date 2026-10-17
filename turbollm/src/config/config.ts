@@ -708,11 +708,13 @@ export function migrateLegacyDataDir(): void {
   }
   // Engine binPaths are absolute and may point into the old data dir (managed
   // llama.cpp builds live under <dataDir>/engines/…). Repoint them at the new
-  // location so they don't dangle after the move.
+  // location so they don't dangle after the move. Decoded as load() decodes it: read as UTF-8, a
+  // UTF-16 file (PowerShell 5.1's `>`) failed the parse here and kept every old binPath, though
+  // load() then read the same file fine.
   try {
     const cfgPath = join(next, 'config.json')
     if (!existsSync(cfgPath)) return
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, '')) as { engines?: { binPath?: string }[] }
+    const cfg = JSON.parse(decodeConfigText(readFileSync(cfgPath))) as { engines?: { binPath?: string }[] }
     let changed = false
     for (const e of cfg.engines ?? []) {
       if (typeof e.binPath === 'string' && e.binPath.startsWith(prev)) {
