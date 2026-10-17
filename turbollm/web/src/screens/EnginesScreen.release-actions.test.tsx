@@ -9,7 +9,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
 import { queryKeys } from '../lib/queries'
 import { customSourceKey } from '../lib/engine-groups'
-import { ApiError, discardReleaseInstall, getEngineUpdates, updateEngine } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, hostKeyAccepted, updateEngine } from '../lib/api'
+import { clearHostKeyNeeded, isHostKeyNeeded } from '../lib/auth-signal'
 import { toast } from '../components/ui/sonner'
 import type { CatalogEngine, CustomEngineSource, Engine, EngineFit, EngineVariant, ReleaseProvenance } from '../lib/types'
 
@@ -120,6 +121,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   updateEngine: vi.fn().mockResolvedValue({ accepted: true }),
   getEngineUpdates: vi.fn(),
   discardReleaseInstall: vi.fn(),
+  hostKeyAccepted: vi.fn(),
 }))
 vi.mock('../components/ui/sonner', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../components/ui/sonner')>()),
@@ -171,6 +173,8 @@ beforeEach(() => {
     calls.push(`discard:${bin}`)
     return { ok: true }
   })
+  vi.mocked(hostKeyAccepted).mockResolvedValue(true)
+  clearHostKeyNeeded()
   state.engines = []
   state.customDisabled = []
   state.catalog = [PRISM_CATALOG]
@@ -397,6 +401,41 @@ describe('Remove on a disabled custom git build', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
     await waitFor(() => expect(toast.success).toHaveBeenCalledWith('My fork removed'))
     expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  // The delete needs a key from a non-host caller, the forget before it does not, and the forget cannot follow the
+  // delete (a remembered source claims the folder: 409 build_dir_taken). A keyless Serve identity, Access JWT or
+  // open-LAN peer had the source forgotten, then the delete refused with no key prompt: the card was gone and the
+  // folder, which no GC sweeps, stayed. The host gate is asked first.
+  it('a caller the host gate refuses forgets nothing and gets the key prompt; the card stays to Remove again', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    vi.mocked(hostKeyAccepted).mockResolvedValue(false)
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(isHostKeyNeeded()).toBe(true))
+    expect(calls).toEqual([])
+    expect(forgetMutate).not.toHaveBeenCalled()
+    expect(deleteBuildMutate).not.toHaveBeenCalled()
+    expect(toast.error).toHaveBeenCalledWith("Deleting an engine's files requires a valid API key.")
+    expect(toast.success).not.toHaveBeenCalled()
+
+    // Once the key is entered the same card's Remove goes through.
+    clearHostKeyNeeded()
+    vi.mocked(hostKeyAccepted).mockResolvedValue(true)
+    await userEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(GIT_SOURCE)}`, `deleteBuild:${GIT_BIN}`]))
+    expect(isHostKeyNeeded()).toBe(false)
+  })
+
+  it('a binary of the user\'s own (no source repo, as a release install) is not asked about: its Remove forgets, then tries the release discard, as before', async () => {
+    const OWN: CustomEngineSource = { name: 'My own binary', binPath: '/opt/llama/llama-server', addedAt: '2026-10-09T00:00:00Z', binPathExists: true }
+    state.customDisabled = [OWN]
+    vi.mocked(hostKeyAccepted).mockResolvedValue(false)
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(OWN)}`, 'discard:/opt/llama/llama-server']))
+    expect(hostKeyAccepted).not.toHaveBeenCalled()
+    expect(isHostKeyNeeded()).toBe(false)
   })
 
   it('is disabled while a build from source runs, which refuses the delete, unlike a Remove that only forgets', async () => {

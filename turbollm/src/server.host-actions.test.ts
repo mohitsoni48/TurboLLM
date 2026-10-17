@@ -633,6 +633,71 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
   }
 })
 
+// DELETE /api/v1/engines/build deletes a Disabled build's folder (a Disabled source-built card's
+// Delete, and the second step of a Disabled git-built custom engine's Remove). Its refusal was a
+// plain 403 'forbidden', which opens no key prompt, so a keyless caller's Delete only toasted.
+// api_key_required, as the purge and the backend delete above answer.
+test('a keyless Serve identity, Access JWT or open-LAN peer cannot delete a Disabled build and gets the key prompt; with a key it can', async () => {
+  /** withEngines' harness plus engines/build/myfork, a build no engine and no source claims. */
+  const disabledBuild = (d: Deps) => {
+    withEngines(d)
+    const dir = join(d.store.dir(), 'engines', 'build', 'myfork')
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'llama-server'), 'bin')
+    return { dir, path: `/api/v1/engines/build?binPath=${encodeURIComponent(join(dir, 'llama-server'))}` }
+  }
+  const assertRefused = async (res: Response, dir: string) => {
+    assert.equal(res.status, 403)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required')
+    assert.ok(existsSync(join(dir, 'llama-server')), 'the folder is kept')
+  }
+  const assertDeleted = async (res: Response, dir: string) => {
+    assert.equal(res.status, 200)
+    assert.equal(existsSync(dir), false)
+  }
+  // Tailscale Serve, no key; with a key it may.
+  {
+    const { d } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const { dir, path } = disabledBuild(d)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertRefused(await tunneled(d, path, serve, {}, 'DELETE'), dir)
+    await assertDeleted(await tunneled(d, path, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE'), dir)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-build.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const { dir, path } = disabledBuild(d)
+      await assertRefused(await tunneled(d, path, { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }, {}, 'DELETE'), dir)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false })
+    const { dir, path } = disabledBuild(d)
+    await assertRefused(await fromLan(d, path, {}, {}, 'DELETE'), dir)
+    await assertDeleted(await fromLan(d, path, { 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE'), dir)
+  }
+  // The host itself, unchanged.
+  {
+    const { d } = mkDeps()
+    const { dir, path } = disabledBuild(d)
+    await assertDeleted(await createApp(d).request(path, { method: 'DELETE', headers: { Host: '127.0.0.1:6996' } }, {
+      incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+    } as never), dir)
+  }
+})
+
 // POST /api/v1/comfyui/install writes the gate node into a custom_nodes folder the caller names and
 // records it as gatePath; POST /comfyui/uninstall deletes gatePath recursively. Refused to the same
 // callers, with api_key_required, so none of them can replace another folder's __init__.py, repoint

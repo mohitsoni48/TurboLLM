@@ -48,7 +48,8 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, discardReleaseInstall, getEngineUpdates, track } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, hostKeyAccepted, track } from '../lib/api'
+import { markHostKeyNeeded } from '../lib/auth-signal'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -1162,8 +1163,20 @@ function EngineGallery({
   // not registered" source leaves nothing the user can still reach (a release install's or a
   // git build's now-unclaimed folder is removed below) — still a real deletion of the remembered
   // engine, so it shares `delete_engine` rather than needing its own action.
-  const doForgetCustom = (source: CustomEngineSource) => {
+  const doForgetCustom = async (source: CustomEngineSource) => {
     track('engines', 'delete_engine')
+    // A git build's Remove ends in DELETE /engines/build, which a non-host caller needs a key for
+    // (isLocalOrAuthenticated). The forget before it is open to anyone, and cannot come after the delete: the route
+    // answers 409 build_dir_taken while the remembered source claims the folder. So a keyless Serve identity, Access
+    // JWT or open-LAN peer had the source forgotten and the card gone, then the delete refused: the folder (no marker,
+    // so no GC sweeps it) stayed on disk with nothing left to delete it from. The key is checked first, through the
+    // host gate (api.ts hostKeyAccepted: GET /keys's hostGate is isLocalOrAuthenticated's rule). Refused: nothing is
+    // forgotten, the key prompt opens, and the card stays, to Remove again once the key is in.
+    if (source.sourceRepo && !(await hostKeyAccepted())) {
+      markHostKeyNeeded()
+      toast.error("Deleting an engine's files requires a valid API key.")
+      return
+    }
     engineMut.forgetCustomSource.mutate(customSourceKey(source), {
       onSuccess: () => {
         // A git build (sourceRepo) goes through the Disabled-build Delete (DELETE /engines/build), as a Disabled
@@ -1350,7 +1363,7 @@ function EngineGallery({
               enabling={enablingKey === customSourceKey(source)}
               onDisable={() => {}}
               onEnable={() => doEnableCustom(source)}
-              onDelete={() => doForgetCustom(source)}
+              onDelete={() => void doForgetCustom(source)}
             />
           ))}
         </div>

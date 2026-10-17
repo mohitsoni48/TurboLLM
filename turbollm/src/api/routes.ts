@@ -1617,8 +1617,11 @@ export function registerApi(app: Hono, d: Deps): void {
   // engine and no remembered custom source points into it and no engine work runs, so a stray call can never delete
   // a live engine's files. Registered before DELETE /engines/:id below, which would swallow "build".
   app.delete('/api/v1/engines/build', (c) => {
+    // api_key_required, as the purge and the backend delete answer: the web client opens its key prompt on it. A
+    // plain 'forbidden' opened none, so a keyless Serve identity, Access JWT or open-LAN peer's Delete of a Disabled
+    // build only toasted, with nowhere to enter the key.
     if (!isLocalOrAuthenticated(c, d))
-      return err(c, 403, 'forbidden', 'Deleting an engine build requires a valid API key from a non-host device.')
+      return err(c, 403, 'api_key_required', "Deleting an engine's files requires a valid API key.")
     // As DELETE /engines/:id: a rebuild or update may be writing into this very folder.
     { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const enginesRoot = join(d.store.dir(), 'engines')
