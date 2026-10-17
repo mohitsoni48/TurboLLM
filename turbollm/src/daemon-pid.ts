@@ -115,14 +115,17 @@ export async function findRunningDaemon(
 // could crash in a migration the other was running) and both kept running on their own ports,
 // with only one of them in daemon.pid for --stop. So a start first claims the data dir: it
 // creates daemon.lock with O_EXCL ('wx'), which of two starts at once only one can do, and keeps
-// it until its pidfile is written; from then on the pidfile guards on its own (findRunningDaemon).
+// it until its pidfile is written; from then on the pidfile guards on its own (findRunningDaemon),
+// except while an in-place rebind has no listener up, which takes the claim again (cli.ts
+// deps.rebind).
 
 /** How far a claim with no readable record (a start between the 'wx' create and its write, or
  *  junk) is honoured: only while it is this fresh. */
 const CLAIM_UNWRITTEN_GRACE_MS = 5_000
 /** A claim whose holder's start time cannot be read (no `ps`, a process this user may not inspect)
- *  is honoured only this long: longer than any boot to the bind, so a live start is never cut off,
- *  and a claim left by a boot that was killed, with its pid since reused, still expires. */
+ *  is honoured only this long after it was taken: longer than any boot to the bind or rebind to
+ *  the new listener, so a live start is never cut off, and a claim left by a boot that was killed,
+ *  with its pid since reused, still expires. */
 const CLAIM_UNVERIFIED_MAX_AGE_MS = 120_000
 
 export interface ClaimHooks {
@@ -141,14 +144,32 @@ export interface ClaimRecord {
   startedAt: number
 }
 
+/** What daemon.lock holds: the record, and when the claim was taken (epoch ms). A boot claims
+ *  within a moment of its start, a rebind (cli.ts deps.rebind) hours or days after it, so the age
+ *  limit on a holder that cannot be checked counts from `claimedAt`. A record without it (written
+ *  by an older version) is aged from its start. */
+interface StoredClaim extends ClaimRecord {
+  claimedAt: number
+}
+
 const defaultClaimHooks: ClaimHooks = {
   processExists: (pid) => defaultHooks.processExists(pid),
   startTime: (pid) => processStartTimes([pid]).get(pid),
   now: () => Date.now(),
 }
 
+/** Worked out once, at this process's first claim (its boot's), and reused by every later one (a
+ *  rebind's, see cli.ts deps.rebind). process.uptime() runs on a monotonic clock that stops while
+ *  the machine sleeps, and the start time another start checks the record against (ps etime) does
+ *  not, so a record worked out after a suspend lay that much later than the process's real start
+ *  and read as a reused pid. A wall-clock jump of over 5 s after the boot (NTP's first sync on a
+ *  board with no RTC, a manual change) is not followed: on Linux, where ps derives the start from
+ *  the time since the machine booted, the record is then off by the jump, and a start mid-rebind
+ *  removes the claim as a reused pid's, as when a rebind took no claim. */
+let ownRecord: ClaimRecord | undefined
 function ownClaimRecord(): ClaimRecord {
-  return { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) }
+  ownRecord ??= { pid: process.pid, startedAt: Date.now() - Math.round(process.uptime() * 1000) }
+  return ownRecord
 }
 
 /** The live start holding the claim at `path`, or null when it is stale or gone. */
@@ -164,14 +185,19 @@ function liveClaimHolder(path: string, hooks: ClaimHooks, self: ClaimRecord): { 
       return null
     }
   }
-  const { pid, startedAt } = (rec ?? {}) as { pid?: unknown; startedAt?: unknown }
+  const { pid, startedAt, claimedAt } = (rec ?? {}) as { pid?: unknown; startedAt?: unknown; claimedAt?: unknown }
   // Every writer records both, in one write: anything else is junk. A record with our own pid
   // was left by an earlier process that had it (ours is not written yet).
   if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0 || typeof startedAt !== 'number') return null
   if (pid === self.pid || !hooks.processExists(pid)) return null
   const actual = hooks.startTime(pid)
   if (actual !== undefined) return Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS ? { pid } : null
-  return hooks.now() - startedAt < CLAIM_UNVERIFIED_MAX_AGE_MS ? { pid } : null
+  // Aged from the claim, not the start: from the start, a rebind's claim read as stale once its
+  // daemon had been up two minutes, and a start mid-rebind removed it and booted beside it,
+  // wherever the start time cannot be read (no `ps`, as in a minimal container image; an elevated
+  // daemon's StartTime on Windows).
+  const since = typeof claimedAt === 'number' ? claimedAt : startedAt
+  return hooks.now() - since < CLAIM_UNVERIFIED_MAX_AGE_MS ? { pid } : null
 }
 
 /**
@@ -208,7 +234,7 @@ export function claimDataDir(
       continue
     }
     try {
-      writeSync(fd, JSON.stringify({ pid: self.pid, startedAt: self.startedAt } satisfies ClaimRecord))
+      writeSync(fd, JSON.stringify({ pid: self.pid, startedAt: self.startedAt, claimedAt: hooks.now() } satisfies StoredClaim))
     } catch {
       // Unwritten, the claim would block others for its grace period and never be released.
       try { closeSync(fd) } catch { /* best-effort */ }

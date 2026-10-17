@@ -5,17 +5,20 @@
 // cli.lifecycle-wiring.test.ts), so these run cli.ts's own text instead. The source from
 // "Resolve listen address" through the end of `deps.rebind = () => {…}` is cut out, its types are
 // stripped by esbuild, and it runs with the real @hono/node-server `serve` on real sockets. The
-// daemon pieces it names (config store, deps, argv, pidfile, banner inputs) are stand-ins, its
-// own timers run SPEEDUP times faster, and process.exit is recorded instead of called.
+// daemon pieces it names (config store, deps, argv, pidfile, banner inputs) are stand-ins (a test
+// can swap in the real ones), its own timers run SPEEDUP times faster, and process.exit is
+// recorded instead of called.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { connect, createServer, type AddressInfo, type Socket } from 'node:net'
 import type { Server } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { transformSync } from 'esbuild'
 import { serve } from '@hono/node-server'
+import { claimDataDir, findRunningDaemon, readPidfile, releaseDataDirClaim, writePidfile } from './daemon-pid'
+import { tmpDir } from './test-support/tmp'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CLI = readFileSync(join(HERE, 'cli.ts'), 'utf8').replace(/\r\n/g, '\n')
@@ -50,7 +53,7 @@ interface Daemon {
   stop(): Promise<void>
 }
 
-function bootDaemon(config: Config, args: string[]): Daemon {
+function bootDaemon(config: Config, args: string[], overrides: Record<string, unknown> = {}): Daemon {
   const logs: string[] = []
   const exits: number[] = []
   const upgraded: Socket[] = []
@@ -87,6 +90,7 @@ function bootDaemon(config: Config, args: string[]): Daemon {
       socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test\r\n\r\n')
     }),
     writePidfile: () => {},
+    claimDataDir: () => null,
     releaseDataDirClaim: () => {},
     dropStaleTerminalSockets: () => {},
     console: {
@@ -106,6 +110,7 @@ function bootDaemon(config: Config, args: string[]): Daemon {
       timers.push(t)
       return t
     },
+    ...overrides,
   }
   const names = Object.keys(scope)
   const run = new Function(...names, `${SOURCE}\nreturn () => server`) as (...v: unknown[]) => () => Server
@@ -338,5 +343,101 @@ test('a rebind that re-points a bind retrying a busy port gives the new port ret
   } finally {
     await d.stop()
     for (const b of blockers) if (b.listening) await new Promise((res) => b.close(res))
+  }
+})
+
+/** A second `turbollm` start's guard on `dir` (claimDataDir, then findRunningDaemon, as cli.ts
+ *  runs it), as another process: its own claim record, and the identity probe reduced to
+ *  "something answers on that port" (the stand-in app is not a full TurboLLM). */
+async function secondStartOn(dir: string): Promise<string> {
+  const other = { pid: process.pid + 1, startedAt: Date.now() }
+  const answers = async (port: number) => {
+    try {
+      return (await fetch(`http://127.0.0.1:${port}/`)).ok
+    } catch {
+      return false
+    }
+  }
+  const holder = claimDataDir(dir, undefined, other)
+  if (holder) return `starting:${holder.pid}`
+  try {
+    return (await findRunningDaemon(dir, { processExists: () => true, confirmTurbollm: answers }, other.pid)) ? 'running' : 'boots'
+  } finally {
+    releaseDataDirClaim(dir, other.pid)
+  }
+}
+
+// While a rebind has no listener up (the old one draining, up to the 3 s fallback with a Code
+// terminal open, then the new bind retrying a busy port), the pidfile still names the old port and
+// nothing answers there. A `turbollm` started then passed the start guard (claimDataDir, then
+// findRunningDaemon, as cli.ts runs it) and booted beside this daemon on its data dir. The real
+// pidfile and claim functions here, on a real data dir.
+test('a start while a rebind is between listeners is refused, and the guard is back to the pidfile after', async () => {
+  const [p, q] = await freePorts(2)
+  const dir = tmpDir('tllm-rebind-claim-')
+  const cfg = config({ port: p })
+  const d = bootDaemon(cfg, [], {
+    store: { snapshot: () => structuredClone(cfg), dir: () => dir },
+    writePidfile,
+    claimDataDir,
+    releaseDataDirClaim,
+  })
+  const secondStart = () => secondStartOn(dir)
+  try {
+    await until('the boot listener is up', () => listening(d) === 1)
+    assert.equal(await secondStart(), 'running')
+    await d.holdUpgrade() // an open Code terminal: the old listener drains until the fallback
+
+    d.config.daemon.port = q
+    d.deps.rebind!()
+    const midRebind = await secondStart()
+    await until('the rebind is up', () => listening(d) === 2)
+    assert.equal(midRebind, `starting:${process.pid}`, 'a start mid-rebind booted beside the daemon')
+    assert.equal(existsSync(join(dir, 'daemon.lock')), false, 'the rebind gave the claim up with its new pidfile')
+    assert.equal(await secondStart(), 'running', 'refused by the pidfile again, now at the new port')
+  } finally {
+    await d.stop()
+  }
+})
+
+// With remote access on at boot, the boot's listen callback waits for the Tailscale reconcile
+// before the remote-access start, and it wrote its pidfile and gave up the start claim only after
+// that wait. A rebind taken meanwhile (a Settings port change in the first seconds) took the claim;
+// the boot callback then resumed, gave the rebind's claim up while no listener was up, and wrote
+// the old listener's port over the pidfile. Real pidfile and claim functions, as above.
+test("a rebind during the boot's wait for the Tailscale reconcile keeps its claim and its pidfile", async () => {
+  const [p, q] = await freePorts(2)
+  const dir = tmpDir('tllm-rebind-boot-wait-')
+  const cfg = config({ port: p })
+  let reconciled!: () => void
+  let started = 0
+  const d = bootDaemon(cfg, [], {
+    store: { snapshot: () => structuredClone(cfg), dir: () => dir },
+    writePidfile,
+    claimDataDir,
+    releaseDataDirClaim,
+    remoteWanted: true,
+    tunnelFlag: true,
+    remote: { enable: () => { started++ } },
+    reconcileTailscalePromise: new Promise<void>((r) => { reconciled = r }),
+  })
+  try {
+    await until('the boot listener is up', () => listening(d) === 1)
+    assert.equal(readPidfile(dir)?.port, p, 'the pidfile waited for the reconcile')
+    await d.holdUpgrade() // an open Code terminal: the old listener drains until the fallback
+
+    d.config.daemon.port = q
+    d.deps.rebind!()
+    reconciled()
+    await until('the boot remote-access start ran', () => started === 1)
+    const midRebind = await secondStartOn(dir)
+    const checkedMidRebind = listening(d) === 1
+    await until('the rebind is up', () => listening(d) === 2)
+    assert.ok(checkedMidRebind, 'the new listener came up before the check')
+    assert.equal(midRebind, `starting:${process.pid}`, "the boot callback gave up the rebind's claim")
+    assert.equal(readPidfile(dir)?.port, q)
+    assert.equal(await secondStartOn(dir), 'running')
+  } finally {
+    await d.stop()
   }
 })

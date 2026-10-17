@@ -331,11 +331,12 @@ if (hasFlag('--stop')) {
 // found none here and both booted on one database. The data dir is therefore claimed first
 // (daemon.lock, claimDataDir): of two starts at once only one gets past this point. The claim is
 // released once this daemon's pidfile is written (the listen callback), and it is taken BEFORE
-// the pidfile is read, so a start that gets it after that release sees this daemon's pidfile.
+// the pidfile is read, so a start that gets it after that release sees this daemon's pidfile. An
+// in-place rebind takes it again until its new pidfile is written (deps.rebind).
 const claimHolder = claimDataDir(store.dir())
 if (claimHolder) {
   console.error(
-    `TurboLLM is already starting for ${store.dir()}${claimHolder.pid ? ` (pid ${claimHolder.pid})` : ''}.\n` +
+    `TurboLLM is already starting, or moving to a new address, for ${store.dir()}${claimHolder.pid ? ` (pid ${claimHolder.pid})` : ''}.\n` +
       `Use that one once it is up, or start this one with its own --config.`,
   )
   process.exit(1)
@@ -1162,6 +1163,20 @@ function listen(attempt = 0): void {
     // Keep the legacy one-liner for log parsers that key on it.
     process.stdout.write(`TurboLLM ${version} listening on http://${displayHost}:${info.port}\n`)
 
+    // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
+    // on every successful bind: the PID is constant, but an in-place rebind changes the
+    // port, so refreshing it keeps the stored port accurate (used by --stop's identity
+    // probe + the "stopped (port N)" message). `rebinding` is already reset to false above,
+    // so this runs for both the initial bind and a rebind. The bound address goes in too: a
+    // daemon bound to one interface (--addr 192.168.1.5:…) never answers on 127.0.0.1, and the
+    // one-daemon-per-data-dir guard above must probe where it really listens. Best-effort.
+    // Before the boot's remote-access start below, not after it: that waits for the Tailscale
+    // reconcile, and a rebind taken meanwhile (a Settings port change) had its start claim given
+    // up by this boot callback, and its new pidfile overwritten with this listener's dead port.
+    try { writePidfile(store.dir(), process.pid, info.port, info.address) } catch { /* best-effort */ }
+    // The pidfile guards this data dir from here on: give up the start claim (see the guard).
+    releaseDataDirClaim(store.dir())
+
     // Runs once, at boot (bootRemoteStarted). Not keyed on remote.state().kind === 'off': Stop
     // (/api/v1/remote/stop → disable()) returns the manager to 'off' too, so every later listen()
     // — a LAN/port rebind, a revert — re-enabled the tunnel the user had stopped, and with
@@ -1183,17 +1198,6 @@ function listen(attempt = 0): void {
       // by a start decided before it, which would publish through a provider nobody confirmed.
       if (tunnelFlag || store.snapshot().remoteAccess.enabled) void remote.enable()
     }
-
-    // Write pidfile so `turbollm --stop` can find and stop this process (F-035). Written
-    // on every successful bind: the PID is constant, but an in-place rebind changes the
-    // port, so refreshing it keeps the stored port accurate (used by --stop's identity
-    // probe + the "stopped (port N)" message). `rebinding` is already reset to false above,
-    // so this runs for both the initial bind and a rebind. The bound address goes in too: a
-    // daemon bound to one interface (--addr 192.168.1.5:…) never answers on 127.0.0.1, and the
-    // one-daemon-per-data-dir guard above must probe where it really listens. Best-effort.
-    try { writePidfile(store.dir(), process.pid, info.port, info.address) } catch { /* best-effort */ }
-    // The pidfile guards this data dir from here on: give up the start claim (see the guard).
-    releaseDataDirClaim(store.dir())
   })
   // The terminal WebSocket upgrade handler goes on EVERY listener instance: a bind retry, a
   // rebind and a revert each create a new server, and one without it hands the handshake to
@@ -1272,6 +1276,14 @@ deps.rebind = () => {
   host = want
   port = wantPort
   rebinding = true
+  // From here until the new bind writes its pidfile nothing answers at the pidfile's address: the
+  // old listener stops accepting at once and drains (up to the 3 s fallback below), then the new
+  // bind may retry a busy port for 10 s. A `turbollm` started meanwhile found the pidfile's port
+  // silent, passed findRunningDaemon and booted beside this daemon on its data dir. So the rebind
+  // takes the start claim, as a boot does, and every listen callback gives it up once its pidfile
+  // is written (a revert's too; an exit gives it up as well). A start already inside its own
+  // guard holds the claim itself and is not waited for.
+  claimDataDir(store.dir())
   const old = server
   try {
     ;(old as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
@@ -1353,9 +1365,9 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   const finish = () => {
     if (finished) return
     finished = true
-    // Normally given up at the first bind, but a restart can come while the boot's listen
-    // callback still waits (the Tailscale reconcile) to write the pidfile: the replacement must
-    // not find this process's start claim.
+    // Normally given up once the first bind writes the pidfile, but an in-place rebind takes the
+    // claim again until its new bind writes one (deps.rebind), and a restart can come meanwhile:
+    // the replacement must not find this process's start claim.
     releaseDataDirClaim(store.dir())
     if (plan.kind === 'self-respawn') {
       try {

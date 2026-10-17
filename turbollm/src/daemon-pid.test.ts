@@ -522,3 +522,53 @@ test('a live process holding the start claim blocks a start until it exits', asy
     cleanup()
   }
 })
+
+// A rebind takes the start claim again (cli.ts deps.rebind) hours or days after the boot.
+// process.uptime() stops while the machine sleeps and the wall clock does not, so a record worked
+// out then lay the time slept after the process's real start, and another start's ps check took
+// the live claim for a reused pid. Real default hooks for that check.
+test("a process's later claim records the start time its first one did, even after the machine slept", (t) => {
+  const { dir, cleanup } = makeTmpDir()
+  const lock = join(dir, 'daemon.lock')
+  try {
+    assert.equal(claimDataDir(dir), null)
+    const record = (): ClaimRecord => {
+      const { pid, startedAt } = JSON.parse(readFileSync(lock, 'utf8')) as ClaimRecord
+      return { pid, startedAt }
+    }
+    const first = record()
+    releaseDataDirClaim(dir)
+
+    const realNow = Date.now
+    const slept = t.mock.method(Date, 'now', () => realNow() + 600_000) // ten minutes asleep
+    assert.equal(claimDataDir(dir), null)
+    slept.mock.restore()
+
+    assert.deepEqual(record(), first)
+    assert.deepEqual(claimDataDir(dir, undefined, { pid: process.pid + 1, startedAt: Date.now() }), { pid: process.pid }, 'the live claim read as stale')
+    releaseDataDirClaim(dir)
+  } finally {
+    cleanup()
+  }
+})
+
+// The same rebind claim where the holder's start time cannot be read (no `ps`, as in a minimal
+// container image; an elevated daemon's StartTime on Windows): such a claim is honoured only while
+// young, and its age was counted from the holder's start. A rebind's claim, taken more than two
+// minutes into its daemon's life, read as stale at once, and a start mid-rebind removed it and
+// booted beside the daemon.
+test('a claim whose holder cannot be checked is aged from when it was taken, not from its start', () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    const daemon: ClaimRecord = { pid: 42, startedAt: 1_000_000 }
+    const other: ClaimRecord = { pid: 43, startedAt: 1_000_000 + 3_600_000 }
+    const at = (now: number): ClaimHooks => ({ processExists: (pid) => pid === daemon.pid, startTime: () => undefined, now: () => now })
+    const rebindAt = daemon.startedAt + 3_600_000 // an hour after its boot
+    assert.equal(claimDataDir(dir, at(rebindAt), daemon), null)
+    assert.deepEqual(claimDataDir(dir, at(rebindAt + 13_000), other), { pid: daemon.pid }, "the rebind's claim read as stale")
+    assert.equal(claimDataDir(dir, at(rebindAt + 121_000), other), null, 'a claim left behind still expires')
+    releaseDataDirClaim(dir, other.pid)
+  } finally {
+    cleanup()
+  }
+})
