@@ -53,7 +53,7 @@ function setup(engines: (root: string) => Engine[]): { d: UpdateApplyDeps; root:
   const d = {
     store,
     registry: new Registry(store),
-    manager: { currentOpts: () => null, stopAndWait: async () => {} },
+    manager: { status: () => ({ state: 'stopped' }), currentOpts: () => null, stopAndWait: async () => {} },
     provision: { start() {}, progress() {}, done() {}, fail() {} },
   } as unknown as UpdateApplyDeps
   return { d, root }
@@ -370,6 +370,38 @@ test('an update of the active KoboldCpp, llamafile, TurboQuant or pip engine kee
     await applyEngineUpdate(d, d.registry.get(id)!)
     assert.equal(d.registry.active()?.id, id, id)
     assert.notEqual(d.registry.get(id)?.version, make(root).version, `${id}: it was updated`)
+  }
+})
+
+// These branches stop what runs on the engine before the download, but the download takes minutes and nothing stopped
+// the user from loading a model on it meanwhile. The swap then replaced the binary under the running model: on Windows
+// the rename fails with an opaque EPERM after ~3 s. The release branch re-checks at the swap; so do these now, with the
+// same "Stop ... before replacing its files" message, and the old binary stays.
+test('a model started on a KoboldCpp, llamafile or TurboQuant engine during its update download blocks the swap', { skip: posixOnly }, async (t) => {
+  const cases = switchableUpdates(t).filter(([id]) => id !== 'vllm')
+  assert.ok(cases.length >= 2)
+  for (const [id, make, stage] of cases) {
+    const { d, root } = setup((root) => [make(root)])
+    stage(root)
+    const before = readFileSync(make(root).binPath, 'utf8')
+    let running = false
+    d.manager = {
+      status: () => ({ state: running ? 'running' : 'stopped' }),
+      currentOpts: () => (running ? { engine: d.registry.get(id) } : null),
+      stopAndWait: async () => { running = false },
+    } as unknown as UpdateApplyDeps['manager']
+    const log: string[] = []
+    d.provision = {
+      start() {},
+      progress: () => { running = true }, // the user loads a model on the engine mid-download
+      done: () => { log.push('done') },
+      fail: (m: string) => { log.push(`fail:${m}`) },
+    } as unknown as UpdateApplyDeps['provision']
+    await assert.rejects(applyEngineUpdate(d, d.registry.get(id)!), new RegExp(`Stop "${id}" before replacing its files`), id)
+    assert.equal(log.length, 1, id)
+    assert.match(log[0]!, new RegExp(`^fail:.*Stop "${id}" before replacing its files`), id)
+    assert.equal(readFileSync(make(root).binPath, 'utf8'), before, `${id}: the binary the model runs is not replaced`)
+    assert.equal(d.registry.get(id)?.version, make(root).version, id)
   }
 })
 

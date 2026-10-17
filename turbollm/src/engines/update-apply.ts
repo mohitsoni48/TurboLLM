@@ -265,6 +265,7 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
       (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
       signal, {
         replace: true,
+        blockSwap: () => releaseSwapBlockReason(d, engine),
         // Registered while the old build is still parked: a probe failure puts it back, and the entry keeps the old
         // build's version. The new build lands at the same path, so the entry is kept: re-probe it, or it keeps the old
         // build's version and capabilities (flags and KV types the new build added stay gated off).
@@ -290,7 +291,11 @@ async function applyKoboldcppUpdate(d: UpdateApplyDeps, engine: Engine, root: st
   try {
     await stopEngineUsers(d, engine.id)
     const hasNvidia = primaryVendor() === 'nvidia'
-    const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
+    // Re-checked at the swap, as for a release update: a model may have been started on the engine during the download.
+    const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, {
+      replace: true,
+      blockSwap: () => releaseSwapBlockReason(d, engine),
+    })
     const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
     keepActiveAfterUpdate(d, engine.id, eng.id)
     d.provision.done()
@@ -307,7 +312,10 @@ async function applyLlamafileUpdate(d: UpdateApplyDeps, engine: Engine, root: st
   d.provision.start('llamafile', d.trigger ?? 'auto_update')
   try {
     await stopEngineUsers(d, engine.id)
-    const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, { replace: true })
+    const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), signal, {
+      replace: true,
+      blockSwap: () => releaseSwapBlockReason(d, engine), // re-checked at the swap (see KoboldCpp)
+    })
     const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
     keepActiveAfterUpdate(d, engine.id, eng.id)
     d.provision.done()

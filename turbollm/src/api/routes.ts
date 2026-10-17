@@ -1271,7 +1271,12 @@ export function registerApi(app: Hono, d: Deps): void {
         const bin = await provisionTurboquant(
           root, entry.repo!,
           (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
-          ac.signal, { replace: upgrade, verify: async (b) => { updated = await register(b) } },
+          ac.signal, {
+            replace: upgrade,
+            verify: async (b) => { updated = await register(b) },
+            // Re-checked at the swap: the download takes minutes, and a model may have been loaded on it meanwhile.
+            blockSwap: cur ? () => releaseSwapBlockReason(d, cur) : undefined,
+          },
         )
         const eng = updated ?? (await register(bin))
         // An update leaves the active engine as it was (as update-apply.ts and the backend update
@@ -1322,7 +1327,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // the TurboQuant route above).
         const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'koboldcpp' && e.binPath === koboldcppBinPath(root)) : undefined
         if (cur) await stopEngineUsers(d, cur.id)
-        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
+        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, {
+          replace: upgrade,
+          blockSwap: cur ? () => releaseSwapBlockReason(d, cur) : undefined, // re-checked at the swap (see TurboQuant)
+        })
         const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
         if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
@@ -1362,7 +1370,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // afterwards only if it still is (as above).
         const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'llamafile' && e.binPath === llamafileBinPath(root)) : undefined
         if (cur) await stopEngineUsers(d, cur.id)
-        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
+        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, {
+          replace: upgrade,
+          blockSwap: cur ? () => releaseSwapBlockReason(d, cur) : undefined, // re-checked at the swap (see TurboQuant)
+        })
         const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
         if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()

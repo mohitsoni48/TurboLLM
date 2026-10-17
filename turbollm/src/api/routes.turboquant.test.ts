@@ -1,7 +1,8 @@
 // POST /api/v1/engines/turboquant?update=1 swaps the new release in at the same path, so it keeps the engine's
 // registry entry: that entry must be re-probed, or it keeps the old build's version and capabilities (flags and KV
-// types the new build added stay gated off). A new build that fails that probe is swapped back out for the old one.
-// GitHub is a stubbed fetch; the binaries are shell scripts (POSIX only).
+// types the new build added stay gated off). A new build that fails that probe is swapped back out for the old one, and
+// a model loaded on the engine during the download refuses the swap. GitHub is a stubbed fetch; the binaries are shell
+// scripts (POSIX only).
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
@@ -72,7 +73,7 @@ function harness(t: { after: (fn: () => void) => void }, newServer: string) {
     for (let i = 0; i < 200 && settled.length === 0; i++) await new Promise((r) => setTimeout(r, 25))
     return settled
   }
-  return { registry, bin, root: join(store.dir(), 'engines'), update }
+  return { d, registry, bin, root: join(store.dir(), 'engines'), update }
 }
 
 test('?update=1 re-probes the TurboQuant engine it keeps: the new build\'s version replaces the old one', { skip }, async (t) => {
@@ -93,4 +94,21 @@ test('?update=1 whose new build fails its probe puts the old build back and keep
   assert.equal(readFileSync(h.bin, 'utf8'), OLD_SERVER, 'the old build is back in place')
   assert.equal(h.registry.get('tq')?.version, '100 (old1234)')
   assert.deepEqual(readdirSync(h.root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+})
+
+// The route stops what runs on TurboQuant before the download, which takes minutes; a model loaded on it meanwhile had
+// its files swapped under it (on Windows the rename fails with an opaque EPERM). Re-checked at the swap now.
+test('?update=1: a model loaded on TurboQuant during the download blocks the swap and keeps the old build', { skip }, async (t) => {
+  const h = harness(t, NEW_SERVER)
+  let running = false
+  Object.assign(h.d.manager, {
+    status: () => ({ state: running ? 'running' : 'stopped' }),
+    currentOpts: () => (running ? { engine: h.registry.get('tq') } : null),
+  })
+  Object.assign(h.d.provision, { progress: () => { running = true } }) // the user loads a model mid-download
+  const settled = await h.update()
+  assert.equal(settled.length, 1)
+  assert.match(settled[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Stop "TurboQuant" before replacing its files/)
+  assert.equal(readFileSync(h.bin, 'utf8'), OLD_SERVER)
+  assert.equal(h.registry.get('tq')?.version, '100 (old1234)')
 })

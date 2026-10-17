@@ -21,7 +21,7 @@
 import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GpuVendor } from '../sysinfo/sysinfo'
-import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset } from './download'
+import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset, type SwapGuard } from './download'
 
 export const KOBOLDCPP_REPO = 'LostRuins/koboldcpp'
 
@@ -94,14 +94,15 @@ export interface KoboldcppRuntime {
  * mark it executable. Returns the binary path + the release tag. `hasNvidia` selects
  * the CUDA build where one exists. `replace` (an update) re-downloads the latest even
  * when a binary is present; the download only replaces it once complete, so a failed
- * fetch or download leaves the working binary in place.
+ * fetch or download leaves the working binary in place. `blockSwap` re-runs right before
+ * that replacement (a model started on the engine during the download refuses it).
  */
 export async function ensureKoboldcpp(
   root: string,
   hasNvidia: boolean,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  opts: { replace?: boolean } = {},
+  opts: { replace?: boolean; blockSwap?: SwapGuard } = {},
 ): Promise<KoboldcppRuntime> {
   const dir = koboldcppDir(root)
   const binPath = koboldcppBinPath(root)
@@ -118,7 +119,7 @@ export async function ensureKoboldcpp(
 
   mkdirSync(dir, { recursive: true })
   onProgress?.({ phase: 'downloading', pct: 0 })
-  await downloadFile(asset.browser_download_url, binPath, onProgress, signal)
+  await downloadFile(asset.browser_download_url, binPath, onProgress, signal, undefined, { blockSwap: opts.blockSwap })
   // POSIX: the downloaded executable needs the execute bit; Windows ignores chmod.
   if (process.platform !== 'win32') {
     try {

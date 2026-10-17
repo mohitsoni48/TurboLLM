@@ -22,7 +22,7 @@
 //   -ngl <n>            GPU layers ; -c <n> context size
 import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset } from './download'
+import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset, type SwapGuard } from './download'
 
 export const LLAMAFILE_REPO = 'Mozilla-Ocho/llamafile'
 
@@ -64,13 +64,14 @@ export interface LlamafileRuntime {
  * extension so it's runnable), and (POSIX) mark it executable. Returns the binary path
  * + release tag. `replace` (an update) re-downloads the latest even when a binary is
  * present; the download only replaces it once complete, so a failed fetch or download
- * leaves the working binary in place.
+ * leaves the working binary in place. `blockSwap` re-runs right before that replacement
+ * (a model started on the engine during the download refuses it).
  */
 export async function ensureLlamafile(
   root: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  opts: { replace?: boolean } = {},
+  opts: { replace?: boolean; blockSwap?: SwapGuard } = {},
 ): Promise<LlamafileRuntime> {
   const dir = llamafileDir(root)
   const binPath = llamafileBinPath(root)
@@ -87,7 +88,7 @@ export async function ensureLlamafile(
 
   mkdirSync(dir, { recursive: true })
   onProgress?.({ phase: 'downloading', pct: 0 })
-  await downloadFile(asset.browser_download_url, binPath, onProgress, signal)
+  await downloadFile(asset.browser_download_url, binPath, onProgress, signal, undefined, { blockSwap: opts.blockSwap })
   if (process.platform !== 'win32') {
     try {
       chmodSync(binPath, 0o755)

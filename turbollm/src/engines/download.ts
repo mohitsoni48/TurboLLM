@@ -317,12 +317,22 @@ export interface ProvisionProgress {
   parts?: number // total archives for this backend
 }
 
+/** Why an update must not replace an engine's files right now (a model was started on it during the download), or
+ *  null. Re-run right before the swap; a refusal throws with code `engine_in_use` and leaves the old files. */
+export type SwapGuard = () => string | null
+
+function throwIfSwapBlocked(blockSwap: SwapGuard | undefined): void {
+  const blocked = blockSwap?.()
+  if (blocked) throw Object.assign(new Error(blocked), { code: 'engine_in_use' })
+}
+
 export async function downloadFile(
   url: string,
   dest: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
   fetchImpl: typeof fetch = fetch,
+  opts: { blockSwap?: SwapGuard } = {},
 ): Promise<void> {
   const res = await fetchImpl(url, { redirect: 'follow', signal })
   if (!res.ok || !res.body) throw Object.assign(new Error(`download failed: HTTP ${res.status}`), { code: 'download_failed' })
@@ -346,6 +356,10 @@ export async function downloadFile(
   const part = `${dest}.part`
   try {
     await pipeline(body, createWriteStream(part), { signal })
+    // An update replaces the binary an engine runs from. Its caller stopped the engine before the download, which
+    // takes minutes: a model loaded on it meanwhile would have its executable replaced under it (on Windows the
+    // rename fails after ~3 s with a bare EPERM instead of saying what to do).
+    throwIfSwapBlocked(opts.blockSwap)
     await renameWithRetry(part, dest)
   } catch (e) {
     // Best effort: AV/the indexer can hold the fresh .part on Windows, and a throw here would replace e
@@ -843,13 +857,13 @@ export async function turboquantAssetUrl(
  *  `verify` (an update only) runs with the new install in place and the old one still
  *  parked; when it throws (the caller probes the new binary there and registers it), the
  *  new install is moved out and the old one put back, so a build that does not run here
- *  never replaces one that does. */
+ *  never replaces one that does. `blockSwap` (an update only) re-runs right before the swap. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  opts: { replace?: boolean; verify?: (bin: string) => Promise<void> } = {},
+  opts: { replace?: boolean; verify?: (bin: string) => Promise<void>; blockSwap?: SwapGuard } = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
   if (opts.replace) {
@@ -859,6 +873,8 @@ export async function provisionTurboquant(
     rmSync(stageRoot, { recursive: true, force: true }) // a stale stage from an interrupted update
     try {
       const stagedBin = await provisionTurboquant(stageRoot, repo, onProgress, signal)
+      // The download took minutes: a model loaded on the engine meanwhile must not have its files swapped under it.
+      throwIfSwapBlocked(opts.blockSwap)
       const parked = existsSync(destDir) ? join(enginesRoot, '.turboquant-old') : null
       if (parked) {
         // A leftover of an earlier update whose delete below failed. Retries: Windows AV/indexer locks are brief.

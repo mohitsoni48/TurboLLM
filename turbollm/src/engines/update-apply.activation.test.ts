@@ -141,7 +141,7 @@ function setup(t: Ctx, c: UpdateCase, updatedIsActive: boolean): { d: UpdateAppl
   const d = {
     store,
     registry: new Registry(store),
-    manager: { currentOpts: () => null, stopAndWait: async () => {} },
+    manager: { status: () => ({ state: 'stopped' }), currentOpts: () => null, stopAndWait: async () => {} },
     provision: { start() {}, progress() {}, done() {}, fail() {} },
   } as unknown as UpdateApplyDeps
   return { d, updated }

@@ -365,3 +365,55 @@ test('POST /engines/<kind>?update=1 keeps an engine switch the user made while i
     assert.equal(registry.active()?.id, 'cuda', `${route}: the engine the user switched to stays active`)
   }
 })
+
+// These routes stop what runs on the engine before the download, which takes minutes, and nothing stopped the user from
+// loading a model on it meanwhile: the swap then replaced its binary under the running model (on Windows the rename of
+// KoboldCpp's or llamafile's .exe failed after ~3 s with a bare EPERM). The swap re-checks now, with the release
+// update's "Stop ... before replacing its files", and the old binary stays. The model is loaded from the route's own
+// progress callback, i.e. mid-download.
+test('POST /engines/<kind>?update=1: a model loaded on the engine during the download blocks the swap (llamafile, KoboldCpp, TurboQuant)', {
+  skip: process.platform === 'win32' && 'shell-script engine binaries',
+}, async (t) => {
+  const cases = switchCases(t).filter((c) => ['llamafile', 'koboldcpp', 'turboquant'].includes(c.route))
+  assert.ok(cases.length >= 2)
+  for (const { route, engine, stage } of cases) {
+    const store = ConfigStore.load(join(tmpDir('tllm-update-swap-guard-'), 'config.json'))
+    const root = join(store.dir(), 'engines')
+    const updated = engine(root)
+    store.update((c) => {
+      c.engines.push(updated)
+      c.activeEngineId = updated.id
+    })
+    stage(root)
+    const before = readFileSync(updated.binPath, 'utf8')
+    const registry = new Registry(store)
+    let running = false
+    let settle: (failure: string | null) => void = () => {}
+    const finished = new Promise<string | null>((r) => { settle = r })
+    const d = {
+      version: 'test',
+      store,
+      registry,
+      manager: {
+        status: () => ({ state: running ? 'running' : 'stopped', model: null }),
+        currentOpts: () => (running ? { engine: registry.get(updated.id) } : null),
+        stopAndWait: async () => { running = false },
+        logPath: () => '',
+      },
+      provision: {
+        get: () => ({ active: false }),
+        start() {},
+        progress: () => { running = true }, // the user loads a model on the engine mid-download
+        done: () => settle(null),
+        fail: (m: string) => settle(m),
+      },
+      build: { isActive: () => false },
+    } as unknown as Deps
+    const app = new Hono()
+    registerApi(app, d)
+    assert.equal((await app.request(`/api/v1/engines/${route}?update=1`, { method: 'POST' })).status, 202, route)
+    assert.match((await finished) ?? '', new RegExp(`Stop "${updated.name}" before replacing its files`), route)
+    assert.equal(readFileSync(updated.binPath, 'utf8'), before, `${route}: the binary the model runs is not replaced`)
+    assert.equal(registry.get(updated.id)?.version, updated.version, route)
+  }
+})
