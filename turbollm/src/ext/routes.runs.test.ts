@@ -10,7 +10,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import { StoreError, type ChatStore } from '../chat/store/chat-store.js'
 import { hashKey } from '../auth.js'
-import { PublicRunManager } from './run-manager.js'
+import { PublicRunManager, type RunRecordStore } from './run-manager.js'
 import { registerExtChatRoutes } from './routes.chats.js'
 import { registerExtRunRoutes, type ExtRouteDeps } from './routes.runs.js'
 import { loadFullHistory } from './generation.js'
@@ -36,6 +36,8 @@ function harness(
   managerStatus?: () => Status,
   /** When given, the body waits for it before emitting its first frame. */
   beforeFirstFrame?: Promise<void>,
+  /** When given, the run manager writes its run records there (the daemon passes its DB). */
+  runDb?: RunRecordStore,
 ) {
   const dir = tmpDir('turbollm-ext-runs-')
   const conv = new ConversationStore(dir)
@@ -61,7 +63,7 @@ function harness(
       target: () => 'http://127.0.0.1:9999',
     },
   } as never
-  const runs = new PublicRunManager()
+  const runs = new PublicRunManager(runDb ? { db: runDb } : undefined)
   const app = new Hono()
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, {
@@ -767,6 +769,43 @@ test('getChat throwing in the generate handler surfaces a JSON error envelope, a
     assert.equal(second.status, 202, 'the failed attempt must not have left the chat permanently blocked')
     const run = await second.json() as { id: string }
     await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})
+
+// runs.start() wrote the run's first record bare, so a write that threw (disk full, DB locked)
+// went out of the generate route as a bare 500 after the user turn was saved, with the chat's
+// reservation and the tenant's concurrency slot never released: every later turn on that chat
+// got 409 generation_in_flight until the daemon restarted.
+test('an ext_runs write that fails on the generate path ends the run as failed and frees the chat for the next turn', async () => {
+  let failing = true
+  const runDb: RunRecordStore = {
+    upsertExtRun: (r) => { if (failing) throw new Error('database or disk is full'); store.db.upsertExtRun(r) },
+    getExtRun: (id) => store.db.getExtRun(id),
+    listExtRuns: (t, o, l) => store.db.listExtRuns(t, o, l),
+    markStreamingExtRunsFailed: (c, m) => store.db.markStreamingExtRunsFailed(c, m),
+  }
+  const store = harness(undefined, undefined, undefined, undefined, runDb)
+  const { app, runs, cleanup } = store
+  try {
+    const chatId = await newChat(app)
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(first.status, 202)
+    const run = await first.json() as { id: string }
+    await runs.settled(run.id)
+    const seen = await (await app.request(`/api/ext/v1/runs/${run.id}?owner=u1`, { headers: { Authorization: ACME } })).json() as { status: string; error: { type: string } | null }
+    assert.equal(seen.status, 'failed')
+    assert.equal(seen.error?.type, 'storage')
+
+    failing = false
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi again', owner: 'u1' }))
+    assert.equal(second.status, 202, 'the failed write must not leave the chat blocked')
+    const next = await second.json() as { id: string }
+    await runs.settled(next.id)
+    assert.equal(runs.get(next.id)?.status, 'complete')
   } finally {
     cleanup()
   }

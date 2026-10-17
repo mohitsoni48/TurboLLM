@@ -2288,11 +2288,16 @@ export class ConversationStore {
       .all({ $t: tenant, $o: owner ?? null, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
   }
 
-  /** Close out runs left mid-stream by a previous process (spec 27 §6.4). */
+  /** Close out runs left mid-stream by a previous process (spec 27 §6.4). A row left with a
+   *  terminal status but no ended_at (the run's final write, the one that sets it, failed) gets
+   *  one as well, its status kept: a row with no ended_at reads as a running run, so it refused
+   *  every turn on its chat, and a restart did not clear it. Returns the rows marked failed. */
   markStreamingExtRunsFailed(code: string, message: string): number {
     const err = JSON.stringify({ type: 'engine', code, message })
+    const now = new Date().toISOString()
     const r = this.db.prepare(`UPDATE ext_runs SET status='failed', error=$e, ended_at=$now WHERE status IN ('queued','streaming')`)
-      .run({ $e: err, $now: new Date().toISOString() } as P) as unknown as Changes
+      .run({ $e: err, $now: now } as P) as unknown as Changes
+    this.db.prepare(`UPDATE ext_runs SET ended_at=$now WHERE ended_at IS NULL`).run({ $now: now } as P)
     return r.changes
   }
 

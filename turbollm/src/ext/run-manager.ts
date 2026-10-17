@@ -77,6 +77,10 @@ interface RunState {
   /** Last time a client attached a stream or polled. Drives reaping (spec 27 §6.5). */
   lastSeen: number
   subscribers: number
+  /** The last write of this run's record failed, so its row may have no ended_at (and still read
+   *  queued/streaming, or the terminal status written just before). prune() keeps such a run in
+   *  memory, where it wins over the row, until a retried write lands. */
+  unsaved: boolean
 }
 
 const DEFAULT_BUFFER_CAP = 5000
@@ -85,6 +89,11 @@ const DEFAULT_ORPHAN_TIMEOUT_MS = 5 * 60_000
  *  frame) can only mean "nothing yet", and `?after=0` replays the whole run. Numbered from 0,
  *  a client that got event_seq 0 and attached with it once frame 0 had gone out lost that frame. */
 const FIRST_EVENT_SEQ = 1
+/** The error a run ends with when its record could not be written before its body started. */
+const RUN_NOT_RECORDED = {
+  type: 'storage', code: 'run_not_recorded',
+  message: 'The run could not be saved to the database, so no reply was generated.',
+} as const
 
 export class PublicRunManager {
   private runs = new Map<string, RunState>()
@@ -169,11 +178,6 @@ export class PublicRunManager {
       createdAt: new Date().toISOString(),
       endedAt: null,
     }
-    // Written synchronously, before the body has taken its first `await` — so the row exists
-    // in the DB even for a run whose settlement this process never gets to observe (e.g. the
-    // caller doesn't await `settled()` before the process ends).
-    this.db?.upsertExtRun(run)
-
     const emit: EmitSink = (ev) => {
       const buffered = buffer.push(ev.event, ev.data)
       run.eventSeq = buffered.seq
@@ -185,21 +189,41 @@ export class PublicRunManager {
       settled: Promise.resolve(),
       lastSeen: Date.now(),
       subscribers: 0,
+      unsaved: false,
     }
+
+    // Written synchronously, before the body has taken its first `await` — so the row exists
+    // in the DB even for a run whose settlement this process never gets to observe (e.g. the
+    // caller doesn't await `settled()` before the process ends).
+    const queuedSaved = this.persist(state)
 
     state.settled = (async () => {
       run.status = 'streaming'
-      this.db?.upsertExtRun(run)
+      // A run whose record could not be written before its body started (a full disk, a locked
+      // or closed DB) ends at once as failed: generated untracked, nothing could report it once
+      // it left memory. Its body still runs, with the signal already aborted as for a run
+      // cancelled at once, so it settles its placeholder message without engine work.
+      const recorded = this.persist(state) && queuedSaved
+      if (!recorded) ac.abort()
       try {
         const outcome = await params.body({ emit, signal: ac.signal })
         run.status = ac.signal.aborted ? 'aborted' : outcome.status
-        this.db?.upsertExtRun(run)
+        this.persist(state)
       } catch (e) {
         run.status = ac.signal.aborted ? 'aborted' : 'failed'
-        run.error = { type: 'engine', code: 'engine_error', message: (e as Error).message }
-        emit({ event: 'error', data: run.error })
-        this.db?.upsertExtRun(run)
+        // A run that was never recorded ends with its storage error alone (below): its body ran
+        // with the signal already aborted, so a second error frame would only blur the cause.
+        if (recorded) {
+          run.error = { type: 'engine', code: 'engine_error', message: (e as Error).message }
+          emit({ event: 'error', data: run.error })
+        }
+        this.persist(state)
       } finally {
+        if (!recorded) {
+          run.status = 'failed'
+          run.error = { ...RUN_NOT_RECORDED }
+          emit({ event: 'error', data: run.error })
+        }
         run.endedAt = new Date().toISOString()
         // The terminal frame is pushed to the buffer BEFORE 'idle', so subscribeToBuffer's
         // documented invariant delivers it to every attached client before ending them.
@@ -208,13 +232,31 @@ export class PublicRunManager {
         // discipline the adapter path uses — not per event, which would be one write per token.
         // After the done frame, so the row read back once the run leaves memory reports the
         // same event_seq (the done frame's) the in-memory run did.
-        this.db?.upsertExtRun(run)
+        this.persist(state)
         emitter.emit('idle')
       }
     })()
 
     this.runs.set(id, state)
     return run
+  }
+
+  /** Writes the run's record. Never throws: these writes ran bare, so one that threw (a full
+   *  disk, a locked or closed DB) in start() went out of the generate route as a bare 500 with
+   *  the chat still reserved, and one in the run's lifecycle skipped the done frame or 'idle',
+   *  leaving every attached stream open and settled() rejected. A failed write is logged and
+   *  marks the run unsaved (see prune()). False when it failed. */
+  private persist(s: RunState): boolean {
+    if (!this.db) return true
+    try {
+      this.db.upsertExtRun(s.run)
+      s.unsaved = false
+      return true
+    } catch (e) {
+      s.unsaved = true
+      console.warn(`[ext-api] could not save run ${s.run.id} (${s.run.status}): ${(e as Error).message}`)
+      return false
+    }
   }
 
   get(id: string): PublicRun | null {
@@ -358,24 +400,32 @@ export class PublicRunManager {
    *  construction, so that part of the sweep below is a formality for the common case, but is
    *  kept for the rare instance where a caller reconciles a manager that already has runs) is
    *  closed out here as `failed`/`daemon_restarted`, so a client that reconnects gets an honest
-   *  answer instead of a 404 that looks like the run never existed. */
+   *  answer instead of a 404 that looks like the run never existed. A row whose terminal status
+   *  landed but whose final write did not gets an ended_at too (its status kept): isChatActive()
+   *  reads a row with no ended_at as a running run, so it blocked its chat, restart or not. */
   reconcileOnStartup(): void {
     for (const s of this.runs.values()) {
       if (!s.run.endedAt) {
         s.run.status = 'failed'
         s.run.error = { type: 'engine', code: 'daemon_restarted', message: 'The daemon restarted while this run was streaming.' }
         s.run.endedAt = new Date().toISOString()
-        this.db?.upsertExtRun(s.run)
+        this.persist(s)
       }
     }
     this.db?.markStreamingExtRunsFailed('daemon_restarted', 'The daemon restarted while this run was streaming.')
   }
 
-  /** Drop terminal runs older than `maxAgeMs` so the map cannot grow without bound. */
+  /** Drop terminal runs older than `maxAgeMs` so the map cannot grow without bound. A run whose
+   *  last write failed stays until a retried write lands: its row may have no ended_at, and once
+   *  the run left memory list() returned that row, so isChatActive() refused every turn and edit
+   *  on its chat (reconcileOnStartup() gives such a row an ended_at, should the daemon exit
+   *  first). */
   prune(maxAgeMs: number): void {
     const cutoff = Date.now() - maxAgeMs
     for (const [id, s] of this.runs) {
-      if (s.run.endedAt && Date.parse(s.run.endedAt) < cutoff) this.runs.delete(id)
+      if (!s.run.endedAt || Date.parse(s.run.endedAt) >= cutoff) continue
+      if (s.unsaved && !this.persist(s)) continue
+      this.runs.delete(id)
     }
   }
 }
