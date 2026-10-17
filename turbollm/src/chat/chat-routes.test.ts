@@ -1047,6 +1047,61 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
   }
 })
 
+// Undo (DELETE /compact) checked nothing: one clicked while a compaction ran cleared the columns,
+// and the compaction then stored its summary over them, so the Undo was undone.
+test('a compaction Undo is refused while a compaction runs, manual or a turn\'s own, so it cannot be undone by it', async () => {
+  const h = inFlightHarness()
+  let finish!: () => void
+  let held = new Promise<void>((r) => { finish = r })
+  const engine = fakeEngine(async (init) => {
+    if (!JSON.parse(String(init?.body)).stream) {
+      await held
+      return new Response(JSON.stringify({ choices: [{ message: { content: `summary ${engine.bodies.length}` } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    return sseReply('a3')
+  })
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const long = 'x'.repeat(6000)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long, { stats: { ctxUsed: 7500, ctxMax: 8192 } })
+    const summary = () => h.store.getConversation(conv.id)!.compactionSummary
+    const undo = async () => {
+      const res = await h.app.request(`${base}/compact`, { method: 'DELETE' })
+      return { status: res.status, error: res.status === 200 ? undefined : ((await res.json()) as { error: unknown }).error }
+    }
+    const refusal = { status: 409, error: { code: 'compaction_in_progress', message: 'This chat is being compacted. Try again when it finishes.' } }
+
+    // The manual Compact.
+    const compacting = h.app.request(`${base}/compact`, json({}))
+    await waitFor(() => engine.bodies.length === 1, 'the summary call to start')
+    assert.deepEqual(await undo(), refusal)
+    finish()
+    assert.equal((await compacting).status, 200)
+    assert.equal(summary(), 'summary 1')
+    assert.deepEqual(await undo(), { status: 200, error: undefined })
+    assert.equal(summary(), undefined, 'undone once it ends')
+
+    // A turn's auto-compaction (the last reply measured 7500 of 8192 tokens).
+    held = new Promise<void>((r) => { finish = r })
+    const turn = (await h.app.request(`${base}/messages`, json({ content: 'q3' }))).text()
+    await waitFor(() => engine.bodies.length === 2, 'the auto-compaction to start')
+    assert.deepEqual(await undo(), refusal)
+    finish()
+    assert.match(await turn, /"phase":"end"[\s\S]*"delta":"a3"/)
+    assert.equal(summary(), 'summary 2')
+    assert.deepEqual(await undo(), { status: 200, error: undefined })
+    assert.equal(summary(), undefined)
+  } finally {
+    finish()
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('deleting a conversation aborts its in-flight generation', async () => {
   const h = inFlightHarness()
   let engineSignal: AbortSignal | undefined

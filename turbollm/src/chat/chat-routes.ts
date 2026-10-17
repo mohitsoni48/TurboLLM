@@ -87,6 +87,21 @@ function releaseInflight(convId: string, ac: AbortController): void {
 const compactions = new WeakSet<AbortController>()
 const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
 
+/** The in-flight entries of turns whose own auto-compaction (maybeAutoCompact) is running. Only
+ *  compaction Undo reads it (the other routes answer such a turn as a running one), since that
+ *  compaction stores its summary over an Undo made meanwhile, as a manual one does. */
+const autoCompactions = new WeakSet<AbortController>()
+/** A turn's maybeAutoCompact phase callback: tags the turn's entry while its compaction runs,
+ *  then tells the client. Tagged first, so a write that fails (client gone) still tags it;
+ *  maybeAutoCompact sends 'end' after every 'start', the compaction failed or not. */
+function autoCompactionPhase(ac: AbortController, write: (phase: 'start' | 'end') => Promise<void>) {
+  return (phase: 'start' | 'end') => {
+    if (phase === 'start') autoCompactions.add(ac)
+    else autoCompactions.delete(ac)
+    return write(phase)
+  }
+}
+
 /** The 409 for a chat whose in-flight slot is taken, or null when it is free: compaction_in_progress
  *  while a manual compaction holds it, otherwise generation_in_flight with the route's own text. */
 function inflightRefusal(c: Context, convId: string, turnMessage: string) {
@@ -433,7 +448,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `upstream` is THIS turn's already-resolved upstream (local or linked host) and `ac`
       // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
       // summarizes on the host it is actually talking to and Stop can interrupt the wait.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) })))
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
@@ -549,7 +564,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
       // Same upstream/abort hand-down as the /messages route above — see its comment.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) }))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) })))
 
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
@@ -670,6 +685,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.delete('/api/v1/conversations/:id/compact', (c) => {
     const convId = c.req.param('id')
     if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    // Not while a compaction runs (POST /compact, or a turn's own auto-compaction): it stores its
+    // summary when it ends, over the columns cleared here, so an Undo made meanwhile was undone.
+    // A turn past its compaction stores none, so Undo still goes ahead while a reply streams.
+    const held = inflight.get(convId)
+    if (held && (compactions.has(held) || autoCompactions.has(held))) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
     db.clearConversationCompaction(convId)
     return c.json(db.getConversation(convId)!)
   })
