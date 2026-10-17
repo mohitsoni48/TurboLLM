@@ -232,7 +232,8 @@ async function resumeLastModel({ entry, engine }: LastModelResume, cfg: Config, 
   await loadPrimaryModel(opts, deps)
 }
 
-/** An embedding model takes its own pool slot through the router, exactly like a manual Load (ADR-389). */
+/** An embedding model loads through the router, exactly like a manual Load (ADR-389). It is the model last loaded
+ *  only when it took an empty primary as the only model (model-router.ts loadInto), so at boot it takes the primary. */
 async function resumeEmbeddingModel(entry: ModelEntry, deps: AutoLoadDeps): Promise<void> {
   const result = await deps.modelRouter.loadExplicit(entry.key)
   if ('status' in result) deps.warn(`auto-load failed: ${result.message}`)

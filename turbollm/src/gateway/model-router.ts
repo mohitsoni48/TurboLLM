@@ -38,7 +38,7 @@ export type RouteResult =
       modelName?: string
       /** Set on a loadExplicit() result whose load recorded its model as config.lastLoaded: the value that record
        *  replaced and the one it wrote. A routine's restore hands its swap's result back (LoadExplicitOpts.restoreAfter)
-       *  to undo that record. Absent: a fast path, a Laya model, a route() load. */
+       *  to undo that record. Absent: a fast path, a Laya model, an embedding model in a pool slot, a route() load. */
       lastLoaded?: { replaced: LastLoaded; recorded: LastLoaded }
     }
   | {
@@ -664,7 +664,13 @@ export class ModelRouter {
     const result = targetManager === this.manager ? { target } : this.served(targetManager, target)
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
     // refuses it, so recording it would leave the machine with no model at all after a restart.
-    if (entry.laya) return result
+    // Nor is an embedding model in a pool slot beside the model in the primary (needsNewSlot: a Load of it, an
+    // /v1/embeddings request with auto-swap on). lastLoaded holds one model, so recording it replaced the chat model's
+    // record, and the next daemon start's resume (auto-load.ts), an Engines Start that names no model and the CLI
+    // launcher's last-used pick all loaded the embedding model alone, into the empty primary the chat screen and the
+    // coding agent talk to. One that took an empty (or stopped) primary is still recorded, as doLoad always did. With
+    // no record there is nothing for a routine's restore to undo (undoSwapRecord).
+    if (entry.laya || (isSideModel(entry) && targetManager !== this.manager)) return result
     const recorded: LastLoaded = { modelKey: entry.key, engineId: engine.id }
     const replaced = explicit ? this.store.snapshot().lastLoaded : undefined
     this.store.update(x => { x.lastLoaded = { ...recorded } })

@@ -14,10 +14,13 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { ModelRouter } from './model-router'
-import type { Manager, StartOpts, Status } from '../engines/manager'
+import { Manager, type StartOpts, type Status } from '../engines/manager'
 import { defaultConfig, type Config, type ConfigStore, type Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
+import { runAutoLoad } from '../engines/auto-load'
+import { getSysInfo } from '../sysinfo/sysinfo'
+import { realEngineSetUp } from '../test-support/stand-in-engine'
 
 /** A Manager double exposing only status() (all the tested paths read). */
 function fakeManager(state: Status['state'], modelKey: string | null): Manager {
@@ -1088,4 +1091,65 @@ test('a model waiting to load into a new pool slot is loaded for the delete guar
   enterGate?.()
   await routed
   assert.equal(r.loadedModelKeys().has('model-b'), false, 'a failed load is no longer reported')
+})
+
+// ── The model last loaded, when an embedding model loads beside the chat model ────────────────────
+// An embedding model loads into a pool slot of its own beside a running chat model (doLoad's needsNewSlot): from its
+// Load button (engine-lifecycle sends a side model through loadExplicit) or from an /v1/embeddings request with
+// auto-swap on. loadInto recorded it as config.lastLoaded, which holds one model, so the chat model's record was
+// replaced. The next daemon start's resume then loaded the embedding model alone, into the empty primary that the chat
+// screen and `turbollm launch` talk to, and left the chat model unloaded.
+for (const [label, autoSwap, loadEmbedding] of [
+  ['its Load button', false, (r: ModelRouter, key: string) => r.loadExplicit(key)],
+  ['an embeddings request with auto-swap on', true, (r: ModelRouter, key: string) => r.route(key, { embeddings: true })],
+] as const) {
+  test(`an embedding model loaded beside the chat model by ${label} stays out of the model last loaded, so the next start resumes the chat model`, {
+    skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+  }, async (t) => {
+    const { store, registry, scanner, manager, modelRouter, userModel, embedModel } = await realEngineSetUp(t)
+    t.after(() => modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+    store.update((c) => { c.gateway.autoSwap = autoSwap; c.autoLoadOnStart = true })
+    const chat = await modelRouter.loadExplicit(userModel.key)
+    assert.ok('target' in chat, JSON.stringify(chat))
+
+    const embedding = await loadEmbedding(modelRouter, embedModel.key)
+
+    assert.ok('target' in embedding, JSON.stringify(embedding))
+    assert.equal('target' in embedding && embedding.lastLoaded, undefined, 'nothing recorded, so nothing for a restore to undo')
+    assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[userModel.key, true], [embedModel.key, false]])
+    assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
+
+    // The next daemon start: nothing running, a new Manager and router on the same config, and the boot resume.
+    await modelRouter.stopPoolSlotsOnEngine('fake', { force: true })
+    await manager.stopAndWait({ force: true })
+    const nextManager = new Manager(store)
+    const nextRouter = new ModelRouter(store, registry, nextManager, scanner, undefined)
+    t.after(async () => {
+      await nextRouter.stopPoolSlotsOnEngine('fake', { force: true })
+      await nextManager.stopAndWait({ force: true })
+    })
+    const warns: string[] = []
+    await runAutoLoad({
+      initialScan: Promise.resolve(), store, registry, scanner, manager: nextManager, modelRouter: nextRouter,
+      comfy: { isBlocked: () => false, freeComfyUIBeforeLoad: async () => {} },
+      sysInfo: getSysInfo, log: () => {}, warn: (line) => { warns.push(line) },
+    })
+
+    assert.deepEqual(warns, [])
+    assert.deepEqual(nextRouter.aliveSlots().map((s) => [s.modelKey, s.state, s.primary]), [[userModel.key, 'running', true]])
+  })
+}
+
+// The record still names an embedding model that loads with nothing else running: it took the empty primary as the
+// only model, and the next start resumes it there.
+test('an embedding model loaded with nothing else running takes the primary and is the model last loaded', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, modelRouter, embedModel } = await realEngineSetUp(t)
+
+  const embedding = await modelRouter.loadExplicit(embedModel.key)
+
+  assert.ok('target' in embedding, JSON.stringify(embedding))
+  assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[embedModel.key, true]])
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: embedModel.key, engineId: 'fake' })
 })

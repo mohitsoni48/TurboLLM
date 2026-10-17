@@ -49,8 +49,9 @@ export async function freePort(): Promise<number> {
   return port
 }
 
-/** Three models on the stand-in: `userModel` and `routineModel`, which start, and `brokenModel`, whose engine exits at
- *  once. Every engine this starts is stopped when the test ends.
+/** Four models on the stand-in: `userModel` and `routineModel`, which start, `brokenModel`, whose engine exits at
+ *  once, and `embedModel`, an embedding model, which starts too (beside a running chat model doLoad gives it a pool
+ *  slot of its own). Every engine this starts is stopped when the test ends.
  *  `comfy`: a real ComfyGuard, wired as cli.ts wires it, with its reverse gate on: `comfyFree.hook`, when set, runs
  *  once inside the next `POST /free` call. */
 export async function realEngineSetUp(t: { after: (fn: () => unknown) => void }, opts: { comfy?: boolean } = {}) {
@@ -63,7 +64,8 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void },
   const userModel = ggufEntry(dir, 'user-model')
   const brokenModel = ggufEntry(dir, 'broken-model')
   const routineModel = ggufEntry(dir, 'routine-model')
-  const models = [userModel, brokenModel, routineModel]
+  const embedModel = { ...ggufEntry(dir, 'embed-model'), embedding: true }
+  const models = [userModel, brokenModel, routineModel, embedModel]
   const ports = await Promise.all(models.map(() => freePort()))
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => {
@@ -100,5 +102,5 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void },
     guard?.stop()
     await manager.stopAndWait({ force: true })
   })
-  return { store, manager, modelRouter, guard, comfyFree, userModel, brokenModel, routineModel }
+  return { store, registry, scanner, manager, modelRouter, guard, comfyFree, userModel, brokenModel, routineModel, embedModel }
 }
