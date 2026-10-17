@@ -3,6 +3,7 @@
 // The reason comes from the one shared `modelIncompatibility()` rule.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
@@ -10,6 +11,7 @@ import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
+import { tmpDir } from '../test-support/tmp'
 
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
@@ -503,3 +505,37 @@ test('POST /api/v1/comfyui/release answers once loads are unblocked, before the 
   assert.equal(starts.length, 1, 'the reload is under way')
   comfy.stop()
 })
+
+// The gate node is installed with TurboLLM's URL baked in, and the ComfyUI process on this machine calls it. The URL was
+// built from the request's Host: installed through remote access (Tailscale Serve, a tunnel) that is the proxy's origin,
+// so the node posted to 127.0.0.1:80 (or :443); on a single-address bind (`--addr 192.168.1.10:…`, daemon.host) it
+// posted to 127.0.0.1, where nothing listens.
+for (const [label, bind, requestUrl, base] of [
+  ['through remote access, the port really bound', { bindHost: '127.0.0.1', bindPort: 6996 }, 'https://box.tailnet.ts.net/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+  ['on a single-address bind, that address', { bindHost: '192.168.1.10', bindPort: 7000 }, 'http://192.168.1.10:7000/api/v1/comfyui/install', 'http://192.168.1.10:7000'],
+  ['on a wildcard bind, loopback', { bindHost: '0.0.0.0', bindPort: 6996 }, 'http://192.168.1.10:6996/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+  ['on an IPv6 loopback bind, that address', { bindHost: '::1', bindPort: 6996 }, 'http://[::1]:6996/api/v1/comfyui/install', 'http://[::1]:6996'],
+  ['with no bind recorded, the configured port', {}, 'http://localhost:5173/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+] as const) {
+  test(`POST /api/v1/comfyui/install bakes in the daemon's own address, not the request's Host: ${label}`, async () => {
+    const comfyDir = tmpDir('tllm-comfy-install-')
+    mkdirSync(join(comfyDir, 'custom_nodes'))
+    const cfg = { daemon: { port: 6996 }, comfyui: { gatePath: '' } }
+    const app = new Hono()
+    registerApi(app, {
+      store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
+      ...bind,
+    } as unknown as Deps)
+
+    const res = await app.request(requestUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ path: comfyDir }),
+    })
+
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.equal(((await res.json()) as { base: string }).base, base)
+    const node = readFileSync(join(comfyDir, 'custom_nodes', 'turbollm_gate', '__init__.py'), 'utf8')
+    assert.match(node, new RegExp(`^TURBOLLM_URL = ${JSON.stringify(base).replace(/[.[\]]/g, '\\$&')}$`, 'm'))
+  })
+}

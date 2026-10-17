@@ -16,8 +16,10 @@
 export const GATE_VERSION = 4
 
 /** Render the Python source for the gate node, with TurboLLM's base URL baked in.
- *  `baseUrl` is TurboLLM's own origin (e.g. http://127.0.0.1:6996), reachable from
- *  the ComfyUI process (same machine → loopback, so no API key is needed). */
+ *  `baseUrl` is the daemon's own address (e.g. http://127.0.0.1:6996), reachable from
+ *  the ComfyUI process on the same machine: the address the daemon is bound to when that
+ *  is one address, else 127.0.0.1 (see the install route). A loopback address needs no
+ *  API key; a LAN one needs requireApiKey off, since the node sends no key. */
 export function gateNodeSource(baseUrl: string): string {
   const base = baseUrl.replace(/\/+$/, '')
   // Embed as a JSON string literal so any quotes/backslashes are escaped for Python

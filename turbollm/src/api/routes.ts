@@ -2193,8 +2193,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // In-app installer (ADR: one-time setup): write the push-gate node into the user's
   // ComfyUI custom_nodes dir, with TurboLLM's own URL baked in. `path` is the ComfyUI
-  // folder (or its custom_nodes dir). The daemon's actual reachable port comes from the
-  // request URL, so it's correct even when started with --port.
+  // folder (or its custom_nodes dir). The URL is the address and port the listener is
+  // really bound to (see below), so it's correct even when started with --port.
   app.post('/api/v1/comfyui/install', async (c) => {
     const b = await body<{ path?: string }>(c)
     const raw = (b.path ?? '').trim()
@@ -2212,11 +2212,15 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 400, 'invalid_config_value', "No 'custom_nodes' folder here. Point me at your ComfyUI folder or its custom_nodes folder.")
     }
 
-    // TurboLLM's reachable origin from ComfyUI's perspective: same machine → loopback,
-    // on whatever port this request arrived on (honors a --port override).
-    const reqUrl = new URL(c.req.url)
-    const port = reqUrl.port || (reqUrl.protocol === 'https:' ? '443' : '80')
-    const base = `http://127.0.0.1:${port}`
+    // TurboLLM's origin as the ComfyUI process on this machine reaches it: the address the listener is bound to when
+    // that is one address (`--addr 192.168.1.10:…`, daemon.host, or a loopback one such as ::1), else loopback (the
+    // default 127.0.0.1 bind, or a wildcard one), and the port really bound (`--port` wins over daemon.port). Never the
+    // request's Host: installed through remote access (Tailscale Serve, a tunnel) or the web dev server that names the
+    // proxy, and the node posted to 127.0.0.1:80, :443 or :5173; on a single-address bind 127.0.0.1 reached nothing.
+    // (There the node is a LAN peer like any process on this box, and sends no key: it gets in with requireApiKey off.)
+    const bound = (d.bindHost ?? '').trim().replace(/^\[|\]$/g, '')
+    const host = !bound || bound === '0.0.0.0' || bound === '::' ? '127.0.0.1' : bound.includes(':') ? `[${bound}]` : bound
+    const base = `http://${host}:${d.bindPort ?? d.store.snapshot().daemon.port}`
 
     const gateDir = join(customNodes, 'turbollm_gate')
     try {
