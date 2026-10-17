@@ -302,12 +302,13 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *     fault deeper in.
    *   - `rfilename` must be a `.gguf`/`.litertlm` single-file model with no path traversal in it.
    *
-   *  Three fields of `EnqueueInput` are deliberately DROPPED rather than passed through:
+   *  Four fields of `EnqueueInput` are deliberately DROPPED rather than passed through:
    *   - `subdir` is `join()`ed onto the host's model dir unsanitised — a peer-supplied
    *     `..` there writes outside it.
    *   - `url` makes the host fetch an arbitrary origin (its own LAN, a cloud metadata
    *     endpoint) and, with `subdir`, to an arbitrary filename.
    *   - `excludeMmproj` is onboarding's internal flag, not part of this contract.
+   *   - `folder` sizes a whole-folder download, which needs `subdir`.
    *  `size` and `sha256` ARE accepted: they only ever tighten behaviour (the free-disk
    *  check and the checksum verification). */
   linkApp.post('/api/link/v1/downloads', requireCapability('downloads:write'), async (c) => {

@@ -1216,6 +1216,11 @@ export function enqueueDownload(input: {
   size?: number
   sha256?: string
   subdir?: string
+  /** With `subdir`: the whole folder download this file is one of, every file of it by where
+   *  its own request puts it (`<subdir>/<basename>`) and its size. The daemon checks free disk
+   *  for each file against the total of those not already downloading, so a folder that does
+   *  not fit has none of its files queued. */
+  folder?: { files: { path: string; size: number }[] }
   /** Onboarding-only (spec 25 §5.4 / ADR-338 Decision 6): drop the shared mmproj vision
    *  projector a blessed catalog GGUF would otherwise expand into — "never pull mmproj-*.gguf
    *  — pure added download before first token." Discover's own manual picks never set this. */

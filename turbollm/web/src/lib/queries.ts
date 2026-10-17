@@ -1091,7 +1091,7 @@ export function useDownloadMutations() {
   }
   return {
     enqueue: useMutation({
-      mutationFn: (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }) =>
+      mutationFn: (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; folder?: { files: { path: string; size: number }[] }; excludeMmproj?: boolean }) =>
         enqueueDownload(input),
       onSuccess: invalidate,
     }),

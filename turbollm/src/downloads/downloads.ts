@@ -107,6 +107,13 @@ export interface EnqueueInput {
   /** Subdirectory under the primary model dir for the downloaded file. Used for
    *  MLX models whose component files must all land in the same directory. */
   subdir?: string
+  /** With `subdir`: the whole folder download this file is one request of (a safetensors
+   *  repo or checkpoint, which the web UI queues file by file): every file of it, each by
+   *  where its own request puts it under the model dir (`<subdir>/<basename>`) and its size.
+   *  The free-disk check is against the total of those no live row already holds, rather
+   *  than this file's size, as a split GGUF drops its live shards and checks the rest as one
+   *  total: a folder too big for the disk has none of its files queued. */
+  folder?: { files: { path: string; size: number }[] }
   /** Drop any `mmproj`-flagged file the expansion would otherwise pull alongside the chosen
    *  GGUF (spec 25 §5.4 / ADR-338 Decision 6: "never pull mmproj-*.gguf — pure added download
    *  before first token"). Onboarding's blessed-catalog downloads are the only caller that
@@ -253,7 +260,11 @@ export class DownloadManager {
       mkdirSync(destDir, { recursive: true })
       const dest = join(destDir, filename)
       if (this.hasLiveDest(dest)) return []
-      if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
+      // A whole-folder download's files each check what is left of the folder, not their own
+      // size: checked one by one, three 18 GB shards on a disk with 30 GB free all passed
+      // (19.8 GB each) and the folder could never finish. Never less than this file's own size.
+      const need = Math.max(input.size ?? 0, this.folderToFetch(dir, input.folder))
+      if (need > 0) this.assertDisk(dir, need)
       return this.commit([
         { name: filename, repo, url: hfResolveUrl(repo, rev, rfilename), dest, total: input.size ?? 0, sha256: input.sha256 },
       ])
@@ -315,6 +326,26 @@ export class DownloadManager {
       if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
     }
     return false
+  }
+
+  /** What is left to fetch of the whole-folder download `folder` names: the total of its files
+   *  that no live row already holds. Their own requests add nothing (hasLiveDest), as the GGUF
+   *  path drops its live shards before totalling them. Counted whole, a folder clicked again
+   *  while some of its files are still downloading would be checked as if every byte were
+   *  still to come: of three 10 GB shards with 1 and 3 still writing and 20 GB free, shard 2
+   *  (errored) refused as needing ~33 GB. Matched file by file, never by the folder's path: a
+   *  root checkpoint's folder is the repo's own, with every nested checkpoint inside it, yet
+   *  its files are only the root's, so a nested one still downloading holds none of them.
+   *  0 without one. */
+  private folderToFetch(dir: string, folder: EnqueueInput['folder']): number {
+    const files = folder?.files
+    if (!Array.isArray(files)) return 0
+    let need = 0
+    for (const f of files) {
+      if (typeof f?.path !== 'string' || typeof f.size !== 'number' || !Number.isFinite(f.size) || f.size <= 0) continue
+      if (!this.hasLiveDest(join(dir, safeRelativeSubdir(f.path)))) need += f.size
+    }
+    return need
   }
 
   /** True when ANOTHER record with one of `statuses` targets this record's dest. hasLiveDest

@@ -6,7 +6,7 @@
 //  - a degenerate repo id is rejected rather than silently mis-placed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DownloadManager, DownloadError } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
@@ -187,6 +187,90 @@ test('enqueue: a per-quant subfolder is preserved under <owner>/<name>/<dir>', a
     // All in the same folder so the scanner groups shards + mmproj together.
     const dirs = new Set(recs.map((r) => dirname(r.dest)))
     assert.equal(dirs.size, 1)
+  } finally {
+    restore()
+  }
+})
+
+/** One whole-folder download as the web queues it: a request per file, each carrying every
+ *  file of the folder by where it lands (`<subdir>/<basename>`) and its size. */
+function queueFolder(dm: DownloadManager, subdir: string, names: string[], size: number) {
+  const folder = { files: names.map((n) => ({ path: `${subdir}/${n}`, size })) }
+  return names.map((rfilename) => dm.enqueue({ repo: 'owner/big', rfilename, size, subdir, folder }))
+}
+
+const SHARDS = [1, 2, 3].map((i) => `model-0000${i}-of-00003.safetensors`)
+
+// A whole-folder download (a safetensors repo, a checkpoint folder) is one request per file,
+// each with the folder as its subdir. Checked file by file, three shards of 60% of the free
+// space each passed (each needs 66%) and queued a folder that needs 198% of it: three 18 GB
+// shards on a disk with 30 GB free. Sized from the real free space so the real check runs.
+test('enqueue: a whole-folder download is checked against the free disk as one total, so none of its files queue when the folder does not fit', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const free = st.bavail * st.bsize
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+
+    const tooBig = await Promise.allSettled(queueFolder(dm, 'big', SHARDS, Math.floor(free * 0.6)))
+    for (const r of tooBig) {
+      assert.equal(r.status, 'rejected', 'every file of a folder that does not fit is refused')
+      assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+    }
+    assert.deepEqual(dm.list(), [], 'nothing of the folder is queued')
+
+    const fits = await Promise.all(queueFolder(dm, 'big', SHARDS, Math.floor(free * 0.1)))
+    assert.deepEqual(fits.map((recs) => recs.length), [1, 1, 1], 'a folder that fits queues every file')
+  } finally {
+    restore()
+  }
+})
+
+// Clicked again while some of its files are still downloading (shard 2 of three errored, 1 and 3
+// still writing), the folder was checked as if all of it were still to come, and the missing
+// shard was refused although it fits on its own. Its live files are not fetched again, so, as a
+// split GGUF drops its live shards before totalling, they come off the folder's total.
+test('enqueue: a whole-folder download clicked again checks only what it still has to fetch', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const shard = Math.floor(st.bavail * st.bsize * 0.4)
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'big/ckpt-2' })
+    await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'big/ckpt-2' })
+
+    const again = await Promise.all(queueFolder(dm, 'big/ckpt-2', SHARDS, shard))
+    assert.deepEqual(again.map((recs) => recs.length), [0, 1, 0], 'the missing shard is queued; the live two add nothing')
+  } finally {
+    restore()
+  }
+})
+
+// Only the folder's OWN files come off its total, never whatever is still downloading under its
+// path. A root checkpoint's folder is the repo's own, so every nested checkpoint sits inside it,
+// yet its files are only the root's (checkpoints.ts: non-recursive). Taken off by path, a live
+// nested checkpoint of 60% of the free space let a root one of 120% queue all three files; and
+// a sibling 'ckpt-2' is not inside 'ckpt', though its path starts with it.
+test('enqueue: a whole-folder download takes off only its own live files, not a nested or sibling folder', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const free = st.bavail * st.bsize
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const nested = await Promise.all(queueFolder(dm, 'big/checkpoint-500', SHARDS, Math.floor(free * 0.2)))
+    assert.deepEqual(nested.map((recs) => recs.length), [1, 1, 1], 'the nested checkpoint fits and is downloading')
+
+    for (const subdir of ['big', 'big/checkpoint-50']) {
+      const results = await Promise.allSettled(queueFolder(dm, subdir, SHARDS, Math.floor(free * 0.4)))
+      for (const r of results) {
+        assert.equal(r.status, 'rejected', `every file of ${subdir} is refused: checkpoint-500's live files are not its own`)
+        assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+      }
+    }
+    assert.equal(dm.list().length, 3, 'only the nested checkpoint is queued')
   } finally {
     restore()
   }

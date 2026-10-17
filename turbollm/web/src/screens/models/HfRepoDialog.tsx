@@ -266,9 +266,19 @@ export function HfRepoContent({
     // mutation's error — reporting success up front hid every refusal behind a closed panel
     // and left an incomplete model folder. `mutateAsync`, because `mutate()`'s own callbacks
     // only fire for the last of several concurrent calls.
+    //
+    // Every request carries the whole folder (`folder`), each file by where its own request puts
+    // it and its size: the daemon checked free disk against each file's own size, so three 18 GB
+    // shards on a disk with 30 GB free were all queued, with "Queued 3 files", for a folder that
+    // could never finish. Checked against the total of its files not already downloading, as a
+    // split GGUF's shards are, a folder that does not fit has none of its files queued and every
+    // request comes back insufficient_disk. By file, not by the folder's path: a root
+    // checkpoint's own files sit next to every nested checkpoint's folder.
+    const placed = files.map((f) => ({ f, subdir: downloadSubdir(repoName, f.name) }))
+    const folder = { files: placed.map(({ f, subdir }) => ({ path: `${subdir}/${f.name.slice(f.name.lastIndexOf('/') + 1)}`, size: f.sizeBytes })) }
     const results = await Promise.allSettled(
-      files.map((f) =>
-        dlMut.enqueue.mutateAsync({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir: downloadSubdir(repoName, f.name) }),
+      placed.map(({ f, subdir }) =>
+        dlMut.enqueue.mutateAsync({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir, folder }),
       ),
     )
     const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
