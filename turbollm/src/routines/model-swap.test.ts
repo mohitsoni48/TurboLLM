@@ -281,3 +281,128 @@ test("a render that begins after the routine's swap stopped the user model makes
   assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
   assert.equal(st.model?.key, userModel.key)
 })
+
+// ── keep-N 2: the restore finds the user's model still in its slot ──────────────────────────────
+// With keep-N 2 or more the routine's swap loads its model into a new pool slot and records it as the model last
+// loaded, while the user's model stays in the primary. The restore then took doLoad's fast path, which recorded nothing:
+// the next daemon start's resume, an Engines Start that names no model and the CLI launcher's last-used pick all brought
+// the routine's model back.
+async function keepN2(t: Parameters<typeof realEngineSetUp>[0], opts: Parameters<typeof realEngineSetUp>[1] = {}) {
+  const set = await realEngineSetUp(t, opts)
+  t.after(() => set.modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+  set.store.update((c) => { c.gateway.keepN = 2 })
+  const first = await set.modelRouter.loadExplicit(set.userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  return set
+}
+
+test("with keep-N 2 the routine's restore puts back the model last loaded before its swap", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, userModel, routineModel } = await keepN2(t)
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    assert.equal(store.snapshot().lastLoaded.modelKey, routineModel.key, "the swap loaded the routine's model into a pool slot")
+  })
+
+  assert.equal(result.outcome, 'ran')
+  const st = manager.status()
+  assert.equal(st.state, 'running')
+  assert.equal(st.model?.key, userModel.key, "the primary kept the user's model")
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+})
+
+// What is put back is what the swap's record replaced, which need not be the model the restore finds running: the
+// user's last pick may be a model that has since been unloaded.
+test("with keep-N 2 the routine's restore puts back a last-loaded model that is no longer running", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, routineModel } = await keepN2(t)
+  const earlier = { modelKey: 'earlier-pick|Q4_K_M|1', engineId: 'fake' }
+  store.update((c) => { c.lastLoaded = { ...earlier } })
+
+  assert.equal((await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {})).outcome, 'ran')
+
+  assert.deepEqual(store.snapshot().lastLoaded, earlier)
+})
+
+// A swap that recorded nothing leaves nothing to undo. Writing the restored model there instead replaced the user's
+// own pick, here a model in a pool slot, on every run: a routine pinned to the model already in that slot, and one
+// pinned to a model that is gone.
+test('with keep-N 2 a routine whose swap records nothing leaves the model last loaded alone', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, userModel, routineModel } = await keepN2(t)
+  assert.ok('target' in await modelRouter.loadExplicit(routineModel.key))
+  assert.equal(store.snapshot().lastLoaded.modelKey, routineModel.key, "the user's own pick, in a pool slot")
+
+  assert.equal((await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {})).outcome, 'ran')
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: routineModel.key, engineId: 'fake' }, 'a swap that found its model running')
+
+  assert.equal((await withPinnedModel({ manager, modelRouter }, 'gone-model', async () => {})).outcome, 'skip-load-failed')
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: routineModel.key, engineId: 'fake' }, 'a swap whose model is gone')
+  assert.equal(manager.status().model?.key, userModel.key)
+})
+
+// A model recorded while the routine ran (a request's swap, an Engines Start) is a newer choice: the restore leaves it.
+test('with keep-N 2 a model recorded while the routine ran stays recorded after the restore', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, routineModel } = await keepN2(t)
+  const meanwhile = { modelKey: 'picked-meanwhile|Q4_K_M|1', engineId: 'fake' }
+
+  assert.equal((await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    store.update((c) => { c.lastLoaded = { ...meanwhile } })
+  })).outcome, 'ran')
+
+  assert.deepEqual(store.snapshot().lastLoaded, meanwhile)
+})
+
+// A render that begins while the routine runs unloads the user's model from the primary, keeps it for its release() to
+// reload, and stops the routine's pool slot. The restore is refused, and the render's release starts the user's model on
+// the Manager, which records nothing: the model last loaded kept naming the routine's.
+test("with keep-N 2 a render during the routine reloads the user's model, which stays the model last loaded", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, userModel, routineModel } = await keepN2(t, { comfy: true })
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    assert.equal(store.snapshot().lastLoaded.modelKey, routineModel.key, "the swap loaded the routine's model into a pool slot")
+    await guard!.acquire() // a render starts mid-run
+  })
+
+  assert.equal(result.outcome, 'ran')
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release reloads the user's model")
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
+})
+
+// The same with keep-N 1, for a render that pauses the restore's own load: the routine's model is stopped, the user's
+// load is refused before its start, and the render's release resumes it on the Manager, which records nothing either.
+test("a render that pauses the routine's restore resumes the user's model, which stays the model last loaded", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, comfyFree, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    assert.equal(store.snapshot().lastLoaded.modelKey, routineModel.key)
+    // The acquire lands during the restore's /free call: Manager.load has stopped the routine's model, and the
+    // restore's load is refused by the pre-start hook once the call returns.
+    comfyFree.hook = () => guard!.acquire()
+  })
+
+  assert.equal(result.outcome, 'ran')
+  assert.equal(guard!.modelKeyLoadedOnRelease(), userModel.key, "the render's release resumes the user's model")
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+  await guard!.release()
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
+})

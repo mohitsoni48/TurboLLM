@@ -53,7 +53,7 @@ import type { AgentRun, ConversationStore } from '../chat/db'
 import type { GenerationGate } from '../agents/gate'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
-import type { RouteResult } from '../gateway/model-router'
+import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { decideModelAction } from './model-conflict'
 import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
 import type { TerminalManager } from '../terminal/terminal-manager'
@@ -70,7 +70,8 @@ export interface CliInteractiveDeps {
   gate: GenerationGate
   getLoadedModelKey: () => string | null
   getEngineIdle: () => boolean
-  loadExplicit: (modelKey: string) => Promise<RouteResult>
+  /** `ModelRouter.loadExplicit`, its arguments passed on (restoreModel passes `restoreAfter`). */
+  loadExplicit: ModelRouter['loadExplicit']
   /** `ModelRouter.reloadAfterRender` (see restoreModel). */
   reloadAfterRender: (modelKey: string, routineModelKey: string) => void
   now: () => Date
@@ -94,11 +95,12 @@ export interface CliInteractiveDeps {
 }
 
 /** codeSessionId -> the model that was loaded before this run swapped it out, so it can be
- *  restored once the run finalizes (spec 20 §5), and the routine's model it swapped in. In-memory
- *  only, same acceptable gap cli-routine.ts's own restore logic documents for a cold daemon: after
- *  a restart there is nothing left in memory to restore FROM, so `finalizeInteractiveRun` simply
- *  skips it — no worse than the one-shot path's own documented behavior. */
-const pendingRestore = new Map<string, { previousModel: string; pinnedModel: string }>()
+ *  restored once the run finalizes (spec 20 §5), the routine's model it swapped in, and the swap's
+ *  own result (see restoreModel). In-memory only, same acceptable gap cli-routine.ts's own restore
+ *  logic documents for a cold daemon: after a restart there is nothing left in memory to restore
+ *  FROM, so `finalizeInteractiveRun` simply skips it — no worse than the one-shot path's own
+ *  documented behavior. */
+const pendingRestore = new Map<string, { previousModel: string; pinnedModel: string; swap: RouteResult | undefined }>()
 
 /** The harness name to use in a user-facing error. This runner now drives claude, opencode and pi,
  *  so a hardcoded "claude" sent the user to debug a CLI that was never involved. */
@@ -143,20 +145,22 @@ export async function runCliInteractiveRoutine(
   }
 
   let previousModel: string | null = null
+  let swap: RouteResult | undefined // the swap's own result, set with previousModel (see restoreModel)
   if (action === 'swap-then-run') {
     const swapResult = await deps.loadExplicit(pinnedModel)
     if ('status' in swapResult) {
       // A load that failed, or a swap a ComfyUI render refused, may already have stopped the
       // user's model (cli-routine.ts's swap explains when): it is restored, or every run of a
       // routine whose model cannot start left the engine empty.
-      if (currentlyLoaded) await restoreModel(deps, currentlyLoaded, pinnedModel)
+      if (currentlyLoaded) await restoreModel(deps, currentlyLoaded, pinnedModel, swapResult)
       finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
       return 'errored'
     }
     previousModel = currentlyLoaded
+    swap = swapResult
   }
   if (abandoned()) {
-    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
     return 'errored'
   }
 
@@ -187,24 +191,27 @@ export async function runCliInteractiveRoutine(
     // Abandoned while the terminal was being started. execute.ts's createTerminal refuses to spawn
     // once the signal is aborted; anything that was spawned anyway is closed again right here.
     if (result.ok) deps.killTerminal(agentRun.id)
-    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
     return 'errored'
   }
   if (!result.ok) {
-    if (previousModel) await restoreModel(deps, previousModel, pinnedModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
     finish({ status: 'errored', error: `Could not start the interactive ${agentLabel(routine)} CLI session: ${result.message}` })
     return 'errored'
   }
 
-  if (previousModel) pendingRestore.set(agentRun.id, { previousModel, pinnedModel })
+  if (previousModel) pendingRestore.set(agentRun.id, { previousModel, pinnedModel, swap })
   // No endedAt: the run has not ended, it's parked. See this module's header comment.
   deps.store.updateRoutineRun(run.id, { status: 'needs_approval' })
   return 'needs_approval'
 }
 
-async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit' | 'reloadAfterRender'>, previousModel: string, pinnedModel: string): Promise<void> {
+/** `swap`: the swap's own result. With keep-N 2 or more the swap took a pool slot and recorded the routine's model as
+ *  the one last loaded, and a restore that finds the user's model still running puts back what that record replaced
+ *  (ModelRouter.undoSwapRecord). */
+async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit' | 'reloadAfterRender'>, previousModel: string, pinnedModel: string, swap: RouteResult | undefined): Promise<void> {
   try {
-    const restoreResult = await deps.loadExplicit(previousModel)
+    const restoreResult = await deps.loadExplicit(previousModel, undefined, { restoreAfter: swap })
     // A ComfyUI render that began while the run was parked (or during its swap) keeps the routine's
     // model for its release() to load, and refuses this restore until it ends. Dropped, the render's
     // end brought the routine's model back and left the user's unloaded: the render's release reloads
@@ -237,7 +244,7 @@ function finalizeInteractiveRun(
     const pending = pendingRestore.get(codeSessionId)
     if (pending) {
       pendingRestore.delete(codeSessionId)
-      void restoreModel(deps, pending.previousModel, pending.pinnedModel)
+      void restoreModel(deps, pending.previousModel, pending.pinnedModel, pending.swap)
     }
   }
 }

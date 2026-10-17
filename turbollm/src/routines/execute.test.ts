@@ -290,6 +290,30 @@ test('executeRoutine keeps permissionMode "auto" on the one-shot branch, never t
   assert.equal(status, 'ok')
 })
 
+// The CLI restores pass `restoreAfter` (ModelRouter.undoSwapRecord): a wiring that drops it left a keep-N 2 restore
+// that found the user's model still running with the routine's model recorded as the one last loaded. The behaviour is
+// tested in cli-routine.test.ts and cli-interactive-runner.test.ts against a real router.
+test("both CLI branches pass a restore's options on to ModelRouter.loadExplicit", async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  const calls: unknown[][] = []
+  ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async (...args: unknown[]) => { calls.push(args); return { target: 'x' } }
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+
+  const swap = { target: 'x', lastLoaded: { replaced: { modelKey: 'user-model', engineId: 'e' }, recorded: { modelKey: 'm', engineId: 'e' } } }
+  await runCliRoutineBranch(d, routine, run, async (_routine, deps) => {
+    await deps.loadExplicit('user-model', undefined, { restoreAfter: swap })
+    deps.store.updateRoutineRun(run.id, { status: 'ok', endedAt: new Date().toISOString() })
+  })
+  await runCliInteractiveBranch(d, routine, db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) }), async (_routine, rr, deps) => {
+    await deps.loadExplicit('user-model', undefined, { restoreAfter: swap })
+    deps.store.updateRoutineRun(rr.id, { status: 'ok', endedAt: new Date().toISOString() })
+    return 'ok'
+  })
+
+  assert.deepEqual(calls, [['user-model', undefined, { restoreAfter: swap }], ['user-model', undefined, { restoreAfter: swap }]])
+})
+
 test('runCliInteractiveBranch is wired with the right deps and reuses the scheduler-created run', async () => {
   const gate = { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate
   const { d, db } = fakeDeps({ loadedKey: 'm', gate })

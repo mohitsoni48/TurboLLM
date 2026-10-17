@@ -14,7 +14,7 @@
 // multi-slot engine (capacity > 1) — see this plan's own Self-review notes for the reconciliation
 // this leaves open.
 import type { Manager } from '../engines/manager'
-import type { ModelRouter } from '../gateway/model-router'
+import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { engineIsIdle } from '../engines/update-scheduler'
 import { decideModelAction } from './model-conflict'
 
@@ -72,7 +72,7 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
     // render runs and handed to its release (see restore()). A render that held the GPU before the swap unloaded the
     // user's model itself and reloads it; the restore leaves that alone.
     if (swapResult.message.includes('ComfyUI is rendering')) {
-      if (currentlyLoaded) await restore(deps, currentlyLoaded, pinnedModel)
+      if (currentlyLoaded) await restore(deps, currentlyLoaded, pinnedModel, swapResult)
       return { outcome: 'skip-comfyui-busy' }
     }
     // A load that ran and failed has already stopped the user's model when it took that model's slot (keep-N 1, or a
@@ -80,7 +80,7 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
     // whose model cannot start left the engine empty. A failure that stopped nothing (an incompatible model, one
     // that is gone) finds the user's model still running, and the restore is a no-op (doLoad's fast path). The
     // caller still holds the gate here: fn never ran, so it was never let go.
-    if (currentlyLoaded) await restore(deps, currentlyLoaded, pinnedModel)
+    if (currentlyLoaded) await restore(deps, currentlyLoaded, pinnedModel, swapResult)
     return { outcome: 'skip-load-failed', message: swapResult.message }
   }
 
@@ -93,7 +93,7 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
       // stop the restore, which must never be skipped.
       const unlock = gate ? await gate.reacquire().catch(() => undefined) : undefined
       try {
-        await restore(deps, currentlyLoaded, pinnedModel)
+        await restore(deps, currentlyLoaded, pinnedModel, swapResult)
       } finally {
         unlock?.()
       }
@@ -102,10 +102,12 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
   return { outcome: 'ran' }
 }
 
-/** Reload the model that was loaded before the routine's swap: the same loadExplicit() the swap made. Best effort. */
-async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: string): Promise<void> {
+/** Reload the model that was loaded before the routine's swap: the same loadExplicit() the swap made. Best effort.
+ *  Handed the swap's result (`swap`), a restore that finds that model still running (keep-N 2 or more: the swap took a
+ *  pool slot) puts back the model last loaded that the swap's record replaced (ModelRouter.undoSwapRecord). */
+async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: string, swap: RouteResult): Promise<void> {
   try {
-    const result = await deps.modelRouter.loadExplicit(modelKey)
+    const result = await deps.modelRouter.loadExplicit(modelKey, undefined, { restoreAfter: swap })
     // A ComfyUI render that began while the routine ran (or during its swap) keeps the routine's model, or the
     // routine's paused load, for its release() to load, and the restore is refused until that render ends. Dropped,
     // the render's end brought the routine's model back and left the user's unloaded: the render's release reloads

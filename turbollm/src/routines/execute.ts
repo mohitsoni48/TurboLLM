@@ -147,7 +147,7 @@ export async function runCliRoutineBranch(
     gate: d.gate ?? ABSENT_GATE,
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
     getEngineIdle: () => engineIsIdle(d.manager),
-    loadExplicit: (modelKey) => d.modelRouter.loadExplicit(modelKey),
+    loadExplicit: (modelKey, overrides, opts) => d.modelRouter.loadExplicit(modelKey, overrides, opts),
     reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
     port: d.bindPort ?? d.store.snapshot().daemon.port, // the port really bound (`--port` wins over config)
@@ -257,10 +257,10 @@ export async function runCliInteractiveBranch(
     // READINESS_TIMEOUT_MS, 600 s, and has seen a 65 GB model take over 120 s); counting it made
     // every fire of a routine pinned to such a model load it, throw it away, reload the previous
     // one and never start the CLI. The load is bounded by the manager itself.
-    loadExplicit: async (modelKey) => {
+    loadExplicit: async (modelKey, overrides, opts) => {
       clearTimeout(timer)
       try {
-        return await d.modelRouter.loadExplicit(modelKey)
+        return await d.modelRouter.loadExplicit(modelKey, overrides, opts)
       } finally {
         if (!kickoffSettled) armTimer()
       }

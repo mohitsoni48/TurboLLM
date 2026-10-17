@@ -830,7 +830,7 @@ deps.links.start()
 const cliInteractiveSweepDeps: CliInteractiveSweepDeps = {
   store: db,
   now: () => new Date(),
-  loadExplicit: (modelKey) => modelRouter.loadExplicit(modelKey),
+  loadExplicit: (modelKey, overrides, opts) => modelRouter.loadExplicit(modelKey, overrides, opts),
   reloadAfterRender: (modelKey, routineModelKey) => modelRouter.reloadAfterRender(modelKey, routineModelKey),
   // Keyed by the run's Code session id, mapped to the manager's own terminal id (see the helper).
   ...terminalLookupsBySession(() => getTerminalManager(deps)),

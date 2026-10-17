@@ -444,6 +444,36 @@ test('a restore a ComfyUI render refused is handed to that render, not warned ab
   assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
 })
 
+// With keep-N 2 or more the routine's swap loads its model into a new pool slot and records it as the model last
+// loaded, while the user's model stays in the primary. The restore then found the user's model running and recorded
+// nothing: the next daemon start, an Engines Start that names no model and the CLI launcher brought the routine's back.
+// The restore is handed the swap's result, so it can put back what the swap's record replaced.
+test('with keep-N 2 the restore puts back the model last loaded before the swap', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store: config, manager, modelRouter, userModel, routineModel } = await realEngineSetUp(t)
+  t.after(() => modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+  config.update((c) => { c.gateway.keepN = 2 })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = codeRoutine(store, { modelKey: routineModel.key })
+
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k, overrides, opts) => modelRouter.loadExplicit(k, overrides, opts),
+    runProcess: async () => {
+      assert.equal(config.snapshot().lastLoaded.modelKey, routineModel.key, "the swap loaded the routine's model into a pool slot")
+      return { exitCode: 0, timedOut: false, stdout: OK_STDOUT, stderr: '' }
+    },
+  }))
+
+  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
+  assert.equal(manager.status().model?.key, userModel.key, "the primary kept the user's model")
+  assert.deepEqual(config.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+})
+
 // A ComfyUI render that begins while the CLI runs unloads the routine's model and keeps it for its release() to
 // reload. The routine's restore of the user's model then met the render, was refused and only warned about: when the
 // render ended, the guard brought the routine's model back, and the user's model stayed unloaded.

@@ -3,7 +3,7 @@
 // the local model library and loads (or swaps to) that model automatically.
 // Inspired by llama-swap; operates on the existing Manager + Scanner primitives.
 import { Manager, type StartOpts } from '../engines/manager'
-import type { ConfigStore, Engine } from '../config/config'
+import type { ConfigStore, Engine, LastLoaded } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
@@ -15,6 +15,13 @@ import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
 import { modelLoadsRefused } from '../auth'
+
+/** loadExplicit's options. `restoreAfter`: the load is a routine's restore of the model its swap displaced (routines/
+ *  model-swap.ts, cli-routine.ts, cli-interactive-runner.ts), and this is that swap's own result. A restore that finds
+ *  its model still running undoes the swap's record of the model last loaded (see ModelRouter.undoSwapRecord). */
+export interface LoadExplicitOpts {
+  restoreAfter?: RouteResult
+}
 
 export type RouteResult =
   | {
@@ -29,6 +36,10 @@ export type RouteResult =
       engineKind?: string
       modelPath?: string
       modelName?: string
+      /** Set on a loadExplicit() result whose load recorded its model as config.lastLoaded: the value that record
+       *  replaced and the one it wrote. A routine's restore hands its swap's result back (LoadExplicitOpts.restoreAfter)
+       *  to undo that record. Absent: a fast path, a Laya model, a route() load. */
+      lastLoaded?: { replaced: LastLoaded; recorded: LastLoaded }
     }
   | {
       status: 503
@@ -231,15 +242,27 @@ export class ModelRouter {
    *  the same withSwapLock()/doLoad() route() itself calls; only the autoSwap early-return is
    *  skipped. Callers are responsible for their OWN idle-vs-busy decision before calling this
    *  (see routines/model-swap.ts) — this method has no opinion on whether now is a safe time to
-   *  swap, only on HOW to swap once that's decided. */
-  async loadExplicit(modelKey: string, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
+   *  swap, only on HOW to swap once that's decided. `opts.restoreAfter`: a routine's restore of the model its swap
+   *  displaced (see undoSwapRecord). */
+  async loadExplicit(modelKey: string, overrides?: Partial<LoadProfile>, opts: LoadExplicitOpts = {}): Promise<RouteResult> {
     // Same invariant-5 guard as route(): a routine pinned to `<machine>/<model>` must
     // never be satisfied by resolveEntry's substring match against a LOCAL model.
     const remote = this.resolveRemote(modelKey)
     if (remote) return remote
     const entry = this.resolveEntry(modelKey)
     if (!entry) return { status: 503, message: `No model matching '${modelKey}' found. Add one in TurboLLM.` }
-    return this.withSwapLock(() => this.doLoad(entry, overrides))
+    return this.withSwapLock(async () => {
+      const result = await this.doLoad(entry, overrides, opts)
+      // A restore refused while a ComfyUI render holds the GPU, when that render's release() brings this model back
+      // itself: the render unloaded it (keep-N 2 or more: the user's model in the primary, and the routine's pool slot
+      // stopped) or paused this restore's own load. release() starts it on the Manager, which records nothing, so the
+      // model last loaded kept naming the routine's. The swap's record is undone as for a restore that finds its model
+      // running. A refused restore the render does not bring back is reloadAfterRender's, which the restores call next.
+      if (opts.restoreAfter && 'status' in result && this.comfy?.modelKeyLoadedOnRelease() === entry.key) {
+        this.undoSwapRecord(opts.restoreAfter)
+      }
+      return result
+    })
   }
 
   /** A routine's restore of `modelKey`, the model its swap displaced, that a ComfyUI render refused
@@ -483,7 +506,8 @@ export class ModelRouter {
     return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
   }
 
-  private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
+  /** `explicit`: loadExplicit's options, absent for route(). */
+  private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>, explicit?: LoadExplicitOpts): Promise<RouteResult> {
     // Re-check after acquiring the lock — another queued request may have already
     // loaded this model while we were waiting.
     {
@@ -491,12 +515,14 @@ export class ModelRouter {
       if (ms.state === 'running' && ms.model && this.keysMatch(ms.model.key, entry)) {
         this.primaryLastUsed = Date.now()
         this.manager.touch()
+        if (explicit?.restoreAfter) this.undoSwapRecord(explicit.restoreAfter)
         return { target: this.manager.target()! }
       }
       const slot = this.extraSlots.get(entry.key)
       if (slot && slot.manager.status().state === 'running') {
         slot.lastUsedMs = Date.now()
         slot.manager.touch()
+        if (explicit?.restoreAfter) this.undoSwapRecord(explicit.restoreAfter)
         return this.served(slot.manager, slot.manager.target()!)
       }
     }
@@ -535,7 +561,7 @@ export class ModelRouter {
     this.loadingKey = entry.key
     this.loadingSlot = targetManager === this.manager ? undefined : { manager: targetManager, engineId: opts.engine.id }
     try {
-      return await this.loadInto(entry, engine, opts, targetManager, inFlight)
+      return await this.loadInto(entry, engine, opts, targetManager, inFlight, explicit !== undefined)
     } finally {
       this.loadingKey = undefined
       this.loadingSlot = undefined
@@ -544,13 +570,15 @@ export class ModelRouter {
   }
 
   /** The load itself, and what follows it. A Laya load (`inFlight`) stays tracked until this returns, so a cancelled
-   *  load is still reported (as 'stopping') while its engine is being stopped. */
+   *  load is still reported (as 'stopping') while its engine is being stopped. `explicit` (loadExplicit): the result
+   *  carries the record of the model last loaded (RouteResult's `lastLoaded`). */
   private async loadInto(
     entry: ModelEntry,
     engine: Engine,
     opts: StartOpts,
     targetManager: Manager,
     inFlight: LayaLoad | undefined,
+    explicit = false,
   ): Promise<RouteResult> {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
@@ -633,15 +661,36 @@ export class ModelRouter {
       this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
+    const result = targetManager === this.manager ? { target } : this.served(targetManager, target)
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
     // refuses it, so recording it would leave the machine with no model at all after a restart.
-    if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
-    return targetManager === this.manager ? { target } : this.served(targetManager, target)
+    if (entry.laya) return result
+    const recorded: LastLoaded = { modelKey: entry.key, engineId: engine.id }
+    const replaced = explicit ? this.store.snapshot().lastLoaded : undefined
+    this.store.update(x => { x.lastLoaded = { ...recorded } })
+    return replaced ? { ...result, lastLoaded: { replaced, recorded } } : result
+  }
+
+  /** A routine's restore (loadExplicit's `restoreAfter`) that found its model still running: the model last loaded is
+   *  put back as the routine's swap found it, when that swap recorded one and nothing has recorded another since. With
+   *  keep-N 2 or more the swap loads the routine's model into a new pool slot and records it, and the user's model
+   *  stays in its slot. The restore then found the user's model running and recorded nothing, so the next daemon
+   *  start's resume (auto-load.ts), an Engines Start that names no model and the CLI launcher's last-used pick all
+   *  brought the routine's model back. A swap that recorded nothing (its model already running, a load that failed)
+   *  is left alone: writing the restored model there instead replaced a pick of the user's own, a model in a pool slot,
+   *  after every run. A restore that has to load its model again records it in loadInto, as any load does. Also for a
+   *  restore a ComfyUI render refused whose model that render's release() brings back (see loadExplicit). */
+  private undoSwapRecord(swap: RouteResult): void {
+    const record = 'target' in swap ? swap.lastLoaded : undefined
+    if (!record) return
+    const now = this.store.snapshot().lastLoaded
+    if (now.modelKey !== record.recorded.modelKey || now.engineId !== record.recorded.engineId) return
+    this.store.update(x => { x.lastLoaded = { ...record.replaced } })
   }
 
   /** A route to a pool slot, described from that slot's own manager (see RouteResult). The primary's routes carry
    *  none of this: the gateway's fallback already reads the primary. */
-  private served(manager: Manager, target: string): RouteResult {
+  private served(manager: Manager, target: string): Extract<RouteResult, { target: string }> {
     const opts = manager.currentOpts()
     return opts ? { target, engineKind: opts.engine.kind, modelPath: opts.modelPath, modelName: opts.model.name } : { target }
   }

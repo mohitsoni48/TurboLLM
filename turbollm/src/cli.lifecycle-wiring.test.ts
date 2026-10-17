@@ -184,6 +184,13 @@ test('the packaged Android app never wires a restart (exiting its in-process Nod
   assert.ok(CLI.includes('if (!packagedAndroidApp()) deps.requestRestart = ('))
 })
 
+// The finalize's restore passes `restoreAfter` (ModelRouter.undoSwapRecord): dropped here, a keep-N 2 restore that
+// found the user's model still running left the routine's model recorded as the one last loaded. The behaviour is
+// tested in routines/cli-interactive-runner.test.ts against a real router.
+test("the interactive-routine sweep passes a restore's options on to the router", () => {
+  assert.ok(CLI.includes('  loadExplicit: (modelKey, overrides, opts) => modelRouter.loadExplicit(modelKey, overrides, opts),'))
+})
+
 test('the interactive-routine sweep maps Code session ids to terminal ids', () => {
   assert.ok(CLI.includes('...terminalLookupsBySession(() => getTerminalManager(deps)),'))
   assert.ok(!/getTerminalManager\(deps\)\.(isActive|isAgentExited|getExitCode|kill)\(codeSessionId\)/.test(CLI),

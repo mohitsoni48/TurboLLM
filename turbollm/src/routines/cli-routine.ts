@@ -67,7 +67,7 @@ import { parseClaudeCliStreamJson } from './cli-output'
 import { inheritedEnv } from '../cli-launch'
 import { sessionAuth } from '../code/session-auth'
 import { resolveClaudePermissionMode } from '../terminal/agent-modes'
-import type { RouteResult } from '../gateway/model-router'
+import type { ModelRouter, RouteResult } from '../gateway/model-router'
 
 export interface CliRoutineDeps {
   store: ConversationStore
@@ -86,8 +86,9 @@ export interface CliRoutineDeps {
    *  than the whole Manager so tests don't have to fake Manager's full surface. */
   getEngineIdle: () => boolean
   /** `ModelRouter.loadExplicit`, or an equivalent. Returns `{ target }` on success and
-   *  `{ status: 503, message }` on failure — it does not throw for a missing model. */
-  loadExplicit: (modelKey: string) => Promise<RouteResult>
+   *  `{ status: 503, message }` on failure — it does not throw for a missing model. Its arguments are passed on
+   *  (the restore below passes `restoreAfter`). */
+  loadExplicit: ModelRouter['loadExplicit']
   /** `ModelRouter.reloadAfterRender`: the restore below hands a refusal from a ComfyUI render to that render's
    *  release, which otherwise reloads the routine's model. */
   reloadAfterRender: (modelKey: string, routineModelKey: string) => void
@@ -146,6 +147,8 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   // Declared OUTSIDE the try so the finally can see it on every exit path — including ones that
   // throw before the swap ever happens, where it must still read `null` so no restore is attempted.
   let previousModel: string | null = null
+  // The swap's own result, which the restore hands back (see the restore in the finally).
+  let swap: RouteResult | undefined
 
   // The exception boundary opens HERE, immediately after the run row exists, and covers the WHOLE
   // body — availability probe, conflict decision, swap, spawn, parse. Anything narrower strands the
@@ -182,6 +185,7 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
 
     if (action === 'swap-then-run') {
       const swapResult = await deps.loadExplicit(pinnedModel)
+      swap = swapResult
       if ('status' in swapResult) {
         // A load that ran and failed has already stopped the user's model when it took that
         // model's slot (keep-N 1, or a full pool): Manager.load stops the slot before it starts the
@@ -256,7 +260,10 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     // outcome with an unrelated error and leave the caller with no result at all.
     if (previousModel) {
       try {
-        const restoreResult = await deps.loadExplicit(previousModel)
+        // Handed the swap's result: with keep-N 2 or more the swap took a pool slot and recorded the routine's model as
+        // the one last loaded, and a restore that finds the user's model still running puts back what that record
+        // replaced (ModelRouter.undoSwapRecord).
+        const restoreResult = await deps.loadExplicit(previousModel, undefined, { restoreAfter: swap })
         // A restore that RETURNS `{ status: 503 }` is the COMMON failure — a model that has since
         // gone missing is exactly the case `loadExplicit` signals by returning rather than throwing
         // (`model-router.ts:104`). Discarding it would leave the engine sitting on the routine's

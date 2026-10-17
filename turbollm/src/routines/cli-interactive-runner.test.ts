@@ -419,6 +419,41 @@ function fakeTerminals(sessions: Record<string, { codeSessionId: string; agentEx
   }
 }
 
+// With keep-N 2 or more the routine's swap loads its model into a new pool slot and records it as the model last
+// loaded, while the user's model stays in the primary. The restore once the run finalized then found the user's model
+// running and recorded nothing: the next daemon start, an Engines Start that names no model and the CLI launcher
+// brought the routine's model back. The swap's result is kept with the parked run, so the restore can put back what
+// the swap's record replaced.
+test('with keep-N 2 the restore puts back the model last loaded before the swap', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store: config, manager, modelRouter, userModel, routineModel } = await realEngineSetUp(t)
+  t.after(() => modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+  config.update((c) => { c.gateway.keepN = 2 })
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = interactiveRoutine(store, { modelKey: routineModel.key })
+  const run = schedulerRun(store, routine)
+  const loads: Promise<unknown>[] = []
+  const loadExplicit: CliInteractiveDeps['loadExplicit'] = (k, overrides, opts) => {
+    const p = modelRouter.loadExplicit(k, overrides, opts)
+    loads.push(p)
+    return p
+  }
+
+  assert.equal(await runCliInteractiveRoutine(routine, run, baseDeps({
+    store, getLoadedModelKey: () => manager.status().model?.key ?? null, loadExplicit,
+  })), 'needs_approval')
+  assert.equal(config.snapshot().lastLoaded.modelKey, routineModel.key, "the swap loaded the routine's model into a pool slot")
+  sweepInteractiveCliRuns(sweepDeps({ store, loadExplicit, isAgentExited: () => true, getExitCode: () => 0 }))
+  await loads[loads.length - 1] // the restore, which the finalize does not wait for
+
+  assert.equal(store.getRoutineRun(run.id)!.status, 'ok')
+  assert.equal(manager.status().model?.key, userModel.key, "the primary kept the user's model")
+  assert.deepEqual(config.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+})
+
 // A ComfyUI render that begins while the run is parked unloads the routine's model and keeps it for its release() to
 // reload. The restore once the run finalized then met the render, was refused and only warned about: when the render
 // ended, the guard brought the routine's model back, and the user's model stayed unloaded.
