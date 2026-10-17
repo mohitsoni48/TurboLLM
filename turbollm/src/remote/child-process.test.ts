@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { ChildTunnel, killTrackedTunnelsSync, reapStaleTunnels } from './child-process'
 import { tmpDir } from '../test-support/tmp'
 
@@ -18,6 +18,50 @@ test('ChildTunnel: a binary that cannot be spawned rejects the start instead of 
   )
   assert.equal(t.alive(), false, 'nothing is tracked as running')
   await t.stop() // and a later stop() has nothing to wait for
+})
+
+// ── Windows Stop force-kills at once ────────────────────────────────────────────────────────
+// A plain `taskkill /PID <pid> /T` only posts WM_CLOSE to the process's windows. cloudflared and
+// ngrok are console programs with none, so Windows refuses it ("This process can only be
+// terminated forcefully (with /F option)") and every Stop sat out the 8 s grace before the
+// force kill. Faked here on POSIX with a `taskkill` stand-in that refuses the same way.
+test('ChildTunnel.stop() on Windows: taskkill /F /T at once, instead of a plain taskkill and the 8 s wait', async (t) => {
+  if (process.platform === 'win32') return t.skip('fakes Windows on a POSIX host')
+  const dataDir = tmpDir('child-tunnel-winstop-')
+  const argsFile = join(dataDir, 'taskkill-args')
+  writeFileSync(join(dataDir, 'taskkill'), [
+    '#!/bin/sh',
+    `echo "$@" >> '${argsFile}'`,
+    'case " $* " in *" /F "*) kill -9 "$2"; exit 0 ;; esac',
+    'echo "ERROR: The process with PID $2 could not be terminated." >&2',
+    'echo "Reason: This process can only be terminated forcefully (with /F option)." >&2',
+    'exit 1',
+    '',
+  ].join('\n'), { mode: 0o755 })
+  const actualPlatform = process.platform
+  const actualPath = process.env.PATH
+  const tunnel = new ChildTunnel(dataDir)
+  try {
+    await tunnel.spawnAndWait(process.execPath, ['-e', "console.log('https://win.example.com'); setInterval(() => {}, 60000)"], /https:\/\/\S+/, 10_000)
+    const [name] = tunnelPidFiles(dataDir)
+    const pid = name.replace(/^tunnel-(\d+)\.pid$/, '$1')
+    process.env.PATH = `${dataDir}${delimiter}${actualPath ?? ''}`
+    const started = Date.now()
+    let stopped: Promise<void>
+    Object.defineProperty(process, 'platform', { value: 'win32' })
+    try {
+      stopped = tunnel.stop()
+    } finally {
+      Object.defineProperty(process, 'platform', { value: actualPlatform })
+    }
+    await stopped
+    assert.equal(readFileSync(argsFile, 'utf8').split('\n')[0], `/PID ${pid} /F /T`, 'the first taskkill forces the tree')
+    assert.ok(Date.now() - started < 4000, `stop() took ${Date.now() - started} ms`)
+    assert.equal(tunnel.alive(), false)
+  } finally {
+    process.env.PATH = actualPath
+    await tunnel.stop()
+  }
 })
 
 // ── reapStaleTunnels: only a pid that is provably still our provider is killed ──────────────

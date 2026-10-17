@@ -254,7 +254,13 @@ export class ChildTunnel {
     this.exitCb = undefined
     this.child = null
     if (child.pid) {
-      if (process.platform === 'win32') execFile('taskkill', ['/PID', String(child.pid), '/T'], () => {})
+      // Windows: force the tree at once. A plain `taskkill /PID <pid> /T` (no /F) only posts
+      // WM_CLOSE to the process's windows, and cloudflared and ngrok are console programs with
+      // none (spawned windowsHide besides), so Windows refuses it ("This process can only be
+      // terminated forcefully (with /F option)") and every Stop, provider switch and restart sat
+      // out the whole 8 s grace below before forceKill ended it anyway. Their own clean exit
+      // runs on a console Ctrl+C/Ctrl+Break, which taskkill never sends.
+      if (process.platform === 'win32') this.forceKill(child)
       else child.kill('SIGTERM')
     }
     const result = await Promise.race([
