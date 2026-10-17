@@ -394,6 +394,64 @@ test('enqueue on linux: dests that differ only in letter case are different file
   }
 })
 
+// Android's shared storage ignores letter case as well: /sdcard, /storage/emulated/0, an SD card
+// under /storage, and the ~/storage links termux-setup-storage makes into them. Seeded as two rows
+// a restart left paused, in two letter cases of one file, since a test cannot create /storage: the
+// second Resume must not become a second writer on the first one's .part.
+const termuxHome = tmpDir('tllm-termux-home-')
+const ANDROID_SHARED: Array<[label: string, root: string]> = [
+  ['/storage/emulated/0', '/storage/emulated/0/models'],
+  ['/sdcard', '/sdcard/models'],
+  ["Termux's ~/storage/shared", join(termuxHome, 'storage', 'shared', 'models')],
+]
+for (const [label, root] of ANDROID_SHARED) {
+  // os.homedir() reads USERPROFILE on Windows, not HOME, and the Termux root is joined with
+  // backslashes there, so only the /storage and /sdcard cases can stand in for Android on it.
+  const skip = process.platform === 'win32' && root.startsWith(termuxHome) && 'os.homedir() ignores HOME on Windows'
+  test(`resume on android: under ${label}, the same file in another letter case is not a second writer on its .part`, { skip }, async (t) => {
+    asPlatform(t, 'android')
+    const home = process.env.HOME
+    process.env.HOME = termuxHome
+    t.after(() => { process.env.HOME = home })
+    const restore = stubFetch()
+    try {
+      const { stateDir } = newDirs()
+      const row = (id: string, repo: string) => ({
+        id, name: 'x.gguf', repo, url: `https://huggingface.co/${repo}/resolve/main/x.gguf`,
+        dest: `${root}/${repo}/x.gguf`, total: 10, createdAt: new Date().toISOString(),
+      })
+      mkdirSync(join(stateDir, 'downloads'), { recursive: true })
+      writeFileSync(
+        join(stateDir, 'downloads', 'manifest.json'),
+        JSON.stringify({ version: 1, entries: [row('a', 'ggml-org/models'), row('b', 'GGML-ORG/MODELS')] }),
+      )
+      const dm = new DownloadManager(fakeStore(root, stateDir), () => {}, () => ({}), echoExpand())
+      assert.equal(dm.resume('a'), true)
+      assert.throws(() => dm.resume('b'), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('enqueue on android: in app-private storage (Termux\'s home), two letter cases are two files', async (t) => {
+  asPlatform(t, 'android')
+  const home = process.env.HOME
+  process.env.HOME = termuxHome
+  t.after(() => { process.env.HOME = home })
+  const restore = stubFetch()
+  try {
+    const { stateDir } = newDirs()
+    const modelDir = join(termuxHome, 'models')
+    mkdirSync(modelDir, { recursive: true })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    assert.equal((await dm.enqueue(CANONICAL)).length, 1)
+    assert.equal((await dm.enqueue(OTHER_CASE)).length, 1, 'a case-sensitive file system holds both')
+  } finally {
+    restore()
+  }
+})
+
 test('enqueue: two quants sharing one mmproj do not double-enqueue the projector', async () => {
   const restore = stubFetch()
   try {

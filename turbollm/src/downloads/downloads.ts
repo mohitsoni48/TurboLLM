@@ -16,6 +16,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
+import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -786,11 +787,30 @@ export class DownloadManager {
  *  dest that differs from a live row's only in case yet opens the same .part. Compared exactly,
  *  both rows wrote it at once: one ended 'done' with a corrupt file in the library (its size and
  *  sha256 checks cover the bytes it streamed, not the file on disk), the other failed on the
- *  rename. Elsewhere case is significant and names compare exactly. The platform is read per
- *  call, not at load, so a test can stand in for another one. */
+ *  rename. On Android only shared storage ignores case ({@link onAndroidSharedStorage}).
+ *  Elsewhere case is significant and names compare exactly. The platform is read per call, not
+ *  at load, so a test can stand in for another one. */
 function sameDest(a: string, b: string): boolean {
   if (process.platform === 'win32' || process.platform === 'darwin') return a.toLowerCase() === b.toLowerCase()
+  if (process.platform === 'android' && onAndroidSharedStorage(a)) return a.toLowerCase() === b.toLowerCase()
   return a === b
+}
+
+/** Android's shared storage ignores letter case (its FUSE layer, like the FAT/exFAT of an SD
+ *  card), while app-private storage under /data, Termux's home included, does not. The rule is
+ *  by path, with no file system probe: shared storage is /sdcard and /storage (the internal
+ *  /storage/emulated/0 and SD cards under /storage), and Termux reaches it through the links
+ *  `termux-setup-storage` makes in ~/storage (shared, downloads, external-1, ...). A model
+ *  folder reached through any other link compares exactly, as before. */
+function onAndroidSharedStorage(path: string): boolean {
+  if (path.startsWith('/sdcard/') || path.startsWith('/storage/')) return true
+  let home: string
+  try {
+    home = homedir()
+  } catch {
+    return false // os.homedir() throws when neither HOME nor the user database names one
+  }
+  return !!home && path.startsWith(`${join(home, 'storage')}/`)
 }
 
 function gb(bytes: number): string {
