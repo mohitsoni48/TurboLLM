@@ -4,7 +4,7 @@
 // on the client, killing the REPLACEMENT mid-initialize and failing its requests.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ChildProcess } from 'node:child_process'
 import { StdioMcpClient } from './mcp-client'
@@ -113,3 +113,70 @@ test('a tool result whose multibyte characters straddle stdout chunks reaches th
     client.disconnect()
   }
 })
+
+// Answers initialize, then, once told `initialized`, closes its end of stdin and writes the marker
+// file: a server on its way out (crashing, or shutting down) whose exit has not been reaped yet.
+// It stays alive, so the client's 'exit' handler cannot clean up first.
+const CLOSING_SERVER = `
+const fs = require('fs')
+const marker = process.argv[2]
+const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n')
+setInterval(() => {}, 1000)
+let buf = ''
+process.stdin.on('data', (c) => {
+  buf += c
+  const lines = buf.split('\\n')
+  buf = lines.pop()
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const m = JSON.parse(line)
+    if (m.method === 'initialize') send({ jsonrpc: '2.0', id: m.id, result: {} })
+    if (m.method === 'notifications/initialized') {
+      // destroy() alone leaves fd 0 open (Node keeps its stdio fds); closing it is what a
+      // process's exit does to the pipe.
+      process.stdin.destroy()
+      fs.closeSync(0)
+      fs.writeFileSync(marker, 'closed')
+    }
+  }
+})
+`
+
+test(
+  'a request written to a server that already closed its stdin fails with "disconnected", with no uncaught EPIPE',
+  // Through `cmd.exe /c` (Windows), cmd.exe keeps its own handle on the pipe, so the write never fails.
+  { skip: process.platform === 'win32' && 'the server runs under cmd.exe, which holds the pipe open' },
+  async () => {
+    const dir = tmpDir('turbollm-mcp-client-')
+    const script = join(dir, 'closing-server.cjs')
+    const marker = join(dir, 'closed')
+    writeFileSync(script, CLOSING_SERVER)
+    const client = new StdioMcpClient({ id: 's', name: 's', command: process.execPath, args: [script, marker] })
+    const procOf = () => (client as unknown as { proc: ChildProcess | null }).proc
+    // An 'error' on a child's stdin with no listener is thrown out of band: in the daemon, the
+    // process exits.
+    const uncaught: unknown[] = []
+    const onUncaught = (e: unknown) => { uncaught.push(e) }
+    process.on('uncaughtException', onUncaught)
+    let timer: NodeJS.Timeout | undefined
+    try {
+      await client.connect()
+      const server = procOf()
+      assert.ok(server)
+      for (let i = 0; i < 200 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 10))
+      assert.ok(existsSync(marker), 'the server closed its stdin')
+
+      // The write is accepted (stdin is still writable on this side) and fails with EPIPE after.
+      const call = client.callTool('echo', {})
+      const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('still pending after 5 s')), 5000) })
+      await assert.rejects(Promise.race([call, late]), /MCP server disconnected/)
+      assert.equal(procOf(), null, 'the broken server is dropped, so the next call spawns a fresh one')
+      assert.equal(server.killed, true)
+      assert.deepEqual(uncaught, [])
+    } finally {
+      clearTimeout(timer)
+      process.off('uncaughtException', onUncaught)
+      client.disconnect()
+    }
+  },
+)

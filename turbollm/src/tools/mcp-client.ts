@@ -120,6 +120,15 @@ export class StdioMcpClient implements IMcpClient {
 
     proc.on('error', () => { if (this.proc === proc) this.cleanup() })
     proc.on('exit', () => { if (this.proc === proc) this.cleanup() })
+    // An 'error' on one of the child's pipes is thrown out of band when nothing listens for it,
+    // and the daemon has no uncaughtException handler, so it exited. The usual one is EPIPE on
+    // stdin: a request written while the server is exiting (it crashed, or was killed) but before
+    // its 'exit' arrives is accepted, since stdin still reads writable on this side, and fails
+    // after. A broken pipe takes no more requests, so it is handled like the exit: the pending
+    // requests fail with "MCP server disconnected" and the next call spawns a fresh server. The
+    // listeners stay on a replaced process, so its late EPIPE is still caught (and ignored).
+    proc.stdin?.on('error', () => { if (this.proc === proc) this.cleanup() })
+    proc.stdout?.on('error', () => { if (this.proc === proc) this.cleanup() })
 
     try {
       await this.sendRequest('initialize', {
