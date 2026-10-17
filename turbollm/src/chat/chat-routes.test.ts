@@ -364,12 +364,20 @@ test('the chat routes return an attached document by name, without its stored te
     const singleVersion = await h.app.request(`${base}/messages/${q1.id}/variants`)
     await (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1.id, content: 'Only the totals.' } }))).text()
     const put = (id: string, content: string) => h.app.request(`${base}/messages/${id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content }) })
+    const activate = () => h.app.request(`${base}/messages/${q1.id}/activate`, { method: 'POST' })
+    // Activating the version already shown (a stale tab, a double click on the switcher) takes the route's
+    // early return, not the switch: that return answers with the messages too.
+    const activateActive = () => {
+      assert.equal(h.store.getMessage(q1.id)!.isActive, true, 'q1 is the active version again')
+      return activate()
+    }
 
     const responses = {
       singleVersion,
       conversation: await h.app.request(base),
       variants: await h.app.request(`${base}/messages/${q1.id}/variants`),
-      activate: await h.app.request(`${base}/messages/${q1.id}/activate`, { method: 'POST' }),
+      activate: await activate(),
+      activateActive: await activateActive(),
       replyEdit: await put(a1.id, 'fixed reply'),
       questionEdit: await put(q1.id, 'Summarize it again.'),
     }
