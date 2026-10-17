@@ -86,6 +86,17 @@ function parseIsoInstant(v: string): number {
   return Date.parse((m[4] === ' ' ? v.replace(' ', '+') : v).toUpperCase())
 }
 
+/** A list route's `limit`: undefined when absent or empty (the store's default), NaN when it is
+ *  not an integer. It went to the store as a bare Number(...), so `limit=1.5` reached SQLite's
+ *  LIMIT as 2.5 (one row is added to look ahead), which it refuses with a datatype mismatch: a
+ *  bare 500 internal. 'abc' silently became the default page size. The range is left to the store
+ *  (the built-in one clamps to 1-200; an adapter applies its own bounds), as before. */
+function pageLimit(v: string | undefined): number | undefined {
+  if (!v) return undefined
+  const n = Number(v)
+  return Number.isInteger(n) ? n : NaN
+}
+
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
  *  it (mount.ts always supplies a shared instance in production; only ad-hoc test harnesses
  *  omit it) keeps compiling and behaving exactly as before — a private, generously-capped
@@ -169,10 +180,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   }))
 
   app.get(`${BASE}/chats`, requireScope('chats:read'), async (c) => {
+    const limit = pageLimit(c.req.query('limit'))
+    if (Number.isNaN(limit)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`limit` must be an integer.', { param: 'limit' })
+    }
     try {
       const page = await d.chatStore.listChats(scopeFor(c, c.req.query('owner')), {
         cursor: c.req.query('cursor'),
-        limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        limit,
         q: c.req.query('q'),
       })
       return c.json({ data: page.data.map(toChatDTO), has_more: page.hasMore, next_cursor: page.nextCursor })
@@ -308,10 +323,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
 
   app.get(`${BASE}/chats/:id/messages`, requireScope('chats:read'), async (c) => {
     const include = parseInclude(c.req.query('include'))
+    const limit = pageLimit(c.req.query('limit'))
+    if (Number.isNaN(limit)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`limit` must be an integer.', { param: 'limit' })
+    }
     try {
       const page = await d.chatStore.listMessages(scopeFor(c, c.req.query('owner')), c.req.param('id'), {
         cursor: c.req.query('cursor'),
-        limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        limit,
       })
       return c.json({ data: page.data.map((m) => toMessageDTO(m, include)), has_more: page.hasMore, next_cursor: page.nextCursor })
     } catch (e) {

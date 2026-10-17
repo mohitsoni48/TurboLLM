@@ -95,7 +95,7 @@ export interface QueryParam {
 }
 // The chat store's cursor pagination (sqlite-chat-store.ts's clampLimit) and dto.ts's include=.
 const CURSOR_PARAM: QueryParam = { name: 'cursor', description: "Opaque cursor: the previous page's `next_cursor`. Omit for the first page." }
-const LIMIT_PARAM: QueryParam = { name: 'limit', type: 'integer', description: 'Page size. The built-in store takes 1-200 (larger values are clamped to 200) and defaults to 50; a configured store adapter applies its own bounds.' }
+const LIMIT_PARAM: QueryParam = { name: 'limit', type: 'integer', description: 'Page size, an integer (any other value gets 400 invalid_input). The built-in store takes 1-200 (larger values are clamped to 200) and defaults to 50; a configured store adapter applies its own bounds.' }
 // idempotency.ts: kept 24 h, in memory only, scoped to tenant + owner + operation.
 const IDEMPOTENCY_KEY = 'Optional client-chosen key that makes a retry safe: a repeat with the same key (and owner) within 24 hours'
 const IDEMPOTENCY_TAIL = 'Keys are held in memory, so a daemon restart forgets them. Reusing a key for a different request is refused with 409 idempotency_key_reused.'

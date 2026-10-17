@@ -540,6 +540,32 @@ test('GET /audit with a negative or zero limit is refused with a clean 400', asy
   }
 })
 
+// GET /chats and GET /chats/:id/messages passed `limit` to the store as Number(...): '1.5' reached
+// SQLite's LIMIT as 2.5 (one row is added to look ahead), which it refuses with a datatype
+// mismatch, a bare 500 internal; 'abc' silently became the default page size.
+test('GET /chats and GET /chats/:id/messages refuse a limit that is not an integer with 400', async () => {
+  const { app, cleanup } = harness()
+  try {
+    const chat = await (await app.request('/api/ext/v1/chats', json(ACME, { title: 'X', owner: 'u1' }))).json() as { id: string }
+    for (const path of ['/api/ext/v1/chats?owner=u1', `/api/ext/v1/chats/${chat.id}/messages?owner=u1`]) {
+      for (const limit of ['1.5', 'abc', 'Infinity', '2e-1']) {
+        const res = await app.request(`${path}&limit=${limit}`, { headers: { Authorization: ACME } })
+        assert.equal(res.status, 400, `${path} limit=${limit}`)
+        const body = await res.json() as { error: { type: string; code: string; param?: string } }
+        assert.equal(body.error.type, 'invalid_request')
+        assert.equal(body.error.code, 'invalid_input')
+        assert.equal(body.error.param, 'limit')
+      }
+      // An integer still works, as does an empty or absent limit (the store's default).
+      for (const q of ['&limit=2', '&limit=1e1', '&limit=', '']) {
+        assert.equal((await app.request(`${path}${q}`, { headers: { Authorization: ACME } })).status, 200, `${path}${q}`)
+      }
+    }
+  } finally {
+    cleanup()
+  }
+})
+
 // GET /audit could never return anything past the newest page — `since` is a lower bound
 // on a newest-first list. `before=<oldest id received>` is how the route pages backward.
 test('GET /audit pages backward with before=<oldest id received>', async () => {
