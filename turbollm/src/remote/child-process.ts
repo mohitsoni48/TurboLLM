@@ -10,10 +10,6 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { join } from 'node:path'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
 function pidDir(dataDir: string): string {
   return join(dataDir, 'run')
 }
@@ -263,10 +259,14 @@ export class ChildTunnel {
       if (process.platform === 'win32') this.forceKill(child)
       else child.kill('SIGTERM')
     }
+    // The grace timer is cleared once the race is decided: left running after a prompt exit, a
+    // ref'd 8 s timer held the event loop (a test file, a CLI run) open for the rest of it.
+    let grace: ReturnType<typeof setTimeout> | undefined
     const result = await Promise.race([
       this.exited.then(() => 'exited' as const),
-      sleep(8000).then(() => 'timeout' as const),
+      new Promise<'timeout'>((resolve) => { grace = setTimeout(() => resolve('timeout'), 8000) }),
     ])
+    clearTimeout(grace)
     if (result === 'timeout') this.forceKill(child)
     clearPid(this.dataDir, child.pid ?? 0)
   }

@@ -64,6 +64,23 @@ test('ChildTunnel.stop() on Windows: taskkill /F /T at once, instead of a plain 
   }
 })
 
+// stop() raced the child's exit against an 8 s sleep it never cleared: a ref'd timer that, after
+// a prompt exit, held the event loop (a test file, a CLI run) open for the rest of the 8 s.
+test('ChildTunnel.stop(): a child that exits promptly leaves no 8 s timer behind', async () => {
+  const dataDir = tmpDir('child-tunnel-stoptimer-')
+  const tunnel = new ChildTunnel(dataDir)
+  const timers = () => process.getActiveResourcesInfo().filter((r) => r === 'Timeout').length
+  try {
+    await tunnel.spawnAndWait(process.execPath, ['-e', "console.log('https://prompt.example.com'); setInterval(() => {}, 60000)"], /https:\/\/\S+/, 10_000)
+    const before = timers()
+    await tunnel.stop()
+    assert.equal(tunnel.alive(), false)
+    assert.equal(timers(), before, 'no timer is left holding the process open')
+  } finally {
+    await tunnel.stop()
+  }
+})
+
 // ── reapStaleTunnels: only a pid that is provably still our provider is killed ──────────────
 // A daemon killed without its exit handler (power loss, OS update reboot) leaves tunnel pidfiles
 // behind, and on the next boot their pids usually belong to unrelated processes — which SIGKILL /
