@@ -11,11 +11,15 @@ import { ComfyGuard } from '../engines/comfy-guard'
 import { Manager } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { ModelEntry, Scanner } from '../models/scanner'
+import { freePort } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 import { ModelRouter } from './model-router'
 
 /** A stand-in llama-server: notes each spawn in $SPAWN_LOG, answers /health on --port once 1 s has passed (the model
- *  "loads"), and exits at once on SIGTERM. */
+ *  "loads"), and exits at once on SIGTERM. It binds the port it is handed, so setUp pins that port to a free ephemeral
+ *  one through the model's saved profile (the router turns profile.port into preferredPort): the 8081+ walk is shared
+ *  with other test files' engines in a parallel run, and two engines handed the same port made the second die with
+ *  EADDRINUSE (see freePort). */
 const FAKE_ENGINE_JS = `
 const fs = require('fs')
 const http = require('http')
@@ -30,7 +34,7 @@ process.on('SIGTERM', () => process.exit(0))
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
+async function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
   const dir = tmpDir('tllm-comfy-reload-')
   const spawnLog = join(dir, 'spawns.log')
   writeFileSync(join(dir, 'fake-engine.js'), FAKE_ENGINE_JS)
@@ -44,12 +48,14 @@ function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
     moe: false, expertCount: 0, nextnLayers: 0, vision: false, audio: false, mmprojPath: null, mmprojSizeBytes: 0,
     hasChatTemplate: true, reasoningEffort: false, embedding: false, incomplete: false, parseError: null,
   } as unknown as ModelEntry
+  const port = await freePort()
 
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => {
     c.comfyui.enabled = true
     c.gateway.autoSwap = true
     c.gateway.keepN = keepN
+    c.modelProfiles[model.key] = { [engine.id]: { profile: { port }, updatedAt: '' } }
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -74,7 +80,7 @@ function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
 }
 
 /** Load the model, render, and route it again just after the render ends, while release() is reloading it. */
-async function renderThenRouteDuringReload(r: ReturnType<typeof setUp>) {
+async function renderThenRouteDuringReload(r: Awaited<ReturnType<typeof setUp>>) {
   const first = await r.router.route(r.model.key)
   assert.ok('target' in first, JSON.stringify(first))
   await r.guard.acquire()
@@ -92,7 +98,7 @@ async function renderThenRouteDuringReload(r: ReturnType<typeof setUp>) {
 test('a request for the model a render unloaded, landing while release() reloads it, waits for that reload (keep-N 1)', {
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
-  const r = setUp(t, 1)
+  const r = await setUp(t, 1)
 
   const after = await renderThenRouteDuringReload(r)
 
@@ -105,7 +111,7 @@ test('a request for the model a render unloaded, landing while release() reloads
 test('with keep-N 2 that request gets the reloading primary, not a second copy in a pool slot', {
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
-  const r = setUp(t, 2)
+  const r = await setUp(t, 2)
 
   const after = await renderThenRouteDuringReload(r)
 
@@ -121,7 +127,8 @@ test('with keep-N 2 that request gets the reloading primary, not a second copy i
 // the primary served the request during the render.
 
 /** A stand-in vLLM venv python: `-c` is the preflight (`import uvloop`), which takes 1 s while a `slow` file exists and
- *  first writes `probing`; anything else is the server, which notes the model in $SPAWN_LOG and answers /health. */
+ *  first writes `probing`; anything else is the server, which notes the model in $SPAWN_LOG and answers /health. Like
+ *  the llama-server one it binds the port it is handed, so setUpVllm pins each model's port in its profile. */
 const FAKE_VLLM_JS = `
 const fs = require('fs')
 const http = require('http')
@@ -132,7 +139,7 @@ http.createServer((req, res) => { res.writeHead(req.url === '/health' ? 200 : 40
 process.on('SIGTERM', () => process.exit(0))
 `
 
-function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: number) {
+async function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: number) {
   const dir = tmpDir('tllm-comfy-preflight-')
   const spawnLog = join(dir, 'spawns.log')
   writeFileSync(join(dir, 'fake-vllm.js'), FAKE_VLLM_JS)
@@ -156,12 +163,17 @@ function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: number) {
   }) as unknown as ModelEntry
   const a = entry('model-a')
   const b = entry('model-b')
+  // One port each: with keep-N 2, model-a runs in the primary while model-b would start in a pool slot.
+  const portA = await freePort()
+  const portB = await freePort()
 
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => {
     c.comfyui.enabled = true
     c.gateway.autoSwap = true
     c.gateway.keepN = keepN
+    c.modelProfiles[a.key] = { [engine.id]: { profile: { port: portA }, updatedAt: '' } }
+    c.modelProfiles[b.key] = { [engine.id]: { profile: { port: portB }, updatedAt: '' } }
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -194,7 +206,7 @@ const RENDERING = { status: 503, message: 'ComfyUI is rendering — model swap p
 test('a render that begins during a pool-slot load\'s vLLM preflight: the slot engine never spawns, and the client may retry', {
   skip: process.platform === 'win32' && 'uses a POSIX shell script as the fake engine interpreter',
 }, async (t) => {
-  const r = setUpVllm(t, 2)
+  const r = await setUpVllm(t, 2)
   assert.ok('target' in (await r.router.route(r.a.key)))
 
   r.slowPreflight()
@@ -211,7 +223,7 @@ test('a render that begins during a pool-slot load\'s vLLM preflight: the slot e
 test('a render that begins during a gateway load\'s vLLM preflight into the primary: refused before the spawn, loaded on release', {
   skip: process.platform === 'win32' && 'uses a POSIX shell script as the fake engine interpreter',
 }, async (t) => {
-  const r = setUpVllm(t, 1)
+  const r = await setUpVllm(t, 1)
 
   r.slowPreflight()
   const pending = r.router.route(r.b.key)

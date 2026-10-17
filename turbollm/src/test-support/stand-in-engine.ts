@@ -36,9 +36,12 @@ function ggufEntry(dir: string, name: string): ModelEntry {
   } as unknown as ModelEntry
 }
 
-/** A port nothing listens on now, from the OS's ephemeral range: a model pinned to it stays clear of the 8081+ walk
- *  every other engine test in a parallel run competes for. */
-async function freePort(): Promise<number> {
+/** A port nothing listens on now, from the OS's ephemeral range: a model pinned to it stays clear of the 8081+ walk.
+ *  Every test whose stand-in engine binds the port it is handed pins one: allocPort only probes a port and closes it
+ *  again, so two test files walking 8081+ at once could be handed the same port, and the engine that bound it second
+ *  died with EADDRINUSE. Pin it with StartOpts.preferredPort, or with a saved profile's `port` when a ModelRouter
+ *  builds the StartOpts (as realEngineSetUp does). */
+export async function freePort(): Promise<number> {
   const srv = createServer()
   await new Promise<void>((resolve) => srv.listen(0, '127.0.0.1', resolve))
   const { port } = srv.address() as AddressInfo

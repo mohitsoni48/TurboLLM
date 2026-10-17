@@ -8,9 +8,14 @@ import { test } from 'node:test'
 import { ConfigStore } from '../config/config'
 import { ComfyGuard } from './comfy-guard'
 import { Manager, type StartOpts } from './manager'
+import { freePort } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 
-/** A stand-in llama-server: answers /health on --port, and takes FAKE_TERM_DELAY_MS to exit on SIGTERM. */
+/** A stand-in llama-server: answers /health on --port, and takes FAKE_TERM_DELAY_MS to exit on SIGTERM.
+ *  It binds the port it is handed, so every test here pins that port (preferredPort) to a free ephemeral one: the
+ *  8081+ walk is shared with other test files' engines in a parallel run, and two of them handed the same port made
+ *  the second die with EADDRINUSE (see freePort). The Manager stops and waits for one engine before it starts the
+ *  next, so one port per test serves every model it loads. */
 const FAKE_ENGINE_JS = `
 const http = require('http')
 const args = process.argv.slice(2)
@@ -29,11 +34,13 @@ test('a render that starts while a swap is stopping the old model kills it, and 
   const bin = join(dir, 'llama-server')
   writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, 'fake-engine.js')}" "$@"\n`)
   chmodSync(bin, 0o755)
+  const port = await freePort()
   const opts = (key: string): StartOpts => ({
     engine: { id: 'fake', name: 'Fake', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
     model: { key, name: key, quant: '', ctx: 0, vision: false },
     modelPath: join(dir, `${key}.gguf`),
     extraArgs: [],
+    preferredPort: port,
   })
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
@@ -74,11 +81,13 @@ test('a paused load the release resumes is refused again by an acquire that land
   const bin = join(dir, 'llama-server')
   writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, 'fake-engine.js')}" "$@"\n`)
   chmodSync(bin, 0o755)
+  const port = await freePort()
   const opts = (key: string): StartOpts => ({
     engine: { id: 'fake', name: 'Fake', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
     model: { key, name: key, quant: '', ctx: 0, vision: false },
     modelPath: join(dir, `${key}.gguf`),
     extraArgs: [],
+    preferredPort: port,
   })
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
@@ -121,11 +130,12 @@ function fakeVllmPython(dir: string): string {
   return bin
 }
 
-const vllmOpts = (bin: string, dir: string, key: string): StartOpts => ({
+const vllmOpts = (bin: string, dir: string, key: string, port: number): StartOpts => ({
   engine: { id: 'fake', name: 'Fake', binPath: bin, kind: 'vllm', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
   model: { key, name: key, quant: '', ctx: 0, vision: false },
   modelPath: join(dir, key),
   extraArgs: [],
+  preferredPort: port,
 })
 
 /** Resolves once the slow preflight has begun: the reload is past its pre-start hook and has not spawned. */
@@ -141,13 +151,14 @@ test('an acquire during the reload\'s engine preflight: the model does not come 
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-preflight-')
   const bin = fakeVllmPython(dir)
+  const port = await freePort()
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
   t.after(() => guard.stop())
-  await manager.load(vllmOpts(bin, dir, 'A'))
+  await manager.load(vllmOpts(bin, dir, 'A', port))
   assert.equal(manager.status().state, 'running')
   await guard.acquire()
 
@@ -172,6 +183,7 @@ test('a paused load the release resumes is refused right before its spawn by an 
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-preflight-resume-')
   const bin = fakeVllmPython(dir)
+  const port = await freePort()
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
   const manager = new Manager(store)
@@ -180,7 +192,7 @@ test('a paused load the release resumes is refused right before its spawn by an 
   t.after(() => guard.stop())
   await guard.acquire()
   await assert.rejects(
-    manager.load(vllmOpts(bin, dir, 'B'), { beforeStart: () => guard.freeComfyUIBeforeLoad() }),
+    manager.load(vllmOpts(bin, dir, 'B', port), { beforeStart: () => guard.freeComfyUIBeforeLoad() }),
     /ComfyUI is rendering/,
   )
 
@@ -203,7 +215,7 @@ test('a paused load the release resumes is refused right before its spawn by an 
 // An engine update, delete or purge does not wait for a render: the model is already unloaded, so nothing refuses it.
 // A purge (or an official llama.cpp backend's update, which registers the new build under a new id and deletes the old
 // one's folder) removed the engine and its binary, and the reload then started that binary: engine_spawn_failed, ENOENT.
-function fakeLlamaEngine(dir: string) {
+function fakeLlamaEngine(dir: string, port: number) {
   writeFileSync(join(dir, 'fake-engine.js'), FAKE_ENGINE_JS)
   const bin = join(dir, 'llama-server')
   writeFileSync(bin, `#!/bin/sh\necho spawned >> "${join(dir, 'spawns')}"\nexec "${process.execPath}" "${join(dir, 'fake-engine.js')}" "$@"\n`)
@@ -211,6 +223,7 @@ function fakeLlamaEngine(dir: string) {
   const engine: StartOpts['engine'] = { id: 'fake', name: 'Fake llama.cpp', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' }
   const opts = (key: string): StartOpts => ({
     engine, model: { key, name: key, quant: '', ctx: 0, vision: false }, modelPath: join(dir, `${key}.gguf`), extraArgs: [],
+    preferredPort: port,
   })
   const registered = new Map([[engine.id, engine]])
   const spawns = () => (existsSync(join(dir, 'spawns')) ? readFileSync(join(dir, 'spawns'), 'utf8').split('\n').filter(Boolean).length : 0)
@@ -235,7 +248,7 @@ test('an engine purged during a render: release does not start its missing binar
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-purged-')
-  const e = fakeLlamaEngine(dir)
+  const e = fakeLlamaEngine(dir, await freePort())
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
   const manager = new Manager(store)
@@ -266,7 +279,7 @@ test('a paused load whose engine was purged during the render is not started, an
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-purged-paused-')
-  const e = fakeLlamaEngine(dir)
+  const e = fakeLlamaEngine(dir, await freePort())
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
   const manager = new Manager(store)
@@ -292,7 +305,7 @@ test('an engine updated to a binary at a new path during a render: release does 
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-moved-')
-  const e = fakeLlamaEngine(dir)
+  const e = fakeLlamaEngine(dir, await freePort())
   const store = ConfigStore.load(join(dir, 'config.json'))
   store.update((c) => { c.comfyui.enabled = true })
   const manager = new Manager(store)
