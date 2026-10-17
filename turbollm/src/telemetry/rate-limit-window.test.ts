@@ -1,6 +1,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluateWindow, ipRateLimitSubject, MACHINE_LIMIT, type RateLimitWindow } from './rate-limit-window'
+import {
+  evaluateWindow,
+  IP_DAILY_LIMIT,
+  IP_LIMIT,
+  IP_TIERS,
+  ipRateLimitSubject,
+  MACHINE_LIMIT,
+  type RateLimitWindow,
+} from './rate-limit-window'
 import { MAX_BATCH } from './ingest'
 
 const PERIOD_MS = 60_000
@@ -81,6 +89,38 @@ test('evaluateWindow: two full queue-drains in one window exactly fill it, a thi
   assert.equal(second.success, true, 'MACHINE_LIMIT is exactly 2x MAX_BATCH by design')
   const third = evaluateWindow(second.next!, 1_040, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
   assert.equal(third.success, false)
+})
+
+// Charges one IP the way the Worker does: every tier in order, each on its own window, stopping at the
+// first that refuses. Returns whether the request got through.
+function chargeIpTiers(windows: Map<string, RateLimitWindow>, now: number, amount: number): boolean {
+  for (const tier of IP_TIERS) {
+    const { next, success } = evaluateWindow(windows.get(tier.key), now, tier.periodSeconds * 1000, amount, tier.limit)
+    if (next) windows.set(tier.key, next)
+    if (!success) return false
+  }
+  return true
+}
+
+test('IP_TIERS: one IP flooding for a day writes at most IP_DAILY_LIMIT rows, quarantined ones included', () => {
+  // IP_LIMIT bounds a minute only: a full batch of quarantine-bound events every 6 s passed 7.2M rows
+  // a day (~29 GB at the 4 KB event cap), which fills a D1 database within hours.
+  const windows = new Map<string, RateLimitWindow>()
+  const DAY_MS = 86_400_000
+  let written = 0
+  for (let t = 0; t < DAY_MS; t += 6_000) {
+    if (chargeIpTiers(windows, t, MAX_BATCH)) written += MAX_BATCH
+  }
+  assert.equal(written, IP_DAILY_LIMIT, `${written} rows from one IP in a day`)
+  assert.equal(chargeIpTiers(windows, DAY_MS, MAX_BATCH), true, 'the next day starts a fresh budget')
+})
+
+test('IP_TIERS: every tier clears a full legitimate flush, and the per-minute tier keeps its key', () => {
+  for (const tier of IP_TIERS) {
+    assert.ok(tier.limit >= MAX_BATCH, `${tier.key}: a limit below MAX_BATCH deadlocks a client's own flush`)
+  }
+  // Renaming it would hand every IP a fresh minute window at the deploy.
+  assert.deepEqual(IP_TIERS[0], { key: 'ip', limit: IP_LIMIT, periodSeconds: 60 })
 })
 
 test('ipRateLimitSubject: every address in one IPv6 /64 shares one key, however it is spelled', () => {

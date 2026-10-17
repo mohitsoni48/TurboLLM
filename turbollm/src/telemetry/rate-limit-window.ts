@@ -26,6 +26,23 @@ export interface RateLimitWindow {
 export const MACHINE_LIMIT = 1000
 export const IP_LIMIT = 5000
 
+// IP_LIMIT bounds a minute, not a day: one IP (or IPv6 /64) holding it for a
+// day writes 7.2M D1 rows, quarantined ones included, of up to MAX_EVENT_BYTES
+// (4 KB) each, ~29 GB, which fills a D1 database (10 GB at most) within
+// hours, after which storing real events fails silently. This caps the day
+// at 20 full queue drains (MAX_BATCH), so a machine catching up or a shared
+// NAT keeps room, and one key's worst case is ~40 MB a day.
+export const IP_DAILY_LIMIT = 10_000
+
+/** The IP tiers the Worker charges, in order, each on its own rate-limiter
+ *  key (`<key>:<ip hash>`) with accepted plus quarantined events, at least 1.
+ *  Exported, like the limits above, so the regression test runs the Worker's
+ *  own tiers rather than a copy of them. */
+export const IP_TIERS: readonly { key: string; limit: number; periodSeconds: number }[] = [
+  { key: 'ip', limit: IP_LIMIT, periodSeconds: 60 },
+  { key: 'ipday', limit: IP_DAILY_LIMIT, periodSeconds: 86_400 },
+]
+
 export interface RateLimitCheck {
   /** The window state to persist, or `null` if nothing should be written. */
   next: RateLimitWindow | null
