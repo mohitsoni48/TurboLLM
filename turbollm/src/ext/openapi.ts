@@ -36,7 +36,8 @@ export interface RouteSpec {
   audited?: string
   requestSchema?: string
   responseSchema?: string
-  /** SSE endpoints document `text/event-stream` alongside `application/json` (spec §5.1, §6.3). */
+  /** SSE endpoints document `text/event-stream` alongside `application/json` (spec §5.1, §6.3),
+   *  always under 200: that is what streamSSE answers. */
   sse?: boolean
   /** A second possible success response, for the one route whose response shape depends on
    *  request BODY content rather than just the `Accept` header (which `sse` already covers).
@@ -161,7 +162,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     // since it originates in the forwarded route.
     altResponse: {
       status: '202', schema: 'Run', sse: true,
-      description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON) or an SSE stream, per Accept (spec §5.1).',
+      description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON), or with Accept: text/event-stream an SSE stream answered with 200 (spec §5.1).',
     },
     errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
     // Read only on the generate:false path, which answers with a Message.
@@ -557,15 +558,16 @@ function buildOperation(route: RouteSpec): JsonSchema {
   // reason — Step 5's real-validator pass, not a guess).
   const sseNote = 'Named SSE events: run, delta, reasoning, tool_call, usage, error, done (spec §5.1, §6.3).'
   const sseContent = { 'text/event-stream': { schema: { type: 'string' } } }
+  // Hono's streamSSE always answers 200, whatever status the route's JSON answer has. The dual-
+  // mode routes listed text/event-stream under their JSON answer's 202, which the stream never
+  // sent, so the stream is documented as its own 200 response.
+  const sseResponse = { description: `OK. For Accept: text/event-stream. ${sseNote}`, content: sseContent }
   let successResponse: JsonSchema
   if (route.responseSchema && route.sse) {
-    // Dual-mode: POST .../messages/generate answers JSON (202) or SSE, per Accept (spec §5.1).
+    // Dual-mode: POST .../messages/generate answers JSON (202) or SSE (200), per Accept (spec §5.1).
     successResponse = {
-      description: `OK. For Accept: text/event-stream, ${sseNote}`,
-      content: {
-        'application/json': { schema: { $ref: `#/components/schemas/${route.responseSchema}` } },
-        ...sseContent,
-      },
+      description: 'OK.',
+      content: { 'application/json': { schema: { $ref: `#/components/schemas/${route.responseSchema}` } } },
     }
   } else if (route.sse) {
     // SSE-only: GET .../stream never answers JSON (routes.runs.ts calls streamSSE unconditionally).
@@ -581,6 +583,7 @@ function buildOperation(route: RouteSpec): JsonSchema {
 
   const responses: Record<string, JsonSchema> = {
     [successStatus]: successResponse,
+    ...(route.responseSchema && route.sse ? { '200': sseResponse } : {}),
     ...errorResponses(route.errors),
   }
 
@@ -591,11 +594,9 @@ function buildOperation(route: RouteSpec): JsonSchema {
     const alt = route.altResponse
     responses[alt.status] = {
       description: alt.description,
-      content: {
-        'application/json': { schema: { $ref: `#/components/schemas/${alt.schema}` } },
-        ...(alt.sse ? sseContent : {}),
-      },
+      content: { 'application/json': { schema: { $ref: `#/components/schemas/${alt.schema}` } } },
     }
+    if (alt.sse) responses['200'] = { ...sseResponse, description: `Default (generate omitted or true) with Accept: text/event-stream. ${sseNote}` }
   }
 
   // Path params: real `parameters` entries (release-gate I11), not the non-standard

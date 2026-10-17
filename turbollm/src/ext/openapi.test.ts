@@ -71,6 +71,60 @@ test('POST .../messages/generate documents 202, not the default-inferred 201', (
   assert.ok(!op.responses['201'], 'must not ALSO claim 201 — that is the wrong status for this route')
 })
 
+// streamSSE always answers 200, but the dual-mode routes listed text/event-stream under the JSON
+// answer's 202, so a client generated from the document treated the stream's 200 as undocumented
+// (or expected a 202 that never came). The SSE status comes from the real routes here.
+test('the generate routes document their SSE stream under 200 and only the JSON Run under 202', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  type Responses = Record<string, { content?: Record<string, unknown> }>
+  const dir = tmpDir('turbollm-ext-openapi-sse-status-')
+  const conv = new ConversationStore(dir)
+  try {
+    const key = 'tllm-ext-openapi-sse-status'
+    const d = {
+      db: conv,
+      chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
+      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
+      manager: { status: () => ({ state: 'running', model: { key: 'm', name: 'm', ctx: 0 } }), target: () => 'http://127.0.0.1:9' },
+    } as never
+    const app = new Hono()
+    const runs = new PublicRunManager()
+    registerExtChatRoutes(app, d)
+    registerExtRunRoutes(app, d, runs, { makeBody: () => async () => ({ status: 'complete' as const }) })
+    const chat = await (await app.request('/api/ext/v1/chats', {
+      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: '{}',
+    })).json() as { id: string }
+    for (const [path, docPath] of [
+      [`/api/ext/v1/chats/${chat.id}/messages/generate`, '/api/ext/v1/chats/{id}/messages/generate'],
+      [`/api/ext/v1/chats/${chat.id}/messages`, '/api/ext/v1/chats/{id}/messages'],
+    ]) {
+      const send = async (accept: string) => {
+        const res = await app.request(path, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: accept },
+          body: JSON.stringify({ role: 'user', content: 'hi' }),
+        })
+        const status = String(res.status)
+        const type = (res.headers.get('Content-Type') ?? '').split(';')[0]
+        if (type === 'application/json') await runs.settled(((await res.json()) as { id: string }).id)
+        else await res.text()
+        return { status, type }
+      }
+      const responses = (doc.paths[docPath].post as { responses: Responses }).responses
+      for (const accept of ['application/json', 'text/event-stream']) {
+        const { status, type } = await send(accept)
+        assert.equal(type, accept)
+        assert.ok(responses[status]?.content?.[type], `${docPath}: the route answers ${status} ${type}, the document does not list it`)
+      }
+      const listing = (type: string) => Object.keys(responses).filter((st) => responses[st].content?.[type] !== undefined)
+      assert.deepEqual(listing('text/event-stream'), ['200'], `${docPath}: the stream is documented only under 200`)
+      assert.ok(!listing('application/json').includes('200'), `${docPath}: no JSON answer is sent with 200`)
+    }
+  } finally {
+    conv.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /runs/:id/cancel documents 200, not the default-inferred 201', () => {
   const doc = buildOpenApiDocument('1.0.0')
   const op = doc.paths['/api/ext/v1/runs/{id}/cancel'].post as { responses: Record<string, unknown> }
