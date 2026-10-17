@@ -2430,6 +2430,9 @@ export function registerApi(app: Hono, d: Deps): void {
             } else {
               bytePos = firstLook ? size : 0
               before = readLogBytes(path, bytePos)
+              // A resume's cut line that had no newline yet (a long `\r` progress bar) belongs
+              // to the old log: left set, the skip ate this new log's first line.
+              dropPartial = false
             }
             lastPath = path
             carry = Buffer.alloc(0)

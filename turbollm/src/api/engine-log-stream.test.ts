@@ -274,4 +274,33 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     assert.deepEqual(JSON.parse((await again.next()).data), { line: 'after' })
     await again.close()
   })
+
+  // A resume whose 256 KiB floor cuts a line skips that line's tail, up to its newline. When
+  // there is no newline yet (a long carriage-return progress bar) and the engine restarts or
+  // switches first, that skip used to carry over to the new log and eat its first line.
+  await t.test('a resume cut mid-line that switches to a new log before any newline still sends the new log\'s first line', async () => {
+    for (const how of ['switch', 'restart'] as const) {
+      const logJ = join(dir, `j-${how}.log`)
+      const logJ2 = join(dir, `j-${how}-next.log`)
+      writeFileSync(logJ, 'seed\n')
+      let active = logJ
+      const app = fakeApp(() => active)
+      const first = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+      const ping = await first.next(3000, { pings: true })
+      await first.close()
+
+      appendFileSync(logJ, 'progress 50%\r'.repeat(Math.ceil((300 * 1024) / 13))) // over 256 KiB, no newline
+      const again = sseEventReader((await resumeFrom(app, ping.id!)).body!)
+      await new Promise((r) => setTimeout(r, 600)) // the resumed first look reads the cut tail
+      if (how === 'switch') {
+        writeFileSync(logJ2, 'new log line 1\nnew log line 2\n')
+        active = logJ2
+      } else {
+        writeFileSync(logJ, 'new log line 1\nnew log line 2\n') // shorter than what was read
+      }
+      assert.deepEqual(JSON.parse((await again.next()).data), { line: 'new log line 1' }, how)
+      assert.deepEqual(JSON.parse((await again.next()).data), { line: 'new log line 2' }, how)
+      await again.close()
+    }
+  })
 })
