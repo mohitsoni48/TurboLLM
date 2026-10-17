@@ -45,8 +45,8 @@ export interface SwapGate {
  *    `fn()`, then restore the prior model (a no-op if nothing was loaded before).
  *  - 'skip-busy': a different model is loaded and the engine is actively generating — `fn` is
  *    never called; the caller logs "skipped — model busy" (spec 20 §6).
- * Restoration is best-effort and always attempted (even if `fn` throws), so a routine run can
- * never strand the engine on a model the user didn't pick.
+ * Restoration is best-effort and attempted after `fn` (even if it throws), and after a pinned model
+ * that fails to load: that load may already have stopped the user's model.
  * With `gate`, the caller holds the GenerationGate on entry: it is released right before `fn` and
  * taken again around the restore (see {@link SwapGate}).
  */
@@ -67,6 +67,12 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
     // ComfyUI busy is a temporary yield, not a load failure.
     if (swapResult.message.includes('ComfyUI is rendering'))
       return { outcome: 'skip-comfyui-busy' }
+    // A load that ran and failed has already stopped the user's model when it took that model's slot (keep-N 1, or a
+    // full pool): Manager.load stops the slot before it starts the new model. Without this every run of a routine
+    // whose model cannot start left the engine empty. A failure that stopped nothing (an incompatible model, one
+    // that is gone) finds the user's model still running, and the restore is a no-op (doLoad's fast path). The
+    // caller still holds the gate here: fn never ran, so it was never let go.
+    if (currentlyLoaded) await restore(deps, currentlyLoaded)
     return { outcome: 'skip-load-failed', message: swapResult.message }
   }
 
@@ -79,13 +85,20 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
       // stop the restore, which must never be skipped.
       const unlock = gate ? await gate.reacquire().catch(() => undefined) : undefined
       try {
-        await deps.modelRouter.loadExplicit(currentlyLoaded)
-      } catch (e) {
-        console.warn(`[routines] failed to restore the previously-loaded model after a routine run: ${e instanceof Error ? e.message : String(e)}`)
+        await restore(deps, currentlyLoaded)
       } finally {
         unlock?.()
       }
     }
   }
   return { outcome: 'ran' }
+}
+
+/** Reload the model that was loaded before the routine's swap: the same loadExplicit() the swap made. Best effort. */
+async function restore(deps: ModelSwapDeps, modelKey: string): Promise<void> {
+  try {
+    await deps.modelRouter.loadExplicit(modelKey)
+  } catch (e) {
+    console.warn(`[routines] failed to restore the previously-loaded model after a routine run: ${e instanceof Error ? e.message : String(e)}`)
+  }
 }

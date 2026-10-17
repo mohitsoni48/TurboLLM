@@ -144,6 +144,10 @@ export async function runCliInteractiveRoutine(
   if (action === 'swap-then-run') {
     const swapResult = await deps.loadExplicit(pinnedModel)
     if ('status' in swapResult) {
+      // A load that failed may already have stopped the user's model (cli-routine.ts's swap
+      // explains when): it is restored, or every run of a routine whose model cannot start left
+      // the engine empty. ComfyUI's temporary refusal is not a load failure.
+      if (currentlyLoaded && !swapResult.message.includes('ComfyUI is rendering')) await restoreModel(deps, currentlyLoaded)
       finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
       return 'errored'
     }

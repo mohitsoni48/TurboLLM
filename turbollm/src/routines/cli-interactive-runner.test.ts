@@ -8,6 +8,7 @@ import {
 } from './cli-interactive-runner'
 import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
 import type { Routine, RoutineRun } from './schema'
+import { realEngineSetUp } from '../test-support/stand-in-engine'
 
 function freshStore(): ConversationStore {
   return new ConversationStore(IN_MEMORY_DATA_DIR)
@@ -184,6 +185,31 @@ test('a failed pinned-model load records errored, never creates a terminal', asy
   }))
   assert.equal(status, 'errored')
   assert.match(store.getRoutineRun(run.id)!.error ?? '', /Could not load pinned model/)
+})
+
+// With keep-N 1 the routine's model loads into the primary, so Manager.load stops the user's model before the
+// routine's own fails to start. Nothing restored it: every run of that routine left the engine empty.
+test('a pinned model that fails to load after the user model was stopped reloads the user model', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, userModel, brokenModel } = await realEngineSetUp(t)
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = interactiveRoutine(store, { modelKey: brokenModel.key })
+  const run = schedulerRun(store, routine)
+
+  const status = await runCliInteractiveRoutine(routine, run, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k) => modelRouter.loadExplicit(k),
+    createTerminal: neverCreatesTerminal(),
+  }))
+
+  assert.equal(status, 'errored')
+  const st = manager.status()
+  assert.equal(st.state, 'running', `the user's model is loaded again, got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
 })
 
 // ── Terminal creation failure ────────────────────────────────────────────────────────────────

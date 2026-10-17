@@ -6,6 +6,7 @@ import { sessionAuth } from '../code/session-auth'
 import { CLI_ROUTINE_TIMEOUT_MS, type CliProcessResult } from './cli-process'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
 import type { Routine } from './schema'
+import { realEngineSetUp } from '../test-support/stand-in-engine'
 
 const OK_STDOUT = '{"type":"result","is_error":false,"result":"done"}'
 
@@ -282,7 +283,7 @@ test('C1: an idle manager AND a free gate slot is what actually allows the swap'
   assert.equal(store.listRoutineRuns(routine.id)[0].status, 'ok')
 })
 
-test('a failed pinned-model load records errored, never spawns, and never restores', async () => {
+test('a failed pinned-model load records errored, never spawns, and restores the previous model', async () => {
   const store = freshStore()
   const routine = codeRoutine(store)
   const loadCalls: string[] = []
@@ -297,7 +298,31 @@ test('a failed pinned-model load records errored, never spawns, and never restor
   assert.equal(runs[0].status, 'errored')
   assert.match(runs[0].error ?? '', /Could not load pinned model 'pinned-model'/)
   assert.match(runs[0].error ?? '', /No model matching/)
-  assert.deepEqual(loadCalls, ['pinned-model'], 'a swap that never happened must not schedule a restore')
+  assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'], 'a failed load may have stopped the previous model already')
+})
+
+// With keep-N 1 the routine's model loads into the primary, so Manager.load stops the user's model before the
+// routine's own fails to start. Nothing restored it: every run of that routine left the engine empty.
+test('a pinned model that fails to load after the user model was stopped reloads the user model', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, userModel, brokenModel } = await realEngineSetUp(t)
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const store = freshStore()
+  const routine = codeRoutine(store, { modelKey: brokenModel.key })
+
+  await runCliCodeRoutine(routine, baseDeps({
+    store,
+    getLoadedModelKey: () => manager.status().model?.key ?? null,
+    loadExplicit: (k) => modelRouter.loadExplicit(k),
+    runProcess: neverSpawns(),
+  }))
+
+  assert.equal(store.listRoutineRuns(routine.id)[0].status, 'errored')
+  const st = manager.status()
+  assert.equal(st.state, 'running', `the user's model is loaded again, got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
 })
 
 // ── Model restore (spec 20 §5 + the documented SPEC-GAP) ──────────────────────────────────────

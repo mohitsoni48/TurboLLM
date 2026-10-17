@@ -7,6 +7,7 @@ import { ModelRouter } from '../gateway/model-router'
 import { defaultConfig, type ConfigStore } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
+import { realEngineSetUp } from '../test-support/stand-in-engine'
 
 function fakeDeps(opts: { loadedKey: string | null; state?: string; activeRequests?: number }): { deps: ModelSwapDeps; loadCalls: string[] } {
   const loadCalls: string[] = []
@@ -173,4 +174,26 @@ test('a routine pinned to a chat model swaps it in, runs, and restores the Jev m
     restoreArgs.includes('--convert') && restoreArgs.includes('classify'),
     `the restored Jev model keeps its launch flags, got ${JSON.stringify(restoreArgs)}`,
   )
+})
+
+// ── a pinned model that fails to load still gives the user's model back ──────────────────────────
+// Against a real ConfigStore, Manager and ModelRouter and a stand-in llama-server: with keep-N 1 the routine's model
+// loads into the primary, so Manager.load stops the user's model before the routine's own fails to start. Nothing
+// restored it: every run of that routine left the engine empty.
+
+test('a pinned model that fails to load after the user model was stopped reloads the user model', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, userModel, brokenModel } = await realEngineSetUp(t)
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  let called = false
+
+  const result = await withPinnedModel({ manager, modelRouter }, brokenModel.key, async () => { called = true })
+
+  assert.equal(result.outcome, 'skip-load-failed')
+  assert.equal(called, false)
+  const st = manager.status()
+  assert.equal(st.state, 'running', `the user's model is loaded again, got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, userModel.key)
 })

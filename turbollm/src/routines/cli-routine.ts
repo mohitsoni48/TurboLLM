@@ -180,12 +180,17 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     if (action === 'swap-then-run') {
       const swapResult = await deps.loadExplicit(pinnedModel)
       if ('status' in swapResult) {
-        // The swap never happened, so there is nothing loaded-by-us to restore — same call the
-        // Chat/pi path makes for its own 'skip-load-failed' outcome (model-swap.ts:53).
+        // A load that ran and failed has already stopped the user's model when it took that
+        // model's slot (keep-N 1, or a full pool): Manager.load stops the slot before it starts the
+        // new model. So it is restored in the finally below, as the Chat/pi path restores on its own
+        // 'skip-load-failed' (model-swap.ts); without that every run of a routine whose model
+        // cannot start left the engine empty. A failure that stopped nothing finds the user's model
+        // still running, and the restore is a no-op (doLoad's fast path). ComfyUI's temporary
+        // refusal is not a load failure.
+        if (!swapResult.message.includes('ComfyUI is rendering')) previousModel = currentlyLoaded
         finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
         return
       }
-      // Only recorded AFTER a successful swap: a failed load must not schedule a restore.
       previousModel = currentlyLoaded
     }
 
