@@ -546,6 +546,42 @@ test('preflight --dry-run --approved does not redeploy the telemetry Worker', PO
   }
 });
 
+// The telemetry gate redeployed the production Worker the moment it saw drift: before the checks after
+// it ran, and whatever the ones before it had found. On a dirty tree that shipped uncommitted Worker
+// code, and preflight then failed on the very problems that should have stopped the deploy.
+test('preflight --approved redeploys the telemetry Worker only once every blocking check passes', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: [], rules: [{ when: 'npm view turbollm version', out: '1.0.0' }] });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    put(s.work, 'telemetry-worker/scripts/schema-hash.mjs', "process.exit(process.argv[2] === 'check' ? 1 : 0);\n");
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'drift');
+    const deploys = () => s.calls().filter((c) => c.startsWith('npm run deploy'));
+
+    // A check that runs before the gate: an uncommitted Worker change.
+    put(s.work, 'telemetry-worker/src/index.ts', 'export default {};\n');
+    const dirty = s.release(['preflight', '--approved']);
+    assert.deepEqual(deploys(), [], 'the uncommitted Worker code went to production');
+    assert.notEqual(dirty.code, 0, dirty.out);
+    assert.match(dirty.out, /working tree is not clean/);
+    assert.match(dirty.out, /telemetry Worker was not redeployed/);
+
+    // A check that runs after it: magic-close syntax in a commit message.
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'worker change, closes #12');
+    const magic = s.release(['preflight', '--approved']);
+    assert.deepEqual(deploys(), [], magic.out);
+    assert.notEqual(magic.code, 0, magic.out);
+    assert.match(magic.out, /Closes\/Fixes\/Resolves #NNN/);
+
+    must(s.g, 'commit', '--amend', '-m', 'worker change (#12)');
+    const clean = s.release(['preflight', '--approved']);
+    assert.equal(deploys().length, 1, clean.out);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
 // A push that failed after the commit left nothing to commit on the re-run, which then recorded ok
 // without pushing: `verify` checked a PR head without the release commit, and `merge` merged it.
 test('prepare re-run after a failed push pushes the release commit', POSIX_ONLY, () => {

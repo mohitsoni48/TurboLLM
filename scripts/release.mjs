@@ -323,24 +323,19 @@ async function phasePreflight(state, flags) {
   //    telling a human to go run that command by hand. Without --approved it
   //    still only reports — a Worker deploy is production infra, so the same
   //    approval bar as merge/publish/announce applies — and a --dry-run only
-  //    says it would deploy, like every other gated side effect.
+  //    says it would deploy, like every other gated side effect. The deploy
+  //    itself waits for every other check below: run here, it shipped
+  //    whatever the tree held (uncommitted Worker code included) from
+  //    whatever branch was checked out, and preflight then failed on the very
+  //    problems that should have stopped it.
   const hashScript = join(REPO, 'telemetry-worker', 'scripts', 'schema-hash.mjs');
+  let redeployWorker = false;
   if (existsSync(hashScript)) {
-    let h = run(process.execPath, [hashScript, 'check']);
+    const h = run(process.execPath, [hashScript, 'check']);
     if (h.code !== 0) {
-      if (flags.approved && flags['dry-run']) {
-        note('[dry-run] telemetry schema drifted from the deployed Worker — would redeploy it now (`cd telemetry-worker && npm run deploy`) and re-check the hash');
-      } else if (flags.approved) {
-        step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
-        const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
-        if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
-        note(tailOf(deploy.out, 12));
-        h = run(process.execPath, [hashScript, 'check']);
-        if (h.code !== 0) {
-          problems.push('telemetry Worker deploy ran but the schema hash still does not match — inspect `telemetry-worker/scripts/schema-hash.mjs check` output above by hand before continuing.');
-        } else {
-          note('telemetry Worker redeployed — schema hash now matches (commit the updated deployed.schema.sha256 in this PR)');
-        }
+      if (flags.approved) {
+        redeployWorker = true;
+        note('telemetry schema drifted from the deployed Worker — it is redeployed once every other check passes (--approved)');
       } else {
         problems.push(
           'telemetry schema-hash gate is RED — the telemetry sources changed since the Worker was deployed.\n'
@@ -373,7 +368,24 @@ async function phasePreflight(state, flags) {
     out.push('WARN PR body not checked (no PR resolved)');
   }
 
-  if (problems.length) fail(`preflight found ${problems.length} blocking problem(s):\n\n- ${problems.join('\n\n- ')}`);
+  if (problems.length) {
+    fail(
+      `preflight found ${problems.length} blocking problem(s):\n\n- ${problems.join('\n\n- ')}`
+      + (redeployWorker ? '\n\nThe telemetry Worker was not redeployed: fix the above, then re-run `preflight --approved`.' : ''),
+    );
+  }
+  if (redeployWorker && flags['dry-run']) {
+    note('[dry-run] telemetry schema drifted from the deployed Worker — would redeploy it now (`cd telemetry-worker && npm run deploy`) and re-check the hash');
+  } else if (redeployWorker) {
+    step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
+    const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+    if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
+    note(tailOf(deploy.out, 12));
+    if (run(process.execPath, [hashScript, 'check']).code !== 0) {
+      fail('telemetry Worker deploy ran but the schema hash still does not match — inspect `telemetry-worker/scripts/schema-hash.mjs check` output above by hand before continuing.');
+    }
+    note('telemetry Worker redeployed — schema hash now matches (commit the updated deployed.schema.sha256 in this PR)');
+  }
   return out.join('\n');
 }
 
