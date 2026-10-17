@@ -25,6 +25,7 @@ import {
   checkApplyBlockers,
   classifyInstall,
   classifyUpdateFailure,
+  detectInstall,
   progressFromResult,
   realPathOr,
   AppUpdateProgressState,
@@ -37,6 +38,7 @@ import { APP_INSTALL_METHODS } from './telemetry/events/app-update'
 function signals(over: Partial<InstallSignals> = {}): InstallSignals {
   return {
     platform: 'linux',
+    androidApp: false,
     entry: '/opt/somewhere/turbollm/bin/turbollm.mjs',
     desktopEnv: false,
     inContainer: false,
@@ -130,6 +132,7 @@ test('classifyInstall: Android refuses and beats every other signal', () => {
   const info = classifyInstall(
     signals({
       platform: 'android',
+      androidApp: true,
       inContainer: true,
       entry: '/data/data/dev.turbollm/files/node_modules/turbollm/bin/turbollm.mjs',
       npmGlobalRoot: '/data/data/dev.turbollm/files/node_modules',
@@ -137,6 +140,37 @@ test('classifyInstall: Android refuses and beats every other signal', () => {
   )
   assert.equal(info.method, 'android')
   assert.equal(info.canSelfUpdate, false)
+})
+
+// Termux's Node reports platform 'android' as the packaged app's does, and every 'android' was
+// taken for the Play Store app: no self-update, and a note pointing at a store Termux users do
+// not install TurboLLM from. There TurboLLM is an ordinary npm install that can update itself.
+test('classifyInstall: Termux (android, not the packaged app) is an npm install that updates itself', () => {
+  const info = classifyInstall(
+    signals({
+      platform: 'android',
+      entry: '/data/data/com.termux/files/usr/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/data/data/com.termux/files/usr/lib/node_modules',
+    }),
+  )
+  assert.equal(info.method, 'npm_global')
+  assert.equal(info.canSelfUpdate, true)
+  assert.equal(info.command, 'npm i -g turbollm@latest')
+})
+
+test('detectInstall: the packaged app is told from Termux by its TURBOLLM_ANDROID_NATIVE_LIB_DIR', async (t) => {
+  const platform = process.platform
+  const libDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => {
+    Object.defineProperty(process, 'platform', { value: platform })
+    if (libDir === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    else process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = libDir
+  })
+  process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/dev.turbollm/lib/arm64'
+  assert.equal((await detectInstall()).method, 'android', 'the packaged app')
+  delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  assert.notEqual((await detectInstall()).method, 'android', 'Termux')
 })
 
 test('classifyInstall: a source checkout refuses and says to pull', () => {
@@ -162,7 +196,7 @@ test('every install method is covered by INSTALL_METHODS', () => {
     classifyInstall(signals({ entry: '/a/_npx/b/c' })).method,
     classifyInstall(signals({ desktopEnv: true })).method,
     classifyInstall(signals({ inContainer: true })).method,
-    classifyInstall(signals({ platform: 'android' })).method,
+    classifyInstall(signals({ platform: 'android', androidApp: true })).method,
     classifyInstall(signals({ sourceCheckout: true })).method,
     classifyInstall(signals()).method,
   ])

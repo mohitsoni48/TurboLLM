@@ -23,6 +23,7 @@ import { execFile, spawn } from 'node:child_process'
 import { existsSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { packagedAndroidApp } from './engines/zip-install'
 
 /** How this daemon was installed. `unknown` is a real, expected answer (an embedding we
  *  don't recognise) and is treated exactly like the refuse-to-self-update methods. */
@@ -43,8 +44,13 @@ export const INSTALL_METHODS: readonly InstallMethod[] = [
 /** The raw environment facts `classifyInstall` decides from. Passed in rather than read,
  *  so a test can present any of the six installs without being one. */
 export interface InstallSignals {
-  /** `process.platform` — 'android' is its own install method (the Play Store app). */
+  /** `process.platform`. */
   platform: string
+  /** The packaged Android app (nodejs-mobile, {@link packagedAndroidApp}): its own install
+   *  method, updated through the Play Store. Not `platform === 'android'` alone: Termux's Node
+   *  reports 'android' too, and there TurboLLM is an ordinary npm install that can update
+   *  itself (the restart it needs is wired there, unlike in the app). */
+  androidApp: boolean
   /** The entry script actually running (`process.argv[1]`), resolved. */
   entry: string
   /** The desktop wrapper sets `TURBOLLM_DESKTOP=1` when it spawns the daemon. The
@@ -89,7 +95,7 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
   // than a Windows branch and a POSIX branch (and so a test can present either shape).
   const entry = s.entry.toLowerCase().replace(/\\/g, '/')
 
-  if (s.platform === 'android') {
+  if (s.androidApp) {
     return {
       method: 'android',
       canSelfUpdate: false,
@@ -244,6 +250,7 @@ export async function detectInstall(): Promise<InstallInfo> {
   const root = await npmGlobalRoot()
   return classifyInstall({
     platform: process.platform,
+    androidApp: packagedAndroidApp(),
     entry,
     desktopEnv: process.env.TURBOLLM_DESKTOP === '1',
     inContainer: detectContainer(),
