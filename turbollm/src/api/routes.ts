@@ -3066,6 +3066,10 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/mcp/servers/:id', async (c) => {
+    // Removes a server the owner set up and stops its process — the same rule as the create and
+    // edit routes above, which a keyless Serve identity, Access JWT or open-LAN peer is refused.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Deleting an MCP server requires a valid API key from a non-host device.')
     const id = c.req.param('id')
     const cfg = d.store.snapshot()
     if (!cfg.mcp.servers.some((s) => s.id === id)) return err(c, 404, 'not_found', 'MCP server not found.')

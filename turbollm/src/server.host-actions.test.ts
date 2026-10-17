@@ -207,3 +207,50 @@ test("a keyless Serve identity, Access JWT or open-LAN peer cannot set an engine
     assert.equal(engine.sourceRepo, EVIL_SOURCE.sourceRepo)
   }
 })
+
+// DELETE /api/v1/mcp/servers/:id removes a server the owner set up (and stops its process): the same
+// host-side change as adding or editing one, refused to the same callers.
+test('a keyless Serve identity, Access JWT or open-LAN peer cannot delete an MCP server; with a key it can', async () => {
+  const saved = { id: 'srv-1', name: 'Owner files', transport: 'stdio' as const, command: 'sh', args: ['-c', 'true'], enabled: false }
+  // Tailscale Serve, no key.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve'; c.mcp.servers.push({ ...saved }) })
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    assert.equal((await tunneled(d, '/api/v1/mcp/servers/srv-1', serve, {}, 'DELETE')).status, 403)
+    assert.equal(cfg.mcp.servers.length, 1, 'the server is kept')
+    assert.equal((await tunneled(d, '/api/v1/mcp/servers/srv-1', { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE')).status, 200)
+    assert.equal(cfg.mcp.servers.length, 0)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-mcp.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d, cfg } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+        c.mcp.servers.push({ ...saved })
+      })
+      const access = { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }
+      assert.equal((await tunneled(d, '/api/v1/mcp/servers/srv-1', access, {}, 'DELETE')).status, 403)
+      assert.equal(cfg.mcp.servers.length, 1)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => {
+      c.daemon.lanBind = true
+      c.daemon.requireApiKey = false
+      c.mcp.servers.push({ ...saved })
+    })
+    assert.equal((await fromLan(d, '/api/v1/mcp/servers/srv-1', {}, {}, 'DELETE')).status, 403)
+    assert.equal(cfg.mcp.servers.length, 1)
+    assert.equal((await fromLan(d, '/api/v1/mcp/servers/srv-1', { 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE')).status, 200)
+    assert.equal(cfg.mcp.servers.length, 0)
+  }
+})
