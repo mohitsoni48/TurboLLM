@@ -6,6 +6,9 @@
 //  - A successful rebuild re-registers the engine and deletes the build it replaced, which runBuild
 //    left parked beside the build directory. Without that delete every successful rebuild left a
 //    multi-GB `.prev` tree behind until the next build of that directory.
+//  - A rebuild that compiles but whose binary fails its probe puts the parked build and its
+//    registration back. The route used to unregister the engine, fail the probe, then delete the
+//    parked build, leaving neither the working build nor its engine.
 // runBuild's own park-and-restore is unit-tested in engines/build-runner.test.ts. Here git, cmake,
 // nvcc and g++ are shell-script stand-ins on build.toolchainDirs (ahead of PATH), so the whole
 // clone → configure → compile → register flow runs with no network and no compiler. POSIX only.
@@ -29,8 +32,13 @@ const posixOnly = process.platform === 'win32' && 'uses shell-script stand-ins f
 const REPO_URL = 'https://127.0.0.1:9/owner/fork.git'
 const PREVIOUS_BUILD = '#!/bin/sh\necho "version: 100 (0123abc)"\n'
 
-/** What the stand-in toolchain does: no cmake at all, a compile that fails, or a build that works. */
-type Toolchain = 'no-cmake' | 'compile-error' | 'builds'
+/** What the stand-in toolchain does: no cmake at all, a compile that fails, a build that works, or one whose
+ *  llama-server does not run here (it fails the probe, as a CUDA build on a box without the driver does) — with the
+ *  parked previous build gone too, for a put-back that cannot happen. */
+type Toolchain = 'no-cmake' | 'compile-error' | 'builds' | 'builds-broken' | 'builds-broken-unparked'
+
+/** `cmake --build`'s stand-in for a llama-server that cannot start here. */
+const BROKEN_SERVER = String.raw`mkdir -p "$2/bin" && printf '#!/bin/sh\necho "libcuda.so.1: cannot open shared object file" >&2\nexit 127\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server"`
 
 function script(dir: string, name: string, lines: string[]): void {
   writeFileSync(join(dir, name), ['#!/bin/sh', ...lines, ''].join('\n'))
@@ -55,7 +63,12 @@ function fakeToolchain(dir: string, toolchain: Toolchain): string {
     toolchain === 'no-cmake' ? '  --version) exit 127 ;;' : '  --version) echo "cmake version 3.28.3" ;;',
     toolchain === 'compile-error'
       ? '  --build) echo "ggml.c:1:1: error: unknown type name ggml_fork_t" >&2; exit 1 ;;'
-      : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
+      : toolchain === 'builds-broken'
+        ? `  --build) ${BROKEN_SERVER} ;;`
+        : toolchain === 'builds-broken-unparked'
+          // $2 is <buildRoot>/build: the parked build is .<name>-<ms>.prev beside <buildRoot>.
+          ? `  --build) ${BROKEN_SERVER} && rm -rf "$2"/../../.*.prev ;;`
+          : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
     'esac',
   ])
   script(bin, 'nvcc', ['echo "Cuda compilation tools, release 12.6, V12.6.20"'])
@@ -116,7 +129,7 @@ function harness(toolchain: Toolchain) {
   }
   /** Everything beside the build directory: a parked `.prev` or moved-aside `.failed` tree. */
   const leftBeside = () => readdirSync(dirname(buildRoot)).filter((n) => n !== basename(buildRoot))
-  return { registry, build, binPath, rebuild, leftBeside }
+  return { store, registry, build, binPath, rebuild, leftBeside }
 }
 
 /** Retries `check` until it passes, for up to 5 s: the build a rebuild replaced is deleted in the background. */
@@ -160,6 +173,72 @@ test('POST /build/run: a successful rebuild replaces the engine and deletes the 
   assert.equal(eng?.version, '200 (4567def)', 'the new build is registered')
   assert.equal(h.registry.list().engines.length, 1, 'it replaced the old registration')
   await eventually(() => assert.deepEqual(h.leftBeside(), [], 'the parked previous build is deleted'))
+})
+
+// The new build compiled, so runBuild handed back the parked previous build for the route to delete. The route then
+// unregistered the engine to register the new binary under its name, the probe failed, and the finally deleted the
+// parked build: the user had neither the working build nor its engine, only a binary that does not run.
+test('POST /build/run: a rebuild whose new binary fails its probe puts the previous build and its engine back', { skip: posixOnly }, async () => {
+  const h = harness('builds-broken')
+  h.registry.setUpdatePolicy('fork', 'off')
+  h.store.update((c) => {
+    c.engines.push({ id: 'other', name: 'Other', binPath: '/opt/other/llama-server', kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' })
+  })
+  assert.equal(await h.rebuild(), 'fail')
+  assert.match(h.build.get().error ?? '', /couldn't register the engine, so the previous build was kept: Could not run the binary/)
+  assert.equal(readFileSync(h.binPath, 'utf8'), PREVIOUS_BUILD, 'the previous build is back where the engine runs it from')
+  const eng = h.registry.active()
+  assert.equal(eng?.id, 'fork', 'the same registration is back, and still active')
+  assert.equal(eng?.version, '100 (0123abc)')
+  assert.equal(eng?.updatePolicy, 'off')
+  assert.deepEqual(h.registry.list().engines.map((e) => e.id), ['fork', 'other'], 'back at its place in the list')
+  await eventually(() => assert.deepEqual(h.leftBeside(), [], 'the new build is removed and nothing is left parked'))
+})
+
+// When the parked build cannot be moved back the log says where it is, and the failure must not claim it was kept.
+// The registration still goes back: the next start's restoreInterruptedBuilds puts a registered engine's parked build
+// back when its directory has no binary.
+test('POST /build/run: a failed registration whose previous build cannot be put back does not report it as kept', { skip: posixOnly }, async () => {
+  const h = harness('builds-broken-unparked')
+  assert.equal(await h.rebuild(), 'fail')
+  const error = h.build.get().error ?? ''
+  assert.doesNotMatch(error, /previous build was kept/)
+  assert.match(error, /couldn't register the engine \(the previous build could not be moved back: the log says where it is kept\): Could not run the binary/)
+  assert.ok(h.build.get().log.some((l) => l.startsWith('Could not put the previous build back')), 'the log says where it is')
+  assert.equal(h.registry.active()?.id, 'fork', 'the registration is back')
+})
+
+// The user switched engines while the new binary was being probed: putting the old registration back made it active
+// again over that switch.
+test('POST /build/run: a failed rebuild puts the engine back without undoing a switch made during the probe', { skip: posixOnly }, async () => {
+  const h = harness('builds-broken')
+  h.store.update((c) => {
+    for (const id of ['other', 'third']) {
+      c.engines.push({ id, name: id, binPath: `/opt/${id}/llama-server`, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' })
+    }
+  })
+  const add = h.registry.add.bind(h.registry)
+  h.registry.add = async (...args: Parameters<Registry['add']>) => {
+    h.registry.activate('third') // remove() made 'other' active in the old engine's place: the user picks 'third'
+    return add(...args)
+  }
+  assert.equal(await h.rebuild(), 'fail')
+  assert.match(h.build.get().error ?? '', /so the previous build was kept/)
+  assert.ok(h.registry.get('fork'), 'the registration is back')
+  assert.equal(h.registry.active()?.id, 'third', "the user's switch stands")
+})
+
+// The engine's build directory was deleted by hand, so the rebuild had nothing to park: the old registration would
+// have come back pointing at the new binary that does not run, under the old version, with the failure claiming the
+// previous build was kept.
+test('POST /build/run: a failed rebuild of a deleted build directory does not put its engine back', { skip: posixOnly }, async () => {
+  const h = harness('builds-broken')
+  fs.rmSync(dirname(dirname(dirname(h.binPath))), { recursive: true, force: true })
+  assert.equal(await h.rebuild(), 'fail')
+  const error = h.build.get().error ?? ''
+  assert.doesNotMatch(error, /previous build/)
+  assert.match(error, /couldn't register the engine: Could not run the binary/)
+  assert.equal(h.registry.get('fork'), undefined, 'no registration for a build that is gone')
 })
 
 // The route deleted the parked build with a recursive rmSync, on the daemon's only thread: for a multi-GB CUDA build

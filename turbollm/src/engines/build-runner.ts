@@ -1019,8 +1019,10 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
  *  after that is moved aside instead when it can be (a lock that defeats the delete — an open handle or a cwd inside
  *  the tree — often blocks the rename too), so the previous build can still go back; the next build of this directory
  *  sweeps the moved-aside tree (sweepParkedBuilds). If the rename fails as well, the log says where the previous
- *  build is: it is kept until a build of this directory succeeds, and the next one puts it back first. */
-async function restorePreviousBuild(buildRoot: string, prevBuildRoot: string | undefined, log: (l: string) => void): Promise<void> {
+ *  build is: it is kept until a build of this directory succeeds, and the next one puts it back first. The build
+ *  route calls it too, for a build that compiled but whose binary could not be registered (its probe failed). False
+ *  when a parked build could not be moved back, so the route does not report it as kept. */
+export async function restorePreviousBuild(buildRoot: string, prevBuildRoot: string | undefined, log: (l: string) => void): Promise<boolean> {
   try {
     try {
       await rm(buildRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
@@ -1030,8 +1032,11 @@ async function restorePreviousBuild(buildRoot: string, prevBuildRoot: string | u
     }
     if (prevBuildRoot) renameSync(prevBuildRoot, buildRoot)
   } catch (e) {
-    if (prevBuildRoot) log(couldNotPutBackMessage(e, prevBuildRoot, buildRoot))
+    if (!prevBuildRoot) return true
+    log(couldNotPutBackMessage(e, prevBuildRoot, buildRoot))
+    return false
   }
+  return true
 }
 
 function couldNotPutBackMessage(e: unknown, parked: string, buildRoot: string): string {

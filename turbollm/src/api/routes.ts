@@ -75,7 +75,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, discardParkedBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, discardParkedBuild, restorePreviousBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
 import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroidApp, SwapBlockedError, ZipError, ZIP_BUILD_MARKER, zipBuildDirName } from '../engines/zip-install'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
@@ -898,6 +898,11 @@ export function registerApi(app: Hono, d: Deps): void {
     d.build.start(name ?? repoUrl)
     void (async () => {
       let out: Awaited<ReturnType<typeof runBuild>> | undefined
+      // The build this one replaced, parked by runBuild, once the new build is registered: deleted by the finally.
+      let replaced: string | undefined
+      // A registration that failed put the build it was replacing (or that build's engine) back ('kept'), or put the
+      // engine back but could not move the parked build back ('stranded': the log says where it is).
+      let previous: 'kept' | 'stranded' | undefined
       try {
         try {
           out = await runBuild(
@@ -938,7 +943,8 @@ export function registerApi(app: Hono, d: Deps): void {
         // only a prior build pinned to that SAME commit, else A/B-ing an old commit against the
         // current build silently deletes the current one's registration (its files on disk are
         // untouched, but it vanishes from the engine list).
-        // A failure HERE keeps the built binary on disk (no GC) so it isn't thrown away.
+        // A failure HERE keeps the built binary on disk (no GC) so it isn't thrown away — unless it replaced a build
+        // runBuild parked: see the catch below.
         const prior = findPriorEngine(d.registry.list().engines, {
           binPath: out.binPath,
           sourceRepo: repoUrl,
@@ -946,16 +952,45 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceCommit: commit,
           defaultBranch: out.defaultBranch,
         })
-        if (prior) {
-          await stopEngineUsers(d, prior.id)
-          try { d.registry.remove(prior.id) } catch { /* already gone */ }
+        // `activeAfter`: the engine remove() made active in its place, to tell a later switch by the user from it.
+        let removed: { engine: Engine; active: boolean; index: number; activeAfter: string | undefined } | undefined
+        let eng: Engine
+        try {
+          if (prior) {
+            await stopEngineUsers(d, prior.id)
+            const engine = d.registry.get(prior.id)
+            const active = d.registry.active()?.id === prior.id
+            const index = d.registry.list().engines.findIndex((e) => e.id === prior.id)
+            try {
+              d.registry.remove(prior.id)
+              if (engine) removed = { engine, active, index, activeAfter: d.registry.active()?.id }
+            } catch { /* already gone */ }
+          }
+          eng = (await d.registry.add(chooseEngineName(name, prior?.name), out.binPath, {
+            sourceRepo: repoUrl,
+            sourceBranch: branch,
+            sourceCommit: commit,
+            sourcePatchUrl: patchUrl,
+          })).engine
+        } catch (e) {
+          // The new binary does not run here (its probe failed: a CUDA build on a box without the driver, a fork tip
+          // that crashes at start) or could not take the name. It sits where the build it replaced ran from, so that
+          // build goes back, and so does its registration (same id, name and policy, active if it was): deleting the
+          // parked build and leaving the engine unregistered threw away the user's only working build. The engine goes
+          // back (at its place in the list) even when the parked build could not be moved back: the next start's
+          // restoreInterruptedBuilds puts it back for a registered engine whose directory has no binary.
+          // Nothing parked and the engine ran from where the new build landed: its build was gone before this one
+          // started (its directory deleted by hand), so there is no previous build to keep, and its registration
+          // would now point, under the old version, at the binary that does not run. It stays removed, as before.
+          if (removed && !out.prevBuildRoot && removed.engine.binPath === out.binPath) removed = undefined
+          const restored = out.prevBuildRoot ? await restorePreviousBuild(out.buildRoot, out.prevBuildRoot, (line) => d.build.log(line)) : true
+          // Active again only when no other engine was made active during the probe (seconds; a slow binary can take
+          // a minute): making it active over the user's own switch would undo it.
+          if (removed) d.registry.reinstate(removed.engine, removed.active && d.registry.active()?.id === removed.activeAfter, removed.index)
+          if (out.prevBuildRoot || removed) previous = restored ? 'kept' : 'stranded'
+          throw e
         }
-        const eng = (await d.registry.add(chooseEngineName(name, prior?.name), out.binPath, {
-          sourceRepo: repoUrl,
-          sourceBranch: branch,
-          sourceCommit: commit,
-          sourcePatchUrl: patchUrl,
-        })).engine
+        replaced = out.prevBuildRoot
         d.registry.activate(eng.id)
         // A genuinely custom repo (not one of the catalog's own known projects) needs its
         // identity remembered independent of the live registration — see recordCustomSource's
@@ -967,15 +1002,21 @@ export function registerApi(app: Hono, d: Deps): void {
         d.build.log(`Registered "${eng.name}" — built from ${out.commit.slice(0, 8)}.`)
         d.build.done()
       } catch (e) {
-        // Registration/probe failed AFTER a successful build: keep the binary (no GC), but
-        // tell the user it built yet couldn't be registered so they can retry/inspect.
-        d.build.fail(`Built successfully, but couldn't register the engine: ${e instanceof Error ? e.message : String(e)}`)
+        // Registration/probe failed AFTER a successful build: tell the user it built yet couldn't be
+        // registered so they can retry/inspect. The binary is kept (no GC) unless it replaced a build
+        // that went back in its place (the catch above), and the failure says whether one did.
+        const kept =
+          previous === 'kept'
+            ? ', so the previous build was kept'
+            : previous === 'stranded'
+              ? ' (the previous build could not be moved back: the log says where it is kept)'
+              : ''
+        d.build.fail(`Built successfully, but couldn't register the engine${kept}: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         if (buildAbort === ac) buildAbort = null
-        // The build this one replaced, parked by runBuild. Once a new binary exists it is gone
-        // either way — as before the parking, a registration failure keeps only the new build.
+        // The build this one replaced, parked by runBuild, once the new build is registered.
         // Deleted in the background: an rmSync of the multi-GB tree stalled the whole daemon.
-        if (out?.prevBuildRoot) void discardParkedBuild(out.prevBuildRoot)
+        if (replaced) void discardParkedBuild(replaced)
       }
     })()
     return c.json({ accepted: true }, 202)

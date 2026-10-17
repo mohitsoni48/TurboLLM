@@ -390,6 +390,18 @@ export class Registry {
     })
   }
 
+  /** Put back an entry {@link remove} took out, as it was (id, name, update policy) and at the `index` it had in the
+   *  list (the UI's order, and firstActivatableEngine's), and make it the active engine again when it was. A rebuild
+   *  removes the engine it replaces to register the new build under its name; when the new binary then fails its
+   *  probe, the build it replaced goes back on disk and so does its registration. */
+  reinstate(engine: Engine, active: boolean, index?: number): void {
+    this.store.update((c) => {
+      const at = index !== undefined && index >= 0 ? Math.min(index, c.engines.length) : c.engines.length
+      if (!findEngine(c.engines, engine.id)) c.engines.splice(at, 0, structuredClone(engine))
+      if (active) c.activeEngineId = engine.id
+    })
+  }
+
   /** Record (or refresh) a custom engine's identity so it survives a later Disable —
    *  see {@link CustomEngineSource}. Idempotent: a second call for the same identity
    *  (customSourceKey) overwrites in place rather than accumulating duplicates. */
