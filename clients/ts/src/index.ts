@@ -176,7 +176,10 @@ export interface AppendMessageInput {
 
 export interface SendParams {
   owner?: string
-  role?: MessageRole
+  // 'user' only: the server refuses any other role on a turn that starts a run (400
+  // invalid_input), so typed as MessageRole this let send() take an assistant turn that could
+  // never succeed. Back-fill an assistant turn with messages.append().
+  role?: 'user'
   // Optional, not required — see AppendMessageInput's `content` doc comment for the rule.
   content?: string
   attachments?: string[]

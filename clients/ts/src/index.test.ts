@@ -454,3 +454,15 @@ test('SendParams and AppendMessageInput both compile and construct with content 
   assert.equal(sendParams.content, undefined)
   assert.equal(appendInput.content, undefined)
 })
+
+// Type-level check, as above: SendParams.role was MessageRole, so send() took role 'assistant'
+// at compile time although the server refuses any role but 'user' on a turn that starts a run
+// (400 invalid_input). An assistant turn is appended with messages.append(), which takes either.
+test("SendParams takes only role 'user'; AppendMessageInput still takes 'assistant'", () => {
+  // @ts-expect-error a turn that starts a run must be role user
+  const assistantTurn: SendParams = { owner: 'u1', role: 'assistant', content: 'an earlier reply' }
+  const appendInput: AppendMessageInput = { owner: 'u1', role: 'assistant', content: 'an earlier reply' }
+  const userTurn: SendParams = { owner: 'u1', role: 'user', content: 'next' }
+  assert.equal(assistantTurn.role, appendInput.role)
+  assert.equal(userTurn.role, 'user')
+})

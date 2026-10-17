@@ -121,7 +121,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
   app.post(`${BASE}/chats/:id/messages/generate`, auditMiddleware(audit, 'run.start'), requireScope('runs:write'), async (c) => {
     const chatId = c.req.param('id')
     const b = await c.req.json().catch(() => ({})) as {
-      role?: 'user'; content?: string; owner?: string
+      role?: unknown; content?: string; owner?: string
       attachments?: string[]; metadata?: Record<string, unknown>
     }
     // Runtime shape guard (round-3 review finding, "N5/N6's byte-size checks crash..."): the
@@ -145,13 +145,22 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     if (b.owner !== undefined && typeof b.owner !== 'string') {
       return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
     }
+    // The turn is saved as role 'user' below whatever `role` says, so an assistant reply sent
+    // here (or to POST /chats/:id/messages with generate left at its default) was stored as a
+    // user turn and answered by a new run. Only a user turn starts a run; an assistant turn is
+    // appended with generate: false.
+    if (b.role !== undefined && b.role !== 'user') {
+      return extError(c, 'invalid_request', 'invalid_input',
+        "`role` must be 'user' for a turn that starts a run. Append an assistant turn with POST /chats/{id}/messages and generate: false.",
+        { param: 'role' })
+    }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
     const attachments = b.attachments
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
     // Everything that makes this "the same request" for a replay: the target chat and the
-    // message body as it would be persisted. `role` is not included — this route always
-    // persists a user turn, whatever the body says.
+    // message body as it would be persisted. `role` is not included — anything but 'user' is
+    // refused above, so this route always persists a user turn.
     const fingerprint = idempotencyKey ? requestFingerprint([chatId, content, attachments ?? null, b.metadata ?? null]) : ''
 
     // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —

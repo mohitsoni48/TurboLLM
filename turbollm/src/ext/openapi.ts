@@ -411,7 +411,7 @@ function buildSchemas(): Record<string, JsonSchema> {
     type: 'object',
     description: 'At least one of `content` or a non-empty `attachments` array must be present — an attachments-only message with no content is valid and will be persisted as such.',
     properties: {
-      role: { type: 'string', enum: ['user', 'assistant'] },
+      role: { type: 'string', enum: ['user', 'assistant'], description: 'Defaults to user. assistant only with generate: false: a turn that starts a run (POST .../messages/generate, or generate omitted or true) must be user, and any other role gets 400 invalid_input.' },
       content: { type: 'string', description: 'Optional if a non-empty `attachments` array is present — at least one of `content` or `attachments` is required.' },
       reasoning: { type: 'string' },
       attachments: { type: 'array', items: { type: 'string' }, description: 'data: URIs. Max 4 per message (spec §4.1). Optional if `content` is present — at least one of `content` or `attachments` is required.' },

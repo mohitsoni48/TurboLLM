@@ -478,6 +478,38 @@ test('a stale Idempotency-Key whose run has already been pruned is refused rathe
   }
 })
 
+// The generate route never read `role`: it saved every turn as role 'user' and started a run, so
+// a client back-filling an assistant reply (POST /chats/:id/messages with role 'assistant' and
+// generate left at its default) got that reply stored as a user turn and a model answer to it.
+test('a turn that starts a run must be role user: assistant or any other role is a 400 and writes nothing', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    for (const path of [`/api/ext/v1/chats/${chatId}/messages/generate`, `/api/ext/v1/chats/${chatId}/messages`]) {
+      for (const role of ['assistant', 'system', 42, null]) {
+        const res = await app.request(path, post(ACME, { role, content: 'an earlier reply', owner: 'u1' }))
+        assert.equal(res.status, 400, `${path} role=${role}`)
+        const body = await res.json() as { error: { type: string; code: string; param?: string } }
+        assert.equal(body.error.code, 'invalid_input')
+        assert.equal(body.error.param, 'role')
+      }
+    }
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'no turn was saved and no run started')
+
+    // An assistant turn is still appended with generate: false, and role 'user' or no role starts a run.
+    const appended = await app.request(`/api/ext/v1/chats/${chatId}/messages`, post(ACME, { role: 'assistant', content: 'an earlier reply', owner: 'u1', generate: false }))
+    assert.equal(appended.status, 201)
+    for (const b of [{ role: 'user', content: 'next' }, { content: 'and next' }]) {
+      const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`, post(ACME, { ...b, owner: 'u1' }))
+      assert.equal(res.status, 202)
+      await runs.settled((await res.json() as { id: string }).id)
+    }
+  } finally {
+    cleanup()
+  }
+})
+
 // ── N1 (final-gate fix round) — IdempotencyStore was not scoped by owner ───────────────────
 // Live-reproduced in the review this fixes: Owner A starts a generation with an Idempotency-Key;
 // a different owner replaying that SAME key received Owner A's real run id and the full
