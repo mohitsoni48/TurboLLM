@@ -27,6 +27,10 @@ export type EnvVar = {
   key: string
   desc: string
   required: boolean
+  /** A password, token or API key: its field is a password input. CustomizeScreen masked only
+   *  required fields, so an optional one (PGPASSWORD, REDIS_PASSWORD, a model hub token) showed
+   *  what was typed into it in clear. */
+  secret?: boolean
 }
 
 export type LocalEntry = {
@@ -211,7 +215,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     desc: 'Web and news search via Brave Search API.',
     cmd: 'npx -y @modelcontextprotocol/server-brave-search',
     iconSlug: 'brave',
-    envs: [{ key: 'BRAVE_API_KEY', desc: 'From search.brave.com → API', required: true }],
+    envs: [{ key: 'BRAVE_API_KEY', desc: 'From search.brave.com → API', required: true, secret: true }],
   },
   {
     id: 'postgres',
@@ -225,7 +229,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     // URL reached every caller that may read settings (a keyless open-LAN peer included).
     // server-postgres hands the URL to pg.Pool, which falls back to PGPASSWORD when the URL
     // has none, and mcp-client.ts spawns it with the server's env.
-    envs: [{ key: 'PGPASSWORD', desc: 'Database password if the server asks for one', required: false }],
+    envs: [{ key: 'PGPASSWORD', desc: 'Database password if the server asks for one', required: false, secret: true }],
     argNote: 'Provide the connection string without the password as an argument: postgresql://user@host/db. Put the password in PGPASSWORD.',
   },
   {
@@ -302,7 +306,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     envs: [
       { key: 'REDIS_HOST', desc: 'Redis host (default: localhost)', required: false },
       { key: 'REDIS_PORT', desc: 'Redis port (default: 6379)', required: false },
-      { key: 'REDIS_PASSWORD', desc: 'Redis password if auth is enabled', required: false },
+      { key: 'REDIS_PASSWORD', desc: 'Redis password if auth is enabled', required: false, secret: true },
     ],
   },
   {
@@ -316,7 +320,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     envs: [
       { key: 'MYSQL_HOST', desc: 'MySQL host (default: localhost)', required: false },
       { key: 'MYSQL_USER', desc: 'Database user', required: true },
-      { key: 'MYSQL_PASSWORD', desc: 'Database password', required: true },
+      { key: 'MYSQL_PASSWORD', desc: 'Database password', required: true, secret: true },
       { key: 'MYSQL_DATABASE', desc: 'Target database name', required: true },
     ],
   },
@@ -374,7 +378,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     cmd: 'npx -y obsidian-mcp-server@latest',
     iconSlug: 'obsidian',
     envs: [
-      { key: 'OBSIDIAN_API_KEY', desc: 'From the Local REST API community plugin settings', required: true },
+      { key: 'OBSIDIAN_API_KEY', desc: 'From the Local REST API community plugin settings', required: true, secret: true },
       { key: 'OBSIDIAN_HOST', desc: 'Obsidian REST API host (default: localhost)', required: false },
     ],
   },
@@ -386,8 +390,8 @@ export const LOCAL_MCPS: LocalEntry[] = [
     cmd: 'npx -y comfyui-mcp',
     envs: [
       { key: 'COMFYUI_URL', desc: 'ComfyUI server URL (default: http://127.0.0.1:8188)', required: false },
-      { key: 'CIVITAI_API_TOKEN', desc: 'For downloading models from CivitAI', required: false },
-      { key: 'HUGGINGFACE_TOKEN', desc: 'For downloading models from Hugging Face', required: false },
+      { key: 'CIVITAI_API_TOKEN', desc: 'For downloading models from CivitAI', required: false, secret: true },
+      { key: 'HUGGINGFACE_TOKEN', desc: 'For downloading models from Hugging Face', required: false, secret: true },
     ],
   },
   {
@@ -398,7 +402,7 @@ export const LOCAL_MCPS: LocalEntry[] = [
     cmd: 'npx -y @upstash/context7-mcp',
     iconSlug: 'upstash',
     envs: [
-      { key: 'CONTEXT7_API_KEY', desc: 'Optional — from context7.com/dashboard for higher rate limits', required: false },
+      { key: 'CONTEXT7_API_KEY', desc: 'Optional — from context7.com/dashboard for higher rate limits', required: false, secret: true },
     ],
   },
 ]

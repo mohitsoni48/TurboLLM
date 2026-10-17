@@ -4,6 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { CustomizeScreen } from './CustomizeScreen'
 import { MCP_ENV_MASK } from '../lib/api'
+import { LOCAL_MCPS } from '../lib/mcp-catalog'
 
 const updateMutate = vi.fn()
 const mut = () => ({ mutate: vi.fn(), isPending: false })
@@ -92,5 +93,28 @@ describe('CustomizeScreen — MCP server edit, saved Bearer key', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Update' }))
     expect(updateMutate).toHaveBeenCalledTimes(1)
     expect(updateMutate.mock.calls[0][0].patch.apiKey).toBe('')
+  })
+})
+
+describe('CustomizeScreen — adding a local MCP server from the catalog', () => {
+  // The env fields were masked only when required, so the optional PGPASSWORD field (and the
+  // other optional passwords and tokens) showed what was typed into it in clear.
+  const SECRET_ENV = /PASSWORD|TOKEN|API_KEY|SECRET/
+
+  it('the PGPASSWORD field, like every env field holding a password or token, is a password input', async () => {
+    render(<MemoryRouter initialEntries={['/customize?tab=mcp']}><CustomizeScreen /></MemoryRouter>)
+    await userEvent.click(screen.getByRole('button', { name: 'Local' }))
+    await userEvent.click(screen.getByText('PostgreSQL', { selector: 'div' }))
+    expect(screen.getByPlaceholderText('Database password if the server asks for one')).toHaveAttribute('type', 'password')
+
+    const checked: string[] = []
+    for (const entry of LOCAL_MCPS.filter((e) => e.envs.some((ev) => SECRET_ENV.test(ev.key)))) {
+      await userEvent.click(screen.getByText(entry.name, { selector: 'div' }))
+      for (const ev of entry.envs.filter((v) => SECRET_ENV.test(v.key))) {
+        expect(screen.getByPlaceholderText(ev.desc), ev.key).toHaveAttribute('type', 'password')
+        checked.push(ev.key)
+      }
+    }
+    expect(checked).toEqual(expect.arrayContaining(['PGPASSWORD', 'REDIS_PASSWORD', 'MYSQL_PASSWORD', 'HUGGINGFACE_TOKEN']))
   })
 })

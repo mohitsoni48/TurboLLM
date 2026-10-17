@@ -326,7 +326,8 @@ function McpLocalPanel({ entry, extraArg, onExtraArgChange, envs, onEnvChange, o
             <span className="font-mono">{ev.key}</span>
             {ev.required && <span className="text-[10px]" style={{ color: 'var(--err)' }}>required</span>}
           </label>
-          <input type={ev.required ? 'password' : 'text'} value={envs[ev.key] ?? ''}
+          {/* A required field has always been masked; `secret` masks an optional password or token too. */}
+          <input type={ev.secret || ev.required ? 'password' : 'text'} value={envs[ev.key] ?? ''}
             onChange={(e) => onEnvChange(ev.key, e.target.value)} placeholder={ev.desc} autoComplete="off"
             className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
         </div>
