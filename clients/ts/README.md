@@ -1,11 +1,11 @@
 # @turbollm/chat-client
 
 A zero-runtime-dependency TypeScript client for TurboLLM's public **External Chat API**
-(`/api/ext/v1`, [spec 27](../../docs/specs/27-external-chat-api.md)). It talks to the daemon
-over plain `fetch` and SSE — nothing here imports from `turbollm/src`, so it can be published
-and consumed standalone.
+(`/api/ext/v1`; the daemon serves its OpenAPI document at `GET /api/ext/v1/openapi.json`). It
+talks to the daemon over plain `fetch` and SSE — nothing here imports from `turbollm/src`, so it
+can be published and consumed standalone.
 
-It exists mainly to get one detail right automatically: spec §7.3's reconciliation rule. If a
+It exists mainly to get one detail right automatically: the API's reconciliation rule. If a
 stream closes without ever seeing a `done` frame, that is not a failure — it's *unknown*, and
 the run record (`GET /runs/{id}`) is the source of truth. `RunStream` tracks this for you.
 
@@ -25,8 +25,8 @@ npm install @turbollm/chat-client
 import { TurboLLMChat } from '@turbollm/chat-client'
 
 const client = new TurboLLMChat({
-  baseUrl: 'http://localhost:11434/api/ext/v1', // your daemon's base URL + /api/ext/v1
-  apiKey: process.env.TURBOLLM_API_KEY!,        // a tllm-ext-… key — server-side only, never in client JS
+  baseUrl: 'http://127.0.0.1:6996/api/ext/v1', // your daemon's base URL (default port 6996) + /api/ext/v1
+  apiKey: process.env.TURBOLLM_API_KEY!,       // a tllm-… key with a non-local tenant — server-side only, never in client JS
 })
 ```
 
@@ -107,8 +107,8 @@ frames, and its `outcome` is the run's own status.
 
 ## Handling errors
 
-Every non-2xx response is thrown as an `ApiError`, carrying the parsed error envelope (spec
-§7.1) as typed properties instead of a raw JSON body you'd have to re-parse:
+Every non-2xx response is thrown as an `ApiError`, carrying the parsed error envelope as typed
+properties instead of a raw JSON body you'd have to re-parse:
 
 ```ts
 import { ApiError } from '@turbollm/chat-client'
@@ -143,8 +143,9 @@ try {
   past the replay window (check `resyncMessage`); `opts.owner` must match the run's owner, same
   as the calls above
 
-All list endpoints return the cursor-paginated envelope `{ data, has_more, next_cursor }` (spec
-§5.2) — pass `next_cursor` back in as `cursor` to page forward.
+`chats.list` and `messages.list` return the cursor-paginated envelope `{ data, has_more,
+next_cursor }` — pass `next_cursor` back in as `cursor` to page forward.
+`runs.list` returns the runs as a plain array: the server does not page them.
 
 ## Testing
 
