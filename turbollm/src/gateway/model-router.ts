@@ -100,6 +100,10 @@ export class ModelRouter {
   private stoppingSlots = new Set<Manager>()
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
+  /** The gateway load (route(), routeTo()) into the primary that a ComfyUI render refused before its spawn or killed
+   *  while it started: that render's release() loads it on the Manager (ComfyGuard.reload), and reloadedAfterRender
+   *  records it then. Cleared by the next load into the primary through loadInto. */
+  private pausedGatewayLoad: string | undefined
   /** Promise chain that serialises swap operations so concurrent requests for
    *  different models queue rather than race. */
   private swapChain: Promise<void> = Promise.resolve()
@@ -584,6 +588,9 @@ export class ModelRouter {
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
     let comfyRefused = false
+    // The primary's next load is this one, so a gateway load a render refused or killed before is not what release()
+    // brings up any more.
+    if (targetManager === this.manager) this.pausedGatewayLoad = undefined
     try {
       await targetManager.load(opts, {
         beforeStart: async () => {
@@ -619,6 +626,7 @@ export class ModelRouter {
       // engine preflight): the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client
       // may retry.
       if (comfyRefused) {
+        this.notePausedLoad(entry, targetManager, explicit)
         return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
       }
       return { status: 503, message: `Engine start failed: ${(e as Error).message}`, permanent: true }
@@ -645,6 +653,7 @@ export class ModelRouter {
       // its model for release() to reload, so it is stopped, not failed, and like the pool slot above the client may
       // retry. A load that failed on its own leaves the engine in 'error' and stays permanent.
       if (s.state !== 'error' && this.comfy?.gpuClaimed()) {
+        this.notePausedLoad(entry, targetManager, explicit)
         return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
       }
       return { status: 503, message: s.err?.message ?? 'Model failed to become ready.', permanent: true }
@@ -675,6 +684,31 @@ export class ModelRouter {
     const replaced = explicit ? this.store.snapshot().lastLoaded : undefined
     this.store.update(x => { x.lastLoaded = { ...recorded } })
     return replaced ? { ...result, lastLoaded: { replaced, recorded } } : result
+  }
+
+  /** A load into the primary that a ComfyUI render refused before its spawn (the primary is left in 'error' with the
+   *  guard's refusal) or killed while it started (the guard keeps its opts): the render's release() loads it, as
+   *  reloadedAfterRender records. Only a gateway load. A loadExplicit() one is a routine's swap, which is not the
+   *  user's pick (release() still resumes one whose routine had no model to restore), a restore, whose record is
+   *  undoSwapRecord's, or a side model's Load or boot resume. */
+  private notePausedLoad(entry: ModelEntry, targetManager: Manager, explicit: boolean): void {
+    if (targetManager === this.manager && !explicit) this.pausedGatewayLoad = entry.key
+  }
+
+  /** A ComfyUI render's release() brought `modelKey` up in the primary, on `engineId` (ComfyGuard.reload), through the
+   *  Manager, which records nothing. When that is the gateway load the render refused or killed (pausedGatewayLoad), it
+   *  is recorded as the model last loaded, as loadInto records a load that runs: left alone, lastLoaded named the model
+   *  that load replaced, so the next daemon start's resume (auto-load.ts), an Engines Start that names no model and the
+   *  CLI launcher's last-used pick brought that one back. Any other model (the one the render unloaded, a manual or
+   *  routine load) is left as recorded. Not a model the library no longer has, whose resume the next start skips, nor
+   *  a Laya model (see loadInto). */
+  reloadedAfterRender(modelKey: string, engineId: string): void {
+    const paused = this.pausedGatewayLoad
+    this.pausedGatewayLoad = undefined
+    if (paused !== modelKey) return
+    const entry = this.scanner.get(modelKey)
+    if (!entry || entry.laya) return
+    this.store.update(x => { x.lastLoaded = { modelKey, engineId } })
   }
 
   /** A routine's restore (loadExplicit's `restoreAfter`) that found its model still running: the model last loaded is

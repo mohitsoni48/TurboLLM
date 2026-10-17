@@ -105,6 +105,9 @@ export class ComfyGuard {
   // The registry's engine lookup (Registry.get), which release()'s reload checks its engine against. Set by
   // setEngineLookup (cli.ts).
   private engineLookup: ((id: string) => Engine | undefined) | null = null
+  // Told which model release()'s reload brought up, so the router can record a gateway load of its own that the render
+  // refused or killed (ModelRouter.reloadedAfterRender). Set by setOnReloaded (cli.ts).
+  private onReloaded: ((modelKey: string, engineId: string) => void) | null = null
 
   private readonly leaseMs: number
   private readonly fetchImpl: FetchImpl
@@ -144,6 +147,11 @@ export class ComfyGuard {
   /** Wire the registry's engine lookup, which release()'s reload checks its engine against (see reload()). */
   setEngineLookup(lookup: (id: string) => Engine | undefined): void {
     this.engineLookup = lookup
+  }
+
+  /** Wire the router's record of the model release()'s reload brought up (see reload()). */
+  setOnReloaded(onReloaded: (modelKey: string, engineId: string) => void): void {
+    this.onReloaded = onReloaded
   }
 
   /** True when a model load should be refused right now (ComfyUI holds the GPU). The
@@ -277,6 +285,17 @@ export class ComfyGuard {
         if (mine && this.reloading === mine) this.reloading = null
       })
     }
+    // The Manager's load, restart and start record nothing as the model last loaded, so a gateway load the render
+    // refused before its spawn, or killed while it started, left lastLoaded naming the model it replaced once loaded
+    // here: the next daemon start's resume, an Engines Start that names no model and the CLI launcher's last-used pick
+    // brought that one back. The router records it (and only its own load) once the model runs and no new render has
+    // begun. Called under the swap lock, so no gateway load queued behind the reload records first.
+    const reloaded = (o: StartOpts | null | undefined) => {
+      const st = this.manager.status()
+      if (o && this.acquires === render && st.state === 'running' && st.model?.key === o.model.key) {
+        this.onReloaded?.(o.model.key, o.engine.id)
+      }
+    }
     let paused = false
     try {
       // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
@@ -291,14 +310,19 @@ export class ComfyGuard {
         engine = resume?.engine
         console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
         // restart() retries the opts Manager.load recorded; on an engine that moved, those opts load on its new binary.
-        await underSwapLock(resume?.model.key, () =>
-          resume && resume !== recorded ? this.manager.load(resume, hooks) : this.manager.restart(hooks))
+        await underSwapLock(resume?.model.key, async () => {
+          await (resume && resume !== recorded ? this.manager.load(resume, hooks) : this.manager.restart(hooks))
+          reloaded(resume)
+        })
       } else if (opts) {
         // A refusal below keeps `opts` for the next release, which looks the engine up again.
         const start = this.onEngineNow(opts)
         engine = start.engine
         console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
-        await underSwapLock(start.model.key, () => this.manager.start(start, hooks))
+        await underSwapLock(start.model.key, async () => {
+          await this.manager.start(start, hooks)
+          reloaded(start)
+        })
         // KV prompt-cache persistence (F-014): if we saved a cache on the way in, restore it
         // now — but only once the reloaded engine is actually ready (the slot endpoint needs
         // the model loaded). Poll readiness up to a generous timeout; a stall or an 'error'

@@ -97,6 +97,7 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void },
       await Promise.all([...modelRouter.poolEngineIds()].map((id) => modelRouter.stopPoolSlotsOnEngine(id, { force: true })))
     })
     guard.setSwapLock((fn) => modelRouter.withSwapLock(fn))
+    guard.setOnReloaded((modelKey, engineId) => modelRouter.reloadedAfterRender(modelKey, engineId))
   }
   t.after(async () => {
     guard?.stop()

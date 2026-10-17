@@ -494,6 +494,9 @@ comfy.setSwapLock((fn) => modelRouter.withSwapLock(fn))
 // That reload checks its engine is still registered: an update or purge during the render can remove it and its files,
 // or move it to a new build folder (the reload then starts the binary registered there).
 comfy.setEngineLookup((id) => registry.get(id))
+// That reload loads on the Manager, which records nothing: a gateway load the render refused or killed is recorded as
+// the model last loaded by the router once it runs.
+comfy.setOnReloaded((modelKey, engineId) => modelRouter.reloadedAfterRender(modelKey, engineId))
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on

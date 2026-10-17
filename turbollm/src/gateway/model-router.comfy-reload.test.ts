@@ -11,7 +11,7 @@ import { ComfyGuard } from '../engines/comfy-guard'
 import { Manager } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { ModelEntry, Scanner } from '../models/scanner'
-import { freePort } from '../test-support/stand-in-engine'
+import { freePort, realEngineSetUp } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 import { ModelRouter } from './model-router'
 
@@ -70,6 +70,7 @@ async function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
     await Promise.all([...router.poolEngineIds()].map((id) => router.stopPoolSlotsOnEngine(id, { force: true })))
   })
   guard.setSwapLock((fn) => router.withSwapLock(fn))
+  guard.setOnReloaded((modelKey, engineId) => router.reloadedAfterRender(modelKey, engineId))
   t.after(async () => {
     guard.stop()
     await router.stopPoolSlotsOnEngine('fake', { force: true })
@@ -178,15 +179,18 @@ async function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: numbe
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
   const registry = { active: () => engine, layaEngine: () => undefined, litertLmEngine: () => undefined } as unknown as Registry
+  // The library as the scanner has it: a test removes a model from it to stand for one deleted during a render.
+  const library = [a, b]
   const scanner = {
-    list: () => ({ models: [a, b], scanning: false, lastScanAt: '' }),
-    get: (key: string) => [a, b].find((m) => m.key === key),
+    list: () => ({ models: library, scanning: false, lastScanAt: '' }),
+    get: (key: string) => library.find((m) => m.key === key),
   } as unknown as Scanner
   const router = new ModelRouter(store, registry, manager, scanner, guard)
   guard.setPoolStopper(async () => {
     await Promise.all([...router.poolEngineIds()].map((id) => router.stopPoolSlotsOnEngine(id, { force: true })))
   })
   guard.setSwapLock((fn) => router.withSwapLock(fn))
+  guard.setOnReloaded((modelKey, engineId) => router.reloadedAfterRender(modelKey, engineId))
   t.after(async () => {
     guard.stop()
     await router.stopPoolSlotsOnEngine('fake', { force: true })
@@ -198,7 +202,7 @@ async function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: numbe
   const preflightBegun = async () => {
     while (!existsSync(join(dir, 'probing'))) await sleep(10)
   }
-  return { a, b, manager, guard, router, spawned, slowPreflight, fastPreflight, preflightBegun }
+  return { a, b, store, library, manager, guard, router, spawned, slowPreflight, fastPreflight, preflightBegun }
 }
 
 const RENDERING = { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
@@ -241,4 +245,149 @@ test('a render that begins during a gateway load\'s vLLM preflight into the prim
   assert.equal(r.manager.status().state, 'running')
   assert.equal(r.manager.status().model?.key, r.b.key)
   assert.deepEqual(r.spawned(), [r.b.path])
+})
+
+// ── The model last loaded, for a gateway load a render paused ─────────────────────────────────────────────
+// A gateway load into the primary that a render refuses, in its pre-start hook (while it waits for the load gate or
+// the reverse gate's /free call) or right before its vLLM or SGLang spawn, leaves the primary in 'error' with the
+// guard's refusal; one the render kills while it starts leaves its opts with the guard. Either way the render's
+// release() loads it on the Manager, which records nothing. config.lastLoaded kept naming the model the load replaced,
+// so the next daemon start's resume, an Engines Start that names no model and the CLI launcher's last-used pick
+// brought that one back.
+
+test('a gateway load a render pauses in its vLLM preflight is the model last loaded once release() loads it', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell script as the fake engine interpreter',
+}, async (t) => {
+  const r = await setUpVllm(t, 1)
+  assert.ok('target' in (await r.router.route(r.a.key)))
+  assert.deepEqual(r.store.snapshot().lastLoaded, { modelKey: r.a.key, engineId: 'fake' })
+
+  r.slowPreflight()
+  const pending = r.router.route(r.b.key)
+  await r.preflightBegun()
+  await r.guard.acquire()
+  assert.deepEqual(await pending, RENDERING)
+  r.fastPreflight()
+  await r.guard.release()
+
+  assert.equal(r.manager.status().state, 'running')
+  assert.equal(r.manager.status().model?.key, r.b.key)
+  assert.deepEqual(r.store.snapshot().lastLoaded, { modelKey: r.b.key, engineId: 'fake' })
+})
+
+test('a gateway load a render pauses in its pre-start hook is the model last loaded once release() loads it', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, comfyFree, userModel, routineModel: otherModel } = await realEngineSetUp(t, { comfy: true })
+  store.update((c) => { c.gateway.autoSwap = true })
+  assert.ok('target' in (await modelRouter.route(userModel.key)))
+  // The acquire lands during the swap's /free call: Manager.load has stopped the user's model, and the load is
+  // refused by the pre-start hook once the call returns.
+  comfyFree.hook = () => guard!.acquire()
+
+  assert.deepEqual(await modelRouter.route(otherModel.key), RENDERING)
+  assert.equal(guard!.modelKeyLoadedOnRelease(), otherModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, 'nothing is recorded while it is paused')
+  await guard!.release()
+
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, otherModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: otherModel.key, engineId: 'fake' })
+})
+
+// A render that kills the load while it starts keeps its opts for release(), which starts it on the Manager too.
+test('a gateway load a render kills while it starts is the model last loaded once release() loads it', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, userModel, routineModel: otherModel } = await realEngineSetUp(t, { comfy: true })
+  store.update((c) => { c.gateway.autoSwap = true })
+  assert.ok('target' in (await modelRouter.route(userModel.key)))
+  // The stand-in engine answers /health 200 ms after it starts: the acquire lands while it is still 'starting'.
+  let acquired: Promise<void> | undefined
+  const watch = setInterval(() => {
+    const st = manager.status()
+    if (st.state === 'starting' && st.model?.key === otherModel.key) {
+      clearInterval(watch)
+      acquired = guard!.acquire()
+    }
+  }, 5)
+  t.after(() => clearInterval(watch))
+
+  assert.deepEqual(await modelRouter.route(otherModel.key), RENDERING)
+  await acquired
+  assert.equal(guard!.modelKeyLoadedOnRelease(), otherModel.key)
+  await guard!.release()
+
+  assert.equal(manager.status().model?.key, otherModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: otherModel.key, engineId: 'fake' })
+})
+
+// The next prompt of an auto-queue usually acquires again while release() is loading: that render kills the resumed
+// load as it starts and keeps it for its own release, which is then the one that brings it up.
+test('a paused gateway load whose resume the next render kills is the model last loaded once that render ends', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, comfyFree, userModel, routineModel: otherModel } = await realEngineSetUp(t, { comfy: true })
+  store.update((c) => { c.gateway.autoSwap = true })
+  assert.ok('target' in (await modelRouter.route(userModel.key)))
+  comfyFree.hook = () => guard!.acquire()
+  assert.deepEqual(await modelRouter.route(otherModel.key), RENDERING)
+  let acquired: Promise<void> | undefined
+  const watch = setInterval(() => {
+    const st = manager.status()
+    if (st.state === 'starting' && st.model?.key === otherModel.key) {
+      clearInterval(watch)
+      acquired = guard!.acquire()
+    }
+  }, 5)
+  t.after(() => clearInterval(watch))
+
+  await guard!.release()
+  await acquired
+  assert.equal(guard!.modelKeyLoadedOnRelease(), otherModel.key, 'the second render keeps the resumed load')
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
+  await guard!.release()
+
+  assert.equal(manager.status().model?.key, otherModel.key)
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: otherModel.key, engineId: 'fake' })
+})
+
+// Only the gateway's own load. A loadExplicit() load the render paused is a routine's swap (the restore's is
+// undoSwapRecord's): release() still resumes it when the routine had no model to restore, but it is not the user's
+// pick, and recording it brought the routine's model back at the next start.
+test("a routine's swap a render pauses is loaded by release() but is not the model last loaded", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, guard, comfyFree, userModel, routineModel } = await realEngineSetUp(t, { comfy: true })
+  const earlier = { modelKey: userModel.key, engineId: 'fake' }
+  store.update((c) => { c.lastLoaded = { ...earlier } })
+  comfyFree.hook = () => guard!.acquire()
+
+  assert.deepEqual(await modelRouter.loadExplicit(routineModel.key), RENDERING)
+  await guard!.release()
+
+  assert.equal(manager.status().model?.key, routineModel.key, 'release() resumed the paused load')
+  assert.deepEqual(store.snapshot().lastLoaded, earlier)
+})
+
+// Nor a model the library no longer has: one deleted during the render still starts from the opts Manager.load kept,
+// and recording it would make the next start's resume skip it as not in the library.
+test('a gateway load a render paused whose model left the library meanwhile is not the model last loaded', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell script as the fake engine interpreter',
+}, async (t) => {
+  const r = await setUpVllm(t, 1)
+  assert.ok('target' in (await r.router.route(r.a.key)))
+
+  r.slowPreflight()
+  const pending = r.router.route(r.b.key)
+  await r.preflightBegun()
+  await r.guard.acquire()
+  assert.deepEqual(await pending, RENDERING)
+  r.library.splice(r.library.indexOf(r.b), 1)
+  r.fastPreflight()
+  await r.guard.release()
+
+  assert.equal(r.manager.status().model?.key, r.b.key)
+  assert.deepEqual(r.store.snapshot().lastLoaded, { modelKey: r.a.key, engineId: 'fake' })
 })

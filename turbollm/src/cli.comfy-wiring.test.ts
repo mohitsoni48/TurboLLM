@@ -17,3 +17,7 @@ test("the ComfyUI guard's reload after a render runs under the gateway router's 
 test("the ComfyUI guard's reload after a render checks its engine is still in the registry", () => {
   assert.ok(CLI.includes('comfy.setEngineLookup((id) => registry.get(id))'))
 })
+
+test("the ComfyUI guard's reload after a render tells the gateway router which model it brought up", () => {
+  assert.ok(CLI.includes('comfy.setOnReloaded((modelKey, engineId) => modelRouter.reloadedAfterRender(modelKey, engineId))'))
+})
