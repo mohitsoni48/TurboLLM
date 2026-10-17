@@ -62,6 +62,11 @@ const IDLE_RETAIN_MS = 30_000
 interface PendingTurn {
   task: string
   userMsgId: string
+  /** The user row was stored for this turn alone (POST /messages with content) and has not reached
+   *  the model, so stop() deletes it with the queue entry. False for a re-run of a row that already
+   *  existed (POST /messages with no content): that row can be the active turn's own message or
+   *  one already steered into the live turn, and stays. */
+  ownsUserMsg: boolean
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — see RunCodeParams.thinkingBudget. */
   thinkingBudget: number
   /** See RunCodeParams.reasoningEffort. Undefined = don't send the field. */
@@ -198,10 +203,10 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, ownsUserMsg: params.ownsUserMsg ?? false, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
@@ -223,7 +228,7 @@ export class CodeRunManager {
    */
   async steer(
     sessionId: string,
-    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
     // Not into a turn that was stopped (Stop, Send now): pi still reports it streaming while it
@@ -498,15 +503,27 @@ export class CodeRunManager {
   }
 
   /**
-   * Stop a session's active run and drop everything queued behind it. The active turn's
-   * AbortController fires (runCodeSession aborts pi); the turn's finally records 'interrupted'.
-   * Returns true if there was anything to stop.
+   * Stop a session's active run and drop everything queued behind it, with the user messages
+   * stored for those queued turns (see PendingTurn.ownsUserMsg). The active turn's AbortController
+   * fires (runCodeSession aborts pi); the turn's finally records 'interrupted'. Returns true if
+   * there was anything to stop. Callers: the user's Stop and the web's Eject (POST /stop), and a
+   * routine's deadline and approval stall (routines/code-runner.ts).
    */
   stop(sessionId: string): boolean {
     const s = this.sessions.get(sessionId)
     if (!s) return false
     const had = s.active !== null || s.queue.length > 0
-    if (s.queue.length > 0) { s.queue = []; this.emitQueue(sessionId) }
+    if (s.queue.length > 0) {
+      // POST /messages stores a follow-up's user row before queueing it. Dropped from the queue
+      // only, the row stayed unanswered: the next turn replayed it to the model as something the
+      // user had said, and the transcript showed it once this turn ended, after the UI had already
+      // cleared its chip. Delete it with its queue entry. Only a row the queued turn owns: a POST
+      // with no content queues a re-run of the last user message, which can be the active turn's
+      // own row or one already steered into it, and that one has been delivered.
+      for (const t of s.queue) if (t.ownsUserMsg) this.d.db.deleteMessage(t.userMsgId)
+      s.queue = []
+      this.emitQueue(sessionId)
+    }
     s.active?.ac.abort()
     return had
   }

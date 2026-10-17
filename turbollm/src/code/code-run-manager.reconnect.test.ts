@@ -12,8 +12,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { CodeRunManager, type BufferedEvent, type CodeSessionRunner } from './code-run-manager'
+import { registerCodeRoutes } from './code-routes'
 import { priorHistoryForTurn } from './code-session'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
@@ -283,6 +285,66 @@ test('stop() aborts the active run and drops everything queued behind it', async
   assert.equal(existsSync(join(repoRoot, 'gamma.txt')), false, 'aborted run wrote no file')
   assert.equal(mgr.isActive(sessionId), false)
   assert.equal(store.getAgentRun(sessionId)?.status, 'interrupted', 'aborted run recorded as interrupted')
+})
+
+// POST /messages stores a follow-up's user row before it queues it, and stop() dropped only the
+// queue entry: the row stayed, unanswered, so the next turn replayed it to the model as something
+// the user had said, and the transcript showed it once the stopped turn ended. Driven through the
+// real routes, since it is POST /messages that tells a row stored for the follow-up from a re-run
+// (no content) of a row that was already there, which must stay.
+test('POST /stop also removes the queued follow-ups\' messages: the next turn does not replay them', async () => {
+  const { d, store } = makeDeps()
+  const routeDeps = {
+    ...d,
+    manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+  } as unknown as Deps
+  const histories: Record<string, string[]> = {}
+  const steered: string[] = []
+  let steerable = false
+  const runner = (async (params) => {
+    const { priorMessages } = priorHistoryForTurn(params.d, params.convId, params.sessionId, params.excludeFromHistory)
+    histories[params.task] = priorMessages.map((m) => `${m.role}:${m.content || '(empty)'}`)
+    if (params.task === 'u1') {
+      params.onSteerable?.(async (text: string) => { steered.push(text); return true })
+      steerable = true
+      while (!params.signal.aborted) await delay(5)
+      params.onSteerable?.(null)
+    }
+    if (params.signal.aborted) return { finalText: '', contextUsed: 1, contextMax: 10, aborted: true }
+    params.sink({ event: 'delta', data: { delta: `reply-${params.task}` } })
+    return { finalText: `reply-${params.task}`, contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(routeDeps, { runner })
+  const app = new Hono()
+  registerCodeRoutes(app, routeDeps, mgr)
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId } = makeSession(store, repoRoot, 'u1')
+  const post = async (path: string, body: unknown) => {
+    const res = await app.request(`/api/v1/code/sessions/${sessionId}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.ok(res.ok, `${path}: ${res.status} ${await res.clone().text()}`)
+    return res.json() as Promise<{ queued?: boolean; steered?: boolean }>
+  }
+
+  await post('/messages', {}) // the session's first run: the seeded task u1
+  while (!steerable) await delay(5)
+  // A re-run of the active turn's own message: it must not take that message with it.
+  assert.equal((await post('/messages', {})).queued, true)
+  // A message steered into the live turn, then a re-run of it: it reached the model and stays.
+  assert.equal((await post('/messages', { content: 's1', kind: 'steer' })).steered, true)
+  assert.equal((await post('/messages', {})).queued, true)
+  for (const content of ['u2', 'u3']) assert.equal((await post('/messages', { content })).queued, true)
+  assert.deepEqual(steered, ['s1'])
+
+  await post('/stop', {})
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  const userRows = () => (store.getConversation(convId, true)?.messages ?? []).filter((m) => m.role === 'user').map((m) => m.content)
+  assert.deepEqual(userRows(), ['u1', 's1'], 'the queued follow-ups are gone; the stopped turn\'s own message and the steered one stay')
+
+  await post('/messages', { content: 'u4' })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(histories.u4?.filter((m) => m.startsWith('user:')), ['user:u1', 'user:s1'], 'u2 and u3 are not replayed to the model')
+  assert.deepEqual(userRows(), ['u1', 's1', 'u4'])
 })
 
 // ── an aborted turn's context-usage stats never regress below the last confirmed value ─

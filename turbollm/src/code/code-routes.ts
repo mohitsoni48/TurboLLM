@@ -898,7 +898,10 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // commits silently did nothing while the repo went dirty. (The site fixed first was /compact —
     // a different one.) Caught by the pre-release review gate, which is why worktrees were cut
     // from v1.9.6 rather than shipped half-wired.
-    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
+    // ownsUserMsg: the row was stored just above for this message alone, so a Stop that drops the
+    // turn from the queue deletes it too (CodeRunManager.stop). A re-run of the last user message
+    // (no content) only points at a row that was already there, and that row is left alone.
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, ownsUserMsg: Boolean(newContent), thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)
