@@ -3,7 +3,7 @@
 // fixtures so the format matches exactly what pi's real edit tool produces).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { createPatch } from 'diff'
 import { revertFileEdits } from './revert'
@@ -159,6 +159,26 @@ test('REGRESSION: an edit made through `@src/a.ts` reverts src/a.ts, chained wit
   assert.deepEqual(result, { reverted: ['src/a.ts', '@src/b.ts'], failed: [] })
   assert.equal(readFileSync(join(repoRoot, 'src', 'a.ts'), 'utf8'), v0)
   assert.equal(readFileSync(join(repoRoot, 'src', 'b.ts'), 'utf8'), 'old\n')
+})
+
+test('REGRESSION: edits made through a symlinked folder and through the real one revert as one file', () => {
+  // Keyed by the path as spelled, `link/a.ts` (link -> src) and `src/a.ts` were two files: the
+  // older edit's reverse no longer applied over the newer one, so it failed, and only the newer
+  // edit was undone, which left the file matching neither its old content nor its new one.
+  const repoRoot = tmpDir('tllm-revert-')
+  mkdirSync(join(repoRoot, 'src'))
+  // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+  symlinkSync(join(repoRoot, 'src'), join(repoRoot, 'link'), 'junction')
+  const v0 = 'value = 1\n'
+  const v1 = 'value = 2\n'
+  const v2 = 'value = 3\n'
+  writeFileSync(join(repoRoot, 'src', 'a.ts'), v2)
+  const result = revertFileEdits([
+    msgWithEdits([{ path: 'src/a.ts', patch: editPatch('src/a.ts', v0, v1) }]),
+    msgWithEdits([{ path: 'link/a.ts', patch: editPatch('link/a.ts', v1, v2) }]),
+  ], repoRoot)
+  assert.deepEqual(result, { reverted: ['src/a.ts'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, 'src', 'a.ts'), 'utf8'), v0)
 })
 
 test('REGRESSION: a path is not trimmed, and Unicode spaces read as spaces, as pi\'s edit tool resolves them', () => {

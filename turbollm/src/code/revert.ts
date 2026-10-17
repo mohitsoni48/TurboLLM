@@ -7,10 +7,10 @@
 // as failed. jsdiff's applyPatch/reversePatch do the actual patch math (hand-rolling a unified-
 // diff reverse-and-apply algorithm is exactly the kind of thing worth a well-tested dependency
 // for, given this mutates the user's real files).
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { applyPatch, parsePatch, reversePatch } from 'diff'
-import { isContainedFromRoot, normalizePiToolPath } from './containment'
+import { isContainedFromRoot, normForCompare, normalizePiToolPath } from './containment'
 import type { Message, ToolCallRecord } from '../chat/db'
 
 export interface RevertFilesResult {
@@ -31,6 +31,21 @@ export interface RevertFilesResult {
  *  flagged: nothing undid them. */
 export type MarkUndoneEdits = (messageId: string, toolCalls: ToolCallRecord[]) => void
 
+/** One key for every spelling of the file `absPath` names. pi's edit tool reaches the same file
+ *  through a symlinked folder (`link/a.ts` with link -> src), or in another letter case where the
+ *  filesystem ignores case (macOS, Windows), and keyed as spelled, those edits made two chains of
+ *  one file: the older chain's reverse no longer applied over the newer edit, so it failed while
+ *  the newer one was undone — the file half-reverted. The OS's own realpath resolves the links and,
+ *  on macOS and Windows, returns each name's case as stored; normForCompare also folds case on
+ *  Windows. A missing file keeps its spelling: it is reported failed whichever chain it is in. */
+function fileKey(absPath: string): string {
+  try {
+    return normForCompare(realpathSync.native(absPath))
+  } catch {
+    return absPath
+  }
+}
+
 /** Reverse-applies every edit-tool patch found in `messages` (the messages about to be
  *  discarded by a revert), grouped by file. For a file edited more than once in that range,
  *  every step is computed IN MEMORY, most recent edit first, and only written to disk if the
@@ -42,7 +57,8 @@ export function revertFileEdits(messages: Message[], repoRoot: string, markUndon
   // Keying and resolving by the trimmed raw `args.path` failed a revert of `@src/a.ts` (no such
   // file), and applied the reverse of an edit made through ` src/c.ts` to src/c.ts, a file pi
   // never touched, leaving the edited one as it was. A file is reported under the `args.path` of
-  // its first edit in the range. A path pi could not convert (null) is never contained: failed.
+  // its first edit in the range, and keyed by the file itself, not its spelling (fileKey). A path
+  // pi could not convert (null) is never contained: failed.
   // Containment is checked on that raw `args.path` (isContainedFromRoot reads it both ways itself),
   // never on the absolute path: run through pi's normalisation again, a Unicode space in the
   // session folder's own name (a CJK full-width space, a pasted no-break space) became ' ', so the
@@ -62,7 +78,7 @@ export function revertFileEdits(messages: Message[], repoRoot: string, markUndon
       if (!path) continue
       const normalized = normalizePiToolPath(path)
       const absPath = normalized === null ? null : resolve(repoRoot, normalized)
-      const key = absPath ?? `\0${path}`
+      const key = absPath === null ? `\0${path}` : fileKey(absPath)
       const entry = editsByFile.get(key) ?? { path, absPath, patches: [], calls: [] }
       entry.patches.push(tc.patch)
       entry.calls.push(tc)
