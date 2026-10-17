@@ -16,7 +16,8 @@ import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
-import { resolveToolApproval } from '../tools/approval-gate'
+import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
+import { isMcpToolName, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
 import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
@@ -288,6 +289,23 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
+
+    // An MCP server tool runs with the owner's credentials (a stdio server is a command on this
+    // machine), so letting one run is a host-side action: the isLocalOrAuthenticated rule that
+    // adding the server (POST /api/v1/mcp/servers) and a chat turn calling it (runGeneration's
+    // refuseMcp) are held to. Without it a keyless Serve identity, Access JWT, open-LAN peer or
+    // remote token could approve the host's own pending MCP call, or save "Allow for this chat"
+    // for an MCP tool ahead of the host's later turns (that write runs before the pending lookup
+    // below). For a chat turn's pending call the name it was registered with decides as well as
+    // the body's toolName, which the caller picks (execute-with-approval.ts records it; a Code
+    // session's own waitForToolApproval calls record none, so for those only the body's toolName
+    // is checked). A deny runs nothing and stays open. api_key_required: the web client opens its
+    // key prompt on it, as for "Always Allow" below.
+    if (decision !== 'deny' && !isLocalOrAuthenticated(c, d)) {
+      const pendingName = pendingToolApprovalName(`${convId}:${toolCallId}`)
+      if (isMcpToolName(toolName) || (pendingName !== undefined && isMcpToolName(pendingName)))
+        return err(c, 403, 'api_key_required', MCP_APPROVAL_REFUSED_MESSAGE)
+    }
 
     let decisionToApply: 'allow' | 'deny'
     if (decision === 'always_allow') {
@@ -924,8 +942,9 @@ interface GenerationCtx {
    *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
    *  executeToolCallWithApproval, which hands it to ToolRegistry.executeTool; there only
    *  create_routine/update_routine/run_routine_now read it, and only for code-flavor routines.
-   *  runGeneration itself reads it for save_skill: the same bar as isLocalOrAuthenticated, which
-   *  POST /api/v1/skills holds a skill's author to. */
+   *  runGeneration itself reads it for save_skill and MCP server tools: the same bar as
+   *  isLocalOrAuthenticated, which POST /api/v1/skills and /api/v1/mcp/servers hold their
+   *  callers to. */
   isCodeAuthorized: boolean
 }
 
@@ -1230,7 +1249,9 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   if (localAccounting) d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
-    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true }) : []
+    // MCP server tools are left out (and refused below) for a caller that may not act on the host:
+    // isCodeAuthorized is the same isLocalRequest || real-key decision as adding an MCP server.
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true, refuseMcp: !ctx.isCodeAuthorized }) : []
     // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
     // registry (every other skill is instructions text only). No-op unless enabled.
     // save_skill writes to the shared skill library, as POST /api/v1/skills and the Save as skill
@@ -1571,6 +1592,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
               // The real per-request trust decision this handler's route computed from its Hono
               // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
               isCodeAuthorized: ctx.isCodeAuthorized,
+              // An MCP call the model makes anyway, unoffered, is refused before any approval prompt.
+              refuseMcp: !ctx.isCodeAuthorized,
             })
             result = approved.result
             callError = approved.error

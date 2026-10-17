@@ -535,7 +535,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
     store: db, now: () => new Date(),
     runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' },
   })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   await scheduler.tick() // fires and parks — inFlight now holds the routine
   await new Promise((resolve) => setImmediate(resolve))
@@ -952,7 +952,7 @@ test('a stale approve on an OLD needs_approval run does not release a DIFFERENT,
 
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' } })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   // A REAL fire happens and genuinely parks — this is the run the scheduler's guard belongs to.
   await scheduler.tick()

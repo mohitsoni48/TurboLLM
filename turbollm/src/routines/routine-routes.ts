@@ -4,6 +4,8 @@ import type { Deps } from '../deps'
 import { isLocalRequest, verifyPresentedKey } from '../auth'
 import { computeNextFireTime } from './schedule'
 import { resumeRoutineRun } from './execute'
+import { parsePendingToolCall } from './approval'
+import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE, MCP_ROUTINE_REFUSED_MESSAGE } from '../tools/tool-registry'
 import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun, CodingAgentChoice } from './schema'
 import { CODING_AGENT_CHOICES } from './schema'
 import { isTextClassifierKey } from '../models/text-classifier'
@@ -187,6 +189,25 @@ export function codeGateBlocks(c: Context, d: Deps): boolean {
   return !isLocalRequest(c, d) && !verifyPresentedKey(c, d)
 }
 
+/** Does a chat routine on this agent run an MCP server tool with no approval? chat-runner.ts runs
+ *  every tool the agent lists unattended (listsMcpTool), so authoring, editing, arming or firing
+ *  one is the owner's MCP tool run on the caller's say-so: refused, like the tool itself in the
+ *  caller's own chat (chat-routes.ts refuseMcp), to whoever codeGateBlocks refuses (the
+ *  isLocalOrAuthenticated bar adding the MCP server has). The agent is read live, as
+ *  chat-runner.ts reads it; a stored routine's agentId cannot change. Pause, deny and delete run
+ *  nothing and stay open. */
+function chatAgentUsesMcp(d: Deps, flavor: RoutineFlavor | undefined, agentId: string | undefined): boolean {
+  if (flavor !== 'chat') return false
+  const agent = d.store.snapshot().customAgents?.find((a) => a.id === agentId)
+  return !!agent && listsMcpTool(agent.tools)
+}
+
+/** chatAgentUsesMcp's refusal: 401 unauthorized like the code gate beside it, which the routine
+ *  UI already reports as an authorization error (web routine-api.ts describeRoutineError). */
+function mcpRoutineRefused(c: Context, message = MCP_ROUTINE_REFUSED_MESSAGE) {
+  return err(c, 401, 'unauthorized', message)
+}
+
 /** Exported (Phase 4) so `routine-tools.ts`'s code-flavor gate refuses with the IDENTICAL wording
  *  this route does — one message for one security property, on both the REST and the tool surface. */
 export const CODE_GATE_MESSAGE = 'A valid API key is required to schedule a Code routine from a non-host device.'
@@ -220,6 +241,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     const b = await body<RoutineBody>(c)
     // Auth before validation, so an ungated caller learns nothing about the request shape.
     if (b.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    if (chatAgentUsesMcp(d, b.flavor, b.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     const problem = validateCreate(b, (key) => d.scanner.list().models.some((m) => m.key === key), isTextClassifierIn(d))
     if (problem) return err(c, 400, 'invalid_routine', problem)
     const routine = d.db.createRoutine({
@@ -238,6 +260,9 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     // the same capability /run-now already gates, just deferred by up to DEFAULT_TICK_INTERVAL_MS.
     // Same ordering as /run-now: 404 before 401, gate before the status check.
     if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    // Arming an MCP-running chat routine is running it too (X2 above), and it would stand in for
+    // the owner's own approval of a routine they have not confirmed.
+    if (chatAgentUsesMcp(d, routine.flavor, routine.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     if (routine.status !== 'pending_confirmation') return err(c, 409, 'not_pending', 'Routine is not awaiting confirmation.')
     const nextFireAt = computeNextFireTime(routine.scheduleRule, new Date()).toISOString()
     return c.json(d.db.confirmRoutine(routine.id, nextFireAt))
@@ -252,6 +277,8 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     if ((routine.flavor === 'code' || b.flavor === 'code') && codeGateBlocks(c, d)) {
       return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
     }
+    // The prompt (and schedule, model) an MCP-running chat routine runs its agent's tools for.
+    if (chatAgentUsesMcp(d, routine.flavor, routine.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     const problem = validateUpdate(b, routine, isTextClassifierIn(d))
     if (problem) return err(c, 400, 'invalid_routine', problem)
     const patch: Parameters<typeof d.db.updateRoutine>[1] = {}
@@ -290,6 +317,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     // X2: the second door into 'active', and the more realistic one — a host who set up a code
     // routine and paused it leaves exactly the state this route re-arms. Same gate, same ordering.
     if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    if (chatAgentUsesMcp(d, routine.flavor, routine.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     if (routine.status !== 'paused') return err(c, 409, 'not_paused', 'Routine is not paused.')
     const nextFireAt = computeNextFireTime(routine.scheduleRule, new Date()).toISOString()
     return c.json(d.db.updateRoutine(routine.id, { status: 'active', nextFireAt }))
@@ -316,6 +344,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
     if (routine.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    if (chatAgentUsesMcp(d, routine.flavor, routine.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     const result = d.routineScheduler.runNow(routine.id)
     if (!result.ok) {
       if (result.reason === 'not_found') return err(c, 404, 'not_found', 'Routine not found.')
@@ -334,6 +363,13 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     // CURRENT flavor, matching create/update's gate.
     const routine = d.db.getRoutine(run.routineId)
     if (routine?.flavor === 'code' && codeGateBlocks(c, d)) return err(c, 401, 'unauthorized', CODE_GATE_MESSAGE)
+    // Approving runs the stalled call, then the rest of the run under the agent's tools. So it is
+    // refused for an MCP-running chat routine, and for a stalled MCP call on any routine (a call
+    // outside the agent's list is what stalls a chat run: chat-runner.ts), as the chat approve route
+    // refuses the same callers an MCP call. A deny runs nothing and stays open.
+    const pendingName = parsePendingToolCall(run.pendingToolCall)?.call.name
+    if (pendingName !== undefined && isMcpToolName(pendingName) && codeGateBlocks(c, d)) return mcpRoutineRefused(c, MCP_APPROVAL_REFUSED_MESSAGE)
+    if (chatAgentUsesMcp(d, routine?.flavor, routine?.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     let result: ResumeResult
     try {
       result = await resumeRoutineRun(d, run, 'allow')

@@ -2,7 +2,7 @@
 // Both live foreground chat (chat-routes.ts) and the background agent runner
 // (generation.ts) call this single implementation instead of maintaining their
 // own inline per-tool-call blocks.
-import type { ToolRegistry, ToolCall } from './tool-registry'
+import { isMcpToolName, type ToolRegistry, type ToolCall } from './tool-registry'
 import { type ToolPolicy, resolveToolPolicy } from './tool-policy'
 import { waitForToolApproval } from './approval-gate'
 
@@ -37,8 +37,23 @@ export async function executeToolCallWithApproval(params: {
    *  routine-tools.ts's own fail-closed philosophy. See each call site for how it computes (or
    *  deliberately omits) it. */
   isCodeAuthorized?: boolean
+  /** Live chat: this turn's caller may not act on the host, so MCP server tools are refused
+   *  (ToolRegistry.executeTool's `refuseMcp`). Unset elsewhere, which leaves them as before. */
+  refuseMcp?: boolean
+  /** A routine's unattended run: refuse create_agent with an MCP tool and the routine tools on a
+   *  chat routine whose agent lists one, but run MCP tools themselves (ToolRegistry.executeTool's
+   *  `refuseMcpAgentsAndRoutines`). */
+  refuseMcpAgentsAndRoutines?: boolean
 }): Promise<{ result: string; error?: string }> {
   const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
+
+  // Refused before its policy is read: an 'ask' would put the approval to a caller whose own
+  // approval could not run it (and the approve route refuses it to them), leaving the turn waiting.
+  if (params.refuseMcp && isMcpToolName(name)) {
+    const result = await tools.executeTool({ id, name, args }, params.isCodeAuthorized ?? false, { refuseMcp: true })
+    await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
+    return { result }
+  }
 
   const policy = resolveToolPolicy(name, globalPolicies, convOverrides, autoAllowAll)
 
@@ -61,7 +76,7 @@ export async function executeToolCallWithApproval(params: {
       }
     } else {
       await sink({ event: 'tool_call', data: { id, name, args, status: 'awaiting_approval' } })
-      const decision = await waitForToolApproval(`${convId}:${id}`, signal)
+      const decision = await waitForToolApproval(`${convId}:${id}`, signal, name)
       if (decision === 'deny') {
         const result = 'Denied by user.'
         await sink({ event: 'tool_call', data: { id, name, args, status: 'done', result } })
@@ -80,7 +95,7 @@ export async function executeToolCallWithApproval(params: {
   let error: string | undefined
   try {
     const call: ToolCall = { id, name, args }
-    result = await tools.executeTool(call, params.isCodeAuthorized ?? false)
+    result = await tools.executeTool(call, params.isCodeAuthorized ?? false, { refuseMcp: params.refuseMcp, refuseMcpAgentsAndRoutines: params.refuseMcpAgentsAndRoutines })
   } catch (e) {
     error = (e as Error).message
     result = `Error: ${error}`

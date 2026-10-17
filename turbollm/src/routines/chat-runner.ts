@@ -149,6 +149,9 @@ export async function resumeChatRoutine(
         // call below. The human here approved ONE specific tool call, not a standing grant to
         // author code-flavor routines, and there is still no HTTP request to authorize against.
         isCodeAuthorized: false,
+        // Same as runChatRoundLoop's call below: the approve route lets a caller who may not use
+        // MCP tools approve a non-MCP call, such as an update_routine on the owner's MCP routine.
+        refuseMcpAgentsAndRoutines: true,
       })
     : { result: 'Error: no tool registry available.' }
   messages.push({ role: 'tool', content: approved.result, tool_call_id: pending.call.id })
@@ -255,6 +258,14 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
             // scheduled code execution begetting more of itself) with no human in the loop.
             // Chat-flavor create/update from a routine is unaffected — the flag only gates code.
             isCodeAuthorized: false,
+            // The MCP counterpart, for the same reason: no request to check, and whoever made or
+            // fired this routine may be a caller who may not use the owner's MCP tools (a keyless
+            // Serve identity, Access JWT or open-LAN peer). Its agent can list update_routine and
+            // run_routine_now without any MCP tool, so without this its run rewrote the prompt of
+            // the owner's routine on an MCP agent and fired it, running that MCP tool unapproved.
+            // create_agent with an MCP tool and those routine tools on a chat routine whose agent
+            // lists one are refused; the MCP tools this agent lists itself still run.
+            refuseMcpAgentsAndRoutines: true,
           })
         : { result: 'Error: no tool registry available.' }
       precedingCalls.push({ id: tc.id, name: tc.function.name, args, result: executed.result })

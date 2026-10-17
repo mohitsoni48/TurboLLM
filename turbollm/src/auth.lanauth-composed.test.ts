@@ -28,8 +28,12 @@ import { ToolRegistry } from './tools/tool-registry'
 import type { RoutineToolsStore } from './routines/routine-tools'
 import type { Routine } from './routines/schema'
 import type { CustomChatAgent } from './config/config'
-import { rmSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { registerChatRoutes } from './chat/chat-routes'
+import { registerChatAgentRoutes } from './chat/chat-agent-routes'
+import type { AgentToolsStore } from './chat/chat-agent-tools'
+import { registerRoutineRoutes } from './routines/routine-routes'
 import { ConversationStore } from './chat/db'
 import { SkillStore } from './agents/skills'
 import { tmpDir } from './test-support/tmp'
@@ -1018,8 +1022,12 @@ const SKILL_AUD = 'aud-skills-gate'
 /** Real lanAuth and chat routes over a real ConversationStore and skills folder, with a running
  *  engine a stubbed fetch answers: a streamed chat round calls the tool `call` names when set and
  *  the round is not answering a tool result, and otherwise replies; the skill author's request
- *  (stream: false) gets back a skill named "planted". `tools` replaces the bare ToolRegistry. */
-function toolChat(mutate: (cfg: ReturnType<typeof defaultConfig>) => void, opts: { call?: string; tools?: ToolRegistry } = {}) {
+ *  (stream: false) gets back a skill named "planted". `args` are that call's arguments (a skill by
+ *  default), read per round. `tools` replaces the bare ToolRegistry. */
+function toolChat(
+  mutate: (cfg: ReturnType<typeof defaultConfig>) => void,
+  opts: { call?: string; args?: Record<string, unknown>; tools?: ToolRegistry } = {},
+) {
   const { d, cfg } = makeDeps(mutate)
   cfg.daemon.autoGenerateTitles = false
   const dir = tmpDir('tllm-lanauth-skills-')
@@ -1062,7 +1070,7 @@ function toolChat(mutate: (cfg: ReturnType<typeof defaultConfig>) => void, opts:
     const call = opts.call && sent.messages?.at(-1)?.role !== 'tool'
     const sse = (call
       ? [
-          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: opts.call, arguments: '{"name":"planted","procedure":"x"}' } }] } }] },
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: opts.call, arguments: JSON.stringify(opts.args ?? { name: 'planted', procedure: 'x' }) } }] } }] },
           { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
         ]
       : [{ choices: [{ delta: { content: 'ok' } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }] }]
@@ -1188,6 +1196,442 @@ test('the save_skill chat tool is neither offered to nor run for a keyless Serve
     await send(h, loopbackRequest, {})
     assert.ok(h.sentTools[0].includes('save_skill'))
     await until(h.planted, "the host's skill is written")
+  } finally {
+    h.cleanup()
+  }
+})
+
+// ── The owner's MCP server tools from a chat ────────────────────────────────────────────────
+// A stdio MCP server is a command the daemon runs with the owner's credentials (a filesystem or
+// shell server is host file or shell access), which is why POST/PUT /api/v1/mcp/servers need
+// isLocalOrAuthenticated. The chat tool loop offered its tools to every turn and ran them for
+// whoever approved the call, so a keyless Serve identity, Access JWT, open-LAN peer or remote
+// token could have the model call one and approve it themselves.
+
+/** A real stdio MCP server with one tool, `run`, that appends every call to a log. */
+const FAKE_MCP_SERVER = `
+const fs = require('fs')
+let buf = ''
+process.stdin.on('data', (c) => {
+  buf += c
+  const lines = buf.split('\\n'); buf = lines.pop()
+  for (const l of lines) {
+    if (!l.trim()) continue
+    const m = JSON.parse(l)
+    if (m.id == null) continue
+    if (m.method === 'tools/call') fs.appendFileSync(process.env.FAKE_MCP_CALLS, m.params.name + '\\n')
+    const result = m.method === 'tools/list'
+      ? { tools: [{ name: 'run', description: 'Run a shell command on the host' }] }
+      : m.method === 'tools/call' ? { content: [{ type: 'text', text: 'ran on the host' }] } : {}
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n')
+  }
+})
+setInterval(() => {}, 1000)
+`
+const MCP_TOOL = 'mcp__srv_1__run'
+
+async function mcpTools(): Promise<{ tools: ToolRegistry; calls: () => number; cleanup: () => void }> {
+  const dir = tmpDir('tllm-lanauth-mcp-')
+  const script = join(dir, 'fake-mcp.cjs')
+  writeFileSync(script, FAKE_MCP_SERVER)
+  const log = join(dir, 'calls.log')
+  const tools = new ToolRegistry({} as never)
+  await tools.syncMcpServers([{ id: 'srv-1', name: 'Shell', transport: 'stdio', enabled: true, command: process.execPath, args: [script], env: { FAKE_MCP_CALLS: log } }])
+  assert.ok((await tools.buildToolDefinitions()).some((t) => t.function.name === MCP_TOOL), 'the stub server is connected')
+  return {
+    tools,
+    calls: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).length : 0),
+    cleanup: () => { tools.disconnectAll(); rmSync(dir, { recursive: true, force: true }) },
+  }
+}
+
+/** Sends a chat turn and reads its stream to the end, running `onAwaiting` once when a tool call
+ *  waits for approval. */
+async function chatTurn(
+  h: ReturnType<typeof toolChat>, request: typeof tunneledRequest, headers: Record<string, string>, convId: string,
+  onAwaiting?: () => Promise<void>,
+): Promise<string> {
+  const res = await request(h.app, `/api/v1/conversations/${convId}/messages`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content: 'run it' }),
+  })
+  assert.equal(res.status, 200)
+  const reader = res.body!.getReader()
+  const decoder = new TextDecoder()
+  let text = ''
+  let awaited = false
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    text += decoder.decode(value, { stream: true })
+    if (!awaited && text.includes('awaiting_approval')) {
+      awaited = true
+      await onAwaiting?.()
+    }
+  }
+  return text
+}
+
+function approve(h: ReturnType<typeof toolChat>, request: typeof tunneledRequest, headers: Record<string, string>, convId: string, body: Record<string, string>) {
+  return request(h.app, `/api/v1/conversations/${convId}/tool-calls/tc1/approve`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+test("the owner's MCP tools are neither offered to nor run for a keyless Serve identity, Access JWT, open-LAN peer or remote token", async () => {
+  const mcp = await mcpTools()
+  try {
+    for (const caller of keylessCallers()) {
+      const h = toolChat(caller.mutate, { call: MCP_TOOL, tools: mcp.tools })
+      const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+      try {
+        const headers = caller.headers(h.d)
+        const conv = h.db.createConversation()
+        // The caller approves its own call if one is put to it: what got the tool run before.
+        const sse = await chatTurn(h, caller.request, headers, conv.id, async () => {
+          await approve(h, caller.request, headers, conv.id, { toolName: MCP_TOOL, decision: 'allow' })
+        })
+        assert.ok(h.sentTools.every((names) => !names.includes(MCP_TOOL)), `${caller.name}: the MCP tool is not offered`)
+        assert.ok(h.sentTools[0].includes('run_code'), `${caller.name}: the other tools still are`)
+        assert.doesNotMatch(sse, /awaiting_approval/, `${caller.name}: no approval is put to the caller`)
+        assert.match(sse, /Using an MCP server tool requires a valid API key/, `${caller.name}: a call made anyway is refused`)
+        assert.equal(mcp.calls(), 0, `${caller.name}: the MCP server must not be called`)
+        // An owner's Allow policy for the tool does not run it for them either.
+        h.cfg.tools.toolPolicies = { [MCP_TOOL]: 'allow' }
+        assert.match(await chatTurn(h, caller.request, headers, h.db.createConversation().id), /requires a valid API key/)
+        assert.equal(mcp.calls(), 0, `${caller.name}: not under an Allow policy either`)
+      } finally {
+        restoreJwks()
+        h.cleanup()
+      }
+    }
+    // The host's own chat is unchanged: offered, put to the host for approval, and run.
+    const h = toolChat(() => {}, { call: MCP_TOOL, tools: mcp.tools })
+    try {
+      const conv = h.db.createConversation()
+      const sse = await chatTurn(h, loopbackRequest, {}, conv.id, async () => {
+        assert.equal((await approve(h, loopbackRequest, {}, conv.id, { toolName: MCP_TOOL, decision: 'allow' })).status, 200)
+      })
+      assert.ok(h.sentTools[0].includes(MCP_TOOL))
+      assert.match(sse, /ran on the host/)
+      assert.equal(mcp.calls(), 1)
+    } finally {
+      h.cleanup()
+    }
+    // So is a LAN caller with a real API key, on an open LAN too.
+    const raw = 'tllm-mcpkeyedmcpkeyedmcpkeyedmcpkeyedmcp1'
+    const keyed = toolChat((cfg) => {
+      cfg.daemon.lanBind = true
+      cfg.daemon.requireApiKey = false
+      cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+    }, { call: MCP_TOOL, tools: mcp.tools })
+    try {
+      const auth = { 'X-TurboLLM-Auth': raw }
+      const conv = keyed.db.createConversation()
+      const sse = await chatTurn(keyed, lanRequest, auth, conv.id, async () => {
+        assert.equal((await approve(keyed, lanRequest, auth, conv.id, { toolName: MCP_TOOL, decision: 'allow' })).status, 200)
+      })
+      assert.ok(keyed.sentTools[0].includes(MCP_TOOL))
+      assert.match(sse, /ran on the host/)
+      assert.equal(mcp.calls(), 2)
+    } finally {
+      keyed.cleanup()
+    }
+  } finally {
+    mcp.cleanup()
+  }
+})
+
+test("approving the host's pending MCP call needs a key: a keyless Serve identity, Access JWT, open-LAN peer or remote token is refused", async () => {
+  const mcp = await mcpTools()
+  try {
+    for (const caller of keylessCallers()) {
+      const h = toolChat(caller.mutate, { call: MCP_TOOL, tools: mcp.tools })
+      const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+      try {
+        const headers = caller.headers(h.d)
+        const conv = h.db.createConversation()
+        const before = mcp.calls()
+        // The host's own turn waits for the host to approve the MCP call.
+        const sse = await chatTurn(h, loopbackRequest, {}, conv.id, async () => {
+          for (const body of [
+            { toolName: MCP_TOOL, decision: 'allow' },
+            { toolName: MCP_TOOL, decision: 'allow_chat' },
+            // The body's toolName is the caller's word: the pending call's own name decides.
+            { toolName: 'web_search', decision: 'allow' },
+          ]) {
+            const res = await approve(h, caller.request, headers, conv.id, body)
+            assert.equal(res.status, 403, `${caller.name}: ${JSON.stringify(body)}`)
+            assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required')
+          }
+          assert.deepEqual(h.db.getToolOverrides(conv.id), {}, `${caller.name}: no "Allow for this chat" may be saved`)
+          // Nor may it pre-allow an MCP tool for the host's later turns in this chat.
+          assert.equal((await request403(h, caller, headers, conv.id)).status, 403)
+          assert.deepEqual(h.db.getToolOverrides(conv.id), {})
+          assert.equal(mcp.calls(), before, `${caller.name}: nothing may run yet`)
+          // The host approves it: it runs.
+          assert.equal((await approve(h, loopbackRequest, {}, conv.id, { toolName: MCP_TOOL, decision: 'allow' })).status, 200)
+        })
+        assert.match(sse, /ran on the host/)
+        assert.equal(mcp.calls(), before + 1)
+      } finally {
+        restoreJwks()
+        h.cleanup()
+      }
+    }
+  } finally {
+    mcp.cleanup()
+  }
+})
+
+/** An "Allow for this chat" for an MCP tool with no call pending (a made-up call id). */
+function request403(h: ReturnType<typeof toolChat>, caller: ReturnType<typeof keylessCallers>[number], headers: Record<string, string>, convId: string) {
+  return caller.request(h.app, `/api/v1/conversations/${convId}/tool-calls/made-up/approve`, {
+    method: 'POST',
+    headers: { ...headers, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ toolName: MCP_TOOL, decision: 'allow_chat' }),
+  })
+}
+
+// ── An agent that lists the owner's MCP tool, and a chat routine on one ─────────────────────
+// A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an agent
+// naming the owner's MCP tool, and a chat routine on it, ran that tool for a caller the chat above
+// refuses it to: POST /api/v1/chat-agents, POST /api/v1/routines, /confirm, /run-now. Approving a
+// routine run stalled on an MCP call ran it too.
+
+const OWNER_MCP_AGENT: CustomChatAgent = { id: 'agent-mcp', name: 'Files', description: '', systemPrompt: 'owner prompt', skillIds: [], tools: [MCP_TOOL] }
+const OWNER_PLAIN_AGENT: CustomChatAgent = { id: 'agent-plain', name: 'Search', description: '', systemPrompt: 'owner prompt', skillIds: [], tools: ['web_search'] }
+const HOURLY = { kind: 'interval' as const, everyMs: 60_000 }
+
+/** Real lanAuth with the real chat-agent and routine routes over a real ConversationStore, with
+ *  Routines on, the owner's two agents and a stub scheduler recording each run-now. The model gate
+ *  always times out, so an approval or deny that gets past the routes' gates ends in 409. */
+function agentRoutineApp(mutate: (cfg: ReturnType<typeof defaultConfig>) => void) {
+  const { d, cfg } = makeDeps(mutate)
+  cfg.daemon.experimental.routines = true
+  cfg.customAgents.push(structuredClone(OWNER_MCP_AGENT), structuredClone(OWNER_PLAIN_AGENT))
+  const dir = tmpDir('tllm-lanauth-routines-')
+  const db = new ConversationStore(dir)
+  const fired: string[] = []
+  Object.assign(d, {
+    db,
+    scanner: { list: () => ({ models: [{ key: 'm', name: 'M' }], scanning: false, lastScanAt: '' }) },
+    gate: { acquire: async () => { throw new Error('busy') } },
+    routineScheduler: { runNow: (id: string) => { fired.push(id); return { ok: true } }, releaseParked: () => {} },
+  })
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerChatAgentRoutes(app, d)
+  registerRoutineRoutes(app, d)
+  /** The owner's chat routines on `agentId`: one active, one awaiting confirmation, one paused. */
+  const routines = (agentId: string) => {
+    const make = () => db.createRoutine({ flavor: 'chat', prompt: 'owner prompt', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId })
+    const active = make()
+    db.confirmRoutine(active.id, '2099-01-01T00:00:00.000Z')
+    const paused = make()
+    db.confirmRoutine(paused.id, '2099-01-01T00:00:00.000Z')
+    db.updateRoutine(paused.id, { status: 'paused', nextFireAt: null })
+    return { active, pending: make(), paused }
+  }
+  /** A run of `routineId` stalled on a call to `callName`, as chat-runner.ts stalls one. */
+  const stalled = (routineId: string, callName: string) => {
+    const run = db.createRoutineRun({ routineId, configSnapshot: JSON.stringify(db.getRoutine(routineId)) })
+    db.updateRoutineRun(run.id, {
+      status: 'needs_approval',
+      pendingToolCall: JSON.stringify({ convId: 'c1', assistantContent: '', precedingCalls: [], call: { id: 'tc1', name: callName, args: {} } }),
+    })
+    return run.id
+  }
+  return { d, cfg, app, db, fired, routines, stalled, cleanup: () => { db.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+async function errorOf(res: Response): Promise<{ status: number; code: string; message: string }> {
+  const body = (await res.json()) as { error?: { code: string; message: string } }
+  return { status: res.status, code: body.error?.code ?? '', message: body.error?.message ?? '' }
+}
+
+test("an agent with the owner's MCP tool, or a chat routine on one, needs a key: a keyless Serve identity, Access JWT, open-LAN peer or remote token is refused", async () => {
+  // lanAuth lets a config:write remote token write agents (requiredCapability), so it reaches the
+  // agent routes' own refusal; a models:use one, and any remote token on a routine route, is refused
+  // by lanAuth before any of this (403 forbidden), as before.
+  const configWriteToken = {
+    name: 'a config:write remote token',
+    mutate: () => {},
+    request: tunneledRequest,
+    headers: (d: Deps) => ({ 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'config:write'] }) }),
+  }
+  for (const caller of [...keylessCallers(), configWriteToken]) {
+    const h = agentRoutineApp(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    try {
+      const headers = caller.headers(h.d)
+      const send = (method: string, path: string, body?: unknown) => caller.request(h.app, path, {
+        method,
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+      const remote = caller.name.includes('remote token')
+      const agentRefusal = caller.name === 'a models:use remote token' ? { status: 403, code: 'forbidden' } : { status: 403, code: 'api_key_required' }
+      const routineRefusal = remote ? { status: 403, code: 'forbidden' } : { status: 401, code: 'unauthorized' }
+      const refused = async (res: Response, want: { status: number; code: string }, what: string) => {
+        const e = await errorOf(res)
+        assert.deepEqual({ status: e.status, code: e.code }, want, `${caller.name}: ${what}`)
+        if (want.code !== 'forbidden') assert.match(e.message, /MCP server tool requires|uses an MCP server tool/, `${caller.name}: ${what}`)
+      }
+
+      await refused(await send('POST', '/api/v1/chat-agents', { name: 'Mine', tools: ['web_search', MCP_TOOL] }), agentRefusal, 'create an agent with an MCP tool')
+      await refused(await send('PUT', `/api/v1/chat-agents/${OWNER_PLAIN_AGENT.id}`, { tools: ['web_search', MCP_TOOL] }), agentRefusal, 'add an MCP tool to an agent')
+      await refused(await send('PUT', `/api/v1/chat-agents/${OWNER_MCP_AGENT.id}`, { systemPrompt: 'attacker prompt' }), agentRefusal, "rewrite an MCP agent's prompt")
+      assert.deepEqual(h.cfg.customAgents, [OWNER_MCP_AGENT, OWNER_PLAIN_AGENT], `${caller.name}: no agent may be added or changed`)
+
+      const mcp = h.routines(OWNER_MCP_AGENT.id)
+      const plain = h.routines(OWNER_PLAIN_AGENT.id)
+      const runOnMcpAgent = h.stalled(mcp.active.id, 'web_search')
+      const mcpCallOnPlainAgent = h.stalled(plain.active.id, MCP_TOOL)
+      const routineCount = h.db.listRoutines().length
+      const create = { flavor: 'chat', prompt: 'attacker prompt', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId: OWNER_MCP_AGENT.id }
+      await refused(await send('POST', '/api/v1/routines', create), routineRefusal, 'create a routine on an MCP agent')
+      await refused(await send('PUT', `/api/v1/routines/${mcp.active.id}`, { prompt: 'attacker prompt' }), routineRefusal, 'edit one')
+      await refused(await send('PUT', `/api/v1/routines/${mcp.pending.id}/confirm`), routineRefusal, 'confirm one')
+      await refused(await send('PUT', `/api/v1/routines/${mcp.paused.id}/resume`), routineRefusal, 'resume one')
+      await refused(await send('POST', `/api/v1/routines/${mcp.active.id}/run-now`), routineRefusal, 'run one now')
+      await refused(await send('POST', `/api/v1/routines/${mcp.active.id}/runs/${runOnMcpAgent}/approve`), routineRefusal, "approve one's stalled run")
+      await refused(await send('POST', `/api/v1/routines/${plain.active.id}/runs/${mcpCallOnPlainAgent}/approve`), routineRefusal, 'approve an MCP call another routine stalled on')
+      assert.equal(h.db.listRoutines().length, routineCount, `${caller.name}: no routine may be created`)
+      assert.equal(h.db.getRoutine(mcp.active.id)?.prompt, 'owner prompt')
+      assert.equal(h.db.getRoutine(mcp.pending.id)?.status, 'pending_confirmation')
+      assert.equal(h.db.getRoutine(mcp.paused.id)?.status, 'paused')
+      assert.deepEqual(h.fired, [], `${caller.name}: nothing may be run`)
+      assert.equal(h.db.getRoutineRun(runOnMcpAgent)?.status, 'needs_approval')
+      assert.equal(h.db.getRoutineRun(mcpCallOnPlainAgent)?.status, 'needs_approval')
+
+      // The rest stays open to them: an agent and a routine with no MCP tool, a rename of an agent
+      // that has none, pausing, and denying (which runs nothing).
+      if (agentRefusal.code === 'api_key_required') {
+        assert.equal((await send('POST', '/api/v1/chat-agents', { name: 'Mine', tools: ['web_search'] })).status, 201, caller.name)
+        assert.equal((await send('PUT', `/api/v1/chat-agents/${OWNER_PLAIN_AGENT.id}`, { name: 'Renamed' })).status, 200, caller.name)
+      }
+      if (!remote) {
+        assert.equal((await send('POST', '/api/v1/routines', { ...create, agentId: OWNER_PLAIN_AGENT.id })).status, 201, caller.name)
+        assert.equal((await send('PUT', `/api/v1/routines/${mcp.active.id}/pause`)).status, 200, caller.name)
+        const denied = await errorOf(await send('POST', `/api/v1/routines/${plain.active.id}/runs/${mcpCallOnPlainAgent}/deny`))
+        assert.equal(denied.code, 'gate_timeout', `${caller.name}: a deny passes the gates`)
+      }
+    } finally {
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+
+  // The host, and a LAN caller with a real key on an open LAN, are unchanged.
+  const raw = 'tllm-mcpagentmcpagentmcpagentmcpagentmcp1'
+  const allowed: Array<[string, typeof tunneledRequest, (cfg: ReturnType<typeof defaultConfig>) => void, Record<string, string>]> = [
+    ['the host', loopbackRequest, () => {}, {}],
+    ['a keyed open-LAN caller', lanRequest, (cfg) => {
+      cfg.daemon.lanBind = true
+      cfg.daemon.requireApiKey = false
+      cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+    }, { 'X-TurboLLM-Auth': raw }],
+  ]
+  for (const [name, request, mutate, headers] of allowed) {
+    const h = agentRoutineApp(mutate)
+    try {
+      const send = (method: string, path: string, body?: unknown) => request(h.app, path, {
+        method,
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      })
+      assert.equal((await send('POST', '/api/v1/chat-agents', { name: 'Mine', tools: [MCP_TOOL] })).status, 201, name)
+      assert.equal((await send('PUT', `/api/v1/chat-agents/${OWNER_MCP_AGENT.id}`, { systemPrompt: 'new prompt' })).status, 200, name)
+      const mcp = h.routines(OWNER_MCP_AGENT.id)
+      const plain = h.routines(OWNER_PLAIN_AGENT.id)
+      const runOnMcpAgent = h.stalled(mcp.active.id, 'web_search')
+      const mcpCallOnPlainAgent = h.stalled(plain.active.id, MCP_TOOL)
+      const create = { flavor: 'chat', prompt: 'p', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId: OWNER_MCP_AGENT.id }
+      assert.equal((await send('POST', '/api/v1/routines', create)).status, 201, name)
+      assert.equal((await send('PUT', `/api/v1/routines/${mcp.active.id}`, { prompt: 'new prompt' })).status, 200, name)
+      assert.equal((await send('PUT', `/api/v1/routines/${mcp.pending.id}/confirm`)).status, 200, name)
+      assert.equal((await send('PUT', `/api/v1/routines/${mcp.paused.id}/resume`)).status, 200, name)
+      assert.equal((await send('POST', `/api/v1/routines/${mcp.active.id}/run-now`)).status, 202, name)
+      assert.deepEqual(h.fired, [mcp.active.id])
+      assert.equal((await errorOf(await send('POST', `/api/v1/routines/${mcp.active.id}/runs/${runOnMcpAgent}/approve`))).code, 'gate_timeout', name)
+      assert.equal((await errorOf(await send('POST', `/api/v1/routines/${plain.active.id}/runs/${mcpCallOnPlainAgent}/approve`))).code, 'gate_timeout', name)
+    } finally {
+      h.cleanup()
+    }
+  }
+})
+
+test("through its chat's tools, a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot give an agent the owner's MCP tool, or author, edit or run a chat routine on one", async () => {
+  /** Real chat routes over a ToolRegistry with the real routine and agent stores, the owner's MCP
+   *  agent and an active chat routine on it. The owner set the four tools to Allow, so nobody is
+   *  asked to approve them. */
+  const setup = (mutate: (cfg: ReturnType<typeof defaultConfig>) => void) => {
+    const spec: { call?: string; args?: Record<string, unknown> } = {}
+    const h = toolChat(mutate, spec)
+    h.cfg.customAgents.push(structuredClone(OWNER_MCP_AGENT))
+    h.cfg.tools.toolPolicies = { create_agent: 'allow', create_routine: 'allow', update_routine: 'allow', run_routine_now: 'allow' }
+    const fired: string[] = []
+    const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
+    Object.assign(h.d, { tools: new ToolRegistry({} as never, h.db, runNow, h.d.store as unknown as AgentToolsStore) })
+    const active = h.db.createRoutine({ flavor: 'chat', prompt: 'owner prompt', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId: OWNER_MCP_AGENT.id })
+    h.db.confirmRoutine(active.id, '2099-01-01T00:00:00.000Z')
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ['create_agent', { name: 'Mine', systemPrompt: 'attacker prompt', tools: [MCP_TOOL] }],
+      ['create_routine', { flavor: 'chat', prompt: 'attacker prompt', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId: OWNER_MCP_AGENT.id }],
+      ['update_routine', { routineId: active.id, prompt: 'attacker prompt', confirm: true }],
+      ['run_routine_now', { routineId: active.id }],
+    ]
+    /** One chat turn per call, the fake model making it; each turn's stream. */
+    const run = async (request: typeof tunneledRequest, headers: Record<string, string>) => {
+      const out: string[] = []
+      for (const [name, args] of calls) {
+        spec.call = name
+        spec.args = args
+        out.push(await chatTurn(h, request, headers, h.db.createConversation().id))
+      }
+      return out
+    }
+    return { h, fired, active, run }
+  }
+
+  for (const caller of keylessCallers()) {
+    const { h, fired, active, run } = setup(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    try {
+      const streams = await run(caller.request, caller.headers(h.d))
+      // A remote token was already refused these four tools (tool-registry.ts); the others now are.
+      const refusal = caller.name.includes('remote token') ? /not allowed/ : /uses an MCP server tool/
+      for (const sse of streams) {
+        assert.match(sse, refusal, caller.name)
+        assert.doesNotMatch(sse, /awaiting_approval/, `${caller.name}: the owner's Allow applies; nobody is asked`)
+      }
+      assert.deepEqual(h.cfg.customAgents, [OWNER_MCP_AGENT], `${caller.name}: no agent may be created`)
+      assert.deepEqual(h.db.listRoutines().map((r) => r.id), [active.id], `${caller.name}: no routine may be created`)
+      assert.equal(h.db.getRoutine(active.id)?.prompt, 'owner prompt', `${caller.name}: nor edited`)
+      assert.deepEqual(fired, [], `${caller.name}: nor run`)
+    } finally {
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+
+  // The host's own chat is unchanged: all four go through.
+  const { h, fired, active, run } = setup(() => {})
+  try {
+    const [agent, routine, update, runNow] = await run(loopbackRequest, {})
+    assert.match(agent, /Created agent /)
+    assert.match(routine, /Created routine /)
+    assert.match(update, /Updated routine /)
+    assert.match(runNow, /is running now/)
+    assert.equal(h.cfg.customAgents.length, 2)
+    assert.deepEqual(h.cfg.customAgents[1].tools, [MCP_TOOL])
+    assert.equal(h.db.listRoutines().length, 2)
+    assert.equal(h.db.getRoutine(active.id)?.prompt, 'attacker prompt')
+    assert.deepEqual(fired, [active.id])
   } finally {
     h.cleanup()
   }

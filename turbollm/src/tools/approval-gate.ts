@@ -7,6 +7,8 @@
 interface PendingApproval {
   resolve: (decision: 'allow' | 'deny') => void
   cleanup: () => void
+  /** The tool the pending call is for, as the generation saw it (never the approver's word). */
+  toolName?: string
 }
 
 const pending = new Map<string, PendingApproval>()
@@ -17,7 +19,7 @@ const pending = new Map<string, PendingApproval>()
  * and cleans up if `signal` fires first. The abort listener is always removed and
  * the pending entry always deleted on every resolution path — no leaks.
  */
-export function waitForToolApproval(key: string, signal: AbortSignal): Promise<'allow' | 'deny'> {
+export function waitForToolApproval(key: string, signal: AbortSignal, toolName?: string): Promise<'allow' | 'deny'> {
   return new Promise<'allow' | 'deny'>((resolvePromise) => {
     const onAbort = () => {
       pending.delete(key)
@@ -32,6 +34,7 @@ export function waitForToolApproval(key: string, signal: AbortSignal): Promise<'
         resolvePromise(decision)
       },
       cleanup,
+      toolName,
     })
     if (signal.aborted) {
       onAbort()
@@ -39,6 +42,13 @@ export function waitForToolApproval(key: string, signal: AbortSignal): Promise<'
     }
     signal.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+/** The tool name `key`'s pending approval was registered with, or undefined when none is pending
+ *  or it was registered without one (a Code session's calls). The approve route decides on it as
+ *  well as on the toolName its caller sends. */
+export function pendingToolApprovalName(key: string): string | undefined {
+  return pending.get(key)?.toolName
 }
 
 /**
