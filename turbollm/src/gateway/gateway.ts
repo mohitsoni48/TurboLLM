@@ -1019,7 +1019,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     )
   }
 
-  // Local: the caller's whole header set, minus `host`. Remote: an ALLOWLIST (invariant 7).
+  // Local: the caller's header set, minus `host`, the hop-by-hop headers and TurboLLM's own
+  // credentials (both dropped just below). Remote: an ALLOWLIST (invariant 7).
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
   // token replaces it, and is added nowhere else.
@@ -1028,9 +1029,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // route correctly among local pool slots — an unrelated fix); a qualified
   // `<machine>/<model>` id sent to `/v1/embeddings` therefore CAN resolve to a remote
   // target now, but is refused above (`link_embeddings_unsupported`) before ever reaching
-  // here — so every request that reaches this line, embeddings included, is guaranteed
-  // chat. Every other verb still routes with an empty id and can never reach the remote
-  // branch below at all.
+  // here — so every remote request that reaches this line is a chat request. Every other
+  // verb still routes with an empty id and can never reach the remote branch below at all.
   //
   // The query string is dropped for a remote request (M-5), for the same reason the header
   // set is an allowlist: a caller that passes a credential as a query parameter would
