@@ -138,6 +138,16 @@ async function refExists(repoRoot: string, name: string): Promise<boolean> {
   return r.ok && r.stdout.trim().length > 0
 }
 
+/** The commit `base` names — a local or remote-tracking branch, a tag, a commit, anything git
+ *  resolves to one — or null. Asked as `<base>^{commit}`, so a tag is peeled to its commit and a
+ *  tree or file name is no base. A leading `-` would reach rev-parse as an option: never a base. */
+async function resolveBaseCommit(repoRoot: string, base: string): Promise<string | null> {
+  if (base.startsWith('-')) return null
+  const r = await runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${base}^{commit}`])
+  const sha = r.stdout.trim()
+  return r.ok && sha ? sha : null
+}
+
 /** First free branch name at or after `desired`, suffixing `-2`, `-3`, … when taken.
  *
  *  Chosen over letting `git worktree add -b` fail and parsing "a branch named 'x' already exists":
@@ -203,21 +213,24 @@ export function agentCwd(run: { repoRoot?: string; worktreePath?: string }): str
 
 export type WorktreeCreation =
   | { ok: true; path: string; branch: string }
-  | { ok: false; code: 'not_a_repo' | 'branch_unavailable' | 'git_failed'; message: string }
+  | { ok: false; code: 'not_a_repo' | 'branch_unavailable' | 'base_unavailable' | 'git_failed'; message: string }
 
 /**
  * Create an isolated worktree for a Code session.
  *
- * `base` is the commit-ish to branch FROM (the composer's "base branch"); when omitted or
- * unresolvable, git's own HEAD is used — branching a session off whatever is checked out is a far
- * better outcome than refusing to start it because a stale base-branch name no longer exists.
+ * `base` is the commit-ish to branch FROM (the composer's "base branch"): any branch, tag or commit
+ * git resolves. Omitted (or blank), the session branches off what is checked out. One that does
+ * not resolve is refused (`base_unavailable`). It used to count only as a local branch name, and
+ * anything else, a tag, a remote-tracking branch, a commit or a name since deleted, was dropped
+ * without a word: the session branched off the current checkout, not the base it was asked for.
  */
 export async function createSessionWorktree(params: {
   repoRoot: string
   branch: string
   base?: string
 }): Promise<WorktreeCreation> {
-  const { repoRoot, base } = params
+  const { repoRoot } = params
+  const base = params.base?.trim()
 
   if (!(await isGitRepo(repoRoot))) {
     return {
@@ -237,6 +250,18 @@ export async function createSessionWorktree(params: {
     }
   }
 
+  // The commit, not the name, goes to `git worktree add`: from a remote-tracking branch git would
+  // also make it the new branch's upstream (branch.autoSetupMerge), and the Git dialog's plain
+  // `git push` of a branch whose upstream has another name is refused under push.default=simple.
+  const baseCommit = base ? await resolveBaseCommit(repoRoot, base) : null
+  if (base && !baseCommit) {
+    return {
+      ok: false,
+      code: 'base_unavailable',
+      message: `Cannot create a worktree: the base "${base}" is not a branch, tag or commit in this repository. Pick another base branch.`,
+    }
+  }
+
   await ensureLocalExclude(repoRoot)
 
   // A session started at a SUBFOLDER of a repo (a monorepo package): `git worktree add` checks out
@@ -251,10 +276,7 @@ export async function createSessionWorktree(params: {
     else prefix = ''
   }
   const worktreeTop = join(top, WORKTREES_SUBDIR, branch)
-  // Only pass a base when it actually resolves — `git worktree add -b x <path> nope` is a hard
-  // failure, and a session that won't start is a worse answer than one branched off HEAD.
-  const baseArgs = base && (await refExists(repoRoot, base)) ? [base] : []
-  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, worktreeTop, ...baseArgs], 120_000)
+  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, worktreeTop, ...(baseCommit ? [baseCommit] : [])], 120_000)
   if (!r.ok) {
     return {
       ok: false,

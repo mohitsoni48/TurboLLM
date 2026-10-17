@@ -184,6 +184,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!task) return err(c, 400, 'invalid_input', 'A task description is required.')
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
     if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
+    // The base is a name for git to resolve (createSessionWorktree trims it): anything but a string
+    // is refused here, never taken for "no base", which would branch off the current checkout.
+    if (b.worktreeBase != null && typeof b.worktreeBase !== 'string') return err(c, 400, 'invalid_input', 'worktreeBase must be a string.')
 
     // ── "Use worktree": actually create one (ADR-316) ─────────────────────────────────────
     // Until now these three fields were stored and never read, so the toggle changed nothing and

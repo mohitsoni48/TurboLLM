@@ -246,12 +246,15 @@ export function CodeHomeScreen() {
     if (isDesktop) inputRef.current?.focus()
   }, [isDesktop])
 
-  // Once the picked repo's branch resolves, default the worktree's base branch to it
-  // (the base a worktree normally branches from) — only when the user hasn't already
-  // picked a different base for this repo.
+  // The worktree's base branch defaults to the picked repo's checked-out branch (the base a
+  // worktree normally branches from), and resets with every repo pick. It used to change only
+  // when a non-empty branch came in, so the base of the previous repo could stay (a repo with a
+  // detached HEAD, or one on a branch of the same name): the session was then asked to branch
+  // off a name this repo may not have, which the daemon refuses (base_unavailable). Empty is the
+  // current checkout.
   useEffect(() => {
-    if (repoBranch) setBaseBranch(repoBranch)
-  }, [repoBranch])
+    setBaseBranch(repoBranch)
+  }, [repoPath, repoBranch])
 
   const chooseRepo = (path: string) => {
     setRepoPath(path)

@@ -232,12 +232,51 @@ test('createSessionWorktree: branches off the requested base when it resolves', 
   }
 })
 
-test('createSessionWorktree: an unresolvable base falls back to HEAD instead of failing', async () => {
-  // A session that won't start is a worse answer than one branched off the current checkout.
+// Only a local branch counted as a base: a tag, a remote-tracking branch or a commit was dropped
+// without a word and the session branched off whatever was checked out instead.
+test('REGRESSION: createSessionWorktree branches off a tag, a remote-tracking branch or a commit the base names', async () => {
   const root = await makeRepo()
   try {
-    const r = await createSessionWorktree({ repoRoot: root, branch: 'feature', base: 'no-such-branch' })
-    assert.ok(r.ok, JSON.stringify(r))
+    await runGit(root, ['checkout', '-q', '-b', 'side'])
+    writeFileSync(join(root, 'only-on-side.txt'), 'x\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'side work'])
+    const sha = (await runGit(root, ['rev-parse', 'HEAD'])).stdout.trim()
+    await runGit(root, ['tag', '-a', '-m', 'release', 'v1.0'])
+    // A configured remote, so git would take origin/release for an upstream (see below).
+    await runGit(root, ['remote', 'add', 'origin', tmpDir('twt-remote-')])
+    await runGit(root, ['update-ref', 'refs/remotes/origin/release', sha])
+    await runGit(root, ['checkout', '-q', 'main'])
+    await runGit(root, ['branch', '-D', 'side'])
+
+    for (const [i, base] of ['v1.0', 'origin/release', sha, sha.slice(0, 10)].entries()) {
+      const r = await createSessionWorktree({ repoRoot: root, branch: `feature-${i}`, base })
+      assert.ok(r.ok, `${base}: ${JSON.stringify(r)}`)
+      if (!r.ok) return
+      assert.ok(existsSync(join(r.path, 'only-on-side.txt')), `${base}: branched from it, not from main`)
+      // Branched from the commit, so a remote base is not set as the new branch's upstream: with
+      // push.default=simple a plain `git push` of a branch tracking origin/release is refused.
+      assert.equal((await runGit(r.path, ['rev-parse', '--abbrev-ref', '@{u}'])).ok, false, `${base}: no upstream`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('createSessionWorktree: an unresolvable base is refused with a clear message, and nothing is created', async () => {
+  const root = await makeRepo()
+  try {
+    for (const base of ['no-such-branch', '-q', 'README.md']) {
+      const r = await createSessionWorktree({ repoRoot: root, branch: 'feature', base })
+      assert.equal(r.ok, false, base)
+      if (r.ok) return
+      assert.equal(r.code, 'base_unavailable', base)
+      assert.match(r.message, new RegExp(`"${base}"`))
+    }
+    assert.equal((await runGit(root, ['branch', '--list', 'feature'])).stdout.trim(), '', 'no branch made')
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR)), 'no worktree made')
+    // An empty base is no base: the current checkout, as when it is left out.
+    assert.equal((await createSessionWorktree({ repoRoot: root, branch: 'feature', base: '  ' })).ok, true)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
