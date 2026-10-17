@@ -1019,8 +1019,9 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     )
   }
 
-  // Local: the caller's header set, minus `host`, the hop-by-hop headers and TurboLLM's own
-  // credentials (both dropped just below). Remote: an ALLOWLIST (invariant 7).
+  // Local: the caller's header set, minus `host`, the hop-by-hop headers, TurboLLM's own
+  // credentials and a browser's Origin and Referer (all dropped just below). Remote: an ALLOWLIST
+  // (invariant 7). Either way a chat body is re-sent as application/json (the isChat branch).
   // The peer's clients authenticate to THIS machine; their credential is meaningless on the
   // host and forwarding it would hand another box a secret it was never issued. The link
   // token replaces it, and is added nowhere else.
@@ -1051,7 +1052,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // carries Turbo Link tokens) are for this daemon only — the engine never reads them, and whatever answers on the
   // engine's internal port must not see them. `authorization` and `x-api-key` are left alone even when they carry the
   // daemon key: an engine started with its own --api-key reads them.
-  if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app']) headers.delete(h)
+  // Nor is a browser's Origin or Referer the engine's to judge: the engine is this daemon's loopback backend, and the
+  // daemon is the caller's cross-origin boundary (/v1 CORS in server.ts, lanAuth). Forwarded, the Android LiteRT-LM
+  // engine's own check (main.cc CrossSiteRefusal: a cross-origin POST must be application/json) refused a browser
+  // app on another origin that posts its JSON as text/plain, and the daemon relayed the 403.
+  if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app', 'origin', 'referer']) headers.delete(h)
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
@@ -1177,6 +1182,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
         injectedUsage = true
       }
       headers.delete('content-length') // re-serialised body has a new length
+      headers.set('content-type', 'application/json') // re-serialised body; never inherited (a client's text/plain)
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
     } else if (isEmbeddings) {
       // Byte-for-byte passthrough of what was already buffered above to read `model` —

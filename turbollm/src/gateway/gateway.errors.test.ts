@@ -454,6 +454,67 @@ test('POST /v1/chat/completions does not hand TurboLLM\'s own credentials to the
   }
 })
 
+// A browser chat app on another origin may post its JSON as text/plain (a "simple" request, no CORS preflight). The
+// local pass-through forwarded that Content-Type with the browser's Origin, and the Android LiteRT-LM engine refuses a
+// cross-origin POST that is not application/json (main.cc CrossSiteRefusal): the daemon relayed its 403. This engine
+// applies the same rule. The engine is this daemon's loopback backend, not the browser's origin.
+function crossSiteCheckingEngine(engineSaw: Record<string, string | undefined>) {
+  return withFakeEngine((req, res) => {
+    for (const h of ['content-type', 'origin', 'referer']) engineSaw[h] = req.headers[h] as string | undefined
+    req.resume()
+    req.on('end', () => {
+      const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase()
+      if (req.headers.origin && type !== 'application/json') {
+        res.writeHead(403, { 'Content-Type': 'text/plain' })
+        res.end('Forbidden: a cross-origin POST must be application/json')
+        return
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ choices: [{ message: { content: 'hi' }, text: 'hi', finish_reason: 'stop' }], data: [] }))
+    })
+  })
+}
+const BROWSER_TEXT_PLAIN = { 'Content-Type': 'text/plain;charset=UTF-8', Origin: 'https://chat.example', Referer: 'https://chat.example/app' }
+
+test('POST /v1/chat/completions posted as text/plain from another origin reaches the engine as application/json, without the browser\'s Origin', async () => {
+  const engineSaw: Record<string, string | undefined> = {}
+  const engine = await crossSiteCheckingEngine(engineSaw)
+  try {
+    const app = new Hono()
+    registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+    const res = await app.request('/v1/chat/completions', {
+      method: 'POST',
+      headers: BROWSER_TEXT_PLAIN,
+      body: JSON.stringify({ model: 'qwen3-8b|Q4|123', messages: [], stream: false }),
+    })
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.deepEqual(engineSaw, { 'content-type': 'application/json', origin: undefined, referer: undefined })
+  } finally {
+    await engine.close()
+  }
+})
+
+// The other local pass-throughs forward the client's own body bytes, so its own Content-Type with them; the browser's
+// Origin and Referer stay behind there too.
+for (const [path, body] of [
+  ['/v1/embeddings', { model: 'qwen3-8b|Q4|123', input: 'hi' }],
+  ['/v1/completions', { model: 'qwen3-8b|Q4|123', prompt: 'hi' }],
+] as const) {
+  test(`${path}: a cross-origin browser request does not hand the engine its Origin or Referer`, async () => {
+    const engineSaw: Record<string, string | undefined> = {}
+    const engine = await crossSiteCheckingEngine(engineSaw)
+    try {
+      const app = new Hono()
+      registerGateway(app, { ...fakeDeps(engine.url), db: { recordApiUsage: () => {} } } as unknown as Deps)
+      const res = await app.request(path, { method: 'POST', headers: BROWSER_TEXT_PLAIN, body: JSON.stringify(body) })
+      assert.equal(res.status, 200, await res.clone().text())
+      assert.deepEqual(engineSaw, { 'content-type': 'text/plain;charset=UTF-8', origin: undefined, referer: undefined })
+    } finally {
+      await engine.close()
+    }
+  })
+}
+
 // ── Route failures: every one is a 503, and Claude Code retries any 5xx up to 10 times unless told not to —
 // re-running a model load that fails (evicting whatever was loaded) on every attempt. Only a refusal the router marks
 // permanent says not to; one that clears by itself (ComfyUI's queue) is left retryable. The status codes are unchanged.
