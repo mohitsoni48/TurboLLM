@@ -7,7 +7,7 @@ import { rm } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
@@ -2320,22 +2320,35 @@ export function registerApi(app: Hono, d: Deps): void {
       // initial-tail GET (whichever arrived first, the result was either duplicated or truncated
       // lines). ADR-409's review, PR #216.
       //
+      // A RECONNECT is not brand-new: starting it from "now" lost every line written while the
+      // client was away (a Wi-Fi drop, sleep/wake, the 3 s before a reopen). Each line and ping
+      // carries the cursor just past it as its SSE id (logCursor), the client sends the last one
+      // back as Last-Event-ID (web sse.ts subscribeSse, as EventSource does), and the first look
+      // resumes there when it still names this log; one from another log (a restart or a switch
+      // while away) starts this one from 0, as the loop does for a new log. A ping goes out on
+      // the first tick too, so a quiet log's connection has a cursor before any line. A resume
+      // replays at most the log's last LOG_RESUME_MAX_BYTES (resumeLogCursor), from the first
+      // whole line in them (`dropPartial`): a cursor from hours ago (a laptop that slept with
+      // Monitor open) or another log's would otherwise read the whole gap in one readSync and
+      // send every line of it, though the client keeps only its last 2000.
+      //
       // Perf follow-up (docs/TODO.md, "Verification & chores", ADR-409 review item 2): the
       // previous version did `readFileSync(path).split('\n')` — the WHOLE file, synchronously,
       // every 400ms tick, for as long as Monitor/Engines-drawer is open. Harmless on a short
       // log; on a long verbose session (tens of MB) it periodically blocked the daemon's event
       // loop, including `/v1/chat/completions`. Now reads only the byte DELTA since the last
       // tick via `readSync` at a tracked offset — a live-tailed log costs O(new bytes), not
-      // O(whole file), per tick. `dec` is a single persistent `TextDecoder` for the WHOLE
-      // connection (not reconstructed per tick) so a multi-byte UTF-8 character split across
-      // two ticks' byte ranges decodes correctly instead of emitting U+FFFD at the boundary
-      // (`{ stream: true }` holds back incomplete trailing bytes for the next chunk) — same
-      // technique `drainOpenAiSseForLog` uses for the exact same reason.
+      // O(whole file), per tick. A line not yet newline-terminated is held as raw bytes (`carry`)
+      // and decoded only once complete, so a multi-byte UTF-8 character split across two ticks'
+      // byte ranges decodes whole instead of as U+FFFD (a newline byte never occurs inside one),
+      // and each line's end is an exact byte offset for its cursor.
+      const resume = c.req.header('Last-Event-ID')
       let bytePos = 0
       let lastPath = ''
       let firstLook = true // this connection has not polled the log yet
-      let carry = '' // a line seen but not yet newline-terminated, held for the next tick
-      const dec = new TextDecoder()
+      let carry: Buffer = Buffer.alloc(0) // a line seen but not yet newline-terminated, held for the next tick
+      let before: Buffer = Buffer.alloc(0) // the bytes just before the cursor (bytePos - carry.length), for logCursor
+      let dropPartial = false // a resume cut short by its floor starts mid-line: skip that line's tail
       let aborted = false
       let ticks = 0
       stream.onAbort(() => {
@@ -2346,10 +2359,17 @@ export function registerApi(app: Hono, d: Deps): void {
         if (path && existsSync(path)) {
           const size = statSync(path).size
           if (path !== lastPath || size < bytePos) {
-            bytePos = firstLook ? size : 0
+            const resumed = firstLook && resume !== undefined ? resumeLogCursor(path, size, resume) : null
+            if (resumed) {
+              bytePos = resumed.at
+              before = resumed.before
+              dropPartial = resumed.midLine
+            } else {
+              bytePos = firstLook ? size : 0
+              before = readLogBytes(path, bytePos)
+            }
             lastPath = path
-            carry = ''
-            dec.decode() // flush/reset any pending partial-char state from the OLD file
+            carry = Buffer.alloc(0)
           }
           if (size > bytePos) {
             const len = size - bytePos
@@ -2360,18 +2380,31 @@ export function registerApi(app: Hono, d: Deps): void {
             } finally {
               closeSync(fd)
             }
+            const chunkStart = bytePos - carry.length
+            const chunk = carry.length ? Buffer.concat([carry, buf]) : buf
+            const beforeChunk = before
             bytePos = size
-            const text = carry + dec.decode(buf, { stream: true })
-            const lines = text.split('\n')
-            carry = lines.pop() ?? ''
-            for (const line of lines) {
-              await stream.writeSSE({ event: 'line', data: JSON.stringify({ line: line.replace(/\r$/, '') }) })
+            let from = 0
+            for (let nl = chunk.indexOf(0x0a); nl !== -1; nl = chunk.indexOf(0x0a, from)) {
+              const line = chunk.toString('utf8', from, nl).replace(/\r$/, '')
+              from = nl + 1
+              before = Buffer.from(
+                from >= LOG_CURSOR_BYTES
+                  ? chunk.subarray(from - LOG_CURSOR_BYTES, from)
+                  : Buffer.concat([beforeChunk, chunk.subarray(0, from)]).subarray(-LOG_CURSOR_BYTES),
+              )
+              if (dropPartial) {
+                dropPartial = false
+                continue
+              }
+              await stream.writeSSE({ event: 'line', data: JSON.stringify({ line }), id: logCursor(path, chunkStart + from, before) })
             }
+            carry = Buffer.from(chunk.subarray(from))
           }
         }
         // Set whether or not a log existed yet: one that appears later is a new run's, read from 0.
         firstLook = false
-        if (++ticks % 37 === 0) await stream.writeSSE({ data: '', event: 'ping' })
+        if (ticks++ % 37 === 0) await stream.writeSSE({ data: '', event: 'ping', id: logCursor(lastPath, bytePos - carry.length, before) })
         await stream.sleep(400)
       }
     }),
@@ -4111,6 +4144,63 @@ function discardPurgeTrash(trash: string): Promise<void> {
     .finally(() => purgeTrashDeletes.delete(trash))
   purgeTrashDeletes.set(trash, deleting)
   return deleting
+}
+
+/** How many bytes before an engine-log cursor its fingerprint covers. */
+const LOG_CURSOR_BYTES = 64
+
+/** An engine-log position for GET /api/v1/engine/logs/stream's resume (its SSE ids): the byte
+ *  offset read up to, and a hash of the log's path and the bytes just before that offset. The
+ *  offset alone could land in another log: a restart rewrites the same path from empty and a
+ *  switch changes it, and the new log can grow past the old offset while the client is away. */
+function logCursor(path: string, end: number, before: Buffer): string {
+  const hash = createHash('sha1').update(path).update('\0').update(before).digest('hex').slice(0, 16)
+  return `${end}:${before.length}:${hash}`
+}
+
+/** Up to LOG_CURSOR_BYTES bytes of `path` ending at `end` (none when it can't be read). */
+function readLogBytes(path: string, end: number, n = Math.min(end, LOG_CURSOR_BYTES)): Buffer {
+  const out = Buffer.alloc(n)
+  if (n === 0) return out
+  try {
+    const fd = openSync(path, 'r')
+    try {
+      return out.subarray(0, readSync(fd, out, 0, n, end - n))
+    } finally {
+      closeSync(fd)
+    }
+  } catch {
+    return Buffer.alloc(0)
+  }
+}
+
+/** The most of an engine log a resumed stream replays: the client keeps its last 2000 lines
+ *  (web use-engine-log.ts MAX_LINES), and a log line is rarely past 128 bytes. */
+const LOG_RESUME_MAX_BYTES = 256 * 1024
+
+/** Where a stream resumed with this Last-Event-ID starts reading `path` (now `size` bytes): the
+ *  cursor's offset when it still names this log, else 0, the start of a log new to this client;
+ *  either way no earlier than the last LOG_RESUME_MAX_BYTES, and `midLine` when that floor cuts
+ *  a line, whose tail the stream skips. Null for an id that is not a logCursor at all, which is
+ *  read as a fresh connection. */
+function resumeLogCursor(path: string, size: number, cursor: string): { at: number; before: Buffer; midLine: boolean } | null {
+  const m = /^(\d+):(\d+):[0-9a-f]{16}$/.exec(cursor)
+  if (!m) return null
+  const end = Number(m[1])
+  const n = Number(m[2])
+  let at = 0
+  let before: Buffer = Buffer.alloc(0)
+  if (end <= size && n <= Math.min(end, LOG_CURSOR_BYTES)) {
+    const bytes = readLogBytes(path, end, n)
+    if (logCursor(path, end, bytes) === cursor) {
+      at = end
+      before = bytes
+    }
+  }
+  const floor = size - LOG_RESUME_MAX_BYTES
+  if (at >= floor) return { at, before, midLine: false }
+  before = readLogBytes(path, floor)
+  return { at: floor, before, midLine: before.length > 0 && before[before.length - 1] !== 0x0a }
 }
 
 function readTail(path: string, n: number): string[] {

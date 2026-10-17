@@ -72,12 +72,14 @@ const SSE_RETRY_MS = 3000
  *  log). A browser EventSource cannot send headers, so over LAN-with-a-key or remote access its
  *  handshake gets a 401 and the tail is silently dead — the daemon accepts credentials only from
  *  headers. This sends `authHeaders()` like every other API call, and keeps EventSource's reconnect
- *  behaviour: a stream that ends or drops is reopened after {@link SSE_RETRY_MS}; an HTTP error
- *  response, or a 200 that isn't `text/event-stream`, fails it for good (as EventSource does).
+ *  behaviour: a stream that ends or drops is reopened after {@link SSE_RETRY_MS}, with the id of
+ *  the last message that had one as `Last-Event-ID`; an HTTP error response, or a 200 that isn't
+ *  `text/event-stream`, fails it for good (as EventSource does). The engine-log tail resumes from
+ *  that id, so the lines written while it reconnected still arrive (it used to start a reopened
+ *  stream from "now" and they were lost). The request-log tail sends no ids and live events only.
  *  `onOpen` runs each time a stream's response arrives, before its first message (EventSource's
- *  `open` event): the daemon's tails send live events only, with no replay, so a caller that also
- *  loads a snapshot loads it from there, the first time and after every reconnect.
- *  Returns the close function. */
+ *  `open` event), so a caller that also loads a snapshot loads it from there, the first time and
+ *  after every reconnect. Returns the close function. */
 export function subscribeSse(
   url: string,
   onMessage: (msg: SseMessage) => void,
@@ -85,15 +87,21 @@ export function subscribeSse(
 ): () => void {
   const ac = new AbortController()
   const { signal } = ac
+  let lastEventId: string | undefined
   void (async () => {
     while (!signal.aborted) {
       try {
-        const res = await fetch(url, { headers: { Accept: 'text/event-stream', ...authHeaders() }, signal })
+        const headers: Record<string, string> = { Accept: 'text/event-stream', ...authHeaders() }
+        if (lastEventId !== undefined) headers['Last-Event-ID'] = lastEventId
+        const res = await fetch(url, { headers, signal })
         // Like EventSource, a 200 that isn't an event stream (a proxy's HTML login/interstitial
         // page) fails for good too, rather than being re-downloaded every few seconds.
         if (!res.ok || !res.body || !/^text\/event-stream/i.test(res.headers.get('content-type') ?? '')) return
         opts.onOpen?.()
-        for await (const msg of readSseStream(res.body)) onMessage(msg)
+        for await (const msg of readSseStream(res.body)) {
+          if (msg.id !== undefined) lastEventId = msg.id
+          onMessage(msg)
+        }
       } catch {
         /* network drop, daemon restart, or our own abort — the loop condition sorts out which */
       }

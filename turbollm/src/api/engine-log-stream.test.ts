@@ -31,7 +31,9 @@ function sseEventReader(body: ReadableStream<Uint8Array>) {
   const dec = new TextDecoder()
   let buf = ''
   return {
-    async next(timeoutMs = 3000): Promise<{ event: string; data: string }> {
+    /** The next frame, skipping keep-alive pings unless `pings` (the stream sends one on its
+     *  first tick, carrying its resume cursor). */
+    async next(timeoutMs = 3000, { pings = false } = {}): Promise<{ event: string; data: string; id?: string }> {
       const deadline = Date.now() + timeoutMs
       while (true) {
         const frameEnd = buf.indexOf('\n\n')
@@ -40,7 +42,9 @@ function sseEventReader(body: ReadableStream<Uint8Array>) {
           buf = buf.slice(frameEnd + 2)
           const event = frame.match(/^event: (.+)$/m)?.[1] ?? ''
           const data = frame.match(/^data: (.*)$/m)?.[1] ?? ''
-          return { event, data }
+          const id = frame.match(/^id: (.+)$/m)?.[1]
+          if (event === 'ping' && !pings) continue
+          return { event, data, id }
         }
         const remaining = deadline - Date.now()
         if (remaining <= 0) throw new Error(`sseEventReader.next: no frame within ${timeoutMs}ms`)
@@ -49,6 +53,8 @@ function sseEventReader(body: ReadableStream<Uint8Array>) {
         buf += dec.decode(value, { stream: true })
       }
     },
+    /** The client goes away: hono's stream sees the cancel as an abort and stops. */
+    close: () => reader.cancel(),
   }
 }
 
@@ -174,8 +180,8 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     assert.deepEqual(JSON.parse((await events.next()).data), { line: 'line b' })
 
     // Tick 2: a multi-byte UTF-8 line (emoji + accented characters) — a byte-range read that
-    // happened to split this character mid-sequence would previously decode as U+FFFD; the
-    // persistent `TextDecoder({ stream: true })` must hold any split bytes across ticks.
+    // happened to split this character mid-sequence would previously decode as U+FFFD; a line's
+    // bytes are held raw (`carry`) until its newline arrives, and decoded whole.
     appendFileSync(logD, 'GPU 温度 café 🚀\n')
     assert.deepEqual(JSON.parse((await events.next()).data), { line: 'GPU 温度 café 🚀' })
 
@@ -185,5 +191,87 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
     await new Promise((r) => setTimeout(r, 500)) // at least one more poll tick with no complete line
     appendFileSync(logD, 'line c\n')
     assert.deepEqual(JSON.parse((await events.next()).data), { line: 'partial-line c' })
+  })
+  // A reconnect (a Wi-Fi drop, sleep/wake, the 3 s before the client reopens) used to start from
+  // "now" like a brand-new connection, so every line written while the client was away was lost.
+  // The client sends back the id of the last frame it got (web sse.ts subscribeSse).
+  const resumeFrom = (app: Hono, id: string) => app.request('/api/v1/engine/logs/stream', { headers: { 'Last-Event-ID': id } })
+
+  await t.test('a reconnect with the last id it got resumes there: the lines written while it was away arrive, none twice', async () => {
+    const logF = join(dir, 'f.log')
+    writeFileSync(logF, 'seed\n')
+    const app = fakeApp(() => logF)
+    const first = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+    await new Promise((r) => setTimeout(r, 600))
+    appendFileSync(logF, 'line a\n')
+    const a = await first.next()
+    assert.deepEqual(JSON.parse(a.data), { line: 'line a' })
+    assert.ok(a.id, 'each line carries its cursor as the SSE id')
+    await first.close()
+
+    appendFileSync(logF, 'while away 1\nwhile away 2\n')
+    const again = sseEventReader((await resumeFrom(app, a.id!)).body!)
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'while away 1' })
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'while away 2' })
+    appendFileSync(logF, 'after\n')
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'after' })
+    await again.close()
+  })
+
+  await t.test('a quiet log: the first ping carries the cursor, so a connection that got no line still resumes', async () => {
+    const logG = join(dir, 'g.log')
+    writeFileSync(logG, 'seed\n')
+    const app = fakeApp(() => logG)
+    const first = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+    const ping = await first.next(3000, { pings: true })
+    assert.equal(ping.event, 'ping')
+    assert.ok(ping.id)
+    await first.close()
+
+    appendFileSync(logG, 'while away\n')
+    const again = sseEventReader((await resumeFrom(app, ping.id!)).body!)
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'while away' })
+    await again.close()
+  })
+
+  await t.test('an id from another log (the engine restarted while it was away) starts this one from its first line', async () => {
+    const logH = join(dir, 'h.log')
+    writeFileSync(logH, 'old run 1\n')
+    const app = fakeApp(() => logH)
+    const first = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+    await new Promise((r) => setTimeout(r, 600))
+    appendFileSync(logH, 'old run 2\n')
+    const last = await first.next()
+    await first.close()
+
+    // The restart rewrote the same path, and its log is already longer than the old cursor.
+    writeFileSync(logH, 'new run, line 1 is longer than the old log\nnew run, line 2\n')
+    const again = sseEventReader((await resumeFrom(app, last.id!)).body!)
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'new run, line 1 is longer than the old log' })
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'new run, line 2' })
+    await again.close()
+  })
+
+  await t.test('a resume far behind replays only the last 256 KiB of the log, from the first whole line in them', async () => {
+    const logI = join(dir, 'i.log')
+    writeFileSync(logI, 'seed\n')
+    const app = fakeApp(() => logI)
+    const first = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+    const ping = await first.next(3000, { pings: true })
+    await first.close()
+
+    // A laptop that slept with Monitor open: 300 lines of 1000 bytes went by while it was away.
+    const line = (i: number) => `line ${String(i).padStart(3, '0')} ${'x'.repeat(990)}`
+    appendFileSync(logI, Array.from({ length: 300 }, (_, i) => line(i) + '\n').join(''))
+    const floor = 5 + 300 * 1000 - 256 * 1024 // routes.ts LOG_RESUME_MAX_BYTES
+    const firstWhole = Math.ceil((floor - 5) / 1000) // line 37 starts before the floor and is cut
+
+    const again = sseEventReader((await resumeFrom(app, ping.id!)).body!)
+    for (let i = firstWhole; i < 300; i++) {
+      assert.deepEqual(JSON.parse((await again.next()).data), { line: line(i) }, `line ${i}`)
+    }
+    appendFileSync(logI, 'after\n')
+    assert.deepEqual(JSON.parse((await again.next()).data), { line: 'after' })
+    await again.close()
   })
 })

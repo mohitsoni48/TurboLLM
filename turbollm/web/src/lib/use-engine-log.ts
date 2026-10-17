@@ -31,7 +31,8 @@ export function useEngineLog(active: boolean) {
       })
 
     // Not an EventSource: it can't send the API key, so the tail would 401 over LAN/remote access.
-    // subscribeSse reconnects the same way when the stream closes.
+    // subscribeSse reconnects the same way when the stream closes, sending the last line's id as
+    // Last-Event-ID: the daemon resumes after it, so the lines written meanwhile are not lost.
     const close = subscribeSse(engineLogStreamUrl, (msg) => {
       if (msg.event !== 'line') return
       try {

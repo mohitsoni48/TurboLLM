@@ -148,6 +148,25 @@ describe('subscribeSse', () => {
     close()
   })
 
+  // The engine-log tail resumes from this id: a reopened stream that did not send it started from
+  // "now", and the lines written while it reconnected were lost.
+  it('a reopened stream sends the id of the last message that had one as Last-Event-ID, as EventSource does', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(ok(['event: line\ndata: a\nid: c1\n\n', 'event: ping\ndata: \nid: c2\n\nevent: other\ndata: x\n\n']))
+      .mockImplementation(async () => ok([]))
+    vi.stubGlobal('fetch', fetchMock)
+    const close = subscribeSse('/s', () => {})
+    await vi.advanceTimersByTimeAsync(0)
+    const headersOf = (i: number) => (fetchMock.mock.calls[i] as unknown as [string, RequestInit])[1].headers as Record<string, string>
+    expect(headersOf(0)['Last-Event-ID']).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(headersOf(1)).toMatchObject({ 'Last-Event-ID': 'c2', 'X-TurboLLM-Auth': 'k-123' })
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(headersOf(2)['Last-Event-ID']).toBe('c2')
+    close()
+  })
+
   it('gives up for good on an HTTP error, as EventSource does on a non-200', async () => {
     const fetchMock = vi.fn(async () => new Response('{"error":{"code":"unauthorized"}}', { status: 401 }))
     vi.stubGlobal('fetch', fetchMock)
