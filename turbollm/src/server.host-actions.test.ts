@@ -352,3 +352,84 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
     }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never), cfg)
   }
 })
+
+// POST /api/v1/downloads with a `url` fetches any origin the caller names and, with a `subdir`, writes
+// under the name the URL ends in, replacing a file there. Callers refused host-side actions get the
+// Turbo Link façade's contract instead: an HF repo file (with a subdir and folder, as the
+// whole-folder dialog sends them), never a URL, an HF one included. A remote token is held to it
+// too, whatever its capabilities.
+function withDownloads(d: Deps): { queued: unknown[] } {
+  const queued: unknown[] = []
+  Object.assign(d, { downloads: { enqueue: async (input: unknown) => { queued.push(input); return [] } } })
+  return { queued }
+}
+const RAW_URL = { url: 'http://127.0.0.1:9/x/authorized_keys', subdir: '.ssh' }
+const HF_URL = { url: 'https://huggingface.co/o/r/resolve/main/m.gguf' }
+const REPO_FILE = { repo: 'o/r', rfilename: 'enc/config.json', subdir: 'r/enc', folder: { files: [{ path: 'r/enc/config.json', size: 10 }] } }
+async function assertUrlRefused(send: (body: unknown) => Response | Promise<Response>, queued: unknown[]): Promise<void> {
+  for (const b of [RAW_URL, HF_URL]) {
+    const res = await send(b)
+    assert.equal(res.status, 403, b.url)
+    assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required', b.url)
+  }
+  assert.deepEqual(queued, [], 'nothing may be queued')
+  assert.equal((await send(REPO_FILE)).status, 202, 'an HF repo file still downloads')
+  assert.deepEqual(queued, [REPO_FILE])
+}
+
+test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot download from a URL; an HF repo file still queues, and with a key a URL does', async () => {
+  // Tailscale Serve, no key.
+  {
+    const { d } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const { queued } = withDownloads(d)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertUrlRefused((b) => tunneled(d, '/api/v1/downloads', serve, b), queued)
+    assert.equal((await tunneled(d, '/api/v1/downloads', { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, RAW_URL)).status, 202)
+    assert.deepEqual(queued.at(-1), RAW_URL)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-downloads.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const { queued } = withDownloads(d)
+      await assertUrlRefused((b) => tunneled(d, '/api/v1/downloads', { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }, b), queued)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false })
+    const { queued } = withDownloads(d)
+    await assertUrlRefused((b) => fromLan(d, '/api/v1/downloads', {}, b), queued)
+    assert.equal((await fromLan(d, '/api/v1/downloads', { 'X-TurboLLM-Auth': RAW_KEY }, RAW_URL)).status, 202)
+    assert.deepEqual(queued.at(-1), RAW_URL)
+  }
+  // A remote-access token holding downloads:write (none the product mints can).
+  {
+    const { d } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick' })
+    const { queued } = withDownloads(d)
+    const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'downloads:write'] }) }
+    await assertUrlRefused((b) => tunneled(d, '/api/v1/downloads', token, b), queued)
+  }
+  // The host itself, unchanged.
+  {
+    const { d } = mkDeps()
+    const { queued } = withDownloads(d)
+    const res = await createApp(d).request('/api/v1/downloads', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Host: '127.0.0.1:6996' },
+      body: JSON.stringify(RAW_URL),
+    }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+    assert.equal(res.status, 202)
+    assert.deepEqual(queued, [RAW_URL])
+  }
+})

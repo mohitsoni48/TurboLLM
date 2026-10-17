@@ -3465,6 +3465,16 @@ export function registerApi(app: Hono, d: Deps): void {
   // Enqueue from an HF repo file {repo, rfilename} OR a raw URL {url}. 202.
   app.post('/api/v1/downloads', async (c) => {
     const b = await body<EnqueueInput>(c)
+    // A `url` is fetched from any origin the caller names (the host's own LAN, a cloud metadata
+    // endpoint) and, with a `subdir`, written under any name the URL ends in, replacing a file
+    // already there. So a caller isLocalOrAuthenticated refuses (a keyless Serve identity, Access
+    // JWT or open-LAN peer, a remote token) gets no `url`, as the Turbo Link façade's peers get none
+    // (link-routes.ts): an HF repo file only, with the `subdir` and `folder` the whole-folder dialog
+    // sends alongside it. With `url` out, DownloadManager.enqueue requires a `repo` and `rfilename`,
+    // so a `subdir` or `folder` never comes without one. Checked as enqueue does (`if (input.url)`),
+    // before anything is queued. api_key_required: the web client opens its key prompt on it.
+    if (b?.url && !isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', 'Importing a model from a URL requires a valid API key.')
     // One request may fan out into several files (split shards + a shared mmproj) —
     // return every record created so the UI reflects the full queued set.
     const out = await enqueueDownload(d, b)

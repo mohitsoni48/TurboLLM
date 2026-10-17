@@ -8,8 +8,10 @@ import {
   createReadStream,
   createWriteStream,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statfsSync,
@@ -17,7 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
@@ -238,6 +240,7 @@ export class DownloadManager {
           throw new DownloadError('invalid_url', 'Could not derive a .gguf or .litertlm filename from that URL.')
         }
         const destDir = explicitSubdir ? join(dir, explicitSubdir) : dir
+        assertInsideModelDir(dir, destDir)
         mkdirSync(destDir, { recursive: true })
         if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
         const dest = join(destDir, filename)
@@ -267,6 +270,7 @@ export class DownloadManager {
       }
       const filename = basename(rfilename)
       const destDir = join(dir, explicitSubdir || repoSubdir(repo))
+      assertInsideModelDir(dir, destDir)
       mkdirSync(destDir, { recursive: true })
       const dest = join(destDir, filename)
       if (this.hasLiveDest(dest)) return []
@@ -290,6 +294,7 @@ export class DownloadManager {
     // The expander's dir is HF-derived (or, on its fallbacks, the caller's own rfilename) —
     // sanitised like the repo id so it can never leave the model folder.
     const destDir = join(dir, repoSubdir(repo), repoSubdir(modelDir))
+    assertInsideModelDir(dir, destDir)
     mkdirSync(destDir, { recursive: true })
 
     const targets = files
@@ -998,4 +1003,52 @@ function repoSubdir(repo: string): string {
     .split('/')
     .filter((s) => s && s !== '.' && s !== '..')
     .join('/')
+}
+
+/** Throw unless `destDir`, a folder below the model folder `dir` built from segments
+ *  {@link repoSubdir} has already cleared of `..`, is inside it on disk as well. The segments
+ *  only keep the path inside on paper: mkdirSync and the .part write follow a folder link, so
+ *  with models/ext a link to a folder outside, a subdir of 'ext/deeper' wrote
+ *  <outside>/deeper/<file>, for any caller. Each path's nearest existing part is resolved
+ *  (mkdirSync makes whatever is still missing below it as real folders), and the destination
+ *  must stay within the model folder's real path, as Scanner.delete holds a delete to its
+ *  roots. A model folder that is itself a link, or a link that stays inside it, still works.
+ *  Run before mkdirSync, which would otherwise make the folders out there first. */
+function assertInsideModelDir(dir: string, destDir: string): void {
+  let rel: string
+  try {
+    rel = relative(realOfNearest(dir), realOfNearest(destDir))
+  } catch (e) {
+    // A folder that cannot be resolved (an lstat refused with EACCES, a primary folder on a
+    // Windows drive that is gone, where realOfNearest climbs to the root and finds nothing, a
+    // dangling link): nothing proves it is inside, so it is still refused, but with its fs error,
+    // as enqueue reports every other fs failure (toDownloadFailure: 500 internal, the
+    // host-authored message kept off the Turbo Link facade). Reported as a link out of the model
+    // folder, it sent the owner looking for a link that is not there.
+    const fsErr = e as NodeJS.ErrnoException
+    const message = String(fsErr.message ?? e)
+    const detail = fsErr.code && !message.startsWith(fsErr.code) ? `${fsErr.code}: ${message}` : message
+    throw new Error(`The download folder could not be checked: ${detail}`)
+  }
+  if (rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))) return
+  throw new DownloadError('invalid_request', 'The download folder leads out of the model folder through a link.')
+}
+
+/** `p` with its nearest existing part resolved to its real path and the missing rest appended. */
+function realOfNearest(p: string): string {
+  let cur = resolve(p)
+  const rest: string[] = []
+  for (;;) {
+    try {
+      lstatSync(cur)
+      break
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      const parent = dirname(cur)
+      if ((code !== 'ENOENT' && code !== 'ENOTDIR') || parent === cur) throw e
+      rest.unshift(basename(cur))
+      cur = parent
+    }
+  }
+  return join(realpathSync(cur), ...rest)
 }
