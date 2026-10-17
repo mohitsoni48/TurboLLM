@@ -2401,13 +2401,14 @@ export function registerApi(app: Hono, d: Deps): void {
       // itself changes on an engine switch — either way the file can shrink below `bytePos`,
       // and unless the cursor is fixed the loop stalls forever: no error, no new lines, until
       // the new file eventually regrows past the old length. So "this is effectively a new log"
-      // (different path, OR the same path now shorter than what's already been read) restarts the
-      // cursor at 0 — the new run's opening lines (build, GPU detection, GGUF metadata) are exactly
-      // what the user needs, and the client never refetches the tail on a restart. Only a
-      // brand-new connection's FIRST look starts at the file's CURRENT size: it starts from "now"
-      // instead of replaying the whole history, which would otherwise race the client's own
-      // initial-tail GET (whichever arrived first, the result was either duplicated or truncated
-      // lines). ADR-409's review, PR #216.
+      // (different path, OR the same path now shorter than what's already been read, OR whose
+      // bytes before the cursor are no longer the ones read there) restarts the cursor at 0 — the
+      // new run's opening lines (build, GPU detection, GGUF metadata) are exactly what the user
+      // needs, and the client never refetches the tail on a restart. Only a brand-new connection's
+      // FIRST look starts at the file's CURRENT size: it starts from "now" instead of replaying
+      // the whole history, which would otherwise race the client's own initial-tail GET (whichever
+      // arrived first, the result was either duplicated or truncated lines). ADR-409's review,
+      // PR #216.
       //
       // A RECONNECT is not brand-new: starting it from "now" lost every line written while the
       // client was away (a Wi-Fi drop, sleep/wake, the 3 s before a reopen). Each line and ping
@@ -2447,7 +2448,13 @@ export function registerApi(app: Hono, d: Deps): void {
         const path = d.manager.logPath()
         if (path && existsSync(path)) {
           const size = statSync(path).size
-          if (path !== lastPath || size < bytePos) {
+          // A restart rewrites the same path, and the next run's log can outgrow a short one (a
+          // model that failed at once) before a tick sees it shorter: going by the size alone,
+          // the loop then read the new log from the old offset, losing its header and opening
+          // lines and sending a line's tail first. Bytes already read before the offset never
+          // change in the same log, so ones that differ now mean a new log too. Checked only when
+          // there is something new to read, so a quiet log's tick costs no extra read.
+          if (path !== lastPath || size < bytePos || (size > bytePos && logRewritten(path, bytePos, before, carry))) {
             const resumed = firstLook && resume !== undefined ? resumeLogCursor(path, size, resume) : null
             if (resumed) {
               bytePos = resumed.at
@@ -4300,6 +4307,17 @@ function readLogBytes(path: string, end: number, n = Math.min(end, LOG_CURSOR_BY
   } catch {
     return Buffer.alloc(0)
   }
+}
+
+/** Whether `path` no longer holds, just before `end`, the bytes a stream read there: its
+ *  fingerprint `before` and then the line it carries (`carry`), at most LOG_CURSOR_BYTES of
+ *  them. A read that fails or comes up short says nothing (a short one is a shrink, which the
+ *  next tick sees). */
+function logRewritten(path: string, end: number, before: Buffer, carry: Buffer): boolean {
+  const held = carry.length >= LOG_CURSOR_BYTES ? carry.subarray(-LOG_CURSOR_BYTES) : Buffer.concat([before, carry]).subarray(-LOG_CURSOR_BYTES)
+  if (held.length === 0) return false
+  const now = readLogBytes(path, end, held.length)
+  return now.length === held.length && !now.equals(held)
 }
 
 /** The most of an engine log a resumed stream replays: the client keeps its last 2000 lines

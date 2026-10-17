@@ -303,4 +303,39 @@ test('GET /api/v1/engine/logs/stream: engine suite', async (t) => {
       await again.close()
     }
   })
+
+  // A restart truncates and rewrites the same engine-<id>.log, and the loop saw a new log only when
+  // it was SHORTER than the cursor at a tick. A model that fails at once leaves a short log, and
+  // the next load on the same engine writes more than that before the next 400 ms tick: the loop
+  // then read the new log from the old offset, so the new run's header and first lines never
+  // showed and its first line event was the tail of a line.
+  await t.test('a restart whose new log is already past the old offset at the next tick is sent from its first line', async () => {
+    const header = '[turbollm] starting engine "llama" on internal port 8081'
+    const newRun = `${header}\nbuild: 4000 (deadbeef) with cc for x86_64\nmain: loading model\n`
+
+    // The stream had sent the failed run's last line.
+    const logK = join(dir, 'k.log')
+    writeFileSync(logK, '[turbollm] starting engine "llama" on internal port 8080\n')
+    const app = fakeApp(() => logK)
+    const events = sseEventReader((await app.request('/api/v1/engine/logs/stream')).body!)
+    await events.next(3000, { pings: true }) // the first look has put the cursor at the log's end
+    appendFileSync(logK, 'error: unknown argument: --bogus\n')
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'error: unknown argument: --bogus' })
+    writeFileSync(logK, newRun) // within the same tick, and longer than the old log
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: header })
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'build: 4000 (deadbeef) with cc for x86_64' })
+    assert.deepEqual(JSON.parse((await events.next()).data), { line: 'main: loading model' })
+    await events.close()
+
+    // The old log held only a line with no newline yet: the stream had sent nothing from it.
+    const logL = join(dir, 'l.log')
+    const appL = fakeApp(() => logL)
+    const eventsL = sseEventReader((await appL.request('/api/v1/engine/logs/stream')).body!)
+    await eventsL.next(3000, { pings: true }) // a first look with no log yet
+    writeFileSync(logL, 'llama_model_load: ...')
+    await new Promise((r) => setTimeout(r, 600)) // a tick reads it from 0 and holds it
+    writeFileSync(logL, newRun)
+    assert.deepEqual(JSON.parse((await eventsL.next()).data), { line: header })
+    await eventsL.close()
+  })
 })
