@@ -1116,7 +1116,8 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
 /** An error the engine reported INSIDE a 200 stream, as `data: {"error": ...}`. llama-server does this when a
  *  request fails after streaming began, and LiteRT-LM does it for every runtime failure (a prompt longer than the
  *  bundle's context, for one). Such a chunk has no `choices`, so the round loop skipped it and the turn ended as an
- *  empty message with no reason given. */
+ *  empty message with no reason given. Also thrown for a non-OK response, so that one is handled (and the turn's
+ *  earlier rounds saved) by the same catch. */
 export class EngineStreamError extends Error {}
 
 /** The error message an SSE chunk carries, if it is an error chunk: `{"error": "…"}` or `{"error": {"message": "…"}}`. */
@@ -1475,9 +1476,13 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           reason = (msg ?? text).trim().slice(0, 500)
         } catch { /* no body */ }
         if (reason) reason = engineErrorText(d, engineKind, reason)
-        restoreReplaced()
-        await emit({ event: 'error', data: { code: 'engine_error', message: reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}` } })
-        return
+        // Thrown, not returned: the catch below sends it as engine_error, puts back a Regenerate's
+        // or a Save & Resend's old turn when this one produced nothing (restoreReplaced), and
+        // otherwise falls through to the one save. A return here skipped that save, so a later tool
+        // round refused this way (its request past n_ctx with round 1's tool result in it, a 503
+        // after a model swap, a linked host's host_busy) lost round 1's text, reasoning and tool
+        // calls, all already streamed, and left the reply empty.
+        throw new EngineStreamError(reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}`)
       }
 
       const reader = res.body.getReader()
@@ -1923,7 +1928,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     releaseInflight(convId, ac)
   }
   // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
-  // count, as on the refused-response return above.
+  // count.
   if (restored) return
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see

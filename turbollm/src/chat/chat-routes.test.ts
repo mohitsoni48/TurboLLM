@@ -980,6 +980,62 @@ test('a Save & Resend the engine or linked host refuses once the turn has starte
   }
 })
 
+// A tool loop's later round the engine refuses with an HTTP error: round 2's request carries round
+// 1's tool result, which can push it past n_ctx (llama-server answers 400 exceed_context_size_error),
+// and a model swap or a linked host can answer 503 between rounds. runGeneration returned from that
+// branch before its one save, so round 1's text, reasoning and tool call, all streamed to the chat,
+// were never written: the reply stayed empty, and on a Regenerate or a Save & Resend the empty reply
+// was shown in place of the old one (restoreReplaced declines once the turn produced anything).
+test('a tool round the engine refuses with an HTTP error keeps what the earlier rounds streamed, on a send, a Regenerate and a Save & Resend', async () => {
+  const h = inFlightHarness({
+    buildToolDefinitions: async () => [{ type: 'function', function: { name: 'web_search', description: '', parameters: { type: 'object', properties: {} } } }],
+    executeTool: async () => 'a long page of results',
+  })
+  const sseLine = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`
+  const toolRound = () => new Response([
+    sseLine({ choices: [{ delta: { reasoning_content: 'I should search.' } }] }),
+    sseLine({ choices: [{ delta: { content: 'Let me look that up for you right now.' } }] }),
+    sseLine({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: 'web_search', arguments: '{"query":"x"}' } }] } }] }),
+    sseLine({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+    'data: [DONE]\n\n',
+  ].join(''), { status: 200 })
+  const refused = () => new Response(JSON.stringify({ error: { message: 'the request exceeds the available context size', type: 'exceed_context_size_error' } }), { status: 400 })
+  // Each flow: one tool round, then the refusal. The Regenerate and the Save & Resend each start
+  // from a chat answered once (a1).
+  const script: Array<() => Response> = [toolRound, refused, () => sseReply('a1'), toolRound, refused, () => sseReply('a1'), toolRound, refused]
+  const engine = fakeEngine((_init, n) => script[n - 1]())
+  try {
+    const flows: Array<[string, (base: string, conv: string) => Promise<string>]> = [
+      ['send', async (base) => (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()],
+      ['regenerate', async (base, conv) => {
+        await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+        const a1 = h.store.getMessages(conv)[1].id
+        return (await h.app.request(`${base}/continue`, json({ regenerate: true, messageId: a1 }))).text()
+      }],
+      ['save & resend', async (base, conv) => {
+        await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+        const q1 = h.store.getMessages(conv)[0].id
+        return (await h.app.request(`${base}/continue`, json({ edit: { messageId: q1, content: 'q1 edited' } }))).text()
+      }],
+    ]
+    for (const [flow, run] of flows) {
+      const conv = h.store.createConversation()
+      const sse = await run(`/api/v1/conversations/${conv.id}`, conv.id)
+      assert.match(sse, /"code":"engine_error","message":"Engine returned 400: the request exceeds the available context size"/, `${flow}: the error still reaches the chat`)
+      const reply = h.store.getMessages(conv.id).at(-1)!
+      assert.equal(reply.role, 'assistant', flow)
+      assert.equal(reply.content, 'Let me look that up for you right now.', `${flow}: round 1's text is kept`)
+      assert.equal(reply.reasoning, 'I should search.', `${flow}: round 1's reasoning is kept`)
+      assert.deepEqual(reply.toolCalls.map((t) => [t.name, t.result]), [['web_search', 'a long page of results']], `${flow}: round 1's tool call is kept`)
+      assert.deepEqual(inFlightChatIds(), [])
+    }
+    assert.equal(engine.bodies.length, script.length)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()
