@@ -17,16 +17,18 @@ export interface BuildStatus {
   log: string[]
   /** Error message when `phase === 'error'`; null otherwise. */
   error: string | null
+  /** The run installs a build tool instead of building an engine: the Windows CUDA Toolkit download (into
+   *  <dataDir>/cuda) or a build guide prerequisite install (the host's package manager). Kept through the run's end.
+   *  Set by the route, never read from the label: those runs are named after the tool ("CUDA Toolkit", "git", "cmake",
+   *  "gcc", "cuda"), and a build's name is the user's to pick, so the web UI took a build named "cuda" for a tool
+   *  install and left open the card actions the daemon refused. */
+  toolInstall: boolean
 }
 
 const LOG_TAIL = 200
 
 export class BuildState {
-  private s: BuildStatus = { active: false, phase: 'preparing', engine: '', log: [], error: null }
-  /** The run installs a build tool instead of building an engine: the Windows CUDA Toolkit download (into
-   *  <dataDir>/cuda) or a build guide prerequisite install (the host's package manager). Named after the tool, which
-   *  the web UI tells apart by label; the daemon is told by the route, since a build's name is the user's to pick. */
-  private toolInstall = false
+  private s: BuildStatus = { active: false, phase: 'preparing', engine: '', log: [], error: null, toolInstall: false }
 
   get(): BuildStatus {
     return { ...this.s, log: [...this.s.log] }
@@ -40,12 +42,11 @@ export class BuildState {
   /** True while a run that builds an engine is running: isActive() minus a CUDA Toolkit download or a prerequisite
    *  install, which write into no engine folder and register nothing. */
   isEngineBuildActive(): boolean {
-    return this.s.active && !this.toolInstall
+    return this.s.active && !this.s.toolInstall
   }
 
   start(engine: string, opts: { toolInstall?: boolean } = {}): void {
-    this.s = { active: true, phase: 'preparing', engine, log: [], error: null }
-    this.toolInstall = opts.toolInstall === true
+    this.s = { active: true, phase: 'preparing', engine, log: [], error: null, toolInstall: opts.toolInstall === true }
   }
 
   phase(phase: BuildPhase): void {

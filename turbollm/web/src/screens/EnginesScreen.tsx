@@ -97,7 +97,7 @@ import { BuildGuideDialog } from './engines/BuildGuideDialog'
 import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
 import { branchOptions } from '../lib/branch-options'
 import { branchLabel, defaultBuildName } from '../lib/engine-build-name'
-import { NOT_AN_ENGINE_BUILD, engineBuildRunning } from '../lib/engine-build-run'
+import { engineBuildRunning, isToolInstall } from '../lib/engine-build-run'
 import { enableRequestFor } from '../lib/engine-enable-request'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
@@ -626,9 +626,11 @@ function EngineHeaderBar({
   useEffect(() => {
     if (wasBuilding.current && !buildActive && eb) {
       build.refresh()
-      if (eb.phase === 'done' && eb.engine && !NOT_AN_ENGINE_BUILD.has(eb.engine)) {
+      if (eb.phase === 'done' && eb.engine && !isToolInstall(eb)) {
         toast.success(`${eb.engine} built and added — it's now your active engine.`)
-      } else if (eb.phase === 'error' && eb.error && eb.engine !== 'CUDA Toolkit') {
+      } else if (eb.phase === 'error' && eb.error && !(eb.engine === 'CUDA Toolkit' && isToolInstall(eb))) {
+        // Only the CUDA Toolkit download stays quiet here (the build guide shows its error); a failed build the user
+        // named "CUDA Toolkit" has its toast, as any other build does.
         toast.error(eb.error)
       }
     }

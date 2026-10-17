@@ -161,6 +161,33 @@ describe('EnginesScreen — the build-settled toast', () => {
     expect(h.toastSuccess).not.toHaveBeenCalled()
   })
 
+  it('announces a real build the user named after a build tool', () => {
+    h.status = { ...run(true, 'compiling', 'cmake'), engineBuild: { ...run(true, 'compiling', 'cmake').engineBuild, toolInstall: false } }
+    const view = render(tree())
+    h.status = { ...run(false, 'done', 'cmake'), engineBuild: { ...run(false, 'done', 'cmake').engineBuild, toolInstall: false } }
+    view.rerender(tree())
+    expect(h.toastSuccess).toHaveBeenCalledWith("cmake built and added — it's now your active engine.")
+  })
+
+  it('shows the error of a failed build the user named "CUDA Toolkit", but not of the CUDA Toolkit download', () => {
+    const failed = (active: boolean, toolInstall: boolean) => ({
+      engine: { state: 'stopped' },
+      engineBuild: { active, phase: active ? 'compiling' : 'error', engine: 'CUDA Toolkit', log: [], error: active ? null : 'cmake exited with code 1', toolInstall },
+    })
+    h.status = failed(true, false)
+    const view = render(tree())
+    h.status = failed(false, false)
+    view.rerender(tree())
+    expect(h.toastError).toHaveBeenCalledWith('cmake exited with code 1')
+
+    h.toastError.mockClear()
+    h.status = failed(true, true)
+    view.rerender(tree())
+    h.status = failed(false, true)
+    view.rerender(tree())
+    expect(h.toastError).not.toHaveBeenCalled()
+  })
+
   it('still announces a real build', () => {
     h.status = run(true, 'compiling', 'ik_llama.cpp')
     const view = render(tree())
@@ -182,9 +209,9 @@ describe('EnginesScreen — card actions while engine work runs', () => {
     id: 'fork', name: 'My fork', binPath: '/opt/fork/bin/llama-server', kind: 'llama-server', version: 'b1',
     capabilities: { kvTypes: [], flags: [] }, sourceRepo: 'https://github.com/me/fork',
   }
-  const running = (engine: string, phase: string) => ({
+  const running = (engine: string, phase: string, toolInstall?: boolean) => ({
     engine: { state: 'stopped' },
-    engineBuild: { active: true, phase, engine, log: [], error: null },
+    engineBuild: { active: true, phase, engine, log: [], error: null, toolInstall },
   })
   const off = (el: HTMLElement) => el.hasAttribute('data-disabled')
   // For each card and the backend row: which of their actions are disabled (true) and which are open.
@@ -209,6 +236,21 @@ describe('EnginesScreen — card actions while engine work runs', () => {
     h.backends = [CUDA_BACKEND]
     h.engines = [FORK]
     h.status = running('ik_llama.cpp', 'compiling')
+    render(tree())
+    expect(await actions()).toEqual({
+      fork: { disable: true, del: true, rebuild: false, menu: false },
+      prism: { enable: true, del: true, rebuild: false },
+      cuda: { disable: true, del: true, policy: false },
+    })
+  })
+
+  // A build's name is the user's to pick, and the tool installs' labels are ordinary words: a build named "cuda" was
+  // taken for the build guide's CUDA install, so the actions stayed clickable and the daemon refused every click.
+  it('disables them while a build from source the user named "cuda" runs, which the daemon says is no tool install', async () => {
+    h.catalog = [PRISM_DISABLED, LLAMA]
+    h.backends = [CUDA_BACKEND]
+    h.engines = [FORK]
+    h.status = running('cuda', 'compiling', false)
     render(tree())
     expect(await actions()).toEqual({
       fork: { disable: true, del: true, rebuild: false, menu: false },

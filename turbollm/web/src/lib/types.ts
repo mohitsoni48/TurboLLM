@@ -87,6 +87,9 @@ export type EngineBuild = {
   engine: string
   log: string[]
   error: string | null
+  /** The run installs a build tool (the CUDA Toolkit download, a build guide prerequisite) and builds no engine.
+   *  Absent from daemons that predate it: see isToolInstall. */
+  toolInstall?: boolean
 }
 
 /** Live running-session stats (B4), from GET /api/v1/status. Null unless the
