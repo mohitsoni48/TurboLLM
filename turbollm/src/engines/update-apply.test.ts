@@ -308,6 +308,36 @@ test('a TurboQuant update whose new build fails its probe puts the old build bac
   assert.deepEqual(fs.readdirSync(root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
 })
 
+// A release that moves the binary (bin/llama-server instead of llama-server at the archive root) lands at another path,
+// so the entry was looked up by the NEW path, not found, and a second "TurboQuant" was added: refused as a taken name
+// after the old build was already deleted, or, for an engine the user had renamed, registered beside an entry left
+// pointing at a deleted binary. The kept entry is the updated engine's, moved to the new path.
+test('a TurboQuant update whose binary moved within the archive moves the engine to it', {
+  skip: process.platform === 'win32' && 'TurboQuant has no Windows prebuilt; shell-script binaries',
+}, async (t) => {
+  for (const name of ['TurboQuant', 'My TQ']) {
+    const bin = (root: string) => join(root, 'turboquant', 'llama-server')
+    const { d, root } = setup((root) => [engine({ id: 'tq', name, binPath: bin(root), version: '100 (old1234)', updatePolicy: 'auto' })])
+    writeExe(bin(root), '#!/bin/sh\necho "version: 100 (old1234)"\n')
+    const src = tmpDir('tllm-tq-src-')
+    writeExe(join(src, 'bin', 'llama-server'), WORKING_SERVER)
+    const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
+    execFileSync('tar', ['-czf', archive, '-C', src, 'bin'])
+    stubTurboquantRelease(t, archive)
+    d.registry.activate('tq')
+    await applyEngineUpdate(d, d.registry.get('tq')!)
+    const moved = join(root, 'turboquant', 'bin', 'llama-server')
+    assert.deepEqual(d.registry.list().engines.map((e) => e.id), ['cuda', 'tq'], `${name}: no second entry`)
+    const eng = d.registry.get('tq')
+    assert.equal(eng?.binPath, moved, name)
+    assert.equal(eng?.version, '200 (abcdef1)', name)
+    assert.equal(eng?.name, name)
+    assert.equal(eng?.updatePolicy, 'auto', name)
+    assert.equal(d.registry.active()?.id, 'tq', name)
+    assert.equal(existsSync(bin(root)), false, `${name}: the old build is replaced`)
+  }
+})
+
 // The KoboldCpp, llamafile, TurboQuant and pip branches read "is it the active engine" before the download or pip
 // upgrade (minutes), and re-activated the updated engine from that snapshot afterwards. The activate route allows a
 // switch while no model runs, so a switch the user made during the update was silently undone. Here the switch is made

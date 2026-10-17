@@ -1257,14 +1257,17 @@ export function registerApi(app: Hono, d: Deps): void {
         // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
         const cur = upgrade ? d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant'))) : undefined
         if (cur) await stopEngineUsers(d, cur.id)
-        // An update lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version
-        // and capabilities (flags and KV types the new build added stay gated off). For an update this runs while the
-        // old build is still parked (provisionTurboquant's verify): a new build that fails the probe is swapped back
-        // out, and the entry keeps the old build and its version.
+        // An update keeps the entry: re-probe it, or it keeps the old build's version and capabilities (flags and KV
+        // types the new build added stay gated off). It is `cur`, found by the path it ran from: a release that moved
+        // the binary within the archive lands elsewhere, where a lookup by the new path found nothing and added a
+        // second "TurboQuant" (refused as a taken name). Moved to the new path then (repairBinPath probes it too). For
+        // an update this runs while the old build is still parked (provisionTurboquant's verify): a new build that
+        // fails the probe is swapped back out, and the entry keeps the old build and its version.
         const register = async (bin: string): Promise<Engine> => {
-          const kept = d.registry.list().engines.find((e) => e.binPath === bin)
-          if (kept) return upgrade ? d.registry.reprobe(kept.id) : kept
-          return (await d.registry.add('TurboQuant', bin)).engine
+          const kept = cur ?? d.registry.list().engines.find((e) => e.binPath === bin)
+          if (!kept) return (await d.registry.add('TurboQuant', bin)).engine
+          if (!upgrade) return kept
+          return kept.binPath === bin ? d.registry.reprobe(kept.id) : d.registry.repairBinPath(kept.id, bin)
         }
         let updated: Engine | undefined
         // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.

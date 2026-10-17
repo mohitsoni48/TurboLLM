@@ -267,11 +267,15 @@ async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string,
         replace: true,
         blockSwap: () => releaseSwapBlockReason(d, engine),
         // Registered while the old build is still parked: a probe failure puts it back, and the entry keeps the old
-        // build's version. The new build lands at the same path, so the entry is kept: re-probe it, or it keeps the old
-        // build's version and capabilities (flags and KV types the new build added stay gated off).
+        // build's version. The entry is kept: re-probe it, or it keeps the old build's version and capabilities (flags
+        // and KV types the new build added stay gated off). It is the updated engine's, found by the path it ran from:
+        // a release that moved the binary within the archive lands elsewhere, and a lookup by the new path found
+        // nothing and added a second "TurboQuant" (refused as a taken name, or beside an entry left on a deleted
+        // binary when the user had renamed it). Moved to the new path then (repairBinPath probes it too).
         verify: async (bin) => {
-          const kept = d.registry.list().engines.find((e) => e.binPath === bin)
-          eng = kept ? await d.registry.reprobe(kept.id) : (await d.registry.add('TurboQuant', bin)).engine
+          const kept = oldEng ?? d.registry.list().engines.find((e) => e.binPath === bin)
+          if (!kept) eng = (await d.registry.add('TurboQuant', bin)).engine
+          else eng = kept.binPath === bin ? await d.registry.reprobe(kept.id) : await d.registry.repairBinPath(kept.id, bin)
         },
       },
     )

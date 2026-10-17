@@ -29,7 +29,7 @@ const skip = process.platform === 'win32' && 'TurboQuant has no Windows prebuilt
 
 /** A TurboQuant engine at engines/turboquant/llama-server, the route over it, and a stubbed GitHub release whose
  *  archive holds `newServer`. `update` POSTs ?update=1 and returns how the provision job ended. */
-function harness(t: { after: (fn: () => void) => void }, newServer: string) {
+function harness(t: { after: (fn: () => void) => void }, newServer: string, newPath = 'llama-server') {
   const store = ConfigStore.load(join(tmpDir('tllm-tq-route-'), 'config.json'))
   const bin = join(store.dir(), 'engines', 'turboquant', 'llama-server')
   writeExe(bin, OLD_SERVER)
@@ -37,9 +37,9 @@ function harness(t: { after: (fn: () => void) => void }, newServer: string) {
     c.engines.push({ id: 'tq', name: 'TurboQuant', kind: 'llama-server', binPath: bin, version: '100 (old1234)', capabilities: { kvTypes: [], flags: [] }, addedAt: '2026-01-01T00:00:00Z' })
   })
   const src = tmpDir('tllm-tq-src-')
-  writeExe(join(src, 'llama-server'), newServer)
+  writeExe(join(src, newPath), newServer)
   const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
-  execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
+  execFileSync('tar', ['-czf', archive, '-C', src, newPath.split('/')[0]!])
   const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
   const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
   const realFetch = globalThis.fetch
@@ -111,4 +111,16 @@ test('?update=1: a model loaded on TurboQuant during the download blocks the swa
   assert.match(settled[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Stop "TurboQuant" before replacing its files/)
   assert.equal(readFileSync(h.bin, 'utf8'), OLD_SERVER)
   assert.equal(h.registry.get('tq')?.version, '100 (old1234)')
+})
+
+// A release that moves the binary within the archive lands at another path: the route looked the entry up by the new
+// path, found none, and added a second "TurboQuant", which the taken name refused (after the old build was deleted).
+test('?update=1 whose binary moved within the archive moves the TurboQuant engine to it', { skip }, async (t) => {
+  const h = harness(t, NEW_SERVER, 'bin/llama-server')
+  assert.deepEqual(await h.update(), ['done'])
+  const moved = join(h.root, 'turboquant', 'bin', 'llama-server')
+  assert.deepEqual(h.registry.list().engines.map((e) => e.id), ['tq'])
+  assert.equal(h.registry.get('tq')?.binPath, moved)
+  assert.equal(h.registry.get('tq')?.version, '200 (abcdef1)')
+  assert.equal(readFileSync(moved, 'utf8'), NEW_SERVER)
 })
