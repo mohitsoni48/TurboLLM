@@ -7,10 +7,13 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto'
+import { existsSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { createApp } from './server'
 import { hashKey, provisionRemoteApiKey } from './auth'
 import { defaultConfig, type Config } from './config/config'
 import type { Deps } from './deps'
+import { Scanner } from './models/scanner'
 import { tmpDir } from './test-support/tmp'
 
 const INGRESS_PORT = 6997
@@ -431,5 +434,84 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
     }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
     assert.equal(res.status, 202)
     assert.deepEqual(queued, [RAW_URL])
+  }
+})
+
+// DELETE /api/v1/models/:key removes model files from the host's disk for good (a whole MLX folder
+// with everything in it): refused to the same callers, with api_key_required. A remote token was
+// already refused (requiredCapability, I3).
+async function withLibrary(d: Deps, cfg: Config): Promise<{ file: string; key: string }> {
+  const dir = tmpDir('host-actions-library-')
+  const file = join(dir, 'other.gguf')
+  writeFileSync(file, Buffer.alloc(2 * 1024 * 1024, 1)) // the scanner lists a .gguf of 1 MiB or more
+  cfg.modelDirs = [dir]
+  const scanner = new Scanner(d.store as never)
+  Object.assign(d, { scanner, modelRouter: { loadedModelKeys: () => new Set<string>() } })
+  await scanner.rescan()
+  const entry = scanner.list().models.find((m) => m.path === file)
+  assert.ok(entry, 'the scanner lists the model')
+  return { file, key: entry.key }
+}
+
+test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot delete a model; with a key it can', async () => {
+  const del = (key: string) => `/api/v1/models/${encodeURIComponent(key)}`
+  const refused = async (res: Response | Promise<Response>, file: string) => {
+    const r = await res
+    assert.equal(r.status, 403)
+    assert.equal(((await r.json()) as { error: { code: string } }).error.code, 'api_key_required')
+    assert.ok(existsSync(file), 'the model file is kept')
+  }
+  // Tailscale Serve, no key.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const { file, key } = await withLibrary(d, cfg)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await refused(tunneled(d, del(key), serve, {}, 'DELETE'), file)
+    assert.equal((await tunneled(d, del(key), { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE')).status, 200)
+    assert.equal(existsSync(file), false)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-models.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d, cfg } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const { file, key } = await withLibrary(d, cfg)
+      await refused(tunneled(d, del(key), { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }, {}, 'DELETE'), file)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false })
+    const { file, key } = await withLibrary(d, cfg)
+    await refused(fromLan(d, del(key), {}, {}, 'DELETE'), file)
+    assert.equal((await fromLan(d, del(key), { 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE')).status, 200)
+    assert.equal(existsSync(file), false)
+  }
+  // A remote-access token, whatever it may otherwise do: refused before the route.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick' })
+    const { file, key } = await withLibrary(d, cfg)
+    const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load', 'config:write', 'downloads:write'] }) }
+    assert.equal((await tunneled(d, del(key), token, {}, 'DELETE')).status, 403)
+    assert.ok(existsSync(file))
+  }
+  // The host itself, unchanged.
+  {
+    const { d, cfg } = mkDeps()
+    const { file, key } = await withLibrary(d, cfg)
+    const res = await createApp(d).request(del(key), { method: 'DELETE', headers: { Host: '127.0.0.1:6996' } }, {
+      incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+    } as never)
+    assert.equal(res.status, 200)
+    assert.equal(existsSync(file), false)
   }
 })

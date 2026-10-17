@@ -2617,6 +2617,12 @@ export function registerApi(app: Hono, d: Deps): void {
   // `c.req.param()` is already percent-decoded (see custom-sources/:key) — decoding again broke
   // every key containing '%' (a URIError 500, or a different key: '%41' → 'A').
   app.delete('/api/v1/models/:key', async (c) => {
+    // Removes files from the host's disk for good (a whole MLX folder, every non-model file in it
+    // included), so it is held to isLocalOrAuthenticated like the other host-side changes: a keyless
+    // Serve identity, Access JWT or open-LAN peer could empty the owner's library. A remote token is
+    // refused before this (requiredCapability, I3). api_key_required: the web client opens its key
+    // prompt on it.
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'api_key_required', 'Deleting a model requires a valid API key.')
     const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
