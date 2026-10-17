@@ -839,13 +839,17 @@ export async function turboquantAssetUrl(
  *  download → extract → locate pipeline. Throws `no_release_asset` when this platform
  *  has no prebuilt. `replace` (an update) fetches the latest even when an install exists:
  *  it is extracted into a staging dir and swapped in only once it holds a llama-server,
- *  so a failed lookup, download or extract leaves the working install untouched. */
+ *  so a failed lookup, download or extract leaves the working install untouched.
+ *  `verify` (an update only) runs with the new install in place and the old one still
+ *  parked; when it throws (the caller probes the new binary there and registers it), the
+ *  new install is moved out and the old one put back, so a build that does not run here
+ *  never replaces one that does. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  opts: { replace?: boolean } = {},
+  opts: { replace?: boolean; verify?: (bin: string) => Promise<void> } = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
   if (opts.replace) {
@@ -868,6 +872,21 @@ export async function provisionTurboquant(
         if (parked) await renameWithRetry(parked, destDir)
         throw e
       }
+      const bin = join(destDir, relative(stagedDir, stagedBin))
+      try {
+        await opts.verify?.(bin)
+      } catch (e) {
+        // The new build does not run here. Deleting the old one first and probing after left the broken binary in
+        // place under the old build's version, so the same update kept being offered and an `auto` engine
+        // downloaded it again on every check. Back to the stage (removed below), and the old install back.
+        try {
+          await renameWithRetry(destDir, stagedDir)
+          if (parked) await renameWithRetry(parked, destDir)
+        } catch {
+          /* the probe error stays the reported cause; a parked old install is still at .turboquant-old */
+        }
+        throw e
+      }
       // The new install is in place: deleting the old one is best effort, never a failed update (the next one
       // removes a leftover first).
       if (parked) {
@@ -877,7 +896,7 @@ export async function provisionTurboquant(
           /* best effort */
         }
       }
-      return join(destDir, relative(stagedDir, stagedBin))
+      return bin
     } finally {
       // After a failed swap the stage still holds those fresh files, and a throw here would mask the real error.
       removeAfterFailure(stageRoot)

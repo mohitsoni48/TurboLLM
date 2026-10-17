@@ -1,9 +1,10 @@
 // POST /api/v1/engines/turboquant?update=1 swaps the new release in at the same path, so it keeps the engine's
 // registry entry: that entry must be re-probed, or it keeps the old build's version and capabilities (flags and KV
-// types the new build added stay gated off). GitHub is a stubbed fetch; the binaries are shell scripts (POSIX only).
+// types the new build added stay gated off). A new build that fails that probe is swapped back out for the old one.
+// GitHub is a stubbed fetch; the binaries are shell scripts (POSIX only).
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
@@ -21,17 +22,21 @@ function writeExe(path: string, text: string): void {
   chmodSync(path, 0o755)
 }
 
-test('?update=1 re-probes the TurboQuant engine it keeps: the new build\'s version replaces the old one', {
-  skip: process.platform === 'win32' && 'TurboQuant has no Windows prebuilt; shell-script binaries',
-}, async (t) => {
+const OLD_SERVER = '#!/bin/sh\necho "version: 100 (old1234)"\n'
+const BROKEN_SERVER = '#!/bin/sh\necho "error while loading shared libraries: libvulkan.so.1" >&2\nexit 127\n'
+const skip = process.platform === 'win32' && 'TurboQuant has no Windows prebuilt; shell-script binaries'
+
+/** A TurboQuant engine at engines/turboquant/llama-server, the route over it, and a stubbed GitHub release whose
+ *  archive holds `newServer`. `update` POSTs ?update=1 and returns how the provision job ended. */
+function harness(t: { after: (fn: () => void) => void }, newServer: string) {
   const store = ConfigStore.load(join(tmpDir('tllm-tq-route-'), 'config.json'))
   const bin = join(store.dir(), 'engines', 'turboquant', 'llama-server')
-  writeExe(bin, '#!/bin/sh\necho "version: 100 (old1234)"\n')
+  writeExe(bin, OLD_SERVER)
   store.update((c) => {
     c.engines.push({ id: 'tq', name: 'TurboQuant', kind: 'llama-server', binPath: bin, version: '100 (old1234)', capabilities: { kvTypes: [], flags: [] }, addedAt: '2026-01-01T00:00:00Z' })
   })
   const src = tmpDir('tllm-tq-src-')
-  writeExe(join(src, 'llama-server'), NEW_SERVER)
+  writeExe(join(src, 'llama-server'), newServer)
   const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
   execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
   const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
@@ -61,11 +66,31 @@ test('?update=1 re-probes the TurboQuant engine it keeps: the new build\'s versi
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  const res = await app.request('/api/v1/engines/turboquant?update=1', { method: 'POST' })
-  assert.equal(res.status, 202)
-  for (let i = 0; i < 200 && settled.length === 0; i++) await new Promise((r) => setTimeout(r, 25))
-  assert.deepEqual(settled, ['done'])
-  assert.equal(readFileSync(bin, 'utf8'), NEW_SERVER)
-  assert.equal(registry.get('tq')?.version, '200 (abcdef1)')
-  assert.deepEqual(registry.list().engines.map((e) => e.id), ['tq'])
+  const update = async (): Promise<string[]> => {
+    const res = await app.request('/api/v1/engines/turboquant?update=1', { method: 'POST' })
+    assert.equal(res.status, 202)
+    for (let i = 0; i < 200 && settled.length === 0; i++) await new Promise((r) => setTimeout(r, 25))
+    return settled
+  }
+  return { registry, bin, root: join(store.dir(), 'engines'), update }
+}
+
+test('?update=1 re-probes the TurboQuant engine it keeps: the new build\'s version replaces the old one', { skip }, async (t) => {
+  const h = harness(t, NEW_SERVER)
+  assert.deepEqual(await h.update(), ['done'])
+  assert.equal(readFileSync(h.bin, 'utf8'), NEW_SERVER)
+  assert.equal(h.registry.get('tq')?.version, '200 (abcdef1)')
+  assert.deepEqual(h.registry.list().engines.map((e) => e.id), ['tq'])
+})
+
+// The new release was swapped in and the old build deleted before the re-probe ran: a build that does not run here
+// stayed in place under the old version string, and the same update kept being offered.
+test('?update=1 whose new build fails its probe puts the old build back and keeps its version', { skip }, async (t) => {
+  const h = harness(t, BROKEN_SERVER)
+  const settled = await h.update()
+  assert.equal(settled.length, 1)
+  assert.match(settled[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Could not run the binary/)
+  assert.equal(readFileSync(h.bin, 'utf8'), OLD_SERVER, 'the old build is back in place')
+  assert.equal(h.registry.get('tq')?.version, '100 (old1234)')
+  assert.deepEqual(readdirSync(h.root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
 })

@@ -11,6 +11,7 @@
 
 import type { ConfigStore, Engine } from '../config/config'
 import type { Manager } from './manager'
+import { ProbeError } from './probe'
 import type { Registry } from './registry'
 import { UPDATE_CHECK_INTERVAL_MS, UpdateChecker, decideAutoUpdate, normalizeUpdatePolicy } from './update'
 
@@ -39,6 +40,10 @@ export function engineIsIdle(manager: Manager): boolean {
 export class UpdateScheduler {
   private timer: ReturnType<typeof setInterval> | null = null
   private running = false
+  /** Per engine, the latest version whose auto-update failed its probe: the new build does not run on this machine,
+   *  so applying it again only downloads it again (every check, for good). Skipped until upstream publishes another
+   *  version or the daemon restarts; the user's own Update is never held back by it. */
+  private failedProbe = new Map<string, string>()
 
   constructor(private deps: UpdateSchedulerDeps) {}
 
@@ -74,11 +79,16 @@ export class UpdateScheduler {
         const hasUpdate = !!status?.hasUpdate
         const idle = engineIsIdle(this.deps.manager)
         if (decideAutoUpdate({ policy, hasUpdate, idle })) {
+          const latest = status?.latest ?? ''
+          if (this.failedProbe.get(e.id) === latest) continue
           try {
             await this.deps.applyUpdate(e)
-          } catch {
+            this.failedProbe.delete(e.id)
+          } catch (err) {
             // Auto-apply failure: leave the engine as-is (rollback is the apply path's
-            // job). The status stays cached; the next tick or a manual update retries.
+            // job). The status stays cached; the next tick or a manual update retries —
+            // except a build that failed its probe, which would fail it again.
+            if (err instanceof ProbeError) this.failedProbe.set(e.id, latest)
           }
         }
       }

@@ -23,8 +23,11 @@ import { latestTagForInstalled } from './update'
 import { parseGitRepo as parseGitRepoFromLeaf } from './github-repo'
 import type { ReleaseProvenance } from './release-install'
 import type { Engine } from '../config/config'
-import { engineIsIdle } from './update-scheduler'
+import { UpdateScheduler, engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
+import { ProbeError } from './probe'
+import type { Registry } from './registry'
+import type { ConfigStore } from '../config/config'
 
 // ─── build-tag comparison ────────────────────────────────────────────────────
 
@@ -423,6 +426,39 @@ test('engineIsIdle: stopped/running-idle are idle; starting/stopping/generating 
   assert.equal(engineIsIdle(managerStub('running', 2)), false) // mid-generation
   assert.equal(engineIsIdle(managerStub('starting')), false)
   assert.equal(engineIsIdle(managerStub('stopping')), false)
+})
+
+// An `auto` engine whose new build fails its probe keeps the old one (the apply path's rollback), so the update stays
+// offered, and every scheduler pass downloaded and probed the same build again, for as long as that version was the
+// latest. A version that failed its probe is skipped until upstream publishes another; any other failure (offline, a
+// rate limit) is retried on the next pass as before.
+test('UpdateScheduler: a version whose auto-update failed its probe is not applied again; a newer one is', async () => {
+  const tq = eng({ id: 'tq', updatePolicy: 'auto' })
+  const other = eng({ id: 'other', updatePolicy: 'auto' })
+  let latest = 'b200'
+  const updates = {
+    prune() {},
+    checkAll: async () => {},
+    get: () => ({ installed: 'b100', latest, hasUpdate: true, checkedAt: '', comparable: true }),
+  } as unknown as UpdateChecker
+  const applied: string[] = []
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => ({ engines: [tq, other], activeEngineId: '' }) } as unknown as Registry,
+    manager: managerStub('stopped'),
+    updates,
+    applyUpdate: async (e) => {
+      applied.push(`${e.id}@${latest}`)
+      if (e.id === 'tq') throw new ProbeError('probe_failed', 'Could not run the binary (--version and --help both failed).')
+      throw new Error('could not query o/r releases: HTTP 503')
+    },
+  })
+  await scheduler.runOnce()
+  await scheduler.runOnce()
+  assert.deepEqual(applied, ['tq@b200', 'other@b200', 'other@b200'], 'the probe failure is not retried; the outage is')
+  latest = 'b300'
+  await scheduler.runOnce()
+  assert.deepEqual(applied.slice(3), ['tq@b300', 'other@b300'])
 })
 
 // ─── source-built engines (ADR-088): commit-hash update detection ─────────────

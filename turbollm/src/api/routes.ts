@@ -1257,17 +1257,23 @@ export function registerApi(app: Hono, d: Deps): void {
         // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
         const cur = upgrade ? d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant'))) : undefined
         if (cur) await stopEngineUsers(d, cur.id)
+        // An update lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version
+        // and capabilities (flags and KV types the new build added stay gated off). For an update this runs while the
+        // old build is still parked (provisionTurboquant's verify): a new build that fails the probe is swapped back
+        // out, and the entry keeps the old build and its version.
+        const register = async (bin: string): Promise<Engine> => {
+          const kept = d.registry.list().engines.find((e) => e.binPath === bin)
+          if (kept) return upgrade ? d.registry.reprobe(kept.id) : kept
+          return (await d.registry.add('TurboQuant', bin)).engine
+        }
+        let updated: Engine | undefined
         // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
         const bin = await provisionTurboquant(
           root, entry.repo!,
           (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
-          ac.signal, { replace: upgrade },
+          ac.signal, { replace: upgrade, verify: async (b) => { updated = await register(b) } },
         )
-        let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-        // An update lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version
-        // and capabilities (flags and KV types the new build added stay gated off).
-        if (eng && upgrade) eng = await d.registry.reprobe(eng.id)
-        if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
+        const eng = updated ?? (await register(bin))
         // An update leaves the active engine as it was (as update-apply.ts and the backend update
         // do): activating it would switch engines under a model running on another. An install
         // activates it. Read now, not before the download: that takes minutes, the activate route
@@ -1280,7 +1286,9 @@ export function registerApi(app: Hono, d: Deps): void {
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
-            : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
+            : upgrade
+              ? `Could not update TurboQuant — your existing build is unchanged: ${e instanceof Error ? e.message : e}`
+              : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
       } finally {
         if (provisionAbort === ac) provisionAbort = null

@@ -283,6 +283,31 @@ test('TurboQuant update re-probes the engine it keeps: the new build\'s version 
   assert.deepEqual(d.registry.list().engines.filter((e) => e.binPath === bin(root)).map((e) => e.id), ['tq'])
 })
 
+// provisionTurboquant swapped the new release in and deleted the old build before anything ran the new binary; the
+// re-probe came after. A new build that does not run here (a missing Vulkan loader) stayed in place under the old
+// build's version string, so the same update kept being offered, and an `auto` engine downloaded it again every day.
+test('a TurboQuant update whose new build fails its probe puts the old build back and keeps its version', {
+  skip: process.platform === 'win32' && 'TurboQuant has no Windows prebuilt; shell-script binaries',
+}, async (t) => {
+  const OLD_SERVER = '#!/bin/sh\necho "version: 100 (old1234)"\n'
+  const bin = (root: string) => join(root, 'turboquant', 'llama-server')
+  const { d, root } = setup((root) => [engine({ id: 'tq', binPath: bin(root), version: '100 (old1234)' })])
+  writeExe(bin(root), OLD_SERVER)
+  const src = tmpDir('tllm-tq-src-')
+  writeExe(join(src, 'llama-server'), BROKEN_SERVER)
+  const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
+  execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
+  stubTurboquantRelease(t, archive)
+  const log: string[] = []
+  d.provision = { start() {}, progress() {}, done: () => { log.push('done') }, fail: (m: string) => { log.push(`fail:${m}`) } } as unknown as UpdateApplyDeps['provision']
+  await assert.rejects(applyEngineUpdate(d, d.registry.get('tq')!), /Could not run the binary/)
+  assert.equal(log.length, 1)
+  assert.match(log[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Could not run the binary/)
+  assert.equal(readFileSync(bin(root), 'utf8'), OLD_SERVER, 'the old build is back in place')
+  assert.equal(d.registry.get('tq')?.version, '100 (old1234)')
+  assert.deepEqual(fs.readdirSync(root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+})
+
 // The KoboldCpp, llamafile, TurboQuant and pip branches read "is it the active engine" before the download or pip
 // upgrade (minutes), and re-activated the updated engine from that snapshot afterwards. The activate route allows a
 // switch while no model runs, so a switch the user made during the update was silently undone. Here the switch is made

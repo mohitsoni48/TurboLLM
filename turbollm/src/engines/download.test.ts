@@ -437,6 +437,36 @@ test('provisionTurboquant replace: a failed update leaves the working install; a
   assert.deepEqual(readdirSync(root), ['turboquant'])
 })
 
+// The new install was swapped in and the old one deleted before anything ran the new binary. `verify` runs with the
+// new install in place and the old one parked: when it throws, the old install goes back.
+test('provisionTurboquant replace: a new install that fails verify is swapped back out for the old one', { skip: tqSkip }, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  const tqDir = join(root, 'turboquant')
+  mkdirSync(tqDir)
+  writeFileSync(join(tqDir, 'llama-server'), 'tq old')
+  const src = tmpDir('tllm-tq-src-')
+  writeFileSync(join(src, 'llama-server'), 'tq new')
+  execFileSync('tar', ['-czf', join(src, 'release.tar.gz'), '-C', src, 'llama-server'])
+  const archive = readFileSync(join(src, 'release.tar.gz'))
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return new Response(archive)
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+  const seen: string[] = []
+  const verify = async (bin: string) => {
+    seen.push(readFileSync(bin, 'utf8'))
+    throw new Error('Could not run the binary (--version and --help both failed).')
+  }
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true, verify }), /Could not run the binary/)
+  assert.deepEqual(seen, ['tq new'], 'verify ran on the new install, in place')
+  assert.equal(readFileSync(join(tqDir, 'llama-server'), 'utf8'), 'tq old')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+})
+
 test('provisionTurboquant replace: a failed download whose stage cleanup is locked reports the download error', { skip: tqSkip }, async (t) => {
   const root = tmpDir('tllm-tq-')
   mkdirSync(join(root, 'turboquant'))

@@ -252,27 +252,33 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
 }
 
 /** TurboQuant fork: re-provision the fork's latest release, swapped in over the install dir
- *  only once it is fully on disk (a failed fetch leaves the working install untouched). */
+ *  only once it is fully on disk (a failed fetch leaves the working install untouched), and
+ *  kept only once it probes there (a build that does not run here is swapped back out). */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {
   d.provision.start('turboquant', d.trigger ?? 'auto_update')
   try {
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     if (oldEng) await stopEngineUsers(d, oldEng.id)
-    const bin = await provisionTurboquant(
+    let eng: Engine | undefined
+    await provisionTurboquant(
       root, 'AtomicBot-ai/atomic-llama-cpp-turboquant',
       (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
-      signal, { replace: true },
+      signal, {
+        replace: true,
+        // Registered while the old build is still parked: a probe failure puts it back, and the entry keeps the old
+        // build's version. The new build lands at the same path, so the entry is kept: re-probe it, or it keeps the old
+        // build's version and capabilities (flags and KV types the new build added stay gated off).
+        verify: async (bin) => {
+          const kept = d.registry.list().engines.find((e) => e.binPath === bin)
+          eng = kept ? await d.registry.reprobe(kept.id) : (await d.registry.add('TurboQuant', bin)).engine
+        },
+      },
     )
-    let eng = d.registry.list().engines.find((e) => e.binPath === bin)
-    // The new build lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version and
-    // capabilities (flags and KV types the new build added stay gated off).
-    if (eng) eng = await d.registry.reprobe(eng.id)
-    else eng = (await d.registry.add('TurboQuant', bin)).engine
-    if (oldEng) keepActiveAfterUpdate(d, oldEng.id, eng.id)
+    if (oldEng && eng) keepActiveAfterUpdate(d, oldEng.id, eng.id)
     d.provision.done()
   } catch (e) {
     if ((e as Error)?.name === 'AbortError') d.provision.done()
-    else d.provision.fail(`Could not update TurboQuant: ${msg(e)}`)
+    else d.provision.fail(`Could not update TurboQuant — your existing build is unchanged: ${msg(e)}`)
     throw e
   }
 }
