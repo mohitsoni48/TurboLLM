@@ -2,7 +2,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import { resolveKey, grantKind, hostGate } from '../auth'
+import { resolveKey, grantKind, hostGate, isLocalOrAuthenticated } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
@@ -19,7 +19,7 @@ import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { resolveToolApproval } from '../tools/approval-gate'
 import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
-import { saveSkillFromConversation } from '../agents/skill-jobs'
+import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
 import { extractMemoryFacts } from './memory'
 import { codeGateBlocks } from '../routines/routine-routes'
 import { emitBenchResult } from '../telemetry/runtime/typed-emit'
@@ -206,6 +206,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // Save this conversation as a reusable SKILL (Voyager-style distill from the
   // transcript). Detached → shared library, deduped by name.
   app.post('/api/v1/conversations/:id/save-skill', (c) => {
+    // It writes a SKILL.md into the shared library, which every Code session's catalog lists and
+    // auto mode can run with bash: the same host-side action as POST /api/v1/skills, so the same
+    // isLocalOrAuthenticated gate. This route is behind lanAuth only (models:use for a remote
+    // token), so without it a keyless Serve identity, Access JWT, open-LAN peer or remote token
+    // that /skills and /skills/import refuse could plant a skill through here.
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', SKILL_AUTHORING_REFUSED)
     const conv = db.getConversation(c.req.param('id'))
     if (!conv) return c.json({ error: { code: 'not_found', message: 'Conversation not found.' } }, 404)
     // Same background skill author the in-chat save_skill tool uses (skill-creator model).
@@ -916,8 +922,10 @@ interface GenerationCtx {
   /** Phase 4 / C1: whether THIS request's caller cleared the code-execution bar (host-local or a
    *  valid API key), computed by the route handler — the only place a Hono `Context` exists — and
    *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
-   *  executeToolCallWithApproval, which hands it to ToolRegistry.executeTool; only
-   *  create_routine/update_routine/run_routine_now read it, and only for code-flavor routines. */
+   *  executeToolCallWithApproval, which hands it to ToolRegistry.executeTool; there only
+   *  create_routine/update_routine/run_routine_now read it, and only for code-flavor routines.
+   *  runGeneration itself reads it for save_skill: the same bar as isLocalOrAuthenticated, which
+   *  POST /api/v1/skills holds a skill's author to. */
   isCodeAuthorized: boolean
 }
 
@@ -1225,8 +1233,14 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true }) : []
     // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
     // registry (every other skill is instructions text only). No-op unless enabled.
+    // save_skill writes to the shared skill library, as POST /api/v1/skills and the Save as skill
+    // route do, and both refuse a caller isLocalOrAuthenticated fails. isCodeAuthorized is that
+    // same decision for this turn's caller (isLocalRequest || a real key), so a turn without it
+    // is not offered save_skill, and a call the model makes anyway is refused here, before the
+    // skill author starts (the tool skips the approval gate, so this is the only check).
     const skillTools = enabledSkillIds.has('skill-creator')
       ? buildSaveSkillTool(() => {
+          if (!ctx.isCodeAuthorized) return `Error: ${SKILL_AUTHORING_REFUSED}`
           // In-chat skill author: read THIS conversation in the background and write a
           // SKILL.md to the shared library.
           const tid = saveSkillFromConversation(d, conv.id)
@@ -1251,7 +1265,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     const scopedBaseToolDefs = conv.allowedTools !== undefined
       ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
       : baseToolDefs
-    const toolDefs = skillTools ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
+    const toolDefs = skillTools && ctx.isCodeAuthorized ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++

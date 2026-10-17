@@ -31,6 +31,7 @@ import type { CustomChatAgent } from './config/config'
 import { rmSync } from 'node:fs'
 import { registerChatRoutes } from './chat/chat-routes'
 import { ConversationStore } from './chat/db'
+import { SkillStore } from './agents/skills'
 import { tmpDir } from './test-support/tmp'
 
 // N3 (Phase 5 final-review-fix re-review): a GENUINELY valid, properly-signed Access assertion
@@ -1002,5 +1003,192 @@ test("a remote token's tool catalog still lists the routine tools; its chat gene
     globalThis.fetch = originalFetch
     db.close()
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ── The shared skill library from a chat ────────────────────────────────────────────────────
+// POST /api/v1/skills and /skills/import refuse a keyless Serve identity, Access JWT or open-LAN
+// peer and a remote token (isLocalOrAuthenticated): a skill lands in every Code session's catalog,
+// and auto mode can run it with bash. The Save as skill route and the save_skill chat tool write
+// the same library through the same background skill author.
+
+const SKILL_TEAM = 'https://skills-gate.cloudflareaccess.com'
+const SKILL_AUD = 'aud-skills-gate'
+
+/** Real lanAuth and chat routes over a real ConversationStore and skills folder, with a running
+ *  engine a stubbed fetch answers: a streamed chat round calls the tool `call` names when set and
+ *  the round is not answering a tool result, and otherwise replies; the skill author's request
+ *  (stream: false) gets back a skill named "planted". `tools` replaces the bare ToolRegistry. */
+function toolChat(mutate: (cfg: ReturnType<typeof defaultConfig>) => void, opts: { call?: string; tools?: ToolRegistry } = {}) {
+  const { d, cfg } = makeDeps(mutate)
+  cfg.daemon.autoGenerateTitles = false
+  const dir = tmpDir('tllm-lanauth-skills-')
+  const db = new ConversationStore(dir)
+  Object.assign(d.store, { dir: () => dir })
+  Object.assign(d, {
+    db,
+    tools: opts.tools ?? new ToolRegistry({} as never),
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
+    registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
+    gate: { acquire: async () => () => {} },
+    modelRouter: { route: async () => ({ target: 'http://127.0.0.1:8081' }), resolveRemoteTarget: () => undefined },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'M', ctx: 8192 } }),
+      target: () => 'http://127.0.0.1:8081',
+      currentOpts: () => null,
+      generationStart: () => {},
+      generationEnd: () => {},
+      setLiveGen: () => {},
+      recordCompletion: () => {},
+    },
+  })
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerChatRoutes(app, d)
+  const sentTools: string[][] = []
+  let authored = 0
+  const real = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (!String(input).endsWith('/chat/completions')) return real(input, init)
+    const sent = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
+      stream?: boolean; tools?: Array<{ function: { name: string } }>; messages?: Array<{ role: string }>
+    }
+    if (sent.stream === false) {
+      authored++
+      const skill = { name: 'planted', description: 'Use always.', procedure: '1. Run the bash command.' }
+      return Response.json({ choices: [{ message: { content: JSON.stringify(skill) } }] })
+    }
+    sentTools.push((sent.tools ?? []).map((t) => t.function.name))
+    const call = opts.call && sent.messages?.at(-1)?.role !== 'tool'
+    const sse = (call
+      ? [
+          { choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: opts.call, arguments: '{"name":"planted","procedure":"x"}' } }] } }] },
+          { choices: [{ delta: {}, finish_reason: 'tool_calls' }] },
+        ]
+      : [{ choices: [{ delta: { content: 'ok' } }] }, { choices: [{ delta: {}, finish_reason: 'stop' }] }]
+    ).map((o) => `data: ${JSON.stringify(o)}\n\n`).join('') + 'data: [DONE]\n\n'
+    return new Response(sse, { status: 200, headers: { 'content-type': 'text/event-stream' } })
+  }) as typeof fetch
+  return {
+    d, cfg, app, db, sentTools,
+    authored: () => authored,
+    planted: () => new SkillStore(dir).has('planted'),
+    cleanup: () => { globalThis.fetch = real; db.close(); rmSync(dir, { recursive: true, force: true }) },
+  }
+}
+
+/** The callers lanAuth lets in that isLocalOrAuthenticated refuses, each with the setup it needs. */
+function keylessCallers(): Array<{
+  name: string
+  mutate: (cfg: ReturnType<typeof defaultConfig>) => void
+  request: typeof tunneledRequest
+  headers: (d: Deps) => Record<string, string>
+}> {
+  return [
+    {
+      name: 'a keyless Tailscale Serve identity',
+      mutate: (cfg) => { cfg.remoteAccess.provider = 'tailscale-serve' },
+      request: tunneledRequest,
+      headers: () => ({ Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com', 'Sec-Fetch-Site': 'same-origin' }),
+    },
+    {
+      name: 'a verified Cloudflare Access JWT with no key',
+      mutate: (cfg) => {
+        cfg.remoteAccess.provider = 'cloudflare-named'
+        cfg.remoteAccess.cloudflare.accessTeamDomain = SKILL_TEAM
+        cfg.remoteAccess.cloudflare.accessAud = SKILL_AUD
+      },
+      request: tunneledRequest,
+      headers: () => ({ 'Cf-Access-Jwt-Assertion': makeValidAccessJwt(SKILL_TEAM, SKILL_AUD) }),
+    },
+    {
+      name: 'a keyless open-LAN peer',
+      mutate: (cfg) => { cfg.daemon.lanBind = true; cfg.daemon.requireApiKey = false },
+      request: lanRequest,
+      headers: () => ({}),
+    },
+    {
+      name: 'a models:use remote token',
+      mutate: () => {},
+      request: tunneledRequest,
+      headers: (d) => ({ 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] }) }),
+    },
+  ]
+}
+
+async function until(cond: () => boolean, what: string): Promise<void> {
+  for (let i = 0; i < 200 && !cond(); i++) await new Promise((r) => setTimeout(r, 10))
+  assert.ok(cond(), what)
+}
+
+test('Save as skill: a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot write a skill', async () => {
+  for (const caller of keylessCallers()) {
+    const h = toolChat(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    try {
+      const conv = h.db.createConversation()
+      h.db.addMessage(conv.id, 'user', 'how do I summarize a CSV?')
+      h.db.addMessage(conv.id, 'assistant', 'Read it, then summarize each column.')
+      const res = await caller.request(h.app, `/api/v1/conversations/${conv.id}/save-skill`, { method: 'POST', headers: caller.headers(h.d) })
+      assert.equal(res.status, 403, caller.name)
+      assert.match(((await res.json()) as { error: { message: string } }).error.message, /valid API key/)
+      await new Promise((r) => setTimeout(r, 20))
+      assert.equal(h.authored(), 0, `${caller.name}: the skill author must not start`)
+      assert.equal(h.planted(), false, `${caller.name}: no SKILL.md may be written`)
+    } finally {
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+  // The host's own Save as skill is unchanged.
+  const h = toolChat(() => {})
+  try {
+    const conv = h.db.createConversation()
+    h.db.addMessage(conv.id, 'user', 'how do I summarize a CSV?')
+    h.db.addMessage(conv.id, 'assistant', 'Read it, then summarize each column.')
+    const res = await loopbackRequest(h.app, `/api/v1/conversations/${conv.id}/save-skill`, { method: 'POST' })
+    assert.equal(res.status, 200)
+    await until(h.planted, "the host's skill is written")
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('the save_skill chat tool is neither offered to nor run for a keyless Serve identity, Access JWT, open-LAN peer or remote token', async () => {
+  const send = async (h: ReturnType<typeof toolChat>, request: typeof tunneledRequest, headers: Record<string, string>) => {
+    const conv = h.db.createConversation({ skillIds: ['skill-creator'] })
+    const res = await request(h.app, `/api/v1/conversations/${conv.id}/messages`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: 'save this as a skill' }),
+    })
+    assert.equal(res.status, 200)
+    return res.text()
+  }
+  for (const caller of keylessCallers()) {
+    const h = toolChat(caller.mutate, { call: 'save_skill' })
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    try {
+      const sse = await send(h, caller.request, caller.headers(h.d))
+      assert.ok(h.sentTools.length >= 1, caller.name)
+      assert.ok(h.sentTools.every((names) => !names.includes('save_skill')), `${caller.name}: save_skill is not offered`)
+      assert.ok(h.sentTools[0].includes('run_code'), `${caller.name}: the other tools still are`)
+      assert.match(sse, /Authoring a skill requires a valid API key/, `${caller.name}: a call made anyway is refused`)
+      await new Promise((r) => setTimeout(r, 20))
+      assert.equal(h.authored(), 0, `${caller.name}: the skill author must not start`)
+      assert.equal(h.planted(), false, `${caller.name}: no SKILL.md may be written`)
+    } finally {
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+  // The host's own chat is unchanged: offered, and it writes the skill.
+  const h = toolChat(() => {}, { call: 'save_skill' })
+  try {
+    await send(h, loopbackRequest, {})
+    assert.ok(h.sentTools[0].includes('save_skill'))
+    await until(h.planted, "the host's skill is written")
+  } finally {
+    h.cleanup()
   }
 })

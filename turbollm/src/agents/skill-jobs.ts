@@ -8,6 +8,11 @@ import type { Deps } from '../deps'
 import { SkillStore, toSkillId, type Skill } from './skills'
 import { distillFromConversation } from './distiller'
 
+/** The refusal for a caller that may not author skills (isLocalOrAuthenticated fails): the same
+ *  words POST /api/v1/skills uses, for both other doors onto saveSkillFromConversation (the
+ *  Save as skill route and the in-chat save_skill tool). */
+export const SKILL_AUTHORING_REFUSED = 'Authoring a skill requires a valid API key from a non-host device.'
+
 /**
  * Kick off authoring a skill from a conversation. Returns the bg-task id (or null if there
  * was nothing to read). Never throws — failures are reported through the task.
