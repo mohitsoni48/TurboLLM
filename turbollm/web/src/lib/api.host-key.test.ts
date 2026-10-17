@@ -5,7 +5,7 @@
 // clients only threw, and the Settings screen and the approval bar showed a toast with nowhere to
 // enter the key. Mirrors code-api.test.ts's localStorage/fetch stubbing.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, saveSettings } from './api'
+import { ApiError, hostKeyAccepted, saveSettings } from './api'
 import { respondToolApproval } from './chat-api'
 import { clearHostKeyNeeded, isHostKeyNeeded } from './auth-signal'
 
@@ -49,5 +49,24 @@ describe('api_key_required asks this browser for a key', () => {
     await expect(respondToolApproval('c1', 't1', 'run_code', 'always_allow')).rejects.toBeInstanceOf(ApiError)
     await expect(saveSettings({ theme: 'dark' })).rejects.toBeInstanceOf(ApiError)
     expect(isHostKeyNeeded()).toBe(false)
+  })
+})
+
+// App.tsx checks a key pasted into that prompt with this before closing it.
+describe('hostKeyAccepted', () => {
+  it('is false when the host gate refuses the key (403, or 401 with requireApiKey on), true when it takes it', async () => {
+    vi.stubGlobal('fetch', refusal('forbidden', 'API keys are only visible from this machine until "Require an API key" is turned on.'))
+    expect(await hostKeyAccepted()).toBe(false)
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } }), { status: 401 })))
+    expect(await hostKeyAccepted()).toBe(false)
+    const ok = vi.fn(async () => new Response(JSON.stringify({ keys: [] }), { status: 200 }))
+    vi.stubGlobal('fetch', ok)
+    expect(await hostKeyAccepted()).toBe(true)
+    expect(ok).toHaveBeenCalledWith('/api/v1/keys', expect.anything())
+  })
+
+  it('a dropped connection says nothing about the key: accepted, as before the check', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
+    expect(await hostKeyAccepted()).toBe(true)
   })
 })

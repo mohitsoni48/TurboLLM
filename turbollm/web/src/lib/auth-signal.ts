@@ -34,8 +34,9 @@ export function subscribeCodeAuthNeeded(listener: () => void): () => void {
 // /status poll nor Code raises AuthGate, and a non-loopback bind's owner (Docker with a
 // published port, a private window, another origin, a revoked key) only ever saw a toast with
 // nowhere to enter the key. api.ts and chat-api.ts mark this on that code; App.tsx shows AuthGate
-// with a "Not now" that clears it, and clears it once a key is entered, since no later request
-// would: the refused change has to be made again.
+// with a "Not now" that clears it, and clears it once the host gate takes the key entered (api.ts
+// hostKeyAccepted), since no later request would: the refused change has to be made again. A
+// key it refuses leaves it set, so AuthGate stays up with "That key was rejected".
 let hostKeyNeeded = false
 const hostKeyListeners = new Set<() => void>()
 

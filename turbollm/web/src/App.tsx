@@ -7,7 +7,7 @@ import {
   useLocation,
   useNavigate,
 } from 'react-router-dom'
-import { useQueryClient } from '@tanstack/react-query'
+import { useQueryClient, type UseQueryResult } from '@tanstack/react-query'
 import { TooltipProvider } from './components/ui/tooltip'
 import { Shell } from './components/Shell'
 import { UnreachableOverlay } from './components/UnreachableOverlay'
@@ -23,9 +23,10 @@ import {
   workspaceRedirect,
 } from './lib/jev-mode'
 import { useJevLoadedToast } from './lib/model-loader'
+import type { Status } from './lib/types'
 import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
-import { setAuthToken } from './lib/api'
+import { hostKeyAccepted, setAuthToken } from './lib/api'
 import { classifyStatusError } from './lib/connection-state'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded, subscribeHostKeyNeeded, isHostKeyNeeded, clearHostKeyNeeded } from './lib/auth-signal'
 import { useCodeFeatureEnabled } from './lib/platform'
@@ -176,6 +177,69 @@ function useResumeOnboardingAfterDiscoverDownload(shouldOnboard: boolean) {
   }, [downloadsQ.data, shouldOnboard, location.pathname, navigate])
 }
 
+/** The API key prompt (AuthGate) over the whole app, and when it shows. Its own hook so
+ *  App.auth.test.tsx can drive it; App is its only caller. */
+export function useKeyPrompt(statusQ: Pick<UseQueryResult<Status>, 'isError' | 'error' | 'isSuccess'>) {
+  const qc = useQueryClient()
+  // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
+  // key. Show the key prompt instead of the misleading "lost connection" overlay.
+  // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
+  // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
+  const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
+  // Nor does it for a host-only setting or "Always Allow" that the daemon refused for want of a
+  // key while requireApiKey is off (auth-signal.ts's host-key signal): the same prompt, which
+  // can be put off, since everything else here works without a key.
+  const hostKeyNeeded = useSyncExternalStore(subscribeHostKeyNeeded, isHostKeyNeeded)
+  // C2 (Phase 5 final-review-fix re-review, ADR-422): `scopedTokenLimited` (403) is neither
+  // "wrong/no credential" (401 — needsAuth) nor "daemon unreachable" — it is a capability-
+  // scoped remote-access token that can chat (auth.ts's requiredCapability deliberately never
+  // grants it config:read, since /status carries the engine's launchCommand and raw stderr,
+  // real filesystem detail). Before this, a phone opening a URL with a fresh, correctly-scoped
+  // token watched the status poll 403 three times in a row and landed on the same
+  // non-dismissible "Lost connection" overlay a genuinely dead daemon shows — the chat surface
+  // itself was reachable the whole time. There is nothing to prompt the user for here (unlike
+  // 401 — no key would fix this, a different token scope would), so this only ever suppresses
+  // App's unreachable overlay; the rest of the app renders normally with `statusQ.data` unset.
+  const { needsAuth: needsAuthFromStatus, scopedTokenLimited } = classifyStatusError(statusQ.isError, statusQ.error)
+  const needsAuth = needsAuthFromStatus || codeAuthNeeded || hostKeyNeeded
+
+  // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
+  // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
+  // pasting the key) flips an occasional poll from 401 → generic network error, which
+  // would tear the dialog down, swap in the "lost connection" overlay, and wipe the
+  // half-typed key. Sticky mount = the input keeps its value + focus while you type.
+  const [authLatched, setAuthLatched] = useState(false)
+  useEffect(() => {
+    if (needsAuth) setAuthLatched(true)
+    else if (statusQ.isSuccess) setAuthLatched(false)
+  }, [needsAuth, statusQ.isSuccess])
+
+  const prompt = authLatched ? (
+    <AuthGate
+      onConnect={(key) => {
+        setAuthToken(key)
+        void qc.invalidateQueries()
+        // A 401 from /status or Code stays until a request with the new key succeeds, so a wrong
+        // key keeps the prompt up with AuthGate's "That key was rejected". The host-key signal
+        // has no such request: the refused change is made again only when the user makes it.
+        // Clearing the signal on any key closed the prompt on a mistyped or revoked key too, so
+        // the hint never showed and the next attempt was refused again. So the key is checked
+        // first, with one request through the same host gate (api.ts hostKeyAccepted), and the
+        // prompt stays up when it is refused.
+        if (hostKeyNeeded) {
+          void hostKeyAccepted().then((ok) => {
+            if (ok) clearHostKeyNeeded()
+          })
+        }
+      }}
+      onDismiss={hostKeyNeeded && !needsAuthFromStatus && !codeAuthNeeded
+        ? () => { clearHostKeyNeeded(); setAuthLatched(false) }
+        : undefined}
+    />
+  ) : null
+  return { authLatched, needsAuth, scopedTokenLimited, prompt }
+}
+
 export function App() {
   const statusQ = useStatus()
   // Turbo Link (ADR-382): the daemon owns which machine this install is pointed at, so mirror
@@ -189,7 +253,6 @@ export function App() {
     if (daemonRemoteModel === undefined) return // older daemon / not loaded yet — leave the cache alone
     syncRemoteModelId(daemonRemoteModel || null)
   }, [daemonRemoteModel, syncRemoteModelId])
-  const qc = useQueryClient()
   const onboardingQ = useOnboardingState()
   const shouldOnboard =
     onboardingQ.data !== undefined &&
@@ -229,38 +292,7 @@ export function App() {
   }, [statusQ.isSuccess, statusQ.isError, statusQ.dataUpdatedAt, statusQ.errorUpdatedAt])
 
   const online = statusQ.isSuccess
-  // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
-  // key. Show the key prompt instead of the misleading "lost connection" overlay.
-  // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
-  // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
-  const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
-  // Nor does it for a host-only setting or "Always Allow" that the daemon refused for want of a
-  // key while requireApiKey is off (auth-signal.ts's host-key signal): the same prompt, which
-  // can be put off, since everything else here works without a key.
-  const hostKeyNeeded = useSyncExternalStore(subscribeHostKeyNeeded, isHostKeyNeeded)
-  // C2 (Phase 5 final-review-fix re-review, ADR-422): `scopedTokenLimited` (403) is neither
-  // "wrong/no credential" (401 — needsAuth) nor "daemon unreachable" — it is a capability-
-  // scoped remote-access token that can chat (auth.ts's requiredCapability deliberately never
-  // grants it config:read, since /status carries the engine's launchCommand and raw stderr,
-  // real filesystem detail). Before this, a phone opening a URL with a fresh, correctly-scoped
-  // token watched the status poll 403 three times in a row and landed on the same
-  // non-dismissible "Lost connection" overlay a genuinely dead daemon shows — the chat surface
-  // itself was reachable the whole time. There is nothing to prompt the user for here (unlike
-  // 401 — no key would fix this, a different token scope would), so this only ever suppresses
-  // the overlay below; the rest of the app renders normally with `statusQ.data` left undefined.
-  const { needsAuth: needsAuthFromStatus, scopedTokenLimited } = classifyStatusError(statusQ.isError, statusQ.error)
-  const needsAuth = needsAuthFromStatus || codeAuthNeeded || hostKeyNeeded
-
-  // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
-  // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
-  // pasting the key) flips an occasional poll from 401 → generic network error, which
-  // would tear the dialog down, swap in the "lost connection" overlay, and wipe the
-  // half-typed key. Sticky mount = the input keeps its value + focus while you type.
-  const [authLatched, setAuthLatched] = useState(false)
-  useEffect(() => {
-    if (needsAuth) setAuthLatched(true)
-    else if (statusQ.isSuccess) setAuthLatched(false)
-  }, [needsAuth, statusQ.isSuccess])
+  const { authLatched, needsAuth, scopedTokenLimited, prompt: keyPrompt } = useKeyPrompt(statusQ)
 
   // While the key prompt is up, or a scoped token is simply missing a capability it was never
   // meant to have, the "lost connection" overlay must yield.
@@ -348,19 +380,7 @@ export function App() {
       {/* Renders nothing until a Jev load actually has something to interrupt (ADR-434 (i)(3)).
           App-level because ModelDetailDialog closes itself in the same click that fires the load. */}
       <JevLoadConfirmHost />
-      {authLatched && (
-        <AuthGate
-          onConnect={(key) => {
-            setAuthToken(key)
-            // No later request clears it: the refused change is made again, now with the key.
-            clearHostKeyNeeded()
-            void qc.invalidateQueries()
-          }}
-          onDismiss={hostKeyNeeded && !needsAuthFromStatus && !codeAuthNeeded
-            ? () => { clearHostKeyNeeded(); setAuthLatched(false) }
-            : undefined}
-        />
-      )}
+      {keyPrompt}
       {unreachable && <UnreachableOverlay />}
     </TooltipProvider>
   )

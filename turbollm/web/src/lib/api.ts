@@ -1142,6 +1142,19 @@ export interface ConnectInfo { cli: string; title: string; steps: ConnectStep[] 
 export function getApiKeys(): Promise<ApiKeysList> {
   return request<ApiKeysList>('/api/v1/keys')
 }
+/** Whether the daemon's host gate (auth.ts hostGate) takes the key this browser now sends: GET
+ *  /api/v1/keys is behind that gate and changes nothing, and answers 403 to a missing, wrong or
+ *  revoked key (401 with requireApiKey on). App.tsx asks it before closing the key prompt a
+ *  host-only setting raised (auth-signal.ts's host-key signal). Any other failure, a dropped
+ *  connection say, says nothing about the key, so it counts as accepted, as before the check. */
+export async function hostKeyAccepted(): Promise<boolean> {
+  try {
+    await getApiKeys()
+    return true
+  } catch (e) {
+    return !(e instanceof ApiError && (e.status === 401 || e.status === 403))
+  }
+}
 export function createApiKey(name: string): Promise<ApiKeyCreated> {
   return request<ApiKeyCreated>('/api/v1/keys', { method: 'POST', json: { name } })
 }
