@@ -5,7 +5,7 @@ import { ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { toast } from '../components/ui/sonner'
 import { useMcpMutations, useSettings, useSysInfo } from '../lib/queries'
-import { ApiError, track } from '../lib/api'
+import { ApiError, MCP_ENV_MASK, track } from '../lib/api'
 import type { McpServer, DaemonSettings, DaemonSettingsPatch } from '../lib/api'
 import { CLOUD_MCPS, LOCAL_MCPS, CLOUD_CATS, LOCAL_CATS, BUILTIN_SEARCH } from '../lib/mcp-catalog'
 import { useDocumentScroll } from '../lib/scroll-mode'
@@ -98,18 +98,26 @@ type McpFormState = {
   name: string; transport: 'stdio' | 'sse'
   command: string; argsStr: string; envStr: string
   url: string; apiKey: string; enabled: boolean
+  // The Bearer key is write-only (never in the settings payload), so the field always opens
+  // blank. apiKeySet says a key is stored, so the form can say so; clearApiKey is the Clear
+  // control, which sends apiKey '' (the only value the PUT route takes as "remove the key").
+  apiKeySet: boolean; clearApiKey: boolean
 }
 
 const emptyMcpForm = (): McpFormState => ({
   name: '', transport: 'stdio', command: '', argsStr: '', envStr: '', url: '', apiKey: '', enabled: true,
+  apiKeySet: false, clearApiKey: false,
 })
 
 function serverToForm(s: McpServer): McpFormState {
   return {
     name: s.name, transport: s.transport,
     command: s.command ?? '', argsStr: (s.args ?? []).join(', '),
+    // The daemon never sends env values, only MCP_ENV_MASK for each. A line left as it is sends
+    // the mask back, and the daemon keeps the stored value for it.
     envStr: Object.entries(s.env ?? {}).map(([k, v]) => `${k}=${v}`).join('\n'),
-    url: s.url ?? '', apiKey: s.apiKey ?? '', enabled: s.enabled,
+    url: s.url ?? '', apiKey: '', enabled: s.enabled,
+    apiKeySet: !!s.apiKeySet, clearApiKey: false,
   }
 }
 
@@ -123,10 +131,15 @@ function formToPayload(f: McpFormState): Omit<McpServer, 'id'> {
   return {
     name: f.name.trim(), transport: f.transport,
     command: f.transport === 'stdio' ? f.command.trim() || undefined : undefined,
-    args: f.transport === 'stdio' && args.length ? args : undefined,
-    env: f.transport === 'stdio' && Object.keys(env).length ? env : undefined,
+    // Sent even when empty: the PUT route only assigns args/env when present, so dropping an
+    // empty list made "remove the last arg / env var" a silent no-op on edit. (Create stores
+    // `?? []` / `?? {}` anyway.)
+    args: f.transport === 'stdio' ? args : undefined,
+    env: f.transport === 'stdio' ? env : undefined,
     url: f.transport === 'sse' ? f.url.trim() || undefined : undefined,
-    apiKey: f.transport === 'sse' && f.apiKey.trim() ? f.apiKey.trim() : undefined,
+    // A typed key replaces the stored one; Clear sends '' to remove it; a blank field sends
+    // nothing and keeps it (the route still drops it if the URL moves to another origin).
+    apiKey: f.transport !== 'sse' ? undefined : f.apiKey.trim() ? f.apiKey.trim() : f.clearApiKey ? '' : undefined,
     enabled: f.enabled,
   }
 }
@@ -509,6 +522,11 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
             <textarea rows={2} value={f.envStr} onChange={(e) => set({ envStr: e.target.value })}
               placeholder={"API_KEY=abc123\nDEBUG=true"}
               className="resize-none rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+            {f.envStr.includes(MCP_ENV_MASK) && (
+              <span className="text-[11px] text-faint">
+                Saved values are hidden. Leave {MCP_ENV_MASK} as it is to keep a value, or type a new one.
+              </span>
+            )}
           </div>
         </>
       ) : (
@@ -521,9 +539,21 @@ function McpSection({ servers, search }: { servers: McpServer[]; search: DaemonS
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-[12px] text-muted">API Key <span className="text-faint">(optional — Bearer token)</span></label>
-            <input type="password" value={f.apiKey} onChange={(e) => set({ apiKey: e.target.value })}
-              placeholder="sk-…" autoComplete="off"
-              className="rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+            <div className="flex gap-2">
+              <input type="password" value={f.apiKey} onChange={(e) => set({ apiKey: e.target.value })}
+                placeholder={f.apiKeySet && !f.clearApiKey ? 'Key set — leave blank to keep' : 'sk-…'} autoComplete="off"
+                className="min-w-0 flex-1 rounded-md border border-border bg-bg px-2 py-1.5 font-mono text-[12px] text-ink outline-none" />
+              {f.apiKeySet && !f.clearApiKey && (
+                <Button variant="outline" size="sm" onClick={() => set({ apiKey: '', clearApiKey: true })}>Clear key</Button>
+              )}
+            </div>
+            {f.apiKeySet && (
+              <span className="text-[11px] text-faint">
+                {f.clearApiKey
+                  ? 'The saved key is removed on Update.'
+                  : 'Moving the URL to another host drops the saved key.'}
+              </span>
+            )}
           </div>
         </>
       )}

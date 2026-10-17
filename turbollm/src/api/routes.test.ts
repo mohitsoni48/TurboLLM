@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
+import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
@@ -101,6 +102,41 @@ test('with no active engine every model is compatible, with no reason', async ()
     { compatibleWithActiveEngine: true, incompatibleReason: null },
     { compatibleWithActiveEngine: true, incompatibleReason: null },
   ])
+})
+
+test('GET /models takes the config snapshot and registry lookups once per request, not once per model', async () => {
+  // Each snapshot (and each registry lookup, which takes one) is a structuredClone of the whole
+  // config; per row, a large library spent hundreds of ms of event loop on every poll.
+  const count = async (n: number) => {
+    const calls = { snapshot: 0, active: 0, laya: 0, litert: 0 }
+    const cfg = { modelProfiles: {}, benchResults: {}, modelDirs: [] }
+    const models = Array.from({ length: n }, (_, i) =>
+      entry({ key: `m${i}|Q4_K_M|1`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
+    const d = {
+      version: 'test',
+      store: { snapshot: () => (calls.snapshot++, cfg), dir: () => '/tmp/unused' },
+      scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
+      manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }) },
+      modelRouter: { loadedModelKeys: () => new Set<string>() },
+      db: { lastGenTpsByModel: () => new Map<string, number>() },
+      registry: {
+        active: () => (calls.active++, { id: 'eng-1', name: 'llama', kind: 'llama-server', binPath: 'engine' }),
+        layaEngine: () => (calls.laya++, undefined),
+        litertLmEngine: () => (calls.litert++, undefined),
+      },
+      downloads: { provenance: () => [] },
+    } as unknown as Deps
+    const app = new Hono()
+    registerApi(app, d)
+    const res = await app.request('/api/v1/models')
+    assert.equal(res.status, 200)
+    assert.equal(((await res.json()) as { models: unknown[] }).models.length, n)
+    return calls
+  }
+  const one = await count(3)
+  const many = await count(30)
+  assert.deepEqual(many, one)
+  assert.ok(one.snapshot <= 1 && one.active <= 1 && one.laya <= 1 && one.litert <= 1, JSON.stringify(one))
 })
 
 // `GET /api/v1/status` carries a local-only `jev` field so Workspace can
@@ -398,4 +434,72 @@ test('interleaveByRepo: alternates two ranked lists and drops a repo both return
   const { interleaveByRepo } = await import('./routes')
   const r = (repo: string) => ({ repo })
   assert.deepEqual(interleaveByRepo([r('a'), r('b'), r('c')], [r('x'), r('a')]).map((x) => x.repo), ['a', 'x', 'b', 'c'])
+})
+
+// The bench route checks isBlocked() (a render holding the GPU) first; the reverse-gate hook after it also refuses
+// while a render is STARTING (an acquire in flight). That refusal is the same 409, not an unhandled 500.
+test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook refuses', async () => {
+  let started = false
+  const d = {
+    store: { snapshot: () => ({}) },
+    comfy: {
+      isBlocked: () => false,
+      freeComfyUIBeforeLoad: async () => { throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.') },
+    },
+    bench: { start: () => { started = true } },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const res = await app.request('/api/v1/bench', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ modelKey: 'm' }),
+  })
+
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'comfyui_busy')
+  assert.equal(started, false)
+})
+
+// The gate node (v3+) holds its lock across the release call, and a prompt ComfyUI queues meanwhile waits for that lock
+// on ComfyUI's server thread. The route used to answer only once the LLM had reloaded, so every "Run (Instant)"
+// auto-queue iteration froze ComfyUI for up to the node's 10 s timeout.
+test('POST /api/v1/comfyui/release answers once loads are unblocked, before the model has reloaded', async () => {
+  let state = 'running'
+  let finishLoad = () => {}
+  const loading = new Promise<void>((resolve) => { finishLoad = resolve })
+  const starts: unknown[] = []
+  const manager = {
+    status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => (state === 'running' || state === 'starting' ? { model: { key: 'llama-8b' } } : null),
+    target: () => null,
+    stopAndWait: async () => { state = 'stopped' },
+    start: async (opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await hooks?.beforeStart?.()
+      starts.push(opts)
+      state = 'starting'
+      await loading // the model takes a while to load
+      state = 'running'
+    },
+  }
+  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
+  const comfy = new ComfyGuard(comfyStore as never, manager as never)
+  await comfy.acquire()
+  const app = new Hono()
+  registerApi(app, { store: { snapshot: () => ({}) }, comfy } as unknown as Deps)
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const res = await Promise.race([
+    app.request('/api/v1/comfyui/release', { method: 'POST' }),
+    new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 2000) }),
+  ])
+  clearTimeout(timer)
+  finishLoad()
+
+  assert.ok(res, 'answered while the model was still loading')
+  assert.equal(res.status, 200)
+  assert.equal(comfy.isBlocked(), false, 'loads are unblocked')
+  assert.equal(starts.length, 1, 'the reload is under way')
+  comfy.stop()
 })

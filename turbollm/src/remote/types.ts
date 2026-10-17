@@ -26,6 +26,10 @@ export interface RemoteProvider {
    *  turning the toggle off leaves the box exposed.
    *  'none' — the user runs their own tunnel; we only record the URL. */
   readonly lifecycle: 'child-process' | 'system-state' | 'none'
+  /** 'system-state' only: the public port the daemon-side entry is keyed by (Tailscale's
+   *  `--https=<port>`), fixed from config when the instance is made, i.e. at start time.
+   *  With `id`, it tells the supervisor whether two instances write the same entry. */
+  readonly publicPort?: number
   /** Usable on this box right now? If not, exactly why — in words a user can act on. */
   preflight(): Promise<PreflightState>
   start(ingressPort: number): Promise<{ url: string }>

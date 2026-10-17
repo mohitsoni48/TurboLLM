@@ -14,6 +14,7 @@ import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
+import { modelLoadsRefused } from '../auth'
 
 export type RouteResult =
   | {
@@ -21,9 +22,24 @@ export type RouteResult =
       /** Present only for a Turbo Link remote model. The gateway uses this to build the
        *  upstream URL and to present the LINK token instead of the caller's credential.
        *  Absent = an ordinary local engine target, unchanged. */
-      remote?: { linkId: string; baseUrl: string; token: string; modelKey: string }
+      remote?: { linkId: string; baseUrl: string; token: string; modelKey: string; noLoad?: true }
+      /** The engine serving `target` when it is an extra pool slot, read from that slot's manager: a `.litertlm` model
+       *  there runs on LiteRT-LM whatever the primary runs. The gateway shapes the outbound request (model alias or path,
+       *  token-limit key) and labels the reply from these; absent (the primary, remote) it reads the primary, as before. */
+      engineKind?: string
+      modelPath?: string
+      modelName?: string
     }
-  | { status: 503; message: string }
+  | {
+      status: 503
+      message: string
+      /** A retry cannot help this caller: its token may not load models and nothing is bringing the model up, the
+       *  active engine cannot run the model, its link needs re-pairing or an update, or the retry would re-run a load
+       *  that just failed or was cancelled (evicting what is loaded each time). The gateway tells clients not to retry
+       *  these. Absent, the refusal may clear by itself (a load in progress, ComfyUI's queue, a link still connecting)
+       *  or costs nothing to repeat, so the client's own retry policy applies. */
+      permanent?: true
+    }
 
 interface PoolSlot {
   manager: Manager
@@ -58,6 +74,19 @@ export class ModelRouter {
   /** Laya loads in flight, by model key. Separate from extraSlots on purpose: a slot is registered only once its
    *  load has succeeded, so a request can never be routed to a manager that is still loading. */
   private layaLoads = new Map<string, LayaLoad>()
+  /** The model doLoad is loading right now (one at a time: it runs under the swap lock). A pool slot's load is
+   *  otherwise visible nowhere until it has succeeded. */
+  private loadingKey: string | undefined
+  /** The pool-slot manager that load runs in, and the engine it loads on (unset for a load into the primary). It is in
+   *  no extraSlots entry until it has loaded, yet it already holds VRAM, so poolEngineIds and stopPoolSlotsOnEngine (a
+   *  ComfyUI render's pool stopper, an engine update) count it too: on that engine, and, while it still runs or stops
+   *  the LRU model it evicted (until Manager.load gets the load gate and that model has exited), on that model's. */
+  private loadingSlot: { manager: Manager; engineId: string } | undefined
+  /** Pool-slot managers dropped from extraSlots (dropSlot) while their engine may still exit: tracked nowhere else, yet
+   *  the process keeps its VRAM and its engine's files until it is gone (a graceful stop, on Windows a full 8 s).
+   *  Exited ones are pruned on every drop and every pool read, so it holds at most the slots that were still exiting
+   *  at the last of those. */
+  private stoppingSlots = new Set<Manager>()
   /** Last-used timestamp for the primary manager slot (for LRU eviction). */
   private primaryLastUsed = 0
   /** Promise chain that serialises swap operations so concurrent requests for
@@ -75,7 +104,7 @@ export class ModelRouter {
      *  exactly as it did before — there are no links, so nothing can be remote. */
     private catalog?: RemoteCatalog,
     /** Builds the Manager for a new pool slot; a parameter only so a test can watch what it loads. */
-    private newSlotManager: () => Manager = () => new Manager(store),
+    private newSlotManager: () => Manager = () => new Manager(store, { poolSlot: true }),
   ) {}
 
   /** Route a request to the correct model target URL.
@@ -119,6 +148,7 @@ export class ModelRouter {
 
     const alive = this.routeResolved(entry)
     if (alive) return alive
+    if (modelLoadsRefused()) return this.notLoadedForCaller(entry)
 
     // Need to load / swap. Serialise so concurrent requests for different models
     // queue rather than racing to start/stop the same engine simultaneously.
@@ -134,6 +164,7 @@ export class ModelRouter {
     if (!this.store.snapshot().gateway.autoSwap) {
       return { status: 503, message: `'${entry.name}' is not loaded. Load it from Models, or turn on auto-swap.` }
     }
+    if (modelLoadsRefused()) return this.notLoadedForCaller(entry)
     return this.withSwapLock(() => this.doLoad(entry))
   }
 
@@ -239,41 +270,84 @@ export class ModelRouter {
     const slot = this.extraSlots.get(modelKey)
     if (!slot) return false
     slot.manager.stop()
-    this.extraSlots.delete(modelKey)
+    this.dropSlot(modelKey)
     return true
+  }
+
+  /** Drop the pool slot `modelKey` from extraSlots, keeping its manager in stoppingSlots until its process has exited:
+   *  an eject, its idle watchdog or an engine stop may still be stopping it. Every removal of a slot whose process may
+   *  be alive goes through here, except evictChatLru's, whose manager the load takes over (loadingSlot). */
+  private dropSlot(modelKey: string): void {
+    const slot = this.extraSlots.get(modelKey)
+    if (!slot) return
+    this.extraSlots.delete(modelKey)
+    // Pruned here too: pool reads are rare (an engine update or delete, a ComfyUI render), and ejects and idle
+    // reloads alone must not keep every stopped manager for the daemon's lifetime.
+    for (const m of this.stoppingSlots) if (!this.slotEngineId(m)) this.stoppingSlots.delete(m)
+    if (this.slotEngineId(slot.manager)) this.stoppingSlots.add(slot.manager) // an exited one ('stopped', 'error') is not
   }
 
   /** Ids of the engines the extra pool slots run on (not the primary). A .litertlm model auto-swapped into a slot
    *  runs on LiteRT-LM whatever engine is active, so an engine can be in use without being active or primary. */
   poolEngineIds(): Set<string> {
     const ids = new Set<string>()
-    for (const slot of this.extraSlots.values()) {
-      const id = slot.manager.currentOpts()?.engine.id
-      if (id) ids.add(id)
-    }
+    for (const p of this.poolProcesses()) for (const id of p.engineIds) ids.add(id)
     return ids
   }
 
   /** How many extra pool slots run on `engineId` (read-only). A release update refuses to replace that engine's
    *  files while this is above zero, rather than stopping a model the user is using. */
   poolSlotsOnEngine(engineId: string): number {
-    let count = 0
-    for (const slot of this.extraSlots.values()) {
-      if (slot.manager.currentOpts()?.engine.id === engineId) count++
-    }
-    return count
+    return this.poolProcesses().filter((p) => p.engineIds.has(engineId)).length
   }
 
   /** Stop and drop every extra pool slot running on `engineId`, resolving once they have exited — before that
-   *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers). */
-  async stopPoolSlotsOnEngine(engineId: string): Promise<void> {
+   *  engine's files are replaced or it is unregistered. The primary is the caller's (stopEngineUsers).
+   *  `force` kills at once, as ComfyUI's acquire does the primary: a render must not wait out the graceful stop
+   *  (on Windows its full 8 s timer, which a windowless llama-server never cuts short). A slot already stopping (an
+   *  eject, or its idle watchdog) is waited for, and with `force` killed now.
+   *  A slot still loading is stopped now, whatever it still runs: the model it evicted (as LRU, still running while
+   *  its load waits for the load gate, or being stopped), or the engine it is starting. A load that has not spawned
+   *  its engine yet is not cancelled by this: for ComfyUI the hook refuses it and loadInto's gpuClaimed() check
+   *  drops one that spawns anyway; an engine update/delete (stopEngineUsers) does not stop such a load. */
+  async stopPoolSlotsOnEngine(engineId: string, opts?: { force?: boolean }): Promise<void> {
     const stopping: Promise<unknown>[] = []
-    for (const [key, slot] of this.extraSlots) {
-      if (slot.manager.currentOpts()?.engine.id !== engineId) continue
-      this.extraSlots.delete(key)
-      stopping.push(slot.manager.stopAndWait())
+    for (const p of this.poolProcesses()) {
+      if (!p.engineIds.has(engineId)) continue
+      if (p.slotKey !== undefined) this.dropSlot(p.slotKey)
+      stopping.push(p.manager.stopAndWait(opts))
     }
     await Promise.all(stopping)
+  }
+
+  /** Every pool-slot manager whose engine process may be alive, with the engine ids it holds: the registered slots
+   *  (`slotKey`), the ejected ones still exiting, and the slot a load runs in (see loadingSlot: on its new engine, and
+   *  on its evicted model's while that model still runs or stops). */
+  private poolProcesses(): Array<{ manager: Manager; engineIds: Set<string>; slotKey?: string }> {
+    const engineIds = (manager: Manager, also?: string): Set<string> => {
+      const ids = new Set<string>()
+      const id = this.slotEngineId(manager)
+      if (id) ids.add(id)
+      if (also) ids.add(also)
+      return ids
+    }
+    const out: Array<{ manager: Manager; engineIds: Set<string>; slotKey?: string }> = []
+    for (const [key, slot] of this.extraSlots) out.push({ manager: slot.manager, engineIds: engineIds(slot.manager), slotKey: key })
+    for (const manager of this.stoppingSlots) {
+      const ids = engineIds(manager)
+      if (ids.size) out.push({ manager, engineIds: ids })
+      else this.stoppingSlots.delete(manager) // exited
+    }
+    const loading = this.loadingSlot
+    if (loading) out.push({ manager: loading.manager, engineIds: engineIds(loading.manager, loading.engineId) })
+    return out
+  }
+
+  /** The engine a pool-slot manager's process runs on, while there is one. currentOpts() names it while the model runs
+   *  or starts; while it stops, currentOpts() is null but the process still holds its VRAM and its engine's files,
+   *  and restartOpts() still names the opts it was started with (Manager.load replaces them only once it has exited). */
+  private slotEngineId(manager: Manager): string | undefined {
+    return (manager.currentOpts() ?? (manager.status().state === 'stopping' ? manager.restartOpts() : null))?.engine.id
   }
 
   /** A manual switch (routes.ts) always loads directly into the PRIMARY manager, never an
@@ -306,6 +380,11 @@ export class ModelRouter {
       if (isAlive(slot.manager.status().state)) add(slot.modelKey)
     }
     for (const load of this.layaLoads.values()) add(load.modelKey)
+    // A load in flight: the model it loads, for the whole load (a pool slot is registered only once it has loaded),
+    // and the LRU model its pool slot still runs while that load waits for the load gate (evictChatLru dropped it).
+    if (this.loadingKey) add(this.loadingKey)
+    const loading = this.loadingSlot?.manager.status()
+    if (loading && isAlive(loading.state) && loading.model) add(loading.model.key)
     return keys
   }
 
@@ -331,11 +410,28 @@ export class ModelRouter {
       if (ss.state === 'running') {
         slot.lastUsedMs = Date.now()
         slot.manager.touch()
-        return { target: slot.manager.target()! }
+        return this.served(slot.manager, slot.manager.target()!)
       }
-      this.extraSlots.delete(entry.key) // dead slot — clean up
+      this.dropSlot(entry.key) // dead or stopping slot (its idle watchdog) — clean up
     }
     return undefined
+  }
+
+  /** The answer to a caller whose credential may not load models (auth.ts modelLoadsRefused) when `entry` is not
+   *  running: the same "not loaded" refusal the Turbo Link façade gives a peer without models:load. It is permanent
+   *  for this caller only when nothing under way brings the model up. A model that is loading, or the one ComfyUI's
+   *  guard loads when the render ends (a load the render paused, else the model it unloaded), is served to this caller
+   *  once it runs, so its client may retry. */
+  private notLoadedForCaller(entry: ModelEntry): RouteResult {
+    const ms = this.manager.status()
+    if ((ms.state === 'starting' && ms.model && this.keysMatch(ms.model.key, entry)) || this.loadingKey === entry.key) {
+      return { status: 503, message: `'${entry.name}' is still loading. Try again shortly.` }
+    }
+    const comfyLoads = this.comfy?.modelKeyLoadedOnRelease() ?? null
+    if (comfyLoads && this.keysMatch(comfyLoads, entry)) {
+      return { status: 503, message: `ComfyUI is rendering — '${entry.name}' is loaded when its queue finishes.` }
+    }
+    return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
   }
 
   private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>): Promise<RouteResult> {
@@ -352,7 +448,7 @@ export class ModelRouter {
       if (slot && slot.manager.status().state === 'running') {
         slot.lastUsedMs = Date.now()
         slot.manager.touch()
-        return { target: slot.manager.target()! }
+        return this.served(slot.manager, slot.manager.target()!)
       }
     }
 
@@ -363,7 +459,8 @@ export class ModelRouter {
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
     const inc = modelIncompatibility(engine.kind, entry)
-    if (inc) return { status: 503, message: inc.message }
+    // Stays so until the owner installs or switches to an engine that runs it; a retry only delays the message.
+    if (inc) return { status: 503, message: inc.message, permanent: true }
 
     const opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
@@ -386,9 +483,13 @@ export class ModelRouter {
     // flight. A pool slot itself is registered only once its load has succeeded, as it always was — registering it
     // earlier lets a request land on a manager that is still waiting on the load gate or stopping its old model.
     const inFlight = entry.laya ? this.trackLayaLoad(entry.key, targetManager) : undefined
+    this.loadingKey = entry.key
+    this.loadingSlot = targetManager === this.manager ? undefined : { manager: targetManager, engineId: opts.engine.id }
     try {
       return await this.loadInto(entry, engine, opts, targetManager, inFlight)
     } finally {
+      this.loadingKey = undefined
+      this.loadingSlot = undefined
       if (inFlight && this.layaLoads.get(entry.key) === inFlight) this.layaLoads.delete(entry.key)
     }
   }
@@ -405,47 +506,81 @@ export class ModelRouter {
     // Single chokepoint (rule 3): load() stops whatever this slot held, runs the
     // reverse gate (free ComfyUI VRAM), spawns, and waits for readiness — all under
     // the global load lock, so concurrent swaps can't spin up two engines at once.
+    let comfyRefused = false
     try {
       await targetManager.load(opts, {
         beforeStart: async () => {
           // Ejected while it waited for the gate: never spawn an engine for it.
           if (inFlight?.cancelled) throw new Error(UNLOADED_WHILE_LOADING)
-          await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+          try {
+            await (this.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve())
+          } catch (e) {
+            comfyRefused = true
+            throw e
+          }
         },
       })
     } catch (e) {
       if (inFlight?.cancelled) {
         await this.stopCancelled(targetManager)
-        return { status: 503, message: UNLOADED_WHILE_LOADING }
+        return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
       }
-      return { status: 503, message: `Engine start failed: ${(e as Error).message}` }
+      // The hook throws only when a ComfyUI render started while this load waited (for the gate or for /free):
+      // the same condition as doLoad's isBlocked() refusal, which clears by itself, so the client may retry.
+      if (comfyRefused) {
+        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
+      }
+      return { status: 503, message: `Engine start failed: ${(e as Error).message}`, permanent: true }
     }
 
     // Ejected while it loaded (stopExplicit): an engine that came up after the eject is stopped again, and waited for,
     // so nothing is left running that the router no longer tracks and a load queued behind this one never overlaps it.
     if (inFlight?.cancelled) {
       await this.stopCancelled(targetManager)
-      return { status: 503, message: UNLOADED_WHILE_LOADING }
+      return { status: 503, message: UNLOADED_WHILE_LOADING, permanent: true }
+    }
+
+    // ComfyUI acquired the GPU while this pool slot loaded: its pool stopper killed the load, or the engine came up
+    // anyway (an acquire landing between the pre-start hook and the spawn). Either way nothing may serve during the
+    // render, so it is stopped and not registered, and like doLoad's isBlocked() refusal the client may retry.
+    if (targetManager !== this.manager && this.comfy?.gpuClaimed()) {
+      await targetManager.stopAndWait({ force: true })
+      return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
     }
 
     const s = targetManager.status()
     if (s.state !== 'running') {
-      return { status: 503, message: s.err?.message ?? 'Model failed to become ready.' }
+      // The primary's load, when ComfyUI's acquire killed it: acquire force-stops a starting primary itself and keeps
+      // its model for release() to reload, so it is stopped, not failed, and like the pool slot above the client may
+      // retry. A load that failed on its own leaves the engine in 'error' and stays permanent.
+      if (s.state !== 'error' && this.comfy?.gpuClaimed()) {
+        return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
+      }
+      return { status: 503, message: s.err?.message ?? 'Model failed to become ready.', permanent: true }
     }
 
     const target = targetManager.target()
-    if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.' }
+    if (!target) return { status: 503, message: 'Model loaded but target URL unavailable.', permanent: true }
 
     if (targetManager === this.manager) {
       this.primaryLastUsed = Date.now()
     } else {
+      // A slot still listed for this key (loadExplicit skips routeResolved's cleanup) is dead or still stopping.
+      this.dropSlot(entry.key)
       this.extraSlots.set(entry.key, { manager: targetManager, modelKey: entry.key, lastUsedMs: Date.now() })
     }
 
     // A Laya model is never the model to resume at boot: the resume path loads on the active engine, which
     // refuses it, so recording it would leave the machine with no model at all after a restart.
     if (!entry.laya) this.store.update(x => { x.lastLoaded = { modelKey: entry.key, engineId: engine.id } })
-    return { target }
+    return targetManager === this.manager ? { target } : this.served(targetManager, target)
+  }
+
+  /** A route to a pool slot, described from that slot's own manager (see RouteResult). The primary's routes carry
+   *  none of this: the gateway's fallback already reads the primary. */
+  private served(manager: Manager, target: string): RouteResult {
+    const opts = manager.currentOpts()
+    return opts ? { target, engineKind: opts.engine.kind, modelPath: opts.modelPath, modelName: opts.model.name } : { target }
   }
 
   /** A slot counts as occupied while 'stopping' too, not just 'running'/'starting' —
@@ -469,7 +604,7 @@ export class ModelRouter {
   private trackLayaLoad(modelKey: string, manager: Manager): LayaLoad {
     // Whatever slot the router still holds for this key is dead or going away: doLoad found no running one under the
     // swap lock. Dropping it means the model is reported once, and an eject reaches the load and not a stale entry.
-    this.extraSlots.delete(modelKey)
+    this.dropSlot(modelKey)
     const load: LayaLoad = { manager, modelKey, startedMs: Date.now(), cancelled: false }
     this.layaLoads.set(modelKey, load)
     return load
@@ -539,7 +674,7 @@ export class ModelRouter {
       }
     }
 
-    if (lruKey !== null) this.extraSlots.delete(lruKey)
+    if (lruKey !== null) this.extraSlots.delete(lruKey) // not dropSlot: the load takes this manager over (loadingSlot)
     return lruManager
   }
 
@@ -580,15 +715,36 @@ export class ModelRouter {
         message:
           `'${parsed.machine}' is not connected (${link.status}). ` +
           `Reconnect it in Settings → Turbo Link.`,
+        // 'unknown' (not probed yet) and 'unreachable' can come back on the next probe; a revoked or incompatible
+        // link stays down until someone re-pairs or updates it.
+        ...(link.status === 'revoked' || link.status === 'incompatible' ? { permanent: true as const } : {}),
       }
     }
     const model = this.catalog.modelOn(link.id, parsed.model)
     if (!model) {
       return { status: 503, message: `'${parsed.machine}' does not have a model '${parsed.model}'.` }
     }
+    // A caller that may not load models (auth.ts modelLoadsRefused) gets a linked machine's model only while it is
+    // already loaded there, as it does locally. The request goes out with THIS daemon's link token, so a link granted
+    // models:load would otherwise have the host swap models for a caller this machine never let load one. `loaded` is
+    // what the host reported on the last catalog refresh (true while its engine runs or starts the model), so this
+    // refuses early and covers a host too old to read the marker below. The host itself decides on its live state:
+    // `noLoad` puts the marker on the request (link-proxy.ts linkHeaders) and on every later request built from this
+    // target, such as the tool rounds of an in-app chat turn.
+    const noLoad = modelLoadsRefused()
+    if (!model.loaded && noLoad) {
+      return {
+        status: 503,
+        message: `'${parsed.machine}/${model.key}' is not loaded, and this access token may not load models.`,
+        permanent: true,
+      }
+    }
     return {
       target: link.baseUrl,
-      remote: { linkId: link.id, baseUrl: link.baseUrl, token: link.token, modelKey: model.key },
+      remote: {
+        linkId: link.id, baseUrl: link.baseUrl, token: link.token, modelKey: model.key,
+        ...(noLoad ? { noLoad: true as const } : {}),
+      },
     }
   }
 

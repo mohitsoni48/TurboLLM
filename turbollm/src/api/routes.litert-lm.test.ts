@@ -6,15 +6,22 @@
 // UpdateChecker with an injected fetcher, so no test touches the network.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
 import { UpdateChecker } from '../engines/update'
 import type { Deps } from '../deps'
+import { tmpDir } from '../test-support/tmp'
 
 function appWithChecker(
   fetcher: (src: { source: string; ref: string }) => Promise<string>,
   installedVersion = '0.17.1',
-  opts: { noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null } = {},
+  opts: {
+    noUpdates?: boolean; activeEngineId?: string | null; runningKind?: string | null; storeDir?: string; downloadActive?: () => boolean
+    /** What stopping an engine's extra pool slots does; resolves at once by default. */
+    stopPoolSlots?: (engineId: string) => Promise<void>
+  } = {},
 ) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
@@ -47,6 +54,8 @@ function appWithChecker(
   ]
   const provisionCalls: string[] = []
   const managerCalls: string[] = []
+  const activateCalls: string[] = []
+  const poolStops: string[] = []
   // The route's stop-guard keys on the engine that is RUNNING (manager currentOpts), not the
   // registry's active engine — an install activates without stopping what is loaded, so the
   // two can differ (v1.14.5). Both knobs stay mockable so every combination can be expressed;
@@ -54,7 +63,7 @@ function appWithChecker(
   const runningKind = opts.runningKind === undefined ? 'litert-lm' : opts.runningKind
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/tmp/turbollm-litert-route' },
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => opts.storeDir ?? '/tmp/turbollm-litert-route' },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     manager: {
       status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),
@@ -63,7 +72,10 @@ function appWithChecker(
       stopAndWait: async () => { managerCalls.push('stopAndWait'); provisionCalls.push('stop') },
       currentOpts: () => (runningKind ? { engine: { kind: runningKind } } : undefined),
     },
-    modelRouter: { loadedModelKeys: () => new Set<string>() },
+    modelRouter: {
+      loadedModelKeys: () => new Set<string>(),
+      stopPoolSlotsOnEngine: async (engineId: string) => { poolStops.push(engineId); await opts.stopPoolSlots?.(engineId) },
+    },
     db: { lastGenTpsByModel: () => new Map<string, number>() },
     registry: {
       engines,
@@ -71,7 +83,7 @@ function appWithChecker(
       active: () =>
         opts.activeEngineId === null ? undefined : engines.find((e) => e.id === (opts.activeEngineId ?? 'litert-1')),
       addLitertLm: (name: string) => ({ id: 'litert-2', name, activate: () => {} }),
-      activate: () => {},
+      activate: (id: string) => activateCalls.push(id),
     },
     downloads: { provenance: () => [] },
     provision: {
@@ -79,7 +91,7 @@ function appWithChecker(
       progress: () => {},
       done: () => provisionCalls.push('done'),
       fail: (e: string) => provisionCalls.push(`fail:${e}`),
-      get: () => ({ active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }),
+      get: () => ({ active: opts.downloadActive?.() ?? false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }),
     },
     build: { isActive: () => false },
     // `noUpdates`: a Deps with no daemon UpdateChecker (the wiring in main.ts always builds
@@ -88,7 +100,7 @@ function appWithChecker(
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, provisionCalls, managerCalls }
+  return { app, provisionCalls, managerCalls, activateCalls, poolStops, engines }
 }
 
 test('?update=1 with the installed version already latest refuses without provisioning', async () => {
@@ -155,6 +167,17 @@ test('an update leaves a running model of ANOTHER engine alone, even when LiteRT
   const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
   assert.equal(res.status, 202)
   assert.equal(provisionCalls.includes('stop'), false)
+})
+
+test('?update=1 whose upstream check let another engine job take the slot is a 409 and provisions nothing', async () => {
+  // A scheduler auto-update can start during the (up to 15 s) check; a second `uv pip install -U` into the same venv
+  // would run on top of it, sharing one progress/Cancel channel.
+  let busy = false
+  const { app, provisionCalls } = appWithChecker(async () => { busy = true; return '0.18.0' }, '0.17.1', { downloadActive: () => busy })
+  const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'engine_already_running')
+  assert.deepEqual(provisionCalls, [])
 })
 
 test('?update=1 without a daemon UpdateChecker falls back to computeUpdateStatus and is just as honest', async () => {
@@ -226,4 +249,54 @@ test('nothing is stopped when nothing is running, or when a DIFFERENT engine is 
   const r2 = await other.app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
   assert.equal(r2.status, 202)
   assert.deepEqual(other.managerCalls, [], 'a running non-LiteRT-LM engine must not be stopped')
+})
+
+test('an update also stops a .litertlm model in an extra pool slot, while the primary runs another engine', async () => {
+  // The primary check above keys on the primary alone, so `uv pip install -U` ran under a pool slot that still held
+  // the native library (file-locked on Windows). The slot stop is held open here, so the venv is never touched.
+  const { app, managerCalls, poolStops, provisionCalls } = appWithChecker(async () => '0.18.0', '0.17.1', {
+    activeEngineId: 'other-1', runningKind: 'llama-server', stopPoolSlots: () => new Promise<void>(() => {}),
+  })
+  const res = await app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.deepEqual(poolStops, ['litert-1'], 'only the LiteRT-LM engine\'s pool slots are stopped')
+  assert.deepEqual(managerCalls, [], 'the primary on another engine is left alone')
+  assert.deepEqual(provisionCalls, ['start:litert-lm'])
+})
+
+// ── An update keeps the active engine, as the scheduler's applyPipUpdate does: the route behind the card's Update
+// button made LiteRT-LM the active engine whatever was active before, and an active LiteRT-LM is sent every GGUF —
+// so updating it on a llama.cpp desktop broke every GGUF load. An install still activates it. The provision runs
+// for real here, offline, against a fake uv and venv python (shell scripts). ──
+test('?update=1 leaves another active engine active; an update of the active LiteRT-LM and an install activate it', async (t) => {
+  if (process.platform === 'win32') return t.skip('fakes uv and the venv python with shell scripts')
+  const storeDir = tmpDir('tllm-litert-activate-')
+  const engines = join(storeDir, 'engines')
+  mkdirSync(join(engines, 'uv'), { recursive: true })
+  writeFileSync(join(engines, 'uv', 'uv'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  mkdirSync(join(engines, 'litert-lm', 'venv', 'bin'), { recursive: true })
+  writeFileSync(join(engines, 'litert-lm', 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.18.0\n', { mode: 0o755 })
+  const provision = async (query: string, activeEngineId: string) => {
+    const h = appWithChecker(async () => '0.18.0', '0.17.1', { activeEngineId, runningKind: null, storeDir })
+    const res = await h.app.request(`/api/v1/engines/litert-lm${query}`, { method: 'POST' })
+    assert.equal(res.status, 202)
+    for (let i = 0; i < 1000 && !h.provisionCalls.some((c) => c === 'done' || c.startsWith('fail:')); i++) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.deepEqual(h.provisionCalls, ['start:litert-lm', 'done'])
+    return h.activateCalls
+  }
+  assert.deepEqual(await provision('?update=1', 'other-1'), [], 'an update must not make LiteRT-LM the active engine')
+  assert.deepEqual(await provision('?update=1', 'litert-1'), ['litert-2'])
+  assert.deepEqual(await provision('', 'other-1'), ['litert-2'], 'an install activates it')
+})
+
+test('GET /engines/updates stops offering an update the engine already took in place (same id, new version)', async () => {
+  const { app, engines } = appWithChecker(async () => '0.18.0')
+  const updates = async (q = '') =>
+    ((await (await app.request(`/api/v1/engines/updates${q}`)).json()) as { updates: Record<string, { hasUpdate: boolean }> }).updates
+  assert.equal((await updates('?refresh=1'))['litert-1']?.hasUpdate, true)
+  // A pip upgrade (here or through ?update=1) re-registers the same engine id with the new version.
+  engines[0]!.version = 'litert-lm 0.18.0'
+  assert.notEqual((await updates())['litert-1']?.hasUpdate, true)
 })

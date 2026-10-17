@@ -127,6 +127,22 @@ test('cleanupIdle: a terminal idle for LESS than maxAgeMs is left alone', () => 
   assert.ok(m.infoMap.has('t4'))
 })
 
+test('cleanupIdle: a terminal created with its own idle TTL (a routine run) uses it instead of maxAgeMs', () => {
+  const m = seededManager()
+  const ttl = (m as unknown as { idleTtl: Map<string, number> }).idleTtl
+  const session = seedTerminal(m, 't5')
+  ttl.set('t5', 35 * 60_000)
+  m.idleSince.set('t5', Date.now() - 6 * 60_000) // never viewed, six minutes old
+
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), false, 'its owner, not the 5-minute default, decides when it ends')
+
+  m.idleSince.set('t5', Date.now() - 36 * 60_000)
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), true, 'past its own TTL it still ages out')
+  assert.equal(ttl.has('t5'), false)
+})
+
 test('registerWsListener: two listeners on the same id both receive broadcast data', () => {
   const m = new TerminalManager()
   const received1: string[] = []
@@ -206,8 +222,8 @@ test('broadcast: onClose fans out to every attached listener', () => {
 // terminal-agent PTYs at all — found live as 11 orphaned claude.exe + 6 orphaned
 // powershell.exe processes after a day of Code-terminal testing with repeated daemon
 // restarts. These pin the same owner-scoped pidfile contract engines/tunnels already have
-// (mirrors manager.reap.test.ts, minus the portAlive cross-check — a plain shell has no
-// meaningful port to verify against, same simplification tunnel/manager.ts already made).
+// (mirrors manager.reap.test.ts; a plain shell has no port for a portAlive cross-check, so the
+// pidfile's recorded start time stands in for it — see the pid-reuse tests below).
 
 function spawnFakeShell(): Promise<{ pid: number; kill: () => void; waitExit: () => Promise<void> }> {
   // A real, long-lived child process standing in for an orphaned terminal shell.
@@ -221,10 +237,13 @@ function spawnFakeShell(): Promise<{ pid: number; kill: () => void; waitExit: ()
   })
 }
 
-function writeTerminalPidFile(dir: string, pid: number, owner?: number): void {
+function writeTerminalPidFile(dir: string, pid: number, owner?: number, startedAt?: number): void {
   const run = join(dir, 'run')
   mkdirSync(run, { recursive: true })
-  writeFileSync(join(run, `terminal-${pid}.pid`), JSON.stringify({ pid, ...(owner !== undefined ? { owner } : {}) }))
+  writeFileSync(
+    join(run, `terminal-${pid}.pid`),
+    JSON.stringify({ pid, ...(owner !== undefined ? { owner } : {}), ...(startedAt !== undefined ? { startedAt } : {}) }),
+  )
 }
 
 function terminalPidFiles(dir: string): string[] {
@@ -241,7 +260,9 @@ test('reapStaleTerminals: reaps a tracked shell with no live owner, and clears i
   const dir = tmpDir('tllm-term-reap-')
   const shell = await spawnFakeShell()
   try {
-    writeTerminalPidFile(dir, shell.pid) // no owner field — ownerless/legacy, must be reaped
+    // No owner field (ownerless), and a spawn time matching the live process — so it is provably
+    // still the shell that pidfile was written for.
+    writeTerminalPidFile(dir, shell.pid, undefined, Date.now())
 
     const killed = reapStaleTerminals(dir)
 
@@ -249,6 +270,41 @@ test('reapStaleTerminals: reaps a tracked shell with no live owner, and clears i
     await Promise.race([shell.waitExit(), sleep(5000)])
     assert.throws(() => process.kill(shell.pid, 0), 'the orphaned shell should be dead')
     assert.equal(terminalPidFiles(dir).length, 0, 'pidfile should be removed after reaping')
+  } finally {
+    shell.kill()
+  }
+})
+
+// The pid-reuse case: a daemon killed without its exit handler (power loss, OS update
+// reboot) leaves a pidfile behind, and on the next boot that pid belongs to some unrelated
+// process — which `taskkill /F /T` would take down with its whole tree. Only a pid whose process
+// started when the pidfile says the shell did may be killed.
+test('reapStaleTerminals: does NOT kill a recycled pid whose process started at a different time', async () => {
+  const dir = tmpDir('tllm-term-reap-')
+  const unrelated = await spawnFakeShell()
+  try {
+    // Written an hour before this process existed — e.g. before a reboot.
+    writeTerminalPidFile(dir, unrelated.pid, 0, Date.now() - 60 * 60_000)
+
+    const killed = reapStaleTerminals(dir)
+
+    assert.equal(killed, 0, 'a pid that is no longer our shell must not be killed')
+    assert.doesNotThrow(() => process.kill(unrelated.pid, 0), 'the unrelated process should still be running')
+    assert.equal(terminalPidFiles(dir).length, 0, 'the stale pidfile is still cleared')
+  } finally {
+    unrelated.kill()
+  }
+})
+
+test('reapStaleTerminals: a pidfile with no recorded start time cannot be verified, so nothing is killed', async () => {
+  const dir = tmpDir('tllm-term-reap-')
+  const shell = await spawnFakeShell()
+  try {
+    writeTerminalPidFile(dir, shell.pid) // the pre-fix format: pid only
+
+    assert.equal(reapStaleTerminals(dir), 0)
+    assert.doesNotThrow(() => process.kill(shell.pid, 0), 'an unverifiable pid must be left running')
+    assert.equal(terminalPidFiles(dir).length, 0, 'the stale pidfile is still cleared')
   } finally {
     shell.kill()
   }

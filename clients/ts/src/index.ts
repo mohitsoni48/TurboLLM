@@ -259,16 +259,36 @@ function parseFrame(block: string): { event: string; data: string; id?: string }
 /** An `AsyncIterable<ExtEvent>` over a run's SSE stream, exposing the bookkeeping spec §7.3
  *  needs so a caller never has to reimplement it: `lastEventSeq` for `?after=` reconnects,
  *  `runId` once the `run` frame arrives, and `outcome` — set from a `done` frame's `status`,
- *  left `'unknown'` if the body ends without one. */
+ *  left `'unknown'` if the body ends without one (including a connection that drops mid-stream:
+ *  that ends the iteration instead of throwing). */
 export class RunStream implements AsyncIterable<ExtEvent> {
   lastEventSeq: number | undefined
   runId: string | undefined
   outcome: RunOutcome = 'unknown'
+  /** Set only by `resume()` when the cursor had aged out of the replay buffer
+   *  (`409 replay_window_exceeded`): the frames between your cursor and this stream's first
+   *  frame are gone, so REPLACE what you rendered with `resyncMessage.content` (and, if you
+   *  render them, `.reasoning` and `.tool_calls`, which it carries too) and append this
+   *  stream's frames to that. The message is checkpointed periodically while it streams, so it
+   *  can trail the reattach point slightly; once `outcome` is known, `messages.get` returns the
+   *  final text. */
+  resyncMessage: Message | undefined
 
   private readonly body: Promise<Response>
 
-  constructor(body: Promise<Response>) {
+  /** `after` is the cursor the stream was attached from: `lastEventSeq` starts there, so a
+   *  stream that drops before its first frame still hands the next resume that cursor instead
+   *  of `undefined`, which would replay the run from the start. `runId` is the run being
+   *  attached to: only `send()`'s stream gets a `run` frame, so without it a chained
+   *  `resume(stream.runId, stream.lastEventSeq)` asks for `/runs/undefined/stream`. */
+  constructor(body: Promise<Response>, after?: number, runId?: string) {
     this.body = body
+    // Only the iterator awaits the fetch. A caller that awaits something else before its
+    // `for await` would otherwise leave a failed fetch (daemon down) unhandled, which kills a
+    // Node process; the iterator still awaits the original promise and throws the error.
+    body.catch(() => { /* surfaced by the iterator */ })
+    this.lastEventSeq = after
+    this.runId = runId
   }
 
   /** Turns one `\n\n`-delimited block into an `ExtEvent`, updating the running bookkeeping
@@ -318,7 +338,9 @@ export class RunStream implements AsyncIterable<ExtEvent> {
       // No readable body stream on this Response (atypical for a real fetch, but keeps this
       // robust against a Response-like object that only implements `.text()`) — fall back to
       // reading it as one complete blob.
-      for (const block of (await res.text()).split('\n\n')) {
+      let text: string
+      try { text = await res.text() } catch { return /* dropped: outcome stays 'unknown' */ }
+      for (const block of text.split('\n\n')) {
         const ev = this.toEvent(block)
         if (ev) yield ev
       }
@@ -330,24 +352,36 @@ export class RunStream implements AsyncIterable<ExtEvent> {
     // (see README) needs each frame as soon as it completes, not all at once when the
     // connection finally closes — buffering here would silently turn a streaming response
     // into a blocking one.
+    //
+    // A dropped connection (daemon restart, network loss) makes `reader.read()` reject; that
+    // ends the iteration with `outcome` still 'unknown' — spec §7.3's "ask the run" case —
+    // instead of throwing out of the caller's `for await` past its reconciliation code. The
+    // partial frame left in `buffer` is discarded: it was cut off, not complete. `finally`
+    // cancels the body when the caller stops early (`break`), which otherwise keeps the HTTP
+    // response open and receiving frames until the run ends.
     const decoder = new TextDecoder()
     let buffer = ''
-    for (;;) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let sep = buffer.indexOf('\n\n')
-      while (sep !== -1) {
-        const block = buffer.slice(0, sep)
-        buffer = buffer.slice(sep + 2)
-        const ev = this.toEvent(block)
-        if (ev) yield ev
-        sep = buffer.indexOf('\n\n')
+    try {
+      for (;;) {
+        let chunk: { done: boolean; value?: Uint8Array }
+        try { chunk = await reader.read() } catch { return }
+        if (chunk.done) break
+        buffer += decoder.decode(chunk.value, { stream: true })
+        let sep = buffer.indexOf('\n\n')
+        while (sep !== -1) {
+          const block = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          const ev = this.toEvent(block)
+          if (ev) yield ev
+          sep = buffer.indexOf('\n\n')
+        }
       }
+      buffer += decoder.decode()
+      const ev = this.toEvent(buffer)
+      if (ev) yield ev
+    } finally {
+      reader.cancel().catch(() => { /* already closed or errored */ })
     }
-    buffer += decoder.decode()
-    const ev = this.toEvent(buffer)
-    if (ev) yield ev
   }
 }
 
@@ -481,12 +515,14 @@ export class TurboLLMChat {
     cancel: (id: string, opts: { owner?: string } = {}): Promise<Run> =>
       this.request(`/runs/${encodeURIComponent(id)}/cancel`, { method: 'POST', query: { owner: opts.owner } }),
 
-    /** Attaches (or re-attaches, via `after`) to a run's SSE stream (spec 27 §6.3). */
+    /** Attaches (or re-attaches, via `after`) to a run's SSE stream (spec 27 §6.3). `after` is
+     *  the last `event_seq` already received — only later frames are sent; omit it to replay
+     *  from the first frame. */
     stream: (runId: string, after?: number, opts: { owner?: string } = {}): RunStream =>
       new RunStream(this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
         query: { after, owner: opts.owner },
         accept: 'text/event-stream',
-      })),
+      }), after, runId),
   }
 
   /** Appends a message and starts a run, returning a `RunStream` of typed events (spec 27
@@ -505,13 +541,18 @@ export class TurboLLMChat {
     }))
   }
 
-  /** Convenience wrapper over `runs.stream` implementing spec §7.3's reconciliation rule: if
-   *  the server answers `409 replay_window_exceeded` (the cursor aged out of the run's replay
-   *  buffer), re-read the message via `runs.get` to resynchronize and attach fresh from the
-   *  run's current `event_seq` instead of surfacing the error to the caller. `owner` must match
-   *  whatever the run was created under (`send()`'s own `owner` param) — omitting it defaults
-   *  to `'default'` server-side, same as every other call in this client (release-gate I5). */
-  async resume(runId: string, afterSeq: number, opts: { owner?: string } = {}): Promise<RunStream> {
+  /** Convenience wrapper over `runs.stream` implementing spec §7.3's reconciliation rule.
+   *  `afterSeq` is the last `event_seq` you already have (`stream.lastEventSeq`); only later
+   *  frames are sent, and `undefined` replays from the first frame. If the server answers
+   *  `409 replay_window_exceeded` (the cursor aged out of the run's replay buffer), this does
+   *  what the server asks — re-reads the message, then attaches at the run's current
+   *  `event_seq` — and returns that stream with `resyncMessage` set: the caller must re-render
+   *  from it rather than append, since the frames in between are gone. A run that has already
+   *  ended has nothing left to attach to: the stream is then empty, with `outcome` read from the
+   *  run record. `owner` must match whatever the run was created under (`send()`'s own `owner`
+   *  param) — omitting it defaults to `'default'` server-side, same as every other call in this
+   *  client (release-gate I5). */
+  async resume(runId: string, afterSeq?: number, opts: { owner?: string } = {}): Promise<RunStream> {
     const probe = await this.raw(`/runs/${encodeURIComponent(runId)}/stream`, {
       query: { after: afterSeq, owner: opts.owner },
       accept: 'text/event-stream',
@@ -520,11 +561,33 @@ export class TurboLLMChat {
       let code: string | undefined
       try { code = ((await probe.clone().json()) as { error?: { code?: string } }).error?.code } catch { /* ignore */ }
       if (code === 'replay_window_exceeded') {
+        // The message BEFORE the run's event_seq, so it can only trail the reattach point. The
+        // other way round, a checkpoint landing between the two reads would already hold frames
+        // the stream then sends again, rendered twice. The first runs.get only finds the message.
+        const { message_id: messageId } = await this.runs.get(runId, opts)
+        // The lost frames include `reasoning` and `tool_call` ones, and the checkpoint persists
+        // both, but they are heavy fields: left out unless asked for.
+        const read = { owner: opts.owner, include: ['reasoning', 'tool_calls'] as HeavyField[] }
+        let message = await this.messages.get(messageId, read)
         const run = await this.runs.get(runId, opts)
-        return this.runs.stream(runId, run.event_seq, opts)
+        // Ended in between: no later frame will carry the tail, but the message is final now (the
+        // server writes it before ending the run), so read it once more.
+        if (run.ended_at !== null) {
+          message = await this.messages.get(messageId, read)
+          // Nor is there a `done` frame left to attach for: the run's own event_seq already
+          // covers it, and a run the daemon has dropped (pruned, or a restart) only 409s again.
+          // So no attach: an empty stream whose outcome is the run record's.
+          const ended = new RunStream(Promise.resolve(new Response(null, { status: 200 })), undefined, runId)
+          if (run.status === 'complete' || run.status === 'failed' || run.status === 'aborted') ended.outcome = run.status
+          ended.resyncMessage = message
+          return ended
+        }
+        const stream = this.runs.stream(runId, run.event_seq, opts)
+        stream.resyncMessage = message
+        return stream
       }
       throw new ApiError(409, ((await probe.json().catch(() => undefined)) as { error?: ExtErrorBody } | undefined)?.error)
     }
-    return new RunStream(Promise.resolve(probe))
+    return new RunStream(Promise.resolve(probe), afterSeq, runId)
   }
 }

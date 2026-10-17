@@ -20,6 +20,7 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
+  useSysInfo,
 } from '../lib/queries'
 import { ModelDirs } from './models/ModelDirs'
 import { ToolPermissionsSection } from './settings/ToolPermissionsSection'
@@ -32,7 +33,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
-import { ApiError, track, type TelemetryLevel } from '../lib/api'
+import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import { toast } from '../components/ui/sonner'
@@ -113,6 +114,9 @@ function NumberField({
 
 const clampN = (n: number, min: number, max: number) => Math.max(min, Math.min(max, Math.round(n)))
 
+/** window.location.hostname of a page the daemon trusts as the host itself (no key needed). */
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]'])
+
 /** Settings categories for the two-pane layout. Each maps to one pane of sections. */
 type CatId = 'general' | 'models' | 'tools' | 'network' | 'experimental' | 'system'
 
@@ -140,6 +144,30 @@ function Slider({ label, hint, value, min, max, step, onChange, fmt }: {
       <input type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))} className="w-full accent-[var(--accent)]" />
     </div>
   )
+}
+
+/** The main Save form's draft values as seeded from `settings` (same defaults as `dirty`). */
+function draftsFrom(s: DaemonSettings) {
+  return {
+    ttl: s.idleTtlMinutes,
+    vramHeadroom: s.vramHeadroomMb ?? 1024,
+    port: s.port ?? 6996,
+    autoTitle: s.autoGenerateTitles,
+    openBrowser: s.openBrowserOnStart,
+    autoLoad: s.autoLoadOnStart ?? false,
+    defCtx: s.modelDefaults?.ctx ?? 8192,
+    defNgl: s.modelDefaults?.ngl ?? 99,
+    defImageMax: s.modelDefaults?.imageMaxTokens ?? 0,
+    defMaxTokens: s.modelDefaults?.maxTokens ?? 0,
+    telemetry: (s.telemetryLevel ?? 'off') as TelemetryLevel,
+    lanBind: s.lanBind ?? false,
+    requireApiKey: s.requireApiKey ?? true,
+    comfyEnabled: s.comfyui?.enabled ?? false,
+    comfyUrl: s.comfyui?.url ?? '',
+    comfyReverseGate: s.comfyui?.reverseGate ?? false,
+    gatewayAutoSwap: s.gateway?.autoSwap ?? true,
+    gatewayKeepN: s.gateway?.keepN ?? 1,
+  }
 }
 
 export function SettingsScreen() {
@@ -187,28 +215,46 @@ export function SettingsScreen() {
 
   // Whether the Code-only sections under "Tools & safety" render at all — see the gate there.
   const codeEnabled = useCodeFeatureEnabled()
+  // The packaged Android app (bundledEnginesOnly — the same test the daemon uses) cannot restart
+  // its daemon: it is the app's own once-per-process Node, so exiting it closes the whole app and
+  // nothing brings it back. The daemon answers 501 there; don't offer the button. Termux keeps it.
+  const inAndroidApp = !!useSysInfo().data?.bundledEnginesOnly
+
+  // What each draft was last seeded with. Many sections save on their own (tokens, Experimental,
+  // Memory, Remote access, …) and every such save swaps in a new `settings` object — so a
+  // re-seed only overwrites a draft that still holds its last-seeded value. An unsaved edit
+  // anywhere else on the page survives it. After this page's own Save, `sent` (the drafts as
+  // they were sent) is the baseline instead: every draft still holding what was sent takes the
+  // stored value (server clamps included), and one edited during the round trip keeps the edit.
+  const seededRef = useRef<ReturnType<typeof draftsFrom> | null>(null)
+  const seedDrafts = (s: DaemonSettings, sent?: ReturnType<typeof draftsFrom>) => {
+    const prev = sent ?? seededRef.current
+    const next = draftsFrom(s)
+    seededRef.current = next
+    const keep = <K extends keyof typeof next>(k: K) => (cur: (typeof next)[K]) => (!prev || cur === prev[k] ? next[k] : cur)
+    setTtl(keep('ttl'))
+    setVramHeadroom(keep('vramHeadroom'))
+    setPort(keep('port'))
+    setAutoTitle(keep('autoTitle'))
+    setOpenBrowser(keep('openBrowser'))
+    setAutoLoad(keep('autoLoad'))
+    setDefCtx(keep('defCtx'))
+    setDefNgl(keep('defNgl'))
+    setDefImageMax(keep('defImageMax'))
+    setDefMaxTokens(keep('defMaxTokens'))
+    setTelemetry(keep('telemetry'))
+    setLanBind(keep('lanBind'))
+    setRequireApiKey(keep('requireApiKey'))
+    setComfyEnabled(keep('comfyEnabled'))
+    setComfyUrl(keep('comfyUrl'))
+    setComfyReverseGate(keep('comfyReverseGate'))
+    setGatewayAutoSwap(keep('gatewayAutoSwap'))
+    setGatewayKeepN(keep('gatewayKeepN'))
+  }
 
   useEffect(() => {
-    if (settings) {
-      setTtl(settings.idleTtlMinutes)
-      setVramHeadroom(settings.vramHeadroomMb ?? 1024)
-      setPort(settings.port ?? 6996)
-      setAutoTitle(settings.autoGenerateTitles)
-      setOpenBrowser(settings.openBrowserOnStart)
-      setAutoLoad(settings.autoLoadOnStart ?? false)
-      setDefCtx(settings.modelDefaults?.ctx ?? 8192)
-      setDefNgl(settings.modelDefaults?.ngl ?? 99)
-      setDefImageMax(settings.modelDefaults?.imageMaxTokens ?? 0)
-      setDefMaxTokens(settings.modelDefaults?.maxTokens ?? 0)
-      setTelemetry(settings.telemetryLevel ?? 'off')
-      setLanBind(settings.lanBind ?? false)
-      setRequireApiKey(settings.requireApiKey ?? true)
-      setComfyEnabled(settings.comfyui?.enabled ?? false)
-      setComfyUrl(settings.comfyui?.url ?? '')
-      setComfyReverseGate(settings.comfyui?.reverseGate ?? false)
-      setGatewayAutoSwap(settings.gateway?.autoSwap ?? true)
-      setGatewayKeepN(settings.gateway?.keepN ?? 1)
-    }
+    if (settings) seedDrafts(settings)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [settings])
 
   // Persist the thinking budget immediately (no Save round-trip; it's client-only).
@@ -245,18 +291,36 @@ export function SettingsScreen() {
     gateway: { autoSwap: gatewayAutoSwap, keepN: clampN(gatewayKeepN, 1, 4) },
   })
 
+  // The listener moved to a new port — hop the browser over once it's up.
+  // Another port is another origin, with its own localStorage: a client off the host that sends a
+  // saved API key lands there without it, and the new port asks for the key again (AuthGate). It
+  // was not told so before the hop. Say it in the toast and leave time to read it. The key itself
+  // is never carried over in the URL. A loopback page needs no key, so it hops as before.
+  const followPort = (newPort: number, message: string) => {
+    const keyStaysBehind = !!getAuthToken() && !LOOPBACK_HOSTNAMES.has(window.location.hostname)
+    if (keyStaysBehind) {
+      toast.success(`${message} This browser keeps the API key per port: paste it again on port ${newPort}.`, { duration: 6000 })
+    } else {
+      toast.success(message)
+    }
+    setTimeout(() => {
+      const u = new URL(window.location.href)
+      u.port = String(newPort)
+      window.location.href = u.toString()
+    }, keyStaysBehind ? 4500 : 1300)
+  }
+
   const handleSave = () => {
+    const sent: ReturnType<typeof draftsFrom> = {
+      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
+      lanBind, requireApiKey, comfyEnabled, comfyUrl, comfyReverseGate, gatewayAutoSwap, gatewayKeepN,
+    }
     save.mutate(settingsPayload(), {
       onSuccess: (res) => {
+        seedDrafts(res, sent)
         const rb = res.rebind
         if (rb?.portChanged) {
-          // The listener moved to a new port — hop the browser over once it's up.
-          toast.success(`Port changed to ${rb.port} — reconnecting…`)
-          setTimeout(() => {
-            const u = new URL(window.location.href)
-            u.port = String(rb.port)
-            window.location.href = u.toString()
-          }, 1300)
+          followPort(rb.port, `Port changed to ${rb.port} — reconnecting…`)
         } else if (rb) {
           // LAN-only change: applied in place, no restart, model stays loaded.
           toast.success(rb.lanBind ? 'LAN access enabled — applied (no restart needed)' : 'LAN access disabled — applied')
@@ -270,9 +334,18 @@ export function SettingsScreen() {
 
   // Restart must persist pending changes FIRST — otherwise a port/LAN toggle the user
   // just flipped is lost and the re-exec'd daemon comes back on the old config.
+  // Except a port change: that save already moves the live daemon to the new port, in place, as
+  // Save does. The restart overlay polls and reloads this page's own origin, which nothing listens
+  // on any more, and it cannot poll the new port instead (another port is another origin, and
+  // /api/* answers no cross-origin read from it). A restart would also race that move. So the page
+  // follows the port like Save, and the daemon is not restarted: the change needed none.
   const requestRestart = () => {
     save.mutate(settingsPayload(), {
-      onSuccess: () => setRestartOverlay(true),
+      onSuccess: (res) => {
+        const rb = res.rebind
+        if (rb?.portChanged) followPort(rb.port, `Port changed to ${rb.port}: applied without a restart. Reconnecting…`)
+        else setRestartOverlay(true)
+      },
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save settings before restart.'),
     })
   }
@@ -671,7 +744,7 @@ export function SettingsScreen() {
           {activeCat === 'network' && (
             <>
               {/* Network (spec 08 §2) */}
-              <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} />
+              <NetworkSection lanBind={lanBind} setLanBind={setLanBind} requireApiKey={requireApiKey} setRequireApiKey={setRequireApiKey} port={port} setPort={setPort} inAndroidApp={inAndroidApp} />
 
               {/* ComfyUI GPU coordination */}
               <ComfyUiSection
@@ -718,7 +791,7 @@ export function SettingsScreen() {
               {TELEMETRY_UI_ENABLED && <PrivacySection level={telemetry} setLevel={setTelemetry} />}
 
               {/* Advanced (spec 08 §2): daemon restart */}
-              <AdvancedSection onRestart={requestRestart} />
+              {!inAndroidApp && <AdvancedSection onRestart={requestRestart} />}
 
               {/* About + app self-update check (F-006) */}
               <AboutSection />
@@ -1005,6 +1078,7 @@ function NetworkSection({
   setRequireApiKey,
   port,
   setPort,
+  inAndroidApp,
 }: {
   lanBind: boolean
   setLanBind: (v: boolean) => void
@@ -1012,6 +1086,7 @@ function NetworkSection({
   setRequireApiKey: (v: boolean) => void
   port: number
   setPort: (v: number) => void
+  inAndroidApp: boolean
 }) {
   // hasApiKey + the reachable LAN URL come from the daemon (server-derived IP/port).
   const { data: net } = useNetworkInfo()
@@ -1022,20 +1097,25 @@ function NetworkSection({
     <section className="rounded-lg border border-border bg-panel p-4">
       <h2 className="mb-3 text-[13px] font-semibold uppercase tracking-wide text-faint">Network</h2>
 
-      <div className="flex items-center justify-between py-2">
-        <div>
-          <div className="text-[14px] font-medium text-ink">Port</div>
-          <div className="text-[12px] text-muted">Port the daemon listens on (1024–65535)</div>
+      {/* No Port row in the packaged Android app: it pins 7000 (its --port, WebView URL and native
+          calls), and its WebView refuses the hop to any other 127.0.0.1 port, so a change would
+          strand the page on a daemon that has moved away. The LAN toggle keeps the bound port. */}
+      {!inAndroidApp && (
+        <div className="flex items-center justify-between py-2">
+          <div>
+            <div className="text-[14px] font-medium text-ink">Port</div>
+            <div className="text-[12px] text-muted">Port the daemon listens on (1024–65535)</div>
+          </div>
+          <NumberField
+            value={port}
+            min={1024}
+            max={65535}
+            onCommit={setPort}
+            ariaLabel="Daemon port"
+            className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
+          />
         </div>
-        <NumberField
-          value={port}
-          min={1024}
-          max={65535}
-          onCommit={setPort}
-          ariaLabel="Daemon port"
-          className="w-24 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none"
-        />
-      </div>
+      )}
 
       <label className="flex cursor-pointer items-center justify-between py-2">
         <div>
@@ -1062,8 +1142,11 @@ function NetworkSection({
           <label className="flex cursor-pointer items-center justify-between">
             <div>
               <div className="text-[14px] font-medium text-ink">Require an API key</div>
+              {/* "Any website": with the key off, a foreign Host is let in like a LAN peer, so a
+                  page that re-points (DNS-rebinds) its own name at this machine gets in keyless. */}
               <div className="text-[12px] text-muted">
-                When off, any device on your network can use this TurboLLM with no key
+                When off, any device on your network, and any website opened in a browser on it,
+                can use this TurboLLM with no key
               </div>
             </div>
             <input
@@ -1089,15 +1172,16 @@ function NetworkSection({
                   {!hasApiKey && (
                     <>
                       {' '}
-                      No API key exists yet — create one on the{' '}
-                      <span className="font-medium text-ink">Developer</span> screen.
+                      No API key exists yet — create one under{' '}
+                      <span className="font-medium text-ink">Customize → Connect → API keys</span>.
                     </>
                   )}
                 </>
               ) : (
                 <>
                   <span className="font-medium text-ink">Open access:</span> any device on your
-                  network can use this TurboLLM with no key. Only enable this on a network you trust.
+                  network, and any website opened in a browser on it, can use this TurboLLM with no
+                  key. Only enable this on a network you trust.
                 </>
               )}
             </div>
@@ -1106,11 +1190,12 @@ function NetworkSection({
       )}
 
       {/* Port + LAN binding apply in place on Save — the listener re-binds without a
-          full restart, so the model stays loaded (spec 08 §2). */}
+          full restart, so the model stays loaded (spec 08 §2). No port clause in the Android
+          app, which has no Port row (above). */}
       <div className="mt-2 border-t border-border pt-3 text-[12px] text-faint">
         Click <span className="font-medium text-ink">Save settings</span> to apply. The
-        listener re-binds in place (no restart, model stays loaded); a port change
-        reconnects this page automatically.
+        listener re-binds in place (no restart, model stays loaded)
+        {inAndroidApp ? '.' : '; a port change reconnects this page automatically.'}
       </div>
     </section>
   )
@@ -1475,22 +1560,57 @@ function AdvancedSection({ onRestart }: { onRestart: () => void }) {
 function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
   const restart = useDaemonRestart()
   const [phase, setPhase] = useState<'restarting' | 'failed'>('restarting')
+  // When the 202 arrived (monotonic clock); null until then. The OLD daemon keeps answering
+  // /status until its teardown ends (cli.ts requestRestart: stopping a loaded engine alone can take
+  // ~8 s on Windows), so an OK is only the new daemon's when its uptime is shorter than the time
+  // since then: the replacement starts after the restart was accepted (at least the route's 200 ms
+  // later), the old daemon before it. uptimeSec is whole seconds, rounded down, so this tells
+  // them apart for any old daemon that had been up over a second when the restart was clicked.
+  const [acceptedAt, setAcceptedAt] = useState<number | null>(null)
   const started = useRef(false)
+  const mounted = useRef(false)
+
+  // Split up so React StrictMode (npm run dev) works: it mounts, unmounts and remounts every
+  // effect. One effect that both fired the restart (once, behind `started`) and owned the poll
+  // timers had its first run's cleanup set `cancelled`, and the remount returned early at
+  // `started`: the overlay never polled, never reloaded and never gave up. Now the restart fires
+  // once, and the poll effect below starts its own timers whenever it runs after the 202.
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   useEffect(() => {
     if (started.current) return
     started.current = true
+    restart.mutate(undefined, {
+      onSuccess: () => setAcceptedAt(performance.now()),
+      onError: (e) => {
+        if (!mounted.current) return
+        setPhase('failed')
+        toast.error(e instanceof ApiError ? e.message : 'Could not restart the daemon.')
+      },
+    })
+    // Intentionally run once on mount.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
+  useEffect(() => {
+    if (acceptedAt === null) return
     let cancelled = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
-    let giveUpTimer: ReturnType<typeof setTimeout> | undefined
 
     const poll = async () => {
       if (cancelled) return
       try {
-        const res = await fetch('/api/v1/status', { headers: { Accept: 'application/json' } })
-        if (res.ok) {
-          // Daemon is back — full reload so the SPA reconnects on the (possibly new) port.
+        // With this client's key, like every other API call: a LAN client's unauthenticated poll
+        // gets 401 from the new daemon too, and the overlay would only ever end on "failed".
+        const res = await fetch('/api/v1/status', { headers: { Accept: 'application/json', ...authHeaders() } })
+        // A body cut off by the old daemon closing its connections has no uptime: keep polling.
+        const status = res.ok ? ((await res.json().catch(() => null)) as { uptimeSec?: unknown } | null) : null
+        const uptimeSec = status?.uptimeSec
+        if (typeof uptimeSec === 'number' && uptimeSec * 1000 < performance.now() - acceptedAt) {
+          // The new daemon is up — full reload so the SPA reconnects to it.
           if (!cancelled) window.location.reload()
           return
         }
@@ -1500,31 +1620,19 @@ function RestartOverlay({ onDismiss }: { onDismiss: () => void }) {
       if (!cancelled) pollTimer = setTimeout(poll, 700)
     }
 
-    restart.mutate(undefined, {
-      onSuccess: () => {
-        // Give the old process a beat to release the socket, then poll for the new one.
-        pollTimer = setTimeout(poll, 700)
-        // If it hasn't come back in 20s, surface a manual fallback.
-        giveUpTimer = setTimeout(() => {
-          if (!cancelled) setPhase('failed')
-        }, 20_000)
-      },
-      onError: (e) => {
-        if (!cancelled) {
-          setPhase('failed')
-          toast.error(e instanceof ApiError ? e.message : 'Could not restart the daemon.')
-        }
-      },
-    })
+    // Give the old process a beat to release the socket, then poll for the new one.
+    pollTimer = setTimeout(poll, 700)
+    // If it hasn't come back in 20s, surface a manual fallback.
+    const giveUpTimer = setTimeout(() => {
+      if (!cancelled) setPhase('failed')
+    }, 20_000)
 
     return () => {
       cancelled = true
       if (pollTimer) clearTimeout(pollTimer)
-      if (giveUpTimer) clearTimeout(giveUpTimer)
+      clearTimeout(giveUpTimer)
     }
-    // Intentionally run once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [acceptedAt])
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-bg/90 backdrop-blur-sm">

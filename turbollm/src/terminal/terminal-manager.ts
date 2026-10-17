@@ -11,6 +11,7 @@ import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'nod
 import { join } from 'node:path'
 import { PTYSession } from './pty-session'
 import { sessionAuth } from '../code/session-auth'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 
 // ── Orphan-safety pidfile (mirrors tunnel/manager.ts's tunnel-<pid>.pid pattern, which
 // itself mirrors engines/manager.ts) ──────────────────────────────────────────────────
@@ -38,7 +39,9 @@ function terminalPidFile(dataDir: string, pid: number): string {
 function writeTerminalPid(dataDir: string, pid: number): void {
   try {
     mkdirSync(terminalPidDir(dataDir), { recursive: true })
-    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid }))
+    // `startedAt` is what lets the next startup tell this shell apart from an unrelated process
+    // that later got the same pid (see reapStaleTerminals).
+    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now() }))
   } catch {
     /* best-effort — tracking is a safety net, never block a launch on it */
   }
@@ -59,7 +62,7 @@ function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
-function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; file: string }> {
+function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; file: string }> {
   const dir = terminalPidDir(dataDir)
   let names: string[]
   try {
@@ -67,13 +70,14 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
   } catch {
     return [] // no run dir yet
   }
-  const out: Array<{ pid: number; owner: number; file: string }> = []
+  const out: Array<{ pid: number; owner: number; startedAt?: number; file: string }> = []
   for (const name of names) {
     const file = join(dir, name)
     try {
-      const { pid, owner } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number }
-      if (typeof pid === 'number' && pid > 0) out.push({ pid, owner: typeof owner === 'number' ? owner : 0, file })
-      else rmSync(file, { force: true })
+      const { pid, owner, startedAt } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number; startedAt?: number }
+      if (typeof pid === 'number' && pid > 0) {
+        out.push({ pid, owner: typeof owner === 'number' ? owner : 0, startedAt: typeof startedAt === 'number' ? startedAt : undefined, file })
+      } else rmSync(file, { force: true })
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
     }
@@ -83,17 +87,29 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
 
 /** Reap terminal-agent shell processes left behind by a previous daemon that didn't shut
  *  down cleanly. Called once at startup, alongside reapStaleEngines/reapStaleTunnels. An
- *  orphan is one whose owner daemon is gone. Returns the number reaped. */
+ *  orphan is one whose owner daemon is gone. Returns the number reaped.
+ *
+ *  A pidfile outlives its shell whenever the daemon dies without its exit handler (SIGKILL,
+ *  OS shutdown, power loss), and after a reboot its pid usually belongs to some unrelated
+ *  process — which `taskkill /T` would take down with its whole tree. So, like
+ *  reapStaleEngines (which checks the engine's port first), this kills only with positive
+ *  evidence the pid is still OUR shell: the process started when the pidfile says it did.
+ *  Anything that can't be verified, including a pidfile from before `startedAt` was recorded,
+ *  is left running and only its stale file is cleared. */
 export function reapStaleTerminals(dataDir: string): number {
+  const orphans = readTerminalPidFiles(dataDir).filter(({ owner }) => !(owner && pidAlive(owner))) // else still managed by a live daemon
+  const started = processStartTimes(orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid))
   let killed = 0
-  for (const { pid, owner, file } of readTerminalPidFiles(dataDir)) {
-    if (owner && pidAlive(owner)) continue // still managed by a live daemon
-    try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      else process.kill(pid, 'SIGKILL')
-      killed++
-    } catch {
-      /* already gone */
+  for (const { pid, startedAt, file } of orphans) {
+    const actual = started.get(pid)
+    if (startedAt !== undefined && actual !== undefined && Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
+      try {
+        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
+        else process.kill(pid, 'SIGKILL')
+        killed++
+      } catch {
+        /* already gone */
+      }
     }
     try { rmSync(file, { force: true }) } catch { /* best-effort */ }
   }
@@ -159,6 +175,8 @@ export class TerminalManager {
    *  (a client-side failure right after the create() response) still starts its idle clock
    *  rather than living forever untracked. */
   private idleSince = new Map<string, number>()
+  /** A terminal's own idle TTL, used by cleanupIdle instead of its default; see create(). */
+  private idleTtl = new Map<string, number>()
 
   /** `dataDir` — the daemon's own data directory (ConfigStore.dir()), for the orphan-safety
    *  pidfile tracking above. Terminal-manager unit tests never spawn a real PTY (see
@@ -180,6 +198,9 @@ export class TerminalManager {
    * @param launchCommand Optional command the shell runs at startup (see pty-session.ts) —
    *   e.g. `turbollm launch claude`, built server-side (terminal-routes.ts), never sent by
    *   the client. Absent for a plain interactive shell.
+   * @param idleTtlMs How long this terminal may go without a viewer before cleanupIdle kills it,
+   *   instead of cleanupIdle's default. A routine's terminal is started server-side and nobody may
+   *   ever open it: its run's own bound decides when it ends (cli-interactive-runner.ts).
    * @returns The session ID
    */
   create(
@@ -188,6 +209,7 @@ export class TerminalManager {
     cols = 80,
     rows = 24,
     launchCommand?: string,
+    idleTtlMs?: number,
   ): string {
     const id = crypto.randomUUID()
     const session = PTYSession.spawn(repoRoot, rows, cols, launchCommand)
@@ -211,6 +233,7 @@ export class TerminalManager {
       this.sessions.delete(id)
       this.infoMap.delete(id)
       this.idleSince.delete(id)
+      this.idleTtl.delete(id)
       if (shellPid) clearTerminalPid(this.dataDir, shellPid)
       // The CLI subprocess exited on its own (e.g. `exit` typed in-shell) rather than via the
       // kill endpoint below — revoke its session-scoped auth token here too, otherwise it only
@@ -231,6 +254,7 @@ export class TerminalManager {
     // (registerWsListener). If nothing ever connects (a client-side failure right after this
     // call returns), the terminal still ages out via cleanupIdle rather than living forever.
     this.idleSince.set(id, Date.now())
+    if (idleTtlMs !== undefined) this.idleTtl.set(id, idleTtlMs)
 
     return id
   }
@@ -267,6 +291,7 @@ export class TerminalManager {
       this.sessions.delete(id)
       this.infoMap.delete(id)
       this.idleSince.delete(id)
+      this.idleTtl.delete(id)
       // Also cleared by the onExit handler in create() once the process actually exits —
       // idempotent (force:true), so clearing eagerly here too just closes the window between
       // "we told it to die" and "it actually did" a little sooner.
@@ -340,7 +365,8 @@ export class TerminalManager {
    * came back. Deliberately NOT based on the terminal's age since creation: switching between
    * Chat and Code sessions (or between two Code sessions) must never kill a still-open CLI —
    * only genuine, sustained abandonment does. A terminal with at least one listener currently
-   * attached is never a candidate, no matter how long it's been running.
+   * attached is never a candidate, no matter how long it's been running. A terminal created
+   * with its own `idleTtlMs` (see create()) uses that instead of `maxAgeMs`.
    */
   cleanupIdle(maxAgeMs = 300_000): void {
     const now = Date.now()
@@ -350,7 +376,7 @@ export class TerminalManager {
       // "never kill something being watched" invariant doesn't depend on that bookkeeping
       // staying perfectly in sync everywhere it's touched.
       if ((this.listeners.get(id)?.size ?? 0) > 0) continue
-      if (now - since > maxAgeMs) this.kill(id)
+      if (now - since > (this.idleTtl.get(id) ?? maxAgeMs)) this.kill(id)
     }
   }
 

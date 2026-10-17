@@ -8,7 +8,7 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { RequestLogEntry } from '../../lib/types'
 import type { DaemonSettings } from '../../lib/api'
 
@@ -30,8 +30,21 @@ const state = vi.hoisted(() => ({
   saveMutateCalls: [] as unknown[],
   trackCalls: [] as [string, string][],
   clearCalls: 0,
+  /** The hook's own list was emptied — logged as `local` AFTER the daemon's clear (`daemon`). */
+  clearOrder: [] as string[],
   detail: undefined as RequestLogEntry | undefined,
+  clearFails: false,
+  toastErrors: [] as string[],
+  /** The daemon's own copy (`GET /requests`), and the `bodies` flag of every call to it. */
+  listed: [] as RequestLogEntry[],
+  listCalls: [] as boolean[],
+  listFails: false,
 }))
+
+vi.mock('../../components/ui/sonner', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../components/ui/sonner')>()
+  return { ...actual, toast: { ...actual.toast, error: (msg: string) => { state.toastErrors.push(msg) } } }
+})
 
 vi.mock('../../lib/use-request-log', () => ({
   useRequestLog: () => ({
@@ -39,6 +52,7 @@ vi.mock('../../lib/use-request-log', () => ({
     autoScroll: true,
     setAutoScroll: vi.fn(),
     viewportRef: { current: null },
+    clear: () => { state.clearOrder.push('local') },
   }),
 }))
 
@@ -58,7 +72,16 @@ vi.mock('../../lib/api', async (importOriginal) => {
   return {
     ...actual,
     track: (screen: string, action: string) => { state.trackCalls.push([screen, action]) },
-    clearRequests: () => { state.clearCalls += 1; return Promise.resolve({ ok: true as const }) },
+    clearRequests: () => {
+      state.clearCalls += 1
+      if (state.clearFails) return Promise.reject(new Error('503'))
+      state.clearOrder.push('daemon')
+      return Promise.resolve({ ok: true as const })
+    },
+    getRequests: (_filter: unknown, bodies = false) => {
+      state.listCalls.push(bodies)
+      return state.listFails ? Promise.reject(new Error('503')) : Promise.resolve({ entries: state.listed })
+    },
     getRequestDetail: (id: string) => Promise.resolve({ entry: state.detail ?? state.entries.find((e) => e.id === id)! }),
   }
 })
@@ -80,7 +103,13 @@ beforeEach(() => {
   state.saveMutateCalls = []
   state.trackCalls = []
   state.clearCalls = 0
+  state.clearOrder = []
   state.detail = undefined
+  state.clearFails = false
+  state.toastErrors = []
+  state.listed = []
+  state.listCalls = []
+  state.listFails = false
 })
 
 describe('RequestsPanel', () => {
@@ -145,6 +174,110 @@ describe('RequestsPanel', () => {
 
     expect(state.trackCalls).toContainEqual(['monitor', 'clear_request_log'])
     await waitFor(() => expect(state.clearCalls).toBe(1))
+    // ...and then empties the panel's own list: the stream never says the log was cleared, so the
+    // rows (a pending one included) used to stay on screen.
+    await waitFor(() => expect(state.clearOrder).toEqual(['daemon', 'local']))
+  })
+
+  it('a refused "Clear log" says so and keeps the rows, instead of an unhandled rejection', async () => {
+    state.entries = [entry()]
+    state.clearFails = true
+    await renderPanel()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Request log settings' }))
+    await userEvent.click(await screen.findByText('Clear log'))
+
+    await waitFor(() => expect(state.toastErrors).toEqual(['Could not clear the request log.']))
+    expect(state.clearOrder).toEqual([])
+  })
+
+  describe('Export JSONL', () => {
+    // jsdom has no Blob-URL APIs, and following a real blob: link logs a "not implemented:
+    // navigation" warning — both stubbed at the browser boundary, so the panel's own download
+    // code runs and the exported Blob is captured for reading back.
+    let exported: Blob[] = []
+    const realUrl = { create: URL.createObjectURL, revoke: URL.revokeObjectURL }
+    beforeEach(() => {
+      exported = []
+      URL.createObjectURL = vi.fn((b: Blob) => { exported.push(b); return 'blob:mock-url' })
+      URL.revokeObjectURL = vi.fn()
+      vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
+    })
+    afterEach(() => {
+      URL.createObjectURL = realUrl.create
+      URL.revokeObjectURL = realUrl.revoke
+      vi.restoreAllMocks()
+    })
+
+    const readExport = async () => {
+      await waitFor(() => expect(exported).toHaveLength(1))
+      const text = await new Promise<string>((resolve) => {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result as string)
+        r.readAsText(exported[0])
+      })
+      return text.split('\n').map((l) => JSON.parse(l) as RequestLogEntry)
+    }
+
+    const clickExport = async () => {
+      await userEvent.click(screen.getByRole('button', { name: 'Request log settings' }))
+      await userEvent.click(await screen.findByText('Export JSONL'))
+    }
+
+    it('with body capture on, exports the daemon\'s copy WITH bodies — the panel\'s streamed rows never carry them', async () => {
+      state.settings = { requestLog: { captureBodies: true } } as unknown as DaemonSettings
+      state.entries = [entry()] // as streamed: bodies stripped
+      state.listed = [entry({ bodies: { request: '{"messages":[]}', response: 'hello' } })]
+      await renderPanel()
+
+      await clickExport()
+
+      const rows = await readExport()
+      expect(state.listCalls).toEqual([true])
+      expect(rows.map((r) => r.bodies)).toEqual([{ request: '{"messages":[]}', response: 'hello' }])
+      expect(state.trackCalls).toContainEqual(['monitor', 'export_request_log'])
+    })
+
+    it('with body capture on, still exports the rows the daemon already evicted (its 32 MB body budget) — metadata only', async () => {
+      state.settings = { requestLog: { captureBodies: true } } as unknown as DaemonSettings
+      state.entries = [entry({ id: 'a' }), entry({ id: 'b' }), entry({ id: 'c' })]
+      // a and b were evicted daemon-side; the stream never says so, so the panel still shows them.
+      state.listed = [entry({ id: 'c', bodies: { request: '{"messages":[]}', response: 'hi' } })]
+      await renderPanel()
+
+      await clickExport()
+
+      const rows = await readExport()
+      expect(rows.map((r) => [r.id, r.bodies])).toEqual([
+        ['a', null],
+        ['b', null],
+        ['c', { request: '{"messages":[]}', response: 'hi' }],
+      ])
+    })
+
+    it('with body capture off, exports the panel\'s rows without a daemon round-trip', async () => {
+      state.entries = [entry({ id: 'a' }), entry({ id: 'b' })]
+      await renderPanel()
+
+      await clickExport()
+
+      const rows = await readExport()
+      expect(rows.map((r) => r.id)).toEqual(['a', 'b'])
+      expect(state.listCalls).toEqual([])
+    })
+
+    it('a failed body fetch still exports the metadata rows, and says the bodies are missing', async () => {
+      state.settings = { requestLog: { captureBodies: true } } as unknown as DaemonSettings
+      state.entries = [entry({ id: 'a' })]
+      state.listFails = true
+      await renderPanel()
+
+      await clickExport()
+
+      const rows = await readExport()
+      expect(rows.map((r) => r.id)).toEqual(['a'])
+      expect(state.toastErrors).toEqual(['Could not fetch the captured bodies — exported without them.'])
+    })
   })
 
   it('a column toggle hides that column\'s value from every row', async () => {

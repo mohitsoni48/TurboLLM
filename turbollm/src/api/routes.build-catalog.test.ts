@@ -32,6 +32,8 @@ interface HarnessOpts {
   engines?: Array<Partial<Engine>> | ((enginesRoot: string) => Array<Partial<Engine>>)
   activeId?: string
   managerState?: string
+  /** The engine the loaded model was started on (may differ from the active one). */
+  servingId?: string
 }
 
 function harness(opts: HarnessOpts = {}): Harness {
@@ -54,11 +56,16 @@ function harness(opts: HarnessOpts = {}): Harness {
     if (opts.activeId) c.activeEngineId = opts.activeId
   })
   const buildStarts: string[] = []
+  const registry = new Registry(store)
   const d = {
     version: 'test',
     store,
-    registry: new Registry(store),
-    manager: { status: () => ({ state: opts.managerState ?? 'stopped', model: null }), logPath: () => '' },
+    registry,
+    manager: {
+      status: () => ({ state: opts.managerState ?? 'stopped', model: null }),
+      logPath: () => '',
+      currentOpts: () => (opts.servingId ? { engine: registry.get(opts.servingId) } : null),
+    },
     provision: { get: () => ({ active: false }) },
     build: { isActive: () => false, start: (name: string) => void buildStarts.push(name) },
   } as unknown as Deps
@@ -120,6 +127,33 @@ test('POST /build/run refuses to rebuild an engine that is running out of that b
       },
     ],
     activeId: 'live',
+    managerState: 'running',
+  })
+  try {
+    const { status, json } = await postBuild(h.app, { ...PRISM, name: 'Prism live' })
+    assert.equal(status, 409)
+    assert.equal(json.error?.code, 'engine_in_use')
+    assert.match(json.error?.message ?? '', /Stop "Prism live"/)
+    assert.deepEqual(h.buildStarts, [])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('POST /build/run refuses to rebuild the engine the loaded model runs on, even when another engine is active', async () => {
+  const h = harness({
+    engines: (enginesRoot) => [
+      {
+        id: 'live',
+        name: 'Prism live',
+        binPath: join(enginesRoot, 'build', 'prismml-eng-llama.cpp-prism', 'build', 'bin', serverExe),
+        sourceRepo: PRISM.repoUrl,
+        sourceBranch: 'prism',
+      },
+      { id: 'cpu', name: 'llama.cpp cpu', binPath: join(enginesRoot, 'llama.cpp-b1-cpu', serverExe) },
+    ],
+    activeId: 'cpu',
+    servingId: 'live',
     managerState: 'running',
   })
   try {
@@ -232,6 +266,33 @@ test('GET /engines/catalog: nothing on disk and nothing registered means not bui
     assert.equal(prism.sourceBuilt, false)
     assert.equal(prism.sourceBranch, '')
   } finally {
+    h.cleanup()
+  }
+})
+
+// Termux reports process.platform 'android'. build-prereqs, runBuild and the catalog's Android
+// source card all support it, yet the route used to 409 every non-desktop platform. Only the
+// packaged Android app (W^X: it can never exec a built binary) is refused.
+test('POST /build/run: Termux reaches the build, the packaged Android app is refused', async () => {
+  const actualPlatform = process.platform
+  const actualLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  const h = harness()
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  try {
+    delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    // An invalid repo URL is the first check past the platform gate — 400 here means "allowed".
+    const termux = await postBuild(h.app, { repoUrl: 'not-a-url' })
+    assert.equal(termux.status, 400)
+    assert.equal(termux.json.error?.code, 'invalid_config_value')
+
+    process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/lib/arm64'
+    const app = await postBuild(h.app, { repoUrl: 'not-a-url' })
+    assert.equal(app.status, 409)
+    assert.equal(app.json.error?.code, 'unsupported_platform')
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    if (actualLibDir === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    else process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = actualLibDir
     h.cleanup()
   }
 })

@@ -36,7 +36,7 @@ export type EnqueueOutcome = { ok: true; downloads: DownloadRecord[] } | Downloa
 
 /** The DownloadError → HTTP status table. One definition, both transports. */
 export function downloadErrorStatus(code: string): DownloadFailureStatus {
-  if (code === 'no_model_dir') return 409
+  if (code === 'no_model_dir' || code === 'download_in_progress') return 409
   if (code === 'hf_unauthorized') return 401
   if (code === 'hf_gated') return 403
   return 400

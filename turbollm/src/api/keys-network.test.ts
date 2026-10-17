@@ -10,7 +10,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
-import { hashKey } from '../auth'
+import { hashKey, lanAuth } from '../auth'
 import type { Deps } from '../deps'
 
 type FakeConfig = { daemon: { lanBind: boolean; requireApiKey: boolean; port: number }; apiKeys: Array<{ id: string; name: string; hash: string; prefix: string; createdAt: string; lastUsedAt: string | null }> }
@@ -139,4 +139,96 @@ test('GET /api/v1/connect/:cli: 200 for a non-host caller once requireApiKey is 
   const { app } = fakeApp(cfg)
   const res = await app.request('/api/v1/connect/claude-code', { headers: { 'X-TurboLLM-Auth': RAW } })
   assert.equal(res.status, 200)
+})
+
+test('GET /api/v1/connect/:cli: the snippets carry the port really bound, not daemon.port', async () => {
+  // `--port`/`--addr` (the Android app's 7000, `turbollm --port 8080`) win over the configured port.
+  const cfg = baseConfig({ lanBind: false, port: 6996 })
+  const app = new Hono()
+  const d = {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+    bindPort: 7000,
+  } as unknown as Deps
+  registerApi(app, d)
+  const body = await (await app.request('/api/v1/connect/claude-code')).text()
+  assert.match(body, /http:\/\/127\.0\.0\.1:7000/)
+  assert.doesNotMatch(body, /:6996/)
+})
+
+// On a LAN-bound daemon this GET replaces the stored `cli-<name>` key, so it changes state
+// like a write, and a GET needs no CORS preflight: an <img> on any site the host's user visits
+// reached it with loopback trust, revoking the CLI's key (or piling up `cli-<anything>` keys).
+test('GET /api/v1/connect/:cli: a cross-site request is refused before it can replace a CLI key', async () => {
+  const cfg = baseConfig({ lanBind: true, requireApiKey: true })
+  cfg.apiKeys.push({ id: 'k0', name: 'cli-claude-code', hash: 'h0', prefix: 'tllm-old', createdAt: '', lastUsedAt: null })
+  const d = {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+  } as unknown as Deps
+  const app = new Hono()
+  app.use('*', lanAuth(d)) // server.ts's order: lanAuth in front of every route
+  registerApi(app, d)
+  // The box's own browser, on its loopback (what an <img> on another site reaches).
+  const env = { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 5555, remoteFamily: 'IPv4' } } }
+  const get = (path: string, headers: Record<string, string>) => app.request(path, { headers: { Host: '127.0.0.1:6996', ...headers } }, env as never)
+
+  for (const site of ['cross-site', 'same-site']) {
+    const res = await get('/api/v1/connect/claude-code', { 'Sec-Fetch-Site': site, 'Sec-Fetch-Dest': 'image' })
+    assert.equal(res.status, 403, site)
+  }
+  assert.equal((await get('/api/v1/connect/flood-1', { 'Sec-Fetch-Site': 'cross-site' })).status, 403)
+  // The same requests carrying the UI's header (below): the cross-site check refuses them on its
+  // own. Without the header the later header check refuses them as well, so only these pin it.
+  for (const site of ['cross-site', 'same-site']) {
+    const res = await get('/api/v1/connect/claude-code', { 'Sec-Fetch-Site': site, 'X-TurboLLM-UI': '1' })
+    assert.equal(res.status, 403, `${site} with the UI header`)
+  }
+  // No Fetch Metadata, but a foreign Origin: the Origin half of the same check.
+  assert.equal((await get('/api/v1/connect/claude-code', { Origin: 'https://evil.example', 'X-TurboLLM-UI': '1' })).status, 403)
+  // An <img> GET carries no Origin, and a browser sends no Fetch Metadata to some URLs that
+  // still land on loopback with loopback trust: an old browser to 127.0.0.1, WebKit to
+  // `localhost.` (its potentially-trustworthy check takes no trailing dot), any browser to a
+  // container host name that the hosts file maps to 127.0.0.1. Nothing marks such a request as
+  // cross-site, so the route also needs a header only the UI sends (a page needs a preflight).
+  const noMetadata = ['127.0.0.1:6996', 'localhost:6996', 'localhost.:6996', 'foo.localhost.:6996', 'host.docker.internal:6996']
+  for (const host of [...noMetadata, '0.0.0.0:6996', '[::ffff:7f00:1]:6996']) {
+    assert.equal((await get('/api/v1/connect/claude-code', { Host: host })).status, 403, host)
+  }
+  // Hosts with no loopback trust at all: refused even with the UI's header.
+  for (const host of ['0.0.0.0:6996', '[::ffff:7f00:1]:6996', '[::ffff:127.0.0.1]:6996']) {
+    assert.equal((await get('/api/v1/connect/claude-code', { Host: host, 'X-TurboLLM-UI': '1' })).status, 401, host)
+  }
+  assert.deepEqual(cfg.apiKeys.map((k) => k.id), ['k0'], 'the CLI key is untouched and nothing was added')
+
+  // The web UI's own "Generate setup with a new key" click (web api.ts getConnect) is
+  // same-origin, sends the header, and still works.
+  const ok = await get('/api/v1/connect/claude-code', { 'Sec-Fetch-Site': 'same-origin', Accept: 'application/json', 'X-TurboLLM-UI': '1' })
+  assert.equal(ok.status, 200)
+  assert.equal(cfg.apiKeys.length, 1)
+  assert.notEqual(cfg.apiKeys[0].id, 'k0', 'an explicit, same-origin request still replaces the key, as the UI warns')
+})
+
+// The Connect page fetches on its own whenever its last network read said loopback-only. That read
+// goes stale when LAN is switched on from another window while the page stays open, and each card
+// click then minted a new cli-<name> key and revoked the one a CLI was using. Such a fetch says
+// `?mint=0`, and a LAN-bound daemon refuses it instead of minting.
+test('GET /api/v1/connect/:cli?mint=0: a LAN-bound daemon answers 409 lan_bound and keeps the CLI key', async () => {
+  const RAW = 'tllm-nomintnomintnomintnomintnomintnomin1'
+  const cfg = baseConfig({ lanBind: true, requireApiKey: true })
+  cfg.apiKeys.push({ id: 'k1', name: 'self', hash: hashKey(RAW), prefix: RAW.slice(0, 12), createdAt: '', lastUsedAt: null })
+  cfg.apiKeys.push({ id: 'k0', name: 'cli-claude-code', hash: 'h0', prefix: 'tllm-old', createdAt: '', lastUsedAt: null })
+  const { app } = fakeApp(cfg)
+  const res = await app.request('/api/v1/connect/claude-code?mint=0', { headers: { 'X-TurboLLM-Auth': RAW } })
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'lan_bound')
+  assert.deepEqual(cfg.apiKeys.map((k) => k.id), ['k1', 'k0'], 'nothing minted, nothing revoked')
+  // The explicit Generate (no mint=0) still replaces it.
+  assert.equal((await app.request('/api/v1/connect/claude-code', { headers: { 'X-TurboLLM-Auth': RAW } })).status, 200)
+  assert.ok(!cfg.apiKeys.some((k) => k.id === 'k0'))
+  // Loopback-only: no key is involved, so the snippet comes back as before.
+  const loop = fakeApp(baseConfig({ lanBind: false }))
+  assert.equal((await loop.app.request('/api/v1/connect/claude-code?mint=0')).status, 200)
 })

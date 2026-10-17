@@ -27,7 +27,7 @@ import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
 import { setAuthToken } from './lib/api'
 import { classifyStatusError } from './lib/connection-state'
-import { subscribeCodeAuthNeeded, isCodeAuthNeeded } from './lib/auth-signal'
+import { subscribeCodeAuthNeeded, isCodeAuthNeeded, subscribeHostKeyNeeded, isHostKeyNeeded, clearHostKeyNeeded } from './lib/auth-signal'
 import { useCodeFeatureEnabled } from './lib/platform'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
 
@@ -234,6 +234,10 @@ export function App() {
   // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
   // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
   const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
+  // Nor does it for a host-only setting or "Always Allow" that the daemon refused for want of a
+  // key while requireApiKey is off (auth-signal.ts's host-key signal): the same prompt, which
+  // can be put off, since everything else here works without a key.
+  const hostKeyNeeded = useSyncExternalStore(subscribeHostKeyNeeded, isHostKeyNeeded)
   // C2 (Phase 5 final-review-fix re-review, ADR-422): `scopedTokenLimited` (403) is neither
   // "wrong/no credential" (401 — needsAuth) nor "daemon unreachable" — it is a capability-
   // scoped remote-access token that can chat (auth.ts's requiredCapability deliberately never
@@ -245,7 +249,7 @@ export function App() {
   // 401 — no key would fix this, a different token scope would), so this only ever suppresses
   // the overlay below; the rest of the app renders normally with `statusQ.data` left undefined.
   const { needsAuth: needsAuthFromStatus, scopedTokenLimited } = classifyStatusError(statusQ.isError, statusQ.error)
-  const needsAuth = needsAuthFromStatus || codeAuthNeeded
+  const needsAuth = needsAuthFromStatus || codeAuthNeeded || hostKeyNeeded
 
   // Latch the auth prompt once we've seen a 401, and keep it up until a poll finally
   // SUCCEEDS. Without this, a flaky LAN link (common on the remote machine where you're
@@ -348,8 +352,13 @@ export function App() {
         <AuthGate
           onConnect={(key) => {
             setAuthToken(key)
+            // No later request clears it: the refused change is made again, now with the key.
+            clearHostKeyNeeded()
             void qc.invalidateQueries()
           }}
+          onDismiss={hostKeyNeeded && !needsAuthFromStatus && !codeAuthNeeded
+            ? () => { clearHostKeyNeeded(); setAuthLatched(false) }
+            : undefined}
         />
       )}
       {unreachable && <UnreachableOverlay />}

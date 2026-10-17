@@ -51,3 +51,31 @@ test('weekly schedule skips today if today matches but the time already passed',
   assert.notEqual(next.getDate(), now.getDate())
   assert.equal(next.getDay(), now.getDay()) // same weekday, one week later
 })
+
+// On the DST spring-forward day, setHours(2, 30) lands at 03:30 (02:30 does not exist), and the
+// following setDate() kept that shifted wall-clock time — so the NEXT day's fire, and a weekly fire
+// stepped across the gap day, came an hour late too.
+function inTimeZone(tz: string, fn: () => void): void {
+  const original = process.env.TZ
+  process.env.TZ = tz
+  try { fn() } finally {
+    if (original === undefined) delete process.env.TZ
+    else process.env.TZ = original
+  }
+}
+
+test('daily schedule in the skipped DST hour is back on time the day after spring-forward', () => {
+  inTimeZone('America/New_York', () => {
+    // Sun 2026-03-08 03:30 EDT — the gap day's (necessarily shifted) fire has just happened.
+    const next = computeNextFireTime({ kind: 'daily', hour: 2, minute: 30 }, new Date('2026-03-08T07:30:00Z'))
+    assert.equal(next.toISOString(), '2026-03-09T06:30:00.000Z') // Mon 02:30 EDT, not 03:30
+  })
+})
+
+test('weekly schedule stepped across the DST gap day keeps its wall-clock time', () => {
+  inTimeZone('America/New_York', () => {
+    // Sat 2026-03-07 07:00 EST; next Monday 02:30 is on the far side of Sunday's gap.
+    const next = computeNextFireTime({ kind: 'weekly', hour: 2, minute: 30, daysOfWeek: [1] }, new Date('2026-03-07T12:00:00Z'))
+    assert.equal(next.toISOString(), '2026-03-09T06:30:00.000Z')
+  })
+})

@@ -16,7 +16,7 @@ import { registerGateway } from './gateway/gateway'
 import { featureForPath } from './telemetry/feature-map'
 import { registerTerminalRoutes } from './terminal/terminal-routes'
 import { registerRoutineRoutes } from './routines/routine-routes'
-import { lanAuth, codeAuth } from './auth'
+import { lanAuth, codeAuth, appSecretProof } from './auth'
 import { registerLinkApi, registerLinkAuth } from './link/link-routes'
 import { mountExtApi } from './ext/mount'
 import { PublicRunManager } from './ext/run-manager'
@@ -59,19 +59,23 @@ export function createApp(d: Deps): Hono {
       allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
     }),
   )
-  // /api/* origin-allowlisted (ADR-216 open question, resolved): wildcard CORS here let
-  // ANY website silently read a loopback user's GPU/CPU/RAM via unauthenticated
-  // /api/v1/sysinfo while the daemon runs — a fingerprinting surface, not just the
-  // turbollm.dev "Suggest for my hardware" integration it was added to support. Compat
-  // swept 2026-07-22: that page (docs/site-build/pages/what-can-i-run.html) is the ONLY
-  // real cross-origin /api/* caller in the codebase, running from the production origin.
-  // A same-origin request (the app's own served UI) is unaffected either way — the
-  // browser never applies CORS to it.
+  // /api/v1/sysinfo alone answers one other origin (ADR-216 open question, resolved): wildcard
+  // CORS on /api/* let ANY website silently read a loopback user's GPU/CPU/RAM via
+  // unauthenticated /api/v1/sysinfo while the daemon runs — a fingerprinting surface, not just
+  // the turbollm.dev "Suggest for my hardware" integration it was added to support. Compat
+  // swept 2026-07-22: that page (docs/site-build/pages/what-can-i-run.html) is the ONLY real
+  // cross-origin /api/* caller, running from the production origin, and it reads sysinfo and
+  // nothing else. The allowlist used to cover all of /api/*, so a script on turbollm.dev (a
+  // compromised deploy, an XSS) could read every keyless loopback GET: conversations, settings
+  // (stdio MCP env values included), the live Code terminal ids. Every other /api route
+  // answers no cross-origin read, and a preflight to one gets no CORS headers, so it fails. A
+  // same-origin request (the app's own served UI) is unaffected either way — the browser never
+  // applies CORS to it.
   app.use(
-    '/api/*',
+    '/api/v1/sysinfo',
     cors({
       origin: 'https://turbollm.dev',
-      allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+      allowMethods: ['GET', 'OPTIONS'],
       allowHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'X-TurboLLM-Auth'],
     }),
   )
@@ -80,8 +84,25 @@ export function createApp(d: Deps): Hono {
     await next()
   })
 
-  // LAN auth gate (spec 06 §5): no-op while loopback-only (lanBind=false); once
-  // LAN-exposed, requires a valid API key for non-loopback /api/* and /v1/* calls.
+  // LAN auth gate (spec 06 §5): once LAN-exposed and requireApiKey is on (the default),
+  // requires a valid API key for non-loopback /api/* and /v1/* calls. Not a no-op while
+  // loopback-only either: it admits keyless only loopback callers whose Host names this machine
+  // (and, on Android, that carry the app secret), and refuses browser cross-site writes to
+  // /api/* — see lanAuth's doc comment.
+  //
+  // GET /api/v1/app-proof: TurboLLM-Android asks it before it sends its app secret anywhere (see
+  // appSecretProof), so it is answered ahead of lanAuth: the app holds no credential it may send
+  // yet, and the answer is only an HMAC of the caller's own nonce. Without the secret (desktop,
+  // npm, Docker) the route does not exist: the request goes on exactly as before.
+  app.get('/api/v1/app-proof', async (c, next) => {
+    if (!process.env.TURBOLLM_APP_SECRET) return next()
+    const proof = appSecretProof(c)
+    if (!proof) {
+      const message = 'nonce must be 32-128 lowercase hex characters.'
+      return c.json({ error: { code: 'bad_request', message } }, 400)
+    }
+    return c.json({ proof })
+  })
   app.use('*', lanAuth(d))
   // Code-specific gate (independent of requireApiKey — see auth.ts's codeAuth doc comment):
   // Code always needs a key from a non-host device, even when the rest of the app is open.
@@ -192,20 +213,36 @@ export function createApp(d: Deps): Hono {
  *  what silently 404'd every `/api/v1/code/*` route from a7a85c2 onward, since that commit moved
  *  Code/Agents route registration to run lazily, after `createApp()` returned with `/*` already
  *  in place; the old inline comment claiming registration order didn't matter was wrong). */
-export function registerSpaFallback(app: Hono): void {
+export function registerSpaFallback(app: Hono, webRoot: string = WEB_ROOT): void {
   app.get('/*', (c) => {
     const path = decodeURIComponent(new URL(c.req.url).pathname).replace(/^\/+/, '')
     if (path.startsWith('api/') || path.startsWith('v1/')) {
       return c.json({ error: { code: 'not_found', message: 'Unknown endpoint.' } }, 404)
     }
-    let file = normalize(join(WEB_ROOT, path || 'index.html'))
-    if (!file.startsWith(WEB_ROOT) || !existsSync(file) || statSync(file).isDirectory()) {
-      file = join(WEB_ROOT, 'index.html')
+    let file = normalize(join(webRoot, path || 'index.html'))
+    if (!file.startsWith(webRoot) || !existsSync(file) || statSync(file).isDirectory()) {
+      file = join(webRoot, 'index.html')
     }
     if (!existsSync(file)) return c.text('web ui not built — run `npm run build:web`', 500)
-    return new Response(readFileSync(file), { status: 200, headers: { 'Content-Type': contentType(file) } })
+    const headers: Record<string, string> = { 'Content-Type': contentType(file) }
+    if (process.env.TURBOLLM_APP_SECRET && headers['Content-Type'].startsWith('text/html')) {
+      headers['Content-Security-Policy'] = APP_SECRET_CSP
+    }
+    return new Response(readFileSync(file), { status: 200, headers })
   })
 }
+
+/** Sent on the UI's HTML only when `TURBOLLM_APP_SECRET` is set (TurboLLM-Android, see auth.ts).
+ *  The app's WebView blocks requests to other 127.0.0.1 ports, but `shouldInterceptRequest` never
+ *  sees redirect hops: an https image in a model card or chat reply could 302 to
+ *  `http://127.0.0.1:<another app's port>` and carry the host-only `turbollm_app` cookie there.
+ *  CSP is re-checked on every hop and `'self'` is port-exact, so these two directives close that.
+ *  Plain-http images (model cards, markdown in replies) still load: a port-less `http://*` matches
+ *  only the scheme's default port, 80, which an Android app cannot bind without root — and Chromium
+ *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
+ *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
+ *  scripts, and the UI's own fetches are same-origin. */
+const APP_SECRET_CSP = "img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:"
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
  *  `createApp()`, before the server starts accepting connections. NOT folded into
@@ -228,10 +265,10 @@ export function registerSpaFallback(app: Hono): void {
  *  `registerSpaFallback`'s doc comment). */
 export async function registerCodeRoutesIfSupported(app: Hono, d: Deps): Promise<void> {
   if (process.platform === 'android') return
-  // code-routes.ts ships as its OWN tsup entry, in its OWN separate build pass (see
-  // tsup.config.ts) — not chunked/shared with cli.js — so this dynamic import can never
-  // accidentally pull the pi-coding-agent chain into cli.js's own static output (esbuild's
-  // default chunk-splitting did exactly that once, confirmed live). The specifier is built
+  // code-routes.ts ships as its OWN tsup entry (see tsup.config.ts), loaded through a
+  // specifier esbuild cannot follow, so this dynamic import can never pull the pi-coding-agent
+  // chain into cli.js's own static output (a static import did exactly that once, confirmed
+  // live). Same build pass as cli.js, so the modules both reach are one instance. The specifier is built
   // via pathToFileURL(join(...)) rather than `new URL('./relative', import.meta.url)` on
   // purpose — that two-argument form is a recognized esbuild asset-reference idiom (the
   // same one builtin.ts's WORKER_PATH deliberately relies on for `new Worker(url)`) and

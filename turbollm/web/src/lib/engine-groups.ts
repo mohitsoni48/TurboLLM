@@ -24,12 +24,13 @@ export function repoSlug(sourceRepo: string | undefined): string | undefined {
     .toLowerCase()
 }
 
-/** PURE: MUST mirror the backend's registry.ts `customSourceKey` exactly (down to the
- *  normalization steps) — this is used to look up a "Forget" request against the SAME record
- *  the backend keyed it under, and a mismatch here means the request silently matches nothing.
- *  Deliberately not built on `repoSlug` above, which normalizes slightly differently (no
- *  trailing-slash strip) — a divergence there wouldn't matter for its own display purpose but
- *  would break this identity match. */
+/** PURE: MUST mirror the backend's registry.ts `customSourceKey` (and build-runner.ts's
+ *  `normRepoUrl`, which it uses) exactly (down to the normalization steps) — this is used to
+ *  look up a "Forget" request against the SAME record the backend keyed it under, and a
+ *  mismatch here means the request silently matches nothing. Deliberately not built on
+ *  `repoSlug` above, which normalizes slightly differently (no trailing-slash strip) — a
+ *  divergence there wouldn't matter for its own display purpose but would break this identity
+ *  match. */
 export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; binPath: string }): string {
   if (!s.sourceRepo) return s.binPath
   const normRepoUrl = s.sourceRepo
@@ -37,8 +38,10 @@ export function customSourceKey(s: { sourceRepo?: string; sourceBranch?: string;
     .toLowerCase()
     .replace(/^https?:\/\//, '')
     .replace(/^github\.com\//, '')
-    .replace(/\.git$/, '')
+    // Trailing slash(es) BEFORE ".git", as the daemon's normRepoUrl does — the other order left
+    // ".../llama.cpp.git/" as ".../llama.cpp.git", so "Forget" on such an entry matched nothing.
     .replace(/\/+$/, '')
+    .replace(/\.git$/, '')
   return `${normRepoUrl}#${(s.sourceBranch ?? '').trim().toLowerCase()}#${(s.sourceCommit ?? '').trim().toLowerCase()}`
 }
 

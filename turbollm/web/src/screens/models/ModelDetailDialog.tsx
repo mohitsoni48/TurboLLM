@@ -1,6 +1,6 @@
-﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+﻿import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
-import { ApiError, track } from '../../lib/api'
+import { ApiError, downloadBenchLog, track } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
 import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
@@ -471,10 +471,9 @@ export function ModelDetailDialog({
         // (cancel included), clobbering unsaved local edits before the user had even decided
         // Save vs. Cancel — that effect is deleted; a real save is the only thing that should
         // ever trigger a refetch, and the existing hook-level invalidation already does that.
+        // Fetched with the API key, not a plain <a href> — that would save a 401 over LAN/remote.
         if (downloadLog) {
-          const a = document.createElement('a')
-          a.href = '/api/v1/bench/log'
-          a.click()
+          downloadBenchLog().catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not download the run log.'))
         }
       },
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save tuned settings.'),
@@ -696,8 +695,12 @@ export function ModelDetailDialog({
                       llama.cpp's own -fit aborts entirely if -ngl is explicit, so "Auto-fit MoE CPU
                       offload" only actually engages -fit when -ngl is omitted too. Hide the slider
                       whenever that's the active fit mode so it can't look like a live control. */}
+                  {/* llama.cpp offloads blockCount + 1 layers — the blocks plus the output layer
+                      ("offloaded 33/33 layers" for 32 blocks): -ngl blockCount still leaves the
+                      output layer on the CPU, so only blockCount + 1 is "All" (auto-tune searches
+                      up to it too). A larger saved value (the default 99) still reads "All". */}
                   {(detail.moe ? !draft.nCpuMoeFit : !draft.nglFit) && (
-                    <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount : 99) ? 'All' : String(v))} />
+                    <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount + 1} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount + 1 : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount + 1 : 99) ? 'All' : String(v))} />
                   )}
                 </>
               )}
@@ -1125,6 +1128,14 @@ function AutoTuneResultDialog({
   onCancel: () => void
 }) {
   const [downloadLog, setDownloadLog] = useState(true)
+  // AlertDialogAction/Cancel compose Radix's Close, so a click on Save ALSO reports the dialog
+  // closing — which meant onCancel, i.e. POST /bench/cancel right behind /bench/save, and the
+  // daemon's cancel drops the result the save needs (409 no_bench_result when it lands first).
+  // Same guard as JevLoadConfirmHost: only a close no button answered (Escape) means Cancel.
+  const answered = useRef(false)
+  useEffect(() => {
+    if (result) answered.current = false
+  }, [result])
   const rec = result?.recommendedSampling
   const s = result?.sampling
   const fromCard = (k: keyof CardSampling) => rec?.[k] != null
@@ -1136,7 +1147,7 @@ function AutoTuneResultDialog({
     { label: 'Min-P', key: 'minP' },
   ]
   return (
-    <AlertDialog open={!!result} onOpenChange={(o) => { if (!o) onCancel() }}>
+    <AlertDialog open={!!result} onOpenChange={(o) => { if (!o && !answered.current) onCancel() }}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Auto-tune complete</AlertDialogTitle>
@@ -1197,8 +1208,8 @@ function AutoTuneResultDialog({
             <input type="checkbox" checked={downloadLog} onChange={(e) => setDownloadLog(e.target.checked)} className="h-3.5 w-3.5 accent-[var(--accent)]" />
             Download run log
           </label>
-          <AlertDialogCancel onClick={() => { track('models', 'dismiss_autotune_result'); onCancel() }}>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={() => { track('models', 'save_autotune_result'); onSave(downloadLog) }}>Save</AlertDialogAction>
+          <AlertDialogCancel onClick={() => { answered.current = true; track('models', 'dismiss_autotune_result'); onCancel() }}>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={() => { answered.current = true; track('models', 'save_autotune_result'); onSave(downloadLog) }}>Save</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -1353,6 +1364,11 @@ function DefaultableNumberInput({ value, placeholder, min, max, step = 1, onChan
   value: number | undefined; placeholder: string; min: number; max: number; step?: number
   onChange: (v: number | undefined) => void
 }) {
+  // The text as typed, while the field is being edited. Clamping into [min, max] on every
+  // keystroke (and writing that back into the field) made a fraction with min > 0 untypable:
+  // the "0" of "0.25" snapped to min (0.01) and the rest was appended to that. A prefix of a
+  // valid value can sit below `min`, so `min` is applied on blur; `max` still applies live.
+  const [text, setText] = useState<string | null>(null)
   return (
     <div className="flex items-center gap-1">
       <input
@@ -1360,11 +1376,17 @@ function DefaultableNumberInput({ value, placeholder, min, max, step = 1, onChan
         min={min}
         max={max}
         step={step}
-        value={value ?? ''}
+        value={text ?? value ?? ''}
         placeholder={placeholder}
         onChange={(e) => {
           const raw = e.target.value
-          onChange(raw === '' ? undefined : Math.max(min, Math.min(max, Number(raw))))
+          setText(raw)
+          if (raw === '') onChange(undefined)
+          else if (Number.isFinite(Number(raw))) onChange(Math.min(max, Number(raw)))
+        }}
+        onBlur={() => {
+          if (text && Number.isFinite(Number(text))) onChange(Math.max(min, Math.min(max, Number(text))))
+          setText(null)
         }}
         className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none placeholder:text-faint"
       />

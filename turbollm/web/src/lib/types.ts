@@ -71,6 +71,9 @@ export type EngineProvision = {
   part?: number // 1-based current archive (multi-asset backends like CUDA)
   parts?: number // total archives for this backend
   error: string | null
+  /** False when POST /engines/backends/cancel can't stop this run (first-run seed, auto-update,
+   *  uv/pip runtime installs). Absent from daemons that predate it. */
+  cancellable?: boolean
 }
 
 /** In-app compile-from-source status (ADR-100), from GET /api/v1/status. A build streams
@@ -692,6 +695,18 @@ export type ModelEntry = {
   nativeCtx: number
   blockCount: number
   headCountKv: number
+  /** Attention/KV layout the daemon's scanner reads from the GGUF (twins of src/models/scanner.ts's
+   *  ModelEntry fields — see there for each one). The daemon always sends `headDim`; the rest only
+   *  when the GGUF declares them. Used only by vram.ts's live estimate, which mirrors the daemon's. */
+  headDim?: number
+  slidingWindow?: number
+  slidingWindowPattern?: boolean[]
+  headDimSwa?: number
+  headCountKvPerLayer?: number[]
+  fullAttentionInterval?: number
+  ssmInnerSize?: number
+  ssmStateSize?: number
+  ssmConvKernel?: number
   moe: boolean
   expertCount: number
   /** >0 when the GGUF carries a built-in NextN multi-token-prediction head. */
@@ -701,6 +716,8 @@ export type ModelEntry = {
    *  tower/encoder, e.g. gemma4's Conformer audio module). Always false for GGUF. */
   audio: boolean
   mmprojPath: string | null
+  /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null) — sizes the projector's VRAM. */
+  mmprojSizeBytes?: number
   hasChatTemplate: boolean
   /** True when the model's chat template supports a `reasoning_effort` control
    *  (low/medium/xhigh) — Qwen3.8's reasoning-depth control. Composers gate the
@@ -1221,6 +1238,8 @@ export type DownloadRecord = {
   bytesPerSec: number
   sha256?: string
   createdAt: string
+  /** When it became 'done' (ISO; absent before that). */
+  finishedAt?: string
 }
 
 export type DownloadsList = {

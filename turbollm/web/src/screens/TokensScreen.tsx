@@ -154,7 +154,10 @@ export function TokensScreen() {
   )
   // A user with zero in-app chats but real gateway (Claude Code / extension) traffic
   // still has something to show — only the true both-empty case gets the empty state.
-  const isEmpty = data?.firstMessageAt === null && (data?.api.requests ?? 0) === 0
+  // Checked against LIFETIME API tokens too: `api.requests` counts only the selected range, so
+  // an API-only user picking 7d/30d with no traffic in it landed here, and the range picker
+  // (rendered only in the non-empty branch) went with it — no way back to "All".
+  const isEmpty = data?.firstMessageAt === null && (data?.api.lifetimeTotalTokens ?? 0) === 0 && (data?.api.requests ?? 0) === 0
 
   return (
     // `pt-4` not `py-6`: since issue #211's follow-up this is exclusively mounted as

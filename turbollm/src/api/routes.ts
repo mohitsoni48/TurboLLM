@@ -2,18 +2,20 @@
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { bodyLimit } from 'hono/body-limit'
 import { streamSSE } from 'hono/streaming'
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { rm } from 'node:fs/promises'
 import { execFileSync } from 'node:child_process'
 import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
+import { stripBodies } from '../observability/request-log'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage } from '../engines/registry'
+import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage, type Registry } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
@@ -73,7 +75,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, discardParkedBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
 import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroidApp, SwapBlockedError, ZipError, ZIP_BUILD_MARKER, zipBuildDirName } from '../engines/zip-install'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
@@ -97,7 +99,7 @@ import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
 import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
-import { enqueueDownload, listDownloads, removeDownload } from './download-lifecycle'
+import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
@@ -106,12 +108,17 @@ import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
 import { stopEngineUsers } from '../engines/serving'
+import { stopRemoteAccess } from '../remote/routes'
 
 type Status = 200 | 201 | 202 | 400 | 401 | 403 | 404 | 409 | 413 | 429 | 500 | 501 | 502 | 503
 
 function err(c: Context, status: Status, code: string, message: string) {
   return c.json({ error: { code, message } }, status)
 }
+
+/** The refusal for a caller failing hostGate that asks the request log for captured bodies —
+ *  see the request log's route comment. */
+const REQUEST_BODIES_HOST_ONLY = 'Captured prompts and responses can only be read on this machine or with a valid API key.'
 
 async function body<T>(c: Context): Promise<T> {
   try {
@@ -199,7 +206,11 @@ export function registerApi(app: Hono, d: Deps): void {
       // a lingering done/error snapshot the detail dialog reads to show the result.
       bench: d.bench.status(),
       downloads: { active: d.downloads.activeCount() },
-      engineProvision: d.provision.get(),
+      // `cancellable`: whether POST /engines/backends/cancel can stop this run — only the
+      // downloads that register `provisionAbort` (declared with the backend routes below). The
+      // first-run seed, auto-updates and the uv/pip runtime installs (MLX*, vLLM, SGLang, Laya)
+      // take no signal, so the banner hides its Cancel for them instead of offering a no-op.
+      engineProvision: { ...d.provision.get(), cancellable: provisionAbort !== null },
       // Background agent tasks (reviewer + skill distill): running + recently-finished,
       // so the UI can show them inline in the conversation + a side panel on click.
       agentTasks: d.agentTasks?.list() ?? [],
@@ -346,7 +357,15 @@ export function registerApi(app: Hono, d: Deps): void {
     const existing = installedBackendBuild(root, def.id)
     if (existing) {
       let eng = d.registry.list().engines.find((e) => e.binPath === existing.bin)
-      if (!eng) eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+      if (!eng) {
+        // A build that no longer runs here: a clear 400, as POST /engines gives, not an opaque 500.
+        try {
+          eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+        } catch (e) {
+          if (e instanceof ProbeError) return err(c, 400, e.code, e.message)
+          throw e
+        }
+      }
       d.registry.activate(eng.id)
       return c.json({ accepted: false, alreadyInstalled: true, build: existing.tag })
     }
@@ -399,6 +418,10 @@ export function registerApi(app: Hono, d: Deps): void {
     // prior update (ADR-085), so resolve the newest build on disk rather than the pinned tag.
     const oldBin = installedBackendBuild(root, def.id)?.bin ?? null
     if (!oldBin) return err(c, 409, 'not_installed', 'Backend is not installed — download it first.')
+    // Android's build is TurboLLM's own, one pinned file at downloadBaseUrl (see availableBackends): upstream's newer
+    // tags have no Android asset there, so updating to one always failed with HTTP 404.
+    if (def.downloadBaseUrl)
+      return err(c, 409, 'no_update_source', 'This build has no automatic update source: upstream llama.cpp publishes no Android build.')
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Honest upstream check FIRST: resolve the real latest tag. Offline → clear 503.
     // Resolved in the INSTALLED tag's own format via the shared resolver: `releases/latest`
@@ -418,6 +441,9 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     const newDef = backendDefAt(def.id as BackendId, latestTag)
     if (!newDef) return err(c, 500, 'internal', 'No upstream build of this backend for your platform.')
+    // The lookup above let another engine job start (a scheduler auto-update, another tab); re-check before taking the
+    // slot, or both would provision the same tag dir and share one progress/Cancel channel.
+    { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const ac = new AbortController()
     provisionAbort = ac
     void (async () => {
@@ -433,18 +459,43 @@ export function registerApi(app: Hono, d: Deps): void {
         // Probe + register the new build (add() probes the binary). Only now do we touch
         // the active engine / old install — if the probe throws, the old build still runs.
         let newEng = d.registry.list().engines.find((e) => e.binPath === newBin)
-        if (!newEng) newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin)).engine
+        if (!newEng) {
+          try {
+            newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin)).engine
+          } catch (e) {
+            // The new build doesn't run here: remove it. Left on disk with its completion marker,
+            // installedBackendBuild (newest tag wins) would pick it over the working build, so
+            // Update would claim "already latest" and Enable/Download would hit the failing probe.
+            // Retries: the probe just ran this tree's exe/DLLs, and a Windows AV/indexer handle can still be
+            // open. Best effort — a failed cleanup must not replace the probe error as the reported cause.
+            try { rmSync(backendDir(root, def.id as BackendId, latestTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
+            throw e
+          }
+        }
         // Stop the engine if the OLD build of this backend is the running active one, so the
         // swap doesn't leave a stale process pointing at a dir we're about to delete.
         const oldEng = d.registry.list().engines.find((e) => e.binPath === oldBin)
+        // The new build takes the old one's place: active only if the old one still is (updating a
+        // fallback backend must not switch the user's engine), and with its update policy (a new
+        // engine id would otherwise fall back to notify). Read after stopEngineUsers: stopping a
+        // pool slot leaves the manager idle, so the activate route allows a switch meanwhile, and a
+        // check read before it undid that switch.
         if (oldEng) await stopEngineUsers(d, oldEng.id)
-        d.registry.activate(newEng.id)
+        if (oldEng && d.registry.active()?.id === oldEng.id) d.registry.activate(newEng.id)
+        // From here the new build has replaced the old one: what follows is best effort, never "your existing build is
+        // unchanged". If a Windows lock refuses the config.json save, the policy stays in memory for the next save to
+        // write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
+        if (oldEng?.updatePolicy && oldEng.id !== newEng.id) {
+          try { d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy) } catch { /* best effort */ }
+        }
         // GC the old install: unregister its engine entry + delete its tag-keyed dir.
         if (oldEng && oldEng.id !== newEng.id) {
           try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
         }
         if (installedTag && installedTag !== latestTag) {
-          rmSync(backendDir(root, def.id as BackendId, installedTag), { recursive: true, force: true })
+          // Best effort, as in update-apply.ts: a Windows lock on the old build (retried here, as it is brief) must not
+          // report the finished update as failed.
+          try { rmSync(backendDir(root, def.id as BackendId, installedTag), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
         }
         d.provision.done()
       } catch (e) {
@@ -469,7 +520,14 @@ export function registerApi(app: Hono, d: Deps): void {
     const build = installedBackendBuild(root, def.id)
     if (!build) return err(c, 409, 'not_installed', 'Backend is not installed on disk — download it first.')
     let eng = d.registry.list().engines.find((e) => e.binPath === build.bin)
-    if (!eng) eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
+    if (!eng) {
+      try {
+        eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
+      } catch (e) {
+        if (e instanceof ProbeError) return err(c, 400, e.code, e.message) // as POST /engines
+        throw e
+      }
+    }
     d.registry.activate(eng.id)
     return c.json({ ok: true, engineId: eng.id })
   })
@@ -479,6 +537,9 @@ export function registerApi(app: Hono, d: Deps): void {
   app.delete('/api/v1/engines/backends/:id', async (c) => {
     const def = availableBackends().find((x) => x.id === c.req.param('id'))
     if (!def) return err(c, 400, 'invalid_config_value', 'Unknown backend for this platform.')
+    // Never under an update or download (see DELETE /engines/:id): an update of this backend would register the build
+    // it swaps in again right after the delete.
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     // Tag-agnostic: unregister + delete EVERY build of this backend (an update may have left
     // more than one tag-keyed dir / registry entry). Stop first if the active engine is one of them.
@@ -508,7 +569,11 @@ export function registerApi(app: Hono, d: Deps): void {
         d.provision.start('mlx', 'runtime_env')
         const rt = await ensureMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlx(`MLX (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        // An update leaves the active engine as it was (as update-apply.ts does): activating it would switch engines
+        // under a model running on another. An install activates it. Each pip engine has one registration, replaced
+        // in place by its venv path, so its kind identifies it. Read now, not before the upgrade: that takes minutes,
+        // the activate route allows a switch meanwhile whenever no model is loaded, and a check read before undid it.
+        if (!upgrade || d.registry.active()?.kind === 'mlx') d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX: ${e instanceof Error ? e.message : e}`)
@@ -532,7 +597,7 @@ export function registerApi(app: Hono, d: Deps): void {
         d.provision.start('rapid-mlx', 'runtime_env')
         const rt = await ensureRapidMlxEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addRapidMlx(`Rapid-MLX (${rt.version})`, rt.bin, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'rapid-mlx') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install Rapid-MLX: ${e instanceof Error ? e.message : e}`)
@@ -556,7 +621,7 @@ export function registerApi(app: Hono, d: Deps): void {
         d.provision.start('mlx-vlm', 'runtime_env')
         const rt = await ensureMlxVlmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addMlxVlm(`MLX-VLM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'mlx-vlm') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install MLX-VLM: ${e instanceof Error ? e.message : e}`)
@@ -757,8 +822,11 @@ export function registerApi(app: Hono, d: Deps): void {
   app.post('/api/v1/build/run', async (c) => {
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Building an engine requires a valid API key from a non-host device.')
-    if (process.platform !== 'win32' && process.platform !== 'linux' && process.platform !== 'darwin')
-      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, or macOS only.')
+    // Termux (platform 'android') is supported — build-prereqs/runBuild/the catalog's Android
+    // source card all handle it. The packaged Android app is not: W^X forbids exec of a built binary.
+    const buildPlatform = ['win32', 'linux', 'darwin'].includes(process.platform) || (process.platform === 'android' && !packagedAndroidApp())
+    if (!buildPlatform)
+      return err(c, 409, 'unsupported_platform', 'In-app build is currently Windows, Linux, macOS, or Android (Termux) only.')
     const b = await body<{ repoUrl?: string; branch?: string; commit?: string; name?: string; patchUrl?: string; patchSha256?: string }>(c)
     const repoUrl = (b.repoUrl ?? '').trim()
     if (!/^https?:\/\//i.test(repoUrl))
@@ -794,8 +862,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const engines = d.registry.list().engines
     const conflict = findNameConflict(engines, name, { buildRoot, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit })
     if (conflict) return err(c, 400, 'name_already_taken', nameTakenMessage(conflict, { sourceRepo: repoUrl, sourceBranch: branch }))
-    const running = d.registry.active()
-    if (running && engineBusy(d) && isEngineInBuildDir(running.binPath, buildRoot))
+    // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+    const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, buildRoot))
+    if (running && engineBusy(d))
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before rebuilding it — the rebuild replaces its files.`)
     // Reserve the build slot SYNCHRONOUSLY (before returning 202) so two near-simultaneous
     // POSTs can't both pass the busy-check and race on the same buildRoot / clobber buildAbort.
@@ -803,8 +872,8 @@ export function registerApi(app: Hono, d: Deps): void {
     buildAbort = ac
     d.build.start(name ?? repoUrl)
     void (async () => {
+      let out: Awaited<ReturnType<typeof runBuild>> | undefined
       try {
-        let out
         try {
           out = await runBuild(
             { repoUrl, branch, commit, patchUrl, patchSha256, enginesRoot, toolchainDirs },
@@ -812,11 +881,11 @@ export function registerApi(app: Hono, d: Deps): void {
             ac.signal,
           )
         } catch (e) {
-          // The BUILD step (clone/configure/compile) failed or was cancelled: GC the partial
-          // tree so repeated attempts don't fill the disk with multi-GB CUDA objects. Only
-          // here — never after a binary was successfully produced (that would throw away a
-          // good build over a mere registration hiccup).
-          try { rmSync(buildRoot, { recursive: true, force: true }) } catch { /* best effort */ }
+          // The BUILD step (clone/configure/compile) failed or was cancelled. runBuild itself
+          // has already removed the partial tree (so repeated attempts don't fill the disk with
+          // multi-GB CUDA objects) and put back the build it was replacing — deleting buildRoot
+          // here would throw away that working build. Never GC after a binary was successfully
+          // produced either (that would throw away a good build over a mere registration hiccup).
           if ((e as Error)?.name === 'AbortError') {
             d.build.log('Build cancelled.')
             d.build.cancel('Build cancelled.')
@@ -878,6 +947,10 @@ export function registerApi(app: Hono, d: Deps): void {
         d.build.fail(`Built successfully, but couldn't register the engine: ${e instanceof Error ? e.message : String(e)}`)
       } finally {
         if (buildAbort === ac) buildAbort = null
+        // The build this one replaced, parked by runBuild. Once a new binary exists it is gone
+        // either way — as before the parking, a registration failure keeps only the new build.
+        // Deleted in the background: an rmSync of the multi-GB tree stalled the whole daemon.
+        if (out?.prevBuildRoot) void discardParkedBuild(out.prevBuildRoot)
       }
     })()
     return c.json({ accepted: true }, 202)
@@ -917,7 +990,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const toolchainDirs = d.store.snapshot().build.toolchainDirs
     const ac = new AbortController()
     buildAbort = ac
-    d.build.start(tool)
+    d.build.start(tool, { toolInstall: true })
     d.build.phase('provisioning')
     void (async () => {
       try {
@@ -952,7 +1025,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const dataDir = d.store.dir()
     const ac = new AbortController()
     buildAbort = ac
-    d.build.start('CUDA Toolkit')
+    d.build.start('CUDA Toolkit', { toolInstall: true })
     d.build.phase('provisioning')
     void (async () => {
       try {
@@ -995,7 +1068,7 @@ export function registerApi(app: Hono, d: Deps): void {
         d.provision.start('vllm', 'runtime_env')
         const rt = await ensureVllmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addVllm(`vLLM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'vllm') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install vLLM: ${e instanceof Error ? e.message : e}`)
@@ -1016,7 +1089,7 @@ export function registerApi(app: Hono, d: Deps): void {
         d.provision.start('sglang', 'runtime_env')
         const rt = await ensureSglangEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade)
         const eng = d.registry.addSglang(`SGLang (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || d.registry.active()?.kind === 'sglang') d.registry.activate(eng.id) // an update keeps the active engine, read now (see MLX)
         d.provision.done()
       } catch (e) {
         d.provision.fail(`Could not install SGLang: ${e instanceof Error ? e.message : e}`)
@@ -1057,6 +1130,8 @@ export function registerApi(app: Hono, d: Deps): void {
       if (status && status.latest !== null && status.comparable && !status.hasUpdate) {
         return c.json({ accepted: false, alreadyLatest: true, version: status.latest, engine: 'litert-lm' })
       }
+      // The check above let another engine job start (a scheduler auto-update): re-check, or two pip installs share the venv.
+      { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     }
     const ac = new AbortController()
     provisionAbort = ac
@@ -1069,9 +1144,15 @@ export function registerApi(app: Hono, d: Deps): void {
         // with the same guard keyed on the registry's active engine; main's v1.14.5 refinement is kept —
         // it is the stricter of the two and covers the PR's case.)
         if (d.manager.currentOpts()?.engine.kind === 'litert-lm') await d.manager.stopAndWait()
+        // A .litertlm model auto-swapped into an extra pool slot holds the same library open while the primary runs
+        // something else (or nothing), so it is stopped too, as this route already stops the primary. Not
+        // stopEngineUsers: it also stops a primary that merely has LiteRT-LM active, which never held the library.
+        for (const e of d.registry.list().engines) if (e.kind === 'litert-lm') await d.modelRouter.stopPoolSlotsOnEngine(e.id)
         const rt = await ensureLitertLmEnv(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), upgrade, ac.signal)
         const eng = d.registry.addLitertLm(`LiteRT-LM (${rt.version})`, rt.python, rt.version)
-        d.registry.activate(eng.id)
+        // An update keeps the active engine, read now (see MLX) — for LiteRT-LM especially: an active LiteRT-LM is sent
+        // every GGUF.
+        if (!upgrade || d.registry.active()?.kind === 'litert-lm') d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
         if ((e as Error)?.name === 'AbortError') d.provision.done() // user cancelled — nothing failed
@@ -1088,7 +1169,7 @@ export function registerApi(app: Hono, d: Deps): void {
   // compatible), and registers it as a kind='llama-server' engine. 202 + progress
   // via /status. The fork currently ships macOS prebuilts only, so the install is
   // platform-guarded to where an asset actually exists (matches the OS prefilter).
-  // ?update=1 removes the existing install dir so the latest release is re-downloaded.
+  // ?update=1 fetches the latest release and swaps it in only once it is on disk.
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
     if (!entry?.repo) return err(c, 500, 'internal', 'TurboQuant catalog entry is misconfigured.')
@@ -1098,28 +1179,45 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    // Cancellable from the provision banner, like the backend install: the download takes the
+    // signal, and an update only swaps the staged release in once it has fully arrived.
+    const ac = new AbortController()
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('turboquant', upgrade ? 'user_update' : 'user_install')
-        // For update: remove existing dir so provisionTurboquant re-downloads the latest.
-        if (upgrade) {
-          const tqDir = join(root, 'turboquant')
-          if (existsSync(tqDir)) rmSync(tqDir, { recursive: true, force: true })
-        }
+        // Update: stop what runs on the install, then let provisionTurboquant stage the latest
+        // beside it and swap only on success. Deleting the dir first left the engine pointing at
+        // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
+        const cur = upgrade ? d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant'))) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
         // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
-        const bin = await provisionTurboquant(root, entry.repo!, (p) =>
-          d.provision.progress(p.phase, p.pct, p.part, p.parts),
+        const bin = await provisionTurboquant(
+          root, entry.repo!,
+          (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
+          ac.signal, { replace: upgrade },
         )
         let eng = d.registry.list().engines.find((e) => e.binPath === bin)
+        // An update lands at the same path, so the entry is kept: re-probe it, or it keeps the old build's version
+        // and capabilities (flags and KV types the new build added stay gated off).
+        if (eng && upgrade) eng = await d.registry.reprobe(eng.id)
         if (!eng) eng = (await d.registry.add('TurboQuant', bin)).engine
-        d.registry.activate(eng.id)
+        // An update leaves the active engine as it was (as update-apply.ts and the backend update
+        // do): activating it would switch engines under a model running on another. An install
+        // activates it. Read now, not before the download: that takes minutes, the activate route
+        // allows a switch meanwhile (the stop above left no model running), and a check read
+        // before undid it.
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
             : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'turboquant' }, 202)
@@ -1127,8 +1225,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Provision KoboldCpp (engine overhaul, Phase 4): download the single platform/GPU-
   // matching binary from its GitHub release, register as a kind='koboldcpp' engine.
-  // 202 + progress via /status. ?update=1 removes the existing binary so the latest is
-  // re-downloaded. CUDA build is chosen on NVIDIA; portable build elsewhere.
+  // 202 + progress via /status. ?update=1 re-downloads the latest, replacing the existing
+  // binary only once the download completed. CUDA build is chosen on NVIDIA; portable build elsewhere.
   app.post('/api/v1/engines/koboldcpp', (c) => {
     const entry = catalogEngine('koboldcpp')
     if (!entry?.repo) return err(c, 500, 'internal', 'KoboldCpp catalog entry is misconfigured.')
@@ -1139,23 +1237,30 @@ export function registerApi(app: Hono, d: Deps): void {
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
     const hasNvidia = primaryVendor(getSysInfo()) === 'nvidia'
+    // Cancellable (as TurboQuant above): the download streams to a `.part`, so the old binary stays.
+    const ac = new AbortController()
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('koboldcpp', upgrade ? 'user_update' : 'user_install')
-        if (upgrade) {
-          const dir = koboldcppDir(root)
-          if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
-        }
-        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts))
+        // Update: stop what runs on the binary (Windows can't replace a running .exe), then
+        // re-download over it — never delete it first. Active afterwards only if it still is (see
+        // the TurboQuant route above).
+        const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'koboldcpp' && e.binPath === koboldcppBinPath(root)) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
+        const rt = await ensureKoboldcpp(root, hasNvidia, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addKoboldcpp(`KoboldCpp (${rt.version})`, rt.binPath, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'KoboldCpp has no prebuilt binary for this operating system/architecture in its latest release.'
             : `Could not install KoboldCpp: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'koboldcpp' }, 202)
@@ -1163,8 +1268,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Provision llamafile (engine overhaul, Phase 4): download the single portable
   // executable from its GitHub release, register as a kind='llamafile' engine. 202 +
-  // progress via /status. ?update=1 removes the existing binary so the latest is
-  // re-downloaded.
+  // progress via /status. ?update=1 re-downloads the latest, replacing the existing
+  // binary only once the download completed.
   app.post('/api/v1/engines/llamafile', (c) => {
     const entry = catalogEngine('llamafile')
     if (!entry?.repo) return err(c, 500, 'internal', 'llamafile catalog entry is misconfigured.')
@@ -1174,23 +1279,28 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    const ac = new AbortController() // cancellable, as KoboldCpp above
+    provisionAbort = ac
     void (async () => {
       try {
         d.provision.start('llamafile', upgrade ? 'user_update' : 'user_install')
-        if (upgrade) {
-          const dir = llamafileDir(root)
-          if (existsSync(dir)) rmSync(dir, { recursive: true, force: true })
-        }
-        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts))
+        // Update: stop, then re-download over the binary — never delete it first; active
+        // afterwards only if it still is (as above).
+        const cur = upgrade ? d.registry.list().engines.find((e) => e.kind === 'llamafile' && e.binPath === llamafileBinPath(root)) : undefined
+        if (cur) await stopEngineUsers(d, cur.id)
+        const rt = await ensureLlamafile(root, (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts), ac.signal, { replace: upgrade })
         const eng = d.registry.addLlamafile(`llamafile (${rt.version})`, rt.binPath, rt.version)
-        d.registry.activate(eng.id)
+        if (!upgrade || (!!cur && d.registry.active()?.id === cur.id)) d.registry.activate(eng.id)
         d.provision.done()
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
             ? 'llamafile has no downloadable binary in its latest release.'
             : `Could not install llamafile: ${e instanceof Error ? e.message : e}`
         d.provision.fail(msg)
+      } finally {
+        if (provisionAbort === ac) provisionAbort = null
       }
     })()
     return c.json({ accepted: true, engine: 'llamafile' }, 202)
@@ -1205,6 +1315,10 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Adding an engine requires a valid API key from a non-host device.')
     const b = await body<{ name?: string; binPath?: string; sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string }>(c)
     if (!b.binPath || !b.binPath.trim()) return err(c, 400, 'invalid_config_value', 'binPath is required.')
+    // Not while an update, download, upload or rebuild runs, like DELETE /engines/:id below (an Enable is the undo of
+    // a Disable, refused then too). A Disabled source-built card's Delete no longer comes through here: it used to
+    // re-register the engine (a probe) and then purge it, and DELETE /engines/build now removes the folder directly.
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     // Provenance comes from the marker this flow wrote on disk, never from the request body.
     const release = readReleaseMarker(sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines')))
     // A release install is identified by its marker, never by a source repo (ADR-088, ADR-388):
@@ -1277,8 +1391,8 @@ export function registerApi(app: Hono, d: Deps): void {
   // reserved, before up to MAX_ZIP_BYTES of a body nobody validated is held in memory —
   // and so the slot also covers the time the body itself spends streaming in.
   const zipUploadGuard: MiddlewareHandler = async (c, next) => {
-    // multipart/form-data needs no CORS preflight, so the /api/* allowlist doesn't stop a
-    // cross-site POST — refuse anything a browser marks as coming from another site.
+    // multipart/form-data needs no CORS preflight, so /api's CORS policy (server.ts) doesn't
+    // stop a cross-site POST — refuse anything a browser marks as coming from another site.
     const site = c.req.header('sec-fetch-site')
     if (site && site !== 'same-origin' && site !== 'none')
       return err(c, 403, 'forbidden', 'Engine uploads must come from the TurboLLM app itself.')
@@ -1337,20 +1451,29 @@ export function registerApi(app: Hono, d: Deps): void {
     const occupant =
       d.registry.list().engines.find((e) => claims(e.binPath)) ??
       d.registry.customSources().find((s) => claims(s.binPath))
-    if (occupant && !existsSync(join(targetDir, ZIP_BUILD_MARKER)))
-      return err(c, 409, 'build_dir_taken', `The build folder "${zipBuildDirName(file.name)}" already belongs to "${occupant.name}" — rename the zip or delete that engine first.`)
+    // The occupant's folder as spelled on disk, as for a release install: claims() ignores case, but a case-sensitive
+    // file system (Linux) would not find the marker under the upload's spelling, so re-uploading 'mybuild.zip' over an
+    // install from 'MyBuild.zip' was refused as someone else's folder instead of replacing it in place.
+    const occupantDir = occupant ? sourceBuildDirOf(occupant.binPath, enginesRoot) : null
+    const installDir = occupantDir && occupantDir.toLowerCase() === targetDir.toLowerCase() ? occupantDir : targetDir
+    if (occupant && !existsSync(join(installDir, ZIP_BUILD_MARKER)))
+      return err(c, 409, 'build_dir_taken', `The build folder "${basename(installDir)}" already belongs to "${occupant.name}" — rename the zip or delete that engine first.`)
     // The replace guard runs before the install AND again at the swap (blockSwap): an
     // engine can be started onto the target files mid-upload.
     const replaceBlocked = (): string | null => {
-      const r = d.registry.active()
-      return r && engineBusy(d) && isEngineInBuildDir(r.binPath, targetDir)
+      // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+      const r = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, targetDir))
+      return r && engineBusy(d)
         ? `Stop "${r.name}" before replacing its files — the upload extracts over its build folder.`
         : null
     }
     const early = replaceBlocked()
     if (early) return err(c, 409, 'engine_in_use', early)
     try {
-      const res = await installZipEngine(enginesRoot, file.name, Buffer.from(await file.arrayBuffer()), { blockSwap: replaceBlocked })
+      const res = await installZipEngine(enginesRoot, file.name, Buffer.from(await file.arrayBuffer()), {
+        blockSwap: replaceBlocked,
+        slug: basename(installDir),
+      })
       // The swap already happened. If a registered engine lives in the target dir this
       // was the same-named re-upload — the "update my custom build" case — so refresh
       // THAT engine's probed identity in place (id and name kept; a plain POST /engines
@@ -1382,12 +1505,52 @@ export function registerApi(app: Hono, d: Deps): void {
       return err(c, 403, 'forbidden', 'Uploading an engine zip requires a valid API key from a non-host device.')
     const enginesRoot = join(d.store.dir(), 'engines')
     const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
-    if (!dir || !existsSync(join(dir, ZIP_BUILD_MARKER)))
+    // Never a hidden folder: a purged zip install's `.<slug>.purge-<ms>` trash still holds the marker, and an rmSync
+    // here would race the purge's own background delete of it (discardPurgeTrash) on the daemon's thread.
+    if (!dir || basename(dir).startsWith('.') || !existsSync(join(dir, ZIP_BUILD_MARKER)))
       return err(c, 404, 'engine_not_found', 'No unconfirmed zip install at that path.')
     const claims = (p: string) => isEngineInBuildDir(p, dir)
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
       return err(c, 409, 'build_dir_taken', 'That install is in use by an engine — delete the engine instead.')
     rmSync(dir, { recursive: true, force: true })
+    return c.json({ ok: true })
+  })
+
+  // Delete a DISABLED source build (build/<slug>, no registry entry): the Engines screen's Delete on a Disabled
+  // source-built catalog card. The purge route only deletes a registered engine's files, so that Delete used to
+  // re-register the build through POST /engines first, which probes (runs) the binary: a build whose binary no
+  // longer starts (a driver or toolkit change left it unable to load libcuda, a build for another arch) failed the
+  // probe or its timeout, and the one build most worth deleting could not be deleted from the UI. Nothing is run
+  // here. Only a build/<slug> folder is removed (never a hidden staging or parked one), and only while no registered
+  // engine and no remembered custom source points into it and no engine work runs, so a stray call can never delete
+  // a live engine's files. Registered before DELETE /engines/:id below, which would swallow "build".
+  app.delete('/api/v1/engines/build', (c) => {
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Deleting an engine build requires a valid API key from a non-host device.')
+    // As DELETE /engines/:id: a rebuild or update may be writing into this very folder.
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    const enginesRoot = join(d.store.dir(), 'engines')
+    const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
+    if (!dir || basename(dir).startsWith('.') || !existsSync(dir))
+      return err(c, 404, 'engine_not_found', 'No engine build at that path.')
+    const claims = (p: string) => isEngineInBuildDir(p, dir)
+    if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
+      return err(c, 409, 'build_dir_taken', 'That build is in use by an engine — delete the engine instead.')
+    // As the purge: renamed aside first, then deleted in the background after the reply (discardPurgeTrash). A
+    // recursive rmSync here held the daemon's only thread for the whole multi-GB tree, plus up to 1.5 s of blocking
+    // retry back-off per locked entry: every request, /status poll and token stream stalled meanwhile. The rename
+    // also makes the Delete all or nothing.
+    sweepPurgeTrash(dirname(dir))
+    const trash = join(dirname(dir), `.${basename(dir)}.purge-${Date.now()}`)
+    try {
+      renameSync(dir, trash)
+    } catch (e) {
+      // A Windows AV or indexer lock: Windows refuses the rename while any file under the folder is open, and reports
+      // a lock as EBUSY, EPERM or EACCES, the codes a permission error has too, so the OS error goes along. Nothing
+      // has changed: the folder is whole and the card still offers the Delete.
+      return err(c, 409, 'engine_files_locked', `Some of the build's files are still in use — try again in a moment. (${(e as Error).message})`)
+    }
+    void discardPurgeTrash(trash)
     return c.json({ ok: true })
   })
 
@@ -1451,8 +1614,12 @@ export function registerApi(app: Hono, d: Deps): void {
     const targetDir = join(enginesRoot, 'build', slug)
     const claims = (p: string) => isEngineInBuildDir(p, targetDir)
     const occupant = d.registry.list().engines.find((e) => claims(e.binPath)) ?? d.registry.customSources().find((s) => claims(s.binPath))
-    if (occupant && !existsSync(join(targetDir, RELEASE_INSTALL_MARKER)))
-      return err(c, 409, 'build_dir_taken', `The build folder "${slug}" already belongs to "${occupant.name}" — delete that engine first.`)
+    // The occupant's folder as spelled on disk: a repo typed in another case is the same repo (GitHub ignores case),
+    // but a case-sensitive file system (Linux) would not find the marker under the typed spelling.
+    const occupantDir = occupant ? sourceBuildDirOf(occupant.binPath, enginesRoot) : null
+    const installDir = occupantDir && occupantDir.toLowerCase() === targetDir.toLowerCase() ? occupantDir : targetDir
+    if (occupant && !existsSync(join(installDir, RELEASE_INSTALL_MARKER)))
+      return err(c, 409, 'build_dir_taken', `The build folder "${basename(installDir)}" already belongs to "${occupant.name}" — delete that engine first.`)
     const replaceBlocked = (): string | null => {
       for (const occupantEngine of d.registry.list().engines.filter((e) => claims(e.binPath))) {
         const reason = releaseSwapBlockReason(d, occupantEngine)
@@ -1473,12 +1640,20 @@ export function registerApi(app: Hono, d: Deps): void {
     releaseJob.start(plan, async () => {
       try {
         const result = await installReleaseAsset(enginesRoot, plan, {
+          slug: basename(installDir),
           blockSwap: replaceBlocked,
           onProgress: (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
           signal: ac.signal,
         })
         if (!result.found) throw noServerBinaryError()
         const prior = d.registry.list().engines.find((e) => claims(e.binPath))
+        // A Cancel or a dismissed dialog that landed after the install's last cancel check (a rename waiting out a
+        // Windows AV lock on the just-probed exe) stopped nothing, and no client is left to confirm or discard the new,
+        // unclaimed build: discard it here, as the dialog would. A dir a remembered source claims is left, as DELETE does.
+        if (ac.signal.aborted && !prior && !d.registry.customSources().some((s) => claims(s.binPath))) {
+          try { rmSync(join(enginesRoot, 'build', basename(installDir)), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* the GC sweeps it */ }
+          throw new DOMException('The install was cancelled.', 'AbortError')
+        }
         d.provision.done()
         if (!prior) return { kind: 'ready', result }
         recordReleaseUpdate(d.registry, d.updates, prior.id, result)
@@ -1507,7 +1682,10 @@ export function registerApi(app: Hono, d: Deps): void {
       return c.json({ ok: true })
     }
     const dir = sourceBuildDirOf(binPath, join(d.store.dir(), 'engines'))
-    if (!dir || !existsSync(join(dir, RELEASE_INSTALL_MARKER)))
+    // Never a hidden folder, as DELETE /engines/zip: a purged release install's `.<slug>.purge-<ms>` trash still holds
+    // the marker, and an rmSync here would race the purge's own background delete of it (discardPurgeTrash) on the
+    // daemon's thread.
+    if (!dir || basename(dir).startsWith('.') || !existsSync(join(dir, RELEASE_INSTALL_MARKER)))
       return err(c, 404, 'engine_not_found', 'No unconfirmed release install at that path.')
     const claims = (p: string) => isEngineInBuildDir(p, dir)
     if (d.registry.list().engines.some((e) => claims(e.binPath)) || d.registry.customSources().some((s) => claims(s.binPath)))
@@ -1562,6 +1740,12 @@ export function registerApi(app: Hono, d: Deps): void {
     if (target && engineDeleteBlocked(d, target)) {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
     }
+    // Not while an update, download, upload or rebuild runs (a second tab, an API client, or the auto-update scheduler
+    // starting while the confirm dialog was open; the Engines screen does not disable Purge during a rebuild). A purge
+    // under an update made its swap hit a missing folder and report "your existing build is unchanged" while leaving
+    // an orphan folder; under a rebuild it deleted build/<slug> but not the parked previous build, which the failing
+    // build then moved back; a removed engine was registered again when the update finished.
+    { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const purge = c.req.query('purge') === '1'
     // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
     // added before customEngineSources tracking existed has no recorded identity, so a plain
@@ -1576,15 +1760,34 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceRepo: eng.sourceRepo, sourceBranch: eng.sourceBranch, sourceCommit: eng.sourceCommit, sourcePatchUrl: eng.sourcePatchUrl,
         })
       }
-      d.registry.remove(id)
       // ?purge=1: also delete the engine's installed files from disk.
       // Only removes dirs under {dataDir}/engines/ — never touches model dirs.
-      if (purge && eng) {
-        const enginesRoot = join(d.store.dir(), 'engines')
-        const purgeDir = engineInstallDir(eng, enginesRoot)
-        if (purgeDir && existsSync(purgeDir)) {
-          rmSync(purgeDir, { recursive: true, force: true })
+      const enginesRoot = join(d.store.dir(), 'engines')
+      const purgeDir = purge && eng ? engineInstallDir(eng, enginesRoot) : null
+      // All or nothing: the folder is first renamed to a hidden sibling, which Windows refuses while any file under it
+      // is open (Defender or the indexer still reading llama-server.exe or ggml-cuda.dll right after a Stop). The
+      // recursive delete this replaces threw part-way instead, AFTER the engine was unregistered: the folder stayed
+      // half deleted, the remembered custom source and LiteRT-LM configs were kept, the client got a 500, and with no
+      // registry entry left the purge could not be repeated (a half-deleted official llama.cpp build was even taken
+      // for an install later). A refused rename now answers 409 with the engine still registered and its files whole.
+      let trash: string | null = null
+      if (eng && purgeDir && existsSync(purgeDir)) {
+        sweepPurgeTrash(dirname(purgeDir))
+        trash = join(dirname(purgeDir), `.${basename(purgeDir)}.purge-${Date.now()}`)
+        try {
+          renameSync(purgeDir, trash)
+        } catch (e) {
+          return err(c, 409, 'engine_files_locked', `Some of ${eng.name}'s files are still in use — try again in a moment. (${(e as Error).message})`)
         }
+      }
+      try {
+        d.registry.remove(id)
+      } catch (e) {
+        // Still registered (a config write failed): its files go back where its binPath points.
+        if (trash && purgeDir) try { renameSync(trash, purgeDir) } catch { /* the error below already reports the failure */ }
+        throw e
+      }
+      if (purge && eng) {
         // LiteRT-LM keeps one launch-config file per port next to its venv (engines/litert-lm/config-<port>.json).
         if (eng.kind === 'litert-lm') {
           const cfgDir = join(enginesRoot, 'litert-lm')
@@ -1599,6 +1802,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // now-broken Enable (its files are gone). A plain Disable (no purge) leaves this
         // record alone; that's the whole point of recordCustomSource.
         d.registry.forgetCustomSource(customSourceKey(eng))
+        // Best effort, as the engine is gone either way, and in the background after the reply (discardPurgeTrash): a
+        // lock that outlasts the retries, or a daemon exit mid-delete, leaves a hidden folder that nothing points at,
+        // and the next purge or delete in the same folder sweeps it (sweepPurgeTrash).
+        if (trash) void discardPurgeTrash(trash)
       }
       return c.json({ ok: true })
     } catch (e) {
@@ -1631,14 +1838,24 @@ export function registerApi(app: Hono, d: Deps): void {
     const busy = engineWorkBusy(d)
     if (busy) return err(c, 409, 'engine_already_running', busy)
     const id = c.req.param('id')
-    const running = d.registry.active()
-    if (engineBusy(d) && running?.id === id)
+    // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
+    const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e?.id === id)
+    if (engineBusy(d) && running)
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
     const engine = d.registry.get(id)
     if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
-    if (!resolveUpdateSource(engine)) return err(c, 409, 'no_update_source', 'This engine has no automatic update source.')
+    // So does an extra pool slot on it, whatever the primary is doing, as for delete (engineDeleteBlocked): every
+    // non-release branch starts with stopEngineUsers, which stopped that slot's model without a word, and it stayed
+    // gone when the update then failed. (A release update refused only later, as a failed job.)
+    if (d.modelRouter.poolEngineIds().has(id))
+      return err(c, 409, 'engine_in_use', `Stop "${engine.name}" before updating it.`)
+    const source = resolveUpdateSource(engine)
+    // applyEngineUpdate has no branch for a source-built engine (notify-only "rebuild") or for SGLang.
+    if (!source || source.source === 'source' || engine.kind === 'sglang')
+      return err(c, 409, 'no_update_source', 'This engine has no automatic update source.')
     const ac = new AbortController()
-    provisionAbort = ac
+    // Only the release and GitHub-release branches take the signal: a pip upgrade cannot be cancelled.
+    if (source.source !== 'pip') provisionAbort = ac
     engineUpdateInFlight = true
     const startsBefore = d.provision.startCount()
     void applyEngineUpdate(
@@ -1675,6 +1892,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const engines = d.registry.list().engines
     const refresh = c.req.query('refresh') === '1'
     d.updates.prune(new Set(engines.map((e) => e.id)))
+    d.updates.forgetChanged(engines)
     if (refresh) {
       await d.updates.checkAll(engines, AbortSignal.timeout(20_000)).catch(() => {})
     } else {
@@ -1955,8 +2173,12 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true, ...d.comfy.snapshot() })
   })
 
-  app.post('/api/v1/comfyui/release', async (c) => {
-    if (d.comfy) await d.comfy.release()
+  app.post('/api/v1/comfyui/release', (c) => {
+    // Answered once loads are unblocked, not after the reload: the gate node (v3+) holds its lock across this call,
+    // and a prompt queued meanwhile waits for that lock on ComfyUI's server thread, so every "Run (Instant)" iteration
+    // froze ComfyUI until the LLM had reloaded (up to the node's 10 s timeout). release() logs a failed reload itself
+    // and never rejects.
+    if (d.comfy) void d.comfy.release()
     return c.json({ ok: true })
   })
 
@@ -2040,13 +2262,14 @@ export function registerApi(app: Hono, d: Deps): void {
       // TRUNCATES the log file (a restart rewrites the same path from empty) and `logPath()`
       // itself changes on an engine switch — either way the file can shrink below `bytePos`,
       // and unless the cursor is fixed the loop stalls forever: no error, no new lines, until
-      // the new file eventually regrows past the old length. Detecting "this is effectively a
-      // new log" (different path, OR the same path now shorter than what's already been read)
-      // and reseeding `bytePos` to the file's CURRENT size — rather than 0 — also covers a
-      // brand-new connection's first tick: it starts from "now" instead of replaying the whole
-      // history, which would otherwise race the client's own initial-tail GET (whichever
-      // arrived first, the result was either duplicated or truncated lines). Same semantics as
-      // before this rewrite (ADR-409's review, PR #216) — only the READ shape changed.
+      // the new file eventually regrows past the old length. So "this is effectively a new log"
+      // (different path, OR the same path now shorter than what's already been read) restarts the
+      // cursor at 0 — the new run's opening lines (build, GPU detection, GGUF metadata) are exactly
+      // what the user needs, and the client never refetches the tail on a restart. Only a
+      // brand-new connection's FIRST look starts at the file's CURRENT size: it starts from "now"
+      // instead of replaying the whole history, which would otherwise race the client's own
+      // initial-tail GET (whichever arrived first, the result was either duplicated or truncated
+      // lines). ADR-409's review, PR #216.
       //
       // Perf follow-up (docs/TODO.md, "Verification & chores", ADR-409 review item 2): the
       // previous version did `readFileSync(path).split('\n')` — the WHOLE file, synchronously,
@@ -2061,6 +2284,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // technique `drainOpenAiSseForLog` uses for the exact same reason.
       let bytePos = 0
       let lastPath = ''
+      let firstLook = true // this connection has not polled the log yet
       let carry = '' // a line seen but not yet newline-terminated, held for the next tick
       const dec = new TextDecoder()
       let aborted = false
@@ -2073,7 +2297,7 @@ export function registerApi(app: Hono, d: Deps): void {
         if (path && existsSync(path)) {
           const size = statSync(path).size
           if (path !== lastPath || size < bytePos) {
-            bytePos = size
+            bytePos = firstLook ? size : 0
             lastPath = path
             carry = ''
             dec.decode() // flush/reset any pending partial-char state from the OLD file
@@ -2096,6 +2320,8 @@ export function registerApi(app: Hono, d: Deps): void {
             }
           }
         }
+        // Set whether or not a log existed yet: one that appears later is a new run's, read from 0.
+        firstLook = false
         if (++ticks % 37 === 0) await stream.writeSSE({ data: '', event: 'ping' })
         await stream.sleep(400)
       }
@@ -2107,7 +2333,12 @@ export function registerApi(app: Hono, d: Deps): void {
   // Chat) — LM Studio-style: params, timings, tokens, and (opt-in) full request/response
   // bodies. In-memory only (`RequestLog`, observability/request-log.ts); nothing here is ever
   // persisted or sent to telemetry. Same auth treatment as `/api/v1/engine/logs` above — no
-  // per-route middleware, covered by the global `lanAuth` mounted in server.ts.
+  // per-route middleware, covered by the global `lanAuth` mounted in server.ts — except the
+  // captured bodies, which carry hostGate (REQUEST_BODIES_HOST_ONLY): they hold Code sessions'
+  // and `turbollm launch` agents' full prompts (files the agent read, `.env` included, and tool
+  // output), which codeAuth keeps from a keyless Tailscale Serve identity, a verified Cloudflare
+  // Access JWT and an open-LAN peer. lanAuth admits all three, so with capture on they read
+  // every agent turn through `?bodies=1` and `/:id` while `/api/v1/code/*` refused them.
   //
   // `/stream` is registered BEFORE `/:id` so it can never be shadowed by the param route —
   // Hono resolves a literal segment over a param one regardless of registration order, but
@@ -2119,7 +2350,11 @@ export function registerApi(app: Hono, d: Deps): void {
       stream.onAbort(() => { aborted = true })
       const unsubscribe = d.requestLog.subscribe((entry) => {
         if (aborted) return
-        void stream.writeSSE({ event: 'entry', data: JSON.stringify(entry) })
+        // Bodies stripped like the list endpoint's: with body capture on, every request would
+        // otherwise ship its full prompt (and again with the response on finalize) into a
+        // 500-row browser buffer the daemon's own 32 MB body budget doesn't bound. The detail
+        // drawer fetches bodies per entry (GET /requests/:id).
+        void stream.writeSSE({ event: 'entry', data: JSON.stringify(stripBodies(entry)) })
       })
       let ticks = 0
       try {
@@ -2144,6 +2379,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // rendering hundreds of entries has no business pulling every captured prompt/response
     // over the wire just to show a time/status/tokens table.
     const bodies = q.bodies === '1' || q.bodies === 'true'
+    if (bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entries: d.requestLog.list({ limit, since, source, modelKey: q.model, status, bodies }) })
   })
 
@@ -2151,6 +2387,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!d.requestLog) return err(c, 404, 'not_found', 'No request log entry with that id.')
     const entry = d.requestLog.get(c.req.param('id'))
     if (!entry) return err(c, 404, 'not_found', 'No request log entry with that id.')
+    // An entry without bodies is what the list already shows; the detail drawer falls back to
+    // the row's own copy on a refusal.
+    if (entry.bodies && !hostGate(c, d)) return err(c, 403, 'forbidden', REQUEST_BODIES_HOST_ONLY)
     return c.json({ entry })
   })
 
@@ -2170,8 +2409,13 @@ export function registerApi(app: Hono, d: Deps): void {
     if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — benchmarking is paused until its queue finishes.')
     // Reverse gate (F-011): a sweep loads the model repeatedly, so free ComfyUI's VRAM
     // once before it begins — the sweep then owns the GPU. No-op unless the reverse gate
-    // is enabled and ComfyUI is idle; non-fatal on failure (benchmarks anyway).
-    await d.comfy?.freeComfyUIBeforeLoad()
+    // is enabled and ComfyUI is idle; non-fatal on failure (benchmarks anyway). It throws
+    // only when a ComfyUI render is starting (an acquire in flight): the same 409 as above.
+    try {
+      await d.comfy?.freeComfyUIBeforeLoad()
+    } catch {
+      return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — benchmarking is paused until its queue finishes.')
+    }
     try {
       // `base` is the user's current config (dialog draft): auto-tune fixes its ctx +
       // KV quant and sweeps only offload on top (spec 09 §1, honoring the user's config).
@@ -2208,7 +2452,11 @@ export function registerApi(app: Hono, d: Deps): void {
   app.get('/api/v1/models', (c) => {
     const { models, scanning, lastScanAt } = d.scanner.list()
     const lastTps = d.db.lastGenTpsByModel()
-    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps)), scanning, lastScanAt })
+    // One config snapshot (and one lookup per registry engine) for the whole list, not per row:
+    // each is a structuredClone of the full config, which itself grows with the library
+    // (profiles, presets, bench results are per model), and the UI polls this every few seconds.
+    const shared = overlayShared(d)
+    return c.json({ models: models.map((m) => overlayModel(m, d, lastTps, shared)), scanning, lastScanAt })
   })
 
   app.post('/api/v1/models/rescan', (c) => {
@@ -2218,8 +2466,10 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Delete a model's file(s) from disk (spec 05). Split GGUFs delete all shards.
   // Blocked while the model is the one currently loaded in the running engine.
+  // `c.req.param()` is already percent-decoded (see custom-sources/:key) — decoding again broke
+  // every key containing '%' (a URIError 500, or a different key: '%41' → 'A').
   app.delete('/api/v1/models/:key', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     // Any slot, not just the primary: a Laya model always runs in its own (ADR-443).
@@ -2236,7 +2486,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/models/:key', (c) => {
-    const e = d.scanner.get(decodeURIComponent(c.req.param('key')))
+    const e = d.scanner.get(c.req.param('key'))
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const sys = getSysInfo()
     const snap = d.store.snapshot()
@@ -2251,7 +2501,7 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.put('/api/v1/models/:key/profile', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
     const p = await body<LoadProfile>(c)
@@ -2263,6 +2513,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // Per-engine profile (issue #35): save into the slot for the engine the client is
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
+    if (isUnsafeMapKey(engineId)) return err(c, 400, 'invalid_profile_value', 'Invalid engine id.')
     d.store.update((cfg) => {
       setModelProfile(cfg, key, engineId, p)
       // An explicit manual save that CHANGES something supersedes the pin: PUT writes
@@ -2273,9 +2524,9 @@ export function registerApi(app: Hono, d: Deps): void {
       //    unpinning there silently broke "your pick is remembered and auto-applied next load".
       //  - The pin is per-MODEL, this save is per-ENGINE. Clearing a pin belonging to a DIFFERENT
       //    engine drops that engine's tune for an edit unrelated to it (issue #35's contract).
-      const pinnedId = cfg.lastPresetId[key]
+      const pinnedId = ownEntry(cfg.lastPresetId, key)
       if (pinnedId) {
-        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         const thisEngine = !pinned || pinned.engineId === '' || pinned.engineId === engineId
         if (thisEngine && !(pinned && profilesEqual(pinned.profile, p))) delete cfg.lastPresetId[key]
       }
@@ -2284,7 +2535,11 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/models/:key/profile/reset', (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
+    // Same model-existence guard as PUT above. Without it the raw key reached the config maps:
+    // `constructor`/`__proto__` resolved to Object/Object.prototype, and the delete below removed
+    // a built-in (`?engine=entries` → Object.entries) for the whole process.
+    if (!d.scanner.get(key)) return err(c, 404, 'no_such_model', 'No model with that key.')
     // Per-engine profile (issue #35): reset only the edited engine's slot (?engine=<id>),
     // falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
@@ -2293,9 +2548,9 @@ export function registerApi(app: Hono, d: Deps): void {
       // A reset must not leave a stale pin shadowing the result — but only for the engine being
       // reset. The pin is per-MODEL and this reset is per-ENGINE, so clearing a pin that belongs
       // to a different engine would drop that engine's tune for an unrelated action (issue #35).
-      const pinnedId = cfg.lastPresetId[key]
+      const pinnedId = ownEntry(cfg.lastPresetId, key)
       if (pinnedId) {
-        const pinned = (cfg.modelPresets[key] ?? []).find((x) => x.id === pinnedId)
+        const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         if (!pinned || pinned.engineId === '' || pinned.engineId === engineId) delete cfg.lastPresetId[key]
       }
     })
@@ -2408,6 +2663,7 @@ export function registerApi(app: Hono, d: Deps): void {
 
     // Telemetry consent level (spec 09 §3): off | anon | full. Validate the enum.
     let telemetryLevel: string | undefined
+    const prevTelemetryLevel = d.store.snapshot().telemetry.level
     if (b.telemetryLevel !== undefined) {
       if (!['off', 'anon', 'full'].includes(b.telemetryLevel)) {
         return err(c, 400, 'invalid_config_value', 'telemetryLevel must be off, anon, or full.')
@@ -2531,8 +2787,31 @@ export function registerApi(app: Hono, d: Deps): void {
       toolPolicies = validated
     }
 
-    const before = d.store.snapshot().daemon
-    d.store.update((cfg) => {
+    // Remote-access provider changes only while no tunnel is up. Saved mid-session, the new
+    // provider is what the next crash/health restart (or boot) starts — publishing the box
+    // through a provider whose exposure was never confirmed — while the UI already labels the
+    // still-running old tunnel with it.
+    let providerChangeClearsEnabled = false
+    if (b.remoteAccess?.provider !== undefined && d.remote) {
+      const kind = d.remote.state().kind
+      const running = kind === 'starting' || kind === 'connected' || kind === 'reconnecting'
+      const enabled = d.store.snapshot().remoteAccess.enabled
+      const changed = normalizeProvider(b.remoteAccess.provider) !== d.store.snapshot().remoteAccess.provider
+      // `enabled` as well: it stays true through failed / needs-setup / unavailable, and the next
+      // boot auto-starts whatever provider is saved. Not in `off`, though, where the UI shows
+      // remote access off and lets a provider be picked (its rule is "any state but off"), so a 409
+      // there was a dead end. `enabled` can be set in `off`: a Start that raced a Stop from another
+      // client, or the moment at boot before the auto-start runs (a config booted with the
+      // experimental flag off has it cleared at boot, see clearEnabledWhileFlagOff). The change is
+      // taken and clears `enabled`, so nothing starts the new provider unconfirmed: not a later
+      // boot, and not this boot's pending start (cli.ts re-checks).
+      if (changed && (running || (kind !== 'off' && enabled))) {
+        return err(c, 409, 'remote_access_running', 'Turn remote access off before changing its provider.')
+      }
+      providerChangeClearsEnabled = changed && enabled
+    }
+
+    const apply = (cfg: Config): void => {
       Object.assign(cfg.daemon, updates)
       Object.assign(cfg.modelDefaults, mdUpdates)
       Object.assign(cfg.comfyui, cuUpdates)
@@ -2570,6 +2849,7 @@ export function registerApi(app: Hono, d: Deps): void {
       // provider must not wipe a stored tunnel token, and vice versa.
       const ra = b.remoteAccess
       if (ra?.provider !== undefined) cfg.remoteAccess.provider = normalizeProvider(ra.provider)
+      if (providerChangeClearsEnabled) cfg.remoteAccess.enabled = false // see the provider-change guard above
       if (ra?.ingressPort !== undefined) cfg.remoteAccess.ingressPort = resolveIngressPort(Number(ra.ingressPort), cfg.daemon.port)
       if (ra?.cloudflare?.tunnelToken !== undefined) cfg.remoteAccess.cloudflare.tunnelToken = String(ra.cloudflare.tunnelToken).trim()
       if (ra?.cloudflare?.hostname !== undefined) cfg.remoteAccess.cloudflare.hostname = String(ra.cloudflare.hostname).trim()
@@ -2616,7 +2896,40 @@ export function registerApi(app: Hono, d: Deps): void {
         cfg.tools.tavily = key ? { apiKey: key } : undefined
         s.tavilyApiKey = key || undefined
       }
-    })
+    }
+    // Some of these settings are credential management or decide who may reach the daemon at
+    // all, so they carry hostGate, like /api/v1/keys and every /api/v1/remote/* route.
+    // lanAuth alone let three callers that hostGate refuses rewrite them: a keyless Tailscale
+    // Serve identity, a verified Cloudflare Access JWT, and any peer on an open LAN (lanBind on,
+    // requireApiKey off). They could turn requireApiKey off or lanBind on (rebinding in place),
+    // swap the tunnel/ngrok tokens or the Access team/aud (a new team/aud takes effect at once on
+    // a running named tunnel, so whoever set it signs their own JWTs from then on, even after
+    // requireApiKey is back on), widen the remote token grant, set every tool to allow, put a
+    // directory of their own first on the build PATH, replace the stored HF/GitHub/search
+    // credentials, or switch on request-body capture to record the host's Code prompts (or
+    // switch the request log off). Judged on the outcome rather than on which fields the body
+    // names: the change is applied to a copy first, so the served UI's own Save, which echoes
+    // lanBind/requireApiKey/port unchanged with every general setting, still works.
+    //
+    // The refusal's code is api_key_required, not forbidden: the web client opens its key prompt
+    // on it (auth-signal.ts). With requireApiKey off nothing 401s, so nothing else asks a browser
+    // without a valid stored key for one, and a non-loopback bind's owner is such a browser:
+    // Docker with a published port (the owner arrives from the bridge address) after turning
+    // the requirement off, in a private window, from another origin, or with a revoked key.
+    // `field` names the setting for API clients; the message uses the Settings screen's words.
+    if (!hostGate(c, d)) {
+      const now = d.store.snapshot()
+      const trial = structuredClone(now)
+      apply(trial)
+      const changed = hostOnlySettingChanged(now, trial)
+      if (changed) {
+        const message = `Changing ${changed.label} requires a valid API key.`
+        return c.json({ error: { code: 'api_key_required', message, field: changed.field } }, 403)
+      }
+    }
+
+    const before = d.store.snapshot().daemon
+    d.store.update(apply)
     // Keep ToolRegistry in sync when tools config changes.
     if (b.tavilyApiKey !== undefined || b.search !== undefined) {
       d.tools?.updateConfig(d.store.snapshot().tools)
@@ -2627,10 +2940,22 @@ export function registerApi(app: Hono, d: Deps): void {
     // Report the consent choice once, ever (ADR-299 Decision 5). This is the
     // ONLY transmission a machine that chose Off ever makes, and the consent
     // copy is written to say exactly that. Fire-and-forget: the settings save
-    // must not wait on, or fail because of, a network call.
-    if (telemetryLevel !== undefined) void sendConsentChoice(d.store.dir(), telemetryLevel)
+    // must not wait on, or fail because of, a network call. Only when the level
+    // actually CHANGED: the Settings screen sends telemetryLevel with every save,
+    // so saving any unrelated field would otherwise spend the once-ever ping on
+    // a "choice" the user never made, and a later real opt-out would go unsent.
+    if (telemetryLevel !== undefined && telemetryLevel !== prevTelemetryLevel) void sendConsentChoice(d.store.dir(), telemetryLevel)
 
     const after = d.store.snapshot().daemon
+
+    // Experimental → Remote access switched off: from here every /api/v1/remote/* route (Stop
+    // included) refuses and the UI hides the section, so a running tunnel would stay public
+    // with no way to stop it. Stop it now, as Stop would (spec 30 §8.1: flag off → "the
+    // supervisor does not run"). Only a UI/config-managed tunnel (`remoteAccess.enabled`): the
+    // ungated `--tunnel` override (cli.ts) leaves that false and keeps running.
+    if (before.experimental?.remoteAccess && !after.experimental?.remoteAccess && d.store.snapshot().remoteAccess.enabled) {
+      await stopRemoteAccess(d)
+    }
 
     // A LAN-bind or port change re-points the HTTP listener. Rather than a full daemon
     // restart (which unloads the model), do an in-place rebind that keeps everything
@@ -2643,7 +2968,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if ((lanChanged || portChanged) && d.rebind) {
       const doRebind = d.rebind
       setTimeout(() => doRebind(), 250)
-      rebind = { portChanged, port: after.port, lanBind: after.lanBind }
+      // The port the listener ends up on: the configured one only when this save changed it —
+      // otherwise the rebind keeps the bound port (`--port`/`--addr`, e.g. the Android app's 7000).
+      rebind = { portChanged, port: portChanged ? after.port : (d.bindPort ?? after.port), lanBind: after.lanBind }
     }
     return c.json({ ...settingsPayload(d), rebind })
   })
@@ -2651,6 +2978,11 @@ export function registerApi(app: Hono, d: Deps): void {
   // ── MCP server management (v0.7.0) ────────────────────────────────────────
 
   app.post('/api/v1/mcp/servers', async (c) => {
+    // A stdio server is a caller-chosen command the daemon spawns right away (syncMcpServers).
+    // Same isLocalOrAuthenticated rule as every other route that executes a caller-supplied
+    // program (POST /engines, /engines/scan, /build/*, ADR-394).
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Adding an MCP server requires a valid API key from a non-host device.')
     const b = await body<Partial<McpServer>>(c)
     const transport = b.transport === 'sse' ? 'sse' : 'stdio'
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
@@ -2680,11 +3012,15 @@ export function registerApi(app: Hono, d: Deps): void {
       await d.tools?.buildToolDefinitions()
     }
     // apiKey is write-only: never echo the Bearer token back, even on the create response.
+    // Env values are write-only too (maskMcpEnv).
     const { apiKey: _created, ...safeServer } = server
-    return c.json(safeServer, 201)
+    return c.json(maskMcpEnv(safeServer), 201)
   })
 
   app.put('/api/v1/mcp/servers/:id', async (c) => {
+    // Can swap in a new command and respawns it — same rule as the create route above.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'forbidden', 'Editing an MCP server requires a valid API key from a non-host device.')
     const id = c.req.param('id')
     const b = await body<Partial<McpServer>>(c)
     const cfg = d.store.snapshot()
@@ -2698,16 +3034,26 @@ export function registerApi(app: Hono, d: Deps): void {
       if (b.enabled !== undefined) s.enabled = !!b.enabled
       if (b.command !== undefined) s.command = b.command
       if (b.args !== undefined) s.args = b.args
-      if (b.env !== undefined) s.env = b.env
-      if (b.url !== undefined) s.url = b.url
+      // Env values go out masked (maskMcpEnv), so the edit form sends a value it never saw as
+      // MCP_ENV_MASK: that keeps the stored one. A key left out is removed, as before.
+      if (b.env !== undefined) s.env = mergeMcpEnv(s.env, b.env)
+      if (b.url !== undefined) {
+        // A stored Bearer key belongs to the service it was issued by. The key is write-only, so
+        // the edit form always opens with a blank key field, and pointing the URL at another host
+        // without typing a new key sent apiKey undefined, which kept the old key: the old service's
+        // token then went to the new host as Authorization: Bearer (mcp-client.ts). A move to
+        // another origin with no new key now drops it; a new path on the same origin keeps it.
+        if (b.apiKey === undefined && s.apiKey && !sameUrlOrigin(s.url, b.url)) s.apiKey = undefined
+        s.url = b.url
+      }
       if (b.apiKey !== undefined) s.apiKey = b.apiKey || undefined
     })
     await d.tools?.syncMcpServers(d.store.snapshot().mcp.servers).catch(() => {})
     await d.tools?.buildToolDefinitions()
-    // apiKey is write-only: strip the Bearer token from the update response too.
+    // apiKey is write-only: strip the Bearer token from the update response too, and mask env.
     const updated = d.store.snapshot().mcp.servers.find((s) => s.id === id)!
     const { apiKey: _updated, ...safeUpdated } = updated
-    return c.json(safeUpdated)
+    return c.json(maskMcpEnv(safeUpdated))
   })
 
   app.delete('/api/v1/mcp/servers/:id', async (c) => {
@@ -2792,7 +3138,7 @@ export function registerApi(app: Hono, d: Deps): void {
     const cfg = d.store.snapshot()
     return c.json({
       lanBind: cfg.daemon.lanBind,
-      lanUrl: `http://${getLanIp() ?? '127.0.0.1'}:${cfg.daemon.port}`,
+      lanUrl: `http://${getLanIp() ?? '127.0.0.1'}:${d.bindPort ?? cfg.daemon.port}`, // the port really bound
       hasApiKey: cfg.apiKeys.length > 0,
       requireApiKey: cfg.daemon.requireApiKey,
       isHost: isLocalRequest(c, d),
@@ -2969,7 +3315,14 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.post('/api/v1/downloads/:id/resume', (c) => {
-    const ok = d.downloads.resume(c.req.param('id'))
+    let ok: boolean
+    try {
+      ok = d.downloads.resume(c.req.param('id'))
+    } catch (e) {
+      // The row exists but another one is writing its file: 409, not "no such download".
+      const f = toDownloadFailure(e)
+      return err(c, f.status, f.code, f.message)
+    }
     if (!ok) return err(c, 404, 'no_such_download', 'No paused or errored download with that id.')
     return c.json({ ok: true })
   })
@@ -3041,12 +3394,14 @@ export function registerApi(app: Hono, d: Deps): void {
   // lanBind is on, with no action beyond loading the page (ConnectSection queries it eagerly for
   // the default-selected CLI). Ungated, a non-host viewer on an open, unauthenticated LAN could
   // get a real credential just by opening Developer — worse than the list/create case, since it
-  // requires no explicit "create" click at all.
+  // requires no explicit "create" click at all. lanAuth (auth.ts) also refuses it cross-site and
+  // without the `X-TurboLLM-UI` header the web UI sends, as it replaces a key on a plain GET.
   app.get('/api/v1/connect/:cli', (c) => {
     if (!keysHostGate(c)) return err(c, 403, 'forbidden', 'Connect setup is only available from this machine until "Require an API key" is turned on.')
     const cli = c.req.param('cli')
     const cfg = d.store.snapshot()
-    const { port, lanBind } = cfg.daemon
+    const { lanBind } = cfg.daemon
+    const port = d.bindPort ?? cfg.daemon.port // the port really bound (see GET /network's lanUrl)
     const host = lanBind ? (getLanIp() ?? '127.0.0.1') : '127.0.0.1'
     const base = `http://${host}:${port}`
     const ms = d.manager.status()
@@ -3055,6 +3410,11 @@ export function registerApi(app: Hono, d: Deps): void {
 
     let apiKey = 'not-needed-on-localhost'
     if (lanBind) {
+      // `?mint=0`: the Connect page fetching on its own because it last read the daemon as
+      // loopback-only. That read can be stale (LAN switched on from another window while the page
+      // stayed open), and minting here would revoke the key a CLI is already using. Refuse; the
+      // page re-reads the network info and offers its explicit "Generate" instead.
+      if (c.req.query('mint') === '0') return err(c, 409, 'lan_bound', 'LAN sharing is on, so setup snippets carry a new key: generate them explicitly.')
       const keyName = `cli-${cli}`
       const { full, hash, prefix } = generateApiKey()
       const fresh: ApiKey = {
@@ -3079,6 +3439,26 @@ export function registerApi(app: Hono, d: Deps): void {
   registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
 }
 
+/** What {@link overlayModel} reads from the config and the registry, taken once per request by
+ *  the list endpoint (every registry lookup is a config snapshot too). The registry lookups are
+ *  lazy and memoized: most rows only need `active`. */
+type OverlayShared = { snap: Config; registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'> }
+
+function overlayShared(d: Deps): OverlayShared {
+  const once = <T>(f: () => T): (() => T) => {
+    let v: { r: T } | undefined
+    return () => (v ??= { r: f() }).r
+  }
+  return {
+    snap: d.store.snapshot(),
+    registry: {
+      active: once(() => d.registry.active()),
+      layaEngine: once(() => d.registry.layaEngine()),
+      litertLmEngine: once(() => d.registry.litertLmEngine()),
+    },
+  }
+}
+
 /** Overlay the live-dynamic flags (loaded, hasProfile) and tiered t/s (lastTps,
  *  liveTps) onto a scanned entry (spec 04 §5). `lastTps` is the most-recent gen
  *  t/s recorded for this model; pass the precomputed map on the list endpoint to
@@ -3086,10 +3466,12 @@ export function registerApi(app: Hono, d: Deps): void {
  *  session-stats accumulator yet (that's a separate B4 task), so we surface the
  *  loaded model's last recorded gen t/s as its live figure — non-null only while
  *  that model is the one currently loaded. */
-function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) {
+function overlayModel(
+  e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>,
+  { snap, registry }: OverlayShared = { snap: d.store.snapshot(), registry: d.registry },
+) {
   const ms = d.manager.status()
   const loadedKey = ms.state === 'running' ? ms.model?.key : undefined
-  const snap = d.store.snapshot()
   const profiles = snap.modelProfiles
   const loadedInPrimary = loadedKey === e.path || loadedKey === e.key
   // F-033: a model loaded via gateway auto-swap (keepN > 1) lives in a separate Manager
@@ -3109,7 +3491,7 @@ function overlayModel(e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>) 
   // MLX/vLLM. No active engine → everything is shown (compatible: true).
   // `incompatibleReason` is the short row text for why not (e.g. "Needs vLLM (Linux or WSL2)").
   // A Laya model is checked against the Laya engine it loads on, not the active one (engineForModel).
-  const engine = engineForModel(d.registry, e)
+  const engine = engineForModel(registry, e)
   const inc = engine ? modelIncompatibility(engine.kind, e) : null
   const compatibleWithActiveEngine = !inc
   const incompatibleReason = inc?.label ?? null
@@ -3164,6 +3546,40 @@ function tunnelStatusSnapshot(d: Deps): { active: boolean; url: string | null; e
   return { active, url: d.remote.url(), error }
 }
 
+/** The first PATCH /api/v1/settings field that `after` changes from `before` and only a caller
+ *  passing hostGate may change, with its name as the Settings screen words it, or null.
+ *  Everything else (theme, titles, model defaults, the gateway pool, ...) stays open to any
+ *  caller lanAuth admits. */
+function hostOnlySettingChanged(before: Config, after: Config): { field: string; label: string } | null {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  const fields: [string, string, (c: Config) => unknown][] = [
+    ['lanBind', 'LAN access', (c) => c.daemon.lanBind],
+    ['requireApiKey', '"Require an API key"', (c) => c.daemon.requireApiKey],
+    ['port', 'the port', (c) => c.daemon.port],
+    ['experimental.remoteAccess', 'remote access', (c) => c.daemon.experimental.remoteAccess],
+    ['remoteAccess', 'remote access', (c) => c.remoteAccess],
+    // First on PATH for the prereq probe (GET /api/v1/build/prereqs, ungated) and every build,
+    // which run git/cmake/nvcc/the compiler from there: a directory of the caller's own, or a
+    // UNC share on Windows (it passes the absolute-path check), is command execution.
+    ['build.toolchainDirs', 'the build toolchain folders', (c) => c.build.toolchainDirs],
+    ['toolPolicies', 'tool permissions', (c) => c.tools.toolPolicies],
+    ['autoAllowAll', '"Auto-allow all"', (c) => c.tools.autoAllowAll],
+    // Body capture records Code sessions' and `turbollm launch` agents' full prompts, which only
+    // a hostGate caller may read back (REQUEST_BODIES_HOST_ONLY); switching it on from here was
+    // the way to start that capture. Turning the log off hides from the owner what was sent.
+    ['requestLog.enabled', 'the request log', (c) => c.requestLog.enabled],
+    ['requestLog.captureBodies', '"Log prompts and responses"', (c) => c.requestLog.captureBodies],
+    ['hfToken', 'the Hugging Face token', (c) => c.hf.token],
+    ['ghToken', 'the GitHub token', (c) => c.gh?.token ?? ''],
+    // Field by field: the handler creates an empty `search` block on every save.
+    ['search.tavilyApiKey', 'the Tavily API key', (c) => [c.tools.search?.tavilyApiKey, c.tools.tavily?.apiKey]],
+    ['search.kagiApiKey', 'the Kagi API key', (c) => c.tools.search?.kagiApiKey],
+    ['search.searxngUrl', 'the SearXNG URL', (c) => c.tools.search?.searxngUrl],
+  ]
+  for (const [field, label, get] of fields) if (!same(get(before), get(after))) return { field, label }
+  return null
+}
+
 /** The UI-exposed settings subset. Telemetry is surfaced as the 3-option enum. */
 function settingsPayload(d: Deps) {
   const cfg = d.store.snapshot()
@@ -3205,7 +3621,9 @@ function settingsPayload(d: Deps) {
       searxngUrl: cfg.tools.search?.searxngUrl ?? '',
     },
     // apiKey is write-only: strip before echoing so Bearer tokens never reach the frontend.
-    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: _k, ...s }) => s) },
+    // apiKeySet says only whether one is stored, so the edit form can show it and offer a clear.
+    // A stdio server's env values are write-only as well: key names only (maskMcpEnv).
+    mcp: { ...cfg.mcp, servers: cfg.mcp.servers.map(({ apiKey: k, ...s }) => ({ ...maskMcpEnv(s), apiKeySet: !!k })) },
     // Build environment (ADR-100): folders prepended to PATH for compile-from-source so a
     // conda-env / custom-path CUDA Toolkit + compiler are found. Not secret — echoed back.
     build: { toolchainDirs: cfg.build.toolchainDirs },
@@ -3399,12 +3817,18 @@ function localCountFor(d: Deps, repo: string): number {
 /** A download (engine provision), a 1-click build, or a .zip upload writes under
  * `<dataDir>/engines` and ends by mutating the registry + flipping the active engine. They
  * must not run at once (ADR-100). Returns a user-facing message when either is in flight,
- * else null. */
-export function engineWorkBusy(d: Deps): string | null {
+ * else null.
+ *
+ * `engineChange`: for the routes that only add, disable or delete an engine (POST /engines, DELETE /engines/:id,
+ * /engines/backends/:id and /engines/build). A CUDA Toolkit download or a build guide prerequisite install does not
+ * count there: it writes into no engine folder and registers nothing, yet it refused every Enable, Disable, Add and
+ * Delete for as long as it ran, with "A build is in progress". A source build still counts, as it may be writing
+ * into the very folder being deleted. */
+export function engineWorkBusy(d: Deps, opts: { engineChange?: boolean } = {}): string | null {
   if (zipUploadInFlight) return 'An engine zip upload is in progress — wait for it to finish.'
   if (engineUpdateInFlight) return 'An engine update is in progress — wait for it to finish.'
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
-  if (d.build.isActive()) return 'A build is in progress — wait for it to finish.'
+  if (d.build.isActive() && (!opts.engineChange || d.build.isEngineBuildActive())) return 'A build is in progress — wait for it to finish.'
   return null
 }
 
@@ -3462,6 +3886,41 @@ function engineBusy(d: Deps): boolean {
 function isCatalogRepo(repoUrl: string | undefined): boolean {
   if (!repoUrl) return false
   return catalogForPlatform().some((e) => sameRepo(repoUrl, e.homepage))
+}
+
+/** What every value of an MCP stdio server's env reads as over the wire (settings payload, the
+ *  POST/PUT /mcp/servers responses). Env is where MCP servers take their credentials (the
+ *  catalog's BRAVE_API_KEY, MYSQL_PASSWORD, HUGGINGFACE_TOKEN, …), and it went out in clear text,
+ *  while every other secret in the payload is write-only: even a keyless open-LAN peer, which may
+ *  not edit or spawn MCP servers, read them from GET /settings. The key names stay, so the edit
+ *  form can list them. web/src/lib/api.ts has the same string. */
+export const MCP_ENV_MASK = '••••••••'
+
+function maskMcpEnv<T extends { env?: Record<string, string> }>(s: T): T {
+  return s.env ? { ...s, env: Object.fromEntries(Object.keys(s.env).map((k) => [k, MCP_ENV_MASK])) } : s
+}
+
+/** PUT /mcp/servers/:id's env: the sent map replaces the stored one (a key left out is removed),
+ *  except that a key sent with MCP_ENV_MASK keeps its stored value; with none stored, it is
+ *  dropped (there is nothing to keep). */
+function mergeMcpEnv(stored: Record<string, string> | undefined, sent: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(sent ?? {})) {
+    if (v !== MCP_ENV_MASK) out[k] = v
+    else if (stored && Object.hasOwn(stored, k)) out[k] = stored[k]
+  }
+  return out
+}
+
+/** True when an MCP server's new URL is on the same origin (scheme, host, port) as its old one,
+ *  so its stored Bearer key may stay. A URL that does not parse counts as the same origin only
+ *  when it is the same string. */
+function sameUrlOrigin(oldUrl: string | undefined, newUrl: string): boolean {
+  try {
+    return new URL(oldUrl ?? '').origin === new URL(newUrl).origin
+  } catch {
+    return oldUrl === newUrl
+  }
 }
 
 function regErr(c: Context, e: unknown) {
@@ -3553,6 +4012,47 @@ function engineInstallDir(eng: Engine, enginesRoot: string): string | null {
     return inside(d) ? d : null
   }
   return null
+}
+
+/** Remove the hidden `.<name>.purge-<ms>` folders a purge or DELETE /engines/build renamed aside in `parent` but
+ *  could not delete (a Windows lock that outlasted the retries). Best effort and in the background
+ *  (discardPurgeTrash); a folder whose delete is still running is left to it. Both routes run it before their own
+ *  rename there. */
+function sweepPurgeTrash(parent: string): void {
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (/^\..+\.purge-\d+$/.test(name)) void discardPurgeTrash(join(parent, name))
+  }
+}
+
+/** The purge-trash deletes still running, by folder. */
+const purgeTrashDeletes = new Map<string, Promise<void>>()
+
+/** Delete a folder a purge or DELETE /engines/build renamed aside, in the background with fs/promises rm, as
+ *  discardParkedBuild does for the build a rebuild replaced. Both routes deleted it with a recursive rmSync, which
+ *  held the daemon's only thread for as long as a multi-GB build tree took to delete, and with maxRetries also slept
+ *  on that thread between retries (up to 1.5 s per locked entry). Now the routes reply first, and the waits on the
+ *  disk (seconds with Windows Defender scanning each file) and the retry back-off leave the thread free. The rm's own
+ *  callbacks still run on it: on a fast disk, a tree of tens of thousands of small files can hold it for about 0.3 s
+ *  at a time, about as long as the rmSync took; only a worker thread would avoid that. It retries, as a Windows lock
+ *  right after a Stop is brief. A folder already being deleted gets no second delete (a sweep finds it before its
+ *  delete has ended): the running one is returned. Never rejects; whatever stays locked, or a daemon exit cut short,
+ *  is swept by the next purge or delete in that folder. */
+function discardPurgeTrash(trash: string): Promise<void> {
+  const running = purgeTrashDeletes.get(trash)
+  if (running) return running
+  const deleting: Promise<void> = rm(trash, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    .catch(() => {
+      /* still locked: swept later */
+    })
+    .finally(() => purgeTrashDeletes.delete(trash))
+  purgeTrashDeletes.set(trash, deleting)
+  return deleting
 }
 
 function readTail(path: string, n: number): string[] {

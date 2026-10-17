@@ -241,6 +241,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // (including a manually-run `turbollm launch claude`) is completely unaffected.
     const { token: anthropicToken, codeSessionId: anthropicCodeSessionId } = resolveCodeSession(c)
     const anthropicHarness = resolveHarness(c, d, 'anthropic')
+    /** The session's slider is at "Off" (0) — applied to the mapped body below, see there. */
+    let thinkingOff = false
+    /** The session's reasoning-effort override — applied to the mapped body below, see there. */
+    let effortOverride: ReturnType<typeof sessionAuth.getReasoningEffortForToken> = null
     if (anthropicCodeSessionId) {
       // Coding-activity attribution, confirm half (see commitConfirmedCodeToolCalls): this
       // request's own history is what tells the daemon whether the edits it watched the engine
@@ -251,7 +255,13 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       const override = sessionAuth.getThinkingBudgetForToken(anthropicToken)
       if (override !== null) {
         req.thinking = override > 0 ? { type: 'enabled', budget_tokens: override } : undefined
+        thinkingOff = override === 0
       }
+      effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
+      // A real effort replaces a client's thinking off, as on the OpenAI passthrough (a session effort there clears a
+      // client's 'off'): mapped to off, {type:'disabled'} would send budget 0 and enable_thinking false beside
+      // reasoning_effort. It is read as thinking with no budget, so it gets mapToOpenAI's default (half of max_tokens).
+      if (req.thinking?.type === 'disabled' && effortOverride !== null && effortOverride !== 'off') req.thinking = { type: 'enabled' }
     }
 
     if (!req.max_tokens) {
@@ -274,6 +284,10 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // Route to the requested model — may trigger an auto-swap (v0.6.0).
     const routeResult = await d.modelRouter.route(req.model ?? '')
     if ('status' in routeResult) {
+      // Claude Code retries any 5xx up to 10 times unless told not to, and each retry of a model that fails to load
+      // evicts what was loaded and runs the whole failing load again. Only a refusal a retry cannot help says so: one
+      // that clears by itself (a model still loading, ComfyUI's queue, a link still connecting) is left retryable.
+      if (routeResult.permanent) c.header('x-should-retry', 'false')
       return c.json(
         { type: 'error', error: { type: 'api_error', message: routeResult.message } },
         routeResult.status,
@@ -289,9 +303,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // A remote answer must be labelled with the model the CALLER asked for. The local
     // manager's loaded model is a different model on a different machine, and reporting it
     // here would name the wrong weights in the response.
+    // A pool slot's model is named by the route (routeResult.modelName), not by the primary — which may hold a
+    // different model, or an embedding model the chat request never touched.
     const modelName = remote
       ? (req.model ?? 'remote')
-      : status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local')
+      : routeResult.modelName ?? (status.state === 'running' ? (status.model?.name ?? req.model ?? 'local') : (req.model ?? 'local'))
 
     // ── Agent behaviour scaffolding for external coding CLIs (see agent-guidance.ts) ──────
     // Loop detection/breaking, search-on-repeated-failure, and version+docs-before-a-dependency
@@ -308,19 +324,23 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     const guidance = req.tools?.length ? applyAgentGuidance(req, requestOrigin) : null
 
     const oaiBody = mapToOpenAI(req)
+    // "Off" must be said explicitly, the same way every other "off" in the daemon says it. With
+    // `req.thinking` merely cleared, mapToOpenAI sends no budget at all — which is how "unlimited"
+    // is spelled — so the slider's Off removed every thinking limit instead of disabling thinking.
+    if (thinkingOff) {
+      oaiBody.thinking_budget_tokens = 0
+      oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+    }
     // Terminal-agent reasoning-effort override (same mechanism as the thinking-budget one
     // above) — no equivalent field exists on the Anthropic-shaped `req`/mapToOpenAI, so this
     // is injected into the already-mapped OpenAI-shaped body's chat_template_kwargs instead.
-    if (anthropicCodeSessionId) {
-      const effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
-      // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
-      // string "off" — see reasoning-effort.ts.
-      if (effortOverride === 'off') {
-        oaiBody.thinking_budget_tokens = 0
-        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-      } else if (effortOverride !== null) {
-        oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
-      }
+    // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
+    // string "off" — see reasoning-effort.ts.
+    if (effortOverride === 'off') {
+      oaiBody.thinking_budget_tokens = 0
+      oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+    } else if (effortOverride !== null) {
+      oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
     }
     // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is
     // not in an external CLI's execution path, so the equivalent lever is denying tool calls for
@@ -338,8 +358,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     if (remote) {
       (oaiBody as Record<string, unknown>).model = remote.modelKey
     } else {
-      const localKind = servingEngineKind(d)
-      const oaiAlias = engineModelAlias(localKind, d.manager.currentOpts()?.modelPath)
+      // Shaped for the engine the router actually sent this to: a pool slot's, else the primary's.
+      const localKind = routeResult.engineKind ?? servingEngineKind(d)
+      const oaiAlias = engineModelAlias(localKind, routeResult.modelPath ?? d.manager.currentOpts()?.modelPath)
       if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
       // mapToOpenAI emits `max_tokens`, which LiteRT-LM ignores (see applyEngineTokenLimit).
       applyEngineTokenLimit(localKind, oaiBody as Record<string, unknown>)
@@ -620,6 +641,7 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
                 try { observeCodeSessionTurn(d, anthropicCodeSessionId, calls) } catch { /* swallow */ }
               },
               skipMessageStart: true, // already sent above, before the queue wait
+              redact: (t) => redactLocalPaths(d, t),
             })
             // streamSSE flushes each chunk immediately through Node.js's HTTP layer.
             // Raw ReadableStream does not — chunks buffer until the response completes,
@@ -688,6 +710,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         status: res.status, error: { code: type ?? anthropicErrorType(res.status), message },
         durationMs: Date.now() - requestStart,
       })
+      // A linked host marks a refusal no retry can help with x-should-retry: false, as this route
+      // does above. Pass it on, as gatewayV1Handler's relay does, or Claude Code runs the host's
+      // failing load again on every retry.
+      const shouldRetry = remote ? res.headers.get('x-should-retry') : null
+      if (shouldRetry) c.header('x-should-retry', shouldRetry)
       return c.json(
         { type: 'error', error: { type: type ?? anthropicErrorType(res.status), message } },
         asClientStatus(res.status),
@@ -789,6 +816,25 @@ export interface GatewayV1Options {
    *  the OWNER touching their own machine (host-idle.ts), or one peer's request would
    *  block the next peer's wake for the whole idle grace window. Defaults to 'local'. */
   origin?: 'local' | 'link'
+}
+
+/** Hop-by-hop headers (RFC 9110 §7.6.1): each describes one connection, the client's to us or ours to the engine,
+ *  so the pass-through forwards none of them in either direction. */
+const HOP_BY_HOP = ['connection', 'keep-alive', 'transfer-encoding', 'te', 'trailer', 'upgrade', 'proxy-authenticate', 'proxy-authorization', 'proxy-connection']
+
+/** The header names a Connection value lists, which are hop-by-hop too (RFC 9110 §7.6.1). Only valid names: Headers
+ *  throws on any other, and a garbled value must not turn the request into a 500. */
+function connectionNamed(headers: Headers): string[] {
+  return (headers.get('connection') ?? '').split(',').map((t) => t.trim().toLowerCase()).filter((t) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(t))
+}
+
+/** An engine response's headers as relayed to the client: without its hop-by-hop headers. llama-server's
+ *  `Connection: close` and `Keep-Alive` described its socket to us, and relayed they closed the client's own
+ *  keep-alive connection to the gateway. */
+function relayedHeaders(res: Response): Headers {
+  const headers = new Headers(res.headers)
+  for (const h of HOP_BY_HOP) headers.delete(h)
+  return headers
 }
 
 /** The whole /v1/* surface: GET /v1/models synthesis, POST /v1/chat/completions (body
@@ -914,6 +960,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   }
   const routeResult = await d.modelRouter.route(requestedModel)
   if ('status' in routeResult) {
+    if (routeResult.permanent) c.header('x-should-retry', 'false') // see the identical line in /v1/messages above
     return c.json(
       { error: { message: routeResult.message, type: 'model_not_loaded', code: 'model_not_loaded' } },
       503,
@@ -993,7 +1040,17 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // is exactly one place that knows how a link URL is spelled.
   const upstream = target + remotePath
   const headers = remote ? linkHeaders(remote, c.req.raw.headers) : new Headers(c.req.raw.headers)
-  if (!remote) headers.delete('host')
+  // Hop-by-hop headers describe the client's connection to US, not ours to the engine, and undici refuses several
+  // outright (`expect`, `transfer-encoding`, `keep-alive`, `upgrade`): fetch throws before any I/O and the client
+  // gets a 500. curl adds `Expect: 100-continue` to any body over 1 MB (a base64 vision request), and every client
+  // that streams its request body sends `Transfer-Encoding: chunked`.
+  // So is any header the client's Connection value names (read before `connection` itself goes).
+  if (!remote) for (const h of [...connectionNamed(headers), 'host', 'expect', ...HOP_BY_HOP]) headers.delete(h)
+  // TurboLLM's own credentials (the Android WebView's app-secret cookie and header, and X-TurboLLM-Auth, which also
+  // carries Turbo Link tokens) are for this daemon only — the engine never reads them, and whatever answers on the
+  // engine's internal port must not see them. `authorization` and `x-api-key` are left alone even when they carry the
+  // daemon key: an engine started with its own --api-key reads them.
+  if (!remote) for (const h of ['cookie', 'x-turbollm-auth', 'x-turbollm-app']) headers.delete(h)
 
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
   // Cancel the upstream engine request if the client disconnects (same reason as
@@ -1001,6 +1058,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // generating and occupy engine slots.
   const ac = clientAbort(c)
   const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
+  /** Set when the gateway itself added `stream_options.include_usage` (below), not the caller. */
+  let injectedUsage = false
 
   if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
     if (isChat) {
@@ -1010,7 +1069,9 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       }
       // LiteRT-LM only reads `max_completion_tokens` (see applyEngineTokenLimit). The local engine's
       // kind says nothing about a Turbo Link host's engine, which shapes the request itself.
-      if (parsedBody && !remote) applyEngineTokenLimit(servingEngineKind(d), parsedBody)
+      // Both shaped for the engine the router actually sent this to: a pool slot's (see RouteResult), else the primary's.
+      const localKind = routeResult.engineKind ?? servingEngineKind(d)
+      if (parsedBody && !remote) applyEngineTokenLimit(localKind, parsedBody)
       // Rewrite the outbound model id for engines that serve under a fixed alias
       // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
       // Routing above already used the caller's original id.
@@ -1020,7 +1081,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       if (parsedBody && remote) {
         parsedBody.model = remote.modelKey
       } else if (parsedBody) {
-        const alias = engineModelAlias(servingEngineKind(d), d.manager.currentOpts()?.modelPath)
+        const alias = engineModelAlias(localKind, routeResult.modelPath ?? d.manager.currentOpts()?.modelPath)
         if (alias) parsedBody.model = alias
       }
       // A plain OpenAI-protocol client (opencode/LiteLLM/any `@ai-sdk/openai-compatible`
@@ -1056,7 +1117,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
         const override = sessionAuth.getThinkingBudgetForToken(chatToken)
         if (override !== null) {
           if (override > 0) parsedBody.thinking_budget_tokens = override
-          else delete parsedBody.thinking_budget_tokens
+          else if (override === 0) {
+            // "Off", spelled the way every other "off" is (deleting the key spelled "unlimited").
+            // Ahead of the effort block below, which may still replace `enable_thinking`.
+            parsedBody.thinking_budget_tokens = 0
+            parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
+          } else delete parsedBody.thinking_budget_tokens
         }
         // Same override mechanism, for reasoning_effort — see session-auth.ts. A deliberate,
         // persistent Code-session override replaces whatever the client itself sent on this
@@ -1102,8 +1168,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // below silently sees no usage and GitHub #71 undercounts every streaming
       // OpenAI-protocol client that doesn't already request it. Only fills the gap
       // when the caller left it unset; never overrides an explicit choice.
+      // The engine then ends the stream with a `choices: []` usage chunk the caller never asked
+      // for, which breaks the standard `chunk.choices[0].delta` loop — so the client's copy has
+      // it removed again below (withoutInjectedUsage); only the stats drain reads it.
       if (parsedBody?.stream === true && parsedBody.stream_options === undefined) {
         parsedBody.stream_options = { include_usage: true }
+        injectedUsage = true
       }
       headers.delete('content-length') // re-serialised body has a new length
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
@@ -1230,11 +1300,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // would let the next queued request in on top of a still-running generation.
       logFinalized = true // the drain above owns finalizing this entry now, not the fallback below
       void drain.finally(() => { d.manager.generationEnd(); chatGateRelease?.() })
-      return new Response(a, { status: res.status, headers: res.headers })
+      if (injectedUsage) return withoutInjectedUsage(a, res)
+      return new Response(a, { status: res.status, headers: relayedHeaders(res) })
     } catch (e) {
       finalizeLog({ status: res.status, error: { code: 'tee_error', message: (e as Error)?.message || 'Failed to tee the response body.' } })
       chatGateRelease?.()
-      return new Response(res.body, { status: res.status, headers: res.headers })
+      return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
     }
   }
 
@@ -1273,7 +1344,98 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       asClientStatus(res.status),
     )
   }
-  return new Response(res.body, { status: res.status, headers: res.headers })
+  // A Turbo Link chat stream lands here, not in the tee above: the injection happened on this machine.
+  if (injectedUsage && res.ok && res.body) return withoutInjectedUsage(res.body, res)
+  if (remote) {
+    // fetch has already decoded whatever the host's side compressed (Cloudflare's edge gzips JSON for a client that
+    // accepts it, and fetch always asks), but keeps the `content-encoding` header: relayed as-is, the client tries
+    // to gunzip plain JSON and every non-streamed remote reply and error body is unreadable.
+    const relayed = relayedHeaders(res)
+    relayed.delete('content-encoding')
+    relayed.delete('content-length')
+    return new Response(res.body, { status: res.status, headers: relayed })
+  }
+  return new Response(res.body, { status: res.status, headers: relayedHeaders(res) })
+}
+
+/** The client's copy of a streamed chat completion as it would have been without the `stream_options.include_usage`
+ *  the gateway injected (see there): the `choices: []` usage chunk the engine sends only because of it is removed, and
+ *  anything else that chunk carried goes back on the finish chunk before it. llama.cpp puts its final `timings` on the
+ *  LAST chunk it sends (to_json_oaicompat_chat_stream), which is the usage chunk when one was asked for and the finish
+ *  chunk otherwise; dropping the usage chunk whole took the timings with it. Every other line passes through unchanged
+ *  as soon as it is complete; a finish chunk waits for the next line (the engine writes the two together), to see
+ *  whether a usage chunk follows it. `content-length` is dropped since the body may now differ from the one it
+ *  described, and `content-encoding` since fetch already decoded the body it applied to (see the remote relay above). */
+function withoutInjectedUsage(body: ReadableStream<Uint8Array>, res: Response): Response {
+  const parse = (line: string): Record<string, unknown> | undefined => {
+    if (!line.startsWith('data:')) return undefined
+    try {
+      const chunk = JSON.parse(line.slice(5).trim()) as unknown
+      return chunk !== null && typeof chunk === 'object' && !Array.isArray(chunk) ? chunk as Record<string, unknown> : undefined
+    } catch { return undefined }
+  }
+  const usageOnly = (line: string): Record<string, unknown> | undefined => {
+    const chunk = line.includes('"usage"') ? parse(line) : undefined
+    return chunk && Array.isArray(chunk.choices) && chunk.choices.length === 0 && chunk.usage != null ? chunk : undefined
+  }
+  const finishChunk = (line: string): Record<string, unknown> | undefined => {
+    const chunk = /"finish_reason"\s*:\s*"/.test(line) ? parse(line) : undefined
+    return chunk && Array.isArray(chunk.choices) && chunk.choices.some((ch) => (ch as { finish_reason?: unknown } | null)?.finish_reason != null)
+      ? chunk
+      : undefined
+  }
+  const dec = new TextDecoder()
+  const enc = new TextEncoder()
+  let buf = ''
+  let dropBlank = false // the blank line that terminated a dropped event goes with it
+  let held: { chunk: Record<string, unknown>; raw: string } | undefined // a finish chunk (and its blank line), unsent
+  const take = (line: string): string => {
+    if (dropBlank && line.trim() === '') { dropBlank = false; return '' }
+    dropBlank = false
+    if (held) {
+      if (line.trim() === '') { held.raw += line; return '' }
+      const { chunk, raw } = held
+      held = undefined
+      const usage = usageOnly(line)
+      if (!usage) return raw + take(line)
+      dropBlank = true
+      // Only what the request would not have produced comes off: `usage` itself. The fields both chunks carry (id,
+      // model, created, ...) are the finish chunk's already.
+      const extra = Object.keys(usage).filter((k) => k !== 'usage' && !(k in chunk))
+      if (extra.length === 0) return raw
+      for (const k of extra) chunk[k] = usage[k]
+      const nl = raw.indexOf('\n')
+      const head = nl === -1 ? raw : raw.slice(0, nl + 1)
+      return `data: ${JSON.stringify(chunk)}${head.slice(head.trimEnd().length)}${raw.slice(head.length)}`
+    }
+    const finish = finishChunk(line)
+    if (finish) { held = { chunk: finish, raw: line }; return '' }
+    if (usageOnly(line)) { dropBlank = true; return '' }
+    return line
+  }
+  const filtered = body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(bytes, controller) {
+      buf += dec.decode(bytes, { stream: true })
+      let out = ''
+      let nl: number
+      while ((nl = buf.indexOf('\n')) !== -1) {
+        const line = buf.slice(0, nl + 1)
+        buf = buf.slice(nl + 1)
+        out += take(line)
+      }
+      if (out) controller.enqueue(enc.encode(out))
+    },
+    flush(controller) {
+      const rest = buf + dec.decode()
+      let out = rest ? take(rest) : ''
+      if (held) out += held.raw
+      if (out) controller.enqueue(enc.encode(out))
+    },
+  }))
+  const headers = relayedHeaders(res)
+  headers.delete('content-length')
+  headers.delete('content-encoding')
+  return new Response(filtered, { status: res.status, headers })
 }
 
 // ── Coding-activity attribution for terminal-agent sessions ─────────────────

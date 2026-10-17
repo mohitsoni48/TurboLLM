@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, codeAuth, requiredCapability } from './auth'
+import { bypassesAuth, isLocalRequest, isLocalOrAuthenticated, isLoopbackBindHost, provisionBootstrapApiKey, provisionTunnelApiKey, verifyPresentedKey, verifyKeyValue, codeAuth, requiredCapability } from './auth'
 import type { ApiKey } from './config/config'
 import type { Context } from 'hono'
 import type { Deps } from './deps'
@@ -149,8 +149,8 @@ test('isLocalRequest: loopback-only bind with no tunnel at all is still always l
 // isLocalOrAuthenticated (agent actions: runs/config/skills, which execute on the host)
 // must inherit the SAME tunnel-safety guarantee as isLocalRequest — a request that
 // actually traversed remote access looks loopback too, so it must never take the bare
-// loopback shortcut; it has to fall through to the requireApiKey check just like any
-// other non-loopback caller (ADR-422, formerly ADR-152).
+// loopback shortcut; it has to present a key just like any other non-loopback caller
+// (ADR-422, formerly ADR-152).
 
 test('isLocalOrAuthenticated: THE CRITICAL CASE — a tunneled request that looks loopback must NOT bypass without a key', () => {
   const d = fakeDeps({ lanBind: false, ingressPort: 6997, requireApiKey: false })
@@ -158,10 +158,12 @@ test('isLocalOrAuthenticated: THE CRITICAL CASE — a tunneled request that look
   assert.equal(isLocalOrAuthenticated(c, d), false)
 })
 
-test('isLocalOrAuthenticated: a tunneled request is allowed once requireApiKey is on (lanAuth already verified the key)', () => {
-  const d = fakeDeps({ lanBind: false, ingressPort: 6997, requireApiKey: true })
-  const c = fakeContext({}, 6997)
-  assert.equal(isLocalOrAuthenticated(c, d), true)
+// requireApiKey on is no proof lanAuth saw a key: its Tailscale Serve and Cloudflare Access
+// exits let a request through with none, so the caller must present one here.
+test('isLocalOrAuthenticated: a tunneled request needs a key it presents itself, requireApiKey on or not', () => {
+  const d = fakeDepsWithKeys({ lanBind: false, ingressPort: 6997, hasKey: true, requireApiKey: true })
+  assert.equal(isLocalOrAuthenticated(fakeContext({}, 6997), d), false, 'no key: a Serve/Access identity alone')
+  assert.equal(isLocalOrAuthenticated(fakeContext({ 'x-turbollm-auth': RAW_KEY }, 6997), d), true)
 })
 
 test('isLocalOrAuthenticated: an ingress listener is bound but THIS request did not arrive on it is still local', () => {
@@ -182,10 +184,17 @@ test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKe
   assert.equal(isLocalOrAuthenticated(c, d), false)
 })
 
-test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel, requireApiKey on — remote allowed (authenticated by lanAuth)', () => {
-  const d = fakeDeps({ lanBind: true, requireApiKey: true })
-  const c = fakeContext({})
-  assert.equal(isLocalOrAuthenticated(c, d), true)
+test('isLocalOrAuthenticated: LAN-exposed, non-loopback, no tunnel — a remote caller with a valid key is allowed, whatever requireApiKey says', () => {
+  for (const requireApiKey of [true, false]) {
+    const d = fakeDepsWithKeys({ lanBind: true, hasKey: true, requireApiKey })
+    assert.equal(isLocalOrAuthenticated(fakeContext({}), d), false, `no key (requireApiKey ${requireApiKey})`)
+    assert.equal(isLocalOrAuthenticated(fakeContext({ authorization: `Bearer ${RAW_KEY}` }), d), true, `key (requireApiKey ${requireApiKey})`)
+  }
+})
+
+test('isLocalOrAuthenticated: a granted (Turbo Link) key is no key here', () => {
+  const d = fakeDepsWithKeys({ lanBind: true, hasKey: true, granted: ['models:use'], requireApiKey: true })
+  assert.equal(isLocalOrAuthenticated(fakeContext({ 'x-turbollm-auth': RAW_KEY }), d), false)
 })
 
 test('provisionTunnelApiKey: stores a fresh key and returns its full (unhashed) value', () => {
@@ -317,7 +326,7 @@ test('provisionBootstrapApiKey: a specific LAN address counts as non-loopback to
 const RAW_KEY = 'tllm-testkeyABCDEFGHIJKLMNOPQRSTUVWXYZ01'
 const RAW_KEY_HASH = createHash('sha256').update(RAW_KEY).digest('hex')
 
-function fakeDepsWithKeys(overrides: { lanBind?: boolean; ingressPort?: number; hasKey?: boolean; granted?: string[] }): Deps {
+function fakeDepsWithKeys(overrides: { lanBind?: boolean; ingressPort?: number; hasKey?: boolean; granted?: string[]; requireApiKey?: boolean }): Deps {
   const apiKeys = overrides.hasKey
     ? [{
         id: 'k1', name: 'test', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null,
@@ -329,7 +338,7 @@ function fakeDepsWithKeys(overrides: { lanBind?: boolean; ingressPort?: number; 
   return {
     store: {
       snapshot: () => ({
-        daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: false },
+        daemon: { lanBind: overrides.lanBind ?? false, requireApiKey: overrides.requireApiKey ?? false },
         apiKeys,
       } as unknown as ReturnType<Deps['store']['snapshot']>),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
@@ -482,4 +491,60 @@ test('requiredCapability: reading /api/v1/activity needs models:load; nothing ma
   assert.equal(requiredCapability('GET', '/api/v1/activity'), 'models:load')
   assert.equal(requiredCapability('HEAD', '/api/v1/activity'), 'models:load')
   assert.equal(requiredCapability('POST', '/api/v1/activity'), null)
+})
+
+// Every key check used to rewrite config.json (a full synchronous serialize + write + rename
+// on the event loop) just to bump lastUsedAt — once or twice per request, for a UI that polls
+// every 1–2 s. The bump is display-only, so a recent value is left alone.
+test('verifyKeyValue: lastUsedAt is persisted at most about once a minute, not on every request', () => {
+  const key = { id: 'k1', name: 't', hash: RAW_KEY_HASH, prefix: RAW_KEY.slice(0, 12), createdAt: '', lastUsedAt: null as string | null }
+  let writes = 0
+  const d = {
+    store: {
+      snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false }, apiKeys: [{ ...key }] }),
+      update: (fn: (cfg: { apiKeys: typeof key[] }) => void) => { writes++; fn({ apiKeys: [key] }) },
+    },
+  } as unknown as Deps
+
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 1, 'a never-used key is stamped')
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 1, 'a fresh stamp is not rewritten on every request')
+
+  key.lastUsedAt = new Date(Date.now() - 2 * 60_000).toISOString()
+  assert.equal(verifyKeyValue(RAW_KEY, d), true)
+  assert.equal(writes, 2, 'a stale stamp is refreshed')
+})
+
+// `--addr 0.0.0.0:…` / daemon.host bind every interface without setting lanBind; the
+// local-only gates must follow the address actually bound.
+test('isLocalRequest / isLocalOrAuthenticated: a non-loopback bind is LAN-exposed even with lanBind off', () => {
+  const d = fakeDeps({ lanBind: false, requireApiKey: false })
+  d.bindHost = '0.0.0.0'
+  const c = fakeContext({}) // address undetermined → fails closed on a LAN-exposed listener
+  assert.equal(isLocalRequest(c, d), false)
+  assert.equal(isLocalOrAuthenticated(c, d), false)
+  d.bindHost = '127.0.0.1'
+  assert.equal(isLocalRequest(c, d), true, 'a loopback bind is unchanged')
+})
+
+// DNS rebinding — loopback trust needs a Host that names this machine.
+test('isLocalRequest: a foreign Host header is never local, even on a loopback-only bind', () => {
+  const d = fakeDeps({ lanBind: false })
+  assert.equal(isLocalRequest(fakeContext({ host: 'rebind.attacker.example:6996' }), d), false)
+  assert.equal(isLocalOrAuthenticated(fakeContext({ host: 'rebind.attacker.example' }), d), false)
+  assert.equal(isLocalRequest(fakeContext({ host: '127.0.0.1:6996' }), d), true)
+  assert.equal(isLocalRequest(fakeContext({ host: 'localhost' }), d), true)
+})
+
+// Docker Desktop's `host.docker.internal` arrives on the host's loopback; neither a `.internal`
+// name nor an IP literal can be DNS-rebound, so both keep loopback trust.
+test('isLocalRequest: a .internal or IP-literal Host stays local on a loopback-only bind', () => {
+  const d = fakeDeps({ lanBind: false })
+  for (const host of ['host.docker.internal:6996', '192.168.1.20:6996', '[fe80::1]:6996']) {
+    assert.equal(isLocalRequest(fakeContext({ host }), d), true, host)
+    assert.equal(isLocalOrAuthenticated(fakeContext({ host }), d), true, host)
+  }
+  assert.equal(isLocalRequest(fakeContext({ host: 'evil.example' }), d), false)
 })

@@ -3,7 +3,7 @@
 // so no locking is needed. Unknown JSON fields ride along on `data` and are
 // preserved across round-trips for free.
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
@@ -409,6 +409,9 @@ export interface RemoteAccessConfig {
   tokenGrant: { capabilities: string[]; models?: string[] }
   /** Last known public URL, shown immediately after a daemon restart, stale until probed. */
   lastUrl: string
+  /** The provider that was serving lastUrl (absent in configs saved before it was recorded).
+   *  auth.ts trusts lastUrl as Serve's name only when Serve saved it. */
+  lastUrlProvider?: RemoteProviderId
 }
 
 /** Coerce anything unrecognized to the zero-setup default rather than leaving a broken id
@@ -709,7 +712,7 @@ export function migrateLegacyDataDir(): void {
   try {
     const cfgPath = join(next, 'config.json')
     if (!existsSync(cfgPath)) return
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8')) as { engines?: { binPath?: string }[] }
+    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8').replace(/^\uFEFF/, '')) as { engines?: { binPath?: string }[] }
     let changed = false
     for (const e of cfg.engines ?? []) {
       if (typeof e.binPath === 'string' && e.binPath.startsWith(prev)) {
@@ -786,6 +789,32 @@ export function defaultConfig(): Config {
   }
 }
 
+/** config.json's text, in whatever encoding a Windows tool saved it. PowerShell 5.1's `>` and
+ *  `Out-File` write UTF-16LE with a BOM (FF FE); `Set-Content -Encoding UTF8` and many editors
+ *  put a UTF-8 BOM first. JSON.parse rejects each of these as read, so load() reset the whole
+ *  config to defaults (API keys, engines, model dirs). A UTF-16BE BOM (FE FF) is decoded too. */
+export function decodeConfigText(bytes: Buffer): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le')
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // No 'utf16be' Buffer encoding: swap to LE (swap16 needs an even length; drop a stray byte).
+    return Buffer.from(bytes.subarray(2, bytes.length - (bytes.length % 2))).swap16().toString('utf16le')
+  }
+  return bytes.toString('utf8').replace(/^\uFEFF/, '')
+}
+
+/** The daemon's configured port from config.json, falling back to the shipped default — what
+ *  `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+ *  Best-effort — a missing/invalid config yields the shipped default. Keeps the literal default
+ *  in ONE place (defaultConfig) rather than hardcoded. Decoded like load() does, so a BOM a
+ *  Windows tool added does not read as "invalid" and silently put the shipped port in its place. */
+export function configuredDaemonPort(configPath: string): number {
+  try {
+    const cfg = JSON.parse(decodeConfigText(readFileSync(configPath))) as { daemon?: { port?: number } }
+    if (typeof cfg.daemon?.port === 'number' && cfg.daemon.port > 0) return cfg.daemon.port
+  } catch { /* missing or invalid config — use the shipped default below */ }
+  return defaultConfig().daemon.port
+}
+
 export class ConfigStore {
   private constructor(
     private data: Config,
@@ -800,12 +829,16 @@ export class ConfigStore {
       return store
     }
     let raw: Record<string, unknown>
-    const text = readFileSync(path, 'utf8')
+    // Decoded first: a BOM (UTF-8 or UTF-16, see decodeConfigText) would otherwise send a valid
+    // hand-edited config to the reset below.
+    const bytes = readFileSync(path)
+    const text = decodeConfigText(bytes)
     try {
       raw = JSON.parse(text) as Record<string, unknown>
     } catch {
       const backup = `${path}.broken-${Math.floor(Date.now() / 1000)}`
-      writeFileSync(backup, text)
+      // The file's own bytes: a decoded copy of a file in another encoding mangles its non-ASCII text.
+      writeFileSync(backup, bytes)
       const store = new ConfigStore(defaultConfig(), path, backup)
       store.save()
       return store
@@ -843,9 +876,20 @@ export class ConfigStore {
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    const tmp = `${this.filePath}.tmp`
+    // A tmp file of this process's own. Every process that loads the config saves it (load()
+    // persists its migration), so `turbollm --stop` or a refused second start writes the RUNNING
+    // daemon's config.json too; with one shared `config.json.tmp`, a Settings save interleaving
+    // with that had its tmp overwritten with the other process's older snapshot (which then
+    // became config.json), or found it already renamed away and threw ENOENT.
+    const tmp = `${this.filePath}.${process.pid}.tmp`
     writeFileSync(tmp, JSON.stringify(this.data, null, 2))
-    renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    try {
+      renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    } catch (e) {
+      // Per-process names are never overwritten by a later save: don't leave this one behind.
+      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
+      throw e
+    }
   }
 }
 
@@ -1255,6 +1299,7 @@ function normalize(c: Config): void {
         : undefined,
     },
     lastUrl: str(ra.lastUrl),
+    lastUrlProvider: (REMOTE_PROVIDERS as readonly string[]).includes(ra.lastUrlProvider as string) ? ra.lastUrlProvider : undefined,
   }
   // App auto-update settings (spec 29 B.4): absent in pre-this-feature configs → the
   // 'notify' default. The policy string is NOT validated here — `normalizeUpdatePolicy`
@@ -1571,21 +1616,36 @@ export function resolveConfiguredCtx(cfg: Config, modelKey: string, engineId: st
   return typeof profile?.ctx === 'number' && profile.ctx > 0 ? profile.ctx : undefined
 }
 
+/** `map[key]` for an OWN entry only. The per-model config maps (`modelProfiles`, `modelPresets`,
+ *  `lastPresetId`, a model's per-engine slots) are plain objects indexed by request input — a
+ *  path's model key, `?engine=` — and a key like `constructor` or `__proto__` would otherwise
+ *  resolve to the Object constructor or Object.prototype, so a later write or `delete` through it
+ *  changes those for the whole process (one request could delete `Object.entries`). */
+export function ownEntry<T>(map: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return map !== undefined && Object.hasOwn(map, key) ? map[key] : undefined
+}
+
+/** Keys no per-model config map may be written under: assigning `__proto__` swaps the map's
+ *  prototype instead of adding an entry, and the other two only ever name built-ins. */
+export function isUnsafeMapKey(key: string): boolean {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype'
+}
+
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model
   // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —
   // auto-tune seeds its search from this function and needs "this engine's own" profile.
   // A pin pointing at a deleted preset, or at a preset for another engine, falls straight
-  // through to the logic below. `?? {}` guards hand-built Configs that skip normalize().
-  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+  // through to the logic below. `ownEntry` also guards hand-built Configs that skip normalize().
+  const pinnedId = ownEntry(cfg.lastPresetId, modelKey)
   if (pinnedId) {
-    const pinned = (cfg.modelPresets ?? {})[modelKey]?.find((p) => p.id === pinnedId)
+    const pinned = ownEntry(cfg.modelPresets, modelKey)?.find((p) => p.id === pinnedId)
     if (pinned && (pinned.engineId === '' || pinned.engineId === engineId)) return pinned.profile
   }
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return undefined
-  const exact = byEngine[engineId]
+  const exact = ownEntry(byEngine, engineId)
   if (exact) return exact.profile
   // `>=` (not `>`): object key insertion order matches save order, so on an exact
   // millisecond tie (two rapid-fire saves) the later-inserted entry — the truly more
@@ -1602,7 +1662,8 @@ export function getModelProfile(cfg: Config, modelKey: string, engineId: string)
  *  engines. Creates the per-model map if absent; never touches other engines' profiles
  *  for the same model. */
 export function setModelProfile(cfg: Config, modelKey: string, engineId: string, profile: unknown): void {
-  ;(cfg.modelProfiles[modelKey] ??= {})[engineId] = { profile, updatedAt: new Date().toISOString() }
+  if (isUnsafeMapKey(modelKey) || isUnsafeMapKey(engineId)) throw new ValueError('modelProfiles', 'invalid model key or engine id.')
+  ;(ownEntry(cfg.modelProfiles, modelKey) ?? (cfg.modelProfiles[modelKey] = {}))[engineId] = { profile, updatedAt: new Date().toISOString() }
 }
 
 /** Move every piece of state keyed on `oldKey` to `newKey` — profiles, presets, the preset pin,
@@ -1652,7 +1713,7 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
  *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
 export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return
   delete byEngine[engineId]
   if (Object.keys(byEngine).length === 0) delete cfg.modelProfiles[modelKey]

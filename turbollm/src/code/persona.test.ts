@@ -6,6 +6,7 @@ import { test } from 'node:test'
 import { writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { agentsMdBlock, agentsMdPresence, buildAppendPrompt } from './persona'
+import { standingGuidance } from '../gateway/agent-guidance'
 import { tmpDir } from '../test-support/tmp'
 
 test('agentsMdBlock: returns "" when neither file exists', () => {
@@ -135,6 +136,31 @@ test('buildAppendPrompt: plan mode with hasWebTools=true still omits edit guidan
   const blocks = buildAppendPrompt('plan', [], undefined, true)
   assert.ok(!blocks.some((b) => b.includes('first read the file, then copy')))
   assert.ok(blocks.some((b) => b.includes('STRICT RULE, no exceptions')))
+})
+
+test('buildAppendPrompt: plan mode with hasWebTools=true never tells the model to call fetch_url (plan has web_search only)', () => {
+  const plan = buildAppendPrompt('plan', [], undefined, true)
+  assert.ok(plan.some((b) => b.includes('do NOT quietly substitute') && b.includes('web_search')))
+  assert.ok(plan.some((b) => b.includes('STRICT RULE, no exceptions') && b.includes('web_search')))
+  assert.ok(!plan.some((b) => b.includes('fetch_url')), 'no plan-mode block may name fetch_url')
+  // ask and auto still have fetch_url, so they keep the fetch step.
+  for (const m of ['ask', 'auto'] as const) {
+    const blocks = buildAppendPrompt(m, [], undefined, true)
+    assert.equal(blocks.filter((b) => b.includes('use fetch_url to read')).length, 2)
+  }
+})
+
+test('buildAppendPrompt: the web-tool rules match the gateway\'s rules 4 and 5 word for word, with fetch_url (ask) and without it (plan)', () => {
+  // gateway/agent-guidance.ts's standingGuidance holds a terminal CLI to the same two rules and is
+  // kept in lockstep with this text, including its wording for a client with no fetch tool.
+  const search = { name: 'web_search', input_schema: {} }
+  const fetch = { name: 'fetch_url', input_schema: {} }
+  for (const [mode, tools] of [['ask', [search, fetch]], ['plan', [search]]] as const) {
+    const [, rule4, rule5] = standingGuidance([...tools])
+    const blocks = buildAppendPrompt(mode, [], undefined, true)
+    assert.ok(blocks.includes(rule4), `${mode}: anti-fallback rule`)
+    assert.ok(blocks.includes(rule5), `${mode}: dependency rule`)
+  }
 })
 
 test('buildAppendPrompt: LSP guidance appears in auto/ask but not plan mode (no edit tool there)', () => {

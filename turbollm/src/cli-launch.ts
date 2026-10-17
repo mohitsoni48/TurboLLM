@@ -537,11 +537,16 @@ const realFs: ConfigFs = {
  *  Regenerated on every launch rather than written once: content is fully determined by `port`,
  *  cheap to overwrite, and a stale port left over from a previous daemon would otherwise point
  *  the CLI at a server that no longer exists. */
-export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs): Promise<string> {
+export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs, platform: NodeJS.Platform = process.platform): Promise<string> {
   const dir = join(fs.home, '.turbollm')
   await fs.mkdir(dir)
   const path = join(dir, 'mcp-launch-config.json')
-  const config = { mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server', '--port', String(port)] } } }
+  const npxArgs = ['turbollm', 'mcp-server', '--port', String(port)]
+  // npx is a `.cmd` shim on native Windows, which claude can't spawn as a bare command (the
+  // server dies with "Connection closed") — run it through `cmd /c`, the wrapper Claude Code's
+  // own docs prescribe and the same one tools/mcp-client.ts uses for its stdio servers.
+  const server = platform === 'win32' ? { command: 'cmd', args: ['/c', 'npx', ...npxArgs] } : { command: 'npx', args: npxArgs }
+  const config = { mcpServers: { turbollm: server } }
   await fs.writeFile(path, JSON.stringify(config, null, 2))
   return path
 }
@@ -635,7 +640,7 @@ function commentedConfigError(path: string, label: string): PrepareResult {
       `Found an existing ${label} config at ${path} that uses comments and isn't yet ` +
       `pointed at TurboLLM — auto-merging would delete your comments when rewriting the file, ` +
       `so this is left to you.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 
@@ -649,13 +654,13 @@ function asObject(v: unknown): Record<string, unknown> | null {
 }
 
 /** Standard "can't safely touch your config" failure — points at the same info the
- *  web UI's Connect screen shows (Developer → Connect a tool). */
+ *  web UI's Connect tab shows (Customize → Connect → Connect an app). */
 function corruptConfigError(path: string, label: string): PrepareResult {
   return {
     ok: false,
     message:
       `Found an existing ${label} config at ${path} that doesn't parse as JSON — not overwriting it.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 

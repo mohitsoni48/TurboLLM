@@ -669,3 +669,14 @@ test('research: a failed reformulation never breaks the search', async () => {
   const results = await research({ query: 'best mattress for back pain' }, CFG, fetchImpl)
   assert.ok(results.length > 0, 'the primary pool must still be returned')
 })
+
+// A failed primary search used to come back as [] — indistinguishable from "found nothing",
+// so web_search told the model "No results found." for a revoked key or a provider outage.
+test('research: a failed primary search rejects instead of returning no results', async () => {
+  const unauthorized: FetchImpl = (async () => ({
+    ok: false, status: 401, statusText: 'Unauthorized', json: async () => ({}), text: async () => 'invalid api key',
+  } as Response)) as unknown as FetchImpl
+  await assert.rejects(research({ query: 'python' }, CFG, unauthorized), /401/)
+  const offline: FetchImpl = (async () => { throw new TypeError('fetch failed') }) as unknown as FetchImpl
+  await assert.rejects(research({ query: 'best mattress for back pain' }, CFG, offline), /fetch failed/)
+})

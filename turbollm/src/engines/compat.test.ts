@@ -77,6 +77,18 @@ test('modelIncompatibility: a GGUF model on vLLM is a format mismatch that needs
   })
 })
 
+// SGLang serves the same HF safetensors directories as vLLM. It used to fall through to the
+// llama.cpp GGUF default: every safetensors model was refused on it, and a GGUF was launched
+// with llama.cpp flags that sglang.launch_server rejects, so nothing could load.
+test('modelIncompatibility: SGLang loads safetensors models and refuses GGUF with its own message', () => {
+  assert.equal(modelIncompatibility('sglang', PLAIN_MLX), null)
+  assert.deepEqual(modelIncompatibility('sglang', PLAIN_GGUF), {
+    code: 'format',
+    label: 'needs llama.cpp',
+    message: 'The active engine is SGLang — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.',
+  })
+})
+
 test('modelIncompatibility: a safetensors model on llama.cpp is a format mismatch that needs MLX or vLLM', () => {
   assert.deepEqual(modelIncompatibility('llama-server', PLAIN_MLX), {
     code: 'format',

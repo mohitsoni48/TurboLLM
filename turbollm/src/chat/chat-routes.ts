@@ -2,16 +2,16 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import { resolveKey, grantKind } from '../auth'
+import { resolveKey, grantKind, hostGate } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import { sseSink, type EmitSink } from './emit-sink.js'
-import { buildEngineMessages, maybeAutoCompact, compactConversation } from './chat-compaction.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent } from './chat-compaction.js'
 
-import type { ClaimVerdict, ConversationStore, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
+import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
@@ -70,6 +70,40 @@ export function inFlightChatIds(): string[] {
   return [...inflight.keys()]
 }
 
+/** Removes `convId`'s entry only while it is still `ac`'s own. A client disconnect or a kill
+ *  switch drops the entry at once, but the aborted turn can keep unwinding for a long time
+ *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong
+ *  to the NEXT turn, which an unconditional delete would leave untracked: unreachable by Stop
+ *  and the kill switches, invisible to inFlightChatIds, and no longer a 409 guard. */
+function releaseInflight(convId: string, ac: AbortController): void {
+  if (inflight.get(convId) === ac) inflight.delete(convId)
+}
+
+/** The in-flight entries POST /compact took. A manual compaction holds the chat's slot as a turn
+ *  does, so every route refuses meanwhile, but with a turn's text ('Stop generation first.', 'A
+ *  generation is already running') the web UI toasted it over a chat showing only its Compacting
+ *  banner and no Stop. Keyed by the entry itself, not the chat, so the tag goes with it. */
+const compactions = new WeakSet<AbortController>()
+const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
+
+/** The 409 for a chat whose in-flight slot is taken, or null when it is free: compaction_in_progress
+ *  while a manual compaction holds it, otherwise generation_in_flight with the route's own text. */
+function inflightRefusal(c: Context, convId: string, turnMessage: string) {
+  const held = inflight.get(convId)
+  if (!held) return null
+  if (compactions.has(held)) return err(c, 409, 'compaction_in_progress', COMPACTING_MESSAGE)
+  return err(c, 409, 'generation_in_flight', turnMessage)
+}
+
+/** A turn route's streamSSE callback, releasing its in-flight entry however the callback
+ *  exits: runGeneration's own finally only covers a turn that reached it, and a throw before
+ *  that (e.g. a malformed request body) left the chat answering 409 until a restart. */
+function releasingInflight<T>(convId: string, ac: AbortController, cb: (stream: T) => Promise<void>): (stream: T) => Promise<void> {
+  return async (stream) => {
+    try { await cb(stream) } finally { releaseInflight(convId, ac) }
+  }
+}
+
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
 // advertising the model, is a REMOTE availability failure, not a local 409.
 // 403 joined with ADR-422's N2 fix: a remote-access token is authenticated but
@@ -77,6 +111,22 @@ export function inFlightChatIds(): string[] {
 type S = 200 | 201 | 202 | 400 | 403 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
+
+const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
+
+/** Edit-and-resend's branch (GitHub #52): the question `msg` and everything after it are frozen,
+ *  not deleted, and `content` becomes the question's newest version, with the same images and
+ *  documents. Shared by PUT /messages/:msgId and /continue { edit }. */
+function branchEditedQuestion(db: ConversationStore, convId: string, msg: Message, content: string): void {
+  // One transaction: an addMessage that failed after the freeze (disk full, an I/O error) left
+  // the question and its tail deactivated with no new version shown in their place.
+  db.transaction(() => {
+    db.freezeTail(convId, msg.seq, msg.id)
+    db.deactivateMessage(msg.id)
+    const variantGroup = db.getMessage(msg.id)!.variantGroup!
+    db.addMessage(convId, 'user', content, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments, docContext: msg.docContext })
+  })
+}
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
@@ -166,7 +216,12 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/conversations/:id', (c) => {
     const conv = db.getConversation(c.req.param('id'), true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
-    return c.json(conv)
+    // The compaction as the turns see it: one cut on a branch the user left is not this
+    // branch's, so the chat shows no divider, summary or Undo for it (Undo would delete the
+    // other branch's compaction) and the meter shows its measured reading, no projection. (The
+    // daemon's auto-compaction gate can judge this branch larger than that reading: see
+    // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
+    return c.json(setAsideFrozenCut(db, conv))
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -181,6 +236,10 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   })
 
   app.delete('/api/v1/conversations/:id', (c) => {
+    // Stop a generation still running for it (a background chat deleted from the sidebar, or
+    // from another device) — otherwise it keeps the engine busy, tool rounds and all, for a
+    // conversation that no longer exists. Its own unwind releases the in-flight entry.
+    inflight.get(c.req.param('id'))?.abort()
     const ok = db.deleteConversation(c.req.param('id'))
     if (!ok) return err(c, 404, 'not_found', 'Conversation not found.')
     return c.json({ ok: true })
@@ -237,6 +296,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       if (grantKind(resolveKey(c, d) ?? { grant: undefined }) === 'remote') {
         return err(c, 403, 'forbidden', 'A remote access token cannot change tool permissions for every future chat — use "Allow for this chat" instead.')
       }
+      // The same write as toolPolicies on PATCH /api/v1/settings, so the same hostGate. lanAuth
+      // lets three callers through here with no key and no capability check (a Tailscale Serve
+      // identity, a verified Cloudflare Access JWT, a peer on an open LAN), and the settings
+      // route refuses them that field; this one let them set any tool to allow for every chat.
+      // Every caller that passes may set toolPolicies through the settings route anyway, so the
+      // write running before the pending-approval lookup (the invariant below) gives none of
+      // them anything new. api_key_required, like the settings route's refusal: the web client
+      // opens its key prompt on it, as nothing else asks a browser on an open LAN for a key.
+      if (!hostGate(c, d)) {
+        return err(c, 403, 'api_key_required', 'Allowing a tool for every future chat requires a valid API key — use "Allow for this chat" instead.')
+      }
       d.store.update((cfg) => {
         cfg.tools.toolPolicies = { ...(cfg.tools.toolPolicies ?? {}), [toolName]: 'allow' }
       })
@@ -268,6 +338,11 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
+    // Checked before anything is stored: a string passed the emptiness check below on its own
+    // .length and was saved on the user row, which then broke the chat's view and every resend.
+    const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === 'string')
+    if (!isStrings(images) || !isStrings(textAttachments) || (b.docContext != null && typeof b.docContext !== 'string'))
+      return err(c, 400, 'invalid_input', 'images and textAttachments must be arrays of strings, and docContext a string.')
     // A message is valid if it has typed text OR carries an image or file
     // attachment — image-only / file-only sends are allowed.
     if (!content && images.length === 0 && textAttachments.length === 0)
@@ -285,11 +360,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
 
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    if (busy) return busy
 
     // Persist user message — only the typed text is stored as content; images are
-    // kept in attachments (the full doc context is folded into the engine prompt below).
-    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments })
+    // kept in attachments (the full doc context is folded into the engine prompt below,
+    // and kept in docContext so /continue can send this turn again with it).
+    const userMsg = db.addMessage(convId, 'user', content, { attachments: images, textAttachments, docContext: b.docContext })
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false } })
@@ -306,8 +383,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // here. Call the named function; never re-inline the expression (see its doc comment, I1).
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, async (stream) => {
-      stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
+    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
+      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
 
       // Emit meta event
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
@@ -322,22 +399,14 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
+      // setAsideFrozenCut: a cut left behind on another branch is not this branch's summary.
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(conv, allMsgs)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs)
       // Fold any attached document text into the prompt; attach images as multimodal parts.
-      const fullContent = b.docContext
-        ? (content ? `${b.docContext}\n\n${content}` : b.docContext)
-        : content
-      const userContent: unknown = images.length
-        ? [
-            ...(fullContent ? [{ type: 'text', text: fullContent }] : []),
-            ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
-          ]
-        : fullContent
-      engineMessages.push({ role: 'user', content: userContent })
+      engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
 
       await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
-    })
+    }))
   })
 
   // ── continue (regenerate last assistant response for the existing last user
@@ -345,7 +414,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/continue', async (c) => {
     const convId = c.req.param('id')
-    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
+    // `messageId` (with `regenerate`): the reply the client shows last, the one it means to replace.
+    // `edit` (Save & Resend, what the web UI sends): the question to give a new version and answer.
+    const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean; messageId?: string; edit?: { messageId?: string; content?: string } }>(c)
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -355,21 +426,67 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const upstream = resolved.upstream
 
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'A generation is already running for this conversation.')
+    const busy = inflightRefusal(c, convId, 'A generation is already running for this conversation.')
+    if (busy) return busy
+
+    // Save & Resend (`edit`): the question is branched only here, once nothing above refused the
+    // turn, as Regenerate sets its reply aside below. Sent first as its own request (PUT), a
+    // /continue the client then skipped (no model ready) or the daemon refused (a Turbo Link
+    // machine asleep, the model gone) left the branch ending on the new question, unanswered: the
+    // next send went out as user, user, which alternating-role templates reject on every later
+    // turn of that branch.
+    if (b.edit) {
+      if (b.regenerate) return err(c, 400, 'invalid_input', 'edit and regenerate cannot be combined.')
+      const content = typeof b.edit.content === 'string' ? b.edit.content.trim() : ''
+      if (!content) return err(c, 400, 'invalid_input', 'content required.')
+      const msg = typeof b.edit.messageId === 'string' ? db.getMessage(b.edit.messageId) : null
+      if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
+      if (msg.role !== 'user') return err(c, 400, 'invalid_input', 'Only a question can be edited and resent.')
+      // As in PUT: only a question on the shown branch.
+      if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+      branchEditedQuestion(db, convId, msg, content)
+      conv.messages = db.getMessages(convId)
+    }
 
     const lastUser = (conv.messages ?? []).filter((m) => m.role === 'user').at(-1)
     if (!lastUser) return err(c, 400, 'no_user_message', 'No user message to respond to.')
 
-    // Chat branching (GitHub #52): if /regenerate just deactivated the prior reply, the new
-    // placeholder joins its variant_group so the client can render a ‹ 1/2 › sibling switcher
-    // instead of the old reply simply having vanished. Must look specifically at the message
-    // immediately after the current active tail (getNextMessageAfterSeq), NOT "whatever has
-    // the globally highest seq" — a conversation with more than one branch point can have
-    // unrelated, higher-seq messages sitting inactive in a completely different branch.
-    const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
-    const variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
-      ? (priorVariant.variantGroup ?? priorVariant.id)
-      : undefined
+    // Regenerate (`regenerate: true`, what the web UI sends): the reply it replaces is set aside
+    // only here, once nothing above refused the turn. Sent first as its own request
+    // (/regenerate), a refusal here (a Turbo Link machine asleep, the model gone) left that reply
+    // deactivated with no switcher to bring it back, and the history ending on a user turn. One the
+    // engine or the host gives once the turn has started puts it back in runGeneration (replacedId).
+    const replaced = b.regenerate ? (conv.messages ?? []).at(-1) : undefined
+    // A stale tab or another device still showing an older last reply (a turn was added since)
+    // would otherwise replace one it never showed. Without `messageId` (API clients), the last
+    // row is replaced, as before.
+    if (b.regenerate && b.messageId != null && b.messageId !== replaced?.id)
+      return err(c, 409, 'stale_message', 'This reply is no longer the last message on the shown branch: the chat changed in another tab or device.')
+
+    // Chat branching (GitHub #52): the new placeholder joins the variant_group of the reply it
+    // replaces, so the client can render a ‹ 1/2 › sibling switcher instead of the old reply
+    // simply having vanished.
+    let variantGroup: string | undefined
+    if (replaced?.role === 'assistant') {
+      db.deactivateMessage(replaced.id)
+      conv.messages = conv.messages!.filter((m) => m.id !== replaced.id)
+      // The group of the reply just set aside (deactivateMessage creates it if it had none) —
+      // not the row right after the question: with two replies in a row (a chat routine's
+      // tool-call round, then its answer; an OpenAI import's tool-call turn), that row is the
+      // first one, still active, so the new reply got no group and the one it replaced sat
+      // alone in a group with no active member, which no switcher can reach.
+      variantGroup = db.getMessage(replaced.id)!.variantGroup!
+    } else {
+      // Otherwise, a reply an earlier POST /regenerate deactivated (API clients), if any. Must
+      // look specifically at the message immediately after the current active tail
+      // (getNextMessageAfterSeq), NOT "whatever has the globally highest seq" — a conversation
+      // with more than one branch point can have unrelated, higher-seq messages sitting inactive
+      // in a completely different branch.
+      const priorVariant = db.getNextMessageAfterSeq(convId, lastUser.seq)
+      variantGroup = priorVariant && priorVariant.role === 'assistant' && !priorVariant.isActive
+        ? (priorVariant.variantGroup ?? priorVariant.id)
+        : undefined
+    }
 
     // Create a placeholder assistant message
     db.addMessage(convId, 'assistant', '', { stats: { aborted: false }, variantGroup })
@@ -382,8 +499,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, async (stream) => {
-      stream.onAbort(() => { ac.abort(); inflight.delete(convId) })
+    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
+      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
 
       // Emit meta event (no new user message — reuse the existing last user message id)
       await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
@@ -397,11 +514,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
       // resolvable; a plain passthrough when not).
+      // `lastUser` is the turn being answered: it goes out with its images and documents, as
+      // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(conv, allMsgs)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), isCodeAuthorized })
-    })
+      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, isCodeAuthorized })
+    }))
   })
 
   // ── stop (spec 07 §2) ──────────────────────────────────────────────────────
@@ -424,7 +543,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!trimmed) return err(c, 400, 'invalid_input', 'content required.')
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
 
     if (msg.role === 'assistant') {
       // GitHub #52: edit the model's own reply in place — just fixing text, not resending,
@@ -438,11 +558,17 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // role === 'user': edit-and-resend now BRANCHES instead of destroying the downstream
     // history (GitHub #52) — the old message and everything after it is frozen, not deleted,
     // the same way /regenerate keeps a deactivated reply instead of deleting it.
-    if (trimmed === msg.content) return c.json({ messages: db.getMessages(convId) }) // no-op
-    db.freezeTail(convId, msg.seq, msg.id)
-    db.deactivateMessage(msg.id)
-    const variantGroup = db.getMessage(msg.id)!.variantGroup!
-    db.addMessage(convId, 'user', trimmed, { variantGroup, attachments: msg.attachments, textAttachments: msg.textAttachments })
+    // Unchanged text branches too: the client follows every user-message edit with /continue
+    // ("Save & Resend"), and an early return here let that answer the same turn a second time —
+    // two replies in a row, which Regenerate can't undo and alternating-role templates reject.
+    // Only a question on the shown branch: one a stale tab or another device still shows after
+    // it was switched away would freeze THIS branch's newer version and its reply under it, and
+    // switching back would then show two replies in a row.
+    // The web UI's Save & Resend goes through /continue { edit } instead, which branches only once
+    // the turn can run; a client that follows this PUT with /continue can still be left with the
+    // new question unanswered when that /continue is refused.
+    if (!msg.isActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+    branchEditedQuestion(db, convId, msg, trimmed)
     return c.json({ messages: db.getMessages(convId) })
   })
 
@@ -461,7 +587,6 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const convId = c.req.param('id')
     const conv = db.getConversation(convId)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
     // Resolved HERE, like the two turn routes, rather than left to compactConversation to
     // re-derive: a bare resolveChatUpstream(d) always lands on the local engine, which for a
     // Turbo Link chat means either a hard 'model_not_loaded' or a summary written by an
@@ -476,12 +601,26 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     const b = await body<{ model?: string }>(c)
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
+    // The compaction holds the conversation's in-flight slot, as a turn does, until it ends: up to
+    // a 60 s gate wait plus a 60 s summary call. Only checked before, a version switch, an edit or
+    // a Regenerate (from this tab or another) still ran meanwhile; the cut, picked from the branch
+    // shown at the start, was then stored on a branch the chat had left, or a turn started a
+    // second summarization. Registered like a turn, Stop, the engine kill switches and deleting
+    // the chat abort it too. Tagged, so what it holds back answers compaction_in_progress rather
+    // than a running turn's text (inflightRefusal).
+    const ac = new AbortController()
+    compactions.add(ac)
+    inflight.set(convId, ac)
     try {
-      await compactConversation(d, convId, { upstream: resolved.upstream })
+      await compactConversation(d, convId, { upstream: resolved.upstream, signal: ac.signal })
     } catch (e) {
       const code = e instanceof Error ? e.message : 'compaction_failed'
       if (code === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Not enough history yet to compact.')
       return err(c, 500, 'compaction_failed', 'Could not summarize this conversation.')
+    } finally {
+      releaseInflight(convId, ac)
     }
     return c.json(db.getConversation(convId)!)
   })
@@ -497,11 +636,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/conversations/:id/regenerate', (c) => {
     const convId = c.req.param('id')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
     const last = db.getLastMessage(convId)
     // Chat branching (GitHub #52): deactivate rather than delete — the old reply is kept
     // as a sibling variant, not destroyed. /continue (called next by the client) creates
-    // the new reply and joins it to the same variant_group.
+    // the new reply and joins it to the same variant_group. The web UI no longer calls this:
+    // it sends /continue { regenerate: true }, which deactivates only once the turn can run.
     if (last?.role === 'assistant') db.deactivateMessage(last.id)
     return c.json({ ok: true })
   })
@@ -515,24 +656,32 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     return c.json({ variants: db.getMessageVariants(msg.variantGroup) })
   })
 
-  // Chat branching: switch which sibling in a variant group is the active one. For a
-  // user-message group this also swaps the entire downstream tail (freeze the one we're
-  // leaving, restore the one we're entering) — an assistant-reply group never has anything
-  // downstream to move, since /regenerate only ever acts on the last message.
+  // Chat branching: switch which sibling in a variant group is the active one. This also
+  // swaps the entire downstream tail (freeze the one we're leaving, restore the one we're
+  // entering) — for an assistant-reply group too: /regenerate only acts on the last message,
+  // but the chat can go on after it, so an older reply's variants each have their own tail.
   app.post('/api/v1/conversations/:id/messages/:msgId/activate', (c) => {
     const { id: convId, msgId } = c.req.param()
     const msg = db.getMessage(msgId)
     if (!msg || msg.convId !== convId) return err(c, 404, 'not_found', 'Message not found.')
     if (!msg.variantGroup) return err(c, 400, 'invalid_input', 'Message has no alternate versions.')
-    if (inflight.has(convId)) return err(c, 409, 'generation_in_flight', 'Stop generation first.')
+    const busy = inflightRefusal(c, convId, 'Stop generation first.')
+    if (busy) return busy
     if (msg.isActive) return c.json({ messages: db.getMessages(convId) }) // already active, no-op
 
-    if (msg.role === 'user') {
-      const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
-      if (currentActive) db.freezeTail(convId, currentActive.seq, currentActive.id)
+    const currentActive = db.getMessageVariants(msg.variantGroup).find((v) => v.isActive)
+    // A group with no active member is not on the shown branch (a stale tab or another device
+    // still shows it): activating one would splice it, and its frozen tail, into this branch.
+    if (!currentActive) return err(c, 409, 'stale_message', STALE_MESSAGE)
+    // One transaction: a switch that failed partway (disk full, an I/O error) left this branch's
+    // tail frozen with the version it belongs to still shown, or the other version's tail restored
+    // next to it.
+    const group = msg.variantGroup
+    const ok = db.transaction(() => {
+      db.freezeTail(convId, currentActive.seq, currentActive.id)
       db.restoreTail(msgId)
-    }
-    const ok = db.setActiveVariant(msg.variantGroup, msgId)
+      return db.setActiveVariant(group, msgId)
+    })
     if (!ok) return err(c, 500, 'internal', 'Could not switch branch.')
     return c.json({ messages: db.getMessages(convId) })
   })
@@ -574,7 +723,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
 
     const cfg = d.store.snapshot()
-    const share = getShareTarget(cfg.daemon.port)
+    // The port really bound, not daemon.port: `--port`/`--addr` (the Android app's 7000) win over config.
+    const share = getShareTarget(d.bindPort ?? cfg.daemon.port)
     const url = `http://${share.host}:${share.port}/chat/${convId}`
     return c.json({ url, onlyLocal: share.onlyLocal })
   })
@@ -760,6 +910,9 @@ interface GenerationCtx {
    *  tool output) for this turn. Undefined on regenerate — no new user text exists there,
    *  so extraction is skipped by design (also avoids re-extracting already-scanned text). */
   userText?: string
+  /** Regenerate (/continue { regenerate: true }): the reply this turn set aside, which a turn the
+   *  engine or linked host refuses before producing anything shows again (see restoreReplaced). */
+  replacedId?: string
   /** Phase 4 / C1: whether THIS request's caller cleared the code-execution bar (host-local or a
    *  valid API key), computed by the route handler — the only place a Hono `Context` exists — and
    *  carried down here because runGeneration is Context-free by design. Forwarded verbatim to
@@ -1033,6 +1186,33 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
    *  progress at all (e.g. `return_progress` unsupported), which is exactly today's behavior. */
   let lastPromptTotal = 0
 
+  /** Regenerate (`ctx.replacedId`): /continue sets the old reply aside only once the turn can run,
+   *  but the engine or a linked host can still refuse it after that: an HTTP error (a 503 while a
+   *  model loads, a host that unloaded it), a fetch that throws (a host asleep since its last probe,
+   *  an engine that died), an error chunk in the stream. Such a turn left the old reply behind the
+   *  version switcher and an empty reply shown in its place. When the turn produced nothing (no
+   *  text, reasoning or tool call, nothing still held back by the parser), the empty placeholder is
+   *  deleted and the old reply shown again, before the error is sent, so the client's refetch on it
+   *  already sees the reply back. Only while both rows are as this turn left them (a DELETE of
+   *  either during the turn stands). Never throws: the catch below calls it, where nothing may. */
+  let restored = false
+  const restoreReplaced = (): boolean => {
+    if (!ctx.replacedId || fullContent || fullReasoning || allToolCalls.length > 0 || pendingParse?.buf) return false
+    try {
+      const replaced = db.getMessage(ctx.replacedId)
+      const placeholder = db.getMessage(assistantMsg.id)
+      const group = replaced?.variantGroup
+      if (!group || !placeholder?.isActive || placeholder.variantGroup !== group) return false
+      db.transaction(() => {
+        db.deleteMessage(assistantMsg.id)
+        db.setActiveVariant(group, replaced.id)
+      })
+      return true
+    } catch {
+      return false // rolled back: the turn ends as before, its empty reply shown
+    }
+  }
+
   // In-app chat is the owner using their own machine — the signal Turbo Link's wake
   // gate reads to refuse a peer's model swap (link/host-idle.ts). The gateway records
   // the terminal-agent paths; this is the only local path that never goes through it.
@@ -1042,7 +1222,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   if (localAccounting) d.manager.generationStart()
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
-    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
+    const baseToolDefs = d.tools ? await d.tools.buildToolDefinitions({ forGeneration: true }) : []
     // 'skill-creator' grants save_skill — the one tool a skill can add beyond the base
     // registry (every other skill is instructions text only). No-op unless enabled.
     const skillTools = enabledSkillIds.has('skill-creator')
@@ -1162,6 +1342,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           reason = (msg ?? text).trim().slice(0, 500)
         } catch { /* no body */ }
         if (reason) reason = engineErrorText(d, engineKind, reason)
+        restoreReplaced()
         await emit({ event: 'error', data: { code: 'engine_error', message: reason ? `Engine returned ${res.status}: ${reason}` : `Engine returned ${res.status}` } })
         return
       }
@@ -1592,6 +1773,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
+      restored = restoreReplaced() // a Stop (isAbort) keeps what it stopped
       // Belt and braces on top of resilientSink (GitHub #177): this emit is the one that used
       // to throw INSIDE the catch block, which no `finally` can contain — the rejection escaped
       // the whole function and skipped the `db.updateMessage` below, discarding everything the
@@ -1603,8 +1785,11 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     }
   } finally {
     if (localAccounting) d.manager.generationEnd()
-    inflight.delete(convId)
+    releaseInflight(convId, ac)
   }
+  // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
+  // count, as on the refused-response return above.
+  if (restored) return
 
   // GitHub #177: drain whatever the parser was still holding when the round was cut short (see
   // `pendingParse`). Non-null ONLY on the interrupted paths — a round that reached its own

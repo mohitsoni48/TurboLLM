@@ -17,12 +17,16 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpDir } from './test-support/tmp'
 import {
   INSTALL_METHODS,
   checkApplyBlockers,
   classifyInstall,
   classifyUpdateFailure,
   progressFromResult,
+  realPathOr,
   AppUpdateProgressState,
   type InstallSignals,
 } from './app-update-apply'
@@ -101,6 +105,17 @@ test('classifyInstall: the packaged desktop daemon is never treated as an npm in
 test('classifyInstall: the desktop env var alone is enough (wrapper-set, path-independent)', () => {
   const info = classifyInstall(signals({ desktopEnv: true, entry: '/anything/at/all/cli.js' }))
   assert.equal(info.method, 'electron')
+})
+
+test('classifyInstall: macOS desktop users are told to download the .dmg, not that updates are automatic', () => {
+  // The wrapper skips electron-updater on macOS: the unsigned dmg-only build cannot be installed by it.
+  const mac = classifyInstall(signals({ platform: 'darwin', desktopEnv: true }))
+  assert.equal(mac.method, 'electron')
+  assert.match(mac.note, /\.dmg/)
+  assert.doesNotMatch(mac.note, /in the background/)
+
+  const win = classifyInstall(signals({ platform: 'win32', desktopEnv: true }))
+  assert.match(win.note, /in the background/)
 })
 
 test('classifyInstall: a container refuses and shows a rebuild command', () => {
@@ -248,4 +263,25 @@ test('AppUpdateProgressState: only the in-flight states count as running', () =>
   // The target survives a transition that does not restate it — the dialog reads it after
   // the restart to confirm which version it landed on.
   assert.equal(s.get().target, '1.12.8')
+})
+
+test('realPathOr: a global install run through its <prefix>/bin symlink classifies as npm_global', { skip: process.platform === 'win32' ? 'symlinks need privileges on Windows (where npm runs the package path directly anyway)' : false }, () => {
+  // The real layout: <prefix>/bin/turbollm -> ../lib/node_modules/turbollm/bin/turbollm.mjs.
+  // argv[1] is the LINK, which is not under `npm root -g` — the bug was classifying it as-is.
+  const prefix = tmpDir('tllm-global-')
+  {
+    const pkgBin = join(prefix, 'lib', 'node_modules', 'turbollm', 'bin')
+    mkdirSync(pkgBin, { recursive: true })
+    writeFileSync(join(pkgBin, 'turbollm.mjs'), '')
+    mkdirSync(join(prefix, 'bin'))
+    const link = join(prefix, 'bin', 'turbollm')
+    symlinkSync(join('..', 'lib', 'node_modules', 'turbollm', 'bin', 'turbollm.mjs'), link)
+    const root = join(prefix, 'lib', 'node_modules')
+    assert.equal(classifyInstall(signals({ entry: link, npmGlobalRoot: root })).method, 'unknown')
+    // Both sides resolved (detectInstall does this): a tmpdir behind a symlink (macOS /var →
+    // /private/var) is the "prefix behind a symlink" case too.
+    assert.equal(classifyInstall(signals({ entry: realPathOr(link), npmGlobalRoot: realPathOr(root) })).method, 'npm_global')
+    // A path that can't be resolved is returned unchanged rather than throwing.
+    assert.equal(realPathOr(join(prefix, 'missing')), join(prefix, 'missing'))
+  }
 })

@@ -32,7 +32,7 @@ vi.mock('../../lib/queries', () => ({
   }),
   useSysInfo: () => ({ data: { gpus: [{ vramMb: 16000 }] } }),
   useStatus: () => ({ data: { engine: { kind: 'llamacpp' } } }),
-  useDownloadMutations: () => ({ enqueue: { mutate: enqueue, isPending: false, error: null } }),
+  useDownloadMutations: () => ({ enqueue: { mutate: enqueue, mutateAsync: enqueue, isPending: false, error: null } }),
   useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false } }),
   useSettings: () => ({ query: { data: { hfTokenSet: state.hfTokenSet } } }),
 }))

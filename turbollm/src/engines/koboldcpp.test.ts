@@ -4,13 +4,17 @@
 // koboldcpp-linux-x64[-nocuda] / koboldcpp-mac-arm64).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, readFileSync } from 'node:fs'
 import {
+  ensureKoboldcpp,
   koboldcppAssetName,
+  koboldcppBinPath,
   koboldcppProfileToArgs,
   koboldcppServerCommand,
   pickKoboldcppAsset,
 } from './koboldcpp'
 import type { ReleaseAsset } from './download'
+import { tmpDir } from '../test-support/tmp'
 
 test('koboldcppServerCommand passes model/host/port + skiplauncher and appends extraArgs', () => {
   const { cmd, args } = koboldcppServerCommand('/bin/koboldcpp', '/models/x.gguf', 8081, '127.0.0.1', [
@@ -94,4 +98,55 @@ test('pickKoboldcppAsset matches the wanted asset by exact name', () => {
 test('pickKoboldcppAsset returns null when the wanted asset is missing', () => {
   const assets: ReleaseAsset[] = [{ name: 'koboldcpp-mac-arm64', browser_download_url: 'u' }]
   assert.equal(pickKoboldcppAsset(assets, true, 'win32', 'x64'), null)
+})
+
+// ── Provisioning (fetch stubbed: the GitHub API answers `tag`, the asset URL answers `download`) ──
+// The binary used to be streamed straight to its final path, and an existing file counted as
+// installed — so a dropped download was later registered as KoboldCpp, an older binary was
+// labelled with the latest tag, and an Update had to delete the working binary before fetching.
+const realFetch = globalThis.fetch
+const ALL_ASSETS: ReleaseAsset[] = ['koboldcpp.exe', 'koboldcpp-nocuda.exe', 'koboldcpp-linux-x64', 'koboldcpp-linux-x64-nocuda', 'koboldcpp-mac-arm64']
+  .map((name) => ({ name, browser_download_url: `https://dl.test/${name}` }))
+const noAsset = !koboldcppAssetName(false) && 'KoboldCpp publishes no asset for this OS/arch'
+
+function stubRelease(t: { after: (fn: () => void) => void }, tag: string, download: () => Response): void {
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (u.includes('api.github.com')) return new Response(JSON.stringify({ tag_name: tag, assets: ALL_ASSETS }))
+    return download()
+  }) as typeof fetch
+}
+
+/** A response whose body dies part-way, like a connection reset mid-download. */
+const droppedDownload = () =>
+  new Response(new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('half a bin')); c.error(new Error('ECONNRESET')) } }))
+
+test('ensureKoboldcpp: an interrupted download leaves nothing a later Install would register', { skip: noAsset }, async (t) => {
+  const root = tmpDir('tllm-kobold-')
+  stubRelease(t, 'v1.2.0', droppedDownload)
+  await assert.rejects(ensureKoboldcpp(root, false))
+  assert.equal(existsSync(koboldcppBinPath(root)), false)
+  assert.equal(existsSync(`${koboldcppBinPath(root)}.part`), false)
+})
+
+test('ensureKoboldcpp: an installed binary reports the release it was downloaded as, not the latest', { skip: noAsset }, async (t) => {
+  const root = tmpDir('tllm-kobold-')
+  stubRelease(t, 'v1.0.0', () => new Response('kobold v1'))
+  assert.equal((await ensureKoboldcpp(root, false)).version, 'v1.0.0')
+  stubRelease(t, 'v2.0.0', () => { throw new Error('an installed binary must not be re-downloaded') })
+  assert.equal((await ensureKoboldcpp(root, false)).version, 'v1.0.0')
+})
+
+test('ensureKoboldcpp replace: a failed update keeps the working binary; a complete one replaces it', { skip: noAsset }, async (t) => {
+  const root = tmpDir('tllm-kobold-')
+  const bin = koboldcppBinPath(root)
+  stubRelease(t, 'v1.0.0', () => new Response('kobold v1'))
+  await ensureKoboldcpp(root, false)
+  stubRelease(t, 'v2.0.0', droppedDownload)
+  await assert.rejects(ensureKoboldcpp(root, false, undefined, undefined, { replace: true }))
+  assert.equal(readFileSync(bin, 'utf8'), 'kobold v1')
+  stubRelease(t, 'v2.0.0', () => new Response('kobold v2'))
+  assert.equal((await ensureKoboldcpp(root, false, undefined, undefined, { replace: true })).version, 'v2.0.0')
+  assert.equal(readFileSync(bin, 'utf8'), 'kobold v2')
 })

@@ -31,6 +31,31 @@ test('a completed run is readable after the manager is rebuilt', async () => {
   }
 })
 
+// The final write ran before the done frame was emitted, so once the run left memory its row
+// reported one frame fewer than the run had while it was live (2 here instead of 3).
+test('a completed run read back from the DB reports the event_seq of its done frame', async () => {
+  const dir = tmpDir('turbollm-run-durable-seq-')
+  const db = new ConversationStore(dir)
+  try {
+    const first = new PublicRunManager({ db })
+    const run = first.start({
+      scope: SCOPE, chatId: 'c1', messageId: 'm1',
+      body: async ({ emit }) => {
+        await emit({ event: 'delta', data: { delta: 'a' } })
+        await emit({ event: 'delta', data: { delta: 'b' } })
+        return { status: 'complete' }
+      },
+    })
+    await first.settled(run.id)
+    assert.equal(first.get(run.id)?.eventSeq, 3, 'two deltas and the done frame, numbered from 1')
+
+    const second = new PublicRunManager({ db })
+    assert.equal(second.get(run.id)?.eventSeq, 3)
+  } finally {
+    db.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('a run still streaming at restart is reconciled to failed/daemon_restarted', async () => {
   const dir = tmpDir('turbollm-run-orphan-')
   const db = new ConversationStore(dir)
@@ -85,6 +110,28 @@ test('listing runs is owner-scoped even when reading back from the persisted DB 
     const rebuilt = new PublicRunManager({ db })
     assert.deepEqual(rebuilt.list('acme', 'u1').map((r) => r.id), [mine.id], 'owner u1 must not see owner u2\'s persisted run')
     assert.deepEqual(rebuilt.list('acme', 'u2').map((r) => r.id), [theirs.id])
+  } finally {
+    db.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// The owner filter ran in JS AFTER the tenant-wide `LIMIT 100`, so once a run left the
+// in-memory map, an owner whose runs were older than 100 other owners' runs got an empty list.
+test("an owner's persisted runs are listed even when other owners in the tenant have 100+ newer runs", () => {
+  const dir = tmpDir('turbollm-run-list-limit-')
+  const db = new ConversationStore(dir)
+  try {
+    const row = (id: string, owner: string, createdAt: string) => ({
+      id, chatId: 'c', messageId: 'm', tenant: 'acme', owner, status: 'complete' as const,
+      eventSeq: 0, error: null, createdAt, endedAt: createdAt,
+    })
+    db.upsertExtRun(row('run_b', 'u-b', '2026-01-01T00:00:00.000Z'))
+    for (let i = 0; i < 100; i++) db.upsertExtRun(row(`run_a${i}`, 'u-a', new Date(Date.UTC(2026, 0, 2, 0, 0, i)).toISOString()))
+
+    // A fresh manager: nothing in memory, so this reads the persisted rows only.
+    const runs = new PublicRunManager({ db })
+    assert.deepEqual(runs.list('acme', 'u-b').map((r) => r.id), ['run_b'])
+    assert.equal(runs.list('acme', 'u-a').length, 100)
   } finally {
     db.close(); rmSync(dir, { recursive: true, force: true })
   }

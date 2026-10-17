@@ -25,6 +25,8 @@ interface FakeOverrides {
   busy?: 'download' | 'build'
   /** A live registered engine whose binary lives under the upload's target dir. */
   runningEngine?: { name: string; binPath: string }
+  /** The engine the loaded model was started on, while another engine (or none) is active. */
+  servingEngine?: { name: string; binPath: string }
   /** Registered (stopped or running) engines the occupant check must see. */
   engines?: Array<{ id: string; name: string; binPath: string }>
   /** Remembered custom sources (a Disabled engine's Enable path) the occupant check must see. */
@@ -44,7 +46,10 @@ function zipApp(o: FakeOverrides, dataDir: string): Hono {
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
-    manager: { status: () => ({ state: o.runningEngine ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }) },
+    manager: {
+      status: () => ({ state: o.runningEngine || o.servingEngine ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => (o.servingEngine ? { engine: { id: 'e-serving', kind: 'llama-server', ...o.servingEngine } } : null),
+    },
     provision: { get: () => ({ active: o.busy === 'download' }) },
     build: { isActive: () => o.busy === 'build' },
     registry: {
@@ -239,6 +244,20 @@ test('POST /api/v1/engines/zip: 409 when the upload would replace the RUNNING en
   }
 })
 
+test('POST /api/v1/engines/zip: 409 when the loaded model runs on the target dir\'s engine though it is not the active one', async () => {
+  const dir = tmpDir('tllm-zip-route-')
+  try {
+    const serving = { name: 'My Fork', binPath: join(dir, 'engines', 'build', 'myfork', serverBinName) }
+    const res = await postZip(zipApp({ servingEngine: serving }, dir), Buffer.from('x'))
+    assert.equal(res.status, 409)
+    const e = await errorBody(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /My Fork/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /api/v1/engines/zip: 409 when a STOPPED engine owns the target dir and it is not a zip install', async () => {
   // The ik_llama.cpp case from the PR review: 1-click git builds made before ADR-387 slug to
   // the bare repo name, so ik_llama.cpp.zip would otherwise delete the build — clone
@@ -328,6 +347,30 @@ test('POST /api/v1/engines/zip: a same-named re-upload UPDATES the existing engi
   }
 })
 
+test('POST /api/v1/engines/zip: a re-upload whose name differs only in letter case updates the engine in its own folder', async () => {
+  // On a case-sensitive file system (Linux) the marker was looked up under the upload's spelling, so this was a 409
+  // build_dir_taken telling the user to delete their own engine (release installs already used the on-disk spelling).
+  if (process.platform === 'win32') return // the probeable fixture is a POSIX script
+  const dir = tmpDir('tllm-zip-route-')
+  const refreshLog: Array<{ id: string; version: string; binPath?: string }> = []
+  try {
+    const buildDir = join(dir, 'engines', 'build', 'MyFork')
+    mkdirSync(buildDir, { recursive: true })
+    writeFileSync(join(buildDir, serverBinName), 'old working binary')
+    writeFileSync(join(buildDir, ZIP_BUILD_MARKER), 'MyFork.zip\n')
+    const engines = [{ id: 'e1', name: 'My Fork', binPath: join(buildDir, serverBinName) }]
+    const res = await postZip(zipApp({ engines, refreshLog }, dir), scriptZip('b5000'), 'myfork.zip')
+    assert.equal(res.status, 200)
+    const body = (await res.json()) as Extract<ZipScanResult, { found: true }> & { updated?: { id: string; name: string } }
+    assert.equal(body.binPath, join(buildDir, serverBinName))
+    assert.deepEqual(body.updated, { id: 'e1', name: 'My Fork' })
+    assert.equal(refreshLog[0]?.binPath, join(buildDir, serverBinName))
+    assert.deepEqual(readdirSync(join(dir, 'engines', 'build')), ['MyFork'])
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /api/v1/engines/zip: a fresh upload lands in engines/build/<slug> and reports the final path', async () => {
   if (process.platform === 'win32') return // the probeable fixture is a POSIX script
   const dir = tmpDir('tllm-zip-route-')
@@ -390,6 +433,22 @@ test('DELETE /api/v1/engines/zip: refuses a dir a registered engine still uses, 
     // A path outside the engines root: 404, never a deletion.
     res = await deleteZipInstall(zipApp({}, dir), '/etc/passwd')
     assert.equal(res.status, 404)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('DELETE /api/v1/engines/zip: refuses the hidden folder a purge renamed a zip install to, marker and all', async () => {
+  const dir = tmpDir('tllm-zip-route-')
+  try {
+    // The purge's background delete owns this folder; an rmSync here would race it on the daemon's thread.
+    const trash = join(dir, 'engines', 'build', `.myfork.purge-${Date.now()}`)
+    mkdirSync(trash, { recursive: true })
+    writeFileSync(join(trash, serverBinName), 'binary')
+    writeFileSync(join(trash, ZIP_BUILD_MARKER), 'myfork.zip\n')
+    const res = await deleteZipInstall(zipApp({}, dir), join(trash, serverBinName))
+    assert.equal(res.status, 404)
+    assert.equal(existsSync(join(trash, serverBinName)), true)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

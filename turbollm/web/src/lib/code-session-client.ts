@@ -86,8 +86,9 @@ export interface CodeSessionClientHandlers {
 export type CodeStreamFn = (sessionId: string, fromSeq: number, signal: AbortSignal) => AsyncGenerator<CodeStreamEvent>
 
 /** One reconnectable GET /stream subscription for a single Code session. Create one per session;
- *  discard (after abort()) and make a fresh one on session change — that's what resets the seq
- *  cursor and active-assistant id, so there's no explicit reset method. */
+ *  discard (after abort()) and make a fresh one on session change — that's what resets the
+ *  active-assistant id (the seq cursor also resets whenever the session goes idle or the client
+ *  gives up reconnecting), so there's no explicit reset method. */
 export class CodeSessionClient {
   private static readonly RECONNECT_MAX = 6
 
@@ -130,9 +131,19 @@ export class CodeSessionClient {
     let attempt = 0
 
     const run = async (): Promise<void> => {
+      let sawSeq = false // whether this connection has delivered a seq-numbered frame yet
       try {
         for await (const evt of this.streamFn(this.sessionId, this.lastSeq, ac.signal)) {
-          if (typeof evt.seq === 'number') this.lastSeq = Math.max(this.lastSeq, evt.seq + 1)
+          if (typeof evt.seq === 'number') {
+            // The daemon replays seq >= our cursor, so a connection whose FIRST numbered frame is
+            // below it got a stale cursor reset: one from before a daemon restart, past the new
+            // buffer's head, which the daemon answers by replaying the in-flight turn from its
+            // start (code-run-manager.ts's subscribe). Follow the new numbering from there. Kept,
+            // the higher old cursor would still be past the head on the next drop, and that
+            // reconnect would replay the whole turn again on top of the text already shown.
+            this.lastSeq = !sawSeq && evt.seq < this.lastSeq ? evt.seq + 1 : Math.max(this.lastSeq, evt.seq + 1)
+            sawSeq = true
+          }
           if (evt.event === 'meta') {
             attempt = 0 // a real frame means the connection is healthy again
             this.activeAssistantId = evt.data.assistantMessageId
@@ -191,6 +202,10 @@ export class CodeSessionClient {
           }
         }
         // Generator completed = the daemon says this session is idle. Stop and reconcile with DB.
+        // The cursor only has to survive reconnects WITHIN a run; the next turn starts from 0
+        // like a fresh client (the daemon floors replay at that turn's meta), so a daemon that
+        // restarted meanwhile and renumbers from 0 still replays the whole next turn.
+        this.lastSeq = 0
         this.active = false
         this.emitLive(null)
         this.handlers.onIdle()
@@ -202,6 +217,11 @@ export class CodeSessionClient {
         if (attempt <= CodeSessionClient.RECONNECT_MAX && this.ac === ac) {
           setTimeout(() => { if (this.ac === ac && !ac.signal.aborted) void run() }, Math.min(500 * attempt, 3000))
         } else {
+          // Giving up ends this run's subscription like the idle end above: the daemon may have
+          // restarted (renumbering from 0) while it was unreachable, so the host's next connect()
+          // on this client starts from 0 too. A still-running run replays from its turn's meta,
+          // as on a fresh page load (live was just cleared, so nothing is duplicated).
+          this.lastSeq = 0
           this.active = false
           this.emitLive(null)
           this.handlers.onLostConnection(e instanceof ApiError && e.status === 404)

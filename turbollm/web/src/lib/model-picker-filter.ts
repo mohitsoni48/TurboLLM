@@ -43,9 +43,10 @@ export function moveActiveIndex(key: string, index: number, count: number): numb
 }
 
 /** Where the highlight is now, given the key of the target the user last highlighted.
- *  Follows the row (even a disabled one: an explicit choice is respected); otherwise the first
- *  PICKABLE match while searching, else none. Never lands on the Eject target (the last of
- *  `targetKeys` beyond `choiceCount`) unless it IS `activeKey`. */
+ *  Follows the row (even a disabled one: an explicit choice is respected). A row the user
+ *  highlighted that has vanished leaves no highlight. With no key at all, the first PICKABLE
+ *  match while searching, else none. Never lands on the Eject target (the last of `targetKeys`
+ *  beyond `choiceCount`) unless it IS `activeKey`. */
 export function resolveActiveIndex(
   activeKey: string | null,
   targetKeys: string[],
@@ -55,7 +56,10 @@ export function resolveActiveIndex(
 ): number {
   const followed = activeKey === null ? -1 : targetKeys.indexOf(activeKey)
   if (followed >= 0) return followed
-  if (!hasQuery) return -1
+  // Typing clears the key and arrows/hover only store keys that exist, so a key that is set but
+  // missing means a refresh removed the user's row. Sliding to the first match would make the
+  // next Enter load a model the user never chose (and turn a highlighted Eject into a load).
+  if (activeKey !== null || !hasQuery) return -1
   return targetKeys.slice(0, choiceCount).findIndex((key) => !disabledKeys.has(key))
 }
 

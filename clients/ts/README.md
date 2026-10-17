@@ -44,7 +44,7 @@ for await (const ev of client.send(chat.id, { owner: 'user_123', content: 'Summa
       console.log('run started', ev.data)
       break
     case 'delta':
-      process.stdout.write((ev.data as { content: string }).content)
+      process.stdout.write((ev.data as { delta: string }).delta)
       break
     case 'done':
       console.log('\ndone:', (ev.data as { status: string }).status)
@@ -56,12 +56,19 @@ for await (const ev of client.send(chat.id, { owner: 'user_123', content: 'Summa
 `send()` returns a `RunStream` — an `AsyncIterable<ExtEvent>` you can `for await` directly. It
 also exposes, once the stream has been consumed:
 
-- `stream.runId` — the run's id, from the `run` frame.
+- `stream.runId` — the run's id, from the `run` frame (a stream from `resume()` or
+  `runs.stream()` carries the id it was attached to).
 - `stream.lastEventSeq` — the highest `event_seq` seen (the SSE `id:` field), the resume token
-  for `?after=` reconnects.
+  for `?after=` reconnects. `after` is exclusive: the server sends only the frames after it, so
+  nothing you already rendered is sent twice. It is `undefined` until the first frame arrives (a
+  stream from `resume()` or `runs.stream(id, after)` starts at the cursor it was attached from).
 - `stream.outcome` — `'complete' | 'failed' | 'aborted'` from the `done` frame's `status`, or
   `'unknown'` if the connection closed before a `done` frame ever arrived. **`'unknown'` is not
-  an error** — it means "ask the run", not "it failed."
+  an error** — it means "ask the run", not "it failed." A connection that drops mid-stream ends
+  the `for await` loop normally with `outcome === 'unknown'`; it does not throw.
+
+Breaking out of the loop early closes the connection. That does not cancel the run; use
+`runs.cancel` for that.
 
 ## Consuming a stream that got cut short
 
@@ -79,15 +86,24 @@ if (stream.outcome === 'unknown' && stream.runId) {
 }
 ```
 
-Or skip the manual reconciliation and use `resume()`, which reattaches from the last known
-`event_seq` and — per spec §7.3 — automatically falls back to `runs.get` + a fresh attach if the
-server reports `409 replay_window_exceeded` (the cursor aged out of the run's in-memory replay
-buffer):
+Or skip the manual reconciliation and use `resume()`, which reattaches after the last known
+`event_seq`. If the server reports `409 replay_window_exceeded` (the cursor aged out of the run's
+in-memory replay buffer), the frames in between are gone. `resume()` then does what the server
+asks: it re-reads the message, attaches at the run's current `event_seq`, and sets
+`resyncMessage` on the returned stream. When it is set, replace your rendered text with it
+instead of appending. It is read with `include: ['reasoning', 'tool_calls']`, so replace a
+rendered reasoning view or tool calls from it too:
 
 ```ts
-const resumed = await client.resume(stream.runId!, stream.lastEventSeq ?? 0, { owner: 'user_123' })
+const resumed = await client.resume(stream.runId!, stream.lastEventSeq, { owner: 'user_123' })
+if (resumed.resyncMessage) { /* replace your rendered text with resumed.resyncMessage.content */ }
 for await (const ev of resumed) { /* continue rendering */ }
 ```
+
+The message is checkpointed periodically while it streams, so `resyncMessage` can trail the
+reattach point slightly. Once the run has ended, `messages.get` returns the final text. If the
+run had already ended by then, `resyncMessage` is that final text, the returned stream yields no
+frames, and its `outcome` is the run's own status.
 
 ## Handling errors
 
@@ -123,8 +139,9 @@ try {
   every run route is owner-scoped server-side, so pass `{ owner }` here whenever the run wasn't
   created under the default owner
 - `send(chatId, params)` — append a message and start a run, returning a `RunStream`
-- `resume(runId, afterSeq, opts?)` — reattach to an existing run, reconciling past the replay
-  window automatically; `opts.owner` must match the run's owner, same as the calls above
+- `resume(runId, afterSeq?, opts?)` — reattach to an existing run after `afterSeq`, reconciling
+  past the replay window (check `resyncMessage`); `opts.owner` must match the run's owner, same
+  as the calls above
 
 All list endpoints return the cursor-paginated envelope `{ data, has_more, next_cursor }` (spec
 §5.2) — pass `next_cursor` back in as `cursor` to page forward.

@@ -162,6 +162,16 @@ export function AddEngineDialog({
 
   // A finished release install joins the shared confirm step like any other result.
   const applyReleaseResult = (res: EngineScanResult) => {
+    // A new release install supersedes an unconfirmed one (zip or release), as a fresh scan or
+    // upload does, unless it replaced that same dir in place (discarding would delete the new build).
+    // Same dir is compared by folder, ignoring case: the daemon spells the dir as the repo was typed,
+    // so on Windows/macOS `Owner/repo` and `owner/repo` land in one physical folder, and a newer tag
+    // may rename the binary inside it. (On Linux the two can be real case-variant dirs; the GC collects
+    // the abandoned one only while no engine claims its twin, since the daemon's ownership check
+    // ignores case.)
+    const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, '').toLowerCase()
+    const prev = pendingInstall.current
+    if (prev && !(res.found && dirOf(res.binPath) === dirOf(prev.binPath))) discardPendingInstall()
     applyScanResult(res)
     if (pendingInstall.current) pendingInstall.current.discard = discardReleaseInstall
     setFromRelease(true)

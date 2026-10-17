@@ -13,6 +13,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { NetworkInfo } from '../lib/api'
 
 let networkInfo: NetworkInfo | undefined
+/** useNetworkInfo's isFetching — true while a (re)fetch is in flight over cached `networkInfo`. */
+let networkFetching = false
+beforeEach(() => { networkFetching = false })
 const getConnectSpy = vi.fn(() => Promise.resolve({ cli: 'claude-code', title: '', steps: [{ label: 'bash', snippet: 'ANTHROPIC_AUTH_TOKEN="tllm-secret-value" claude', lang: 'bash' }] }))
 
 vi.mock('../lib/queries', async (importOriginal) => {
@@ -24,7 +27,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
       create: { mutate: vi.fn(), isPending: false },
       revoke: { mutate: vi.fn(), isPending: false },
     }),
-    useNetworkInfo: () => ({ data: networkInfo }),
+    useNetworkInfo: () => ({ data: networkInfo, isFetching: networkFetching }),
   }
 })
 
@@ -98,6 +101,42 @@ describe('DeveloperScreen — Connect-an-app setup snippet gating', () => {
   it('fetches and shows the live-key setup snippet on the host machine, even with LAN open and no auth yet', async () => {
     networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: true }
     await renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /generate setup with a new key/i }))
+    await screen.findByText(/tllm-secret-value/)
+    expect(getConnectSpy).toHaveBeenCalled()
+  })
+
+  it('on a LAN-bound daemon, mints only on the explicit click — not on mount, and not when switching cards back', async () => {
+    // Each GET /api/v1/connect/:cli on a LAN-bound daemon mints a new cli-<name> key and
+    // revokes the previous one, so merely opening the page (or re-clicking a card) used to
+    // silently break a CLI already configured on another machine.
+    networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: false, requireApiKey: false, isHost: true }
+    await renderScreen()
+    const generate = await screen.findByRole('button', { name: /generate setup with a new key/i })
+    expect(getConnectSpy).not.toHaveBeenCalled()
+    await userEvent.click(generate)
+    await screen.findByText(/tllm-secret-value/)
+    expect(getConnectSpy).toHaveBeenCalledTimes(1)
+    await userEvent.click(screen.getByRole('button', { name: /opencode/i }))
+    await userEvent.click(screen.getByRole('button', { name: /claude code/i }))
+    // The generated snippet (still the live key) is shown again from cache — no second mint.
+    await screen.findByText(/tllm-secret-value/)
+    expect(getConnectSpy).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not fetch on its own from a cached lanBind:false while the network info is refetching', async () => {
+    // Settings applies a LAN switch in place, so the cached "loopback-only" can be stale: until
+    // the refetch settles, a mount must not mint (and revoke) a CLI key as if it were loopback.
+    networkInfo = { lanBind: false, lanUrl: '', hasApiKey: false, requireApiKey: false, isHost: true }
+    networkFetching = true
+    await renderScreen()
+    await new Promise((r) => setTimeout(r, 20))
+    expect(getConnectSpy).not.toHaveBeenCalled()
+  })
+
+  it('fetches the setup snippet on its own when the daemon is loopback-only (no key is minted there)', async () => {
+    networkInfo = { lanBind: false, lanUrl: '', hasApiKey: false, requireApiKey: false, isHost: true }
+    await renderScreen()
     await screen.findByText(/tllm-secret-value/)
     expect(getConnectSpy).toHaveBeenCalled()
   })
@@ -113,6 +152,7 @@ describe('DeveloperScreen — Connect-an-app setup snippet gating', () => {
   it('fetches the setup snippet again once requireApiKey is on, even for a non-host viewer', async () => {
     networkInfo = { lanBind: true, lanUrl: 'http://192.168.1.5:6996', hasApiKey: true, requireApiKey: true, isHost: false }
     await renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: /generate setup with a new key/i }))
     await screen.findByText(/tllm-secret-value/)
     expect(getConnectSpy).toHaveBeenCalled()
   })

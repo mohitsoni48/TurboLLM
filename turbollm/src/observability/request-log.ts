@@ -239,7 +239,9 @@ export class RequestLog {
   }
 }
 
-function stripBodies(e: RequestLogEntry): RequestLogEntry {
+/** The entry without its captured request/response payloads — what the list endpoint and the
+ *  live `/requests/stream` send. Bodies are fetched per entry on demand (`GET /requests/:id`). */
+export function stripBodies(e: RequestLogEntry): RequestLogEntry {
   return e.bodies ? { ...e, bodies: null } : e
 }
 

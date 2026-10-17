@@ -20,7 +20,7 @@
 // reproduced by running the test suite in the environment it happens to run in.
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -103,7 +103,12 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
       method: 'electron',
       canSelfUpdate: false,
       command: '',
-      note: 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
+      // The mac build is an unsigned .dmg, which electron-updater cannot install, so the wrapper
+      // never auto-updates on macOS (wrapper/main.js setupAutoUpdate).
+      note:
+        s.platform === 'darwin'
+          ? 'The TurboLLM desktop app cannot update itself on macOS yet: download the new .dmg from the TurboLLM releases page and replace the app.'
+          : 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
     }
   }
 
@@ -199,8 +204,12 @@ let npmRootCache: { value: string | null } | null = null
 export async function npmGlobalRoot(): Promise<string | null> {
   if (npmRootCache) return npmRootCache.value
   const value = await new Promise<string | null>((res) => {
-    const cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    execFile(cmd, ['root', '-g'], { timeout: 10_000, windowsHide: true }, (e, stdout) => {
+    // On Windows npm is a `.cmd` shim, which Node refuses to spawn without a shell (EINVAL since
+    // the CVE-2024-27980 fix — thrown synchronously, so it read as "no npm" and every global
+    // install as `unknown`). The command is a fixed literal, so cmd.exe gets the whole line and
+    // no args array (an args array with `shell` is DEP0190 and quotes nothing).
+    const isWin = process.platform === 'win32'
+    execFile(isWin ? 'npm root -g' : 'npm', isWin ? [] : ['root', '-g'], { timeout: 10_000, windowsHide: true, shell: isWin }, (e, stdout) => {
       if (e) return res(null)
       const out = String(stdout).trim()
       res(out || null)
@@ -215,16 +224,30 @@ export function resetNpmRootCache(): void {
   npmRootCache = null
 }
 
+/** `p` with every symlink resolved, or `p` itself when it can't be (missing, no access).
+ *  A global install runs as `<prefix>/bin/turbollm` — a SYMLINK to the package file under
+ *  `npm root -g` on macOS/Linux, and argv[1] is the link, not its target — so the install
+ *  checks compare real paths. Exported for tests. */
+export function realPathOr(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
 /** Classify the running daemon. Async only because `npm root -g` is a subprocess; every
  *  other signal is a cheap local read. Never throws. */
 export async function detectInstall(): Promise<InstallInfo> {
-  const entry = resolve(process.argv[1] ?? '')
+  const entry = realPathOr(resolve(process.argv[1] ?? ''))
+  // Resolved too, so a prefix that itself sits behind a symlink still contains the entry.
+  const root = await npmGlobalRoot()
   return classifyInstall({
     platform: process.platform,
     entry,
     desktopEnv: process.env.TURBOLLM_DESKTOP === '1',
     inContainer: detectContainer(),
-    npmGlobalRoot: await npmGlobalRoot(),
+    npmGlobalRoot: root && realPathOr(root),
     sourceCheckout: detectSourceCheckout(entry),
   })
 }

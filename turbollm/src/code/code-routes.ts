@@ -40,6 +40,12 @@ import { sessionAuth } from './session-auth'
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
+/** `contextFiles` is stored as the user row's textAttachments, which the chat and Code views
+ *  render as an array of strings (a string or object there crashed them): anything else is
+ *  refused before it is stored. Absent or null is fine. */
+function badContextFiles(v: unknown): boolean {
+  return v != null && !(Array.isArray(v) && v.every((x) => typeof x === 'string'))
+}
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
 
@@ -177,6 +183,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!repoRoot) return err(c, 400, 'invalid_input', 'repoRoot is required.')
     if (!task) return err(c, 400, 'invalid_input', 'A task description is required.')
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
+    if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
 
     // ── "Use worktree": actually create one (ADR-316) ─────────────────────────────────────
     // Until now these three fields were stored and never read, so the toggle changed nothing and
@@ -251,7 +258,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // machine through. A `fetch(url,{method:'POST'})` with no body sets no Content-Type, making it
     // a CORS-SIMPLE request — no preflight — so any website the user happened to be visiting could
     // fire `npm install -g <pkg>` (and its postinstall scripts) with no interaction. Requiring a
-    // JSON content-type forces a preflight, which the origin allowlist then fails.
+    // JSON content-type forces a preflight, which then fails: /api answers no other origin's
+    // preflight outside /api/v1/sysinfo (server.ts).
     if (!(c.req.header('content-type') ?? '').toLowerCase().includes('application/json')) {
       return err(c, 400, 'unsupported_media_type', 'This endpoint requires Content-Type: application/json.')
     }
@@ -719,6 +727,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       if (/not a git repository/i.test(message)) return err(c, 400, 'not_a_git_repo', message)
       if (/nothing to commit|nothing staged/i.test(message)) return err(c, 400, 'nothing_to_commit', message)
       if (/outside the repo/i.test(message)) return err(c, 400, 'invalid_input', message)
+      if (/outside this folder are already staged/i.test(message)) return err(c, 409, 'staged_outside_folder', message)
       return err(c, 500, 'git_commit_failed', message)
     }
   })
@@ -837,6 +846,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const conv = db.getConversation(run.convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
 
     // Fail fast with a clear message if there is nothing to run against right now. (A turn
     // that queues while a model is loaded but is then unloaded before it runs fails cleanly

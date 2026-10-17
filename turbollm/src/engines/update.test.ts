@@ -163,6 +163,19 @@ test('resolveUpdateSource: managed official llama.cpp → ggml-org repo + tag fr
   assert.deepEqual(src, { source: 'github-release', ref: 'ggml-org/llama.cpp', installed: 'b9608' })
 })
 
+// On Android (Termux) the managed build is TurboLLM's own cross-compile, one pinned file on Hugging Face: upstream's
+// newer tags have no Android asset there, so an update offered against them could only fail with HTTP 404.
+test('resolveUpdateSource: a managed llama.cpp build on Android has no update source', async (t) => {
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actualPlatform }))
+  const engine = eng({ binPath: '/data/data/com.termux/files/home/.turbollm/engines/llama.cpp-b9608-cpu/llama-server' })
+  assert.equal(resolveUpdateSource(engine), null)
+  const st = await computeUpdateStatus(engine, async () => 'b10818')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
+})
+
 test('resolveUpdateSource: turboquant fork → fork repo + tag from version', () => {
   const src = resolveUpdateSource(
     eng({ binPath: '/root/engines/turboquant/llama-server', version: 'build b9000' }),
@@ -364,6 +377,23 @@ test('UpdateChecker: forget drops the cached status of one engine only', async (
   assert.equal(checker.get('b')?.latest, 'b9761')
 })
 
+test('UpdateChecker: forgetChanged drops a status whose engine was updated in place, and keeps the rest', async () => {
+  const kobold = eng({ id: 'k', kind: 'koboldcpp', binPath: '/root/engines/koboldcpp/koboldcpp', version: 'v1.70' })
+  const mlx = eng({ id: 'm', kind: 'mlx', version: 'mlx-lm 0.31.2' })
+  const plain = eng({ id: 'p', binPath: '/opt/custom/llama-server', version: 'b1' })
+  const checker = new UpdateChecker(async (src) => (src.ref === 'mlx-lm' ? '0.32.0' : 'v1.80'))
+  for (const e of [kobold, mlx, plain]) await checker.check(e)
+  assert.equal(checker.get('k')?.hasUpdate, true)
+  // The update re-registered the same id with the new version (addKoboldcpp keeps the id).
+  checker.forgetChanged([{ ...kobold, version: 'v1.80' }, mlx, plain])
+  assert.equal(checker.get('k'), undefined)
+  assert.equal(checker.get('m')?.hasUpdate, true)
+  assert.equal(checker.get('p')?.error, 'no_source')
+  // A pip version string compares by its stripped version, as the check recorded it.
+  checker.forgetChanged([{ ...mlx, version: 'mlx-lm 0.32.0' }])
+  assert.equal(checker.get('m'), undefined)
+})
+
 test('UpdateChecker: offline with no prior success caches the offline state', async () => {
   const e = eng({ kind: 'mlx', version: 'mlx-lm 0.31.2' })
   const checker = new UpdateChecker(async () => {
@@ -433,6 +463,19 @@ test('resolveUpdateSource: sourceRepo takes precedence → source mode with bran
     }),
   )
   assert.deepEqual(src, { source: 'source', ref: 'owner/repo', branch: 'main', installed: '0a635dc' })
+})
+
+test('resolveUpdateSource: a commit-pinned source build has no update source (never "newer source · rebuild")', async () => {
+  const pinned = eng({
+    binPath: '/root/engines/build/ggml-org-llama.cpp-846e991ec3c7/build/bin/llama-server',
+    version: '1 (846e991)',
+    sourceRepo: 'https://github.com/ggml-org/llama.cpp',
+    sourceCommit: '846e991ec3c7ccec49112ff2c5b00b710e5f551d',
+  })
+  assert.equal(resolveUpdateSource(pinned), null)
+  const st = await computeUpdateStatus(pinned, async () => 'abcdef0123456789abcdef0123456789abcdef01')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
 })
 
 test('resolveUpdateSource: sourceRepo with no branch → empty branch (default branch)', () => {

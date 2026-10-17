@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { engineLogStreamUrl, getEngineLogs } from './api'
+import { subscribeSse } from './sse'
 
 const MAX_LINES = 2000
 
@@ -29,10 +30,12 @@ export function useEngineLog(active: boolean) {
         /* daemon may be down — leave panel empty rather than crash */
       })
 
-    const es = new EventSource(engineLogStreamUrl)
-    es.addEventListener('line', (ev) => {
+    // Not an EventSource: it can't send the API key, so the tail would 401 over LAN/remote access.
+    // subscribeSse reconnects the same way when the stream closes.
+    const close = subscribeSse(engineLogStreamUrl, (msg) => {
+      if (msg.event !== 'line') return
       try {
-        const data = JSON.parse((ev as MessageEvent).data) as { line?: string }
+        const data = JSON.parse(msg.data) as { line?: string }
         if (typeof data.line === 'string') {
           setLines((prev) => {
             const next = [...prev, data.line as string]
@@ -43,13 +46,10 @@ export function useEngineLog(active: boolean) {
         /* ignore malformed frames */
       }
     })
-    es.onerror = () => {
-      /* stream closes when the engine stops; reconnection handled by browser */
-    }
 
     return () => {
       cancelled = true
-      es.close()
+      close()
     }
   }, [active])
 

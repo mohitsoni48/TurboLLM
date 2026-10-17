@@ -8,6 +8,7 @@
 import { type ChildProcess, execFile, spawn, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
@@ -19,15 +20,24 @@ function pidDir(dataDir: string): string {
 function pidFile(dataDir: string, pid: number): string {
   return join(pidDir(dataDir), `tunnel-${pid}.pid`)
 }
+/** Pids of the providers THIS daemon spawned. A pidfile naming our pid as its owner is not proof
+ *  on its own: after an unclean exit and a reboot (or in a container, where pids repeat) a daemon
+ *  can get its predecessor's pid, and the predecessor's leftover pidfiles then name it as their
+ *  owner. Kept in memory rather than compared by time, so a wall-clock step can't disown one. */
+const spawnedHere = new Set<number>()
 function writePid(dataDir: string, pid: number): void {
+  spawnedHere.add(pid)
   try {
     mkdirSync(pidDir(dataDir), { recursive: true })
-    writeFileSync(pidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid }))
+    // `startedAt` is what lets the next startup tell this provider apart from an unrelated
+    // process that later got the same pid (see reapStaleTunnels).
+    writeFileSync(pidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now() }))
   } catch {
     /* best-effort — tracking is a safety net, never block a start on it */
   }
 }
 function clearPid(dataDir: string, pid: number): void {
+  spawnedHere.delete(pid)
   try {
     rmSync(pidFile(dataDir, pid), { force: true })
   } catch {
@@ -43,20 +53,32 @@ function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
-function readPidFiles(dataDir: string): Array<{ pid: number; owner: number; file: string }> {
+/** Whether a pidfile records a provider THIS daemon spawned (see spawnedHere). */
+function spawnedByUs({ pid, owner }: { pid: number; owner: number }): boolean {
+  return owner === process.pid && spawnedHere.has(pid)
+}
+function readPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; file: string }> {
   let names: string[]
   try {
     names = readdirSync(pidDir(dataDir)).filter((n) => /^tunnel-\d+\.pid$/.test(n))
   } catch {
     return []
   }
-  const out: Array<{ pid: number; owner: number; file: string }> = []
+  const out: Array<{ pid: number; owner: number; startedAt?: number; file: string }> = []
   for (const name of names) {
     const file = join(pidDir(dataDir), name)
     try {
-      const { pid, owner } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number }
-      if (typeof pid === 'number' && pid > 0) out.push({ pid, owner: typeof owner === 'number' ? owner : 0, file })
-      else rmSync(file, { force: true })
+      const { pid, owner, startedAt } = JSON.parse(readFileSync(file, 'utf8')) as {
+        pid?: number; owner?: number; startedAt?: number
+      }
+      if (typeof pid === 'number' && pid > 0) {
+        out.push({
+          pid,
+          owner: typeof owner === 'number' ? owner : 0,
+          startedAt: typeof startedAt === 'number' ? startedAt : undefined,
+          file,
+        })
+      } else rmSync(file, { force: true })
     } catch {
       try {
         rmSync(file, { force: true })
@@ -70,17 +92,34 @@ function readPidFiles(dataDir: string): Array<{ pid: number; owner: number; file
 
 /** Reap provider processes left behind by a previous daemon that didn't shut down cleanly.
  *  Called once at startup alongside reapStaleEngines. An orphan is one whose owner daemon
- *  is gone. Returns the number reaped. Kills by exact PID only, never by name. */
+ *  is gone. Returns the number reaped. Kills by exact PID only, never by name.
+ *
+ *  Same pid-reuse rule as reapStaleTerminals: a pidfile left by a daemon that died without its
+ *  exit handler (SIGKILL, OS shutdown, power loss) usually names some unrelated process after a
+ *  reboot, which `taskkill /F /T` would take down with its whole tree. So a pid is killed only
+ *  when its process started when the pidfile says the provider did (util/process-start-time.ts).
+ *  Anything that can't be verified, including a pidfile from before `startedAt` was recorded,
+ *  is left running and only its stale file is cleared. */
 export function reapStaleTunnels(dataDir: string): number {
+  // A record naming our own pid as owner that we did not spawn (spawnedByUs) was left by an
+  // earlier daemon with our pid: an orphan like any other. Else a live owner still manages it.
+  const orphans = readPidFiles(dataDir).filter((r) =>
+    (r.owner === process.pid ? !spawnedByUs(r) : !(r.owner && pidAlive(r.owner))),
+  )
+  const started = processStartTimes(
+    orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid),
+  )
   let killed = 0
-  for (const { pid, owner, file } of readPidFiles(dataDir)) {
-    if (owner && pidAlive(owner)) continue
-    try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      else process.kill(pid, 'SIGKILL')
-      killed++
-    } catch {
-      /* already gone */
+  for (const { pid, startedAt, file } of orphans) {
+    const actual = started.get(pid)
+    if (startedAt !== undefined && actual !== undefined && Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
+      try {
+        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
+        else process.kill(pid, 'SIGKILL')
+        killed++
+      } catch {
+        /* already gone */
+      }
     }
     try {
       rmSync(file, { force: true })
@@ -95,8 +134,9 @@ export function reapStaleTunnels(dataDir: string): number {
  *  handler (which can't await). Owner-scoped so a daemon exiting during a restart overlap
  *  never kills the incoming daemon's provider. */
 export function killTrackedTunnelsSync(dataDir: string): void {
-  for (const { pid, owner, file } of readPidFiles(dataDir)) {
-    if (owner !== process.pid) continue
+  for (const rec of readPidFiles(dataDir)) {
+    if (!spawnedByUs(rec)) continue // not ours, or a predecessor's with our pid: reapStaleTunnels checks those
+    const { pid, file } = rec
     try {
       if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
       else process.kill(pid, 'SIGKILL')
@@ -168,6 +208,19 @@ export class ChildTunnel {
       }
       child.stderr?.on('data', onData)
       child.stdout?.on('data', onData)
+
+      // A spawn failure — ENOENT (the binary was deleted, or quarantined by antivirus) or
+      // EACCES (start()'s best-effort chmod failed) — arrives as an 'error' event and NO
+      // 'exit'. Unlistened, Node throws it as an uncaught exception and the whole daemon dies.
+      // An 'error' on a child that did spawn (e.g. a failed kill) leaves the rest to its 'exit'.
+      child.on('error', (err) => {
+        if (child.pid !== undefined) return
+        if (this.child === child) this.child = null
+        if (!settled) {
+          settled = true
+          reject(err)
+        }
+      })
 
       this.exited = new Promise((res) => {
         child.on('exit', (code) => {

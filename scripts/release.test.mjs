@@ -3,9 +3,9 @@
 
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +20,8 @@ import {
   splitPreflightDirty,
   stageReleasePaths,
   syncMainFastForward,
+  waitForCommitRun,
+  waitForWorkflowRun,
 } from './release.mjs';
 
 const RELEASE_URL = new URL('./release.mjs', import.meta.url).href;
@@ -247,4 +249,296 @@ test('importing the module does not run the CLI', () => {
   assert.equal(isCliEntry(RELEASE_URL, fileURLToPath(RELEASE_URL)), true);
   assert.equal(isCliEntry(RELEASE_URL, join(tmpdir(), 'somewhere-else.mjs')), false);
   assert.equal(isCliEntry(RELEASE_URL, undefined), false);
+});
+
+test('isCliEntry: a symlinked path to the script still runs the CLI', { skip: process.platform === 'win32' && 'file symlinks need privileges on Windows' }, () => {
+  // Node resolves the main module's real path but leaves argv[1] as typed (macOS /tmp → /private/tmp,
+  // a symlinked checkout): comparing them as-is made the script exit 0 having done nothing.
+  const root = mkdtempSync(join(tmpdir(), 'turbollm-release-link-'));
+  try {
+    const link = join(root, 'release.mjs');
+    symlinkSync(fileURLToPath(RELEASE_URL), link);
+    assert.equal(isCliEntry(RELEASE_URL, link), true);
+  } finally {
+    cleanup(root);
+  }
+});
+
+test('merge polls the ci.yml run for the merge commit, waiting for GitHub to create it', async () => {
+  const sha = 'a'.repeat(40);
+  const calls = [];
+  const answers = ['', '', '4242'];
+  const fakeGh = (...args) => {
+    calls.push(args);
+    return { code: 0, stdout: answers.shift() ?? '', stderr: '', out: '' };
+  };
+
+  assert.equal(await waitForCommitRun('ci.yml', sha, 60_000, fakeGh, 1), 4242);
+  assert.equal(calls.length, 3, 'a run that does not exist yet is waited for, not replaced by the newest one');
+  for (const args of calls) {
+    assert.equal(args[args.indexOf('--workflow') + 1], 'ci.yml');
+    assert.equal(args[args.indexOf('--commit') + 1], sha);
+    assert.ok(!args.includes('--branch'), 'the branch alone also matches the previous main run');
+  }
+});
+
+test('merge gives up on the post-merge run at the deadline instead of picking another run', async () => {
+  const none = () => ({ code: 0, stdout: '', stderr: '', out: '' });
+  assert.equal(await waitForCommitRun('ci.yml', 'b'.repeat(40), 0, none, 1), null);
+});
+
+// gh exits non-zero with nothing on stdout on any error, which read as "the run does not exist
+// yet": a gh without `run list --commit` polled the full 5 minutes after every merge, then warned
+// that the run was not found.
+test('merge stops at once when gh run list fails instead of polling it as a missing run', async () => {
+  const calls = [];
+  const oldGh = (...args) => {
+    calls.push(args);
+    const stderr = 'unknown flag: --commit\n\nUsage:  gh run list [flags]';
+    return { code: 1, stdout: '', stderr, out: stderr };
+  };
+  await assert.rejects(waitForCommitRun('ci.yml', 'c'.repeat(40), 60_000, oldGh, 1), /no `run list --commit`: update gh/);
+  assert.equal(calls.length, 1, 'no second poll');
+
+  const loggedOut = () => ({ code: 4, stdout: '', stderr: 'To get started with GitHub CLI, please run:  gh auth login', out: 'To get started with GitHub CLI, please run:  gh auth login' });
+  await assert.rejects(waitForCommitRun('ci.yml', 'c'.repeat(40), 60_000, loggedOut, 1), (e) => /failed \(exit 4\)/.test(e.message) && /gh auth login/.test(e.message));
+});
+
+// A GitHub Release older than npm-publish.yml never fires it, so every later release's run passed
+// the "created after this release" check: publish waited on another tag's run (which succeeded)
+// instead of reaching the local-token fallback, then failed polling npm for its own version.
+test('publish waits only for the npm-publish.yml run of its own tag', async () => {
+  const ghWith = (runs) => (...args) => {
+    const stdout = args[0] === 'release' ? '2025-01-01T00:00:00Z' : JSON.stringify(runs);
+    return { code: 0, stdout, stderr: '', out: stdout };
+  };
+  const later = { createdAt: '2026-06-01T00:00:00Z' };
+  const otherTag = { databaseId: 7, event: 'release', headBranch: 'v1.2.0', ...later };
+
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([otherTag]), 1), null,
+    'no run for v1.0.1 is what lets publish fall back to the local token');
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([otherTag, { databaseId: 8, event: 'release', headBranch: 'v1.0.1', ...later }]), 1), 8);
+  // A dispatched run carries the branch it was dispatched from, not the tag; it still counts.
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([{ databaseId: 9, event: 'workflow_dispatch', headBranch: 'main', ...later }]), 1), 9);
+});
+
+// A release's createdAt is the tagged commit's date, not when the release was made, so it never
+// excluded an earlier attempt's run for the same tag: after the release was deleted and recreated,
+// the first poll (before GitHub lists the new run) returned the old failed run and publish failed on it.
+test('publish does not take an earlier attempt\'s run for a recreated release', async () => {
+  const release = { createdAt: '2026-10-04T12:00:00Z', publishedAt: '2026-10-04T13:00:00Z' };
+  const oldRun = { databaseId: 111, event: 'release', headBranch: 'v1.0.1', createdAt: '2026-10-04T12:10:00Z' };
+  const newRun = { databaseId: 222, event: 'release', headBranch: 'v1.0.1', createdAt: '2026-10-04T13:00:02Z' };
+  const ghWith = (runs) => (...args) => {
+    const stdout = args[0] === 'release' ? (release[args[args.indexOf('--json') + 1]] ?? '') : JSON.stringify(runs);
+    return { code: 0, stdout, stderr: '', out: stdout };
+  };
+
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([oldRun]), 1), null);
+  assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([newRun, oldRun]), 1), 222);
+});
+
+// ── the real CLI, against stub `gh` / `npm` ──────────────────────────────────
+// The stubs are sh scripts, and spawnSync without a shell finds only .exe files on Windows.
+const POSIX_ONLY = { skip: process.platform === 'win32' && 'the gh/npm stubs are sh scripts' };
+
+// Serialized into the sandbox as the stub's source: logs every call to calls.log and answers from
+// rules.json, the first rule whose `when` is part of the command line. `out` may be a list, answered
+// in order across repeated calls (the last one repeats).
+function stubMain() {
+  const { appendFileSync, readFileSync } = require('node:fs');
+  const { join } = require('node:path');
+  const [dir, tool, ...args] = process.argv.slice(2);
+  const line = [tool, ...args].join(' ');
+  let seen = [];
+  try { seen = readFileSync(join(dir, 'calls.log'), 'utf8').split('\n'); } catch { /* first call */ }
+  appendFileSync(join(dir, 'calls.log'), `${line}\n`);
+  const rule = JSON.parse(readFileSync(join(dir, 'rules.json'), 'utf8')).find((r) => line.includes(r.when)) || {};
+  const outs = [].concat(rule.out ?? []);
+  if (outs.length) {
+    const n = seen.filter((l) => l.includes(rule.when)).length;
+    process.stdout.write(`${outs[Math.min(n, outs.length - 1)]}\n`);
+  }
+  process.exit(rule.code ?? 0);
+}
+
+// The sandbox repo with this release.mjs in it, a release branch tracking origin, run state with
+// `phases` recorded ok, and the stubs first on PATH. HOME points into the sandbox so a real
+// ~/.turbollm-release token is never picked up.
+function cliSandbox({ version, phases, notes = {}, rules = [] }) {
+  const s = sandbox();
+  put(s.work, 'scripts/release.mjs', readFileSync(fileURLToPath(RELEASE_URL)));
+  put(s.work, '.gitignore', '.omc/\n');
+  put(s.work, 'turbollm/CHANGELOG.md', `## [${version}]\n\n- a fix\n\n### Discord\n\n- a fix\n`);
+  must(s.g, 'add', '-A');
+  must(s.g, 'commit', '-m', 'release tooling');
+  must(s.g, 'push');
+  must(s.g, 'checkout', '-b', `release/v${version}`);
+  must(s.g, 'push', '-u', 'origin', `release/v${version}`);
+
+  put(s.work, `.omc/release/${version}.json`, JSON.stringify({
+    version, createdAt: new Date().toISOString(), updatedAt: null, notes,
+    phases: Object.fromEntries(phases.map((p) => [p, { status: 'ok' }])),
+  }));
+
+  const stubDir = join(s.root, 'stub');
+  const bin = join(stubDir, 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(stubDir, 'rules.json'), JSON.stringify(rules));
+  writeFileSync(join(stubDir, 'stub.cjs'), `(${stubMain.toString()})();\n`);
+  for (const tool of ['gh', 'npm']) {
+    const p = join(bin, tool);
+    writeFileSync(p, `#!/bin/sh\nexec "${process.execPath}" "${join(stubDir, 'stub.cjs')}" "${stubDir}" ${tool} "$@"\n`);
+    chmodSync(p, 0o755);
+  }
+
+  const release = (args, env = {}) => {
+    const r = spawnSync(process.execPath, [join(s.work, 'scripts', 'release.mjs'), ...args, '--version', version], {
+      cwd: s.work,
+      encoding: 'utf8',
+      env: {
+        ...process.env, PATH: `${bin}${delimiter}${process.env.PATH}`, HOME: s.root, USERPROFILE: s.root,
+        NO_COLOR: '1', TURBOLLM_NPM_TOKEN: '', ...env,
+      },
+    });
+    return { code: r.status, out: `${r.stdout}\n${r.stderr}` };
+  };
+  const calls = () => {
+    try { return readFileSync(join(stubDir, 'calls.log'), 'utf8').split('\n').filter(Boolean); } catch { return []; }
+  };
+  return { ...s, release, calls };
+}
+
+const BEFORE_PUBLISH = ['preflight', 'review', 'prepare', 'verify', 'merge'];
+
+// The gate used to sit at the npm step, after the tag, the push and `gh release create`, and creating
+// the release is itself what fires npm-publish.yml.
+test('publish without --approved stops before the tag, the push and the GitHub Release', POSIX_ONLY, () => {
+  const s = cliSandbox({
+    version: '1.0.1',
+    phases: BEFORE_PUBLISH,
+    rules: [{ when: '--json tagName', code: 1 }, { when: 'npm view turbollm version', out: '1.0.0' }],
+  });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+
+    const r = s.release(['publish']);
+
+    assert.notEqual(r.code, 0);
+    assert.match(r.out, /--approved/);
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('gh release create')), []);
+    assert.equal(must(s.g, 'tag', '--list', 'v1.0.1').stdout, '');
+    assert.equal(must(s.g, 'ls-remote', '--tags', 'origin').stdout, '');
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+test('publish leaves npm to the OIDC workflow it triggered, even when a local token exists', POSIX_ONLY, () => {
+  const s = cliSandbox({
+    version: '1.0.1',
+    phases: BEFORE_PUBLISH,
+    rules: [
+      { when: '--json tagName', code: 1 },
+      { when: '--json publishedAt', out: '2026-01-01T00:00:00Z' },
+      { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","headBranch":"v1.0.1","createdAt":"2026-01-01T00:00:05Z"}]' },
+      { when: 'run view 42', out: 'completed success' },
+      { when: 'npm view turbollm version', out: ['1.0.0', '1.0.1'] },
+      { when: '--json assets', out: 'TurboLLM-Setup-x64.exe\nTurboLLM-x86_64.AppImage\nTurboLLM-arm64.dmg' },
+    ],
+  });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+
+    const r = s.release(['publish', '--approved'], { TURBOLLM_NPM_TOKEN: 'npm_local_token' });
+
+    assert.equal(r.code, 0, r.out);
+    assert.ok(s.calls().some((c) => c.startsWith('gh release create v1.0.1')));
+    assert.deepEqual(s.calls().filter((c) => /^npm (publish|whoami)/.test(c)), [], 'a local publish races npm-publish.yml for the same version');
+    assert.ok(s.calls().some((c) => c.startsWith('gh run view 42')), 'the workflow run is what gets waited on');
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// A failed tag push was only noted. `gh release create` then made the missing tag itself, from the
+// default branch's tip, which is not this commit if main moved during the post-merge CI wait, and
+// npm-publish.yml published from that tag while the phase recorded ok.
+test('publish stops when the tag push fails, and the release never creates its own tag', POSIX_ONLY, () => {
+  const s = cliSandbox({
+    version: '1.0.1',
+    phases: BEFORE_PUBLISH,
+    rules: [
+      { when: '--json tagName', code: 1 },
+      { when: '--json publishedAt', out: '2026-01-01T00:00:00Z' },
+      { when: 'run list --workflow npm-publish.yml', out: '[{"databaseId":42,"event":"release","headBranch":"v1.0.1","createdAt":"2026-01-01T00:00:05Z"}]' },
+      { when: 'run view 42', out: 'completed success' },
+      { when: 'npm view turbollm version', out: ['1.0.0', '1.0.1'] },
+    ],
+  });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    must(s.g, 'remote', 'set-url', 'origin', join(s.root, 'unreachable.git'));
+
+    const r = s.release(['publish', '--approved', '--skip-desktop']);
+
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /could not push tag v1\.0\.1/);
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('gh release create')), []);
+    assert.equal(JSON.parse(readFileSync(join(s.work, '.omc', 'release', '1.0.1.json'), 'utf8')).phases.publish.status, 'failed');
+
+    // And with the push working, the release is told to use the pushed tag, never to make one.
+    must(s.g, 'remote', 'set-url', 'origin', s.origin);
+    const again = s.release(['publish', '--approved', '--skip-desktop']);
+    assert.equal(again.code, 0, again.out);
+    assert.equal(must(s.g, 'ls-remote', '--tags', 'origin', 'v1.0.1').stdout.split(/\s+/)[0], must(s.g, 'rev-parse', 'HEAD').stdout);
+    assert.ok(s.calls().some((c) => c.startsWith('gh release create v1.0.1') && c.split(' ').includes('--verify-tag')));
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// On a drifted telemetry schema, --approved redeployed the production Worker whether or not --dry-run
+// was also given, and the phase was then recorded as a dry run.
+test('preflight --dry-run --approved does not redeploy the telemetry Worker', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: [], rules: [{ when: 'npm view turbollm version', out: '1.0.0' }] });
+  try {
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1"\n}\n');
+    put(s.work, 'telemetry-worker/scripts/schema-hash.mjs', "process.exit(process.argv[2] === 'check' ? 1 : 0);\n");
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'drift');
+    const deploys = () => s.calls().filter((c) => c.startsWith('npm run deploy'));
+
+    const dry = s.release(['preflight', '--dry-run', '--approved']);
+
+    assert.equal(dry.code, 0, dry.out);
+    assert.match(dry.out, /\[dry-run\] .*would redeploy/);
+    assert.deepEqual(deploys(), []);
+
+    const real = s.release(['preflight', '--approved']);
+    assert.equal(deploys().length, 1, real.out);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
+// A push that failed after the commit left nothing to commit on the re-run, which then recorded ok
+// without pushing: `verify` checked a PR head without the release commit, and `merge` merged it.
+test('prepare re-run after a failed push pushes the release commit', POSIX_ONLY, () => {
+  const s = cliSandbox({ version: '1.0.1', phases: ['preflight', 'review'], notes: { baseVersion: '1.0.0' } });
+  try {
+    must(s.g, 'remote', 'set-url', 'origin', join(s.root, 'unreachable.git'));
+    const first = s.release(['prepare']);
+    assert.notEqual(first.code, 0, 'the push must fail while origin is unreachable');
+    must(s.g, 'remote', 'set-url', 'origin', s.origin);
+
+    const second = s.release(['prepare']);
+
+    assert.equal(second.code, 0, second.out);
+    const head = must(s.g, 'rev-parse', 'HEAD').stdout;
+    assert.match(must(s.g, 'log', '-1', '--format=%s').stdout, /^chore\(release\): v1\.0\.1/);
+    assert.equal(must(s.g, 'ls-remote', 'origin', 'refs/heads/release/v1.0.1').stdout.split(/\s+/)[0], head);
+  } finally {
+    cleanup(s.root);
+  }
 });

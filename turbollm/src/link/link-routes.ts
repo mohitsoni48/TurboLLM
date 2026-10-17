@@ -23,6 +23,7 @@ import { SINGLE_FILE_MODEL_RE } from '../downloads/downloads'
 import { allowsModel, hasCapability } from './capabilities'
 import { applyScopedPatch, scrubConfigForRead } from './config-scope'
 import { canWake, hostIdleState } from './host-idle'
+import { LINK_NO_LOAD_HEADER } from './link-proxy'
 import { FALLBACK_MACHINE_NAME, sanitizeMachineName } from './machine-name'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, redactDownload, type HelloResponse } from './types'
@@ -524,6 +525,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     // past the gate and reach the swap machinery anyway.
     const loaded = d.manager.status().model?.key ?? null
     if (requested && requested !== loaded) {
+      // The peer marks a request whose own caller may not load models (link-proxy.ts
+      // LINK_NO_LOAD_HEADER). The link may hold models:load or models:wake, but this request
+      // gets what a link holding neither gets, decided here on the live state: the peer's own
+      // check reads its catalog, which can be a refresh behind an owner's switch. Refused as
+      // that check refuses it: final (a retry is refused the same way), and with the type
+      // gatewayV1Handler gives a route refusal.
+      if (c.req.header(LINK_NO_LOAD_HEADER) !== undefined) {
+        c.header('x-should-retry', 'false')
+        return c.json(
+          {
+            error: {
+              code: 'model_not_loaded',
+              type: 'model_not_loaded',
+              message:
+                `'${requested}' is not loaded on this machine, and the access token ` +
+                `this request came with may not load models.`,
+            },
+          },
+          503,
+        )
+      }
       if (hasCapability(key, 'models:load')) {
         // Unconditional by design: models:load IS the "you may take the machine" grant.
         // Fall through to the normal auto-swap path.
@@ -535,15 +557,35 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
           )
         }
       } else {
+        // Final and typed, like the marked refusal above: untyped, a peer's /v1/messages reads
+        // this 503 as an overloaded host, and its client retries a refusal no retry can change.
+        c.header('x-should-retry', 'false')
         return c.json(
           {
             error: {
               code: 'model_not_loaded',
+              type: 'model_not_loaded',
               message: `'${requested}' is not loaded on this machine, and this link may not load it.`,
             },
           },
           503,
         )
+      }
+    }
+
+    // The allowlist binds the model that ANSWERS, not only the `model` string checked above.
+    // ModelRouter.route() answers with whatever is loaded when `model` is empty, auto-swap is
+    // off, or the name resolves to nothing — so a restricted token could otherwise leave
+    // `model` out and be served a model GET /api/link/v1/models hid from it. targetEntry() is
+    // route()'s own load-free mirror; when it names no entry, route() can only fall back to
+    // the loaded model (or 503 when there is none).
+    if (key?.grant?.models?.length) {
+      const servedKey = d.modelRouter.targetEntry(requested)?.key ?? loaded
+      if (servedKey && !allowsModel(key, servedKey)) {
+        const message = requested
+          ? `This machine would answer '${requested}' with a model this link may not use.`
+          : "This link may use only specific models — name one in 'model'."
+        return c.json({ error: { code: 'forbidden', message } }, 403)
       }
     }
 

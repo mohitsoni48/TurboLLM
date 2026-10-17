@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { evaluateWindow, MACHINE_LIMIT, type RateLimitWindow } from './rate-limit-window'
+import { evaluateWindow, ipRateLimitSubject, MACHINE_LIMIT, type RateLimitWindow } from './rate-limit-window'
 import { MAX_BATCH } from './ingest'
 
 const PERIOD_MS = 60_000
@@ -81,4 +81,25 @@ test('evaluateWindow: two full queue-drains in one window exactly fill it, a thi
   assert.equal(second.success, true, 'MACHINE_LIMIT is exactly 2x MAX_BATCH by design')
   const third = evaluateWindow(second.next!, 1_040, PERIOD_MS, MAX_BATCH, MACHINE_LIMIT)
   assert.equal(third.success, false)
+})
+
+test('ipRateLimitSubject: every address in one IPv6 /64 shares one key, however it is spelled', () => {
+  const key = ipRateLimitSubject('2001:db8:85a3:12::1')
+  assert.equal(key, '2001:db8:85a3:12::/64')
+  for (const ip of [
+    '2001:db8:85a3:12:ffff:ffff:ffff:ffff',
+    '2001:0DB8:85A3:0012:0000:0000:0000:0001',
+    '2001:db8:85a3:12:dead:beef::',
+  ]) {
+    assert.equal(ipRateLimitSubject(ip), key, ip)
+  }
+  assert.notEqual(ipRateLimitSubject('2001:db8:85a3:13::1'), key, 'the neighbouring /64 is a different subject')
+  assert.equal(ipRateLimitSubject('::1'), '0:0:0:0::/64')
+})
+
+test('ipRateLimitSubject: IPv4, IPv4-embedded IPv6 and junk keep the whole address', () => {
+  // ::ffff:a.b.c.d all share the /64 0:0:0:0 — truncating would rate-limit unrelated clients together.
+  for (const ip of ['203.0.113.7', '::ffff:203.0.113.7', 'unknown', '1:2:3:4:5:6:7:8:9', '1::2::3', 'g::1', '']) {
+    assert.equal(ipRateLimitSubject(ip), ip, ip)
+  }
 })

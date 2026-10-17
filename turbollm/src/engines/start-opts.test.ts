@@ -6,6 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type Config, type Engine, defaultConfig } from '../config/config'
+import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { koboldcppProfileToArgs } from './koboldcpp'
@@ -69,6 +70,28 @@ test('llama-server keeps the saved pinned port as the preferred port', () => {
   const opts = resumeLoad(ggufModel(), 'llama-server', cfg)
 
   assert.equal(opts.preferredPort, 9200)
+})
+
+// The load dialog's "this load only" (Remember unchecked) sends its draft as overrides. The model-directory
+// path resolved them into `profile` but launched from the saved profile alone, so a draft tensor-parallel
+// size, pinned port or MLX sampling never reached the engine.
+test('model-directory engines launch with the "this load only" overrides over the saved profile', () => {
+  const cfg = configWithSavedProfile({ port: 9200, gpu: { tensorParallelSize: 1 }, sampling: { temp: 0.7, topP: 0.9 } })
+  const overrides = {
+    port: 9300,
+    gpu: { splitMode: 'layer', tensorSplit: [], mainGpu: -1, tensorParallelSize: 2 },
+    sampling: { temp: 0.2 }, // a partial draft, as an API caller may send
+  } as unknown as Partial<LoadProfile>
+  const build = (kind: string) =>
+    buildStartOpts({ entry: safetensorsModel(), engine: testEngine(kind), cfg, sys: NO_GPU_MACHINE, overrides, trigger: 'manual' })
+
+  const vllm = build('vllm')
+  const mlx = build('mlx')
+
+  assert.equal(vllm.tensorParallelSize, 2)
+  assert.equal(vllm.preferredPort, 9300)
+  assert.deepEqual(mlx.extraArgs, ['--temp', '0.2', '--top-p', '0.9'])
+  assert.equal(mlx.preferredPort, 9300)
 })
 
 test('building StartOpts leaves the config snapshot it reads unchanged', () => {

@@ -129,3 +129,67 @@ test('revertFileEdits: a nested-directory relative path resolves correctly under
   assert.deepEqual(result.reverted, ['src/lib/util.ts'])
   assert.equal(readFileSync(join(repoRoot, 'src', 'lib', 'util.ts'), 'utf8'), 'export const x = 1\n')
 })
+
+test('REGRESSION: a file with a UTF-8 BOM reverts (an edit touching line 1) and keeps its BOM', () => {
+  const repoRoot = tmpDir('tllm-revert-')
+  // pi's edit tool strips the BOM before diffing and writes it back, so the stored patch is
+  // computed on BOM-less text while the file on disk still starts with U+FEFF.
+  writeFileSync(join(repoRoot, 'a.cs'), '\uFEFF' + 'using New;\nclass A {}\n')
+  const patch = editPatch('a.cs', 'using Old;\nclass A {}\n', 'using New;\nclass A {}\n')
+  const result = revertFileEdits([msgWithEdits([{ path: 'a.cs', patch }])], repoRoot)
+  assert.deepEqual(result, { reverted: ['a.cs'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, 'a.cs'), 'utf8'), '\uFEFF' + 'using Old;\nclass A {}\n')
+})
+
+test('REGRESSION: an edit made through `@src/a.ts` reverts src/a.ts, chained with edits made through the plain path', () => {
+  // pi's edit tool strips one leading `@` (resolveToCwd), so `@src/a.ts` IS src/a.ts. Keyed by the
+  // raw string, its revert looked for a file named `@src/a.ts`, failed, and kept the edit.
+  const repoRoot = tmpDir('tllm-revert-')
+  mkdirSync(join(repoRoot, 'src'))
+  const v0 = 'one\n'
+  const v1 = 'one\ntwo\n'
+  const v2 = 'one\ntwo\nthree\n'
+  writeFileSync(join(repoRoot, 'src', 'a.ts'), v2)
+  writeFileSync(join(repoRoot, 'src', 'b.ts'), 'new\n')
+  const messages = [
+    msgWithEdits([{ path: 'src/a.ts', patch: editPatch('src/a.ts', v0, v1) }]),
+    msgWithEdits([{ path: '@src/a.ts', patch: editPatch('src/a.ts', v1, v2) }, { path: '@src/b.ts', patch: editPatch('src/b.ts', 'old\n', 'new\n') }]),
+  ]
+  const result = revertFileEdits(messages, repoRoot)
+  assert.deepEqual(result, { reverted: ['src/a.ts', '@src/b.ts'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, 'src', 'a.ts'), 'utf8'), v0)
+  assert.equal(readFileSync(join(repoRoot, 'src', 'b.ts'), 'utf8'), 'old\n')
+})
+
+test('REGRESSION: a path is not trimmed, and Unicode spaces read as spaces, as pi\'s edit tool resolves them', () => {
+  // ` src/c.ts` is a file in a folder named ` src`; trimmed, its reverse patch was applied to
+  // src/c.ts, which pi never touched. A no-break space in a name is a plain space to pi.
+  const repoRoot = tmpDir('tllm-revert-')
+  mkdirSync(join(repoRoot, ' src'))
+  mkdirSync(join(repoRoot, 'src'))
+  writeFileSync(join(repoRoot, ' src', 'c.ts'), 'new\n')
+  writeFileSync(join(repoRoot, 'src', 'c.ts'), 'new\n')
+  writeFileSync(join(repoRoot, 'my file.txt'), 'new\n')
+  const result = revertFileEdits([msgWithEdits([
+    { path: ' src/c.ts', patch: editPatch(' src/c.ts', 'old\n', 'new\n') },
+    { path: 'my file.txt', patch: editPatch('my file.txt', 'old\n', 'new\n') },
+  ])], repoRoot)
+  assert.deepEqual(result, { reverted: [' src/c.ts', 'my file.txt'], failed: [] })
+  assert.equal(readFileSync(join(repoRoot, ' src', 'c.ts'), 'utf8'), 'old\n', 'the file pi edited is reverted')
+  assert.equal(readFileSync(join(repoRoot, 'src', 'c.ts'), 'utf8'), 'new\n', 'a file pi never touched is left alone')
+  assert.equal(readFileSync(join(repoRoot, 'my file.txt'), 'utf8'), 'old\n')
+})
+
+test('REGRESSION: a session folder with a Unicode space in its own name still reverts (pi normalises the path, never its cwd)', () => {
+  // Checked on the absolute path, the containment check ran pi's normalisation over the folder's
+  // own name too: its U+3000 or U+00A0 read as ' ', the path was no longer under the root, and
+  // every revert in that folder was reported failed with the edit kept.
+  for (const name of ['my　project', 'my project']) {
+    const repoRoot = join(tmpDir('tllm-revert-'), name)
+    mkdirSync(join(repoRoot, 'src'), { recursive: true })
+    writeFileSync(join(repoRoot, 'src', 'a.ts'), 'new\n')
+    const result = revertFileEdits([msgWithEdits([{ path: 'src/a.ts', patch: editPatch('src/a.ts', 'old\n', 'new\n') }])], repoRoot)
+    assert.deepEqual(result, { reverted: ['src/a.ts'], failed: [] }, JSON.stringify(name))
+    assert.equal(readFileSync(join(repoRoot, 'src', 'a.ts'), 'utf8'), 'old\n')
+  }
+})

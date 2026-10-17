@@ -2,7 +2,8 @@ import { useMemo, useState } from 'react'
 import { Settings2, Trash2, Download } from 'lucide-react'
 import { useRequestLog } from '../../lib/use-request-log'
 import { useSettings } from '../../lib/queries'
-import { clearRequests, track } from '../../lib/api'
+import { clearRequests, getRequests, track } from '../../lib/api'
+import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
 import type { RequestLogEntry, RequestLogSource } from '../../lib/types'
 import { Switch } from '../../components/ui/switch'
@@ -96,8 +97,27 @@ function exportJsonl(entries: RequestLogEntry[]): void {
   URL.revokeObjectURL(url)
 }
 
+/** The panel's own rows never carry bodies (the live stream strips them — routes.ts), so with
+ *  capture on, an export built from them alone would silently drop every prompt/response. Fill
+ *  in, by id, the bodies the daemon still holds — but keep the panel's row set: the daemon evicts
+ *  WHOLE entries under its 32 MB body budget without telling the stream, so its list can be far
+ *  shorter than what is on screen, and those older rows must still be exported (metadata only).
+ *  If the fetch fails, still export the metadata rows, and say the bodies are missing. */
+async function exportRequestLog(entries: RequestLogEntry[], withBodies: boolean): Promise<void> {
+  let rows = entries
+  if (withBodies) {
+    try {
+      const held = new Map((await getRequests({}, true)).entries.map((e) => [e.id, e]))
+      rows = entries.map((e) => held.get(e.id) ?? e)
+    } catch {
+      toast.error('Could not fetch the captured bodies — exported without them.')
+    }
+  }
+  exportJsonl(rows)
+}
+
 export function RequestsPanel({ active }: { active: boolean }) {
-  const { entries, autoScroll, setAutoScroll, viewportRef } = useRequestLog(active)
+  const { entries, autoScroll, setAutoScroll, viewportRef, clear } = useRequestLog(active)
   const { query: settingsQ, save } = useSettings()
   const [columns, setColumns] = useState(loadColumnPrefs)
   const [selected, setSelected] = useState<RequestLogEntry | null>(null)
@@ -185,12 +205,12 @@ export function RequestsPanel({ active }: { active: boolean }) {
                 </label>
               </div>
               <DropdownMenuSeparator />
-              <DropdownMenuItem onSelect={() => { track('monitor', 'export_request_log'); exportJsonl(entries) }}>
+              <DropdownMenuItem onSelect={() => { track('monitor', 'export_request_log'); void exportRequestLog(entries, captureBodies) }}>
                 <Download size={14} /> Export JSONL
               </DropdownMenuItem>
               <DropdownMenuItem
                 destructive
-                onSelect={() => { track('monitor', 'clear_request_log'); void clearRequests() }}
+                onSelect={() => { track('monitor', 'clear_request_log'); void clearRequests().then(clear, () => toast.error('Could not clear the request log.')) }}
               >
                 <Trash2 size={14} /> Clear log
               </DropdownMenuItem>

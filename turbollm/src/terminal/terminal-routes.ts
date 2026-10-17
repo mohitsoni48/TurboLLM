@@ -300,7 +300,7 @@ export function getTerminalManager(d: Deps): TerminalManager {
 
 export type CreateAgentTerminalResult =
   | { ok: true; terminalId: string }
-  | { ok: false; status: 400 | 501 | 500; code: string; message: string }
+  | { ok: false; status: 400 | 409 | 501 | 500; code: string; message: string }
 
 /** The "spawn a fresh terminal" core of `POST /api/v1/code/sessions/:sessionId/terminal`,
  *  factored out so a server-side caller can start the SAME kind of terminal-agent session a
@@ -319,7 +319,7 @@ export type CreateAgentTerminalResult =
 export async function createAgentTerminal(
   d: Deps,
   run: AgentRun,
-  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string } = {},
+  opts: { cols?: number; rows?: number; mode?: string; firstMessage?: string; signal?: AbortSignal; idleTtlMs?: number } = {},
 ): Promise<CreateAgentTerminalResult> {
   if (!run.repoRoot) return { ok: false, status: 400, code: 'invalid_input', message: 'Session has no repo root.' }
   const agent = run.codeAgent ?? 'turbollm'
@@ -344,7 +344,9 @@ export async function createAgentTerminal(
   const rows = opts.rows && opts.rows > 0 ? Math.floor(opts.rows) : 24
   const m = getManager(d)
   try {
-    const port = d.store.snapshot().daemon.port
+    // The port really bound, not daemon.port: under `--port`/`--addr` the agent would otherwise
+    // dial the configured port, where this daemon is not listening.
+    const port = d.bindPort ?? d.store.snapshot().daemon.port
     const token = sessionAuth.mint(run.id)
     const mode = opts.mode ?? d.db.getConversation(run.convId)?.agentMode ?? 'auto'
     // Only claude's mapping needs the `--help` probe (its accepted value list changed across
@@ -356,7 +358,13 @@ export async function createAgentTerminal(
       mode,
       opts.firstMessage,
     )
-    const terminalId = m.create(cwd, run.id, cols, rows, launchCommand)
+    // A routine kickoff abandoned while the probe above was in flight (execute.ts's kickoff bound)
+    // must not launch the CLI at all — see cli-interactive-runner.ts's `kickoffSignal`.
+    if (opts.signal?.aborted) {
+      sessionAuth.revoke(run.id)
+      return { ok: false, status: 409, code: 'aborted', message: 'Starting the terminal was cancelled.' }
+    }
+    const terminalId = m.create(cwd, run.id, cols, rows, launchCommand, opts.idleTtlMs)
     if (!run.terminalLaunchedOnce) d.db.updateAgentRun(run.id, { terminalLaunchedOnce: true })
     return { ok: true, terminalId }
   } catch (e) {
@@ -520,11 +528,24 @@ interface WS {
   readyState: number
   send(data: string): void
   close(code?: number, reason?: string): void
+  terminate(): void
   on(event: string, listener: (...args: any[]) => void): void
 }
 
 /** OPEN constant from ws library */
 const WS_OPEN = 1
+
+/** Every open terminal WebSocket, on any listener registerTerminalWs was given. */
+const openTerminalSockets = new Set<WS>()
+
+/** Drop every open Code-terminal WebSocket at once; the daemon's shutdown calls this beside
+ *  closeAllConnections(). An upgraded socket is no longer one of the HTTP server's connections,
+ *  so closeAllConnections() leaves it open and server.close() waits for it: one open terminal
+ *  held the shutdown until its fallback timer, and `--stop` SIGKILLs at 10 s. terminate(), not
+ *  close(): a close handshake waits on the peer (up to 30 s for one that went away). */
+export function closeTerminalSockets(): void {
+  for (const ws of openTerminalSockets) ws.terminate()
+}
 
 /**
  * Register the WebSocket upgrade handler directly with the Node server.
@@ -551,7 +572,8 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
     // sibling REST endpoint demands a key. Browsers can't set custom headers on a
     // WebSocket handshake, so the key travels as a `key` query param instead of the
     // `X-TurboLLM-Auth` header the REST client uses (verifyKeyValue is the same
-    // credential check either way).
+    // credential check either way). No CORS applies to a handshake, so isLocalUpgrade also
+    // refuses loopback trust to one a browser sends from another site's page.
     const local = isLocalUpgrade(socket.remoteAddress, socket.localPort, request.headers, _d)
     if (!local && !verifyKeyValue(url.searchParams.get('key') ?? '', _d)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
@@ -565,6 +587,8 @@ export function registerTerminalWs(server: import('http').Server, _d: Deps): voi
   })
 
   wss.on('connection', (ws: WS, _request: import('http').IncomingMessage) => {
+    openTerminalSockets.add(ws)
+    ws.on('close', () => { openTerminalSockets.delete(ws) })
     const url = new URL(_request.url ?? '', 'http://localhost')
     const terminalId = url.searchParams.get('terminalId') ?? ''
     const m = getManager(_d)

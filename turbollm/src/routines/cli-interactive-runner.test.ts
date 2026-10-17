@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { GenerationGate } from '../agents/gate'
 import {
-  CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, runCliInteractiveRoutine, sweepInteractiveCliRuns,
+  CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, runCliInteractiveRoutine, sweepInteractiveCliRuns, terminalLookupsBySession,
   type CliInteractiveDeps, type CliInteractiveSweepDeps,
 } from './cli-interactive-runner'
 import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
@@ -372,4 +372,49 @@ test('a swap-then-run whose interactive run later finalizes restores the previou
     loadExplicit: async (k) => { loadCalls.push(k); return { target: 'http://127.0.0.1:8081' } },
   }))
   assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'], 'restore happens once the run actually finalizes')
+})
+
+// ── terminalLookupsBySession: the sweep's real TerminalManager wiring (cli.ts) ─────────────────
+
+/** A TerminalManager stand-in keyed the way the real one is: by its OWN terminal id, with the
+ *  Code session id only as an attribute (findByCodeSessionId maps one to the other). */
+function fakeTerminals(sessions: Record<string, { codeSessionId: string; agentExited?: boolean; exitCode?: number }>) {
+  const live = new Map(Object.entries(sessions))
+  const killed: string[] = []
+  return {
+    killed,
+    findByCodeSessionId: (codeSessionId: string) => [...live].find(([, s]) => s.codeSessionId === codeSessionId)?.[0] ?? null,
+    isActive: (id: string) => live.has(id),
+    isAgentExited: (id: string) => live.get(id)?.agentExited === true,
+    getExitCode: (id: string) => live.get(id)?.exitCode,
+    kill: (id: string) => { if (live.delete(id)) killed.push(id) },
+  }
+}
+
+test('terminalLookupsBySession: a parked run whose CLI is still running stays parked (session id mapped to terminal id)', () => {
+  const store = freshStore()
+  const run = parkedRun(store)
+  const tm = fakeTerminals({ 'term-1': { codeSessionId: run.codeSessionId! } })
+  sweepInteractiveCliRuns(sweepDeps({ store, ...terminalLookupsBySession(() => tm), now: () => new Date(new Date(run.startedAt).getTime() + 1000) }))
+  assert.equal(store.getRoutineRun(run.id)!.status, 'needs_approval')
+})
+
+test('terminalLookupsBySession: the wall-clock timeout really kills the run\'s terminal', () => {
+  const store = freshStore()
+  const run = parkedRun(store)
+  const tm = fakeTerminals({ 'term-1': { codeSessionId: run.codeSessionId! }, 'term-2': { codeSessionId: 'someone-else' } })
+  sweepInteractiveCliRuns(sweepDeps({ store, ...terminalLookupsBySession(() => tm), now: () => new Date(new Date(run.startedAt).getTime() + CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS + 1) }))
+  assert.equal(store.getRoutineRun(run.id)!.status, 'errored')
+  assert.deepEqual(tm.killed, ['term-1'])
+})
+
+test('terminalLookupsBySession: agent exit is read off the mapped terminal; no terminal at all reads as gone', () => {
+  const store = freshStore()
+  const done = parkedRun(store)
+  const gone = parkedRun(store)
+  const tm = fakeTerminals({ 'term-1': { codeSessionId: done.codeSessionId!, agentExited: true, exitCode: 0 } })
+  sweepInteractiveCliRuns(sweepDeps({ store, ...terminalLookupsBySession(() => tm) }))
+  assert.equal(store.getRoutineRun(done.id)!.status, 'ok')
+  assert.equal(store.getRoutineRun(gone.id)!.status, 'errored')
+  assert.match(store.getRoutineRun(gone.id)!.error ?? '', /ended unexpectedly/)
 })

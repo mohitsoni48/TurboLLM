@@ -15,6 +15,14 @@ import { findTextClassificationRepos, type ListedModel } from './text-classifica
 
 const BASE = 'https://huggingface.co'
 const CACHE_TTL_MS = 5 * 60 * 1000
+/** Upper bound on cached responses. The TTL only decides freshness — an expired entry is kept as
+ *  the fallback for when HF is unreachable — so without a cap every distinct search, repo, tree
+ *  and model card would be held for the daemon's lifetime. The oldest-written entry goes first. */
+const CACHE_MAX_ENTRIES = 200
+/** HF pages the recursive tree listing at 1000 entries (directories included) behind a
+ *  `Link: <…>; rel="next"` header. Followed up to this many pages (50k entries) — a bound, not a
+ *  size any real model repo reaches. */
+const TREE_MAX_PAGES = 50
 /** Cap for the model card when read for sampling extraction (ADR-099). Much larger than the
  *  12k display cap because big model cards put their recommended-settings section deep in the
  *  card — e.g. Qwen3.5 cards run ~80–95k chars with the "recommended sampling parameters" block
@@ -224,7 +232,7 @@ export class HfClient {
    *  `.litertlm` bundles (LiteRT-LM), with the format the repo actually ships. */
   async getRepo(repo: string): Promise<HfRepoDetail> {
     const info = await this.getJson<RawRepoInfo>(`${BASE}/api/models/${repo}`)
-    const tree = await this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/main?recursive=true`)
+    const tree = await this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/main?recursive=true`, TREE_MAX_PAGES)
 
     const ggufEntries = tree.filter((e) => e.type === 'file' && /\.gguf$/i.test(e.path))
     const safetensorsEntries = tree.filter((e) => e.type === 'file' && /\.safetensors$/i.test(e.path))
@@ -347,7 +355,10 @@ export class HfClient {
     const wantBase = base(rfilename).toLowerCase()
     let tree: RawTreeEntry[]
     try {
-      tree = await this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/${encodeURIComponent(rev)}?recursive=true`)
+      tree = await this.getJson<RawTreeEntry[]>(
+        `${BASE}/api/models/${repo}/tree/${encodeURIComponent(rev)}?recursive=true`,
+        TREE_MAX_PAGES,
+      )
     } catch {
       return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
     }
@@ -393,9 +404,12 @@ export class HfClient {
 
     const ggufs = tree.filter((e) => e.type === 'file' && /\.gguf$/i.test(e.path))
 
-    // Locate the chosen file by basename (the UI carries a split group's first-shard
-    // basename; the tree recovers its full repo path + siblings).
-    const chosen = ggufs.find((e) => base(e.path).toLowerCase() === wantBase)
+    // Locate the chosen file: by its exact repo path when the caller sent one (a row whose
+    // basename is shared across folders is listed by full path — see groupFiles), else by
+    // basename (the UI carries a split group's first-shard basename; the tree recovers its full
+    // repo path + siblings).
+    const chosen =
+      ggufs.find((e) => e.path === rfilename) ?? ggufs.find((e) => base(e.path).toLowerCase() === wantBase)
     if (!chosen) {
       // Requested file not in the tree — fall back to the name as given.
       return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
@@ -458,7 +472,7 @@ export class HfClient {
         const res = await fetch(url, { headers: this.authHeaders(), redirect: 'follow' })
         if (!res.ok) continue
         const raw = await res.text()
-        this.cache.set(url, { at: now, value: raw })
+        this.remember(url, { at: now, value: raw })
         return raw
       } catch {
         continue
@@ -504,7 +518,7 @@ export class HfClient {
       const raw = await res.text()
       // Strip a leading `---\n…\n---` YAML frontmatter block, then cap (cache the full window).
       const full = raw.replace(/^﻿?---\r?\n[\s\S]*?\r?\n---\r?\n/, '').trim().slice(0, CARD_EXTRACT_MAX)
-      this.cache.set(url, { at: now, value: full })
+      this.remember(url, { at: now, value: full })
       return full.slice(0, maxLen)
     } catch {
       return ''
@@ -544,7 +558,9 @@ export class HfClient {
 
   // ── internals ──────────────────────────────────────────────────────────────
 
-  private async getJson<T>(url: string): Promise<T> {
+  /** Cached JSON GET. `maxPages` > 1 follows `Link: rel="next"` pagination (see
+   *  {@link TREE_MAX_PAGES}) and caches the concatenated array as one value. */
+  private async getJson<T>(url: string, maxPages = 1): Promise<T> {
     const now = Date.now()
     const hit = this.cache.get(url)
     if (hit && now - hit.at < CACHE_TTL_MS) return hit.value as T
@@ -576,9 +592,45 @@ export class HfClient {
       if (hit) return hit.value as T
       throw new HfError('hf_unreachable', `Hugging Face request failed (HTTP ${res.status}).`)
     }
-    const value = (await res.json()) as T
-    this.cache.set(url, { at: now, value })
+    let value = (await res.json()) as T
+    if (maxPages > 1 && Array.isArray(value)) {
+      const all: unknown[] = value
+      let next = nextPageUrl(res.headers.get('link'), url)
+      for (let page = 1; next && page < maxPages; page++) {
+        const r = await fetch(next, { headers: this.authHeaders(), redirect: 'follow' }).catch(() => null)
+        const more: unknown = r?.ok ? await r.json().catch(() => null) : null
+        if (!r || !Array.isArray(more)) {
+          // A half-read listing must never pass (or be cached) as the whole repo.
+          if (hit) return hit.value as T
+          throw new HfError('hf_unreachable', 'Hugging Face is unreachable — check your connection.')
+        }
+        all.push(...more)
+        next = nextPageUrl(r.headers.get('link'), next)
+      }
+      value = all as T
+    }
+    this.remember(url, { at: now, value })
     return value
+  }
+
+  /** Cache a response, evicting the oldest-written entries past {@link CACHE_MAX_ENTRIES}. */
+  private remember(url: string, row: CacheRow): void {
+    this.cache.delete(url) // re-insert, so a refreshed entry counts as the newest
+    this.cache.set(url, row)
+    while (this.cache.size > CACHE_MAX_ENTRIES) this.cache.delete(this.cache.keys().next().value as string)
+  }
+}
+
+/** The `rel="next"` target of an HTTP `Link` header, resolved against `current` — only when it
+ *  stays on the same origin, since the request carries the user's HF token. */
+function nextPageUrl(link: string | null, current: string): string | null {
+  const m = link?.match(/<([^>]+)>\s*;[^,]*\brel="?next"?/i)
+  if (!m) return null
+  try {
+    const u = new URL(m[1], current)
+    return u.origin === new URL(current).origin ? u.toString() : null
+  } catch {
+    return null
   }
 }
 
@@ -624,7 +676,9 @@ function groupFiles(repo: string, entries: RawTreeEntry[]): HfRepoFile[] {
   for (const e of entries) {
     const m = base(e.path).match(SPLIT_RE)
     if (m) {
-      const gkey = `${m[1]}|${m[3]}`
+      // The directory is part of the key: per-quant subfolders (`Q4_K_M/model-00001-of-00003.gguf`
+      // beside `Q8_0/model-00001-of-00003.gguf`) reuse one shard basename for different quants.
+      const gkey = `${dirOf(e.path)}|${m[1]}|${m[3]}`
       const g = splits.get(gkey) ?? { parts: [], total: Number(m[3]) }
       g.parts.push(e)
       splits.set(gkey, g)
@@ -633,14 +687,20 @@ function groupFiles(repo: string, entries: RawTreeEntry[]): HfRepoFile[] {
     }
   }
 
-  const out: HfRepoFile[] = []
-  for (const e of singles) out.push(fileFor(repo, e, base(e.path), 1))
+  const rows: Array<{ e: RawTreeEntry; parts: number; size?: number }> = singles.map((e) => ({ e, parts: 1 }))
   for (const { parts, total } of splits.values()) {
     parts.sort((a, b) => a.path.localeCompare(b.path))
-    const first = parts[0]
-    const size = parts.reduce((s, p) => s + sizeOf(p), 0)
-    out.push(fileFor(repo, first, base(first.path), total, size))
+    rows.push({ e: parts[0], parts: total, size: parts.reduce((s, p) => s + sizeOf(p), 0) })
   }
+  // A basename shared across folders would make two rows indistinguishable, and a download by that
+  // name resolves to whichever folder the tree lists first — those rows carry their full repo path
+  // instead (as litertlmFiles does), which expandModelFiles matches exactly. Case-insensitive, like
+  // expandModelFiles' basename match.
+  const nameCount = new Map<string, number>()
+  for (const { e } of rows) nameCount.set(base(e.path).toLowerCase(), (nameCount.get(base(e.path).toLowerCase()) ?? 0) + 1)
+  const out = rows.map(({ e, parts, size }) =>
+    fileFor(repo, e, (nameCount.get(base(e.path).toLowerCase()) ?? 0) > 1 ? e.path : base(e.path), parts, size),
+  )
   // Recommended-first ordering is the UI's job; keep a stable name sort here.
   return out.sort((a, b) => a.name.localeCompare(b.name))
 }
@@ -652,10 +712,12 @@ function fileFor(
   parts: number,
   sizeOverride?: number,
 ): HfRepoFile {
-  const mmproj = name.toLowerCase().includes('mmproj')
+  // From the basename: `name` is a full repo path when groupFiles had to disambiguate it, and a
+  // folder must not read as a quant token or an mmproj.
+  const mmproj = base(name).toLowerCase().includes('mmproj')
   return {
     name,
-    quant: mmproj ? 'mmproj' : quantFromName(name),
+    quant: mmproj ? 'mmproj' : quantFromName(base(name)),
     sizeBytes: sizeOverride ?? sizeOf(e),
     parts,
     mmproj,

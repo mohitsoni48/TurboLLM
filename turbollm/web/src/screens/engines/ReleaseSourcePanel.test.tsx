@@ -1,11 +1,13 @@
 // ReleaseSourcePanel (issue #276): type a repo or tap a fork chip, see the builds ranked for
 // this machine, install one with visible progress and Cancel. The API layer is mocked per-test.
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ReleaseSourcePanel } from './ReleaseSourcePanel'
+import { queryKeys } from '../../lib/queries'
 import {
   ApiError,
   discardReleaseInstall,
@@ -62,17 +64,19 @@ const FOUND: EngineScanResult = {
   suggestedName: 'Prism (b10770)',
 }
 
-function wrap(props: Partial<React.ComponentProps<typeof ReleaseSourcePanel>> = {}) {
+function wrap(props: Partial<React.ComponentProps<typeof ReleaseSourcePanel>> = {}, { strict = false } = {}) {
   const onReady = vi.fn()
   const onCancel = vi.fn()
-  const ui = render(
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const tree = (
     <MemoryRouter>
-      <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+      <QueryClientProvider client={qc}>
         <ReleaseSourcePanel knownRepos={[]} onReady={onReady} onCancel={onCancel} {...props} />
       </QueryClientProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   )
-  return { onReady, onCancel, ...ui }
+  const ui = render(strict ? <StrictMode>{tree}</StrictMode> : tree)
+  return { onReady, onCancel, qc, ...ui }
 }
 
 async function submitRepo(repo: string) {
@@ -176,6 +180,52 @@ describe('ReleaseSourcePanel', () => {
     expect(vi.mocked(discardReleaseInstall).mock.calls[0]).toEqual([])
   })
 
+  // The job can finish between two polls (1 s apart). Its build then never reached the dialog's confirm step, whose
+  // dismissal discards it, and the abort alone does nothing to a finished job: the build would stay on disk until the
+  // daemon's 24 h GC.
+  const FINISHED: ReleaseJobView = { state: 'ready', plan: { repo: LISTING.repo, tag: LISTING.tag, asset: CUDA }, result: FOUND }
+
+  it('dismissed after the job finished but before the poll saw it: the finished build is discarded', async () => {
+    const { unmount } = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    unmount()
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(vi.mocked(discardReleaseInstall).mock.calls[0]).toEqual([])
+  })
+
+  it('Cancel after the job finished but before the poll saw it discards the finished build', async () => {
+    const { onReady } = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(onReady).not.toHaveBeenCalled()
+  })
+
+  it('dismissed while installing: a finished job of another install, or an in-place update, is not discarded', async () => {
+    for (const view of [
+      { ...FINISHED, plan: { ...FINISHED.plan!, asset: CPU } },
+      { ...FINISHED, state: 'updated', updated: { id: 'e1', name: 'Prism' } },
+    ] as ReleaseJobView[]) {
+      vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
+      const { unmount } = wrap({ initialRepo: 'a/b' })
+      await screen.findByText(CUDA)
+      await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+      await screen.findByText(/part 2\/2/)
+      vi.mocked(getReleaseInstall).mockResolvedValue(view)
+      const polls = vi.mocked(getReleaseInstall).mock.calls.length
+      unmount()
+      await waitFor(() => expect(vi.mocked(getReleaseInstall).mock.calls.length).toBe(polls + 1))
+      await new Promise((r) => setTimeout(r, 20))
+      expect(discardReleaseInstall).not.toHaveBeenCalledWith(FOUND.binPath)
+    }
+  })
+
   it('a ready job hands its result to onReady', async () => {
     vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: FOUND })
     const { onReady } = wrap({ initialRepo: 'a/b' })
@@ -192,6 +242,46 @@ describe('ReleaseSourcePanel', () => {
     await screen.findByText(CUDA)
     await userEvent.click(screen.getByRole('button', { name: 'Install' }))
     await waitFor(() => expect(onReady).toHaveBeenCalledWith({ ...FOUND, updated: { id: 'e1', name: 'Prism' } }))
+  })
+
+  it('an updated job refetches the engine list, catalog and status (the engine changed in place)', async () => {
+    vi.mocked(getReleaseInstall).mockResolvedValue({
+      state: 'updated', result: FOUND, updated: { id: 'e1', name: 'Prism' },
+    })
+    const { onReady, qc } = wrap({ initialRepo: 'a/b' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1))
+    const keys = invalidate.mock.calls.map((c) => c[0]?.queryKey)
+    expect(keys).toEqual(expect.arrayContaining([queryKeys.engines, queryKeys.engineCatalog, queryKeys.status]))
+  })
+
+  it('a ready job (nothing registered yet) refetches nothing: the Add that follows does', async () => {
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: FOUND })
+    const { onReady, qc } = wrap({ initialRepo: 'a/b' })
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await waitFor(() => expect(onReady).toHaveBeenCalledTimes(1))
+    expect(invalidate).not.toHaveBeenCalled()
+  })
+
+  it('under StrictMode (dev double mount) an accepted install shows progress and is not discarded', async () => {
+    wrap({ initialRepo: 'a/b' }, { strict: true })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    expect(await screen.findByText(/part 2\/2/)).toBeTruthy()
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  it('under StrictMode a refused start still shows its error inline', async () => {
+    vi.mocked(startReleaseInstall).mockRejectedValue(new ApiError('engine_already_running', 'Another engine job is running.', 409))
+    wrap({ initialRepo: 'a/b' }, { strict: true })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    expect(await screen.findByText('Another engine job is running.')).toBeTruthy()
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
   })
 
   it('an error job returns to the assets step with an inline error', async () => {

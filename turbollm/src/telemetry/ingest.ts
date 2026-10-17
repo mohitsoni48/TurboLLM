@@ -164,8 +164,11 @@ export interface QuarantinedEvent {
 export interface IngestDeps {
   now: () => number
   /** Returns whether this caller may proceed. Keyed on machineId + IP hash by
-   *  the Worker; the IP is used transiently and never persisted. */
-  rateLimit: (req: Request, events: Record<string, unknown>[]) => Promise<boolean>
+   *  the Worker; the IP is used transiently and never persisted. `quarantined`
+   *  is how many rows this request would write to quarantine: they cost a D1
+   *  write each, so the IP tier charges them too (their machineIds are
+   *  unvalidated, so the machine tier does not). */
+  rateLimit: (req: Request, events: Record<string, unknown>[], quarantined: number) => Promise<boolean>
   /** Durable raw mirror (D1) — the owned copy, and the one the benchmark-page
    *  generator reads. */
   store: (events: Record<string, unknown>[]) => Promise<void>
@@ -231,7 +234,7 @@ export async function handleIngest(req: Request, d: IngestDeps): Promise<Respons
     quarantined.push({ raw: raw as Record<string, unknown>, reason: result.reason })
   }
 
-  if (!(await d.rateLimit(req, accepted))) {
+  if (!(await d.rateLimit(req, accepted, quarantined.length))) {
     return new Response('slow down', { status: 429 })
   }
 

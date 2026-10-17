@@ -12,13 +12,15 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import fs, { readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import {
   ANY_ENGINE,
   ConfigStore,
   MODEL_PRESET_CAP,
   SCHEMA_VERSION,
+  configuredDaemonPort,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
@@ -223,6 +225,29 @@ test('deleteModelProfile removes only the target slot, pruning the model when em
 
   // Deleting from an unknown model is a no-op (no throw).
   assert.doesNotThrow(() => deleteModelProfile(cfg, 'gone|q4|1', 'aaaa'))
+})
+
+test('profile helpers never reach Object or Object.prototype through a key like constructor or __proto__', () => {
+  // A probe stands in for a built-in such as Object.entries, which
+  // `delete cfg.modelProfiles["constructor"][engine]` used to remove process-wide.
+  const probe = '__tllmProfileProbe'
+  const objects = [Object, Object.prototype] as unknown as Array<Record<string, unknown>>
+  for (const o of objects) Object.defineProperty(o, probe, { value: 1, configurable: true, writable: true })
+  try {
+    const cfg = defaultConfig()
+    deleteModelProfile(cfg, 'constructor', probe)
+    deleteModelProfile(cfg, '__proto__', probe)
+    for (const o of objects) assert.equal(o[probe], 1)
+    assert.equal(getModelProfile(cfg, 'constructor', probe), undefined)
+    assert.throws(() => setModelProfile(cfg, '__proto__', 'aaaa', flatProfile()))
+    assert.throws(() => setModelProfile(cfg, 'm|q4|1', '__proto__', flatProfile()))
+    // An inherited name that is not reserved becomes an ordinary own entry.
+    setModelProfile(cfg, 'toString', 'aaaa', flatProfile({ ctx: 1024 }))
+    assert.equal(Object.hasOwn(cfg.modelProfiles, 'toString'), true)
+    assert.equal((getModelProfile(cfg, 'toString', 'aaaa') as { ctx: number }).ctx, 1024)
+  } finally {
+    for (const o of objects) delete o[probe]
+  }
 })
 
 test('bug #35 scenario: two engines for one model keep independent profiles; unknown falls back to the last-used one', () => {
@@ -680,4 +705,127 @@ test('migrateModelKey: renaming to the same key is a no-op', () => {
   setModelProfile(cfg, 'm|q4|1', 'e', flatProfile())
   const moved = migrateModelKey(cfg, 'm|q4|1', 'm|q4|1')
   assert.equal(moved, false)
+})
+
+// A UTF-8 BOM (Windows editors, PowerShell 5.1 `Set-Content -Encoding UTF8`) made JSON.parse
+// throw, and load() then treated a valid hand-edited config as corrupt and reset it to defaults
+// — API keys, engines and model dirs gone.
+test('ConfigStore.load: a UTF-8 BOM before the JSON is ignored, not treated as a corrupt file', () => {
+  const path = tmpConfigPath()
+  try {
+    const cfg = { ...defaultConfig(), modelDirs: ['/models/bom-test'] }
+    writeFileSync(path, '\uFEFF' + JSON.stringify(cfg))
+
+    const store = ConfigStore.load(path)
+
+    assert.equal(store.brokenBackup(), '', 'no .broken-* backup may be written')
+    assert.deepEqual(store.snapshot().modelDirs, ['/models/bom-test'])
+  } finally {
+    cleanup(path)
+  }
+})
+
+// PowerShell 5.1's `>` and `Out-File` write UTF-16LE with a BOM. Read as UTF-8 that is not JSON,
+// so load() reset the whole config to defaults and kept a backup decoded as UTF-8, mangling any
+// non-ASCII text in it.
+test('ConfigStore.load: a UTF-16 (LE or BE) config with a BOM is read, not reset to defaults', () => {
+  for (const [label, encode] of [
+    ['UTF-16LE', (t: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(t, 'utf16le')])],
+    ['UTF-16BE', (t: string) => Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(t, 'utf16le').swap16()])],
+  ] as const) {
+    const path = tmpConfigPath()
+    try {
+      const cfg = defaultConfig()
+      cfg.daemon.port = 7123
+      cfg.modelDirs = ['C:\\Modèles\\日本']
+      writeFileSync(path, encode(JSON.stringify(cfg)))
+
+      const store = ConfigStore.load(path)
+
+      assert.equal(store.brokenBackup(), '', `${label}: no .broken-* backup may be written`)
+      assert.equal(store.snapshot().daemon.port, 7123, label)
+      assert.deepEqual(store.snapshot().modelDirs, ['C:\\Modèles\\日本'], label)
+    } finally {
+      cleanup(path)
+    }
+  }
+})
+
+test('ConfigStore.load: the .broken-* backup of an unreadable config is its exact bytes', () => {
+  const path = tmpConfigPath()
+  try {
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"modelDirs": ["Modèles"', 'utf16le')])
+    writeFileSync(path, bytes)
+
+    const store = ConfigStore.load(path)
+
+    assert.ok(store.brokenBackup(), 'a truncated file is still reset')
+    assert.deepEqual(readFileSync(store.brokenBackup()), bytes)
+  } finally {
+    cleanup(path)
+  }
+})
+
+// What `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+test('configuredDaemonPort: reads the port through a UTF-8 or UTF-16 BOM; shipped default otherwise', () => {
+  const path = tmpConfigPath()
+  try {
+    const json = JSON.stringify({ daemon: { port: 7123 } })
+    writeFileSync(path, '\uFEFF' + json)
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-8 BOM')
+    writeFileSync(path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, 'utf16le')]))
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-16LE BOM')
+    writeFileSync(path, json)
+    assert.equal(configuredDaemonPort(path), 7123)
+    writeFileSync(path, '{ not json')
+    assert.equal(configuredDaemonPort(path), defaultConfig().daemon.port)
+    assert.equal(configuredDaemonPort(join(path, '..', 'absent.json')), defaultConfig().daemon.port)
+  } finally {
+    cleanup(path)
+  }
+})
+
+// Every process that loads the config saves it (load() persists its migration), so
+// `turbollm --stop` and a refused second start write the running daemon's config.json too. With
+// one shared `config.json.tmp`, such a load landing between a daemon save's write and its rename
+// overwrote the daemon's tmp with its own snapshot and renamed it away: the daemon's rename then
+// threw ENOENT and its change never reached disk.
+test("ConfigStore: another process's load during a save leaves that save's tmp file alone", (t) => {
+  const path = tmpConfigPath()
+  const realRename = fs.renameSync
+  const realPid = process.pid
+  const setPid = (pid: number) =>
+    Object.defineProperty(process, 'pid', { value: pid, writable: false, enumerable: true, configurable: true })
+  try {
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    const daemon = ConfigStore.load(path)
+    let interleaved = false
+    t.mock.method(fs, 'renameSync', (from: string, to: string) => {
+      if (!interleaved) {
+        // The daemon's tmp is written, its rename not yet done: `turbollm --stop` loads now.
+        interleaved = true
+        setPid(realPid + 1)
+        try {
+          ConfigStore.load(path)
+        } finally {
+          setPid(realPid)
+        }
+      }
+      return realRename(from, to)
+    })
+    syncBuiltinESMExports()
+
+    daemon.update((c) => {
+      c.modelDirs = ['/models/saved-by-daemon']
+    })
+
+    assert.equal(interleaved, true)
+    assert.deepEqual((JSON.parse(readFileSync(path, 'utf8')) as Config).modelDirs, ['/models/saved-by-daemon'])
+    assert.deepEqual(readdirSync(join(path, '..')).filter((n) => n.endsWith('.tmp')), [], 'no tmp file left behind')
+  } finally {
+    setPid(realPid)
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+    cleanup(path)
+  }
 })

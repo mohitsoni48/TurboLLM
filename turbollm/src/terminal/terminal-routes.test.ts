@@ -11,8 +11,16 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
+import http from 'node:http'
+import { createRequire } from 'node:module'
+import type { AddressInfo } from 'node:net'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets } from './terminal-routes'
+import { TerminalManager } from './terminal-manager'
+import type { Deps } from '../deps'
+import type { AgentRun } from '../chat/db'
+import { tmpDir } from '../test-support/tmp'
 import { quotePtyShellArg } from '../util/shell-command'
+import { hashKey } from '../auth'
 import { enforcesPlanMode, permissionModeArgs } from './agent-modes'
 
 test('buildTerminalLaunchCommand: a genuinely first-ever launch registers this session\'s own id', () => {
@@ -334,4 +342,105 @@ test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangle
 test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', () => {
   // The common case must keep working; only the two genuinely unconveyable classes are refused.
   assert.equal(canSeedFirstMessage("don't break this", 'claude'), true)
+})
+
+// A routine kickoff that execute.ts has already given up on (its row is 'errored' and the
+// scheduler has released the routine) passes an aborted signal — the CLI must never be launched.
+test('createAgentTerminal: an aborted signal never spawns the terminal', async () => {
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
+    db: { getConversation: () => undefined, updateAgentRun: () => {} },
+  } as unknown as Deps
+  const run = { id: 'abort-session', convId: 'c', repoRoot: tmpDir('terminal-routes-abort-repo-'), codeAgent: 'opencode' } as unknown as AgentRun
+  const ac = new AbortController()
+  ac.abort()
+  const result = await createAgentTerminal(d, run, { mode: 'ask', signal: ac.signal })
+  const spawned = getTerminalManager(d).findByCodeSessionId(run.id)
+  if (spawned) getTerminalManager(d).kill(spawned)
+  assert.equal(result.ok, false)
+  // The abort outcome itself, not just "no terminal": without node-pty (an optionalDependency) the
+  // stub manager's create() throws, so an unfixed build also fails with no terminal (501).
+  assert.equal((result as { code?: string }).code, 'aborted')
+  assert.equal(spawned, null)
+})
+
+// Shutdown (cli.ts) drops the HTTP connections with closeAllConnections() and then awaits
+// server.close(). A Code terminal's WebSocket is an upgraded socket, which that leaves open: one
+// open terminal held the close until the 12 s fallback, and `--stop` SIGKILLed the daemon at 10 s.
+test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutdown\'s server.close()', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  // A live terminal without spawning a PTY: the handshake only asks the manager these.
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const client = new WebSocket(`ws://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1/code/terminal/ws?terminalId=t1`)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise((resolve, reject) => { client.once('open', resolve); client.once('error', reject) })
+    const closed = await new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), 2_000)
+      // The shutdown's own sequence.
+      server.closeAllConnections()
+      closeTerminalSockets()
+      server.close(() => resolve(true))
+    })
+    assert.equal(closed, true, 'server.close() completed promptly')
+  } finally {
+    clearTimeout(timer)
+    client.terminate()
+    server.close()
+  }
+})
+
+// The handshake gets no CORS check, and a page on another site that opens ws://127.0.0.1:<port>
+// sends a genuine Host, so loopback trust let any website attach to a live terminal whose id it
+// had (https://turbollm.dev could list them through /api's CORS). Its Origin gives it away.
+test('a terminal WebSocket handshake from another site needs a key; the app\'s own page does not', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const raw = 'tllm-terminalwsoriginterminalwsoriginter1'
+  const cfg = {
+    daemon: { port: 6996 },
+    apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null }],
+  }
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const handshake = (headers: Record<string, string>, query = '') =>
+    new Promise<number | 'open'>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/code/terminal/ws?terminalId=t1${query}`, { headers })
+      ws.once('open', () => { ws.terminate(); resolve('open') })
+      ws.once('unexpected-response', (_req: unknown, res: { statusCode: number }) => { ws.terminate(); resolve(res.statusCode) })
+      ws.once('error', () => resolve(-1))
+    })
+  try {
+    for (const headers of [
+      { Origin: 'https://turbollm.dev' },
+      { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' },
+      { Origin: 'null' },
+      { Origin: `http://127.0.0.1:${port + 1}` },
+    ] as Record<string, string>[]) {
+      assert.equal(await handshake(headers), 401, JSON.stringify(headers))
+    }
+    // The app's own page (Electron, the browser, the Android WebView), a CLI with no Origin.
+    assert.equal(await handshake({ Origin: `http://127.0.0.1:${port}` }), 'open')
+    assert.equal(await handshake({ Origin: `http://LOCALHOST:${port}`, Host: `localhost:${port}` }), 'open')
+    assert.equal(await handshake({}), 'open')
+    // Another site's page holding a real key still connects, as a LAN client would.
+    assert.equal(await handshake({ Origin: 'https://evil.example' }, `&key=${raw}`), 'open')
+  } finally {
+    server.close()
+  }
 })

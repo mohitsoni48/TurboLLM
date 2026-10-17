@@ -7,7 +7,7 @@ import { writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, win32 } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
-import { archiveExtractor, extractArchive } from './download'
+import { archiveExtractor, extractArchive, powershellExpandArgs } from './download'
 
 const DEST = 'dest-dir'
 const everythingExists = () => true
@@ -19,7 +19,8 @@ const plan = (archive: string, platform: NodeJS.Platform, env: { SystemRoot?: st
 
 test('archiveExtractor: .zip per platform', () => {
   assert.deepEqual(plan('a.zip', 'win32'), { kind: 'powershell' })
-  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: 'tar', args: ['-xf', 'a.zip', '-C', DEST] })
+  // Pinned: only bsdtar reads zip, and a GNU tar first on PATH (Homebrew gnubin) cannot.
+  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', 'a.zip', '-C', DEST] })
   assert.deepEqual(plan('a.zip', 'linux'), { kind: 'node-zip' })
   assert.deepEqual(plan('a.zip', 'android'), { kind: 'node-zip' })
 })
@@ -80,6 +81,19 @@ test('existing callers keep their extractor', () => {
     assert.equal(p.kind, expected, archive + ' on ' + platform)
     if (expected === 'tar') assert.deepEqual(p, { kind: 'tar', cmd: 'tar', args: ['-xzf', archive, '-C', DEST] })
   }
+})
+
+// PowerShell reads U+2018-U+201B as single quotes too, so each must be doubled inside the '...' literal like the ASCII
+// one; escaping only ' let a profile folder such as O’Brien end the -LiteralPath string at the ’.
+test('powershellExpandArgs: every kind of single quote in a path is doubled, so the path stays one literal', () => {
+  const archive = String.raw`C:\Users\O’Brien\.turbollm\engines\llama.zip`
+  const dest = String.raw`C:\Users\‘Kai’ ‚x‛ it's\.turbollm\engines\llama.cpp-b1-cuda`
+  const args = powershellExpandArgs(archive, dest)
+  assert.deepEqual(args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-Command'])
+  assert.equal(
+    args[3],
+    String.raw`Expand-Archive -LiteralPath 'C:\Users\O’’Brien\.turbollm\engines\llama.zip' -DestinationPath 'C:\Users\‘‘Kai’’ ‚‚x‛‛ it''s\.turbollm\engines\llama.cpp-b1-cuda' -Force`,
+  )
 })
 
 test('extractArchive: a corrupt archive fails with code extract_failed naming the file', async () => {

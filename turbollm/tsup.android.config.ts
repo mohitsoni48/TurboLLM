@@ -19,7 +19,15 @@ import { defineConfig } from 'tsup'
 // appeared to work because earlier dev sessions had pushed extra files onto the device by
 // hand — exactly the injected state a Play Store download will not have.
 export default defineConfig({
-  entry: { cli: 'src/cli.ts' },
+  entry: {
+    cli: 'src/cli.ts',
+    // run_code's worker and its sandbox are loaded at runtime from files beside the bundle
+    // (builtin.ts's WORKER_PATH → run-code-worker.js → run-code-sandbox.js), never imported, so
+    // they must be entries here exactly as in tsup.config.ts — without them every run_code call on
+    // the phone failed with "Cannot find module …/dist/run-code-worker.js".
+    'run-code-worker': 'src/tools/run-code-worker.ts',
+    'run-code-sandbox': 'src/tools/run-code-sandbox.ts',
+  },
   format: ['esm'],
   clean: true,
   outDir: 'dist-android',

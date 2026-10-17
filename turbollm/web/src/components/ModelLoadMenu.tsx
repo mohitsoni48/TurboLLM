@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import type { KeyboardEvent, RefObject } from 'react'
+import type { KeyboardEvent, MouseEvent, RefObject } from 'react'
 import { AlertTriangle, Check, ChevronDown, CircleSlash, Cloud, Cpu, Loader2, Search, SlidersHorizontal, Star } from 'lucide-react'
 import { filterModelGroups, moveActiveIndex, resolveActiveIndex } from '../lib/model-picker-filter'
 import type { ModelEntry } from '../lib/types'
@@ -78,8 +78,12 @@ export function ModelLoadMenu({
   const idPrefix = useId()
   // Pinned models float to the top (same convention as the library list in ModelsScreen),
   // stable otherwise so unpinned order is unaffected.
+  // One row per key: the same GGUF in two model folders gets one key, and both rows would load
+  // that same key. Two rows sharing it break the key-tracked highlight (ArrowDown from the first
+  // resolves back onto it, so it sticks there) and share a DOM id and a React key.
+  const seenKeys = new Set<string>()
   const loadable = models
-    .filter((m) => !m.incomplete && !m.parseError)
+    .filter((m) => !m.incomplete && !m.parseError && !seenKeys.has(m.key) && !!seenKeys.add(m.key))
     .map((m, i) => ({ m, i }))
     .sort((a, b) => {
       const p = Number(isPinned(b.m.key)) - Number(isPinned(a.m.key))
@@ -91,8 +95,19 @@ export function ModelLoadMenu({
   // All of the "which group, what does the user read, is this row pickable and why not"
   // logic lives in the PURE helper (lib/remote-models.ts) and is unit-tested there; this
   // component only renders what it returns.
-  const repoByKey = new Map(loadable.flatMap((m) => (m.sourceRepo ? [[m.key, m.sourceRepo] as const] : [])))
-  const groups = groupModelChoices({ local: loadable, links: links ?? [], remote: remoteModels ?? [] })
+  // From every loadable copy, not only the one row kept per key: the kept copy may sit in a flat
+  // folder with no repo while its twin has one, and searching that repo must still find the row.
+  const repoByKey = new Map(
+    models.flatMap((m) => (!m.incomplete && !m.parseError && m.sourceRepo ? [[m.key, m.sourceRepo] as const] : [])),
+  )
+  // One row per (link, key), for the same reason as `loadable`: a host with the GGUF in two
+  // folders lists both copies. Link names are unique, so this is one row per choice id.
+  const seenRemote = new Set<string>()
+  const remote = (remoteModels ?? []).filter((r) => {
+    const id = `${r.linkId}\u0000${r.model.key}`
+    return !seenRemote.has(id) && !!seenRemote.add(id)
+  })
+  const groups = groupModelChoices({ local: loadable, links: links ?? [], remote })
   const flat = isFlat(groups)
   const total = groups.reduce((n, g) => n + g.choices.length, 0)
   const searching = query.trim() !== ''
@@ -184,6 +199,7 @@ export function ModelLoadMenu({
         id={optionId(idPrefix, index)}
         data-active={index === activeIndex ? '' : undefined}
         onMouseMove={highlightOnMouseMove(choice.id)}
+        onMouseDown={keepFocusInBox}
         role="menuitem"
         tabIndex={-1}
         aria-disabled={choice.disabled || undefined}
@@ -313,6 +329,7 @@ export function ModelLoadMenu({
                 id={ejectId(idPrefix)}
                 data-active={targetKeys[activeIndex] === EJECT_KEY ? '' : undefined}
                 onMouseMove={highlightOnMouseMove(EJECT_KEY)}
+                onMouseDown={keepFocusInBox}
                 className={ROW_CLASS}
                 style={{ color: 'var(--err)' }}
                 onClick={() => pick(EJECT_KEY, { alt: false })}
@@ -389,6 +406,14 @@ function listIdOf(idPrefix: string): string {
 
 function domIdOfTarget(idPrefix: string, index: number, choiceCount: number): string {
   return index < choiceCount ? optionId(idPrefix, index) : ejectId(idPrefix)
+}
+
+/** Pressing a row must not move focus from the search box onto the (tabIndex -1) row: a disabled
+ *  row keeps the menu open after its click, and with focus on the row the next keys would feed
+ *  Radix type-ahead instead of the box. The click still fires. Not a refocus in pick(): on a touch
+ *  device that would raise the soft keyboard the picker deliberately avoids. */
+function keepFocusInBox(e: MouseEvent) {
+  if (e.button === 0) e.preventDefault() // the primary button only: a middle-click autoscroll still starts
 }
 
 /** Radix type-ahead hijacks every plain character typed inside the menu, so those keys must not

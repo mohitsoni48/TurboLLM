@@ -138,3 +138,36 @@ test('prune drops entries older than the retention window', () => {
     cleanup()
   }
 })
+
+// `since` is a lower bound and the order is newest-first, so every `since` value returned
+// the same newest rows — nothing past the first page was reachable. `before` (the id of the
+// oldest row received) pages backward; rows sharing a millisecond across a page boundary must
+// be neither skipped nor repeated, hence the (at, id) keyset rather than `at` alone.
+test('list() pages backward with `before` through every row, including same-millisecond ties at page boundaries', () => {
+  const { audit, db, cleanup } = make()
+  try {
+    const insert = db.handle.prepare(`INSERT INTO ext_audit (id,tenant,owner,action,target_id,request_id,status,key_prefix,at) VALUES ($id,'acme','u1','chat.create',$id,$id,201,'k',$at)`)
+    // 20 rows in groups of three sharing one timestamp; pages of 7 split several groups.
+    for (let i = 0; i < 20; i++) {
+      insert.run({ $id: `row-${String(i).padStart(2, '0')}`, $at: new Date(Date.UTC(2026, 0, 1, 0, 0, Math.floor(i / 3))).toISOString() })
+    }
+    // Another owner's row: must never appear, and its id must not work as this owner's cursor.
+    db.handle.prepare(`INSERT INTO ext_audit (id,tenant,owner,action,target_id,request_id,status,key_prefix,at) VALUES ('other','acme','u2','chat.create','x','x',201,'k','2026-01-01T00:00:03.000Z')`).run()
+
+    const seen: string[] = []
+    let before: string | undefined
+    for (let page = 0; page < 10; page++) {
+      const rows = audit.list('acme', 'u1', { limit: 7, before })
+      seen.push(...rows.map((r) => r.id))
+      if (rows.length < 7) break
+      before = rows[rows.length - 1].id
+    }
+    assert.equal(seen.length, 20, 'every row is reachable')
+    assert.equal(new Set(seen).size, 20, 'no row is repeated')
+    const ats = seen.map((id) => Number(id.slice(4)))
+    assert.deepEqual(ats, [...ats].sort((a, b) => b - a), 'newest first across pages')
+    assert.deepEqual(audit.list('acme', 'u1', { before: 'other' }), [], "another owner's row id is not a valid cursor")
+  } finally {
+    cleanup()
+  }
+})

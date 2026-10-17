@@ -29,6 +29,15 @@ export interface ModelSwapDeps {
   modelRouter: ModelRouter
 }
 
+/** For a caller that took the GenerationGate for the swap decision but must not hold it while `fn`
+ *  runs (a pi Code routine: its session takes the gate before every provider request). */
+export interface SwapGate {
+  /** Lets go of the gate right before `fn` runs. */
+  release: () => void
+  /** Takes it again for the restore, so the restore waits for whoever is generating by then. */
+  reacquire: () => Promise<() => void>
+}
+
 /**
  * Resolve the model-conflict decision for `pinnedModel` and run `fn` under it:
  *  - 'run': the pinned model is already loaded — call `fn()` directly, no swap.
@@ -38,13 +47,16 @@ export interface ModelSwapDeps {
  *    never called; the caller logs "skipped — model busy" (spec 20 §6).
  * Restoration is best-effort and always attempted (even if `fn` throws), so a routine run can
  * never strand the engine on a model the user didn't pick.
+ * With `gate`, the caller holds the GenerationGate on entry: it is released right before `fn` and
+ * taken again around the restore (see {@link SwapGate}).
  */
-export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: () => Promise<void>): Promise<ModelSwapOutcome> {
+export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: () => Promise<void>, gate?: SwapGate): Promise<ModelSwapOutcome> {
   const currentlyLoaded = deps.manager.status().model?.key ?? null
   const action = decideModelAction({ pinnedModel, currentlyLoaded, engineIdle: engineIsIdle(deps.manager) })
 
   if (action === 'skip-busy') return { outcome: 'skip-busy' }
   if (action === 'run') {
+    gate?.release()
     await fn()
     return { outcome: 'ran' }
   }
@@ -59,13 +71,19 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
   }
 
   try {
+    gate?.release()
     await fn()
   } finally {
     if (currentlyLoaded) {
+      // A gate that cannot be taken back (its queue timeout: a holder leaked its release) does not
+      // stop the restore, which must never be skipped.
+      const unlock = gate ? await gate.reacquire().catch(() => undefined) : undefined
       try {
         await deps.modelRouter.loadExplicit(currentlyLoaded)
       } catch (e) {
         console.warn(`[routines] failed to restore the previously-loaded model after a routine run: ${e instanceof Error ? e.message : String(e)}`)
+      } finally {
+        unlock?.()
       }
     }
   }

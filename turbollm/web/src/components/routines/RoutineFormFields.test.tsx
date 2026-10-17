@@ -124,8 +124,8 @@ describe('RoutineFormFields — flavor toggle', () => {
     await user.click(screen.getByRole('button', { name: 'Code' }))
     const next = onChange.mock.calls[0][0] as RoutineDraft
     expect(next.flavor).toBe('code')
-    // Not just "truthy" — the backend resolves an ABSENT permissionMode to 'auto', so the field
-    // must be present, and must be the 'ask' the select is already showing.
+    // Not just "truthy" — the stored value must be explicit, and must be the 'ask' the select
+    // then shows (an ABSENT one runs as 'auto' for the in-app agent).
     expect(Object.prototype.hasOwnProperty.call(next, 'permissionMode')).toBe(true)
     expect(next.permissionMode).toBe('ask')
   })
@@ -158,6 +158,45 @@ describe('RoutineFormFields — flavor toggle', () => {
     expect(next.workspacePath).toBeUndefined()
     expect(next.codingAgent).toBeUndefined()
     expect(next.permissionMode).toBeUndefined()
+  })
+})
+
+// A routine create_routine/REST stored with no permission mode runs as whatever the daemon's
+// default is for its coding agent ('auto' for in-app pi, one-shot `claude -p` for claude_cli) —
+// the select must name that, not show "Ask", and must not store anything the user didn't pick.
+describe('RoutineFormFields — a stored routine with no permission mode', () => {
+  const unset = (codingAgent: RoutineDraft['codingAgent']): RoutineDraft => ({ ...codeWeeklyDraft(), codingAgent, permissionMode: undefined })
+  const modeSelect = () => screen.getByLabelText('Permission mode') as HTMLSelectElement
+  const selectedText = (s: HTMLSelectElement) => s.options[s.selectedIndex].textContent
+
+  it('shows the in-app agent\'s unset mode as the Auto it actually runs, not Ask', () => {
+    renderControlled(unset('pi'), vi.fn(), false, true)
+    expect(modeSelect().value).toBe('')
+    expect(selectedText(modeSelect())).toBe('Not set: Auto — runs tools without asking')
+  })
+
+  it('names the one-shot claude -p path for claude_cli, and Ask for the other terminal agents', () => {
+    const { unmount } = renderControlled(unset('claude_cli'), vi.fn(), false, true)
+    expect(selectedText(modeSelect())).toMatch(/^Not set: One-shot claude -p with Claude's default permissions/)
+    unmount()
+    renderControlled(unset('opencode_cli'), vi.fn(), false, true)
+    expect(selectedText(modeSelect())).toBe('Not set: Ask before each tool call')
+  })
+
+  it('leaves the mode unset when another field is edited, and stores one only when the user picks it', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    renderControlled(unset('pi'), onChange, false, true)
+    fireEvent.change(screen.getByLabelText('Task prompt'), { target: { value: 'Tidy it all' } })
+    expect((onChange.mock.lastCall![0] as RoutineDraft).permissionMode).toBeUndefined()
+    await user.selectOptions(modeSelect(), 'ask')
+    expect((onChange.mock.lastCall![0] as RoutineDraft).permissionMode).toBe('ask')
+  })
+
+  it('offers no "Not set" choice once a mode is stored (PUT cannot clear one)', () => {
+    renderControlled(codeWeeklyDraft(), vi.fn(), false, true)
+    expect(modeSelect().value).toBe('ask')
+    expect(screen.queryByRole('option', { name: /^Not set/ })).not.toBeInTheDocument()
   })
 })
 
@@ -235,6 +274,35 @@ describe('RoutineFormFields — cleared time input', () => {
     renderControlled({ ...emptyRoutineDraft(), scheduleRule: { kind: 'daily', hour: 14, minute: 35 } }, onChange)
     fireEvent.change(screen.getByLabelText('Time of day'), { target: { value: '07:05' } })
     expect((onChange.mock.calls[0][0] as RoutineDraft).scheduleRule).toEqual({ kind: 'daily', hour: 7, minute: 5 })
+  })
+})
+
+describe('RoutineFormFields — interval minutes', () => {
+  function IntervalHarness({ onRule }: { onRule: (everyMs: number) => void }) {
+    const [draft, setDraft] = useState<RoutineDraft>({ ...emptyRoutineDraft(), scheduleRule: { kind: 'interval', everyMs: 60 * 60_000 } })
+    return <RoutineFormFields draft={draft} onChange={(d) => { setDraft(d); if (d.scheduleRule.kind === 'interval') onRule(d.scheduleRule.everyMs) }} />
+  }
+
+  it('lets the field be cleared and retyped — clearing no longer snaps to 1 (60 → "30" gave 130)', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    await userEvent.clear(input)
+    expect(input.value).toBe('')
+    await userEvent.type(input, '30')
+    expect(input.value).toBe('30')
+    expect(onRule).toHaveBeenLastCalledWith(30 * 60_000)
+  })
+
+  it('never commits below one minute, and shows the committed value once the field is left', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    await userEvent.clear(input)
+    await userEvent.type(input, '0')
+    expect(onRule).toHaveBeenLastCalledWith(60_000)
+    fireEvent.blur(input)
+    expect(input.value).toBe('1')
   })
 })
 

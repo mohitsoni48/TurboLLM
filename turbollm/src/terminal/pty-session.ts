@@ -36,9 +36,11 @@ function resolveWindowsShell(): string {
   return cachedWindowsShell
 }
 
-/** Cap on the in-memory scrollback buffer (bytes) — generous enough for a full-screen TUI
- *  repaint history without unbounded growth for a long-lived session. Trimmed from the
- *  FRONT (oldest first) once exceeded, same as any bounded scrollback. */
+/** Cap on the in-memory scrollback buffer, in UTF-16 chars (String length) — generous enough
+ *  for a full-screen TUI repaint history without unbounded growth for a long-lived session.
+ *  Trimmed from the FRONT (oldest first) once exceeded, same as any bounded scrollback.
+ *  Mirrored by DAEMON_REPLAY_CAP in web/src/screens/code/TerminalView.tsx, which clears on a
+ *  reconnect only for a replay shorter than this: keep the two in step. */
 const SCROLLBACK_CAP = 512 * 1024
 
 /** A single PTY session backed by node-pty. */

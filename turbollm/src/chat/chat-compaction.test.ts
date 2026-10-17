@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import {
   withCurrentDate, shouldAutoCompact, lastCtxUsage, resolveCompactionCut,
   buildEngineMessages, pickCompactionCut, AUTO_COMPACT_THRESHOLD,
-  compactConversation, maybeAutoCompact,
+  compactConversation, maybeAutoCompact, setAsideFrozenCut,
 } from './chat-compaction.js'
 import type { Conversation, Message } from './db.js'
 import type { ChatUpstream } from './chat-upstream.js'
@@ -112,7 +112,7 @@ test('resolveCompactionCut: no cut set → summary null, rest is everything', ()
 })
 
 test('resolveCompactionCut: resolved cut → summary + only messages AFTER the cut', () => {
-  const m1 = makeMsg('user', 'a'); const m2 = makeMsg('assistant', 'b'); const m3 = makeMsg('user', 'c')
+  const m1 = makeMsg('assistant', 'a'); const m2 = makeMsg('user', 'b'); const m3 = makeMsg('assistant', 'c')
   const conv = makeConv({ compactionSummary: 'earlier stuff', compactionUpToMessageId: m1.id })
   const { summary, rest } = resolveCompactionCut(conv, [m1, m2, m3])
   assert.equal(summary, 'earlier stuff')
@@ -137,6 +137,20 @@ test('resolveCompactionCut: cut resolves to the LAST active message → empty ta
   assert.deepEqual(rest.map((m) => m.id), [m1.id, m2.id]) // full list, never an empty tail
 })
 
+test('resolveCompactionCut: a cut ON a user turn (stored before cuts were aligned) keeps that turn, so the prompt never opens on its reply', () => {
+  const u1 = makeMsg('user', 'q1'); const a1 = makeMsg('assistant', 'r1')
+  const u2 = makeMsg('user', 'q2'); const a2 = makeMsg('assistant', 'r2'); const u3 = makeMsg('user', 'q3')
+  const conv = makeConv({ systemPrompt: '', compactionSummary: 'earlier stuff', compactionUpToMessageId: u2.id })
+  const { summary, rest } = resolveCompactionCut(conv, [u1, a1, u2, a2, u3])
+  assert.equal(summary, 'earlier stuff')
+  assert.deepEqual(rest.map((m) => m.id), [u2.id, a2.id, u3.id])
+  assert.deepEqual(buildEngineMessages(conv, [u1, a1, u2, a2, u3]).map((m) => m.role), ['system', 'user', 'assistant', 'user'])
+  // A user cut NOT followed by its reply already opens the tail on a user turn: unchanged.
+  const lone = makeMsg('user', 'unanswered')
+  const conv2 = makeConv({ compactionSummary: 's', compactionUpToMessageId: lone.id })
+  assert.deepEqual(resolveCompactionCut(conv2, [u1, a1, lone, u3]).rest.map((m) => m.id), [u3.id])
+})
+
 // ── buildEngineMessages ──────────────────────────────────────────────────────────────
 
 test('buildEngineMessages: no cut, no system prompt — plain passthrough', () => {
@@ -154,15 +168,44 @@ test('buildEngineMessages: system prompt gets the date-injected treatment', () =
   assert.match(out[0].content as string, /^Be nice\.\n\nToday's date is/)
 })
 
-test('buildEngineMessages: with a resolved cut, emits system + summary-as-system + only the tail', () => {
-  const m1 = makeMsg('user', 'old'); const m2 = makeMsg('assistant', 'new')
+test('buildEngineMessages: with a resolved cut, emits ONE system message (prompt + date + summary) + only the tail', () => {
+  const m1 = makeMsg('assistant', 'old'); const m2 = makeMsg('user', 'new')
   const conv = makeConv({ systemPrompt: 'Be nice.', compactionSummary: 'User said old things.', compactionUpToMessageId: m1.id })
   const out = buildEngineMessages(conv, [m1, m2])
-  assert.equal(out.length, 3)
-  assert.equal(out[0].role, 'system') // date-injected system prompt
-  assert.equal(out[1].role, 'system')
-  assert.equal(out[1].content, 'Earlier conversation summary:\n\nUser said old things.')
-  assert.deepEqual(out[2], { role: 'assistant', content: 'new' })
+  assert.equal(out.length, 2)
+  assert.equal(out[0].role, 'system')
+  // A second `system` turn is rejected by alternation-enforcing templates (Gemma 2/3, older
+  // Mistral), so the summary is folded into the one leading system message, after the date.
+  assert.match(out[0].content as string, /^Be nice\.\n\nToday's date is [^\n]+\n\nEarlier conversation summary:\n\nUser said old things\.$/)
+  assert.deepEqual(out[1], { role: 'user', content: 'new' })
+})
+
+test('buildEngineMessages: a summary with NO system prompt is the one system message on its own (no date line added)', () => {
+  const m1 = makeMsg('user', 'old'); const m2 = makeMsg('assistant', 'new'); const m3 = makeMsg('user', 'next')
+  const conv = makeConv({ systemPrompt: '', compactionSummary: 'User said old things.', compactionUpToMessageId: m2.id })
+  const out = buildEngineMessages(conv, [m1, m2, m3])
+  assert.deepEqual(out, [
+    { role: 'system', content: 'Earlier conversation summary:\n\nUser said old things.' },
+    { role: 'user', content: 'next' },
+  ])
+})
+
+test('buildEngineMessages: the answered user turn is rebuilt with its images and document text; older turns stay text-only (as POST /messages sends them)', () => {
+  const old = makeMsg('user', 'older question', { attachments: ['data:image/png;base64,OLD'], docContext: '[Attached: old.txt]\nold doc' })
+  const reply = makeMsg('assistant', 'older answer')
+  const answering = makeMsg('user', 'What is in this picture?', { attachments: ['data:image/png;base64,AAAA'], docContext: '[Attached: report.txt]\nQ3 revenue was $4M' })
+  const out = buildEngineMessages(makeConv(), [old, reply, answering], answering.id)
+  assert.deepEqual(out[0], { role: 'user', content: 'older question' })
+  assert.deepEqual(out[2], {
+    role: 'user',
+    content: [
+      { type: 'text', text: '[Attached: report.txt]\nQ3 revenue was $4M\n\nWhat is in this picture?' },
+      { type: 'image_url', image_url: { url: 'data:image/png;base64,AAAA' } },
+    ],
+  })
+  // An image-only turn: no empty text part, just the image.
+  const imageOnly = makeMsg('user', '', { attachments: ['data:image/png;base64,BBBB'] })
+  assert.deepEqual(buildEngineMessages(makeConv(), [imageOnly], imageOnly.id)[0].content, [{ type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } }])
 })
 
 test('buildEngineMessages: preserveThinking folds reasoning into an assistant message ONLY for the raw tail, never for the summary', () => {
@@ -187,8 +230,22 @@ test('pickCompactionCut: always keeps at least the last message in the tail, eve
   const messages = [makeMsg('user', 'a'), makeMsg('assistant', 'b'), makeMsg('user', 'c'), makeMsg('assistant', big)]
   const picked = pickCompactionCut(messages, 100) // tiny budget
   assert.ok(picked)
-  assert.equal(picked!.toSummarize.length, 3) // everything but the huge last message
-  assert.equal(picked!.cutMessageId, messages[2].id)
+  // The huge last reply stays, along with the user turn it answers — the tail must open on a
+  // user turn (see the next test), so the tail widens back to it rather than start mid-pair.
+  assert.equal(picked!.toSummarize.length, 2)
+  assert.equal(picked!.cutMessageId, messages[1].id)
+})
+
+test('pickCompactionCut: the kept tail always opens on a user turn — the cut moves forward past an assistant reply', () => {
+  // Budget room for the last three messages (assistant, user, assistant): a tail opening on that
+  // assistant would follow the system message directly, which Gemma-style templates reject.
+  const messages = Array.from({ length: 8 }, (_, i) => makeMsg(i % 2 === 0 ? 'user' : 'assistant', 'y'.repeat(100)))
+  const picked = pickCompactionCut(messages, 650)
+  assert.ok(picked)
+  const tail = messages.slice(picked!.toSummarize.length)
+  assert.equal(tail[0].role, 'user')
+  assert.equal(picked!.cutMessageId, messages[5].id)
+  assert.equal(tail.length, 2)
 })
 
 test('pickCompactionCut: cutMessageId is the LAST message being summarized, and toSummarize+tail cover everything with no gap or overlap', () => {
@@ -242,7 +299,8 @@ test('pickCompactionCut: an extreme realCtxUsed is clamped, not applied verbatim
   // rule from the uncalibrated version still holds on top of it.
   const picked = pickCompactionCut(messages, 100, 1_000_000)
   assert.ok(picked)
-  assert.equal(picked!.toSummarize.length, messages.length - 1)
+  // The last message plus the user turn that opens the tail.
+  assert.equal(picked!.toSummarize.length, messages.length - 2)
 })
 
 test('pickCompactionCut: a tiny pool ignores realCtxUsed — not enough text for the ratio to mean anything', () => {
@@ -266,8 +324,11 @@ test('pickCompactionCut: preserveThinking makes the sizing estimate count reason
       ? makeMsg('user', 'ok continue')
       : makeMsg('assistant', 'x'.repeat(200), { reasoning: 'y'.repeat(460) }),
   )
-  const ctxMax = 2000
-  const realCtxUsed = 1600 // the engine's real prompt size, reasoning included
+  // Sized so the content-only tail holds two user/assistant pairs: the tail now always opens on
+  // a user turn, which rounds both cuts to a pair boundary, and a smaller window rounded the
+  // two estimates onto the same cut.
+  const ctxMax = 4000
+  const realCtxUsed = 3200 // the engine's real prompt size, reasoning included
 
   const withoutReasoning = pickCompactionCut(messages, ctxMax, realCtxUsed, false)
   const withReasoning = pickCompactionCut(messages, ctxMax, realCtxUsed, true)
@@ -729,6 +790,195 @@ test('compactConversation: an aborted caller signal reaches the summarization ca
     ac.abort()
     await assert.rejects(() => compactConversation(fakeDeps(db, 200), conv.id, { upstream: localUpstream(200), signal: ac.signal, fetchImpl }))
     assert.equal(db.getConversation(conv.id)!.compactionSummary, undefined)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// ── Compaction fixes: the turn's snapshot, an already-applied compaction, a frozen cut ────
+
+/** A fake summarizer that records every summarization prompt it is sent. */
+function recordingFetch(prompts: string[]): typeof fetch {
+  return (async (_url: unknown, init: RequestInit | undefined) => {
+    prompts.push(String(init?.body ?? ''))
+    return new Response(JSON.stringify({ choices: [{ message: { content: `SUMMARY ${prompts.length}` } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  }) as unknown as typeof fetch
+}
+
+test('maybeAutoCompact: compacts the caller\'s snapshot — the user message this turn just inserted is never summarized', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const ctxMax = 8192
+    const conv = db.createConversation({ title: 'T', systemPrompt: 'sys' })
+    for (let i = 0; i < 19; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `m${i} ` + 'x'.repeat(1000))
+    db.addMessage(conv.id, 'assistant', 'last', { stats: { ctxUsed: 6800, ctxMax } })
+    // POST /messages order: snapshot, then this turn's user row + placeholder, then maybeAutoCompact.
+    const snapshot = db.getConversation(conv.id, true)!
+    const current = db.addMessage(conv.id, 'user', 'PASTED DOC ' + 'y'.repeat(5000))
+    db.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
+    const prompts: string[] = []
+    await maybeAutoCompact(fakeDeps(db, ctxMax), conv.id, snapshot, localUpstream(ctxMax), new AbortController().signal, async () => {}, recordingFetch(prompts))
+    assert.equal(prompts.length, 1)
+    assert.ok(!prompts[0].includes('PASTED DOC'), 'the current turn\'s own message must not be summarized')
+    const cut = db.getConversation(conv.id)!.compactionUpToMessageId
+    assert.notEqual(cut, current.id)
+    assert.ok(snapshot.messages!.some((m) => m.id === cut), 'the cut must resolve inside the snapshot this turn builds from')
+    // ...so this turn's prompt really is compacted: one system message, then a tail opening on a user turn.
+    const engine = buildEngineMessages(snapshot, snapshot.messages!)
+    assert.equal(engine.filter((m) => m.role === 'system').length, 1)
+    assert.match(engine[0].content as string, /Earlier conversation summary:\n\nSUMMARY 1$/)
+    assert.equal(engine[1].role, 'user')
+    assert.ok(engine.length < snapshot.messages!.length)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: no second, redundant compaction right after a manual one — the >80% reading predates it (compactionAppliedAt)', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const ctxMax = 8192
+    const conv = db.createConversation({ title: 'T', modelKey: 'm' })
+    for (let i = 0; i < 23; i++) db.addMessage(conv.id, i % 2 === 0 ? 'user' : 'assistant', `m${i} ` + 'x'.repeat(1000))
+    db.addMessage(conv.id, 'assistant', 'last ' + 'x'.repeat(1000), { stats: { ctxUsed: 7000, ctxMax } })
+    await new Promise((r) => setTimeout(r, 5)) // the user clicks Compact after that reply, never in the same millisecond
+    const prompts: string[] = []
+    const fetchImpl = recordingFetch(prompts)
+    await compactConversation(fakeDeps(db, ctxMax), conv.id, { upstream: localUpstream(ctxMax), fetchImpl }) // manual Compact
+    const afterManual = db.getConversation(conv.id)!
+    // The next send: snapshot, user row + placeholder, maybeAutoCompact.
+    const snapshot = db.getConversation(conv.id, true)!
+    db.addMessage(conv.id, 'user', 'short follow-up question')
+    db.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
+    const events: string[] = []
+    await maybeAutoCompact(fakeDeps(db, ctxMax), conv.id, snapshot, localUpstream(ctxMax), new AbortController().signal, async (p) => { events.push(p) }, fetchImpl)
+    assert.equal(prompts.length, 1, 'only the manual compaction may call the summarizer')
+    assert.deepEqual(events, [])
+    assert.equal(db.getConversation(conv.id)!.compactionUpToMessageId, afterManual.compactionUpToMessageId)
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('setAsideFrozenCut: a cut frozen on a branch the user left is neither sent nor seeded into the next compaction; a DELETED cut still keeps its summary', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const conv = db.createConversation({ title: 'T', modelKey: 'm' })
+    const u1 = db.addMessage(conv.id, 'user', 'Write a web scraper in Python')
+    db.addMessage(conv.id, 'assistant', 'Here is a Python scraper using requests + bs4 ...')
+    db.addMessage(conv.id, 'user', 'Add retries')
+    const cut = db.addMessage(conv.id, 'assistant', 'Added tenacity-based retries ...')
+    db.addMessage(conv.id, 'user', 'Now add a CLI')
+    db.addMessage(conv.id, 'assistant', 'argparse CLI ...')
+    db.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper.', upToMessageId: cut.id, tokensBefore: 500 })
+    // Edit-and-resend of the first message (the PUT route's own steps): the cut is frozen with the old branch.
+    db.freezeTail(conv.id, u1.seq, u1.id)
+    db.deactivateMessage(u1.id)
+    db.addMessage(conv.id, 'user', 'Write a web scraper in Go', { variantGroup: db.getMessage(u1.id)!.variantGroup! })
+    for (let i = 0; i < 6; i++) db.addMessage(conv.id, i % 2 === 0 ? 'assistant' : 'user', `go branch message ${i} with enough real content to count`)
+
+    const stored = db.getConversation(conv.id, true)!
+    const sent = buildEngineMessages(setAsideFrozenCut(db, stored), stored.messages!)
+    assert.ok(!sent.some((m) => String(m.content).includes('PYTHON')), 'the abandoned branch\'s summary must not be sent')
+    assert.equal(sent.length, stored.messages!.length) // uncompacted: every active message replayed
+
+    const prompts: string[] = []
+    await compactConversation(fakeDeps(db, 200), conv.id, { upstream: localUpstream(200), fetchImpl: recordingFetch(prompts) })
+    assert.ok(!prompts[0].includes('PYTHON'), 'the abandoned branch\'s summary must not be folded into the new one')
+
+    // Deleted (not deactivated): resolveCompactionCut's never-drop fallback still applies.
+    db.setConversationCompaction(conv.id, { summary: 'Deleted-cut summary.', upToMessageId: 'deleted-msg-id', tokensBefore: 10 })
+    const again = db.getConversation(conv.id, true)!
+    assert.ok(buildEngineMessages(setAsideFrozenCut(db, again), again.messages!).some((m) => String(m.content).includes('Deleted-cut summary.')))
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('maybeAutoCompact: a compaction set aside for this branch (frozen cut) does not suppress auto-compaction of a >80% reading that predates it', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const ctxMax = 8192
+    const conv = db.createConversation({ title: 'T', modelKey: 'm' })
+    const u1 = db.addMessage(conv.id, 'user', 'Write a web scraper in Python')
+    const cut = db.addMessage(conv.id, 'assistant', 'Here is a Python scraper ...')
+    db.addMessage(conv.id, 'user', 'Add retries')
+    // Edit-and-resend of the first message: the Python branch (and the cut on it) is frozen.
+    db.freezeTail(conv.id, u1.seq, u1.id)
+    db.deactivateMessage(u1.id)
+    db.addMessage(conv.id, 'user', 'Write a web scraper in Go', { variantGroup: db.getMessage(u1.id)!.variantGroup! })
+    for (let i = 0; i < 21; i++) db.addMessage(conv.id, i % 2 === 0 ? 'assistant' : 'user', `go m${i} ` + 'x'.repeat(1000))
+    db.addMessage(conv.id, 'assistant', 'last ' + 'x'.repeat(1000), { stats: { ctxUsed: 7000, ctxMax } })
+    await new Promise((r) => setTimeout(r, 5))
+    // A compaction applied AFTER that reading, but on the Python branch (as after switching there,
+    // compacting, and switching back): its cut is inactive on the Go branch, so it is set aside.
+    db.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper.', upToMessageId: cut.id, tokensBefore: 500 })
+    const snapshot = db.getConversation(conv.id, true)!
+    assert.ok(snapshot.compactionAppliedAt! > snapshot.messages!.at(-1)!.createdAt)
+    db.addMessage(conv.id, 'user', 'short follow-up question')
+    db.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
+    const prompts: string[] = []
+    const events: string[] = []
+    await maybeAutoCompact(fakeDeps(db, ctxMax), conv.id, snapshot, localUpstream(ctxMax), new AbortController().signal, async (p) => { events.push(p) }, recordingFetch(prompts))
+    assert.equal(prompts.length, 1, 'the Go branch\'s >80% reading must be compacted')
+    assert.deepEqual(events, ['start', 'end'])
+    assert.ok(!prompts[0].includes('PYTHON'))
+    const after = db.getConversation(conv.id)!.compactionUpToMessageId
+    assert.ok(snapshot.messages!.some((m) => m.id === after), 'the new cut lands on the active (Go) branch')
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// One compaction per conversation: branch A's was replaced by branch B's, so A is replayed in full,
+// while A's last reading was taken on A's compacted prompt. Gated on that reading alone, A was
+// never compacted again and every turn sent its whole history, well past the context.
+test('maybeAutoCompact: a branch whose own compaction another branch replaced is judged by its full history, not the reading taken under that compaction', async () => {
+  const root = makeTmpRoot()
+  const db = new ConversationStore(root)
+  try {
+    const ctxMax = 8192
+    const conv = db.createConversation({ title: 'T', modelKey: 'm' })
+    const u1 = db.addMessage(conv.id, 'user', 'Write a web scraper in Python')
+    for (let i = 0; i < 29; i++) db.addMessage(conv.id, i % 2 === 0 ? 'assistant' : 'user', `python m${i} ` + 'x'.repeat(1000))
+    const cutA = db.getMessages(conv.id).at(-6)!
+    db.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper.', upToMessageId: cutA.id, tokensBefore: 6000 })
+    await new Promise((r) => setTimeout(r, 5))
+    db.addMessage(conv.id, 'user', 'Add a CLI')
+    db.addMessage(conv.id, 'assistant', 'argparse CLI ...', { stats: { ctxUsed: 2500, ctxMax } }) // measured on A's compacted prompt
+    // Edit the first question (branch B), which compacts on its own, replacing A's compaction...
+    db.freezeTail(conv.id, u1.seq, u1.id)
+    db.deactivateMessage(u1.id)
+    const u1b = db.addMessage(conv.id, 'user', 'Write a web scraper in Go', { variantGroup: db.getMessage(u1.id)!.variantGroup! })
+    const cutB = db.addMessage(conv.id, 'assistant', 'Here is a Go scraper ...')
+    await new Promise((r) => setTimeout(r, 5))
+    db.setConversationCompaction(conv.id, { summary: 'User wants a GO scraper.', upToMessageId: cutB.id, tokensBefore: 500 })
+    // ...then switch back to A (the /activate route's steps).
+    db.freezeTail(conv.id, u1b.seq, u1b.id)
+    db.restoreTail(u1.id)
+    db.setActiveVariant(db.getMessage(u1.id)!.variantGroup!, u1.id)
+
+    const snapshot = db.getConversation(conv.id, true)!
+    assert.equal(snapshot.messages!.length, 32)
+    assert.equal(setAsideFrozenCut(db, snapshot).compactionSummary, undefined, 'A is replayed without any summary')
+    const prompts: string[] = []
+    const events: string[] = []
+    await maybeAutoCompact(fakeDeps(db, ctxMax), conv.id, snapshot, localUpstream(ctxMax), new AbortController().signal, async (p) => { events.push(p) }, recordingFetch(prompts))
+    assert.equal(prompts.length, 1, 'A\'s full history (~9k estimated tokens of an 8192 context) must be compacted')
+    assert.deepEqual(events, ['start', 'end'])
+    assert.ok(!prompts[0].includes('GO scraper'), 'B\'s summary is not folded into A\'s')
+    const after = db.getConversation(conv.id)!.compactionUpToMessageId
+    assert.ok(snapshot.messages!.some((m) => m.id === after), 'the new cut lands on A')
+    assert.ok(snapshot.compactionSummary, 'the turn builds on the fresh compaction')
   } finally {
     db.close()
     rmSync(root, { recursive: true, force: true })

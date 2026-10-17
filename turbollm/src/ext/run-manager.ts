@@ -35,7 +35,7 @@ export interface PublicRun {
 export interface RunRecordStore {
   upsertExtRun(r: PublicRun): void
   getExtRun(id: string): RunRecordRow | null
-  listExtRuns(tenant: string, limit?: number): RunRecordRow[]
+  listExtRuns(tenant: string, owner?: string, limit?: number): RunRecordRow[]
   markStreamingExtRunsFailed(code: string, message: string): number
 }
 
@@ -81,6 +81,10 @@ interface RunState {
 
 const DEFAULT_BUFFER_CAP = 5000
 const DEFAULT_ORPHAN_TIMEOUT_MS = 5 * 60_000
+/** Frames are numbered from 1, so an `event_seq` of 0 (what a run reports before its first
+ *  frame) can only mean "nothing yet", and `?after=0` replays the whole run. Numbered from 0,
+ *  a client that got event_seq 0 and attached with it once frame 0 had gone out lost that frame. */
+const FIRST_EVENT_SEQ = 1
 
 export class PublicRunManager {
   private runs = new Map<string, RunState>()
@@ -149,7 +153,7 @@ export class PublicRunManager {
 
   start(params: { scope: Scope; chatId: string; messageId: string; body: RunBody }): PublicRun {
     const id = `run_${randomUUID()}`
-    const buffer = new RingBuffer(this.bufferCap)
+    const buffer = new RingBuffer(this.bufferCap, FIRST_EVENT_SEQ)
     const emitter = new EventEmitter()
     emitter.setMaxListeners(0) // unbounded: many clients may reconnect/poll one run
     const ac = new AbortController()
@@ -197,12 +201,14 @@ export class PublicRunManager {
         this.db?.upsertExtRun(run)
       } finally {
         run.endedAt = new Date().toISOString()
-        // eventSeq is flushed with the status transitions only, matching the checkpointing
-        // discipline the adapter path uses — not per event, which would be one write per token.
-        this.db?.upsertExtRun(run)
         // The terminal frame is pushed to the buffer BEFORE 'idle', so subscribeToBuffer's
         // documented invariant delivers it to every attached client before ending them.
         emit({ event: 'done', data: { run_id: run.id, status: run.status, message_id: run.messageId } })
+        // eventSeq is flushed with the status transitions only, matching the checkpointing
+        // discipline the adapter path uses — not per event, which would be one write per token.
+        // After the done frame, so the row read back once the run leaves memory reports the
+        // same event_seq (the done frame's) the in-memory run did.
+        this.db?.upsertExtRun(run)
         emitter.emit('idle')
       }
     })()
@@ -225,13 +231,10 @@ export class PublicRunManager {
    *  real scope) still compiles; every HTTP route always passes one. Filters BOTH sources: the
    *  in-memory map (this process's own live/recent runs) and the persisted rows `db.listExtRuns`
    *  returns (spec 27 §6.4) — a durable row from another owner must never leak through the
-   *  fallback path either. Filtering happens here, in JS, rather than in a WHERE clause on the
-   *  `db.listExtRuns` SQL itself: `RunRecordStore` is a narrow port this file owns and tests
-   *  against without a real DB, and its `listExtRuns(tenant, limit?)` signature is shared with
-   *  the real `ConversationStore` implementation outside this file's scope for this change —
-   *  post-query filtering is fully correct (no row from another owner is ever returned to the
-   *  caller), just not the most efficient shape; pushing the filter into the SQL itself is a
-   *  reasonable follow-up whenever that store method is next touched. */
+   *  fallback path either. The persisted rows are owner-filtered IN the SQL (`listExtRuns`'s
+   *  `owner`): filtering the tenant's newest 100 rows afterwards silently dropped an owner's
+   *  runs once other owners in the tenant had 100 newer ones. The JS owner check below stays as
+   *  defense in depth. */
   list(tenant: string, owner?: string): PublicRun[] {
     const inMemory = [...this.runs.values()]
       .filter((s) => s.run.tenant === tenant && (owner === undefined || s.run.owner === owner))
@@ -239,7 +242,7 @@ export class PublicRunManager {
     if (!this.db) return inMemory
     const seen = new Set(inMemory.map((r) => r.id))
     // In-memory copy wins on id collision — it is fresher than whatever was last flushed.
-    const persisted = this.db.listExtRuns(tenant)
+    const persisted = this.db.listExtRuns(tenant, owner)
       .filter((r) => !seen.has(r.id) && (owner === undefined || r.owner === owner))
       .map(rowToRun)
     return [...inMemory, ...persisted]
@@ -280,9 +283,11 @@ export class PublicRunManager {
   canReplayFrom(id: string, fromSeq: number): boolean {
     const s = this.runs.get(id)
     if (!s) return false
-    const retained = s.buffer.since(fromSeq)
-    if (retained.length === 0) return fromSeq >= s.buffer.head()
-    return retained[0].seq === fromSeq
+    // A cursor before the first frame (0 = "from the start") asks for the whole run.
+    const from = Math.max(fromSeq, FIRST_EVENT_SEQ)
+    const retained = s.buffer.since(from)
+    if (retained.length === 0) return from >= s.buffer.head()
+    return retained[0].seq === from
   }
 
   subscribe(id: string, fromSeq: number): Subscription {

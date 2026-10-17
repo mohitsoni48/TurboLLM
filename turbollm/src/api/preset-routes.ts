@@ -9,7 +9,7 @@
 import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
-import { MODEL_PRESET_CAP, type ModelPreset } from '../config/config'
+import { MODEL_PRESET_CAP, ownEntry, type ModelPreset } from '../config/config'
 import { validateLoadProfileFields } from './profile-validate'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -23,21 +23,25 @@ async function body<T>(c: any): Promise<T> {
 }
 
 export function registerPresetRoutes(app: Hono, d: Deps): void {
+  // Every handler: `c.req.param()` is already percent-decoded (decoding again broke keys with
+  // '%'), and the key is request input, so the config maps are read through `ownEntry` — a key
+  // like `constructor` would otherwise index Object itself (see config.ts).
+  //
   // Returns the pin alongside the list. The client cannot know which preset is active otherwise,
   // and a dropdown that always opens on "No preset applied" is actively misleading: the pin is
   // what getModelProfile serves on the next load.
   app.get('/api/v1/models/:key/presets', (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const snap = d.store.snapshot()
-    const presets = snap.modelPresets[key] ?? []
+    const presets = ownEntry(snap.modelPresets, key) ?? []
     return c.json({
       presets: [...presets].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : a.updatedAt > b.updatedAt ? -1 : 0)),
-      pinnedId: snap.lastPresetId[key] ?? null,
+      pinnedId: ownEntry(snap.lastPresetId, key) ?? null,
     })
   })
 
   app.post('/api/v1/models/:key/presets', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     // Same model-existence guard PUT /models/:key/profile applies — without it any client can
     // write presets under unlimited arbitrary keys into config.json.
     if (!d.scanner.get(key)) return err(c, 404, 'no_such_model', 'No model with that key.')
@@ -52,7 +56,7 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     // Cap pre-check BEFORE store.update — update() runs validate() and throws, so a cap
     // breach here would be a 500. The cap is PER MODEL.
-    if ((d.store.snapshot().modelPresets[key] ?? []).length >= MODEL_PRESET_CAP) {
+    if ((ownEntry(d.store.snapshot().modelPresets, key) ?? []).length >= MODEL_PRESET_CAP) {
       return err(c, 400, 'too_many_presets', `Preset limit reached (${MODEL_PRESET_CAP}).`)
     }
     const preset: ModelPreset = {
@@ -64,15 +68,15 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
       origin: 'manual',
     }
     d.store.update((cfg) => {
-      ;(cfg.modelPresets[key] ??= []).push(preset)
+      ;(ownEntry(cfg.modelPresets, key) ?? (cfg.modelPresets[key] = [])).push(preset)
     })
     return c.json(preset, 201)
   })
 
   app.put('/api/v1/models/:key/presets/:id', async (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const id = c.req.param('id')
-    const existing = (d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)
+    const existing = (ownEntry(d.store.snapshot().modelPresets, key) ?? []).find((p) => p.id === id)
     if (!existing) return err(c, 404, 'not_found', 'Preset not found.')
     const b = await body<Partial<ModelPreset>>(c)
     if (b.name !== undefined && (typeof b.name !== 'string' || !b.name.trim())) {
@@ -89,7 +93,7 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     // throw a parse error instead of showing "Preset not found").
     let stillExists = false
     d.store.update((cfg) => {
-      const arr = cfg.modelPresets[key] ?? []
+      const arr = ownEntry(cfg.modelPresets, key) ?? []
       const i = arr.findIndex((p) => p.id === id)
       if (i === -1) return
       stillExists = true
@@ -104,30 +108,30 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
       }
     })
     if (!stillExists) return err(c, 404, 'not_found', 'Preset not found.')
-    const updated = (d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)
+    const updated = (ownEntry(d.store.snapshot().modelPresets, key) ?? []).find((p) => p.id === id)
     if (!updated) return err(c, 404, 'not_found', 'Preset not found.')
     return c.json(updated)
   })
 
   app.delete('/api/v1/models/:key/presets/:id', (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const id = c.req.param('id')
-    const existing = (d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)
+    const existing = (ownEntry(d.store.snapshot().modelPresets, key) ?? []).find((p) => p.id === id)
     if (!existing) return err(c, 404, 'not_found', 'Preset not found.')
     d.store.update((cfg) => {
       // Filter and assign back — never `delete cfg.modelPresets[key]`: a present-but-empty
       // array means "already seeded" to the seed migration, and dropping the key would
       // resurrect every deleted preset on the next load.
-      cfg.modelPresets[key] = (cfg.modelPresets[key] ?? []).filter((p) => p.id !== id)
-      if (cfg.lastPresetId?.[key] === id) delete cfg.lastPresetId[key]
+      cfg.modelPresets[key] = (ownEntry(cfg.modelPresets, key) ?? []).filter((p) => p.id !== id)
+      if (ownEntry(cfg.lastPresetId, key) === id) delete cfg.lastPresetId[key]
     })
     return c.json({ ok: true })
   })
 
   app.post('/api/v1/models/:key/presets/:id/apply', (c) => {
-    const key = decodeURIComponent(c.req.param('key'))
+    const key = c.req.param('key')
     const id = c.req.param('id')
-    const existing = (d.store.snapshot().modelPresets[key] ?? []).find((p) => p.id === id)
+    const existing = (ownEntry(d.store.snapshot().modelPresets, key) ?? []).find((p) => p.id === id)
     if (!existing) return err(c, 404, 'not_found', 'Preset not found.')
     d.store.update((cfg) => {
       ;(cfg.lastPresetId ??= {})[key] = id

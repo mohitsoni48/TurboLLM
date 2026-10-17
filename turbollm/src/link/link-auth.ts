@@ -8,7 +8,8 @@ import type { LinkCapability } from './types'
 /** Turbo Link's gate for /api/link/v1 — an INVERSION of lanAuth, and the reason the
  *  capability model is not decorative (spec §3.3, ADR-376).
  *
- *  lanAuth exempts loopback unconditionally and only enforces a key when lanBind is on.
+ *  lanAuth trusts loopback callers (whose Host names this machine and, on Android, that carry
+ *  the app secret) and lets a LAN peer through keyless when "Require API key" is off.
  *  Correct for its own purpose, catastrophic here:
  *    - a host with LAN open and "Require API key" OFF would let a peer call in with NO
  *      token at all, bypassing the grant entirely; and

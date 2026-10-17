@@ -13,7 +13,7 @@
  */
 
 import { analyticsIdentity, flattenForAnalytics, handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
-import { MACHINE_LIMIT, IP_LIMIT } from '../../turbollm/src/telemetry/rate-limit-window'
+import { MACHINE_LIMIT, IP_LIMIT, ipRateLimitSubject } from '../../turbollm/src/telemetry/rate-limit-window'
 import { RateLimiterDO } from './rate-limiter-do'
 
 export { RateLimiterDO }
@@ -63,9 +63,10 @@ async function checkLimit(ns: DurableObjectNamespace, key: string, limit: number
 }
 
 /** Hash the IP so the rate-limit key cannot be reversed into an address. The IP
- *  itself is never written anywhere — this is the only thing derived from it. */
+ *  itself is never written anywhere — this is the only thing derived from it.
+ *  An IPv6 address is keyed on its /64 (see ipRateLimitSubject). */
 async function ipKey(req: Request): Promise<string> {
-  const ip = req.headers.get('cf-connecting-ip') ?? 'unknown'
+  const ip = ipRateLimitSubject(req.headers.get('cf-connecting-ip') ?? 'unknown')
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(ip))
   return [...new Uint8Array(digest)].slice(0, 8).map((b) => b.toString(16).padStart(2, '0')).join('')
 }
@@ -74,7 +75,7 @@ function makeDeps(env: Env): IngestDeps {
   return {
     now: () => Date.now(),
 
-    rateLimit: async (req, events) => {
+    rateLimit: async (req, events, quarantined) => {
       try {
         // Charge the full event count, not 1 per HTTP call — otherwise a
         // large batch (up to MAX_BATCH) buys unlimited event volume for the
@@ -84,7 +85,9 @@ function makeDeps(env: Env): IngestDeps {
         // (correct for the machine tier, which has no id to even charge) —
         // but the IP tier's other job is bounding raw REQUEST frequency
         // regardless of payload validity, so it must never charge 0.
-        const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT, Math.max(1, events.length))
+        // Quarantined rows are charged here too: each one is a D1 write, and
+        // uncharged they let one IP fill the quarantine table without limit.
+        const ipOk = await checkLimit(env.RATE_LIMITER, `ip:${await ipKey(req)}`, IP_LIMIT, Math.max(1, events.length + quarantined))
         if (!ipOk) return false
 
         // consent_choice carries no machineId by design, so it is rate-limited

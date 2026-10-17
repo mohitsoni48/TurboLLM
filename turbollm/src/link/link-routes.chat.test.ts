@@ -113,6 +113,25 @@ test('models:use on a COLD model is a typed model_not_loaded 503, and never swap
   assert.deepEqual(h.routed, [], 'the request never reached the router')
 })
 
+// Same shape as the marked no-load refusal below: untyped and without x-should-retry, a peer's
+// /v1/messages turned it into overloaded_error and Claude Code retried a final refusal ~10 times.
+test('a models:use-only refusal is final and typed, like the no-load one', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use'])])
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), 'false')
+  const error = ((await res.json()) as { error?: { type?: string; code?: string } }).error
+  assert.equal(error?.type, 'model_not_loaded')
+  assert.equal(error?.code, 'model_not_loaded')
+})
+
+test('a busy-host refusal on a models:wake link stays retryable', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])], { busy: true })
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), null)
+})
+
 test('models:wake on a COLD model with an IDLE host swaps', async () => {
   const { d, h } = mkDeps([key('tllm-a', ['models:use', 'models:wake'])])
   const res = await post(d, 'tllm-a', COLD)
@@ -149,6 +168,49 @@ test('a token without models:use at all is 403 from requireCapability', async ()
   assert.equal(res.status, 403)
   assert.equal(await errorCode(res), 'forbidden')
   assert.deepEqual(h.routed, [])
+})
+
+// ── A request whose caller on the peer may not load models (link-proxy.ts LINK_NO_LOAD_HEADER) ──────────────────
+// The link may hold models:load or models:wake; the person behind this request may not. The peer checks its catalog
+// first, but that can be a refresh behind an owner's switch, so the façade decides on its live state: the request is
+// served only what is loaded, like a models:use-only link.
+
+function postNoLoad(d: Deps, token: string, model: string) {
+  return app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': token, 'content-type': 'application/json', 'X-TurboLLM-Link-No-Load': '1' },
+    body: JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }),
+  })
+}
+
+for (const caps of [['models:use', 'models:load'], ['models:use', 'models:wake']]) {
+  test(`a no-load request on a ${caps[1]} link is model_not_loaded for a COLD model, and never swaps`, async () => {
+    const { d, h } = mkDeps([key('tllm-a', caps)])
+    const res = await postNoLoad(d, 'tllm-a', COLD)
+    assert.equal(res.status, 503)
+    assert.equal(await errorCode(res), 'model_not_loaded')
+    assert.deepEqual(h.routed, [], 'the request never reached the router')
+  })
+}
+
+// The peer refuses the same request itself when its catalog is current (model-router.ts resolveRemote): with
+// x-should-retry: false and gatewayV1Handler's typed body. The façade's refusal must read the same, or a client retries
+// (and, on /v1/messages, reads an overloaded host) only because the peer's catalog was a refresh behind.
+test('a no-load refusal says a retry cannot help, typed like the gateway refusal the peer gives', async () => {
+  const { d } = mkDeps([key('tllm-a', ['models:use', 'models:load'])])
+  const res = await postNoLoad(d, 'tllm-a', COLD)
+  assert.equal(res.status, 503)
+  assert.equal(res.headers.get('x-should-retry'), 'false')
+  const error = ((await res.json()) as { error?: { type?: string; code?: string } }).error
+  assert.equal(error?.type, 'model_not_loaded')
+  assert.equal(error?.code, 'model_not_loaded')
+})
+
+test('a no-load request is still served the model that IS loaded', async () => {
+  const { d, h } = mkDeps([key('tllm-a', ['models:use', 'models:load'])])
+  const res = await postNoLoad(d, 'tllm-a', LOADED)
+  assert.equal(res.status, 200)
+  assert.deepEqual(h.routed, [LOADED])
 })
 
 test("a peer's own request does NOT count as the owner's local activity", async () => {
@@ -203,4 +265,65 @@ test('a LOCAL model key containing a slash is untouched by the chaining guard', 
   const res = await post(d, 'tllm-a', 'unsloth/Qwen3-GGUF')
   assert.equal(res.status, 200)
   assert.ok(upstream, 'reached the engine')
+})
+
+// ── The allowlist binds the model that ANSWERS, not just the `model` string ─────────────
+// ModelRouter.route() answers with whatever is loaded when `model` is empty or auto-swap is
+// off, so a check on the requested string alone let a restricted token be served a model
+// GET /api/link/v1/models deliberately hid from it.
+
+/** Mirrors ModelRouter.targetEntry: with auto-swap off (or no model named) the loaded model
+ *  answers; otherwise the named one does. */
+function servingDeps(caps: string[], models: string[], autoSwap: boolean): { d: Deps; h: Harness } {
+  const out = mkDeps([key('tllm-a', caps, models)])
+  const cfg = out.d.store.snapshot() as unknown as { gateway: { autoSwap: boolean } }
+  cfg.gateway.autoSwap = autoSwap
+  ;(out.d as unknown as { modelRouter: Record<string, unknown> }).modelRouter.targetEntry =
+    (m: string) => ({ key: !autoSwap || !m ? LOADED : m })
+  return out
+}
+
+function postWithoutModel(d: Deps, token: string) {
+  return app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': token, 'content-type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'hi' }] }),
+  })
+}
+
+test('an allowlisted token that leaves out `model` is not answered by a model outside its list', async () => {
+  const { d, h } = servingDeps(['models:use'], [COLD], true)
+  const res = await postWithoutModel(d, 'tllm-a')
+  assert.equal(res.status, 403)
+  assert.equal(await errorCode(res), 'forbidden')
+  assert.deepEqual(h.routed, [], 'the loaded model was never reached')
+  assert.equal(upstream, null)
+})
+
+test('the no-`model` fallback is also checked when the router names no entry for it', async () => {
+  // A loaded model the scanner no longer lists: targetEntry() has nothing to say, but
+  // route('') still answers with manager.target() — so the loaded key is what is checked.
+  const { d, h } = mkDeps([key('tllm-a', ['models:use'], [COLD])])
+  const res = await postWithoutModel(d, 'tllm-a')
+  assert.equal(res.status, 403)
+  assert.deepEqual(h.routed, [])
+})
+
+test('with auto-swap off, an allowlisted name the host would answer with ANOTHER model is refused', async () => {
+  const { d, h } = servingDeps(['models:use', 'models:load'], [COLD], false)
+  const res = await post(d, 'tllm-a', COLD)
+  assert.equal(res.status, 403)
+  assert.equal(await errorCode(res), 'forbidden')
+  assert.deepEqual(h.routed, [])
+})
+
+test('a restricted token is still served when the answering model is on its list', async () => {
+  // Leaving `model` out is fine when what is loaded is allowed...
+  const a = servingDeps(['models:use'], [LOADED], true)
+  assert.equal((await postWithoutModel(a.d, 'tllm-a')).status, 200)
+  assert.deepEqual(a.h.routed, [''])
+  // ...and an allowed cold model still wakes onto the auto-swap path.
+  const b = servingDeps(['models:use', 'models:wake'], [COLD], true)
+  assert.equal((await post(b.d, 'tllm-a', COLD)).status, 200)
+  assert.deepEqual(b.h.routed, [COLD])
 })

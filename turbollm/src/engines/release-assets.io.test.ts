@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { GithubRateLimitError } from './download'
 import {
+  assetKey,
   newestMatchingRelease,
   ReleaseNotFoundError,
   releaseByTag,
@@ -212,9 +213,151 @@ test('newestMatchingRelease: falls back to an identical classification when exac
     release('b200', ['llama-renamed-b200-win-x64-cuda-13.3.zip', 'llama-b200-bin-win-cpu-x64.zip'], {
       published_at: '2026-09-02T00:00:00Z',
     }),
+    // GitHub's listing still carries the installed release, whose own asset matches the recorded key.
+    release('b100', ['llama-b100-bin-win-cuda-13.3-x64.zip'], { published_at: T0 }),
   )
   const found = await newestMatchingRelease(INSTALLED, undefined, gh.fetchImpl)
+  assert.equal(found?.tag, 'b200')
   assert.equal(found?.asset, 'llama-renamed-b200-win-x64-cuda-13.3.zip')
+})
+
+test('newestMatchingRelease: a newer release that renamed hip-radeon to rocm wins over the listed installed release', async () => {
+  const gh = listing(
+    release('b200', ['llama-b200-bin-win-rocm-7.1-x64.zip', 'llama-b200-bin-win-cpu-x64.zip'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+    release('b100', ['llama-b100-bin-win-hip-radeon-x64.zip'], { published_at: T0 }),
+  )
+  const installed = { ...INSTALLED, asset: 'llama-b100-bin-win-hip-radeon-x64.zip', assetKey: 'llama-bin-win-hip-radeon-x64.zip' }
+  assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.asset, 'llama-b200-bin-win-rocm-7.1-x64.zip')
+})
+
+test('newestMatchingRelease: an ambiguous newest release is skipped, not a stop; an older keyed one still wins', async () => {
+  const gh = listing(
+    release('b300', ['a-b300-win-x64-cuda-13.3.zip', 'b-b300-win-x64-cuda-13.3.zip'], {
+      published_at: '2026-09-03T00:00:00Z',
+    }),
+    release('b200', ['llama-b200-bin-win-cuda-13.3-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('b100', ['llama-b100-bin-win-cuda-13.3-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED, undefined, gh.fetchImpl))?.tag, 'b200')
+})
+
+test('newestMatchingRelease: with nothing newer matching, the installed release itself comes back (no update)', async () => {
+  const gh = listing(
+    release('b200', ['llama-b200-bin-win-vulkan-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('b100', ['llama-b100-bin-win-cuda-13.3-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED, undefined, gh.fetchImpl))?.tag, 'b100')
+})
+
+test('newestMatchingRelease: a version-less asset name keys the same under every tag, so the next release is found', async () => {
+  const names = ['tool-win-cuda-12.4-x64.zip', 'tool-extras-win-cuda-12.4-x64.zip']
+  const gh = listing(release('v5', names, { published_at: '2026-09-02T00:00:00Z' }), release('v4', names, { published_at: T0 }))
+  const installed: ReleaseProvenance = {
+    ...INSTALLED,
+    tag: 'v4',
+    asset: 'tool-win-cuda-12.4-x64.zip',
+    assetKey: assetKey('tool-win-cuda-12.4-x64.zip', 'v4'),
+  }
+  assert.deepEqual(await newestMatchingRelease(installed, undefined, gh.fetchImpl), {
+    tag: 'v5',
+    asset: 'tool-win-cuda-12.4-x64.zip',
+    publishedAt: '2026-09-02T00:00:00Z',
+  })
+})
+
+const INSTALLED_V2: ReleaseProvenance = {
+  ...INSTALLED,
+  tag: 'v2.0.0',
+  asset: 'app-v2.0.0-win-x64.zip',
+  assetKey: 'app-win-x64.zip',
+}
+
+test('newestMatchingRelease: a backport on an older version line published later is not an update', async () => {
+  const gh = listing(
+    release('v1.9.5', ['app-v1.9.5-win-x64.zip'], { published_at: '2026-09-03T00:00:00Z' }),
+    release('v2.0.0', ['app-v2.0.0-win-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_V2, undefined, gh.fetchImpl))?.tag, 'v2.0.0')
+})
+
+test('newestMatchingRelease: a newer version is still found behind a later backport', async () => {
+  const gh = listing(
+    release('v1.9.5', ['app-v1.9.5-win-x64.zip'], { published_at: '2026-09-03T00:00:00Z' }),
+    release('v2.0.1', ['app-v2.0.1-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('v2.0.0', ['app-v2.0.0-win-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_V2, undefined, gh.fetchImpl))?.tag, 'v2.0.1')
+})
+
+test('newestMatchingRelease: a tag with no version order keeps the publish-time rule', async () => {
+  const gh = listing(
+    release('nightly', ['app-nightly-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('v2.0.0', ['app-v2.0.0-win-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_V2, undefined, gh.fetchImpl))?.tag, 'nightly')
+})
+
+test('newestMatchingRelease: commit-SHA tags keep the publish-time rule, not an order read from their leading digits', async () => {
+  for (const [installedTag, newerTag] of [
+    ['9f1e2d3', '1a2b3c4'],
+    ['88123ab', '5c0ffee'],
+  ]) {
+    const gh = listing(
+      release(newerTag, [`app-${newerTag}-win-x64.zip`], { published_at: '2026-09-02T00:00:00Z' }),
+      release(installedTag, [`app-${installedTag}-win-x64.zip`], { published_at: T0 }),
+    )
+    const installed = { ...INSTALLED_V2, tag: installedTag, asset: `app-${installedTag}-win-x64.zip` }
+    assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, newerTag, installedTag)
+  }
+})
+
+const INSTALLED_ZIP: ReleaseProvenance = {
+  ...INSTALLED,
+  asset: 'llama-b100-bin-ubuntu-x64.zip',
+  assetKey: assetKey('llama-b100-bin-ubuntu-x64.zip', 'b100'),
+}
+
+test('newestMatchingRelease: a .zip install still sees the newer release once upstream ships .tar.gz', async () => {
+  const gh = listing(
+    release('b300', ['llama-b300-bin-ubuntu-x64.tar.gz', 'llama-b300-bin-ubuntu-vulkan-x64.tar.gz'], {
+      published_at: '2026-09-03T00:00:00Z',
+    }),
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz'], { published_at: '2026-09-02T00:00:00Z' }),
+    release('b100', ['llama-b100-bin-ubuntu-x64.zip'], { published_at: T0 }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, gh.fetchImpl))?.asset, 'llama-b300-bin-ubuntu-x64.tar.gz')
+  // The same with the installed release gone from the listing (it is no longer what comes back).
+  const later = listing(
+    release('b300', ['llama-b300-bin-ubuntu-x64.tar.gz'], { published_at: '2026-09-03T00:00:00Z' }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, later.fetchImpl))?.tag, 'b300')
+})
+
+test('newestMatchingRelease: a release shipping both archive kinds keeps the installed one', async () => {
+  const gh = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-x64.zip'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(INSTALLED_ZIP, undefined, gh.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.zip')
+})
+
+test('newestMatchingRelease: the classification fallback also crosses a .zip to .tar.gz switch, keeping the installed kind on a tie', async () => {
+  const installed = { ...INSTALLED_ZIP, asset: 'llama-b100-bin-ubuntu-x64.zip', assetKey: 'old-name-ubuntu-x64.zip' }
+  const switched = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-vulkan-x64.tar.gz'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(installed, undefined, switched.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.tar.gz')
+  const both = listing(
+    release('b200', ['llama-b200-bin-ubuntu-x64.tar.gz', 'llama-b200-bin-ubuntu-x64.zip'], {
+      published_at: '2026-09-02T00:00:00Z',
+    }),
+  )
+  assert.equal((await newestMatchingRelease(installed, undefined, both.fetchImpl))?.asset, 'llama-b200-bin-ubuntu-x64.zip')
 })
 
 test('newestMatchingRelease: refuses the classification fallback when two assets qualify', async () => {

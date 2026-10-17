@@ -40,6 +40,7 @@ import type {
   TokenUsageStats,
   TokenUsageRange,
 } from './types'
+import { markHostKeyNeeded } from './auth-signal'
 
 const AUTH_KEY = 'tllm.authToken'
 
@@ -107,6 +108,8 @@ async function request<T>(
     const rescued = init?.rescue?.(res.status, data)
     if (rescued !== undefined) return rescued
     const env = data as { error?: { code?: string; message?: string } } | undefined
+    // A host-only setting refused for want of a valid key: ask for one (auth-signal.ts).
+    if (res.status === 403 && env?.error?.code === 'api_key_required') markHostKeyNeeded()
     throw new ApiError(
       env?.error?.code ?? 'http_error',
       env?.error?.message ?? `Request failed with status ${res.status}.`,
@@ -495,6 +498,15 @@ export function purgeEngine(id: string): Promise<{ ok: true }> {
   })
 }
 
+/** Delete a DISABLED source build's folder (engines/build/<slug>, no registered engine) without
+ *  running its binary, so a build that no longer starts can still be deleted. The daemon refuses
+ *  a folder any engine or remembered source still points into. */
+export function deleteEngineBuild(binPath: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/build?binPath=${encodeURIComponent(binPath)}`, {
+    method: 'DELETE',
+  })
+}
+
 /** Enable an installed llama.cpp backend without re-downloading (register + activate). */
 export function enableBackend(id: string): Promise<{ ok: true; engineId: string }> {
   return request<{ ok: true; engineId: string }>(
@@ -591,7 +603,7 @@ export function getEngineLogs(tail = 200): Promise<EngineLogs> {
   return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}`)
 }
 
-/** URL for the SSE live log tail (consumed via EventSource). */
+/** URL for the SSE live log tail (consumed via sse.ts's subscribeSse — not EventSource, which can't send the key). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
@@ -624,7 +636,7 @@ export function clearRequests(): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/requests', { method: 'DELETE' })
 }
 
-/** URL for the SSE live entry stream (consumed via EventSource), same convention as
+/** URL for the SSE live entry stream (consumed via sse.ts's subscribeSse), same convention as
  *  {@link engineLogStreamUrl}. */
 export const requestsStreamUrl = '/api/v1/requests/stream'
 
@@ -820,16 +832,25 @@ export function uninstallComfyGate(): Promise<{ ok: boolean }> {
   return request('/api/v1/comfyui/uninstall', { method: 'POST', json: {} })
 }
 
+/** What the daemon sends for every MCP stdio env value (routes.ts's MCP_ENV_MASK, same string):
+ *  env holds the servers' credentials, so its values are write-only. Sent back unchanged in a
+ *  PUT, a masked value keeps the stored one. */
+export const MCP_ENV_MASK = '••••••••'
+
 export type McpServer = {
   id: string
   name: string
   transport: 'stdio' | 'sse'
   command?: string
   args?: string[]
+  /** stdio only. Read back with each value as MCP_ENV_MASK, never the value itself. */
   env?: Record<string, string>
   url?: string
-  /** sse only — Bearer token for Authorization header (ADR-124) */
+  /** sse only — Bearer token for Authorization header (ADR-124). Write-only: sent on add/edit,
+   *  never returned ('' on edit removes it). */
   apiKey?: string
+  /** Read-only, from the settings payload: whether a Bearer key is stored. */
+  apiKeySet?: boolean
   enabled: boolean
 }
 
@@ -1127,8 +1148,13 @@ export function createApiKey(name: string): Promise<ApiKeyCreated> {
 export function deleteApiKey(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
-export function getConnect(cli: string): Promise<ConnectInfo> {
-  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}`)
+/** The daemon refuses this GET without `X-TurboLLM-UI` (auth.ts lanAuth): it can replace a CLI
+ *  key, and a page on another site cannot add a custom header without a CORS preflight. */
+/** `mint: false` is a fetch the user did not click for: a LAN-bound daemon then answers 409
+ *  `lan_bound` instead of minting a new `cli-<name>` key (which revokes the previous one). */
+export function getConnect(cli: string, opts: { mint?: boolean } = {}): Promise<ConnectInfo> {
+  const query = opts.mint === false ? '?mint=0' : ''
+  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}${query}`, { headers: { 'X-TurboLLM-UI': '1' } })
 }
 
 // ── System info (spec 05 §6) ─────────────────────────────────────────────────
@@ -1246,28 +1272,39 @@ export async function getDebugSnapshot(convId: string): Promise<string> {
 
 // ── F-024: export / import chat ───────────────────────────────────────────────
 
-/** Trigger a browser download of the chat as a .turbollm-chat.json file. */
-export function downloadChatExport(convId: string): void {
-  // Build a hidden anchor with auth header isn't possible; use a form or direct href.
-  // Since the auth token may be needed, fetch the blob and trigger download via object URL.
-  const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders() }
-  fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, { headers })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`Export failed with status ${res.status}`)
-      const cd = res.headers.get('Content-Disposition') ?? ''
-      const nameMatch = cd.match(/filename="([^"]+)"/)
-      const filename = nameMatch ? nameMatch[1] : 'chat.turbollm-chat.json'
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-    })
-    .catch(() => { /* silently ignore — caller shows error via toast */ })
+/** Fetch `path` with the API key and save the response as a browser download (Blob + a temporary
+ *  `<a download>`, named from the daemon's Content-Disposition). A plain `<a href>` can't send
+ *  X-TurboLLM-Auth, so over LAN/remote access it would save the daemon's 401 JSON instead of the
+ *  file. Rejects with an `ApiError` on a non-OK response, so the caller can toast it. */
+async function downloadWithAuth(path: string, fallbackName: string): Promise<void> {
+  const res = await fetch(path, { headers: { Accept: 'application/json', ...authHeaders() } })
+  if (!res.ok) {
+    const env = safeJson(await res.text().catch(() => '')) as { error?: { code?: string; message?: string } } | undefined
+    throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Download failed with status ${res.status}.`, res.status)
+  }
+  const cd = res.headers.get('Content-Disposition') ?? ''
+  const nameMatch = cd.match(/filename="([^"]+)"/)
+  const filename = nameMatch ? nameMatch[1] : fallbackName
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** Trigger a browser download of the chat as a .turbollm-chat.json file. Rejects when the export
+ *  fails (401 on LAN without a key, deleted chat, network error) so the caller can tell the user. */
+export function downloadChatExport(convId: string): Promise<void> {
+  return downloadWithAuth(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, 'chat.turbollm-chat.json')
+}
+
+/** Download the last auto-tune run's log (GET /api/v1/bench/log). Rejects like {@link downloadChatExport}. */
+export function downloadBenchLog(): Promise<void> {
+  return downloadWithAuth('/api/v1/bench/log', 'autotune-log.json')
 }
 
 /** Import a chat from a parsed JSON object. Returns the new conversation id. */

@@ -17,6 +17,7 @@
 import { readQueue, remove } from './queue'
 import { recordSent } from './log'
 import { telemetryDisabled } from './disabled'
+import { REGISTRY, type EventName } from './schema'
 
 /** The ingest endpoint. Public and openly documented — there is nothing secret
  *  about the URL, and pretending otherwise would be security theatre. */
@@ -52,15 +53,28 @@ export async function flush(dataDir: string, level: string, transport: Transport
       for (const q of queued) remove(dataDir, q.file)
       return
     }
-    if (queued.length === 0) return
 
-    const events = queued.map((q) => q.event)
+    // Lowering consent full → anon withdraws the full-only events already queued
+    // (click stream, error fingerprints, model/harness identity): the per-event
+    // requirement Emitter.canSend applies at emit time is re-applied here at send
+    // time, and those events are purged rather than preserved — same reasoning as
+    // consent off above.
+    const sendable = level === 'full'
+      ? queued
+      : queued.filter((q) => {
+          if (REGISTRY[q.event.event as EventName]?.consent !== 'full') return true
+          remove(dataDir, q.file)
+          return false
+        })
+    if (sendable.length === 0) return
+
+    const events = sendable.map((q) => q.event)
     const accepted = await transport(events)
     if (accepted) {
       // Logged only on success — the submission log's value is that it records
       // what actually left the machine, not what we tried to send.
       recordSent(dataDir, events)
-      for (const q of queued) remove(dataDir, q.file)
+      for (const q of sendable) remove(dataDir, q.file)
     }
   } catch {
     // Best-effort by contract: a telemetry failure is never the user's problem.

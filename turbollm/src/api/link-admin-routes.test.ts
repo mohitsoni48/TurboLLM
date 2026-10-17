@@ -11,7 +11,7 @@ import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
-function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>) {
+function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>, deps?: Record<string, unknown>) {
   const cfg: Record<string, unknown> = {
     // Turbo Link ships behind `daemon.experimental.turboLink` (link/gate.ts), off by
     // default. This suite is about the admin routes' OWN behaviour, so it runs with the
@@ -22,6 +22,7 @@ function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<st
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     ...(telemetry ? { telemetry } : {}),
+    ...deps,
   } as unknown as Deps
   const app = new Hono()
   registerLinkAdminRoutes(app, d, { fetchImpl })
@@ -123,6 +124,16 @@ test('mint falls back to auto-detection when the override is unset', async () =>
   assert.ok(baseUrl.startsWith('http://'))
   assert.ok(!baseUrl.includes('llm.example.com'))
   assert.ok(baseUrl.endsWith(':6996'))
+})
+
+test('mint advertises the port really bound, not daemon.port (--port/--addr, Android 7000)', async () => {
+  const baseUrl = await withAdvertisedHost(undefined, async () => {
+    const { app } = mkApp(undefined, undefined, undefined, { bindPort: 7000 })
+    const body = await (await app.request('/api/v1/links/mint',
+      json({ name: 'laptop', capabilities: ['models:use'] }))).json() as { linkString: string }
+    return decodeLinkString(body.linkString)!.baseUrl
+  })
+  assert.match(baseUrl, /:7000$/)
 })
 
 test('mint refuses an unknown capability instead of storing it', async () => {

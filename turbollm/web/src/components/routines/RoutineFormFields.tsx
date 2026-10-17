@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import type { RoutineDraft } from '../../lib/routine-form'
+import { unsetPermissionModeLabel, type RoutineDraft } from '../../lib/routine-form'
 import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
@@ -23,20 +23,48 @@ const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const inputCls = 'w-full rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint'
 const labelCls = 'text-[12px] font-medium text-muted'
 
+/** "Every N minutes" with a text draft while focused — the same idea as SettingsScreen's
+ *  NumberField. Rendering the rule's own value on every keystroke snapped an emptied field back
+ *  to "1" under the caret (`Math.max(1, Number(''))`), so selecting "60" and typing "30" gave
+ *  130. Now the field shows what was typed; each finite value commits (clamped to ≥1, so the
+ *  rule stays valid), and an empty field keeps the last committed value. */
+function IntervalMinutesInput({ everyMs, disabled, className, onCommit }: {
+  everyMs: number; disabled?: boolean; className: string; onCommit: (everyMs: number) => void
+}) {
+  const [text, setText] = useState<string | null>(null) // null = not editing: show the rule
+  return (
+    <input
+      disabled={disabled}
+      type="number"
+      min={1}
+      aria-label="Minutes between runs"
+      className={className}
+      value={text ?? String(Math.round(everyMs / 60_000))}
+      onChange={(e) => {
+        const raw = e.target.value
+        setText(raw)
+        const n = Number(raw)
+        if (raw.trim() !== '' && Number.isFinite(n)) onCommit(Math.max(1, n) * 60_000)
+      }}
+      onBlur={() => setText(null)}
+    />
+  )
+}
+
 /** Switching flavor rewrites the draft so it carries ONLY the chosen flavor's fields, and so the
  *  permission mode the form is about to DISPLAY is actually present on the draft.
  *
  *  Two defects live on this one transition:
  *
- *  1. Safety. The permission-mode select renders `draft.permissionMode ?? 'ask'`, i.e. it shows
- *     "Ask before each tool call" as selected before the user has touched it. But
- *     `emptyRoutineDraft()` never sets the field and `isRoutineDraftComplete` does not require
- *     it, so the common path (pick Code, pick a workspace and a coding agent, never touch a
- *     control that already looks set) persists `permissionMode: undefined` — and the backend
- *     resolves that to `'auto'`, not `'ask'` (`src/routines/code-runner.ts`: `routine.permissionMode
- *     ?? 'auto'`). The routine would then edit files and run commands unattended while the UI
- *     that created it displayed the approval gate. Materialising the default here makes the
- *     displayed mode and the executed mode the same value.
+ *  1. Safety. A new code routine starts on an explicit 'ask', which the select then shows as
+ *     chosen. `emptyRoutineDraft()` never sets the field and `isRoutineDraftComplete` does not
+ *     require it, so without this the common path (pick Code, pick a workspace and a coding
+ *     agent) would persist `permissionMode: undefined` — and the backend resolves that to
+ *     `'auto'` for the in-app agent (`src/routines/code-runner.ts`: `routine.permissionMode ??
+ *     'auto'`): a routine that edits files and runs commands unattended that nobody chose.
+ *     Materialising the default here makes the displayed mode and the executed mode the same,
+ *     explicitly stored value. An EXISTING routine with no mode (create_routine/REST) is shown
+ *     as its own "Not set: …" option naming what actually runs, and is left unset.
  *  2. Dirty data. Only spreading `{ ...draft, flavor }` leaves the departing flavor's fields
  *     behind, and `src/routines/routine-routes.ts` validates only the chosen flavor's required
  *     field while persisting `agentId`/`workspacePath`/`codingAgent`/`permissionMode`
@@ -190,9 +218,13 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
               id={id('permission-mode')}
               disabled={disabled}
               className={inputCls}
-              value={draft.permissionMode ?? 'ask'}
-              onChange={(e) => onChange({ ...draft, permissionMode: e.target.value as RoutineDraft['permissionMode'] })}
+              value={draft.permissionMode ?? ''}
+              onChange={(e) => onChange({ ...draft, permissionMode: (e.target.value || undefined) as RoutineDraft['permissionMode'] })}
             >
+              {/* A stored routine with no mode: name what the daemon actually runs for it (which
+                  depends on the coding agent), and keep it unset unless the user picks a mode.
+                  Only offered while unset — PUT cannot clear a stored mode. */}
+              {draft.permissionMode === undefined && <option value="">Not set: {unsetPermissionModeLabel(draft.codingAgent)}</option>}
               {PERMISSION_MODE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
@@ -219,14 +251,11 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
         </select>
 
         {rule.kind === 'interval' ? (
-          <input
+          <IntervalMinutesInput
             disabled={disabled}
-            type="number"
-            min={1}
-            aria-label="Minutes between runs"
             className={inputCls}
-            value={Math.round(rule.everyMs / 60_000)}
-            onChange={(e) => onChange({ ...draft, scheduleRule: { kind: 'interval', everyMs: Math.max(1, Number(e.target.value)) * 60_000 } })}
+            everyMs={rule.everyMs}
+            onCommit={(everyMs) => onChange({ ...draft, scheduleRule: { kind: 'interval', everyMs } })}
           />
         ) : clock ? (
           <div className="flex flex-wrap items-center gap-2">

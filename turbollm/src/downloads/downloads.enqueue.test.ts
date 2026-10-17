@@ -6,7 +6,7 @@
 //  - a degenerate repo id is rejected rather than silently mis-placed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { DownloadManager, DownloadError } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
@@ -254,6 +254,62 @@ test('enqueue: a concurrent duplicate (same dest) is not enqueued twice', async 
   }
 })
 
+/** Stand in for another platform for one test (restored after it). */
+function asPlatform(t: { after: (fn: () => void) => void }, platform: NodeJS.Platform) {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: platform })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actual }))
+}
+
+// Hugging Face serves a repo id in any letter case, so a pasted URL in another casing names the
+// same file as a live Discover download. On a case-insensitive file system (Windows, default
+// macOS) the two dests open one .part, so a second row would be a second writer on it.
+const CANONICAL = { repo: 'ggml-org/models', rfilename: 'x.gguf' }
+const OTHER_CASE = { url: 'https://huggingface.co/GGML-ORG/MODELS/resolve/main/x.gguf' }
+
+for (const platform of ['win32', 'darwin'] as const) {
+  test(`enqueue on ${platform}: the same file under another letter case is not a second writer on its .part`, async (t) => {
+    asPlatform(t, platform)
+    const restore = stubFetch()
+    try {
+      const { modelDir, stateDir } = newDirs()
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+      const [a] = await dm.enqueue(CANONICAL)
+      assert.ok(a)
+      assert.deepEqual(await dm.enqueue(OTHER_CASE), [], 'a live row already owns that file')
+      assert.equal(dm.list().length, 1)
+
+      // A stale errored row next to a live one in another case: no second writer on resume.
+      const asAny = dm as unknown as { records: Map<string, { status: string }> }
+      asAny.records.get(a.id)!.status = 'error'
+      const [b] = await dm.enqueue(OTHER_CASE)
+      assert.ok(b, 'an errored row does not block a fresh attempt')
+      assert.notEqual(a.dest, b.dest)
+      assert.equal(a.dest.toLowerCase(), b.dest.toLowerCase())
+      assert.throws(() => dm.resume(a.id), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
+      // Nor may the stale row delete the live row's .part.
+      writeFileSync(`${b.dest}.part`, Buffer.alloc(16, 1))
+      assert.equal(dm.remove(a.id), true)
+      assert.ok(existsSync(`${b.dest}.part`))
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('enqueue on linux: dests that differ only in letter case are different files', async (t) => {
+  asPlatform(t, 'linux')
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    assert.equal((await dm.enqueue(CANONICAL)).length, 1)
+    assert.equal((await dm.enqueue(OTHER_CASE)).length, 1, 'a case-sensitive file system holds both')
+  } finally {
+    restore()
+  }
+})
+
 test('enqueue: two quants sharing one mmproj do not double-enqueue the projector', async () => {
   const restore = stubFetch()
   try {
@@ -390,6 +446,76 @@ test('enqueue: a non-HF raw URL stays a single flat file', async () => {
     assert.equal(recs.length, 1)
     assert.equal(recs[0].repo, '')
     assert.equal(recs[0].dest, join(modelDir, 'model.Q4_K_M.gguf'))
+  } finally {
+    restore()
+  }
+})
+
+test('run: the HF token goes only to the HF origin — never to a raw-URL import host', async () => {
+  const { modelDir, stateDir } = newDirs()
+  const real = globalThis.fetch
+  const seen: Array<{ url: string; headers: Record<string, string> }> = []
+  globalThis.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ url: String(url), headers: { ...init.headers } })
+    return new Response('x', { status: 200 })
+  }) as unknown as typeof fetch
+  try {
+    const auth = () => ({ 'User-Agent': 'TurboLLM/test', Authorization: 'Bearer hf_SECRET' })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, auth, echoExpand())
+    for (const url of ['http://192.168.1.5/model.gguf', 'https://mirror.example/model.gguf', 'http://huggingface.co/x.gguf']) {
+      const [rec] = await dm.enqueue({ url })
+      await waitTerminal(dm, rec.id)
+    }
+    const [hfRec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+    await waitTerminal(dm, hfRec.id)
+
+    const raw = seen.filter((s) => !s.url.startsWith('https://huggingface.co/'))
+    assert.equal(raw.length, 3)
+    for (const s of raw) {
+      assert.equal(s.headers.Authorization, undefined, `no token for ${s.url}`)
+      assert.equal(s.headers['User-Agent'], 'TurboLLM/test', 'other headers are kept')
+    }
+    const hf = seen.find((s) => s.url === 'https://huggingface.co/owner/repo/resolve/main/model.gguf')
+    assert.equal(hf?.headers.Authorization, 'Bearer hf_SECRET', 'an HF download still authenticates (gated repos)')
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test('enqueue: a ".." segment in the file path is rejected (decoded resolve URL or raw rfilename)', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    // The expander's fallback (tree 404 / file not in the tree) echoes the caller's own path.
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    await assert.rejects(
+      () => dm.enqueue({ url: 'https://huggingface.co/x/y/resolve/main/..%2F..%2F..%2F..%2Fescaped%2Fevil.gguf' }),
+      (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+    )
+    for (const rfilename of ['../../escaped/evil.gguf', 'sub/../../evil.gguf', '..\\..\\evil.gguf']) {
+      await assert.rejects(
+        () => dm.enqueue({ repo: 'owner/repo', rfilename }),
+        (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+        rfilename,
+      )
+    }
+    assert.equal(dm.list().length, 0)
+  } finally {
+    restore()
+  }
+})
+
+test("enqueue: the expander's dir is sanitised, so it can never place files outside the model dir", async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const hostile = async (): Promise<HfModelFiles> => ({
+      dir: '../../escaped',
+      files: [{ rfilename: 'evil.gguf', size: 10, mmproj: false }],
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), hostile)
+    const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'evil.gguf' })
+    assert.equal(rec.dest, join(modelDir, 'owner', 'repo', 'escaped', 'evil.gguf'))
   } finally {
     restore()
   }

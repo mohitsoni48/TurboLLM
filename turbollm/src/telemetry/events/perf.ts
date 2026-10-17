@@ -16,6 +16,7 @@
 
 import { defineEvent, f } from '../core/define'
 import { OUTCOMES } from '../core/enums'
+import { toSafeIdent, toSafeNameIdent } from '../core/validate'
 import type { PayloadOf } from '../core/types'
 import type { LoadProfile } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -91,9 +92,13 @@ export function buildBenchResultConfig(
 ): Pick<PayloadOf<NonNullable<(typeof benchResult)['payload']>>, 'model' | 'engine' | 'params'> & {
   hw: { cpu: string; ramMb: number; gpus: { name: string; vramMb: number }[] }
 } {
+  // Raw names go through toSafeIdent: a CPU/GPU name with `@`, `/` or `[...]` would otherwise
+  // fail the identifier check and drop the whole event before it is queued. The model name and
+  // engine version use toSafeNameIdent, which reports a path-shaped one as 'unknown' rather than
+  // as its directory names.
   return {
-    model: { name: entry.name, quant: entry.quant, arch: entry.arch, sizeBytes: entry.sizeBytes, moe: entry.moe },
-    engine: { version: engineVersion },
+    model: { name: toSafeNameIdent(entry.name), quant: toSafeIdent(entry.quant), arch: toSafeIdent(entry.arch), sizeBytes: entry.sizeBytes, moe: entry.moe },
+    engine: { version: toSafeNameIdent(engineVersion) },
     params: {
       ctx: profile.ctx,
       ngl: profile.ngl,
@@ -105,9 +110,9 @@ export function buildBenchResultConfig(
       flashAttn: profile.flashAttn,
     },
     hw: {
-      cpu: sys.cpu,
+      cpu: toSafeIdent(sys.cpu),
       ramMb: sys.ramMB,
-      gpus: sys.gpus.map((g) => ({ name: g.name, vramMb: g.vramMb })),
+      gpus: sys.gpus.map((g) => ({ name: toSafeIdent(g.name), vramMb: g.vramMb })),
     },
   }
 }

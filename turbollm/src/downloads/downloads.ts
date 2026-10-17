@@ -5,6 +5,7 @@
 // a failed job sets status='error' with a message and never crashes the daemon.
 import { createHash } from 'node:crypto'
 import {
+  createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
@@ -39,7 +40,14 @@ export interface DownloadRecord {
   bytesPerSec: number
   /** HF LFS sha256 to verify against when known (spec 10 §5). */
   sha256?: string
+  /** The server's strong validator (ETag, else Last-Modified) for the version of the file the
+   *  .part holds — sent as If-Range on resume. */
+  validator?: string
   createdAt: string
+  /** When the record became 'done' (ISO), set in the same tick that requests the rescan. A
+   *  models list whose lastScanAt is later has scanned this file: the web stops waiting for it
+   *  to get a row then (a deleted model, an orphaned mmproj never will). */
+  finishedAt?: string
 }
 
 /** Persisted manifest shape (spec 10 §5). Live runtime fields (controller, timers)
@@ -52,6 +60,7 @@ interface ManifestEntry {
   dest: string
   total: number
   sha256?: string
+  validator?: string
   createdAt: string
 }
 
@@ -72,6 +81,10 @@ export interface ProvenanceEntry {
 }
 
 const MAX_CONCURRENT = 2
+
+/** Statuses whose record still owns its .part (writing it, or able to resume from it) — the
+ *  same set {@link DownloadManager.hasLiveDest} treats as live. */
+const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
 
 /** The model file formats that make sense as a STANDALONE single-file download: a GGUF
  *  and a LiteRT-LM bundle each carry everything a load needs (weights, tokenizer, and
@@ -222,6 +235,12 @@ export class DownloadManager {
     // HF repos are always `owner/name` — reject anything that can't be one (also stops a
     // degenerate `repo` from sanitising to an empty subfolder that lands in the root).
     if (!repo.includes('/') || !rfilename) throw new DownloadError('invalid_request', 'repo and rfilename are required.')
+    // A `..` segment — raw in a request body, or `..%2F` decoded out of a resolve URL — would
+    // climb out of the model folder, both in the fetched path and in the destination the
+    // expander's fallback derives from it.
+    if (rfilename.split(/[\\/]/).includes('..')) {
+      throw new DownloadError('invalid_request', 'The file path must not contain ".." segments.')
+    }
     if (!explicitSubdir && !SINGLE_FILE_MODEL_RE.test(rfilename)) {
       throw new DownloadError('invalid_url', 'The file must be a .gguf or .litertlm model file.')
     }
@@ -247,7 +266,9 @@ export class DownloadManager {
     // two quants that share a shard basename never collide. A .litertlm bundle is one
     // self-contained file with no siblings to group (handled inside the expander).
     const { dir: modelDir, files } = await this.expand(repo, rfilename, rev)
-    const destDir = join(dir, repoSubdir(repo), modelDir)
+    // The expander's dir is HF-derived (or, on its fallbacks, the caller's own rfilename) —
+    // sanitised like the repo id so it can never leave the model folder.
+    const destDir = join(dir, repoSubdir(repo), repoSubdir(modelDir))
     mkdirSync(destDir, { recursive: true })
 
     const targets = files
@@ -286,12 +307,23 @@ export class DownloadManager {
     )
   }
 
-  /** True when a queued/downloading/paused record already targets this exact dest — the
-   *  guard against two concurrent writers corrupting one file. Terminal records
-   *  (done/cancelled/error) don't block a fresh attempt. */
+  /** True when a queued/downloading/paused record already targets this dest (as the file
+   *  system compares names, {@link sameDest}) — the guard against two concurrent writers
+   *  corrupting one file. Terminal records (done/cancelled/error) don't block a fresh attempt. */
   private hasLiveDest(dest: string): boolean {
     for (const r of this.records.values()) {
-      if (r.dest === dest && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
+      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
+    }
+    return false
+  }
+
+  /** True when ANOTHER record with one of `statuses` targets this record's dest. hasLiveDest
+   *  lets a fresh enqueue through while an errored row for the same file remains, so two rows
+   *  can share one .part: the stale row must neither delete it under the live one (cancel /
+   *  remove) nor start a second writer on it (resume). */
+  private sharesDest(rec: DownloadRecord, statuses: DownloadStatus[]): boolean {
+    for (const r of this.records.values()) {
+      if (r.id !== rec.id && sameDest(r.dest, rec.dest) && statuses.includes(r.status)) return true
     }
     return false
   }
@@ -333,7 +365,7 @@ export class DownloadManager {
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
     if (rec.status !== 'done') {
-      rmSync(`${rec.dest}.part`, { force: true })
+      if (!this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
       rec.status = 'cancelled'
       rec.bytesPerSec = 0
     }
@@ -346,10 +378,15 @@ export class DownloadManager {
    *  up. run() already resumes from the .part file's byte offset via a Range request —
    *  this just flips the status so the queue actually starts it again. A restart-
    *  restored job comes back as 'paused' with no automatic way back to 'downloading'
-   *  until this is called. */
+   *  until this is called. False when there is no paused or errored row with that id; throws
+   *  DownloadError('download_in_progress') when the row exists but cannot start. */
   resume(id: string): boolean {
     const rec = this.records.get(id)
     if (!rec || (rec.status !== 'paused' && rec.status !== 'error')) return false
+    // Another row is already (about to be) writing this .part — a second writer would interleave.
+    if (this.sharesDest(rec, ['queued', 'downloading'])) {
+      throw new DownloadError('download_in_progress', 'Another download is already writing this file.')
+    }
     rec.status = 'queued'
     rec.error = null
     this.persist()
@@ -363,7 +400,7 @@ export class DownloadManager {
     if (!rec) return false
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
-    if (rec.status !== 'done') rmSync(`${rec.dest}.part`, { force: true })
+    if (rec.status !== 'done' && !this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
     this.records.delete(id)
     this.persist()
     this.pump()
@@ -429,10 +466,62 @@ export class DownloadManager {
       }
       rec.received = startAt
 
-      const headers: Record<string, string> = { ...this.authHeaders() }
-      if (startAt > 0) headers.Range = `bytes=${startAt}-`
+      // sha256 covers the whole file, so a resume first hashes the prefix already in the .part
+      // (streamed, never buffered whole): a stale or corrupt prefix then fails the checksum
+      // instead of being spliced onto the new bytes and accepted as done. Done BEFORE the
+      // request so a large prefix never holds an open response idle.
+      let hash = rec.sha256 ? createHash('sha256') : null
+      if (hash && startAt > 0) {
+        for await (const chunk of createReadStream(part, { end: startAt - 1 })) {
+          if (ac.signal.aborted) break // cancelled mid-hash: the fetch below rejects with AbortError
+          hash.update(chunk as Buffer)
+        }
+      }
 
-      const res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      const headers: Record<string, string> = { ...this.authHeaders() }
+      // The HF token is for Hugging Face alone: a raw-URL import can name any host, even over
+      // plain http://, so only a request to the HF origin may carry it.
+      if (!isHfOrigin(rec.url)) delete headers.Authorization
+      if (startAt > 0) {
+        headers.Range = `bytes=${startAt}-`
+        // Only the rest of the SAME file: a server whose file changed since the .part was
+        // written answers 200 with the whole new file, which the "ignored Range" path below
+        // restarts from, instead of a 206 tail spliced onto the old prefix. A raw URL usually
+        // has no sha256 to catch that splice.
+        if (rec.validator) headers['If-Range'] = rec.validator
+      }
+
+      let res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      // A 416 to a resume: the .part is as long as the server's file or longer, so no byte of
+      // `bytes=<.part size>-` exists (the file shrank on the server while paused, or the daemon
+      // died after the last write but before the rename below). Thrown as a plain HTTP error with
+      // the .part kept, every later Resume asked for the same range and got the same 416. A .part
+      // that passes the same size and sha256 checks as a finished stream IS the file: finish it.
+      // Anything else is dropped and fetched again from byte 0, once, without Range or If-Range;
+      // a 416 to that request fails below like any other HTTP error, with no .part left behind.
+      if (res.status === 416 && startAt > 0) {
+        await res.body?.cancel().catch(() => {})
+        if (hash && (rec.total <= 0 || startAt === rec.total) && hash.digest('hex') === rec.sha256) {
+          this.finish(rec, part)
+          return
+        }
+        rmSync(part, { force: true })
+        startAt = 0
+        rec.received = 0
+        // The row's total is the length of the file the .part was written against, which this 416
+        // says the server may no longer hold. Kept, a restart whose 200 has no Content-Length was
+        // size-checked against it and failed "size did not match", removing the .part, and every
+        // later Resume did the same. A 416 names the current length as `bytes */N` (RFC 9110
+        // §15.5.17); without one it is unknown until the reply says it. Persisted at once: the
+        // persist below runs only when the reply brings a validator or length other than the row's,
+        // so a daemon killed during a restart that brings neither came back with the old length.
+        rec.total = unsatisfiedRangeLength(res.headers.get('content-range'))
+        this.persist()
+        if (hash) hash = createHash('sha256')
+        delete headers.Range
+        delete headers['If-Range']
+        res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      }
       if (res.status === 401) throw new DownloadError('hf_unauthorized', 'Your Hugging Face token was rejected.')
       if (res.status === 403) throw new DownloadError('hf_gated', 'This repository is gated — accept its license and add your token.')
       if (!res.ok && res.status !== 206) throw new DownloadError('download_failed', `Download failed (HTTP ${res.status}).`)
@@ -444,10 +533,44 @@ export class DownloadManager {
         rmSync(part, { force: true })
         startAt = 0
         rec.received = 0
+        if (hash) hash = createHash('sha256') // the hashed prefix is gone with the .part
+      }
+      // A server that ignores If-Range (Hugging Face's own CDN does), or a row with no validator
+      // to send, can still return another file's tail as a 206. It shows when the 206 names
+      // another strong validator than the one the .part was written under, or when its
+      // Content-Range starts elsewhere, stops before the end of the file or names another full
+      // length. Checked before rec.total is overwritten with this reply's length, which would
+      // make the size check below pass for any splice or truncation.
+      const got = strongValidator(res.headers)
+      if (
+        resuming &&
+        ((rec.validator !== undefined && validatorChanged(rec.validator, res.headers)) ||
+          !rangeContinues(res.headers.get('content-range'), startAt, rec.total))
+      ) {
+        await res.body.cancel().catch(() => {})
+        rmSync(part, { force: true })
+        rec.received = 0
+        throw new DownloadError(
+          'download_failed',
+          "The server's reply does not continue the partial file (the file may have changed on the server since this download started). Removed the partial file: resume to download it again.",
+        )
       }
 
       const clen = Number(res.headers.get('content-length') ?? 0)
-      if (clen > 0) rec.total = resuming ? startAt + clen : clen
+      // A 206 names the full length itself; offset + content-length would take a body shorter
+      // than its own Content-Range for the whole file.
+      const rangeFull = resuming ? contentRangeFull(res.headers.get('content-range')) : 0
+      const total = rangeFull > 0 ? rangeFull : clen > 0 ? (resuming ? startAt + clen : clen) : rec.total
+      // Remember which version of the file the .part now holds (for If-Range and the check
+      // above) and its full length (for the Content-Range check), persisted at once: a daemon
+      // restart mid-download is exactly when they are needed, and nothing else writes the
+      // manifest until this run ends. A raw URL is enqueued with total 0.
+      const validator = got ?? (resuming ? rec.validator : undefined)
+      if (validator !== rec.validator || total !== rec.total) {
+        rec.validator = validator
+        rec.total = total
+        this.persist()
+      }
 
       // Disk guard at download time (spec 10 §6): content-length is often the FIRST real
       // size we see — a raw URL, or an HF expansion where the tree metadata was
@@ -456,9 +579,7 @@ export class DownloadManager {
       // instead of silently filling the disk.
       if (clen > 0) this.assertDisk(dirname(part), clen)
 
-      const hash = rec.sha256 ? createHash('sha256') : null
-      // sha256 can only be verified over the full file; skip it on a partial resume.
-      const verifyHash = hash !== null && startAt === 0
+      const verifyHash = hash !== null
 
       let lastTick = Date.now()
       let lastBytes = startAt
@@ -491,18 +612,7 @@ export class DownloadManager {
         }
       }
 
-      renameSync(part, rec.dest) // atomic within the same dir
-      rec.status = 'done'
-      rec.bytesPerSec = 0
-      this.controllers.delete(rec.id)
-      this.recordProvenance(rec)
-      this.persist()
-      try {
-        this.onComplete()
-      } catch {
-        /* scan trigger is best-effort */
-      }
-      this.settle('ok')
+      this.finish(rec, part)
     } catch (e) {
       this.controllers.delete(rec.id)
       rec.bytesPerSec = 0
@@ -510,7 +620,9 @@ export class DownloadManager {
       // record) — never clobber it back to 'error'. Aborts land here too.
       const terminal: DownloadStatus[] = ['cancelled', 'done']
       if (terminal.includes(rec.status) || (e as Error)?.name === 'AbortError') {
-        if (rec.status !== 'done') rec.status = 'cancelled'
+        // Widened: finish(), cancel() and remove() set the status where the narrowing from
+        // run()'s own 'downloading' cannot see it.
+        if ((rec.status as DownloadStatus) !== 'done') rec.status = 'cancelled'
       } else {
         rec.status = 'error'
         rec.error = e instanceof Error ? e.message : String(e)
@@ -523,6 +635,24 @@ export class DownloadManager {
     } finally {
       this.pump()
     }
+  }
+
+  /** Move a verified .part into place and mark its row done: the end of a streamed download,
+   *  and of a resume whose .part already held the whole file (run()'s 416 path). */
+  private finish(rec: DownloadRecord, part: string): void {
+    renameSync(part, rec.dest) // atomic within the same dir
+    rec.status = 'done'
+    rec.finishedAt = new Date().toISOString()
+    rec.bytesPerSec = 0
+    this.controllers.delete(rec.id)
+    this.recordProvenance(rec)
+    this.persist()
+    try {
+      this.onComplete()
+    } catch {
+      /* scan trigger is best-effort */
+    }
+    this.settle('ok')
   }
 
   /** Append a completed download to the permanent provenance list, keyed by dest
@@ -572,6 +702,7 @@ export class DownloadManager {
         dest: r.dest,
         total: r.total,
         sha256: r.sha256,
+        validator: r.validator,
         createdAt: r.createdAt,
       })
     }
@@ -611,14 +742,83 @@ export class DownloadManager {
         error: null,
         bytesPerSec: 0,
         sha256: e.sha256,
+        validator: e.validator,
         createdAt: e.createdAt,
       })
     }
   }
 }
 
+/** True when two destinations name one file on this platform's file system. Windows and
+ *  (by default) macOS ignore letter case, and Hugging Face serves a repo id in any casing
+ *  (`GGML-ORG/MODELS/resolve/...` redirects to `ggml-org/models`), so a pasted URL can build a
+ *  dest that differs from a live row's only in case yet opens the same .part. Compared exactly,
+ *  both rows wrote it at once: one ended 'done' with a corrupt file in the library (its size and
+ *  sha256 checks cover the bytes it streamed, not the file on disk), the other failed on the
+ *  rename. Elsewhere case is significant and names compare exactly. The platform is read per
+ *  call, not at load, so a test can stand in for another one. */
+function sameDest(a: string, b: string): boolean {
+  if (process.platform === 'win32' || process.platform === 'darwin') return a.toLowerCase() === b.toLowerCase()
+  return a === b
+}
+
 function gb(bytes: number): string {
   return (bytes / 1e9).toFixed(1)
+}
+
+/** The response's strong validator, usable in If-Range (RFC 9110 §13.1.5): a strong ETag, or
+ *  Last-Modified when there is no ETag at all. A weak ETag may not be sent there, and with one
+ *  present a date may not stand in for it, so that case yields none. */
+function strongValidator(h: Headers): string | undefined {
+  const etag = h.get('etag')?.trim()
+  if (etag) return etag.startsWith('W/') ? undefined : etag
+  return h.get('last-modified')?.trim() || undefined
+}
+
+/** True when a 206 names another version of the file than `stored` (the strongValidator the
+ *  .part was written under). Only like is compared with like: a stored date with the 206's
+ *  Last-Modified, a stored ETag with its strong ETag. A 206 that carries only the other kind (an
+ *  ETag on the 200 and only a date on the 206, or the reverse) says nothing either way and is
+ *  left to the Content-Range check. */
+function validatorChanged(stored: string, h: Headers): boolean {
+  let theirs: string | undefined
+  // An HTTP-date (any of RFC 9110's three forms) starts with a day name and has a time; an
+  // ETag, quoted or not, has no space.
+  if (/^[A-Za-z]{3,9},? .*\d{2}:\d{2}:\d{2}/.test(stored)) theirs = h.get('last-modified')?.trim()
+  else {
+    const etag = h.get('etag')?.trim()
+    theirs = etag?.startsWith('W/') ? undefined : etag
+  }
+  return !!theirs && theirs !== stored
+}
+
+/** True when a 206's Content-Range continues the .part to the end of the file: it starts at
+ *  `startAt`, names the full length the row expects when both sides know it, and ends at the
+ *  last byte when the full length is known (a server capping open-ended ranges sends less,
+ *  which startAt + content-length would then take for the whole file). A 206 without the header
+ *  (which the spec requires), or with one this cannot read, cannot be checked and is let
+ *  through, as before: refusing it would throw away the .part on a merely sloppy server. */
+function rangeContinues(contentRange: string | null, startAt: number, total: number): boolean {
+  const m = contentRange === null ? null : /^bytes[\s=]+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange.trim())
+  if (!m) return true
+  if (Number(m[1]) !== startAt) return false
+  const full = m[3] === '*' ? total : Number(m[3])
+  if (total > 0 && full !== total) return false
+  return full <= 0 || Number(m[2]) === full - 1
+}
+
+/** The full length a Content-Range names (`bytes a-b/N`), or 0 for `/*` or an unreadable header. */
+function contentRangeFull(contentRange: string | null): number {
+  const m = contentRange === null ? null : /^bytes[\s=]+\d+-\d+\/(\d+)$/i.exec(contentRange.trim())
+  return m ? Number(m[1]) : 0
+}
+
+/** The current length a 416 names (`bytes *\/N`, RFC 9110 §14.4), or 0 when it names none. Apart
+ *  from contentRangeFull: a 206 must not carry that form, and one that does stays unreadable
+ *  there, as rangeContinues already treats it. */
+function unsatisfiedRangeLength(contentRange: string | null): number {
+  const m = contentRange === null ? null : /^bytes[\s=]+\*\/(\d+)$/i.exec(contentRange.trim())
+  return m ? Number(m[1]) : 0
 }
 
 /** Rewrite HF blob viewer URLs to the direct-download resolve URL so raw HTTP
@@ -657,6 +857,16 @@ function safePathname(u: string): string {
 function hfBaseUrl(): string {
   const override = process.env.TURBOLLM_HF_BASE?.trim()
   return override ? override.replace(/\/+$/, '') : 'https://huggingface.co'
+}
+
+/** True when `u` is on the HF origin (scheme, host and port of {@link hfBaseUrl}) — the only
+ *  place the user's HF token may be sent. */
+function isHfOrigin(u: string): boolean {
+  try {
+    return new URL(u).origin === new URL(hfBaseUrl()).origin
+  } catch {
+    return false
+  }
 }
 
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file

@@ -1,14 +1,16 @@
 // main.js — TurboLLM Desktop native wrapper
 // Spawns the TurboLLM daemon (bundled under resources/daemon/), waits for /healthz,
 // then opens a native window pointed at http://localhost:6996.
-const { app, BrowserWindow } = require('electron')
+const { app, BrowserWindow, session, shell } = require('electron')
 const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
 const { createDaemonSupervisor } = require('./daemon-supervisor')
+const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
+const APP_ORIGIN = appOriginFor(PORT)
 
 // ── Locate daemon files ───────────────────────────────────────────────────────
 // The daemon depends on node-pty (native addon, used by the terminal-agent PTY
@@ -71,6 +73,11 @@ function setupAutoUpdate () {
   // Only meaningful in a packaged app: a dev run has no update manifest to compare against
   // and electron-updater throws rather than no-oping.
   if (!app.isPackaged) return
+  // Nor on macOS: electron-updater's MacUpdater installs only from a .zip (Squirrel.Mac), and only
+  // into a signed app. The mac build is an unsigned dmg (electron-builder.config.cjs), so every check
+  // would just fail. The daemon tells mac desktop users to download the new .dmg instead
+  // (classifyInstall in turbollm/src/app-update-apply.ts).
+  if (process.platform === 'darwin') return
 
   let autoUpdater
   try {
@@ -123,9 +130,10 @@ function waitForDaemon (retryMs = 500, timeoutMs = 45000) {
 }
 
 // ── Spawn the daemon ──────────────────────────────────────────────────────────
-// Resolved once at startup, so every respawn after a requested restart is launched
-// exactly like the first launch: same node, argv, cwd and env.
-function daemonLaunchSpec () {
+// Built for every spawn, so a respawn after a requested restart is launched exactly like
+// the first launch: same node, argv, cwd and env, except the port, which is the one the
+// window is on (daemonPort below).
+function daemonLaunchSpec (port) {
   const node = getDaemonNode()
   const daemonDir = getDaemonDir()
 
@@ -141,7 +149,10 @@ function daemonLaunchSpec () {
 
   return {
     node,
-    args: [cliPath, '--port', String(PORT), '--addr', `127.0.0.1:${PORT}`],
+    // --no-open: this window IS the UI. Without it the daemon also opens the system browser on
+    // every launch and on every respawn after a requested restart. Passed even though the daemon
+    // has its own openBrowserOnStart setting, which a user may have left on for CLI use.
+    args: [cliPath, '--port', String(port), '--addr', `127.0.0.1:${port}`, '--no-open'],
     options: {
       cwd: daemonDir,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -164,18 +175,63 @@ function spawnDaemonFrom (spec) {
   return child
 }
 
+// PORT until a port change in Settings moves the live daemon and then the window (window-guards.js
+// daemonPortFor); from then on the window's port, so a respawn comes back where the window is.
+function daemonPort () {
+  const url = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : ''
+  return daemonPortFor(url, APP_ORIGIN, PORT)
+}
+
 function onDaemonLost (reason) {
   console.error(`TurboLLM daemon ${reason}`)
   setImmediate(() => app.quit())
 }
 
+// Keeps links and permission requests from turning this window into a browser (window-guards.js).
+function guardWindow (win) {
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    if (isWebUrl(url)) shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  win.webContents.on('will-navigate', (event, legacyUrl) => {
+    // event.url on current Electron; the positional url is the deprecated spelling of the same.
+    const url = event.url || legacyUrl
+    if (isAppUrl(url, APP_ORIGIN)) return
+    event.preventDefault()
+    if (isWebUrl(url)) shell.openExternal(url)
+  })
+}
+
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 let mainWindow = null
 
+// One app at a time. A second launch (a double-click while the first window still waits on
+// /healthz) would start a second daemon on the same data dir, which fails to bind and exits, taking
+// the second window with it. The running app gets the focus instead.
+const isPrimaryInstance = app.requestSingleInstanceLock()
+if (!isPrimaryInstance) app.quit()
+
+app.on('second-instance', () => {
+  // No window yet: the daemon is still starting, and the window appears on its own once it answers.
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
+
 app.whenReady().then(() => {
+  // Quitting already (see requestSingleInstanceLock above): start no daemon and open no window.
+  if (!isPrimaryInstance) return
+
+  // Deny by default (Electron's own default grants everything); see window-guards.js.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback, details) => {
+    callback(allowPermission(permission, (details && details.requestingUrl) || webContents.getURL(), APP_ORIGIN))
+  })
+  session.defaultSession.setPermissionCheckHandler((_webContents, permission, requestingOrigin) =>
+    allowPermission(permission, requestingOrigin, APP_ORIGIN))
+
   try {
-    const spec = daemonLaunchSpec()
-    supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(spec), onDaemonLost })
+    supervisor = createDaemonSupervisor({ spawnDaemon: () => spawnDaemonFrom(daemonLaunchSpec(daemonPort())), onDaemonLost })
     supervisor.start()
   }
   catch (err) {
@@ -199,6 +255,7 @@ app.whenReady().then(() => {
         contextIsolation: true,
       },
     })
+    guardWindow(mainWindow)
 
     mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
 
@@ -218,6 +275,7 @@ app.whenReady().then(() => {
         title: 'TurboLLM', backgroundColor: '#0a0a0a',
         webPreferences: { nodeIntegration: false, contextIsolation: true },
       })
+      guardWindow(mainWindow)
       mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
     }
   })

@@ -20,8 +20,10 @@
 //    detached HEAD needs an explicit `<remote> HEAD:<branch>` refspec, extra complexity/risk this
 //    pass doesn't add; surfaced as a distinct, actionable error instead of a confusing generic one.
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { isAbsolute, resolve } from 'node:path'
 import { promisify } from 'node:util'
-import { isContainedFromRoot } from './containment'
+import { isInsideAny } from './containment'
 
 const execFileAsync = promisify(execFile)
 
@@ -55,7 +57,9 @@ async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Pro
       // failure as a normal command error instead of hanging the request.
       env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     })
-    return stdout.trim()
+    // trimEnd, not trim: `status --porcelain` lines start with a significant space (' M path' =
+    // unstaged change), and stripping the first one shifted that entry's code and path by a char.
+    return stdout.trimEnd()
   } catch (e) {
     const failure = e as { stderr?: string; code?: number; killed?: boolean; message: string }
     if (failure.killed) throw new GitError(`git ${args[0]} timed out after ${timeoutMs}ms`, failure.stderr ?? '', null)
@@ -121,10 +125,26 @@ export async function getGitStatus(repoRoot: string): Promise<GitStatusResult> {
     } catch { /* branch has no upstream tracking configured yet */ }
   }
 
-  const raw = await git(['status', '--porcelain=v1'], repoRoot)
-  const files: GitFileStatus[] = raw
-    ? raw.split('\n').filter(Boolean).map((line) => ({ code: line.slice(0, 2), path: line.slice(3) }))
-    : []
+  // -z: these paths go back to `git add` for a selective commit, and without it git C-quotes any
+  // path with a space or non-ASCII character ('"caf\303\251.txt"') and prints a rename as
+  // 'old -> new' — none of which git accepts back. With -z each entry is 'XY path' NUL-terminated,
+  // unquoted, and a rename/copy is followed by one more NUL-terminated field: its original path.
+  // Porcelain prints every path relative to the repository's top level whatever the cwd, while
+  // `git add` (and commitGitChanges' containment check) read one relative to the cwd. So a session
+  // opened at a subfolder of a repo (a monorepo package) lists only its own folder (`-- .`), with
+  // the folder's prefix taken off. An untracked session folder is listed as itself: '.'.
+  let prefix = ''
+  try { prefix = await git(['rev-parse', '--show-prefix'], repoRoot) } catch { /* at the top level */ }
+  const raw = (await git(['status', '--porcelain=v1', '-z', '--', '.'], repoRoot)).split('\0')
+  const files: GitFileStatus[] = []
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i]
+    if (!entry) continue
+    const code = entry.slice(0, 2)
+    const path = entry.slice(3)
+    files.push({ code, path: path.startsWith(prefix) ? path.slice(prefix.length) || '.' : path })
+    if (/[RC]/.test(code)) i++ // skip the original path; the new one is what gets staged
+  }
 
   return { isRepo: true, branch, detached, files, hasRemote, hasUpstream, ahead, behind }
 }
@@ -134,12 +154,73 @@ export interface CommitResult {
   filesCommitted: number
 }
 
+/** Whether `git add -- <f>` run in `repoRoot` stages something inside it. Lexical on purpose, not
+ *  containment.ts's write-tool guard (which follows links and applies pi's `~`/`@` reading): git
+ *  stages a symlink as a link without following it, refuses a path through a symlinked directory
+ *  itself ('beyond a symbolic link'), and with literal pathspecs reads '~/x' as an in-repo name. */
+function isGitPathInside(f: unknown, repoRoot: string): boolean {
+  if (typeof f !== 'string' || f.length === 0 || f.includes('\0')) return false
+  const root = resolve(repoRoot)
+  return isInsideAny(resolve(root, f), [root])
+}
+
+/** For a session opened at a repo subfolder, the repo paths (relative to the top level) already
+ *  staged outside that folder: `git commit` commits the whole index, but getGitStatus lists only
+ *  the folder, so these would go into the commit unseen. [] at the top level. Read from porcelain
+ *  status (top-level-relative, unquoted with -z, unaffected by diff.relative); a staged rename
+ *  counts by both of its paths, so one moved in from outside still counts by its old path. */
+async function stagedOutsideFolder(repoRoot: string): Promise<string[]> {
+  const prefix = await git(['rev-parse', '--show-prefix'], repoRoot).catch(() => '')
+  if (!prefix) return []
+  const raw = (await git(['status', '--porcelain=v1', '-z', '--untracked-files=no'], repoRoot)).split('\0')
+  const outside: string[] = []
+  for (let i = 0; i < raw.length; i++) {
+    const entry = raw[i]
+    if (!entry) continue
+    const code = entry.slice(0, 2)
+    const paths = [entry.slice(3)]
+    if (/[RC]/.test(code)) {
+      const orig = raw[++i] ?? ''
+      if (code[0] === 'R') paths.push(orig) // a copy leaves its original as it was
+    }
+    if (code[0] === ' ') continue // nothing staged for this entry
+    for (const p of paths) if (p && !p.startsWith(prefix)) outside.push(p)
+  }
+  return outside
+}
+
+/** 'A merge' etc. while an operation that staged its own result is stopped: what concludes it (the
+ *  commit, or `--continue` for a rebase or `git am`) needs that result.
+ *  MERGE_HEAD, CHERRY_PICK_HEAD and REVERT_HEAD end with the commit, reset or --abort that ends
+ *  the operation (rev-parse rather than a file check: only MERGE_HEAD is always a file in a
+ *  reftable repo). REBASE_HEAD does not: git leaves it behind when a rebase that stopped on its
+ *  last pick is continued, so a rebase is decided as `git status` decides it, by its per-worktree
+ *  state directory: rebase-merge, or rebase-apply without `applying`. With `applying` it is a
+ *  stopped `git am`, which stages its patch's changes the same way. */
+async function operationInProgress(repoRoot: string): Promise<string | null> {
+  const ops: Array<[string, string]> = [['MERGE_HEAD', 'A merge'], ['CHERRY_PICK_HEAD', 'A cherry-pick'], ['REVERT_HEAD', 'A revert']]
+  for (const [ref, label] of ops) {
+    if (await git(['rev-parse', '-q', '--verify', ref], repoRoot).then(() => true, () => false)) return label
+  }
+  // Relative to the cwd from a subfolder ('../../.git/rebase-merge'), absolute in a linked worktree.
+  // Not resolve(): git counts that '..' from the real folder, so for a session folder reached
+  // through a symlink only the filesystem resolves it right, not a lexical join.
+  const dirs = await git(['rev-parse', '--git-path', 'rebase-merge', '--git-path', 'rebase-apply'], repoRoot)
+    .then((out) => out.split(/\r?\n/), () => [])
+  if (dirs.length !== 2) return null
+  const [merge, apply] = dirs.map((p) => (isAbsolute(p) ? p : `${repoRoot}/${p}`))
+  // rebase-apply first, as `git status` checks it (both exist when a rebase's exec stops in `git am`).
+  if (existsSync(apply)) return existsSync(`${apply}/applying`) ? 'A patch application (git am)' : 'A rebase'
+  return existsSync(merge) ? 'A rebase' : null
+}
+
 /** Stages then commits. `files`, when given, stages ONLY those paths (each containment-checked
  *  against `repoRoot` — the same boundary every other Code filesystem operation enforces, since a
  *  caller-supplied path list is exactly the input that boundary exists for); omitted stages
- *  everything (`git add -A`), matching a plain "commit all my changes" affordance. Throws
- *  `GitError` for every failure case (no message, not a repo, nothing to commit/stage, containment
- *  violation, or the underlying `git commit` itself failing) — callers map `.message` to a route
+ *  everything in the session's folder (`git add -A -- .`), matching a plain "commit all my
+ *  changes" affordance. Throws `GitError` for every failure case (no message, not a repo, nothing
+ *  to commit/stage, containment violation, changes staged outside a subfolder session's folder, or
+ *  the underlying `git commit` itself failing) — callers map `.message` to a route
  *  error, no silent partial-success. */
 export async function commitGitChanges(repoRoot: string, message: string, files?: string[]): Promise<CommitResult> {
   const trimmedMessage = message.trim()
@@ -149,19 +230,42 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
   if (!status.isRepo) throw new GitError('Not a git repository.', '', null)
   if (status.files.length === 0) throw new GitError('Nothing to commit — the working tree is clean.', '', null)
 
+  // Checked before staging anything. Typically the agent's own `git add -A`, run in the package
+  // folder, which stages the whole repository. During a merge (cherry-pick, revert, rebase or git am stop)
+  // the staged changes outside are that operation's result: unstaging them would make the commit
+  // that concludes it drop them, so it is not advised there. `git reset --`, not `git restore
+  // --staged`: the latter fails before the first commit.
+  const outside = await stagedOutsideFolder(repoRoot)
+  if (outside.length > 0) {
+    const shown = outside.slice(0, 5).join(', ') + (outside.length > 5 ? ` and ${outside.length - 5} more` : '')
+    const op = await operationInProgress(repoRoot)
+    throw new GitError(
+      op
+        ? `${op} is in progress, and its changes outside this folder are already staged (${shown}). `
+          + 'Its commit needs them: finish it from the repository\'s top level.'
+        : `Changes outside this folder are already staged (${shown}) and would be committed too. `
+          + 'Unstage them at the repository\'s top level (git reset -- <path>) or commit from there.',
+      '', null,
+    )
+  }
+
   if (files && files.length > 0) {
     for (const f of files) {
-      if (!isContainedFromRoot(f, repoRoot)) throw new GitError(`Refusing to stage a path outside the repo: ${f}`, '', null)
+      if (!isGitPathInside(f, repoRoot)) throw new GitError(`Refusing to stage a path outside the repo: ${f}`, '', null)
     }
-    await git(['add', '--', ...files], repoRoot)
+    // Literal: these are file names (from getGitStatus), so '[ab].txt' must not also match a.txt
+    // as a glob, nor a leading ':' read as pathspec magic.
+    await git(['--literal-pathspecs', 'add', '--', ...files], repoRoot)
   } else {
-    await git(['add', '-A'], repoRoot)
+    // `-- .`: without a pathspec `git add -A` stages the whole working tree, which for a session
+    // opened at a repo subfolder includes changes outside the folder (getGitStatus lists only it).
+    await git(['add', '-A', '--', '.'], repoRoot)
   }
 
   // Re-check what's actually staged rather than trusting `status.files` was non-empty for the
   // repo as a whole — a caller-supplied `files` list can point at paths with no real changes,
   // which `git add` silently no-ops on, leaving nothing staged.
-  const staged = await git(['diff', '--cached', '--name-only'], repoRoot).catch(() => '')
+  const staged = await git(['diff', '--cached', '--name-only', '--', '.'], repoRoot).catch(() => '')
   const stagedList = staged.split('\n').filter(Boolean)
   if (stagedList.length === 0) throw new GitError('Nothing staged — the selected file(s) have no changes.', '', null)
 

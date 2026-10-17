@@ -38,6 +38,7 @@ import {
   deleteEngineBackend,
   enableBackend,
   purgeEngine,
+  deleteEngineBuild,
   forgetCustomEngineSource,
   updateBackend,
   updateVllm,
@@ -572,6 +573,11 @@ export function useEngineMutations() {
       mutationFn: (id: string) => purgeEngine(id),
       onSuccess: invalidate,
     }),
+    /** Delete a DISABLED source build's folder: no live engine to purge, and nothing is probed. */
+    deleteBuild: useMutation({
+      mutationFn: (binPath: string) => deleteEngineBuild(binPath),
+      onSuccess: invalidate,
+    }),
     /** Forget a DISABLED custom engine's remembered identity — no live engine to purge. */
     forgetCustomSource: useMutation({
       mutationFn: (key: string) => forgetCustomEngineSource(key),
@@ -696,7 +702,18 @@ export function useModels(): UseQueryResult<ModelsList> {
   const qc = useQueryClient()
   return useQuery({
     queryKey: queryKeys.models,
-    queryFn: getModels,
+    queryFn: async () => {
+      const prev = qc.getQueryData<ModelsList>(queryKeys.models)
+      const next = await getModels()
+      // An HF repo panel's Downloaded/"Load" state is resolved by the daemon against this scanned
+      // library, but `useHfRepo` only re-polls while verifying — so a download finishing while the
+      // panel was open left it offering "Download", and clicking it fetched the file again from
+      // zero. A new scan pass is when that answer changes (a finished download triggers one, after
+      // its record already reads `done` — keying on the record would race the scan), so mark every
+      // repo detail stale; only an open panel actually refetches.
+      if (prev && prev.lastScanAt !== next.lastScanAt) void qc.invalidateQueries({ queryKey: ['hf-repo'] })
+      return next
+    },
     refetchInterval: (q) =>
       modelsRefetchInterval(q.state.data, qc.getQueryData<Status>(queryKeys.status), qc.getQueryData<DownloadsList>(queryKeys.downloads)),
     refetchIntervalInBackground: false,
@@ -1039,9 +1056,23 @@ export function useHfTokenTest() {
 /** Downloads list, polled every 1.5s while any job is active so progress/speed
  *  stay live; otherwise refetched on focus only. */
 export function useDownloads(): UseQueryResult<DownloadsList> {
+  const qc = useQueryClient()
   return useQuery({
     queryKey: queryKeys.downloads,
-    queryFn: listDownloads,
+    queryFn: async () => {
+      const prev = qc.getQueryData<DownloadsList>(queryKeys.downloads)
+      const next = await listDownloads()
+      // A download that just finished means a rescan is under way (the daemon starts it in the same tick that
+      // marks the record `done`, so the list reads `scanning` until it lands). Wake the models list: with no
+      // model loaded its own poll is quiet whenever every finished download is already accounted for by a
+      // row — and shards 2..N of a split GGUF (an MLX/vLLM model's later files) are, by the split's row while
+      // it is still flagged incomplete, so the row would keep reading "incomplete" after the last shard.
+      const wasDone = new Set(prev?.downloads.filter((d) => d.status === 'done').map((d) => d.id))
+      if (prev && next.downloads.some((d) => d.status === 'done' && !wasDone.has(d.id))) {
+        void qc.invalidateQueries({ queryKey: queryKeys.models })
+      }
+      return next
+    },
     refetchInterval: (q) =>
       q.state.data?.downloads.some((dl) => dl.status === 'downloading' || dl.status === 'queued') ? 1500 : false,
     refetchIntervalInBackground: false,

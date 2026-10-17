@@ -13,6 +13,7 @@ vi.mock('../../lib/api', async (importOriginal) => ({
 
 const localCancel = vi.fn()
 const localRemove = vi.fn()
+const localResume = vi.fn()
 
 // Only the LOCAL data layer is mocked. `link-queries` is deliberately real — see the note
 // in ModelsScreen.fleet.test.tsx: a mocked mutation can only prove what a click handed off,
@@ -24,7 +25,7 @@ vi.mock('../../lib/queries', () => ({
   useDownloadMutations: () => ({
     cancel: { mutate: localCancel, isPending: false, variables: undefined },
     remove: { mutate: localRemove, isPending: false },
-    resume: { mutate: vi.fn(), isPending: false },
+    resume: { mutate: localResume, isPending: false },
   }),
 }))
 
@@ -108,6 +109,7 @@ beforeEach(() => {
   calls.length = 0
   localCancel.mockClear()
   localRemove.mockClear()
+  localResume.mockReset()
   installFetch()
 })
 
@@ -268,6 +270,18 @@ describe('DownloadsPanel — merged fleet', () => {
     await screen.findByText('remote.gguf')
     const row = document.querySelector('[data-testid="download-row-remote-1"]')!
     expect(within(row as HTMLElement).queryByRole('button', { name: /resume/i })).toBeNull()
+  })
+
+  it('shows a refused local Resume on its row instead of dropping it', async () => {
+    // The daemon's 409 when another row is already writing the same file.
+    localResume.mockImplementation((_id: string, opts?: { onError?: (e: Error) => void }) =>
+      opts?.onError?.(new Error('Another download is already writing this file.')))
+    state.local = [{ ...localDl, status: 'error', error: 'network blip' }]
+    renderPanel()
+    await userEvent.click(screen.getByRole('button', { name: /resume/i }))
+    expect(localResume).toHaveBeenCalledWith('local-1', expect.anything())
+    const row = document.querySelector('[data-testid="download-row-local-1"]') as HTMLElement
+    expect(within(row).getByRole('alert').textContent).toBe('Another download is already writing this file.')
   })
 
   describe('bulk actions', () => {

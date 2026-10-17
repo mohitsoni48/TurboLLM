@@ -348,13 +348,19 @@ test('a duplicate Idempotency-Key on POST /chats returns the same chat rather th
     assert.equal(first.status, 201)
     const firstBody = await first.json() as { id: string; title: string }
 
-    // A retry with the SAME key but a DIFFERENT body — proving the replay returns the frozen
-    // original result rather than re-running createChat with the new content.
-    const second = await app.request('/api/ext/v1/chats', post('A different title'))
+    // A genuine retry (SAME key, SAME body) returns the frozen original result rather than
+    // re-running createChat.
+    const second = await app.request('/api/ext/v1/chats', post('Hello'))
     assert.equal(second.status, 201)
     const secondBody = await second.json() as { id: string; title: string }
     assert.equal(secondBody.id, firstBody.id, 'the replay must return the SAME chat, not a new one')
     assert.equal(secondBody.title, firstBody.title, 'the replay returns the ORIGINAL result, not a re-execution')
+
+    // The SAME key with a DIFFERENT body is a different request — refused, not answered
+    // with a chat that does not match what was asked for.
+    const reused = await app.request('/api/ext/v1/chats', post('A different title'))
+    assert.equal(reused.status, 409)
+    assert.equal((await reused.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
 
     const list = await app.request('/api/ext/v1/chats?owner=u1', { headers: { Authorization: ACME } })
     const page = await list.json() as { data: unknown[] }
@@ -529,6 +535,86 @@ test('GET /audit with a negative or zero limit is refused with a clean 400', asy
     const res = await app.request('/api/ext/v1/audit?owner=u1&limit=0', { headers: { Authorization: ACME } })
     assert.equal(res.status, 400)
     assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+// GET /audit could never return anything past the newest page — `since` is a lower bound
+// on a newest-first list. `before=<oldest id received>` is how the route pages backward.
+test('GET /audit pages backward with before=<oldest id received>', async () => {
+  const { app, cleanup } = harness()
+  try {
+    for (const title of ['A', 'B', 'C']) await app.request('/api/ext/v1/chats', json(ACME, { title, owner: 'u1' }))
+    const get = async (q: string) => (await (await app.request(`/api/ext/v1/audit?owner=u1&${q}`, { headers: { Authorization: ACME } })).json() as { data: Array<{ id: string }> }).data
+    const page1 = await get('limit=2')
+    assert.equal(page1.length, 2)
+    const page2 = await get(`limit=2&before=${page1[1].id}`)
+    assert.equal(page2.length, 1, 'the third, oldest row is reachable on the next page')
+    assert.ok(!page1.some((r) => r.id === page2[0].id), 'the next page holds only older rows')
+  } finally {
+    cleanup()
+  }
+})
+
+// `since` was compared as text against toISOString() values, so the same instant written without
+// milliseconds or with an offset cut in the wrong place ('.' sorts before 'Z'; '11' after '10').
+test('GET /audit `since` is compared as an instant, whatever ISO form it is written in', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'A', owner: 'u1' }))
+    const get = async (since: string) => {
+      const res = await app.request(`/api/ext/v1/audit?owner=u1&since=${encodeURIComponent(since)}`, { headers: { Authorization: ACME } })
+      return { status: res.status, body: await res.json() as { data: Array<{ at: string }>; error?: { code: string } } }
+    }
+    const at = (await get('1970-01-01T00:00:00Z')).body.data[0].at
+    const ms = Date.parse(at)
+    // The same wall-clock instant shifted into a UTC offset: '+01:00' reads one hour later.
+    const withOffset = (t: number, minutes: number) => {
+      const sign = minutes < 0 ? '-' : '+'
+      const hhmm = `${String(Math.floor(Math.abs(minutes) / 60)).padStart(2, '0')}:${String(Math.abs(minutes) % 60).padStart(2, '0')}`
+      return new Date(t + minutes * 60_000).toISOString().replace('Z', `${sign}${hhmm}`)
+    }
+    const secondFloor = new Date(Math.floor(ms / 1000) * 1000).toISOString().replace('.000Z', 'Z')
+    assert.equal((await get(secondFloor)).body.data.length, 1, `${secondFloor} (no milliseconds) is at or before ${at}`)
+    assert.equal((await get(withOffset(ms, 60))).body.data.length, 1, 'the row\'s own instant, written +01:00')
+    assert.equal((await get(withOffset(ms + 1000, -60))).body.data.length, 0, 'one second after the row, written -01:00')
+    const bad = await get('not-a-date')
+    assert.equal(bad.status, 400)
+    assert.equal(bad.body.error?.code, 'invalid_input')
+  } finally {
+    cleanup()
+  }
+})
+
+// `since` went through a bare Date.parse, which also takes V8's legacy formats: '1' and 'foo 1'
+// both read as 2001-01-01 and returned every row since then instead of the documented 400.
+test('GET /audit refuses a `since` that is not in ISO 8601 extended format', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'A', owner: 'u1' }))
+    const get = async (since: string) => {
+      const res = await app.request(`/api/ext/v1/audit?owner=u1&since=${encodeURIComponent(since)}`, { headers: { Authorization: ACME } })
+      return { status: res.status, body: await res.json() as { data?: unknown[]; error?: { code: string; param?: string } } }
+    }
+    for (const since of [
+      '1', 'foo 1', '10/15/2026', 'Thu, 15 Oct 2026 10:00:00 GMT', '2026-10-15 10:00:00', '2026-10-15T10:00:00+0200',
+      '20261015T100000Z', '+002026-10-15', '2026-10T10:00Z', '2026-02-30', '2026-13-01', '0001-02-29',
+    ]) {
+      const r = await get(since)
+      assert.equal(r.status, 400, since)
+      assert.equal(r.body.error?.code, 'invalid_input', since)
+    }
+    // Every ISO 8601 extended form still works: a year or month alone, a date, minutes only, a long
+    // fraction, local time, a lowercase t/z (RFC 3339), a leap day in year 0.
+    for (const since of [
+      '1970', '1970-01', '1970-01-01', '1970-01-01T00:00Z', '1970-01-01T00:00:00.123456Z', '1970-01-02T00:00:00',
+      '1970-01-01t00:00z', '2026-02-28', '0000-02-29',
+    ]) {
+      const r = await get(since)
+      assert.equal(r.status, 200, since)
+    }
+    assert.equal((await get('1970-01-01T00:00Z')).body.data?.length, 1)
   } finally {
     cleanup()
   }

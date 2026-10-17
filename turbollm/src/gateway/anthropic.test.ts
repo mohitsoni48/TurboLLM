@@ -114,6 +114,15 @@ test('mapToOpenAI leaves thinking_budget_tokens unset when thinking is enabled b
   assert.equal('thinking_budget_tokens' in oai, false)
 })
 
+// thinking:{type:'disabled'} is the Anthropic API's explicit off switch. It used to fall into the
+// budget-less default above (half of max_tokens, no enable_thinking:false), so a model that thinks
+// by default kept reasoning on 4000 of 8000 tokens after the client had turned thinking off.
+test("mapToOpenAI maps thinking {type:'disabled'} to off: budget 0 plus enable_thinking false", () => {
+  const oai = mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 8000, thinking: { type: 'disabled' } })
+  assert.equal(oai.thinking_budget_tokens, 0)
+  assert.deepEqual(oai.chat_template_kwargs, { enable_thinking: false })
+})
+
 // ── mapToOpenAI maps a `role:'system'` entry inside `messages` correctly ────
 // Regression coverage for a real bug (found + fully root-caused live 2026-07-23, via a
 // captured real Claude Code request): Claude Code injects hook context (e.g. a
@@ -574,6 +583,94 @@ test('streamToAnthropic does NOT fire onToolCalls when the stream fails mid-turn
   assert.equal(fired, false, 'a half-received turn must never be observed as a completed one')
   assert.equal(usageFired, false, 'nor recorded as usage')
   assert.equal(events.at(-1)?.event, 'error', 'the client is told the engine stopped, in place of message_stop')
+})
+
+// ── streamToAnthropic: an error the engine reports IN the stream ────────────
+// llama-server writes `data: {"error":{...}}` and closes when it fails after streaming began (compute error, slot
+// abort, context shift); LiteRT-LM writes `event: response.error` + `data: {"error":"…"}`. Neither has `choices`,
+// so both used to be skipped and the half answer ended as a clean end_turn the client took as complete.
+
+for (const [label, lines, expected] of [
+  ['llama-server', ['data: {"error":{"code":500,"message":"Compute error at /home/me/models/q.gguf","type":"server_error"}}'], 'Compute error at <path>'],
+  ['LiteRT-LM', ['event: response.error', 'data: {"error":"RuntimeError: Compute error at /home/me/models/q.gguf"}'], 'RuntimeError: Compute error at <path>'],
+] as const) {
+  test(`streamToAnthropic turns a mid-stream ${label} error into an error event, not end_turn`, async () => {
+    const upstream = sseStream([
+      'data: {"choices":[{"delta":{"content":"Half an ans"}}]}',
+      ...lines,
+    ])
+    let usageFired = false
+    let toolCallsFired = false
+    const events: { event: string; data: string }[] = []
+    for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_engine_err', {
+      onUsage: () => { usageFired = true },
+      onToolCalls: () => { toolCallsFired = true },
+      redact: (t) => t.replace('/home/me/models/q.gguf', '<path>'),
+    })) events.push(evt)
+
+    assert.equal(events.at(-1)?.event, 'error')
+    assert.deepEqual(JSON.parse(events.at(-1)!.data), { type: 'error', error: { type: 'api_error', message: expected } })
+    assert.ok(!events.some((e) => e.event === 'message_delta' || e.event === 'message_stop'), 'no clean finish after the error')
+    assert.equal(usageFired, false, 'a failed turn is not recorded as a completed one')
+    assert.equal(toolCallsFired, false)
+  })
+}
+
+// ── streamToAnthropic: content block indices stay well-formed ───────────────
+// One block open at a time, indices strictly sequential, every delta/stop on the open block. Claude Code's
+// accumulator assigns by index on start and throws "Content block not found" on a delta/stop for an unknown one.
+
+function blockTypes(events: { event: string; data: string }[]): string[] {
+  let open = -1
+  let next = 0
+  const types: string[] = []
+  for (const e of events) {
+    if (!e.event.startsWith('content_block_')) continue
+    const d = JSON.parse(e.data) as { index: number; content_block?: { type: string } }
+    if (e.event === 'content_block_start') {
+      assert.equal(open, -1, `block ${d.index} started while block ${open} is still open`)
+      assert.equal(d.index, next, 'block indices are sequential')
+      open = d.index
+      next++
+      types.push(d.content_block!.type)
+    } else {
+      assert.equal(d.index, open, `${e.event} for block ${d.index}, but the open block is ${open}`)
+      if (e.event === 'content_block_stop') open = -1
+    }
+  }
+  assert.equal(open, -1, 'every block is stopped')
+  return types
+}
+
+const toolDelta = (index: number, id: string) =>
+  `data: {"choices":[{"delta":{"tool_calls":[{"index":${index},"id":"${id}","function":{"name":"Read","arguments":"{}"}}]}}]}`
+
+test('streamToAnthropic closes a tool_use block before text that follows it (between parallel calls, and trailing)', async () => {
+  const upstream = sseStream([
+    toolDelta(0, 'toolu_a'),
+    'data: {"choices":[{"delta":{"content":"Now the second file:"}}]}',
+    toolDelta(1, 'toolu_b'),
+    'data: {"choices":[{"delta":{"content":"Done."}}]}',
+    'data: {"choices":[{"finish_reason":"tool_calls"}]}',
+    'data: [DONE]',
+  ])
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_interleave')) events.push(evt)
+  assert.deepEqual(blockTypes(events), ['tool_use', 'text', 'tool_use', 'text'])
+})
+
+test('streamToAnthropic closes an open text or tool_use block before reasoning that follows it', async () => {
+  const upstream = sseStream([
+    'data: {"choices":[{"delta":{"content":"Let me check."}}]}',
+    'data: {"choices":[{"delta":{"reasoning_content":"Which file?"}}]}',
+    toolDelta(0, 'toolu_a'),
+    'data: {"choices":[{"delta":{"reasoning_content":"And then?"}}]}',
+    'data: {"choices":[{"delta":{"content":"Answer."}}]}',
+    'data: [DONE]',
+  ])
+  const events: { event: string; data: string }[] = []
+  for await (const evt of streamToAnthropic(upstream, 'test-model', 'msg_reason_after')) events.push(evt)
+  assert.deepEqual(blockTypes(events), ['text', 'thinking', 'tool_use', 'thinking', 'text'])
 })
 
 // ── streamToAnthropic usage mapping ─────────────────────────────────────────

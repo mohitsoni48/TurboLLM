@@ -220,8 +220,13 @@ export const LOCAL_MCPS: LocalEntry[] = [
     desc: 'Natural-language queries against PostgreSQL.',
     cmd: 'npx -y @modelcontextprotocol/server-postgres',
     iconSlug: 'postgresql',
-    envs: [],
-    argNote: 'Provide the connection string as an argument: postgresql://user:pass@host/db',
+    // The password goes in PGPASSWORD, never in the connection string: GET /api/v1/settings
+    // masks each server's env values but returns its args as they are, so a password in the
+    // URL reached every caller that may read settings (a keyless open-LAN peer included).
+    // server-postgres hands the URL to pg.Pool, which falls back to PGPASSWORD when the URL
+    // has none, and mcp-client.ts spawns it with the server's env.
+    envs: [{ key: 'PGPASSWORD', desc: 'Database password if the server asks for one', required: false }],
+    argNote: 'Provide the connection string without the password as an argument: postgresql://user@host/db. Put the password in PGPASSWORD.',
   },
   {
     id: 'sqlite',

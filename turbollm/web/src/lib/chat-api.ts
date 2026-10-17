@@ -1,5 +1,7 @@
 import type { Conversation, Folder, Message, ChatSseEvent, MemoryFact } from './chat-types'
 import { ApiError, authHeaders } from './api'
+import { markHostKeyNeeded } from './auth-signal'
+import { readSseStream } from './sse'
 import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -12,6 +14,8 @@ async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Pr
   const data = text ? (() => { try { return JSON.parse(text) } catch { return undefined } })() : undefined
   if (!res.ok) {
     const env = data as { error?: { code?: string; message?: string } } | undefined
+    // "Always Allow" refused for want of a valid key: ask for one (auth-signal.ts).
+    if (res.status === 403 && env?.error?.code === 'api_key_required') markHostKeyNeeded()
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
   return data as T
@@ -162,32 +166,16 @@ export async function* sendMessage(
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
 
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
+  yield* chatSseEvents(res.body)
+}
 
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      let event = ''
-      for (const line of lines) {
-        if (line.startsWith('event: '))      { event = line.slice(7).trim() }
-        else if (line.startsWith('data: ')) {
-          const raw = line.slice(6).trim()
-          try {
-            const data = JSON.parse(raw)
-            if (event) yield { event, data } as ChatSseEvent
-          } catch { /* skip malformed */ }
-          event = ''
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock()
+/** Typed chat events off a turn's SSE body — unnamed or malformed (non-JSON) messages skipped. */
+async function* chatSseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<ChatSseEvent> {
+  for await (const msg of readSseStream(body)) {
+    if (!msg.event) continue
+    let data: unknown
+    try { data = JSON.parse(msg.data) } catch { continue /* skip malformed */ }
+    yield { event: msg.event, data } as ChatSseEvent
   }
 }
 
@@ -202,11 +190,21 @@ export async function* continueConversation(
   reasoningEffort?: ReasoningEffort,
   /** See {@link sendMessage}. */
   model?: string,
+  /** Regenerate the reply with this id, the one shown last: the daemon sets it aside as a
+   *  sibling version, and only once the turn can run (a refused turn leaves it in place). It
+   *  answers 409 stale_message when that reply is no longer the last one (the chat changed in
+   *  another tab or device), rather than replacing a reply this view never showed. */
+  regenerateId?: string,
+  /** Save & Resend: give this question a new version (its later turns kept on the old one) and
+   *  answer it, in this one request, so the daemon branches only once the turn can run. A
+   *  refused turn changes nothing; a question no longer on the shown branch is 409
+   *  stale_message. */
+  edit?: { messageId: string; content: string },
 ): AsyncGenerator<ChatSseEvent> {
   const res = await fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/continue`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders() },
-    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined }),
+    body: JSON.stringify({ thinkingBudget: thinkingBudget !== undefined && thinkingBudget !== -1 ? thinkingBudget : undefined, reasoningEffort: reasoningEffort !== undefined && reasoningEffort !== DEFAULT_REASONING_EFFORT ? reasoningEffort : undefined, model: model || undefined, regenerate: regenerateId ? true : undefined, messageId: regenerateId || undefined, edit }),
     signal,
   })
   if (!res.ok || !res.body) {
@@ -214,25 +212,5 @@ export async function* continueConversation(
     const env = (() => { try { return JSON.parse(text) } catch { return undefined } })() as { error?: { code?: string; message?: string } } | undefined
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      let event = ''
-      for (const line of lines) {
-        if (line.startsWith('event: ')) { event = line.slice(7).trim() }
-        else if (line.startsWith('data: ')) {
-          const raw = line.slice(6).trim()
-          try { const data = JSON.parse(raw); if (event) yield { event, data } as ChatSseEvent } catch { /* skip */ }
-          event = ''
-        }
-      }
-    }
-  } finally { reader.releaseLock() }
+  yield* chatSseEvents(res.body)
 }

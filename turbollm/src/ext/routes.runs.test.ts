@@ -34,6 +34,8 @@ function harness(
   bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>,
   ext?: ExtRouteDeps,
   managerStatus?: () => Status,
+  /** When given, the body waits for it before emitting its first frame. */
+  beforeFirstFrame?: Promise<void>,
 ) {
   const dir = tmpDir('turbollm-ext-runs-')
   const conv = new ConversationStore(dir)
@@ -64,6 +66,7 @@ function harness(
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, {
     makeBody: () => async ({ emit }) => {
+      if (beforeFirstFrame) await beforeFirstFrame
       await emit({ event: 'delta', data: { content: 'hello' } })
       await emit({ event: 'delta', data: { content: ' world' } })
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
@@ -217,10 +220,39 @@ test('reattaching with ?after replays only later frames', async () => {
       post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
     await runs.settled(started.id)
 
+    const ids = (text: string) => [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]))
     const full = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?owner=u1`, { headers: { Authorization: ACME } })).text()
-    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=2&owner=u1`, { headers: { Authorization: ACME } })).text()
-    assert.ok(full.length > tail.length)
+    assert.deepEqual(ids(full), [1, 2, 3], 'no ?after replays every frame: delta, delta, done')
+    // `after` is the last id the client already HAS (exclusive) — `?after=N` used to resend
+    // frame N, duplicating the last rendered delta on every resume.
+    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=1&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.deepEqual(ids(tail), [2, 3], '?after=1 must not resend frame 1')
     assert.match(tail, /event: done/, 'a late reattach still receives the terminal frame')
+  } finally {
+    cleanup()
+  }
+})
+
+// The 202 body and an early GET /runs/{id} report event_seq 0 before any frame exists. Frames
+// used to be numbered from 0 as well, so a client that attached later with ?after=<that
+// event_seq> (once frame 0 had been sent) lost the run's first frame.
+test('?after=<the event_seq reported before any frame> still gets the first frame', async () => {
+  let start: () => void
+  const firstFrame = new Promise<void>((r) => { start = r })
+  const { app, runs, cleanup } = harness(undefined, undefined, undefined, firstFrame)
+  try {
+    const chatId = await newChat(app)
+    const created = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string; event_seq: number }
+    const early = await (await app.request(`/api/ext/v1/runs/${created.id}?owner=u1`, { headers: { Authorization: ACME } })).json() as { event_seq: number }
+    assert.equal(created.event_seq, 0)
+    assert.equal(early.event_seq, 0)
+    start!()
+    await runs.settled(created.id)
+
+    const text = await (await app.request(`/api/ext/v1/runs/${created.id}/stream?after=${early.event_seq}&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.match(text, /"content":"hello"/, 'the first frame, sent after event_seq 0 was reported, must not be skipped')
+    assert.deepEqual([...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1])), [1, 2, 3])
   } finally {
     cleanup()
   }
@@ -340,9 +372,8 @@ test('a duplicate Idempotency-Key on the generate path reattaches to the same ru
     const run1 = await first.json() as { id: string }
     await runs.settled(run1.id)
 
-    // Retry with the SAME key but DIFFERENT content — proving this reattaches rather than
-    // starting a fresh generation from the new body.
-    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi again'))
+    // A genuine retry: SAME key, SAME body — reattaches rather than starting a fresh generation.
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi'))
     assert.equal(second.status, 202)
     const run2 = await second.json() as { id: string }
     assert.equal(run2.id, run1.id, 'the replay must reattach to the SAME run, not start a new one')
@@ -350,6 +381,40 @@ test('a duplicate Idempotency-Key on the generate path reattaches to the same ru
     const list = await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })
     const page = await list.json() as { data: Array<{ role: string }> }
     assert.deepEqual(page.data.map((m) => m.role), ['user', 'assistant'], 'the replay must not persist a second user/assistant pair')
+  } finally {
+    cleanup()
+  }
+})
+
+// The replay used to ignore the chat id and body, so a key reused for a DIFFERENT message
+// (e.g. an integrator keying sends by turn number, unique per chat but not across chats)
+// answered 202 with the OLD run while the new message was never persisted.
+test('an Idempotency-Key reused for a different chat or different content is refused with 409, not replayed', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatA = await newChat(app)
+    const chatB = await newChat(app)
+    const gen = (chatId: string, content: string) => app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'turn-1' },
+      body: JSON.stringify({ role: 'user', content, owner: 'u1' }),
+    })
+
+    const first = await gen(chatA, 'hello A')
+    assert.equal(first.status, 202)
+    await runs.settled((await first.json() as { id: string }).id)
+
+    const otherChat = await gen(chatB, 'hello B')
+    assert.equal(otherChat.status, 409, 'a different chat under the same key must not be reported as sent')
+    assert.equal((await otherChat.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
+    const msgsB = await (await app.request(`/api/ext/v1/chats/${chatB}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(msgsB.data.length, 0)
+
+    const otherContent = await gen(chatA, 'something else')
+    assert.equal(otherContent.status, 409, 'different content on the same chat under the same key is a different request')
+    assert.equal((await otherContent.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
+    const msgsA = await (await app.request(`/api/ext/v1/chats/${chatA}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(msgsA.data.length, 2, 'only the first request\'s user/assistant pair exists')
   } finally {
     cleanup()
   }

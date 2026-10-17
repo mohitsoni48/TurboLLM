@@ -34,20 +34,20 @@ function everythingUnder(dir: string): string[] {
   return readdirSync(dir, { recursive: true }).map((p) => String(p).split(/[\\/]/).join('/'))
 }
 
-test('extractZipAll: writes nested members to their relative paths', () => {
+test('extractZipAll: writes nested members to their relative paths', async () => {
   const dest = join(tmpDir('zip-all-'), 'out')
-  extractZipAll(buildZipArchive([member('a/b/llama-server', 'bin'), member('a/lib.so', 'lib'), member('top.txt', 'top')]), dest)
+  await extractZipAll(buildZipArchive([member('a/b/llama-server', 'bin'), member('a/lib.so', 'lib'), member('top.txt', 'top')]), dest)
   assert.equal(readFileSync(join(dest, 'a', 'b', 'llama-server'), 'utf8'), 'bin')
   assert.equal(readFileSync(join(dest, 'a', 'lib.so'), 'utf8'), 'lib')
   assert.equal(readFileSync(join(dest, 'top.txt'), 'utf8'), 'top')
 })
 
-for (const hostile of ['../evil.txt', 'a/../../evil.txt', '/abs.txt', 'C:/abs.txt', '..']) {
-  test(`extractZipAll: refuses the member name ${hostile} and writes nothing outside destDir`, () => {
+for (const hostile of ['../evil.txt', 'a/../../evil.txt', '/abs.txt', 'C:/abs.txt', '..', '.', '../', 'a/../../']) {
+  test(`extractZipAll: refuses the member name ${hostile} and writes nothing outside destDir`, async () => {
     const parent = tmpDir('zip-all-')
     const dest = join(parent, 'out')
-    assert.throws(
-      () => extractZipAll(buildZipArchive([member(hostile)]), dest),
+    await assert.rejects(
+      extractZipAll(buildZipArchive([member(hostile)]), dest),
       (e: unknown) => e instanceof ZipError && e.code === 'bad_zip',
     )
     assert.deepEqual(readdirSync(parent).filter((n) => n !== 'out'), [])
@@ -55,9 +55,9 @@ for (const hostile of ['../evil.txt', 'a/../../evil.txt', '/abs.txt', 'C:/abs.tx
   })
 }
 
-test('extractZipAll: directory members become directories, not files', () => {
+test('extractZipAll: directory members become directories, not files', async () => {
   const dest = join(tmpDir('zip-all-'), 'out')
-  extractZipAll(buildZipArchive([{ name: 'empty/', data: Buffer.alloc(0) }, member('x/f.txt')]), dest)
+  await extractZipAll(buildZipArchive([{ name: 'empty/', data: Buffer.alloc(0) }, member('x/f.txt')]), dest)
   assert.ok(lstatSync(join(dest, 'empty')).isDirectory())
   assert.ok(lstatSync(join(dest, 'x', 'f.txt')).isFile())
 })
@@ -66,34 +66,60 @@ function link(name: string, target: string): ZipMember {
   return { name, data: Buffer.from(target), symlink: true }
 }
 
-test('extractZipAll: an in-root symlink member is materialised as a copy of its target bytes', () => {
+test('extractZipAll: an in-root symlink member is materialised as a copy of its target bytes', async () => {
   const dest = join(tmpDir('zip-all-'), 'out')
-  extractZipAll(buildZipArchive([member('lib/libllama.so.0.0.1', 'bytes'), link('lib/libllama.so.0', 'libllama.so.0.0.1')]), dest)
+  await extractZipAll(buildZipArchive([member('lib/libllama.so.0.0.1', 'bytes'), link('lib/libllama.so.0', 'libllama.so.0.0.1')]), dest)
   assert.deepEqual(everythingUnder(dest).sort(), ['lib', 'lib/libllama.so.0', 'lib/libllama.so.0.0.1'])
   assert.ok(lstatSync(join(dest, 'lib', 'libllama.so.0')).isFile(), 'a regular file, not a link')
   assert.equal(readFileSync(join(dest, 'lib', 'libllama.so.0'), 'utf8'), 'bytes')
 })
 
-test('extractZipAll: a chain of in-root symlinks resolves to the final file', () => {
+test('extractZipAll: a chain of in-root symlinks resolves to the final file', async () => {
   const dest = join(tmpDir('zip-all-'), 'out')
-  extractZipAll(buildZipArchive([link('a.so.0', 'a.so.0.1'), link('a.so.0.1', 'a.so.0.1.2'), member('a.so.0.1.2', 'real')]), dest)
+  await extractZipAll(buildZipArchive([link('a.so.0', 'a.so.0.1'), link('a.so.0.1', 'a.so.0.1.2'), member('a.so.0.1.2', 'real')]), dest)
   assert.equal(readFileSync(join(dest, 'a.so.0'), 'utf8'), 'real')
 })
 
 for (const hostile of ['../secret', '/etc/passwd', 'C:/secret', 'missing.so', 'loop.so']) {
-  test('extractZipAll: a symlink member pointing at ' + hostile + ' is dropped and nothing escapes', () => {
+  test('extractZipAll: a symlink member pointing at ' + hostile + ' is dropped and nothing escapes', async () => {
     const parent = tmpDir('zip-all-')
     const dest = join(parent, 'out')
-    extractZipAll(buildZipArchive([member('real.so', 'bytes'), link('link.so', hostile), link('loop.so', 'loop.so')]), dest)
+    await extractZipAll(buildZipArchive([member('real.so', 'bytes'), link('link.so', hostile), link('loop.so', 'loop.so')]), dest)
     assert.deepEqual(everythingUnder(dest), ['real.so'])
     assert.deepEqual(readdirSync(parent), ['out'])
   })
 }
 
-test('extractZipAll: never writes a release or zip install marker, whoever supplied it', () => {
+test('extractZipAll: never writes a release or zip install marker, whoever supplied it', async () => {
   const dest = join(tmpDir('zip-all-'), 'out')
-  extractZipAll(buildZipArchive([member('real.so', 'bytes'), member('.turbollm-release-install', '{}'), member('sub/.turbollm-zip-install', 'x')]), dest)
+  await extractZipAll(buildZipArchive([member('real.so', 'bytes'), member('.turbollm-release-install', '{}'), member('sub/.turbollm-zip-install', 'x')]), dest)
   assert.deepEqual(everythingUnder(dest).filter((p) => !p.endsWith('sub')), ['real.so'])
+})
+
+test('extractZipAll: a marker in another letter case is not extracted either (NTFS/APFS would read it as the marker)', async () => {
+  const dest = join(tmpDir('zip-all-'), 'out')
+  await extractZipAll(buildZipArchive([member('real.so', 'bytes'), member('.TurboLLM-Release-Install', '{}'), member('sub/.TURBOLLM-ZIP-INSTALL', 'x')]), dest)
+  assert.deepEqual(everythingUnder(dest).filter((p) => !p.endsWith('sub')), ['real.so'])
+})
+
+test("extractZipAll: a './' root directory entry (bsdtar -a -cf x.zip .) is a no-op, not a traversal", async () => {
+  const dest = join(tmpDir('zip-all-'), 'out')
+  const empty = Buffer.alloc(0)
+  await extractZipAll(buildZipArchive([{ name: './', data: empty }, { name: './bin/', data: empty }, { name: 'a/../', data: empty }, member('./bin/llama-server', 'elf')]), dest)
+  assert.deepEqual(everythingUnder(dest).sort(), ['bin', 'bin/llama-server'])
+  assert.equal(readFileSync(join(dest, 'bin', 'llama-server'), 'utf8'), 'elf')
+})
+
+test('extractZipAll: symlink copies count toward the total uncompressed cap, checked before anything is written', async () => {
+  // Each link declares only its link text but is written as a full copy of its target. The
+  // declared size stands in for real bytes: the cap must refuse before any inflate, so the
+  // under-filled member below is never even decompressed.
+  const parent = tmpDir('zip-all-')
+  const dest = join(parent, 'out')
+  const almost2GiB = 2 * 1024 * 1024 * 1024 - 1
+  const archive = buildZipArchive([{ name: 'lib/libggml.so', lieSize: almost2GiB }, link('lib/a.so', 'libggml.so'), link('lib/b.so', 'libggml.so')])
+  await assert.rejects(extractZipAll(archive, dest), (e: unknown) => e instanceof ZipError && e.code === 'zip_too_large')
+  assert.deepEqual(everythingUnder(dest), [])
 })
 
 test('walkArchiveMembers: reports posix-relative file names and skips directories', () => {
