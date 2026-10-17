@@ -10,6 +10,7 @@
 // that once (an admin `probe()` diverging from `LinkManager.probeOnce`).
 import type { Context } from 'hono'
 import { basename } from 'node:path'
+import { isLocalOrAuthenticated } from '../auth'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
@@ -18,6 +19,7 @@ import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { launchFieldsRefusal, launchKeyRequired, loadsWithNow } from './profile-validate'
 
 type Status = 200 | 202 | 400 | 409 | 500
 
@@ -27,10 +29,12 @@ function err(c: Context, status: Status, code: string, message: string) {
 
 /** What `POST /api/v1/engine/start` accepts.
  *
- *  `modelPath` / `extraArgs` / `modelName` are the transitional pre-A4 fallback and are
- *  LOCAL-ONLY in practice: they name a filesystem path and extra process arguments, which is
- *  precisely what ADR-139 says no remote caller may supply. The Turbo Link façade therefore
- *  constructs this object itself with `modelKey` alone — it never forwards a peer's body. */
+ *  `modelPath` / `extraArgs` / `modelName` are the transitional pre-A4 fallback. `modelPath` and
+ *  `extraArgs` name a filesystem path and extra process arguments, which is precisely what
+ *  ADR-139 says no remote caller may supply, so startEngine refuses them, and launch fields in
+ *  `profileOverrides` (launchFieldsRefusal), to a caller failing isLocalOrAuthenticated. The
+ *  Turbo Link façade constructs this object itself with `modelKey` alone — it never forwards a
+ *  peer's body. */
 export interface EngineStartBody {
   modelKey?: string
   profileOverrides?: Partial<LoadProfile>
@@ -52,6 +56,16 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   // A Laya model loads on the Laya engine whichever engine is active; every other model on the active one.
   const active = entry ? engineForModel(d.registry, entry) : d.registry.active()
   if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  // A model path or engine flags of the caller's own (ADR-139), refused before anything is
+  // stopped or loaded: the legacy fields whenever they are sent (as PUT /api/v1/engines/:id does
+  // for a source repo), an override's flags and files only when they differ from what the model
+  // loads with on this engine, which the Load dialog sends back with every load.
+  if (b.modelPath !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'modelPath', 'Loading a model by its file path')
+  if (b.extraArgs !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'extraArgs', 'Setting extra command-line flags')
+  if (entry) {
+    const refused = launchFieldsRefusal(c, d, b.profileOverrides, loadsWithNow(d, entry.key, active.id))
+    if (refused) return refused
+  }
   // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
   // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
   if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')

@@ -11,8 +11,16 @@
 // Partial-tolerant by design: every check is skipped when the field is absent, so an older client
 // that omits `gpu`/`nCpuMoe` still writes cleanly. `requireCtx` is the one caller-dependent knob —
 // the profile route demands a usable ctx, a preset patch may legitimately omit it.
+//
+// Also the one launch-field gate (launchFieldsRefusal) for every route that takes a profile from a
+// client: the two above, POST /api/v1/engine/start's overrides, a preset's /apply and the
+// auto-tune base.
 
-import { CACHE_RAM_MAX_MIB, isCacheRamMib } from '../models/profile'
+import type { Context } from 'hono'
+import { isLocalOrAuthenticated } from '../auth'
+import { getModelProfile } from '../config/config'
+import type { Deps } from '../deps'
+import { CACHE_RAM_MAX_MIB, isCacheRamMib, tokenizeExtraArgs } from '../models/profile'
 
 /** Returns a human-readable reason the profile is invalid, or `null` when it is acceptable. */
 export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolean }): string | null {
@@ -71,6 +79,93 @@ export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolea
   }
 
   return null
+}
+
+/** The load-profile fields that put something of the caller's choosing on the engine's command
+ *  line, with what the refusal calls setting them. profileToArgs appends `extraArgs` verbatim
+ *  after every flag it builds (so they override any of them: `--host 0.0.0.0`, `--log-file
+ *  <path>`, `--model <path>`), and hands the engine the next three paths to open.
+ *  `vllm.trustRemoteCode` is the one switch that runs code: vllmProfileToArgs turns it into
+ *  `--trust-remote-code`, on which vLLM imports the Python a model's repo ships, and a caller
+ *  without a key may download any repo's files, so it is `extraArgs: ['--trust-remote-code']`
+ *  by another name. The rest of a profile only fills in single values of flags TurboLLM itself
+ *  chose, none of which opens a file or runs code of the caller's choosing. A dotted name reads
+ *  one level down (launchField). */
+const LAUNCH_FIELDS = [
+  ['extraArgs', 'Setting extra command-line flags'],
+  ['chatTemplateFile', 'Setting a chat template file'],
+  ['draftModelPath', 'Setting a draft model from outside the library'],
+  ['mtpHeadPath', 'Setting an MTP head file from outside the library'],
+  ['vllm.trustRemoteCode', "Trusting a model's remote code"],
+] as const
+
+/** Launch field `field` of profile `p` (a dotted name one level down), or undefined. */
+function launchField(p: unknown, field: string): unknown {
+  let v = p
+  for (const part of field.split('.')) v = v && typeof v === 'object' ? (v as Record<string, unknown>)[part] : undefined
+  return v
+}
+
+/** How a launch field reads on the command line, so that two spellings of one launch compare
+ *  equal: extraArgs split the way resolveProfile splits it for every load, a path as itself, the
+ *  vLLM switch as on or off (vllmProfileToArgs tests it for truth), and an absent or null field
+ *  as none (no flags, no path, off; over a saved profile it keeps the saved value). Anything else
+ *  compares as its JSON. */
+function launchValue(field: string, v: unknown): string {
+  if (field === 'vllm.trustRemoteCode') return v ? 'true' : 'false'
+  if (v === undefined || v === null) return field === 'extraArgs' ? '[]' : '""'
+  if (field === 'extraArgs' && Array.isArray(v)) return JSON.stringify(tokenizeExtraArgs(v))
+  return JSON.stringify(v) ?? ''
+}
+
+/** The first launch field (LAUNCH_FIELDS) that `p` sets to a value of the caller's own, or null.
+ *  A value is not the caller's own when it is none, when `current()` (the profile the model loads
+ *  with now, or the preset being edited) already holds it, or, for the draft and MTP model files,
+ *  when it is a model in the library, which the caller may load anyway. */
+export function launchFieldChosen(
+  p: unknown,
+  current: () => unknown,
+  inLibrary: (path: string) => boolean,
+): { field: string; phrase: string } | null {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return null
+  for (const [field, phrase] of LAUNCH_FIELDS) {
+    const sent = launchField(p, field)
+    const v = launchValue(field, sent)
+    if (v === launchValue(field, undefined)) continue
+    if (v === launchValue(field, launchField(current(), field))) continue
+    if ((field === 'draftModelPath' || field === 'mtpHeadPath') && typeof sent === 'string' && inLibrary(sent)) continue
+    return { field, phrase }
+  }
+  return null
+}
+
+/** What model `key` loads with now on `engineId` ('' for the active engine): the profile
+ *  getModelProfile serves the next load (the pinned preset, else the engine's saved profile), and
+ *  what GET /api/v1/models/:key shows the dialog, so what launchFieldsRefusal compares with. */
+export function loadsWithNow(d: Deps, key: string, engineId: string): () => unknown {
+  return () => getModelProfile(d.store.snapshot(), key, engineId || d.registry.active()?.id || '*')
+}
+
+/** The refusal for a caller that may not choose what goes on the engine's command line: 403
+ *  api_key_required, on which the web client opens its key prompt, with `field` naming it. */
+export function launchKeyRequired(c: Context, field: string, phrase: string): Response {
+  return c.json({ error: { code: 'api_key_required', message: `${phrase} requires a valid API key.`, field } }, 403)
+}
+
+/** That refusal when profile `p` sets a launch field to a value of the caller's own
+ *  (launchFieldChosen) and the caller is neither on this machine nor holding a real key, else
+ *  null. ADR-139 keeps caller-chosen arguments and paths off the engine's command line for remote
+ *  callers, and /build/run, engine add and an engine's source repo apply this same
+ *  isLocalOrAuthenticated rule; without it a keyless Tailscale Serve identity, Cloudflare Access
+ *  login or open-LAN peer, or a remote-access token with models:load, could load a model with
+ *  flags and files of its own, or with vLLM running a repo's code, or store them in a profile,
+ *  preset or tune for the owner's next load. An unchanged echo still passes, as the web UI sends
+ *  its whole draft (the profile the model loads with now) on every Load, Save, Save as preset
+ *  and Auto-tune. */
+export function launchFieldsRefusal(c: Context, d: Deps, p: unknown, current: () => unknown): Response | null {
+  const chosen = launchFieldChosen(p, current, (path) => d.scanner.list().models.some((m) => m.path === path))
+  if (!chosen || isLocalOrAuthenticated(c, d)) return null
+  return launchKeyRequired(c, chosen.field, chosen.phrase)
 }
 
 /** Order-independent deep equality for two stored profiles.

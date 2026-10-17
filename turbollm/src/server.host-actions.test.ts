@@ -15,7 +15,7 @@ import { defaultConfig, type Config } from './config/config'
 import type { Deps } from './deps'
 import { availableBackends } from './engines/download'
 import { BuildState } from './engines/build-state'
-import { Scanner } from './models/scanner'
+import { Scanner, type ModelEntry } from './models/scanner'
 import { tmpDir } from './test-support/tmp'
 
 const INGRESS_PORT = 6997
@@ -265,7 +265,7 @@ test('a keyless Serve identity, Access JWT or open-LAN peer cannot delete an MCP
 // home folder and make it primary could write ~/.ssh/authorized_keys. Refused to the same callers as
 // an MCP server, with api_key_required (the web client's key prompt). A remote token was already
 // refused (no capability maps /modeldirs).
-type Send = (path: string, body: unknown, method: string) => Response | Promise<Response>
+type Send = (path: string, body: unknown, method?: string) => Response | Promise<Response>
 async function assertModelDirsRefused(send: Send, cfg: Config): Promise<void> {
   const [a, b] = cfg.modelDirs
   const home = tmpDir('host-actions-home-')
@@ -722,4 +722,175 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
       body: JSON.stringify(b),
     }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never), cfg, h)
   }
+})
+
+// Engine launch fields: a model profile's extra command-line flags, chat template file, draft model
+// and MTP head file, and /engine/start's legacy model path and flags, all go onto the engine's
+// command line as sent (profileToArgs appends extraArgs verbatim), and vLLM's trust-remote-code
+// switch runs a repo's Python. Choosing them is a host-side action like a build: a caller refused
+// /build/run may not put a flag or a file of its own there.
+// It may still load, save a profile or a preset, or tune with the values the model already has
+// (the web UI sends its whole draft every time), and pick a library model as the draft model.
+function modelEntry(key: string, path: string): ModelEntry {
+  return {
+    key, name: key, path, dir: '/models', format: 'gguf', sizeBytes: 1, sizeLabel: '1 GB', arch: 'qwen3', quant: 'Q4_K_M',
+    nativeCtx: 8192, blockCount: 1, headCountKv: 1, headDim: 1, moe: false, expertCount: 0, nextnLayers: 0, vision: false,
+    audio: false, mmprojPath: null, mmprojSizeBytes: 0, hasChatTemplate: true, reasoningEffort: false, embedding: false,
+    incomplete: false,
+  } as unknown as ModelEntry
+}
+const MODEL = modelEntry('m1', '/models/m1.gguf')
+const DRAFT = modelEntry('d1', '/models/d1.gguf')
+const OWNER_FLAGS = ['--owner-flag']
+
+interface LaunchHarness { loads: { modelPath: string; extraArgs: string[] }[]; benches: { key: string; base: unknown }[] }
+
+/** A llama-server engine, the library (MODEL and DRAFT), and the owner's saved profile for MODEL
+ *  with OWNER_FLAGS plus an unpinned preset of someone else's flags; load and bench record calls. */
+function withLaunch(d: Deps, cfg: Config): LaunchHarness {
+  const h: LaunchHarness = { loads: [], benches: [] }
+  const engine = { id: 'e1', kind: 'llama-server', name: 'llama', binPath: '/opt/llama-server', capabilities: { flags: [], kvTypes: [] } }
+  cfg.modelProfiles = { m1: { e1: { profile: { ctx: 4096, extraArgs: OWNER_FLAGS }, updatedAt: '2026-10-01T00:00:00.000Z' } } }
+  cfg.modelPresets = { m1: [{ id: 'p1', name: 'Other', engineId: '', profile: { ctx: 4096, extraArgs: ['--other'] }, updatedAt: '2026-10-01T00:00:00.000Z', origin: 'manual' }] }
+  Object.assign(d as unknown as Record<string, unknown>, {
+    scanner: { get: (k: string) => [MODEL, DRAFT].find((m) => m.key === k), list: () => ({ models: [MODEL, DRAFT], scanning: false, lastScanAt: '' }) },
+    manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null, load: (o: { modelPath: string; extraArgs: string[] }) => { h.loads.push(o); return Promise.resolve() } },
+    modelRouter: { withSwapLock: (fn: () => unknown) => Promise.resolve(fn()), markPrimaryLoaded: () => {}, loadExplicit: () => Promise.resolve() },
+    bench: { cancel: () => {}, waitIdle: () => Promise.resolve(), start: (key: string, base: unknown) => { h.benches.push({ key, base }) } },
+  })
+  Object.assign((d as unknown as { registry: Record<string, unknown> }).registry, { active: () => engine, get: (id: string) => (id === 'e1' ? engine : undefined) })
+  return h
+}
+
+/** Every way to put a flag or a file of the caller's own on the command line is refused with
+ *  api_key_required (the web UI's key prompt) and changes nothing. `engine` is false for a remote
+ *  token, which lanAuth already refuses /engine/start and /bench (no capability maps there). */
+async function assertLaunchRefused(send: Send, cfg: Config, h: LaunchHarness, engine = true) {
+  const saved = JSON.stringify({ p: cfg.modelProfiles, s: cfg.modelPresets, pin: cfg.lastPresetId })
+  const refused = async (what: string, res: Response, field: string) => {
+    assert.equal(res.status, 403, what)
+    const { error } = (await res.json()) as { error: { code: string; field: string; message: string } }
+    assert.equal(error.code, 'api_key_required', what)
+    assert.equal(error.field, field, what)
+    assert.match(error.message, /requires a valid API key\.$/, what)
+  }
+  if (engine) {
+    await refused('legacy modelPath', await send('/api/v1/engine/start', { modelPath: '/any/where/file.gguf', extraArgs: ['--zz'] }), 'modelPath')
+    await refused('legacy extraArgs', await send('/api/v1/engine/start', { extraArgs: ['--zz'] }), 'extraArgs')
+    await refused('start overrides', await send('/api/v1/engine/start', { modelKey: 'm1', profileOverrides: { ctx: 4096, extraArgs: ['--zz'] } }), 'extraArgs')
+    await refused('start template', await send('/api/v1/engine/start', { modelKey: 'm1', profileOverrides: { chatTemplateFile: '/home/owner/.ssh/id_ed25519' } }), 'chatTemplateFile')
+    // vLLM's --trust-remote-code runs the Python a model's repo ships: a flag by another name.
+    await refused('start remote code', await send('/api/v1/engine/start', { modelKey: 'm1', profileOverrides: { vllm: { trustRemoteCode: true } } }), 'vllm.trustRemoteCode')
+    await refused('bench base', await send('/api/v1/bench', { modelKey: 'm1', base: { ctx: 4096, extraArgs: ['--zz'] } }), 'extraArgs')
+    assert.deepEqual(h.loads, [], 'nothing may load')
+    assert.deepEqual(h.benches, [], 'no tune may start')
+  }
+  await refused('profile flags', await send('/api/v1/models/m1/profile', { ctx: 4096, extraArgs: ['--zz'] }, 'PUT'), 'extraArgs')
+  await refused('profile draft file', await send('/api/v1/models/m1/profile', { ctx: 4096, extraArgs: OWNER_FLAGS, draftModelPath: '/tmp/x.gguf' }, 'PUT'), 'draftModelPath')
+  await refused('profile MTP file', await send('/api/v1/models/m1/profile', { ctx: 4096, mtpHeadPath: '/tmp/x.gguf' }, 'PUT'), 'mtpHeadPath')
+  await refused('profile remote code', await send('/api/v1/models/m1/profile', { ctx: 4096, extraArgs: OWNER_FLAGS, vllm: { trustRemoteCode: true } }, 'PUT'), 'vllm.trustRemoteCode')
+  await refused('preset create', await send('/api/v1/models/m1/presets', { name: 'x', profile: { ctx: 4096, chatTemplateFile: '/etc/passwd' } }), 'chatTemplateFile')
+  await refused('preset update', await send('/api/v1/models/m1/presets/p1', { profile: { ctx: 4096, extraArgs: ['--zz'] } }, 'PUT'), 'extraArgs')
+  await refused('preset remote code', await send('/api/v1/models/m1/presets/p1', { profile: { ctx: 4096, extraArgs: ['--other'], vllm: { trustRemoteCode: true } } }, 'PUT'), 'vllm.trustRemoteCode')
+  // A stored preset whose flags differ from what the model loads with now: pinning it changes them.
+  await refused('preset apply', await send('/api/v1/models/m1/presets/p1/apply', {}), 'extraArgs')
+  assert.equal(JSON.stringify({ p: cfg.modelProfiles, s: cfg.modelPresets, pin: cfg.lastPresetId }), saved, 'nothing may be stored')
+}
+
+/** The same caller keeps every use of the model's own values: an unchanged echo of the saved
+ *  flags, no flags, and a library model as the draft. */
+async function assertLaunchEchoOpen(send: Send, cfg: Config, h: LaunchHarness, engine = true) {
+  if (engine) {
+    assert.equal((await send('/api/v1/engine/start', { modelKey: 'm1' })).status, 202)
+    assert.equal((await send('/api/v1/engine/start', { modelKey: 'm1', profileOverrides: { ctx: 8192, extraArgs: OWNER_FLAGS, chatTemplateFile: '' } })).status, 202)
+    assert.equal(h.loads.length, 2)
+    assert.equal(h.loads[1].modelPath, MODEL.path)
+    assert.ok(h.loads[1].extraArgs.includes('--owner-flag'))
+    assert.equal((await send('/api/v1/bench', { modelKey: 'm1', base: { ctx: 4096, extraArgs: OWNER_FLAGS } })).status, 202)
+    assert.equal(h.benches.length, 1)
+  }
+  const profile = { ctx: 8192, extraArgs: ['--owner-flag'], draftModelPath: DRAFT.path, speculative: 'draft', vllm: { dtype: 'bfloat16', trustRemoteCode: false } }
+  assert.equal((await send('/api/v1/models/m1/profile', profile, 'PUT')).status, 200)
+  assert.equal((cfg.modelProfiles.m1.e1.profile as { draftModelPath: string }).draftModelPath, DRAFT.path)
+  assert.equal((await send('/api/v1/models/m1/profile', { ctx: 4096, extraArgs: [] }, 'PUT')).status, 200)
+  assert.equal((await send('/api/v1/models/m1/presets', { name: 'mine', profile: { ctx: 4096 } })).status, 201)
+  assert.equal((await send('/api/v1/models/m1/presets/p1', { name: 'renamed' }, 'PUT')).status, 200)
+}
+
+test("a keyless Serve identity, Access JWT or open-LAN peer cannot put its own flags or files on the engine's command line", async () => {
+  // Tailscale Serve, no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const h = withLaunch(d, cfg)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertLaunchRefused((p, b, m) => tunneled(d, p, serve, b, m), cfg, h)
+    await assertLaunchEchoOpen((p, b, m) => tunneled(d, p, serve, b, m), cfg, h)
+    const keyed = { ...serve, 'X-TurboLLM-Auth': RAW_KEY }
+    assert.equal((await tunneled(d, '/api/v1/engine/start', keyed, { modelKey: 'm1', profileOverrides: { extraArgs: ['--zz'] } })).status, 202)
+    assert.deepEqual(h.loads.at(-1)?.extraArgs.slice(-1), ['--zz'])
+    const keyedProfile = { ctx: 4096, extraArgs: ['--zz'], vllm: { trustRemoteCode: true } }
+    assert.equal((await tunneled(d, '/api/v1/models/m1/profile', keyed, keyedProfile, 'PUT')).status, 200)
+    // What the owner stored is now the model's own: the keyless dialog's echo of it passes.
+    assert.equal((await tunneled(d, '/api/v1/models/m1/profile', serve, { ...keyedProfile, ctx: 8192 }, 'PUT')).status, 200)
+    assert.equal((await tunneled(d, '/api/v1/engine/start', serve, { modelKey: 'm1', profileOverrides: keyedProfile })).status, 202)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-launch.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d, cfg } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const h = withLaunch(d, cfg)
+      const access = { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }
+      await assertLaunchRefused((p, b, m) => tunneled(d, p, access, b, m), cfg, h)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => {
+      c.daemon.lanBind = true
+      c.daemon.requireApiKey = false
+    })
+    const h = withLaunch(d, cfg)
+    await assertLaunchRefused((p, b, m) => fromLan(d, p, {}, b, m), cfg, h)
+    await assertLaunchEchoOpen((p, b, m) => fromLan(d, p, {}, b, m), cfg, h)
+    const keyed = { 'X-TurboLLM-Auth': RAW_KEY }
+    assert.equal((await fromLan(d, '/api/v1/engine/start', keyed, { modelPath: '/any/where/file.gguf', extraArgs: ['--zz'] })).status, 202)
+    assert.equal(h.loads.at(-1)?.modelPath, '/any/where/file.gguf')
+    assert.equal((await fromLan(d, '/api/v1/models/m1/presets/p1/apply', keyed, {})).status, 200)
+    assert.equal(cfg.lastPresetId.m1, 'p1')
+  }
+  // The host itself, unchanged.
+  {
+    const { d, cfg } = mkDeps()
+    const h = withLaunch(d, cfg)
+    const local = (p: string, b: unknown, m = 'POST') => createApp(d).request(p, {
+      method: m,
+      headers: { 'Content-Type': 'application/json', Host: '127.0.0.1:6996' },
+      body: JSON.stringify(b),
+    }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+    assert.equal((await local('/api/v1/engine/start', { modelKey: 'm1', profileOverrides: { extraArgs: ['--zz'] } })).status, 202)
+    assert.equal((await local('/api/v1/bench', { modelKey: 'm1', base: { chatTemplateFile: '/home/owner/t.jinja' } })).status, 202)
+    assert.equal((await local('/api/v1/models/m1/profile', { ctx: 4096, mtpHeadPath: '/home/owner/mtp.gguf' }, 'PUT')).status, 200)
+    assert.equal((await local('/api/v1/models/m1/presets', { name: 'x', profile: { ctx: 4096, extraArgs: ['--zz'] } })).status, 201)
+    assert.equal(h.loads.length, 1)
+  }
+})
+
+test("a remote-access token with models:load cannot set a model's engine flags through its profile or presets", async () => {
+  const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick' })
+  const h = withLaunch(d, cfg)
+  const raw = 'tllm-remotetokenremotetokenremotetokenre1'
+  cfg.apiKeys.push({ id: 'r1', name: 'remote', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null, grant: { kind: 'remote', capabilities: ['models:use', 'models:load'] } })
+  const token = { Host: 'quick-tunnel.trycloudflare.com', Authorization: `Bearer ${raw}` }
+  await assertLaunchRefused((p, b, m) => tunneled(d, p, token, b, m), cfg, h, false)
+  await assertLaunchEchoOpen((p, b, m) => tunneled(d, p, token, b, m), cfg, h, false)
 })

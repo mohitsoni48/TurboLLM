@@ -697,8 +697,10 @@ export function requiredCapability(method: string, path: string): LinkCapability
   // I3 (Phase 5 final review): permanent, irreversible deletion of a model's own file(s) from
   // disk (scanner.delete -> rmSync) is never authorized for a remote grant, at ANY capability
   // — unlike load/unload (`models:load`, below) or a model's saved presets (M6, unreviewed but
-  // lower-stakes, deliberately left as-is). Matched narrowly — exactly one path segment after
-  // `/models/`, no further subpath — so it catches only `DELETE /api/v1/models/:key`.
+  // lower-stakes, deliberately left as-is; the engine flags and files a profile or preset
+  // carries need an ungranted key anyway, launchFieldsRefusal). Matched narrowly — exactly one
+  // path segment after `/models/`, no further subpath — so it catches only
+  // `DELETE /api/v1/models/:key`.
   if (m === 'DELETE' && /^\/api\/v1\/models\/[^/]+$/.test(path)) return null
   if (path === '/api/v1/models' || path.startsWith('/api/v1/models/')) return read ? 'models:use' : 'models:load'
   if (path.startsWith('/api/v1/downloads')) return read ? 'downloads:read' : 'downloads:write'

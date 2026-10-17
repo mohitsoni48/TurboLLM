@@ -90,7 +90,7 @@ import { TEXT_CLASSIFICATION_CATEGORY } from '../hf/text-classification-search'
 import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
-import { validateLoadProfileFields, profilesEqual } from './profile-validate'
+import { validateLoadProfileFields, profilesEqual, launchFieldsRefusal, loadsWithNow } from './profile-validate'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
 import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
@@ -2576,6 +2576,10 @@ export function registerApi(app: Hono, d: Deps): void {
     const b = await body<{ modelKey?: string; base?: Partial<LoadProfile> }>(c)
     const key = (b.modelKey ?? '').trim()
     if (!key) return err(c, 400, 'invalid_config_value', 'modelKey is required.')
+    // The base's flags and files go onto every candidate's command line and into the tune Save
+    // keeps (and pins), so they are held to /engine/start's rule: the model's own, or a key.
+    const launchRefused = launchFieldsRefusal(c, d, b.base, loadsWithNow(d, key, ''))
+    if (launchRefused) return launchRefused
     // A sweep loads the model repeatedly — same GPU contention as a normal load.
     if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — benchmarking is paused until its queue finishes.')
     // Reverse gate (F-011): a sweep loads the model repeatedly, so free ComfyUI's VRAM
@@ -2691,6 +2695,10 @@ export function registerApi(app: Hono, d: Deps): void {
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     if (isUnsafeMapKey(engineId)) return err(c, 400, 'invalid_profile_value', 'Invalid engine id.')
+    // Flags and files of the caller's own need a key (launchFieldsRefusal); the dialog's Save and
+    // "Remember these settings" send back what GET /models/:key showed for this engine.
+    const launchRefused = launchFieldsRefusal(c, d, p, loadsWithNow(d, key, engineId))
+    if (launchRefused) return launchRefused
     d.store.update((cfg) => {
       setModelProfile(cfg, key, engineId, p)
       // An explicit manual save that CHANGES something supersedes the pin: PUT writes

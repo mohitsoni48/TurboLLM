@@ -10,7 +10,7 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { MODEL_PRESET_CAP, ownEntry, type ModelPreset } from '../config/config'
-import { validateLoadProfileFields } from './profile-validate'
+import { launchFieldsRefusal, loadsWithNow, validateLoadProfileFields } from './profile-validate'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
@@ -26,6 +26,11 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
   // Every handler: `c.req.param()` is already percent-decoded (decoding again broke keys with
   // '%'), and the key is request input, so the config maps are read through `ownEntry` — a key
   // like `constructor` would otherwise index Object itself (see config.ts).
+  //
+  // A preset's flags and files reach the engine's command line once it is pinned, so creating,
+  // editing and pinning one are held to /engine/start's rule (launchFieldsRefusal): values of the
+  // caller's own need a key. What it is compared with is what the model loads with now on the
+  // preset's engine (the dialog's Save as… sends that draft), or the preset's own when editing.
   //
   // Returns the pin alongside the list. The client cannot know which preset is active otherwise,
   // and a dropdown that always opens on "No preset applied" is actively misleading: the pin is
@@ -54,6 +59,8 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     // load of that model fails. Must match PUT /models/:key/profile exactly.
     const invalid = validateLoadProfileFields(b.profile, { requireCtx: true })
     if (invalid) return err(c, 400, 'invalid_config_value', invalid)
+    const launchRefused = launchFieldsRefusal(c, d, b.profile, loadsWithNow(d, key, typeof b.engineId === 'string' ? b.engineId : ''))
+    if (launchRefused) return launchRefused
     // Cap pre-check BEFORE store.update — update() runs validate() and throws, so a cap
     // breach here would be a 500. The cap is PER MODEL.
     if ((ownEntry(d.store.snapshot().modelPresets, key) ?? []).length >= MODEL_PRESET_CAP) {
@@ -86,6 +93,8 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
       // Partial-tolerant: a patch may omit ctx, but whatever it DOES set must be loadable.
       const bad = validateLoadProfileFields(b.profile, { requireCtx: false })
       if (bad) return err(c, 400, 'invalid_config_value', bad)
+      const launchRefused = launchFieldsRefusal(c, d, b.profile, () => existing.profile)
+      if (launchRefused) return launchRefused
     }
     // The 404 pre-check above happened before `await body()` yielded the event loop, so a delete
     // for this same id can land in between. Track whether the preset still existed at write time
@@ -133,6 +142,10 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     const id = c.req.param('id')
     const existing = (ownEntry(d.store.snapshot().modelPresets, key) ?? []).find((p) => p.id === id)
     if (!existing) return err(c, 404, 'not_found', 'Preset not found.')
+    // Pinning a stored preset whose flags differ from the model's current ones changes them for
+    // the next load just as an edit would, whoever stored it.
+    const launchRefused = launchFieldsRefusal(c, d, existing.profile, loadsWithNow(d, key, existing.engineId))
+    if (launchRefused) return launchRefused
     d.store.update((cfg) => {
       ;(cfg.lastPresetId ??= {})[key] = id
     })
