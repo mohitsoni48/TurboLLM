@@ -94,14 +94,19 @@ function PresetsPanel({
     setOpen(false)
     setMenuId(null)
     track('models', 'apply_model_preset')
+    // The preset reaches the draft and the dropdown only once the pin is accepted. The daemon
+    // refuses the pin to a caller without a key when the preset's flags or files are not what the
+    // model loads with now (preset-routes.ts, launchFieldsRefusal). Merged up front, with only the
+    // selection undone on the refusal, the draft kept the preset's flags under a dropdown reading
+    // "No preset applied", and the next Save and Load sent them and were refused again, for flags
+    // the user never typed. A refusal changes no pin, so the selection, which mirrors it, stays.
     m.apply.mutate(p.id, {
-      onError: (e) => {
-        setSelectedId(null)
-        toast.error(e instanceof ApiError ? e.message : 'Could not apply preset.')
+      onSuccess: () => {
+        setSelectedId(p.id)
+        onApplyPreset(p.profile)
       },
+      onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not apply preset.'),
     })
-    setSelectedId(p.id)
-    onApplyPreset(p.profile)
   }
 
   const openSaveAs = () => {
