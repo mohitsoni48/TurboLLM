@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
-import { delimiter, join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { delimiter, dirname, join } from 'node:path'
 import { tmpDir } from '../../test-support/tmp'
 import { NgrokProvider, NGROK_URL_RE, ngrokAssetUrl } from './ngrok'
 import { ensureNgrok, ngrokBinPath } from './ngrok-provision'
@@ -43,6 +43,73 @@ test('ngrok: the authtoken travels as NGROK_AUTHTOKEN, not argv — readable via
 test('ngrok: parses the assigned URL out of its log line', () => {
   const line = 't=2026-09-10T10:00:00+0000 lvl=info msg="started tunnel" url=https://a1b2-c3d4.ngrok-free.app'
   assert.equal(NGROK_URL_RE.exec(line)?.[0], 'https://a1b2-c3d4.ngrok-free.app')
+})
+
+// ngrok 3.39.11's own log lines (`ngrok http 6997 --log stdout --domain llm.example.com`); the
+// run had no valid authtoken, so the "started tunnel" line is in the same logfmt shape, as ngrok
+// prints it once the session is up.
+const NGROK_STARTUP = [
+  't=2026-10-17T09:25:36+0000 lvl=info msg="no configuration paths supplied"',
+  't=2026-10-17T09:25:36+0000 lvl=info msg="starting web service" obj=web addr=127.0.0.1:4040 allow_hosts=[]',
+  '',
+].join('\n')
+const startedOn = (url: string) =>
+  `t=2026-10-17T09:25:37+0000 lvl=info msg="started tunnel" obj=tunnels name=command_line addr=http://localhost:6997 url=${url}\n`
+
+test('ngrok: with a reserved custom domain, the URL it waits for is that domain', () => {
+  const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  const out = NGROK_STARTUP + startedOn('https://llm.example.com')
+  assert.equal(NGROK_URL_RE.exec(out), null, 'the random-URL pattern never sees it')
+  assert.equal(p.urlPattern().exec(out)?.[0], 'https://llm.example.com')
+  // An ngrok-hosted reserved domain too, and no domain still means a random ngrok URL.
+  const hosted = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.ngrok.app' })
+  assert.equal(hosted.urlPattern().exec(startedOn('https://llm.ngrok.app'))?.[0], 'https://llm.ngrok.app')
+  assert.equal(new NgrokProvider('/tmp/data', cfg).urlPattern(), NGROK_URL_RE)
+})
+
+test('ngrok: a reserved domain entered as a URL is used as its bare host', () => {
+  // ngrok's own `--url` help writes it as https://api.example.com, so a pasted URL is likely.
+  for (const domain of ['https://llm.ngrok.app/', 'HTTP://llm.ngrok.app', 'llm.ngrok.app/']) {
+    const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain })
+    assert.deepEqual(p.argv(6997), ['http', '6997', '--log', 'stdout', '--domain', 'llm.ngrok.app'], domain)
+    assert.equal(p.urlPattern().exec(NGROK_STARTUP + startedOn('https://llm.ngrok.app'))?.[0], 'https://llm.ngrok.app', domain)
+  }
+})
+
+test('ngrok: an error naming the reserved domain, or a different host, is not the tunnel URL', () => {
+  const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  const refused = [
+    `t=2026-10-17T09:25:37+0000 lvl=eror msg="failed to start tunnel" obj=tunnels.session err="The endpoint 'https://llm.example.com' is already online."`,
+    "ERROR:  The endpoint 'https://llm.example.com' is already online.",
+    '',
+  ].join('\n')
+  assert.equal(p.urlPattern().exec(NGROK_STARTUP + refused), null)
+  assert.equal(p.urlPattern().exec(startedOn('https://llm.example.com.evil.test')), null)
+  assert.equal(p.urlPattern().exec(startedOn('https://xllm.example.com')), null)
+})
+
+test('ngrok: start() with a reserved custom domain resolves with it instead of timing out', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('the stand-in ngrok is a shell script')
+    return
+  }
+  // A stand-in at the cached binary path, so ensureNgrok reuses it: it logs what ngrok does,
+  // then exits a moment later (without the fix, the start failed on that exit, or after 30 s).
+  const dataDir = tmpDir('ngrok-domain-')
+  const binPath = ngrokBinPath(dataDir)
+  mkdirSync(dirname(binPath), { recursive: true })
+  writeFileSync(binPath, [
+    '#!/bin/sh',
+    `printf '%s' '${NGROK_STARTUP + startedOn('https://llm.example.com')}'`,
+    'sleep 1',
+    '',
+  ].join('\n'), { mode: 0o755 })
+  const p = new NgrokProvider(dataDir, { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  try {
+    assert.deepEqual(await p.start(6997), { url: 'https://llm.example.com' })
+  } finally {
+    await p.stop()
+  }
 })
 
 test('ngrok: an unpublished platform/arch has no asset URL', () => {
