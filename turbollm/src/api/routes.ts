@@ -1794,7 +1794,18 @@ export function registerApi(app: Hono, d: Deps): void {
       // ?purge=1: also delete the engine's installed files from disk.
       // Only removes dirs under {dataDir}/engines/ — never touches model dirs.
       const enginesRoot = join(d.store.dir(), 'engines')
-      const purgeDir = purge && eng ? engineInstallDir(eng, enginesRoot) : null
+      // A folder another registered engine runs from stays, left to that engine: POST /engines registers any server
+      // binary, so the same build can be added twice under two names, or a binary of a TurboQuant or llama.cpp install
+      // added by hand, and the purge renamed the folder away from under the other one, still registered with its
+      // binary gone. This engine is unregistered as for any purge; the last one on the folder deletes it. A Disabled
+      // custom engine on the folder (another remembered source; this engine's own is forgotten below) keeps it too, as
+      // DELETE /engines/build counts one: its Enable re-registers from that folder.
+      const installDir = purge && eng ? engineInstallDir(eng, enginesRoot) : null
+      const ownSource = eng ? customSourceKey(eng) : ''
+      const shared = !!installDir && (
+        d.registry.list().engines.some((e) => e.id !== id && isEngineInBuildDir(e.binPath, installDir)) ||
+        d.registry.customSources().some((s) => customSourceKey(s) !== ownSource && isEngineInBuildDir(s.binPath, installDir)))
+      const purgeDir = shared ? null : installDir
       // All or nothing: the folder is first renamed to a hidden sibling, which Windows refuses while any file under it
       // is open (Defender or the indexer still reading llama-server.exe or ggml-cuda.dll right after a Stop). The
       // recursive delete this replaces threw part-way instead, AFTER the engine was unregistered: the folder stayed

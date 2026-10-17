@@ -37,7 +37,7 @@ function harness(busy: 'download' | 'build' | null) {
   ]
   const removed: string[] = []
   const added: string[] = []
-  const sources: { binPath: string }[] = []
+  const sources: { binPath: string; sourceRepo?: string; sourceBranch?: string }[] = []
   const forgotten: string[] = []
   const failRemove = { on: false }
   // The active engine and how long stopping it takes: a model stop waits for the process to exit.
@@ -81,7 +81,7 @@ function harness(busy: 'download' | 'build' | null) {
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, d, cfg, build, live, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
+  return { app, d, cfg, build, live, engines, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
 }
 
 async function errorCode(res: Response): Promise<string> {
@@ -492,6 +492,46 @@ test('DELETE /engines/:id?purge=1 whose renamed-aside folder stays locked still 
 
   assert.equal((await h.app.request('/api/v1/engines/other?purge=1', { method: 'DELETE' })).status, 200)
   await eventually(() => assert.deepEqual(fs.readdirSync(buildRoot), [], 'the leftover is swept with the next purge'))
+})
+
+// POST /engines registers any server binary, so the same build can be added twice under two names (one per launch
+// setup), or a binary in a TurboQuant or llama.cpp install added by hand. A purge of one renamed away the folder the
+// other still ran from, and that engine stayed registered with its binary gone.
+test('DELETE /engines/:id?purge=1 leaves the folder to another registered engine that runs from it, until that one goes too', async () => {
+  const h = harness(null)
+  h.engines.push({ id: 'twin', name: 'My fork (8 slots)', kind: 'llama-server', binPath: join(h.forkDir, 'llama-server') })
+  const buildRoot = join(h.dataDir, 'engines', 'build')
+  const res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  assert.equal(res.status, 200)
+  assert.deepEqual(h.removed, ['fork'])
+  assert.equal(h.forgotten.length, 1, 'the purged engine\'s remembered source is dropped as usual')
+  assert.equal(existsSync(join(h.forkDir, 'llama-server')), true, 'the other engine still runs from it')
+  assert.deepEqual(fs.readdirSync(buildRoot).sort(), ['myfork', 'otherfork'], 'nothing is renamed aside')
+
+  assert.equal((await h.app.request('/api/v1/engines/twin?purge=1', { method: 'DELETE' })).status, 200)
+  assert.deepEqual(h.removed, ['fork', 'twin'])
+  assert.equal(existsSync(h.forkDir), false, 'the last engine on it takes the folder')
+  await eventually(() => assert.deepEqual(fs.readdirSync(buildRoot), ['otherfork']))
+})
+
+// A Disabled custom engine is a remembered source with no registry entry, and its Enable re-registers it from its
+// folder: DELETE /engines/build already counts one as a claim on the folder. The purge counted only registered engines.
+test('DELETE /engines/:id?purge=1 leaves the folder to a Disabled custom engine that runs from it, not to its own remembered source', async () => {
+  const bin = (h: ReturnType<typeof harness>) => join(h.forkDir, 'llama-server')
+  const own = harness(null)
+  own.sources.push({ binPath: bin(own) }) // the purged engine's own (keyed by its binPath), which the purge forgets
+  assert.equal((await own.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })).status, 200)
+  assert.deepEqual(own.forgotten, [bin(own)])
+  assert.equal(existsSync(own.forkDir), false)
+
+  const h = harness(null)
+  h.sources.push({ binPath: bin(h) }, { binPath: bin(h), sourceRepo: 'https://github.com/me/fork', sourceBranch: 'cuda' })
+  const res = await h.app.request('/api/v1/engines/fork?purge=1', { method: 'DELETE' })
+  assert.equal(res.status, 200)
+  assert.deepEqual(h.removed, ['fork'])
+  assert.deepEqual(h.forgotten, [bin(h)])
+  assert.equal(existsSync(bin(h)), true, 'the Disabled engine can still be enabled')
+  assert.deepEqual(fs.readdirSync(join(h.dataDir, 'engines', 'build')).sort(), ['myfork', 'otherfork'], 'nothing is renamed aside')
 })
 
 test('DELETE /engines/:id?purge=1 whose unregister fails puts the folder back', async () => {
