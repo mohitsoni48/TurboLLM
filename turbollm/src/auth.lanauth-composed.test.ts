@@ -1772,7 +1772,10 @@ test("through its chat's tools, a keyless Serve identity, Access JWT, open-LAN p
 // Code routine's run (GET /api/v1/routines/:id/runs, open by design) named the conversation.
 
 /** toolChat's app plus the routine routes, with a Code conversation whose ask-mode routine run
- *  is stalled on a bash call exactly as code-runner.ts stalls it, and an ordinary chat. */
+ *  is stalled on a bash call exactly as code-runner.ts stalls it, an earlier run of the same
+ *  routine whose own Code session finished as code-runner.ts and execute.ts's finalizeOutcome
+ *  finish one (its result that session's last reply), a one-shot claude_cli routine whose run
+ *  errored with the CLI's final text as cli-routine.ts stores it, and an ordinary chat. */
 function codeConversation(mutate: (cfg: ReturnType<typeof defaultConfig>) => void) {
   const h = toolChat(mutate)
   registerRoutineRoutes(h.app, h.d)
@@ -1781,30 +1784,49 @@ function codeConversation(mutate: (cfg: ReturnType<typeof defaultConfig>) => voi
   h.db.addMessage(conv.id, 'assistant', 'code-session-secret-output')
   const session = h.db.createAgentRun({ convId: conv.id, title: 'list', allowedTools: [], repoRoot: '/repo', codeAgent: 'pi' })
   const routine = h.db.createRoutine({ flavor: 'code', prompt: 'list the files', scheduleDisplay: 'daily', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'pi', permissionMode: 'ask' })
+  const doneConv = h.db.createConversation({ kind: 'code', modelKey: 'm' })
+  h.db.addMessage(doneConv.id, 'user', 'list the files')
+  h.db.addMessage(doneConv.id, 'assistant', 'code-session-final-reply')
+  const doneSession = h.db.createAgentRun({ convId: doneConv.id, title: 'list', allowedTools: [], repoRoot: '/repo', codeAgent: 'pi' })
+  const done = h.db.createRoutineRun({ routineId: routine.id, configSnapshot: '{}' })
+  h.db.updateRoutineRun(done.id, { codeSessionId: doneSession.id })
+  h.db.updateRoutineRun(done.id, { status: 'ok', result: h.db.getConversation(doneConv.id, true)?.messages?.at(-1)?.content, endedAt: new Date().toISOString() })
+  const cli = h.db.createRoutine({ flavor: 'code', prompt: 'list the files', scheduleDisplay: 'daily', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'auto' })
+  const cliRun = h.db.createRoutineRun({ routineId: cli.id, configSnapshot: '{}' })
+  h.db.updateRoutineRun(cliRun.id, { status: 'errored', error: 'cli-final-reply-secret', endedAt: new Date().toISOString() })
   const run = h.db.createRoutineRun({ routineId: routine.id, configSnapshot: '{}' })
   h.db.updateRoutineRun(run.id, { codeSessionId: session.id })
   stallRoutineRun(h.db, run.id, { convId: conv.id, sessionId: session.id, assistantContent: '', precedingCalls: [], call: { id: 'tc1', name: 'bash', args: { command: 'ls' } } })
   const chat = h.db.createConversation()
-  return { h, conv, question, session, routine, chat }
+  return { h, conv, question, session, routine, cli, chat }
 }
 
 test("a Code session's conversation is refused through the chat routes to a caller codeAuth refuses", async () => {
   for (const caller of keylessCallers()) {
-    const { h, conv, question, session, routine, chat } = codeConversation(caller.mutate)
+    const { h, conv, question, session, routine, cli, chat } = codeConversation(caller.mutate)
     const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
     try {
       const headers = { ...caller.headers(h.d), 'Content-Type': 'application/json' }
       const send = (method: string, path: string, body?: unknown) =>
         caller.request(h.app, path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
-      // The stalled run still shows what waits for approval, but not which conversation it is in.
+      // The stalled run still shows what waits for approval, but not which conversation it is in,
+      // and no run shows the session's reply: a finished run's result is its last message, and a
+      // one-shot CLI run's error the CLI's final text. Each run's status is still shown.
       if (!caller.name.includes('remote token')) {
         const runs = await send('GET', `/api/v1/routines/${routine.id}/runs`)
         assert.equal(runs.status, 200, caller.name)
         const text = await runs.text()
         assert.ok(!text.includes(conv.id), `${caller.name}: the conversation id is shown nowhere in the run`)
-        const [shown] = JSON.parse(text) as { pendingToolCall: string }[]
-        const pending = JSON.parse(shown.pendingToolCall) as Record<string, unknown>
+        assert.doesNotMatch(text, /code-session-final-reply/, `${caller.name}: nor a finished session's reply`)
+        const shown = JSON.parse(text) as { status: string; pendingToolCall?: string; result?: string }[]
+        assert.deepEqual(shown.map((r) => r.status).sort(), ['needs_approval', 'ok'], caller.name)
+        const pending = JSON.parse(shown.find((r) => r.status === 'needs_approval')!.pendingToolCall!) as Record<string, unknown>
         assert.deepEqual(pending.call, { id: 'tc1', name: 'bash', args: { command: 'ls' } }, caller.name)
+        const cliRuns = await send('GET', `/api/v1/routines/${cli.id}/runs`)
+        assert.equal(cliRuns.status, 200, caller.name)
+        const cliText = await cliRuns.text()
+        assert.doesNotMatch(cliText, /cli-final-reply-secret/, `${caller.name}: nor the CLI's final text`)
+        assert.equal((JSON.parse(cliText) as { status: string }[])[0].status, 'errored', caller.name)
       }
       const base = `/api/v1/conversations/${conv.id}`
       const routes: [string, string, unknown?][] = [
@@ -1843,11 +1865,15 @@ test("a Code session's conversation is refused through the chat routes to a call
     }
   }
 
-  // The host sees and manages it as before, and the run names its conversation.
-  const { h, conv, routine } = codeConversation(() => {})
+  // The host sees and manages it as before, the run names its conversation, and the finished
+  // runs show their result and error.
+  const { h, conv, routine, cli } = codeConversation(() => {})
   try {
-    const runs = (await (await loopbackRequest(h.app, `/api/v1/routines/${routine.id}/runs`)).json()) as { pendingToolCall: string }[]
-    assert.equal((JSON.parse(runs[0].pendingToolCall) as { convId: string }).convId, conv.id)
+    const runs = (await (await loopbackRequest(h.app, `/api/v1/routines/${routine.id}/runs`)).json()) as { status: string; pendingToolCall?: string; result?: string }[]
+    assert.equal((JSON.parse(runs.find((r) => r.status === 'needs_approval')!.pendingToolCall!) as { convId: string }).convId, conv.id)
+    assert.equal(runs.find((r) => r.status === 'ok')?.result, 'code-session-final-reply')
+    const cliRuns = (await (await loopbackRequest(h.app, `/api/v1/routines/${cli.id}/runs`)).json()) as { error?: string }[]
+    assert.equal(cliRuns[0].error, 'cli-final-reply-secret')
     const res = await loopbackRequest(h.app, `/api/v1/conversations/${conv.id}`)
     assert.equal(res.status, 200)
     assert.match(await res.text(), /code-session-secret-output/)
@@ -1860,6 +1886,10 @@ test("a Code session's conversation is refused through the chat routes to a call
   try {
     const raw = 'tllm-codeconvcodeconvcodeconvcodeconv01'
     keyed.h.cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null })
+    const runs = (await (await lanRequest(keyed.h.app, `/api/v1/routines/${keyed.routine.id}/runs`, { headers: { 'X-TurboLLM-Auth': raw } })).json()) as { status: string; result?: string }[]
+    assert.equal(runs.find((r) => r.status === 'ok')?.result, 'code-session-final-reply')
+    const cliRuns = (await (await lanRequest(keyed.h.app, `/api/v1/routines/${keyed.cli.id}/runs`, { headers: { 'X-TurboLLM-Auth': raw } })).json()) as { error?: string }[]
+    assert.equal(cliRuns[0].error, 'cli-final-reply-secret')
     const res = await lanRequest(keyed.h.app, `/api/v1/conversations/${keyed.conv.id}`, { headers: { 'X-TurboLLM-Auth': raw } })
     assert.equal(res.status, 200)
     assert.match(await res.text(), /code-session-secret-output/)

@@ -226,7 +226,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // /api/v1/code/* is: these routes are behind lanAuth only, so a keyless Serve identity, Access
   // JWT or open-LAN peer, or a remote token, that codeAuth refuses could read, export, rewrite and
   // delete a Code transcript (the session's agent run with it) once it had the id, which a stalled
-  // ask-mode Code routine's run showed (routine-routes.ts withoutConvId). One gate for every
+  // ask-mode Code routine's run showed (routine-routes.ts forCodeGateRefused). One gate for every
   // route under the id, so a new one is covered too. Not the tool-call approve route: a Deny
   // there must stay open to anyone, so what it lets a caller decide on a Code conversation is
   // gated by decision in that route. api_key_required: the web client opens its key prompt on it.

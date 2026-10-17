@@ -206,16 +206,26 @@ function chatAgentUsesMcp(d: Deps, flavor: RoutineFlavor | undefined, agentId: s
  *  pendingToolCall is code-runner.ts's resume point, naming the Code conversation; the run GETs
  *  stay open, but that conversation id is what the chat conversation routes take, which is how
  *  such a caller read, rewrote and deleted a Code transcript (pi replays it into the owner's next
- *  Approve). Only that id goes: the call is what the approval card shows, and the session id is
- *  on the run anyway as its codeSessionId (the session the routine page embeds, whose 401 opens
- *  Code's key prompt) and on /api/v1/activity while the session runs, and it opens only
- *  codeAuth's routes. A value that does not parse is dropped whole. */
-function withoutConvId(run: RoutineRun): RoutineRun {
-  if (!run.pendingToolCall) return run
+ *  Approve). That id goes: the call is what the approval card shows, and the session id is on the
+ *  run anyway as its codeSessionId (the session the routine page embeds, whose 401 opens Code's
+ *  key prompt) and on /api/v1/activity while the session runs, and it opens only codeAuth's
+ *  routes. A value that does not parse is dropped whole.
+ *
+ *  `result` and `error` go too, from every run: they are the session's own words. A finished
+ *  pi run's result is the Code conversation's last message (code-runner.ts), and a one-shot
+ *  claude_cli run's result, or its error when the CLI reports a failure, is the CLI's final reply
+ *  (cli-routine.ts), so either can carry the bash output and file contents the chat routes now
+ *  refuse these callers. The status stays, so the run list still says what happened. The routine
+ *  page shows a run with a codeSessionId through the embedded session, which these callers cannot
+ *  open anyway; a run with none (a one-shot claude_cli run, or one older than that field) now
+ *  shows them no text either. */
+function forCodeGateRefused(run: RoutineRun): RoutineRun {
+  const shown: RoutineRun = { ...run, result: undefined, error: undefined }
+  if (!run.pendingToolCall) return shown
   const pending = parsePendingToolCall(run.pendingToolCall)
-  if (!pending) return { ...run, pendingToolCall: undefined }
+  if (!pending) return { ...shown, pendingToolCall: undefined }
   const { convId: _convId, ...rest } = pending
-  return { ...run, pendingToolCall: JSON.stringify(rest) }
+  return { ...shown, pendingToolCall: JSON.stringify(rest) }
 }
 
 /** chatAgentUsesMcp's refusal: 401 unauthorized like the code gate beside it, which the routine
@@ -248,7 +258,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     const routine = d.db.getRoutine(c.req.param('id'))
     if (!routine) return err(c, 404, 'not_found', 'Routine not found.')
     const runs = d.db.listRoutineRuns(routine.id)
-    return c.json(routine.flavor === 'code' && codeGateBlocks(c, d) ? runs.map(withoutConvId) : runs)
+    return c.json(routine.flavor === 'code' && codeGateBlocks(c, d) ? runs.map(forCodeGateRefused) : runs)
   })
 
   app.post('/api/v1/routines', async (c) => {
