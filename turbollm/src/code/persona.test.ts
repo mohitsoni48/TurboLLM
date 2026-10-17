@@ -185,3 +185,16 @@ test('buildAppendPrompt: hasSessionTools=false (a delegate_task sub-agent) names
     assert.ok(blocks.some((b) => b.includes('first read the file, then copy')), `${m}: the edit guidance stays`)
   }
 })
+
+// A plan run's delegate_task sub-agent gets read, grep, find and ls only, and its preamble says it
+// cannot delegate or invoke skills. The plan-mode line still offered it web search and spoke of
+// the skills and sub-agents it starts.
+test('buildAppendPrompt: hasSessionTools=false in plan mode names only read, grep, find and ls', () => {
+  const blocks = buildAppendPrompt('plan', [], undefined, false, false)
+  assert.ok(blocks.some((b) => b.includes('MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls).')))
+  for (const said of ['web search', 'research tools', 'skills', 'sub-agents']) {
+    assert.ok(!blocks.some((b) => b.includes(said)), `no "${said}"`)
+  }
+  // The top-level plan session has them, and keeps its line.
+  assert.ok(buildAppendPrompt('plan', [], undefined, true).some((b) => b.includes('such as web search; skills and sub-agents you start are read-only too')))
+})

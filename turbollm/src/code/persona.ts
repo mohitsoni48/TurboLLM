@@ -67,13 +67,18 @@ export function basePersona(): string {
 }
 
 /** Per-mode behavioural framing. Mirrors the UI labels in code-mock.ts AGENT_MODES exactly:
- *  auto = "asks only when blocked", plan = "plan before touching files", ask = "approval gate". */
-export function modeGuidance(mode: CodeMode): string {
+ *  auto = "asks only when blocked", plan = "plan before touching files", ask = "approval gate".
+ *  `hasSessionTools` as buildAppendPrompt takes it: false for a delegate_task sub-agent, whose plan
+ *  toolset is read, grep, find and ls alone (no web_search, invoke_skill or delegate_task), so its
+ *  plan line names those four and no research tools, skills or sub-agents. */
+export function modeGuidance(mode: CodeMode, hasSessionTools = true): string {
   switch (mode) {
     case 'plan':
       return [
-        'MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls, plus any listed research',
-        'tools such as web search; skills and sub-agents you start are read-only too). You cannot',
+        hasSessionTools
+          ? 'MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls, plus any listed research'
+            + ' tools such as web search; skills and sub-agents you start are read-only too). You cannot'
+          : 'MODE: PLAN. You have READ-ONLY tools only (read, grep, find, ls). You cannot',
         'edit, write, or run shell commands in this mode. Explore the codebase as needed, then produce a',
         'clear, concrete, step-by-step implementation plan as your final message: which files',
         'to change, what each change is, and any risks. Do not ask for permission to explore —',
@@ -347,7 +352,8 @@ export function agentsMdBlock(
  *  cache them, so a changed setting takes effect on the session's next turn. `hasWebTools`:
  *  web_search/fetch_url are registered. `hasSessionTools`: the top-level session's own
  *  install_lsp and update_todos tools, and the LSP diagnostics its hook appends to edits, are
- *  there — false for a delegate_task sub-agent, which gets pi's file tools and bash only. */
+ *  there, and in plan mode its web_search, invoke_skill and delegate_task (modeGuidance) — false
+ *  for a delegate_task sub-agent, which gets pi's file tools and bash only. */
 export function buildAppendPrompt(
   mode: CodeMode,
   skills: Skill[] = [],
@@ -355,7 +361,7 @@ export function buildAppendPrompt(
   hasWebTools = false,
   hasSessionTools = true,
 ): string[] {
-  const blocks = [basePersona(), modeGuidance(mode)]
+  const blocks = [basePersona(), modeGuidance(mode, hasSessionTools)]
   // Read-only plan mode has no edit tool, so the edit/LSP guidance is irrelevant there — and neither
   // install_lsp nor update_todos is in plan mode's toolset (see PLAN_MODE_EXTENSION_TOOLS).
   if (mode !== 'plan') {
