@@ -7,12 +7,14 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto'
-import { existsSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createApp } from './server'
 import { hashKey, provisionRemoteApiKey } from './auth'
 import { defaultConfig, type Config } from './config/config'
 import type { Deps } from './deps'
+import { availableBackends } from './engines/download'
+import { BuildState } from './engines/build-state'
 import { Scanner } from './models/scanner'
 import { tmpDir } from './test-support/tmp'
 
@@ -513,5 +515,120 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
     } as never)
     assert.equal(res.status, 200)
     assert.equal(existsSync(file), false)
+  }
+})
+
+// DELETE /api/v1/engines/:id?purge=1 deletes an engine's install folder and DELETE
+// /api/v1/engines/backends/:id every build of a backend: refused to the same callers as DELETE
+// /engines/build (a Disabled build's smaller delete), with api_key_required. A plain Disable only
+// unregisters, keeps the files and stays open. A remote token was already refused (no capability
+// maps /engines).
+function withEngines(d: Deps): { buildDir: string; otherDir: string; backendDir: string; backendId: string; removed: string[] } {
+  const root = join(d.store.dir(), 'engines')
+  const buildDir = join(root, 'build', 'mybuild')
+  const otherDir = join(root, 'build', 'otherbuild')
+  for (const dir of [buildDir, otherDir]) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'llama-server'), 'bin')
+  }
+  const backendId = availableBackends()[0]!.id
+  const backendDir = join(root, `llama.cpp-b1-${backendId}`)
+  mkdirSync(backendDir, { recursive: true })
+  writeFileSync(join(backendDir, 'llama-server'), 'bin')
+  const engines = [
+    { id: 'e1', name: 'My build', kind: 'llama-server', binPath: join(buildDir, 'llama-server') },
+    { id: 'e2', name: 'Other build', kind: 'llama-server', binPath: join(otherDir, 'llama-server') },
+    { id: 'be', name: 'llama.cpp', kind: 'llama-server', binPath: join(backendDir, 'llama-server') },
+  ]
+  const removed: string[] = []
+  const live = () => engines.filter((e) => !removed.includes(e.id))
+  Object.assign(d, {
+    provision: { get: () => ({ active: false }) },
+    build: new BuildState(),
+    manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null, stopAndWait: async () => {} },
+    modelRouter: { poolEngineIds: () => new Set<string>(), stopPoolSlotsOnEngine: async () => {} },
+    registry: {
+      active: () => undefined,
+      list: () => ({ engines: live() }),
+      get: (id: string) => live().find((e) => e.id === id),
+      remove: (id: string) => { removed.push(id) },
+      recordCustomSource: () => {},
+      forgetCustomSource: () => {},
+      customSources: () => [],
+    },
+  })
+  return { buildDir, otherDir, backendDir, backendId, removed }
+}
+
+test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot purge an engine or delete a backend; Disable stays open, and with a key they can', async () => {
+  const assertRefused = async (send: (path: string) => Response | Promise<Response>, h: ReturnType<typeof withEngines>) => {
+    for (const path of ['/api/v1/engines/e1?purge=1', `/api/v1/engines/backends/${h.backendId}`]) {
+      const res = await send(path)
+      assert.equal(res.status, 403, path)
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required', path)
+    }
+    assert.deepEqual(h.removed, [], 'nothing unregistered')
+    assert.ok(existsSync(h.buildDir) && existsSync(h.backendDir), 'the files are kept')
+  }
+  const assertAllowed = async (send: (path: string) => Response | Promise<Response>, h: ReturnType<typeof withEngines>) => {
+    assert.equal((await send('/api/v1/engines/e1?purge=1')).status, 200)
+    assert.equal(existsSync(h.buildDir), false)
+    assert.equal((await send(`/api/v1/engines/backends/${h.backendId}`)).status, 200)
+    assert.equal(existsSync(h.backendDir), false)
+    assert.ok(h.removed.includes('e1') && h.removed.includes('be'))
+  }
+  // Tailscale Serve, no key.
+  {
+    const { d } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const h = withEngines(d)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertRefused((p) => tunneled(d, p, serve, {}, 'DELETE'), h)
+    // A plain Disable only unregisters, keeps the files and stays open.
+    assert.equal((await tunneled(d, '/api/v1/engines/e2', serve, {}, 'DELETE')).status, 200)
+    assert.deepEqual(h.removed, ['e2'])
+    assert.ok(existsSync(h.otherDir))
+    await assertAllowed((p) => tunneled(d, p, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE'), h)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-purge.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const h = withEngines(d)
+      await assertRefused((p) => tunneled(d, p, { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }, {}, 'DELETE'), h)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false })
+    const h = withEngines(d)
+    await assertRefused((p) => fromLan(d, p, {}, {}, 'DELETE'), h)
+    await assertAllowed((p) => fromLan(d, p, { 'X-TurboLLM-Auth': RAW_KEY }, {}, 'DELETE'), h)
+  }
+  // A remote-access token, whatever it may otherwise do: refused before the route.
+  {
+    const { d } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick' })
+    const h = withEngines(d)
+    const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load', 'config:write', 'downloads:write'] }) }
+    for (const path of ['/api/v1/engines/e1?purge=1', `/api/v1/engines/backends/${h.backendId}`])
+      assert.equal((await tunneled(d, path, token, {}, 'DELETE')).status, 403, path)
+    assert.deepEqual(h.removed, [])
+  }
+  // The host itself, unchanged.
+  {
+    const { d } = mkDeps()
+    const h = withEngines(d)
+    await assertAllowed((p) => createApp(d).request(p, { method: 'DELETE', headers: { Host: '127.0.0.1:6996' } }, {
+      incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+    } as never), h)
   }
 })

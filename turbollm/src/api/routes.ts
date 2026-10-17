@@ -553,6 +553,10 @@ export function registerApi(app: Hono, d: Deps): void {
   // Delete an installed backend's files + unregister its engine. Stops the engine
   // first if it's the active, running one.
   app.delete('/api/v1/engines/backends/:id', async (c) => {
+    // Deletes every build of the backend from disk, so it needs a key from a non-host caller like the purge of
+    // DELETE /engines/:id below and DELETE /engines/build. api_key_required: the web client opens its key prompt.
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', "Deleting an engine's files requires a valid API key.")
     const def = availableBackends().find((x) => x.id === c.req.param('id'))
     if (!def) return err(c, 400, 'invalid_config_value', 'Unknown backend for this platform.')
     // Never under an update or download (see DELETE /engines/:id): an update of this backend would register the build
@@ -1833,6 +1837,14 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/engines/:id', (c) => {
     const id = c.req.param('id')
+    const purge = c.req.query('purge') === '1'
+    // ?purge=1 deletes the engine's install folder (a source build costs a recompile), so it is held to
+    // isLocalOrAuthenticated like DELETE /engines/build, the smaller delete of a Disabled build: a keyless
+    // Serve identity, Access JWT or open-LAN peer could otherwise purge every engine on the box. A plain
+    // Disable (no purge, recordSource included) only unregisters, keeps the files and stays open.
+    // api_key_required: the web client opens its key prompt on it.
+    if (purge && !isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', "Deleting an engine's files requires a valid API key.")
     const target = d.registry.get(id)
     if (target && engineDeleteBlocked(d, target)) {
       return err(c, 409, 'engine_in_use', 'Stop the engine before removing it.')
@@ -1843,7 +1855,6 @@ export function registerApi(app: Hono, d: Deps): void {
     // an orphan folder; under a rebuild it deleted build/<slug> but not the parked previous build, which the failing
     // build then moved back; a removed engine was registered again when the update finished.
     { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
-    const purge = c.req.query('purge') === '1'
     // Set by the frontend's custom-engine Disable (never alongside purge): a custom engine
     // added before customEngineSources tracking existed has no recorded identity, so a plain
     // Disable would otherwise vanish it with no Enable path back. recordCustomSource is a
