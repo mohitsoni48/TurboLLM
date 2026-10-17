@@ -426,13 +426,13 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   `/api/ext/v1`, for building a real chat product instead of the gateway's stateless
   send-full-history-every-call model — persistence, history, message editing, and resumable
   streaming generation are handled for you. Off by default; using it today needs two manual
-  `config.json` edits — a key with an explicit, non-`local` `tenant` field (the local tenant, this
-  install's own desktop UI data, is never reachable through this API), and a configured
-  `chatStore` adapter (the SQLite default only ever serves the `local` tenant). A generated
-  OpenAPI spec, a TypeScript client, and a working Postgres adapter example ship with it. The
-  daemon logs a warning at startup while it's enabled — a remote tenant's generations currently
-  inherit this install's own tool permissions, not an independent trust boundary of their own.
-  [Full guide](https://turbollm.dev/docs/api/external).
+  `config.json` edits — a key with an explicit, non-`local` `tenant` field, which works on this
+  API and nowhere else (the local tenant, this install's own desktop UI data, is never reachable
+  through this API), and a configured `chatStore` adapter (the SQLite default only ever serves
+  the `local` tenant). A generated OpenAPI spec, a TypeScript client, and a working Postgres
+  adapter example ship with it. The daemon logs a warning at startup while it's enabled — a
+  remote tenant's generations currently inherit this install's own tool permissions, not an
+  independent trust boundary of their own. [Full guide](https://turbollm.dev/docs/api/external).
 
 **The gateway loads models for you.** Most local hosts make you load a model first, then call it.
 TurboLLM's gateway reads the `model` field of any incoming request, **fuzzy-matches it to your

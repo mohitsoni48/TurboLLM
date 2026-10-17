@@ -662,6 +662,38 @@ export function isFacadeOnlyKey(key: Pick<ApiKey, 'grant'>): boolean {
   return !!key.grant
 }
 
+/** The External Chat API tenant a stored key authenticates (spec 27 §10): its `tenant`, or
+ *  'local' (this install's own data) for a key that names none, which is every key TurboLLM
+ *  mints. ext/auth.ts's resolveTenantFromKey reads it through this, so the ext API and the
+ *  refusal below agree on which keys are tenant keys. */
+export function keyTenant(key: Pick<ApiKey, 'tenant'>): string {
+  return key.tenant ?? 'local'
+}
+
+/** Is this stored key an External Chat API tenant key — usable only on `/api/ext/v1`
+ *  (ext/auth.ts), and refused by every other credential path?
+ *
+ *  The same rule as {@link isFacadeOnlyKey}, for the other credential that is issued for one
+ *  surface: a key with a non-local tenant is added to config.json for a backend that serves
+ *  that tenant's users, scoped by `scopes` (as narrow as chats:read), and only the ext API reads
+ *  either field. It carries no `grant`, so every internal check took it for an owner key: it
+ *  minted permanent keys, added stdio MCP servers, read the settings, opened Code and its
+ *  terminal, and got every Turbo Link capability. lanAuth still lets it through to
+ *  `/api/ext/v1` (verifyKeyValue's `ext` flag), as a backend on another machine reaches that
+ *  API over the LAN or a tunnel. */
+export function isExtOnlyKey(key: Pick<ApiKey, 'tenant'>): boolean {
+  return keyTenant(key) !== 'local'
+}
+
+/** The External Chat API's path prefix, the one surface where lanAuth accepts a tenant key
+ *  ({@link isExtOnlyKey}). Duplicated as a literal like LINK_API_PREFIX: ext/ imports this
+ *  module. */
+const EXT_API_PREFIX = '/api/ext/v1'
+
+function isExtApi(c: Context): boolean {
+  return c.req.path === EXT_API_PREFIX || c.req.path.startsWith(`${EXT_API_PREFIX}/`)
+}
+
 /** Which enforcement path a stored key's grant belongs to (ADR-422).
  *
  *  A grant with no `kind` is a LINK grant: every grant minted before ADR-422 was minted for
@@ -738,14 +770,15 @@ export function requiredCapability(method: string, path: string): LinkCapability
  *  ({@link isFacadeOnlyKey}, ADR-376 review). Every surface downstream of THIS function —
  *  lanAuth over /v1/*, codeAuth over Code's real shell and filesystem access, the terminal
  *  WebSocket's pty upgrade — compares the hash and NOTHING else, so this is the choke point
- *  for all of them.
+ *  for all of them. An External Chat API tenant key ({@link isExtOnlyKey}) is refused the same
+ *  way, unless `ext` says lanAuth is judging a request for /api/ext/v1.
  *
  *  It is NOT the only one in the process, and the earlier version of this comment claiming
  *  "the single choke point" was wrong: the External Chat API (`ext/auth.ts`) landed on main
  *  with its own hash comparison and never routes through here. It calls
  *  {@link isFacadeOnlyKey} directly instead. Two enforcement points, ONE predicate — if you
  *  add a third credential path, call the predicate rather than re-deriving the rule. */
-export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean }): boolean {
+export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean; ext?: boolean }): boolean {
   if (!key) return false
   const hash = hashKey(key)
   const cfg = d.store.snapshot()
@@ -762,6 +795,9 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean 
   // false. Capability enforcement for an accepted remote token is the CALLER's job; this
   // function answers "is this credential usable here at all".
   if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
+  // An External Chat API tenant key ({@link isExtOnlyKey}) likewise, except where lanAuth judges
+  // a request for /api/ext/v1 itself (`ext`), which then checks the tenant and scopes.
+  if (isExtOnlyKey(match) && opts?.ext !== true) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   touchLastUsed(d, match)
   return true
@@ -772,13 +808,13 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean 
  *  once its key is revoked. No lastUsedAt bump: nothing is being used. */
 export function keyHashStillAccepted(hash: string, d: Deps): boolean {
   const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
-  return !!match && !isFacadeOnlyKey(match)
+  return !!match && !isFacadeOnlyKey(match) && !isExtOnlyKey(match)
 }
 
 /** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
  *  keys. Shared by lanAuth and codeAuth below so both enforce the identical credential check —
  *  only WHEN each one is triggered differs. */
-export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boolean }): boolean {
+export function verifyPresentedKey(c: Context, d: Deps, opts?: { ingress?: boolean; ext?: boolean }): boolean {
   return verifyKeyValue(presentedKey(c), d, opts)
 }
 
@@ -958,7 +994,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     }
 
     const ingress = isTunneled(c, d)
-    if (!verifyPresentedKey(c, d, { ingress })) {
+    if (!verifyPresentedKey(c, d, { ingress, ext: isExtApi(c) })) {
       return c.json(
         { error: { code: 'unauthorized', message: 'A valid API key is required for non-local access.' } },
         401,
