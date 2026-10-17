@@ -87,6 +87,12 @@ const MAX_CONCURRENT = 2
  *  same set {@link DownloadManager.hasLiveDest} treats as live. */
 const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
 
+/** The most files a whole-folder download's `folder` may list. The web sends a model folder's
+ *  own files (a repo's root components, or one checkpoint's): tens, or a few hundred for the
+ *  most heavily sharded models. Any caller that may write downloads chooses the list, so it is
+ *  capped well above that instead of walked whatever its length. */
+export const MAX_FOLDER_FILES = 4096
+
 /** The model file formats that make sense as a STANDALONE single-file download: a GGUF
  *  and a LiteRT-LM bundle each carry everything a load needs (weights, tokenizer, and
  *  for multimodal models the encoders) inside one file, so one URL/rfilename is a
@@ -256,6 +262,9 @@ export class DownloadManager {
     // Safetensors/MLX pass an explicit subdir and enqueue each component file themselves
     // — no expansion. Place it (single file) directly under that subdir.
     if (explicitSubdir || !this.expand) {
+      if (Array.isArray(input.folder?.files) && input.folder.files.length > MAX_FOLDER_FILES) {
+        throw new DownloadError('invalid_request', `A folder download may list at most ${MAX_FOLDER_FILES} files.`)
+      }
       const filename = basename(rfilename)
       const destDir = join(dir, explicitSubdir || repoSubdir(repo))
       mkdirSync(destDir, { recursive: true })
@@ -337,14 +346,27 @@ export class DownloadManager {
    *  (errored) refused as needing ~33 GB. Matched file by file, never by the folder's path: a
    *  root checkpoint's folder is the repo's own, with every nested checkpoint inside it, yet
    *  its files are only the root's, so a nested one still downloading holds none of them.
-   *  0 without one. */
+   *  0 without one.
+   *
+   *  The live dests are collected once, keyed as {@link sameDest} compares them (exactly, or
+   *  lowercased where the record's dest {@link foldsCase}), so each file is a lookup: calling
+   *  hasLiveDest per file scanned every record for every file, and one request listing 20000
+   *  files against 2000 rows held the daemon's event loop for nearly 3 s. */
   private folderToFetch(dir: string, folder: EnqueueInput['folder']): number {
     const files = folder?.files
     if (!Array.isArray(files)) return 0
+    const exact = new Set<string>()
+    const folded = new Set<string>()
+    for (const r of this.records.values()) {
+      if (!LIVE.includes(r.status)) continue
+      if (foldsCase(r.dest)) folded.add(r.dest.toLowerCase())
+      else exact.add(r.dest)
+    }
     let need = 0
     for (const f of files) {
       if (typeof f?.path !== 'string' || typeof f.size !== 'number' || !Number.isFinite(f.size) || f.size <= 0) continue
-      if (!this.hasLiveDest(join(dir, safeRelativeSubdir(f.path)))) need += f.size
+      const dest = join(dir, safeRelativeSubdir(f.path))
+      if (!exact.has(dest) && !folded.has(dest.toLowerCase())) need += f.size
     }
     return need
   }
@@ -791,9 +813,13 @@ export class DownloadManager {
  *  Elsewhere case is significant and names compare exactly. The platform is read per call, not
  *  at load, so a test can stand in for another one. */
 function sameDest(a: string, b: string): boolean {
-  if (process.platform === 'win32' || process.platform === 'darwin') return a.toLowerCase() === b.toLowerCase()
-  if (process.platform === 'android' && onAndroidSharedStorage(a)) return a.toLowerCase() === b.toLowerCase()
-  return a === b
+  return foldsCase(a) ? a.toLowerCase() === b.toLowerCase() : a === b
+}
+
+/** Whether {@link sameDest} ignores letter case comparing against the dest `a`. */
+function foldsCase(a: string): boolean {
+  if (process.platform === 'win32' || process.platform === 'darwin') return true
+  return process.platform === 'android' && onAndroidSharedStorage(a)
 }
 
 /** Android's shared storage ignores letter case (its FUSE layer, like the FAT/exFAT of an SD

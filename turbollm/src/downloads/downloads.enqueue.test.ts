@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DownloadManager, DownloadError } from './downloads'
+import { DownloadManager, DownloadError, MAX_FOLDER_FILES } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
 import { tmpDir } from '../test-support/tmp'
 
@@ -276,6 +276,50 @@ test('enqueue: a whole-folder download takes off only its own live files, not a 
   }
 })
 
+// The caller chooses the folder's list, and checking it scanned every row for every listed file:
+// one POST /api/v1/downloads of 20000 entries against 2000 errored rows held the daemon's event
+// loop for nearly 3 s, stalling every chat stream and SSE tail, and nothing capped the list.
+test('enqueue: a whole-folder download listing more than MAX_FOLDER_FILES files is refused; one at the cap queues', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const listing = (n: number) => ({ files: Array.from({ length: n }, (_, i) => ({ path: `big/file-${i}.bin`, size: 1 })) })
+    await assert.rejects(
+      dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder: listing(MAX_FOLDER_FILES + 1) }),
+      (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+    )
+    assert.deepEqual(dm.list(), [], 'nothing is queued')
+    const at = await dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder: listing(MAX_FOLDER_FILES) })
+    assert.equal(at.length, 1)
+  } finally {
+    restore()
+  }
+})
+
+// Every listed file walked every row: thousands of rows (errored ones stay until removed, and
+// each enqueue can leave one) times a folder at the cap was ~20M comparisons as macOS, seconds of
+// the event loop for one request. The live dests are now read once. Counted as walks of the row
+// table rather than timed, so a slow or busy machine cannot fail it and a fast one cannot pass it
+// with the per-file walk back; every walk in DownloadManager goes through records.values().
+test('enqueue: a whole-folder download at the cap walks the download rows a few times, not once per listed file', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const records = (dm as unknown as { records: Map<string, object> }).records
+    let walks = 0
+    const values = records.values.bind(records)
+    records.values = () => { walks++; return values() }
+    const folder = { files: Array.from({ length: MAX_FOLDER_FILES }, (_, i) => ({ path: `big/file-${i}.bin`, size: 1 })) }
+    const out = await dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder })
+    assert.equal(out.length, 1)
+    assert.ok(walks < 16, `enqueue walked the download rows ${walks} times for ${MAX_FOLDER_FILES} listed files`)
+  } finally {
+    restore()
+  }
+})
+
 test('enqueue: an HF resolve URL honours the linked revision (not main) + decodes path', async () => {
   const restore = stubFetch()
   try {
@@ -451,6 +495,44 @@ test('enqueue on android: in app-private storage (Termux\'s home), two letter ca
     restore()
   }
 })
+
+// The folder's live files are matched as sameDest matches one file: where the file system ignores
+// letter case (Windows, macOS, Android's shared storage), a live row in another case holds the
+// same file and comes off the total; where it does not (Linux), it is another file.
+for (const [platform, folds] of [['win32', true], ['darwin', true], ['android', true], ['linux', false]] as const) {
+  const skip = process.platform === 'win32' && platform === 'android' && 'os.homedir() ignores HOME on Windows'
+  test(`enqueue on ${platform}: a whole-folder download takes off its live files in another letter case ${folds ? 'as the same files' : 'only when the case matches'}`, { skip }, async (t) => {
+    asPlatform(t, platform)
+    const home = process.env.HOME
+    const termux = tmpDir('tllm-termux-home-')
+    process.env.HOME = termux
+    t.after(() => { process.env.HOME = home })
+    const restore = stubFetch()
+    try {
+      const { modelDir: plain, stateDir } = newDirs()
+      // On Android, in Termux's link into shared storage (a test cannot create /storage).
+      const modelDir = platform === 'android' ? join(termux, 'storage', 'shared', 'models') : plain
+      mkdirSync(modelDir, { recursive: true })
+      const st = statfsSync(modelDir)
+      const shard = Math.floor(st.bavail * st.bsize * 0.4)
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+      await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'Big/Ckpt-2' })
+      await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'Big/Ckpt-2' })
+
+      const again = await Promise.allSettled(queueFolder(dm, 'big/ckpt-2', SHARDS, shard))
+      if (folds) {
+        assert.deepEqual(again.map((r) => r.status === 'fulfilled' && r.value.length), [0, 1, 0], 'the missing shard is queued; the live two add nothing')
+      } else {
+        for (const r of again) {
+          assert.equal(r.status, 'rejected', 'the live two are other files, so the folder needs all three')
+          assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+        }
+      }
+    } finally {
+      restore()
+    }
+  })
+}
 
 test('enqueue: two quants sharing one mmproj do not double-enqueue the projector', async () => {
   const restore = stubFetch()
