@@ -338,6 +338,30 @@ test('publish does not take an earlier attempt\'s run for a recreated release', 
   assert.equal(await waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 0, ghWith([newRun, oldRun]), 1), 222);
 });
 
+// A failing `gh run list` read as "no run yet": after 5 minutes of polling it, publish fell back to a
+// local `npm publish` with the token, racing the npm-publish.yml run the release had just fired.
+test('publish stops at once when gh fails instead of reading it as no npm-publish.yml run', async () => {
+  const calls = [];
+  const loggedOut = (...args) => {
+    calls.push(args);
+    if (args[0] === 'release') return { code: 0, stdout: '2026-10-04T13:00:00Z', stderr: '', out: '2026-10-04T13:00:00Z' };
+    const stderr = 'To get started with GitHub CLI, please run:  gh auth login';
+    return { code: 4, stdout: '', stderr, out: stderr };
+  };
+  await assert.rejects(waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 60_000, loggedOut, 1),
+    (e) => /`gh run list --workflow npm-publish\.yml` failed \(exit 4\)/.test(e.message) && /gh auth login/.test(e.message) && /Nothing was published/.test(e.message));
+  assert.equal(calls.filter((a) => a[0] === 'run').length, 1, 'no second poll');
+
+  // A failed release view read as "published at the epoch", so an earlier attempt's run matched.
+  const oldRun = { databaseId: 111, event: 'release', headBranch: 'v1.0.1', createdAt: '2026-10-04T12:10:00Z' };
+  const noView = (...args) => {
+    if (args[0] === 'release') return { code: 1, stdout: '', stderr: 'HTTP 401: Bad credentials', out: 'HTTP 401: Bad credentials' };
+    return { code: 0, stdout: JSON.stringify([oldRun]), stderr: '', out: '' };
+  };
+  await assert.rejects(waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 60_000, noView, 1),
+    (e) => /`gh release view v1\.0\.1` failed \(exit 1\)/.test(e.message) && /Bad credentials/.test(e.message));
+});
+
 // ── the real CLI, against stub `gh` / `npm` ──────────────────────────────────
 // The stubs are sh scripts, and spawnSync without a shell finds only .exe files on Windows.
 const POSIX_ONLY = { skip: process.platform === 'win32' && 'the gh/npm stubs are sh scripts' };

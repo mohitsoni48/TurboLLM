@@ -899,29 +899,39 @@ async function phasePublish(state, flags) {
 // it never excluded an earlier attempt's failed run for a recreated release.
 // Returns the run id, or null if none shows up before the timeout (e.g. the
 // release was published before npm-publish.yml existed, so it never fired it).
+// A gh that fails is not "no run yet": a lost login, an expired token or a
+// network error exits non-zero, and this loop used to poll that for the whole
+// 5 minutes and return null, which sends publish to the local-token fallback
+// while the workflow may be publishing the same version. It stops at once.
 export async function waitForWorkflowRun(workflowFile, tag, timeoutMs, ghRun = gh, pollMs = 15_000) {
-  const releaseAt = ghRun('release', 'view', tag, '--json', 'publishedAt', '-q', '.publishedAt').stdout;
-  const since = Date.parse(releaseAt) || 0;
+  const ghFailed = (what, r) => fail(
+    `\`gh ${what}\` failed (exit ${r.code}), so whether ${workflowFile} started for ${tag} cannot be checked.\n`
+    + 'Nothing was published from here: a local publish could race the workflow for the same version.\n'
+    + `Fix gh (\`gh auth status\`), then re-run this phase.\n${tailOf(r.out, 20)}`,
+  );
+  const release = ghRun('release', 'view', tag, '--json', 'publishedAt', '-q', '.publishedAt');
+  // A failed view read as "published at the epoch", and every earlier run for the tag matched.
+  if (release.code !== 0) ghFailed(`release view ${tag}`, release);
+  const since = Date.parse(release.stdout) || 0;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const r = ghRun(
       'run', 'list', '--workflow', workflowFile, '--limit', '5',
       '--json', 'databaseId,event,createdAt,headBranch',
     );
-    if (r.code === 0) {
-      try {
-        const runs = JSON.parse(r.stdout || '[]');
-        // 60s clock-skew grace on the lower bound only. A `release` run's headBranch is its tag:
-        // for a release older than the workflow, every later release's run is "after" it too, and
-        // taking one of those skipped the token fallback. A dispatched run's headBranch is the
-        // branch it was dispatched from (a tag older than the workflow has no workflow file to
-        // dispatch on), so nothing here ties it to a tag and it matches on time alone.
-        const match = runs.find((x) =>
-          ((x.event === 'release' && x.headBranch === tag) || x.event === 'workflow_dispatch')
-          && Date.parse(x.createdAt) >= since - 60_000);
-        if (match) return match.databaseId;
-      } catch { /* fall through to retry */ }
-    }
+    if (r.code !== 0) ghFailed(`run list --workflow ${workflowFile}`, r);
+    try {
+      const runs = JSON.parse(r.stdout || '[]');
+      // 60s clock-skew grace on the lower bound only. A `release` run's headBranch is its tag:
+      // for a release older than the workflow, every later release's run is "after" it too, and
+      // taking one of those skipped the token fallback. A dispatched run's headBranch is the
+      // branch it was dispatched from (a tag older than the workflow has no workflow file to
+      // dispatch on), so nothing here ties it to a tag and it matches on time alone.
+      const match = runs.find((x) =>
+        ((x.event === 'release' && x.headBranch === tag) || x.event === 'workflow_dispatch')
+        && Date.parse(x.createdAt) >= since - 60_000);
+      if (match) return match.databaseId;
+    } catch { /* fall through to retry */ }
     if (Date.now() > deadline) return null;
     step(`waiting for ${workflowFile} to start for ${tag}…`);
     await sleep(pollMs);
