@@ -37,8 +37,10 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
   // Dismissal is keyed to THE failure it was clicked on: this banner is mounted once for the
   // app's lifetime and is the only place a background install failure shows, so a plain
   // "dismissed" flag hid every later failure (another engine's, or a retry's) for the session.
-  // A new run starting clears it too, so a retry that fails the same way shows again.
-  const errorKey = p?.phase === 'error' ? `${p.backend}\n${p.error ?? ''}` : null
+  // The run's start time is part of the key: a retry that failed the same way between two status
+  // polls was never seen running, so the clear below missed it and its failure stayed hidden. A
+  // new run seen starting clears it too (all an older daemon, which sends no startedAt, allows).
+  const errorKey = p?.phase === 'error' ? `${p.startedAt ?? ''}\n${p.backend}\n${p.error ?? ''}` : null
   const [dismissedError, setDismissedError] = useState<string | null>(null)
   useEffect(() => {
     if (p?.active) setDismissedError(null)

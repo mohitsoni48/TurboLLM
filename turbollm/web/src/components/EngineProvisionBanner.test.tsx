@@ -38,8 +38,8 @@ describe('EngineProvisionBanner — Laya', () => {
 })
 
 describe('EngineProvisionBanner — a dismissed failure', () => {
-  const failed = (backend: string, error: string) =>
-    ({ engineProvision: { active: false, phase: 'error', backend, pct: 0, error } }) as unknown as Status
+  const failed = (backend: string, error: string, startedAt?: number) =>
+    ({ engineProvision: { active: false, phase: 'error', backend, pct: 0, error, startedAt } }) as unknown as Status
 
   it('stays dismissed, but a later, different failure still shows', async () => {
     const view = render(<EngineProvisionBanner status={failed('vllm', 'Could not install vLLM: pip failed')} />)
@@ -57,6 +57,17 @@ describe('EngineProvisionBanner — a dismissed failure', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
     view.rerender(<EngineProvisionBanner status={statusWith('vllm')} />)
     view.rerender(<EngineProvisionBanner status={failed('vllm', 'Could not install vLLM: pip failed')} />)
+    expect(screen.getByText('Could not install vLLM: pip failed')).toBeTruthy()
+  })
+
+  // /status is polled every 2 s, and a retry can fail faster than that (offline, a pip index refused): no poll saw it
+  // running, so only the run's start time tells its failure from the dismissed one.
+  it('shows again when a retry fails the same way before a status poll sees it running', async () => {
+    const view = render(<EngineProvisionBanner status={failed('vllm', 'Could not install vLLM: pip failed', 1000)} />)
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    view.rerender(<EngineProvisionBanner status={failed('vllm', 'Could not install vLLM: pip failed', 1000)} />)
+    expect(screen.queryByText(/pip failed/)).toBeNull()
+    view.rerender(<EngineProvisionBanner status={failed('vllm', 'Could not install vLLM: pip failed', 5000)} />)
     expect(screen.getByText('Could not install vLLM: pip failed')).toBeTruthy()
   })
 })

@@ -74,6 +74,9 @@ export type EngineProvision = {
   /** False when POST /engines/backends/cancel can't stop this run (first-run seed, auto-update,
    *  uv/pip runtime installs). Absent from daemons that predate it. */
   cancellable?: boolean
+  /** When this run began (epoch ms), kept on its failure; 0 when idle. Identifies the run, so a dismissed failure
+   *  is told from a retry's. Absent from daemons that predate it. */
+  startedAt?: number
 }
 
 /** In-app compile-from-source status (ADR-100), from GET /api/v1/status. A build streams
