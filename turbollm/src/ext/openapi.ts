@@ -193,7 +193,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     scope: 'chats:read', responseSchema: 'AuditPage', errors: CHAT_ERRORS,
     query: [
       { name: 'limit', type: 'integer', description: 'Page size, a positive integer (larger values are clamped to 200). Default 200.' },
-      { name: 'since', description: 'ISO 8601 date or date-time in extended format, e.g. 2026-10-15, 2026-10-15T10:00:00Z or 2026-10-15T12:00:00.250+02:00 (seconds and fraction optional; a date, or a bare YYYY-MM or YYYY, is midnight UTC; a date-time with neither Z nor an offset is read in the daemon\'s local time zone): only rows at or after that instant. Any other form, the basic format (20261015T100000Z) included, is refused with 400 invalid_input.' },
+      { name: 'since', description: 'ISO 8601 date or date-time in extended format, e.g. 2026-10-15, 2026-10-15T10:00:00Z or 2026-10-15T12:00:00.250+02:00 (seconds and fraction optional; a date, or a bare YYYY-MM or YYYY, is midnight UTC; a date-time with neither Z nor an offset is read in the daemon\'s local time zone): only rows at or after that instant. A + offset may be sent percent-encoded (%2B) or raw: a raw + decodes to a space, and a space in its place is read as +. Any other form, the basic format (20261015T100000Z) included, is refused with 400 invalid_input.' },
       { name: 'before', description: 'The `id` of the oldest row a previous page returned: only rows older than it.' },
     ],
   },

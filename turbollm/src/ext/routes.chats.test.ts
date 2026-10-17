@@ -620,6 +620,40 @@ test('GET /audit refuses a `since` that is not in ISO 8601 extended format', asy
   }
 })
 
+// A query string decodes a raw '+' to a space, so the documented `since=...T12:00:00+02:00`,
+// sent as typed (curl, a hand-built URL), reached the route as '...T12:00:00 02:00' and got 400.
+test('GET /audit reads a `since` offset whose raw + arrived as a space as +HH:mm', async () => {
+  const { app, cleanup } = harness()
+  try {
+    await app.request('/api/ext/v1/chats', json(ACME, { title: 'A', owner: 'u1' }))
+    const raw = async (q: string) => {
+      const res = await app.request(`/api/ext/v1/audit?owner=u1&since=${q}`, { headers: { Authorization: ACME } })
+      return { status: res.status, body: await res.json() as { data?: Array<{ at: string }>; error?: { code: string } } }
+    }
+    const at = (await raw('1970-01-01T00:00:00Z')).body.data![0].at
+    const ms = Date.parse(at)
+    // The row's own instant and one second after it, both written in +01:00 with a raw '+'.
+    const plus1h = (t: number) => new Date(t + 3_600_000).toISOString().replace('Z', '+01:00')
+    const own = await raw(plus1h(ms))
+    assert.equal(own.status, 200, plus1h(ms))
+    assert.equal(own.body.data?.length, 1, 'the row\'s own instant, +01:00 with a raw +')
+    const later = await raw(plus1h(ms + 1000))
+    assert.equal(later.status, 200)
+    assert.equal(later.body.data?.length, 0, 'one second after the row: + read as +, not as -')
+    // Minutes only, and the percent-encoded form, as before.
+    assert.equal((await raw('1970-01-01T01:00+01:00')).status, 200)
+    assert.equal((await raw(encodeURIComponent(plus1h(ms)))).body.data?.length, 1)
+    // A space anywhere else is still refused: in place of T, before Z, a short offset, a date alone.
+    for (const q of ['2026-10-15+10:00:00', '2026-10-15T10:00:00+Z', '2026-10-15T10:00:00+0200', '2026-10-15+02:00', '2026-10-15T10:00:00%20%2002:00']) {
+      const r = await raw(q)
+      assert.equal(r.status, 400, q)
+      assert.equal(r.body.error?.code, 'invalid_input', q)
+    }
+  } finally {
+    cleanup()
+  }
+})
+
 test('a rate-limited mutation (the blanket per-tenant budget) still produces an audit row', async () => {
   const ext: ExtRouteDeps = { idempotency: new IdempotencyStore(), limiter: new TenantLimiter({ maxInFlight: 100, ratePerMinute: 1 }) }
   const { app, db, cleanup } = harness(ext)

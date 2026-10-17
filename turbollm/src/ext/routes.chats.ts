@@ -61,8 +61,11 @@ function hasActiveRun(runs: PublicRunManager | undefined, scope: Scope, chatId: 
 }
 
 /** ISO 8601 extended format: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, and after a full date optionally
- *  `THH:mm[:ss[.fraction]]` with `Z` or `±HH:mm`. `t` and `z` may be lowercase, as RFC 3339 allows. */
-const ISO_8601 = /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?)?)?)?$/i
+ *  `THH:mm[:ss[.fraction]]` with `Z` or `±HH:mm`. `t` and `z` may be lowercase, as RFC 3339 allows.
+ *  The offset's sign may also be a space (group 4): a query string decodes a raw `+` to a space,
+ *  so the documented `since=2026-10-15T12:00:00+02:00`, typed as is into curl or a URL, arrives as
+ *  `...T12:00:00 02:00` and was refused with 400. A space can stand only for that `+` there. */
+const ISO_8601 = /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|([+ -])\d{2}:\d{2})?)?)?)?$/i
 
 /** GET /audit's `since` as epoch ms, or NaN when it is not in the ISO 8601 extended format above.
  *  A bare Date.parse also takes V8's legacy formats: `since=1` or `since=foo 1` read as 2001-01-01
@@ -79,7 +82,8 @@ function parseIsoInstant(v: string): number {
     d.setUTCFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
     if (d.getUTCDate() !== Number(m[3])) return NaN
   }
-  return Date.parse(v.toUpperCase())
+  // The only space the pattern lets through is that offset sign.
+  return Date.parse((m[4] === ' ' ? v.replace(' ', '+') : v).toUpperCase())
 }
 
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
