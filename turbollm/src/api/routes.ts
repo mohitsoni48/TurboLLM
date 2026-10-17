@@ -135,8 +135,15 @@ async function body<T>(c: Context): Promise<T> {
 let zipUploadInFlight = false
 
 /** Whether a manual engine update has been accepted but may not have called provision.start
- *  yet (the update looks up GitHub first). Reserves the engine-work slot across that gap. */
+ *  yet (the update looks up GitHub first). Reserves the engine-work slot across that gap.
+ *  POST /engines/backends/:id/update takes it for its own lookup too (see there). */
 let engineUpdateInFlight = false
+
+/** Whether DELETE /engines/backends/:id is under way. It stops the backend's engine and pool slots before it
+ *  unregisters them and deletes their folders, and a model stop waits seconds for the process to exit: an update of
+ *  the backend, the auto-update scheduler or a download started in that wait registered the deleted backend again once
+ *  it finished. Holds the engine-work slot across the wait, as zipUploadInFlight does for an upload. */
+let backendDeleteInFlight = false
 
 export function registerApi(app: Hono, d: Deps): void {
   // ---- meta ----
@@ -429,10 +436,17 @@ export function registerApi(app: Hono, d: Deps): void {
     // downloading it 404'd while the build the user actually wanted (b10818) was never fetched.
     const installedTag = tagFromManagedBinPath(oldBin)
     let latestTag: string
+    // The lookup holds the engine-work slot (up to 15 s), as POST /engines/:id/update's does: a Delete of this backend
+    // that arrived meanwhile, with no engine to stop, ended before the re-check below, which then passed, and the
+    // update downloaded and registered the backend the user had just deleted. Released before that re-check, which
+    // still catches a job that passed its own check before this one; provision.start then follows with no await.
+    engineUpdateInFlight = true
     try {
       latestTag = await latestTagForInstalled('ggml-org/llama.cpp', installedTag, AbortSignal.timeout(15_000))
     } catch {
       return err(c, 503, 'offline', "Couldn't reach GitHub to check for a newer build. Try again when online.")
+    } finally {
+      engineUpdateInFlight = false
     }
     if (!latestTag) return err(c, 503, 'offline', "GitHub didn't report a latest build. Try again later.")
     // Already on the real latest → honest "already latest" (no download).
@@ -441,8 +455,9 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     const newDef = backendDefAt(def.id as BackendId, latestTag)
     if (!newDef) return err(c, 500, 'internal', 'No upstream build of this backend for your platform.')
-    // The lookup above let another engine job start (a scheduler auto-update, another tab); re-check before taking the
-    // slot, or both would provision the same tag dir and share one progress/Cancel channel.
+    // A job that passed its own check before this one's could still start during the lookup (a scheduler auto-update in
+    // its own lookup); re-check before taking the slot, or both would provision the same tag dir and share one
+    // progress/Cancel channel.
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const ac = new AbortController()
     provisionAbort = ac
@@ -540,18 +555,25 @@ export function registerApi(app: Hono, d: Deps): void {
     // Never under an update or download (see DELETE /engines/:id): an update of this backend would register the build
     // it swaps in again right after the delete.
     { const busy = engineWorkBusy(d, { engineChange: true }); if (busy) return err(c, 409, 'engine_already_running', busy) }
-    const root = join(d.store.dir(), 'engines')
-    // Tag-agnostic: unregister + delete EVERY build of this backend (an update may have left
-    // more than one tag-keyed dir / registry entry). Stop first if the active engine is one of them.
-    // `[^\\/]+` (not `.+`) so the tag can't greedily span path separators into another segment.
-    const backendDirRe = new RegExp(`[\\\\/]engines[\\\\/]llama\\.cpp-[^\\\\/]+-${def.id}[\\\\/]`)
-    const engs = d.registry.list().engines.filter((e) => backendDirRe.test(e.binPath))
-    for (const e of engs) await stopEngineUsers(d, e.id)
-    for (const e of engs) {
-      try { d.registry.remove(e.id) } catch { /* already gone */ }
+    // Taken synchronously after the check and held until the builds are gone: the stops below are awaited, and a job
+    // started meanwhile would otherwise pass its own check (see backendDeleteInFlight).
+    backendDeleteInFlight = true
+    try {
+      const root = join(d.store.dir(), 'engines')
+      // Tag-agnostic: unregister + delete EVERY build of this backend (an update may have left
+      // more than one tag-keyed dir / registry entry). Stop first if the active engine is one of them.
+      // `[^\\/]+` (not `.+`) so the tag can't greedily span path separators into another segment.
+      const backendDirRe = new RegExp(`[\\\\/]engines[\\\\/]llama\\.cpp-[^\\\\/]+-${def.id}[\\\\/]`)
+      const engs = d.registry.list().engines.filter((e) => backendDirRe.test(e.binPath))
+      for (const e of engs) await stopEngineUsers(d, e.id)
+      for (const e of engs) {
+        try { d.registry.remove(e.id) } catch { /* already gone */ }
+      }
+      deleteAllBackendBuilds(root, def.id)
+      return c.json({ ok: true })
+    } finally {
+      backendDeleteInFlight = false
     }
-    deleteAllBackendBuilds(root, def.id)
-    return c.json({ ok: true })
   })
 
   // Provision the MLX engine (macOS-only, ADR-025 Phase 3): uv → venv → mlx-lm,
@@ -3848,6 +3870,7 @@ function localCountFor(d: Deps, repo: string): number {
 export function engineWorkBusy(d: Deps, opts: { engineChange?: boolean } = {}): string | null {
   if (zipUploadInFlight) return 'An engine zip upload is in progress — wait for it to finish.'
   if (engineUpdateInFlight) return 'An engine update is in progress — wait for it to finish.'
+  if (backendDeleteInFlight) return 'An engine is being deleted — wait for it to finish.'
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
   if (d.build.isActive() && (!opts.engineChange || d.build.isEngineBuildActive())) return 'A build is in progress — wait for it to finish.'
   return null

@@ -12,7 +12,7 @@ import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
-import { registerApi } from './routes'
+import { engineWorkBusy, registerApi } from './routes'
 import type { Deps } from '../deps'
 import { availableBackends } from '../engines/download'
 import { BuildState } from '../engines/build-state'
@@ -40,6 +40,8 @@ function harness(busy: 'download' | 'build' | null) {
   const sources: { binPath: string }[] = []
   const forgotten: string[] = []
   const failRemove = { on: false }
+  // The active engine and how long stopping it takes: a model stop waits for the process to exit.
+  const live = { activeId: '', stopping: null as Promise<void> | null, stops: 0 }
   const cfg = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [], links: [], telemetry: { level: 'off', machineId: 'm' },
@@ -52,13 +54,17 @@ function harness(busy: 'download' | 'build' | null) {
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
-    manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), currentOpts: () => null, stopAndWait: async () => {} },
+    manager: {
+      status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => null,
+      stopAndWait: async () => { live.stops++; await live.stopping },
+    },
     provision: { get: () => ({ active: busy === 'download', phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }) },
     build,
     modelRouter: { poolEngineIds: () => new Set<string>(), stopPoolSlotsOnEngine: async () => {} },
     registry: {
-      active: () => undefined,
-      list: () => ({ engines: engines.filter((e) => !removed.includes(e.id)), activeEngineId: '' }),
+      active: () => engines.find((e) => e.id === live.activeId && !removed.includes(e.id)),
+      list: () => ({ engines: engines.filter((e) => !removed.includes(e.id)), activeEngineId: live.activeId }),
       get: (id: string) => engines.find((e) => e.id === id && !removed.includes(id)),
       remove: (id: string) => {
         if (failRemove.on) throw Object.assign(new Error('EPERM: operation not permitted, rename config.json'), { code: 'EPERM' })
@@ -75,7 +81,7 @@ function harness(busy: 'download' | 'build' | null) {
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, cfg, build, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
+  return { app, d, cfg, build, live, removed, added, sources, forgotten, failRemove, dataDir, forkDir, otherForkDir, backendDir, backendId: backend.id }
 }
 
 async function errorCode(res: Response): Promise<string> {
@@ -137,6 +143,77 @@ test('with no engine work running, a re-register, a purge and a backend delete s
   assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
   assert.equal(existsSync(h.backendDir), false)
   assert.deepEqual(h.removed, ['fork', 'be'])
+})
+
+// DELETE /engines/backends/:id stops whatever runs on the backend's builds before it unregisters them and deletes
+// their folders, and a model stop waits seconds for the process to exit. The engine-work slot was checked only before
+// that wait: an update of the backend (it is not refused for a running engine), the auto-update scheduler, a download
+// or an upload could start in it, and an update then registered the deleted backend again once it finished.
+test('DELETE /engines/backends/:id holds the engine-work slot while it stops the engine, so no update starts meanwhile', async (t) => {
+  const h = harness(null)
+  writeFileSync(join(h.backendDir, '.turbollm-provisioned'), '') // a finished install, so its Update is offered
+  h.live.activeId = 'be'
+  let stopped!: () => void
+  h.live.stopping = new Promise<void>((resolve) => { stopped = resolve })
+  // Not reached with the fix; without it the update went on to look up GitHub's latest build.
+  t.mock.method(globalThis, 'fetch', (() => Promise.reject(new Error('offline'))) as typeof fetch)
+  const del = h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })
+  await eventually(() => assert.equal(h.live.stops, 1))
+  assert.equal(engineWorkBusy(h.d), 'An engine is being deleted — wait for it to finish.', 'the scheduler and every engine job see it')
+  const update = await h.app.request(`/api/v1/engines/backends/${h.backendId}/update`, { method: 'POST' })
+  assert.equal(update.status, 409)
+  assert.equal(await errorCode(update), 'engine_already_running')
+  stopped()
+  assert.equal((await del).status, 200)
+  assert.deepEqual(h.removed, ['be'])
+  assert.equal(existsSync(h.backendDir), false)
+  assert.equal(engineWorkBusy(h.d), null, 'the slot is free again')
+})
+
+test('DELETE /engines/backends/:id frees the engine-work slot when stopping the engine fails', async () => {
+  const h = harness(null)
+  h.live.activeId = 'be'
+  h.live.stopping = Promise.reject(new Error('the engine did not exit'))
+  h.live.stopping.catch(() => {})
+  const res = await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })
+  assert.equal(res.status, 500)
+  assert.deepEqual(h.removed, [])
+  assert.equal(existsSync(h.backendDir), true)
+  assert.equal(engineWorkBusy(h.d), null)
+})
+
+// The other order: the backend's Update checked the slot, then looked up GitHub's latest build (up to 15 s) holding
+// nothing. A Delete in that lookup, with no engine to stop, was over before the Update's re-check, so the Update went
+// on to download and register the backend the user had just deleted.
+test('DELETE /engines/backends/:id is refused while the backend\'s Update looks up its latest build', async (t) => {
+  const h = harness(null)
+  writeFileSync(join(h.backendDir, '.turbollm-provisioned'), '') // a finished install, so its Update is offered
+  let answer!: (res: Response) => void
+  const lookups: string[] = []
+  t.mock.method(globalThis, 'fetch', ((url: string | URL | Request) => {
+    lookups.push(String(url))
+    return new Promise<Response>((resolve) => { answer = resolve })
+  }) as typeof fetch)
+  const update = h.app.request(`/api/v1/engines/backends/${h.backendId}/update`, { method: 'POST' })
+  await eventually(() => assert.equal(lookups.length, 1))
+  const del = await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })
+  assert.equal(del.status, 409)
+  assert.equal(await errorCode(del), 'engine_already_running')
+  assert.deepEqual(h.removed, [])
+  assert.equal(existsSync(h.backendDir), true)
+  answer(new Response(JSON.stringify([{ tag_name: 'b1' }]))) // already the latest: the Update ends here
+  const done = await update
+  assert.equal(done.status, 200)
+  assert.equal(((await done.json()) as { alreadyLatest?: boolean }).alreadyLatest, true)
+  assert.equal(engineWorkBusy(h.d), null, 'the lookup frees the slot')
+
+  // A failed lookup frees it too, and the Delete then goes through.
+  t.mock.method(globalThis, 'fetch', (() => Promise.reject(new Error('offline'))) as typeof fetch)
+  assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}/update`, { method: 'POST' })).status, 503)
+  assert.equal(engineWorkBusy(h.d), null)
+  assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
+  assert.deepEqual(h.removed, ['be'])
+  assert.equal(existsSync(h.backendDir), false)
 })
 
 // The Windows CUDA Toolkit download (POST /build/cuda) and a build guide prerequisite install (POST

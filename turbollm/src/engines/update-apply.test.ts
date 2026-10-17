@@ -183,6 +183,27 @@ test('an auto-update with the engine-work slot taken starts nothing, whatever th
   assert.deepEqual(fetched, [], 'not even the GitHub lookup runs')
 })
 
+// The scheduler lists its engines, then checks each one's status on GitHub holding no slot: a Delete, Disable or Purge
+// in that check left nothing for workBusy, and the update then downloaded and registered again the engine just removed.
+test('an auto-update of an engine removed after the scheduler listed it starts nothing', async (t) => {
+  const fetched: string[] = []
+  stubFetch(t, (url) => { fetched.push(url); return new Response(null, { status: 500 }) })
+  const cases: Array<[string, (root: string) => Engine]> = [
+    ['llama.cpp', (root) => engine({ id: 'llama', binPath: join(root, 'llama.cpp-b100-cpu', 'llama-server') })],
+    ['turboquant', (root) => engine({ id: 'turboquant', binPath: join(root, 'turboquant', 'llama-server') })],
+    ['koboldcpp', (root) => engine({ id: 'koboldcpp', kind: 'koboldcpp', binPath: koboldcppBinPath(root), version: 'v1.0.0' })],
+    ['llamafile', (root) => engine({ id: 'llamafile', kind: 'llamafile', binPath: llamafileBinPath(root), version: '0.9.0' })],
+  ]
+  for (const [id, make] of cases) {
+    const { d, root } = setup(() => []) // the scheduler's copy of the engine is all that is left of it
+    const starts: string[] = []
+    d.provision = { start: (b: string) => { starts.push(b) }, progress() {}, done() {}, fail() {} } as unknown as UpdateApplyDeps['provision']
+    await assert.doesNotReject(applyEngineUpdate({ ...d, workBusy: () => null }, make(root)), id)
+    assert.deepEqual(starts, [], id)
+  }
+  assert.deepEqual(fetched, [], 'not even the GitHub lookup runs')
+})
+
 test('a llama.cpp auto-update whose GitHub lookup let another engine job take the slot starts nothing', { skip: posixOnly }, async (t) => {
   const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
   let busy: string | null = null
@@ -195,6 +216,22 @@ test('a llama.cpp auto-update whose GitHub lookup let another engine job take th
   await applyEngineUpdate({ ...d, workBusy: () => busy }, oldEngine)
   assert.deepEqual(starts, [])
   assert.ok(d.registry.get('old'), 'the installed build is untouched')
+})
+
+// The scheduler holds no slot during its lookup, and a backend Delete with no engine to stop is over within it: it
+// left nothing for workBusy to see, and the update then downloaded and registered the backend the user had deleted.
+test('a llama.cpp auto-update whose GitHub lookup saw the backend deleted registers nothing', { skip: posixOnly }, async (t) => {
+  const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  stubFetch(t, () => {
+    d.registry.remove('old') // DELETE /engines/backends/:id meanwhile
+    fs.rmSync(dirname(oldEngine.binPath), { recursive: true, force: true })
+    return new Response(JSON.stringify([{ tag_name: 'b200' }, { tag_name: 'b100' }]))
+  })
+  const starts: string[] = []
+  d.provision = { start: (b: string) => { starts.push(b) }, progress() {}, done() {}, fail() {} } as unknown as UpdateApplyDeps['provision']
+  await applyEngineUpdate({ ...d, workBusy: () => null }, oldEngine)
+  assert.deepEqual(starts, [])
+  assert.deepEqual(d.registry.list().engines.map((e) => e.id), ['cuda'], 'the deleted backend is not registered again')
 })
 
 const ALL_KOBOLD_ASSETS = ['koboldcpp.exe', 'koboldcpp-nocuda.exe', 'koboldcpp-linux-x64', 'koboldcpp-linux-x64-nocuda', 'koboldcpp-mac-arm64']
@@ -342,7 +379,7 @@ test('a cancelled KoboldCpp, llamafile or TurboQuant update ends in done() with 
 })
 
 test('a custom llama-server with no release provenance has no automatic update source', async () => {
-  const deps = { store: { dir: () => 'unused' } } as unknown as UpdateApplyDeps
   const custom = { id: 'c1', name: 'Custom', kind: 'llama-server', binPath: '/opt/custom/llama-server' } as Engine
+  const deps = { store: { dir: () => 'unused' }, registry: { get: () => custom } } as unknown as UpdateApplyDeps
   await assert.rejects(applyEngineUpdate(deps, custom), /no automatic update source/)
 })

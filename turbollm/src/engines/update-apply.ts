@@ -74,6 +74,10 @@ export async function applyEngineUpdate(d: UpdateApplyDeps, engine: Engine, sign
   // Another engine job (a download, build, zip upload or manual update) owns the slot: starting would take over its
   // progress and Cancel, and could write the same build folder. The next scheduler pass retries.
   if (d.workBusy?.()) return
+  // Nor once the engine has left the registry: the scheduler lists its engines, then checks each one's status on
+  // GitHub holding no slot, so a Delete, Disable or Purge in that check left no trace for workBusy, and the update then
+  // downloaded and registered again the engine the user had just removed (and put its folder back).
+  if (!d.registry.get(engine.id)) return
   const root = join(d.store.dir(), 'engines')
   if (engine.release) return applyReleaseUpdate(d, engine, engine.release, root, signal)
   if (engine.kind === 'mlx') return applyPipUpdate(d, 'mlx', engine, root)
@@ -100,6 +104,9 @@ async function applyReleaseUpdate(
   const newer = await newestMatchingRelease(installed, signal, d.fetchImpl)
   if (!newer || newer.tag === installed.tag) return
   if (d.workBusy?.()) return // the listing await let another engine job take the slot; the next tick retries
+  // Nor once the listing (which holds no slot either) saw the engine purged: the update then installed into the slug
+  // just purged, bringing its folder back, and failed its registry refresh as "your existing build is unchanged".
+  if (!d.registry.get(engine.id)) return
 
   d.provision.start('github-release', d.trigger ?? 'auto_update')
   try {
@@ -189,6 +196,10 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
   const newDef = backendDefAt(backendId, latestTag)
   if (!newDef) throw new Error('No upstream build of this backend for your platform.')
   if (d.workBusy?.()) return // the lookup await let another engine job take the slot; the next pass retries
+  // Nor once this build has left the registry: the scheduler holds no slot during the lookup, so a Delete (or a
+  // Disable) of the backend that came and went meanwhile left no trace for workBusy, and the update then downloaded and
+  // registered the backend the user had just deleted.
+  if (!d.registry.get(engine.id)) return
 
   d.provision.start(backendId, d.trigger ?? 'auto_update')
   try {

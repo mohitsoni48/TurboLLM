@@ -2,7 +2,7 @@
 // installed into the same slug, keeps the engine's id, and leaves the old build alone on failure.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { buildZipArchive } from '../test-support/zip-archive'
@@ -59,10 +59,12 @@ function harness(opts: { activeId?: string; servingId?: string; probe?: () => Pr
   const calls: string[] = []
   const refreshed: { id: string; binPath?: string }[] = []
   const releases: { id: string; tag: string }[] = []
+  let removed = false
   const deps: UpdateApplyDeps = {
     store: { dir: () => dataDir } as unknown as UpdateApplyDeps['store'],
     registry: {
       active: () => (opts.activeId ? { id: opts.activeId } : undefined),
+      get: (id: string) => (!removed && id === engine.id ? engine : undefined),
       list: () => ({ engines: [engine], activeEngineId: opts.activeId ?? '' }),
       refresh: (id: string, _pr: ProbeResult, binPath?: string) => { refreshed.push({ id, binPath }); return engine },
       setRelease: (id: string, p: ReleaseProvenance) => { releases.push({ id, tag: p.tag }); return engine },
@@ -81,7 +83,7 @@ function harness(opts: { activeId?: string; servingId?: string; probe?: () => Pr
     } as unknown as UpdateApplyDeps['provision'],
     probeFn: opts.probe ?? (async () => PROBE_OK),
   }
-  return { deps, engine, slugDir, calls, refreshed, releases, startEngine: () => { managerState = 'running' } }
+  return { deps, engine, slugDir, calls, refreshed, releases, startEngine: () => { managerState = 'running' }, remove: () => { removed = true } }
 }
 
 const NEWER = release('b2', '2026-09-10T00:00:00Z')
@@ -154,6 +156,25 @@ test('a job that takes the slot during the release listing makes the update back
   assert.deepEqual(h.calls, [])
   assert.deepEqual(h.refreshed, [])
   assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
+})
+
+// The listing holds no slot, and DELETE /engines/:id?purge=1 is over within it, so workBusy saw nothing: the update
+// installed into the slug just purged, bringing its folder back, then failed its registry refresh.
+test('a purge of the engine during the release listing makes the update back off before its own job', async () => {
+  const h = harness()
+  const gh = fakeGithub([NEWER])
+  const listing = (async (input: string | URL | Request, init?: RequestInit) => {
+    const res = await gh.fetchImpl(input, init)
+    if (String(input).includes('/releases?')) { // purged while GitHub answered
+      h.remove()
+      rmSync(h.slugDir, { recursive: true, force: true })
+    }
+    return res
+  }) as typeof fetch
+  await applyEngineUpdate({ ...h.deps, fetchImpl: listing, workBusy: () => null }, h.engine)
+  assert.deepEqual(h.calls, [])
+  assert.deepEqual(h.refreshed, [])
+  assert.equal(existsSync(h.slugDir), false, 'the purged folder is not brought back')
 })
 
 test('workBusy returning null lets the update proceed', async () => {
