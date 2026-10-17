@@ -7,6 +7,7 @@ import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
+import { hashKey } from '../auth'
 import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
@@ -509,7 +510,9 @@ test('POST /api/v1/comfyui/release answers once loads are unblocked, before the 
 // The gate node is installed with TurboLLM's URL baked in, and the ComfyUI process on this machine calls it. The URL was
 // built from the request's Host: installed through remote access (Tailscale Serve, a tunnel) that is the proxy's origin,
 // so the node posted to 127.0.0.1:80 (or :443); on a single-address bind (`--addr 192.168.1.10:…`, daemon.host) it
-// posted to 127.0.0.1, where nothing listens.
+// posted to 127.0.0.1, where nothing listens. Each request presents a stored key: install needs one from a caller that
+// is not the host, as it is on a single-address bind (same-machine connections to it count as remote) or a LAN peer.
+const COMFY_KEY = 'tllm-comfyinstallcomfyinstallcomfyinstall01'
 for (const [label, bind, requestUrl, base] of [
   ['through remote access, the port really bound', { bindHost: '127.0.0.1', bindPort: 6996 }, 'https://box.tailnet.ts.net/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
   ['on a single-address bind, that address', { bindHost: '192.168.1.10', bindPort: 7000 }, 'http://192.168.1.10:7000/api/v1/comfyui/install', 'http://192.168.1.10:7000'],
@@ -520,7 +523,11 @@ for (const [label, bind, requestUrl, base] of [
   test(`POST /api/v1/comfyui/install bakes in the daemon's own address, not the request's Host: ${label}`, async () => {
     const comfyDir = tmpDir('tllm-comfy-install-')
     mkdirSync(join(comfyDir, 'custom_nodes'))
-    const cfg = { daemon: { port: 6996 }, comfyui: { gatePath: '' } }
+    const cfg = {
+      daemon: { port: 6996 },
+      comfyui: { gatePath: '' },
+      apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(COMFY_KEY), prefix: COMFY_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }],
+    }
     const app = new Hono()
     registerApi(app, {
       store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
@@ -529,7 +536,7 @@ for (const [label, bind, requestUrl, base] of [
 
     const res = await app.request(requestUrl, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': COMFY_KEY },
       body: JSON.stringify({ path: comfyDir }),
     })
 

@@ -2305,7 +2305,17 @@ export function registerApi(app: Hono, d: Deps): void {
   // ComfyUI custom_nodes dir, with TurboLLM's own URL baked in. `path` is the ComfyUI
   // folder (or its custom_nodes dir). The URL is the address and port the listener is
   // really bound to (see below), so it's correct even when started with --port.
+  //
+  // Install and uninstall are host-side changes held to isLocalOrAuthenticated, like MCP servers and
+  // builds: install writes the node's __init__.py into any custom_nodes folder the caller names
+  // (replacing one there) and records that folder as gatePath, and uninstall deletes gatePath
+  // recursively, so a keyless Serve identity, Access JWT or open-LAN peer could remove the owner's
+  // working gate (renders then run with the LLM still in VRAM) or delete a folder it pointed gatePath
+  // at. api_key_required: the web client opens its key prompt on it. /comfyui/acquire and /release
+  // stay open: the gate node calls them with no key.
   app.post('/api/v1/comfyui/install', async (c) => {
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', 'Installing the ComfyUI gate node requires a valid API key.')
     const b = await body<{ path?: string }>(c)
     const raw = (b.path ?? '').trim()
     if (!raw) return err(c, 400, 'invalid_config_value', 'Enter the path to your ComfyUI folder.')
@@ -2347,6 +2357,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Remove the installed gate node and forget its path.
   app.post('/api/v1/comfyui/uninstall', (c) => {
+    if (!isLocalOrAuthenticated(c, d))
+      return err(c, 403, 'api_key_required', 'Removing the ComfyUI gate node requires a valid API key.')
     const dir = d.store.snapshot().comfyui.gatePath
     if (dir && existsSync(dir)) {
       try {

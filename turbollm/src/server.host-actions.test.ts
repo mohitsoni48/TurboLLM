@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createSign, generateKeyPairSync, randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createApp } from './server'
 import { hashKey, provisionRemoteApiKey } from './auth'
@@ -630,5 +630,96 @@ test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot
     await assertAllowed((p) => createApp(d).request(p, { method: 'DELETE', headers: { Host: '127.0.0.1:6996' } }, {
       incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
     } as never), h)
+  }
+})
+
+// POST /api/v1/comfyui/install writes the gate node into a custom_nodes folder the caller names and
+// records it as gatePath; POST /comfyui/uninstall deletes gatePath recursively. Refused to the same
+// callers, with api_key_required, so none of them can replace another folder's __init__.py, repoint
+// gatePath, or delete the owner's working gate. A remote token was already refused (no capability
+// maps /comfyui).
+function withComfy(cfg: Config): { ownerGate: string; other: string } {
+  const owner = tmpDir('host-actions-comfy-owner-')
+  const ownerGate = join(owner, 'custom_nodes', 'turbollm_gate')
+  mkdirSync(ownerGate, { recursive: true })
+  writeFileSync(join(ownerGate, '__init__.py'), 'owner gate')
+  cfg.comfyui.gatePath = ownerGate
+  const other = join(tmpDir('host-actions-comfy-other-'), 'custom_nodes')
+  mkdirSync(join(other, 'turbollm_gate'), { recursive: true })
+  writeFileSync(join(other, 'turbollm_gate', '__init__.py'), 'foreign node')
+  return { ownerGate, other }
+}
+
+test('a keyless Serve identity, Access JWT, open-LAN peer or remote token cannot install or remove the ComfyUI gate node; with a key it can', async () => {
+  const assertRefused = async (send: (path: string, body: unknown) => Response | Promise<Response>, cfg: Config, h: ReturnType<typeof withComfy>) => {
+    for (const [path, body] of [['/api/v1/comfyui/install', { path: h.other }], ['/api/v1/comfyui/uninstall', {}]] as const) {
+      const res = await send(path, body)
+      assert.equal(res.status, 403, path)
+      assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'api_key_required', path)
+    }
+    assert.equal(cfg.comfyui.gatePath, h.ownerGate, 'gatePath is unchanged')
+    assert.equal(readFileSync(join(h.ownerGate, '__init__.py'), 'utf8'), 'owner gate', "the owner's gate is kept")
+    assert.equal(readFileSync(join(h.other, 'turbollm_gate', '__init__.py'), 'utf8'), 'foreign node', 'nothing is written')
+  }
+  const assertAllowed = async (send: (path: string, body: unknown) => Response | Promise<Response>, cfg: Config, h: ReturnType<typeof withComfy>) => {
+    assert.equal((await send('/api/v1/comfyui/install', { path: h.other })).status, 200)
+    assert.equal(cfg.comfyui.gatePath, join(h.other, 'turbollm_gate'))
+    assert.match(readFileSync(join(h.other, 'turbollm_gate', '__init__.py'), 'utf8'), /^TURBOLLM_URL = /m)
+    assert.equal((await send('/api/v1/comfyui/uninstall', {})).status, 200)
+    assert.equal(cfg.comfyui.gatePath, '')
+    assert.equal(existsSync(join(h.other, 'turbollm_gate')), false)
+  }
+  // Tailscale Serve, no key.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'tailscale-serve' })
+    const h = withComfy(cfg)
+    const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'bob@example.com' }
+    await assertRefused((p, b) => tunneled(d, p, serve, b), cfg, h)
+    await assertAllowed((p, b) => tunneled(d, p, { ...serve, 'X-TurboLLM-Auth': RAW_KEY }, b), cfg, h)
+  }
+  // A verified Cloudflare Access JWT, no key.
+  {
+    const teamDomain = 'https://host-actions-comfy.cloudflareaccess.com'
+    const real = globalThis.fetch
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) =>
+      String(input) === `${teamDomain}/cdn-cgi/access/certs` ? new Response(JWKS, { status: 200 }) : real(input, init)) as typeof fetch
+    try {
+      const { d, cfg } = mkDeps((c) => {
+        c.remoteAccess.provider = 'cloudflare-named'
+        c.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        c.remoteAccess.cloudflare.accessAud = 'aud-host-actions'
+      })
+      const h = withComfy(cfg)
+      await assertRefused((p, b) => tunneled(d, p, { Host: 'llm.example.com', 'Cf-Access-Jwt-Assertion': accessJwt(teamDomain, 'aud-host-actions') }, b), cfg, h)
+    } finally {
+      globalThis.fetch = real
+    }
+  }
+  // An open LAN (requireApiKey off), no key; with a key it may.
+  {
+    const { d, cfg } = mkDeps((c) => { c.daemon.lanBind = true; c.daemon.requireApiKey = false })
+    const h = withComfy(cfg)
+    await assertRefused((p, b) => fromLan(d, p, {}, b), cfg, h)
+    await assertAllowed((p, b) => fromLan(d, p, { 'X-TurboLLM-Auth': RAW_KEY }, b), cfg, h)
+  }
+  // A remote-access token, whatever it may otherwise do: refused before the route.
+  {
+    const { d, cfg } = mkDeps((c) => { c.remoteAccess.provider = 'cloudflare-quick' })
+    const h = withComfy(cfg)
+    const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load', 'config:write', 'downloads:write'] }) }
+    assert.equal((await tunneled(d, '/api/v1/comfyui/install', token, { path: h.other })).status, 403)
+    assert.equal((await tunneled(d, '/api/v1/comfyui/uninstall', token, {})).status, 403)
+    assert.equal(cfg.comfyui.gatePath, h.ownerGate)
+    assert.ok(existsSync(h.ownerGate))
+  }
+  // The host itself, unchanged.
+  {
+    const { d, cfg } = mkDeps()
+    const h = withComfy(cfg)
+    await assertAllowed((p, b) => createApp(d).request(p, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Host: '127.0.0.1:6996' },
+      body: JSON.stringify(b),
+    }, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never), cfg, h)
   }
 })
