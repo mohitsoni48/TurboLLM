@@ -435,6 +435,31 @@ function cliSandbox({ version, phases, notes = {}, rules = [] }) {
 
 const BEFORE_PUBLISH = ['preflight', 'review', 'prepare', 'verify', 'merge'];
 
+// The merge commit's sha came from `gh pr view` with its exit code unread: a failing gh (a lost login,
+// a network error) gave no sha, which read as "no post-merge run to find". The phase warned, skipped
+// the CI check on main and recorded the merge ok, and publish could then tag a red main.
+test('merge stops when gh pr view fails instead of skipping the post-merge CI check', POSIX_ONLY, () => {
+  const s = cliSandbox({
+    version: '1.0.1',
+    phases: ['preflight', 'review', 'prepare', 'verify'],
+    notes: { reviewVerdict: 'approve', pr: 7 },
+    rules: [{ when: 'pr view 7 --json mergeCommit', code: 1, out: 'HTTP 401: Bad credentials (https://api.github.com/graphql)' }],
+  });
+  try {
+    const r = s.release(['merge', '--approved']);
+
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /`gh pr view 7 --json mergeCommit` failed \(exit 1\)/);
+    assert.match(r.out, /Bad credentials/);
+    assert.match(r.out, /The PR is merged/);
+    assert.doesNotMatch(r.out, /could not find the post-merge main run/);
+    assert.equal(JSON.parse(readFileSync(join(s.work, '.omc', 'release', '1.0.1.json'), 'utf8')).phases.merge.status, 'failed');
+    assert.deepEqual(s.calls().filter((c) => c.startsWith('gh run list')), []);
+  } finally {
+    cleanup(s.root);
+  }
+});
+
 // The gate used to sit at the npm step, after the tag, the push and `gh release create`, and creating
 // the release is itself what fires npm-publish.yml.
 test('publish without --approved stops before the tag, the push and the GitHub Release', POSIX_ONLY, () => {

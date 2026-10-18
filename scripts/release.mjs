@@ -705,8 +705,18 @@ async function phaseMerge(state, flags) {
   step('polling the post-merge main run…');
   // The ci.yml run for THIS merge commit. The newest main run right after merging is usually the
   // previous one (GitHub creates the push run a few seconds later) or a scheduled runpod-image.yml
-  // run, and a stale green run would wave a red main through.
-  const mergeSha = gh('pr', 'view', String(pr), '--json', 'mergeCommit', '-q', '.mergeCommit.oid').stdout;
+  // run, and a stale green run would wave a red main through. A gh that fails here is not "no run to
+  // find": read as one, a lost login or a network error skipped the CI check on main and recorded
+  // the merge ok, so it stops the phase as a failing `gh run list` does in waitForCommitRun.
+  const prView = gh('pr', 'view', String(pr), '--json', 'mergeCommit', '-q', '.mergeCommit.oid');
+  if (prView.code !== 0) {
+    fail(
+      `\`gh pr view ${pr} --json mergeCommit\` failed (exit ${prView.code}), so the post-merge run on main cannot be checked.\n`
+      + 'The PR is merged; do not tag or publish until that run is green. Fix gh (`gh auth status`), then re-run this phase.\n'
+      + tailOf(prView.out, 20),
+    );
+  }
+  const mergeSha = prView.stdout;
   const runId = /^[0-9a-f]{40}$/i.test(mergeSha) ? await waitForCommitRun('ci.yml', mergeSha, 5 * 60_000) : null;
   if (runId == null) {
     warnLine('could not find the post-merge main run — check it by hand before publishing');
