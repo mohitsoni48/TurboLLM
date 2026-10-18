@@ -17,7 +17,8 @@ import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { transformSync } from 'esbuild'
 import { serve } from '@hono/node-server'
-import { claimDataDir, findRunningDaemon, readPidfile, releaseDataDirClaim, writePidfile } from './daemon-pid'
+import { claimDataDir, daemonReachHost, findRunningDaemon, readPidfile, releaseDataDirClaim, writePidfile } from './daemon-pid'
+import { parseListenAddr } from './net'
 import { tmpDir } from './test-support/tmp'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -75,6 +76,8 @@ function bootDaemon(config: Config, args: string[], overrides: Record<string, un
       return i >= 0 && i + 1 < args.length ? args[i + 1] : fallback
     },
     hasFlag: (...names: string[]) => names.some((n) => args.includes(n)),
+    parseListenAddr,
+    daemonReachHost,
     provisionBootstrapApiKey: () => null,
     getAdvertisedHost: () => null,
     spawn: () => { throw new Error('no browser in a test') },
@@ -437,6 +440,80 @@ test("a rebind during the boot's wait for the Tailscale reconcile keeps its clai
     assert.equal(midRebind, `starting:${process.pid}`, "the boot callback gave up the rebind's claim")
     assert.equal(readPidfile(dir)?.port, q)
     assert.equal(await secondStartOn(dir), 'running')
+  } finally {
+    await d.stop()
+  }
+})
+
+// `--addr [::1]:6996` handed serve() the hostname '[::1]', which no lookup resolves, so the daemon
+// failed to bind and exited; `--addr ::1:6996` bound, but the banner, the browser and the
+// `listening on` line got http://::1:6996, which no browser or log parser reads as a URL. serve()
+// is a stand-in here (this machine may have no IPv6): it records the hostname and "binds" it.
+test('an IPv6 --addr binds the bare address and prints its URLs bracketed', async () => {
+  for (const [addr, bound, url] of [
+    ['[::1]:7123', '::1', 'http://[::1]:7123'],
+    ['::1:7123', '::1', 'http://[::1]:7123'],
+    ['::1', '::1', 'http://[::1]:6996'],
+    ['[::1]', '::1', 'http://[::1]:6996'],
+    ['[::]:7123', '::', 'http://127.0.0.1:7123'], // every interface: the UI is opened on loopback
+  ] as const) {
+    const binds: { hostname: string; port: number }[] = []
+    const fakeServe = (opts: { hostname: string; port: number }, onListen: (info: AddressInfo) => void) => {
+      binds.push({ hostname: opts.hostname, port: opts.port })
+      setImmediate(() => onListen({ address: opts.hostname, family: 'IPv6', port: opts.port }))
+      return { on: () => {}, close: (cb?: () => void) => cb?.(), address: () => ({ address: opts.hostname, port: opts.port }) }
+    }
+    const d = bootDaemon(config({}), ['--addr', addr], { serve: fakeServe })
+    try {
+      await until(`${addr}: the boot listener is up`, () => listening(d) === 1)
+      assert.deepEqual(binds, [{ hostname: bound, port: Number(url.slice(url.lastIndexOf(':') + 1)) }], addr)
+      assert.equal(d.deps.bindHost, bound, `${addr}: the auth gates see the bare address`)
+      assert.deepEqual(d.exits, [], addr)
+      assert.ok(d.logs.includes(`  Local:   ${url}`), `${addr}: ${d.logs.join('\n')}`)
+      assert.ok(d.logs.includes(`  API:     ${url}/api/v1/status`), addr)
+      const shown = bound.includes(':') ? `[${bound}]` : bound
+      assert.ok(d.logs.includes(`TurboLLM test listening on http://${shown}:${binds[0].port}`), `${addr}: ${d.logs.join('\n')}`)
+    } finally {
+      await d.stop()
+    }
+  }
+})
+
+// The boot reads daemon.host through parseListenAddr, so `[::1]` there bound ::1, but a rebind
+// back to the configured host (LAN turned off) handed serve() '[::1]', which no lookup resolves,
+// and reverted to every interface. A failed bind's line printed the IPv6 address unbracketed.
+test('a rebind binds a bracketed daemon.host bare, and a failed bind names an IPv6 address bracketed', async () => {
+  const binds: string[] = []
+  const fakeServe = (opts: { hostname: string; port: number }, onListen: (info: AddressInfo) => void) => {
+    binds.push(`${opts.hostname} ${opts.port}`)
+    const fails = opts.port === 7124
+    if (!fails) setImmediate(() => onListen({ address: opts.hostname, family: 'IPv6', port: opts.port }))
+    return {
+      on: (ev: string, cb: (e: NodeJS.ErrnoException) => void) => {
+        if (ev === 'error' && fails) setImmediate(() => cb(Object.assign(new Error('bind EADDRNOTAVAIL'), { code: 'EADDRNOTAVAIL' })))
+      },
+      close: (cb?: () => void) => cb?.(),
+      address: () => ({ address: opts.hostname, port: opts.port }),
+    }
+  }
+  const d = bootDaemon(config({ host: '[::1]', port: 7123 }), [], { serve: fakeServe })
+  try {
+    await until('the boot listener is up', () => listening(d) === 1)
+    d.config.daemon.lanBind = true
+    d.deps.rebind!()
+    await until('the LAN-on rebind is up', () => listening(d) === 2)
+    d.config.daemon.lanBind = false
+    d.deps.rebind!()
+    await until('the LAN-off rebind is up', () => listening(d) === 3)
+    assert.deepEqual(binds, ['::1 7123', '0.0.0.0 7123', '::1 7123'])
+    assert.equal(d.deps.bindHost, '::1')
+
+    d.config.daemon.port = 7124
+    d.deps.rebind!()
+    await until('the revert is up', () => listening(d) === 4)
+    assert.deepEqual(binds.slice(3), ['::1 7124', '::1 7123'])
+    assert.ok(d.logs.includes('ERR Could not bind [::1]:7124 (bind EADDRNOTAVAIL); reverting to [::1]:7123.'), d.logs.join('\n'))
+    assert.deepEqual(d.exits, [])
   } finally {
     await d.stop()
   }

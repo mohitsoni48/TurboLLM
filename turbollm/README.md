@@ -641,7 +641,7 @@ turbollm launch opencode        # wire opencode (or kilo / openclaw) to TurboLLM
 | Flag | Description |
 |------|-------------|
 | `--port <n>` | Listen on a specific port (default: `6996`) |
-| `--addr <host:port>` | Full host:port override, e.g. `0.0.0.0:6996` for LAN sharing |
+| `--addr <host:port>` | Full host:port override, e.g. `0.0.0.0:6996` for LAN sharing; an IPv6 address bracketed, `[::1]:6996` |
 | `--no-open` | Start without opening a browser window |
 | `--config <file>` | Path to a custom config file |
 | `--stop` | Stop a running TurboLLM daemon (reads `~/.turbollm/daemon.pid`) and exit |

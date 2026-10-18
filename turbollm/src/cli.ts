@@ -64,7 +64,7 @@ import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from '.
 import { registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
 import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
-import { getAdvertisedHost } from './net'
+import { getAdvertisedHost, parseListenAddr } from './net'
 import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
 import { reconcileTailscale } from './remote/providers/tailscale'
 import { RemoteAccessManager } from './remote/manager'
@@ -255,7 +255,7 @@ if (hasFlag('--help', '-h')) {
     `                                   { "command": "npx", "args": ["turbollm", "mcp-server"] }\n\n` +
     `Options:\n` +
     `  --port <n>     Port to listen on / connect to (default: 6996)\n` +
-    `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996)\n` +
+    `  --addr <h:p>   Full host:port override (e.g. 0.0.0.0:6996, [::1]:6996)\n` +
     `                 Binding a non-loopback address turns on API-key enforcement;\n` +
     `                 if no key exists yet, one is generated and printed on startup.\n` +
     `  --no-open      Do not open a browser window on startup\n` +
@@ -422,7 +422,7 @@ try {
 const bootIngressPort = (() => {
   const portFlag = argValue('--port', '')
   const addr = portFlag ? `:${portFlag}` : argValue('--addr', `:${store.snapshot().daemon.port}`)
-  return resolveIngressPort(store.snapshot().remoteAccess.ingressPort, Number(addr.slice(addr.lastIndexOf(':') + 1)) || 6996)
+  return resolveIngressPort(store.snapshot().remoteAccess.ingressPort, parseListenAddr(addr).port)
 })()
 const reconcileTailscalePromise = reconcileTailscale(bootIngressPort).then((acted) => {
   if (acted) console.log('reset a Tailscale serve/funnel left over from a previous run')
@@ -1040,10 +1040,12 @@ if (portFlag) {
 } else {
   addr = argValue('--addr', `${defaultHost}:${cfg.daemon.port}`)
 }
-const lastColon = addr.lastIndexOf(':')
+// The host bare, as serve() binds it; an IPv6 literal is bracketed only where it goes into a URL
+// (listen(), parseListenAddr).
+const listenAddr = parseListenAddr(addr)
 // Mutable so an in-place LAN/port rebind can re-point the listener without a full restart.
-let host = addr.slice(0, lastColon) || '127.0.0.1'
-let port = Number(addr.slice(lastColon + 1)) || 6996
+let host = listenAddr.host
+let port = listenAddr.port
 
 // Headless bootstrap key: on a non-loopback bind with requireApiKey on and no key ever
 // minted, mint exactly one now so a remote/headless operator (a Docker container, where
@@ -1122,6 +1124,8 @@ let appliedLanBind = cfg.daemon.lanBind
 let appliedCfgHost = cfg.daemon.host
 // The boot-time remote-access start is one-shot (see the listen callback).
 let bootRemoteStarted = false
+/** `host:port` for a log line, an IPv6 host bracketed as in the "listening on" URL. */
+const hostPort = (h: string, p: number): string => `${h.includes(':') ? `[${h}]` : h}:${p}`
 function listen(attempt = 0): void {
   const tried = `${host}:${port}` // see the bind retry below
   const s = serve({ fetch: app.fetch, hostname: host, port }, async (info) => {
@@ -1133,8 +1137,9 @@ function listen(attempt = 0): void {
     // A terminal WebSocket from another machine outlives the listener it came in on: after LAN
     // access is turned off, drop it once this bind is no longer LAN-exposed (see the function).
     dropStaleTerminalSockets(deps)
-    const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host
-    const uiUrl = `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${info.port}`
+    // An IPv6 host bracketed, as a URL needs it: `--addr ::1:6996` printed http://::1:6996.
+    const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host.includes(':') ? `[${host}]` : host
+    const uiUrl = `http://${daemonReachHost(host)}:${info.port}` // loopback for 0.0.0.0 and ::
 
     // A revert (the rebind's new address failed) is still an in-place rebind, not a boot:
     // re-running the banner would open another browser tab and, with --print-token, mint a key.
@@ -1261,14 +1266,14 @@ function listen(attempt = 0): void {
         setTimeout(() => listen(`${host}:${port}` === tried ? attempt + 1 : 0), 500)
       } else if (rebinding) {
         // A rebind couldn't bind the new address — revert so the daemon stays reachable.
-        console.error(`Could not bind ${host}:${port} (${e?.message ?? e}); reverting to ${prevHost}:${prevPort}.`)
+        console.error(`Could not bind ${hostPort(host, port)} (${e?.message ?? e}); reverting to ${hostPort(prevHost, prevPort)}.`)
         rebinding = false
         reverting = true
         host = prevHost
         port = prevPort
         listen()
       } else {
-        console.error(`Could not bind ${host}:${port}: ${e?.message ?? e}`)
+        console.error(`Could not bind ${hostPort(host, port)}: ${e?.message ?? e}`)
         process.exit(1)
       }
     },
@@ -1285,7 +1290,10 @@ listen()
 deps.rebind = () => {
   const c = store.snapshot()
   const hostChanged = c.daemon.lanBind !== appliedLanBind || c.daemon.host !== appliedCfgHost // see appliedCfgHost
-  const want = hostChanged ? (c.daemon.lanBind ? '0.0.0.0' : (c.daemon.host || '127.0.0.1')) : host
+  // The configured host read as the boot reads it (parseListenAddr): a daemon.host of `[::1]`
+  // bound ::1 at boot, but went to serve() as '[::1]' here, which no lookup resolves.
+  const cfgHost = parseListenAddr(`${c.daemon.host || '127.0.0.1'}:${c.daemon.port}`).host
+  const want = hostChanged ? (c.daemon.lanBind ? '0.0.0.0' : cfgHost) : host
   const wantPort = c.daemon.port !== appliedCfgPort ? c.daemon.port : port // see appliedCfgPort
   appliedLanBind = c.daemon.lanBind
   appliedCfgHost = c.daemon.host
