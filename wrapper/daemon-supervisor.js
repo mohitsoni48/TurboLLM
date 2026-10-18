@@ -3,6 +3,8 @@
 // A daemon exits RESTART_REQUESTED_EXIT_CODE to ask for a fresh one; any other exit means the daemon is gone.
 // The constant mirrors turbollm/src/daemon-restart.ts, and daemon-supervisor.test.js pins that.
 
+const { spawnSync } = require('node:child_process')
+
 const RESTART_REQUESTED_EXIT_CODE = 75 // mirrors turbollm/src/daemon-restart.ts
 
 /**
@@ -11,10 +13,15 @@ const RESTART_REQUESTED_EXIT_CODE = 75 // mirrors turbollm/src/daemon-restart.ts
  * @param {{ spawnDaemon: () => import('node:child_process').ChildProcess,
  *           onDaemonLost: (reason: string) => void,
  *           log?: Pick<Console,'log'|'error'>,
- *           killGraceMs?: number }} deps
+ *           killGraceMs?: number,
+ *           platform?: NodeJS.Platform,
+ *           killTreeSync?: (pid: number) => void }} deps
  * @returns {{ start(): ChildProcess, stop(): void, current(): ChildProcess | null }}
  */
-function createDaemonSupervisor ({ spawnDaemon, onDaemonLost, log = console, killGraceMs = 5000 }) {
+function createDaemonSupervisor ({
+  spawnDaemon, onDaemonLost, log = console, killGraceMs = 5000,
+  platform = process.platform, killTreeSync = taskkillTreeSync
+}) {
   let state = 'idle'
   let current = null
 
@@ -62,12 +69,35 @@ function createDaemonSupervisor ({ spawnDaemon, onDaemonLost, log = console, kil
   }
 
   function endDaemon (child) {
+    // On Windows kill() is TerminateProcess whatever the signal, so the daemon's SIGTERM and 'exit' handlers never
+    // run, nor does the one that ends a running build's compiler tree (build-runner.ts runStep). The vcvars step's
+    // cmd.exe died with the daemon's job object, but cmake, ninja and cl/nvcc had broken away from it and kept
+    // compiling after the app quit. So the daemon's whole tree is ended first, while its children are still linked
+    // to it (once it is gone /T finds none), and synchronously: before-quit returns and Electron exits, and an async
+    // taskkill would die with the app. The kill below stays, for a taskkill that is missing or failed.
+    if (platform === 'win32' && child.pid > 0) {
+      try {
+        killTreeSync(child.pid)
+      } catch (err) {
+        log.error(`TurboLLM daemon tree kill failed: ${err.message}`)
+      }
+    }
     child.kill('SIGTERM')
     const escalation = setTimeout(() => isRunning(child) && child.kill('SIGKILL'), killGraceMs)
     escalation.unref() // a daemon that ignores SIGTERM must not hold the quitting app open
   }
 
   return { start, stop, current: () => current }
+}
+
+// The default tree kill: what `turbollm --stop` does on Windows (daemon-pid.ts), synchronously (see endDaemon).
+// Bounded, so a taskkill that hangs cannot hold the quitting app open. spawnSync never throws: a missing taskkill
+// (ENOENT), the timeout and a taskkill that failed come back in its result, so they are thrown from here for
+// endDaemon to log.
+function taskkillTreeSync (pid) {
+  const r = spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true, timeout: 10_000 })
+  if (r.error) throw r.error
+  if (r.status !== 0) throw new Error(`taskkill exited with code ${r.status}`)
 }
 
 /**

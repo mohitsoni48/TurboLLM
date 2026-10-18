@@ -14,7 +14,7 @@
 //
 // The toolchain PATH override (build-prereqs.ts `buildEnv`) is applied so a conda-env /
 // custom-path CUDA Toolkit (and a user-provided ninja) are found. Windows or Linux + CUDA only.
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
@@ -760,7 +760,8 @@ function winComSpec(): string {
 /** Run one child process, streaming combined stdout+stderr line-by-line to `onLine` and
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
  *  spawn error; aborting `signal` kills the child and everything under it (on Linux/macOS with `killTree: false`,
- *  only the child, with SIGTERM) and rejects with an AbortError.
+ *  only the child, with SIGTERM) and rejects with an AbortError. The daemon's exit kills the same tree (on
+ *  Linux/macOS with `killTree: false`, nothing).
  *  Exported for tests. */
 export function runStep(
   cmd: string,
@@ -813,9 +814,21 @@ export function runStep(
       execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => reject(aborted()))
     }
     if (isWindows || killGroupOnAbort) opts.signal.addEventListener('abort', onAbort, { once: true })
-    // In a group of its own the step no longer gets the Ctrl+C of the daemon's terminal: the daemon's exit ends it.
-    const killOnExit = killGroupOnAbort && child.pid !== undefined
-    if (killOnExit) process.once('exit', killGroup)
+    // The daemon's exit (Settings Restart, Ctrl+C, a crash that reaches 'exit') ends the step's whole tree too. In a
+    // group of its own the step no longer gets the Ctrl+C of the daemon's terminal. On Windows the exit ended only
+    // the direct child: the job object Node puts its children in kills them when the daemon exits but lets their own
+    // children break away, so cmd.exe died while cmake → ninja → cl/nvcc kept compiling, and later dropped a
+    // llama-server.exe nothing had probed into the directory the engine runs from. An exit handler cannot wait for
+    // an async kill, so taskkill runs synchronously there.
+    const killTreeSync = () => {
+      try {
+        spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      } catch {
+        /* the tree is already gone */
+      }
+    }
+    const killOnExit = child.pid === undefined ? null : killGroupOnAbort ? killGroup : isWindows ? killTreeSync : null
+    if (killOnExit) process.once('exit', killOnExit)
     let stdout = ''
     let outBuf = ''
     let errBuf = ''
@@ -837,7 +850,7 @@ export function runStep(
     child.on('error', (e) => reject(e))
     child.on('close', (code) => {
       opts.signal.removeEventListener('abort', onAbort)
-      if (killOnExit) process.removeListener('exit', killGroup)
+      if (killOnExit) process.removeListener('exit', killOnExit)
       if (outBuf) opts.onLine(outBuf.replace(/\r$/, ''))
       if (errBuf) opts.onLine(errBuf.replace(/\r$/, ''))
       if (opts.signal.aborted) reject(aborted())

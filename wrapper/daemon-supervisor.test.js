@@ -4,9 +4,9 @@ const { after } = require('node:test')
 const assert = require('node:assert/strict')
 const { spawn } = require('node:child_process')
 const { EventEmitter, once } = require('node:events')
-const { existsSync, mkdtempSync, readFileSync, rmSync } = require('node:fs')
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
-const { join } = require('node:path')
+const { delimiter, join } = require('node:path')
 const { setTimeout: sleep } = require('node:timers/promises')
 
 const {
@@ -26,6 +26,7 @@ const POLL_INTERVAL_MS = 50
 const PROCESS_GONE_DEADLINE_MS = 5_000
 const SURVIVAL_WINDOW_MS = 2_000
 const WINDOWS_ONLY = { skip: process.platform !== 'win32' && 'job-object reaping is Windows-only' }
+const POSIX_ONLY = { skip: process.platform === 'win32' && 'fakes taskkill with a shell script' }
 
 const supervisors = []
 const tempDirs = []
@@ -283,6 +284,124 @@ test('quitting in the gap after an exit 75 kills nothing and respawns nothing', 
   child.emit('exit', 75, null)
   assert.equal(launches.spawned.length, 1)
   assert.deepEqual(lost, [])
+})
+
+// On Windows kill() is TerminateProcess whatever the signal: the daemon's SIGTERM and 'exit' handlers never ran, so
+// neither did the one that ends a running build's compiler tree, and cmake, ninja and cl/nvcc (which break away from
+// the daemon's job object) kept compiling after the app quit. The tree must be ended while the daemon still links it.
+test('stop() on Windows ends the daemon\'s whole tree before it signals the daemon', () => {
+  const treeKills = []
+  let child = null
+  const supervisor = supervise({
+    spawnDaemon: fakeLaunches().spawnDaemon,
+    onDaemonLost: () => {},
+    platform: 'win32',
+    killTreeSync: (pid) => treeKills.push({ pid, killCallsBefore: [...child.killCalls] })
+  })
+  child = supervisor.start()
+  child.pid = 4242
+
+  supervisor.stop()
+  assert.deepEqual(treeKills, [{ pid: 4242, killCallsBefore: [] }])
+  assert.deepEqual(child.killCalls, ['SIGTERM'], 'kill() stays the fallback')
+})
+
+test('stop() on Windows still signals the daemon when its tree kill throws', () => {
+  const errors = []
+  const supervisor = createDaemonSupervisor({
+    spawnDaemon: fakeLaunches().spawnDaemon,
+    onDaemonLost: () => {},
+    log: { log () {}, error (line) { errors.push(line) } },
+    platform: 'win32',
+    killTreeSync: () => { throw new Error('spawnSync taskkill ENOENT') }
+  })
+  supervisors.push(supervisor)
+  const child = supervisor.start()
+  child.pid = 4242
+
+  assert.doesNotThrow(() => supervisor.stop())
+  assert.deepEqual(child.killCalls, ['SIGTERM'])
+  assert.deepEqual(errors, ['TurboLLM daemon tree kill failed: spawnSync taskkill ENOENT'])
+})
+
+test('stop() kills no tree on Linux/macOS, nor for a daemon that never got a pid', () => {
+  for (const [platform, pid] of [['linux', 4242], ['darwin', 4242], ['win32', undefined]]) {
+    const treeKills = []
+    const supervisor = supervise({
+      spawnDaemon: fakeLaunches().spawnDaemon,
+      onDaemonLost: () => {},
+      platform,
+      killTreeSync: (p) => treeKills.push(p)
+    })
+    const child = supervisor.start()
+    child.pid = pid
+
+    supervisor.stop()
+    assert.deepEqual(treeKills, [], `${platform}, pid ${pid}`)
+    assert.deepEqual(child.killCalls, ['SIGTERM'], `${platform}, pid ${pid}`)
+  }
+})
+
+// The default tree kill, Windows faked on POSIX with a taskkill stand-in (as build-runner.test.ts does for the build's
+// own tree kill; not run on a Windows machine). The stand-in sleeps before it records its arguments, so this also
+// catches a kill that does not wait for it: before-quit returns and Electron exits, taking an async taskkill with it.
+test('stop() on Windows runs taskkill /PID <pid> /T /F synchronously, before the daemon\'s own kill', POSIX_ONLY, async () => {
+  const dir = newDir()
+  const binDir = join(dir, 'bin')
+  const argsFile = join(dir, 'taskkill-args')
+  mkdirSync(binDir)
+  writeFileSync(join(binDir, 'taskkill'), `#!/bin/sh\nsleep 0.3\necho "$@" > '${argsFile}'\nkill -9 "$2"\n`, { mode: 0o755 })
+  const actualPath = process.env.PATH
+  process.env.PATH = `${binDir}${delimiter}${actualPath ?? ''}`
+  try {
+    const supervisor = supervise({ spawnDaemon: fakeDaemon(dir, 'stay'), onDaemonLost: () => {}, platform: 'win32' })
+    const child = supervisor.start()
+    await waitUntil(() => readPids(dir).length === 1, DEADLINE_MS, 'the daemon to start')
+    const exited = once(child, 'exit')
+
+    supervisor.stop()
+    assert.equal(existsSync(argsFile) && readFileSync(argsFile, 'utf8').trim(), `/PID ${child.pid} /T /F`)
+    // Its SIGTERM handler would have exited 75: the tree kill reached it first.
+    assert.deepEqual(await exited, [null, 'SIGKILL'])
+    settled(dir)
+  } finally {
+    process.env.PATH = actualPath
+  }
+})
+
+// spawnSync never throws: a missing taskkill and one that failed came back in its result, and the default tree kill
+// dropped them, so the failure was never logged (only an injected tree kill could reach the log).
+test('stop() on Windows logs a taskkill that is missing or fails, and still signals the daemon', POSIX_ONLY, () => {
+  const dir = newDir()
+  settled(dir) // the fake daemon has a pid but no process
+  const binDir = join(dir, 'bin')
+  mkdirSync(binDir)
+  const actualPath = process.env.PATH
+  process.env.PATH = binDir
+  try {
+    for (const [taskkill, logged] of [
+      [null, /^TurboLLM daemon tree kill failed: spawnSync taskkill ENOENT$/],
+      ['#!/bin/sh\nexit 1\n', /^TurboLLM daemon tree kill failed: taskkill exited with code 1$/]
+    ]) {
+      if (taskkill) writeFileSync(join(binDir, 'taskkill'), taskkill, { mode: 0o755 })
+      const errors = []
+      const supervisor = createDaemonSupervisor({
+        spawnDaemon: fakeLaunches().spawnDaemon,
+        onDaemonLost: () => {},
+        log: { log () {}, error (line) { errors.push(line) } },
+        platform: 'win32'
+      })
+      const child = supervisor.start()
+      child.pid = 4242
+
+      supervisor.stop()
+      assert.equal(errors.length, 1, String(taskkill))
+      assert.match(errors[0], logged)
+      assert.deepEqual(child.killCalls, ['SIGTERM'], 'kill() stays the fallback')
+    }
+  } finally {
+    process.env.PATH = actualPath
+  }
 })
 
 test('on Windows a supervised daemon dies with its host even without stop()', WINDOWS_ONLY, async () => {

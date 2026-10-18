@@ -948,6 +948,7 @@ test('runStep on Windows: aborting runs taskkill /PID <pid> /T /F and rejects wi
   const dir = tmpDir('tllm-treekill-')
   const argsFile = join(dir, 'taskkill-args')
   writeFileSync(join(dir, 'taskkill'), `#!/bin/sh\necho "$@" > '${argsFile}'\nkill -9 "$2"\n`, { mode: 0o755 })
+  const before = process.listeners('exit')
   const actualPlatform = process.platform
   const actualPath = process.env.PATH
   process.env.PATH = `${dir}${delimiter}${actualPath ?? ''}`
@@ -965,8 +966,52 @@ test('runStep on Windows: aborting runs taskkill /PID <pid> /T /F and rejects wi
     ac.abort()
     await assert.rejects(step, { name: 'AbortError' })
     assert.equal(readFileSync(argsFile, 'utf8').trim(), `/PID ${pid} /T /F`)
+    // The step's exit listener goes when its child closes, which can be after the AbortError (taskkill answers
+    // first): waited for, so the exit listener counts of the tests below never see it.
+    const added = () => process.listeners('exit').filter((l) => !before.includes(l))
+    for (let i = 0; i < 500 && added().length > 0; i++) await new Promise((r) => setTimeout(r, 10))
+    assert.deepEqual(added(), [], 'the exit listener is removed with the step')
   } finally {
     process.env.PATH = actualPath
+  }
+})
+
+// The daemon's exit (Settings Restart, Ctrl+C) ends only the step's direct child on Windows: the job object Node puts
+// its children in lets theirs break away, so cmake → ninja → cl/nvcc kept compiling and later dropped an untested
+// llama-server.exe where the engine runs from. An exit handler cannot wait, so the tree kill must be synchronous: the
+// stand-in's record is there as soon as the listener returns. The stand-in sleeps before it writes it: spawn starts it
+// at once, so an async kill's stand-in could otherwise write before the check. The listener is called directly, not
+// via a real exit.
+test('runStep on Windows: the daemon exit runs taskkill /PID <pid> /T /F synchronously, and leaves no exit listener', async (t) => {
+  if (process.platform === 'win32') return t.skip('fakes Windows on a POSIX host')
+  const dir = tmpDir('tllm-exitkill-')
+  const argsFile = join(dir, 'taskkill-args')
+  writeFileSync(join(dir, 'taskkill'), `#!/bin/sh\nsleep 0.3\necho "$@" > '${argsFile}'\nkill -9 "$2"\n`, { mode: 0o755 })
+  const before = process.listeners('exit')
+  const actualPlatform = process.platform
+  const actualPath = process.env.PATH
+  process.env.PATH = `${dir}${delimiter}${actualPath ?? ''}`
+  let step: Promise<string>
+  let pid = ''
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  try {
+    step = runStep('sh', ['-c', 'echo $$; exec sleep 30'], { env: { ...process.env }, signal: new AbortController().signal, onLine: (l) => { pid ||= l.trim() } })
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+  }
+  try {
+    while (!pid) await new Promise((r) => setTimeout(r, 10))
+    const added = process.listeners('exit').filter((l) => !before.includes(l))
+    assert.equal(added.length, 1, 'the step ends with the daemon')
+    ;(added[0] as () => void)()
+    assert.equal(readFileSync(argsFile, 'utf8').trim(), `/PID ${pid} /T /F`)
+    await assert.rejects(step, /exited with code null/)
+    // By identity, not by count: a listener other code adds or removes meanwhile does not count.
+    assert.ok(!process.listeners('exit').includes(added[0]!), 'the exit listener is removed with the step')
+  } finally {
+    process.env.PATH = actualPath
+    try { if (pid) process.kill(Number(pid), 'SIGKILL') } catch { /* already gone */ }
+    await step.catch(() => {})
   }
 })
 
