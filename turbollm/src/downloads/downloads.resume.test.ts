@@ -285,7 +285,7 @@ async function interruptedRawDownload(
       assert.equal(first.list()[0].status, 'downloading', 'killed mid-body, before any error path')
     }
     assert.equal(readFileSync(part).length, prefixLen, 'the first attempt left its prefix in the .part')
-    return { modelDir, stateDir, id: rec.id, dest: rec.dest }
+    return { modelDir, stateDir, id: rec.id, dest: rec.dest, dm: first }
   } finally {
     globalThis.fetch = real
   }
@@ -743,6 +743,71 @@ test('resume: a reply with no validator keeps the stored one on a 206 and drops 
   assert.equal(restarted.status, 'error')
   assert.equal(readFileSync(`${whole.dest}.part`).length, 20, 'the 200 started the .part again')
   assert.deepEqual(manifestEntries(whole.stateDir).map((e) => e.validator), [undefined])
+})
+
+/** The URL imported again (a new row, not Resume) while the first attempt's row is still errored
+ *  with its prefix in the .part, against `fetchImpl`: the new row as it settles. */
+async function importAgain(dm: DownloadManager, url: string, fetchImpl: typeof fetch) {
+  const real = globalThis.fetch
+  globalThis.fetch = fetchImpl
+  try {
+    const [rec] = await dm.enqueue({ url })
+    assert.ok(rec, 'an errored row does not block a new import of the same file')
+    return await waitSettled(dm, rec.id)
+  } finally {
+    globalThis.fetch = real
+  }
+}
+
+test('a new import over an errored row\'s .part resumes only under that row\'s validator: a changed file comes whole, not spliced', async () => {
+  // The first attempt dropped at 60 bytes of the old file; the file then changed upstream and
+  // the user imported the URL again instead of pressing Resume. The new row had no validator,
+  // so its bare Range got the new file's tail as a 206 and the old prefix + new tail was done.
+  const changed = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await importAgain(changed.dm, 'https://mirror.example/model.gguf', serve(NEW_FILE, '"new"', seen))
+  assert.equal(seen[0]['If-Range'], '"old"', 'the errored row\'s validator goes with the .part')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(changed.dest), NEW_FILE, 'the library gets the new file, not old prefix + new tail')
+
+  // A server that ignores If-Range is refused as on Resume, not spliced.
+  const ignored = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const refused = await importAgain(ignored.dm, 'https://mirror.example/model.gguf', serve(NEW_FILE, '"new"', [], { ignoreIfRange: true }))
+  assert.equal(refused.status, 'error')
+  assert.match(refused.error ?? '', /changed on the server/)
+  assert.equal(existsSync(ignored.dest), false, 'the spliced file never reaches the library')
+})
+
+test('a new import over an errored row\'s .part still resumes the same file from the .part offset', async () => {
+  const { dm, dest } = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen: Array<Record<string, string>> = []
+  const rec = await importAgain(dm, 'https://mirror.example/model.gguf', serve(OLD_FILE, '"old"', seen, { ignoreIfRange: true }))
+  assert.equal(seen[0].Range, 'bytes=60-')
+  assert.equal(seen[0]['If-Range'], '"old"')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.equal(seen.length, 1, 'resumed from the .part, not restarted')
+  assert.deepEqual(readFileSync(dest), OLD_FILE)
+})
+
+test('a new import with no validator of the same URL for the .part starts from byte 0', async () => {
+  // The first attempt's server sent no ETag or Last-Modified: nothing tells which version the
+  // .part holds, so the new row must not resume it. A server that answers any Range with a 206
+  // of the current file then spliced it onto the old prefix.
+  const bare = await interruptedRawDownload(OLD_FILE, 60, {})
+  const seen: Array<Record<string, string>> = []
+  const rec = await importAgain(bare.dm, 'https://mirror.example/model.gguf', serve(NEW_FILE, '"new"', seen, { ignoreIfRange: true }))
+  assert.equal(seen[0].Range, undefined, 'the whole file, not the rest of the .part')
+  assert.equal(rec.status, 'done', rec.error ?? '')
+  assert.deepEqual(readFileSync(bare.dest), NEW_FILE)
+
+  // The .part came from another URL (a second mirror's file of the same name): that row's
+  // validator says nothing about this URL's file.
+  const other = await interruptedRawDownload(OLD_FILE, 60, '"old"')
+  const seen2: Array<Record<string, string>> = []
+  const fromOther = await importAgain(other.dm, 'https://other.example/model.gguf', serve(NEW_FILE, '"old"', seen2, { ignoreIfRange: true }))
+  assert.equal(seen2[0].Range, undefined)
+  assert.equal(fromOther.status, 'done', fromOther.error ?? '')
+  assert.deepEqual(readFileSync(other.dest), NEW_FILE)
 })
 
 test('a finished download carries finishedAt, already set when the rescan is requested', async () => {

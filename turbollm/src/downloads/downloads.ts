@@ -394,18 +394,20 @@ export class DownloadManager {
     const created: DownloadRecord[] = []
     for (const t of targets) {
       const id = `dl-${Date.now().toString(36)}-${(this.nextSeq++).toString(36)}`
+      const carried = this.takeOverPart(t)
       const rec: DownloadRecord = {
         id,
         name: t.name,
         repo: t.repo,
         url: t.url,
         dest: t.dest,
-        total: t.total,
+        total: carried?.total ?? t.total,
         received: 0,
         status: 'queued',
         error: null,
         bytesPerSec: 0,
         sha256: t.sha256,
+        validator: carried?.validator,
         createdAt: new Date().toISOString(),
       }
       this.records.set(id, rec)
@@ -414,6 +416,36 @@ export class DownloadManager {
     this.persist()
     this.pump()
     return created
+  }
+
+  /** What a new row for `t` may take over from a .part already on disk, or undefined after
+   *  removing it. run() resumes any .part it finds, and a new row (the URL imported again, or a
+   *  repo file downloaded again, while the failed attempt's row is still errored) had no
+   *  validator or full length of its own: its bare Range took any 206, so a file changed
+   *  upstream since the failure was spliced onto the old prefix and marked done. The .part is
+   *  kept only under the checks Resume of the errored row would apply: every errored row for
+   *  this file (one of them wrote it; no live row does, or the caller would not be here) has
+   *  this URL and one strong validator, which the new row sends as If-Range and checks the 206
+   *  against, with their full length when the new row knows none or the same one. Anything else
+   *  (no validator, another URL, rows that disagree, an orphan .part with no row) says nothing
+   *  about which bytes the .part holds, so the new row starts from byte 0. Decided here, not in
+   *  run(): a row left queued behind the concurrency cap comes back from a restart as paused and
+   *  is resumed from whatever .part it finds. */
+  private takeOverPart(t: { url: string; dest: string; total: number }): { validator: string; total: number } | undefined {
+    const part = `${t.dest}.part`
+    if (!existsSync(part)) return undefined
+    const errored = [...this.records.values()].filter((r) => r.status === 'error' && sameDest(r.dest, t.dest))
+    const first = errored[0]
+    if (
+      first?.validator !== undefined &&
+      errored.every((r) => r.url === t.url && r.validator === first.validator && r.total === first.total) &&
+      (t.total <= 0 || first.total <= 0 || t.total === first.total)
+    ) {
+      return { validator: first.validator, total: t.total > 0 ? t.total : first.total }
+    }
+    rmSync(part, { force: true })
+    for (const r of errored) r.received = 0 // their Resume starts from byte 0 now too
+    return undefined
   }
 
   /** Cancel an in-flight or queued job: abort the stream, delete the .part, mark
