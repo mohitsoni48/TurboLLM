@@ -17,7 +17,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { generateKeyPairSync, createSign, randomUUID } from 'node:crypto'
 import { Hono } from 'hono'
-import { lanAuth, hostGate, hashKey, provisionRemoteApiKey, isLocalOrAuthenticated, isLocalUpgrade } from './auth'
+import { lanAuth, hostGate, hashKey, provisionRemoteApiKey, isLocalOrAuthenticated, isLocalUpgrade, codeAuth } from './auth'
 import { defaultConfig } from './config/config'
 import type { Deps } from './deps'
 import { ModelRouter } from './gateway/model-router'
@@ -594,6 +594,116 @@ test('only the container-runtime host names are trusted, not every .internal nam
     assert.equal((await loopbackRequest(app, '/v1/models', { headers: { Host: host } })).status, 401, host)
     assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host }, d), false, host)
   }
+})
+
+// A hostile resolver (a cafe Wi-Fi, a compromised router) can point the six container names at
+// 127.0.0.1 too, and Firefox and Safari send no Fetch Metadata to such a plain-http name. A page
+// served under one was same-origin with the daemon and got loopback trust on its Host alone: it
+// minted a permanent key, could add an MCP server that runs a command, and opened terminals. Only
+// a request no browser sent keeps that trust; a browser's is judged like any foreign Host.
+test('a browser on a container host name gets no loopback trust; a container client keeps it', async () => {
+  const raw = 'tllm-containerbrowserkeycontainerbrowser1'
+  for (const lan of [false, true]) {
+    const { d, cfg } = makeDeps((cfg) => {
+      cfg.daemon.lanBind = lan
+      cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+    })
+    const app = buildApp(d)
+    app.use('/api/v1/code/*', codeAuth(d))
+    app.get('/api/v1/code/sessions', (c) => c.json({ ok: true }))
+    // Mirrors routes.ts's GET /api/v1/connect/:cli, which mints a key on a LAN bind.
+    app.get('/api/v1/connect/:cli', (c) => (hostGate(c, d) ? c.json({ ok: true }) : c.json({ error: { code: 'forbidden' } }, 403)))
+    const host = 'host.docker.internal:6996'
+    const page = 'http://host.docker.internal:6996'
+    // The reproduction: the page's own fetch('/api/v1/keys', { method: 'POST' }) in a browser that
+    // does send Fetch Metadata, then one that does not, and each other marker on its own. Not
+    // Sec-Fetch-Mode alone: Node's fetch sends that (the clients below), and a browser never does.
+    const browser = (origin: string): Array<Record<string, string>> => [
+      { Origin: origin, 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors', 'Sec-Fetch-Dest': 'empty' },
+      { Origin: origin },
+      { Referer: `${origin}/` },
+      { 'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors' },
+      { 'Sec-Fetch-Dest': 'empty', 'Sec-Fetch-Mode': 'cors' },
+      { 'Sec-Fetch-Site': 'same-origin' },
+      { 'Sec-Fetch-Dest': 'empty' },
+      { 'Sec-Fetch-User': '?1' },
+    ]
+    for (const name of ['host.docker.internal:6996', 'gateway.docker.internal', 'host.containers.internal:6996', 'HOST.ORB.INTERNAL.']) {
+      for (const marks of browser(`http://${name.toLowerCase()}`)) {
+        const headers = { Host: name, ...marks }
+        const why = `${name} ${JSON.stringify(marks)} lan=${lan}`
+        assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers })).status, 401, why)
+        assert.equal((await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers })).status, 401, why)
+        assert.equal((await loopbackRequest(app, '/api/v1/status', { headers })).status, 401, why)
+        assert.equal((await loopbackRequest(app, '/api/v1/code/sessions', { headers })).status, 401, why)
+        const ws = Object.fromEntries(Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]))
+        assert.equal(isLocalUpgrade('127.0.0.1', 6996, ws, d), false, `upgrade ${why}`)
+      }
+    }
+    // A WebSocket handshake from the page always carries its Origin.
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host, origin: page }, d), false)
+    // The web UI's own header marks the one state-changing GET (connect) as a browser's, so a page
+    // that drops its Referer cannot mint a CLI key through it on a LAN bind.
+    assert.equal((await loopbackRequest(app, '/api/v1/connect/claude-code', { headers: { Host: host, 'X-TurboLLM-UI': '1' } })).status, 401)
+    assert.equal(cfg.apiKeys.length, 1, 'nothing was minted')
+    // Such a browser gets in with a key, as from the LAN; the UI's same-origin writes then pass.
+    const keyed = { Host: host, Origin: page, 'Sec-Fetch-Site': 'same-origin', 'X-TurboLLM-Auth': raw }
+    assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers: keyed })).status, 200)
+    assert.equal((await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers: keyed })).status, 200)
+    assert.equal((await loopbackRequest(app, '/api/v1/code/sessions', { headers: keyed })).status, 200)
+    // The containerised clients the names exist for (an SDK, curl, Open WebUI's server side) send
+    // none of those headers and keep keyless loopback trust on every gate. Node's built-in fetch
+    // adds Sec-Fetch-Mode: cors (and Accept-Language: *) to every request: these two are the
+    // headers the OpenAI JS SDK and a plain fetch() on Node 22 sent, as captured.
+    const clients: Array<Record<string, string>> = [
+      { Host: host },
+      { Host: 'host.containers.internal:6996', 'User-Agent': 'OpenAI/Python 1.51.0', Accept: 'application/json', 'Content-Type': 'application/json' },
+      { Host: 'host.lima.internal:6996', 'User-Agent': 'curl/8.5.0', Accept: '*/*' },
+      { Host: 'host.rancher-desktop.internal', 'User-Agent': 'Python/3.11 aiohttp/3.10.5' },
+      {
+        Host: host,
+        Accept: 'application/json',
+        'User-Agent': 'OpenAI/JS 6.26.0',
+        'X-Stainless-Lang': 'js',
+        'X-Stainless-Runtime': 'node',
+        Authorization: 'Bearer none',
+        'Accept-Language': '*',
+        'Sec-Fetch-Mode': 'cors',
+      },
+      { Host: 'gateway.docker.internal', Accept: '*/*', 'Accept-Language': '*', 'Sec-Fetch-Mode': 'cors', 'User-Agent': 'node' },
+    ]
+    for (const client of clients) {
+      const why = `${JSON.stringify(client)} lan=${lan}`
+      assert.equal((await loopbackRequest(app, '/v1/models', { headers: client })).status, 200, why)
+      assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers: client })).status, 200, why)
+      assert.equal((await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers: client })).status, 200, why)
+      assert.equal((await loopbackRequest(app, '/api/v1/code/sessions', { headers: client })).status, 200, why)
+      const ws = Object.fromEntries(Object.entries(client).map(([k, v]) => [k.toLowerCase(), v]))
+      assert.equal(isLocalUpgrade('127.0.0.1', 6996, ws, d), true, `upgrade ${why}`)
+    }
+    // Node's own WebSocket marks its handshake Sec-Fetch-Mode: websocket, and no Origin.
+    const nodeWs = { host, 'sec-fetch-mode': 'websocket', 'user-agent': 'node', 'accept-language': '*', upgrade: 'websocket' }
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, nodeWs, d), true, `node upgrade lan=${lan}`)
+    // 127.0.0.1 and localhost are unaffected: the UI opened there keeps loopback trust.
+    const ui = { Host: '127.0.0.1:6996', Origin: 'http://127.0.0.1:6996', 'Sec-Fetch-Site': 'same-origin', Referer: 'http://127.0.0.1:6996/' }
+    assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers: ui })).status, 200)
+    assert.equal(isLocalUpgrade('127.0.0.1', 6996, { host: 'localhost:6996', origin: 'http://localhost:6996' }, d), true)
+  }
+  // With keyless LAN access on, a browser on such a name is a LAN peer: lanAuth lets it through,
+  // and the host-only gates (hostGate, isLocalOrAuthenticated, codeAuth) still refuse it.
+  const { d } = makeDeps((cfg) => {
+    cfg.daemon.lanBind = true
+    cfg.daemon.requireApiKey = false
+  })
+  const app = buildApp(d)
+  app.use('/api/v1/code/*', codeAuth(d))
+  app.get('/api/v1/code/sessions', (c) => c.json({ ok: true }))
+  const headers = { Host: 'host.docker.internal:6996', Origin: 'http://host.docker.internal:6996' }
+  assert.equal((await loopbackRequest(app, '/api/v1/status', { headers })).status, 200)
+  assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers })).status, 403)
+  assert.equal((await loopbackRequest(app, '/api/v1/build/run', { method: 'POST', headers })).status, 403)
+  assert.equal((await loopbackRequest(app, '/api/v1/code/sessions', { headers })).status, 401)
+  assert.equal((await loopbackRequest(app, '/api/v1/keys', { method: 'POST', headers: { Host: 'host.docker.internal:6996' } })).status, 200)
 })
 
 // Docker Desktop delivers a container's `host.docker.internal` connection on the host's own

@@ -157,7 +157,8 @@ export function isLanExposed(d: Deps): boolean {
  *  in browsers and has no public zone, so no attacker can serve a page under it. An absent Host
  *  (HTTP/1.0, Node test harnesses) passes: every browser sends one.
  *
- *  Also passed: the names container runtimes give the host ({@link CONTAINER_HOST_NAMES}) and any
+ *  Also passed: the names container runtimes give the host ({@link CONTAINER_HOST_NAMES}; only for a
+ *  request no browser sent, `browser`, see there) and any
  *  IP literal: rebinding needs a DNS name to re-resolve, and a page served from an IP is
  *  same-origin only with that IP, never with 127.0.0.1. Except the unspecified address
  *  (`0.0.0.0`, `[::]`) and the IPv4-mapped ones (`[::ffff:127.0.0.1]`, which a browser writes
@@ -168,7 +169,7 @@ export function isLanExposed(d: Deps): boolean {
  *  the banner, the browser it opens and the snippets say 127.0.0.1 (or the LAN address). Some
  *  names kept below get no Fetch Metadata in some browser either (WebKit's `localhost.`, a
  *  container name), which is why the one GET that changes state also needs the UI's header. */
-function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
+function hostNamesThisMachine(host: string | undefined, browser: boolean, d: Deps): boolean {
   if (!host) return true
   const name = hostHeaderName(host)
   if (/^0\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name)) return false // 0/8, as tools/security.ts treats it
@@ -183,7 +184,7 @@ function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
     if (v6 === '[::]' || v6.startsWith('[::ffff:')) return false
   }
   if (isLoopbackBindHost(name) || name.endsWith('.localhost')) return true
-  if (CONTAINER_HOST_NAMES.has(name)) return true
+  if (CONTAINER_HOST_NAMES.has(name) && !browser) return true
   if (/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(name) || /^\[[0-9a-f:.]*:[0-9a-f:.]*\]$/.test(name)) return true
   const unbracket = (s: string) => s.replace(/^\[|\]$/g, '')
   return d.bindHost !== undefined && unbracket(name) === unbracket(d.bindHost.trim().toLowerCase())
@@ -195,7 +196,19 @@ function hostNamesThisMachine(host: string | undefined, d: Deps): boolean {
  *  `gateway.docker.internal`, Podman `host.containers.internal`, Lima `host.lima.internal`,
  *  OrbStack's own `host.orb.internal`, Rancher Desktop's own `host.rancher-desktop.internal`.
  *  Exactly these, not every `*.internal`: the zone has no public DNS, but whoever answers the
- *  victim's DNS queries (a hostile Wi-Fi or router) can answer for any name in it and rebind it. */
+ *  victim's DNS queries (a hostile Wi-Fi or router) can answer for any name in it and rebind it.
+ *  That holds for these six too, so they name this machine only for a request no browser sent
+ *  ({@link fromBrowser}): the clients they exist for (SDKs, curl, Open WebUI's server side) send
+ *  no Origin, Referer, Sec-Fetch-Site or Sec-Fetch-Dest (Node's fetch adds a Sec-Fetch-Mode of
+ *  its own, so that one is not counted), while a page a hostile resolver points one of them at
+ *  127.0.0.1 runs in a browser, which adds Origin to every write and every WebSocket handshake.
+ *  Trusted on the Host alone, such a page in Firefox or Safari (no Fetch Metadata to these plain
+ *  http names) minted a permanent key with POST /api/v1/keys, added an MCP server that runs a
+ *  command, and opened terminals. A browser on one of these names is judged like any other
+ *  foreign Host (LAN rules: a key). Not closed: a same-origin GET that drops its Referer
+ *  (referrer policy no-referrer) carries none of these headers, so such a page can still read
+ *  what a keyless GET answers; the one GET that changes state needs the UI's header, which
+ *  counts as a browser's. */
 const CONTAINER_HOST_NAMES = new Set([
   'host.docker.internal',
   'gateway.docker.internal',
@@ -257,6 +270,23 @@ const APP_SECRET_HEADER = 'x-turbollm-app'
 /** Sent by the web UI on the one state-changing GET, `/api/v1/connect/:cli` (see lanAuth). Not a
  *  secret: only proof that the request is not a simple cross-site one. */
 const UI_HEADER = 'x-turbollm-ui'
+
+/** Headers only a browser adds to a request: Origin (to every write, every CORS request and every
+ *  WebSocket handshake), Referer (unless the page's referrer policy drops it), Fetch Metadata
+ *  (only to "potentially trustworthy" URLs) and the web UI's own {@link UI_HEADER}. A CLI, an SDK
+ *  or a server-side client sends none of them. Sec-Fetch-Mode is left out on purpose: Node's
+ *  built-in fetch (undici) adds `cors` to every request and its WebSocket `websocket` to every
+ *  handshake, so every Node client on it (the OpenAI JS SDK, clients/ts, anything built on them)
+ *  sends it from a container, and counting it would take keyless loopback trust on these names
+ *  from all of them. A browser that sends Fetch Metadata always sends Sec-Fetch-Site and
+ *  Sec-Fetch-Dest with it, so leaving it out misses no browser request. */
+const BROWSER_HEADERS = ['origin', 'referer', 'sec-fetch-site', 'sec-fetch-dest', 'sec-fetch-user', UI_HEADER]
+
+/** Did a browser send this request, by {@link BROWSER_HEADERS}? `header` looks a lowercase header
+ *  name up: Hono's `c.req.header` or a raw handshake's headers. For {@link CONTAINER_HOST_NAMES}. */
+function fromBrowser(header: (name: string) => string | undefined): boolean {
+  return BROWSER_HEADERS.some((h) => !!header(h))
+}
 
 /** Does a loopback caller prove it is the app that started this daemon? Only asked when
  *  `TURBOLLM_APP_SECRET` is set, which only TurboLLM-Android does (a fresh random value per
@@ -471,7 +501,7 @@ export function isTunneled(c: Context, d: Deps): boolean {
  *  own terminal, `--stop`, `launch claude`) is unaffected. */
 export function isLocalRequest(c: Context, d: Deps): boolean {
   if (isTunneled(c, d)) return false
-  if (!hostNamesThisMachine(c.req.header('host'), d)) return false // DNS rebinding — see hostNamesThisMachine
+  if (!hostNamesThisMachine(c.req.header('host'), fromBrowser((h) => c.req.header(h)), d)) return false // DNS rebinding — see hostNamesThisMachine
   if (!hasAppSecret(c)) return false // another app on the phone — see appSecretPresented
   if (!isLanExposed(d)) return true // loopback-only bind → always local
   return isLoopback(c) === true
@@ -550,8 +580,8 @@ export function isLocalUpgrade(
   }
   // DNS rebinding — see hostNamesThisMachine. A refused handshake still gets in with a `key`.
   const host = headers.host
-  if (!hostNamesThisMachine(typeof host === 'string' ? host : undefined, d)) return false
   const one = (v: string | string[] | undefined) => (typeof v === 'string' ? v : undefined)
+  if (!hostNamesThisMachine(one(host), fromBrowser((h) => one(headers[h])), d)) return false
   if (crossSite(one(headers['sec-fetch-site']), one(headers.origin), one(host))) return false
   // Another app on the phone — see appSecretPresented. The WebView's handshake carries the cookie.
   const cookie = headers.cookie
@@ -913,7 +943,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // A loopback connection whose Host names some other machine (DNS rebinding — see
     // hostNamesThisMachine) gets no loopback trust: it is judged exactly like a LAN request on
     // a LAN-exposed listener.
-    const foreignHost = !tunneled && !hostNamesThisMachine(c.req.header('host'), d)
+    const foreignHost = !tunneled && !hostNamesThisMachine(c.req.header('host'), fromBrowser((h) => c.req.header(h)), d)
     // Likewise a loopback request without the Android app's secret: another app on the phone (see
     // appSecretPresented). With nothing LAN-exposed, `requireApiKey: false` opened the API to no
     // one, so it is not read as consent to open it to every other app (or to a rebinding page,
