@@ -5,10 +5,13 @@
 //   • disabled → acquire/release are no-ops and loads are never blocked.
 //   • the lease backstop auto-releases (reloads) if release never arrives.
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { ComfyGuard } from './comfy-guard'
 import type { FetchImpl } from './comfy-guard'
 import type { StartOpts, Status } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
 /** Records the reverse-gate `POST {url}/free` calls so tests can assert on them, and
  *  returns a scripted response. `throws` simulates an unreachable/timed-out ComfyUI. */
@@ -538,6 +541,52 @@ test('cachePersist: an acquire landing during the reload\'s restore keeps the ca
   await g.release()
 
   assert.deepEqual(slotCalls.map((u) => /action=(\w+)/.exec(u)?.[1]), ['save', 'restore', 'save', 'restore'])
+})
+
+// The same race with the cache file itself, written and read as llama-server does: the next prompt's save lands while
+// the reload's restore is still in flight and writes the file under the same name (same model, same launch args).
+// The restore then deleted that file as its own single-use one once it returned, so that render's release had none to
+// restore and the model came back without its cache after all.
+test("cachePersist: the reload's restore keeps the file a save made during it wrote, for the next release", async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const dataDir = tmpDir('comfy-slot-race-')
+  const cacheDir = join(dataDir, 'slot-cache')
+  mkdirSync(cacheDir, { recursive: true })
+  const restored: string[] = []
+  let saved = 0
+  let restoring = 0
+  let finishRestore = () => {}
+  const http: FetchImpl = async (url, init) => {
+    const file = join(cacheDir, (JSON.parse(String(init?.body ?? '{}')) as { filename?: string }).filename ?? '')
+    if (url.includes('action=save')) {
+      writeFileSync(file, `kv-${++saved}`)
+    } else if (url.includes('action=restore')) {
+      // llama-server reads the file into the slot and answers; a file it cannot open is a 400.
+      if (!existsSync(file)) {
+        restored.push('missing')
+        return { ok: false, status: 400 }
+      }
+      restored.push(readFileSync(file, 'utf8'))
+      // The first restore is slow: it answers only once the next prompt's save has written its file.
+      if (++restoring === 1) await new Promise<void>((resolve) => { finishRestore = resolve })
+    }
+    return { ok: true, status: 200 }
+  }
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true } }),
+    dir: () => dataDir,
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never, undefined, http)
+  await g.acquire() // saves kv-1
+
+  const reload = g.release()
+  while (restoring === 0) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt: saves kv-2 under the same name while kv-1's restore is in flight
+  finishRestore()
+  await reload
+  await g.release()
+
+  assert.deepEqual(restored, ['kv-1', 'kv-2'], "the next release restores the cache the next prompt's save wrote")
 })
 
 // More often the next prompt's acquire catches the reload still starting (the release route answers at once, so an
