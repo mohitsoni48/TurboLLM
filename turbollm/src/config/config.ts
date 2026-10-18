@@ -1839,6 +1839,26 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
   return moved
 }
 
+/** Move what is saved under engine `oldId` to `newId`: each model's profile there, the presets tuned on it, and the
+ *  last-loaded record. For an engine whose update registers the new build under a new id (an official llama.cpp
+ *  backend's, in its own tag-keyed folder) and unregisters the old one: those stayed under the old id, so the next load
+ *  on the updated backend ran untuned defaults (auto-tune's result included), a preset pinned for it stopped applying,
+ *  and the startup resume named an engine that no longer exists. As in migrateModelKey, a model `newId` already has a
+ *  profile for keeps it. */
+export function migrateEngineId(cfg: Config, oldId: string, newId: string): void {
+  if (oldId === newId || isUnsafeMapKey(newId)) return
+  for (const byEngine of Object.values(cfg.modelProfiles)) {
+    const entry = ownEntry(byEngine, oldId)
+    if (!entry) continue
+    if (!ownEntry(byEngine, newId)) byEngine[newId] = entry
+    delete byEngine[oldId]
+  }
+  for (const presets of Object.values(cfg.modelPresets)) {
+    for (const p of presets) if (p.engineId === oldId) p.engineId = newId
+  }
+  if (cfg.lastLoaded.engineId === oldId) cfg.lastLoaded = { ...cfg.lastLoaded, engineId: newId }
+}
+
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
  *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
 export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {

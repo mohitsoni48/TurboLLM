@@ -145,6 +145,29 @@ test('POST /backends/:id/update whose policy copy cannot be saved still reports 
   assert.equal(existsSync(oldDir), false, 'the old build is deleted')
 })
 
+// The new build is a new engine id and the old one is unregistered: the tune, the presets and the last-loaded record
+// saved under the old id, and a name the user gave the backend, were left behind with it.
+test('POST /backends/:id/update carries the old build\'s profiles, presets, last-loaded record and custom name over', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  h.registry.rename('old', 'My GPU build')
+  const at = '2026-02-01T00:00:00Z'
+  h.d.store.update((c) => {
+    c.modelProfiles = { m: { old: { profile: { ctx: 8192 }, updatedAt: at } } }
+    c.modelPresets = { m: [{ id: 'tuned', name: 'Tuned', engineId: 'old', profile: { ctx: 16384 }, updatedAt: at, origin: 'autotune' }] }
+    c.lastLoaded = { modelKey: 'm', engineId: 'old' }
+  })
+  const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.equal(await h.finished, null)
+  const updated = h.registry.list().engines.find((e) => e.binPath === h.newBin)!
+  assert.ok(updated && updated.id !== 'old')
+  const cfg = h.d.store.snapshot()
+  assert.deepEqual(cfg.modelProfiles.m, { [updated.id]: { profile: { ctx: 8192 }, updatedAt: at } })
+  assert.equal(cfg.modelPresets.m![0]!.engineId, updated.id)
+  assert.deepEqual(cfg.lastLoaded, { modelKey: 'm', engineId: updated.id })
+  assert.equal(updated.name, 'My GPU build')
+})
+
 // The route checks the engine-work slot before its GitHub lookup; a scheduler auto-update (or another tab) can take the
 // slot during that lookup. Starting anyway would run two jobs into the same tag dir on one progress/Cancel channel.
 test('POST /backends/:id/update whose GitHub lookup let another engine job take the slot is a 409 and starts nothing', { skip: posixOnly }, async (t) => {

@@ -13,7 +13,7 @@
 import { rmSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { sourceBuildDirOf } from './build-runner'
-import type { ConfigStore, Engine } from '../config/config'
+import { migrateEngineId, type ConfigStore, type Engine } from '../config/config'
 import type { Manager } from './manager'
 import type { ProvisionState } from './provision-state'
 import type { Registry } from './registry'
@@ -225,18 +225,14 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
     // Stop the running engine only if it's the OLD build of this backend.
     const oldEng = d.registry.list().engines.find((e) => e.binPath === engine.binPath)
     // The scheduler also auto-updates engines that are merely installed: the new build takes the
-    // old one's place — active only if the old one still is, and with its update policy (it is a new
-    // engine id, so the policy would otherwise fall back to notify and `auto` apply only once).
+    // old one's place — active only if the old one still is, and with everything kept under its id
+    // (handOverBackendEngine).
     if (oldEng) await stopEngineUsers(d, oldEng.id)
     if (oldEng) keepActiveAfterUpdate(d, oldEng.id, newEng.id)
     // From here the new build has replaced the old one: what follows is best effort, never a failed update (that would
-    // say the existing build is unchanged). If a Windows lock refuses the config.json save, the policy stays in memory
-    // for the next save to write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
-    if (oldEng?.updatePolicy && oldEng.id !== newEng.id) {
-      try { d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy) } catch { /* best effort */ }
-    }
+    // say the existing build is unchanged).
     if (oldEng && oldEng.id !== newEng.id) {
-      try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
+      handOverBackendEngine(d, oldEng, newEng.id, installedTag ? `llama.cpp ${installedTag} (${backendId})` : null)
     }
     if (installedTag && installedTag !== latestTag) {
       // Retries: a Windows AV/indexer lock is brief. A leftover is an older tag, so the newest-tag-wins lookups never
@@ -248,6 +244,31 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
     if ((e as Error)?.name === 'AbortError') d.provision.done()
     else d.provision.fail(`Could not update llama.cpp (${backendId}) — your existing build is unchanged: ${msg(e)}`)
     throw e
+  }
+}
+
+/** The end of an official llama.cpp backend's update (applyLlamaCppUpdate, POST /engines/backends/:id/update): the new
+ *  build, registered under a new id (it has its own tag-keyed folder), takes over from `oldEng`, which is unregistered.
+ *  It keeps the old one's update policy (a new id would fall back to notify, and `auto` apply only once), what is saved
+ *  under its id (migrateEngineId: each model's profile, the presets tuned on it, the last-loaded record) and a name the
+ *  user gave it; the default name (`defaultOldName`, null when the tag is unknown) follows the new tag. Only the policy
+ *  and the unregister were carried before: every tune, preset and custom name was left on the old id. Each step is best
+ *  effort, as the update has happened: if a Windows lock refuses the config.json save, the change stays in memory for
+ *  the next save to write; at worst, if no later save succeeds before the daemon exits, it is lost. */
+export function handOverBackendEngine(
+  d: Pick<UpdateApplyDeps, 'store' | 'registry'>,
+  oldEng: Engine,
+  newId: string,
+  defaultOldName: string | null,
+): void {
+  if (oldEng.updatePolicy) {
+    try { d.registry.setUpdatePolicy(newId, oldEng.updatePolicy) } catch { /* best effort */ }
+  }
+  try { d.store.update((c) => migrateEngineId(c, oldEng.id, newId)) } catch { /* best effort */ }
+  try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
+  // After the unregister, which frees the name.
+  if (defaultOldName !== null && oldEng.name.trim() !== defaultOldName) {
+    try { d.registry.rename(newId, oldEng.name) } catch { /* best effort */ }
   }
 }
 

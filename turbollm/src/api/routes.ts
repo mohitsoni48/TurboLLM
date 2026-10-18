@@ -59,7 +59,7 @@ import {
   latestTagForInstalled,
   type UpdateStatus,
 } from '../engines/update'
-import { applyEngineUpdate, recordReleaseUpdate, releaseSwapBlockReason } from '../engines/update-apply'
+import { applyEngineUpdate, handOverBackendEngine, recordReleaseUpdate, releaseSwapBlockReason } from '../engines/update-apply'
 import { checkApplyBlockers, currentRunState, detectInstall, spawnUpdateHelper } from '../app-update-apply'
 import { emit } from '../telemetry/runtime/typed-emit'
 import { appUpdateClicked } from '../telemetry/events/app-update'
@@ -535,21 +535,16 @@ export function registerApi(app: Hono, d: Deps): void {
         // swap doesn't leave a stale process pointing at a dir we're about to delete.
         const oldEng = d.registry.list().engines.find((e) => e.binPath === oldBin)
         // The new build takes the old one's place: active only if the old one still is (updating a
-        // fallback backend must not switch the user's engine), and with its update policy (a new
-        // engine id would otherwise fall back to notify). Read after stopEngineUsers: stopping a
-        // pool slot leaves the manager idle, so the activate route allows a switch meanwhile, and a
-        // check read before it undid that switch.
+        // fallback backend must not switch the user's engine), and with everything kept under its id
+        // (handOverBackendEngine). Read after stopEngineUsers: stopping a pool slot leaves the manager
+        // idle, so the activate route allows a switch meanwhile, and a check read before it undid that
+        // switch.
         if (oldEng) await stopEngineUsers(d, oldEng.id)
         if (oldEng && d.registry.active()?.id === oldEng.id) d.registry.activate(newEng.id)
         // From here the new build has replaced the old one: what follows is best effort, never "your existing build is
-        // unchanged". If a Windows lock refuses the config.json save, the policy stays in memory for the next save to
-        // write; at worst, if no later save succeeds before the daemon exits, it reverts to notify.
-        if (oldEng?.updatePolicy && oldEng.id !== newEng.id) {
-          try { d.registry.setUpdatePolicy(newEng.id, oldEng.updatePolicy) } catch { /* best effort */ }
-        }
-        // GC the old install: unregister its engine entry + delete its tag-keyed dir.
+        // unchanged". GC the old install: unregister its engine entry + delete its tag-keyed dir.
         if (oldEng && oldEng.id !== newEng.id) {
-          try { d.registry.remove(oldEng.id) } catch { /* already gone */ }
+          handOverBackendEngine(d, oldEng, newEng.id, installedTag ? `llama.cpp ${installedTag} (${def.id})` : null)
         }
         if (installedTag && installedTag !== latestTag) {
           // Best effort, as in update-apply.ts: a Windows lock on the old build (retried here, as it is brief) must not

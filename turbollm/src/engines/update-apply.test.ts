@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process'
 import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
-import { ConfigStore, type Engine } from '../config/config'
+import { ConfigStore, getModelProfile, type Engine } from '../config/config'
 import { tmpDir } from '../test-support/tmp'
 import { availableBackends, installedBackendBuild } from './download'
 import { koboldcppAssetName, koboldcppBinPath } from './koboldcpp'
@@ -158,6 +158,48 @@ test('llama.cpp update whose policy copy cannot be saved still ends in done(), a
   assert.equal(d.registry.get('old'), undefined, 'the old build is unregistered')
   assert.equal(existsSync(dirname(oldEngine.binPath)), false, 'the old build is deleted')
   assert.equal(installedBackendBuild(root, backend.id)?.tag, 'b200')
+})
+
+// The new build is a new engine id (its own tag-keyed folder), and the old id is unregistered. Everything saved under
+// the old id stayed there: each model's tune (auto-tune's too), the presets tuned on it (a pinned one stopped applying)
+// and the startup resume, so the next load on the updated backend ran untuned defaults; a name the user gave the
+// backend went back to "llama.cpp b<tag> (<backend>)".
+test('llama.cpp update carries the old build\'s profiles, presets, last-loaded record and custom name over to the new build', { skip: posixOnly }, async (t) => {
+  for (const [name, expectedName] of [
+    ['My CUDA build', 'My CUDA build'],
+    [`llama.cpp b100 (${backend.id})`, `llama.cpp b200 (${backend.id})`], // the default name follows the new tag
+  ]) {
+    const { d, newDir, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+    d.registry.rename('old', name)
+    const at = '2026-02-01T00:00:00Z'
+    d.store.update((c) => {
+      c.modelProfiles = {
+        m: { old: { profile: { ctx: 8192 }, updatedAt: at }, cuda: { profile: { ctx: 4096 }, updatedAt: '2026-01-01T00:00:00Z' } },
+        n: { old: { profile: { ctx: 2048 }, updatedAt: at } },
+      }
+      c.modelPresets = {
+        m: [
+          { id: 'tuned', name: 'Tuned', engineId: 'old', profile: { ctx: 16384 }, updatedAt: at, origin: 'autotune' },
+          { id: 'any', name: 'Any', engineId: '', profile: { ctx: 1024 }, updatedAt: at, origin: 'manual' },
+          { id: 'other', name: 'Other', engineId: 'cuda', profile: { ctx: 512 }, updatedAt: at, origin: 'manual' },
+        ],
+      }
+      c.lastPresetId = { m: 'tuned' }
+      c.lastLoaded = { modelKey: 'm', engineId: 'old' }
+    })
+    await applyEngineUpdate(d, oldEngine)
+    const updated = d.registry.list().engines.find((e) => e.binPath === join(newDir, 'llama-server'))!
+    assert.ok(updated && updated.id !== 'old', 'the new build is a new engine')
+    const cfg = d.store.snapshot()
+    assert.deepEqual(Object.keys(cfg.modelProfiles.m!).sort(), ['cuda', updated.id].sort(), name)
+    assert.deepEqual(cfg.modelProfiles.m![updated.id]?.profile, { ctx: 8192 })
+    assert.deepEqual(cfg.modelProfiles.n, { [updated.id]: { profile: { ctx: 2048 }, updatedAt: at } })
+    assert.deepEqual(cfg.modelPresets.m!.map((p) => p.engineId), [updated.id, '', 'cuda'])
+    assert.deepEqual(getModelProfile(cfg, 'm', updated.id), { ctx: 16384 }, 'the pinned preset still applies')
+    assert.deepEqual(cfg.lastLoaded, { modelKey: 'm', engineId: updated.id })
+    assert.equal(updated.name, expectedName)
+    assert.equal(updated.updatePolicy, 'auto')
+  }
 })
 
 // The scheduler passes workBusy: an auto-update must not start while another engine job (a download, build, zip upload
