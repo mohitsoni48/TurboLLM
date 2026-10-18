@@ -74,12 +74,33 @@ export function getAuthToken(): string | null {
   return localStorage.getItem(AUTH_KEY)
 }
 
+const authTokenListeners = new Set<() => void>()
+
 /** Persist (or clear) the API key this client sends as X-TurboLLM-Auth. Needed for
  *  LAN access, where the daemon requires a key for non-loopback requests (spec 06 §5). */
 export function setAuthToken(token: string): void {
   const t = token.trim()
   if (t) localStorage.setItem(AUTH_KEY, t)
   else localStorage.removeItem(AUTH_KEY)
+  authTokenListeners.forEach((l) => l())
+}
+
+/** Runs `listener` after each setAuthToken, which is how the key prompt stores a key, and when
+ *  another tab of this origin sets or clears the stored key. A live tail refused 401/403 for want
+ *  of a key waits on it to reopen with the new one (sse.ts subscribeSse): nothing else would tell
+ *  it the prompt was answered. The key is in localStorage, which every tab of the origin shares,
+ *  but setAuthToken in another tab runs only that tab's listeners: a tail here woke only on a key
+ *  stored in its own tab, so one pasted into the other tab's prompt left it dead while the rest
+ *  of this page, which reads the key afresh per request, went on with it. The browser tells the
+ *  other tabs with a 'storage' event (key null for a clear()). Returns the unsubscribe. */
+export function subscribeAuthToken(listener: () => void): () => void {
+  authTokenListeners.add(listener)
+  const onStorage = (e: StorageEvent) => { if (e.key === AUTH_KEY || e.key === null) listener() }
+  window.addEventListener('storage', onStorage)
+  return () => {
+    authTokenListeners.delete(listener)
+    window.removeEventListener('storage', onStorage)
+  }
 }
 
 async function request<T>(
