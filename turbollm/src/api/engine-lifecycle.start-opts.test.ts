@@ -228,6 +228,7 @@ function mkDeps(s: LoadScenario) {
   const modelRouter = {
     withSwapLock: (fn: () => unknown) => Promise.resolve(fn()),
     markPrimaryLoaded: () => {},
+    recordManualLoad: () => {},
   }
   const d = {
     store, scanner, manager, registry, modelRouter,

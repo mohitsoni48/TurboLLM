@@ -145,6 +145,7 @@ function recordingEngineSide(parity: ParityCase) {
     modelRouter: {
       withSwapLock: <T>(fn: () => Promise<T>) => fn(),
       markPrimaryLoaded: () => {},
+      recordManualLoad: () => {},
       loadExplicit: (...args: unknown[]) => {
         loadExplicitCalls.push([...args])
         return Promise.resolve({ target: 'http://127.0.0.1:2' })

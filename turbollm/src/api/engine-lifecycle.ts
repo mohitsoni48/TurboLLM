@@ -120,9 +120,10 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
       .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
       .then(() => d.modelRouter.markPrimaryLoaded())
       .catch((e) => console.warn(`engine load failed: ${e}`))
-    d.store.update((x) => {
-      x.lastLoaded = { modelKey: entry.key, engineId: active.id }
-    })
+    // Recorded through the router: this load may be queued behind the swap lock that release()'s resume of a gateway
+    // load a ComfyUI render paused holds, and that resume must not record its model over this one (see
+    // ModelRouter.recordManualLoad).
+    d.modelRouter.recordManualLoad(entry.key, active.id)
     return c.json({ ok: true }, 202)
   }
 

@@ -102,7 +102,8 @@ export class ModelRouter {
   private primaryLastUsed = 0
   /** The gateway load (route(), routeTo()) into the primary that a ComfyUI render refused before its spawn or killed
    *  while it started: that render's release() loads it on the Manager (ComfyGuard.reload), and reloadedAfterRender
-   *  records it then. Cleared by the next load into the primary through loadInto. */
+   *  records it then. Cleared by the next load into the primary through loadInto, and by a manual Load
+   *  (recordManualLoad). */
   private pausedGatewayLoad: string | undefined
   /** Promise chain that serialises swap operations so concurrent requests for
    *  different models queue rather than race. */
@@ -708,6 +709,19 @@ export class ModelRouter {
     if (paused !== modelKey) return
     const entry = this.scanner.get(modelKey)
     if (!entry || entry.laya) return
+    this.store.update(x => { x.lastLoaded = { modelKey, engineId } })
+  }
+
+  /** A manual Load into the primary (api/engine-lifecycle.ts startEngine: the Models screen's Load, an Engines Start,
+   *  the Turbo Link façade's load) recorded as the model last loaded. It is recorded as soon as it is queued, before it
+   *  waits for the swap lock, which release()'s resume of a gateway load a ComfyUI render paused may hold: that
+   *  resume's record (reloadedAfterRender) then came after it, and named the paused load's model while the user's
+   *  pick loaded next, so the next daemon start's resume, an Engines Start that names no model and the CLI launcher's
+   *  last-used pick brought the paused one back. So the note goes with this record, whichever model it names (a Load
+   *  of the model already recorded changes nothing a comparison could see). Every other record is made under the swap
+   *  lock, where it follows the resume's, or by a load into the primary, which drops the note itself (loadInto). */
+  recordManualLoad(modelKey: string, engineId: string): void {
+    this.pausedGatewayLoad = undefined
     this.store.update(x => { x.lastLoaded = { modelKey, engineId } })
   }
 

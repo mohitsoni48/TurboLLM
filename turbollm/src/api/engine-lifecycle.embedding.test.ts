@@ -47,6 +47,7 @@ function mkDeps(models: ModelEntry[]) {
     },
     withSwapLock: (fn: () => unknown) => Promise.resolve(fn()),
     markPrimaryLoaded: () => {},
+    recordManualLoad: () => {},
   }
   const d = {
     version: '1.12.0',

@@ -6,7 +6,10 @@ import assert from 'node:assert/strict'
 import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { Hono } from 'hono'
+import { startEngine, type EngineStartBody } from '../api/engine-lifecycle'
 import { ConfigStore, type Engine } from '../config/config'
+import type { Deps } from '../deps'
 import { ComfyGuard } from '../engines/comfy-guard'
 import { Manager } from '../engines/manager'
 import type { Registry } from '../engines/registry'
@@ -390,4 +393,36 @@ test('a gateway load a render paused whose model left the library meanwhile is n
 
   assert.equal(r.manager.status().model?.key, r.b.key)
   assert.deepEqual(r.store.snapshot().lastLoaded, { modelKey: r.a.key, engineId: 'fake' })
+})
+
+// A manual Load (POST /api/v1/engine/start) records its model as soon as it is queued, and then waits for the swap
+// lock, which release()'s resume of a paused gateway load holds. The resume's record of the paused load came after it:
+// the user's model loaded next, but lastLoaded named the paused one, which the next daemon start's resume, an Engines
+// Start that names no model and the CLI launcher's last-used pick brought back. The Load here names the model the paused
+// load replaced, so the record it writes is the one there before.
+test('a manual Load made while release() resumes a paused gateway load stays the model last loaded', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, registry, scanner, manager, modelRouter, guard, comfyFree, userModel, routineModel: otherModel } = await realEngineSetUp(t, { comfy: true })
+  store.update((c) => { c.gateway.autoSwap = true })
+  const d = {
+    store, registry, scanner, manager, modelRouter, comfy: guard,
+    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+  } as unknown as Deps
+  const app = new Hono()
+  app.post('/start', async (c) => startEngine(c, d, await c.req.json<EngineStartBody>()))
+  assert.ok('target' in (await modelRouter.route(userModel.key)))
+  comfyFree.hook = () => guard!.acquire()
+  assert.deepEqual(await modelRouter.route(otherModel.key), RENDERING)
+
+  const released = guard!.release()
+  assert.equal(guard!.modelKeyReloading(), otherModel.key, 'the resume is under way')
+  const res = await app.request('/start', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modelKey: userModel.key }),
+  })
+  assert.equal(res.status, 202)
+  await released
+  while (manager.status().state !== 'running' || manager.status().model?.key !== userModel.key) await sleep(10)
+
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' })
 })

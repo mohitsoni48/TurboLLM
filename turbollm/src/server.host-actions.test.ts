@@ -820,7 +820,7 @@ function withLaunch(d: Deps, cfg: Config): LaunchHarness {
   Object.assign(d as unknown as Record<string, unknown>, {
     scanner: { get: (k: string) => [MODEL, DRAFT].find((m) => m.key === k), list: () => ({ models: [MODEL, DRAFT], scanning: false, lastScanAt: '' }) },
     manager: { status: () => ({ state: 'stopped', model: null }), currentOpts: () => null, load: (o: { modelPath: string; extraArgs: string[] }) => { h.loads.push(o); return Promise.resolve() } },
-    modelRouter: { withSwapLock: (fn: () => unknown) => Promise.resolve(fn()), markPrimaryLoaded: () => {}, loadExplicit: () => Promise.resolve() },
+    modelRouter: { withSwapLock: (fn: () => unknown) => Promise.resolve(fn()), markPrimaryLoaded: () => {}, recordManualLoad: () => {}, loadExplicit: () => Promise.resolve() },
     bench: { cancel: () => {}, waitIdle: () => Promise.resolve(), start: (key: string, base: unknown) => { h.benches.push({ key, base }) } },
   })
   Object.assign((d as unknown as { registry: Record<string, unknown> }).registry, { active: () => engine, get: (id: string) => (id === 'e1' ? engine : undefined) })
