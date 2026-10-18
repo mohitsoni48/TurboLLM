@@ -931,6 +931,58 @@ test('on a specific non-loopback bind, a Tailscale identity sent to the ingress 
   }
 })
 
+// isTunneled reads a local port it cannot read (a future @hono/node-server reshaping its
+// bindings, an internal app.fetch without them) as tunneled while remote access is up, which
+// only makes a request stricter. The trust only the ingress gives (a remote token, a Serve
+// identity, an Access login in place of a key) was keyed off the same answer, so such a request
+// on the main listener got it: any LAN peer can send the Serve header there.
+test('a request whose local port cannot be read gets no tunnel-only trust while remote access is up', async () => {
+  const teamDomain = 'https://unread-port.cloudflareaccess.com'
+  const restoreFetch = stubJwksEndpoint(teamDomain)
+  try {
+    const raw = 'tllm-unreadportunreadportunreadportunrea1'
+    /** From loopback, with no local port on the socket. */
+    const unread = (app: Hono, headers: Record<string, string>) => app.request('/api/v1/conversations/abc/messages', { method: 'POST', headers }, {
+      incoming: { socket: { remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+    } as never)
+    const onIngress = (app: Hono, headers: Record<string, string>) => tunneledRequest(app, '/api/v1/conversations/abc/messages', { method: 'POST', headers })
+    for (const provider of ['tailscale-serve', 'cloudflare-named', 'ngrok'] as const) {
+      const { d, cfg } = makeDeps((cfg) => {
+        cfg.remoteAccess.provider = provider
+        cfg.remoteAccess.cloudflare.accessTeamDomain = teamDomain
+        cfg.remoteAccess.cloudflare.accessAud = 'aud-unread'
+        cfg.apiKeys.push({ id: 'k1', name: 'x', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+      })
+      const app = buildApp(d)
+      const token = { 'X-TurboLLM-Auth': provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] }) }
+      const serve = { Host: SERVE_HOST, 'Tailscale-User-Login': 'eve@example.com' }
+      const access = { 'Cf-Access-Jwt-Assertion': makeValidAccessJwt(teamDomain, 'aud-unread') }
+      const key = { 'X-TurboLLM-Auth': raw }
+      // Each is let in on the proven ingress, for the provider it belongs to (unchanged).
+      assert.equal((await onIngress(app, token)).status, 200, provider)
+      if (provider === 'tailscale-serve') assert.equal((await onIngress(app, serve)).status, 200)
+      if (provider === 'cloudflare-named') assert.equal((await onIngress(app, access)).status, 200)
+      // With the local port unreadable, none of them is a credential, and loopback trust stays off.
+      for (const [what, headers] of [['a remote token', token], ['a Serve identity', serve], ['an Access login', access], ['nothing', {}]] as const) {
+        assert.equal((await unread(app, headers)).status, 401, `${provider}: ${what}`)
+      }
+      // An ordinary key still gets in.
+      assert.equal((await unread(app, key)).status, 200, provider)
+      if (provider === 'cloudflare-named') {
+        // Access required: judged as tunneled, so a key needs the verified login beside it, and
+        // the login alone is still no credential.
+        cfg.remoteAccess.cloudflare.requireAccess = true
+        assert.equal((await unread(app, key)).status, 401)
+        assert.equal((await unread(app, access)).status, 401)
+        assert.equal((await unread(app, { ...access, ...key })).status, 200)
+        assert.equal((await onIngress(app, access)).status, 200, 'the proven ingress is unchanged')
+      }
+    }
+  } finally {
+    restoreFetch()
+  }
+})
+
 // ── A remote token without models:load must not load (and evict) models via /v1/* ──────────
 
 function routerWithUnloadedModel(): { router: ModelRouter; loads: unknown[] } {

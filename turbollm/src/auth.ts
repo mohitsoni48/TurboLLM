@@ -491,6 +491,20 @@ export function isTunneled(c: Context, d: Deps): boolean {
   return port === ingress
 }
 
+/** True only when this request provably arrived on the remote-access ingress socket: its local
+ *  port was read, and it is the ingress port. The trust only a tunneled request gets (a
+ *  remote-access token, a Tailscale Serve identity, a Cloudflare Access login in place of a key)
+ *  needs this, not {@link isTunneled}: that one reads an unreadable port as tunneled, which only
+ *  makes a request stricter (no loopback trust), and read as proof of the ingress it handed that
+ *  trust to a request on the main listener, where any LAN peer or local process can send the Serve
+ *  header and a remote token is no credential. Unreadable while remote access is live, a request
+ *  is thus judged as tunneled for what it loses and as on the main listener for what it gains:
+ *  it needs an ordinary key (and, while Access is required, the verified login as well). */
+function arrivedOnIngress(c: Context, d: Deps): boolean {
+  const ingress = d.remote?.ingressPort()
+  return ingress !== undefined && localPort(c) === ingress
+}
+
 /** True when a request is local to the daemon host: either the daemon is loopback-only
  *  bound (no LAN listener at all) or the request came from a loopback address. Use to
  *  gate **local-admin actions that execute a caller-supplied binary** (add/scan engine,
@@ -972,9 +986,11 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // site the user visits could run inference (and auto-swap models), list the library and read
     // the answers. Serve is https, so browsers always send Fetch Metadata there; the served UI is
     // same-origin, and CLIs, SDKs and server-side clients send neither header. A cross-site
-    // browser client falls through to the key check below, like any other remote caller.
+    // browser client falls through to the key check below, like any other remote caller. The
+    // ingress socket proven (arrivedOnIngress), not a local port that can't be read: that is the
+    // main listener as far as anyone knows, where any LAN peer can send the header.
     if (
-      isTunneled(c, d) &&
+      arrivedOnIngress(c, d) &&
       d.remote?.activeProvider?.() === 'tailscale-serve' &&
       namesServedHost(c.req.header('host'), d) &&
       localProcessesTrusted(d) &&
@@ -1031,8 +1047,10 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       // cookie, and with /v1's CORS '*' a page on any site the owner visits could run inference
       // and auto-swap models with no key. Such a request goes on to the key check below; with
       // requireAccess on it still needs the verified login as well, as that key check is then a
-      // supplement, not a replacement.
-      if (verified && !isCrossSite(c)) return next()
+      // supplement, not a replacement. Likewise a request whose local port can't be read
+      // (arrivedOnIngress): it is judged as tunneled here, so requireAccess still applies, but the
+      // login is no credential on its own off the proven ingress.
+      if (verified && !isCrossSite(c) && arrivedOnIngress(c, d)) return next()
       // I2 (Phase 5 final review): `requireAccess: true` must refuse whenever control reaches
       // here WITHOUT a genuinely verified assertion, for ANY reason — none presented, one that
       // failed verification, or a JWKS fetch that itself failed. The previous structure only
@@ -1045,7 +1063,9 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       }
     }
 
-    const ingress = isTunneled(c, d)
+    // A remote-access token only on the proven ingress (arrivedOnIngress), not on a request whose
+    // local port can't be read.
+    const ingress = arrivedOnIngress(c, d)
     if (!verifyPresentedKey(c, d, { ingress, ext: isExtApi(c) })) {
       return lanRefusal(c, 401, 'unauthorized', 'A valid API key is required for non-local access.')
     }
