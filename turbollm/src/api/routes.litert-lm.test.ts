@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
-import { registerApi } from './routes'
+import { engineWorkBusy, registerApi } from './routes'
 import { UpdateChecker } from '../engines/update'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
@@ -56,6 +56,7 @@ function appWithChecker(
   const managerCalls: string[] = []
   const activateCalls: string[] = []
   const poolStops: string[] = []
+  const removed: string[] = []
   // The route's stop-guard keys on the engine that is RUNNING (manager currentOpts), not the
   // registry's active engine — an install activates without stopping what is loaded, so the
   // two can differ (v1.14.5). Both knobs stay mockable so every combination can be expressed;
@@ -75,6 +76,7 @@ function appWithChecker(
     modelRouter: {
       loadedModelKeys: () => new Set<string>(),
       stopPoolSlotsOnEngine: async (engineId: string) => { poolStops.push(engineId); await opts.stopPoolSlots?.(engineId) },
+      poolEngineIds: () => new Set<string>(),
     },
     db: { lastGenTpsByModel: () => new Map<string, number>() },
     registry: {
@@ -84,6 +86,13 @@ function appWithChecker(
         opts.activeEngineId === null ? undefined : engines.find((e) => e.id === (opts.activeEngineId ?? 'litert-1')),
       addLitertLm: (name: string) => ({ id: 'litert-2', name, activate: () => {} }),
       activate: (id: string) => activateCalls.push(id),
+      // What DELETE /engines/:id (Disable) reads and does.
+      get: (id: string) => engines.find((e) => e.id === id),
+      customSources: () => [],
+      remove: (id: string) => {
+        removed.push(id)
+        engines.splice(engines.findIndex((e) => e.id === id), 1)
+      },
     },
     downloads: { provenance: () => [] },
     provision: {
@@ -100,7 +109,7 @@ function appWithChecker(
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
-  return { app, provisionCalls, managerCalls, activateCalls, poolStops, engines }
+  return { app, d, provisionCalls, managerCalls, activateCalls, poolStops, engines, removed }
 }
 
 test('?update=1 with the installed version already latest refuses without provisioning', async () => {
@@ -178,6 +187,30 @@ test('?update=1 whose upstream check let another engine job take the slot is a 4
   assert.equal(res.status, 409)
   assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'engine_already_running')
   assert.deepEqual(provisionCalls, [])
+})
+
+// The route checked the engine-work slot, then looked up PyPI's latest (up to 15 s) holding nothing. A Disable (or
+// Purge) of the engine in that lookup was over before the re-check after it, so the update went on to pip-install and
+// register the engine the user had just disabled.
+test('?update=1 holds the engine-work slot while it looks up the latest release, so a Disable meanwhile is refused', async () => {
+  let answer!: (latest: string) => void
+  let lookups = 0
+  const h = appWithChecker(() => { lookups++; return new Promise<string>((resolve) => { answer = resolve }) }, '0.17.1', { runningKind: null, activeEngineId: 'other-1' })
+  const update = h.app.request('/api/v1/engines/litert-lm?update=1', { method: 'POST' })
+  for (let i = 0; i < 500 && lookups === 0; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(lookups, 1)
+  const disable = await h.app.request('/api/v1/engines/litert-1', { method: 'DELETE' })
+  assert.equal(disable.status, 409)
+  assert.equal(((await disable.json()) as { error: { code: string } }).error.code, 'engine_already_running')
+  assert.deepEqual(h.removed, [])
+  answer('0.17.1') // already the latest: the update ends here
+  const done = await update
+  assert.equal(done.status, 200)
+  assert.equal(((await done.json()) as { alreadyLatest?: boolean }).alreadyLatest, true)
+  assert.equal(engineWorkBusy(h.d), null, 'the lookup frees the slot')
+  assert.equal((await h.app.request('/api/v1/engines/litert-1', { method: 'DELETE' })).status, 200)
+  assert.deepEqual(h.removed, ['litert-1'])
+  assert.deepEqual(h.provisionCalls, [])
 })
 
 test('?update=1 without a daemon UpdateChecker falls back to computeUpdateStatus and is just as honest', async () => {

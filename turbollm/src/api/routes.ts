@@ -57,6 +57,7 @@ import {
   resolveUpdateSource,
   tagFromManagedBinPath,
   latestTagForInstalled,
+  type UpdateStatus,
 } from '../engines/update'
 import { applyEngineUpdate, recordReleaseUpdate, releaseSwapBlockReason } from '../engines/update-apply'
 import { checkApplyBlockers, currentRunState, detectInstall, spawnUpdateHelper } from '../app-update-apply'
@@ -1183,12 +1184,22 @@ export function registerApi(app: Hono, d: Deps): void {
     // re-check), and lets tests stub the upstream.
     if (upgrade) {
       const registered = d.registry.list().engines.find((e) => e.kind === 'litert-lm')
-      const status = registered
-        ? await (d.updates
-            ? d.updates.check(registered, AbortSignal.timeout(15_000))
-            : computeUpdateStatus(registered, undefined, AbortSignal.timeout(15_000))
-          ).catch(() => null)
-        : null
+      // The lookup holds the engine-work slot (up to 15 s), as the backend Update's does: a Disable or Purge of the
+      // engine that arrived meanwhile was over before the re-check below, which then passed, and the pip install
+      // registered the engine again (and rebuilt the purged venv). Released before that re-check; provision.start
+      // then follows with no await.
+      engineUpdateInFlight = true
+      let status: UpdateStatus | null
+      try {
+        status = registered
+          ? await (d.updates
+              ? d.updates.check(registered, AbortSignal.timeout(15_000))
+              : computeUpdateStatus(registered, undefined, AbortSignal.timeout(15_000))
+            ).catch(() => null)
+          : null
+      } finally {
+        engineUpdateInFlight = false
+      }
       // Only a POSITIVE "already latest" short-circuits, and only when the versions were
       // actually COMPARABLE: update.ts answers `hasUpdate: false, comparable: false` when the
       // installed version can't be ordered against PyPI's latest (an odd or unparsable
