@@ -69,8 +69,14 @@ RUN echo '{ \
 
 # Force the GPU backend during the image build.
 # Docker builds cannot detect the host GPU.
+# This seeding run binds loopback: --addr 127.0.0.1, not --port, which would bind the
+# 0.0.0.0 lanBind asks for. On a bind other machines can reach, with requireApiKey on and no
+# key yet, the daemon mints its bootstrap API key; one minted here was printed in the build
+# log and stored in the image's config.json, so every container built from the image
+# accepted it. The container's first start (CMD below, on 0.0.0.0) mints that key instead,
+# into its own ~/.turbollm volume, and prints it.
 ENV TURBOLLM_SEED_BACKEND=rocm
-RUN (node bin/turbollm.mjs --no-open --port 6996 &) \
+RUN (node bin/turbollm.mjs --no-open --addr 127.0.0.1:6996 &) \
     && for i in $(seq 1 60); do \
       node -e "process.exit((()=>{try{return JSON.parse(require('fs').readFileSync(process.env.HOME+'/.turbollm/config.json','utf8')).engines.length>0}catch{return false}})()?0:1)" && break; \
       sleep 3; \
