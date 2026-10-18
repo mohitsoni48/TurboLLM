@@ -1,6 +1,7 @@
 import { hideChildConsoleWindows } from './util/hide-console-windows'
+import { openOwnerOnlyLog } from './util/owner-only-log'
 import { spawn } from 'node:child_process'
-import { openSync, readFileSync } from 'node:fs'
+import { closeSync, openSync, readFileSync } from 'node:fs'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -1323,6 +1324,20 @@ deps.rebind = () => {
 let restarting = false
 // Evaluated once: the environment the parent gave this process cannot change.
 const supervisedByDesktop = isDesktopSupervised(process.env)
+// restart.log gets the replacement's stdout, and a daemon started with --print-token or --tunnel
+// prints a fresh API key there on every restart. spawnReplacement opens it for appending with
+// the default mode (0644 under umask 022: readable by every local account in a 0755 ~/.turbollm),
+// and stays as shipped (ADR-442, cli.restart-wiring.test.ts). An append keeps an existing file's
+// mode, so the file is created, or an older one's mode fixed, owner-only here at boot, before any
+// restart writes to it (util/owner-only-log.ts). Best-effort, like the open in spawnReplacement.
+// Not where no replacement is ever spawned: the packaged Android app and the desktop app.
+if (!packagedAndroidApp() && !supervisedByDesktop) {
+  try {
+    closeSync(openOwnerOnlyLog(join(store.dir(), 'restart.log')))
+  } catch {
+    /* no data dir to write to: spawnReplacement falls back to 'ignore' as well */
+  }
+}
 function spawnReplacement(): void {
   // Re-exec with the SAME interpreter + argv (minus argv[0]=node) and cwd, detached
   // so it outlives this dying parent. `stdio:'ignore'` (NOT 'inherit') is essential:

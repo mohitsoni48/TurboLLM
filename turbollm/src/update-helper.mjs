@@ -24,7 +24,7 @@
 // failed install leaves the old version installed and simply relaunches it.
 
 import { spawn } from 'node:child_process'
-import { openSync, writeFileSync } from 'node:fs'
+import { fchmodSync, openSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** How long to wait for the old daemon to actually exit before giving up. Must comfortably
@@ -106,11 +106,18 @@ function run(cmd, args) {
 /** Relaunch the daemon EXACTLY as it was launched, from the identity the daemon recorded
  *  at boot (spec 29 B.1 step 3 — "so the helper never has to guess"). Detached with its
  *  own log file: this helper is about to exit, so inheriting its streams would break the
- *  new daemon's stdio the moment it does. */
+ *  new daemon's stdio the moment it does. Owner-only, as util/owner-only-log.ts opens it for
+ *  the helper (this file is copied to dist on its own, so it can't import that): a daemon
+ *  started with --print-token or --tunnel prints its fresh API key into this log. */
 function relaunch() {
   let out = 'ignore'
   try {
-    out = openSync(join(opts.dataDir, 'update.log'), 'a')
+    out = openSync(join(opts.dataDir, 'update.log'), 'a', 0o600)
+    try {
+      fchmodSync(out, 0o600) // a mode passed to open applies only to a file it creates
+    } catch {
+      /* best-effort: the log still works */
+    }
   } catch {
     out = 'ignore'
   }

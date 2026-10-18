@@ -20,10 +20,11 @@
 // reproduced by running the test suite in the environment it happens to run in.
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { packagedAndroidApp } from './engines/zip-install'
+import { openOwnerOnlyLog } from './util/owner-only-log'
 
 /** How this daemon was installed. `unknown` is a real, expected answer (an embedding we
  *  don't recognise) and is treated exactly like the refuse-to-self-update methods. */
@@ -467,7 +468,9 @@ export function helperPath(): string {
  *  `detached: true` + `unref()` is what makes it outlive the daemon that spawned it — the
  *  whole point. stdio goes to `~/.turbollm/update.log`, NEVER to the parent's streams:
  *  the parent is about to exit, and inheriting handles from a dying (possibly itself
- *  detached) process breaks the child's output immediately. */
+ *  detached) process breaks the child's output immediately. Owner-only (openOwnerOnlyLog):
+ *  the daemon the helper relaunches into the same log prints its --print-token or --tunnel
+ *  key there. */
 export function spawnUpdateHelper(opts: {
   dataDir: string
   method: InstallMethod
@@ -477,7 +480,7 @@ export function spawnUpdateHelper(opts: {
 }): boolean {
   let out: number | 'ignore' = 'ignore'
   try {
-    out = openSync(join(opts.dataDir, UPDATE_LOG_FILE), 'a')
+    out = openOwnerOnlyLog(join(opts.dataDir, UPDATE_LOG_FILE))
   } catch {
     out = 'ignore'
   }

@@ -17,7 +17,8 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpDir } from './test-support/tmp'
 import {
@@ -28,7 +29,10 @@ import {
   detectInstall,
   progressFromResult,
   realPathOr,
+  helperPath,
+  spawnUpdateHelper,
   AppUpdateProgressState,
+  UPDATE_LOG_FILE,
   type InstallSignals,
 } from './app-update-apply'
 import { APP_INSTALL_METHODS } from './telemetry/events/app-update'
@@ -317,5 +321,48 @@ test('realPathOr: a global install run through its <prefix>/bin symlink classifi
     assert.equal(classifyInstall(signals({ entry: realPathOr(link), npmGlobalRoot: realPathOr(root) })).method, 'npm_global')
     // A path that can't be resolved is returned unchanged rather than throwing.
     assert.equal(realPathOr(join(prefix, 'missing')), join(prefix, 'missing'))
+  }
+})
+
+// The relaunched daemon's stdout goes to update.log, and one started with --print-token or
+// --tunnel prints a fresh API key there. Opened with the default mode (0644 under umask 022), it
+// was readable by every other local account in a 0755 ~/.turbollm, as config.json was.
+test('spawnUpdateHelper: update.log, where the relaunched daemon prints its key, is owner-only', { skip: process.platform === 'win32' ? 'Windows keeps only the write bit of a mode' : false }, async () => {
+  // A pid that has already exited, so the helper goes straight on (no install for 'source').
+  const gone = spawn(process.execPath, ['-e', ''])
+  await new Promise((r) => gone.once('exit', r))
+  const prevUmask = process.umask(0o022)
+  try {
+    for (const existing of [false, true]) {
+      const dataDir = tmpDir('tllm-update-log-')
+      const log = join(dataDir, UPDATE_LOG_FILE)
+      if (existing) writeFileSync(log, 'an older update\n', { mode: 0o644 })
+      const launched = spawnUpdateHelper({
+        dataDir, method: 'source', from: '1.0.0', to: '1.0.1',
+        run: { pid: gone.pid!, execPath: process.execPath, argv: ['-e', "console.log('  Token:   tllm-relaunched')"], cwd: dataDir, version: '1.0.0', startedAt: '' },
+      })
+      assert.equal(launched, true)
+      // Already owner-only as the helper starts: one opened for reading meanwhile, while it was
+      // 0644, could read the key the relaunched daemon later appends.
+      assert.equal(statSync(log).mode & 0o777, 0o600, 'owner-only from the helper spawn on')
+      for (let i = 0; i < 300 && !(existsSync(log) && readFileSync(log, 'utf8').includes('tllm-relaunched')); i++) await new Promise((r) => setTimeout(r, 20))
+      const text = readFileSync(log, 'utf8')
+      assert.match(text, /Token: {3}tllm-relaunched/, 'the relaunched daemon wrote to update.log')
+      assert.match(text, /update helper starting/, "and so did the helper")
+      if (existing) assert.ok(text.startsWith('an older update\n'), 'an existing log is appended to')
+      assert.equal(statSync(log).mode & 0o777, 0o600, existing ? 'an existing 0644 log is made owner-only' : 'a new log is created owner-only')
+    }
+    // The helper's own relaunch opens update.log too (update-helper.mjs): run on its own, with its
+    // output elsewhere, it creates the log the relaunched daemon writes to, owner-only as well.
+    const dataDir = tmpDir('tllm-update-log-')
+    const log = join(dataDir, UPDATE_LOG_FILE)
+    const payload = JSON.stringify({ pid: gone.pid, dataDir, method: 'source', from: '1.0.0', to: '1.0.1', execPath: process.execPath, argv: ['-e', "console.log('  Token:   tllm-relaunched')"], cwd: dataDir })
+    const helper = spawn(process.execPath, [helperPath(), payload], { stdio: 'ignore' })
+    await new Promise((r) => helper.once('exit', r))
+    for (let i = 0; i < 300 && !(existsSync(log) && readFileSync(log, 'utf8').includes('tllm-relaunched')); i++) await new Promise((r) => setTimeout(r, 20))
+    assert.match(readFileSync(log, 'utf8'), /Token: {3}tllm-relaunched/)
+    assert.equal(statSync(log).mode & 0o777, 0o600, "the helper's relaunch creates it owner-only")
+  } finally {
+    process.umask(prevUmask)
   }
 })

@@ -153,3 +153,20 @@ test('the desktop-supervised plan spawns nothing itself', () => {
   )
   assert.ok(!restartHandler.includes('spawn('), 'under the desktop app the supervisor starts the fresh daemon')
 })
+
+// The replacement's stdout goes to restart.log, and one started with --print-token or --tunnel
+// prints a fresh API key there. spawnReplacement() opens it with the default mode (0644 under
+// umask 022) and stays as shipped (above), so cli.ts creates it owner-only at boot, at the top
+// level, before the restart handler exists: an append keeps the mode a file already has
+// (util/owner-only-log.test.ts).
+const RESTART_LOG_PREPARED = "closeSync(openOwnerOnlyLog(join(store.dir(), 'restart.log')))"
+
+test('restart.log is made owner-only at boot, before any restart can write to it', () => {
+  assert.equal(occurrencesOf(CLI, RESTART_LOG_PREPARED), 1, `cli.ts must contain "${RESTART_LOG_PREPARED}" exactly once`)
+  assert.ok(CLI.includes("import { openOwnerOnlyLog } from './util/owner-only-log'"))
+  assert.ok(
+    CLI.includes(`if (!packagedAndroidApp() && !supervisedByDesktop) {\n  try {\n    ${RESTART_LOG_PREPARED}\n`),
+    'at the top level, skipped only where no replacement is ever spawned',
+  )
+  assert.ok(CLI.indexOf(RESTART_LOG_PREPARED) < CLI.indexOf(RESTART_HANDLER_OPENING), 'before the restart handler is defined')
+})
