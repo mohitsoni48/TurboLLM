@@ -663,6 +663,56 @@ test('queued follow-ups: each turn replays the turns before it — not its own m
   assert.deepEqual(histories.u3, ['user:u1', 'assistant:reply-u1', 'user:u2', 'assistant:reply-u2'], 'u2\'s reply is part of u3\'s history')
 })
 
+// POST /messages with no content re-runs the last user message, whose row can already have replies
+// after it: its earlier answer, or (queued behind the turn that answers it) that turn's reply once
+// it runs. Only the re-run's own rows were left out of its history, so those replies were replayed
+// after the question was left out, and the question then went as the prompt: the model read its
+// earlier answer before the question it answered.
+test('a re-run of a message (no content) is sent the history before the question, not its earlier answer ahead of it', async () => {
+  const { d, store } = makeDeps()
+  const routeDeps = {
+    ...d,
+    manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+  } as unknown as Deps
+  const turns: Array<{ task: string; history: string[] }> = []
+  let releaseFirst: (() => void) | undefined
+  const runner = (async (params) => {
+    const { priorMessages } = priorHistoryForTurn(params.d, params.convId, params.sessionId, params.excludeFromHistory)
+    turns.push({ task: params.task, history: priorMessages.map((m) => `${m.role}:${m.content || '(empty)'}`) })
+    if (turns.length === 1) await new Promise<void>((r) => { releaseFirst = r })
+    params.sink({ event: 'delta', data: { delta: `reply-${turns.length}` } })
+    return { finalText: `reply-${turns.length}`, contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(routeDeps, { runner })
+  const app = new Hono()
+  registerCodeRoutes(app, routeDeps, mgr)
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId } = makeSession(store, repoRoot, 'u1')
+  const post = async (body: unknown) => {
+    const res = await app.request(`/api/v1/code/sessions/${sessionId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.ok(res.ok, `${res.status} ${await res.clone().text()}`)
+  }
+
+  await post({}) // the session's first run: the seeded task u1
+  while (!releaseFirst) await delay(5)
+  await post({ content: 'u2' }) // queued behind turn 1
+  await post({}) // a re-run of u2, queued behind u2's own turn
+  releaseFirst()
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  await post({}) // a re-run of u2 again, now answered twice
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+
+  assert.deepEqual(turns, [
+    { task: 'u1', history: [] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+  ])
+  const stored = (store.getConversation(convId, true)?.messages ?? []).map((m) => `${m.role}:${m.content}`)
+  assert.deepEqual(stored, ['user:u1', 'assistant:reply-1', 'user:u2', 'assistant:reply-2', 'assistant:reply-3', 'assistant:reply-4'], 'each answer is stored after its question')
+})
+
 test('seqs keep rising after an idle session\'s state is dropped, so a reconnect with the client\'s old cursor still replays the new turn', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] })
   const { d, store } = makeDeps()

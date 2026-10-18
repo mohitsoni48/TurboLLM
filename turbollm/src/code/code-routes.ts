@@ -903,8 +903,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // from v1.9.6 rather than shipped half-wired.
     // ownsUserMsg: the row was stored just above for this message alone, so a Stop that drops the
     // turn from the queue deletes it too (CodeRunManager.stop). A re-run of the last user message
-    // (no content) only points at a row that was already there, and that row is left alone.
-    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, ownsUserMsg: Boolean(newContent), thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
+    // (no content) only points at a row that was already there, and that row is left alone; its
+    // history stops at that row (rerun, see CodeRunManager.pump).
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, ownsUserMsg: Boolean(newContent), rerun: !newContent, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)

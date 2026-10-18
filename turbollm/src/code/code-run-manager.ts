@@ -67,6 +67,9 @@ interface PendingTurn {
    *  existed (POST /messages with no content): that row can be the active turn's own message or
    *  one already steered into the live turn, and stays. */
   ownsUserMsg: boolean
+  /** Asks a user message that was already there again (POST /messages with no content). Its row
+   *  can have replies after it by the time it runs, so its history is what came before it (pump). */
+  rerun: boolean
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — see RunCodeParams.thinkingBudget. */
   thinkingBudget: number
   /** See RunCodeParams.reasoningEffort. Undefined = don't send the field. */
@@ -203,10 +206,10 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; rerun?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, ownsUserMsg: params.ownsUserMsg ?? false, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, ownsUserMsg: params.ownsUserMsg ?? false, rerun: params.rerun ?? false, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
@@ -228,7 +231,7 @@ export class CodeRunManager {
    */
   async steer(
     sessionId: string,
-    params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; rerun?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
     // Not into a turn that was stopped (Stop, Send now): pi still reports it streaming while it
@@ -385,6 +388,15 @@ export class CodeRunManager {
       // for the live ask-gate switch); a run that starts with no model loaded fails cleanly below.
       const mode = (this.d.db.getConversation(s.convId)?.agentMode ?? 'auto') as CodeMode
 
+      // A re-run's question can already have replies after it: its earlier answers, the live
+      // turn's placeholder when it re-runs that turn's own message, and the reply of a turn queued
+      // ahead of it for the same message. Leaving out only its own rows replayed those after the
+      // question and then sent the question as the prompt, so the model read the earlier answer
+      // BEFORE the question it answered. Its history is what came before the question.
+      const conversation = turn.rerun ? (this.d.db.getConversation(s.convId, true)?.messages ?? []) : []
+      const questionAt = conversation.findIndex((m) => m.id === turn.userMsgId)
+      const afterQuestion = questionAt === -1 ? [] : conversation.slice(questionAt + 1).map((m) => m.id)
+
       const result = await this.runner({
         d: this.d,
         convId: s.convId,
@@ -396,8 +408,9 @@ export class CodeRunManager {
         task: turn.task,
         // Not prior history for this turn: its own user message + placeholder, and the follow-ups
         // still queued behind it (their user rows are already in the DB, ahead of this turn's
-        // placeholder) — see RunCodeParams.excludeFromHistory.
-        excludeFromHistory: [turn.userMsgId, assistantMsg.id, ...s.queue.map((t) => t.userMsgId)],
+        // placeholder) — see RunCodeParams.excludeFromHistory. For a re-run, everything after its
+        // question too (afterQuestion above).
+        excludeFromHistory: [turn.userMsgId, assistantMsg.id, ...s.queue.map((t) => t.userMsgId), ...afterQuestion],
         model: turn.model,
         signal: ac.signal,
         sink,
