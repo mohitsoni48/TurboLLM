@@ -860,21 +860,30 @@ export function verifyKeyValue(key: string, d: Deps, opts?: { ingress?: boolean;
   // upgrade, ext/auth.ts's own path) keeps refusing both kinds, because the default is
   // false. Capability enforcement for an accepted remote token is the CALLER's job; this
   // function answers "is this credential usable here at all".
-  if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
-  // An External Chat API tenant key ({@link isExtOnlyKey}) likewise, except where lanAuth judges
-  // a request for /api/ext/v1 itself (`ext`), which then checks the tenant and scopes.
-  if (isExtOnlyKey(match) && opts?.ext !== true) return false
+  if (!acceptedHere(match, opts)) return false
   // Best-effort lastUsedAt bump (spec 06 §5). Never block the request on it.
   touchLastUsed(d, match)
   return true
 }
 
-/** Would {@link verifyKeyValue} (no `ingress` flag) still accept the key whose hash this is? For a
- *  credential checked once and then held open (a Code terminal's WebSocket), so it can be dropped
- *  once its key is revoked. No lastUsedAt bump: nothing is being used. */
-export function keyHashStillAccepted(hash: string, d: Deps): boolean {
+/** {@link verifyKeyValue}'s rule for a stored key it matched, shared with
+ *  {@link keyHashStillAccepted} so a re-check cannot drift from it. */
+function acceptedHere(match: ApiKey, opts?: { ingress?: boolean; ext?: boolean }): boolean {
+  // A grant only as the ADR-422 exception (see verifyKeyValue).
+  if (isFacadeOnlyKey(match) && !(opts?.ingress === true && grantKind(match) === 'remote')) return false
+  // An External Chat API tenant key ({@link isExtOnlyKey}) likewise, except where lanAuth judges
+  // a request for /api/ext/v1 itself (`ext`), which then checks the tenant and scopes.
+  if (isExtOnlyKey(match) && opts?.ext !== true) return false
+  return true
+}
+
+/** Would {@link verifyKeyValue} still accept the key whose hash this is, on the same terms
+ *  (`opts`; none for a Code terminal)? For a credential checked once and then held open (a Code
+ *  terminal's WebSocket, an SSE stream), so it can be dropped once its key is revoked. No
+ *  lastUsedAt bump: nothing is being used. */
+export function keyHashStillAccepted(hash: string, d: Deps, opts?: { ingress?: boolean; ext?: boolean }): boolean {
   const match = d.store.snapshot().apiKeys.find((k) => k.hash === hash)
-  return !!match && !isFacadeOnlyKey(match) && !isExtOnlyKey(match)
+  return !!match && acceptedHere(match, opts)
 }
 
 /** Checks the presented key (any of the accepted headers, see presentedKey) against stored API
@@ -963,14 +972,19 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // one, so it is not read as consent to open it to every other app (or to a rebinding page,
     // above): such a caller needs a key.
     const foreignApp = !tunneled && !foreignHost && !hasAppSecret(c)
-    const allow = bypassesAuth({
+    const basis = {
       lanBind: isLanExposed(d) || foreignHost || foreignApp,
       requireApiKey: daemon.requireApiKey || ((foreignHost || foreignApp) && !isLanExposed(d)),
       tunneled,
       loopback: foreignHost || foreignApp ? false : isLoopback(c),
       exempt: isExempt(c),
-    })
-    if (allow) return next()
+    }
+    if (bypassesAuth(basis)) {
+      // Keyless only because "Require an API key" is off (an open LAN) unless it would pass with
+      // the requirement on as well (see holdOpen).
+      admit(c, bypassesAuth({ ...basis, requireApiKey: true }) ? { by: 'local' } : { by: 'open' })
+      return next()
+    }
 
     // Tailscale Serve identity (ADR-422 §6.1): a tailnet-authenticated user needs no shared
     // secret. Gated on BOTH the ingress socket and the provider actually RUNNING being Serve —
@@ -997,6 +1011,7 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       !isCrossSite(c) &&
       tailscaleIdentity(c)
     ) {
+      admit(c, { by: 'identity' })
       return next()
     }
 
@@ -1050,7 +1065,10 @@ export function lanAuth(d: Deps): MiddlewareHandler {
       // supplement, not a replacement. Likewise a request whose local port can't be read
       // (arrivedOnIngress): it is judged as tunneled here, so requireAccess still applies, but the
       // login is no credential on its own off the proven ingress.
-      if (verified && !isCrossSite(c) && arrivedOnIngress(c, d)) return next()
+      if (verified && !isCrossSite(c) && arrivedOnIngress(c, d)) {
+        admit(c, { by: 'identity' })
+        return next()
+      }
       // I2 (Phase 5 final review): `requireAccess: true` must refuse whenever control reaches
       // here WITHOUT a genuinely verified assertion, for ANY reason — none presented, one that
       // failed verification, or a JWKS fetch that itself failed. The previous structure only
@@ -1066,9 +1084,11 @@ export function lanAuth(d: Deps): MiddlewareHandler {
     // A remote-access token only on the proven ingress (arrivedOnIngress), not on a request whose
     // local port can't be read.
     const ingress = arrivedOnIngress(c, d)
-    if (!verifyPresentedKey(c, d, { ingress, ext: isExtApi(c) })) {
+    const ext = isExtApi(c)
+    if (!verifyPresentedKey(c, d, { ingress, ext })) {
       return lanRefusal(c, 401, 'unauthorized', 'A valid API key is required for non-local access.')
     }
+    admit(c, { by: 'key', ingress, ext })
     // A scoped remote token is additionally held to its capability set. An ordinary
     // (ungranted) key skips this entirely and behaves exactly as it always has.
     const resolved = ingress ? resolveKey(c, d) : undefined
@@ -1123,12 +1143,93 @@ export function modelLoadsRefused(): boolean {
  *  non-local, ADR-152) — register this scoped to /api/v1/code/* only, AFTER lanAuth. */
 export function codeAuth(d: Deps): MiddlewareHandler {
   return async (c, next) => {
-    if (isLocalRequest(c, d)) return next()
-    if (verifyPresentedKey(c, d)) return next()
+    // Recorded over lanAuth's verdict: on Code a key is what lets a non-host caller in, whatever
+    // "Require an API key" says (see holdOpen).
+    if (isLocalRequest(c, d)) {
+      admit(c, { by: 'local' })
+      return next()
+    }
+    if (verifyPresentedKey(c, d)) {
+      admit(c, { by: 'key', ingress: false, ext: false })
+      return next()
+    }
 
     return c.json(
       { error: { code: 'unauthorized', message: 'A valid API key is required to access Code from a non-host device.' } },
       401,
     )
   }
+}
+
+// ── Responses held open after their request was let in ─────────────────────────
+
+/** How lanAuth, then codeAuth on /api/v1/code/*, let a request in. Both judge a request once, as it
+ *  arrives; a response held open after it (an SSE stream) outlives that judgement, so holdOpen
+ *  keeps this to judge it again once what let it in may be gone (endStaleStreams). */
+type Admission =
+  /** Nothing was needed, whatever the settings: the host's own caller (or a path open to all). */
+  | { by: 'local' }
+  /** Nothing was needed only because "Require an API key" is off: a peer on an open LAN. */
+  | { by: 'open' }
+  /** A Tailscale Serve identity or a Cloudflare Access login, on the remote-access ingress. */
+  | { by: 'identity' }
+  /** The key it presented, accepted on these terms (verifyKeyValue's `ingress` and `ext`). */
+  | { by: 'key'; ingress: boolean; ext: boolean }
+
+/** Each request's admission, for as long as the request object lives. */
+const admissions = new WeakMap<Request, Admission>()
+
+function admit(c: Context, a: Admission): void {
+  admissions.set(c.req.raw, a)
+}
+
+interface HeldStream {
+  admission: Extract<Admission, { by: 'open' | 'key' }>
+  /** The hash of the key the request presented, if it presented one. */
+  keyHash?: string
+  end(): void
+}
+
+/** Every stream holdOpen keeps that could still be ended, until it ends. */
+const heldStreams = new Set<HeldStream>()
+
+/** Wrap an SSE stream's callback (streamSSE) so that, while it runs, endStaleStreams can end it
+ *  through `stream.abort()` once what let its request in is gone: that runs the stream's own
+ *  onAbort, as a client's disconnect does. The host's own caller, a Serve identity or Access login,
+ *  and a request no lanAuth judged (an app built without it) are not kept: nothing here ends those. */
+export function holdOpen<T extends { abort(): void }>(c: Context, cb: (stream: T) => Promise<void>): (stream: T) => Promise<void> {
+  return async (stream) => {
+    const admission = admissions.get(c.req.raw)
+    if (!admission || admission.by === 'local' || admission.by === 'identity') return cb(stream)
+    const raw = presentedKey(c)
+    const held: HeldStream = { admission, keyHash: raw ? hashKey(raw) : undefined, end: () => stream.abort() }
+    heldStreams.add(held)
+    try { await cb(stream) } finally { heldStreams.delete(held) }
+  }
+}
+
+/** End each held stream (holdOpen) whose way in is gone, and return how many. lanAuth and codeAuth
+ *  checked its credential only when it opened, and it then ran until its client went away: a LAN
+ *  client kept the engine log, the request log or a Code session's running turn after the key it
+ *  opened them with was deleted or replaced, and a keyless open-LAN peer kept the two logs after
+ *  "Require an API key" was turned on, while every new request of theirs got 401. Gone:
+ *  - let in on a key that would no longer be accepted on the same terms (keyHashStillAccepted);
+ *  - let in keyless on an open LAN, now that a key is required, unless it also sent one that is
+ *    still accepted.
+ *  What else lets a request in is the bind and the ingress, and those end these streams already: a
+ *  rebind and remote access's Stop close the old listener's connections (closeAllConnections),
+ *  unlike a Code terminal's upgraded socket (dropStaleTerminalSockets). Called where a key is
+ *  removed (DELETE /api/v1/keys/:id, Connect's re-mint) and when PATCH /api/v1/settings turns the
+ *  requirement on. */
+export function endStaleStreams(d: Deps): number {
+  let ended = 0
+  const keyRequired = d.store.snapshot().daemon.requireApiKey
+  for (const s of heldStreams) {
+    const keyOk = s.keyHash !== undefined && keyHashStillAccepted(s.keyHash, d, s.admission.by === 'key' ? s.admission : undefined)
+    if (keyOk || (s.admission.by === 'open' && !keyRequired)) continue
+    heldStreams.delete(s)
+    s.end()
+    ended++
+  }
+  return ended
 }

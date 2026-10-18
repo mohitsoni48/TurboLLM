@@ -20,6 +20,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
+import { holdOpen } from '../auth'
 import type { AgentRun, Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
@@ -941,7 +942,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const fromSeqRaw = Number.parseInt(c.req.query('fromSeq') ?? '', 10)
     const fromSeq = Number.isFinite(fromSeqRaw) && fromSeqRaw >= 0 ? fromSeqRaw : 0
 
-    return streamSSE(c, async (stream) => {
+    // holdOpen: the key that let it in can be revoked while the turn runs (see endStaleStreams).
+    return streamSSE(c, holdOpen(c, async (stream) => {
       const sub = runs.subscribe(id, fromSeq)
       stream.onAbort(() => { sub.close() })
 
@@ -961,6 +963,6 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
         // The `id:` field carries the seq so the client can reconnect with ?fromSeq=<last id>.
         await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
       }
-    })
+    }))
   })
 }

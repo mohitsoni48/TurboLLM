@@ -17,7 +17,7 @@ import { stripBodies } from '../observability/request-log'
 import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage, type Registry } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
-import { generateApiKey, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
+import { endStaleStreams, generateApiKey, holdOpen, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
 import { dropStaleTerminalSockets, isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
@@ -2462,7 +2462,8 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   app.get('/api/v1/engine/logs/stream', (c) =>
-    streamSSE(c, async (stream) => {
+    // holdOpen: the key or the open LAN that let it in can go while it runs (see endStaleStreams).
+    streamSSE(c, holdOpen(c, async (stream) => {
       // `bytePos`/`lastPath` are this CONNECTION's own cursor. `manager.ts`'s engine start
       // TRUNCATES the log file (a restart rewrites the same path from empty) and `logPath()`
       // itself changes on an engine switch — either way the file can shrink below `bytePos`,
@@ -2573,7 +2574,7 @@ export function registerApi(app: Hono, d: Deps): void {
         if (ticks++ % 37 === 0) await stream.writeSSE({ data: '', event: 'ping', id: logCursor(lastPath, bytePos - carry.length, before) })
         await stream.sleep(400)
       }
-    }),
+    })),
   )
 
   // ---- Developer request log (issue #211 follow-up) ----
@@ -2592,7 +2593,8 @@ export function registerApi(app: Hono, d: Deps): void {
   // Hono resolves a literal segment over a param one regardless of registration order, but
   // ordering it this way keeps the intent obvious without relying on that.
   app.get('/api/v1/requests/stream', (c) =>
-    streamSSE(c, async (stream) => {
+    // holdOpen: the key or the open LAN that let it in can go while it runs (see endStaleStreams).
+    streamSSE(c, holdOpen(c, async (stream) => {
       if (!d.requestLog) return
       let aborted = false
       stream.onAbort(() => { aborted = true })
@@ -2613,7 +2615,7 @@ export function registerApi(app: Hono, d: Deps): void {
       } finally {
         unsubscribe()
       }
-    }),
+    })),
   )
 
   app.get('/api/v1/requests', (c) => {
@@ -3287,6 +3289,9 @@ export function registerApi(app: Hono, d: Deps): void {
     if (telemetryLevel !== undefined && telemetryLevel !== prevTelemetryLevel) void sendConsentChoice(d.store.dir(), telemetryLevel)
 
     const after = d.store.snapshot().daemon
+    // "Require an API key" turned on does no rebind, so nothing else ends a stream a keyless
+    // open-LAN peer opened while it was off (see endStaleStreams).
+    if (after.requireApiKey && !before.requireApiKey) endStaleStreams(d)
 
     // Experimental → Remote access switched off: from here every /api/v1/remote/* route (Stop
     // included) refuses and the UI hides the section, so a running tunnel would stay public
@@ -3750,8 +3755,10 @@ export function registerApi(app: Hono, d: Deps): void {
     d.store.update((cfg) => {
       cfg.apiKeys = cfg.apiKeys.filter((k) => k.id !== id)
     })
-    // A Code terminal opened with this key was checked only at its handshake: close it too.
+    // A Code terminal opened with this key was checked only at its handshake: close it too, and so
+    // is a stream it opened (the logs, a Code session's run).
     dropStaleTerminalSockets(d)
+    endStaleStreams(d)
     return c.json({ ok: true })
   })
 
@@ -3797,8 +3804,9 @@ export function registerApi(app: Hono, d: Deps): void {
         cfgMut.apiKeys = cfgMut.apiKeys.filter((k) => k.name !== keyName)
         cfgMut.apiKeys.push(fresh)
       })
-      // The replaced key is revoked: a Code terminal opened with it closes (see DELETE /keys/:id).
+      // The replaced key is revoked: a Code terminal or a stream opened with it closes (see DELETE /keys/:id).
       dropStaleTerminalSockets(d)
+      endStaleStreams(d)
       apiKey = full
     }
 

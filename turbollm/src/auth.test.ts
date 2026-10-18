@@ -378,7 +378,8 @@ test('verifyPresentedKey: the correct key via Authorization: Bearer → true', (
 function fakeMiddlewareContext(headers: Record<string, string | undefined>, localPort?: number): { c: Context; jsonResult: () => { body: unknown; status: number } | undefined } {
   let jsonResult: { body: unknown; status: number } | undefined
   const c = {
-    req: { header: (name: string) => headers[name.toLowerCase()] },
+    // `raw`: codeAuth records what let the request in against it (see auth.ts holdOpen).
+    req: { header: (name: string) => headers[name.toLowerCase()], raw: new Request('http://localhost/api/v1/code/sessions') },
     env: localPort !== undefined ? { incoming: { socket: { localPort } } } : {},
     json: (body: unknown, status: number) => { jsonResult = { body, status }; return jsonResult },
   } as unknown as Context
