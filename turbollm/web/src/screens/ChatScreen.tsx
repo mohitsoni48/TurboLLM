@@ -727,12 +727,17 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // after it has stored the user message, so `false` means the message exists nowhere.
   // `on.start` runs when the turn starts; `on.refused` when it fails before it started, with the
   // error (not for an abort).
-  const streamFrom = async (convId: string, gen: AsyncGenerator<ChatSseEvent>, on?: { start?: () => void; refused?: (e: unknown) => void }): Promise<boolean> => {
+  // `ac` is this request's own controller. The chat's abort entry (what Stop, Eject and delete
+  // abort, and what holds back a second Regenerate or Save & Resend) is the turn that started, so
+  // meta takes it, and only this request's own entry is removed when it ends: a send refused
+  // while a Regenerate was starting removed the Regenerate's, and Stop then left its request open.
+  const streamFrom = async (convId: string, ac: AbortController, gen: AsyncGenerator<ChatSseEvent>, on?: { start?: () => void; refused?: (e: unknown) => void }): Promise<boolean> => {
     let started = false
     try {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
           started = true
+          abortRefs.current[convId] = ac
           on?.start?.()
           deltaTimestamps.current[convId] = []
           setLiveByConv((prev) => ({
@@ -807,7 +812,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       }
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } finally {
-      delete abortRefs.current[convId]
+      if (abortRefs.current[convId] === ac) delete abortRefs.current[convId]
     }
     return started
   }
@@ -878,8 +883,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       setTimeout(autoResize, 0)
     }
 
-    // Hoisted above the try so the catch block can target the right conversation's
-    // live/abort state even when it fails partway through creating a new conversation.
+    // Hoisted above the try so the catch block (and restoreComposer) can target the right
+    // conversation even when it fails partway through creating a new conversation.
     let convId = activeId
     try {
       // Create conversation on first message, baking in the selected agent + personalization.
@@ -949,15 +954,21 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       if (matchedSkill) toast.success(`Using skill: ${matchedSkill.name}`)
 
       const ac = new AbortController()
-      abortRefs.current[convId] = ac
+      // The composer is held back by `live` only, which a Regenerate starting from this view has
+      // not set yet: that Regenerate keeps the chat's abort entry, and the daemon refuses this
+      // send (one turn per chat). Should this one start instead, its meta takes the entry.
+      if (!abortRefs.current[convId]) abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      const started = await streamFrom(convId, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
+      const started = await streamFrom(convId, ac, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
       // streamFrom toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !ac.signal.aborted) restoreComposer()
     } catch (e) {
-      if (convId) clearLive(convId)
+      // A failure here came before this send streamed (streamFrom never throws): creating the
+      // chat, or turning on the '/skill' it named. So the chat's live view, if any, is another
+      // turn's, a Regenerate that went live meanwhile, and it is left alone: clearing it took that
+      // reply's streamed text and Stop while it kept running.
       if ((e as Error)?.name !== 'AbortError') {
         toast.error(e instanceof ApiError ? e.message : 'Request failed.')
         restoreComposer()
@@ -1005,6 +1016,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     let refusal: unknown
     const started = await streamFrom(
       convId,
+      ac,
       continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }),
       { start: closeEdit, refused: (e) => { refusal = e } },
     )
@@ -1035,7 +1047,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // /continue was then refused. It names the reply clicked: when another tab or device has
     // added a turn since, the daemon refuses it as stale_message instead of replacing a reply
     // this view never showed, and streamFrom shows why and refetches the chat.
-    await streamFrom(activeId, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId))
+    await streamFrom(activeId, ac, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId))
     // The new reply joined the old one's version group, whose switcher list is cached (and a
     // stale refusal means it may have changed elsewhere).
     void qc.invalidateQueries({ queryKey: ['message-variants'] })

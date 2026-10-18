@@ -29,6 +29,8 @@ beforeEach(() => {
   compactingConv = null
   convs.clear()
   engineState = 'running'
+  skills = []
+  updateMutateAsync = vi.fn(() => Promise.resolve())
 })
 
 vi.mock('../lib/queries', async (importOriginal) => {
@@ -49,6 +51,10 @@ vi.mock('../lib/queries', async (importOriginal) => {
 
 /** 'stopped' = no model ready to answer. */
 let engineState = 'running'
+/** What GET /skills lists. */
+let skills: unknown[] = []
+/** mut.update's mutateAsync (PATCH /conversations/:id, which a '/skill' send turns the skill on with). */
+let updateMutateAsync = vi.fn((): Promise<unknown> => Promise.resolve())
 /** The chat a manual Compact is running for (mut.compact pending with it), or null. */
 let compactingConv: string | null = null
 const stopSpy = vi.fn((_id: string) => Promise.resolve())
@@ -89,7 +95,7 @@ vi.mock('../lib/chat-queries', async (importOriginal) => {
       const idle = () => ({ mutate: vi.fn(), mutateAsync: vi.fn(() => Promise.resolve()), isPending: false })
       return {
         create: { ...idle(), mutateAsync: vi.fn(() => Promise.resolve({ id: 'new1' })) },
-        update: idle(), compact: { ...idle(), isPending: compactingConv !== null, variables: compactingConv ? { convId: compactingConv } : undefined }, deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
+        update: { ...idle(), mutateAsync: (...args: unknown[]) => updateMutateAsync(...(args as [])) }, compact: { ...idle(), isPending: compactingConv !== null, variables: compactingConv ? { convId: compactingConv } : undefined }, deleteMsg: idle(), editMsg: { ...idle(), mutate: editMsgMutate }, regenerate: { ...idle(), mutateAsync: regenerateSpy },
         stop: { ...idle(), mutateAsync: stopSpy }, undoCompaction: idle(), remove: idle(), moveToFolder: idle(),
         createFolder: idle(), deleteFolder: idle(), renameFolder: idle(),
       }
@@ -120,7 +126,7 @@ vi.mock('../lib/link-queries', async (importOriginal) => {
 })
 vi.mock('../lib/agent-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/agent-api')>()
-  return { ...actual, fetchSkills: () => Promise.resolve([]) }
+  return { ...actual, fetchSkills: () => Promise.resolve(skills) }
 })
 vi.mock('../lib/useIsDesktop', () => ({ useIsDesktop: () => true }))
 // pdfjs-dist reads DOMMatrix at import time, which jsdom lacks; no PDF is attached here.
@@ -572,6 +578,63 @@ describe('ChatScreen — Regenerate', () => {
       expect(stopSpy).toHaveBeenCalledWith('c1')
     } finally {
       refuse()
+    }
+  })
+
+  // The send took the chat's abort entry (the Regenerate's request) for its own, and its refusal
+  // removed it: Stop then left the Regenerate's request open, Eject did not end it, and a second
+  // Regenerate click was no longer held back.
+  it('a send refused while a Regenerate is starting leaves that Regenerate its request\'s abort and its double-click guard', async () => {
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    const stream = steppedStream()
+    nextGen = stream.gen
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      await renderScreen('/chat/c1')
+      const regenerate = await screen.findByTitle('Regenerate')
+      await act(async () => { fireEvent.click(regenerate) })
+      nextGen = async function* () { throw new ApiError('generation_in_flight', 'A generation is already running for this conversation.', 409) }
+      await sendText('meanwhile')
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith('A generation is already running for this conversation.'))
+      await act(async () => { fireEvent.click(regenerate) })
+      expect(continueCalls).toHaveLength(1)
+      await stream.push(meta)
+      await stream.push({ event: 'delta', data: { delta: 'Second answer' } } as ChatSseEvent)
+      await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
+      expect(stopSpy).toHaveBeenCalledWith('c1')
+      expect((continueCalls[0][1] as AbortSignal).aborted).toBe(true)
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  // A '/skill' send turns the skill on first (PATCH), and its failure cleared the chat's live
+  // view: when the Regenerate went live meanwhile, its streamed text and Stop went with it.
+  it('a send that fails before it streams leaves the live view and Stop of a Regenerate that went live meanwhile', async () => {
+    skills = [{ id: 'notes', name: 'Notes', description: '', instructions: '', tools: [] }]
+    let failUpdate!: () => void
+    updateMutateAsync = vi.fn(() => new Promise<unknown>((_, reject) => { failUpdate = () => reject(new ApiError('http_error', 'Request failed with status 500.', 500)) }))
+    showMessages([message('u1', 1, 'user', 'hi'), message('a1', 2, 'assistant', 'hello')])
+    const stream = steppedStream()
+    nextGen = stream.gen
+    const toastError = vi.spyOn(toast, 'error')
+    try {
+      const view = await renderScreen('/chat/c1')
+      await waitFor(() => expect(view.qc.getQueryData(['skills', 'list'])).toBeDefined())
+      await act(async () => { fireEvent.click(await screen.findByTitle('Regenerate')) })
+      await sendText('/notes meanwhile')
+      expect(updateMutateAsync).toHaveBeenCalledTimes(1)
+      await stream.push(meta)
+      await stream.push({ event: 'delta', data: { delta: 'Second answer' } } as ChatSseEvent)
+      await act(async () => { failUpdate(); await new Promise((r) => setTimeout(r, 0)) })
+      expect(toastError).toHaveBeenCalledWith('Request failed with status 500.')
+      expect(sendCalls).toHaveLength(0)
+      await stream.push({ event: 'delta', data: { delta: ' streams on' } } as ChatSseEvent)
+      expect(screen.getByText(/Second answer streams on/)).toBeInTheDocument()
+      await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
+      expect((continueCalls[0][1] as AbortSignal).aborted).toBe(true)
+    } finally {
+      toastError.mockRestore()
     }
   })
 })
