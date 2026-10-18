@@ -381,6 +381,68 @@ test('ask mode: the same re-check holds for a skill\'s write and for a delegate_
   assert.match(String(delegated.last?.data.result), /outside the allowed repo root/)
 })
 
+// pi prepares the calls of one reply one after another (the tool_call hook, approval wait and
+// re-check included) but, in its default parallel mode, runs none of them until all are prepared.
+// So the first write's re-check ran before the second one's approval wait, and the first write
+// itself only after it: a folder swapped for a link during that wait took the write out of the
+// repo, though it had been checked again once approved.
+
+/** Runs an ask-mode turn whose engine script makes one reply with two writes, to sub/a.txt and to
+ *  b.txt (both inside the repo), approves the first, and while the second awaits approval replaces
+ *  the folder `sub` with a link to a folder outside the repo, then approves the second. Returns
+ *  what the first write had put in the repo by the time the second awaited approval (read before
+ *  the swap), whether it landed outside, and what the second one wrote. */
+async function approveTwoWritesAfterSwap(script: (twoWrites: Reply) => Reply[]) {
+  const twoWrites: Reply = (res) => sse(res, [
+    { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: [
+      { index: 0, id: 'call_a', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: 'sub/a.txt', content: 'first\n' }) } },
+      { index: 1, id: 'call_b', type: 'function', function: { name: 'write', arguments: JSON.stringify({ path: 'b.txt', content: 'second\n' }) } },
+    ] }, finish_reason: null }] },
+    { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+  ])
+  const engine = await stubEngine(script(twoWrites))
+  try {
+    const h = harness(engine.base, 'ask')
+    const outside = tmpDir('tllm-code-run-outside-')
+    mkdirSync(join(h.repoRoot, 'sub'))
+    const settled = h.turn('write both', new AbortController().signal)
+    const awaiting = async (id: string) => {
+      for (;;) {
+        if (h.frames.some((x) => x.event === 'tool_call' && x.data.id === id && x.data.status === 'awaiting_approval')) return
+        await new Promise((r) => setTimeout(r, 10))
+      }
+    }
+    assert.notEqual(await within(awaiting('call_a'), 10_000), 'timeout', 'the first write is awaiting approval')
+    assert.ok(resolveToolApproval(`${h.convId}:call_a`, 'allow'))
+    assert.notEqual(await within(awaiting('call_b'), 10_000), 'timeout', 'the second write is awaiting approval')
+    // Read before the swap removes it: a first write that was refused, or that only runs once the
+    // whole batch is prepared, has written nothing here yet.
+    const firstInside = join(h.repoRoot, 'sub', 'a.txt')
+    const firstBeforeSecondWait = existsSync(firstInside) ? readFileSync(firstInside, 'utf8') : undefined
+    rmSync(join(h.repoRoot, 'sub'), { recursive: true })
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(outside, join(h.repoRoot, 'sub'), 'junction')
+    assert.ok(resolveToolApproval(`${h.convId}:call_b`, 'allow'))
+    assert.notEqual(await within(settled, 10_000), 'timeout', 'the turn settled')
+    const second = join(h.repoRoot, 'b.txt')
+    return { firstBeforeSecondWait, landedOutside: existsSync(join(outside, 'a.txt')), second: existsSync(second) ? readFileSync(second, 'utf8') : undefined }
+  } finally { await engine.close() }
+}
+
+test('ask mode: of two writes in one reply, the first runs before the second one\'s wait, right after its re-check, in the session, a skill and a delegate_task sub-agent', { timeout: 60_000 }, async () => {
+  const flows: Array<[string, (twoWrites: Reply) => Reply[]]> = [
+    ['session', (twoWrites) => [twoWrites, text('done')]],
+    ['skill', (twoWrites) => [toolCall('invoke_skill', { skillId: 'filesystem', task: 'write both' }), twoWrites, text('skill done'), text('all done')]],
+    ['delegate_task', (twoWrites) => [toolCall('delegate_task', { task: 'Write "first" to sub/a.txt and "second" to b.txt in this repository.' }), twoWrites, text('sub-agent done'), text('all done')]],
+  ]
+  for (const [flow, script] of flows) {
+    const r = await approveTwoWritesAfterSwap(script)
+    assert.equal(r.firstBeforeSecondWait, 'first\n', `${flow}: the first write ran inside the repo before the second one's wait`)
+    assert.equal(r.landedOutside, false, `${flow}: nothing written outside the repo`)
+    assert.equal(r.second, 'second\n', `${flow}: the second write ran`)
+  }
+})
+
 // ── ask mode: a pending call is registered with its tool's name ───────────────────────────────
 
 /** Runs an ask-mode turn whose engine script makes a `write` inside the repo and, while it awaits

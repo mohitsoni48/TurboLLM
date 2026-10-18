@@ -18,6 +18,8 @@ import { Type, Unsafe, type TSchema } from 'typebox'
 import {
   createAgentSession,
   createBashTool,
+  createEditToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   ModelRegistry,
   AuthStorage,
@@ -29,6 +31,7 @@ import {
   type ToolCallEventResult,
   type ToolResultEvent,
   type AgentSessionEvent,
+  type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
 import { estimateTokens, calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { createRobustBashOperations } from './robust-bash'
@@ -415,6 +418,24 @@ export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'
 // docs while investigating is a normal, safe read. containment.ts's isContainedFromRoot is only
 // actually enforced (as a block) for entries in this set — see the shared PATH_TOOLS gate below.
 export const WRITE_PATH_TOOLS = new Set(['edit', 'write'])
+
+/** pi's own edit and write tools (the built-ins, made the same way), but run one at a time with the
+ *  other calls of the same reply. pi prepares a reply's calls in turn (each one's tool_call hook:
+ *  containment, the ask-mode approval wait, the re-check after it) and, in its default parallel
+ *  mode, runs none until all are prepared. So with two writes in one reply the first ran only after
+ *  the second one's approval wait, which can last minutes, and its re-check no longer held: a folder
+ *  swapped for a link out of the repo meanwhile took the approved write out of it. One sequential
+ *  tool makes pi run its whole batch in order, each call right after its own hook. Registered as
+ *  customTools, which replace the built-ins of the same name and obey the same allowlist (plan mode
+ *  still has neither). */
+function sequentialWriteTools(repoRoot: string): ToolDefinition[] {
+  // Widened to the plain ToolDefinition customTools takes (their typed render callbacks don't fit
+  // its `unknown` args).
+  return [
+    { ...createEditToolDefinition(repoRoot), executionMode: 'sequential' },
+    { ...createWriteToolDefinition(repoRoot), executionMode: 'sequential' },
+  ] as ToolDefinition[]
+}
 
 // ── Consecutive identical tool-call loop breaker (founder-reported) ────────────
 // The rules themselves now live in ./agent-loop-rules — they are pure string/counter logic, and
@@ -971,7 +992,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Same ctx-scaled auto-compaction settings as the outer session (compactionSettingsFor) —
       // a skill sub-session shares the same model/contextWindow, so the same defaults apply.
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [skillBash],
+      customTools: [skillBash, ...sequentialWriteTools(repoRoot)],
       ...(skillTools ? { tools: skillTools } : {}),
     })
 
@@ -1161,7 +1182,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       resourceLoader: subResourceLoader,
       sessionManager: SessionManager.inMemory(repoRoot),
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [subBash],
+      customTools: [subBash, ...sequentialWriteTools(repoRoot)],
       ...(subTools ? { tools: subTools } : {}),
       // No invoke_skill / delegate_task / web / mcp / lsp tools registered → depth-1, bounded set.
     })
@@ -1997,7 +2018,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     resourceLoader,
     sessionManager,
     settingsManager,
-    customTools: [robustBash],
+    customTools: [robustBash, ...sequentialWriteTools(repoRoot)],
     ...(tools ? { tools } : {}),
   })
 
