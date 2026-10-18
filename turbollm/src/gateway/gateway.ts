@@ -1127,26 +1127,51 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
           if (override > 0) parsedBody.thinking_budget_tokens = override
           else if (override === 0) {
             // "Off", spelled the way every other "off" is (deleting the key spelled "unlimited").
-            // Ahead of the effort block below, which may still replace `enable_thinking`.
+            // Ahead of the effort block below, which keeps it (a level does not turn thinking back on).
             parsedBody.thinking_budget_tokens = 0
             parsedBody.chat_template_kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
           } else delete parsedBody.thinking_budget_tokens
+          // A budget set on the slider (anything but Off or Unlimited: Unlimited is stored as no override and never
+          // gets here, so the client's off holds there) wins over what the client said about thinking, in either
+          // spelling of its off (its own enable_thinking false, or a reasoning_effort 'off' or 'none', opencode's
+          // no-reasoning variant, parsed above), as on /v1/messages, where it replaces a thinking {type:'disabled'}.
+          // Left in, that off turned thinking off under the budget the user set, and kept the session's effort level
+          // below from applying. The budget can be the web's default one, which a session's slider starts from, also
+          // where the toolbar shows the effort select in place of the slider (a model with a reasoning-effort control).
+          const clientKwargs = parsedBody.chat_template_kwargs as Record<string, unknown> | undefined
+          if (override !== 0 && clientKwargs?.enable_thinking === false) {
+            const kwargs = { ...clientKwargs }
+            delete kwargs.enable_thinking
+            if (Object.keys(kwargs).length) parsedBody.chat_template_kwargs = kwargs
+            else delete parsedBody.chat_template_kwargs
+          }
+          if (override !== 0 && effort === 'off') effort = undefined
         }
         // Same override mechanism, for reasoning_effort — see session-auth.ts. A deliberate,
-        // persistent Code-session override replaces whatever the client itself sent on this
-        // turn (including the plain-client value parsed above), same precedence the
-        // thinking-budget override above already has.
+        // persistent Code-session override replaces whatever level the client itself sent on
+        // this turn (including the plain-client value parsed above), same precedence the
+        // thinking-budget override above already has. Not a client's 'off' ('none'): a level
+        // says how hard to think, not whether, and the web sets one for every terminal session
+        // it opens (its default xhigh until the user picks another), so that off never got
+        // through from one. The session's own 'off' still wins over a client's level.
         const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
-        if (effortOverride !== null) effort = effortOverride
+        if (effortOverride !== null && (effortOverride === 'off' || effort !== 'off')) effort = effortOverride
       }
       // Applied exactly once, from whichever of the two sources above won, so a client value
-      // and a session override that disagree (e.g. client sends 'off' but the session's own
-      // override is 'low') can never leave a stale `enable_thinking`/`reasoning_effort` key
+      // and a session override that disagree (e.g. client sends 'medium' but the session's own
+      // override is 'off') can never leave a stale `enable_thinking`/`reasoning_effort` key
       // behind from a discarded intermediate write — every prior key this pair can set is
       // cleared before the winning one is applied. 'off' collapses onto
       // enable_thinking/thinking_budget_tokens (reasoning-effort.ts) since it isn't itself a
       // template value.
-      if (parsedBody && effort !== undefined) {
+      // A level (low/medium/xhigh) says how hard to think, not whether: thinking already off, by the slider's Off above
+      // or the client's own enable_thinking false (which a slider's budget above clears), stays off and gets no
+      // level. Its write used to clear that enable_thinking with the rest, and the web sets an effort for every
+      // terminal session it opens (its default xhigh until the user picks another): the slider's Off kept only
+      // thinking_budget_tokens 0, which vLLM, SGLang, MLX and llama.cpp builds without that sampler field ignore, so
+      // the model went on thinking.
+      const thinkingIsOff = (parsedBody?.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking === false
+      if (parsedBody && effort !== undefined && (effort === 'off' || !thinkingIsOff)) {
         const kwargs = { ...(parsedBody.chat_template_kwargs as Record<string, unknown> ?? {}) }
         delete kwargs.enable_thinking
         delete kwargs.reasoning_effort
