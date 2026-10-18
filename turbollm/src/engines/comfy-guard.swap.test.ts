@@ -212,6 +212,147 @@ test('a paused load the release resumes is refused right before its spawn by an 
   assert.equal(manager.status().model?.key, 'B')
 })
 
+// onLoadSettled is what cli.ts reports as telemetry's model_load. A load a render paused reported there as a failed
+// load (load_failed), each time a render refused it, though the render's release resumes it and that load reports its
+// own outcome.
+test('a load a render paused, in its pre-start hook or right before its spawn, is not reported as a failed load; the load its release resumes is', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell script as the fake engine interpreter',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-paused-report-')
+  const bin = fakeVllmPython(dir)
+  const port = await freePort()
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  t.after(() => guard.stop())
+  const reports: { ok: boolean; key: string }[] = []
+  manager.onLoadSettled = (ok, _err, o) => reports.push({ ok, key: o.model.key })
+  await guard.acquire()
+  await assert.rejects(
+    manager.load(vllmOpts(bin, dir, 'B', port), { beforeStart: () => guard.freeComfyUIBeforeLoad() }),
+    /ComfyUI is rendering/,
+  )
+  assert.deepEqual(reports, [], 'refused in its pre-start hook: not reported')
+
+  writeFileSync(join(dir, 'slow'), '')
+  const resumed = guard.release()
+  await preflightBegun(dir)
+  await guard.acquire() // the next prompt
+  await resumed
+  assert.equal(manager.status().state, 'error', 'B did not start under the new render')
+  assert.deepEqual(reports, [], 'refused right before its spawn: not reported')
+
+  rmSync(join(dir, 'slow'))
+  await guard.release()
+  assert.equal(manager.status().state, 'running')
+  assert.deepEqual(reports, [{ ok: true, key: 'B' }], 'the load that ran is reported once')
+})
+
+/** A stand-in llama-server that binds its port only 1 s after it starts while a `slow-listen` file exists beside it,
+ *  so a test can catch its load still starting. */
+function slowListenEngine(dir: string, port: number): (key: string) => StartOpts {
+  writeFileSync(join(dir, 'fake-engine.js'), FAKE_ENGINE_JS.replace(
+    /http\.createServer\((.*)\)\.listen\(port, '127\.0\.0\.1'\)/,
+    `const listen = () => http.createServer($1).listen(port, '127.0.0.1')
+setTimeout(listen, require('fs').existsSync(require('path').join(__dirname, 'slow-listen')) ? 1000 : 0)`,
+  ))
+  const bin = join(dir, 'llama-server')
+  writeFileSync(bin, `#!/bin/sh\nexec "${process.execPath}" "${join(dir, 'fake-engine.js')}" "$@"\n`)
+  chmodSync(bin, 0o755)
+  return (key) => ({
+    engine: { id: 'fake', name: 'Fake', binPath: bin, kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' },
+    model: { key, name: key, quant: '', ctx: 0, vision: false },
+    modelPath: join(dir, `${key}.gguf`),
+    extraArgs: [],
+    preferredPort: port,
+  })
+}
+
+async function untilStarting(manager: Manager): Promise<void> {
+  while (manager.status().state !== 'starting') await sleep(10)
+}
+
+// A render whose acquire catches a load still starting kills it and keeps its model for the release, which reloads it
+// with Manager.start. That load was reported as a failed load, and the reload that brought the model up reported
+// nothing. The readiness wait is the longest part of a load, so this is how most loads a render paused were counted.
+test('a load a render stops while it starts is not reported as a failed load; the reload of it after the render is, once', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-stopped-report-')
+  const opts = slowListenEngine(dir, await freePort())
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  t.after(() => guard.stop())
+  const reports: { ok: boolean; key: string }[] = []
+  manager.onLoadSettled = (ok, _err, o) => reports.push({ ok, key: o.model.key })
+  writeFileSync(join(dir, 'slow-listen'), '')
+  const load = manager.load(opts('B'), { beforeStart: () => guard.freeComfyUIBeforeLoad() })
+  await untilStarting(manager)
+  await guard.acquire()
+  await load
+  assert.equal(manager.status().state, 'stopped')
+  assert.equal(guard.snapshot().suspendedModelKey, 'B')
+  assert.deepEqual(reports, [], 'stopped while it started: not reported')
+
+  const reload = guard.release()
+  await untilStarting(manager)
+  await guard.acquire() // the next prompt
+  await reload
+  assert.equal(manager.status().state, 'stopped')
+  assert.deepEqual(reports, [], 'its reload, stopped while it started: not reported')
+
+  rmSync(join(dir, 'slow-listen'))
+  await guard.release()
+  assert.equal(manager.status().state, 'running')
+  assert.deepEqual(reports, [{ ok: true, key: 'B' }], 'the reload that ran is reported once')
+
+  // A model running when the render began was reported by its own load: its reload is not reported again.
+  await guard.acquire()
+  await guard.release()
+  assert.equal(manager.status().state, 'running')
+  assert.deepEqual(reports, [{ ok: true, key: 'B' }])
+})
+
+// A release can land while the acquire is still killing that load (the kill waits for the process to exit). It takes
+// the suspended model, and its reload is refused under the render the acquire goes on to hold, which keeps the model
+// for that render's release. Marked as a load that reports only once the kill was over, the model was taken unmarked
+// and its reload after the render was never reported.
+test('a release landing while the render kills a starting load still has the reload of it reported once', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const dir = tmpDir('tllm-comfy-kill-release-report-')
+  const opts = slowListenEngine(dir, await freePort())
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => { c.comfyui.enabled = true })
+  const manager = new Manager(store)
+  t.after(() => manager.stopAndWait({ force: true }))
+  const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
+  t.after(() => guard.stop())
+  const reports: { ok: boolean; key: string }[] = []
+  manager.onLoadSettled = (ok, _err, o) => reports.push({ ok, key: o.model.key })
+  writeFileSync(join(dir, 'slow-listen'), '')
+  const load = manager.load(opts('B'), { beforeStart: () => guard.freeComfyUIBeforeLoad() })
+  await untilStarting(manager)
+  const acquired = guard.acquire()
+  const released = guard.release() // the acquire is still killing B
+  await acquired
+  await released
+  await load
+  assert.equal(manager.status().state, 'stopped', 'the reload was refused under the render')
+  assert.equal(guard.snapshot().suspendedModelKey, 'B')
+  assert.deepEqual(reports, [])
+
+  rmSync(join(dir, 'slow-listen'))
+  await guard.release()
+  assert.equal(manager.status().state, 'running')
+  assert.deepEqual(reports, [{ ok: true, key: 'B' }], 'the reload that ran is reported once')
+})
+
 // An engine update, delete or purge does not wait for a render: the model is already unloaded, so nothing refuses it.
 // A purge (or an official llama.cpp backend's update, which registers the new build under a new id and deletes the old
 // one's folder) removed the engine and its binary, and the reload then started that binary: engine_spawn_failed, ENOENT.

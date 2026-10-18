@@ -143,10 +143,21 @@ function posNum(v: unknown): number {
 /** Hooks a load or start runs inside the global load gate. `beforeStart` runs first, before the start's own awaits
  *  (the vLLM/SGLang/LiteRT-LM preflight, the port allocation). `beforeSpawn` runs after the last of them, in the same
  *  tick as the spawn, so whatever it checks still holds when the engine starts. A throw from either starts nothing and
- *  rejects the load. */
+ *  rejects the load; a {@link LoadPausedError} is not reported as a failed load. */
 export interface LoadHooks {
   beforeStart?: () => Promise<void>
   beforeSpawn?: () => void
+}
+
+/** A hook's refusal that is a pause, not the load failing: the ComfyUI guard's while a render holds the GPU, whose
+ *  release resumes the load. load() keeps it as the engine's error, as any throw (the guard recognises its message
+ *  there), but does not report it to onLoadSettled: telemetry's model_load counted every load a render paused as a
+ *  failed one (load_failed), once per refusal, and the resumed load then reported its own outcome as well. */
+export class LoadPausedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LoadPausedError'
+  }
 }
 
 export class BusyError extends Error {
@@ -210,6 +221,10 @@ export class Manager {
    *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
   private watchdog: ReturnType<typeof setInterval> | null = null
   private readonly poolSlot: boolean
+  /** The load() in flight, or a start() that reports (`report`), from its entry into the load gate until it reports.
+   *  A ComfyUI render's stop marks it paused (stopAndWait's `onPausedLoad`): it then reports nothing, as a load the
+   *  guard's hooks refuse does not (LoadPausedError), and the guard reports the reload of it instead. */
+  private reporting: { paused: boolean } | null = null
 
   /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
    *  engine, so its engine log gets a file of its own (see startInternal). */
@@ -230,6 +245,8 @@ export class Manager {
     // whole fallback mechanism exists to fix.
     let effectiveOpts = opts
     await Manager.runExclusive(async () => {
+      const attempt = { paused: false }
+      this.reporting = attempt
       try {
         if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
           await this.stopAndWait()
@@ -274,8 +291,9 @@ export class Manager {
         // free. Manager stays telemetry-agnostic: it reports an outcome, and the
         // consumer (wired in cli.ts) decides what that means. Uses effectiveOpts (the
         // fallback's, when one ran and the retry is what actually ended up loaded/failed)
-        // so a successful text-only fallback isn't misreported as a load "with mmproj".
-        this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
+        // so a successful text-only fallback isn't misreported as a load "with mmproj". A load a ComfyUI render
+        // stopped while it started did not fail either: that render's release reloads it, and reports the reload.
+        if (!attempt.paused) this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -283,8 +301,11 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
-        this.reportLoad(false, this.errInfo, effectiveOpts)
+        // A load a ComfyUI render paused did not fail: that render's release resumes it, and the resumed load reports.
+        if (!attempt.paused && !(e instanceof LoadPausedError)) this.reportLoad(false, this.errInfo, effectiveOpts)
         throw e
+      } finally {
+        if (this.reporting === attempt) this.reporting = null
       }
     })
   }
@@ -293,12 +314,28 @@ export class Manager {
    *  the global load gate through readiness so concurrent loads can't spin up two
    *  engines at once. Most callers want load() (which stops first); this exists for
    *  paths that have already ensured the engine is free (bench, ComfyUI reload). `hooks` run inside the gate, as
-   *  load()'s do: a throw from one starts nothing and rejects the start. */
-  async start(opts: StartOpts, hooks?: LoadHooks): Promise<void> {
+   *  load()'s do: a throw from one starts nothing and rejects the start. `report`: report the outcome as load() does
+   *  (the ComfyUI guard's reload of a load a render stopped while it started, which reported nothing); a start that
+   *  is paused, refused by the guard (LoadPausedError) or finds another model loaded (BusyError: that load reports its
+   *  own) reports nothing. */
+  async start(opts: StartOpts, hooks?: LoadHooks, report = false): Promise<void> {
     await Manager.runExclusive(async () => {
-      if (hooks?.beforeStart) await hooks.beforeStart()
-      await this.startInternal(opts, undefined, hooks?.beforeSpawn)
-      await this.awaitNotStarting()
+      const attempt = report ? { paused: false } : null
+      this.reporting = attempt
+      try {
+        if (hooks?.beforeStart) await hooks.beforeStart()
+        await this.startInternal(opts, undefined, hooks?.beforeSpawn)
+        await this.awaitNotStarting()
+        if (attempt && !attempt.paused) this.reportLoad(this.state === 'running', this.errInfo, opts)
+      } catch (e) {
+        if (attempt && !attempt.paused && !(e instanceof LoadPausedError) && !(e instanceof BusyError)) {
+          const message = e instanceof Error ? e.message : String(e)
+          this.reportLoad(false, { code: 'load_failed', message, exitCode: -1, logTail: [] }, opts)
+        }
+        throw e
+      } finally {
+        if (this.reporting === attempt) this.reporting = null
+      }
     })
   }
 
@@ -485,7 +522,16 @@ export class Manager {
     forceKill(child)
   }
 
-  async stopAndWait(opts?: { force?: boolean }): Promise<void> {
+  /** `onPausedLoad`: the ComfyUI guard's stop for a render. A load() still starting, or up and not yet reported, is
+   *  paused, not failed: it reports nothing, and onPausedLoad is called (before the first await), so the guard reports
+   *  the reload of it (start()'s `report`). That load was reported as a failed one, and its reload, a start(), reported
+   *  nothing. */
+  async stopAndWait(opts?: { force?: boolean; onPausedLoad?: () => void }): Promise<void> {
+    const loading = this.reporting
+    if (opts?.onPausedLoad && loading && !loading.paused && (this.state === 'starting' || this.state === 'running')) {
+      loading.paused = true
+      opts.onPausedLoad()
+    }
     const exited = this.exited
     if (this.state === 'running' || this.state === 'starting') {
       // force: SIGKILL immediately rather than the graceful TERM→8s-then-kill path.

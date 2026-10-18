@@ -68,8 +68,10 @@ export const modelDownloaded = defineEvent({
 /** Who initiated a load. `gateway_switch` and `resume`/`manual` all funnel
  *  through `Manager.onLoadSettled` (cli.ts); `autotune` is reported directly
  *  by `bench.ts`, since an auto-tune sweep calls `Manager.start()` — a
- *  separate entry point from `.load()` that `onLoadSettled` never fires for
- *  (see cli.ts's own comment on this exact gap for `model_first_load`). */
+ *  separate entry point from `.load()` that fires `onLoadSettled` only when
+ *  its caller asks (`report`: the ComfyUI guard's reload of a load a render
+ *  stopped while it started), never for a sweep's probes (see cli.ts's own
+ *  comment on this exact gap for `model_first_load`). */
 export const MODEL_LOAD_TRIGGERS = ['manual', 'autotune', 'gateway_switch', 'resume'] as const
 
 /** Structured `LoadError.code` values this product's own code emits (grep

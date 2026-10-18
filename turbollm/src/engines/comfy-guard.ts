@@ -26,7 +26,7 @@
 // turning the slow re-prefill of a long prefix into a cheap memcpy. See ./slot-cache.
 import { existsSync } from 'node:fs'
 import type { ConfigStore, Engine } from '../config/config'
-import type { Manager, StartOpts } from './manager'
+import { LoadPausedError, type Manager, type StartOpts } from './manager'
 import { cacheEligible, restoreSlot, SAVE_CAP_MS, saveSlot, slotCacheDir, slotCacheKey, TTL_MS } from './slot-cache'
 
 /** The subset of the global `fetch` the reverse gate needs. Injectable so tests can
@@ -38,8 +38,8 @@ export type FetchImpl = (input: string, init?: RequestInit) => Promise<{ ok: boo
  *  load anyway (the gate node treats an unreachable TurboLLM the same way). */
 const FREE_TIMEOUT_MS = 10_000
 
-/** The refusal freeComfyUIBeforeLoad throws; Manager.load stores it as the engine's error, and release()
- *  recognises it there to resume that load. */
+/** The refusal freeComfyUIBeforeLoad throws (as a LoadPausedError, which Manager.load does not report as a failed
+ *  load); Manager.load stores it as the engine's error, and release() recognises it there to resume that load. */
 const LOAD_PAUSED = 'ComfyUI is rendering — model loading is paused until its queue finishes.'
 
 /** The refusal of a reload whose engine was unregistered, or moved to a binary that is missing, during the render (see
@@ -80,6 +80,9 @@ export class ComfyGuard {
   // The model we unloaded because ComfyUI started: release() reloads it unless a load the render
   // paused takes its place.
   private suspended: StartOpts | null = null
+  // `suspended` is a load the render stopped while it started (or up and not yet reported), which reported nothing:
+  // release()'s reload reports it (Manager.start's `report`).
+  private suspendedLoad = false
   private leaseTimer: ReturnType<typeof setTimeout> | null = null
   private lastSignalAt = 0
   // Serialize concurrent acquire() calls (rapid-fire enqueues) onto one unload.
@@ -183,7 +186,11 @@ export class ComfyGuard {
       // now, and the incoming model's load is refused while we hold the GPU (freeComfyUIBeforeLoad).
       if (st.state === 'running' || st.state === 'starting' || st.state === 'stopping') {
         const opts = tuning ? null : this.manager.currentOpts()
-        if (opts && !this.suspended) this.suspended = opts
+        const suspending = !!opts && !this.suspended
+        if (suspending) {
+          this.suspended = opts
+          this.suspendedLoad = false
+        }
         // KV prompt-cache persistence (F-014): only a RUNNING engine has a real cache and a
         // reachable port to save it from. When eligible, try the CAPPED save BEFORE the
         // unload; whether it succeeds or not we then free VRAM immediately (the cap means
@@ -208,7 +215,16 @@ export class ComfyGuard {
           }
         }
         console.log('[comfy-guard] ComfyUI acquired the GPU — force-unloading the model.')
-        await this.manager.stopAndWait({ force: true })
+        // A load still starting is paused, not failed: it reports nothing, and release()'s reload of it reports. Marked
+        // in the callback, which stopAndWait calls before its first await, not once the kill is over: a release()
+        // landing during the kill takes `suspended` with the mark, so the reload it carries to the next release (it is
+        // refused under this render) still reports.
+        await this.manager.stopAndWait({
+          force: true,
+          onPausedLoad: () => {
+            if (suspending && this.suspended === opts) this.suspendedLoad = true
+          },
+        })
       }
       // Not suspended for release(), by decision: a pool slot's model comes back only when the gateway
       // reloads it on demand, which takes auto-swap on and a caller allowed to load models. Otherwise
@@ -235,20 +251,24 @@ export class ComfyGuard {
     if (!this.held && !this.suspended) return Promise.resolve()
     this.held = false
     const opts = this.suspended
+    const report = this.suspendedLoad
     this.suspended = null
+    this.suspendedLoad = false
     // Taken now, not read after the reload: an acquire landing during it saves the cache of the engine it stops, and
     // that file is the next release's to restore.
     const cachedFile = this.cachedFile
     this.cachedFile = null
-    return this.reload(opts, cachedFile)
+    return this.reload(opts, cachedFile, report)
   }
 
   /** release()'s reload. A render that acquires while it runs (the route has already answered, so the next prompt's
    *  acquire can come at once) stops it as it stops any load: a reload already spawned is suspended and killed by
    *  acquire() itself. One not spawned yet (waiting for the load gate, or in the engine's preflight) gives that acquire
    *  nothing to suspend: it is refused, never spawned under the render, and stays the model to reload when that render
-   *  ends. */
-  private async reload(opts: StartOpts | null, cachedFile: string | null): Promise<void> {
+   *  ends. `report`: `opts` is a load the render stopped while it started, which reported nothing: its reload reports
+   *  the outcome (once it settles; a reload paused again carries it to the next release). A model that was running
+   *  when the render began was reported by its own load, so its reload is not reported again. */
+  private async reload(opts: StartOpts | null, cachedFile: string | null, report: boolean): Promise<void> {
     const render = this.acquires
     let refused = false
     // The engine the reload starts on, set once it is known which load that is.
@@ -331,7 +351,7 @@ export class ComfyGuard {
         engine = start.engine
         console.log('[comfy-guard] ComfyUI released the GPU — reloading the previous model.')
         await underSwapLock(start.model.key, async () => {
-          await this.manager.start(start, hooks)
+          await this.manager.start(start, hooks, report)
           reloaded(start)
         })
         // KV prompt-cache persistence (F-014): if we saved a cache on the way in, restore it
@@ -353,6 +373,7 @@ export class ComfyGuard {
       // the one its release reloads, unless that acquire suspended a model loaded since (the user's newer choice).
       if (!paused && opts && !this.suspended) {
         this.suspended = opts
+        this.suspendedLoad = report
         this.cachedFile = cachedFile
       }
     }
@@ -392,6 +413,7 @@ export class ComfyGuard {
     }
     if (this.suspended && this.suspended.model.key !== routineModelKey) return false
     this.suspended = opts
+    this.suspendedLoad = false // the displaced model ran before the routine: its load reported
     this.cachedFile = null // a KV cache saved on the way in is the routine model's
     return true
   }
@@ -487,7 +509,7 @@ export class ComfyGuard {
    *  port, and a render acquiring there finds no engine to stop. Throws while a render claims the GPU. */
   refuseLoadWhileHeld(): void {
     if (this.gpuClaimed()) {
-      throw new Error(LOAD_PAUSED)
+      throw new LoadPausedError(LOAD_PAUSED)
     }
   }
 
