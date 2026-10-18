@@ -16,6 +16,7 @@ import {
   androidEngineProblem,
   assertOrder,
   isCliEntry,
+  localPublishProblem,
   splitDirtyPaths,
   splitPreflightDirty,
   stageReleasePaths,
@@ -360,6 +361,56 @@ test('publish stops at once when gh fails instead of reading it as no npm-publis
   };
   await assert.rejects(waitForWorkflowRun('npm-publish.yml', 'v1.0.1', 60_000, noView, 1),
     (e) => /`gh release view v1\.0\.1` failed \(exit 1\)/.test(e.message) && /Bad credentials/.test(e.message));
+});
+
+// The local-token fallback runs `npm publish` in turbollm/, whose prepublishOnly builds what is on
+// disk: it uploaded uncommitted edits and untracked files, at whatever commit HEAD was, as the tag.
+test('the local npm fallback publishes only a checkout that is exactly the tag', () => {
+  const s = sandbox();
+  try {
+    must(s.g, 'tag', 'v1.0.1');
+    assert.equal(localPublishProblem('v1.0.1', s.g), null, 'HEAD at the tag with a clean turbollm/');
+
+    // Someone else's edit outside the package changes nothing npm publish builds.
+    put(s.work, 'signup-worker/index.ts', 'export const a = 2;\n');
+    assert.equal(localPublishProblem('v1.0.1', s.g), null);
+    must(s.g, 'checkout', '--', 'signup-worker/index.ts');
+
+    put(s.work, 'turbollm/package.json', '{\n  "version": "1.0.1",\n  "private": false\n}\n');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /turbollm\/ holds changes that v1\.0\.1 does not[^]*M turbollm\/package\.json/);
+    must(s.g, 'checkout', '--', 'turbollm/package.json');
+
+    put(s.work, 'turbollm/src/new.ts', 'export {};\n');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /\?\? turbollm\/src\/new\.ts/, 'an untracked file is built too');
+    rmSync(join(s.work, 'turbollm', 'src'), { recursive: true });
+
+    // bin/ ships as it is, so a file git ignores there is uploaded as well (*.bin and *.local are
+    // ignored here, as in the root .gitignore).
+    put(s.work, '.gitignore', '*.bin\n*.local\n');
+    must(s.g, 'add', '.gitignore');
+    must(s.g, 'commit', '-m', 'ignore');
+    must(s.g, 'tag', '-f', 'v1.0.1');
+    put(s.work, 'turbollm/bin/stale.bin', 'x');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /!! turbollm\/bin\/stale\.bin/);
+    rmSync(join(s.work, 'turbollm', 'bin'), { recursive: true });
+    // So is one in web/public/: vite copies it verbatim into the web build, which ships in dist/.
+    put(s.work, 'turbollm/web/public/brand/old.bin', 'x');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /!! turbollm\/web\/public\/brand\/old\.bin/);
+    rmSync(join(s.work, 'turbollm', 'web', 'public'), { recursive: true });
+    // And an ignored web/.env*.local: vite loads it into the build with no import naming it.
+    put(s.work, 'turbollm/web/.env.production.local', 'NODE_ENV=development\n');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /!! turbollm\/web\/\.env\.production\.local/);
+    rmSync(join(s.work, 'turbollm', 'web'), { recursive: true });
+    assert.equal(localPublishProblem('v1.0.1', s.g), null);
+
+    put(s.work, 'turbollm/README.md', 'later\n');
+    must(s.g, 'add', '-A');
+    must(s.g, 'commit', '-m', 'after the tag');
+    assert.match(localPublishProblem('v1.0.1', s.g) ?? '', /HEAD \([0-9a-f]{7}\) is not the tagged commit v1\.0\.1/);
+    assert.match(localPublishProblem('v9.9.9', s.g) ?? '', /could not both be resolved/, 'a missing tag fails closed');
+  } finally {
+    cleanup(s.root);
+  }
 });
 
 // ── the real CLI, against stub `gh` / `npm` ──────────────────────────────────

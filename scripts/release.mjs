@@ -776,6 +776,35 @@ function resolveNpmToken(opts = {}) {
   );
 }
 
+// Why the local-token fallback may not publish from this checkout, or null when it may. That
+// fallback runs `npm publish` in turbollm/, whose prepublishOnly builds whatever is on disk there
+// (web/ and src/), so it uploaded the working copy: uncommitted edits and untracked files
+// included, at whatever commit HEAD was, while npm-publish.yml builds a fresh checkout of the tag.
+// It may run only when the working copy is the tag: HEAD at the tagged commit, and nothing in
+// turbollm/ that git does not have at it, installed node_modules/ aside. Only turbollm/ counts, as
+// the package's build reads nothing outside it. Ignored files count where the build takes files as
+// they are: bin/, which ships as it is; web/public/, which vite copies verbatim into src/webdist/
+// and the build on into dist/webdist/; and web/.env*, which vite loads into the web build with no
+// import naming them (an .env.production.local with NODE_ENV=development ships React's development
+// build). npm reads no .gitignore above the package, so a file the root .gitignore ignores there
+// (*.zip, *.bin, *.log, *.local, ...) is uploaded or built in too. dist/ and src/webdist/
+// themselves are emptied and rebuilt by that build. A git that fails is a problem, not a pass.
+export function localPublishProblem(tag, gitRun = git) {
+  const head = gitRun('rev-parse', '--verify', 'HEAD^{commit}');
+  const tagged = gitRun('rev-parse', '--verify', '-q', `refs/tags/${tag}^{commit}`);
+  if (head.code !== 0 || tagged.code !== 0) {
+    return `HEAD and the tag ${tag} could not both be resolved.\n${[head.out, tagged.out].filter(Boolean).join('\n')}`.trim();
+  }
+  if (head.stdout !== tagged.stdout) return `HEAD (${head.stdout.slice(0, 7)}) is not the tagged commit ${tag} (${tagged.stdout.slice(0, 7)}).`;
+  const status = gitRun('status', '--porcelain', '--untracked-files=all', '--', 'turbollm');
+  const ignored = gitRun('ls-files', '--others', '--ignored', '--exclude-standard', '--', 'turbollm/bin', 'turbollm/web/public', 'turbollm/web/.env*');
+  if (status.code !== 0 || ignored.code !== 0) return `\`git status\` of turbollm/ failed:\n${status.out}\n${ignored.out}`.trim();
+  const lines = (s) => s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const changed = [...lines(status.stdout), ...lines(ignored.stdout).map((p) => `!! ${p}`)];
+  if (changed.length) return `turbollm/ holds changes that ${tag} does not, and npm publish would upload them:\n${changed.join('\n')}`;
+  return null;
+}
+
 // Publish with a throwaway userconfig so the token never lands in a persistent
 // .npmrc. Always removed in the finally.
 function npmPublishWithToken(token, { dryRun }) {
@@ -893,6 +922,15 @@ async function phasePublish(state, flags) {
           + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
           + `  or this release never fired it (one published before npm-publish.yml was added does not).\n`
           + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
+        );
+      }
+      const notTheTag = localPublishProblem(tag);
+      if (notTheTag) {
+        fail(
+          `no npm-publish.yml run found for ${tag}, and the local-token fallback would not publish ${tag}: ${notTheTag}\n`
+          + `  It publishes this checkout's turbollm/ as it is on disk. Nothing was published to npm.\n`
+          + `  Dispatch the workflow instead (\`gh workflow run npm-publish.yml -f tag=${tag}\`), which builds the tag itself,\n`
+          + `  or check out ${tag} with a clean turbollm/ (\`git checkout ${tag}\`, \`git status -- turbollm\`) and re-run publish.`,
         );
       }
       warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
