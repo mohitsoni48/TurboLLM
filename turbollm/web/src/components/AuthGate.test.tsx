@@ -1,7 +1,7 @@
-// AuthGate is non-dismissible for a 401 (the daemon or Code wants a key for everything), but when
-// only a host-only setting or "Always Allow" asked for one (auth-signal.ts's host-key signal) the
-// rest of the app works without a key, so the prompt offers "Not now" instead of locking a keyless
-// open-LAN browser out of chat until a reload.
+// AuthGate is non-dismissible for a 401 from /status (the daemon wants a key for everything), but
+// when only a host-only setting, "Always Allow" or Code asked for one (auth-signal.ts's signals)
+// the rest of the app works without a key, so the prompt offers "Not now" instead of locking a
+// keyless open-LAN browser out of chat until a reload.
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'

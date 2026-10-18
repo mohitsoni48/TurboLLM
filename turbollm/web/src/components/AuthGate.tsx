@@ -8,8 +8,8 @@ import { track, type KeyCheck } from '../lib/api'
 /** Shown when the daemon answers 401 — i.e. it's exposed on the LAN and this client
  *  has no (or a stale) API key. Lets the user paste a key; the parent checks it, then stores it
  *  and refetches. Replaces the misleading "lost connection" overlay for the auth case.
- *  `onDismiss` adds a "Not now", for when only a host-only setting asked for the key
- *  (auth-signal.ts's host-key signal) and the rest of the app works without one.
+ *  `onDismiss` adds a "Not now", for when only a host-only setting or Code asked for the key
+ *  (auth-signal.ts's signals) and the rest of the app works without one.
  *  `fullKeyNeeded` is for a key this browser has that a host-only change or Code did not take:
  *  most often one that works but cannot do what was asked (a remote-access token), or else one
  *  revoked since, which those refuse the same way. The prompt says a full API key is needed and

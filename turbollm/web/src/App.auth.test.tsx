@@ -10,10 +10,12 @@ import { useState, type ReactNode } from 'react'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useKeyPrompt } from './App'
 import { ApiError, KEY_CHECK_TIMEOUT_MS, createModelPreset, setPrimaryModelDir } from './lib/api'
-import { clearCodeAuthNeeded, clearHostKeyNeeded, isHostKeyNeeded, markCodeAuthNeeded, markHostKeyNeeded } from './lib/auth-signal'
+import { listCodeSessions } from './lib/code-api'
+import { clearCodeAuthNeeded, clearHostKeyNeeded, isCodeAuthNeeded, isHostKeyNeeded, markCodeAuthNeeded, markHostKeyNeeded } from './lib/auth-signal'
 import { Button } from './components/ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from './components/ui/dialog'
 import {
@@ -44,12 +46,29 @@ function Host({ status: first }: { status: typeof STATUS_OK | typeof STATUS_401 
   return <>{useKeyPrompt(status).prompt}</>
 }
 
-function mount(status: typeof STATUS_OK | typeof STATUS_401 = STATUS_OK, beside?: ReactNode) {
+function Path() {
+  return <span data-testid="path">{useLocation().pathname}</span>
+}
+
+/** The router's navigate, for a test to move between screens as the user would. */
+let navigateTo: (path: string) => void = () => {}
+function Navigator() {
+  const navigate = useNavigate()
+  navigateTo = (path) => navigate(path)
+  return null
+}
+
+/** Inside a router, as App is (main.tsx's BrowserRouter), at `path`. */
+function mount(status: typeof STATUS_OK | typeof STATUS_401 = STATUS_OK, beside?: ReactNode, path = '/workspace/chat') {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      {beside}
-      <Host status={status} />
+      <MemoryRouter initialEntries={[path]}>
+        {beside}
+        <Host status={status} />
+        <Path />
+        <Navigator />
+      </MemoryRouter>
     </QueryClientProvider>,
   )
 }
@@ -181,7 +200,7 @@ describe('a key pasted into the prompt replaces the one this browser has only on
   it('a key pasted at the Code prompt is checked by the same gate as Code before it replaces the stored one', async () => {
     vi.stubGlobal('fetch', fetchMock)
     localStorage.setItem('tllm.authToken', 'tllm-revoked')
-    mount()
+    mount(STATUS_OK, undefined, '/workspace/code/s1')
     act(() => markCodeAuthNeeded())
     expect(await screen.findByRole('alertdialog', { name: 'API key required' })).toHaveTextContent(/This needs a full API key/)
     await connectWith('tllm-typo')
@@ -286,6 +305,133 @@ describe('a key pasted into the prompt replaces the one this browser has only on
     const prompt = await screen.findByRole('alertdialog', { name: 'API key required' })
     expect(prompt).toHaveTextContent(/so it needs an API key/)
     expect(prompt).not.toHaveTextContent(/full API key/)
+  })
+})
+
+// Code needs a key from any device but the host (auth.ts codeAuth) even where the rest of the app
+// needs none, and its prompt had no "Not now": a keyless open-LAN browser that opened Code was shut
+// out of Chat too, the prompt covering the whole page, until it had a key.
+describe('the API key prompt Code opens', () => {
+  it('offers "Not now", which puts it off without a key or a request and goes back to Chat; Code asks again when it is opened again', async () => {
+    mount(STATUS_OK, undefined, '/workspace/code/s1')
+    act(() => markCodeAuthNeeded())
+    await userEvent.click(await screen.findByRole('button', { name: 'Not now' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(screen.getByTestId('path')).toHaveTextContent(/^\/workspace\/chat$/)
+    expect(isCodeAuthNeeded()).toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(localStorage.getItem('tllm.authToken')).toBeNull()
+
+    act(() => navigateTo('/workspace/code/s1'))
+    act(() => markCodeAuthNeeded())
+    expect(await screen.findByRole('alertdialog', { name: 'API key required' })).toBeTruthy()
+  })
+
+  it('Escape puts it off too, back to Chat', async () => {
+    mount(STATUS_OK, undefined, '/workspace/code')
+    act(() => markCodeAuthNeeded())
+    await screen.findByRole('alertdialog', { name: 'API key required' })
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(screen.getByTestId('path')).toHaveTextContent(/^\/workspace\/chat$/)
+    expect(isCodeAuthNeeded()).toBe(false)
+  })
+
+  // Code's polls (every 4-6 s) keep running under the prompt, and one still out when "Not now" was
+  // clicked answered 401 after the move to Chat: the prompt came straight back there.
+  it('a Code poll that answers 401 after it was put off does not bring it back on Chat; Code asks at once when opened again', async () => {
+    let answer: (res: Response) => void = () => {}
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => { answer = resolve }))
+    mount(STATUS_OK, undefined, '/workspace/code/s1')
+    act(() => markCodeAuthNeeded())
+    const poll = listCodeSessions().catch((e: unknown) => e)
+    await userEvent.click(await screen.findByRole('button', { name: 'Not now' }))
+    expect(screen.getByTestId('path')).toHaveTextContent(/^\/workspace\/chat$/)
+
+    await act(async () => {
+      answer(new Response(JSON.stringify({ error: { code: 'unauthorized', message: 'A valid API key is required to use Code from another device.' } }), { status: 401 }))
+      expect(await poll).toBeInstanceOf(ApiError)
+    })
+    expect(isCodeAuthNeeded()).toBe(true)
+    await act(async () => {})
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+
+    act(() => navigateTo('/workspace/code/s1'))
+    expect(await screen.findByRole('alertdialog', { name: 'API key required' })).toBeTruthy()
+  })
+
+  it('away from Code a Code 401 raises no prompt, and leaving Code takes its prompt down', async () => {
+    mount(STATUS_OK, undefined, '/models')
+    act(() => markCodeAuthNeeded())
+    await act(async () => {})
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+
+    act(() => navigateTo('/workspace/code'))
+    await screen.findByRole('alertdialog', { name: 'API key required' })
+    act(() => navigateTo('/workspace/chat'))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+  })
+
+  // lanAuth answers a remote-access token 403 forbidden on every Code route, which raises no prompt,
+  // so the Code signal is up with one only from a 401 before it was stored: through a tunnel a
+  // revoked key is refused 401 by /status and Code alike, and a remote-access token pasted at that
+  // prompt is taken (/status answers it 403). No Code request succeeds with it to clear the signal,
+  // and no /status poll either (no config:read), so whether the prompt is up is left to the Code
+  // signal alone: leaving Code must take it down there too.
+  it('leaving Code takes its prompt down when a revoked key\'s Code 401 set the signal and a remote-access token, whose /status never succeeds, was then pasted at the /status prompt', async () => {
+    localStorage.setItem('tllm.authToken', 'tllm-revoked')
+    mount(STATUS_401, undefined, '/workspace/code/s1')
+    act(() => markCodeAuthNeeded())
+    await screen.findByRole('alertdialog', { name: 'API key required' })
+    const scoped = { code: 'forbidden', message: 'This access token is not allowed to do that.' }
+    fetchMock.mockImplementationOnce(async () => new Response(JSON.stringify({ error: scoped }), { status: 403 }))
+    await connectWith('tllm-remote')
+    await waitFor(() => expect(localStorage.getItem('tllm.authToken')).toBe('tllm-remote'))
+    expect(fetchMock.mock.calls.map(([p]) => p)).toEqual(['/api/v1/status'])
+    act(() => setStatus(STATUS_403))
+    // The Code signal is still up, so the prompt stays on Code, now Code's, which can be put off.
+    expect(await screen.findByRole('button', { name: 'Not now' })).toBeTruthy()
+    act(() => navigateTo('/workspace/chat'))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(localStorage.getItem('tllm.authToken')).toBe('tllm-remote')
+
+    // Opened again, Code asks again, and its prompt can still be put off.
+    act(() => navigateTo('/workspace/code/s1'))
+    await userEvent.click(await screen.findByRole('button', { name: 'Not now' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(screen.getByTestId('path')).toHaveTextContent(/^\/workspace\/chat$/)
+  })
+
+  // A routine's page embeds a Code-flavor run's session (RoutineEditPage's CodeSessionScreen), whose
+  // requests mark the Code signal too. The page shows the routine and its runs without a key, so
+  // "Not now" stays there, and the run view's next 401 must not bring the prompt straight back.
+  it('a routine\'s page, whose run view embeds a Code session, asks too; "Not now" stays on it and puts the prompt off until the page is left', async () => {
+    mount(STATUS_OK, undefined, '/workspace/routines/r1')
+    act(() => markCodeAuthNeeded())
+    await userEvent.click(await screen.findByRole('button', { name: 'Not now' }))
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+    expect(screen.getByTestId('path')).toHaveTextContent(/^\/workspace\/routines\/r1$/)
+    expect(isCodeAuthNeeded()).toBe(false)
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    // The run view's next poll is refused too.
+    act(() => markCodeAuthNeeded())
+    await act(async () => {})
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+
+    // The routines list sends no Code request; opened again, the routine's page asks again.
+    act(() => navigateTo('/workspace/routines'))
+    await act(async () => {})
+    expect(screen.queryByRole('alertdialog')).toBeNull()
+    act(() => navigateTo('/workspace/routines/r1'))
+    expect(await screen.findByRole('alertdialog', { name: 'API key required' })).toBeTruthy()
+  })
+
+  it('has no "Not now" while /status answers 401 too: nothing works without a key then', async () => {
+    mount(STATUS_401, undefined, '/workspace/code')
+    act(() => markCodeAuthNeeded())
+    await screen.findByRole('alertdialog', { name: 'API key required' })
+    expect(screen.queryByRole('button', { name: 'Not now' })).toBeNull()
   })
 })
 

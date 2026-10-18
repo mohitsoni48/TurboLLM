@@ -28,7 +28,7 @@ import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
 import { getAuthToken, hostKeyAccepted, hostKeyCheck, setAuthToken, statusKeyCheck } from './lib/api'
 import { classifyStatusError } from './lib/connection-state'
-import { subscribeCodeAuthNeeded, isCodeAuthNeeded, subscribeHostKeyNeeded, isHostKeyNeeded, clearHostKeyNeeded } from './lib/auth-signal'
+import { subscribeCodeAuthNeeded, isCodeAuthNeeded, clearCodeAuthNeeded, subscribeHostKeyNeeded, isHostKeyNeeded, clearHostKeyNeeded } from './lib/auth-signal'
 import { useCodeFeatureEnabled } from './lib/platform'
 import { useRoutineNotificationPoller } from './lib/notify-routine'
 
@@ -181,14 +181,29 @@ function useResumeOnboardingAfterDiscoverDownload(shouldOnboard: boolean) {
  *  App.auth.test.tsx can drive it; App is its only caller. */
 export function useKeyPrompt(statusQ: Pick<UseQueryResult<Status>, 'isError' | 'error' | 'isSuccess'>) {
   const qc = useQueryClient()
+  const navigate = useNavigate()
+  const { pathname } = useLocation()
   // A 401 isn't a lost connection — the daemon is up but (LAN-exposed) wants an API
   // key. Show the key prompt instead of the misleading "lost connection" overlay.
   // Code has its OWN always-on key gate independent of the global one (auth.ts's codeAuth) —
-  // /status itself never 401s for it, so code-api.ts marks this separate signal instead.
+  // /status itself never 401s for it, so code-api.ts marks this separate signal instead (and
+  // terminal-connection.ts, on the POST /api/v1/code/sessions/:id/terminal that creates a
+  // terminal). It counts only where Code requests come from: a Code screen, and a routine's page,
+  // whose run view embeds a Code-flavor run's session (RoutineEditPage's CodeSessionScreen). A Code
+  // poll still out when the prompt was put off answered 401 after the move to Chat, marked the
+  // signal again and brought the prompt back over Chat. Opened again, Code asks at once if it is
+  // still set.
+  const onCodeScreen = pathname === '/workspace/code' || pathname.startsWith('/workspace/code/')
+  const onRoutinePage = pathname.startsWith('/workspace/routines/')
+  // The routine's page where "Not now" put Code's prompt off: its run view polls on, and each 401
+  // would bring the prompt straight back. Forgotten once the user leaves that page.
+  const [codePutOffOn, setCodePutOffOn] = useState<string | null>(null)
+  useEffect(() => { setCodePutOffOn(null) }, [pathname])
   const codeAuthNeeded = useSyncExternalStore(subscribeCodeAuthNeeded, isCodeAuthNeeded)
+    && (onCodeScreen || (onRoutinePage && codePutOffOn !== pathname))
   // Nor does it for a host-only setting or "Always Allow" that the daemon refused for want of a
   // key while requireApiKey is off (auth-signal.ts's host-key signal): the same prompt, which
-  // can be put off, since everything else here works without a key.
+  // can be put off, as Code's can, since everything else here works without a key.
   const hostKeyNeeded = useSyncExternalStore(subscribeHostKeyNeeded, isHostKeyNeeded)
   // C2 (Phase 5 final-review-fix re-review, ADR-422): `scopedTokenLimited` (403) is neither
   // "wrong/no credential" (401 — needsAuth) nor "daemon unreachable" — it is a capability-
@@ -255,8 +270,25 @@ export function useKeyPrompt(statusQ: Pick<UseQueryResult<Status>, 'isError' | '
         if (hostKeyNeeded && (forHostGate || (await hostKeyAccepted()))) clearHostKeyNeeded()
         return check
       }}
-      onDismiss={hostKeyNeeded && !needsAuthFromStatus && !codeAuthNeeded
-        ? () => { clearHostKeyNeeded(); setAuthLatched(false) }
+      // "Not now" (and Escape) whenever the rest of the app works without a key: for a host-only
+      // change, and for Code, whose gate asks for a key even where nothing else does (auth.ts
+      // codeAuth). Code's prompt had none, so a keyless open-LAN browser that opened Code was shut
+      // out of Chat as well until it had a key. Code stays gated: a Code screen would only ask again
+      // at its next poll, so putting it off there goes back to Chat, replacing the Code entry so
+      // Back does not walk into the prompt again. A routine's page shows the routine and its runs
+      // without a key, all but a Code-flavor run's session, so putting it off there stays on the
+      // page, with Code's prompt put off until the user leaves it. Opened again, Code asks again.
+      // Not with a 401 from /status, which nothing works without.
+      onDismiss={forHostGate
+        ? () => {
+            clearHostKeyNeeded()
+            if (codeAuthNeeded) {
+              clearCodeAuthNeeded()
+              if (onCodeScreen) navigate('/workspace/chat', { replace: true })
+              else setCodePutOffOn(pathname)
+            }
+            setAuthLatched(false)
+          }
         : undefined}
     />
   ) : null

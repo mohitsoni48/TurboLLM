@@ -3,7 +3,11 @@
 // gate (Chat/most of the app stays open on the LAN; only Code always requires a key from a
 // non-host device, see auth.ts's codeAuth). code-api.ts marks this signal on a 401 from any
 // Code endpoint; App.tsx subscribes via useSyncExternalStore and shows the SAME AuthGate.
-// Cleared on the next SUCCESSFUL Code request (a valid key was entered and something refetched).
+// Cleared on the next SUCCESSFUL Code request (a valid key was entered and something refetched),
+// or by the prompt's "Not now", which leaves Code for Chat: Code asks again when opened again.
+// App.tsx heeds it only where Code requests come from, a Code screen and a routine's page (which
+// embeds a Code-flavor run's session), so a Code request that answers after the move to Chat
+// cannot bring the prompt back there.
 let needed = false
 const listeners = new Set<() => void>()
 
