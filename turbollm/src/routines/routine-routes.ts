@@ -9,6 +9,7 @@ import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE, MCP_ROUTINE_
 import type { ScheduleRule, RoutineFlavor, Routine, RoutineRun, CodingAgentChoice } from './schema'
 import { CODING_AGENT_CHOICES } from './schema'
 import { isTextClassifierKey } from '../models/text-classifier'
+import { nonStringField } from '../util/string-fields'
 
 type Status = 200 | 201 | 400 | 401 | 403 | 404 | 409 | 500 | 503
 
@@ -114,6 +115,10 @@ export function validateCreate(
   isTextClassifier?: (key: string) => boolean,
 ): string | null {
   if (b.flavor !== 'chat' && b.flavor !== 'code') return 'flavor must be "chat" or "code".'
+  // Trimmed below and on the route: anything but a string threw, a bare 500 from the REST route. The tool executors check
+  // the same fields first (routine-tools.ts stringFieldProblem).
+  const notString = nonStringField(b, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath'])
+  if (notString) return `${notString} must be a string.`
   if (!b.prompt?.trim()) return 'prompt is required.'
   if (!b.scheduleDisplay?.trim()) return 'scheduleDisplay is required.'
   if (!b.scheduleRule) return 'scheduleRule is required.'
@@ -143,11 +148,18 @@ export function validateUpdate(
   current: Routine,
   isTextClassifier?: (key: string) => boolean,
 ): string | null {
+  // As in validateCreate, and a null too for the three fields this route reads whenever they are not undefined (none of
+  // them can be cleared): it threw the same way. A workspacePath that is not a string was stored as is on a chat routine
+  // (a number as "5.0"), or was a SQLite bind error; a null one still clears it there.
+  const fields = b as Record<string, unknown>
+  const notString = (['prompt', 'scheduleDisplay', 'modelKey'] as const).find((f) => fields[f] === null)
+    ?? nonStringField(b, ['prompt', 'scheduleDisplay', 'modelKey', 'workspacePath'])
+  if (notString) return `${notString} must be a string.`
   if (b.prompt !== undefined && !b.prompt.trim()) return 'prompt cannot be empty.'
   if (b.modelKey !== undefined && isTextClassifier?.(b.modelKey.trim())) {
     return TEXT_CLASSIFIER_ROUTINE_MODEL_MESSAGE(b.modelKey.trim())
   }
-  if (current.flavor === 'code' && b.workspacePath !== undefined && !b.workspacePath.trim()) {
+  if (current.flavor === 'code' && b.workspacePath !== undefined && !b.workspacePath?.trim()) {
     return 'workspacePath cannot be empty for a code-flavor routine.'
   }
   return validateCommonFields(b)

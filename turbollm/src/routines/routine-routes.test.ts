@@ -1107,3 +1107,57 @@ test('validateCreate with no predicates behaves exactly as before', () => {
   assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: JEV_KEY } as never), null)
   assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: '   ' } as never), 'modelKey is required.')
 })
+
+// A text field that held a number, an object, an array or a boolean threw where it is trimmed (`.trim is not a function`)
+// or stored (a SQLite bind error), a bare 500 from Hono's default handler; a number in a chat routine's workspacePath,
+// or on POST in a code routine's agentId, was stored as "5.0". On PUT a null threw the same way for the three fields
+// that route reads whenever they are not undefined.
+test('POST /api/v1/routines refuses a text field that is not a string with 400, creating nothing', async () => {
+  const { app, db } = testApp()
+  const post = (body: unknown) => app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  for (const [base, fields] of [
+    [{ ...CHAT_ROUTINE_BODY, modelKey: 'm' }, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+    [CODE_ROUTINE, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+  ] as const) {
+    for (const field of fields) {
+      for (const bad of [5, { text: 'x' }, ['x'], true]) {
+        const res = await post({ ...base, [field]: bad })
+        const what = `${base.flavor} ${field} ${JSON.stringify(bad)}`
+        assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
+        assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: `${field} must be a string.` } }, what)
+      }
+    }
+  }
+  assert.equal(db.listRoutines().length, 0, 'nothing created')
+  assert.equal((await post({ ...CHAT_ROUTINE_BODY, modelKey: 'm' })).status, 201, 'strings still create one')
+})
+
+test('PUT /api/v1/routines/:id refuses a text field that is not a string with 400, changing nothing', async () => {
+  const { app, db } = testApp()
+  const chat = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const code = db.createRoutine({ ...CODE_ROUTINE })
+  const put = (id: string, body: unknown) => app.request(`/api/v1/routines/${id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  const before = [JSON.stringify(db.getRoutine(chat.id)), JSON.stringify(db.getRoutine(code.id))]
+  for (const routine of [chat, code]) {
+    for (const field of ['prompt', 'scheduleDisplay', 'modelKey', 'workspacePath']) {
+      for (const bad of [5, { text: 'x' }, ['x'], true, ...(field === 'workspacePath' ? [] : [null])]) {
+        const res = await put(routine.id, { [field]: bad })
+        const what = `${routine.flavor} ${field} ${JSON.stringify(bad)}`
+        assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
+        assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: `${field} must be a string.` } }, what)
+      }
+    }
+  }
+  // A code routine's workspacePath cannot be cleared: a null is refused like a blank one (it threw).
+  const cleared = await put(code.id, { workspacePath: null })
+  assert.equal(cleared.status, 400)
+  assert.equal(((await cleared.json()) as { error: { message: string } }).error.message, 'workspacePath cannot be empty for a code-flavor routine.')
+  assert.deepEqual([JSON.stringify(db.getRoutine(chat.id)), JSON.stringify(db.getRoutine(code.id))], before, 'nothing changed')
+  // Strings still update.
+  assert.equal((await put(chat.id, { prompt: 'new', scheduleDisplay: 'e', modelKey: 'qwen3-coder-32b' })).status, 200)
+  assert.deepEqual([db.getRoutine(chat.id)?.prompt, db.getRoutine(chat.id)?.modelKey], ['new', 'qwen3-coder-32b'])
+})

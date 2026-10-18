@@ -1303,3 +1303,51 @@ test("a tool the conversation's agent does not list is refused like an unknown t
     h.cleanup()
   }
 })
+
+// A text field (trimmed, resolved as a model id, or stored as text) that held a number, an object, an array or a boolean
+// threw (`.trim is not a function`, a SQLite bind error): Hono's default handler answered a bare 500 text/plain.
+test('the chat and folder routes refuse a text field that is not a string with 400, changing nothing', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine()
+  try {
+    const folder = h.store.createFolder('Work')
+    const conv = h.store.createConversation()
+    const question = h.store.addMessage(conv.id, 'user', 'What is 2+2?')
+    const c = `/api/v1/conversations/${conv.id}`
+    const send = (method: string, url: string, body: unknown) =>
+      h.app.request(url, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const routes: Array<[string, string, Record<string, unknown>, string[]]> = [
+      ['POST', '/api/v1/folders', {}, ['name']],
+      ['PATCH', `/api/v1/folders/${folder.id}`, {}, ['name']],
+      ['POST', `${c}/tool-calls/t1/approve`, { toolName: 'web_search', decision: 'allow' }, ['toolName']],
+      ['POST', `${c}/messages`, { content: 'hi' }, ['content', 'model']],
+      ['POST', `${c}/continue`, {}, ['model']],
+      ['PUT', `${c}/messages/${question.id}`, { content: 'What is 3+3?' }, ['content']],
+      ['POST', `${c}/compact`, {}, ['model']],
+    ]
+    for (const [method, url, base, fields] of routes) {
+      for (const field of fields) {
+        for (const bad of [7, { text: 'x' }, ['x'], true]) {
+          const what = `${method} ${url} with ${field} ${JSON.stringify(bad)}`
+          const res = await send(method, url, { ...base, [field]: bad })
+          assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
+          assert.deepEqual(await res.json(), { error: { code: 'invalid_input', message: `${field} must be a string.` } }, what)
+        }
+      }
+    }
+    assert.deepEqual(h.store.listFolders().map((f) => f.name), ['Work'])
+    assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.content), ['What is 2+2?'], 'nothing stored or edited')
+    assert.equal(engine.bodies.length, 0, 'no turn ran')
+    assert.deepEqual(inFlightChatIds(), [])
+    // Strings (and null for an absent field) still go through.
+    assert.equal((await send('POST', '/api/v1/folders', { name: 'Home' })).status, 201)
+    assert.equal((await send('PATCH', `/api/v1/folders/${folder.id}`, { name: 'Office' })).status, 200)
+    const ok = await send('POST', `${c}/messages`, { content: 'hi', model: null })
+    assert.equal(ok.status, 200)
+    await ok.text()
+    assert.deepEqual(h.store.getMessages(conv.id).map((m) => m.role), ['user', 'user', 'assistant'])
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})

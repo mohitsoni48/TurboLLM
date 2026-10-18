@@ -35,6 +35,7 @@ import { noteLocalActivity } from '../link/host-idle'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream'
 import { servingEngine, servingEngineKind } from '../engines/serving'
 import { redactLocalPaths } from '../util/redact-paths'
+import { nonStringField } from '../util/string-fields'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
  *  pinned — both generation entry points must call this, never inline the expression.
@@ -186,6 +187,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/folders', async (c) => {
     const b = await body<{ name?: string }>(c)
+    if (nonStringField(b, ['name'])) return err(c, 400, 'invalid_input', 'name must be a string.')
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
     return c.json(db.createFolder(name), 201)
@@ -193,6 +195,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.patch('/api/v1/folders/:id', async (c) => {
     const b = await body<{ name?: string }>(c)
+    if (nonStringField(b, ['name'])) return err(c, 400, 'invalid_input', 'name must be a string.')
     const name = (b.name ?? '').trim()
     if (!name) return err(c, 400, 'invalid_input', 'Folder name required.')
     const ok = db.renameFolder(c.req.param('id'), name)
@@ -368,6 +371,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/conversations/:id/tool-calls/:toolCallId/approve', async (c) => {
     const { id: convId, toolCallId } = c.req.param()
     const b = await body<{ toolName?: string; decision?: string }>(c)
+    if (nonStringField(b, ['toolName'])) return err(c, 400, 'invalid_input', 'toolName must be a string.')
     const toolName = (b.toolName ?? '').trim()
     const decision = b.decision
     if (!toolName) return err(c, 400, 'invalid_input', 'toolName is required.')
@@ -464,6 +468,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.post('/api/v1/conversations/:id/messages', async (c) => {
     const convId = c.req.param('id')
     const b = await body<{ content?: string; images?: string[]; docContext?: string; textAttachments?: string[]; thinkingBudget?: number; reasoningEffort?: string; model?: string }>(c)
+    // Trimmed here and in resolveChatUpstream (the model): anything but a string threw, a bare 500.
+    const notString = nonStringField(b, ['content', 'model'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const content = (b.content ?? '').trim()
     const images = b.images ?? []
     const textAttachments = b.textAttachments ?? []
@@ -546,6 +553,8 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // `messageId` (with `regenerate`): the reply the client shows last, the one it means to replace.
     // `edit` (Save & Resend, what the web UI sends): the question to give a new version and answer.
     const b = await body<{ thinkingBudget?: number; reasoningEffort?: string; model?: string; regenerate?: boolean; messageId?: string; edit?: { messageId?: string; content?: string } }>(c)
+    // resolveChatUpstream trims the model: anything but a string threw, a bare 500.
+    if (nonStringField(b, ['model'])) return err(c, 400, 'invalid_input', 'model must be a string.')
 
     const conv = db.getConversation(convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Conversation not found.')
@@ -670,6 +679,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   app.put('/api/v1/conversations/:id/messages/:msgId', async (c) => {
     const { id: convId, msgId } = c.req.param()
     const b = await body<{ content?: string }>(c)
+    if (nonStringField(b, ['content'])) return err(c, 400, 'invalid_input', 'content must be a string.')
     const trimmed = b.content?.trim()
     if (!trimmed) return err(c, 400, 'invalid_input', 'content required.')
     const msg = db.getMessage(msgId)
@@ -730,6 +740,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // client to protect either: the daemon ships its own webdist bundle, so server and client
     // are always in lockstep.
     const b = await body<{ model?: string }>(c)
+    if (nonStringField(b, ['model'])) return err(c, 400, 'invalid_input', 'model must be a string.')
     const resolved = resolveChatUpstream(d, b.model)
     if (!resolved.ok) return err(c, resolved.status, resolved.code, resolved.message)
     const busy = inflightRefusal(c, convId, 'Stop generation first.')

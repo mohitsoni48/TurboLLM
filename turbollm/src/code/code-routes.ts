@@ -33,6 +33,7 @@ import { agentAvailability, installAgent } from './agent-availability'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
+import { nonStringField } from '../util/string-fields'
 
 // 503 is Turbo Link's (ADR-376): a linked machine that went offline between the picker
 // listing it and this turn being submitted. Deliberately not 409 — nothing about THIS
@@ -45,16 +46,6 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
  *  refused before it is stored. Absent or null is fine. */
 function badContextFiles(v: unknown): boolean {
   return v != null && !(Array.isArray(v) && v.every((x) => typeof x === 'string'))
-}
-/** The first of `fields` that the request body carries as anything but a string (absent or null is
- *  fine). These are trimmed, handed to git or the shell, or stored as text: a number or an object
- *  there threw (`.trim is not a function`, a SQLite bind error) and answered an unhandled 500, or
- *  was stored as is. The routes refuse it with 400 invalid_input before doing anything. */
-function nonStringField(b: object, fields: string[]): string | undefined {
-  return fields.find((f) => {
-    const v = (b as Record<string, unknown>)[f]
-    return v != null && typeof v !== 'string'
-  })
 }
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
