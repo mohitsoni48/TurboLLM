@@ -487,6 +487,39 @@ test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook
   assert.equal(started, false)
 })
 
+// Auto-tune stops the primary between its probes, which the activate route read as idle: a switch got through mid-run
+// and the rest of the run loaded the model on the newly selected engine with the old one's llama.cpp flags.
+test('POST /api/v1/engines/:id/activate refuses a switch while auto-tune runs', async () => {
+  let tuning = true
+  const engines = [{ id: 'cuda', name: 'llama.cpp CUDA', kind: 'llama-server' }, { id: 'vllm', name: 'vLLM', kind: 'vllm' }]
+  let activeId = 'cuda'
+  const activated: string[] = []
+  const d = {
+    manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), clearError: () => {} },
+    bench: { isRunning: () => tuning },
+    registry: {
+      active: () => engines.find((e) => e.id === activeId),
+      get: (id: string) => engines.find((e) => e.id === id),
+      activate: (id: string) => { activated.push(id); activeId = id },
+    },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+  const activate = (id: string) => app.request(`/api/v1/engines/${id}/activate`, { method: 'POST' })
+
+  const refused = await activate('vllm')
+  assert.equal(refused.status, 409)
+  const body = (await refused.json()) as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'engine_running')
+  assert.equal(body.error.message, 'Stop auto-tune before switching the active engine.')
+  assert.deepEqual(activated, [])
+  // Picking the engine the run tunes changes nothing, so it is not refused.
+  assert.equal((await activate('cuda')).status, 200)
+  tuning = false
+  assert.equal((await activate('vllm')).status, 200)
+  assert.deepEqual(activated, ['cuda', 'vllm'])
+})
+
 // The gate node (v3+) holds its lock across the release call, and a prompt ComfyUI queues meanwhile waits for that lock
 // on ComfyUI's server thread. The route used to answer only once the LLM had reloaded, so every "Run (Instant)"
 // auto-queue iteration froze ComfyUI for up to the node's 10 s timeout.

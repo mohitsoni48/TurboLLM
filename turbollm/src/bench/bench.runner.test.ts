@@ -30,6 +30,8 @@ const CAPS = { kvTypes: ['f16', 'q8_0'], flags: [] as string[] }
 interface RunnerInternals {
   deadline: number
   cancelled: boolean
+  /** The run's engine, which start() takes; set by hand where a test drives a probe without a run. */
+  engine: unknown
   probeVram: (...a: unknown[]) => Promise<{ outcome: 'ok'; vramAbsMb: number | null; spillMb: number | null }>
   settleGpu: (...a: unknown[]) => Promise<void>
   benchAt: (e: ModelEntry, s: SysInfo, p: LoadProfile, ...rest: unknown[]) => Promise<null>
@@ -51,6 +53,7 @@ function runner(store: unknown = {}): { r: RunnerInternals; started: unknown[] }
   const bench = new BenchRunner(manager as never, store as never, {} as never, registry as never, 'test', {} as never)
   const r = bench as unknown as RunnerInternals
   r.deadline = Date.now() + 60_000
+  r.engine = registry.active()
   return { r, started }
 }
 
@@ -98,6 +101,7 @@ test('measure: with parallel slots and no unified KV, the bench prompt fits one 
     const bench = new BenchRunner(manager as never, {} as never, {} as never, registry as never, 'test', {} as never)
     const r = bench as unknown as RunnerInternals & { prefillProbe: (t: string, messages: { content: string }[]) => Promise<unknown> }
     r.deadline = Date.now() + 60_000
+    r.engine = registry.active()
     let promptChars = 0
     r.prefillProbe = async (_t, messages) => {
       promptChars = messages.reduce((n, msg) => n + msg.content.length, 0)
@@ -145,6 +149,7 @@ test('a ComfyUI render cancels auto-tune: a probe waiting for the load gate star
   const r = bench as unknown as RunnerInternals & { state: { running: boolean } }
   r.deadline = Date.now() + 60_000
   r.state = { running: true }
+  r.engine = registry.active()
   const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
   const comfy = new ComfyGuard(comfyStore as never, manager as never)
   comfy.setAutoTune(bench)
@@ -161,6 +166,51 @@ test('a ComfyUI render cancels auto-tune: a probe waiting for the load gate star
   assert.equal(comfy.snapshot().suspendedModelKey, null, 'the killed probe is not the model to reload')
   await comfy.release()
   assert.deepEqual(spawned, [], 'release loads no probe configuration')
+})
+
+// A run used to look the active engine up again for every probe. The primary is stopped between two probes and the
+// activate route checked only the primary, so a switch there sent the rest of the run to the newly selected engine (a
+// GGUF launched on vLLM with llama.cpp's -ngl flags), and the winner was saved under the engine the run started on.
+// Driven through start(), with the search cut to two probes and the switch landing between them (the settle window).
+test('auto-tune starts every probe on the engine it started with, and stops when another engine is selected', async () => {
+  const engines = {
+    cuda: { id: 'cuda', name: 'llama.cpp CUDA', kind: 'llama-server', binPath: '/e/llama-server', version: 'b1', capabilities: CAPS },
+    vllm: { id: 'vllm', name: 'vLLM', kind: 'vllm', binPath: '/e/python', version: 'vllm 0.1', capabilities: { kvTypes: [], flags: [] } },
+  }
+  let activeId: keyof typeof engines = 'cuda'
+  const started: string[] = []
+  const manager = {
+    // Manager.start's shape: beforeStart runs inside the load gate, then the spawn.
+    start: async (opts: { engine: { id: string } }, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await hooks?.beforeStart?.()
+      started.push(opts.engine.id)
+    },
+    stopAndWait: async () => {},
+    status: () => ({ state: 'stopped', err: null }), // every probe reads as a crash at once: only its start matters here
+    logPath: () => null,
+    target: () => null,
+  }
+  const registry = { active: () => engines[activeId] }
+  const m = model({ blockCount: 2 })
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
+  const bench = new BenchRunner(manager as never, store as never, scanner as never, registry as never, 'test', {} as never)
+  const r = bench as unknown as RunnerInternals
+  r.settleGpu = async () => {}
+  r.denseSearch = async (e, s, p, caps, results) => {
+    await r.probeVram(e, s, { ...p, ngl: 1 }, caps)
+    activeId = 'vllm' // the user picks vLLM in Engines, or an install activates it
+    await r.probeVram(e, s, { ...p, ngl: 2 }, caps)
+    return r.benchAt(e, s, { ...p, ngl: 2 }, caps, results, 'ngl=2')
+  }
+
+  bench.start(m.key)
+  while (bench.isRunning()) await new Promise((res) => setTimeout(res, 20))
+
+  assert.deepEqual(started, ['cuda'], 'nothing starts on the engine selected mid-run')
+  const st = bench.status()
+  assert.equal(st.done, true)
+  assert.match(st.error ?? '', /another engine was selected/)
 })
 
 test('saved auto-tune result is queued even when the CPU/GPU names are not identifier-safe', () => {

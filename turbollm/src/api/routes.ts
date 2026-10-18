@@ -2018,6 +2018,11 @@ export function registerApi(app: Hono, d: Deps): void {
 
   app.post('/api/v1/engines/:id/activate', (c) => {
     if (engineBusy(d)) return err(c, 409, 'engine_running', 'Stop the running engine before switching the active engine.')
+    // Auto-tune stops the primary between its probes, which engineBusy reads as idle, so a switch got through mid-run
+    // and the rest of the run loaded the model on the new engine with the old one's flags. A run tunes the engine it
+    // started on and stops when another is selected (BenchRunner.startEngine); the switch is refused here instead.
+    if (d.bench.isRunning() && d.registry.active()?.id !== c.req.param('id'))
+      return err(c, 409, 'engine_running', 'Stop auto-tune before switching the active engine.')
     try {
       d.registry.activate(c.req.param('id'))
       // Switching engines invalidates any prior load error (e.g. a failed vLLM load on an

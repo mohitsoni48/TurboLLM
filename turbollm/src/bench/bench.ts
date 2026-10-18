@@ -156,6 +156,8 @@ const TOTAL_BUDGET_MS = 45 * 60_000
 // during graph capture once the allocation failed). Treat all of these as OOM so the search
 // offloads more and the result reads as a fit problem rather than a mystery crash.
 const OOM_RE = /out of memory|cudaMalloc|failed to allocate|unable to allocate|device not ready|CUDA error/i
+// The run's result when another engine was selected while it ran (see BenchRunner.startEngine).
+const ENGINE_SWITCHED = 'Auto-tune stopped: another engine was selected during the run. Run it again to tune that engine.'
 
 // Auto-tune may also sweep the KV-cache quant — but only ever SELECTS a quality-preserving type:
 // full-precision f16, near-lossless q8_0, and (on TurboQuant forks) turbo4 (≈ q8_0 quality). This
@@ -191,6 +193,10 @@ export class BenchError extends Error {
 export class BenchRunner {
   private state: BenchState = { running: false }
   private cancelled = false
+  // The engine this run tunes, taken once by start(): every probe launches on it, and its caps and the id the result is
+  // saved under are its own. `engineSwitched`: the run stopped because another engine was selected (startEngine).
+  private engine: Engine | null = null
+  private engineSwitched = false
   private deadline = 0
   // Aborts the in-flight measurement request the instant cancel() is called, so a
   // stop/restart/load (kill switches) interrupts auto-tune immediately rather than
@@ -305,11 +311,25 @@ export class BenchRunner {
   /** Every engine start in this file. A cancelled run starts nothing more, checked inside the load gate: a ComfyUI
    *  render cancels auto-tune (ComfyGuard.acquire), since Manager.start runs no ComfyUI pre-start hook, and a probe
    *  that was waiting for the gate would otherwise load gigabytes under that render. Callers read the throw as the
-   *  start failing. */
+   *  start failing.
+   *
+   *  Every start is on the run's own engine (`opts.engine` is `this.engine`), and only while that engine is still the
+   *  selected one, checked in the same gate. The probes used to look the active engine up again each time, and the
+   *  primary is stopped between two of them, so a switch there (the activate route checked only the primary) sent
+   *  the rest of the run to the newly selected engine: a GGUF launched on vLLM with llama.cpp's flags, or a Vulkan
+   *  build measured, and the winner saved and pinned under the engine the run started on. The activate route now
+   *  refuses a switch during a run; an install or Enable that activates another engine still can make one, and the
+   *  run then stops here as a cancel does, with ENGINE_SWITCHED as its error, rather than load a model on an engine
+   *  the user has just left. */
   private startEngine(opts: StartOpts): Promise<void> {
     return this.manager.start(opts, {
       beforeStart: async () => {
         if (this.cancelled) throw new Error('Auto-tune was cancelled.')
+        if (this.registry.active()?.id !== opts.engine.id) {
+          this.engineSwitched = true
+          this.cancelled = true
+          throw new Error(ENGINE_SWITCHED)
+        }
       },
     })
   }
@@ -380,6 +400,8 @@ export class BenchRunner {
     if (entry.incomplete || entry.parseError) throw new BenchError('model_not_loadable', 'This model is incomplete or unreadable.')
 
     this.cancelled = false
+    this.engine = active
+    this.engineSwitched = false
     this.abort = new AbortController()
     this.winning = null
     this.runLog = []
@@ -400,7 +422,7 @@ export class BenchRunner {
   private async run(modelKey: string, entry: ModelEntry, base?: Partial<LoadProfile>): Promise<void> {
     const sys = getSysInfo()
     this.runLogMeta = { modelKey, startedAt: new Date().toISOString(), sys }
-    const active = this.registry.active()
+    const active = this.engine
     const caps = active?.capabilities ?? { flags: [], kvTypes: [] }
     // Per-engine profile (issue #35): tune from the profile saved for the active engine
     // (falling back to the '*' migrated profile), so a re-tune builds on this engine's own basis.
@@ -493,7 +515,7 @@ export class BenchRunner {
         // not the same signal as one whose load broke — same reasoning already
         // applied to download outcomes (ADR-299).
         this.reportFirstLoad('cancelled')
-        this.state = { running: false, modelKey, done: true, candidates: results }
+        this.state = { running: false, modelKey, done: true, candidates: results, ...(this.engineSwitched ? { error: ENGINE_SWITCHED } : {}) }
         return
       }
       const profile =
@@ -539,7 +561,7 @@ export class BenchRunner {
       // say so with the context size so the fix (lower ctx) is obvious — rather than a vague crash.
       const memoryBound = results.length > 0 && results.every((r) => r.outcome === 'oom')
       const err = this.cancelled
-        ? undefined
+        ? this.engineSwitched ? ENGINE_SWITCHED : undefined
         : memoryBound
           ? `This model doesn't fit on your GPU at ${baseProfile.ctx.toLocaleString()} context — even with maximum CPU offload it ran out of VRAM. Lower the context length and try again.`
           : 'No candidate completed successfully.'
@@ -834,7 +856,7 @@ export class BenchRunner {
     caps: Engine['capabilities'],
   ): Promise<{ outcome: 'ok' | 'timeout' | 'crash' | 'oom'; vramAbsMb: number | null; spillMb: number | null }> {
     const profile = withBalancedSplit(profileIn, entry, sys)
-    const active = this.registry.active()
+    const active = this.engine
     if (!active) return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     const testDeadline = Math.min(Date.now() + READY_TIMEOUT_MS + 5_000, this.deadline)
     const opts: StartOpts = {
@@ -949,7 +971,7 @@ export class BenchRunner {
     // 'crash' is the same non-ok outcome awaitReady reports for a cancel.
     if (this.cancelled) return fail('crash')
 
-    const active = this.registry.active()
+    const active = this.engine
     if (!active) return fail('crash')
 
     // Per-test cap (PER_TEST_TIMEOUT_MS, 10 min — raised from 3 for deep-ctx trials, ADR-217
@@ -1285,7 +1307,7 @@ export class BenchRunner {
     sys: SysInfo,
     card: string,
   ): Promise<CardSampling | undefined> {
-    const active = this.registry.active()
+    const active = this.engine
     if (!active) return undefined
     const opts: StartOpts = {
       engine: active,
