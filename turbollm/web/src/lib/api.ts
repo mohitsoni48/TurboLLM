@@ -1144,15 +1144,68 @@ export function getApiKeys(): Promise<ApiKeysList> {
 }
 /** Whether the daemon's host gate (auth.ts hostGate) takes the key this browser now sends: GET
  *  /api/v1/keys is behind that gate and changes nothing, and answers 403 to a missing, wrong or
- *  revoked key (401 with requireApiKey on). App.tsx asks it before closing the key prompt a
- *  host-only setting raised (auth-signal.ts's host-key signal). Any other failure, a dropped
- *  connection say, says nothing about the key, so it counts as accepted, as before the check. */
+ *  revoked key or a remote-access token (401 with requireApiKey on or through a tunnel).
+ *  EnginesScreen asks it before a git build's Remove, and App.tsx before closing the prompt a
+ *  host-only setting raised once a key judged by /status is stored. Any other failure, a dropped
+ *  connection or no answer in time say, says nothing about the key, so it counts as accepted, as
+ *  before the check. */
 export async function hostKeyAccepted(): Promise<boolean> {
+  return (await keyCheck('/api/v1/keys', authHeaders(), hostGateVerdict)) !== 'refused'
+}
+/** What a check said about a key pasted into the key prompt (App.tsx useKeyPrompt), which replaces
+ *  the stored one only when 'accepted'. 'unchecked' is no answer about the key at all: a dropped
+ *  connection, or a tunnel's or proxy's 5xx while the daemon restarts. The stored key can be a
+ *  remote-access token, shown once and never again, so that must not count as taken: a typo
+ *  pasted while the daemon was restarting replaced it as surely as one the daemon refused. No
+ *  answer within KEY_CHECK_TIMEOUT_MS is 'unchecked' too. */
+export type KeyCheck = 'accepted' | 'refused' | 'unchecked'
+/** `key` checked at the host gate (see hostKeyAccepted), which is also Code's gate (auth.ts
+ *  codeAuth): for a key pasted into the prompt a host-only change or Code raised (auth-signal.ts).
+ *  Only a 2xx takes it. */
+export function hostKeyCheck(key: string): Promise<KeyCheck> {
+  return keyCheck('/api/v1/keys', { 'X-TurboLLM-Auth': key }, hostGateVerdict)
+}
+/** `key` checked by lanAuth through GET /api/v1/status, for a key pasted into the prompt a 401
+ *  from /status raised: only a 401 refuses it. A 403 is a remote-access token without config:read,
+ *  a key that works for everything it was given (connection-state.ts's scopedTokenLimited), so it
+ *  takes the key as a 2xx does. */
+export function statusKeyCheck(key: string): Promise<KeyCheck> {
+  return keyCheck('/api/v1/status', { 'X-TurboLLM-Auth': key }, (status) =>
+    status === 401 ? 'refused' : (status >= 200 && status < 300) || status === 403 ? 'accepted' : 'unchecked')
+}
+function hostGateVerdict(status: number): KeyCheck {
+  return status === 401 || status === 403 ? 'refused' : status >= 200 && status < 300 ? 'accepted' : 'unchecked'
+}
+/** How long a key check waits for an answer before it gives up, as 'unchecked'. */
+export const KEY_CHECK_TIMEOUT_MS = 10_000
+/** GET `path` with `auth` and what `verdict` makes of the answer. A plain fetch, not request(): a
+ *  check's refusal must not raise the auth signals (auth-signal.ts) the prompt it answers is built
+ *  on, and the stored key must not be touched. A dropped connection is 'unchecked', and so is no
+ *  answer within KEY_CHECK_TIMEOUT_MS. */
+async function keyCheck(path: string, auth: Record<string, string>, verdict: (status: number) => KeyCheck): Promise<KeyCheck> {
+  const headers = { Accept: 'application/json', ...auth }
+  // A key with a character no request header can carry (a curly quote or a zero-width space
+  // pasted along with it) made fetch throw before anything was sent, which read as a dropped
+  // connection: the prompt said to try again in a moment, which never helped. No key has such a
+  // character, so it is refused, without a request.
   try {
-    await getApiKeys()
-    return true
-  } catch (e) {
-    return !(e instanceof ApiError && (e.status === 401 || e.status === 403))
+    new Headers(headers)
+  } catch {
+    return 'refused'
+  }
+  // A check with no answer at all (a tunnel holding the connection open) kept AuthGate's Connect
+  // disabled, with no hint, for as long as it was out, and the prompt a 401 from /status opens has
+  // no "Not now": nothing on it could be clicked. So it gives up, and says no more than a dropped
+  // connection does.
+  const abort = new AbortController()
+  const timer = setTimeout(() => abort.abort(), KEY_CHECK_TIMEOUT_MS)
+  try {
+    const res = await fetch(path, { headers, signal: abort.signal })
+    return verdict(res.status)
+  } catch {
+    return 'unchecked'
+  } finally {
+    clearTimeout(timer)
   }
 }
 export function createApiKey(name: string): Promise<ApiKeyCreated> {

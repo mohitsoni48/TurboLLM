@@ -26,7 +26,7 @@ import { useJevLoadedToast } from './lib/model-loader'
 import type { Status } from './lib/types'
 import { useUiStore } from './stores/ui'
 import { useOnboardingState } from './lib/onboarding-queries'
-import { hostKeyAccepted, setAuthToken } from './lib/api'
+import { getAuthToken, hostKeyAccepted, hostKeyCheck, setAuthToken, statusKeyCheck } from './lib/api'
 import { classifyStatusError } from './lib/connection-state'
 import { subscribeCodeAuthNeeded, isCodeAuthNeeded, subscribeHostKeyNeeded, isHostKeyNeeded, clearHostKeyNeeded } from './lib/auth-signal'
 import { useCodeFeatureEnabled } from './lib/platform'
@@ -208,29 +208,52 @@ export function useKeyPrompt(statusQ: Pick<UseQueryResult<Status>, 'isError' | '
   // pasting the key) flips an occasional poll from 401 → generic network error, which
   // would tear the dialog down, swap in the "lost connection" overlay, and wipe the
   // half-typed key. Sticky mount = the input keeps its value + focus while you type.
+  // Or until /status answers 403 (scopedTokenLimited): a remote-access token, a key the daemon
+  // took, which is never given config:read, so no poll with it succeeds. A remote-access token
+  // pasted at a 401 there was stored, and the prompt then stayed up for good, with no "Not now",
+  // until a reload: on a phone opening the tunnel's URL for the first time, say.
   const [authLatched, setAuthLatched] = useState(false)
   useEffect(() => {
     if (needsAuth) setAuthLatched(true)
-    else if (statusQ.isSuccess) setAuthLatched(false)
-  }, [needsAuth, statusQ.isSuccess])
+    else if (statusQ.isSuccess || scopedTokenLimited) setAuthLatched(false)
+  }, [needsAuth, statusQ.isSuccess, scopedTokenLimited])
 
+  // A pasted key is checked before it replaces the stored one. That one can be a remote-access
+  // token, shown once when remote access started and never again: one with models:load is refused
+  // 403 api_key_required for a preset whose launch flags are its own, and storing whatever was
+  // pasted then replaced a working token with a typo for good, locking this browser out of the
+  // tunnel. Code's prompt is held to the same rule: Code answers 401 (auth.ts codeAuth) to a stale
+  // or revoked key on an open LAN, where /status still succeeds. A remote-access token never gets
+  // that far: through a tunnel lanAuth answers it 403 forbidden on every Code route, which opens no
+  // prompt. So the check is the one that fits what the prompt is up for, sent with the pasted key
+  // (api.ts): the host gate, which is also Code's gate, for a host-only change or Code; lanAuth
+  // through /status for a 401 there, where a remote-access token is a key that works. A key it
+  // refuses is not stored and AuthGate says it was rejected. Nor is one it got no answer about
+  // (api.ts KeyCheck 'unchecked': a dropped connection, a tunnel's 502 while the daemon restarts,
+  // no answer in 10 s), which says nothing about the key: AuthGate asks to try again.
+  const forHostGate = !needsAuthFromStatus && (hostKeyNeeded || codeAuthNeeded)
   const prompt = authLatched ? (
     <AuthGate
-      onConnect={(key) => {
+      // The key this browser has can work, but not for this (a remote-access token at a host-only
+      // change): say so instead of asking for "an API key", which reads as if that one were wrong and
+      // invites pasting over it. The text allows for a stale or revoked key too, which the host gate
+      // refuses the same way and which is the one a Code 401 comes with.
+      fullKeyNeeded={forHostGate && getAuthToken() !== null}
+      onConnect={async (key) => {
+        const check = await (forHostGate ? hostKeyCheck(key) : statusKeyCheck(key))
+        if (check !== 'accepted') return check
         setAuthToken(key)
         void qc.invalidateQueries()
-        // A 401 from /status or Code stays until a request with the new key succeeds, so a wrong
-        // key keeps the prompt up with AuthGate's "That key was rejected". The host-key signal
-        // has no such request: the refused change is made again only when the user makes it.
+        // A key the check took is stored, and the prompt a 401 from /status or Code opened goes
+        // once a request with it succeeds (or /status answers 403, above); a wrong key never gets
+        // here, as the check refused it. The host-key signal has no such request: the refused
+        // change is made again only when the user makes it.
         // Clearing the signal on any key closed the prompt on a mistyped or revoked key too, so
-        // the hint never showed and the next attempt was refused again. So the key is checked
-        // first, with one request through the same host gate (api.ts hostKeyAccepted), and the
-        // prompt stays up when it is refused.
-        if (hostKeyNeeded) {
-          void hostKeyAccepted().then((ok) => {
-            if (ok) clearHostKeyNeeded()
-          })
-        }
+        // the hint never showed and the next attempt was refused again. So it is cleared only once
+        // the host gate has taken the key: checked above (api.ts hostKeyCheck) unless the prompt
+        // was up for /status too, and then with hostKeyAccepted.
+        if (hostKeyNeeded && (forHostGate || (await hostKeyAccepted()))) clearHostKeyNeeded()
+        return check
       }}
       onDismiss={hostKeyNeeded && !needsAuthFromStatus && !codeAuthNeeded
         ? () => { clearHostKeyNeeded(); setAuthLatched(false) }
