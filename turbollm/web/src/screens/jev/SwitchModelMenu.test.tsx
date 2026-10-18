@@ -55,9 +55,9 @@ function rowOf(name: string): HTMLElement {
   return row
 }
 
-function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT) {
+function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT, showAllEngineModels?: boolean) {
   const onPick = vi.fn()
-  render(<SwitchModelMenu current={current} models={models} onPick={onPick} />)
+  render(<SwitchModelMenu current={current} models={models} onPick={onPick} showAllEngineModels={showAllEngineModels} />)
   return { onPick }
 }
 
@@ -109,6 +109,20 @@ describe('SwitchModelMenu', () => {
     ])
     const names = screen.getAllByRole('button').map((b) => b.textContent)
     expect(names).toEqual(['Gemma 27B'])
+  })
+
+  // Settings → Models, "Show models for every engine" covers this picker too: such a pick loads on the selected engine,
+  // which shows its own error if it cannot. A Laya model never runs there, so with no Laya engine it is still not
+  // offered.
+  it('offers a model the engine cannot run with "Show models for every engine" on', () => {
+    renderMenu([
+      CHAT,
+      model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false }),
+      model({ key: 'laya-off', name: 'Laya, no engine', laya: { checkpoints: ['english'] }, compatibleWithActiveEngine: false }),
+      model({ key: 'embed', name: 'An embedder', embedding: true }),
+    ], CURRENT, true)
+    const names = screen.getAllByRole('button').map((b) => b.textContent)
+    expect(names).toEqual(['Gemma 27B', 'Wrong format'])
   })
 
   it('does not offer the model that is already loaded', () => {

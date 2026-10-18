@@ -27,7 +27,9 @@ vi.mock('../lib/queries', () => ({
   // Settles at once, so the restart overlay goes straight to polling for the new daemon.
   useDaemonRestart: () => ({ ...mut(), mutate: (_: unknown, o?: { onSuccess?: () => void }) => { state.restarts++; o?.onSuccess?.() } }),
   useHfTokenTest: () => mut(),
-  useModelDirs: () => ({ data: { dirs: [], primaryDir: '' } }), useModelMutations: () => ({}),
+  useModelDirs: () => ({ data: { dirs: [], primaryDir: '' } }),
+  // The Models & loading tab renders the model folders, which read these.
+  useModelMutations: () => ({ addDir: mut(), removeDir: mut(), setPrimaryDir: mut(), rescan: mut() }),
   useNetworkInfo: () => ({ data: undefined }), useStatus: () => ({ data: undefined }),
   useTelemetryPreview: () => ({ data: undefined }), useTelemetryLog: () => ({ data: undefined }),
   useRegenerateMachineId: () => mut(), useAppUpdate: () => ({ data: undefined }), useSysInfo: () => ({ data: state.sysInfo }),
@@ -112,6 +114,33 @@ describe('SettingsScreen drafts', () => {
     expect(titles().checked).toBe(false)
     expect(autoLoad().checked).toBe(true)
     expect(screen.getByText('Unsaved changes')).toBeTruthy()
+  })
+})
+
+describe('SettingsScreen — Show models for every engine', () => {
+  const openModels = () => userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: 'Models & loading' }))
+  const toggle = () => screen.getByRole('checkbox', { name: /Show models for every engine/ }) as HTMLInputElement
+
+  it('is off by default and sends showAllEngineModels with Save once turned on', async () => {
+    state.settings = mk()
+    state.saveCalls = []
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await openModels()
+    expect(toggle().checked).toBe(false)
+
+    await userEvent.click(toggle())
+    expect(screen.getByText('Unsaved changes')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: /Save settings/ }))
+
+    expect(state.saveCalls).toHaveLength(1)
+    expect((state.saveCalls[0].payload as { showAllEngineModels?: boolean }).showAllEngineModels).toBe(true)
+  })
+
+  it('shows the stored value', async () => {
+    state.settings = mk({ showAllEngineModels: true })
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await openModels()
+    expect(toggle().checked).toBe(true)
   })
 })
 

@@ -18,17 +18,27 @@ export function TextClassificationModelList({
   models,
   current,
   pendingKey,
+  showAllEngineModels = false,
   ...actions
 }: {
   models: ModelEntry[]
   current: LoadedJev | null
   pendingKey: string | undefined
+  /** Settings → Models, "Show models for every engine": a row the selected engine cannot run offers its Load. */
+  showAllEngineModels?: boolean
 } & ModelActions) {
   return (
     <section aria-label={TITLE} className="flex min-h-0 flex-col gap-1 overflow-y-auto px-2 py-3">
       <h2 className="px-2 text-[11px] font-medium uppercase tracking-wide text-faint">{TITLE}</h2>
       {models.filter(isSystemOneModel).map((m) => (
-        <ModelRow key={m.key} model={m} loaded={isLoaded(m, current)} loading={m.key === pendingKey} {...actions} />
+        <ModelRow
+          key={m.key}
+          model={m}
+          loaded={isLoaded(m, current)}
+          loading={m.key === pendingKey}
+          showAllEngineModels={showAllEngineModels}
+          {...actions}
+        />
       ))}
     </section>
   )
@@ -44,16 +54,18 @@ function ModelRow({
   model,
   loaded,
   loading,
+  showAllEngineModels,
   onLoad,
   onEject,
-}: { model: ModelEntry; loaded: boolean; loading: boolean } & ModelActions) {
-  const loadable = canLoadNow(model)
+}: { model: ModelEntry; loaded: boolean; loading: boolean; showAllEngineModels: boolean } & ModelActions) {
+  const loadable = canLoadNow(model, showAllEngineModels)
   return (
     <div className="flex items-center gap-2 rounded-md px-2 py-1.5">
       <div className="flex min-w-0 flex-1 flex-col">
         <span className="truncate text-[13px] text-ink">{model.name}</span>
         <TextClassificationRuntimeLabel model={model} />
-        {!loaded && !loadable && model.incompatibleReason && (
+        {/* Also beside a Load offered anyway (Settings' "Show models for every engine"): it says why it may fail. */}
+        {!loaded && model.incompatibleReason && (
           <span className="text-[11px] text-faint">{model.incompatibleReason}</span>
         )}
       </div>

@@ -2762,6 +2762,7 @@ export function registerApi(app: Hono, d: Deps): void {
       autoMemoryEnabled?: boolean
       openBrowserOnStart?: boolean
       autoLoadOnStart?: boolean
+      showAllEngineModels?: boolean
       vramHeadroomMb?: number
       lanBind?: boolean
       requireApiKey?: boolean
@@ -3022,6 +3023,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
+      if (b.showAllEngineModels !== undefined) cfg.showAllEngineModels = !!b.showAllEngineModels
       if (vramHeadroomMb !== undefined) cfg.vramHeadroomMb = vramHeadroomMb
       if (telemetryLevel !== undefined) cfg.telemetry.level = telemetryLevel
       // Cloud Launch deploy-link settings (ADR-153): the RunPod Template ID the user
@@ -3827,6 +3829,7 @@ function settingsPayload(d: Deps) {
     autoMemoryEnabled: cfg.daemon.autoMemoryEnabled,
     openBrowserOnStart: cfg.daemon.openBrowserOnStart,
     autoLoadOnStart: cfg.autoLoadOnStart,
+    showAllEngineModels: cfg.showAllEngineModels,
     vramHeadroomMb: cfg.vramHeadroomMb,
     lanBind: cfg.daemon.lanBind,
     requireApiKey: cfg.daemon.requireApiKey,

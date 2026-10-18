@@ -19,6 +19,7 @@ const localEject = vi.fn()
 vi.mock('../lib/queries', () => ({
   queryKeys: { models: ['models'], status: ['status'] },
   useModels: () => ({ data: { models: state.models, scanning: false }, isLoading: false, isError: false, refetch: vi.fn() }),
+  useShowAllEngineModels: () => false,
   useModelDirs: () => ({ data: { dirs: ['D:\\models'], primaryDir: 'D:\\models' } }),
   useModelMutations: () => ({
     rescan: { mutate: vi.fn() }, addDir: { mutate: vi.fn(), isPending: false, error: null },

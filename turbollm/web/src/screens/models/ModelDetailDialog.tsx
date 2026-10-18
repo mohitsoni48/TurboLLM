@@ -7,6 +7,7 @@ import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/t
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultLitertLm, defaultVllm } from '../../lib/types'
 import { loadModeFor } from '../../lib/load-mode'
+import { isChatModel } from '../../lib/model-kind'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
 import { tokenizeExtraArgs } from '../../lib/argv'
 import { Button } from '../../components/ui/button'
@@ -1536,12 +1537,27 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
   hint?: string; value: string; onChange: (v: string) => void; sourceRepo?: string | null; excludePath?: string
 }) {
   const modelsQ = useModels()
-  const all = (modelsQ.data?.models ?? []).filter((m) => m.path !== excludePath)
+  // Only what llama.cpp can take as a draft: a GGUF chat model the selected engine runs. The list held every scanned
+  // model, so it offered a .litertlm bundle, an MLX folder or a Jev/Laya model, hidden everywhere else, and llama.cpp
+  // then failed the load on it. Settings' "Show models for every engine" does not reach this list: a draft is passed
+  // to llama.cpp as a file it must read, never loaded as a model of its own.
+  const library = modelsQ.data?.models ?? []
+  const all = library.filter(
+    (m) => m.path !== excludePath && m.format === 'gguf' && m.compatibleWithActiveEngine && !m.embedding && isChatModel(m),
+  )
   const sameRepo = sourceRepo ? all.filter((m) => m.sourceRepo === sourceRepo) : []
   const [showAll, setShowAll] = useState(false)
   const scoped = sameRepo.length > 0 && !showAll
   const models = scoped ? sameRepo : all
   const orphanPath = value && !models.some((m) => m.path === value) ? value : null
+  // A saved draft outside the list says why: one the same-repo scope leaves out reads as the model it is, one still in
+  // the library that cannot be a draft says so, and only one the library no longer has says it is gone.
+  const orphanModel = orphanPath ? library.find((m) => m.path === orphanPath) : undefined
+  const orphanLabel = !orphanModel
+    ? `${orphanPath} (not in the current library)`
+    : all.includes(orphanModel)
+      ? `${orphanModel.name} · ${orphanModel.quant} — ${orphanModel.dir}`
+      : `${orphanPath} (not usable as a draft)`
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center justify-between">
@@ -1558,7 +1574,7 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
         className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[12px] text-ink outline-none"
       >
         <option value="">Choose a model…</option>
-        {orphanPath && <option value={orphanPath}>{orphanPath} (not in the current library)</option>}
+        {orphanPath && <option value={orphanPath} title={orphanPath}>{orphanLabel}</option>}
         {models.map((m) => (
           <option key={m.key} value={m.path} title={m.path}>
             {m.name} · {m.quant} — {m.dir}

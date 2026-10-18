@@ -817,6 +817,13 @@ export function useSettings() {
   return { query, save }
 }
 
+/** Settings → Models, "Show models for every engine" (DaemonSettings.showAllEngineModels): false until the settings
+ *  have loaded, and from a daemon without the setting. Read with the settings query itself, so a save shows at once. */
+export function useShowAllEngineModels(): boolean {
+  const q = useQuery({ queryKey: ['settings'], queryFn: getSettings, retry: false })
+  return q.data?.showAllEngineModels ?? false
+}
+
 /** Install / uninstall the ComfyUI push-gate node. Both refresh settings (gatePath)
  *  and status (live gate state) so the UI reflects the change immediately. */
 export function useComfyGate() {

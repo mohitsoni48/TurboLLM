@@ -16,9 +16,11 @@ const loadModelMock = vi.hoisted(() => vi.fn())
 const trackMock = vi.hoisted(() => vi.fn())
 const patchCtxMock = vi.hoisted(() => vi.fn())
 const onContinueMock = vi.hoisted(() => vi.fn())
+const showAllMock = vi.hoisted(() => ({ value: false }))
 
 vi.mock('../../../lib/queries', () => ({
   useModels: () => modelsMock,
+  useShowAllEngineModels: () => showAllMock.value,
   useSysInfo: () => ({ isLoading: false, data: undefined }),
   useDownloadMutations: () => ({ enqueue: { mutateAsync: vi.fn() } }),
 }))
@@ -40,9 +42,9 @@ const ctx: OnboardingCtx = {
   loadCompletedOnce: false,
 }
 
-const chatModel: Partial<ModelEntry> = { key: 'qwen3-8b', name: 'Qwen3 8B', quant: 'Q4_K_M', sizeLabel: '4.7 GB' }
+const chatModel: Partial<ModelEntry> = { key: 'qwen3-8b', name: 'Qwen3 8B', quant: 'Q4_K_M', sizeLabel: '4.7 GB', compatibleWithActiveEngine: true }
 const jevModel: Partial<ModelEntry> = {
-  key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', quant: 'BF16', sizeLabel: '8.0 GB',
+  key: 'qwen3.5 4b nli v2', name: 'qwen3.5 4b nli v2', quant: 'BF16', sizeLabel: '8.0 GB', compatibleWithActiveEngine: true,
   jev: { labels: ['contradiction', 'entailment', 'neutral'], nliTemplate: 'Premise: {premise} Hypothesis: {hypothesis}', architecture: 'Qwen3_5ForSequenceClassification', verified: true },
 }
 
@@ -57,6 +59,7 @@ function renderStep() {
 beforeEach(() => {
   vi.clearAllMocks()
   loadModelMock.mockResolvedValue(undefined)
+  showAllMock.value = false
 })
 
 describe('ModelStep — "Use a model I already have" offers chat models only', () => {
@@ -84,5 +87,27 @@ describe('ModelStep — "Use a model I already have" offers chat models only', (
     expect(screen.queryByText('Use a model I already have')).not.toBeInTheDocument()
     expect(screen.queryByRole('combobox')).not.toBeInTheDocument()
     expect(screen.queryByText(/qwen3\.5 4b nli v2/)).not.toBeInTheDocument()
+  })
+})
+
+// Only what the selected engine can run, as every other picker offers: a .litertlm bundle under llama.cpp was offered,
+// and its load then failed. Settings → Models' "Show models for every engine" lists it again.
+describe('ModelStep — "Use a model I already have" offers what the selected engine can run', () => {
+  const bundle: Partial<ModelEntry> = {
+    key: 'gemma-litert', name: 'Gemma 3n', quant: 'INT4', sizeLabel: '3.1 GB', format: 'litertlm', compatibleWithActiveEngine: false,
+  }
+  const options = () => within(screen.getByRole('combobox')).getAllByRole('option').map((o) => o.textContent)
+
+  it('leaves out a model the selected engine cannot run', () => {
+    modelsMock.data = { models: [chatModel, bundle] }
+    renderStep()
+    expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB'])
+  })
+
+  it('lists it with "Show models for every engine" on', () => {
+    showAllMock.value = true
+    modelsMock.data = { models: [chatModel, bundle] }
+    renderStep()
+    expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB', 'Gemma 3n · INT4 · 3.1 GB'])
   })
 })

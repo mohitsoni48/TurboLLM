@@ -8,10 +8,10 @@ import { getPersonalization } from '../../lib/personas'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, formatDiff } from '../../lib/utils'
 import { ApiError, track } from '../../lib/api'
-import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
+import { useGitBranch, useModelActions, useModels, useShowAllEngineModels, useStatus } from '../../lib/queries'
 import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
-import { isChatModel } from '../../lib/model-kind'
+import { isChatModel, listedForLoading } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
@@ -154,8 +154,9 @@ export function CodeHomeScreen() {
   // engine-compatible models are offered), so picking a model here triggers a real
   // load (the engine auto-starts), exactly like Chat's own model picker.
   const modelsQ = useModels()
+  const showAllEngineModels = useShowAllEngineModels()
   const modelActions = useModelActions()
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
+  const allModels = (modelsQ.data?.models ?? []).filter((m) => listedForLoading(m, showAllEngineModels) && isChatModel(m))
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||

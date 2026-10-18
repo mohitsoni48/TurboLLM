@@ -49,7 +49,15 @@ describe('JevLoadConfirmHost', () => {
     openConfirm({ items: [], engineGenerating: true })
     render(<JevLoadConfirmHost />)
     expect(screen.getByText('Load qwen3.5 4b nli v2?')).toBeTruthy()
-    expect(screen.getByText('Loading a text classification model on vLLM stops the running model and interrupts:')).toBeTruthy()
+    expect(screen.getByText('Loading a text classification model stops the running model and interrupts:')).toBeTruthy()
+  })
+
+  // The load starts on the selected engine, which need not be vLLM once every model is shown: the dialog named an
+  // engine that never ran.
+  it('names no engine the load would run on', () => {
+    openConfirm({ items: [], engineGenerating: true })
+    render(<JevLoadConfirmHost />)
+    expect(screen.queryByText(/vLLM/)).toBeNull()
   })
 
   it('names each kind of work in the words the user would use', () => {

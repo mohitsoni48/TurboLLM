@@ -23,13 +23,13 @@ import {
 } from 'lucide-react'
 import { ApiError, deleteModel, track } from '../lib/api'
 import { useModelLoader } from '../lib/model-loader'
-import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus, useSysInfo } from '../lib/queries'
+import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { importModelFiles } from '../lib/android-app'
 import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import type { ModelEntry } from '../lib/types'
-import { isChatModel, isSystemOneModel } from '../lib/model-kind'
+import { isChatModel, isSystemOneModel, loadOffered } from '../lib/model-kind'
 import { TextClassificationRuntimeLabel } from '../components/TextClassificationRuntimeLabel'
 import { cn } from '../lib/utils'
 import { useIsDesktop } from '../lib/useIsDesktop'
@@ -188,7 +188,11 @@ export function ModelsScreen() {
   useDocumentScroll(tab === 'library')
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
-  const [showIncompatible, setShowIncompatible] = useState(false)
+  // "Show all" on the hidden-models banner, else Settings → Models' "Show models for every engine" (off by default).
+  // Either way a listed model still loads only on the selected engine: its Load starts it there, never on another.
+  const showAllEngineModels = useShowAllEngineModels()
+  const [showIncompatibleChoice, setShowIncompatible] = useState<boolean | null>(null)
+  const showIncompatible = showIncompatibleChoice ?? showAllEngineModels
   const [foldersOpen, setFoldersOpen] = useState(false)
   const [openKey, setOpenKey] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<ModelEntry | null>(null)
@@ -702,6 +706,7 @@ function LibraryTab({
                     busy={loadBusy}
                     loadingKey={loadingKey}
                     ejecting={actions.eject.isPending}
+                    showIncompatible={showIncompatible}
                     isPinned={isPinned}
                     togglePinned={togglePinned}
                   />
@@ -747,14 +752,19 @@ function useDeleteModel() {
 
 const INSTALL_LAYA_ENGINE_TITLE = 'Install the Laya engine (Engines) to load this model.'
 
-/** Why the Load button is dead. A text classification model needs its own runtime, so "switch to" is the wrong
- *  advice for it. A Jev model takes the daemon's own wording, which names vLLM: `incompatibleReason` is the short
- *  chip label, and serving it here for every model would duplicate the chip beside it and drop the half that says
- *  what to do about it. A Laya model never runs on the active engine at all: its engine is installed beside it. */
-function cannotLoadTitle(m: ModelEntry, needsEngine: string): string {
+/** A row the selected engine is not expected to run, shown by "Show all" or Settings' "Show models for every engine":
+ *  its Load starts it on that engine all the same (lib/model-kind.ts loadOffered). */
+const LOADS_ON_SELECTED_ENGINE_TITLE =
+  "The selected engine isn't expected to load this model. Load starts it there anyway, and shows the engine's error if it fails."
+
+/** Why the Load button is dead: a text classification model the user has not shown every model for (the engine
+ *  filter never hides one, ADR-434 (g)). A Jev model takes the daemon's own wording, which names vLLM:
+ *  `incompatibleReason` is the short chip label. A Laya model never runs on the active engine at all: its engine is
+ *  installed beside it. Any other model the engine cannot run is hidden until shown, and then offers its Load. */
+function cannotLoadTitle(m: ModelEntry): string {
   if (m.laya) return INSTALL_LAYA_ENGINE_TITLE
   if (m.jev && m.incompatibleReason) return m.incompatibleReason
-  return `The active engine can't load this model — switch to ${needsEngine}`
+  return "The active engine can't load this model."
 }
 
 /** One row per model name. Multiple quants collapse into a single row with a quant
@@ -772,6 +782,7 @@ function ModelRow({
   busy,
   loadingKey,
   ejecting,
+  showIncompatible,
   isPinned,
   togglePinned,
 }: {
@@ -793,6 +804,8 @@ function ModelRow({
   busy: boolean
   loadingKey: string | undefined
   ejecting: boolean
+  /** "Show all" or Settings' "Show models for every engine" is on: a row the engine cannot run offers its Load. */
+  showIncompatible: boolean
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
 }) {
@@ -809,6 +822,9 @@ function ModelRow({
   const pinned = isPinned(m.key)
   const loadable = !m.incomplete && !m.parseError
   const compatible = m.compatibleWithActiveEngine !== false
+  // A row the engine cannot run, once shown, still loads on the selected engine only (the daemon starts it there and
+  // its error shows if it fails). Its Load was off, so a model listed to be loaded could not be.
+  const offered = loadOffered(m, showIncompatible)
   const needsEngine = m.format === 'gguf' ? 'llama.cpp' : m.format === 'litertlm' ? 'LiteRT-LM' : 'MLX or vLLM'
   // GGUF models fall back to llama.cpp's built-in per-architecture chat template when the
   // file has none; MLX-format models have no such fallback (mlx-lm/Rapid-MLX read the
@@ -918,13 +934,15 @@ function ModelRow({
         <Button
           size="sm"
           onClick={() => { track('models', 'load_model'); onLoad(m) }}
-          disabled={!loadable || !compatible || busy}
+          disabled={!loadable || !offered || busy}
           title={
             !loadable
               ? 'Model is incomplete or unreadable'
-              : !compatible
-                ? cannotLoadTitle(m, needsEngine)
-                : ''
+              : compatible
+                ? ''
+                : offered
+                  ? LOADS_ON_SELECTED_ENGINE_TITLE
+                  : cannotLoadTitle(m)
           }
         >
           {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}

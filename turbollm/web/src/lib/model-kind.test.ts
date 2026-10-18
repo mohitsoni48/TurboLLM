@@ -1,7 +1,7 @@
 // ADR-434 (f): a Jev model labels premise/hypothesis pairs and can never chat, so every list
 // that says "pick a model to talk to" must leave it out. One predicate, so no picker can drift.
 import { describe, expect, it } from 'vitest'
-import { isChatModel, isSystemOneModel, textClassificationRuntime, textClassificationRuntimeLabel } from './model-kind'
+import { isChatModel, isSystemOneModel, loadOffered, textClassificationRuntime, textClassificationRuntimeLabel } from './model-kind'
 import type { JevInfo, ModelEntry } from './types'
 
 const JEV_INFO: JevInfo = {
@@ -77,5 +77,21 @@ describe('textClassificationRuntimeLabel', () => {
 describe('isChatModel with a Laya model', () => {
   it('leaves a Laya decision model out: it answers /v1/systemone and can never chat', () => {
     expect(isChatModel(model({ key: 'laya', laya: { checkpoints: ['english'] } }))).toBe(false)
+  })
+})
+
+// A model shown for loading loads on the selected engine, which shows its own error if it cannot (the daemon no longer
+// refuses it up front); only a Laya model, which never runs on the selected engine, keeps its Load off with no Laya
+// engine installed.
+describe('loadOffered', () => {
+  it('offers a model the engine runs, and one it does not once every model is shown', () => {
+    expect(loadOffered({ compatibleWithActiveEngine: true }, false)).toBe(true)
+    expect(loadOffered({ compatibleWithActiveEngine: false }, false)).toBe(false)
+    expect(loadOffered({ compatibleWithActiveEngine: false }, true)).toBe(true)
+  })
+
+  it('never offers a Laya model with no Laya engine', () => {
+    expect(loadOffered({ compatibleWithActiveEngine: false, laya: { checkpoints: ['english'] } }, true)).toBe(false)
+    expect(loadOffered({ compatibleWithActiveEngine: true, laya: { checkpoints: ['english'] } }, false)).toBe(true)
   })
 })

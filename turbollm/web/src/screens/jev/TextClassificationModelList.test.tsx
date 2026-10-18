@@ -27,10 +27,22 @@ const LAYA = model({ key: 'laya-key', name: 'laya', laya: { checkpoints: ['engli
 
 const LAYA_LOADED: LoadedJev = { key: 'laya-key', name: 'laya', labels: [], checkpoints: ['english'], state: 'running', slot: 'pool' }
 
-function renderList(models: ModelEntry[], { current = null, pendingKey }: { current?: LoadedJev | null; pendingKey?: string } = {}) {
+function renderList(
+  models: ModelEntry[],
+  { current = null, pendingKey, showAllEngineModels }: { current?: LoadedJev | null; pendingKey?: string; showAllEngineModels?: boolean } = {},
+) {
   const onLoad = vi.fn()
   const onEject = vi.fn()
-  render(<TextClassificationModelList models={models} current={current} pendingKey={pendingKey} onLoad={onLoad} onEject={onEject} />)
+  render(
+    <TextClassificationModelList
+      models={models}
+      current={current}
+      pendingKey={pendingKey}
+      showAllEngineModels={showAllEngineModels}
+      onLoad={onLoad}
+      onEject={onEject}
+    />,
+  )
   return { onLoad, onEject }
 }
 
@@ -72,6 +84,19 @@ describe('TextClassificationModelList', () => {
     renderList([{ ...JEV, compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' }])
     expect(screen.getByRole('button', { name: 'Load Qwen NLI' })).toBeDisabled()
     expect(within(list()).getByText('Needs vLLM (Linux or WSL2)')).toBeInTheDocument()
+  })
+
+  // Settings → Models, "Show models for every engine": a model listed for loading loads on the selected engine,
+  // which shows its own error if it cannot; its Load was off. A Laya model never runs there, so with no Laya engine
+  // its Load stays off.
+  it('offers the Load of a model the engine cannot run with "Show models for every engine" on, and still says why', async () => {
+    const jev = { ...JEV, compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' }
+    const laya = { ...LAYA, compatibleWithActiveEngine: false, incompatibleReason: 'Needs the Laya engine' }
+    const { onLoad } = renderList([jev, laya], { showAllEngineModels: true })
+    expect(within(list()).getByText('Needs vLLM (Linux or WSL2)')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Load laya' })).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Load Qwen NLI' }))
+    expect(onLoad).toHaveBeenCalledWith(jev)
   })
 
   it('shows the load in flight', () => {

@@ -15,9 +15,8 @@ import { systemone } from '../../lib/jev-api'
 import { CHAT_PATH, hasTextClassifier, jevPresence, modelsOnceScanned, type JevPresence } from '../../lib/jev-mode'
 import { isSystemOneModel } from '../../lib/model-kind'
 import { useModelLoader, type LoadTarget } from '../../lib/model-loader'
-import { useModelActions, useModels, useStatus } from '../../lib/queries'
+import { servingElsewhere, useModelActions, useModels, useShowAllEngineModels, useStatus } from '../../lib/queries'
 import { loadedSystemOneModel } from '../../lib/systemone-model'
-import { servingElsewhere } from '../../lib/queries'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { AnswerList } from './AnswerList'
@@ -43,6 +42,7 @@ export function JevPlaygroundScreen() {
   const location = useLocation()
   const { requestLoad, pendingKey } = useModelLoader()
   const { eject } = useModelActions()
+  const showAllEngineModels = useShowAllEngineModels()
 
   const models = modelsOnceScanned(modelsQ.data)
   const jev = loadedSystemOneModel(statusQ.data, models)
@@ -115,6 +115,7 @@ export function JevPlaygroundScreen() {
       models={models ?? []}
       current={jev}
       pendingKey={pendingKey}
+      showAllEngineModels={showAllEngineModels}
       onLoad={loadModel}
       onEject={(m) => void ejectModel(m, { stopEngine: eject.mutateAsync })}
     />
@@ -164,7 +165,7 @@ export function JevPlaygroundScreen() {
         )}
 
         <JevHeader jev={jev} engine={engineOf(jev, statusQ.data)} onSwitch={() => setSwitchOpen((open) => !open)} />
-        {switchOpen && <SwitchModelMenu current={jev} models={models ?? []} onPick={pickModel} />}
+        {switchOpen && <SwitchModelMenu current={jev} models={models ?? []} onPick={pickModel} showAllEngineModels={showAllEngineModels} />}
 
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
           <section aria-label="Request" className="flex min-w-0 flex-col gap-3">

@@ -20,6 +20,7 @@ beforeEach(() => {
 })
 
 let mockLibrary: Array<Partial<ModelEntry>> = []
+let mockShowAll = false
 
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
@@ -27,6 +28,7 @@ vi.mock('../../lib/queries', async (importOriginal) => {
     ...actual,
     useStatus: () => ({ data: { engine: { state: 'running' } } }),
     useModels: () => ({ data: { models: mockLibrary } }),
+    useShowAllEngineModels: () => mockShowAll,
     useModelActions: () => ({
       load: { mutate: vi.fn(), isPending: false },
       eject: { mutate: vi.fn(), isPending: false },
@@ -76,11 +78,21 @@ describe('CodeHomeScreen — model picker offers chat models only', () => {
   beforeEach(() => {
     mockLibrary = [chatModel, jevModel, wrongEngineChatModel]
     modelsOfferedByComposer = null
+    mockShowAll = false
   })
 
   it('offers the engine-compatible chat model and not the Jev model', async () => {
     await renderScreen()
     await waitFor(() => expect(modelsOfferedByComposer).not.toBeNull())
     expect(modelsOfferedByComposer?.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+
+  // Settings → Models' "Show models for every engine": the picker offers a chat model the selected engine cannot run
+  // too (its load is then refused with the reason); still no Jev model.
+  it('offers every chat model with "Show models for every engine" on', async () => {
+    mockShowAll = true
+    await renderScreen()
+    await waitFor(() => expect(modelsOfferedByComposer).not.toBeNull())
+    expect(modelsOfferedByComposer?.map((m) => m.key)).toEqual(['qwen3-8b', 'gguf-on-vllm'])
   })
 })

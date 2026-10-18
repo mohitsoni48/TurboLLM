@@ -60,8 +60,10 @@ export function JevLoadConfirmHost() {
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Load {target.name}?</AlertDialogTitle>
+          {/* No engine named: the load starts on the selected engine, whichever it is, and a Jev model is offered
+              under any engine once every model is shown. "on vLLM" named an engine that may never run. */}
           <AlertDialogDescription>
-            Loading a text classification model on vLLM stops the running model and interrupts:
+            Loading a text classification model stops the running model and interrupts:
           </AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="text-sm text-muted list-disc pl-5 space-y-1">

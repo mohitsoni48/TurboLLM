@@ -33,6 +33,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   only on the engine the user selected, and no path starts LiteRT-LM on its own: under another engine they are hidden
   from the Models screen and the pickers, and a Load asked for anyway is started on the selected engine, whose own
   error says it could not load the file.
+- **Show models for every engine** (Settings → Models & loading, off by default) lists every model in the Models screen
+  and the model pickers, also those the selected engine is not expected to run. A model shown that way still loads only
+  on the selected engine: its Load starts there and, if that engine cannot load it, fails with the engine's own error.
+  Nothing switches to another engine or suggests one.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.

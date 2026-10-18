@@ -4,7 +4,7 @@ import { ArrowDown, Copy, Download, Loader2, PanelLeft, Paperclip, Search, SendH
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useStatus, useSysInfo } from '../lib/queries'
+import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { isAndroidOs } from '../lib/platform'
 import { copyToClipboard } from '../lib/clipboard'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
@@ -36,7 +36,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { useLinks, useLinkStatus, useRemoteModels } from '../lib/link-queries'
 import { describeRemoteHost, findRemoteChoice, selectModel } from '../lib/remote-models'
-import { isChatModel } from '../lib/model-kind'
+import { isChatModel, listedForLoading } from '../lib/model-kind'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -265,6 +265,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const qc = useQueryClient()
   const mut = useConversationMutations()
   const modelsQ = useModels()
+  const showAllEngineModels = useShowAllEngineModels()
   const modelActions = useModelActions()
 
   const convQ = useConversation(activeId)
@@ -354,9 +355,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }, [pendingConversationId])
 
   // Only offer models the active engine can actually load (ADR-044) — GGUFs under
-  // llama.cpp, safetensors under MLX/vLLM. Keeps the chat model menu from listing
-  // models that would 409 on load.
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
+  // llama.cpp, safetensors under MLX/vLLM, .litertlm under LiteRT-LM — unless Settings asks for every engine's models
+  // (lib/model-kind.ts listedForLoading). A model listed that way still loads only on the selected engine: its Load
+  // starts there and, if that engine cannot load it, fails with the engine's own error (the load-failure banner).
+  const allModels = (modelsQ.data?.models ?? []).filter((m) => listedForLoading(m, showAllEngineModels) && isChatModel(m))
   // Turbo Link (ADR-376 §6.3): models living on other machines, grouped under their machine
   // in the picker below. Both queries fail soft (`?? []`) — a host-gated 403 or a daemon
   // with no links must leave the chat screen exactly as it was, not error it.

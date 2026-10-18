@@ -155,6 +155,7 @@ function draftsFrom(s: DaemonSettings) {
     autoTitle: s.autoGenerateTitles,
     openBrowser: s.openBrowserOnStart,
     autoLoad: s.autoLoadOnStart ?? false,
+    showAllEngineModels: s.showAllEngineModels ?? false,
     defCtx: s.modelDefaults?.ctx ?? 8192,
     defNgl: s.modelDefaults?.ngl ?? 99,
     defImageMax: s.modelDefaults?.imageMaxTokens ?? 0,
@@ -187,6 +188,7 @@ export function SettingsScreen() {
   const [autoTitle, setAutoTitle] = useState(true)
   const [openBrowser, setOpenBrowser] = useState(true)
   const [autoLoad, setAutoLoad] = useState(false)
+  const [showAllEngineModels, setShowAllEngineModels] = useState(false)
   const [defCtx, setDefCtx] = useState<number>(8192)
   const [defNgl, setDefNgl] = useState<number>(99)
   const [defImageMax, setDefImageMax] = useState<number>(0)
@@ -238,6 +240,7 @@ export function SettingsScreen() {
     setAutoTitle(keep('autoTitle'))
     setOpenBrowser(keep('openBrowser'))
     setAutoLoad(keep('autoLoad'))
+    setShowAllEngineModels(keep('showAllEngineModels'))
     setDefCtx(keep('defCtx'))
     setDefNgl(keep('defNgl'))
     setDefImageMax(keep('defImageMax'))
@@ -289,6 +292,7 @@ export function SettingsScreen() {
     if (edited('autoTitle', autoTitle)) p.autoGenerateTitles = autoTitle
     if (edited('openBrowser', openBrowser)) p.openBrowserOnStart = openBrowser
     if (edited('autoLoad', autoLoad)) p.autoLoadOnStart = autoLoad
+    if (edited('showAllEngineModels', showAllEngineModels)) p.showAllEngineModels = showAllEngineModels
     if (edited('telemetry', telemetry)) p.telemetryLevel = telemetry
     if (edited('lanBind', lanBind)) p.lanBind = lanBind
     if (edited('requireApiKey', requireApiKey)) p.requireApiKey = requireApiKey
@@ -331,7 +335,7 @@ export function SettingsScreen() {
 
   const handleSave = () => {
     const sent: ReturnType<typeof draftsFrom> = {
-      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
+      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, showAllEngineModels, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
       lanBind, requireApiKey, comfyEnabled, comfyUrl, comfyReverseGate, gatewayAutoSwap, gatewayKeepN,
     }
     save.mutate(settingsPayload(), {
@@ -380,6 +384,7 @@ export function SettingsScreen() {
       autoTitle !== settings.autoGenerateTitles ||
       openBrowser !== settings.openBrowserOnStart ||
       autoLoad !== (settings.autoLoadOnStart ?? false) ||
+      showAllEngineModels !== (settings.showAllEngineModels ?? false) ||
       defCtx !== (settings.modelDefaults?.ctx ?? 8192) ||
       defNgl !== (settings.modelDefaults?.ngl ?? 99) ||
       defImageMax !== (settings.modelDefaults?.imageMaxTokens ?? 0) ||
@@ -607,6 +612,22 @@ export function SettingsScreen() {
                     <span className="text-[12px] text-muted">min</span>
                   </div>
                 </div>
+
+                <label className="flex cursor-pointer items-center justify-between py-2">
+                  <div>
+                    <div className="text-[14px] font-medium text-ink">Show models for every engine</div>
+                    <div className="text-[12px] text-muted">
+                      List every model, not only those the selected engine can run. A model still loads only on the
+                      selected engine, and shows that engine&apos;s error if it can&apos;t run it
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={showAllEngineModels}
+                    onChange={(e) => setShowAllEngineModels(e.target.checked)}
+                    className="h-4 w-4 accent-[var(--accent)]"
+                  />
+                </label>
               </section>
 
               {/* Model Defaults — context length (primary) */}

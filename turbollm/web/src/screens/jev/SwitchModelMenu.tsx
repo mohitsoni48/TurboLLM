@@ -6,7 +6,7 @@
 // model picked here has replaced its own.
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
-import { isSystemOneModel } from '../../lib/model-kind'
+import { isSystemOneModel, loadOffered } from '../../lib/model-kind'
 import { TextClassificationRuntimeLabel } from '../../components/TextClassificationRuntimeLabel'
 import { toast } from '../../components/ui/sonner'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
@@ -22,12 +22,15 @@ export function SwitchModelMenu({
   current,
   models,
   onPick,
+  showAllEngineModels = false,
 }: {
   current: LoadedJev
   models: ModelEntry[]
   onPick: (m: ModelEntry) => void
+  /** Settings → Models, "Show models for every engine" (useShowAllEngineModels). */
+  showAllEngineModels?: boolean
 }) {
-  const loadable = models.filter((m) => canLoad(m, current))
+  const loadable = models.filter((m) => canLoad(m, current, showAllEngineModels))
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border p-3">
@@ -116,11 +119,13 @@ function ModelGroup({ title, models, onPick }: { title: string; models: ModelEnt
   )
 }
 
-function canLoad(m: ModelEntry, current: LoadedJev): boolean {
-  return canLoadNow(m) && m.key !== current.key
+function canLoad(m: ModelEntry, current: LoadedJev, showAllEngineModels: boolean): boolean {
+  return canLoadNow(m, showAllEngineModels) && m.key !== current.key
 }
 
-/** Only models that would really load right now — an offer that 400s is worse than no offer. */
-export function canLoadNow(m: ModelEntry): boolean {
-  return !m.incomplete && !m.parseError && m.compatibleWithActiveEngine && !m.embedding
+/** Only models that would really load right now — an offer that 400s is worse than no offer. With Settings' "Show
+ *  models for every engine" on, also one the selected engine is not expected to run: like every model picker's, its
+ *  load starts on the selected engine and shows that engine's error if it fails (lib/model-kind.ts loadOffered). */
+export function canLoadNow(m: ModelEntry, showAllEngineModels = false): boolean {
+  return !m.incomplete && !m.parseError && loadOffered(m, showAllEngineModels) && !m.embedding
 }

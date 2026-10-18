@@ -34,6 +34,7 @@ vi.mock('../../lib/queries', async (importOriginal) => ({
   useModels: () => ({ data: state.models ? { models: state.models, scanning: state.scanning } : undefined }),
   useSettings: () => ({ query: { data: { experimental: { routines: false } } } }),
   useSysInfo: () => ({ data: { os: 'linux/x64' }, isError: false }),
+  useShowAllEngineModels: () => false,
 }))
 vi.mock('../../lib/useIsDesktop', () => ({ useIsDesktop: () => state.desktop }))
 vi.mock('../../lib/jev-api', async (importOriginal) => ({

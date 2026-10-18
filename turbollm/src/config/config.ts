@@ -601,6 +601,11 @@ export interface Config {
    *  rather than failing every request. */
   selectedRemoteModel: string
   autoLoadOnStart: boolean
+  /** Settings → Models, "Show models for every engine" (off by default): the Models screen and the model pickers list
+   *  every model, not only those the selected engine can run. A model listed that way still loads only on the selected
+   *  engine (registry.engineForModel): a Load starts it there, and if the engine cannot load it the load fails with the
+   *  engine's own error (compat.ts manualLoadRefusal). Nothing switches engines or suggests another. */
+  showAllEngineModels: boolean
   hf: HF
   gh: GitHub
   modelDefaults: ModelDefaults
@@ -762,6 +767,7 @@ export function defaultConfig(): Config {
     lastLoaded: { modelKey: '', engineId: '' },
     selectedRemoteModel: '',
     autoLoadOnStart: false,
+    showAllEngineModels: false,
     hf: { token: '' },
     gh: { token: '' },
     modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
@@ -1185,6 +1191,7 @@ function normalize(c: Config): void {
       ? c.vramHeadroomMb
       : VRAM_HEADROOM_DEFAULT_MB
   c.autoLoadOnStart ??= false
+  c.showAllEngineModels = c.showAllEngineModels === true
   c.featuredOverrideUrl ??= ''
   // ComfyUI coordination (absent in pre-comfyui configs → defaults; never throw on an
   // old file). Reseat only the known fields so the retired url/pollSeconds keys from

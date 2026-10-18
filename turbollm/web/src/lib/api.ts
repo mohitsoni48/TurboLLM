@@ -889,6 +889,9 @@ export type DaemonSettings = {
   autoMemoryEnabled: boolean
   openBrowserOnStart: boolean
   autoLoadOnStart: boolean
+  /** Settings → Models, "Show models for every engine": list every model, not only those the selected engine can run
+   *  (they still load only on it, and fail with its error if it cannot). Off by default; absent from older daemons. */
+  showAllEngineModels?: boolean
   /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024) — OR 0, an
    *  explicit opt-in letting the MoE hill-climb spill past all headroom for more t/s. A later
    *  desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a sysmem spill. */
