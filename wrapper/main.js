@@ -312,6 +312,10 @@ app.whenReady().then(() => {
 
   // macOS: double-click dock icon
   app.on('activate', () => {
+    // No window yet: the daemon is still starting, and the window appears on its own once it answers (as for a
+    // second launch). One opened here loaded the port before anything listened on it, showing a connection error,
+    // and the startup window then opened beside it. Refused (onDaemonLost): no window opens at all.
+    if (!mainWindow || daemonRefused) return
     if (BrowserWindow.getAllWindows().length === 0) {
       mainWindow = new BrowserWindow({
         width: 1200, height: 800, minWidth: 800, minHeight: 600,

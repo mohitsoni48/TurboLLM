@@ -114,22 +114,27 @@ function loadMain ({ healthz = 'ok' } = {}) {
   const spawned = []
   const dialogs = []
   const heldHealthz = []
+  const windows = []
+  const appHandlers = {}
   let quits = 0
   let windowUrl = ''
   let ready = null
   class FakeWindow {
     constructor () {
       this.webContents = { setWindowOpenHandler () {}, on () {}, openDevTools () {}, getURL: () => windowUrl }
+      this.url = ''
+      this.destroyed = false
+      windows.push(this)
     }
 
-    loadURL (url) { windowUrl = url }
-    isDestroyed () { return false }
-    static getAllWindows () { return [] }
+    loadURL (url) { windowUrl = url; this.url = url }
+    isDestroyed () { return this.destroyed }
+    static getAllWindows () { return windows.filter((w) => !w.destroyed) }
   }
   const electron = {
     app: {
       isPackaged: false,
-      on () {},
+      on (event, handler) { appHandlers[event] = handler },
       quit () { quits += 1 },
       requestSingleInstanceLock: () => true,
       whenReady: () => ({ then (f) { ready = f } }),
@@ -179,6 +184,8 @@ function loadMain ({ healthz = 'ok' } = {}) {
     ready: () => ready(),
     quits: () => quits,
     answerHealthz: () => heldHealthz.splice(0).forEach((answer) => answer()),
+    emit: (event, ...args) => appHandlers[event](...args),
+    windows: () => FakeWindow.getAllWindows(),
     windowUrl: () => windowUrl,
     setWindowUrl: (url) => { windowUrl = url },
   }
@@ -272,4 +279,27 @@ test('main.js: a daemon that crashes still quits the app at once, with no dialog
   } finally {
     console.error = error
   }
+})
+
+// macOS: a Dock click while the daemon was still starting (up to its 45 s health wait) opened a
+// window on the port nothing listened on yet, which showed a connection error, and the startup
+// window then opened beside it.
+test('main.js: the Dock icon clicked while the daemon starts opens no window; the one window opens once it answers', async () => {
+  const main = loadMain({ healthz: 'held' })
+  main.ready()
+  main.emit('activate')
+  assert.deepEqual(main.windows(), [], 'no window before the daemon answers')
+
+  main.answerHealthz()
+  await turns()
+  assert.equal(main.windows().length, 1)
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:6996')
+  main.emit('activate')
+  assert.equal(main.windows().length, 1, 'the open window is the one window')
+
+  // Once up, reopening a closed window works as before.
+  main.windows()[0].destroyed = true
+  main.emit('activate')
+  assert.equal(main.windows().length, 1)
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:6996')
 })
