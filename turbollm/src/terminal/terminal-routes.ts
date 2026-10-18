@@ -137,15 +137,25 @@ const AGENT_PROMPT_STYLE: Partial<Record<string, 'positional' | 'flag'>> = {
 // Claude only: a positional prompt is that CLI's documented syntax, and passing one to an agent
 // whose syntax hasn't been verified is the same guess AGENT_SESSION_ID_FLAGS refuses to make.
 
-/** Upper bound on a seeded first message. Windows caps a command line near 8191 chars and this
- *  one is nested inside another (`powershell -Command "turbollm launch … 'prompt'"`), so the
- *  budget is shared. 4000 leaves ample room for the flags either side while covering any realistic
- *  opening message. Over the cap the prompt is omitted rather than truncated — a silently
+/** Upper bound on a seeded first message on Windows. Windows caps a command line near 8191 chars
+ *  and this one is nested inside another (`powershell -Command "turbollm launch … 'prompt'"`), so
+ *  the budget is shared. 4000 leaves ample room for the flags either side while covering any
+ *  realistic opening message. Over the cap the prompt is omitted rather than truncated — a silently
  *  half-sent instruction is worse than a message the user can see was not sent. */
 export const MAX_SEEDED_MESSAGE_CHARS = 4000
 
-/** Characters that do not survive the trip to the CLI intact even after normalization (below), so
- *  a message containing one is not seeded at all.
+/** The same bound everywhere else, where pty-session.ts runs the launch command as bash's one
+ *  `-lc` argument and `turbollm launch` hands the prompt on as one argument again: Linux holds a
+ *  single argument to 128 KiB (MAX_ARG_STRLEN), macOS all of them together to 1 MiB. It bounds
+ *  the prompt's UTF-8 as quotePtyShellArg writes it into that `-lc` argument, where each `'`
+ *  takes four bytes: a 40,000-byte prompt of apostrophes is a 160 KB command, which bash cannot
+ *  be started with (E2BIG). 64 KiB of it leaves room for the flags around it. The Windows cap
+ *  held a routine's prompt to 4000 characters on every platform, and an opencode or pi routine
+ *  over it opened an idle CLI that nobody typed into. */
+export const MAX_SEEDED_MESSAGE_BYTES_POSIX = 64 * 1024
+
+/** Characters that do not survive the trip to the CLI intact on Windows even after normalization
+ *  (below), so a message containing one is not seeded there at all.
  *
  *  Measured, not assumed (pre-release review, 2026-08-01). The launch command is parsed by
  *  PowerShell before `turbollm launch` ever re-spawns the CLI, and PowerShell 5.1 does not escape
@@ -154,26 +164,34 @@ export const MAX_SEEDED_MESSAGE_CHARS = 4000
  *    `look in C:\repo\`       arrives as  `look in C:\repo"`      (trailing \ becomes a quote)
  *  Single-quoting the argument stops any INJECTION — that was verified separately across ten
  *  hostile inputs, zero of which escaped — but it cannot stop this mangling, which happens inside
- *  PowerShell's own native-argument marshalling.
+ *  PowerShell's own native-argument marshalling. The `.cmd` shim a Windows npm install leaves
+ *  (cli-launch.ts realSpawn) then goes through cmd.exe, where a quote would escape its quoting.
  *
  *  Not seeding is the honest outcome: the user retypes the message (exactly the behaviour before
  *  seeding existed), rather than the agent silently acting on a corrupted version of it.
  *
- *  Deliberately narrower than "every C0 control code" (founder-reported, 2026-08-07: a fresh
- *  Code session's first message silently never reached the CLI). The composer's own hint text
- *  advertises "Shift+Enter for newline", so a multi-line task description is the NORMAL case, not
- *  an edge case — and the original `\u0000-\u001f` range caught `\n`/`\r`/`\t` right along with
- *  the genuinely dangerous control bytes, so almost any multi-sentence task silently produced an
- *  empty terminal. Line breaks and tabs are folded to spaces by `normalizeSeededMessage` instead
- *  of being rejected — measured safe (they cannot smuggle a `"` or a trailing `\` past the fold).
- *  What's still blocked here is the genuine remainder: a literal quote, and any other non-
- *  printable control byte (NUL, ESC, …) that has no safe single-line form and could otherwise
- *  inject a terminal escape sequence once it reaches the PTY. */
-const UNSEEDABLE = /["\u0000-\u0008\u000b\u000c\u000e-\u001f]/
+ *  Windows only. Elsewhere the launch command is bash's `-lc` argument, where quotePtyShellArg's
+ *  single quotes keep every character literal (only `'` itself is closed, escaped and reopened),
+ *  and `turbollm launch` spawns the CLI with an argument array and no shell: a quote and a trailing
+ *  backslash arrive as typed. Refusing them there too opened an idle CLI for any opencode or pi
+ *  routine whose prompt quoted a name, and the run held the routine's model for 30 minutes. */
+const UNSEEDABLE_WINDOWS = /"/
+
+/** What no platform can seed. Deliberately narrower than "every C0 control code"
+ *  (founder-reported, 2026-08-07: a fresh Code session's first message silently never reached the
+ *  CLI). The composer's own hint text advertises "Shift+Enter for newline", so a multi-line task
+ *  description is the NORMAL case, not an edge case — and the original `\u0000-\u001f` range
+ *  caught `\n`/`\r`/`\t` right along with the genuinely dangerous control bytes, so almost any
+ *  multi-sentence task silently produced an empty terminal. Line breaks and tabs are folded to
+ *  spaces by `normalizeSeededMessage` instead of being rejected — measured safe (they cannot
+ *  smuggle a `"` or a trailing `\` past the fold). What's still blocked here is the genuine
+ *  remainder: any other non-printable control byte (NUL, ESC, …) that has no safe single-line form
+ *  and could otherwise inject a terminal escape sequence once it reaches the PTY. */
+const UNSEEDABLE_CONTROL = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/
 
 /** Fold a message's own line breaks and tabs into plain spaces before it crosses the PowerShell
- *  `-Command "…"` boundary — see UNSEEDABLE's own comment for why a literal one can't survive
- *  that trip today. Collapses a run of them to ONE space (so a blank line between paragraphs
+ *  `-Command "…"` boundary — see UNSEEDABLE_CONTROL's own comment for why a literal one can't
+ *  survive that trip today. Collapses a run of them to ONE space (so a blank line between paragraphs
  *  doesn't read as a stutter) and re-trims the result, since folding can expose new leading/
  *  trailing whitespace (e.g. a message ending in `\n`). Pure/exported so both the eligibility
  *  check and the actual quoted text agree on exactly what "the message" is. */
@@ -181,22 +199,38 @@ export function normalizeSeededMessage(message: string): string {
   return message.replace(/[\r\n\t]+/g, ' ').trim()
 }
 
-/** Whether this message can be handed to the CLI as a launch argument. Tests the NORMALIZED text
- *  (line breaks/tabs already folded) — a message that's only "unseedable" because of a newline is
- *  seedable once folded; `MAX_SEEDED_MESSAGE_CHARS` and UNSEEDABLE both apply to that same text. */
-export function canSeedFirstMessage(message: string, agent: string): boolean {
+/** Why this message cannot be handed to the CLI as a launch argument, or null when it can. Tests
+ *  the NORMALIZED text (line breaks/tabs already folded) — a message that's only "unseedable"
+ *  because of a newline is seedable once folded; every limit applies to that same text. `platform`
+ *  names the shell pty-session.ts runs the launch command in: PowerShell on Windows, bash elsewhere.
+ *  The reason reads after "it cannot be handed over because …" (cli-interactive-runner.ts says it
+ *  to a routine's owner). */
+export function firstMessageSeedProblem(message: string, agent: string, platform: NodeJS.Platform = process.platform): string | null {
   // Gated on the harness having a VERIFIED way to take an opening prompt (AGENT_PROMPT_STYLE), not
   // on it being claude. The character restrictions below still apply to every harness without
-  // exception: the mangling they guard against happens in the `powershell -Command "…"` wrapper
-  // pty-session.ts spawns, OUTSIDE the CLI, so it is identical no matter which CLI is inside — even
-  // for opencode, whose `--prompt` flag is otherwise the safest of the three.
-  if (!AGENT_PROMPT_STYLE[agent]) return false
+  // exception: the mangling they guard against happens in the shell wrapper pty-session.ts spawns,
+  // OUTSIDE the CLI, so it is identical no matter which CLI is inside — even for opencode, whose
+  // `--prompt` flag is otherwise the safest of the three.
+  if (!AGENT_PROMPT_STYLE[agent]) return `${agent} has no verified way to take an opening prompt`
   const normalized = normalizeSeededMessage(message)
-  if (normalized.length === 0 || normalized.length > MAX_SEEDED_MESSAGE_CHARS) return false
-  if (UNSEEDABLE.test(normalized)) return false
-  // A trailing backslash is mangled into a quote by the same marshalling.
-  if (normalized.endsWith('\\')) return false
-  return true
+  if (normalized.length === 0) return 'it is empty'
+  if (UNSEEDABLE_CONTROL.test(normalized)) return 'it contains a control character'
+  if (platform === 'win32') {
+    if (normalized.length > MAX_SEEDED_MESSAGE_CHARS) return `it is over ${MAX_SEEDED_MESSAGE_CHARS} characters, the most a Windows launch command can carry`
+    if (UNSEEDABLE_WINDOWS.test(normalized)) return 'it contains a double quote, which a Windows launch command cannot carry'
+    // A trailing backslash is mangled into a quote by the same marshalling.
+    if (normalized.endsWith('\\')) return 'it ends in a backslash, which a Windows launch command cannot carry'
+    return null
+  }
+  if (Buffer.byteLength(quotePtyShellArg(normalized, platform)) > MAX_SEEDED_MESSAGE_BYTES_POSIX) {
+    return `it is over ${MAX_SEEDED_MESSAGE_BYTES_POSIX / 1024} KiB as the launch command quotes it, the most that command can carry`
+  }
+  return null
+}
+
+/** Whether this message can be handed to the CLI as a launch argument: see {@link firstMessageSeedProblem}. */
+export function canSeedFirstMessage(message: string, agent: string, platform: NodeJS.Platform = process.platform): boolean {
+  return firstMessageSeedProblem(message, agent, platform) === null
 }
 
 /** Pure/exported so the resume-flag decision is unit-testable without a live PTY/daemon (mirrors
@@ -213,7 +247,9 @@ export function canSeedFirstMessage(message: string, agent: string): boolean {
  *  Everything after `launch <agent>` that isn't one of our own flags is forwarded to the CLI
  *  verbatim by cli.ts's passthrough filter — `--permission-mode` included.
  *
- *  `firstMessage` seeds the CLI's opening turn — see the block comment above. */
+ *  `firstMessage` seeds the CLI's opening turn — see the block comment above. `platform` picks the
+ *  shell the command is quoted for and the limits it can carry (firstMessageSeedProblem); tests
+ *  pass it, the daemon runs with its own. */
 export function buildTerminalLaunchCommand(
   agent: string,
   port: number,
@@ -223,6 +259,7 @@ export function buildTerminalLaunchCommand(
   permissionMode?: string | null,
   mode?: string | null,
   firstMessage?: string | null,
+  platform: NodeJS.Platform = process.platform,
 ): string {
   const sessionArg = sessionIdArg(agent, sessionId, launchedOnce)
   // `permissionMode` now arrives as the harness's ALREADY-RESOLVED argument list (agent-modes.ts's
@@ -235,8 +272,8 @@ export function buildTerminalLaunchCommand(
   const allowedArg = allowed?.length ? ` --allowedTools ${allowed.join(',')}` : ''
   // Quoting matters more than usual here — this is arbitrary user prose reaching a command line,
   // where an apostrophe in "don't" would otherwise terminate the string.
-  const seedable = firstMessage && canSeedFirstMessage(firstMessage, agent)
-  const quotedPrompt = seedable ? quotePtyShellArg(normalizeSeededMessage(firstMessage)) : ''
+  const seedable = firstMessage && canSeedFirstMessage(firstMessage, agent, platform)
+  const quotedPrompt = seedable ? quotePtyShellArg(normalizeSeededMessage(firstMessage), platform) : ''
   // A POSITIONAL prompt goes FIRST, before any flag. Position is load-bearing, not stylistic:
   // `--allowedTools, --allowed-tools <tools...>` is VARIADIC in claude's own `--help`, so it
   // consumes every token that follows it. Placed at the end, the prompt was silently eaten as one

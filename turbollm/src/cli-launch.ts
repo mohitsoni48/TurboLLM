@@ -374,10 +374,11 @@ const realSpawn: SpawnLike = (cmd, args, opts) => {
   // Residual shim path (`claude.cmd` from a global npm install), which cannot avoid cmd.exe.
   // The `\"` weakness above is NOT reachable through it in the daemon-driven flow: the only
   // argument here carrying arbitrary user prose is a Code session's seeded first message, and
-  // `canSeedFirstMessage` (terminal-routes.ts) refuses any message containing a double quote
-  // before it is ever put on a command line. Every other argument is one of our own flags, drawn
-  // from a fixed safe character set. A hand-run `turbollm launch claude "…"` can still pass a
-  // quote through, but that is the user's own shell invocation, not a privilege boundary.
+  // `canSeedFirstMessage` (terminal-routes.ts) refuses on Windows, the only platform this path
+  // runs on, any message containing a double quote before it is ever put on a command line.
+  // Every other argument is one of our own flags, drawn from a fixed safe character set. A
+  // hand-run `turbollm launch claude "…"` can still pass a quote through, but that is the user's
+  // own shell invocation, not a privilege boundary.
   return spawn(buildShellCommand(cmd, args), opts)
 }
 

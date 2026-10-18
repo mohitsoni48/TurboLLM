@@ -13,8 +13,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import http from 'node:http'
 import { createRequire } from 'node:module'
+import { spawnSync } from 'node:child_process'
 import type { AddressInfo } from 'node:net'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, firstMessageSeedProblem, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, MAX_SEEDED_MESSAGE_BYTES_POSIX, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
 import { TerminalManager } from './terminal-manager'
 import type { Deps } from '../deps'
 import type { AgentRun } from '../chat/db'
@@ -258,10 +259,10 @@ test('the unseedable-character rules apply to EVERY harness, not just claude', (
   // The mangling they guard against happens in the `powershell -Command "…"` wrapper, outside the
   // CLI — so it is identical whichever CLI is inside, including opencode's safer --prompt flag.
   for (const agent of ['claude', 'pi', 'opencode']) {
-    assert.equal(canSeedFirstMessage('rename "foo"', agent), false, `${agent}: a literal quote cannot survive`)
-    assert.equal(canSeedFirstMessage('look in C:\\repo\\', agent), false, `${agent}: a trailing backslash becomes a quote`)
-    assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), agent), false, `${agent}: over the cap`)
-    assert.equal(canSeedFirstMessage('multi\nline task', agent), true, `${agent}: newlines fold to spaces`)
+    assert.equal(canSeedFirstMessage('rename "foo"', agent, 'win32'), false, `${agent}: a literal quote cannot survive`)
+    assert.equal(canSeedFirstMessage('look in C:\\repo\\', agent, 'win32'), false, `${agent}: a trailing backslash becomes a quote`)
+    assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), agent, 'win32'), false, `${agent}: over the cap`)
+    assert.equal(canSeedFirstMessage('multi\nline task', agent, 'win32'), true, `${agent}: newlines fold to spaces`)
   }
 })
 
@@ -269,14 +270,14 @@ test('canSeedFirstMessage: blank and over-long messages are skipped, not truncat
   assert.equal(canSeedFirstMessage('Hi', 'claude'), true)
   assert.equal(canSeedFirstMessage('   ', 'claude'), false, 'whitespace-only is not a message')
   assert.equal(canSeedFirstMessage('', 'claude'), false)
-  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS), 'claude'), true, 'exactly at the cap is fine')
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS), 'claude', 'win32'), true, 'exactly at the cap is fine')
   // Truncating would send a half-instruction the user believes was delivered in full.
-  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), 'claude'), false)
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), 'claude', 'win32'), false)
 })
 
 test('buildTerminalLaunchCommand: an over-long message is omitted rather than half-sent', () => {
   const long = 'x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1)
-  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', long)
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', long, 'win32')
   assert.ok(!cmd.includes('xxx'), 'no fragment of the message may leak into the command')
   assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })
@@ -287,19 +288,67 @@ test('buildTerminalLaunchCommand: an over-long message is omitted rather than ha
 // `rename foo to bar` and `look in C:\repo\` arrives as `look in C:\repo"`. Single-quoting stops
 // INJECTION (verified across ten hostile inputs, none escaped) but cannot stop that mangling.
 // Not seeding is the honest outcome — the user retypes, rather than the agent acting on a
-// silently corrupted version of their instruction.
+// silently corrupted version of their instruction. All of that is PowerShell's: elsewhere the
+// command is bash's `-lc` argument (pty-session.ts), whose single quotes keep every character, so
+// the same refusal there left an opencode or pi routine whose prompt quoted a name, or ran past
+// 4000 characters, with an idle CLI that never got its task.
+
+test('outside Windows a first message with double quotes, backslashes and 5,000 characters reaches the CLI as typed', {
+  skip: process.platform === 'win32' && 'runs the launch command through bash',
+}, () => {
+  const BS = '\\'
+  const message = `Rename "foo" to "bar" in C:${BS}repo${BS} (don't touch $HOME, \`ls\` or !1). ${'x'.repeat(5000)} end${BS}`
+  for (const [agent, mode] of [['claude', null], ['pi', null], ['opencode', '--auto']] as const) {
+    const cmd = buildTerminalLaunchCommand(agent, 6996, 'tok', 'sess', false, mode, 'auto', message, 'linux')
+    // pty-session.ts runs `bash -lc '<cmd>; exec bash'`; a `turbollm` function prints the arguments
+    // `turbollm launch` would get, one per NUL.
+    const out = spawnSync('bash', ['-c', `turbollm() { printf '%s\\0' "$@"; }; ${cmd}`], { encoding: 'utf8' })
+    assert.equal(out.status, 0, out.stderr)
+    const argv = out.stdout.split('\0').slice(0, -1)
+    const at = agent === 'opencode' ? argv.indexOf('--prompt') + 1 : 2
+    assert.equal(argv[at], message, `${agent}: the prompt arrives as one argument, byte for byte`)
+    assert.equal(argv.filter((a) => a.includes('Rename')).length, 1, `${agent}: and only once`)
+  }
+})
+
+test('canSeedFirstMessage: outside Windows the cap is 64 KiB of UTF-8 as quoted for bash, and control bytes are still refused', () => {
+  // quotePtyShellArg's own two quotes count.
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX - 2), 'pi', 'linux'), true)
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX - 1), 'pi', 'linux'), false)
+  assert.equal(canSeedFirstMessage('é'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX / 2 + 1), 'pi', 'darwin'), false, 'bytes, not characters')
+  assert.equal(canSeedFirstMessage('drop a bell\x07here', 'opencode', 'linux'), false)
+  assert.equal(canSeedFirstMessage('rename "foo"', 'kilo', 'linux'), false, 'a harness with no prompt syntax is still never seeded')
+  assert.match(firstMessageSeedProblem('rename "foo"', 'opencode', 'win32') ?? '', /double quote/)
+  assert.equal(firstMessageSeedProblem('rename "foo"', 'opencode', 'linux'), null)
+})
+
+// Each `'` takes four bytes in the quoted command (`'\''`). Measured on the bare text, 40,000 of them
+// would pass and make a 160 KB `-lc` argument, past Linux's 128 KiB, and bash could not be started.
+test('outside Windows a message of apostrophes is measured as quoted, and the longest one allowed still starts bash', {
+  skip: process.platform === 'win32' && 'runs the launch command through bash',
+}, () => {
+  assert.equal(canSeedFirstMessage("'".repeat(40_000), 'pi', 'linux'), false)
+  assert.match(firstMessageSeedProblem("'".repeat(40_000), 'pi', 'linux') ?? '', /over 64 KiB as the launch command quotes it/)
+  const longest = "'".repeat(Math.floor((MAX_SEEDED_MESSAGE_BYTES_POSIX - 2) / 4))
+  assert.equal(canSeedFirstMessage(longest + "'", 'pi', 'linux'), false)
+  const cmd = buildTerminalLaunchCommand('pi', 6996, 'tok', 'sess', false, null, 'auto', longest, 'linux')
+  const out = spawnSync('bash', ['-c', `turbollm() { printf '%s\\0' "$@"; }; ${cmd}`], { encoding: 'utf8' })
+  assert.equal(out.error, undefined)
+  assert.equal(out.status, 0, out.stderr)
+  assert.equal(out.stdout.split('\0')[2], longest, 'the prompt arrives as one argument, byte for byte')
+})
 
 test('canSeedFirstMessage: refuses a message containing a double quote', () => {
-  assert.equal(canSeedFirstMessage('rename "foo" to "bar"', 'claude'), false)
-  assert.equal(canSeedFirstMessage('rename foo to bar', 'claude'), true)
+  assert.equal(canSeedFirstMessage('rename "foo" to "bar"', 'claude', 'win32'), false)
+  assert.equal(canSeedFirstMessage('rename foo to bar', 'claude', 'win32'), true)
 })
 
 test('canSeedFirstMessage: refuses a message ending in a backslash', () => {
   // A raw template literal cannot END in a backslash (it would escape the closing backtick), so
   // the trailing-backslash case is written with an ordinary escaped string.
   const BS = '\\'
-  assert.equal(canSeedFirstMessage(`look in C:${BS}repo${BS}`, 'claude'), false)
-  assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude'), true, 'an interior backslash is fine')
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo${BS}`, 'claude', 'win32'), false)
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude', 'win32'), true, 'an interior backslash is fine')
 })
 
 // Founder-reported, 2026-08-07: a fresh Code session's first message silently never reached the
@@ -334,7 +383,7 @@ test('buildTerminalLaunchCommand: a multi-line first message reaches the CLI as 
 })
 
 test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangled onto the line', () => {
-  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'rename "foo"')
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'rename "foo"', 'win32')
   assert.ok(!cmd.includes('rename'), 'no fragment of the message may reach the command line')
   assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })

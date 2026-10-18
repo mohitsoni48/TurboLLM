@@ -55,7 +55,7 @@ import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { decideModelAction } from './model-conflict'
-import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { firstMessageSeedProblem, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
 import type { TerminalManager } from '../terminal/terminal-manager'
 
 /** Generous relative to CLI_ROUTINE_TIMEOUT_MS/ROUTINE_RUN_TIMEOUT_MS's 10 minutes: those bound a
@@ -131,6 +131,19 @@ export async function runCliInteractiveRoutine(
     return 'skipped'
   }
 
+  // The routine's whole task reaches the CLI only as its opening prompt on the launch command line
+  // (createAgentTerminal). One the command line cannot carry (terminal-routes.ts's
+  // firstMessageSeedProblem: on Windows a double quote, a trailing backslash or over 4000
+  // characters; elsewhere over 64 KiB once quoted for bash; anywhere a control character) used to
+  // open an idle CLI that nobody may ever type into, and the run held the routine's swapped-in
+  // model until the sweep's 30-minute bound. It ends here instead, before any swap, saying why.
+  const harness = isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude'
+  const promptProblem = firstMessageSeedProblem(routine.prompt, harness)
+  if (promptProblem) {
+    finish({ status: 'errored', error: `The routine's prompt cannot be handed to the ${agentLabel(routine)} CLI because ${promptProblem}. Shorten or reword it.` })
+    return 'errored'
+  }
+
   const pinnedModel = routine.modelKey
   const currentlyLoaded = deps.getLoadedModelKey()
   const { inFlight, capacity } = deps.gate.stats()
@@ -174,18 +187,15 @@ export async function runCliInteractiveRoutine(
     // terminal harness (claude/opencode/pi), and stamping 'claude' on an opencode routine would
     // make createAgentTerminal build a claude launch command for it. See schema.ts's
     // TERMINAL_CODE_AGENT for why the two vocabularies differ.
-    codeAgent: isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude',
+    codeAgent: harness,
   })
   deps.store.updateRoutineRun(run.id, { codeSessionId: agentRun.id })
   deps.store.addMessage(conv.id, 'user', routine.prompt)
 
   // The launch command ALSO seeds this same prompt as the CLI's own opening argument
   // (buildTerminalLaunchCommand) — the addMessage call above is a durable record for the UI/run
-  // history, not the delivery mechanism. `canSeedFirstMessage`'s limits (length, quotes, control
-  // characters) still apply here exactly as they do for a human's first Code-session message: a
-  // prompt that doesn't fit opens an idle CLI instead of a silently-failed one — worse than normal
-  // seeding, but still strictly better than erroring the routine outright, and no one is
-  // guaranteed to be watching to retype it the way a human would.
+  // history, not the delivery mechanism. A prompt the command line cannot carry has already ended
+  // the run above: no one is guaranteed to be watching to retype it the way a human would.
   const result = await deps.createTerminal(agentRun, { mode, firstMessage: routine.prompt })
   if (abandoned()) {
     // Abandoned while the terminal was being started. execute.ts's createTerminal refuses to spawn

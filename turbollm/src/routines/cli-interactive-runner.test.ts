@@ -6,7 +6,8 @@ import {
   CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, runCliInteractiveRoutine, sweepInteractiveCliRuns, terminalLookupsBySession,
   type CliInteractiveDeps, type CliInteractiveSweepDeps,
 } from './cli-interactive-runner'
-import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { buildTerminalLaunchCommand, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { quotePtyShellArg } from '../util/shell-command'
 import type { Routine, RoutineRun } from './schema'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
 
@@ -231,6 +232,51 @@ test('a terminal-creation failure records errored and restores the swapped model
   assert.match(persisted.error ?? '', /spawn ENOENT/)
   assert.ok(persisted.endedAt)
   assert.deepEqual(loadCalls, ['pinned-model', 'some-other-model'], 'the swap must still be undone on a failed spawn')
+})
+
+// ── A prompt the launch command line cannot carry ────────────────────────────────────────────
+// The routine's task reaches the CLI only as its seeded opening prompt. An opencode or pi routine
+// whose prompt quoted a name or ran past 4000 characters opened an idle CLI that nobody typed
+// into, and the run held the routine's swapped-in model until the 30-minute sweep.
+
+test('an opencode routine whose prompt has double quotes and 5,000 characters launches with that prompt', {
+  skip: process.platform === 'win32' && 'a Windows launch command cannot carry either (terminal-routes.ts)',
+}, async () => {
+  const store = freshStore()
+  const prompt = `Rename "foo" to "bar" in C:\\repo\\ and explain why. ${'x'.repeat(5000)}`
+  const routine = interactiveRoutine(store, { codingAgent: 'opencode_cli', permissionMode: 'auto', prompt })
+  const run = schedulerRun(store, routine)
+  // The launch command createAgentTerminal builds for it.
+  let launchCommand = ''
+  const status = await runCliInteractiveRoutine(routine, run, baseDeps({
+    store,
+    createTerminal: async (agentRun, opts) => {
+      launchCommand = buildTerminalLaunchCommand(agentRun.codeAgent!, 6996, 'tok', agentRun.id, false, '--auto', opts.mode, opts.firstMessage)
+      return { ok: true, terminalId: 'term-1' }
+    },
+  }))
+  assert.equal(status, 'needs_approval')
+  assert.ok(launchCommand.startsWith('turbollm launch opencode --port 6996'), launchCommand.slice(0, 80))
+  assert.ok(launchCommand.endsWith(` --prompt ${quotePtyShellArg(prompt)}`), 'the whole prompt is on the command line')
+})
+
+test('a prompt the launch command cannot carry ends the run before any model swap', async () => {
+  const store = freshStore()
+  const routine = interactiveRoutine(store, { codingAgent: 'pi_cli', permissionMode: 'auto', prompt: 'x'.repeat(70 * 1024) })
+  const run = schedulerRun(store, routine)
+  const loadCalls: string[] = []
+  const status = await runCliInteractiveRoutine(routine, run, baseDeps({
+    store,
+    getLoadedModelKey: () => 'some-other-model',
+    loadExplicit: async (k) => { loadCalls.push(k); return { target: 'http://127.0.0.1:8081' } },
+    createTerminal: neverCreatesTerminal(),
+  }))
+  assert.equal(status, 'errored')
+  const persisted = store.getRoutineRun(run.id)!
+  assert.match(persisted.error ?? '', /prompt cannot be handed to the pi CLI because it is over/)
+  assert.ok(persisted.endedAt)
+  assert.equal(persisted.codeSessionId, undefined, 'no Code session is created for it')
+  assert.deepEqual(loadCalls, [], "the user's model is never swapped out")
 })
 
 // ── sweepInteractiveCliRuns: the two completion signals + the wall-clock safety net ───────────
