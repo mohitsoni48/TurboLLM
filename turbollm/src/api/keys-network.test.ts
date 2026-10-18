@@ -163,6 +163,26 @@ test('GET /api/v1/connect/:cli: the snippets carry the port really bound, not da
   assert.doesNotMatch(body, /:6996/)
 })
 
+// `--addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1: a client set up from
+// the snippets could not connect.
+test('GET /api/v1/connect/:cli: on a bind to another loopback address alone the snippets carry that address', async () => {
+  for (const [bindHost, origin] of [['::1', 'http://[::1]:7000'], ['127.0.0.2', 'http://127.0.0.2:7000']]) {
+    const cfg = baseConfig({ lanBind: false, port: 6996 })
+    const app = new Hono()
+    const d = {
+      version: 'test',
+      store: { snapshot: () => cfg, update: (fn: (c: FakeConfig) => void) => fn(cfg) },
+      manager: { status: () => ({ state: 'stopped', model: null }) },
+      bindHost,
+      bindPort: 7000,
+    } as unknown as Deps
+    registerApi(app, d)
+    const body = await (await app.request('/api/v1/connect/claude-code')).text()
+    assert.ok(body.includes(origin), `${bindHost}: ${body}`)
+    assert.ok(!body.includes('127.0.0.1:7000'), bindHost)
+  }
+})
+
 // On a LAN-bound daemon this GET replaces the stored `cli-<name>` key, so it changes state
 // like a write, and a GET needs no CORS preflight: an <img> on any site the host's user visits
 // reached it with loopback trust, revoking the CLI's key (or piling up `cli-<anything>` keys).

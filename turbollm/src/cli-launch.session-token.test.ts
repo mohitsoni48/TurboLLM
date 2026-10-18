@@ -561,3 +561,39 @@ test('a SYNC DOES refresh a harness that was previously launched', async () => {
   assert.ok(models.length > 1, 'the refreshed config carries the whole library')
   assert.equal(models.find((m: { id: string }) => m.id === 'mykey').contextWindow, 32768)
 })
+
+// `turbollm --addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1, and launch
+// dialed http://127.0.0.1:<port> anyway: "Could not reach TurboLLM", so no harness launched, not even
+// from a Code terminal. cli.ts hands launchCli the host the daemon's pidfile records.
+test('a daemon bound to another loopback address alone is dialed and wired there, and its resync keeps that config fresh', async () => {
+  const dialed: string[] = []
+  const inner = makeFetch()
+  const recording = (async (input: string | URL | globalThis.Request, init?: RequestInit) => {
+    dialed.push(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url)
+    return inner(input, init)
+  }) as typeof fetch
+  const fs = memFs()
+  const pi = makeSpawn()
+  const claude = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    assert.equal(await launchCli('pi', 6996, [], pi.fn, undefined, recording, undefined, fs, '::1'), 0)
+    assert.equal(await launchCli('claude', 7000, [], claude.fn, undefined, recording, undefined, memFs(), '127.0.0.2'), 0)
+  } finally {
+    unsilence()
+  }
+  assert.ok(dialed.length > 0)
+  for (const url of dialed) assert.match(url, /^http:\/\/(\[::1\]:6996|127\.0\.0\.2:7000)\//, url)
+  const provider = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm
+  assert.equal(provider.baseUrl, 'http://[::1]:6996/v1')
+  assert.equal(claude.calls[0].env.ANTHROPIC_BASE_URL, 'http://127.0.0.2:7000')
+
+  // A model load's resync (cli.ts: the pidfile's host) finds that config wired to this daemon.
+  const { syncHarnessModelConfig } = await import('./cli-launch.js')
+  await syncHarnessModelConfig('pi', {
+    port: 6996, host: '::1', pinnedModel: 'mykey', modelName: 'MyModel', modelCtx: 16384, models: LIBRARY,
+  }, fs)
+  const synced = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm
+  assert.equal(synced.baseUrl, 'http://[::1]:6996/v1')
+  assert.equal(synced.models.find((m: { id: string }) => m.id === 'mykey').contextWindow, 16384)
+})

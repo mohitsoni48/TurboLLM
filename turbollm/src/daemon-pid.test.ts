@@ -16,6 +16,8 @@ import {
   claimDataDir,
   releaseDataDirClaim,
   daemonReachHost,
+  localDaemonOrigin,
+  resolveDaemonAddress,
   resolveDaemonPort,
   stopDaemon,
   DATA_DIR_IN_USE_EXIT_CODE,
@@ -519,6 +521,39 @@ test('daemonReachHost: the bound address, loopback for a wildcard or unrecorded 
   assert.equal(daemonReachHost('127.0.0.1'), '127.0.0.1')
   assert.equal(daemonReachHost('192.168.1.5'), '192.168.1.5')
   assert.equal(daemonReachHost('::1'), '[::1]')
+})
+
+// `--addr [::1]:6996` (the IPv6 form --help gives) or `127.0.0.2:…` binds nothing on 127.0.0.1, and
+// every client on this machine (`turbollm launch`, so every Code terminal, its exit report,
+// `turbollm mcp-server`, a routine's CLI) dialed http://127.0.0.1:<port>: "Could not reach TurboLLM".
+test('localDaemonOrigin: 127.0.0.1, except the address of a bind to another loopback address alone', () => {
+  assert.equal(localDaemonOrigin('::1', 6996), 'http://[::1]:6996')
+  assert.equal(localDaemonOrigin('[::1]', 6996), 'http://[::1]:6996')
+  assert.equal(localDaemonOrigin('127.0.0.2', 7000), 'http://127.0.0.2:7000')
+  assert.equal(localDaemonOrigin('localhost', 7000), 'http://localhost:7000')
+  // As before: the default bind, a wildcard one, an older pidfile with no host, and a single
+  // non-loopback address (where these clients would need a key).
+  for (const host of ['127.0.0.1', '0.0.0.0', '::', undefined, '', '192.168.1.5', 'fe80::1']) {
+    assert.equal(localDaemonOrigin(host, 6996), 'http://127.0.0.1:6996', String(host))
+  }
+})
+
+test('resolveDaemonAddress: the pidfile\'s host goes with its port only, never with another one', () => {
+  const { dir, cleanup } = makeTmpDir()
+  try {
+    assert.deepEqual(resolveDaemonAddress(dir, undefined, 6996), { port: 6996 }, 'no pidfile')
+    assert.deepEqual(resolveDaemonAddress(dir, 7000, 6996), { port: 7000 }, 'no pidfile, --port')
+    writePidfile(dir, 1, 7000, '::1')
+    assert.deepEqual(resolveDaemonAddress(dir, undefined, 6996), { port: 7000, host: '::1' })
+    // A Code terminal's launch passes --port: the same daemon, so the same host.
+    assert.deepEqual(resolveDaemonAddress(dir, 7000, 6996), { port: 7000, host: '::1' })
+    // Another port is not that daemon.
+    assert.deepEqual(resolveDaemonAddress(dir, 8000, 6996), { port: 8000 })
+    writePidfile(dir, 1, 7000)
+    assert.deepEqual(resolveDaemonAddress(dir, undefined, 6996), { port: 7000 }, 'an older pidfile with no host')
+  } finally {
+    cleanup()
+  }
 })
 
 // ── Start claim (daemon.lock): two daemons started at once ────────────────────

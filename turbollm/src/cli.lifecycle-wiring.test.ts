@@ -161,6 +161,21 @@ test('the start guard claims the data dir first and gives the claim up once the 
   assert.ok(release > 0 && release < restart.indexOf('spawnReplacement()') && release < restart.indexOf('process.exit(plan.exitCode)'))
 })
 
+// `--addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1, and these all dialed
+// http://127.0.0.1:<port>: "Could not reach TurboLLM". What the address works out to is
+// daemon-pid.test.ts's localDaemonOrigin and resolveDaemonAddress tests.
+test("launch, its exit report, mcp-server and the harness resync dial the daemon's loopback address, not a fixed 127.0.0.1", () => {
+  assert.ok(!/http:\/\/127\.0\.0\.1:\$\{(port|mcpPort)\}/.test(CLI), 'no client URL on a fixed 127.0.0.1')
+  const launch = blockFrom("if (argv[0] === 'launch') {")
+  assert.match(launch, /const \{ port, host: daemonHost \} = resolveDaemonAddress\(/)
+  assert.match(launch, /await launchCli\([^)]*, daemonHost\)/)
+  assert.match(launch, /fetch\(`\$\{localDaemonOrigin\(daemonHost, port\)\}\/api\/v1\/code\/sessions\//)
+  const mcp = blockFrom("if (argv[0] === 'mcp-server') {")
+  assert.match(mcp, /const mcpDaemon = resolveDaemonAddress\([\s\S]*runMcpServer\(localDaemonOrigin\(mcpDaemon\.host, mcpDaemon\.port\), version\)/)
+  const call = CLI.indexOf('await syncHarnessModelConfig(target, {')
+  assert.match(CLI.slice(call, call + 600), /\n\s*host: readPidfile\(store\.dir\(\)\)\?\.host,/)
+})
+
 test('the harness resync after a model load uses the bound port, not daemon.port', () => {
   const call = CLI.indexOf('await syncHarnessModelConfig(target, {')
   assert.ok(call >= 0)

@@ -19,6 +19,7 @@ import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
 import { endStaleStreams, generateApiKey, holdOpen, hostGate, isLocalOrAuthenticated, isLocalRequest } from '../auth'
 import { enabledFeatures } from '../features'
+import { localDaemonOrigin } from '../daemon-pid'
 import { dropStaleTerminalSockets, isTerminalBackendAvailable } from '../terminal/terminal-routes'
 import {
   LLAMA_BUILD,
@@ -3789,8 +3790,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const cfg = d.store.snapshot()
     const { lanBind } = cfg.daemon
     const port = d.bindPort ?? cfg.daemon.port // the port really bound (see GET /network's lanUrl)
-    const host = lanBind ? (getLanIp() ?? '127.0.0.1') : '127.0.0.1'
-    const base = `http://${host}:${port}`
+    // Off the LAN, the loopback address the daemon is bound to when that is not 127.0.0.1 (`--addr [::1]:6996`,
+    // where nothing answers on 127.0.0.1: localDaemonOrigin).
+    const base = lanBind ? `http://${getLanIp() ?? '127.0.0.1'}:${port}` : localDaemonOrigin(d.bindHost, port)
     const ms = d.manager.status()
     const modelName = ms.state === 'running' ? (ms.model?.name ?? 'local') : 'local'
     const modelKey = ms.state === 'running' ? (ms.model?.key ?? modelName) : modelName

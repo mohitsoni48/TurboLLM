@@ -7,6 +7,7 @@ import { execFileSync, spawnSync } from 'node:child_process'
 import http from 'node:http'
 import { isIP } from 'node:net'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from './util/process-start-time'
+import { isLoopbackBindHost } from './auth'
 
 export interface PidfileData {
   pid: number
@@ -92,6 +93,31 @@ export function removeOwnPidfile(dir: string, pid: number = process.pid): void {
 export function daemonReachHost(host: string | undefined): string {
   if (!host || host === '0.0.0.0' || host === '::') return '127.0.0.1'
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
+}
+
+/** The origin a client on this machine (`turbollm launch`, its exit report, `turbollm mcp-server`, a
+ *  routine's CLI, a harness config) dials for a daemon bound on `host`: http://127.0.0.1:<port>, except
+ *  on a bind to another loopback address alone (`--addr [::1]:6996`, which --help gives as the IPv6
+ *  form, or `127.0.0.2:…`), where nothing listens on 127.0.0.1 and every such client failed with
+ *  "Could not reach TurboLLM": there that address, an IPv6 one bracketed. A wildcard bind, no host
+ *  (an older pidfile) and a single non-loopback address keep 127.0.0.1 as before. */
+export function localDaemonOrigin(host: string | undefined, port: number): string {
+  const h = host?.trim()
+  return `http://${h && isLoopbackBindHost(h) ? daemonReachHost(h) : '127.0.0.1'}:${port}`
+}
+
+/** Where a client that finds the daemon through `<dir>/daemon.pid` dials it, for
+ *  {@link localDaemonOrigin}: the port {@link resolveDaemonPort} resolves, and the host the pidfile
+ *  records when that daemon is the one on this port (no `--port`, or the same one, as a Code
+ *  terminal's `turbollm launch --port` passes). */
+export function resolveDaemonAddress(
+  dir: string,
+  explicitPort: number | undefined,
+  fallbackPort: number,
+): { port: number; host?: string } {
+  const port = resolveDaemonPort(dir, explicitPort, fallbackPort)
+  const data = readPidfile(dir)
+  return data?.host && data.port === port ? { port, host: data.host } : { port }
 }
 
 /** Exit status of a start refused because another TurboLLM holds its data dir: one running there

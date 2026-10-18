@@ -57,7 +57,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE, CONFIG_ACCESS_EXIT_CODE } from './daemon-pid'
+import { writePidfile, readPidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonAddress, localDaemonOrigin, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE, CONFIG_ACCESS_EXIT_CODE } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -164,10 +164,12 @@ if (argv[0] === 'launch') {
   // Resolve the daemon's port without ever assuming a fixed default: an explicit
   // --port wins; otherwise the running daemon's pidfile gives its ACTUAL bound port
   // (correct even when it was started with --port/--addr or a custom --config);
-  // otherwise the configured port in config.json; otherwise the shipped default.
+  // otherwise the configured port in config.json; otherwise the shipped default. On the host that
+  // pidfile records when it is a loopback one other than 127.0.0.1 (`--addr [::1]:6996`), where
+  // nothing answers on 127.0.0.1 (localDaemonOrigin).
   const launchConfigPath = argValue('--config', defaultConfigPath())
   const explicitPort = Number(argValue('--port', '')) || undefined
-  const port = resolveDaemonPort(
+  const { port, host: daemonHost } = resolveDaemonAddress(
     dirname(launchConfigPath),
     explicitPort,
     configuredDaemonPort(launchConfigPath),
@@ -186,7 +188,7 @@ if (argv[0] === 'launch') {
       a !== '--token' && arr[i - 1] !== '--token' &&
       a !== '--code-session-id' && arr[i - 1] !== '--code-session-id',
   )
-  const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken)
+  const code = await launchCli(target, port, passthrough, undefined, modelKey, undefined, authToken, undefined, daemonHost)
   // Tell the daemon the agent is done. The shell that ran us stays alive on purpose
   // (`-NoExit`/`exec bash`, pty-session.ts), so from the daemon's side the PTY still looks like a
   // running agent terminal — reattaching would hand the user a bare prompt with stale scrollback
@@ -205,7 +207,7 @@ if (argv[0] === 'launch') {
     argValue('--code-session-id', '') || argValue('--session-id', '') || argValue('--resume', '')
   if (codeSessionId) {
     try {
-      await fetch(`http://127.0.0.1:${port}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
+      await fetch(`${localDaemonOrigin(daemonHost, port)}/api/v1/code/sessions/${codeSessionId}/terminal/agent-exited`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ exitCode: code }),
@@ -225,12 +227,13 @@ if (argv[0] === 'launch') {
 if (argv[0] === 'mcp-server') {
   const mcpConfigPath = argValue('--config', defaultConfigPath())
   const mcpExplicitPort = Number(argValue('--port', '')) || undefined
-  const mcpPort = resolveDaemonPort(
+  // On the pidfile's host when it is a loopback one other than 127.0.0.1, as for launch above.
+  const mcpDaemon = resolveDaemonAddress(
     dirname(mcpConfigPath),
     mcpExplicitPort,
     configuredDaemonPort(mcpConfigPath),
   )
-  await runMcpServer(`http://127.0.0.1:${mcpPort}`, version)
+  await runMcpServer(localDaemonOrigin(mcpDaemon.host, mcpDaemon.port), version)
   process.exit(0)
 }
 
@@ -674,7 +677,10 @@ manager.onLoadSettled = (ok, err, opts) => {
           await syncHarnessModelConfig(target, {
             // The BOUND port (what `turbollm launch` wired, via the pidfile), not daemon.port —
             // they differ under --port/--addr, and isAlreadyWired would then skip every resync.
+            // The same for the host: the bound address the pidfile records, which launch wires
+            // when it is a loopback one other than 127.0.0.1 (`--addr [::1]:6996`).
             port,
+            host: readPidfile(store.dir())?.host,
             pinnedModel: st.model.key,
             modelName: st.model.name ?? st.model.key,
             modelCtx: st.model.ctx,

@@ -23,12 +23,14 @@ import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
 import { isQualifiedId } from './link/model-id'
 import { isTextClassifier } from './models/text-classifier'
+import { localDaemonOrigin } from './daemon-pid'
 
 /** Everything a harness might need to wire itself to this daemon, resolved once per launch and
  *  handed to every per-harness hook on {@link CliSpec}. Exists so adding a harness is a data entry
  *  rather than another `if (target === 'x')` branch in launchCli. */
 export interface LaunchContext {
-  /** `http://127.0.0.1:<port>` — the gateway origin. */
+  /** `http://127.0.0.1:<port>` — the gateway origin (on a daemon bound to another loopback
+   *  address alone, such as `--addr [::1]:6996`, that address: localDaemonOrigin). */
   base: string
   port: number
   /** The token this launch should present. **Session-scoped** for an embedded-terminal launch
@@ -1278,8 +1280,8 @@ export const CONFIG_FILE_HARNESSES: readonly string[] =
  *  Deliberately a read of the REAL config path per harness. hermes always answers false: its config
  *  is YAML written by shelling out to `hermes config set`, so there is nothing cheap to read and a
  *  probe would mean spawning a process on every model load. It is refreshed at launch instead. */
-async function isAlreadyWired(target: string, port: number, fs: ConfigFs): Promise<boolean> {
-  const base = `http://127.0.0.1:${port}`
+async function isAlreadyWired(target: string, port: number, fs: ConfigFs, host?: string): Promise<boolean> {
+  const base = localDaemonOrigin(host, port)
   const paths: Record<string, string> = {
     opencode: join(fs.home, '.config', 'opencode', 'opencode.json'),
     kilo: join(fs.home, '.config', 'kilo', 'kilo.jsonc'),
@@ -1316,7 +1318,7 @@ async function isAlreadyWired(target: string, port: number, fs: ConfigFs): Promi
  *  `opencode`, which is why it is not skipped. */
 export async function syncHarnessModelConfig(
   target: string,
-  opts: { port: number; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
+  opts: { port: number; host?: string; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
   fs: ConfigFs = realFs,
 ): Promise<PrepareResult> {
   const spec = Object.hasOwn(SUPPORTED, target) ? SUPPORTED[target] : undefined
@@ -1331,8 +1333,9 @@ export async function syncHarnessModelConfig(
   // "Already wired" is a fact on disk: the harness's own config carries a `turbollm` provider,
   // which only a previous `turbollm launch` puts there. A harness the user has never launched is
   // left completely untouched, and starts being synced the moment they do launch it once.
-  if (!(await isAlreadyWired(target, opts.port, fs))) return { ok: true }
-  const base = `http://127.0.0.1:${opts.port}`
+  // `host`: the address the daemon bound, as `turbollm launch` wired it (localDaemonOrigin).
+  if (!(await isAlreadyWired(target, opts.port, fs, opts.host))) return { ok: true }
+  const base = localDaemonOrigin(opts.host, opts.port)
   return await spec.prepareConfig(
     {
       base,
@@ -1355,6 +1358,10 @@ export async function syncHarnessModelConfig(
 /** Launch `target` CLI wired to the TurboLLM gateway on 127.0.0.1:<port>. Returns
  *  the child's exit code (or a non-zero code on a setup failure). Pure launcher —
  *  it never starts the daemon itself.
+ *
+ *  `host` — the address the daemon bound, from its pidfile (cli.ts): on a bind to another loopback
+ *  address alone (`--addr [::1]:6996`) the gateway is dialed and wired there instead, since nothing
+ *  answers on 127.0.0.1 (localDaemonOrigin).
  *
  *  `modelKey` — when provided, resolve + load that model before launching.
  *  `_spawn` is an optional injection point used by unit tests to capture the env
@@ -1420,6 +1427,7 @@ export async function launchCli(
   _fetch: typeof fetch = fetch,
   authToken?: string,
   _mcpFs: ConfigFs = realFs,
+  host?: string,
 ): Promise<number> {
   const spec = SUPPORTED[target]
   if (!target || !spec) {
@@ -1428,7 +1436,7 @@ export async function launchCli(
     return 1
   }
 
-  const base = `http://127.0.0.1:${port}`
+  const base = localDaemonOrigin(host, port)
 
   // Confirm the daemon is up before anything else.
   let status: DaemonStatus | null

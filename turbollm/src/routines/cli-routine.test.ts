@@ -61,6 +61,7 @@ function baseDeps(overrides: Partial<CliRoutineDeps> = {}): CliRoutineDeps {
     reloadAfterRender: overrides.reloadAfterRender ?? (() => {}),
     now: overrides.now ?? (() => new Date('2026-08-01T10:00:00.000Z')),
     port: overrides.port ?? 6996,
+    host: overrides.host,
     isAvailable: overrides.isAvailable ?? (async () => true),
     permissionModeChoices: overrides.permissionModeChoices ?? (async () => ['auto', 'plan', 'manual']),
     runProcess: overrides.runProcess ?? (async () => ({ exitCode: 0, timedOut: false, stdout: OK_STDOUT, stderr: '' })),
@@ -843,6 +844,16 @@ test('the subprocess env points at the daemon own port with a session-scoped tok
   assert.equal(env.ANTHROPIC_TIMEOUT, '300000')
   assert.equal(env.ANTHROPIC_MAX_RETRIES, '0')
   assert.ok(tokenDuringRun && tokenDuringRun.startsWith('tllm-cs-'), `unexpected token: ${tokenDuringRun}`)
+})
+
+// `--addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1, where claude dialed.
+test('the subprocess env points at the loopback address the daemon is bound to when it is not 127.0.0.1', async () => {
+  for (const [host, url] of [['::1', 'http://[::1]:7777'], ['127.0.0.2', 'http://127.0.0.2:7777'], ['0.0.0.0', 'http://127.0.0.1:7777'], ['127.0.0.1', 'http://127.0.0.1:7777']]) {
+    const store = freshStore()
+    const rec = recordingProcess()
+    await runCliCodeRoutine(codeRoutine(store), baseDeps({ store, port: 7777, host, runProcess: rec.runProcess }))
+    assert.equal(rec.calls[0].opts.env.ANTHROPIC_BASE_URL, url, host)
+  }
 })
 
 test('the session token resolves to this run while it is live, and is revoked afterwards', async () => {

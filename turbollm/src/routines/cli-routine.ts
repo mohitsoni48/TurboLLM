@@ -65,6 +65,7 @@ import { decideModelAction } from './model-conflict'
 import { CLI_ROUTINE_TIMEOUT_MS, type CliProcessResult } from './cli-process'
 import { parseClaudeCliStreamJson } from './cli-output'
 import { inheritedEnv } from '../cli-launch'
+import { localDaemonOrigin } from '../daemon-pid'
 import { sessionAuth } from '../code/session-auth'
 import { resolveClaudePermissionMode } from '../terminal/agent-modes'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
@@ -97,6 +98,9 @@ export interface CliRoutineDeps {
    *  ANTHROPIC_BASE_URL — the same source `createAgentTerminal` uses and for the same reason: never
    *  the incoming request's Host, since this spawns a LOCAL subprocess that must reach the real daemon. */
   port: number
+  /** The address the daemon's listener is bound to (`d.bindHost`). On a bind to another loopback address alone
+   *  (`--addr [::1]:6996`) nothing answers on 127.0.0.1, so ANTHROPIC_BASE_URL names that one (localDaemonOrigin). */
+  host?: string
   isAvailable: () => Promise<boolean>
   permissionModeChoices: () => Promise<string[]>
   /** `runClaudeCliProcess`, partially applied with its spawn/kill seams. The prompt goes in
@@ -210,7 +214,7 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     const permissionMode = routine.permissionMode ? resolveClaudePermissionMode(routine.permissionMode, choices) : null
     const env: NodeJS.ProcessEnv = {
       ...inheritedEnv(),
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${deps.port}`,
+      ANTHROPIC_BASE_URL: localDaemonOrigin(deps.host, deps.port),
       ANTHROPIC_AUTH_TOKEN: token,
       ANTHROPIC_TIMEOUT: '300000',
       ANTHROPIC_MAX_RETRIES: '0',

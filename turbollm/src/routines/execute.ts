@@ -151,6 +151,7 @@ export async function runCliRoutineBranch(
     reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
     port: d.bindPort ?? d.store.snapshot().daemon.port, // the port really bound (`--port` wins over config)
+    host: d.bindHost, // and the address: `--addr [::1]:6996` answers on no 127.0.0.1
     isAvailable: () => isClaudeCliAvailable(),
     permissionModeChoices: () => claudePermissionModeChoices(),
     runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),

@@ -168,6 +168,20 @@ test('claude_cli codingAgent: ANTHROPIC_BASE_URL uses the bound port, not the co
   assert.equal(captured?.port, 7000)
 })
 
+// `--addr [::1]:6996` binds nothing on 127.0.0.1: the routine's CLI must be told the bound address.
+test('claude_cli codingAgent: the routine gets the address the listener is bound to', async () => {
+  const { d, db } = fakeDeps({ loadedKey: 'm' })
+  d.bindHost = '::1'
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let captured: CliRoutineDeps | undefined
+  await runCliRoutineBranch(d, routine, run, async (_routine, deps) => {
+    captured = deps
+    deps.store.updateRoutineRun(deps.existingRun!.id, { status: 'skipped', skipReason: 'cli_unavailable', endedAt: new Date().toISOString() })
+  })
+  assert.equal(captured?.host, '::1')
+})
+
 // The single most regression-prone wiring point on this branch: `getEngineIdle` must be
 // engineIsIdle(manager) — which reads manager.sessionStats().activeRequests, the ONLY signal that
 // observes the main in-app chat stream — and NOT a gate.stats() read. A gate-only busy-check
