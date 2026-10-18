@@ -74,6 +74,8 @@ function harness(opts: { activeId?: string; servingId?: string; probe?: () => Pr
       status: () => ({ state: managerState }),
       // The engine the loaded model was started on, which need not be the active one.
       currentOpts: () => (managerState === 'running' && opts.servingId ? { engine: { id: opts.servingId } } : null),
+      // The last load's, also while it stops (currentOpts() names none then), as Manager's.
+      restartOpts: () => (opts.servingId ? { engine: { id: opts.servingId } } : null),
     } as unknown as UpdateApplyDeps['manager'],
     provision: {
       start: (backend: string, trigger?: string) => { calls.push(`start:${backend}:${trigger}`) },
@@ -83,7 +85,12 @@ function harness(opts: { activeId?: string; servingId?: string; probe?: () => Pr
     } as unknown as UpdateApplyDeps['provision'],
     probeFn: opts.probe ?? (async () => PROBE_OK),
   }
-  return { deps, engine, slugDir, calls, refreshed, releases, startEngine: () => { managerState = 'running' }, remove: () => { removed = true } }
+  return {
+    deps, engine, slugDir, calls, refreshed, releases,
+    startEngine: () => { managerState = 'running' },
+    stopEngine: () => { managerState = 'stopping' }, // a graceful stop, still under way
+    remove: () => { removed = true },
+  }
 }
 
 const NEWER = release('b2', '2026-09-10T00:00:00Z')
@@ -115,7 +122,8 @@ test('trigger defaults to auto_update', async () => {
 })
 
 test('the active engine is stopped before the install', async () => {
-  const h = harness({ activeId: 'e1' })
+  const h = harness({ activeId: 'e1', servingId: 'e1' })
+  h.startEngine()
   await applyEngineUpdate({ ...h.deps, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine)
   assert.deepEqual(h.calls.slice(0, 2), ['start:github-release:auto_update', 'stop'])
 })
@@ -185,7 +193,7 @@ test('workBusy returning null lets the update proceed', async () => {
 })
 
 test('a user starting the engine during the download blocks the swap and keeps the old build', async () => {
-  const h = harness({ activeId: 'e1' })
+  const h = harness({ activeId: 'e1', servingId: 'e1' })
   const probe = async () => { h.startEngine(); return PROBE_OK }
   await assert.rejects(applyEngineUpdate({ ...h.deps, probeFn: probe, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine), /Stop/)
   assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
@@ -206,6 +214,34 @@ test('a model started on the engine during the download blocks the swap, even wh
   await assert.rejects(applyEngineUpdate({ ...h.deps, probeFn: probe, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine), /Stop "Rel"/)
   assert.equal(readFileSync(join(h.slugDir, serverBinName), 'utf8'), 'OLD')
   assert.deepEqual(h.refreshed, [])
+})
+
+// The active engine counted as in use whatever the loaded model ran on, and an install or Enable activates another
+// engine without stopping what is loaded. An update of the active release engine (the auto-update scheduler's too)
+// then stopped that model on another engine before the install, and a model running on another engine at the swap
+// refused it ("Stop ... before replacing its files") though nothing ran on the engine being updated.
+test('an update of the active engine leaves a model on another engine running, and is not refused for it', async () => {
+  const h = harness({ activeId: 'e1', servingId: 'litert' })
+  h.startEngine()
+  await applyEngineUpdate({ ...h.deps, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine)
+  assert.deepEqual(h.calls, ['start:github-release:auto_update', 'done'], 'the model on LiteRT-LM is not stopped')
+  assert.equal(h.refreshed.length, 1)
+
+  const late = harness({ activeId: 'e1', servingId: 'litert' })
+  // Started at the probe, after the pre-install check: only the swap re-check sees the model on LiteRT-LM.
+  const probe = async () => { late.startEngine(); return PROBE_OK }
+  await applyEngineUpdate({ ...late.deps, probeFn: probe, fetchImpl: fakeGithub([NEWER]).fetchImpl }, late.engine)
+  assert.deepEqual(late.calls, ['start:github-release:auto_update', 'done'])
+  assert.equal(late.refreshed.length, 1, 'the swap was not refused')
+})
+
+// A model still stopping runs its engine's binary until the process exits, though currentOpts() names no model then.
+test('a model still stopping on the engine is waited for before the install, even when another engine is active', async () => {
+  const h = harness({ activeId: 'cpu', servingId: 'e1' })
+  h.stopEngine()
+  await applyEngineUpdate({ ...h.deps, fetchImpl: fakeGithub([NEWER]).fetchImpl }, h.engine)
+  assert.deepEqual(h.calls.slice(0, 2), ['start:github-release:auto_update', 'stop'])
+  assert.equal(h.refreshed.length, 1)
 })
 
 test('a classification-fallback match updates into the original slug dir', async () => {

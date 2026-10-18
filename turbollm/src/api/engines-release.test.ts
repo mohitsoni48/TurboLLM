@@ -30,6 +30,7 @@ interface Opts {
   dataDir?: string
   lanBind?: boolean
   busy?: 'download' | 'build'
+  /** The active engine ('e-run'), with a model running on it. */
   runningBinPath?: string
   /** The engine the loaded model was started on, while another engine (or none) is active. */
   serving?: { id: string; name: string; binPath: string }
@@ -60,6 +61,7 @@ function harness(o: Opts = {}): Harness {
   const realProvision = new ProvisionState()
   realProvision.onSettled = (ok, trigger) => { settlements.push({ ok, trigger }) }
   const engines = o.engines ?? []
+  const runningEngine = o.runningBinPath ? { id: 'e-run', name: 'Running', binPath: o.runningBinPath, kind: 'llama-server' } : undefined
   const cfg = {
     daemon: { lanBind: o.lanBind ?? false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [], links: [], telemetry: { level: 'off', machineId: 'm' },
@@ -69,7 +71,10 @@ function harness(o: Opts = {}): Harness {
     store: { snapshot: () => cfg, dir: () => dataDir },
     manager: {
       status: () => ({ state: o.runningBinPath || o.serving ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
-      currentOpts: () => (o.serving ? { engine: o.serving } : null),
+      currentOpts: () => {
+        const engine = o.serving ?? runningEngine
+        return engine ? { engine } : null
+      },
     },
     provision: {
       get: () => ({ ...realProvision.get(), active: realProvision.get().active || o.busy === 'download' }),
@@ -86,7 +91,7 @@ function harness(o: Opts = {}): Harness {
       stopPoolSlotsOnEngine: o.stopPoolSlots ?? (async () => {}),
     },
     registry: {
-      active: () => (o.runningBinPath ? { id: 'e-run', name: 'Running', binPath: o.runningBinPath, kind: 'llama-server' } : undefined),
+      active: () => runningEngine,
       list: () => ({ engines, activeEngineId: '' }),
       get: (id: string) => engines.find((e) => e.id === id),
       customSources: () => o.customSources ?? [],

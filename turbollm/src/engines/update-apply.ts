@@ -167,10 +167,14 @@ function primarySlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'n
   return stopBeforeReplacingMessage(engine)
 }
 
-/** The primary model runs on `engineId`: it is the active engine, or the one the loaded model was started on (an
- *  install or Enable activates another engine without stopping what is loaded, so the two can differ). */
+/** The primary model runs on `engineId`: the loaded (or loading) model was started on it, also while it stops (its
+ *  process runs that engine's binary until it exits, and currentOpts() names no model then). Whether `engineId` is the
+ *  active engine does not matter: an install or Enable activates another engine without stopping what is loaded.
+ *  Counting the active engine stopped that model on another engine before a release update of the active one (the
+ *  auto-update scheduler's too), and refused the update's swap ("Stop ... before replacing its files") for it. */
 function primaryOnEngine(d: SwapGuardDeps, engineId: string): boolean {
-  return d.registry.active()?.id === engineId || d.manager.currentOpts()?.engine.id === engineId
+  const opts = d.manager.status().state === 'stopping' ? d.manager.restartOpts() : d.manager.currentOpts()
+  return opts?.engine.id === engineId
 }
 
 function poolSlotBlockReason(d: SwapGuardDeps, engine: Pick<Engine, 'id' | 'name'>): string | null {
