@@ -9,7 +9,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, rmSync, symlinkSync } from 'node:fs'
-import { join, parse, resolve, sep } from 'node:path'
+import { join, parse, posix, resolve, sep, win32 } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { createWriteToolDefinition } from '@earendil-works/pi-coding-agent'
 import {
@@ -18,6 +18,7 @@ import {
   isInsideAny,
   isContained,
   isContainedFromRoot,
+  resolveToolPath,
 } from './containment'
 import { tmpDir } from '../test-support/tmp'
 
@@ -502,4 +503,30 @@ test('REGRESSION: a filesystem / drive root (`/`, `D:\\`) contains its descendan
   assert.ok(isInsideAny(fsRoot, [fsRoot]))
   assert.ok(isContainedFromRoot(join('src', 'a.ts'), fsRoot))
   if (isWin) assert.ok(isInsideAny('D:\\src\\a.ts', ['D:\\']))
+})
+
+// On Windows `\x` and `/x` are rooted on the current drive: pi's write and edit tools take them as
+// absolute and write them on the daemon's own drive, while the check resolved them against the
+// project's. A project on D: (or at D:\ itself) and a daemon started on C: let
+// `\Users\me\AppData\...\Startup\x.bat` pass as D:\Users\... while pi wrote it to C:.
+test('REGRESSION: on Windows a path rooted without a drive is refused, not checked on the project\'s drive', () => {
+  const startup = '\\Users\\me\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\x.bat'
+  for (const p of [startup, '/Users/me/x.bat', '//x', '\\\\x', '\\']) {
+    assert.equal(resolveToolPath('D:\\', p, win32), null, p)
+    assert.equal(resolveToolPath('D:\\proj', p, win32), null, p)
+  }
+  // Every other form is resolved as pi's tools resolve it.
+  assert.equal(resolveToolPath('D:\\', 'src\\a.ts', win32), 'D:\\src\\a.ts')
+  assert.equal(resolveToolPath('D:\\proj', 'D:\\proj\\a.ts', win32), 'D:\\proj\\a.ts')
+  assert.equal(resolveToolPath('D:\\proj', 'C:\\x', win32), 'C:\\x')
+  assert.equal(resolveToolPath('D:\\proj', '\\\\srv\\share\\x', win32), '\\\\srv\\share\\x')
+  // On POSIX `/x` is an ordinary absolute path and `\x` a file name.
+  assert.equal(resolveToolPath('/proj', '/x', posix), '/x')
+  assert.equal(resolveToolPath('/proj', '\\x', posix), '/proj/\\x')
+  if (isWin) {
+    const root = parse(process.cwd()).root
+    assert.equal(isContainedFromRoot('\\src\\a.ts', root), false)
+    assert.equal(isContainedFromRoot('/src/a.ts', root), false)
+    assert.equal(isContainedFromRoot('src\\a.ts', root), true)
+  }
 })

@@ -6,7 +6,7 @@
 // per-tool wiring, which is replaced by the pi SDK's real tool_call hook.
 import { lstatSync, readlinkSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { resolve, dirname, basename, join, sep } from 'node:path'
+import { resolve, dirname, basename, join, sep, posix, win32, type PlatformPath } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const isWin = process.platform === 'win32'
@@ -166,11 +166,27 @@ export function isContainedFromRoot(input: string | null | undefined, root: stri
   const normalized = normalizePiToolPath(input)
   if (normalized === null) return false
   for (const candidate of normalized === input ? [input] : [input, normalized]) {
-    let resolved: string
-    try { resolved = resolve(root, candidate) } catch { return false }
-    if (!isContained(resolved, root)) return false
+    let resolved: string | null
+    try { resolved = resolveToolPath(root, candidate) } catch { return false }
+    if (resolved === null || !isContained(resolved, root)) return false
   }
   return true
+}
+
+/** `candidate` resolved against `root` for the containment check, or null for a path that pi's
+ *  write/edit tools would not write there. On Windows `\x` and `/x` (rooted, with no drive or
+ *  share) are absolute to pi (path.isAbsolute), so it writes them on the CURRENT drive, the
+ *  daemon's own (process.cwd()'s), while resolve(root, candidate) put them on the root's drive:
+ *  with a project on D: and the daemon on C:, `\Users\me\...\Startup\x.bat` was checked as
+ *  D:\Users\... (inside a project opened at D:\) and written as C:\Users\.... Such a path is
+ *  refused rather than resolved either way, so the check never judges a file other than the one
+ *  written. `p` is the platform's path module (win32 in the tests, which run on any OS). */
+export function resolveToolPath(root: string, candidate: string, p: PlatformPath = isWin ? win32 : posix): string | null {
+  if (p.sep === '\\') {
+    const rootOf = p.parse(candidate).root
+    if (rootOf === '\\' || rootOf === '/') return null
+  }
+  return p.resolve(root, candidate)
 }
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g
