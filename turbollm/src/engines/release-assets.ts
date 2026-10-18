@@ -402,17 +402,27 @@ export async function newestMatchingRelease(
   const candidates = listed.filter((r) => isUpdateCandidate(r, provenance))
   // Key then classification inside each release. A key-only pass over every candidate would always
   // stop at the installed release (it is listed, and its own asset has the key), so a newer release
-  // that renamed the asset would never be reached. Of the releases that match, the highest version
-  // wins, not the first listed: GitHub lists by creation, so a backport cut after a new major (v1.9.5
-  // published after v2.0.0) came first and v2.0.0 was never offered. Tags with no version order keep
-  // the listing's newest-first order.
+  // that renamed the asset would never be reached. The first match listed (newest first) is the pick,
+  // and a match listed after it replaces it only with a higher version in a numbering the two share
+  // (see tagNumberings): GitHub lists by creation, so a backport cut after a new major (v1.9.5
+  // published after v2.0.0) came first and v2.0.0 was never offered. Versions are not compared across
+  // numberings: compareBuildTags reads a date or a build number as a major version, so the installed
+  // 20240501, always a candidate itself, outranked every later v1.x. A match in a numbering the pick
+  // does not share, or with no version order, never replaces it, however recently it was published:
+  // an engine on v0.9.0 offered v0.9.9, 20261001 and v1.0.0, listed in that order, gets v1.0.0, not
+  // the later 20261001. The pick does not look at which numberings the repo used before the install:
+  // the listing holds only its last 30 releases, and the installed release would then beat every later
+  // one in a numbering ranked below its own, for good. Nor does it prefer the installed tag's
+  // numbering: nothing tells a backport on the line the repo left (a v1.0.1 cut after the repo moved
+  // to 20261001) from a line that goes on beside another (a fork's b4600 cut after its v0.4.0), so an
+  // engine on 20261001 offered a v1.0.1 published after it takes v1.0.1, as on main.
   let best: MatchingRelease | null = null
   for (const release of candidates) {
     const match =
       findByAssetKey([release], provenance.assetKey) ?? findByIdenticalClassification([release], provenance.asset)
     if (!match) continue
     if (!best) best = match
-    else if (versionLike(best.tag) && versionLike(match.tag) && compareBuildTags(best.tag, match.tag) === 'newer') best = match
+    else if (sameNumbering(best.tag, match.tag) && compareBuildTags(best.tag, match.tag) === 'newer') best = match
   }
   return best
 }
@@ -437,19 +447,35 @@ function isUpdateCandidate(release: GithubRelease, installed: ReleaseProvenance)
   if (release.draft === true) return false
   if (release.prerelease === true && !installed.prerelease) return false
   // A backport on an older version line (v1.9.5 published after v2.0.0) is not an update. Tags with
-  // no version order (nightly, a commit SHA) keep the publish-time rule, and so does a higher version
-  // published before the installed release: a repo that renumbered its tags downward (20240501 or a
-  // build number such as 4500, then v1.0.0) still lists its old releases, which outrank every v1.x, so
-  // an engine on `auto` would be moved to one and never offered a v1.x again.
+  // no version order (nightly, a commit SHA), or in different numberings, keep the publish-time rule,
+  // and so does a higher version published before the installed release: a repo that renumbered its
+  // tags downward (20240501 or a build number such as 4500, then v1.0.0) still lists its old releases,
+  // which outrank every v1.x, so an engine on `auto` would be moved to one and never offered a v1.x again.
   const tag = release.tag_name ?? ''
-  if (versionLike(installed.tag) && versionLike(tag) && compareBuildTags(installed.tag, tag) === 'older') return false
+  if (sameNumbering(installed.tag, tag) && compareBuildTags(installed.tag, tag) === 'older') return false
   return (release.published_at ?? '') >= installed.publishedAt
 }
 
-// b<build>, a plain number or a dotted version. compareBuildTags reads the leading digits of any tag,
-// so a commit SHA such as 9f1e2d3 would otherwise be ordered by them (as 9) at random.
-function versionLike(tag: string): boolean {
-  return parseBuildTag(tag) !== null || /^v?\d+(?:\.\d+|$)/.test(tag.trim())
+// The numberings a tag's version order comes from: a llama.cpp build (b4500), a plain build or date
+// number (4500, 20240501), a dotted calendar version (2024.05.01) or a version (v1.2.3, 0.10.3, v5). A
+// plain number under four digits is both a build number and a major version (5, then a v4.9.1
+// backport). None for a tag with no order: compareBuildTags reads the leading digits of any tag, so a
+// commit SHA such as 9f1e2d3 would otherwise be ordered by them (as 9) at random.
+function tagNumberings(tag: string): string[] {
+  const t = tag.trim()
+  if (parseBuildTag(t) !== null) return ['build']
+  if (/^\d+$/.test(t)) return t.length < 4 ? ['number', 'version'] : ['number']
+  if (/^v?(?:19|20)\d\d\.\d/.test(t)) return ['calendar']
+  return /^v?\d+(?:\.\d+|$)/.test(t) ? ['version'] : []
+}
+
+// Two tags are ordered by version only when they share a numbering. compareBuildTags reads a date, a
+// build number or a year as a major version, so across a renumbering every v1.x compared older than a
+// release tagged 20240501 or 4500: an engine installed from one was refused every later semver
+// release, and was never offered an update again.
+function sameNumbering(a: string, b: string): boolean {
+  const theirs = tagNumberings(b)
+  return tagNumberings(a).some((n) => theirs.includes(n))
 }
 
 // The archive kind is not part of the build: a fork that moves from .zip to .tar.gz (as llama.cpp

@@ -333,6 +333,77 @@ test('newestMatchingRelease: an old release from before a downward renumbering i
   }
 })
 
+// The same renumbering seen from an engine installed before it. compareBuildTags reads a date or a plain build number
+// as a major version, so every v1.x compared older than the install and was refused: an engine on 20240501 or 4500
+// was never offered a release again once the repo moved to semver. Across numberings the publish-time rule decides,
+// and the highest version still wins among the releases that share one (a lower one published later is listed first).
+test('newestMatchingRelease: a version published after a date- or build-numbered install is an update, and the reverse', async () => {
+  for (const [installedTag, newerTag, backport] of [
+    ['20240501', 'v1.0.0', 'v0.9.9'],
+    ['4500', 'v1.0.0', 'v0.9.9'],
+    ['2024.05.01', 'v1.0.0', 'v0.9.9'],
+    ['v1.0.0', '20261001', '20260901'],
+    ['v1.0.0', '4600', '4550'],
+  ]) {
+    const gh = listing(
+      release(backport, [`app-${backport}-win-x64.zip`], { published_at: '2026-10-02T00:00:00Z' }),
+      release(newerTag, [`app-${newerTag}-win-x64.zip`], { published_at: '2026-10-01T00:00:00Z' }),
+      release(installedTag, [`app-${installedTag}-win-x64.zip`], { published_at: T0 }),
+    )
+    const installed = { ...INSTALLED_V2, tag: installedTag, asset: `app-${installedTag}-win-x64.zip` }
+    assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, newerTag, installedTag)
+  }
+})
+
+// The first match listed is the pick, and a match listed after it replaces it only with a higher version in a
+// numbering the two share: one in another numbering never does, however recently published. The numberings the repo
+// used before the install do not tell the line it is on now (the listing holds only its last 30 releases), and the
+// installed release, a candidate itself, must not outrank a later release for being in a numbering of its own. An
+// engine on 20240501 in a repo that tagged v0.9.0 before its dates is offered v1.0.0; one on v1.0.0 (or on a v1.0.1
+// backport) in a repo that used dates before is offered the next date release; one on a fork's b4500 gets the b4600
+// cut after the fork's v0.4.0; one on v0.9.0 gets v1.0.0 over a 20261001 published after it; and one on 20261001
+// takes a v1.0.1 backport of the old line published after it, as on main.
+test('newestMatchingRelease: only a higher version in its numbering replaces the first match listed, whatever the repo used before the install', async () => {
+  const cases: [installed: [string, string], others: [string, string][], want: string][] = [
+    [['20240501', '2026-09-01'], [['v1.0.0', '2026-10-01'], ['v0.9.0', '2026-08-01']], 'v1.0.0'],
+    [['v1.0.0', '2026-09-01'], [['20261002', '2026-10-02'], ['20240401', '2026-08-01']], '20261002'],
+    [['v1.0.1', '2026-09-15'], [['20261001', '2026-10-01'], ['20260901', '2026-09-01'], ['v1.0.0', '2026-08-01']], '20261001'],
+    [['b4500', '2026-09-01'], [['b4600', '2026-10-03'], ['v0.4.0', '2026-10-01'], ['b4550', '2026-09-15'], ['b4400', '2026-08-01']], 'b4600'],
+    [['v0.4.0', '2026-10-01'], [['b4600', '2026-10-03'], ['b4550', '2026-09-15'], ['b4500', '2026-09-01']], 'b4600'],
+    // Both lines going on since the install: the one listed first wins, on the installed tag's line or not.
+    [['v1.0.0', '2026-09-01'], [['v1.0.1', '2026-10-02'], ['20261001', '2026-10-01']], 'v1.0.1'],
+    [['v1.0.0', '2026-09-01'], [['20261002', '2026-10-02'], ['v1.0.1', '2026-10-01']], '20261002'],
+    // v0.9.9, listed first, is replaced by the higher v1.0.0, not by the 20261001 published between them.
+    [['v0.9.0', '2026-09-01'], [['v0.9.9', '2026-10-03'], ['20261001', '2026-10-02'], ['v1.0.0', '2026-10-01']], 'v1.0.0'],
+    // An engine on the date line takes a backport of the old line published after it, over a newer date listed after.
+    [['20261001', '2026-10-01'], [['v1.0.1', '2026-10-03'], ['20261002', '2026-10-02'], ['v1.0.0', '2026-08-01']], 'v1.0.1'],
+  ]
+  for (const [[installedTag, at], others, want] of cases) {
+    const all = [...others, [installedTag, at] as [string, string]].sort((a, b) => b[1].localeCompare(a[1]))
+    const gh = listing(...all.map(([tag, day]) => release(tag, [`app-${tag}-win-x64.zip`], { published_at: `${day}T00:00:00Z` })))
+    const installed = { ...INSTALLED_V2, tag: installedTag, asset: `app-${installedTag}-win-x64.zip`, publishedAt: `${at}T00:00:00Z` }
+    assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, want, `${installedTag}: ${all.map((r) => r[0]).join(', ')}`)
+  }
+})
+
+// Within one numbering a lower number published later is still not an update, as for a backport on a version line. A
+// short plain number is also read as a major version, so a v4.9.1 backport is not an update for an engine on 5.
+test('newestMatchingRelease: a lower date or build number published after the install is not an update', async () => {
+  for (const [installedTag, lowerTag] of [
+    ['20240501', '20240401'],
+    ['4500', '4400'],
+    ['2024.05.01', '2024.04.01'],
+    ['5', 'v4.9.1'],
+  ]) {
+    const gh = listing(
+      release(lowerTag, [`app-${lowerTag}-win-x64.zip`], { published_at: '2026-10-01T00:00:00Z' }),
+      release(installedTag, [`app-${installedTag}-win-x64.zip`], { published_at: T0 }),
+    )
+    const installed = { ...INSTALLED_V2, tag: installedTag, asset: `app-${installedTag}-win-x64.zip` }
+    assert.equal((await newestMatchingRelease(installed, undefined, gh.fetchImpl))?.tag, installedTag, lowerTag)
+  }
+})
+
 test('newestMatchingRelease: a tag with no version order keeps the publish-time rule', async () => {
   const gh = listing(
     release('nightly', ['app-nightly-win-x64.zip'], { published_at: '2026-09-02T00:00:00Z' }),
