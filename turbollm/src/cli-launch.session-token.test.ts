@@ -198,13 +198,11 @@ test('opencode: none of claude\'s own wiring is applied to a non-Anthropic harne
   // Asserts what WE set, not what the env happens to contain: `inheritedEnv` deliberately passes
   // the daemon's own environment through, so a developer whose shell already exports
   // ANTHROPIC_BASE_URL (measured: this machine does) would fail a blanket prefix check for a
-  // reason that has nothing to do with opencode. The keys below are the ones claudeEnv sets.
-  const { calls, fn } = makeSpawn()
-  const restore = silenceOutput()
-  try {
-    await launchCli('opencode', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
-  } finally { restore() }
-  for (const key of [
+  // reason that has nothing to do with opencode. The keys below are the ones claudeEnv sets, and
+  // they are cleared from this process's environment for the launch: a shell that exports one of
+  // them (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80, say) passed it into the launch and failed the test
+  // for the same reason.
+  const keys = [
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_MODEL',
     'ANTHROPIC_TIMEOUT',
@@ -213,7 +211,21 @@ test('opencode: none of claude\'s own wiring is applied to a non-Anthropic harne
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
     'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE',
     'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS',
-  ]) {
+  ]
+  const saved = new Map(keys.map((k) => [k, process.env[k]]))
+  for (const k of keys) delete process.env[k]
+  const { calls, fn } = makeSpawn()
+  const restore = silenceOutput()
+  try {
+    await launchCli('opencode', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
+  } finally {
+    restore()
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+  for (const key of keys) {
     assert.equal(calls[0].env[key], undefined, `${key} is claude-only and must not be set for opencode`)
   }
   // And the session token must never be smuggled in under an Anthropic name either.
