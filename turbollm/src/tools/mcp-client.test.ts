@@ -180,3 +180,59 @@ test(
     }
   },
 )
+
+// Answers initialize after 300 ms and, as the Python MCP SDK does, refuses any other request that
+// arrives before the client's `notifications/initialized`. Counts its spawns in argv[2].
+const STRICT_SERVER = `
+const fs = require('fs')
+const countFile = process.argv[2]
+fs.writeFileSync(countFile, String((Number(fs.existsSync(countFile) ? fs.readFileSync(countFile, 'utf8') : 0) || 0) + 1))
+process.stdin.on('end', () => process.exit(0))
+const send = (m) => process.stdout.write(JSON.stringify(m) + '\\n')
+let initialized = false
+let buf = ''
+process.stdin.on('data', (c) => {
+  buf += c
+  const lines = buf.split('\\n')
+  buf = lines.pop()
+  for (const line of lines) {
+    if (!line.trim()) continue
+    const m = JSON.parse(line)
+    if (m.method === 'notifications/initialized') { initialized = true; continue }
+    if (m.id == null) continue
+    if (m.method === 'initialize') { setTimeout(() => send({ jsonrpc: '2.0', id: m.id, result: {} }), 300); continue }
+    if (!initialized) { send({ jsonrpc: '2.0', id: m.id, error: { code: -32602, message: 'Received request before initialization was complete' } }); continue }
+    if (m.method === 'tools/list') send({ jsonrpc: '2.0', id: m.id, result: { tools: [{ name: 'echo' }] } })
+    else send({ jsonrpc: '2.0', id: m.id, result: { content: [{ type: 'text', text: 'pong' }] } })
+  }
+})
+`
+
+// connect() returned at once whenever a server process existed, so a call made while another
+// call's initialize was still in flight (two chats listing tools at once after the server had
+// exited, or a tool call during another chat's listing) skipped the handshake and wrote its
+// request before `notifications/initialized`, and a server that enforces the order refused it.
+test('calls made while the server is still starting wait for the same handshake instead of skipping it', async () => {
+  const dir = tmpDir('turbollm-mcp-client-')
+  const script = join(dir, 'strict-server.cjs')
+  const countFile = join(dir, 'spawns')
+  writeFileSync(script, STRICT_SERVER)
+  const command = process.platform === 'win32' ? 'node' : process.execPath
+  const client = new StdioMcpClient({ id: 's', name: 's', command, args: [script, countFile] })
+  try {
+    const [tools, a, b] = await Promise.all([client.listTools(), client.callTool('echo', {}), client.callTool('echo', {})])
+    assert.deepEqual(tools.map((t) => t.name), ['echo'])
+    assert.equal(a, 'pong')
+    assert.equal(b, 'pong')
+    // An explicit connect() during a start resolves only once that start's handshake is done.
+    client.disconnect()
+    const connecting = client.connect()
+    await client.connect()
+    assert.equal((client as unknown as { initialized: boolean }).initialized, true, 'the second connect() waited for the handshake')
+    await connecting
+    assert.equal(await client.callTool('echo', {}), 'pong')
+    assert.equal(readFileSync(countFile, 'utf8'), '2', 'one server per start: no extra spawn for the waiting calls')
+  } finally {
+    client.disconnect()
+  }
+})

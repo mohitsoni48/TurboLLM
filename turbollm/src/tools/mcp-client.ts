@@ -59,6 +59,8 @@ export class StdioMcpClient implements IMcpClient {
   private buf = ''
   private msgId = 0
   private initialized = false
+  /** The handshake (initialize, then `notifications/initialized`) of the process in `proc`. */
+  private handshake: Promise<void> | null = null
 
   constructor(opts: { id: string; name: string; command: string; args?: string[]; env?: Record<string, string> }) {
     this.serverId = opts.id
@@ -68,8 +70,20 @@ export class StdioMcpClient implements IMcpClient {
     this.env = opts.env ?? {}
   }
 
-  async connect(): Promise<void> {
-    if (this.proc) return
+  /** A call made while the server is still starting waits for that same handshake. connect()
+   *  used to return at once whenever a process existed, so a second listTools/callTool during
+   *  the first one's initialize wrote its request before `notifications/initialized`, and a
+   *  server that enforces the order (the Python MCP SDK does) refused it. Only while that process
+   *  is still `proc`: once it is gone (cleanup()), the next call spawns a replacement. */
+  connect(): Promise<void> {
+    if (this.proc && this.handshake) return this.handshake
+    // start() spawns and sets `proc` before its first await, so a call right after this one
+    // already sees both.
+    this.handshake = this.start()
+    return this.handshake
+  }
+
+  private async start(): Promise<void> {
     // npx/uvx are .cmd shims on Windows; Node refuses to spawn .cmd directly (CVE-2024-27980)
     // and won't resolve them via PATHEXT without a shell. Instead of shell:true with a
     // concatenated string (DEP0190 + shell-injection surface from custom commands), run the
