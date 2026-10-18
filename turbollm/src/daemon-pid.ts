@@ -105,6 +105,17 @@ export function daemonReachHost(host: string | undefined): string {
  *  by no other path. */
 export const DATA_DIR_IN_USE_EXIT_CODE = 73
 
+/** Exit status of a start that may not read or write its config.json (configAccessProblem in
+ *  config.ts: another user's file, as `sudo turbollm` leaves it under the owner's HOME).
+ *  MIRRORED in wrapper/daemon-supervisor.js; change both or neither (both test suites pin it).
+ *  On exit 1 the desktop app took it for a crash and quit at once, so the app opened and vanished
+ *  and the message, which says whose the file is and the `sudo chown` that gives it back, went to
+ *  a stderr no one sees. On this status it shows it.
+ *  77 = sysexits EX_NOPERM (this user lacks the permission the start needs): outside Node's
+ *  reserved exit codes (1,3-7,9,10,12,13), below the 128+signal range, not the restart status
+ *  (75) nor DATA_DIR_IN_USE_EXIT_CODE, and produced by no other path. */
+export const CONFIG_ACCESS_EXIT_CODE = 77
+
 /** The daemon that already owns <dir>/daemon.pid and is alive, or null. Alive means the same
  *  proof {@link stopDaemon} demands before it kills anything: the PID exists AND a TurboLLM
  *  answers on the recorded address and port — so a stale pidfile, a recycled PID or a daemon

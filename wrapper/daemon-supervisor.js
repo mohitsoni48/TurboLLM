@@ -2,7 +2,8 @@
 // Electron-free on purpose, so it can be tested with real child processes under plain `node --test`.
 // A daemon exits RESTART_REQUESTED_EXIT_CODE to ask for a fresh one; any other exit means the daemon is gone.
 // It exits DATA_DIR_IN_USE_EXIT_CODE when its start guard refused it because another TurboLLM holds its data
-// dir (a CLI daemon on ~/.turbollm): gone too, but the app tells the user why (main.js onDaemonLost).
+// dir (a CLI daemon on ~/.turbollm), and CONFIG_ACCESS_EXIT_CODE when it may not read or write its config.json
+// (another user's, as `sudo turbollm` leaves it): gone too, but the app tells the user why (main.js onDaemonLost).
 // The constants mirror turbollm/src/daemon-restart.ts and turbollm/src/daemon-pid.ts, and
 // daemon-supervisor.test.js pins that.
 
@@ -10,13 +11,15 @@ const { spawnSync } = require('node:child_process')
 
 const RESTART_REQUESTED_EXIT_CODE = 75 // mirrors turbollm/src/daemon-restart.ts
 const DATA_DIR_IN_USE_EXIT_CODE = 73 // mirrors turbollm/src/daemon-pid.ts
+const CONFIG_ACCESS_EXIT_CODE = 77 // mirrors turbollm/src/daemon-pid.ts
 
 /**
  * Tracks exactly one live daemon: respawns it on a requested restart, reports any other exit as lost
  * (once), and on stop() ends whichever daemon is live now. A loss says whether the daemon was refused
- * because another TurboLLM holds its data dir (dataDirInUse).
+ * because another TurboLLM holds its data dir (dataDirInUse) or because it may not read or write its
+ * config.json (configAccess).
  * @param {{ spawnDaemon: () => import('node:child_process').ChildProcess,
- *           onDaemonLost: (reason: string, details: { dataDirInUse: boolean }) => void,
+ *           onDaemonLost: (reason: string, details: { dataDirInUse: boolean, configAccess: boolean }) => void,
  *           log?: Pick<Console,'log'|'error'>,
  *           killGraceMs?: number,
  *           platform?: NodeJS.Platform,
@@ -43,7 +46,7 @@ function createDaemonSupervisor ({
     if (child !== current) return
     const decision = decideOnDaemonExit({ code, signal, stopping: state !== 'running' })
     if (decision.action === 'respawn') respawn()
-    else if (decision.action === 'lost') lose(decision.reason, decision.dataDirInUse === true)
+    else if (decision.action === 'lost') lose(decision.reason, decision.dataDirInUse === true, decision.configAccess === true)
   }
 
   // Node may emit 'error' without 'exit' (a spawn that never started), or both.
@@ -61,10 +64,10 @@ function createDaemonSupervisor ({
     }
   }
 
-  function lose (reason, dataDirInUse = false) {
+  function lose (reason, dataDirInUse = false, configAccess = false) {
     if (state !== 'running') return
     state = 'lost'
-    onDaemonLost(reason, { dataDirInUse })
+    onDaemonLost(reason, { dataDirInUse, configAccess })
   }
 
   function stop () {
@@ -108,7 +111,7 @@ function taskkillTreeSync (pid) {
 /**
  * Pure.
  * @param {{ code: number | null, signal: string | null, stopping: boolean }} exit
- * @returns {{ action: 'respawn'|'lost'|'none', reason: string, dataDirInUse?: true }}
+ * @returns {{ action: 'respawn'|'lost'|'none', reason: string, dataDirInUse?: true, configAccess?: true }}
  */
 function decideOnDaemonExit ({ code, signal, stopping }) {
   if (stopping) return { action: 'none', reason: 'stopping' }
@@ -120,6 +123,13 @@ function decideOnDaemonExit ({ code, signal, stopping }) {
       action: 'lost',
       reason: `refused: another TurboLLM holds its data dir (exit ${DATA_DIR_IN_USE_EXIT_CODE})`,
       dataDirInUse: true
+    }
+  }
+  if (code === CONFIG_ACCESS_EXIT_CODE) {
+    return {
+      action: 'lost',
+      reason: `refused: it may not read or write its config file (exit ${CONFIG_ACCESS_EXIT_CODE})`,
+      configAccess: true
     }
   }
   return { action: 'lost', reason: `exited (code=${code}, signal=${signal ?? 'none'})` }
@@ -142,6 +152,37 @@ function dataDirInUseNotice (daemonStderr) {
   }
 }
 
+/**
+ * Pure. The dialog the app shows before it quits when its daemon may not read or write its config.json. The
+ * daemon's own message (its stderr) names the file, whose it is and the `sudo chown` that gives it back, so it
+ * is the detail; without it the dialog still says where the file is and what to do.
+ * Windows has no sudo or chown, and there the daemon names no owner (no POSIX uid): its EPERM or EACCES comes
+ * from the file's permissions, a read-only file or another program holding it, so the dialog says that.
+ * @param {string} daemonStderr
+ * @param {NodeJS.Platform} [platform]
+ * @returns {{ title: string, message: string, detail: string }}
+ */
+function configAccessNotice (daemonStderr, platform = process.platform) {
+  const problem = String(daemonStderr || '').trim()
+  if (platform === 'win32') {
+    return {
+      title: 'TurboLLM cannot open its settings file',
+      message: 'TurboLLM cannot read or write its settings file (config.json in your TurboLLM data folder), ' +
+        'so the app cannot start. Check that your user may read and write it and its folder, that it is not ' +
+        'read-only and that no other program holds it, then open the app again.',
+      detail: problem || 'The file is .turbollm\\config.json in your user folder (%USERPROFILE%).'
+    }
+  }
+  return {
+    title: 'TurboLLM cannot open its settings file',
+    message: 'TurboLLM cannot read or write its settings file (config.json in your TurboLLM data folder), ' +
+      'so the app cannot start. This happens when it was run as another user, such as with sudo. ' +
+      'Give the file back to your user, then open the app again.',
+    detail: problem || 'The file is ~/.turbollm/config.json. If it belongs to another user, ' +
+      '`sudo chown "$(id -un)" ~/.turbollm/config.json` gives it back.'
+  }
+}
+
 /** Pure. Still running iff it has neither an exit code nor a terminating signal.
  *  (Replaces main.js's `!exitCode`, which is true for a process that exited with 0.) */
 function isRunning (child) {
@@ -151,7 +192,9 @@ function isRunning (child) {
 module.exports = {
   RESTART_REQUESTED_EXIT_CODE,
   DATA_DIR_IN_USE_EXIT_CODE,
+  CONFIG_ACCESS_EXIT_CODE,
   dataDirInUseNotice,
+  configAccessNotice,
   decideOnDaemonExit,
   isRunning,
   createDaemonSupervisor

@@ -125,7 +125,7 @@ test('--stop never loads config.json, and a start that may not read or write it 
   assert.ok(stop.includes("stopDaemon(dirname(argValue('--config', defaultConfigPath()))"), "the data dir is the config file's")
   assert.match(
     CLI,
-    /try \{\n\s*return ConfigStore\.load\(configPath\)\n\s*\} catch \(e\) \{\n\s*const problem = configAccessProblem\(configPath, e\)\n\s*if \(!problem\) throw e\n\s*console\.error\(problem\)\n\s*return process\.exit\(1\)/,
+    /try \{\n\s*return ConfigStore\.load\(configPath\)\n\s*\} catch \(e\) \{\n\s*const problem = configAccessProblem\(configPath, e\)\n\s*if \(!problem\) throw e\n\s*console\.error\(problem\)\n\s*return process\.exit\(CONFIG_ACCESS_EXIT_CODE\)/,
   )
   // An unparsable one of another user's is not reset by the load: the start must not say it was
   // reset, nor that it stays, as a save of the run (such as of the telemetry id it mints)

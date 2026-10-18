@@ -6,7 +6,7 @@ const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
-const { createDaemonSupervisor, dataDirInUseNotice } = require('./daemon-supervisor')
+const { createDaemonSupervisor, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
@@ -207,22 +207,25 @@ function daemonPort () {
   return daemonPortFor(url, APP_ORIGIN, PORT)
 }
 
-// Set once the daemon was refused because another TurboLLM holds the data dir: from then on the dialog below
-// decides when the app quits, and no window opens.
+// Set once the daemon was refused because another TurboLLM holds the data dir, or because it may not read or
+// write its config.json: from then on the dialog below decides when the app quits, and no window opens.
 let daemonRefused = false
 
-function onDaemonLost (reason, { dataDirInUse = false } = {}) {
+function onDaemonLost (reason, { dataDirInUse = false, configAccess = false } = {}) {
   console.error(`TurboLLM daemon ${reason}`)
-  if (!dataDirInUse) {
+  if (!dataDirInUse && !configAccess) {
     setImmediate(() => app.quit())
     return
   }
   // The daemon's start guard refused it (turbollm/src/cli.ts): a CLI daemon already uses ~/.turbollm, or another
   // start there is still under way. The app quit here at once, as after a crash, so to the user it opened and
   // vanished, and the refusal, which names that daemon and how to stop it, went to a stderr no one sees.
+  // The same for a config.json the daemon may not read or write (another user's, as `sudo turbollm` leaves it):
+  // its message says whose the file is and the `sudo chown` that gives it back.
   daemonRefused = true
+  const notice = configAccess ? configAccessNotice : dataDirInUseNotice
   stderrOf(supervisor && supervisor.current())
-    .then((stderr) => dialog.showMessageBox({ type: 'error', buttons: ['Quit'], ...dataDirInUseNotice(stderr) }))
+    .then((stderr) => dialog.showMessageBox({ type: 'error', buttons: ['Quit'], ...notice(stderr) }))
     .catch((err) => console.error('Could not show why the daemon was refused:', err.message))
     .finally(() => app.quit())
 }

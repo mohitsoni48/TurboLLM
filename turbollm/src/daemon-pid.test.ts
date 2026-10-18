@@ -19,6 +19,7 @@ import {
   resolveDaemonPort,
   stopDaemon,
   DATA_DIR_IN_USE_EXIT_CODE,
+  CONFIG_ACCESS_EXIT_CODE,
   type ClaimHooks,
   type ClaimRecord,
   type StopHooks,
@@ -379,6 +380,16 @@ test('a start refused for an in-use data dir exits 73: not a Node-reserved, sign
   assert.ok(![0, 1, 3, 4, 5, 6, 7, 9, 10, 12, 13].includes(DATA_DIR_IN_USE_EXIT_CODE))
   assert.ok(DATA_DIR_IN_USE_EXIT_CODE < 128)
   assert.notEqual(DATA_DIR_IN_USE_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE)
+})
+
+// The same for a start that may not read or write config.json (cli.ts, configAccessProblem): on
+// exit 1 the desktop app quit as after a crash, and its message went to a stderr no one sees.
+test('a start that may not read or write config.json exits 77: not a Node-reserved, signal, restart or data-dir status', () => {
+  assert.equal(CONFIG_ACCESS_EXIT_CODE, 77)
+  assert.ok(![0, 1, 3, 4, 5, 6, 7, 9, 10, 12, 13].includes(CONFIG_ACCESS_EXIT_CODE))
+  assert.ok(CONFIG_ACCESS_EXIT_CODE < 128)
+  assert.notEqual(CONFIG_ACCESS_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE)
+  assert.notEqual(CONFIG_ACCESS_EXIT_CODE, DATA_DIR_IN_USE_EXIT_CODE)
 })
 
 test('removeOwnPidfile: leaves another daemon\'s pidfile alone, removes its own', () => {

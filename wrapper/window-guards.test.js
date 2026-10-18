@@ -264,6 +264,51 @@ test('main.js: a daemon refused because another TurboLLM holds the data dir is s
   }
 })
 
+// A `sudo turbollm` start (macOS keeps HOME) saves the owner's config.json as root, mode 0600. The app's
+// daemon then may not read it: it says whose the file is and the `sudo chown` that gives it back, and exits.
+// On exit 1 the app quit at once, as after a crash: it opened and vanished, with that in a stderr no one sees.
+test('main.js: a daemon that may not read or write its config file is shown in a dialog before the app quits', async () => {
+  const problem = "TurboLLM cannot read or write its config file /Users/u/.turbollm/config.json (EACCES: permission denied, open '/Users/u/.turbollm/config.json').\n" +
+    'It belongs to another user (uid 0; this is uid 501), as after running turbollm with sudo. Give it back to this user with:\n' +
+    "  sudo chown \"$(id -un)\" '/Users/u/.turbollm/config.json'\n"
+  const main = loadMain({ healthz: 'held' })
+  const error = console.error
+  console.error = () => {} // main.js logs the loss
+  try {
+    main.ready()
+    const daemon = main.spawned[0].child
+    daemon.exitCode = 77
+    daemon.emit('exit', 77, null) // cli.ts's status for it; its stderr can still be on the way
+    const write = process.stderr.write
+    process.stderr.write = () => true // main.js passes the daemon's stderr through
+    try {
+      daemon.stderr.emit('data', Buffer.from(problem))
+    } finally {
+      process.stderr.write = write
+    }
+    daemon.stderr.emit('close')
+    await turns()
+
+    assert.equal(main.dialogs.length, 1, 'the problem is shown')
+    const [{ options, answer }] = main.dialogs
+    assert.equal(options.type, 'error')
+    assert.equal(options.title, 'TurboLLM cannot open its settings file')
+    assert.match(options.message, /cannot read or write its settings file/)
+    assert.equal(options.detail, problem.trim(), 'the dialog says whose the file is and how to give it back')
+    assert.equal(main.quits(), 0, 'the app stays until the dialog is answered')
+    main.answerHealthz()
+    await turns()
+    assert.equal(main.windowUrl(), '', 'no window opens')
+
+    answer()
+    await turns()
+    assert.equal(main.quits(), 1)
+    assert.equal(main.spawned.length, 1, 'a refused daemon is not respawned')
+  } finally {
+    console.error = error
+  }
+})
+
 test('main.js: a daemon that crashes still quits the app at once, with no dialog', async () => {
   const main = loadMain({ healthz: 'held' })
   const error = console.error

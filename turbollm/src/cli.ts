@@ -57,7 +57,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE } from './daemon-pid'
+import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE, CONFIG_ACCESS_EXIT_CODE } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -321,7 +321,9 @@ if (hasFlag('--stop')) {
 if (!process.argv.includes('--config')) migrateLegacyDataDir()
 const configPath = argValue('--config', defaultConfigPath())
 // A config.json this user may not read or write (another user's, as `sudo turbollm` leaves it)
-// ends the start with what to do about it, not an uncaught EACCES (configAccessProblem).
+// ends the start with what to do about it, not an uncaught EACCES (configAccessProblem). It exits
+// CONFIG_ACCESS_EXIT_CODE, not 1: on 1 the desktop app quit as after a crash, so it opened and
+// vanished with these lines in a stderr no one sees; on this status it shows them (wrapper/main.js).
 const store = (() => {
   try {
     return ConfigStore.load(configPath)
@@ -329,7 +331,7 @@ const store = (() => {
     const problem = configAccessProblem(configPath, e)
     if (!problem) throw e
     console.error(problem)
-    return process.exit(1)
+    return process.exit(CONFIG_ACCESS_EXIT_CODE)
   }
 })()
 if (store.brokenBackup()) {

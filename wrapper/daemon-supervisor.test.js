@@ -12,7 +12,9 @@ const { setTimeout: sleep } = require('node:timers/promises')
 const {
   RESTART_REQUESTED_EXIT_CODE,
   DATA_DIR_IN_USE_EXIT_CODE,
+  CONFIG_ACCESS_EXIT_CODE,
   dataDirInUseNotice,
+  configAccessNotice,
   decideOnDaemonExit,
   isRunning,
   createDaemonSupervisor
@@ -22,6 +24,7 @@ const DAEMON_RESTART_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-r
 const DAEMON_EXIT_CODE_DECLARATION = /export const RESTART_REQUESTED_EXIT_CODE = (\d+)/
 const DAEMON_PID_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-pid.ts')
 const DATA_DIR_IN_USE_DECLARATION = /export const DATA_DIR_IN_USE_EXIT_CODE = (\d+)/
+const CONFIG_ACCESS_DECLARATION = /export const CONFIG_ACCESS_EXIT_CODE = (\d+)/
 
 const FAKE_DAEMON = join(__dirname, 'test-fixtures', 'fake-daemon.js')
 const SUPERVISOR_HOST = join(__dirname, 'test-fixtures', 'supervisor-host.js')
@@ -59,6 +62,13 @@ test('the data-dir-in-use exit code matches turbollm/src/daemon-pid.ts', () => {
   assert.equal(DATA_DIR_IN_USE_EXIT_CODE, 73)
 })
 
+test('the config-access exit code matches turbollm/src/daemon-pid.ts', () => {
+  const declaration = readFileSync(DAEMON_PID_SOURCE, 'utf8').match(CONFIG_ACCESS_DECLARATION)
+  assert.ok(declaration, `${DAEMON_PID_SOURCE} must declare the daemon's CONFIG_ACCESS_EXIT_CODE`)
+  assert.equal(Number(declaration[1]), CONFIG_ACCESS_EXIT_CODE)
+  assert.equal(CONFIG_ACCESS_EXIT_CODE, 77)
+})
+
 // The daemon's start guard refuses it when another TurboLLM (a CLI daemon on ~/.turbollm) holds its
 // data dir. The app quit on it as on any crash, so the user never learnt why the app vanished.
 test('decideOnDaemonExit: exit 73 is a daemon refused because another TurboLLM holds its data dir', () => {
@@ -67,6 +77,53 @@ test('decideOnDaemonExit: exit 73 is a daemon refused because another TurboLLM h
     { action: 'lost', reason: 'refused: another TurboLLM holds its data dir (exit 73)', dataDirInUse: true }
   )
   assert.deepEqual(decideOnDaemonExit({ code: 73, signal: null, stopping: true }), { action: 'none', reason: 'stopping' })
+})
+
+// A daemon that may not read or write its config.json (another user's, as `sudo turbollm` leaves it) says
+// whose it is and how to give it back, then exits. On exit 1 the app quit as on any crash, with that unseen.
+test('decideOnDaemonExit: exit 77 is a daemon that may not read or write its config file', () => {
+  assert.deepEqual(
+    decideOnDaemonExit({ code: 77, signal: null, stopping: false }),
+    { action: 'lost', reason: 'refused: it may not read or write its config file (exit 77)', configAccess: true }
+  )
+  assert.deepEqual(decideOnDaemonExit({ code: 77, signal: null, stopping: true }), { action: 'none', reason: 'stopping' })
+})
+
+test('configAccessNotice: the dialog shows the daemon\'s message, which says whose the file is and how to give it back', () => {
+  const problem = "TurboLLM cannot read or write its config file /Users/u/.turbollm/config.json (EACCES: permission denied, open '/Users/u/.turbollm/config.json').\n" +
+    'It belongs to another user (uid 0; this is uid 501), as after running turbollm with sudo. Give it back to this user with:\n' +
+    "  sudo chown \"$(id -un)\" '/Users/u/.turbollm/config.json'"
+  for (const platform of ['darwin', 'linux']) {
+    const notice = configAccessNotice(`${problem}\n`, platform)
+    assert.equal(notice.title, 'TurboLLM cannot open its settings file')
+    assert.match(notice.message, /cannot read or write its settings file/)
+    assert.match(notice.message, /Give the file back to your user, then open the app again\./)
+    assert.equal(notice.detail, problem)
+
+    // Nothing read from its stderr: the dialog still names the file and how to give it back.
+    for (const nothing of ['', '  \n', undefined]) {
+      assert.match(configAccessNotice(nothing, platform).detail, /~\/\.turbollm\/config\.json/)
+      assert.match(configAccessNotice(nothing, platform).detail, /sudo chown/)
+    }
+  }
+})
+
+test('configAccessNotice: on Windows the dialog names neither sudo nor chown', () => {
+  // configAccessProblem names no owner there (no POSIX uid), only what Node got and what to check.
+  const problem = "TurboLLM cannot read or write its config file C:\\Users\\u\\.turbollm\\config.json (EPERM: operation not permitted, open 'C:\\Users\\u\\.turbollm\\config.json').\n" +
+    'Check that this user may read and write it and its folder.'
+  const notice = configAccessNotice(`${problem}\n`, 'win32')
+  assert.equal(notice.title, 'TurboLLM cannot open its settings file')
+  assert.match(notice.message, /cannot read or write its settings file/)
+  assert.match(notice.message, /no other program holds it, then open the app again\./)
+  assert.doesNotMatch(notice.message, /sudo|chown|another user/)
+  assert.equal(notice.detail, problem)
+
+  for (const nothing of ['', '  \n', undefined]) {
+    const { detail } = configAccessNotice(nothing, 'win32')
+    assert.match(detail, /\.turbollm\\config\.json in your user folder/)
+    assert.doesNotMatch(detail, /sudo|chown|~\//)
+  }
 })
 
 test('dataDirInUseNotice: the dialog shows the daemon\'s refusal, which names the running one and how to stop it', () => {
@@ -173,7 +230,26 @@ test('a daemon refused for its data dir is not respawned: the app is told why, o
   await exited
   assert.equal(launches.count, 1, 'a refused daemon is never respawned')
   assert.deepEqual(lost, [
-    { reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true } }
+    { reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true, configAccess: false } }
+  ])
+  settled(dir)
+})
+
+test('a daemon that may not read or write its config file is not respawned: the app is told why, once', async () => {
+  const dir = newDir()
+  const lost = []
+  const launches = countingSpawner(fakeDaemon(dir, '77'))
+  const child = supervise({
+    spawnDaemon: launches.spawnDaemon,
+    onDaemonLost: (reason, details) => lost.push({ reason, details })
+  }).start()
+  const exited = once(child, 'exit')
+
+  await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the daemon to be reported lost')
+  await exited
+  assert.equal(launches.count, 1, 'a refused daemon is never respawned')
+  assert.deepEqual(lost, [
+    { reason: 'refused: it may not read or write its config file (exit 77)', details: { dataDirInUse: false, configAccess: true } }
   ])
   settled(dir)
 })
