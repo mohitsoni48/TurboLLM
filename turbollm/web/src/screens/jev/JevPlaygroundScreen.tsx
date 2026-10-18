@@ -17,6 +17,7 @@ import { isSystemOneModel } from '../../lib/model-kind'
 import { useModelLoader, type LoadTarget } from '../../lib/model-loader'
 import { useModelActions, useModels, useStatus } from '../../lib/queries'
 import { loadedSystemOneModel } from '../../lib/systemone-model'
+import { servingElsewhere } from '../../lib/queries'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { AnswerList } from './AnswerList'
@@ -305,13 +306,20 @@ function CentredStatus({ children }: { children: ReactNode }) {
   )
 }
 
-/** The engine answering: a Laya model always runs on the Laya engine, whichever engine is active (ADR-443). */
+/** The engine answering: a Laya model always runs on the Laya engine, whichever engine is active (ADR-443). A Jev
+ *  model in the primary runs on the engine the primary runs, which need not be the active one: an engine install or
+ *  Enable activates another without stopping the model, and the header named the active engine beside the model's
+ *  state. One in a pool slot keeps the engine that loaded it, which the status does not name, so the header names
+ *  none rather than the active one; nor for a slot it cannot tell (the catalog fallback). */
 function engineOf(model: LoadedJev, status: Status | undefined): { name: string; kind: string } {
   if (model.checkpoints) return { name: 'Laya', kind: 'laya' }
-  return activeEngine(status)
+  if (model.slot !== 'primary') return { name: '', kind: '' }
+  return primaryEngine(status)
 }
 
-function activeEngine(status: Status | undefined): { name: string; kind: string } {
+function primaryEngine(status: Status | undefined): { name: string; kind: string } {
+  const elsewhere = servingElsewhere(status)
+  if (elsewhere) return { name: elsewhere, kind: status?.engine?.servingKind ?? '' }
   return { name: status?.engine?.name ?? '', kind: status?.engine?.kind ?? '' }
 }
 

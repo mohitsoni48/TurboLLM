@@ -183,7 +183,12 @@ export function listRemoteModels(): Promise<RemoteModelRow[]> {
  *  Structurally carries no host filesystem detail: `launchCommand` and the engine error's
  *  log tail are absent from the shared builder, not stripped from it. */
 export interface RemoteStatus {
-  engine: { id: string; name: string; kind: string; state: string; port: number | null; pid: number | null; parallelSlots?: number }
+  engine: {
+    id: string; name: string; kind: string; state: string; port: number | null; pid: number | null; parallelSlots?: number
+    /** The engine the host's loaded model runs on, which need not be the host's selected one (`id`, `name`): see
+     *  EngineRuntime. Optional: an older host sends only servingId, or none of them. */
+    servingId?: string; servingKind?: string; servingName?: string
+  }
   model: { key: string; name: string; quant: string | null; ctx: number | null; vision: boolean } | null
   engineStats: unknown
   liveGeneration: unknown

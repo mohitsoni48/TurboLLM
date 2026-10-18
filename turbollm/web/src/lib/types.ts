@@ -42,11 +42,13 @@ export type EngineRuntime = {
   error?: EngineError
   port?: number
   pid?: number
-  /** Id of the engine the loaded model actually runs on ('' when none). Not always `id`: a .litertlm model runs on
-   *  LiteRT-LM whichever engine is active. Absent from older daemons. */
+  /** Id of the engine the loaded model actually runs on ('' when none). Not always `id` (the active engine): an engine
+   *  install or Enable activates another engine without stopping the model. Absent from older daemons. */
   servingId?: string
   /** Kind of the engine in `servingId` ('' when none). Absent from older daemons. */
   servingKind?: string
+  /** Name of the engine in `servingId` ('' when none). Absent from older daemons. */
+  servingName?: string
   /** The exact command last spawned, formatted for copy-paste into a terminal.
    *  Present only while this engine is the one actually running/starting. */
   launchCommand?: string

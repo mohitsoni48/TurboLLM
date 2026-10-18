@@ -33,6 +33,7 @@ import {
 import { useQueryClient } from '@tanstack/react-query'
 import {
   activeEngineOf,
+  servingElsewhere,
   queryKeys,
   useBackendInstall,
   useBuild,
@@ -674,8 +675,14 @@ function EngineHeaderBar({
 
   const busy = mut.activate.isPending
   // The active engine's live run-state drives the traffic-light on the selector below
-  // (green running · amber starting · red error · grey stopped).
-  const engineState = status?.engine.state ?? 'stopped'
+  // (green running · amber starting · red error · grey stopped). Only while the loaded model runs on it: one that
+  // another engine runs (an install or Enable activated this one without stopping it) lit the selected engine's light,
+  // so it read as running a model it never loaded. The status card below names the engine that does.
+  const elsewhere = servingElsewhere(status)
+  const engineState = elsewhere ? 'stopped' : (status?.engine.state ?? 'stopped')
+  // And the caption over the selector says "Selected engine" then: "Running now" over the selected engine's name read
+  // as that engine running the model, light off or not.
+  const selectorCaption = elsewhere ? 'Selected engine' : 'Running now'
 
   const activate = (id: string) => {
     if (id === activeEngine?.id) return
@@ -703,7 +710,7 @@ function EngineHeaderBar({
         </div>
 
         <div className="flex flex-col items-start gap-1.5 md:items-end">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-muted">Running now</span>
+          <span className="text-[11px] font-medium uppercase tracking-wide text-muted">{selectorCaption}</span>
           <div className="flex flex-wrap items-center gap-2 md:justify-end">
             <DropdownMenu>
               <DropdownMenuTrigger
@@ -2114,7 +2121,8 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
   const { data: status } = useStatus()
   const engines = (list?.engines ?? []).filter((e) => e.kind !== 'laya')
   const running = status?.engine.state === 'running' || status?.engine.state === 'starting'
-  // The engine the loaded model runs on — a .litertlm model runs on LiteRT-LM while llama.cpp stays active.
+  // The engine the loaded model runs on, which need not be the active one (an install or Enable activates another
+  // without stopping the model).
   const servingId = status?.engine.servingId ?? activeEngine?.id
 
   const use = (e: Engine) => {

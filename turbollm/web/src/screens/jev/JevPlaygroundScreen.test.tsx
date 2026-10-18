@@ -217,6 +217,28 @@ describe('JevPlaygroundScreen', () => {
     expect(screen.getByLabelText('state')).toBeInTheDocument()
   })
 
+  // The header named the active engine beside the model's state. An engine install or Enable activates another engine
+  // without stopping the model, so it read as the selected engine running a model another engine ran.
+  it('names the engine running a model in the primary, not the active one', () => {
+    state.status = status({
+      engine: { id: 'llama', name: 'llama.cpp b6000', kind: 'llama-server', state: 'running', servingId: 'vllm', servingKind: 'vllm', servingName: 'vLLM 0.29' },
+    })
+    renderScreen()
+    expect(screen.getByText('qwen3.5 4b nli v2 · vLLM 0.29 · running')).toBeInTheDocument()
+    expect(screen.queryByText(/llama\.cpp/)).toBeNull()
+  })
+
+  // A pool slot keeps the engine that loaded it, which the status does not name: the active one may not be it.
+  it('names no engine for a model in a pool slot', () => {
+    state.status = status({
+      engine: { id: 'llama', name: 'llama.cpp b6000', kind: 'llama-server', state: 'running', servingId: '', servingKind: '', servingName: '' },
+      jev: { key: KEY, name: 'qwen3.5 4b nli v2', labels: ['contradiction', 'entailment', 'neutral'], state: 'running', slot: 'pool' },
+    })
+    renderScreen()
+    expect(screen.getByText('qwen3.5 4b nli v2 · running')).toBeInTheDocument()
+    expect(screen.queryByText(/llama\.cpp/)).toBeNull()
+  })
+
   it('shows Loading… while the model is starting', () => {
     state.status = status({
       jev: { key: KEY, name: 'qwen3.5 4b nli v2', labels: ['contradiction', 'entailment', 'neutral'], state: 'starting', slot: 'primary' },

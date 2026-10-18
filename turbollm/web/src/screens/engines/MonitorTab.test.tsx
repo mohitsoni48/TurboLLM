@@ -128,6 +128,19 @@ describe('MonitorTab', () => {
     expect(state.getRequestsCalls).toBe(0)
   })
 
+  // The header named the active engine beside the primary's state, so a model another engine ran (an install or Enable
+  // activates an engine without stopping it) read as running on the selected one.
+  it('names the engine running the model when it is not the active one', async () => {
+    state.enginesList = { engines: [engine()], activeEngineId: 'e1', customDisabled: [] }
+    state.status = {
+      engine: { id: 'e1', name: 'llama.cpp', state: 'running', servingId: 'lit', servingKind: 'litert-lm', servingName: 'LiteRT-LM' },
+    } as unknown as Status
+    await renderTab()
+
+    expect(screen.getByText('LiteRT-LM')).toBeInTheDocument()
+    expect(screen.queryByText('llama.cpp')).not.toBeInTheDocument()
+  })
+
   it('tracks the auto-scroll toggle on the monitor screen, not engines', async () => {
     state.enginesList = { engines: [engine()], activeEngineId: 'e1', customDisabled: [] }
     state.status = { engine: { id: 'e1', name: 'llama.cpp', state: 'running' } } as unknown as Status

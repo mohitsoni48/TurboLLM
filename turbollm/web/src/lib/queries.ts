@@ -325,6 +325,19 @@ export function activeEngineOf(list: EnginesList | undefined): Engine | null {
   return list?.engines.find((e) => e.id === activeId) ?? null
 }
 
+/** The name of the engine running the loaded model when it is not the active one (an engine install or Enable activates
+ *  another engine without stopping the model), else null. A screen that names the engine running a model shows this
+ *  in its place, so it never says the selected engine runs a model another engine does. Takes a linked machine's
+ *  status too (RemoteStatus): the Turbo Link façade serves the same engine block, without the serving fields from an
+ *  older host. */
+export function servingElsewhere(
+  status: { engine?: Pick<Status['engine'], 'id' | 'servingId' | 'servingName'> | null } | null | undefined,
+): string | null {
+  const e = status?.engine
+  if (!e?.servingId || e.servingId === e.id) return null
+  return e.servingName || 'another engine'
+}
+
 /** Available llama.cpp backends + the hardware-recommended one (ADR-025).
  *  Polls while a provision is active so installed/active flags stay fresh. */
 export function useEngineBackends(provisioning: boolean): UseQueryResult<EngineBackends> {

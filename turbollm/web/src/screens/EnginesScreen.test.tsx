@@ -9,7 +9,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
-import type { CatalogEngine, Engine, EngineFit, EngineVariant } from '../lib/types'
+import type { CatalogEngine, Engine, EngineFit, EngineVariant, Status } from '../lib/types'
 
 const installLayaMutate = vi.fn()
 const installLitertLmMutate = vi.fn()
@@ -46,7 +46,7 @@ const LAYA_FIT: EngineFit = {
   recommended: false,
 }
 
-const state: { engines: Engine[]; activeEngineId: string; catalog: CatalogEngine[]; fits: EngineFit[]; updates: Record<string, unknown>; policies: Record<string, string> } = {
+const state: { engines: Engine[]; activeEngineId: string; catalog: CatalogEngine[]; fits: EngineFit[]; updates: Record<string, unknown>; policies: Record<string, string>; status?: Status } = {
   engines: [], activeEngineId: '', catalog: [], fits: [], updates: {}, policies: {},
 }
 
@@ -63,7 +63,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     }),
     useEngineUpdates: () => ({ data: { updates: state.updates, policies: state.policies } }),
     useSysInfo: () => ({ data: { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
-    useStatus: () => ({ data: undefined }),
+    useStatus: () => ({ data: state.status }),
     useBuild: () => ({
       start: { mutate: vi.fn(), isPending: false }, cancel: { mutate: vi.fn() },
       cuda: { mutate: vi.fn() }, installPrereq: { mutate: vi.fn() }, refresh: vi.fn(),
@@ -118,6 +118,7 @@ beforeEach(() => {
   state.fits = []
   state.updates = {}
   state.policies = {}
+  state.status = undefined
   installLayaMutate.mockClear()
   installLitertLmMutate.mockClear()
   updateLitertLmMutate.mockClear()
@@ -143,6 +144,52 @@ describe('EnginesScreen — Laya is never offered as the active engine', () => {
     const menu = await screen.findByRole('menu')
     expect(within(menu).getByText('llama.cpp')).toBeTruthy()
     expect(within(menu).queryByText('Laya')).toBeNull()
+  })
+})
+
+// The "Running now" selector lit the active engine's light, and the status card under it named the model, whenever the
+// primary ran one, even when another engine ran it (an install or Enable activates an engine without stopping the
+// model): the screen read as the selected engine running a model it never loaded.
+describe('EnginesScreen — the engine running the model, when it is not the active one', () => {
+  const runningOn = (servingId: string, servingName: string) => ({
+    engine: { id: LLAMA_LIVE_ENGINE.id, name: 'llama.cpp', kind: 'llama-server', state: 'running', servingId, servingKind: 'litert-lm', servingName },
+    model: { key: 'gemma', name: 'Gemma 3n', quant: null, ctx: 4096, vision: false },
+    downloads: { active: 0 },
+  }) as unknown as Status
+  const selectorLight = () =>
+    screen.getByText(/^(Running now|Selected engine)$/).closest('div')!.querySelector('button[aria-haspopup="menu"] [aria-label]')!.getAttribute('aria-label')
+
+  it('leaves the active engine unlit and names the engine running the model', () => {
+    state.engines = [LLAMA_LIVE_ENGINE]
+    state.activeEngineId = LLAMA_LIVE_ENGINE.id
+    state.status = runningOn('litert-1', 'LiteRT-LM')
+    renderScreen()
+
+    expect(selectorLight()).toBe('Stopped')
+    expect(screen.getByText(/Gemma 3n — on LiteRT-LM/)).toBeTruthy()
+  })
+
+  // "Running now" over the selected engine's name read as that engine running the model, light off or not.
+  it('captions the selector "Selected engine", not "Running now", while another engine runs the model', () => {
+    state.engines = [LLAMA_LIVE_ENGINE]
+    state.activeEngineId = LLAMA_LIVE_ENGINE.id
+    state.status = runningOn('litert-1', 'LiteRT-LM')
+    renderScreen()
+
+    expect(screen.getByText('Selected engine')).toBeTruthy()
+    expect(screen.queryByText('Running now')).toBeNull()
+  })
+
+  it('lights the active engine and names no other one while it runs the model itself', () => {
+    state.engines = [LLAMA_LIVE_ENGINE]
+    state.activeEngineId = LLAMA_LIVE_ENGINE.id
+    state.status = runningOn(LLAMA_LIVE_ENGINE.id, 'llama.cpp')
+    renderScreen()
+
+    expect(selectorLight()).toBe('Running')
+    expect(screen.getByText('Running now')).toBeTruthy()
+    expect(screen.getByText('Gemma 3n')).toBeTruthy()
+    expect(screen.queryByText(/ — on /)).toBeNull()
   })
 })
 
