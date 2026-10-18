@@ -2196,3 +2196,54 @@ test("a chat routine's run conversation on the owner's MCP agent cannot be chang
     mcp.cleanup()
   }
 })
+
+// ── "Allow for this chat" against a global Deny ─────────────────────────────────────────────
+// The approve route saves "Allow for this chat" before it looks for a pending call, for any
+// caller lanAuth lets into the chat, and that override beat the owner's global Deny: a keyless
+// caller could re-enable a denied tool for the owner's own later turns in a chat.
+
+test('a global Deny wins over "Allow for this chat", which a caller isLocalOrAuthenticated refuses cannot save for a denied tool', async (t) => {
+  const allowChat = (h: ReturnType<typeof toolChat>, request: typeof tunneledRequest, headers: Record<string, string>, convId: string, toolName: string) =>
+    request(h.app, `/api/v1/conversations/${convId}/tool-calls/tc-none/approve`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ toolName, decision: 'allow_chat' }),
+    })
+  for (const caller of keylessCallers()) {
+    const h = toolChat(caller.mutate)
+    const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+    try {
+      h.cfg.tools.toolPolicies = { run_code: 'deny' }
+      const conv = h.db.createConversation()
+      const e = await errorOf(await allowChat(h, caller.request, caller.headers(h.d), conv.id, 'run_code'))
+      assert.deepEqual({ status: e.status, code: e.code }, { status: 403, code: 'api_key_required' }, caller.name)
+      assert.match(e.message, /set to Deny/, caller.name)
+      assert.deepEqual(h.db.getToolOverrides(conv.id), {}, `${caller.name}: nothing is saved`)
+      // A tool that is not denied is unchanged: saved, then 404 for want of a pending call.
+      assert.equal((await allowChat(h, caller.request, caller.headers(h.d), conv.id, 'fetch_url')).status, 404, caller.name)
+      assert.deepEqual(h.db.getToolOverrides(conv.id), { fetch_url: 'allow' }, caller.name)
+    } finally {
+      restoreJwks()
+      h.cleanup()
+    }
+  }
+
+  // The host may still save it, and the owner's own turn in that chat is still refused the tool.
+  const h = toolChat(() => {}, { call: 'run_code', args: { code: 'print(1)' } })
+  const ran = t.mock.method(h.d.tools!, 'executeTool', async () => 'ran on the host')
+  try {
+    h.cfg.tools.toolPolicies = { run_code: 'deny' }
+    const conv = h.db.createConversation()
+    assert.equal((await allowChat(h, loopbackRequest, {}, conv.id, 'run_code')).status, 404)
+    assert.deepEqual(h.db.getToolOverrides(conv.id), { run_code: 'allow' })
+    const sse = await chatTurn(h, loopbackRequest, {}, conv.id)
+    assert.match(sse, /set to Deny in Tool Permissions/)
+    assert.equal(ran.mock.callCount(), 0, 'the denied tool does not run')
+    // Once the owner lifts the Deny, the chat's Allow applies again.
+    h.cfg.tools.toolPolicies = {}
+    await chatTurn(h, loopbackRequest, {}, conv.id)
+    assert.equal(ran.mock.callCount(), 1)
+  } finally {
+    h.cleanup()
+  }
+})

@@ -138,6 +138,10 @@ const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat c
  *  registerChatRoutes's conversationGate). Code's own refusal, in codeAuth's words. */
 const CODE_CONVERSATION_REFUSED = 'A valid API key is required to access Code from a non-host device.'
 
+/** "Allow for this chat" for a tool set to Deny in Settings, to a caller isLocalOrAuthenticated
+ *  refuses (the approve route). */
+const DENIED_TOOL_CHAT_ALLOW_REFUSED = 'This tool is set to Deny in Tool Permissions. Allowing it for a chat requires a valid API key from a non-host device.'
+
 /** A change to an MCP-running chat routine's run conversation, to a caller the routine routes
  *  refuse that routine (see registerChatRoutes's conversationGate). */
 const MCP_ROUTINE_CONVERSATION_REFUSED = 'Changing the conversation of a routine whose agent uses an MCP server tool requires a valid API key from a non-host device.'
@@ -430,6 +434,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       })
       decisionToApply = 'allow'
     } else if (decision === 'allow_chat') {
+      // A tool the owner set to Deny in Settings: a global Deny wins over this chat's Allow
+      // (resolveToolPolicy), but the override would stay saved and take effect the moment the
+      // owner relaxes that Deny, so a caller who may not change tool policies (the
+      // isLocalOrAuthenticated bar the MCP refusal above uses) may not save one for it either.
+      if (d.store.snapshot().tools.toolPolicies?.[toolName] === 'deny' && !isLocalOrAuthenticated(c, d)) {
+        return err(c, 403, 'api_key_required', DENIED_TOOL_CHAT_ALLOW_REFUSED)
+      }
       db.setToolOverride(convId, toolName, 'allow')
       decisionToApply = 'allow'
     } else if (decision === 'allow') {

@@ -248,7 +248,8 @@ export interface ToolsConfig {
   search?: SearchConfig
   /** Global per-tool approval policy (tool-call approval gate). Every tool defaults
    *  to 'ask' unless explicitly set here to 'allow' or 'deny'. A per-conversation
-   *  override (Conversation.toolOverrides) takes precedence over this map. */
+   *  override (Conversation.toolOverrides) takes precedence over this map, except a
+   *  'deny' here, which no chat override lifts; see resolveToolPolicy. */
   toolPolicies?: Record<string, 'ask' | 'allow' | 'deny'>
   /** Master toggle (Settings → Tool permissions), default OFF: when true, every tool
    *  call that would otherwise show an "awaiting approval" prompt runs immediately
