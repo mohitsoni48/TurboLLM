@@ -39,7 +39,8 @@ const ANDROID_VULKAN_ENGINE_NAME = 'llama-server-android-vulkan'
 
 /** The app's bundled LiteRT-LM engine: the native port of `litert-lm serve` that TurboLLM-Android ships beside
  *  liblitert-lm.so (litert-lm.ts, LITERT_LM_NATIVE_SERVER). Registered only when the APK carries it, like the Vulkan
- *  engine. It never needs activating: .litertlm models are routed to it whatever engine is active (engineForModel). */
+ *  engine. Not activated: like every engine, it loads models only once the user selects it in Engines (a .litertlm
+ *  model loads on nothing else, see engineForModel). */
 const ANDROID_LITERT_LM_ENGINE_NAME = 'litert-lm-android'
 
 /** BUG-01 fix (QA_BUGS.md): on Android, the llama-server binary bundled inside the APK

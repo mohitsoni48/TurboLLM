@@ -39,10 +39,11 @@ const JEV_MODEL = entry({
   key: JEV_KEY, name: 'qwen3.5 4b nli v2', path: '/models/openjev/qwen3.5-4b-nli-v2', format: 'mlx', jev: OPENJEV,
 })
 const GGUF_MODEL = entry({})
+const LITERT_MODEL = entry({ key: 'gemma-litert', format: 'litertlm', path: 'D:\\models\\gemma.litertlm' } as Partial<ModelEntry>)
 
 type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo }
 
-function appWithActiveEngine(engineKind: string | null, models: ModelEntry[]) {
+function appWithActiveEngine(engineKind: string | null, models: ModelEntry[], registry: Record<string, unknown> = {}) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [],
@@ -61,6 +62,7 @@ function appWithActiveEngine(engineKind: string | null, models: ModelEntry[]) {
     db: { lastGenTpsByModel: () => new Map<string, number>() },
     registry: {
       active: () => (engineKind ? { id: 'eng-1', name: engineKind, kind: engineKind, binPath: 'engine' } : undefined),
+      ...registry,
     },
     downloads: { provenance: () => [] },
   } as unknown as Deps
@@ -98,6 +100,19 @@ test('a GGUF model under vLLM needs llama.cpp', async () => {
   assert.deepEqual(compatOf(row), { compatibleWithActiveEngine: false, incompatibleReason: 'needs llama.cpp' })
 })
 
+// A .litertlm model under another engine was listed as loadable (the overlay asked the engine it would have been sent
+// to, the LiteRT-LM one), so the Models screen and every picker showed it while KoboldCpp or llama.cpp was selected.
+test('a .litertlm model under KoboldCpp needs LiteRT-LM, though a LiteRT-LM engine is installed', async () => {
+  const app = appWithActiveEngine('koboldcpp', [LITERT_MODEL], {
+    litertLmEngine: () => ({ id: 'litert-1', name: 'LiteRT-LM', kind: 'litert-lm', binPath: 'engine' }),
+    layaEngine: () => undefined,
+  })
+  const res = await app.request('/api/v1/models')
+  const [row] = ((await res.json()) as { models: ModelRow[] }).models
+
+  assert.deepEqual(compatOf(row), { compatibleWithActiveEngine: false, incompatibleReason: 'needs LiteRT-LM' })
+})
+
 test('with no active engine every model is compatible, with no reason', async () => {
   const rows = await listModels(null, [JEV_MODEL, GGUF_MODEL])
 
@@ -111,7 +126,7 @@ test('GET /models takes the config snapshot and registry lookups once per reques
   // Each snapshot (and each registry lookup, which takes one) is a structuredClone of the whole
   // config; per row, a large library spent hundreds of ms of event loop on every poll.
   const count = async (n: number) => {
-    const calls = { snapshot: 0, active: 0, laya: 0, litert: 0 }
+    const calls = { snapshot: 0, active: 0, laya: 0 }
     const cfg = { modelProfiles: {}, benchResults: {}, modelDirs: [] }
     const models = Array.from({ length: n }, (_, i) =>
       entry({ key: `m${i}|Q4_K_M|1`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
@@ -125,7 +140,6 @@ test('GET /models takes the config snapshot and registry lookups once per reques
       registry: {
         active: () => (calls.active++, { id: 'eng-1', name: 'llama', kind: 'llama-server', binPath: 'engine' }),
         layaEngine: () => (calls.laya++, undefined),
-        litertLmEngine: () => (calls.litert++, undefined),
       },
       downloads: { provenance: () => [] },
     } as unknown as Deps
@@ -139,7 +153,7 @@ test('GET /models takes the config snapshot and registry lookups once per reques
   const one = await count(3)
   const many = await count(30)
   assert.deepEqual(many, one)
-  assert.ok(one.snapshot <= 1 && one.active <= 1 && one.laya <= 1 && one.litert <= 1, JSON.stringify(one))
+  assert.ok(one.snapshot <= 1 && one.active <= 1 && one.laya <= 1, JSON.stringify(one))
 })
 
 // `GET /api/v1/status` carries a local-only `jev` field so Workspace can
@@ -232,11 +246,11 @@ test('registerApi registers GET /api/v1/activity', async () => {
 })
 
 // ADR-444: Discover's "Text classification" category is `?category=text-classification` on the same search route.
-function appWithHfSearch(hf: Record<string, unknown>) {
+function appWithHfSearch(hf: Record<string, unknown>, registry: Record<string, unknown> = {}) {
   const d = {
     store: { snapshot: () => ({}) },
     hf,
-    registry: { active: () => ({ kind: 'llama-server' }), litertLmEngine: () => undefined },
+    registry: { active: () => ({ kind: 'llama-server' }), ...registry },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
   } as unknown as Deps
   const app = new Hono()
@@ -271,6 +285,20 @@ test('GET /api/v1/hf/search browses the category when no query is typed', async 
 
   assert.equal(res.status, 200)
   assert.deepEqual(calls, [['', 'best-match']])
+})
+
+// Discover searched the LiteRT-LM repos beside the active engine's whenever a LiteRT-LM engine was installed, since a
+// .litertlm model loaded there whatever engine was active. It loads only while LiteRT-LM is selected now, so a bundle
+// found under llama.cpp would be one the selected engine cannot load.
+test('GET /api/v1/hf/search searches only what the active engine runs, a LiteRT-LM engine installed or not', async () => {
+  const calls: unknown[][] = []
+  const hf = { searchModels: async (...args: unknown[]) => (calls.push(args), []) }
+  const app = appWithHfSearch(hf, { litertLmEngine: () => ({ id: 'litert-1', kind: 'litert-lm' }) })
+
+  const res = await app.request('/api/v1/hf/search?q=gemma')
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(calls, [['gemma', 'llama-server', 'best-match']])
 })
 
 test('GET /api/v1/hf/search ignores an unknown category and searches as before', async () => {
@@ -431,12 +459,6 @@ test('provenance fallback: unconditional by name, full-path rows resolve by sha2
     [entry({ key: 'gguf-key', path: ggufDest })],
   )
   assert.deepEqual(files.map((f) => f.downloaded), [true])
-})
-
-test('interleaveByRepo: alternates two ranked lists and drops a repo both returned', async () => {
-  const { interleaveByRepo } = await import('./routes')
-  const r = (repo: string) => ({ repo })
-  assert.deepEqual(interleaveByRepo([r('a'), r('b'), r('c')], [r('x'), r('a')]).map((x) => x.repo), ['a', 'x', 'b', 'c'])
 })
 
 // The bench route checks isBlocked() (a render holding the GPU) first; the reverse-gate hook after it also refuses

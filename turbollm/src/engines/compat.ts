@@ -30,6 +30,22 @@ export function modelIncompatibility(
   return null
 }
 
+/** What refuses a load the user asks for by hand (a Models screen Load, the Load dialog, a model picker, an Engines
+ *  Start: POST /api/v1/engine/start, which the Turbo Link façade's load mounts too) before it starts: only a Laya model
+ *  with no Laya engine installed, since a Laya model never loads on the selected engine (registry.engineForModel).
+ *  Every other model is started on the selected engine whatever modelIncompatibility says of it, and if that engine
+ *  cannot load it the load fails with the engine's own error (the load-failure banner): the user chose both the engine
+ *  and the model, and nothing may pick or suggest another engine for them. The pre-refusal ("activate the LiteRT-LM
+ *  engine to load it" for a .litertlm model under KoboldCpp) did. The automatic loads (the gateway's auto-swap, a
+ *  routine's swap and restore, the boot resume, ComfyUI's reload) keep modelIncompatibility's refusal: started anyway,
+ *  each would unload the running model for a load that cannot succeed, with nobody asking for it. */
+export function manualLoadRefusal(
+  engineKind: string,
+  entry: Parameters<typeof modelIncompatibility>[1],
+): Incompatibility | null {
+  return entry.laya ? modelIncompatibility(engineKind, entry) : null
+}
+
 const NEEDS_VLLM: Incompatibility = {
   code: 'needs_vllm',
   label: 'Needs vLLM (Linux or WSL2)',

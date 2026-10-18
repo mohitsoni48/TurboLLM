@@ -7,6 +7,7 @@
 // only `trigger` became a parameter. Pure: it never reads the store or calls getSysInfo(), so a caller
 // gets StartOpts for exactly the config snapshot and hardware it made its decision with.
 import { type Config, type Engine, getModelProfile } from '../config/config'
+import { engineAcceptsFormat, type ModelFormat } from './compat'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import { litertLmProfileToConfig } from './litert-lm'
 import type { StartOpts } from './manager'
@@ -16,8 +17,9 @@ import type { ModelEntry } from '../models/scanner'
 import { autoThreadCount, type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 
 export interface BuildStartOptsInput {
-  /** Precondition: loadable (not incomplete, no parseError), a format the engine accepts, and not
-   *  audio-rejected. Callers check; this function does not re-check. */
+  /** Precondition: loadable (not incomplete, no parseError). The automatic loads also check that the engine can run
+   *  it (modelIncompatibility); a load the user asks for by hand starts it on the selected engine either way
+   *  (compat.ts manualLoadRefusal). Callers check; this function does not re-check. */
   entry: ModelEntry
   engine: Engine
   /** The snapshot the caller decided with; never re-read here. */
@@ -28,9 +30,21 @@ export interface BuildStartOptsInput {
 }
 
 export function buildStartOpts(input: BuildStartOptsInput): StartOpts {
-  if (input.entry.format === 'litertlm') return buildLitertLmStartOpts(input)
-  if (input.entry.format !== 'gguf') return buildModelDirectoryStartOpts(input)
+  const format = launchFormat(input.engine.kind, input.entry.format)
+  if (format === 'litertlm') return buildLitertLmStartOpts(input)
+  if (format !== 'gguf') return buildModelDirectoryStartOpts(input)
   return buildGgufStartOpts(input)
+}
+
+/** The format whose options the launch is built for: the model's own when the engine reads it, else the one the engine
+ *  reads. A manual Load starts a model on the selected engine whatever its format (compat.ts manualLoadRefusal): built
+ *  for the model's format, a GGUF on vLLM got llama.cpp's flags and a .litertlm under KoboldCpp the LiteRT-LM options,
+ *  so the engine failed on arguments it does not take instead of on the file. Never differs for a model the engine
+ *  runs, the only kind an automatic load starts. */
+function launchFormat(engineKind: string, format: ModelFormat): ModelFormat {
+  if (engineAcceptsFormat(engineKind, format)) return format
+  if (engineKind === 'litert-lm') return 'litertlm'
+  return engineAcceptsFormat(engineKind, 'gguf') ? 'gguf' : 'mlx'
 }
 
 function buildModelDirectoryStartOpts({ entry, engine, cfg, sys, overrides, trigger }: BuildStartOptsInput): StartOpts {

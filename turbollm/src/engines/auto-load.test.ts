@@ -458,6 +458,23 @@ for (const { reason, options, line } of SKIP_CASES) {
   })
 }
 
+// A model resumes only on the engine the user selected: a last-used .litertlm model resumed on the registered LiteRT-LM
+// engine whenever another kind was active, so the boot started LiteRT-LM on its own under llama.cpp.
+test('runAutoLoad: a last-used .litertlm model under llama.cpp prints the engine skip line, LiteRT-LM installed', async () => {
+  const bundle = entry({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+  const { deps, record } = mkRunDeps({ findModel: recordingLibrary(bundle).findModel })
+  Object.assign(deps.registry, { litertLmEngine: () => engineOfKind('litert-lm', 'LiteRT-LM') })
+
+  const plan = await runAutoLoad(deps)
+
+  assert.equal(plan.kind, 'skip')
+  assert.deepEqual(record.logs, [
+    'auto-load skipped: engine "llama.cpp" (llama-server) can\'t load last model "gemma 4 e4b|Q6_K|6217256480" (format litertlm)',
+  ])
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(record.loadExplicitCalls, [])
+})
+
 test('runAutoLoad AC6: auto-load off is silent and loads nothing', async () => {
   const { deps, record } = mkRunDeps({ data: resumableConfig({ autoLoadOnStart: false }) })
 

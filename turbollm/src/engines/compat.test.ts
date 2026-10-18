@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { homedir } from 'node:os'
-import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS, modelIncompatibility } from './compat'
+import { engineAcceptsFormat, engineModelAlias, engineRejectsAudioModel, ENGINE_MODEL_ALIAS, manualLoadRefusal, modelIncompatibility } from './compat'
 import type { JevInfo } from '../models/jev'
 import { vllmServerCommand, vllmServeBlocker, classifyVllmBlocker } from './vllm'
 import { UvloopPreflight } from './py-engine-blocker'
@@ -24,6 +24,23 @@ test('engineAcceptsFormat: koboldcpp + llamafile are GGUF engines (Phase 4)', ()
   assert.equal(engineAcceptsFormat('koboldcpp', 'mlx'), false)
   assert.equal(engineAcceptsFormat('llamafile', 'gguf'), true)
   assert.equal(engineAcceptsFormat('llamafile', 'mlx'), false)
+})
+
+// A load the user asks for by hand is started on the selected engine whatever the model's format, audio tower or Jev
+// vLLM requirement, and fails with that engine's own error; only a Laya model, which never loads on the selected engine,
+// is refused for want of the Laya engine. The automatic loads keep modelIncompatibility's refusal.
+test('manualLoadRefusal: only a Laya model with no Laya engine is refused', () => {
+  const base = { format: 'gguf' as const, audio: false, jev: undefined, laya: undefined }
+  assert.equal(manualLoadRefusal('koboldcpp', { ...base, format: 'litertlm' }), null)
+  assert.equal(manualLoadRefusal('vllm', base), null)
+  assert.equal(manualLoadRefusal('llama-server', { ...base, format: 'mlx', jev: {} as JevInfo }), null)
+  assert.equal(manualLoadRefusal('rapid-mlx', { ...base, format: 'mlx', audio: true }), null)
+  assert.equal(manualLoadRefusal('llama-server', { ...base, arch: 'ggmlc' }), null)
+  const laya = { ...base, format: 'mlx' as const, laya: {} as NonNullable<Parameters<typeof manualLoadRefusal>[1]['laya']> }
+  assert.equal(manualLoadRefusal('llama-server', laya)?.code, 'needs_laya')
+  assert.equal(manualLoadRefusal('laya', laya), null)
+  // The automatic loads' rule is unchanged.
+  assert.equal(modelIncompatibility('koboldcpp', { ...base, format: 'litertlm' })?.code, 'format')
 })
 
 // Regression: Rapid-MLX's bundled mlx_vlm double-transposes gemma4's audio-tower conv

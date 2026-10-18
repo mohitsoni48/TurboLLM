@@ -20,7 +20,7 @@ export interface AutoLoadDeps {
   /** The boot scan's promise (cli.ts). Never rejects (CoalescedRunner C4). */
   initialScan: Promise<void>
   store: Pick<ConfigStore, 'snapshot'>
-  registry: Pick<Registry, 'active'> & Partial<Pick<Registry, 'litertLmEngine'>>
+  registry: Pick<Registry, 'active'>
   comfy: Pick<ComfyGuard, 'isBlocked' | 'freeComfyUIBeforeLoad'>
   scanner: Pick<Scanner, 'get'>
   manager: Pick<Manager, 'load'>
@@ -44,7 +44,6 @@ export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
     plan = planAutoLoad({
       cfg,
       engine: deps.registry.active(),
-      litertLmEngine: deps.registry.litertLmEngine?.(),
       comfyBlocked: deps.comfy.isBlocked(),
       findModel: (key) => deps.scanner.get(key),
     })
@@ -73,12 +72,11 @@ export type AutoLoadPlan =
 export interface AutoLoadPlanInput {
   /** The POST-scan snapshot, so a key the scan just migrated is already current. */
   cfg: Config
-  /** `registry.active()`. A resume loads onto the active engine, never `lastLoaded.engineId`. */
+  /** `registry.active()`. A resume loads onto the active engine, never `lastLoaded.engineId`, and never onto another
+   *  engine the model's format would suit (registry.engineForModel): a `.litertlm` model resumes only while LiteRT-LM
+   *  is the active engine, and is skipped as engine-incompatible under any other. A resume is not the user's own
+   *  load, so it does not start a model there that the engine cannot run (compat.ts manualLoadRefusal). */
   engine: Engine | undefined
-  /** `registry.litertLmEngine()`: a `.litertlm` model resumes on it whichever engine is active, the way a manual
-   *  load routes it (registry.engineForModel). Without this the Android app, whose active engine is llama.cpp, skipped
-   *  its last LiteRT-LM model at every boot as engine-incompatible. */
-  litertLmEngine?: Engine
   /** `comfy.isBlocked()` */
   comfyBlocked: boolean
   findModel: (key: string) => ModelEntry | undefined
@@ -92,7 +90,7 @@ export function planAutoLoad(input: AutoLoadPlanInput): AutoLoadPlan {
   if (isPointedAtLinkedModel(cfg)) {
     return skipBecause({ code: 'remote-model-selected', selectedModel: cfg.selectedRemoteModel })
   }
-  return planLocalResume({ cfg, engine, litertLmEngine: input.litertLmEngine, findModel: input.findModel })
+  return planLocalResume({ cfg, engine, findModel: input.findModel })
 }
 
 export function skipLine(reason: AutoLoadSkipReason): string {
@@ -110,7 +108,6 @@ export function fallbackLine(reason: AutoLoadSkipReason, devModel: DevModel): st
 interface LocalResumeInput {
   cfg: Config
   engine: Engine
-  litertLmEngine?: Engine
   findModel: AutoLoadPlanInput['findModel']
 }
 
@@ -149,13 +146,12 @@ function loadDevModel(devModel: DevModel, engine: Engine, lastModel: LastModelRe
   return { kind: 'load-dev-model', devModel, engine, fallbackFrom: lastModel.reason }
 }
 
-function resolveLastModel({ cfg, engine: active, litertLmEngine, findModel }: LocalResumeInput): LastModelResolution {
+function resolveLastModel({ cfg, engine, findModel }: LocalResumeInput): LastModelResolution {
   const modelKey = cfg.lastLoaded.modelKey
   if (!modelKey) return { kind: 'none-recorded' }
   const entry = findModel(modelKey)
   if (!entry) return unresolved({ code: 'model-not-in-library', modelKey })
   if (entry.incomplete || entry.parseError) return unresolved({ code: 'model-not-loadable', modelKey })
-  const engine = entry.format === 'litertlm' && active.kind !== 'litert-lm' && litertLmEngine ? litertLmEngine : active
   const detail = incompatibilityDetail(engine, entry)
   if (detail) {
     const { name: engineName, kind: engineKind } = engine

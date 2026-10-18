@@ -29,8 +29,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
   existing LiteRT-LM config, warm-up and request handling apply unchanged; it is not updated from PyPI (it updates
   with the app) and needs no Python preflight.
-- `.litertlm` models load on the LiteRT-LM engine whichever engine is active, the way Laya models go to Laya — no
-  engine switch needed first.
+- `.litertlm` models load on the LiteRT-LM engine once it is the selected engine (Engines). Like every model, they load
+  only on the engine the user selected, and no path starts LiteRT-LM on its own: under another engine they are hidden
+  from the Models screen and the pickers, and a Load asked for anyway is started on the selected engine, whose own
+  error says it could not load the file.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
@@ -44,9 +46,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Engine errors sent inside a stream reach the chat.** LiteRT-LM (and llama-server once streaming has begun) report a
   failed turn as a `data: {"error": …}` chunk, which the chat skipped, ending the turn as an empty message. The error
   is now shown, a non-OK engine response carries the engine's reason, and a LiteRT-LM context overflow says why.
-- **Requests are shaped for the engine actually serving the model.** A `.litertlm` model runs on LiteRT-LM whichever
-  engine is active, but chat, the gateway, routines, the extension API and the agents shaped requests (model field,
-  token limit) for the active engine. The last-used `.litertlm` model also resumes on LiteRT-LM at boot now.
+- **Requests are shaped for the engine actually serving the model.** A model goes on running on the engine it was
+  loaded on when an engine install or Enable activates another, but chat, the gateway, routines, the extension API and
+  the agents shaped requests (model field, token limit) for the active engine.
 - **RAM usage counts the page cache as available** (MemAvailable, not Node 18's MemFree), which made Linux and
   Android machines look nearly out of memory.
 - **Auto CPU threads use the performance cores on big.LITTLE arm64** (phones, Termux, ARM Linux), where threads on

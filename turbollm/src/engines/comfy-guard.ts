@@ -296,6 +296,12 @@ export class ComfyGuard {
         this.onReloaded?.(o.model.key, o.engine.id)
       }
     }
+    // A model loads only on the engine the user selected (see isOnSelectedEngine()).
+    const onSelectedEngine = (o: StartOpts | null | undefined): boolean => {
+      if (!o || this.isOnSelectedEngine(o)) return true
+      console.log(`[comfy-guard] ComfyUI released the GPU — not reloading ${o.model.name}: ${o.engine.name} is no longer the selected engine.`)
+      return false
+    }
     let paused = false
     try {
       // A load we refused mid-render (one that reached its start while we held the GPU, e.g. a swap whose old
@@ -306,6 +312,10 @@ export class ComfyGuard {
       paused = this.hasPausedLoad()
       if (paused) {
         const recorded = this.manager.restartOpts()
+        if (!onSelectedEngine(recorded)) {
+          this.manager.clearError()
+          return
+        }
         const resume = recorded && this.onEngineNow(recorded)
         engine = resume?.engine
         console.log('[comfy-guard] ComfyUI released the GPU — loading the model whose load it paused.')
@@ -315,6 +325,7 @@ export class ComfyGuard {
           reloaded(resume)
         })
       } else if (opts) {
+        if (!onSelectedEngine(opts)) return
         // A refusal below keeps `opts` for the next release, which looks the engine up again.
         const start = this.onEngineNow(opts)
         engine = start.engine
@@ -385,6 +396,16 @@ export class ComfyGuard {
     return true
   }
 
+  /** Whether release() may load `o`: a model loads only on the engine the user selected (registry.engineForModel).
+   *  The render leaves the primary stopped, so the Engines screen lets the user select another engine meanwhile, and
+   *  the reload then brought the model back on the one they had just left. It stays unloaded instead, as the switch
+   *  leaves a stopped primary; a paused load's refusal is cleared with it. An engine still selected, or no selection
+   *  on record, reloads. */
+  private isOnSelectedEngine(o: StartOpts): boolean {
+    const selected = this.store.snapshot().activeEngineId
+    return !selected || selected === o.engine.id
+  }
+
   /** The primary is in 'error' with our pre-start hook's refusal: release() resumes that load. */
   private hasPausedLoad(): boolean {
     const st = this.manager.status()
@@ -392,12 +413,14 @@ export class ComfyGuard {
   }
 
   /** Key of the model release() loads when this render ends, as release() decides it: the load it paused, else the
-   *  model it unloaded. null when it loads none, or no render claims the GPU. The gateway uses it to tell a caller that
-   *  may not load models whether waiting brings its model up. */
+   *  model it unloaded. null when it loads none (also when the user has selected another engine than that model's
+   *  since, which release() then leaves unloaded), or no render claims the GPU. The gateway uses it to tell a caller
+   *  that may not load models whether waiting brings its model up, and the router whether a refused restore is
+   *  brought back. */
   modelKeyLoadedOnRelease(): string | null {
     if (!this.gpuClaimed()) return null
-    if (this.hasPausedLoad()) return this.manager.restartOpts()?.model.key ?? null
-    return this.suspended?.model.key ?? null
+    const loads = this.hasPausedLoad() ? this.manager.restartOpts() : this.suspended
+    return loads && this.isOnSelectedEngine(loads) ? loads.model.key : null
   }
 
   /** Key of the model release()'s reload is loading right now (the model the render unloaded, or the load it paused),

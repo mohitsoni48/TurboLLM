@@ -72,8 +72,9 @@ test('POST /v1/messages on LiteRT-LM sends the client cap as max_completion_toke
 })
 
 // The router can send a request to an extra pool slot (keepN ≥ 2, or a chat model beside an embedding model in
-// the primary). A .litertlm model there runs on LiteRT-LM whatever the primary runs, and the request used to be shaped
-// and labelled from the PRIMARY: llama.cpp's shape (no path in `model`, `max_tokens`) and the primary model's name.
+// the primary). A slot keeps the engine it was loaded on, LiteRT-LM here, whatever the primary runs (an engine install
+// or Enable activates another without stopping it), and the request used to be shaped and labelled from the PRIMARY:
+// llama.cpp's shape (no path in `model`, `max_tokens`) and the primary model's name.
 
 function slotDeps(): Deps {
   const d = litertDeps() as unknown as Record<string, unknown>

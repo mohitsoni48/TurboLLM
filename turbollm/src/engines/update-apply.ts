@@ -339,8 +339,7 @@ const PIP_ENGINE_LABEL: Record<PipEngineKind, string> =
 async function applyPipUpdate(d: UpdateApplyDeps, kind: PipEngineKind, engine: Engine, root: string): Promise<void> {
   d.provision.start(kind, d.trigger ?? 'auto_update')
   // An update keeps an engine active only when it still is the active engine (keepActiveAfterUpdate): the scheduler
-  // also updates engines that are merely installed. (For LiteRT-LM it matters twice — it serves .litertlm models
-  // without being active (engineForModel), and activating it sends every GGUF to it.)
+  // also updates engines that are merely installed. (Activating LiteRT-LM, say, would leave every GGUF unloadable.)
   try {
     await stopEngineUsers(d, engine.id)
     if (kind === 'mlx') {

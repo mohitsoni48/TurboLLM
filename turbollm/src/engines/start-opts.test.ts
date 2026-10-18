@@ -141,6 +141,27 @@ test('a Jev model on MLX keeps the MLX sampling path, with no Jev flags', () => 
   assert.deepEqual(opts.extraArgs, mlxSamplingArgs(undefined))
 })
 
+// A manual Load starts a model on the selected engine whatever its format (compat.ts manualLoadRefusal). Built for the
+// model's format, the engine got options of another engine: llama.cpp's -c and -ngl on vLLM, the LiteRT-LM --config
+// object under KoboldCpp, so it failed on arguments it does not take instead of on the file it was handed.
+test("a model the engine does not read is launched with that engine's own options", () => {
+  const litertlm = ggufModel({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+  const kobold = resumeLoad(litertlm, 'koboldcpp')
+  assert.deepEqual(kobold.extraArgs, koboldcppProfileToArgs(kobold.profile!, primaryVendor(NO_GPU_MACHINE), false))
+  assert.equal(kobold.litertLmConfig, undefined)
+  assert.equal(kobold.modelPath, litertlm.path)
+
+  const vllm = resumeLoad(ggufModel(), 'vllm')
+  assert.ok(vllm.extraArgs.includes('--max-num-batched-tokens'), vllm.extraArgs.join(' '))
+  assert.ok(!vllm.extraArgs.includes('-c'), vllm.extraArgs.join(' '))
+
+  const llama = resumeLoad(safetensorsModel(), 'llama-server')
+  assert.deepEqual(llama.extraArgs.slice(0, 2), ['-c', String(llama.profile!.ctx)])
+
+  const litert = resumeLoad(ggufModel(), 'litert-lm')
+  assert.ok(litert.litertLmConfig, 'the LiteRT-LM engine reads its options from --config')
+})
+
 function resumeLoad(entry: ModelEntry, kind: string, cfg: Config = defaultConfig()): StartOpts {
   return buildStartOpts({ entry, engine: testEngine(kind), cfg, sys: NO_GPU_MACHINE, trigger: 'resume' })
 }

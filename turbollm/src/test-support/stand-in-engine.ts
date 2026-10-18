@@ -86,7 +86,7 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void },
       return { ok: true, status: 200 }
     })
     : undefined
-  const registry = { active: () => engine, layaEngine: () => undefined, litertLmEngine: () => undefined } as unknown as Registry
+  const registry = { active: () => engine, layaEngine: () => undefined } as unknown as Registry
   const scanner = {
     list: () => ({ models, scanning: false, lastScanAt: '' }),
     get: (key: string) => models.find((m) => m.key === key),

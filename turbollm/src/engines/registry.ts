@@ -278,11 +278,6 @@ export class Registry {
     return this.store.snapshot().engines.find((e) => e.kind === 'laya')
   }
 
-  /** The LiteRT-LM engine a .litertlm model loads on when the active engine is another kind (engineForModel). */
-  litertLmEngine(): Engine | undefined {
-    return this.store.snapshot().engines.find((e) => e.kind === 'litert-lm')
-  }
-
   /** Register a KoboldCpp engine (kind='koboldcpp'). binPath is the single KoboldCpp
    *  binary, not a llama-server, so llama.cpp capabilities/flags don't apply (it uses
    *  its own CLI flag names — see koboldcppProfileToArgs). */
@@ -608,17 +603,14 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
 /** The engine that loads `entry`: the Laya engine for a Laya model, the active engine for every other one. A
  *  Laya model with no Laya engine installed gets the active engine, whose compat check refuses it with the reason
  *  (compat.ts NEEDS_LAYA). Free-standing, and asking for the Laya engine only for a Laya model, so every caller's
- *  registry needs nothing beyond active() for every other model. */
-export function engineForModel(
-  registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'>,
-  entry: Pick<ModelEntry, 'laya'> & Partial<Pick<ModelEntry, 'format'>>,
-): Engine | undefined {
+ *  registry needs nothing beyond active() for every other model.
+ *  A .litertlm model gets the active engine too, as every other format does: a model loads only on the engine the
+ *  user selected. It used to go to the registered LiteRT-LM engine whenever another kind was active, so a Load, an
+ *  Engines Start, a gateway auto-swap, a routine's swap or restore and the boot resume all started LiteRT-LM on their
+ *  own while the user had KoboldCpp or llama.cpp selected, and the Models screen listed the model as loadable there.
+ *  Now a load the user asks for by hand starts it on the active engine, which fails with its own error, and an
+ *  automatic one is refused by the active engine's compat check (compat.ts manualLoadRefusal, modelIncompatibility). */
+export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
   if (entry.laya) return registry.layaEngine() || registry.active()
-  // A .litertlm bundle runs on LiteRT-LM and nothing else (compat.engineAcceptsFormat), so when the active engine is
-  // another kind it would only ever fail with engine_model_mismatch. Route it to the registered LiteRT-LM engine the
-  // way a Laya model goes to Laya. This is what makes the Android app's bundled engine usable without first switching
-  // engines by hand: the app activates its llama.cpp engine, and every .litertlm model still has a home.
-  const active = registry.active()
-  if (entry.format === 'litertlm' && active?.kind !== 'litert-lm') return registry.litertLmEngine() || active
-  return active
+  return registry.active()
 }

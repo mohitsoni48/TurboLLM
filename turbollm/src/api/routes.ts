@@ -14,7 +14,6 @@ import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bo
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { stripBodies } from '../observability/request-log'
-import { abortAllInFlightChats } from '../chat/chat-routes'
 import { NameTakenError, NotFoundError, customSourceKey, engineForModel, nameTakenMessage, type Registry } from '../engines/registry'
 import { ProbeError, probe } from '../engines/probe'
 import { resolveServerBinary, suggestEngineName } from '../engines/scan'
@@ -98,7 +97,7 @@ import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
-import { startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
+import { restartEngine, startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
 import { jevStatus } from './jev-status'
@@ -2265,25 +2264,16 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // ---- lifecycle (A2) ----
-  // Both lifecycle handlers live in engine-lifecycle.ts, not here: the Turbo Link façade
-  // (/api/link/v1/models/load and /unload) mounts the SAME functions behind
-  // requireCapability, so a linked peer gets identical eviction / keep-N / ComfyUI-guard /
-  // swap-serialization behaviour instead of a second, drifting implementation.
+  // The lifecycle handlers live in engine-lifecycle.ts, not here (restart's beside the load it
+  // mirrors): the Turbo Link façade (/api/link/v1/models/load and /unload) mounts the SAME
+  // start and stop functions behind requireCapability, so a linked peer gets identical
+  // eviction / keep-N / ComfyUI-guard / swap-serialization behaviour instead of a second,
+  // drifting implementation.
   app.post('/api/v1/engine/start', async (c) => startEngine(c, d, await body<EngineStartBody>(c)))
 
   app.post('/api/v1/engine/stop', async (c) => stopEngine(c, d, await body<EngineStopBody>(c)))
 
-  app.post('/api/v1/engine/restart', (c) => {
-    // Kill switch: cancel auto-tune + abort chats, wait for the runner to release the engine,
-    // then restart — so the reload doesn't race auto-tune's teardown.
-    d.bench.cancel()
-    abortAllInFlightChats()
-    void (async () => {
-      await d.bench.waitIdle()
-      await d.manager.restart()
-    })().catch(() => {})
-    return c.json({ ok: true }, 202)
-  })
+  app.post('/api/v1/engine/restart', (c) => restartEngine(c, d))
 
   // ---- ComfyUI GPU gate (push coordination) ----
   // The installed ComfyUI node calls these. acquire() blocks until VRAM is freed so
@@ -3683,7 +3673,7 @@ export function registerApi(app: Hono, d: Deps): void {
 /** What {@link overlayModel} reads from the config and the registry, taken once per request by
  *  the list endpoint (every registry lookup is a config snapshot too). The registry lookups are
  *  lazy and memoized: most rows only need `active`. */
-type OverlayShared = { snap: Config; registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'> }
+type OverlayShared = { snap: Config; registry: Pick<Registry, 'active' | 'layaEngine'> }
 
 function overlayShared(d: Deps): OverlayShared {
   const once = <T>(f: () => T): (() => T) => {
@@ -3695,7 +3685,6 @@ function overlayShared(d: Deps): OverlayShared {
     registry: {
       active: once(() => d.registry.active()),
       layaEngine: once(() => d.registry.layaEngine()),
-      litertLmEngine: once(() => d.registry.litertLmEngine()),
     },
   }
 }
@@ -4013,30 +4002,9 @@ function telemetryPreview(level: string, version: string) {
 async function searchHf(d: Deps, q: string, sort: HfSortOption, category: string | undefined): Promise<HfSearchItem[]> {
   if (category === TEXT_CLASSIFICATION_CATEGORY) return d.hf.searchTextClassification(q, sort)
   const engineKind = d.registry.active()?.kind
-  const run = (kind: string | undefined) => (q ? d.hf.searchModels(q, kind, sort) : d.hf.browseModels(sort, kind))
-  // A .litertlm model runs on the LiteRT-LM engine whichever engine is active (engineForModel), so when one is
-  // installed but another is active — the Android app, where llama.cpp is active — search its repos as well;
-  // otherwise the active engine's `filter=gguf` hides every litert-community bundle. Best-effort.
-  if (engineKind !== 'litert-lm' && d.registry.litertLmEngine()) {
-    const [main, litert] = await Promise.all([run(engineKind), run('litert-lm').catch(() => [] as HfSearchItem[])])
-    return interleaveByRepo(main, litert)
-  }
-  return run(engineKind)
-}
-
-/** Alternate two ranked result lists (so neither engine's matches sink below the fold), dropping repeats. */
-export function interleaveByRepo<T extends { repo: string }>(a: T[], b: T[]): T[] {
-  const out: T[] = []
-  const seen = new Set<string>()
-  for (let i = 0; i < Math.max(a.length, b.length); i++) {
-    for (const item of [a[i], b[i]]) {
-      if (item && !seen.has(item.repo)) {
-        seen.add(item.repo)
-        out.push(item)
-      }
-    }
-  }
-  return out
+  // Only what the active engine runs, LiteRT-LM included: a .litertlm model loads only while LiteRT-LM is the active
+  // engine (engineForModel), so its repos are searched then and not beside another engine's.
+  return q ? d.hf.searchModels(q, engineKind, sort) : d.hf.browseModels(sort, engineKind)
 }
 
 /** Heuristic count of local quant variants that plausibly belong to an HF repo

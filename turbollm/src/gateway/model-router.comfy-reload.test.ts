@@ -62,7 +62,7 @@ async function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
-  const registry = { active: () => engine, layaEngine: () => undefined, litertLmEngine: () => undefined } as unknown as Registry
+  const registry = { active: () => engine, layaEngine: () => undefined } as unknown as Registry
   const scanner = {
     list: () => ({ models: [model], scanning: false, lastScanAt: '' }),
     get: (key: string) => (key === model.key ? model : undefined),
@@ -181,7 +181,7 @@ async function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: numbe
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
-  const registry = { active: () => engine, layaEngine: () => undefined, litertLmEngine: () => undefined } as unknown as Registry
+  const registry = { active: () => engine, layaEngine: () => undefined } as unknown as Registry
   // The library as the scanner has it: a test removes a model from it to stand for one deleted during a render.
   const library = [a, b]
   const scanner = {

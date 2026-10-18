@@ -452,6 +452,66 @@ test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and
   assert.deepEqual(loads, [])
 })
 
+// A model loads only on the engine the user selected: a .litertlm model went to the registered LiteRT-LM engine whenever
+// another kind was active, so a gateway auto-swap, a routine's swap or a side model's Load started LiteRT-LM on its own.
+function litertRouter(primary: Manager, comfy?: ConstructorParameters<typeof ModelRouter>[4], updates: unknown[] = []) {
+  const bundle = { ...fakeEntry('gemma-litert'), format: 'litertlm', path: '/models/gemma.litertlm' } as ModelEntry
+  const gguf = { ...fakeEntry('routine-gguf'), format: 'gguf', path: '/models/routine.gguf' } as ModelEntry
+  const models = [bundle, gguf]
+  const scanner = { list: () => ({ models }), get: (k: string) => models.find((m) => m.key === k) } as unknown as Scanner
+  const litert = { id: 'litert-1', kind: 'litert-lm', capabilities: { flags: [] } } as unknown as Engine
+  const registry = { active: () => fakeEngine('koboldcpp'), litertLmEngine: () => litert, layaEngine: () => undefined } as unknown as Registry
+  const store = {
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {} }),
+    update: (fn: (c: { lastLoaded?: unknown }) => void) => { const c = {}; fn(c); updates.push(c) },
+  } as unknown as ConfigStore
+  return { r: new ModelRouter(store, registry, primary, scanner, comfy), bundle, gguf }
+}
+
+const LITERT_REFUSAL = {
+  status: 503,
+  message: 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.',
+  permanent: true,
+}
+
+test('route and loadExplicit: a .litertlm model under KoboldCpp is refused and never loads, LiteRT-LM installed', async () => {
+  const { manager, loads } = recordingPrimary()
+  const { r, bundle } = litertRouter(manager)
+
+  assert.deepEqual(await r.route(bundle.key), LITERT_REFUSAL)
+  assert.deepEqual(await r.loadExplicit(bundle.key), LITERT_REFUSAL)
+  assert.deepEqual(loads, [])
+})
+
+// A load the user asks for by hand (startEngine hands the router an embedding or Laya model's Load as `manual`) is
+// started on the selected engine even when that engine is not expected to run the model, and fails with the engine's
+// own error; the refusal above is for the automatic loads only. It used to be refused as they are, with the advice to
+// activate another engine.
+test('loadExplicit, manual: a .litertlm model under KoboldCpp is started on KoboldCpp, never LiteRT-LM', async () => {
+  const { manager, loads } = recordingPrimary()
+  const { r, bundle } = litertRouter(manager)
+
+  await r.loadExplicit(bundle.key, undefined, { manual: true })
+
+  assert.deepEqual((loads as StartOpts[]).map((o) => [o.engine.id, o.engine.kind, o.modelPath]), [['eng1', 'koboldcpp', bundle.path]])
+})
+
+test("reloadAfterRender: a routine's restore of a .litertlm model under KoboldCpp is not handed to the render's release", async () => {
+  const { manager } = recordingPrimary()
+  const handed: unknown[] = []
+  const comfy = {
+    reloadOnReleaseInstead: (...args: unknown[]) => (handed.push(args), true),
+  } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+  const updates: unknown[] = []
+  // The routine's own model, which the render unloaded, is a GGUF the active engine runs.
+  const { r, bundle, gguf } = litertRouter(manager, comfy, updates)
+
+  r.reloadAfterRender(bundle.key, gguf.key)
+
+  assert.deepEqual(handed, [])
+  assert.deepEqual(updates, [], 'nothing recorded as the model last loaded')
+})
+
 // A load that an acquire overtook while it waited (for the load gate or ComfyUI's /free) is refused by the guard's
 // pre-start hook. That clears by itself, like doLoad's isBlocked() refusal, so it is a retryable (not permanent) 503.
 test('route: a load refused by the ComfyUI pre-start hook is a retryable 503', async () => {

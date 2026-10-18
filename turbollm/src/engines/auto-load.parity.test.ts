@@ -63,7 +63,10 @@ test('embedding model: resume and manual Load hand the same key to the router, n
 
   assert.deepEqual(manual.primaryLoads, [])
   assert.deepEqual(resume.primaryLoads, [])
-  assert.deepEqual(manual.loadExplicitCalls, [[embedding.entry.key, undefined]])
+  // The manual Load is the user's own, so it goes to the router flagged `manual` (no compatibility refusal of the
+  // router's own, compat.ts manualLoadRefusal); the boot resume is an automatic load and passes no flag, so the router
+  // still refuses it a model the selected engine cannot run.
+  assert.deepEqual(manual.loadExplicitCalls, [[embedding.entry.key, undefined, { manual: true }]])
   assert.deepEqual(resume.loadExplicitCalls, [[embedding.entry.key]])
 })
 

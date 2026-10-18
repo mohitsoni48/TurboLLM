@@ -8,7 +8,7 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
-import { modelIncompatibility } from '../engines/compat'
+import { manualLoadRefusal, modelIncompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -18,9 +18,14 @@ import { modelLoadsRefused } from '../auth'
 
 /** loadExplicit's options. `restoreAfter`: the load is a routine's restore of the model its swap displaced (routines/
  *  model-swap.ts, cli-routine.ts, cli-interactive-runner.ts), and this is that swap's own result. A restore that finds
- *  its model still running undoes the swap's record of the model last loaded (see ModelRouter.undoSwapRecord). */
+ *  its model still running undoes the swap's record of the model last loaded (see ModelRouter.undoSwapRecord).
+ *  `manual`: the user asked for this load by hand (startEngine's side models: an embedding or Laya model's Load). It
+ *  starts on the selected engine even when that engine is not expected to run the model, and fails with the engine's
+ *  own error, as startEngine's chat-model load does (compat.ts manualLoadRefusal). Every other load (route(), a
+ *  routine's swap and restore, the boot resume) is refused for such a model before anything is unloaded. */
 export interface LoadExplicitOpts {
   restoreAfter?: RouteResult
+  manual?: true
 }
 
 export type RouteResult =
@@ -30,8 +35,8 @@ export type RouteResult =
        *  upstream URL and to present the LINK token instead of the caller's credential.
        *  Absent = an ordinary local engine target, unchanged. */
       remote?: { linkId: string; baseUrl: string; token: string; modelKey: string; noLoad?: true }
-      /** The engine serving `target` when it is an extra pool slot, read from that slot's manager: a `.litertlm` model
-       *  there runs on LiteRT-LM whatever the primary runs. The gateway shapes the outbound request (model alias or path,
+      /** The engine serving `target` when it is an extra pool slot, read from that slot's manager: a slot keeps the
+       *  engine it was loaded on, whatever the primary runs. The gateway shapes the outbound request (model alias or path,
        *  token-limit key) and labels the reply from these; absent (the primary, remote) it reads the primary, as before. */
       engineKind?: string
       modelPath?: string
@@ -358,8 +363,9 @@ export class ModelRouter {
     if (this.slotEngineId(slot.manager)) this.stoppingSlots.add(slot.manager) // an exited one ('stopped', 'error') is not
   }
 
-  /** Ids of the engines the extra pool slots run on (not the primary). A .litertlm model auto-swapped into a slot
-   *  runs on LiteRT-LM whatever engine is active, so an engine can be in use without being active or primary. */
+  /** Ids of the engines the extra pool slots run on (not the primary). A slot keeps the engine it was loaded on when
+   *  another is activated (an install or Enable does that without stopping anything), so an engine can be in use
+   *  without being active or primary. */
   poolEngineIds(): Set<string> {
     const ids = new Set<string>()
     for (const p of this.poolProcesses()) for (const id of p.engineIds) ids.add(id)
@@ -538,7 +544,7 @@ export class ModelRouter {
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    const inc = modelIncompatibility(engine.kind, entry)
+    const inc = explicit?.manual ? manualLoadRefusal(engine.kind, entry) : modelIncompatibility(engine.kind, entry)
     // Stays so until the owner installs or switches to an engine that runs it; a retry only delays the message.
     if (inc) return { status: 503, message: inc.message, permanent: true }
 
@@ -939,7 +945,7 @@ export class ModelRouter {
 
   /** Gateway loads build their StartOpts through the one shared builder (start-opts.ts), like the
    *  manual Load and the boot resume, so a Jev model's launch flags and a pinned port reach
-   *  auto-swap loads too. doLoad has already checked compatibility, buildStartOpts's precondition. */
+   *  auto-swap loads too. doLoad has already checked compatibility (a manual load's only for a Laya model). */
   private buildOpts(entry: ModelEntry, engine: Engine, overrides?: Partial<LoadProfile>): StartOpts | null {
     if (entry.incomplete || entry.parseError) return null
     return buildStartOpts({

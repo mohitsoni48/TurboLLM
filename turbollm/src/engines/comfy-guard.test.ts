@@ -95,6 +95,93 @@ test('acquire force-unloads the running model + blocks; release reloads exactly 
   assert.equal(g.snapshot().suspendedModelKey, null, 'capture cleared')
 })
 
+// A model loads only on the engine the user selected. A render leaves the primary stopped, so the Engines screen lets
+// the user select another engine meanwhile; release() then brought the model back on the engine they had left.
+test('release does not reload the model on an engine the user left during the render', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+
+  await g.acquire()
+  activeEngineId = 'other'
+  await g.release()
+
+  assert.equal(calls.starts.length, 0, 'not started on the engine the user left')
+  assert.equal(g.isBlocked(), false)
+
+  // Still selected, it is reloaded as before.
+  const again = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  activeEngineId = 'e'
+  const g2 = new ComfyGuard(store, again.mgr as never)
+  await g2.acquire()
+  await g2.release()
+  assert.equal(again.calls.starts.length, 1)
+})
+
+// The same for a load the render paused, after an engine install or Enable activated another engine (they do not
+// clear the paused load's refusal, as Engines' own switch does): it is not resumed there, and its refusal, which
+// says loading resumes when the queue finishes, is cleared.
+test('release does not resume a paused load on an engine that is no longer the selected one', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  let activeEngineId = 'e'
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+  await g.acquire()
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let paused = true
+  let restarts = 0
+  const stopped = mgr.status
+  Object.assign(mgr, {
+    status: () => (paused
+      ? { state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }
+      : stopped()),
+    restartOpts: () => OPTS('picked'),
+    restart: async () => { restarts++ },
+    clearError: () => { paused = false },
+  })
+  activeEngineId = 'other'
+
+  await g.release()
+
+  assert.equal(restarts, 0, 'not resumed on the engine the user left')
+  assert.equal(calls.starts.length, 0)
+  assert.equal(paused, false, "the paused load's refusal is cleared")
+})
+
+// modelKeyLoadedOnRelease is release()'s decision told in advance: it went on naming the model on the engine the user
+// left, so the gateway told a caller that may not load models it comes back after the render, and a routine's refused
+// restore of it had its swap's lastLoaded record undone for a reload that never happens.
+test('modelKeyLoadedOnRelease names no model once the user selects another engine during the render', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+  await g.acquire()
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a', 'the model the render unloaded, its engine still selected')
+  activeEngineId = 'other'
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the model the render unloaded, on the engine the user left')
+
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restartOpts: () => OPTS('b'),
+    restart: async () => {},
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the load the render paused, on the engine the user left')
+  activeEngineId = 'e'
+  assert.equal(g.modelKeyLoadedOnRelease(), 'b', 'the load the render paused, its engine selected again')
+})
+
 test('acquire with nothing loaded still blocks; release has nothing to reload', async () => {
   const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
   const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
