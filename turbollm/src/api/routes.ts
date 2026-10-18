@@ -2875,6 +2875,63 @@ export function registerApi(app: Hono, d: Deps): void {
       }
     }>(c)
 
+    // The types above are what the Settings screen sends, not a check. A JSON `null` body threw
+    // at the first field read below, and a wrong JSON type in a field read with a string or array
+    // method (comfyui.url, the search keys, remoteAccess.tokenGrant) threw there or inside
+    // apply(): every one went out as Hono's bare text/plain 500. Checked here and next to each
+    // such field, before anything is applied. A body that is any other non-object (an array, a
+    // string) was an empty patch; it is refused the same way.
+    if (typeof b !== 'object' || b === null || Array.isArray(b)) {
+      return err(c, 400, 'invalid_config_value', 'The settings patch must be a JSON object.')
+    }
+    for (const f of ['tavilyApiKey', 'kagiApiKey', 'searxngUrl'] as const) {
+      const v: unknown = b.search?.[f]
+      if (v !== undefined && typeof v !== 'string') return err(c, 400, 'invalid_config_value', `search.${f} must be a string.`)
+    }
+    for (const f of ['capabilities', 'models'] as const) {
+      const v: unknown = b.remoteAccess?.tokenGrant?.[f]
+      if (v !== undefined && !Array.isArray(v)) return err(c, 400, 'invalid_config_value', `remoteAccess.tokenGrant.${f} must be an array of strings.`)
+    }
+    // Every other field below is read with `!!`, String() or Number() (modelDefaults.* and
+    // gateway.keepN through coerceBounded), which took any JSON type and stored what that made of
+    // it, with a 200: "false" turned lanBind (a rebind onto the LAN) or autoAllowAll on, null
+    // turned requireApiKey or Cloudflare Access off, stored a token as the text "null", and made
+    // vramHeadroomMb 0 (VRAM spill). The Settings screen sends each as its own JSON type, so
+    // anything else is refused here, null included, before anything is applied.
+    const raBody = b.remoteAccess
+    const typed: Array<[string, unknown, 'boolean' | 'string' | 'number']> = [
+      ['idleTtlMinutes', b.idleTtlMinutes, 'number'],
+      ['port', b.port, 'number'],
+      ['vramHeadroomMb', b.vramHeadroomMb, 'number'],
+      ['machineName', b.machineName, 'string'],
+      ['hfToken', b.hfToken, 'string'],
+      ['ghToken', b.ghToken, 'string'],
+      ['tavilyApiKey', b.tavilyApiKey, 'string'],
+      ['cloudDeploy.runpodTemplateId', b.cloudDeploy?.runpodTemplateId, 'string'],
+      ...(['autoGenerateTitles', 'autoMemoryEnabled', 'openBrowserOnStart', 'autoLoadOnStart', 'showAllEngineModels', 'lanBind', 'requireApiKey', 'autoAllowAll'] as const)
+        .map((f): [string, unknown, 'boolean'] => [f, b[f], 'boolean']),
+      ['comfyui.enabled', b.comfyui?.enabled, 'boolean'],
+      ['comfyui.reverseGate', b.comfyui?.reverseGate, 'boolean'],
+      ['gateway.autoSwap', b.gateway?.autoSwap, 'boolean'],
+      ['requestLog.enabled', b.requestLog?.enabled, 'boolean'],
+      ['requestLog.captureBodies', b.requestLog?.captureBodies, 'boolean'],
+      ...(['memory', 'cloudDeploy', 'routines', 'turboLink', 'remoteAccess'] as const)
+        .map((f): [string, unknown, 'boolean'] => [`experimental.${f}`, b.experimental?.[f], 'boolean']),
+      ['remoteAccess.ingressPort', raBody?.ingressPort, 'number'],
+      ['remoteAccess.tailscale.port', raBody?.tailscale?.port, 'number'],
+      ['remoteAccess.cloudflare.requireAccess', raBody?.cloudflare?.requireAccess, 'boolean'],
+      ...(['tunnelToken', 'hostname', 'accessTeamDomain', 'accessAud'] as const)
+        .map((f): [string, unknown, 'string'] => [`remoteAccess.cloudflare.${f}`, raBody?.cloudflare?.[f], 'string']),
+      ['remoteAccess.ngrok.authtoken', raBody?.ngrok?.authtoken, 'string'],
+      ['remoteAccess.ngrok.domain', raBody?.ngrok?.domain, 'string'],
+      ['remoteAccess.custom.publicUrl', raBody?.custom?.publicUrl, 'string'],
+    ]
+    for (const [field, v, type] of typed) {
+      if (v !== undefined && typeof v !== type) {
+        return err(c, 400, 'invalid_config_value', `${field} must be ${type === 'boolean' ? 'true or false' : `a ${type}`}.`)
+      }
+    }
+
     const updates: Record<string, unknown> = {}
     if (b.idleTtlMinutes !== undefined) {
       const v = Number(b.idleTtlMinutes)
@@ -2978,6 +3035,7 @@ export function registerApi(app: Hono, d: Deps): void {
     if (b.comfyui?.enabled !== undefined) cuUpdates.enabled = !!b.comfyui.enabled
     if (b.comfyui?.reverseGate !== undefined) cuUpdates.reverseGate = !!b.comfyui.reverseGate
     if (b.comfyui?.url !== undefined) {
+      if (typeof b.comfyui.url !== 'string') return err(c, 400, 'invalid_config_value', 'comfyui.url must be a string: an http(s):// origin, or empty.')
       const u = b.comfyui.url.trim()
       if (u && !/^https?:\/\//i.test(u)) {
         return err(c, 400, 'invalid_config_value', 'comfyui.url must be an http(s):// origin (e.g. http://127.0.0.1:8188).')
@@ -2999,7 +3057,8 @@ export function registerApi(app: Hono, d: Deps): void {
     // here for a clean 400 (config.validate() would otherwise throw a 500 on update()).
     let toolchainDirs: string[] | undefined
     if (b.build?.toolchainDirs !== undefined) {
-      if (!Array.isArray(b.build.toolchainDirs)) {
+      // Each entry is a string too: String() made a nested ['/x'] the path '/x' (see `typed` above).
+      if (!Array.isArray(b.build.toolchainDirs) || !b.build.toolchainDirs.every((p: unknown) => typeof p === 'string')) {
         return err(c, 400, 'invalid_config_value', 'build.toolchainDirs must be an array of paths.')
       }
       const dirs = b.build.toolchainDirs.map((p) => String(p).trim()).filter(Boolean)
@@ -3024,7 +3083,8 @@ export function registerApi(app: Hono, d: Deps): void {
     ] as const) {
       const raw = b.code?.[key]
       if (raw === undefined) continue
-      if (!Array.isArray(raw)) return err(c, 400, 'invalid_config_value', `code.${key} must be an array of filenames.`)
+      // Each entry a string as well: String() stored a null or 5 as the filename "null" or "5".
+      if (!Array.isArray(raw) || !raw.every((p: unknown) => typeof p === 'string')) return err(c, 400, 'invalid_config_value', `code.${key} must be an array of filenames.`)
       const list = raw.map((p) => String(p).trim()).filter(Boolean)
       if (list.length > MAX_AGENTS_MD_CANDIDATES) return err(c, 400, 'invalid_config_value', `code.${key}: at most ${MAX_AGENTS_MD_CANDIDATES} candidates.`)
       for (const entry of list) {
