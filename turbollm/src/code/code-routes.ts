@@ -46,6 +46,16 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 function badContextFiles(v: unknown): boolean {
   return v != null && !(Array.isArray(v) && v.every((x) => typeof x === 'string'))
 }
+/** The first of `fields` that the request body carries as anything but a string (absent or null is
+ *  fine). These are trimmed, handed to git or the shell, or stored as text: a number or an object
+ *  there threw (`.trim is not a function`, a SQLite bind error) and answered an unhandled 500, or
+ *  was stored as is. The routes refuse it with 400 invalid_input before doing anything. */
+function nonStringField(b: object, fields: string[]): string | undefined {
+  return fields.find((f) => {
+    const v = (b as Record<string, unknown>)[f]
+    return v != null && typeof v !== 'string'
+  })
+}
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
 
@@ -176,6 +186,12 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       repoRoot?: string; repoBranch?: string; modelKey?: string; mode?: string; task?: string; title?: unknown
       useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; contextFiles?: string[]
     }>(c)
+    // The base is a name for git to resolve (createSessionWorktree trims it): anything but a string
+    // is refused here, never taken for "no base", which would branch off the current checkout. The
+    // same for the other text fields (nonStringField). `title` is not among them: one that is not
+    // text is ignored (cleanSessionTitle).
+    const notString = nonStringField(b, ['repoRoot', 'task', 'repoBranch', 'modelKey', 'worktreeBranch', 'worktreeBase'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const repoRoot = (b.repoRoot ?? '').trim()
     const task = (b.task ?? '').trim()
     const chosenTitle = cleanSessionTitle(b.title)
@@ -184,9 +200,6 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!task) return err(c, 400, 'invalid_input', 'A task description is required.')
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
     if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
-    // The base is a name for git to resolve (createSessionWorktree trims it): anything but a string
-    // is refused here, never taken for "no base", which would branch off the current checkout.
-    if (b.worktreeBase != null && typeof b.worktreeBase !== 'string') return err(c, 400, 'invalid_input', 'worktreeBase must be a string.')
 
     // ── "Use worktree": actually create one (ADR-316) ─────────────────────────────────────
     // Until now these three fields were stored and never read, so the toggle changed nothing and
@@ -527,6 +540,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
     const b = await body<{ instructions?: string; model?: string }>(c)
+    const notString = nonStringField(b, ['instructions', 'model'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     // Same Turbo Link branch as the turn route: a session whose history was generated on a
     // linked machine is compacted BY that machine, so this machine's engine state is not what
     // decides whether compaction can run.
@@ -633,6 +648,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   app.post('/api/v1/code/sessions/:id/revert', async (c) => {
     const id = c.req.param('id')
     const b = await body<{ messageId?: string; revertFiles?: boolean }>(c)
+    if (nonStringField(b, ['messageId'])) return err(c, 400, 'invalid_input', 'messageId must be a string.')
     const messageId = (b.messageId ?? '').trim()
     if (!messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
 
@@ -722,6 +738,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before committing.')
     const b = await body<{ message?: string; files?: string[] }>(c)
+    if (nonStringField(b, ['message'])) return err(c, 400, 'invalid_input', 'message must be a string.')
+    // Staged one by one: a string was staged character by character, a number threw (500).
+    if (badContextFiles(b.files)) return err(c, 400, 'invalid_input', 'files must be an array of strings.')
     try {
       const result = await commitGitChanges(agentCwd(run), b.message ?? '', b.files)
       return c.json({ ok: true, ...result })
@@ -778,6 +797,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before running a command.')
     const b = await body<{ command?: string; feedToModel?: boolean }>(c)
+    if (nonStringField(b, ['command'])) return err(c, 400, 'invalid_input', 'command must be a string.')
     const command = (b.command ?? '').trim()
     if (!command) return err(c, 400, 'invalid_input', 'A command is required.')
     const feedToModel = b.feedToModel !== false // default true (the `!` variant); `!!` sends false
@@ -851,6 +871,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
+    const notString = nonStringField(b, ['content', 'promptOverride', 'model'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
 
     // Fail fast with a clear message if there is nothing to run against right now. (A turn
     // that queues while a model is loaded but is then unloaded before it runs fails cleanly
