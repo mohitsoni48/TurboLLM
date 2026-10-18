@@ -75,7 +75,8 @@ vi.mock('../lib/agent-api', async (importOriginal) => {
 
 vi.mock('../lib/useIsDesktop', () => ({ useIsDesktop: () => true }))
 
-// pdfjs-dist reads DOMMatrix at import time, which jsdom lacks; no PDF is attached in this test.
+// pdfjs-dist reads DOMMatrix at import time, which jsdom lacks; a test that attaches a PDF sets
+// what extraction gives.
 vi.mock('../lib/pdf-extract', () => ({ extractPdfText: vi.fn() }))
 
 vi.mock('./chat/ConversationSidebar', () => ({ ConversationSidebar: () => null }))
@@ -288,5 +289,60 @@ describe('ChatScreen — model picker offers chat models only', () => {
     await renderScreen()
     await waitFor(() => expect(modelsOfferedByPicker).not.toBeNull())
     expect(modelsOfferedByPicker?.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+})
+
+// A PDF pdf.js cannot open (damaged, password-protected, not really a PDF) rejected the whole pick
+// with nothing on screen, and skipped the input's reset, so the same file could not be picked again
+// (picking an unchanged value fires no change event).
+describe('ChatScreen — attaching a file that cannot be read', () => {
+  it('says the PDF could not be read, attaches the rest of the pick, and lets the same file be picked again', async () => {
+    const { extractPdfText } = await import('../lib/pdf-extract')
+    const { toast } = await import('../components/ui/sonner')
+    const toastError = vi.spyOn(toast, 'error')
+    vi.mocked(extractPdfText).mockRejectedValueOnce(new Error('Invalid PDF structure.'))
+    try {
+      const { container } = await renderScreen()
+      const input = container.querySelector('input[type="file"][accept*=".pdf"]') as HTMLInputElement
+      // An input keeps its value until reset: record the reset that lets the same file be picked again.
+      const reset = vi.fn()
+      Object.defineProperty(input, 'value', { configurable: true, get: () => '', set: reset })
+      const bad = new File(['%PDF-1.7 truncated'], 'scan.pdf', { type: 'application/pdf' })
+      const notes = new File(['hello'], 'notes.txt', { type: 'text/plain' })
+
+      fireEvent.change(input, { target: { files: [bad, notes] } })
+
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith('Could not read the PDF scan.pdf. It may be damaged or password-protected.'))
+      expect(await screen.findByText('notes.txt')).toBeTruthy()
+      expect(screen.queryByText('scan.pdf')).toBeNull()
+      expect(reset).toHaveBeenCalledWith('')
+    } finally {
+      toastError.mockRestore()
+    }
+  })
+
+  it('says so for any other file the browser fails to read, instead of waiting on it forever', async () => {
+    const { toast } = await import('../components/ui/sonner')
+    const toastError = vi.spyOn(toast, 'error')
+    const realFileReader = globalThis.FileReader
+    // A file moved or locked after it was picked: the read ends in `error`, never `load`.
+    vi.stubGlobal('FileReader', class {
+      result: string | null = null
+      error = new DOMException('The file could not be read.', 'NotReadableError')
+      onload: (() => void) | null = null
+      onerror: (() => void) | null = null
+      readAsText() { queueMicrotask(() => this.onerror?.()) }
+      readAsDataURL() { queueMicrotask(() => this.onerror?.()) }
+    })
+    try {
+      const { container } = await renderScreen()
+      const input = container.querySelector('input[type="file"][accept*=".pdf"]') as HTMLInputElement
+      fireEvent.change(input, { target: { files: [new File(['x'], 'gone.txt', { type: 'text/plain' })] } })
+      await waitFor(() => expect(toastError).toHaveBeenCalledWith('Could not read gone.txt.'))
+      expect(screen.queryByText('gone.txt')).toBeNull()
+    } finally {
+      toastError.mockRestore()
+      vi.stubGlobal('FileReader', realFileReader)
+    }
   })
 })

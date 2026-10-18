@@ -678,23 +678,35 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files ?? [])
+    // Reset before any read, so the same file can be picked again: an input keeps its value, and
+    // picking an unchanged value fires no change event. This ran after every read had worked, so
+    // a PDF pdf.js could not open (damaged, password-protected) skipped it, and its rejection
+    // dropped the whole pick with nothing on screen. Each file that cannot be read now says so and
+    // the rest of the pick is attached.
+    e.target.value = ''
     const loaded = await Promise.all(files.map(async (file) => {
       const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(file.name)
-      if (isPdf) {
-        // PDFs are binary — extract real text client-side instead of reading raw bytes as text.
-        const text = await extractPdfText(file)
-        return { file, dataUrl: text }
+      try {
+        if (isPdf) {
+          // PDFs are binary — extract real text client-side instead of reading raw bytes as text.
+          const text = await extractPdfText(file)
+          return { file, dataUrl: text }
+        }
+        const dataUrl = await new Promise<string>((res, rej) => {
+          const r = new FileReader()
+          r.onload = () => res(r.result as string)
+          r.onerror = () => rej(r.error)
+          if (file.type.startsWith('image/')) r.readAsDataURL(file)
+          else r.readAsText(file)
+        })
+        return { file, dataUrl }
+      } catch {
+        toast.error(isPdf ? `Could not read the PDF ${file.name}. It may be damaged or password-protected.` : `Could not read ${file.name}.`)
+        return null
       }
-      const dataUrl = await new Promise<string>((res) => {
-        const r = new FileReader()
-        r.onload = () => res(r.result as string)
-        if (file.type.startsWith('image/')) r.readAsDataURL(file)
-        else r.readAsText(file)
-      })
-      return { file, dataUrl }
     }))
-    setAttachments((prev) => [...prev, ...loaded])
-    e.target.value = ''
+    const read = loaded.filter((a): a is NonNullable<typeof a> => a !== null)
+    if (read.length) setAttachments((prev) => [...prev, ...read])
   }
 
   // Record one generated token for `convId` and return its rolling 2-second tok/s estimate.
