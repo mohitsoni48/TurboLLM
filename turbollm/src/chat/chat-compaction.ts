@@ -75,9 +75,13 @@ export function lastCtxUsage(messages: Message[]): { ctxUsed: number; ctxMax: nu
   return { ctxUsed: last?.stats?.ctxUsed ?? 0, ctxMax: last?.stats?.ctxMax ?? 0 }
 }
 
-/** The message lastCtxUsage reads its numbers from. */
+/** The message lastCtxUsage reads its numbers from. A ctxUsed of 0 is skipped like a missing one:
+ *  no prompt is 0 tokens, so it is a turn the engine measured nothing of (a send refused on its
+ *  first round, written as 0 before chat-routes.ts left it out; one that failed or was stopped
+ *  before any usage or prompt progress arrived). Read as a measurement it said "empty", and the
+ *  auto-compaction gate stayed shut for a chat the engine had just refused for its size. */
 function lastMeasuredReply(messages: Message[]): Message | undefined {
-  return [...messages].reverse().find((m) => m.role === 'assistant' && m.stats?.ctxUsed !== undefined)
+  return [...messages].reverse().find((m) => m.role === 'assistant' && !!m.stats?.ctxUsed)
 }
 
 // ── cut resolution ───────────────────────────────────────────────────────────────────

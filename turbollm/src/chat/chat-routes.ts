@@ -2024,7 +2024,12 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     thinkMs,
     // Full context occupancy: cache-reused prompt tokens still sit in the KV cache / context
     // window (they're skipped only for recomputation), so they must stay counted here.
-    ctxUsed: promptTokensFallback + genTokensFallback,
+    // Not for a turn that failed before the engine reported its prompt's size: a send refused
+    // on its first round (400 exceed_context_size_error, a 503 while a model loads) has no
+    // measurement, and the 0 it wrote became the reading maybeAutoCompact judges the next turn
+    // by, so a chat refused for its size was never compacted again. With no ctxUsed the gate
+    // reads the last reply that has one (lastCtxUsage).
+    ...(engineFailed && !promptTokensFallback ? {} : { ctxUsed: promptTokensFallback + genTokensFallback }),
     ctxMax,
     model: upstream.modelName,
     aborted,

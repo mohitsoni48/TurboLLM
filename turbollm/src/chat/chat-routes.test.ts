@@ -1036,6 +1036,46 @@ test('a tool round the engine refuses with an HTTP error keeps what the earlier 
   }
 })
 
+// A send the engine refuses on its first round (400 exceed_context_size_error) reports no prompt
+// size, and since the refused turn is saved (the test above) its reply was written with
+// ctxUsed 0. The auto-compaction gate reads the last reply's ctxUsed, so it read 0 from then on
+// and never compacted again: every later send went out with the same full history and was refused
+// the same way until the user compacted by hand.
+test('a send the engine refuses before it measures anything leaves the last measurement standing, so the next turn compacts', async () => {
+  const h = inFlightHarness()
+  const refused = () => new Response(JSON.stringify({ error: { message: 'the request exceeds the available context size', type: 'exceed_context_size_error' } }), { status: 400 })
+  const summary = (text: string) => new Response(JSON.stringify({ choices: [{ message: { content: text } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  // Turn 1: its auto-compaction's summary call fails (best-effort, the turn goes on uncompacted)
+  // and the engine refuses the turn. Turn 2: the compaction is tried again and succeeds.
+  const script: Array<() => Response> = [() => new Response('busy', { status: 500 }), refused, () => summary('The user asked twice about x.'), () => sseReply('a3')]
+  const engine = fakeEngine((_init, n) => script[n - 1]())
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    const long = 'x'.repeat(6000)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long, { stats: { ctxUsed: 7500, ctxMax: 8192 } })
+
+    const first = await (await h.app.request(`${base}/messages`, json({ content: 'q3' }))).text()
+    assert.match(first, /"code":"engine_error","message":"Engine returned 400: the request exceeds the available context size"/)
+    const refusedReply = h.store.getMessages(conv.id).at(-1)!
+    assert.equal(refusedReply.role, 'assistant')
+    assert.equal(refusedReply.stats?.ctxUsed, undefined, 'a turn the engine measured nothing of records no context size')
+    assert.equal(h.store.getConversation(conv.id)!.compactionSummary, undefined)
+
+    const second = await (await h.app.request(`${base}/messages`, json({ content: 'q4' }))).text()
+    assert.equal(engine.bodies.length, 4, 'the second turn tried the compaction again')
+    assert.equal((engine.bodies[2] as { stream?: boolean }).stream, false, 'the third call is the summary')
+    assert.equal(h.store.getConversation(conv.id)!.compactionSummary, 'The user asked twice about x.')
+    assert.match(second, /"phase":"end"[\s\S]*"delta":"a3"/)
+  } finally {
+    engine.restore()
+    h.cleanup()
+  }
+})
+
 test('after an edit freezes the compaction cut, the next turn does not send the abandoned branch\'s summary', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()

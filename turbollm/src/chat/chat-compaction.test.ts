@@ -103,6 +103,18 @@ test('lastCtxUsage: skips an assistant placeholder row with empty stats (mid-gen
   assert.deepEqual(lastCtxUsage(messages), { ctxUsed: 300, ctxMax: 8192 })
 })
 
+// A reply saved with ctxUsed 0 (a send the engine refused before measuring anything, as earlier
+// builds wrote it, or one that failed or was stopped before any usage arrived) measured nothing:
+// read as "empty", it kept the auto-compaction gate shut for a chat refused for its size.
+test('lastCtxUsage: skips a reply recorded with ctxUsed 0, which measured nothing', () => {
+  const messages = [
+    makeMsg('assistant', 'done', { stats: { ctxUsed: 7500, ctxMax: 8192 } }),
+    makeMsg('user', 'another'),
+    makeMsg('assistant', '', { stats: { ctxUsed: 0, ctxMax: 8192, aborted: false } }),
+  ]
+  assert.deepEqual(lastCtxUsage(messages), { ctxUsed: 7500, ctxMax: 8192 })
+})
+
 // ── resolveCompactionCut ─────────────────────────────────────────────────────────────
 
 test('resolveCompactionCut: no cut set → summary null, rest is everything', () => {
