@@ -487,8 +487,23 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { model?: string; stream?: unknown }
-    const requested = body.model ?? ''
+    const body = await c.req.json().catch(() => ({})) as { model?: unknown; stream?: unknown }
+    // A model that is not a string threw in resolveRemoteTarget below (its remote-id parse trims it): a bare 500
+    // from Hono's default handler. Refused as the /v1 route this one hands off to refuses it (gateway.ts).
+    if (body.model != null && typeof body.model !== 'string') {
+      return c.json(
+        {
+          error: {
+            message: 'model must be a string.',
+            type: 'invalid_request_error',
+            param: 'model',
+            code: 'invalid_type',
+          },
+        },
+        400,
+      )
+    }
+    const requested = (body.model as string | null | undefined) ?? ''
     if (requested && !allowsModel(key, requested)) {
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${requested}'.` } }, 403)
     }

@@ -10,6 +10,7 @@ import { Hono } from 'hono'
 import { createHash, randomUUID } from 'node:crypto'
 import { registerLinkApi } from './link-routes'
 import { resetLocalActivity } from './host-idle'
+import { ModelRouter } from '../gateway/model-router'
 import type { Deps } from '../deps'
 import type { ApiKey } from '../config/config'
 
@@ -326,4 +327,49 @@ test('a restricted token is still served when the answering model is on its list
   const b = servingDeps(['models:use', 'models:wake'], [COLD], true)
   assert.equal((await post(b.d, 'tllm-a', COLD)).status, 200)
   assert.deepEqual(b.h.routed, [COLD])
+})
+
+// ── A request the /v1 route refuses with a typed 400 is refused the same way here, not with a bare 500 ──────────
+// The façade reads the body for its own gates before it hands off to gatewayV1Handler, so a request the gateway refuses
+// threw here first, and Hono's default handler answered a bare text/plain 500. The router is the REAL one: cli.ts always
+// wires a RemoteCatalog, so resolveRemoteTarget parses whatever model it is given.
+
+/** mkDeps with the real ModelRouter's resolveRemoteTarget, over a catalog with no links. */
+function realResolveDeps(caps: string[]): { d: Deps; h: Harness } {
+  const out = mkDeps([key('tllm-a', caps)])
+  const catalog = { linkByName: () => undefined, modelOn: () => undefined }
+  const router = new ModelRouter(
+    out.d.store as never, {} as never, out.d.manager as never, out.d.scanner as never, undefined, catalog as never,
+  )
+  ;(out.d as unknown as { modelRouter: Record<string, unknown> }).modelRouter.resolveRemoteTarget =
+    (m: string) => router.resolveRemoteTarget(m)
+  return out
+}
+
+function postRaw(d: Deps, token: string, body: string) {
+  return app(d).request('/api/link/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'X-TurboLLM-Auth': token, 'content-type': 'application/json' },
+    body,
+  })
+}
+
+for (const model of [5, { name: LOADED }, [LOADED], true]) {
+  test(`a model of ${JSON.stringify(model)} is a 400 invalid_type, as /v1/chat/completions answers it (real router)`, async () => {
+    const { d, h } = realResolveDeps(['models:use'])
+    const res = await postRaw(d, 'tllm-a', JSON.stringify({ model, messages: [{ role: 'user', content: 'hi' }] }))
+    assert.equal(res.status, 400, await res.clone().text())
+    assert.deepEqual(await res.json(), {
+      error: { message: 'model must be a string.', type: 'invalid_request_error', param: 'model', code: 'invalid_type' },
+    })
+    assert.deepEqual(h.routed, [])
+    assert.equal(upstream, null)
+  })
+}
+
+test('a null model is still served the loaded model (real router)', async () => {
+  const { d, h } = realResolveDeps(['models:use'])
+  const res = await postRaw(d, 'tllm-a', JSON.stringify({ model: null, messages: [{ role: 'user', content: 'hi' }] }))
+  assert.equal(res.status, 200, await res.clone().text())
+  assert.deepEqual(h.routed, [''])
 })

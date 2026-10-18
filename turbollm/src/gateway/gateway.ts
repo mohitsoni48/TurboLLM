@@ -194,6 +194,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         400,
       )
     }
+    // A model that is not a string threw on the first string method below or in the router (the claude- prefix check,
+    // the remote-id parse, the name match): a bare 500 from Hono's default handler instead of the API's own 400.
+    if (req.model != null && typeof req.model !== 'string') {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message: 'model must be a string.' } }, 400)
+    }
     // Claude Code's gateway model discovery only keeps /v1/models ids that start with
     // `claude`/`anthropic`, so we advertise local models as `claude-<key>` (see /v1/models
     // below). Strip that prefix in-place so both the router AND the outbound engine request
@@ -950,6 +955,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
     ? analyzeTurn(chatView, url.origin)
     : null
 
+  // A model that is not a string threw in the router (the remote-id parse, the name match): a bare 500 from Hono's
+  // default handler instead of the API's own 400. OpenAI's shape for a parameter of the wrong type.
+  if ((isChat || isEmbeddings) && parsedBody?.model != null && typeof parsedBody.model !== 'string') {
+    return c.json({ error: { message: 'model must be a string.', type: 'invalid_request_error', param: 'model', code: 'invalid_type' } }, 400)
+  }
   const requestedModel = (isChat || isEmbeddings) ? ((parsedBody?.model as string | undefined) ?? '') : ''
   // A text classification model can neither chat nor embed (ADR-434 (f), ADR-444). Asked of targetEntry,
   // which loads nothing, so the refusal never swaps the model in first.

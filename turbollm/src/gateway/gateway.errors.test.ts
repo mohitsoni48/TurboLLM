@@ -580,6 +580,39 @@ for (const [label, deps, model, retry] of [
   }
 }
 
+// A `model` that is not a string reached the router, whose remote-id parse and name match call string methods on it:
+// a bare 500 (Hono's default error page) instead of the API's own 400. On /v1/messages the claude- prefix check threw
+// first.
+for (const model of [5, { name: 'qwen3' }, ['qwen3'], true]) {
+  test(`/v1/messages: a model of ${JSON.stringify(model)} is a 400 invalid_request_error (real router)`, async () => {
+    const app = new Hono()
+    registerGateway(app, realRouterDeps({}))
+    const res = await app.request('/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, max_tokens: 100, messages: [] }),
+    })
+    assert.equal(res.status, 400, await res.clone().text())
+    assert.deepEqual(await res.json(), { type: 'error', error: { type: 'invalid_request_error', message: 'model must be a string.' } })
+  })
+
+  for (const path of ['/v1/chat/completions', '/v1/embeddings'] as const) {
+    test(`${path}: a model of ${JSON.stringify(model)} is a 400 invalid_request_error (real router)`, async () => {
+      const app = new Hono()
+      registerGateway(app, realRouterDeps({}))
+      const res = await app.request(path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: [], input: 'x' }),
+      })
+      assert.equal(res.status, 400, await res.clone().text())
+      assert.deepEqual(await res.json(), {
+        error: { message: 'model must be a string.', type: 'invalid_request_error', param: 'model', code: 'invalid_type' },
+      })
+    })
+  }
+}
+
 // ── A remote-access token without models:load (auth.ts modelLoadsRefused) is answered "not loaded" instead of
 // auto-swapping. That is final for the token only when nothing is bringing the model up: a model still loading (in the
 // primary or into a pool slot), or the one ComfyUI's guard unloaded and reloads when its render ends, is served to the
