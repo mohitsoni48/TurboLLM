@@ -76,6 +76,28 @@ describe('SettingsScreen drafts', () => {
     expect(screen.queryByText('Unsaved changes')).toBeNull()
   })
 
+  // Settings are not refetched on focus (main.tsx), so a tab left open holds what it loaded. Its
+  // Save sent every field as loaded: one opened while "Require an API key" was off turned the key
+  // back off, LAN back on, with the next unrelated Save after another tab or the CLI changed them.
+  it('sends only what was edited on this page, so a tab loaded before a change made elsewhere does not undo it', async () => {
+    state.settings = mk({ lanBind: true, requireApiKey: false, telemetryLevel: 'anon' as DaemonSettings['telemetryLevel'] })
+    state.saveCalls = []
+    render(page())
+    await userEvent.click(titles())
+    await userEvent.click(screen.getByRole('button', { name: /Save settings/ }))
+    expect(state.saveCalls.map((c) => c.payload)).toEqual([{ autoGenerateTitles: false }])
+  })
+
+  it('an edit beside the network settings sends that member of its block alone', async () => {
+    state.settings = mk({ lanBind: true, requireApiKey: false })
+    state.saveCalls = []
+    render(page())
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: /Network/ }))
+    await userEvent.click(screen.getByRole('checkbox', { name: /Pause for ComfyUI/ }))
+    await userEvent.click(screen.getByRole('button', { name: /Save settings/ }))
+    expect(state.saveCalls.map((c) => c.payload)).toEqual([{ comfyui: { enabled: true } }])
+  })
+
   it('keeps an edit made while its Save was in flight', async () => {
     state.settings = mk()
     state.saveCalls = []

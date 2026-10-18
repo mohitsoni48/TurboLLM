@@ -33,7 +33,7 @@ import { TurboLinkSection } from './settings/TurboLinkSection'
 import { RemoteAccessSection } from './settings/RemoteAccessSection'
 import { HardwareSection } from './settings/HardwareSection'
 
-import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type TelemetryLevel } from '../lib/api'
+import { ApiError, authHeaders, getAuthToken, track, type DaemonSettings, type DaemonSettingsPatch, type TelemetryLevel } from '../lib/api'
 import { TELEMETRY_UI_ENABLED } from '../lib/flags'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import { toast } from '../components/ui/sonner'
@@ -267,29 +267,48 @@ export function SettingsScreen() {
     localStorage.setItem(CONFIRM_DELETE_KEY, confirmDelete ? 'true' : 'false')
   }, [confirmDelete])
 
-  const settingsPayload = () => ({
+  // Only the fields edited on this page: each draft against the value it was last seeded with
+  // (seededRef). Save used to send every field as this tab last loaded it, and settings are not
+  // refetched on focus (main.tsx), so a tab left open since before another tab or the CLI turned
+  // "Require an API key" on (or LAN off, or moved the port) put the old value back with its next
+  // unrelated Save. The daemon applies each field, and each member of modelDefaults, comfyui and
+  // gateway, on its own (PATCH /api/v1/settings), so one left out keeps what is stored. The
+  // daemon's host-only check (lanBind, requireApiKey, port) still judges the outcome, not the
+  // fields named, so a non-host caller's Save is refused only for a host-only field it changed.
+  const settingsPayload = (): DaemonSettingsPatch => {
+    const base = seededRef.current
+    const edited = <K extends keyof ReturnType<typeof draftsFrom>>(k: K, v: ReturnType<typeof draftsFrom>[K]) => !base || v !== base[k]
+    const p: DaemonSettingsPatch = {}
     // Clamp defensively: NumberField commits unclamped while editing and only
     // snaps to range on blur, so guard the final ranges here too (spec 08 §2).
-    idleTtlMinutes: clampN(ttl, 0, 1440),
+    if (edited('ttl', ttl)) p.idleTtlMinutes = clampN(ttl, 0, 1440)
     // 0 is the distinct "allow VRAM spill" opt-in (VRAM_HEADROOM_SPILL_MB), not a smaller safety
     // margin — clampN(v, 300, 2048) would otherwise clamp it up to 300 and silently discard it.
-    vramHeadroomMb: vramHeadroom === 0 ? 0 : clampN(vramHeadroom, 300, 2048),
-    port: clampN(port, 1024, 65535),
-    autoGenerateTitles: autoTitle,
-    openBrowserOnStart: openBrowser,
-    autoLoadOnStart: autoLoad,
-    telemetryLevel: telemetry,
-    lanBind,
-    requireApiKey,
-    modelDefaults: {
-      ctx: Math.max(256, Math.round(defCtx)),
-      ngl: clampN(defNgl, 0, 99),
-      imageMaxTokens: Math.max(0, Math.round(defImageMax)),
-      maxTokens: Math.max(0, Math.round(defMaxTokens)),
-    },
-    comfyui: { enabled: comfyEnabled, url: comfyUrl.trim(), reverseGate: comfyReverseGate },
-    gateway: { autoSwap: gatewayAutoSwap, keepN: clampN(gatewayKeepN, 1, 4) },
-  })
+    if (edited('vramHeadroom', vramHeadroom)) p.vramHeadroomMb = vramHeadroom === 0 ? 0 : clampN(vramHeadroom, 300, 2048)
+    if (edited('port', port)) p.port = clampN(port, 1024, 65535)
+    if (edited('autoTitle', autoTitle)) p.autoGenerateTitles = autoTitle
+    if (edited('openBrowser', openBrowser)) p.openBrowserOnStart = openBrowser
+    if (edited('autoLoad', autoLoad)) p.autoLoadOnStart = autoLoad
+    if (edited('telemetry', telemetry)) p.telemetryLevel = telemetry
+    if (edited('lanBind', lanBind)) p.lanBind = lanBind
+    if (edited('requireApiKey', requireApiKey)) p.requireApiKey = requireApiKey
+    const md: NonNullable<DaemonSettingsPatch['modelDefaults']> = {}
+    if (edited('defCtx', defCtx)) md.ctx = Math.max(256, Math.round(defCtx))
+    if (edited('defNgl', defNgl)) md.ngl = clampN(defNgl, 0, 99)
+    if (edited('defImageMax', defImageMax)) md.imageMaxTokens = Math.max(0, Math.round(defImageMax))
+    if (edited('defMaxTokens', defMaxTokens)) md.maxTokens = Math.max(0, Math.round(defMaxTokens))
+    if (Object.keys(md).length) p.modelDefaults = md
+    const cu: NonNullable<DaemonSettingsPatch['comfyui']> = {}
+    if (edited('comfyEnabled', comfyEnabled)) cu.enabled = comfyEnabled
+    if (edited('comfyUrl', comfyUrl)) cu.url = comfyUrl.trim()
+    if (edited('comfyReverseGate', comfyReverseGate)) cu.reverseGate = comfyReverseGate
+    if (Object.keys(cu).length) p.comfyui = cu
+    const gw: NonNullable<DaemonSettingsPatch['gateway']> = {}
+    if (edited('gatewayAutoSwap', gatewayAutoSwap)) gw.autoSwap = gatewayAutoSwap
+    if (edited('gatewayKeepN', gatewayKeepN)) gw.keepN = clampN(gatewayKeepN, 1, 4)
+    if (Object.keys(gw).length) p.gateway = gw
+    return p
+  }
 
   // The listener moved to a new port — hop the browser over once it's up.
   // Another port is another origin, with its own localStorage: a client off the host that sends a

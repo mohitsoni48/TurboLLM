@@ -3117,8 +3117,9 @@ export function registerApi(app: Hono, d: Deps): void {
     // directory of their own first on the build PATH, replace the stored HF/GitHub/search
     // credentials, or switch on request-body capture to record the host's Code prompts (or
     // switch the request log off). Judged on the outcome rather than on which fields the body
-    // names: the change is applied to a copy first, so the served UI's own Save, which echoes
-    // lanBind/requireApiKey/port unchanged with every general setting, still works.
+    // names: the change is applied to a copy first, so a Save that echoes lanBind/requireApiKey/
+    // port unchanged still works. The served UI's Save sends only the fields edited on the page
+    // now, but one in a tab opened before an update still echoes them with every general setting.
     //
     // The refusal's code is api_key_required, not forbidden: the web client opens its key prompt
     // on it (auth-signal.ts). With requireApiKey off nothing 401s, so nothing else asks a browser
@@ -3150,8 +3151,9 @@ export function registerApi(app: Hono, d: Deps): void {
     // ONLY transmission a machine that chose Off ever makes, and the consent
     // copy is written to say exactly that. Fire-and-forget: the settings save
     // must not wait on, or fail because of, a network call. Only when the level
-    // actually CHANGED: the Settings screen sends telemetryLevel with every save,
-    // so saving any unrelated field would otherwise spend the once-ever ping on
+    // actually CHANGED: the Settings screen sent telemetryLevel with every save
+    // (a tab opened before an update still does; the current one sends only edited
+    // fields), so saving any unrelated field would otherwise spend the once-ever ping on
     // a "choice" the user never made, and a later real opt-out would go unsent.
     if (telemetryLevel !== undefined && telemetryLevel !== prevTelemetryLevel) void sendConsentChoice(d.store.dir(), telemetryLevel)
 

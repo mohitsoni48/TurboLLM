@@ -986,8 +986,12 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
   comfyui?: Partial<ComfyUiSettings>
+  /** Patchable per-field, same reason as `experimental`: routes.ts keeps every member this patch
+   *  leaves out, and Settings' Save sends only the members edited on the page. */
+  modelDefaults?: Partial<ModelDefaults>
+  gateway?: Partial<DaemonSettings['gateway']>
   /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
    *  patch touching only one flag must not be forced to also supply the other. */
   experimental?: Partial<DaemonSettings['experimental']>
