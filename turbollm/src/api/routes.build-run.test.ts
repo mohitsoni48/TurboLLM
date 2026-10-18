@@ -16,11 +16,11 @@ import assert from 'node:assert/strict'
 import fs, { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, relative } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { ConfigStore, type Engine } from '../config/config'
-import { buildDirName } from '../engines/build-runner'
+import { BUILD_INCOMPLETE_MARKER, buildDirName, restoreInterruptedBuilds } from '../engines/build-runner'
 import { BuildState } from '../engines/build-state'
 import { Registry } from '../engines/registry'
 import type { Deps } from '../deps'
@@ -35,7 +35,7 @@ const PREVIOUS_BUILD = '#!/bin/sh\necho "version: 100 (0123abc)"\n'
 /** What the stand-in toolchain does: no cmake at all, a compile that fails, a build that works, or one whose
  *  llama-server does not run here (it fails the probe, as a CUDA build on a box without the driver does) — with the
  *  parked previous build gone too, for a put-back that cannot happen. */
-type Toolchain = 'no-cmake' | 'compile-error' | 'builds' | 'builds-broken' | 'builds-broken-unparked'
+type Toolchain = 'no-cmake' | 'compile-error' | 'builds' | 'builds-broken' | 'builds-broken-unparked' | 'cut-short'
 
 /** `cmake --build`'s stand-in for a llama-server that cannot start here. */
 const BROKEN_SERVER = String.raw`mkdir -p "$2/bin" && printf '#!/bin/sh\necho "libcuda.so.1: cannot open shared object file" >&2\nexit 127\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server"`
@@ -46,7 +46,9 @@ function script(dir: string, name: string, lines: string[]): void {
 }
 
 /** `git clone` writes a CMakeLists.txt, configure does nothing, and `cmake --build` writes a llama-server that reports
- *  version 200 — or prints a compiler error and fails, like an upstream tip that no longer compiles. */
+ *  version 200 — or prints a compiler error and fails, like an upstream tip that no longer compiles. 'cut-short': the
+ *  link has written part of a llama-server when the daemon dies; what the daemon leaves on disk then is copied to
+ *  `<dir>/snapshot/build` (as the engines folder's build/), and the compile fails so the live build cleans up. */
 function fakeToolchain(dir: string, toolchain: Toolchain): string {
   const bin = join(dir, 'fakebin')
   mkdirSync(bin)
@@ -68,7 +70,9 @@ function fakeToolchain(dir: string, toolchain: Toolchain): string {
         : toolchain === 'builds-broken-unparked'
           // $2 is <buildRoot>/build: the parked build is .<name>-<ms>.prev beside <buildRoot>.
           ? `  --build) ${BROKEN_SERVER} && rm -rf "$2"/../../.*.prev ;;`
-          : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
+          : toolchain === 'cut-short'
+            ? `  --build) mkdir -p "$2/bin" "${join(dir, 'snapshot')}" && printf '#!/bin/sh\\necho "vers' > "$2/bin/llama-server" && cp -a "$2/../.." "${join(dir, 'snapshot', 'build')}" && exit 1 ;;`
+            : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
     'esac',
   ])
   script(bin, 'nvcc', ['echo "Cuda compilation tools, release 12.6, V12.6.20"'])
@@ -129,7 +133,7 @@ function harness(toolchain: Toolchain) {
   }
   /** Everything beside the build directory: a parked `.prev` or moved-aside `.failed` tree. */
   const leftBeside = () => readdirSync(dirname(buildRoot)).filter((n) => n !== basename(buildRoot))
-  return { store, registry, build, binPath, rebuild, leftBeside }
+  return { dir, app, store, registry, build, binPath, rebuild, leftBeside }
 }
 
 /** Retries `check` until it passes, for up to 5 s: the build a rebuild replaced is deleted in the background. */
@@ -173,6 +177,60 @@ test('POST /build/run: a successful rebuild replaces the engine and deletes the 
   assert.equal(eng?.version, '200 (4567def)', 'the new build is registered')
   assert.equal(h.registry.list().engines.length, 1, 'it replaced the old registration')
   await eventually(() => assert.deepEqual(h.leftBeside(), [], 'the parked previous build is deleted'))
+})
+
+// Boot recovery took any llama-server in the build directory for a finished build: one a daemon exit cut short while
+// the link was writing it (or that a compile outliving the daemon wrote later) stayed, and the parked previous build
+// was never put back. Only a build whose binary passed its probe counts now.
+test('POST /build/run: a rebuild cut short while its binary was being written gets the previous build back at boot', { skip: posixOnly }, async () => {
+  const h = harness('cut-short')
+  assert.equal(await h.rebuild(), 'fail')
+  assert.equal(readFileSync(h.binPath, 'utf8'), PREVIOUS_BUILD, 'the failed build put the previous one back')
+  // What the daemon's death mid-link left: a partial llama-server in the build directory, the previous build parked.
+  const snapshot = join(h.dir, 'snapshot')
+  const bin = join(snapshot, relative(join(h.store.dir(), 'engines'), h.binPath))
+  assert.equal(readFileSync(bin, 'utf8'), '#!/bin/sh\necho "vers')
+  restoreInterruptedBuilds(snapshot, [bin], () => {})
+  assert.equal(readFileSync(bin, 'utf8'), PREVIOUS_BUILD, 'boot put the previous build back')
+})
+
+// The other side: a build that registered is finished, so boot leaves it even with a parked build beside it (its
+// background delete failed).
+test('POST /build/run: a rebuild that registered is kept at boot over a parked build left beside it', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  assert.equal(await h.rebuild(), 'ok')
+  await eventually(() => assert.deepEqual(h.leftBeside(), []))
+  const buildRoot = dirname(dirname(dirname(h.binPath)))
+  const parked = join(dirname(buildRoot), `.${basename(buildRoot)}-1700000000000.prev`, 'build', 'bin')
+  mkdirSync(parked, { recursive: true })
+  writeFileSync(join(parked, 'llama-server'), PREVIOUS_BUILD)
+  restoreInterruptedBuilds(join(h.store.dir(), 'engines'), [h.binPath], () => {})
+  assert.match(readFileSync(h.binPath, 'utf8'), /version: 200/, 'the registered build stays')
+})
+
+// A build whose own registration failed stays marked unfinished. Enabling it later (POST /engines, which probes it)
+// makes it the engine's working build: left marked, a later rebuild the daemon cut short could not put it back.
+test('POST /engines: enabling a build left marked unfinished marks it finished', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  const add = (name: string, binPath: string) => h.app.request('/api/v1/engines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, binPath }),
+  })
+  const tree = (root: string) => {
+    const bin = join(root, 'build', 'bin', 'llama-server')
+    mkdirSync(dirname(bin), { recursive: true })
+    writeFileSync(bin, PREVIOUS_BUILD)
+    chmodSync(bin, 0o755)
+    writeFileSync(join(root, BUILD_INCOMPLETE_MARKER), '')
+    return bin
+  }
+  const root = join(h.store.dir(), 'engines', 'build', 'owner-other-main')
+  const bin = tree(root)
+  // A build of the same name under another data dir is not this one: its Add leaves this tree marked.
+  const elsewhere = tree(join(h.dir, 'other-data', 'engines', 'build', 'owner-other-main'))
+  assert.equal((await add('Elsewhere', elsewhere)).status, 201)
+  assert.equal(fs.existsSync(join(root, BUILD_INCOMPLETE_MARKER)), true)
+  assert.equal((await add('Other', bin)).status, 201)
+  assert.equal(fs.existsSync(join(root, BUILD_INCOMPLETE_MARKER)), false)
 })
 
 // The new build compiled, so runBuild handed back the parked previous build for the route to delete. The route then

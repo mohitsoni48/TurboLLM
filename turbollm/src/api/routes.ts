@@ -75,7 +75,7 @@ import { ensureKoboldcpp, koboldcppBinPath, koboldcppDir } from '../engines/kobo
 import { ensureLlamafile, llamafileBinPath, llamafileDir } from '../engines/llamafile'
 import { catalogForPlatform, catalogEngine } from '../engines/catalog'
 import { checkBuildPrereqs } from '../engines/build-prereqs'
-import { runBuild, runPrereqInstall, discardParkedBuild, restorePreviousBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
+import { runBuild, runPrereqInstall, discardParkedBuild, markBuildComplete, restorePreviousBuild, buildDirName, chooseEngineName, findCatalogBuildOnDisk, findEngineForCatalogEntry, findNameConflict, findReleaseEngineForCatalogEntry, pickReleaseSource, findPriorEngine, isEngineInBuildDir, normRepoUrl, sameRepo, sourceBuildDirOf, type ReleaseCatalogEntry } from '../engines/build-runner'
 import { gcAbandonedZipInstalls, installZipEngine, MAX_ZIP_BYTES, packagedAndroidApp, SwapBlockedError, ZipError, ZIP_BUILD_MARKER, zipBuildDirName } from '../engines/zip-install'
 import { provisionCuda } from '../engines/cuda-provision'
 import { detectHardware } from '../engines/hardware'
@@ -994,6 +994,8 @@ export function registerApi(app: Hono, d: Deps): void {
           if (out.prevBuildRoot || removed) previous = restored ? 'kept' : 'stranded'
           throw e
         }
+        // The binary passed its probe: boot recovery and the next build's sweep keep this build from now on.
+        markBuildComplete(out.buildRoot)
         replaced = out.prevBuildRoot
         d.registry.activate(eng.id)
         // A genuinely custom repo (not one of the catalog's own known projects) needs its
@@ -1430,6 +1432,12 @@ export function registerApi(app: Hono, d: Deps): void {
       : { sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl }
     try {
       const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, { release: release ?? undefined, ...source })
+      // A 1-click build whose own registration failed (a taken name, a probe that timed out) stays marked unfinished on
+      // disk. Its Enable (or Add) has just passed the probe: it is this engine's working build now, for boot recovery
+      // too. Only a binary in this daemon's own build directory: sourceBuildDirOf maps any .../engines/build/<name>/
+      // path (another or a legacy data dir) onto ours, whose build/<name> may be a cut-short tree.
+      const buildDir = sourceBuildDirOf(b.binPath, join(d.store.dir(), 'engines'))
+      if (buildDir && isEngineInBuildDir(b.binPath, buildDir)) markBuildComplete(buildDir)
       // Same custom-source tracking as the 1-click build completion above — a manually
       // pointed-at binary (with or without a sourceRepo) is just as much a "custom engine"
       // as a self-service build, and deserves the same Disable-survives-as-Enable treatment.

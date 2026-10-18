@@ -1026,6 +1026,32 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   }
 }
 
+/** Written into a build directory as the build starts, and removed (markBuildComplete) only once the built
+ *  llama-server has passed its probe and is registered: by the build route, or by a later Enable of a build whose own
+ *  registration failed. While it is there the tree is not a finished build, whatever it holds: boot recovery
+ *  (restoreInterruptedBuilds) and the next build's sweep took any llama-server in it for one, so a binary a daemon
+ *  exit cut short mid-link, or one a compile that outlived the daemon wrote later, stayed in place of the parked
+ *  previous build. The marker marks the unfinished tree rather than the finished one, so a build made before it
+ *  existed still counts as finished. It sits at the build directory's top, beside the `_tllm_*.bat` steps, where
+ *  nothing the compile writes can remove it. */
+export const BUILD_INCOMPLETE_MARKER = '.turbollm-build-incomplete'
+
+/** The build in `buildRoot` passed its probe: from now on boot recovery and the next build's sweep keep it. Best
+ *  effort: a marker left behind only makes a parked build beside it go back at the next start. */
+export function markBuildComplete(buildRoot: string): void {
+  try {
+    rmSync(join(buildRoot, BUILD_INCOMPLETE_MARKER), { force: true })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** A finished build: a server binary, and no BUILD_INCOMPLETE_MARKER. */
+function isFinishedBuild(root: string): boolean {
+  if (existsSync(join(root, BUILD_INCOMPLETE_MARKER))) return false
+  return (resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)) !== null
+}
+
 /** Remove a failed build's partial tree and move the parked previous build (if any) back. On Windows the tree can
  *  stay locked for a moment (TerminateProcess of a cancelled compiler tree is asynchronous, and Defender scans the
  *  fresh objects), so the delete retries — asynchronously, not to freeze the daemon meanwhile. A tree still locked
@@ -1082,10 +1108,10 @@ export function discardParkedBuild(prevBuildRoot: string): Promise<void> {
  *  is a whole build, often several GB, see discardParkedBuild) and the returned promise settles once all have ended;
  *  the put-back below is synchronous and done by the time this returns.
  *
- *  When `buildRoot` holds no server binary (the daemon died mid-build, or restorePreviousBuild could not move the
- *  parked build back), the newest parked build that has one is the only working copy: it is put back first (the
- *  partial tree moved aside and swept with the rest), or kept if that fails — never swept. `sweep: false` only puts
- *  it back and deletes nothing (restoreInterruptedBuilds). */
+ *  When `buildRoot` holds no finished build (isFinishedBuild: the daemon died mid-build, or restorePreviousBuild
+ *  could not move the parked build back), the newest finished parked build is the only working copy: it is put back
+ *  first (the partial tree moved aside and swept with the rest), or kept if that fails — never swept. `sweep: false`
+ *  only puts it back and deletes nothing (restoreInterruptedBuilds). */
 function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { sweep?: boolean } = {}): Promise<void> {
   const parent = dirname(buildRoot)
   const prefix = `.${basename(buildRoot)}-`
@@ -1096,13 +1122,12 @@ function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { 
     return Promise.resolve()
   }
   const parked = names.filter((name) => name.startsWith(prefix) && /^\d+\.(prev|failed)$/.test(name.slice(prefix.length)))
-  const hasServerBinary = (root: string) => (resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)) !== null
-  if (!hasServerBinary(buildRoot)) {
+  if (!isFinishedBuild(buildRoot)) {
     const msOf = (name: string) => parseInt(name.slice(prefix.length), 10)
     const lastGood = parked
       .filter((name) => name.endsWith('.prev'))
       .sort((a, b) => msOf(b) - msOf(a))
-      .find((name) => hasServerBinary(join(parent, name)))
+      .find((name) => isFinishedBuild(join(parent, name)))
     if (lastGood) {
       parked.splice(parked.indexOf(lastGood), 1)
       try {
@@ -1127,12 +1152,13 @@ function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { 
   return Promise.all(deletes).then(() => undefined)
 }
 
-/** At boot: put the previous build back for every registered (or remembered) source build whose directory has no
- *  server binary while a `.<name>-<ms>.prev` beside it has one. A daemon that exits mid-rebuild kills the compile, but
- *  runBuild's restorePreviousBuild never runs, so the engine pointed at a missing binary until the next build of that
- *  same directory put it back (sweepParkedBuilds), which a SIGKILL or crash mid-build left the same way. Only puts
- *  back: the partial tree is moved aside, and it and other leftovers are swept by that directory's next build, so a
- *  multi-GB delete does not hold up startup. A directory nothing claims is left to its next build too. */
+/** At boot: put the previous build back for every registered (or remembered) source build whose directory holds no
+ *  finished build (no server binary, or BUILD_INCOMPLETE_MARKER still there) while a `.<name>-<ms>.prev` beside it
+ *  does. A daemon that exits mid-rebuild kills the compile, but runBuild's restorePreviousBuild never runs, so the
+ *  engine pointed at a missing binary until the next build of that same directory put it back (sweepParkedBuilds),
+ *  which a SIGKILL or crash mid-build left the same way. Only puts back: the partial tree is moved aside, and it and
+ *  other leftovers are swept by that directory's next build, so a multi-GB delete does not hold up startup. A
+ *  directory nothing claims is left to its next build too. */
 export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: string[], log: (l: string) => void): void {
   const buildDir = join(enginesRoot, 'build')
   let names: string[]
@@ -1217,6 +1243,9 @@ async function buildFromSource(
   dirs.buildRoot = buildRoot
   dirs.prevBuildRoot = prevBuildRoot
   mkdirSync(buildRoot, { recursive: true })
+  // Unfinished until the route has probed and registered the binary (markBuildComplete): a daemon exit from here on
+  // leaves a tree that boot recovery must not take for the working build.
+  writeFileSync(join(buildRoot, BUILD_INCOMPLETE_MARKER), '')
 
   // 1) Shallow clone — a branch tip, or (when `req.commit` is set) an exact historical SHA.
   hooks.phase('cloning')

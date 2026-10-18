@@ -6,7 +6,7 @@ import fs, { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readli
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
 import { tmpDir } from '../test-support/tmp'
-import { copyCudaRuntimeLibs, discardParkedBuild, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
+import { BUILD_INCOMPLETE_MARKER, copyCudaRuntimeLibs, discardParkedBuild, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
 import { checkBuildPrereqs } from './build-prereqs'
 
 test('buildDirName: owner/repo from a .git URL, branch appended', () => {
@@ -938,6 +938,27 @@ test('restoreInterruptedBuilds: a working build, or a directory no engine claims
   assert.equal(existsSync(join(buildDir, 'unclaimed', 'build')), false)
   // A missing build directory is a no-op, not a throw.
   restoreInterruptedBuilds(join(buildDir, 'nope'), [], () => {})
+})
+
+// Any llama-server counted as a finished build: one the link had half written when the daemon died (or that a compile
+// outliving the daemon wrote later) kept the parked previous build from going back. A tree the runner has not marked
+// finished is not the working build, in the build directory or parked beside it (a tree like that parked by the next
+// build); a tree with no marker at all, as every build made before the marker has, still is (the test above).
+test('restoreInterruptedBuilds: a tree still marked unfinished is not the working build, whatever llama-server it holds', () => {
+  const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
+  const name = 'owner-fork-main'
+  const tree = (dir: string, content: string, unfinished: boolean) => {
+    mkdirSync(join(buildDir, dir, 'build', 'bin'), { recursive: true })
+    writeFileSync(join(buildDir, dir, 'build', 'bin', 'llama-server'), content)
+    if (unfinished) writeFileSync(join(buildDir, dir, BUILD_INCOMPLETE_MARKER), '')
+  }
+  tree(name, 'half-written', true)
+  tree(`.${name}-1700000000001.prev`, 'an unfinished tree the next build parked', true)
+  tree(`.${name}-1700000000000.prev`, 'last working build', false)
+  const bin = join(buildDir, name, 'build', 'bin', 'llama-server')
+  restoreInterruptedBuilds(join(buildDir, '..'), [bin], () => {})
+  assert.equal(readFileSync(bin, 'utf8'), 'last working build')
+  assert.equal(existsSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER)), false)
 })
 
 // ── Windows Cancel kills the compiler tree, not just cmd.exe ─────────────────────────────────────
