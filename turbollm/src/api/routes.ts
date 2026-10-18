@@ -2820,6 +2820,20 @@ export function registerApi(app: Hono, d: Deps): void {
       // config.validate() enforces 1024–65535 and would throw on update() otherwise;
       // reject out-of-range here so the client gets a clean 400, not a 500.
       if (!Number.isInteger(v) || v < 1024 || v > 65535) return err(c, 400, 'invalid_config_value', 'port must be 1024–65535.')
+      // The remote-access ingress port is fixed per boot (cli.ts resolves it against the port
+      // the main listener bound), and this change moves the main listener in place, at once.
+      // Onto that port while remote access is on (bound, starting or reconnecting, or enabled
+      // with a retry or Start still to bind it), the two collide: the rebind fails and reverts
+      // after the page was told to hop there, or the ingress cannot bind. While it is off this
+      // is taken, since nothing holds the port and the next boot moves the ingress off it
+      // (resolveIngressPort): refusing it then would keep the port from ever being picked here.
+      // GET /api/v1/remote/status then names no port for a self-run tunnel until that restart.
+      const rc = d.remote
+      if (rc && v !== d.store.snapshot().daemon.port && rc.targetIngressPort?.() === v) {
+        const kind = rc.state().kind
+        const on = rc.ingressPort() !== undefined || kind === 'starting' || kind === 'connected' || kind === 'reconnecting' || d.store.snapshot().remoteAccess.enabled
+        if (on) return err(c, 400, 'invalid_config_value', `port ${v} is remote access's own port while it is on; pick another, or turn remote access off first.`)
+      }
       updates.port = v
     }
     if (b.theme !== undefined) {

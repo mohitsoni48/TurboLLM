@@ -296,6 +296,69 @@ describe('RemoteAccessSection', () => {
     expect(document.querySelector('#remote-ngrok-token')).toBeNull()
   })
 
+  it('"I run my own" names the port its tunnel points at, from the daemon, and warns off the main port', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // As under `--port 6997`: settings still say 6997 for the ingress, which is the main port
+    // this boot, and the daemon moved the ingress to 6996. The option must name 6996.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      port: 6996,
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'custom',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+      tunnelTargetPort: 6996,
+      mainPort: 6997,
+    })
+    wrap(<RemoteAccessSection />)
+    const target = await screen.findByText('http://127.0.0.1:6996')
+    expect(target.closest('p')?.textContent).toMatch(/^Point your tunnel at http:\/\/127\.0\.0\.1:6996\. That port listens only while remote access is on/)
+    const warning = screen.getByText(/^Never point it at port 6997, this app's own port:/)
+    expect(warning.textContent).toMatch(/full control and no key/)
+    expect(screen.queryByText(/127\.0\.0\.1:6997/)).toBeNull()
+  })
+
+  it('"I run my own" names no port before the daemon has said which one, and still warns off the main port', async () => {
+    const apiLib = await import('../../lib/api')
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    // The file's default status: no tunnelTargetPort, as before it loads.
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/^Point your tunnel at this machine's remote-access port/)).toBeTruthy()
+    expect(screen.getByText(/^Never point it at this app's own port:/)).toBeTruthy()
+    expect(screen.queryByText(/6997/)).toBeNull()
+  })
+
+  it('"I run my own" says to restart, and names no port to point at, while the daemon names none', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // Settings moved this app's port onto this boot's remote-access port (6997), so the daemon
+    // answers no tunnel port: naming one would name the main listener.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      port: 6997,
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'custom',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+      tunnelTargetPort: null,
+      mainPort: 6997,
+    })
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/^Restart TurboLLM before you point a tunnel here:/)).toBeTruthy()
+    expect(screen.queryByText(/Point your tunnel at/)).toBeNull()
+    expect(screen.queryByText(/127\.0\.0\.1/)).toBeNull()
+    expect(screen.getByText(/^Never point it at port 6997, this app's own port:/)).toBeTruthy()
+  })
+
   it('puts the selection back when the daemon refuses a provider change', async () => {
     const apiLib = await import('../../lib/api')
     // The daemon refuses a provider change while a tunnel is running (409) — e.g. one started

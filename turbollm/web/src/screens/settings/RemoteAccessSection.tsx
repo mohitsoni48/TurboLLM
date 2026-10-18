@@ -568,6 +568,43 @@ export function RemoteAccessSection() {
 
                     {selected && id === 'custom' && (
                       <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+                        {/* This option used to ask only for the URL and never say where the tunnel
+                            goes. The obvious guess, the port this page is open on, is the main
+                            listener, where a tunnel or proxy that rewrites Host to 127.0.0.1 gets
+                            loopback trust: every visitor is the owner at this machine, no key. The
+                            ports come from the daemon's status, not settings: settings'
+                            remoteAccess.ingressPort is not the bound one under --port (6997 there
+                            is the main port, the ingress moved to 6996). The daemon answers null
+                            for it while this app's own port was moved onto the remote-access one
+                            in Settings (that port is fixed until a restart), where naming it would
+                            name the main port. */}
+                        <p className="text-[12px] text-muted">
+                          {status?.tunnelTargetPort === null ? (
+                            <>
+                              Restart TurboLLM before you point a tunnel here: this app's own port was moved onto the one
+                              remote access uses, and remote access gets another, named here, only after a restart.
+                            </>
+                          ) : (
+                            <>
+                              Point your tunnel at{' '}
+                              {status?.tunnelTargetPort ? (
+                                <span className="font-mono text-ink">http://127.0.0.1:{status.tunnelTargetPort}</span>
+                              ) : (
+                                "this machine's remote-access port (shown here once its status loads)"
+                              )}
+                              . That port listens only while remote access is on, and everything arriving there is
+                              treated as coming from the internet.
+                            </>
+                          )}
+                        </p>
+                        <p className="flex gap-1.5 text-[12px]" style={{ color: 'var(--warn)' }}>
+                          <AlertTriangle size={13} className="mt-px shrink-0" />
+                          <span>
+                            Never point it at {status?.mainPort ? `port ${status.mainPort}, this app's own port` : "this app's own port"}:
+                            a tunnel or proxy that rewrites the Host header (nginx does by default) makes every visitor
+                            look like you at this machine, with full control and no key.
+                          </span>
+                        </p>
                         <label className="text-[12px] text-muted" htmlFor="remote-custom-url">Public URL</label>
                         <input
                           id="remote-custom-url"

@@ -22,6 +22,12 @@ export interface RemoteIngress {
  *  is typed as this; `auth.ts` only ever calls the seam above, which is why the
  *  narrow interface above stays separate rather than being folded in here. */
 export interface RemoteControl extends RemoteIngress {
+  /** The loopback port the ingress listens on whenever remote access is on: the bound one, or,
+   *  while off, the one the next start binds. It is fixed for the boot (cli.ts resolves it
+   *  against the main listener's port, so `--port 6997` moves it to 6996), which config's
+   *  `remoteAccess.ingressPort` is not, and a self-run tunnel ("I run my own") is pointed at it
+   *  by hand. Optional so a fake can omit it. */
+  targetIngressPort?(): number
   state(): RemoteState
   url(): string | null
   enable(): Promise<void>

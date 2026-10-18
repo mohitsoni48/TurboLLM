@@ -74,6 +74,12 @@ export class RemoteAccessManager implements RemoteIngress {
     return this.ingress.ingressPort()
   }
 
+  /** See RemoteControl.targetIngressPort. Every enable() binds exactly opts.ingressPort (or
+   *  fails), so that is the port while off; the bound one covers the tests' ephemeral 0. */
+  targetIngressPort(): number {
+    return this.ingress.ingressPort() ?? this.opts.ingressPort
+  }
+
   /** The provider serving the ingress right now (see RemoteIngress.activeProvider), or
    *  undefined when the ingress is down. */
   activeProvider(): RemoteProviderId | undefined {

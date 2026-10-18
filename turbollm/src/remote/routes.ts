@@ -89,12 +89,25 @@ export function registerRemoteApi(app: Hono, d: Deps): void {
     const refused = guard(c)
     if (refused) return refused
     const cfg = d.store.snapshot().remoteAccess
+    const mainPort = d.bindPort ?? d.store.snapshot().daemon.port // the port really bound
+    const target = d.remote?.targetIngressPort?.() ?? null
     return c.json({
       provider: cfg.provider,
       enabled: cfg.enabled,
       state: d.remote?.state() ?? { kind: 'off' },
       url: d.remote?.url() ?? cfg.lastUrl ?? '',
       ingressPort: d.remote?.ingressPort() ?? null,
+      // The two ports Settings' "I run my own" names: the one a self-run tunnel must point at,
+      // known while off too (ingressPort above is null until the ingress binds, and config's
+      // remoteAccess.ingressPort is not the bound one under --port), and the main listener's,
+      // which it must never point at: a tunnel or proxy that rewrites Host to 127.0.0.1 (nginx
+      // does by default) gets loopback trust there, so the whole internet gets this machine
+      // with no key. The first is fixed for the boot, and a Settings port change moves the main
+      // listener in place: one onto it (taken while remote access is off, PATCH /api/v1/settings)
+      // made both the same port, and the row said to point the tunnel at the main listener. Null
+      // then, until a restart gives remote access another.
+      tunnelTargetPort: target !== null && target !== mainPort ? target : null,
+      mainPort,
     })
   })
 
