@@ -1678,11 +1678,24 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           // and routes straight to its own executor. Everything else (normal chat
           // tools) still goes through the real approval gate below.
           const isSkillTool = skillTools?.names.has(tc.name) ?? false
+          // The agent's allow-list (conv.allowedTools, scopedBaseToolDefs above) decides what may
+          // RUN, not only what the model is offered: a model can name any tool, offered or not
+          // (small models do hallucinate tool names), and the approval gate below ran such a call
+          // whenever its policy allowed it, so an agent fixed to web_search still ran run_code or
+          // an MCP tool. A base tool the list leaves out is answered as executeTool answers one
+          // that does not exist. Skill tools are never on the list (see scopedBaseToolDefs).
+          const unlisted = !isSkillTool && conv.allowedTools !== undefined && !conv.allowedTools.includes(tc.name)
 
           let result: string
           let callError: string | undefined
 
-          if (isSkillTool && skillTools) {
+          if (unlisted) {
+            result = `Error: unknown tool "${tc.name}"`
+            await emit({
+              event: 'tool_call',
+              data: { id: tc.id, name: tc.name, args: parsedArgs, status: 'done', result },
+            })
+          } else if (isSkillTool && skillTools) {
             // Emit pending event so the frontend can show "calling..."
             await emit({
               event: 'tool_call',
@@ -1728,7 +1741,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           }
 
           // F-021: track web_search calls and accumulate research sources.
-          if (tc.name === 'web_search' && !callError) {
+          if (tc.name === 'web_search' && !callError && !unlisted) {
             searchCallCount++
             // The result string embeds the structured data; also ask the registry
             // for the raw ResearchResult[] via a direct research call on the same

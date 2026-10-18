@@ -1215,3 +1215,51 @@ test('share-url: advertises the port really bound, not daemon.port', async () =>
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// A custom agent's tool allow-list (Customize → Agents, conv.allowedTools) filtered only the tool
+// definitions the model was offered. A model can name any tool, offered or not, and the loop ran
+// the call whenever its policy allowed it, so an agent fixed to web_search still ran run_code.
+test("a tool the conversation's agent does not list is refused like an unknown tool, not run", async () => {
+  const ran: string[] = []
+  const h = inFlightHarness({
+    buildToolDefinitions: async () => ['web_search', 'run_code'].map((name) => ({ type: 'function', function: { name, description: '', parameters: { type: 'object', properties: {} } } })),
+    executeTool: async (call: { name: string }) => { ran.push(call.name); return `ran ${call.name}` },
+  })
+  const sseLine = (obj: unknown) => `data: ${JSON.stringify(obj)}\n\n`
+  /** The model calls `name` once, then answers. */
+  const calling = (name: string) => (_init: RequestInit | undefined, n: number) => n % 2 === 1
+    ? new Response([
+        sseLine({ choices: [{ delta: { tool_calls: [{ index: 0, id: `tc${n}`, function: { name, arguments: '{"code":"print(1)"}' } }] } }] }),
+        sseLine({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }),
+        'data: [DONE]\n\n',
+      ].join(''), { status: 200 })
+    : sseReply('done')
+  try {
+    const cases: Array<[string, string[] | undefined, string, boolean]> = [
+      ['an agent fixed to web_search calling run_code', ['web_search'], 'run_code', false],
+      ['an agent with no tools (the Blank persona) calling run_code', [], 'run_code', false],
+      ['an agent calling a tool it lists', ['web_search', 'run_code'], 'run_code', true],
+      ['a chat with no allow-list', undefined, 'run_code', true],
+    ]
+    for (const [what, allowedTools, name, runs] of cases) {
+      ran.length = 0
+      const engine = fakeEngine(calling(name))
+      try {
+        const conv = h.store.createConversation({ allowedTools })
+        const sse = await (await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'go' }))).text()
+        const offered = (engine.bodies[0] as { tools?: Array<{ function: { name: string } }> }).tools?.map((t) => t.function.name) ?? []
+        assert.equal(offered.includes(name), runs, `${what}: offered only when listed (unchanged)`)
+        const want = runs ? `ran ${name}` : `Error: unknown tool "${name}"`
+        assert.deepEqual(ran, runs ? [name] : [], `${what}: run only when listed`)
+        const toolReply = engine.bodies[1].messages.at(-1)!
+        assert.deepEqual([toolReply.role, toolReply.content], ['tool', want], `${what}: the model is told what happened`)
+        assert.deepEqual(h.store.getMessages(conv.id).at(-1)!.toolCalls.map((t) => [t.name, t.result]), [[name, want]], `${what}: and so is the chat`)
+        assert.ok(sse.includes(JSON.stringify(want).slice(1, -1)), `${what}: the stream shows it`)
+      } finally {
+        engine.restore()
+      }
+    }
+  } finally {
+    h.cleanup()
+  }
+})
