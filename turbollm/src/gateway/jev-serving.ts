@@ -269,6 +269,10 @@ export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/** The refusal of a request body that is not a JSON object (null, an array or a primitive): the Jev endpoints' and
+ *  the gateway's /v1 routes', which read fields of it. */
+export const NOT_A_JSON_OBJECT = 'Request body must be a JSON object.'
+
 export const JEV_LATEST = 'jev-latest'
 
 export const NO_JEV_MODEL_FOR_LATEST: JevHttpError = {

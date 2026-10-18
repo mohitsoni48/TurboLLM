@@ -613,6 +613,38 @@ for (const model of [5, { name: 'qwen3' }, ['qwen3'], true]) {
   }
 }
 
+// A JSON body that is not an object. With a model to route to, a number, string or boolean on /v1/chat/completions
+// threw at the body's first `in` test (reasoning_effort), and a null on /v1/messages at its first field read: a bare 500
+// from Hono's default handler. A null or an array on /v1/chat/completions, and any of them on /v1/embeddings, got no 500
+// but was sent on to the engine (null as an empty body on chat), and on /v1/messages a number, string or array was
+// refused as missing max_tokens. Claude Code's /v1/messages/count_tokens threw on all of them in mapToOpenAI: a bare
+// 500.
+for (const body of ['5', '"hello"', 'true', 'null', '[]', '[{"role":"user","content":"hi"}]']) {
+  for (const path of ['/v1/messages', '/v1/messages/count_tokens'] as const) {
+    test(`${path}: a JSON body of ${body} is a 400 invalid_request_error`, async () => {
+      const app = new Hono()
+      registerGateway(app, fakeDeps())
+      const res = await app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+      assert.equal(res.status, 400, await res.clone().text())
+      assert.deepEqual(await res.json(), {
+        type: 'error', error: { type: 'invalid_request_error', message: 'Request body must be a JSON object.' },
+      })
+    })
+  }
+
+  for (const path of ['/v1/chat/completions', '/v1/embeddings'] as const) {
+    test(`${path}: a JSON body of ${body} is a 400 invalid_request_error`, async () => {
+      const app = new Hono()
+      registerGateway(app, fakeDeps())
+      const res = await app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body })
+      assert.equal(res.status, 400, await res.clone().text())
+      assert.deepEqual(await res.json(), {
+        error: { message: 'Request body must be a JSON object.', type: 'invalid_request_error', code: 'invalid_type' },
+      })
+    })
+  }
+}
+
 // ── A remote-access token without models:load (auth.ts modelLoadsRefused) is answered "not loaded" instead of
 // auto-swapping. That is final for the token only when nothing is bringing the model up: a model still loading (in the
 // primary or into a pool slot), or the one ComfyUI's guard unloaded and reloads when its render ends, is served to the

@@ -21,6 +21,7 @@ import { classifyHarness } from '../telemetry/classify'
 import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
+import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
 import { appendNudges, appendSystemRules, declaresTools, openAiRequestView } from './openai-guidance'
 import {
   extractSearchQuery,
@@ -193,6 +194,11 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         { type: 'error', error: { type: 'invalid_request_error', message: 'Invalid JSON body.' } },
         400,
       )
+    }
+    // JSON that is not an object (null threw at the first field read: a bare 500; a number, string or array was
+    // refused as missing max_tokens).
+    if (!isJsonObject(req)) {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message: NOT_A_JSON_OBJECT } }, 400)
     }
     // A model that is not a string threw on the first string method below or in the router (the claude- prefix check,
     // the remote-id parse, the name match): a bare 500 from Hono's default handler instead of the API's own 400.
@@ -773,6 +779,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     } catch {
       req = { messages: [] }
     }
+    // JSON that is not an object threw in mapToOpenAI below (null at its first field read, the rest at its messages
+    // loop): a bare 500 from Hono's default handler. Refused as /v1/messages refuses it; JSON that does not parse is
+    // still counted as no messages.
+    if (!isJsonObject(req)) {
+      return c.json({ type: 'error', error: { type: 'invalid_request_error', message: NOT_A_JSON_OBJECT } }, 400)
+    }
 
     const target = d.manager.target()
     const oaiBody = mapToOpenAI(req)
@@ -918,14 +930,23 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   // For all other endpoints: skip body parsing and pass through untouched.
   let parsedBody: Record<string, unknown> | null = null
   let embeddingsBodyText: string | null = null
+  // Undefined when the body was not read or is not JSON at all (forwarded as before, for the engine to refuse).
+  let parsedJson: unknown
   if (isChat) {
-    try { parsedBody = (await c.req.json()) as Record<string, unknown> } catch { parsedBody = null }
+    try { parsedJson = await c.req.json() } catch { parsedJson = undefined }
   } else if (isEmbeddings) {
     try {
       embeddingsBodyText = await c.req.text()
-      parsedBody = JSON.parse(embeddingsBodyText) as Record<string, unknown>
-    } catch { parsedBody = null }
+      parsedJson = JSON.parse(embeddingsBodyText)
+    } catch { parsedJson = undefined }
   }
+  // JSON that is not an object: a number, string or boolean threw at the chat body's first `in` test (a bare 500 from
+  // Hono's default handler), and a chat null or array, or any of them for embeddings, was sent on to the engine (a chat
+  // null as an empty body).
+  if (parsedJson !== undefined && !isJsonObject(parsedJson)) {
+    return c.json({ error: { message: NOT_A_JSON_OBJECT, type: 'invalid_request_error', code: 'invalid_type' } }, 400)
+  }
+  if (parsedJson !== undefined) parsedBody = parsedJson as Record<string, unknown>
   const { token: chatToken, codeSessionId: chatCodeSessionId } = resolveCodeSession(c)
   const chatHarness = resolveHarness(c, d, 'openai')
 

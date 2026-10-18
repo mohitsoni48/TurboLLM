@@ -373,3 +373,18 @@ test('a null model is still served the loaded model (real router)', async () => 
   assert.equal(res.status, 200, await res.clone().text())
   assert.deepEqual(h.routed, [''])
 })
+
+// null threw at the first field read; a number, string, boolean or array went on to the gateway's own 400. All are refused
+// before the façade's gates, in the gateway's shape.
+for (const body of ['null', '5', '"hello"', 'true', '[]', '[{"role":"user","content":"hi"}]']) {
+  test(`a JSON body of ${body} is a 400 invalid_type, as /v1/chat/completions answers it`, async () => {
+    const { d, h } = realResolveDeps(['models:use'])
+    const res = await postRaw(d, 'tllm-a', body)
+    assert.equal(res.status, 400, await res.clone().text())
+    assert.deepEqual(await res.json(), {
+      error: { message: 'Request body must be a JSON object.', type: 'invalid_request_error', code: 'invalid_type' },
+    })
+    assert.deepEqual(h.routed, [])
+    assert.equal(upstream, null)
+  })
+}

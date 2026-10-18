@@ -8,6 +8,7 @@ import type { ApiKey } from '../config/config'
 import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
+import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
 import {
@@ -142,6 +143,16 @@ function linkDownloadErr(c: { json: (b: unknown, s: number) => Response }, f: Do
   )
 }
 
+/** The request body when it is a JSON object, else `{}`, so a body that is not JSON at all,
+ *  or JSON that is not an object, falls into the route's own 400 for a missing field. A body
+ *  of `null` threw at the first field read instead: a bare 500 from Hono's default handler. */
+async function objectBody(
+  c: { req: { json: () => Promise<unknown> } },
+): Promise<Record<string, unknown>> {
+  const parsed = await c.req.json().catch(() => ({}))
+  return isJsonObject(parsed) ? parsed : {}
+}
+
 /** Thrown inside `PATCH /api/link/v1/config`'s `store.update` callback when the second
  *  `applyScopedPatch` pass disagrees with the dry-run. Unreachable today; it exists so that
  *  if it ever DOES happen it aborts the write and surfaces as a 500, rather than committing
@@ -255,7 +266,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  no filesystem detail (see engine-lifecycle.ts). */
   linkApp.post('/api/link/v1/models/load', requireCapability('models:load'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { modelKey?: unknown }
+    const body = await objectBody(c)
     const modelKey = typeof body.modelKey === 'string' ? body.modelKey.trim() : ''
     if (!modelKey) {
       return c.json({ error: { code: 'invalid_input', message: 'modelKey is required.' } }, 400)
@@ -312,7 +323,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  `size` and `sha256` ARE accepted: they only ever tighten behaviour (the free-disk
    *  check and the checksum verification). */
   linkApp.post('/api/link/v1/downloads', requireCapability('downloads:write'), async (c) => {
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const body = await objectBody(c)
     const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
     const rfilename = typeof body.rfilename === 'string' ? body.rfilename.trim() : ''
     if (!HF_REPO_ID.test(repo) || !isSafeRepoFile(rfilename)) {
@@ -386,7 +397,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  The patch is dry-run against a SNAPSHOT before `store.update` is called at all, so a
    *  refused patch never causes a config.json write. */
   linkApp.patch('/api/link/v1/config', requireCapability('config:write'), async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { patch?: unknown }
+    const body = await objectBody(c)
     const patch = body.patch
     if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
       return c.json(
@@ -487,9 +498,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { model?: unknown; stream?: unknown }
-    // A model that is not a string threw in resolveRemoteTarget below (its remote-id parse trims it): a bare 500
-    // from Hono's default handler. Refused as the /v1 route this one hands off to refuses it (gateway.ts).
+    const parsed: unknown = await c.req.json().catch(() => ({}))
+    // JSON that is not an object: a null threw at the first field read below, a bare 500 from
+    // Hono's default handler. Refused as the /v1 route this one hands off to refuses it
+    // (gateway.ts), before any gate here reads the body. A body that is not JSON at all still
+    // goes on to that route, as before.
+    if (!isJsonObject(parsed)) {
+      return c.json(
+        {
+          error: {
+            message: NOT_A_JSON_OBJECT,
+            type: 'invalid_request_error',
+            code: 'invalid_type',
+          },
+        },
+        400,
+      )
+    }
+    const body = parsed as { model?: unknown; stream?: unknown }
+    // A model that is not a string threw in resolveRemoteTarget below (its remote-id parse
+    // trims it): a bare 500 from Hono's default handler. Refused as the /v1 route this one
+    // hands off to refuses it (gateway.ts).
     if (body.model != null && typeof body.model !== 'string') {
       return c.json(
         {

@@ -179,6 +179,23 @@ test('a missing modelKey is 400 — it never falls through to the host lastLoade
   assert.deepEqual(h.loads, [])
 })
 
+// A body of null threw at the first field read: a bare 500 from Hono's default handler.
+test('a JSON body that is not an object is the missing-modelKey 400, not a 500', async () => {
+  const h = mkDeps([key('tllm-a', ['models:load'])], [entry({ key: 'qwen3-35b' })])
+  const a = app(h.d)
+  for (const body of ['null', '5', '"qwen3-35b"', '["qwen3-35b"]']) {
+    const res = await a.request('/api/link/v1/models/load', {
+      method: 'POST',
+      headers: { 'X-TurboLLM-Auth': 'tllm-a', 'content-type': 'application/json' },
+      body,
+    })
+    assert.equal(res.status, 400, `${body}: ${await res.clone().text()}`)
+    assert.deepEqual(await res.json(), { error: { code: 'invalid_input', message: 'modelKey is required.' } })
+  }
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(h.loads, [])
+})
+
 test('a second load while one is in flight serializes through the existing swap chain', async () => {
   const h = mkDeps(
     [key('tllm-a', ['models:load'])],
