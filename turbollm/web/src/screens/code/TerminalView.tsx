@@ -123,18 +123,27 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
   // Set by a REconnect until that socket's first frame lands: the daemon sends its whole buffered
   // replay as that one frame, before any live output (terminal-manager.ts registerWsListener).
   const replayPendingRef = useRef(false)
+  // Whether this outage has had its toast. A drop is followed by up to five reconnect attempts
+  // (useTerminalConnection: 0.5 s, then every 2 s), and a browser fires `error` and then `close`
+  // 1006 on the drop and on every handshake that fails: toasting each one stacked 12 toasts
+  // over a 10-second outage. The first event of an outage toasts; a socket that opens ends it.
+  const outageToastedRef = useRef(false)
 
   const { send, sendResize } = useTerminalConnection(terminalId, {
     onConnect: () => {
+      outageToastedRef.current = false
       replayPendingRef.current = connectedOnceRef.current
       connectedOnceRef.current = true
     },
     onClose: (code, reason) => {
-      if (code !== 1000) {
+      if (code !== 1000 && !outageToastedRef.current) {
+        outageToastedRef.current = true
         toast.warning(`Terminal connection closed: ${reason || code}`)
       }
     },
     onError: () => {
+      if (outageToastedRef.current) return
+      outageToastedRef.current = true
       toast.error('Terminal connection error.')
     },
     // PTY output → xterm display. Passed straight through to useTerminalConnection, which
@@ -212,6 +221,7 @@ export const TerminalView = forwardRef<TerminalViewHandle, TerminalViewProps>(fu
     terminalRef.current = term
     connectedOnceRef.current = false
     replayPendingRef.current = false
+    outageToastedRef.current = false
 
     term.loadAddon(fitAddon)
     term.open(containerRef.current)
