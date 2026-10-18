@@ -302,12 +302,16 @@ if (hasFlag('--help', '-h')) {
 // Before daemon startup so we never spin up two daemons, and before the config is loaded: --stop
 // needs only the data dir's pidfile. A load could save config.json, and `sudo turbollm --stop` (a
 // daemon started elevated) left it owned by root, mode 0600: the owner's next start could not read
-// it. The data dir is the config file's (ConfigStore.dir()).
+// it. The data dir is the config file's (ConfigStore.dir()). A daemon still booting or mid-rebind
+// is waited for (stopDaemon), and the wait is said.
 if (hasFlag('--stop')) {
-  const result = await stopDaemon(dirname(argValue('--config', defaultConfigPath())))
+  const result = await stopDaemon(dirname(argValue('--config', defaultConfigPath())), undefined, {
+    onWait: (line) => process.stdout.write(line + '\n'),
+  })
   process.stdout.write(result.message + '\n')
-  // 1 only when the daemon it found is still running (StopResult.failed), so `turbollm --stop &&
-  // …` does not carry on beside it; nothing to stop is still 0.
+  // 1 only when the daemon it found is still running, or one booting or mid-rebind did not finish
+  // in time (StopResult.failed), so `turbollm --stop && …` does not carry on beside it; nothing to
+  // stop is still 0.
   process.exit(result.failed ? 1 : 0)
 }
 

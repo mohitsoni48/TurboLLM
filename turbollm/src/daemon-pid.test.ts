@@ -670,3 +670,91 @@ test('a claim whose holder cannot be checked is aged from when it was taken, not
     cleanup()
   }
 })
+
+// A boot has no pidfile until it binds, and a rebind has nothing answering at its pidfile's address
+// until the new bind writes the new one; both hold the claim meanwhile. --stop exited 0 with "No
+// running TurboLLM daemon found" while the boot went on to start, and called the daemon mid-rebind
+// stale, its PID maybe reused, and handed out `kill -9`.
+test('--stop waits for a boot or rebind holding the claim, then stops that daemon; it is never called stale', async () => {
+  const { dir, cleanup } = makeTmpDir()
+  const daemon: ClaimRecord = { pid: 42, startedAt: 999_000 }
+  const opts = (waits: string[], claimWaitMs = 5_000) => ({
+    claimHooks: claimHooks(new Map([[daemon.pid, daemon.startedAt]])),
+    claimWaitMs,
+    onWait: (m: string) => waits.push(m),
+  })
+  /** The holder finishing: its new pidfile, then the claim given up (the listen callback's order). */
+  const finishLater = (port: number, hooks: { confirmed: boolean }) =>
+    setTimeout(() => {
+      writePidfile(dir, daemon.pid, port)
+      hooks.confirmed = true
+      releaseDataDirClaim(dir, daemon.pid)
+    }, 300)
+  const confirmable = () => {
+    const hooks = Object.assign(makeHooks(true, { platform: 'linux' }), { confirmed: false })
+    hooks.confirmTurbollm = async () => hooks.confirmed
+    return hooks
+  }
+  try {
+    // Mid-rebind: the pidfile names the old port, where nothing answers now.
+    writePidfile(dir, daemon.pid, 7000)
+    claimDataDir(dir, claimHooks(new Map()), daemon)
+    const rebind = confirmable()
+    const rebindWaits: string[] = []
+    finishLater(7001, rebind)
+    const r1 = await stopDaemon(dir, rebind, opts(rebindWaits))
+    assert.equal(r1.stopped, true, r1.message)
+    assert.equal(r1.port, 7001, 'the daemon at its new address')
+    assert.deepEqual(rebind.signals, ['SIGTERM'])
+    assert.deepEqual(rebindWaits, ['TurboLLM is starting, or moving to a new address (pid 42); waiting for it to finish…'])
+
+    // Mid-boot: no pidfile yet.
+    claimDataDir(dir, claimHooks(new Map()), daemon)
+    const boot = confirmable()
+    finishLater(6996, boot)
+    const r2 = await stopDaemon(dir, boot, opts([]))
+    assert.equal(r2.stopped, true, r2.message)
+    assert.equal(r2.port, 6996)
+
+    // A rebind that takes the claim between --stop's claim check and its probe.
+    writePidfile(dir, daemon.pid, 7000)
+    const late = confirmable()
+    late.confirmTurbollm = async () => {
+      if (late.confirmed) return true
+      claimDataDir(dir, claimHooks(new Map()), daemon)
+      finishLater(7002, late)
+      return false
+    }
+    const r3 = await stopDaemon(dir, late, opts([]))
+    assert.equal(r3.stopped, true, r3.message)
+    assert.equal(r3.port, 7002)
+
+    // A rebind that begins and ends during the probe: no claim left for the recheck to find.
+    writePidfile(dir, daemon.pid, 7000)
+    const quick = confirmable()
+    quick.confirmTurbollm = async (port) => {
+      if (port === 7003) return true
+      writePidfile(dir, daemon.pid, 7003)
+      return false
+    }
+    const r5 = await stopDaemon(dir, quick, opts([]))
+    assert.equal(r5.stopped, true, r5.message)
+    assert.equal(r5.port, 7003)
+    assert.deepEqual(quick.signals, ['SIGTERM'])
+
+    // Still at it when the wait runs out: nothing killed, the pidfile kept, and --stop exits 1.
+    writePidfile(dir, daemon.pid, 7000)
+    claimDataDir(dir, claimHooks(new Map()), daemon)
+    const stuck = confirmable()
+    const r4 = await stopDaemon(dir, stuck, opts([], 400))
+    assert.equal(r4.stopped, false)
+    assert.equal(r4.failed, true)
+    assert.match(r4.message, /^TurboLLM is starting, or moving to a new address, for .* \(pid 42\), and was not done after 1 s\. Nothing was stopped/)
+    assert.doesNotMatch(r4.message, /kill -9|stale/)
+    assert.deepEqual(stuck.signals, [])
+    assert.deepEqual(readPidfile(dir), { pid: 42, port: 7000 })
+  } finally {
+    releaseDataDirClaim(dir, daemon.pid)
+    cleanup()
+  }
+})

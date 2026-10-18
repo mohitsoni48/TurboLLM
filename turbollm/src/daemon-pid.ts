@@ -409,13 +409,38 @@ export interface StopResult {
   /** Whether a running daemon was found and stopped. */
   stopped: boolean
   /** A running daemon was found (the pid alive and a TurboLLM with that pid answering, what the
-   *  start guard counts as running) and it is still running: `turbollm --stop` exits 1. False
-   *  when there was nothing to stop, as well as when it was stopped. */
+   *  start guard counts as running) and it is still running, or a start or rebind holding the
+   *  claim was still at it when --stop gave up waiting: `turbollm --stop` exits 1. False when
+   *  there was nothing to stop, as well as when it was stopped. */
   failed: boolean
   /** The port the daemon was listening on (when stopped = true). */
   port?: number
   /** Human-readable message to print. */
   message: string
+}
+
+/** What changes each time the daemon writes its pidfile: the text, and the mtime for a rewrite of
+ *  the same text (a rebind's revert to the old address). '' when there is none. */
+function pidfileStamp(dir: string): string {
+  const path = join(dir, 'daemon.pid')
+  try {
+    return `${statSync(path).mtimeMs} ${readFileSync(path, 'utf8')}`
+  } catch {
+    return ''
+  }
+}
+
+/** How long --stop waits for a start or an in-place rebind holding the claim (daemon.lock) to
+ *  finish: past a boot's way to its bind and a rebind's drain (3 s) and busy-port retries (10 s). */
+const STOP_CLAIM_WAIT_MS = 30_000
+
+export interface StopOptions {
+  /** The claim's process checks (tests). */
+  claimHooks?: ClaimHooks
+  /** How long to wait for a start or rebind in progress (default {@link STOP_CLAIM_WAIT_MS}). */
+  claimWaitMs?: number
+  /** Told once, when --stop starts waiting for one. */
+  onWait?: (message: string) => void
 }
 
 /**
@@ -428,39 +453,75 @@ export interface StopResult {
  *
  * The pidfile is removed after a successful stop.
  */
-export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks): Promise<StopResult> {
-  const data = readPidfile(dir)
+export async function stopDaemon(dir: string, hooks: StopHooks = defaultHooks, opts: StopOptions = {}): Promise<StopResult> {
+  // A start or rebind in progress holds the claim (see the claim section) and has nothing
+  // answering at a pidfile's address: a boot has written none yet, and a rebind's old listener is
+  // closed until its new bind writes the new one. --stop then exited 0 with "No running TurboLLM
+  // daemon found" while a boot went on to start, or called the daemon mid-rebind stale, said its
+  // PID may have been reused and handed out `kill -9`. So it waits for the holder to finish, then
+  // stops the daemon its pidfile names; one that does not finish in time is reported as such and
+  // exits 1, without anything being killed.
+  const claimPath = join(dir, 'daemon.lock')
+  const claimHooks = opts.claimHooks ?? defaultClaimHooks
+  const deadline = Date.now() + (opts.claimWaitMs ?? STOP_CLAIM_WAIT_MS)
+  let waiting = false
+  let data: PidfileData | null
+  for (;;) {
+    const holder = liveClaimHolder(claimPath, claimHooks, ownClaimRecord())
+    if (holder) {
+      const who = holder.pid ? ` (pid ${holder.pid})` : ''
+      if (Date.now() >= deadline) {
+        return {
+          stopped: false,
+          failed: true,
+          message:
+            `TurboLLM is starting, or moving to a new address, for ${dir}${who}, and was not done after ` +
+            `${Math.ceil((opts.claimWaitMs ?? STOP_CLAIM_WAIT_MS) / 1000)} s. Nothing was stopped: run \`turbollm --stop\` again once it is up.`,
+        }
+      }
+      if (!waiting) opts.onWait?.(`TurboLLM is starting, or moving to a new address${who}; waiting for it to finish…`)
+      waiting = true
+      await new Promise<void>((r) => setTimeout(r, 250))
+      continue
+    }
 
-  if (!data) {
-    return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
-  }
+    const stamp = pidfileStamp(dir) // see the recheck after the probe
+    data = readPidfile(dir)
+    if (!data) {
+      return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
+    }
 
-  const { pid, port } = data
+    // Check if the process is actually still alive before attempting to stop it.
+    if (!hooks.processExists(data.pid)) {
+      removeOwnPidfile(dir, data.pid)
+      return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
+    }
 
-  // Check if the process is actually still alive before attempting to stop it.
-  if (!hooks.processExists(pid)) {
-    removeOwnPidfile(dir, pid)
-    return { stopped: false, failed: false, message: 'No running TurboLLM daemon found.' }
-  }
-
-  // Identity check (guards against a recycled PID): the pidfile is removed on every
-  // clean-exit path, so a stale pidfile only survives a hard kill — and if the OS then
-  // reassigns that PID to an unrelated process, blindly killing it would be a footgun
-  // (worse on Windows, where taskkill /T also kills the child tree). Confirm a TurboLLM
-  // daemon is actually answering on the recorded port before we kill the PID. If it
-  // isn't, refuse and hand the user the manual command rather than risk the wrong process.
-  if (!(await hooks.confirmTurbollm(port, data.host, pid))) {
-    const manual = hooks.platform === 'win32' ? `taskkill /PID ${pid} /T /F` : `kill -9 ${pid}`
+    // Identity check (guards against a recycled PID): the pidfile is removed on every
+    // clean-exit path, so a stale pidfile only survives a hard kill — and if the OS then
+    // reassigns that PID to an unrelated process, blindly killing it would be a footgun
+    // (worse on Windows, where taskkill /T also kills the child tree). Confirm a TurboLLM
+    // daemon is actually answering on the recorded port before we kill the PID. If it
+    // isn't, refuse and hand the user the manual command rather than risk the wrong process.
+    if (await hooks.confirmTurbollm(data.port, data.host, data.pid)) break
+    // A rebind that began after the check above: it takes the claim before it closes the old listener.
+    if (liveClaimHolder(claimPath, claimHooks, ownClaimRecord())) continue
+    // One that began and ended during the probe (took the claim, bound, wrote its new pidfile and
+    // gave the claim up) leaves no claim to find: its pidfile, rewritten, names where it answers now.
+    if (pidfileStamp(dir) !== stamp) continue
+    const manual = hooks.platform === 'win32' ? `taskkill /PID ${data.pid} /T /F` : `kill -9 ${data.pid}`
     return {
       stopped: false,
       // Not a failure: nothing the start guard counts as a running daemon was found.
       failed: false,
       message:
-        `Found a pidfile (pid ${pid}, port ${port}), but no TurboLLM daemon with that pid is responding there — ` +
+        `Found a pidfile (pid ${data.pid}, port ${data.port}), but no TurboLLM daemon with that pid is responding there — ` +
         `it may be stale or the PID was reused by another process. Not killing it automatically.\n` +
         `If you're sure it's TurboLLM, stop it manually: ${manual}`,
     }
   }
+
+  const { pid, port } = data
 
   let refused: string | undefined
   try {
