@@ -954,6 +954,62 @@ test("a pi Code routine's model restore waits for a gate holder that started dur
   assert.deepEqual(gate.stats(), { inFlight: 0, queued: 0, capacity: 1 })
 })
 
+// A Deny runs nothing on the engine (both runners end the run without a request), yet it took the
+// gate and loaded the routine's model first. While the user chatted it waited and timed out, and
+// once the routine's model was gone it answered model_unavailable on every try: the run stayed
+// stalled for good.
+test("a Deny ends a stalled run without loading the routine's model, even when that model is gone", async () => {
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'm' })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const stallStub = stubFetchStall()
+  try { await executeRoutine(d, routine, run) } finally { stallStub.restore() }
+  assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval')
+
+  // The user has another model loaded now, and the routine's model is no longer in the library.
+  ;(d as unknown as { manager: Manager }).manager = {
+    status: () => ({ state: 'running', model: { key: 'other' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+  } as unknown as Manager
+  ;(d.modelRouter as unknown as ModelRouter).loadExplicit = async (key: string) => {
+    loadCalls.push(key)
+    return { status: 503, message: `No model matching '${key}' found. Add one in TurboLLM.` } // ModelRouter's own answer
+  }
+
+  const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'deny')
+  assert.deepEqual(res, { ok: true })
+  const final = db.getRoutineRun(run.id)!
+  assert.equal(final.status, 'errored')
+  assert.match(final.error ?? '', /denied by user/)
+  assert.ok(final.endedAt)
+  assert.deepEqual(loadCalls, [], 'nothing is loaded for a Deny')
+})
+
+test('a Deny ends a stalled pi Code run at once while another caller holds the gate', async () => {
+  const gate = new GenerationGate(() => 1)
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'other', gate })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'p', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60000 }, modelKey: 'm', workspacePath: tmpDir('execute-pi-deny-'), codingAgent: 'pi', permissionMode: 'ask' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const conv = db.createConversation({ kind: 'code', modelKey: 'm' })
+  stallRoutineRun(db, run.id, { convId: conv.id, assistantContent: '', precedingCalls: [], call: { id: 'c1', name: 'bash', args: {} }, sessionId: conv.id })
+  const holder = await gate.acquire('fg') // the user's chat turn
+
+  const denied = resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'deny')
+  try {
+    const res = await Promise.race([denied, new Promise((r) => setTimeout(() => r('still waiting for the gate'), 500))])
+    assert.deepEqual(res, { ok: true })
+    const final = db.getRoutineRun(run.id)!
+    assert.equal(final.status, 'errored')
+    assert.match(final.error ?? '', /denied by user/)
+    assert.equal(final.pendingToolCall, '')
+    assert.deepEqual(loadCalls, [])
+    assert.deepEqual(gate.stats(), { inFlight: 1, queued: 0, capacity: 1 }, 'the Deny never queued for the gate')
+  } finally {
+    holder()
+  }
+  await denied
+})
+
 // withPinnedModel can report 'skip-comfyui-busy' without ever running fn. resumeRoutineRun
 // used to fall through to {ok:true}, leaving its claim at 'running' forever (and every retry 409).
 test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', async () => {

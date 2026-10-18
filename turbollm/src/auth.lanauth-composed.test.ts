@@ -1808,8 +1808,9 @@ test("an agent with the owner's MCP tool, or a chat routine on one, needs a key:
       if (!remote) {
         assert.equal((await send('POST', '/api/v1/routines', { ...create, agentId: OWNER_PLAIN_AGENT.id })).status, 201, caller.name)
         assert.equal((await send('PUT', `/api/v1/routines/${mcp.active.id}/pause`)).status, 200, caller.name)
-        const denied = await errorOf(await send('POST', `/api/v1/routines/${plain.active.id}/runs/${mcpCallOnPlainAgent}/deny`))
-        assert.equal(denied.code, 'gate_timeout', `${caller.name}: a deny passes the gates`)
+        const denied = await send('POST', `/api/v1/routines/${plain.active.id}/runs/${mcpCallOnPlainAgent}/deny`)
+        assert.equal(denied.status, 200, `${caller.name}: a deny passes the gates`)
+        assert.equal(h.db.getRoutineRun(mcpCallOnPlainAgent)?.status, 'errored', `${caller.name}: the deny ends the run`)
       }
     } finally {
       restoreJwks()

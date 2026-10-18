@@ -412,9 +412,9 @@ export async function executeRoutine(
  *  nothing else can interleave — flipping its status away from 'needs_approval' to CLAIM it
  *  before any async work starts. A second concurrent call for the same run id then sees a
  *  non-'needs_approval' status and fails cleanly with 'not_stalled' instead of double-dispatching.
- *  If the claim is made but dispatch never actually runs (gate timeout, model busy, model load
- *  failed, or dispatch throwing outright), the claim is reverted so the run can still be retried
- *  later. */
+ *  If the claim is made but dispatch never actually runs (an Approve's gate timeout, busy model or
+ *  failed model load, or dispatch throwing outright), the claim is reverted so the run can still be
+ *  retried later. A Deny takes neither the gate nor the routine's model (see below). */
 export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allow' | 'deny'): Promise<{ ok: true } | { ok: false; code: string; message: string }> {
   const current = d.db.getRoutineRun(run.id)
   if (!current || current.status !== 'needs_approval') return { ok: false, code: 'not_stalled', message: 'This run is not awaiting approval.' }
@@ -438,6 +438,21 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
   // concurrent second call fail cleanly instead of double-executing the approved action.
   d.db.updateRoutineRun(current.id, { status: 'running' })
   const revertClaim = () => d.db.updateRoutineRun(current.id, { status: 'needs_approval' })
+
+  // A Deny runs nothing on the engine: both runners end the run on it without a request
+  // (chat-runner.ts and code-runner.ts's deny branches). It used to take the gate and load the
+  // routine's model first, like an Approve: while the user was chatting it waited out the gate and
+  // answered gate_timeout, it swapped the user's model out and back for nothing, and once the
+  // routine's model was gone every Deny answered model_unavailable, so the run stayed stalled.
+  if (decision === 'deny') {
+    try {
+      finalizeOutcome(d, current.id, await dispatchResume(d, routine, current, pending, 'deny', new AbortController().signal))
+    } catch (e) {
+      revertClaim() // see the catch below
+      throw e
+    }
+    return { ok: true }
+  }
 
   const deadline = createRunDeadline()
   try {
