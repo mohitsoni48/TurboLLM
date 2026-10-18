@@ -210,7 +210,7 @@ export const EXT_ROUTES: RouteSpec[] = [
   },
   {
     method: 'GET', path: '/runs',
-    summary: 'List runs for the tenant.',
+    summary: "List the caller's recent runs: the newest 100 stored and any still held in memory, never older ones.",
     scope: 'chats:read', responseSchema: 'RunPage', errors: CHAT_ERRORS,
   },
   {
@@ -464,10 +464,13 @@ function buildSchemas(): Record<string, JsonSchema> {
   }
 
   // NOT `pageOf('Run')`, for the same reason as AuditPage: GET /runs (routes.runs.ts) returns
-  // exactly `{ data: [...] }` — no cursor, no has_more/next_cursor.
+  // exactly `{ data: [...] }` — no cursor, no has_more/next_cursor. "The caller's runs" alone
+  // read as every run the owner has, while PublicRunManager.list() returns the runs this daemon
+  // still holds (server.ts prunes an ended one after an hour) plus ConversationStore.listExtRuns's
+  // newest 100 stored rows, and nothing older.
   const RunPage: JsonSchema = {
     type: 'object',
-    description: "The caller's runs. Not cursor-paginated.",
+    description: "The caller's recent runs, not all of them: those this daemon started that are still running or ended within about the last hour, plus the caller's newest 100 stored runs. An older run is not listed and no cursor pages to it, but GET /runs/{id} still reads it by id.",
     properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Run' } } },
     required: ['data'],
   }

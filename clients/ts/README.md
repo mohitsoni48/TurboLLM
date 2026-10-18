@@ -145,7 +145,9 @@ try {
 
 `chats.list` and `messages.list` return the cursor-paginated envelope `{ data, has_more,
 next_cursor }` — pass `next_cursor` back in as `cursor` to page forward.
-`runs.list` returns the runs as a plain array: the server does not page them.
+`runs.list` returns the runs as a plain array, and only the recent ones: the owner's newest 100
+stored runs and any the daemon still holds in memory. The server does not page them, so an
+older run is reachable only by id through `runs.get`.
 
 ## Testing
 

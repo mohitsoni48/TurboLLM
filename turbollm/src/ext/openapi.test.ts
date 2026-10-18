@@ -365,7 +365,7 @@ const KEY_LOCAL = 'tllm-ext-openapi-local'
 /** A real chat + run route set over a temp store. `adapter: false` leaves the chat store with no
  *  adapter, which is how every non-local tenant's store call gets 501 not_supported. `wrap`
  *  stands in for a third-party adapter around the temp store. */
-function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatStore }) {
+function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatStore; runDb?: boolean }) {
   const dir = tmpDir('turbollm-ext-openapi-status-')
   const conv = new ConversationStore(dir)
   const d = {
@@ -382,11 +382,12 @@ function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatSt
       target: () => 'http://127.0.0.1:9999',
     },
   } as never
-  const runs = new PublicRunManager()
+  // `runDb`: run records go to the conversation DB, as the daemon's do.
+  const runs = new PublicRunManager(opts.runDb ? { db: conv } : undefined)
   const app = new Hono()
   registerExtChatRoutes(app, d, undefined, runs)
   registerExtRunRoutes(app, d, runs, { makeBody: () => async () => ({ status: 'complete' as const }) })
-  return { app, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+  return { app, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
 }
 
 // The documented error statuses drifted from what the routes send — 403 (scope / local
@@ -482,6 +483,40 @@ test('GET /runs response body satisfies every field its own documented schema re
     for (const field of required) {
       assert.ok(field in responseBody, `${schemaName} declares "${field}" required, but the real GET /runs response has no such key (got: ${Object.keys(responseBody).join(', ')}) — schema/route drift`)
     }
+  } finally {
+    h.cleanup()
+  }
+})
+
+// RunPage said "The caller's runs. Not cursor-paginated." and the summary "List runs for the
+// tenant.", which read as every run the owner has. The route lists the runs the daemon still
+// holds plus the owner's newest 100 stored ones (ConversationStore.listExtRuns's LIMIT), so an
+// integrator walking GET /runs for its history silently missed every older run.
+test('GET /runs documents that it lists the newest 100 stored runs, not all of them, as the route does', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const runPage = doc.components.schemas.RunPage as { description?: string }
+  const summary = (doc.paths['/api/ext/v1/runs'].get as { summary?: string }).summary ?? ''
+  assert.match(runPage.description ?? '', /newest 100 stored runs/)
+  assert.match(runPage.description ?? '', /not all of them/)
+  assert.match(summary, /newest 100 stored/)
+
+  const h = statusHarness({ adapter: true, runDb: true })
+  try {
+    // 105 stored runs of the default owner (the one a request without ?owner= reads), none in
+    // memory: a fresh process after a restart.
+    for (let i = 0; i < 105; i++) {
+      const at = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString()
+      h.db.upsertExtRun({
+        id: `run_${String(i).padStart(3, '0')}`, chatId: 'c', messageId: 'm', tenant: 'acme', owner: 'default',
+        status: 'complete', eventSeq: 1, error: null, createdAt: at, endedAt: at,
+      })
+    }
+    const auth = { headers: { Authorization: `Bearer ${KEY_FULL}` } }
+    const listed = ((await (await h.app.request('/api/ext/v1/runs', auth)).json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)
+    assert.equal(listed.length, 100)
+    for (let i = 0; i < 5; i++) assert.ok(!listed.includes(`run_00${i}`), `the 5 oldest are not listed (run_00${i})`)
+    // ...and an unlisted run is still read by id, as the description says.
+    assert.equal((await h.app.request('/api/ext/v1/runs/run_000', auth)).status, 200)
   } finally {
     h.cleanup()
   }
