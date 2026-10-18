@@ -203,6 +203,16 @@ test('the packaged Android app never wires a restart (exiting its in-process Nod
   assert.ok(CLI.includes('if (!packagedAndroidApp()) deps.requestRestart = ('))
 })
 
+// The app updates through the Play Store; the npm check reached registry.npmjs.org from the phone
+// at every launch, for a release nothing there can apply. With no checker, GET /api/v1/app/update
+// answers "no update" (routes.ts) and the boot check does not run.
+test('the packaged Android app never checks npm for an app update', () => {
+  assert.ok(CLI.includes('const appUpdates = packagedAndroidApp() ? undefined : new AppUpdateChecker(version)'))
+  assert.equal(CLI.split('new AppUpdateChecker(').length, 2, 'one checker')
+  assert.match(CLI, /if \(appUpdates\) setTimeout\(\(\) => \{\n\s*void appUpdates\n\s*\.check\(/, 'the boot check needs the checker')
+  assert.equal(CLI.split('appUpdates.check(').length, 1, 'no other check from cli.ts')
+})
+
 // The finalize's restore passes `restoreAfter` (ModelRouter.undoSwapRecord): dropped here, a keep-N 2 restore that
 // found the user's model still running left the routine's model recorded as the one last loaded. The behaviour is
 // tested in routines/cli-interactive-runner.test.ts against a real router.

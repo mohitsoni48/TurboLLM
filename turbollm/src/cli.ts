@@ -557,7 +557,12 @@ const startedAt = Date.now()
 // App self-update checker (F-006, ADR-031): is a newer TurboLLM published on npm than
 // the version we're running? Informational only — npm does the upgrade. The route serves
 // this cache offline-first; the startup check below warms it so the chip is ready.
-const appUpdates = new AppUpdateChecker(version)
+// None in the packaged Android app: it updates through the Play Store (classifyInstall's
+// 'android'), nothing there can apply an npm release, and the check reached
+// registry.npmjs.org from the phone at every launch and every stale Settings read. Without a
+// checker the route answers "no update" (it already did for this case). Termux is an npm
+// install and keeps it.
+const appUpdates = packagedAndroidApp() ? undefined : new AppUpdateChecker(version)
 // Pluggable chat storage (spec 27 §4.5): compose the tenant-dispatching router here. A
 // misconfigured adapter must stop the daemon with a message the operator can act on —
 // never surface later as mysterious per-request failures, and never silently fall back
@@ -983,7 +988,7 @@ registerSpaFallback(app)
 // Warm the app-update cache shortly after boot (ADR-031: "once per daemon start") so the
 // Settings chip is ready without the user clicking refresh. Offline-silent; unref'd so it
 // never holds the process open. The 24h re-check is on-demand when the cache goes stale.
-setTimeout(() => {
+if (appUpdates) setTimeout(() => {
   void appUpdates
     .check(AbortSignal.timeout(10_000))
     .then(async (status) => {
