@@ -320,6 +320,50 @@ test('remote routes: a Start sent during a Stop waits for it, then answers with 
   }
 })
 
+// The remote token is cached for the daemon process's lifetime so a reconnect re-shows it, and
+// `cachedRemoteToken ??= provisionRemoteApiKey(...)` kept it whether or not its key was still
+// stored. Once the owner revoked that key (Customize → Connect, DELETE /api/v1/keys/:id), the
+// next Start still answered with the cached token, which no request over the tunnel accepts.
+test('remote routes: Start answers with a token whose key is stored, minting afresh once the cached one was revoked', async () => {
+  const cfg = defaultConfig()
+  cfg.daemon.experimental.remoteAccess = true
+  const d = {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '' },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+    remote: {
+      ingressPort: () => 6997,
+      state: () => ({ kind: 'connected', url: 'https://x.test', since: '2026-09-10T00:00:00Z' }),
+      url: () => 'https://x.test',
+      enable: async () => {},
+      disable: async () => {},
+    },
+  } as unknown as Deps
+  const app = new Hono()
+  registerRemoteApi(app, d)
+  registerApi(app, d)
+  const start = async () => ((await (await app.request('/api/v1/remote/start', { method: 'POST' }, LOCAL_ENV)).json()) as { token?: string }).token
+  const remoteKeys = () => cfg.apiKeys.filter((k) => k.grant?.kind === 'remote')
+  // The cache is module state: clear whatever an earlier test in this file left in it.
+  assert.equal((await app.request('/api/v1/remote/stop', { method: 'POST' }, LOCAL_ENV)).status, 200)
+
+  const first = await start()
+  assert.ok(first && verifyKeyValue(first, d, { ingress: true }))
+  assert.equal(await start(), first, 'a reconnect re-shows the same token')
+
+  // Revoked from the key list, as the owner would.
+  const [revoked] = remoteKeys()
+  assert.equal((await app.request(`/api/v1/keys/${revoked.id}`, { method: 'DELETE' }, LOCAL_ENV)).status, 200)
+  assert.equal(verifyKeyValue(first, d, { ingress: true }), false)
+
+  const second = await start()
+  assert.ok(second && second !== first, 'a fresh token, not the revoked one')
+  assert.equal(verifyKeyValue(second, d, { ingress: true }), true, 'the token shown works over the tunnel')
+  assert.equal(remoteKeys().length, 1)
+  assert.equal(await start(), second, 'and is the one re-shown from then on')
+  assert.equal(remoteKeys().length, 1, 'with no key minted on top of it')
+})
+
 test('settings: secrets are write-only — GET reports only whether one is stored', () => {
   // Mirrors settingsPayload's redaction (spec 30 T-11). A payload that echoed the token back
   // would put a live Cloudflare credential into every settings poll the browser makes.
