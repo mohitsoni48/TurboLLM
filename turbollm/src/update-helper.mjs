@@ -23,8 +23,8 @@
 // which is what the restarted daemon reads once on boot and surfaces as a toast. A
 // failed install leaves the old version installed and simply relaunches it.
 
-import { spawn } from 'node:child_process'
-import { fchmodSync, openSync, writeFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { fchmodSync, openSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 /** How long to wait for the old daemon to actually exit before giving up. Must comfortably
@@ -52,16 +52,37 @@ function writeResult(ok, error) {
   }
 }
 
+/** Whether `pid` has exited and only waits for its parent to reap it (a zombie). Signal 0 still
+ *  reaches a zombie, so a daemon whose parent does not reap it (a Python Popen handle kept and
+ *  never waited on, a container PID 1 that is not an init) read as alive through the whole wait
+ *  below: the update was abandoned and nothing relaunched the daemon, which was gone. False when
+ *  it cannot be told. Windows has none to tell: libuv's signal 0 there checks the exit code. The
+ *  same test as daemon-pid.ts's isZombie, which this file may not import (see the header). */
+function isZombie(pid) {
+  if (process.platform === 'win32') return false
+  try {
+    if (process.platform === 'linux' || process.platform === 'android') {
+      // `<pid> (<comm>) <state> …`; the command name may hold spaces and parentheses.
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
+      return /^[ZX]/.test(stat.slice(stat.lastIndexOf(')') + 2))
+    }
+    const r = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8', timeout: 5_000 })
+    return /^\s*Z/.test(String(r.stdout ?? ''))
+  } catch {
+    return false
+  }
+}
+
 /** Is the daemon PID still alive? `kill(pid, 0)` is the portable liveness probe: it sends
  *  no signal and throws ESRCH once the process is gone. EPERM means it exists but belongs
- *  to someone else — still alive, so keep waiting. */
+ *  to someone else — still alive, so keep waiting. A zombie is gone (isZombie). */
 function alive(pid) {
   try {
     process.kill(pid, 0)
-    return true
   } catch (e) {
-    return e && e.code === 'EPERM'
+    if (!e || e.code !== 'EPERM') return false
   }
+  return !isZombie(pid)
 }
 
 async function waitForExit(pid) {
