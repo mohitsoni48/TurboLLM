@@ -8,6 +8,7 @@ import { defaultConfig, type ConfigStore } from '../config/config'
 import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
+import { GenerationGate } from '../agents/gate'
 
 function fakeDeps(opts: { loadedKey: string | null; state?: string; activeRequests?: number }): { deps: ModelSwapDeps; loadCalls: string[] } {
   const loadCalls: string[] = []
@@ -198,6 +199,42 @@ test('a pinned model that fails to load after the user model was stopped reloads
   assert.equal(st.model?.key, userModel.key)
 })
 
+// A pi Code routine lets go of the gate while its session runs and takes it back for the restore
+// (execute.ts pinnedGate). When the wait for it timed out (the gate's 3-minute queue limit), the
+// restore ran anyway and stopped the engine under the generation still holding the only slot.
+/** The routine's own hold on a one-slot gate, for the swap decision and load, given back before
+ *  `fn` and asked for again with a 30 ms queue limit; `takeSlot` is another caller (a chat
+ *  routine, a compaction) that takes the slot mid-run and keeps it. */
+async function heldGate() {
+  const gate = new GenerationGate(() => 1)
+  const release = await gate.acquire('bg')
+  let holder: (() => void) | undefined
+  return {
+    gate,
+    swapGate: { release, reacquire: () => gate.acquire('bg', { timeoutMs: 30 }) },
+    takeSlot: async () => { holder = await gate.acquire('bg') },
+    releaseSlot: () => holder?.(),
+  }
+}
+
+test('a restore that cannot take the gate back is skipped while another holder still has it', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { manager, modelRouter, userModel, routineModel } = await realEngineSetUp(t)
+  const first = await modelRouter.loadExplicit(userModel.key)
+  assert.ok('target' in first, JSON.stringify(first))
+  const held = await heldGate()
+  t.after(held.releaseSlot)
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, held.takeSlot, held.swapGate)
+
+  assert.equal(result.outcome, 'ran')
+  const st = manager.status()
+  assert.equal(st.state, 'running', `got ${st.state} (${st.err?.message ?? ''})`)
+  assert.equal(st.model?.key, routineModel.key, 'no restore while the holder still generates')
+  assert.deepEqual(held.gate.stats(), { inFlight: 1, queued: 0, capacity: 1 }, 'only the other holder is in the gate')
+})
+
 // A ComfyUI render that begins while a routine runs unloads the routine's model and keeps it for its release() to
 // reload. The routine's restore of the user's model then meets the render and is refused, and nothing recorded it:
 // when the render ended, the guard brought the routine's model back, and the user's model stayed unloaded. The model
@@ -356,6 +393,27 @@ test('with keep-N 2 a model recorded while the routine ran stays recorded after 
   })).outcome, 'ran')
 
   assert.deepEqual(store.snapshot().lastLoaded, meanwhile)
+})
+
+// The same gate wait with keep-N 2 and a free pool slot: the user's model kept its slot, so its restore stops nothing
+// and only puts back the model last loaded. Skipped along with the load, the swap's record stayed and the next start
+// resumed the routine's model.
+test('with keep-N 2 a restore that cannot take the gate back still puts back the model last loaded', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, manager, modelRouter, userModel, routineModel } = await keepN2(t)
+  const held = await heldGate()
+  t.after(held.releaseSlot)
+
+  const result = await withPinnedModel({ manager, modelRouter }, routineModel.key, async () => {
+    assert.equal(store.snapshot().lastLoaded.modelKey, routineModel.key, "the swap loaded the routine's model into a pool slot")
+    await held.takeSlot()
+  }, held.swapGate)
+
+  assert.equal(result.outcome, 'ran')
+  assert.equal(manager.status().model?.key, userModel.key, "the primary kept the user's model")
+  assert.deepEqual(store.snapshot().lastLoaded, { modelKey: userModel.key, engineId: 'fake' }, "the next start resumes the user's model")
+  assert.deepEqual(held.gate.stats(), { inFlight: 1, queued: 0, capacity: 1 }, 'only the other holder is in the gate')
 })
 
 // A render that begins while the routine runs unloads the user's model from the primary, keeps it for its release() to

@@ -34,7 +34,9 @@ export interface ModelSwapDeps {
 export interface SwapGate {
   /** Lets go of the gate right before `fn` runs. */
   release: () => void
-  /** Takes it again for the restore, so the restore waits for whoever is generating by then. */
+  /** Takes it again for the restore, so the restore waits for whoever is generating by then. A
+   *  rejection (the gate's queue timeout) skips any restore that would load: someone still holds
+   *  the gate. */
   reacquire: () => Promise<() => void>
 }
 
@@ -49,7 +51,8 @@ export interface SwapGate {
  * that fails to load or a swap a ComfyUI render refused: either may already have stopped the user's
  * model. A restore a render refuses is left to that render's release (ModelRouter.reloadAfterRender).
  * With `gate`, the caller holds the GenerationGate on entry: it is released right before `fn` and
- * taken again around the restore (see {@link SwapGate}).
+ * taken again around the restore (see {@link SwapGate}); a restore that cannot take it back does
+ * not load, so it never stops the engine under the generation that still holds it.
  */
 export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: () => Promise<void>, gate?: SwapGate): Promise<ModelSwapOutcome> {
   const currentlyLoaded = deps.manager.status().model?.key ?? null
@@ -89,13 +92,35 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
     await fn()
   } finally {
     if (currentlyLoaded) {
-      // A gate that cannot be taken back (its queue timeout: a holder leaked its release) does not
-      // stop the restore, which must never be skipped.
-      const unlock = gate ? await gate.reacquire().catch(() => undefined) : undefined
-      try {
-        await restore(deps, currentlyLoaded, pinnedModel, swapResult)
-      } finally {
-        unlock?.()
+      // The restore stops the engine as the swap did, so it waits for the gate as the swap did. A
+      // re-acquire that fails is the gate's 3-minute queue timeout: someone still holds the slot,
+      // a chat routine, a compaction or title call, or a holder that leaked its release. Restoring
+      // anyway stopped the engine under that generation, so the restore loads nothing then: the
+      // routine's model stays loaded, and the next load (a request's auto-swap, a manual load)
+      // replaces it. With keep-N 2 or more the swap took a free pool slot, or in a full pool
+      // evicted the model used least recently. When that was another model, the user's is still
+      // running and its restore stops nothing: it only undoes the swap's record of the model last
+      // loaded, and still does (`runningOnly`), or the next daemon start resumed the routine's
+      // model. A swap that evicted the user's model is left as with keep-N 1, warning included.
+      let unlock: (() => void) | undefined
+      let gateHeld = false
+      if (gate) {
+        try {
+          unlock = await gate.reacquire()
+        } catch (e) {
+          gateHeld = true
+          const kept = await restore(deps, currentlyLoaded, pinnedModel, swapResult, { runningOnly: true })
+          if (!kept || 'status' in kept) {
+            console.warn(`[routines] not restoring '${currentlyLoaded}' after a routine run: the generation gate is still held (${e instanceof Error ? e.message : String(e)}), and the restore would stop the engine under it. '${pinnedModel}' stays loaded.`)
+          }
+        }
+      }
+      if (!gateHeld) {
+        try {
+          await restore(deps, currentlyLoaded, pinnedModel, swapResult)
+        } finally {
+          unlock?.()
+        }
       }
     }
   }
@@ -104,10 +129,11 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
 
 /** Reload the model that was loaded before the routine's swap: the same loadExplicit() the swap made. Best effort.
  *  Handed the swap's result (`swap`), a restore that finds that model still running (keep-N 2 or more: the swap took a
- *  pool slot) puts back the model last loaded that the swap's record replaced (ModelRouter.undoSwapRecord). */
-async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: string, swap: RouteResult): Promise<void> {
+ *  pool slot) puts back the model last loaded that the swap's record replaced (ModelRouter.undoSwapRecord).
+ *  `runningOnly` (LoadExplicitOpts): only that, never a load. The result, or undefined when the load threw. */
+async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: string, swap: RouteResult, opts: { runningOnly?: boolean } = {}): Promise<RouteResult | undefined> {
   try {
-    const result = await deps.modelRouter.loadExplicit(modelKey, undefined, { restoreAfter: swap })
+    const result = await deps.modelRouter.loadExplicit(modelKey, undefined, { restoreAfter: swap, ...opts })
     // A ComfyUI render that began while the routine ran (or during its swap) keeps the routine's model, or the
     // routine's paused load, for its release() to load, and the restore is refused until that render ends. Dropped,
     // the render's end brought the routine's model back and left the user's unloaded: the render's release reloads
@@ -116,7 +142,9 @@ async function restore(deps: ModelSwapDeps, modelKey: string, pinnedModel: strin
     if ('status' in result && result.message.includes('ComfyUI is rendering')) {
       deps.modelRouter.reloadAfterRender(modelKey, pinnedModel)
     }
+    return result
   } catch (e) {
     console.warn(`[routines] failed to restore the previously-loaded model after a routine run: ${e instanceof Error ? e.message : String(e)}`)
+    return undefined
   }
 }

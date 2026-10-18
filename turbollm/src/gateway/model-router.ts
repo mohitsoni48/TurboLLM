@@ -19,12 +19,17 @@ import { modelLoadsRefused } from '../auth'
 /** loadExplicit's options. `restoreAfter`: the load is a routine's restore of the model its swap displaced (routines/
  *  model-swap.ts, cli-routine.ts, cli-interactive-runner.ts), and this is that swap's own result. A restore that finds
  *  its model still running undoes the swap's record of the model last loaded (see ModelRouter.undoSwapRecord).
+ *  `runningOnly`: take only doLoad's fast paths, which stop nothing; a model that is not running is refused, not
+ *  loaded. For a routine's restore that could not take the GenerationGate back (model-swap.ts): with keep-N 2 or more
+ *  the user's model keeps its slot unless the swap evicted it as the one used least recently, and that restore still
+ *  undoes the swap's record.
  *  `manual`: the user asked for this load by hand (startEngine's side models: an embedding or Laya model's Load). It
  *  starts on the selected engine even when that engine is not expected to run the model, and fails with the engine's
  *  own error, as startEngine's chat-model load does (compat.ts manualLoadRefusal). Every other load (route(), a
  *  routine's swap and restore, the boot resume) is refused for such a model before anything is unloaded. */
 export interface LoadExplicitOpts {
   restoreAfter?: RouteResult
+  runningOnly?: boolean
   manual?: true
 }
 
@@ -537,6 +542,8 @@ export class ModelRouter {
         return this.served(slot.manager, slot.manager.target()!)
       }
     }
+    // Checked under the swap lock, so nothing can stop the model between the fast paths above and this answer.
+    if (explicit?.runningOnly) return { status: 503, message: `'${entry.name}' is not running.` }
 
     if (this.comfy?.isBlocked()) {
       return { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' }
