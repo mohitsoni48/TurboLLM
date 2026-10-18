@@ -352,7 +352,10 @@ export async function removeSessionWorktree(repoRoot: string, worktreePath: stri
   const prefix = asked.stdout.replace(/\r?\n$/, '')
   // Outside any repository (rev-parse fails) the missing path is no prefix of anything.
   const parts = [...prefix.split('/').filter(Boolean), ...(asked.ok ? missing : [])]
-  const tail = worktreePath.split(/[\\/]+/).filter(Boolean).slice(-parts.length)
+  // `\` separates only on Windows. On POSIX it is a filename character: split on it, the tail of a
+  // session started at <repo>/pkg\web was `web`, never the prefix `pkg\web`, so only the session's
+  // own folder was tried ("is not a working tree") and the worktree stayed registered.
+  const tail = worktreePath.split(process.platform === 'win32' ? /[\\/]+/ : /\/+/).filter(Boolean).slice(-parts.length)
   const targets = parts.length > 0 && tail.join('/') === parts.join('/')
     ? [resolve(worktreePath, ...parts.map(() => '..')), worktreePath]
     : [worktreePath]

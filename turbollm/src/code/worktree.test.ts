@@ -603,6 +603,33 @@ test('REGRESSION: a subfolder session\'s worktree is removed even when its folde
   }
 })
 
+// The stored path's tail was compared with the folder's prefix after splitting it on `\` too. On
+// POSIX `\` is a filename character, so a session started at `<repo>/pkg\web` (one folder) had a
+// tail of `web` against the prefix `pkg\web`: only the session's own folder was tried, git said
+// "is not a working tree", and the worktree stayed registered with its branch checked out there.
+test('REGRESSION: on POSIX a subfolder session\'s worktree is removed when the folder name has a backslash', { skip: process.platform === 'win32' }, async () => {
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'pkg\\web')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.equal(r.path, join(root, WORKTREES_SUBDIR, 'feat', 'pkg\\web'))
+
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR, 'feat')), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('REGRESSION: a worktree is removed when the base was a link into a subfolder the base checkout no longer has', async () => {
   // <tmp>/home/web -> <tmp>/repo/packages/web, and the base checks out a branch without it: the link
   // dangles. Walking up from the link's own name stopped at <tmp>/home, in no repository, so
