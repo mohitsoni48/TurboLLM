@@ -14,7 +14,7 @@ import {
   migrateLegacyDataDir,
   resolveIngressPort,
 } from './config/config'
-import { setGithubTokenProvider } from './engines/download'
+import { restoreInterruptedTurboquantUpdate, setGithubTokenProvider } from './engines/download'
 import { Manager, killTrackedEnginesSync, reapStaleEngines } from './engines/manager'
 import { ComfyGuard } from './engines/comfy-guard'
 import { Registry } from './engines/registry'
@@ -437,12 +437,14 @@ try {
 
 const registry = new Registry(store)
 // A zip or release install whose swap died half-way (the daemon exited between parking the old build and moving the
-// new one in), or a rebuild the daemon's exit cut short, left the engine's only build parked under a hidden name: put
-// it back before anything looks for it.
+// new one in), a rebuild the daemon's exit cut short, or a TurboQuant update cut off before its new build passed the
+// probe, left the engine's only build parked under a hidden name: put it back before anything looks for it.
 {
   const claimedBinPaths = [...registry.list().engines, ...registry.customSources()].map((e) => e.binPath)
   restoreParkedInstalls(join(store.dir(), 'engines'), claimedBinPaths)
   restoreInterruptedBuilds(join(store.dir(), 'engines'), claimedBinPaths, (l) => console.log(l))
+  if (!restoreInterruptedTurboquantUpdate(join(store.dir(), 'engines')))
+    console.warn('could not put back the TurboQuant build an interrupted update kept at engines/.turboquant-old; the next update or Install retries')
 }
 const pruned = registry.pruneDeadManagedBuilds()
 if (pruned > 0) console.log(`pruned ${pruned} dangling engine build(s)`)

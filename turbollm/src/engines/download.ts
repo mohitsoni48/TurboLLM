@@ -848,6 +848,50 @@ export async function turboquantAssetUrl(
   return null
 }
 
+/** Written into the working TurboQuant install right before an update parks it at .turboquant-old, and removed once
+ *  the new install passed `verify`: while the parked install carries it, the update that parked it never finished and
+ *  it is still the working build. */
+const TURBOQUANT_UPDATE_INCOMPLETE_MARKER = '.turbollm-update-incomplete'
+
+/** Best effort, with retries (Windows AV/indexer locks are brief). A marker left in turboquant/ itself is never read
+ *  (only a parked install's is), and the next park writes it anew. */
+function clearTurboquantUpdateMarker(dir: string): void {
+  try {
+    rmSync(join(dir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), { force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Put the parked TurboQuant install back when an update was cut off (the daemon exited or died) after parking it at
+ *  .turboquant-old and before the new install passed its probe: between the two renames (no install in place), or
+ *  while the new one was probed. Nothing did, so the engine stayed on a build that never ran here, its only working
+ *  build in a hidden folder, and the next update took that folder for a leftover and deleted it. Such a parked
+ *  install still carries TURBOQUANT_UPDATE_INCOMPLETE_MARKER; the unverified install beside it is moved into the
+ *  update's stage, which the next update clears first. A parked install without the marker is a leftover whose
+ *  delete failed after its update passed, left for the next update to delete: also when turboquant/ is gone beside
+ *  it (a Purge renames away only that), where putting it back would show TurboQuant installed again and hand its old
+ *  binary to the next Install instead of a download. A rename that fails leaves everything for the next call. Runs
+ *  at boot and at the start of every update and Install; returns false when the parked install is still the working
+ *  build and could not be put back. */
+export function restoreInterruptedTurboquantUpdate(enginesRoot: string): boolean {
+  const destDir = join(enginesRoot, 'turboquant')
+  const parked = join(enginesRoot, '.turboquant-old')
+  if (!existsSync(join(parked, TURBOQUANT_UPDATE_INCOMPLETE_MARKER))) return true
+  try {
+    if (existsSync(destDir)) {
+      const stageRoot = join(enginesRoot, '.turboquant-update')
+      mkdirSync(stageRoot, { recursive: true })
+      renameSync(destDir, join(stageRoot, `unverified-${Date.now()}`))
+    }
+    renameSync(parked, destDir)
+  } catch {
+    return false
+  }
+  clearTurboquantUpdateMarker(destDir)
+  return true
+}
+
 /** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`,
  *  resolving the right per-platform source (HF on Windows, GitHub elsewhere) via the
  *  download → extract → locate pipeline. Throws `no_release_asset` when this platform
@@ -857,7 +901,9 @@ export async function turboquantAssetUrl(
  *  `verify` (an update only) runs with the new install in place and the old one still
  *  parked; when it throws (the caller probes the new binary there and registers it), the
  *  new install is moved out and the old one put back, so a build that does not run here
- *  never replaces one that does. `blockSwap` (an update only) re-runs right before the swap. */
+ *  never replaces one that does. An update cut off before verify passed is put back at the
+ *  next start, or by the next update or Install first ({@link restoreInterruptedTurboquantUpdate}).
+ *  `blockSwap` (an update only) re-runs right before the swap. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
@@ -866,6 +912,16 @@ export async function provisionTurboquant(
   opts: { replace?: boolean; verify?: (bin: string) => Promise<void>; blockSwap?: SwapGuard } = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
+  // An update cut off before its new build passed the probe left the working build parked: put it back first. An
+  // update's leftover delete below would take it. An Install (after a boot that could not move it back, turboquant/
+  // gone, its entry left on the missing binary) downloaded beside it, and the next start swapped that download out for
+  // it. When it cannot be put back it is still the only working build, so stop.
+  if (!restoreInterruptedTurboquantUpdate(enginesRoot)) {
+    throw new Error(
+      `An earlier TurboQuant update was cut short and its working build, kept at ${join(enginesRoot, '.turboquant-old')}, ` +
+        'could not be moved back yet. Try again in a moment.',
+    )
+  }
   if (opts.replace) {
     // Provision into a staging root exactly as a first install would, then swap the dirs.
     const stageRoot = join(enginesRoot, '.turboquant-update')
@@ -879,13 +935,24 @@ export async function provisionTurboquant(
       if (parked) {
         // A leftover of an earlier update whose delete below failed. Retries: Windows AV/indexer locks are brief.
         rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
-        await renameWithRetry(destDir, parked)
+        // Parked, it stays the working build until the new one passed verify below: marked first, so the next start
+        // (or update) puts it back when the daemon exits or dies before then (restoreInterruptedTurboquantUpdate).
+        writeFileSync(join(destDir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), '')
+        try {
+          await renameWithRetry(destDir, parked)
+        } catch (e) {
+          clearTurboquantUpdateMarker(destDir)
+          throw e
+        }
       }
       try {
         // The staged tree was extracted moments ago: AV/the indexer may still hold its files open.
         await renameWithRetry(stagedDir, destDir)
       } catch (e) {
-        if (parked) await renameWithRetry(parked, destDir)
+        if (parked) {
+          await renameWithRetry(parked, destDir)
+          clearTurboquantUpdateMarker(destDir)
+        }
         throw e
       }
       const bin = join(destDir, relative(stagedDir, stagedBin))
@@ -897,15 +964,20 @@ export async function provisionTurboquant(
         // downloaded it again on every check. Back to the stage (removed below), and the old install back.
         try {
           await renameWithRetry(destDir, stagedDir)
-          if (parked) await renameWithRetry(parked, destDir)
+          if (parked) {
+            await renameWithRetry(parked, destDir)
+            clearTurboquantUpdateMarker(destDir)
+          }
         } catch {
-          /* the probe error stays the reported cause; a parked old install is still at .turboquant-old */
+          /* the probe error stays the reported cause; a parked old install is still at .turboquant-old, marked */
         }
         throw e
       }
       // The new install is in place: deleting the old one is best effort, never a failed update (the next one
-      // removes a leftover first).
+      // removes a leftover first). From here a parked old one is a leftover: its marker goes first, so a failed
+      // delete of it is never taken for an update cut short.
       if (parked) {
+        clearTurboquantUpdateMarker(parked)
         try {
           rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
         } catch {
