@@ -148,6 +148,40 @@ let engineUpdateInFlight = false
  *  it finished. Holds the engine-work slot across the wait, as zipUploadInFlight does for an upload. */
 let backendDeleteInFlight = false
 
+/** Whether POST /engines/backends/:id/enable (or the Download of a Disabled backend, its Enable too) is registering a
+ *  backend's build. Registering probes (runs) the binary, for seconds: a Delete of the backend in that probe found
+ *  nothing registered to remove and deleted the build, and the Enable then registered and activated an engine whose
+ *  binary was gone. Holds the engine-work slot across the probe, as backendDeleteInFlight does across a Delete's engine
+ *  stop. */
+let backendEnableInFlight = false
+
+/** Whether POST /engines (the Enable of a Disabled source-built, release or custom card, or the Add of an engine) is
+ *  registering a binary. Its probe takes seconds too, and the route held nothing across it: a Delete of that Disabled
+ *  build (DELETE /engines/build, or a release card's forget and discard) in the probe deleted the folder, and the
+ *  Enable then registered an engine whose binary was gone; a rebuild of the folder started in it had the unfinished
+ *  marker it had just written removed by the Enable's markBuildComplete. Holds the engine-work slot across the probe,
+ *  as backendEnableInFlight does. */
+let engineEnableInFlight = false
+
+// engineWorkBusy's answers for the three flags above, also the backend Enable's own refusals.
+const BACKEND_DELETE_BUSY = 'An engine is being deleted — wait for it to finish.'
+const BACKEND_ENABLE_BUSY = 'An engine is being enabled — wait for it to finish.'
+const ENGINE_ENABLE_BUSY = 'An engine is being added or enabled — wait for it to finish.'
+
+/** Why a backend's build on disk may not be registered and activated now (its Enable, or its Download when it is
+ *  Disabled), or null. Not while a backend Delete runs: one stopping this backend's engine removed the engine activated
+ *  here, or deleted the build registered here, right after. Nor while this backend downloads or updates: an update
+ *  (it runs on a Disabled backend too) that reached its swap during the probe of the old build found no engine of it
+ *  to hand over, so it deleted that build, and the engine registered here ran a binary that was gone. Anything else
+ *  still lets it through, so an Enable during a source build goes on (the Engines screen offers it then). */
+function backendEnableBusy(d: Deps, backendId: string): string | null {
+  if (backendDeleteInFlight) return BACKEND_DELETE_BUSY
+  if (backendEnableInFlight) return BACKEND_ENABLE_BUSY
+  const provision = d.provision.get()
+  if (provision.active && provision.backend === backendId) return 'This backend is being downloaded or updated — wait for it to finish.'
+  return null
+}
+
 export function registerApi(app: Hono, d: Deps): void {
   // ---- meta ----
   app.get('/api/v1/status', (c) => {
@@ -366,18 +400,25 @@ export function registerApi(app: Hono, d: Deps): void {
     // there, so there was never anything to actually download).
     const existing = installedBackendBuild(root, def.id)
     if (existing) {
-      let eng = d.registry.list().engines.find((e) => e.binPath === existing.bin)
-      if (!eng) {
-        // A build that no longer runs here: a clear 400, as POST /engines gives, not an opaque 500.
-        try {
-          eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
-        } catch (e) {
-          if (e instanceof ProbeError) return err(c, 400, e.code, e.message)
-          throw e
+      // This is the backend's Enable, so it waits for the same jobs and holds the same slot (backendEnableBusy).
+      { const busy = backendEnableBusy(d, def.id); if (busy) return err(c, 409, 'engine_already_running', busy) }
+      backendEnableInFlight = true
+      try {
+        let eng = d.registry.list().engines.find((e) => e.binPath === existing.bin)
+        if (!eng) {
+          // A build that no longer runs here: a clear 400, as POST /engines gives, not an opaque 500.
+          try {
+            eng = (await d.registry.add(`llama.cpp ${existing.tag} (${def.id})`, existing.bin)).engine
+          } catch (e) {
+            if (e instanceof ProbeError) return err(c, 400, e.code, e.message)
+            throw e
+          }
         }
+        d.registry.activate(eng.id)
+        return c.json({ accepted: false, alreadyInstalled: true, build: existing.tag })
+      } finally {
+        backendEnableInFlight = false
       }
-      d.registry.activate(eng.id)
-      return c.json({ accepted: false, alreadyInstalled: true, build: existing.tag })
     }
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const ac = new AbortController()
@@ -532,22 +573,30 @@ export function registerApi(app: Hono, d: Deps): void {
   app.post('/api/v1/engines/backends/:id/enable', async (c) => {
     const def = availableBackends().find((x) => x.id === c.req.param('id'))
     if (!def) return err(c, 400, 'invalid_config_value', 'Unknown backend for this platform.')
-    const root = join(d.store.dir(), 'engines')
-    // Tag-agnostic: enable whatever build is on disk (a de-pinned update may have left a
-    // non-LLAMA_BUILD tag), naming the registry entry after that build's real tag.
-    const build = installedBackendBuild(root, def.id)
-    if (!build) return err(c, 409, 'not_installed', 'Backend is not installed on disk — download it first.')
-    let eng = d.registry.list().engines.find((e) => e.binPath === build.bin)
-    if (!eng) {
-      try {
-        eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
-      } catch (e) {
-        if (e instanceof ProbeError) return err(c, 400, e.code, e.message) // as POST /engines
-        throw e
+    // Taken synchronously after the check (backendEnableBusy) and held through the probe (see backendEnableInFlight),
+    // so a Delete, an update and every other engine job waits for it.
+    { const busy = backendEnableBusy(d, def.id); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    backendEnableInFlight = true
+    try {
+      const root = join(d.store.dir(), 'engines')
+      // Tag-agnostic: enable whatever build is on disk (a de-pinned update may have left a
+      // non-LLAMA_BUILD tag), naming the registry entry after that build's real tag.
+      const build = installedBackendBuild(root, def.id)
+      if (!build) return err(c, 409, 'not_installed', 'Backend is not installed on disk — download it first.')
+      let eng = d.registry.list().engines.find((e) => e.binPath === build.bin)
+      if (!eng) {
+        try {
+          eng = (await d.registry.add(`llama.cpp ${build.tag} (${def.id})`, build.bin)).engine
+        } catch (e) {
+          if (e instanceof ProbeError) return err(c, 400, e.code, e.message) // as POST /engines
+          throw e
+        }
       }
+      d.registry.activate(eng.id)
+      return c.json({ ok: true, engineId: eng.id })
+    } finally {
+      backendEnableInFlight = false
     }
-    d.registry.activate(eng.id)
-    return c.json({ ok: true, engineId: eng.id })
   })
 
   // Delete an installed backend's files + unregister its engine. Stops the engine
@@ -1430,6 +1479,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const source: Pick<typeof b, 'sourceRepo' | 'sourceBranch' | 'sourceCommit' | 'sourcePatchUrl'> = release
       ? {}
       : { sourceRepo: b.sourceRepo, sourceBranch: b.sourceBranch, sourceCommit: b.sourceCommit, sourcePatchUrl: b.sourcePatchUrl }
+    // Held through the probe until the route answers (see engineEnableInFlight); nothing above awaits since the check.
+    engineEnableInFlight = true
     try {
       const { engine, warning } = await d.registry.add(b.name ?? '', b.binPath, { release: release ?? undefined, ...source })
       // A 1-click build whose own registration failed (a taken name, a probe that timed out) stays marked unfinished on
@@ -1453,6 +1504,8 @@ export function registerApi(app: Hono, d: Deps): void {
       if (e instanceof NameTakenError) return err(c, 400, 'name_already_taken', e.message)
       if (e instanceof ProbeError) return err(c, 400, e.code, e.message)
       return err(c, 500, 'internal', (e as Error).message)
+    } finally {
+      engineEnableInFlight = false
     }
   })
 
@@ -1613,6 +1666,10 @@ export function registerApi(app: Hono, d: Deps): void {
   app.delete('/api/v1/engines/zip', (c) => {
     if (!isLocalOrAuthenticated(c, d))
       return err(c, 403, 'forbidden', 'Uploading an engine zip requires a valid API key from a non-host device.')
+    // Not during an Enable's probe (see engineEnableInFlight), as DELETE /engines/release/install: nothing claims the
+    // install until the Add registers it, so a dialog dismissed while its Add probes (the discard sent on close) deleted
+    // the folder, and the Add then registered an engine whose binary was gone.
+    if (engineEnableInFlight) return err(c, 409, 'engine_already_running', ENGINE_ENABLE_BUSY)
     const enginesRoot = join(d.store.dir(), 'engines')
     const dir = sourceBuildDirOf(c.req.query('binPath') ?? '', enginesRoot)
     // Never a hidden folder: a purged zip install's `.<slug>.purge-<ms>` trash still holds the marker, and an rmSync
@@ -1794,6 +1851,9 @@ export function registerApi(app: Hono, d: Deps): void {
       releaseAbort?.abort()
       return c.json({ ok: true })
     }
+    // Not during an Enable's probe of this install (releaseGuard checks the engine-work slot for POST only): a discard
+    // then deleted the folder, and the Enable registered an engine whose binary was gone.
+    if (engineEnableInFlight) return err(c, 409, 'engine_already_running', ENGINE_ENABLE_BUSY)
     const dir = sourceBuildDirOf(binPath, join(d.store.dir(), 'engines'))
     // Never a hidden folder, as DELETE /engines/zip: a purged release install's `.<slug>.purge-<ms>` trash still holds
     // the marker, and an rmSync here would race the purge's own background delete of it (discardPurgeTrash) on the
@@ -1848,6 +1908,9 @@ export function registerApi(app: Hono, d: Deps): void {
   // Registered BEFORE the :id route below — Hono matches in registration order, and :id would
   // otherwise swallow "custom-sources" as its own param value.
   app.delete('/api/v1/engines/custom-sources/:key', (c) => {
+    // Not during an Enable's probe (see engineEnableInFlight): a release card's Delete forgets its source and then
+    // discards the install, which nothing claims any more.
+    if (engineEnableInFlight) return err(c, 409, 'engine_already_running', ENGINE_ENABLE_BUSY)
     // c.req.param() already URL-decodes path segments (Hono) — decoding again corrupts any
     // key containing a literal '%' (the binPath fallback key can) and throws on an invalid
     // escape, since a normal key's second decode is a harmless no-op that hid this on the
@@ -4058,7 +4121,9 @@ function localCountFor(d: Deps, repo: string): number {
 export function engineWorkBusy(d: Deps, opts: { engineChange?: boolean } = {}): string | null {
   if (zipUploadInFlight) return 'An engine zip upload is in progress — wait for it to finish.'
   if (engineUpdateInFlight) return 'An engine update is in progress — wait for it to finish.'
-  if (backendDeleteInFlight) return 'An engine is being deleted — wait for it to finish.'
+  if (backendDeleteInFlight) return BACKEND_DELETE_BUSY
+  if (backendEnableInFlight) return BACKEND_ENABLE_BUSY
+  if (engineEnableInFlight) return ENGINE_ENABLE_BUSY
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
   if (d.build.isActive() && (!opts.engineChange || d.build.isEngineBuildActive())) return 'A build is in progress — wait for it to finish.'
   return null

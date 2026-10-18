@@ -16,6 +16,10 @@ import { engineWorkBusy, registerApi } from './routes'
 import type { Deps } from '../deps'
 import { availableBackends } from '../engines/download'
 import { BuildState } from '../engines/build-state'
+import { ProvisionState } from '../engines/provision-state'
+import { writeReleaseMarker } from '../engines/release-install'
+import { ZIP_BUILD_MARKER } from '../engines/zip-install'
+import { ProbeError } from '../engines/probe'
 import { tmpDir } from '../test-support/tmp'
 
 function harness(busy: 'download' | 'build' | null) {
@@ -214,6 +218,214 @@ test('DELETE /engines/backends/:id is refused while the backend\'s Update looks 
   assert.equal((await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })).status, 200)
   assert.deepEqual(h.removed, ['be'])
   assert.equal(existsSync(h.backendDir), false)
+})
+
+// POST /engines/backends/:id/enable re-registers a Disabled backend's build, and registering probes (runs) its binary,
+// which takes seconds. It held nothing and checked nothing: a Delete of the backend in that probe found no engine to
+// unregister and deleted the build, and the Enable then registered and activated an engine whose binary was gone, so
+// every load failed to spawn it. An Enable during a Delete's engine stop activated the engine the Delete then removed.
+// POST /engines/backends/install of a backend already on disk (its Download when it is Disabled, GitHub #102) is the
+// same Enable.
+type Harness = ReturnType<typeof harness>
+const enableRoutes: [string, (h: Harness) => Response | Promise<Response>][] = [
+  ['POST /engines/backends/:id/enable', (h) => h.app.request(`/api/v1/engines/backends/${h.backendId}/enable`, { method: 'POST' })],
+  ['POST /engines/backends/install of a Disabled backend', (h) => h.app.request('/api/v1/engines/backends/install', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ backend: h.backendId }),
+  })],
+]
+
+for (const [route, enableBackend] of enableRoutes) {
+  test(`${route} and DELETE /engines/backends/:id refuse each other while either runs`, async () => {
+    const h = harness(null)
+    writeFileSync(join(h.backendDir, '.turbollm-provisioned'), '') // a finished install, so Enable finds it
+    const bin = join(h.backendDir, 'llama-server')
+    let probed!: () => void
+    const activated: string[] = []
+    Object.assign(h.d.registry, {
+      // The probe, held until the test lets it finish. The harness's add registers nothing; this one does, as Enable's
+      // add() does.
+      add: async (name: string, binPath: string) => {
+        await new Promise<void>((resolve) => { probed = resolve })
+        h.added.push(binPath)
+        h.engines.push({ id: 'be2', name, kind: 'llama-server', binPath })
+        return { engine: { id: 'be2', name, binPath, kind: 'llama-server' }, warning: null }
+      },
+      activate: (id: string) => { activated.push(id); h.live.activeId = id },
+    })
+    h.removed.push('be') // Disabled: Enable registers the build again
+
+    const enable = enableBackend(h)
+    await eventually(() => assert.ok(probed, 'the probe has begun'))
+    const del = await h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })
+    assert.equal(del.status, 409, 'no Delete during the probe')
+    assert.equal(await errorCode(del), 'engine_already_running')
+    assert.equal(existsSync(h.backendDir), true)
+    probed()
+    assert.equal((await enable).status, 200)
+    assert.deepEqual(h.added, [bin])
+    assert.deepEqual(activated, ['be2'])
+    assert.equal(engineWorkBusy(h.d), null, 'the slot is free again')
+
+    // The other order: a Delete stopping the backend's running engine.
+    let stopped!: () => void
+    h.live.stopping = new Promise<void>((resolve) => { stopped = resolve })
+    const deleting = h.app.request(`/api/v1/engines/backends/${h.backendId}`, { method: 'DELETE' })
+    await eventually(() => assert.equal(h.live.stops, 1))
+    const again = await enableBackend(h)
+    assert.equal(again.status, 409, 'no Enable during the Delete')
+    assert.equal(await errorCode(again), 'engine_already_running')
+    stopped()
+    assert.equal((await deleting).status, 200)
+    assert.deepEqual(activated, ['be2'], 'the Delete was not undone')
+    assert.equal(existsSync(h.backendDir), false)
+  })
+
+  // The backend's Update works on a Disabled backend too. One that reached its swap during the Enable's probe of the
+  // old build found no engine of it to hand over, so it deleted that build, and the Enable then registered and
+  // activated an engine whose binary was gone. The Update (or the backend's download) is under way from its
+  // provision.start(<backend>) until its swap and clean-up are over.
+  test(`${route} is refused while that backend downloads or updates, not while another one does`, async () => {
+    const h = harness(null)
+    writeFileSync(join(h.backendDir, '.turbollm-provisioned'), '') // a finished install, so Enable finds it
+    h.removed.push('be') // Disabled: Enable registers the build again
+    const activated: string[] = []
+    Object.assign(h.d.registry, { activate: (id: string) => { activated.push(id) } })
+    const provision = new ProvisionState()
+    Object.assign(h.d, { provision })
+    provision.start(h.backendId, 'user_update')
+    const res = await enableBackend(h)
+    assert.equal(res.status, 409, 'no Enable during the backend\'s update')
+    assert.equal(await errorCode(res), 'engine_already_running')
+    assert.deepEqual([h.added, activated], [[], []])
+    provision.done()
+    provision.start('another-backend', 'user_install')
+    assert.equal((await enableBackend(h)).status, 200, 'another backend\'s download does not refuse it')
+    assert.deepEqual([h.added, activated], [[join(h.backendDir, 'llama-server')], ['fork2']])
+  })
+}
+
+// POST /engines is the Enable of a Disabled source-built or release card (and the Add of any engine), and registering
+// probes (runs) the binary, for seconds. Unlike the backend's Enable above, it held nothing across that probe: a
+// Delete of that Disabled build (DELETE /engines/build, or a release card's forget and discard) in it deleted the
+// folder, and the Enable then registered an engine whose binary was gone, so every load failed to spawn it. A rebuild
+// of the folder started in it had the unfinished marker it had just written removed by the Enable's
+// markBuildComplete, so a crash mid-compile left the cut-short tree in place at the next start.
+const ENGINE_ENABLE_BUSY = 'An engine is being added or enabled — wait for it to finish.'
+
+/** POST /engines of `binPath`, its probe held until `finish()`: like the Enable's own add(), it then registers the
+ *  binary, or fails the probe when `finish(probeError)` is given one. */
+function heldEnable(h: Harness, name: string, binPath: string) {
+  let finish: ((probeError?: ProbeError) => void) | undefined
+  Object.assign(h.d.registry, {
+    add: async (n: string, p: string) => {
+      const probeError = await new Promise<ProbeError | undefined>((resolve) => { finish = resolve })
+      if (probeError) throw probeError
+      h.added.push(p)
+      return { engine: { id: 'enabled', name: n, binPath: p, kind: 'llama-server' }, warning: null }
+    },
+  })
+  const res = h.app.request('/api/v1/engines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, binPath }),
+  })
+  return {
+    res,
+    probing: () => eventually(() => assert.ok(finish, 'the probe has begun')),
+    finish: (probeError?: ProbeError) => finish!(probeError),
+  }
+}
+
+test('POST /engines of a Disabled source build refuses its Delete, a rebuild and every engine job while it probes', async () => {
+  const h = harness(null)
+  const bin = disabledBuild(h.dataDir, 'prismml-eng-llama.cpp-prism')
+  const enable = heldEnable(h, 'Prism', bin)
+  await enable.probing()
+  const del = await h.app.request(`/api/v1/engines/build?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
+  assert.equal(del.status, 409, 'no Delete during the probe')
+  assert.equal(await errorCode(del), 'engine_already_running')
+  assert.equal(existsSync(bin), true)
+  // Nothing listens on port 9, should the clone ever run.
+  const rebuild = await h.app.request('/api/v1/build/run', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ repoUrl: 'https://127.0.0.1:9/prismml-eng/llama.cpp.git', branch: 'prism' }),
+  })
+  assert.equal(rebuild.status, 409, 'no rebuild during the probe')
+  assert.equal(await errorCode(rebuild), 'engine_already_running')
+  assert.equal(h.build.isActive(), false)
+  assert.equal(engineWorkBusy(h.d), ENGINE_ENABLE_BUSY, 'the scheduler and every engine job see it')
+  assert.equal(engineWorkBusy(h.d, { engineChange: true }), ENGINE_ENABLE_BUSY, 'and a Disable, a Purge, an Add')
+  enable.finish()
+  assert.equal((await enable.res).status, 201)
+  assert.deepEqual(h.added, [bin])
+  assert.equal(engineWorkBusy(h.d), null, 'the slot is free again')
+
+  // A probe that fails frees it too.
+  const failing = heldEnable(h, 'Prism', bin)
+  await failing.probing()
+  assert.equal(engineWorkBusy(h.d), ENGINE_ENABLE_BUSY)
+  failing.finish(new ProbeError('probe_failed', 'llama-server exited with code 127'))
+  assert.equal((await failing.res).status, 400)
+  assert.equal(engineWorkBusy(h.d), null)
+})
+
+test('POST /engines of a Disabled release install refuses its forget and its discard while it probes', async () => {
+  const h = harness(null)
+  const dir = join(h.dataDir, 'engines', 'build', 'ggml-org-llama.cpp-cpu')
+  mkdirSync(dir, { recursive: true })
+  const bin = join(dir, 'llama-server')
+  writeFileSync(bin, 'bin')
+  writeReleaseMarker(dir, {
+    repo: 'ggml-org/llama.cpp', tag: 'b1', asset: 'llama-b1-bin-cpu.zip', assetKey: 'cpu',
+    publishedAt: '2026-09-01T00:00:00Z', prerelease: false, companions: [],
+  })
+  h.sources.push({ binPath: bin }) // the Disabled card
+  const enable = heldEnable(h, 'llama.cpp b1', bin)
+  await enable.probing()
+  const forget = await h.app.request(`/api/v1/engines/custom-sources/${encodeURIComponent(bin)}`, { method: 'DELETE' })
+  assert.equal(forget.status, 409, 'no forget during the probe')
+  assert.equal(await errorCode(forget), 'engine_already_running')
+  assert.deepEqual(h.forgotten, [])
+  // The discard the Delete sends next, as an API client (or a forget before the Enable) leaves it: nothing claims the
+  // folder, so only the probe can refuse it.
+  h.sources.length = 0
+  const discard = await h.app.request(`/api/v1/engines/release/install?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
+  assert.equal(discard.status, 409, 'no discard during the probe')
+  assert.equal(await errorCode(discard), 'engine_already_running')
+  assert.equal(existsSync(bin), true)
+  enable.finish()
+  assert.equal((await enable.res).status, 201)
+  assert.deepEqual(h.added, [bin])
+  assert.equal(existsSync(bin), true)
+
+  // With no Enable running, both go through again (the discard of an unclaimed install; the registered one is 409).
+  assert.equal((await h.app.request(`/api/v1/engines/custom-sources/${encodeURIComponent(bin)}`, { method: 'DELETE' })).status, 200)
+  assert.deepEqual(h.forgotten, [bin])
+  assert.equal((await h.app.request(`/api/v1/engines/release/install?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })).status, 200)
+  assert.equal(existsSync(dir), false)
+})
+
+// The Add of an uploaded zip: nothing claims the install until it is registered, and AddEngineDialog dismissed while
+// its Add probes (Escape, a click outside) sends this discard on close.
+test('POST /engines of an uploaded zip install refuses its discard while it probes', async () => {
+  const h = harness(null)
+  const dir = join(h.dataDir, 'engines', 'build', 'myzip')
+  mkdirSync(dir, { recursive: true })
+  const bin = join(dir, 'llama-server')
+  writeFileSync(bin, 'bin')
+  writeFileSync(join(dir, ZIP_BUILD_MARKER), 'myzip.zip\n2026-09-01T00:00:00.000Z\n')
+  const enable = heldEnable(h, 'myzip', bin)
+  await enable.probing()
+  const discard = await h.app.request(`/api/v1/engines/zip?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })
+  assert.equal(discard.status, 409, 'no discard during the probe')
+  assert.equal(await errorCode(discard), 'engine_already_running')
+  assert.equal(existsSync(bin), true)
+  enable.finish()
+  assert.equal((await enable.res).status, 201)
+  assert.deepEqual(h.added, [bin])
+  assert.equal(existsSync(bin), true)
+
+  // With no Add running, the discard of an unclaimed install goes through again.
+  assert.equal((await h.app.request(`/api/v1/engines/zip?binPath=${encodeURIComponent(bin)}`, { method: 'DELETE' })).status, 200)
+  assert.equal(existsSync(dir), false)
 })
 
 // The Windows CUDA Toolkit download (POST /build/cuda) and a build guide prerequisite install (POST
