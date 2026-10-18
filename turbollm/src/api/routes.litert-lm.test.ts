@@ -3,7 +3,8 @@
 // provisioning — the old unconditional `uv pip install -U` lit the global "Downloading…"
 // banner for a no-op every time "Check for update" was clicked. Mirrors the llama.cpp
 // backends' alreadyLatest contract (routes.ts, ADR-085). The upstream here is the daemon's
-// UpdateChecker with an injected fetcher, so no test touches the network.
+// UpdateChecker with an injected fetcher, and an accepted request provisions into a fresh temp
+// folder holding a fake uv and venv python (litertStore), so no test touches the network.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdirSync, writeFileSync } from 'node:fs'
@@ -13,6 +14,27 @@ import { engineWorkBusy, registerApi } from './routes'
 import { UpdateChecker } from '../engines/update'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
+
+/** A fresh store folder for one harness. An accepted request runs the real provision in the background
+ *  (ensureLitertLmEnv), so the folder holds a fake uv, which ensureUv finds instead of downloading one and whose
+ *  "pip install" does nothing, and a fake venv python that answers the version probe: the provision ends here,
+ *  offline. With the fixed /tmp/turbollm-litert-route this harness used before, every accepted test downloaded uv
+ *  and pip-installed litert-lm from PyPI there (about 200 MB, never removed, plus the caller's ~/.cache/uv), and
+ *  passed either way. Windows cannot run the shell-script fakes, so there `engines` is a plain file: the provision
+ *  fails at its first mkdir, before any download. */
+function litertStore(): string {
+  const storeDir = tmpDir('tllm-litert-route-')
+  const engines = join(storeDir, 'engines')
+  if (process.platform === 'win32') {
+    writeFileSync(engines, '')
+    return storeDir
+  }
+  mkdirSync(join(engines, 'uv'), { recursive: true })
+  writeFileSync(join(engines, 'uv', 'uv'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+  mkdirSync(join(engines, 'litert-lm', 'venv', 'bin'), { recursive: true })
+  writeFileSync(join(engines, 'litert-lm', 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.18.0\n', { mode: 0o755 })
+  return storeDir
+}
 
 function appWithChecker(
   fetcher: (src: { source: string; ref: string }) => Promise<string>,
@@ -62,9 +84,10 @@ function appWithChecker(
   // two can differ (v1.14.5). Both knobs stay mockable so every combination can be expressed;
   // by default a LiteRT-LM model is running and LiteRT-LM is also the active engine.
   const runningKind = opts.runningKind === undefined ? 'litert-lm' : opts.runningKind
+  const storeDir = opts.storeDir ?? litertStore()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => opts.storeDir ?? '/tmp/turbollm-litert-route' },
+    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => storeDir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     manager: {
       status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }),
@@ -300,15 +323,10 @@ test('an update also stops a .litertlm model in an extra pool slot, while the pr
 // ── An update keeps the active engine, as the scheduler's applyPipUpdate does: the route behind the card's Update
 // button made LiteRT-LM the active engine whatever was active before, and an active LiteRT-LM is sent every GGUF —
 // so updating it on a llama.cpp desktop broke every GGUF load. An install still activates it. The provision runs
-// for real here, offline, against a fake uv and venv python (shell scripts). ──
+// for real here, offline, against litertStore's fake uv and venv python (shell scripts). ──
 test('?update=1 leaves another active engine active; an update of the active LiteRT-LM and an install activate it', async (t) => {
   if (process.platform === 'win32') return t.skip('fakes uv and the venv python with shell scripts')
-  const storeDir = tmpDir('tllm-litert-activate-')
-  const engines = join(storeDir, 'engines')
-  mkdirSync(join(engines, 'uv'), { recursive: true })
-  writeFileSync(join(engines, 'uv', 'uv'), '#!/bin/sh\nexit 0\n', { mode: 0o755 })
-  mkdirSync(join(engines, 'litert-lm', 'venv', 'bin'), { recursive: true })
-  writeFileSync(join(engines, 'litert-lm', 'venv', 'bin', 'python'), '#!/bin/sh\necho 0.18.0\n', { mode: 0o755 })
+  const storeDir = litertStore()
   const provision = async (query: string, activeEngineId: string) => {
     const h = appWithChecker(async () => '0.18.0', '0.17.1', { activeEngineId, runningKind: null, storeDir })
     const res = await h.app.request(`/api/v1/engines/litert-lm${query}`, { method: 'POST' })
