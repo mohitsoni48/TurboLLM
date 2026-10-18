@@ -404,6 +404,13 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
       return extError(c, 'invalid_request', 'invalid_input', '`after` must be an integer event_seq.', { param: 'after' })
     }
     const from = after !== undefined ? after + 1 : 0
+    // A cursor past the run's last frame names frames it never sent (run-manager.ts isPastEnd):
+    // it used to get 200, an empty stream from a finished run and, from a live one, frames at or
+    // below the cursor. Checked here, before the stream opens; the run only moves forward after.
+    if (runs.isPastEnd(run.id, from)) {
+      return extError(c, 'invalid_request', 'invalid_input',
+        `\`after\` is past the last frame this run has sent (event_seq ${run.eventSeq}).`, { param: 'after' })
+    }
     if (!runs.canReplayFrom(run.id, from)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
         'That cursor has aged out of the replay buffer. Re-read the message, then attach at the run current event_seq.')

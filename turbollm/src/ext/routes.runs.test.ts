@@ -264,6 +264,60 @@ test('?after that is not an integer is a 400 invalid_input, not a 409 replay_win
   }
 })
 
+// canReplayFrom took a cursor past the run's last frame for "caught up" (nothing retained after
+// it, and not before the buffer's head): a finished run answered 200 with an empty stream, and a
+// live one then sent every frame it emitted, at or below the cursor too, which the client took
+// for frames it already had. Such a cursor names frames the run never sent.
+test('?after past the last frame the run has sent is a 400 invalid_input, for a finished run and a live one', async () => {
+  const ids = (text: string) => [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]))
+  const expectPastEnd = async (res: Response, label: string) => {
+    assert.equal(res.status, 400, label)
+    const body = await res.json() as { error: { type: string; code: string; param?: string } }
+    assert.equal(body.error.type, 'invalid_request', label)
+    assert.equal(body.error.code, 'invalid_input', label)
+    assert.equal(body.error.param, 'after', label)
+  }
+
+  // Finished: delta, delta, done (frames 1-3).
+  const done = harness()
+  try {
+    const chatId = await newChat(done.app)
+    const started = await (await done.app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await done.runs.settled(started.id)
+    for (const after of [4, 99]) {
+      await expectPastEnd(await done.app.request(`/api/ext/v1/runs/${started.id}/stream?after=${after}&owner=u1`, { headers: { Authorization: ACME } }), `finished, after=${after}`)
+    }
+    // The last frame itself is a cursor that is caught up: 200, and nothing more to send.
+    const caughtUp = await done.app.request(`/api/ext/v1/runs/${started.id}/stream?after=3&owner=u1`, { headers: { Authorization: ACME } })
+    assert.equal(caughtUp.status, 200)
+    assert.deepEqual(ids(await caughtUp.text()), [])
+  } finally {
+    done.cleanup()
+  }
+
+  // Live: both deltas (frames 1-2) sent, the done frame (3) held back until released.
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const live = harness(async () => { await gate; return { status: 'complete' as const } })
+  try {
+    const chatId = await newChat(live.app)
+    const started = await (await live.app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    while ((live.runs.get(started.id)?.eventSeq ?? 0) < 2) await new Promise((r) => setTimeout(r, 5))
+    await expectPastEnd(await live.app.request(`/api/ext/v1/runs/${started.id}/stream?after=5&owner=u1`, { headers: { Authorization: ACME } }), 'live, after=5')
+    // A cursor at the last frame sent still attaches, and gets only the frames after it.
+    const attached = await live.app.request(`/api/ext/v1/runs/${started.id}/stream?after=2&owner=u1`, { headers: { Authorization: ACME } })
+    assert.equal(attached.status, 200)
+    release!()
+    assert.deepEqual(ids(await attached.text()), [3])
+    await live.runs.settled(started.id)
+  } finally {
+    release!()
+    live.cleanup()
+  }
+})
+
 // The 202 body and an early GET /runs/{id} report event_seq 0 before any frame exists. Frames
 // used to be numbered from 0 as well, so a client that attached later with ?after=<that
 // event_seq> (once frame 0 had been sent) lost the run's first frame.

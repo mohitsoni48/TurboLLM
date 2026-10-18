@@ -321,15 +321,27 @@ export class PublicRunManager {
   }
 
   /** Whether `fromSeq` is still inside the retained window. False ⇒ the caller must be told
-   *  `replay_window_exceeded` and re-read the message instead of silently getting a gap. */
+   *  `replay_window_exceeded` and re-read the message instead of silently getting a gap. A
+   *  `fromSeq` past the next frame (see isPastEnd) is not inside it either. */
   canReplayFrom(id: string, fromSeq: number): boolean {
     const s = this.runs.get(id)
     if (!s) return false
     // A cursor before the first frame (0 = "from the start") asks for the whole run.
     const from = Math.max(fromSeq, FIRST_EVENT_SEQ)
     const retained = s.buffer.since(from)
-    if (retained.length === 0) return from >= s.buffer.head()
+    if (retained.length === 0) return from === s.buffer.head()
     return retained[0].seq === from
+  }
+
+  /** Whether `fromSeq` is past the next frame of a run this process still holds: a client's
+   *  cursor for frames the run never sent. `from >= head` above read such a cursor as caught
+   *  up, so a finished run answered it with an empty stream and a live one went on to send it
+   *  frames at or below its cursor, which the client took for frames it already had. False for a
+   *  run that has left memory: its stored event_seq is written only with status changes, so after
+   *  a restart it can trail what the run really sent, and such a run replays from no cursor. */
+  isPastEnd(id: string, fromSeq: number): boolean {
+    const s = this.runs.get(id)
+    return s !== undefined && fromSeq > s.buffer.head()
   }
 
   subscribe(id: string, fromSeq: number): Subscription {
