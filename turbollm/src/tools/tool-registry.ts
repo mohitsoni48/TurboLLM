@@ -363,18 +363,19 @@ export class ToolRegistry {
     if (opts.refuseMcp && isMcpToolName(name)) return `Error: ${MCP_TOOLS_REFUSED_MESSAGE}`
     const mcpMatch = name.match(/^mcp__([^_]+(?:_[^_]+)*)__(.+)$/)
     if (mcpMatch) {
-      const rawServerId = mcpMatch[1].replace(/_/g, '-')
       const toolName = mcpMatch[2]
 
-      // Find the client — try exact match first, then normalized
-      let client = this.mcpClients.get(rawServerId)
-      if (!client) {
-        // Brute-force search since ID normalization is lossy
-        for (const [id, c] of this.mcpClients) {
-          if (id.replace(/-/g, '_') === mcpMatch[1]) { client = c; break }
-        }
+      // Only the canonical spelling buildToolDefinitions gives the tool (the server id with '-' as
+      // '_') reaches the server. That is the name Tool Permissions stores a Deny under, and
+      // resolveToolPolicy looks a policy up by the exact name the model sent, so a second spelling
+      // of the same tool skipped its Deny. This used to look the id up with every '_' turned back
+      // into '-', which a UUID id's real hyphens, or any mix of '-' and '_', also matched: a model
+      // calling mcp__<the UUID>__tool ran a tool the owner had set to Deny.
+      let client: IMcpClient | undefined
+      for (const [id, c] of this.mcpClients) {
+        if (id.replace(/-/g, '_') === mcpMatch[1]) { client = c; break }
       }
-      if (!client) return `Error: MCP server "${rawServerId}" not connected.`
+      if (!client) return `Error: MCP server "${mcpMatch[1].replace(/_/g, '-')}" not connected.`
       return client.callTool(toolName, args)
     }
 

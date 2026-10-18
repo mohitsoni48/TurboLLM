@@ -4,6 +4,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ToolRegistry } from './tool-registry'
+import { executeToolCallWithApproval } from './execute-with-approval'
 import type { RoutineToolsStore, RunRoutineNowFn } from '../routines/routine-tools'
 import { CODE_GATE_MESSAGE, ROUTINES_DISABLED_MESSAGE, TEXT_CLASSIFIER_ROUTINE_MODEL_MESSAGE } from '../routines/routine-routes'
 import type { Routine } from '../routines/schema'
@@ -427,6 +428,7 @@ test('executeTool(create_routine): a chat modelKey still creates the routine', a
 //   FAKE_MCP_LOG   file it appends its pid to on start (counts spawns, finds the process)
 //   FAKE_MCP_TOOL  the one tool name tools/list reports
 //   FAKE_MCP_MODE  'error-init' rejects initialize; 'stderr' writes 1 MB to stderr per request
+//   FAKE_MCP_CALLS file it appends each tools/call's tool name to (what really ran)
 const FAKE_MCP_SERVER = `
 const fs = require('fs')
 if (process.env.FAKE_MCP_LOG) fs.appendFileSync(process.env.FAKE_MCP_LOG, process.pid + '\\n')
@@ -446,21 +448,27 @@ process.stdin.on('data', (c) => {
     // fs.writeSync, not process.stderr.write: a blocking write, like a Python server's logging,
     // so an unread pipe really stalls the server instead of buffering in its own memory.
     if (mode === 'stderr') for (let i = 0; i < 1024; i++) fs.writeSync(2, 'x'.repeat(1023) + '\\n')
-    const result = m.method === 'tools/list' ? { tools: [{ name: process.env.FAKE_MCP_TOOL || 't' }] } : {}
+    if (m.method === 'tools/call' && process.env.FAKE_MCP_CALLS) fs.appendFileSync(process.env.FAKE_MCP_CALLS, m.params.name + '\\n')
+    const result = m.method === 'tools/list' ? { tools: [{ name: process.env.FAKE_MCP_TOOL || 't' }] }
+      : m.method === 'tools/call' ? { content: [{ type: 'text', text: 'ran ' + m.params.name }] }
+      : {}
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: m.id, result }) + '\\n')
   }
 })
 setInterval(() => {}, 1000)
 `
 
-function fakeMcpServer(env: Record<string, string>): { server: McpServer; spawnedPids: () => number[] } {
+function fakeMcpServer(env: Record<string, string>): { server: McpServer; spawnedPids: () => number[]; calls: () => string[] } {
   const dir = tmpDir('tool-registry-mcp-')
   const script = join(dir, 'fake-mcp.cjs')
   writeFileSync(script, FAKE_MCP_SERVER)
   const log = join(dir, 'spawns.log')
+  const callLog = join(dir, 'calls.log')
+  const lines = (f: string) => (existsSync(f) ? readFileSync(f, 'utf8').split('\n').filter(Boolean) : [])
   return {
-    server: { id: 'srv-1', name: 'S', transport: 'stdio', enabled: true, command: process.execPath, args: [script], env: { FAKE_MCP_LOG: log, ...env } },
-    spawnedPids: () => (existsSync(log) ? readFileSync(log, 'utf8').split('\n').filter(Boolean).map(Number) : []),
+    server: { id: 'srv-1', name: 'S', transport: 'stdio', enabled: true, command: process.execPath, args: [script], env: { FAKE_MCP_LOG: log, FAKE_MCP_CALLS: callLog, ...env } },
+    spawnedPids: () => lines(log).map(Number),
+    calls: () => lines(callLog),
   }
 }
 
@@ -492,6 +500,55 @@ test('syncMcpServers: concurrent syncs spawn a server once', async () => {
   try {
     await Promise.all([reg.syncMcpServers([server]), reg.syncMcpServers([server])])
     assert.equal(spawnedPids().length, 1)
+  } finally { reg.disconnectAll() }
+})
+
+// A real MCP server id is a UUID (POST /api/v1/mcp/servers). buildToolDefinitions names its tools
+// with the id's '-' as '_', and that is the name Tool Permissions lists and stores a Deny under;
+// resolveToolPolicy looks the policy up by the exact name the model sent. executeTool also took
+// the id with its real hyphens, or any mix of '-' and '_', for the same server, so such a
+// spelling ran a tool set to Deny (and under Auto-allow all, with no prompt).
+const UUID_SERVER_ID = '3f2a1b2c-1111-2222-3333-444455556666'
+const CANONICAL_MCP_NAME = 'mcp__3f2a1b2c_1111_2222_3333_444455556666__delete_file'
+const OTHER_MCP_SPELLINGS = [
+  'mcp__3f2a1b2c-1111-2222-3333-444455556666__delete_file',
+  'mcp__3f2a1b2c_1111-2222_3333-444455556666__delete_file',
+]
+
+test('executeTool runs an MCP tool only under the name buildToolDefinitions gives it', async () => {
+  const { server, calls } = fakeMcpServer({ FAKE_MCP_TOOL: 'delete_file' })
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  try {
+    await reg.syncMcpServers([{ ...server, id: UUID_SERVER_ID }])
+    assert.deepEqual(await mcpToolNames(reg), [CANONICAL_MCP_NAME])
+    assert.equal(await reg.executeTool({ id: 't1', name: CANONICAL_MCP_NAME, args: {} }), 'ran delete_file')
+    for (const name of OTHER_MCP_SPELLINGS) {
+      assert.match(await reg.executeTool({ id: 't2', name, args: {} }), /^Error: MCP server ".*" not connected\.$/, name)
+    }
+    assert.deepEqual(calls(), ['delete_file'], 'only the canonical call reaches the server')
+  } finally { reg.disconnectAll() }
+})
+
+test('a Deny on an MCP tool holds for every spelling of its server id', async () => {
+  const { server, calls } = fakeMcpServer({ FAKE_MCP_TOOL: 'delete_file' })
+  const reg = new ToolRegistry(EMPTY_TOOLS_CFG)
+  const run = (name: string, shape: { interactive: boolean; autoAllowAll: boolean; agentAllowedTools?: string[] }) =>
+    executeToolCallWithApproval({
+      tools: reg, sink: () => {}, convId: 'c1', id: 't1', name, args: {},
+      globalPolicies: { [CANONICAL_MCP_NAME]: 'deny' }, convOverrides: {},
+      signal: new AbortController().signal, isCodeAuthorized: true, ...shape,
+    })
+  // The owner's own chat under Auto-allow all, and a routine run whose allow-list (or the
+  // owner's approval of its stalled call, chat-runner.ts) names that spelling.
+  const owner = { interactive: true, autoAllowAll: true }
+  try {
+    await reg.syncMcpServers([{ ...server, id: UUID_SERVER_ID }])
+    assert.match((await run(CANONICAL_MCP_NAME, owner)).result, /^Blocked: this tool is set to Deny/)
+    for (const name of OTHER_MCP_SPELLINGS) {
+      assert.match((await run(name, owner)).result, /not connected/, name)
+      assert.match((await run(name, { interactive: false, autoAllowAll: false, agentAllowedTools: [name] })).result, /not connected/, name)
+    }
+    assert.deepEqual(calls(), [], 'the denied tool never ran')
   } finally { reg.disconnectAll() }
 })
 
