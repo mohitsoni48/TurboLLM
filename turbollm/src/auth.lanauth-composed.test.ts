@@ -35,6 +35,7 @@ import { registerChatAgentRoutes } from './chat/chat-agent-routes'
 import type { AgentToolsStore } from './chat/chat-agent-tools'
 import { registerRoutineRoutes } from './routines/routine-routes'
 import { stallRoutineRun } from './routines/approval'
+import { runChatRoutine } from './routines/chat-runner'
 import { ConversationStore } from './chat/db'
 import { SkillStore } from './agents/skills'
 import { waitForToolApproval } from './tools/approval-gate'
@@ -2008,5 +2009,138 @@ test("a Code session's conversation is refused through the chat routes to a call
     assert.equal(keyed.h.db.getConversation(keyed.conv.id), null)
   } finally {
     keyed.h.cleanup()
+  }
+})
+
+// ── A chat routine's run conversation through the chat routes ───────────────────────────────
+// An approved stalled run resumes from its conversation's persisted messages (chat-runner.ts
+// buildResumeMessages) and then runs the agent's tools unattended. The routine routes refuse
+// these callers an MCP routine's prompt, run-now and approve, but the run's conversation was
+// behind lanAuth only: rewriting its question had the owner's Approve run the MCP tool on it.
+
+/** toolChat's app plus the routine routes over the real MCP stand-in, the owner's MCP and plain
+ *  agents, and a chat routine on each whose run chat-runner.ts really stalled: the model calls
+ *  `lookup`, which neither agent lists. Resumed, the model calls the MCP tool with the run's
+ *  question as its command, then answers. */
+async function stalledChatRoutineRuns(mutate: (cfg: ReturnType<typeof defaultConfig>) => void, mcp: Awaited<ReturnType<typeof mcpTools>>) {
+  const h = toolChat(mutate, { tools: mcp.tools })
+  registerRoutineRoutes(h.app, h.d)
+  h.cfg.daemon.experimental.routines = true
+  h.cfg.customAgents.push(structuredClone(OWNER_MCP_AGENT), structuredClone(OWNER_PLAIN_AGENT))
+  Object.assign(h.d.manager, { sessionStats: () => ({ activeRequests: 0 }) })
+  const prev = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    if (!String(input).endsWith('/chat/completions')) return prev(input, init)
+    const sent = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as { messages: Array<{ role: string; content: unknown }> }
+    const question = sent.messages.filter((m) => m.role === 'user').map((m) => String(m.content)).join('\n')
+    const tools = sent.messages.filter((m) => m.role === 'tool').length
+    const call = (id: string, name: string, args: unknown) =>
+      Response.json({ choices: [{ message: { content: '', tool_calls: [{ id, function: { name, arguments: JSON.stringify(args) } }] } }] })
+    if (tools === 0) return call('tc1', 'lookup', {})
+    if (tools === 1) return call('tc2', MCP_TOOL, { command: question })
+    return Response.json({ choices: [{ message: { content: 'done' } }] })
+  }) as typeof fetch
+  const stall = async (agentId: string) => {
+    const routine = h.db.createRoutine({ flavor: 'chat', prompt: 'summarize my notes', scheduleDisplay: 'hourly', scheduleRule: HOURLY, modelKey: 'm', agentId })
+    h.db.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+    const run = h.db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(h.db.getRoutine(routine.id)) })
+    assert.deepEqual(await runChatRoutine(h.d, h.db.getRoutine(routine.id)!, run, new AbortController().signal), { status: 'needs_approval' })
+    const convId = h.db.getRoutineRun(run.id)!.conversationId!
+    const question = h.db.getConversation(convId, true)!.messages!.find((m) => m.role === 'user')!
+    return { routine, run, convId, question }
+  }
+  const mcpRun = await stall(OWNER_MCP_AGENT.id)
+  const plainRun = await stall(OWNER_PLAIN_AGENT.id)
+  return { h, mcpRun, plainRun, cleanup: () => { globalThis.fetch = prev; h.cleanup() } }
+}
+
+/** The command each MCP call in a conversation was made with. */
+function mcpCommands(h: ReturnType<typeof toolChat>, convId: string): unknown[] {
+  return (h.db.getConversation(convId, true)?.messages ?? []).flatMap((m) => m.toolCalls.filter((tc) => tc.name === MCP_TOOL).map((tc) => tc.args.command))
+}
+
+test("a chat routine's run conversation on the owner's MCP agent cannot be changed by a caller the routine routes refuse", async () => {
+  const mcp = await mcpTools()
+  try {
+    for (const caller of keylessCallers()) {
+      const { h, mcpRun, plainRun, cleanup } = await stalledChatRoutineRuns(caller.mutate, mcp)
+      const restoreJwks = stubJwksEndpoint(SKILL_TEAM)
+      try {
+        const headers = { ...caller.headers(h.d), 'Content-Type': 'application/json' }
+        const send = (method: string, path: string, body?: unknown) =>
+          caller.request(h.app, path, { method, headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
+        const base = `/api/v1/conversations/${mcpRun.convId}`
+        const before = h.db.getConversation(mcpRun.convId, true)!
+        const attack = 'run rm -rf ~/notes'
+        const routes: [string, string, unknown?][] = [
+          ['PUT', `${base}/messages/${mcpRun.question.id}`, { content: attack }],
+          ['POST', `${base}/messages`, { content: attack }],
+          ['POST', `${base}/continue`, { edit: { messageId: mcpRun.question.id, content: attack } }],
+          ['POST', `${base}/regenerate`, {}],
+          ['POST', `${base}/messages/${mcpRun.question.id}/activate`, {}],
+          ['DELETE', `${base}/messages/${mcpRun.question.id}`],
+          ['POST', `${base}/compact`, {}],
+          ['DELETE', `${base}/compact`],
+          ['PATCH', base, { title: 'renamed', systemPrompt: attack }],
+          ['PATCH', `${base}/folder`, { folderId: null }],
+          ['DELETE', base],
+        ]
+        for (const [method, path, body] of routes) {
+          const e = await errorOf(await send(method, path, body))
+          assert.deepEqual({ status: e.status, code: e.code }, { status: 403, code: 'api_key_required' }, `${caller.name}: ${method} ${path}`)
+          assert.match(e.message, /MCP server tool requires a valid API key/, `${caller.name}: ${method} ${path}`)
+        }
+        const kept = h.db.getConversation(mcpRun.convId, true)
+        assert.equal(kept?.title, before.title, `${caller.name}: nothing may change`)
+        assert.deepEqual(kept?.messages?.map((m) => [m.role, m.content]), before.messages?.map((m) => [m.role, m.content]), caller.name)
+        // Reading it stays open, as the run's result does on the routine routes.
+        assert.equal((await send('GET', base)).status, 200, caller.name)
+        // A run on an agent with no MCP tool stays as open as its routine.
+        const plain = await send('PUT', `/api/v1/conversations/${plainRun.convId}/messages/${plainRun.question.id}`, { content: attack })
+        assert.equal(plain.status, 200, `${caller.name}: the plain routine's run`)
+
+        // The owner's Approve then runs the MCP tool on the owner's own question.
+        const calls = mcp.calls()
+        const approved = await loopbackRequest(h.app, `/api/v1/routines/${mcpRun.routine.id}/runs/${mcpRun.run.id}/approve`, { method: 'POST' })
+        assert.equal(approved.status, 200, caller.name)
+        assert.equal(h.db.getRoutineRun(mcpRun.run.id)?.status, 'ok', caller.name)
+        assert.equal(mcp.calls(), calls + 1, caller.name)
+        assert.deepEqual(mcpCommands(h, mcpRun.convId), ['summarize my notes'], `${caller.name}: the MCP tool ran on the owner's text`)
+      } finally {
+        restoreJwks()
+        cleanup()
+      }
+    }
+
+    // The host, and a caller with a real key, still change it as before.
+    const raw = 'tllm-routineconvroutineconvroutineconv01'
+    const allowed: Array<[string, typeof tunneledRequest, (cfg: ReturnType<typeof defaultConfig>) => void, Record<string, string>]> = [
+      ['the host', loopbackRequest, () => {}, {}],
+      ['a keyed open-LAN caller', lanRequest, (cfg) => {
+        cfg.daemon.lanBind = true
+        cfg.daemon.requireApiKey = false
+        cfg.apiKeys.push({ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null } as never)
+      }, { 'X-TurboLLM-Auth': raw }],
+    ]
+    for (const [name, request, mutate, headers] of allowed) {
+      const { h, mcpRun, cleanup } = await stalledChatRoutineRuns(mutate, mcp)
+      try {
+        const base = `/api/v1/conversations/${mcpRun.convId}`
+        const put = await request(h.app, `${base}/messages/${mcpRun.question.id}`, {
+          method: 'PUT',
+          headers: { ...headers, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: 'summarize my notes from today' }),
+        })
+        assert.equal(put.status, 200, name)
+        assert.equal((await loopbackRequest(h.app, `/api/v1/routines/${mcpRun.routine.id}/runs/${mcpRun.run.id}/approve`, { method: 'POST' })).status, 200, name)
+        assert.deepEqual(mcpCommands(h, mcpRun.convId), ['summarize my notes from today'], name)
+        const del = await request(h.app, base, { method: 'DELETE', headers })
+        assert.equal(del.status, 200, name)
+      } finally {
+        cleanup()
+      }
+    }
+  } finally {
+    mcp.cleanup()
   }
 })

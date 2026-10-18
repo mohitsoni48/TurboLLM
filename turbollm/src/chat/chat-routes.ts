@@ -17,7 +17,7 @@ import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
-import { isMcpToolName, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
+import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
 import { buildSaveSkillTool } from '../agents/agent-tools'
 import { SkillStore } from '../agents/skills'
 import { saveSkillFromConversation, SKILL_AUTHORING_REFUSED } from '../agents/skill-jobs'
@@ -135,8 +135,12 @@ async function body<T>(c: Context): Promise<T> { try { return await c.req.json()
 const STALE_MESSAGE = 'This message is no longer on the shown branch: the chat changed in another tab or device.'
 
 /** A Code session's conversation through the chat routes, to a caller codeAuth refuses (see
- *  registerChatRoutes's codeConversationGate). Code's own refusal, in codeAuth's words. */
+ *  registerChatRoutes's conversationGate). Code's own refusal, in codeAuth's words. */
 const CODE_CONVERSATION_REFUSED = 'A valid API key is required to access Code from a non-host device.'
+
+/** A change to an MCP-running chat routine's run conversation, to a caller the routine routes
+ *  refuse that routine (see registerChatRoutes's conversationGate). */
+const MCP_ROUTINE_CONVERSATION_REFUSED = 'Changing the conversation of a routine whose agent uses an MCP server tool requires a valid API key from a non-host device.'
 
 /** Messages as the chat routes return them: without `docContext`, the attached documents' full
  *  text. It is stored so a Regenerate or a Save & Resend can send the turn again with its
@@ -230,17 +234,38 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
   // route under the id, so a new one is covered too. Not the tool-call approve route: a Deny
   // there must stay open to anyone, so what it lets a caller decide on a Code conversation is
   // gated by decision in that route. api_key_required: the web client opens its key prompt on it.
+  //
+  // A chat routine's run conversation (kind 'agent', chat-runner.ts) is the routine's own in the
+  // same way: an approved stalled run resumes from its persisted messages (buildResumeMessages)
+  // and then runs every tool the agent lists, unattended. So for a routine whose agent lists an
+  // MCP server tool, read live as chat-runner.ts and routine-routes.ts's chatAgentUsesMcp read it,
+  // every route here that changes the conversation is held to the bar those routine routes hold
+  // its prompt, run-now and approve to (codeGateBlocks). Without it such a caller rewrote a
+  // stalled MCP routine's question (PUT .../messages/:msgId), and the owner's Approve then ran the
+  // MCP tool on that text. Reads stay open, as the run's result does on the routine routes. A run
+  // on an agent with no MCP tool stays as open as its routine, whose prompt such a caller may
+  // edit and run anyway.
   const approveRoute = /^\/api\/v1\/conversations\/[^/]+\/tool-calls\/[^/]+\/approve$/
-  const codeConversationGate: MiddlewareHandler = async (c, next) => {
+  const conversationGate: MiddlewareHandler = async (c, next) => {
     if (approveRoute.test(c.req.path)) return next()
     const id = c.req.param('id')
-    if (id && db.getConversation(id)?.kind === 'code' && codeGateBlocks(c, d)) {
+    const conv = id ? db.getConversation(id) : null
+    if (conv?.kind === 'code' && codeGateBlocks(c, d)) {
       return err(c, 403, 'api_key_required', CODE_CONVERSATION_REFUSED)
+    }
+    const read = c.req.method === 'GET' || c.req.method === 'HEAD'
+    if (!read && conv?.kind === 'agent' && runsMcpAgent(conv.agentId) && codeGateBlocks(c, d)) {
+      return err(c, 403, 'api_key_required', MCP_ROUTINE_CONVERSATION_REFUSED)
     }
     return next()
   }
-  app.use('/api/v1/conversations/:id', codeConversationGate)
-  app.use('/api/v1/conversations/:id/*', codeConversationGate)
+  /** Does the chat agent a routine run's conversation belongs to list an MCP server tool now? */
+  const runsMcpAgent = (agentId: string | undefined) => {
+    const agent = agentId ? d.store.snapshot().customAgents?.find((a) => a.id === agentId) : undefined
+    return !!agent && listsMcpTool(agent.tools)
+  }
+  app.use('/api/v1/conversations/:id', conversationGate)
+  app.use('/api/v1/conversations/:id/*', conversationGate)
 
   app.get('/api/v1/conversations', (c) => {
     const q = c.req.query('q')
