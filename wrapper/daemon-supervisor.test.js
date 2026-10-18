@@ -11,6 +11,8 @@ const { setTimeout: sleep } = require('node:timers/promises')
 
 const {
   RESTART_REQUESTED_EXIT_CODE,
+  DATA_DIR_IN_USE_EXIT_CODE,
+  dataDirInUseNotice,
   decideOnDaemonExit,
   isRunning,
   createDaemonSupervisor
@@ -18,6 +20,8 @@ const {
 
 const DAEMON_RESTART_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-restart.ts')
 const DAEMON_EXIT_CODE_DECLARATION = /export const RESTART_REQUESTED_EXIT_CODE = (\d+)/
+const DAEMON_PID_SOURCE = join(__dirname, '..', 'turbollm', 'src', 'daemon-pid.ts')
+const DATA_DIR_IN_USE_DECLARATION = /export const DATA_DIR_IN_USE_EXIT_CODE = (\d+)/
 
 const FAKE_DAEMON = join(__dirname, 'test-fixtures', 'fake-daemon.js')
 const SUPERVISOR_HOST = join(__dirname, 'test-fixtures', 'supervisor-host.js')
@@ -46,6 +50,38 @@ test('the restart exit code matches turbollm/src/daemon-restart.ts', () => {
   const declaration = readFileSync(DAEMON_RESTART_SOURCE, 'utf8').match(DAEMON_EXIT_CODE_DECLARATION)
   assert.ok(declaration, `${DAEMON_RESTART_SOURCE} must declare the daemon's RESTART_REQUESTED_EXIT_CODE`)
   assert.equal(Number(declaration[1]), RESTART_REQUESTED_EXIT_CODE)
+})
+
+test('the data-dir-in-use exit code matches turbollm/src/daemon-pid.ts', () => {
+  const declaration = readFileSync(DAEMON_PID_SOURCE, 'utf8').match(DATA_DIR_IN_USE_DECLARATION)
+  assert.ok(declaration, `${DAEMON_PID_SOURCE} must declare the daemon's DATA_DIR_IN_USE_EXIT_CODE`)
+  assert.equal(Number(declaration[1]), DATA_DIR_IN_USE_EXIT_CODE)
+  assert.equal(DATA_DIR_IN_USE_EXIT_CODE, 73)
+})
+
+// The daemon's start guard refuses it when another TurboLLM (a CLI daemon on ~/.turbollm) holds its
+// data dir. The app quit on it as on any crash, so the user never learnt why the app vanished.
+test('decideOnDaemonExit: exit 73 is a daemon refused because another TurboLLM holds its data dir', () => {
+  assert.deepEqual(
+    decideOnDaemonExit({ code: 73, signal: null, stopping: false }),
+    { action: 'lost', reason: 'refused: another TurboLLM holds its data dir (exit 73)', dataDirInUse: true }
+  )
+  assert.deepEqual(decideOnDaemonExit({ code: 73, signal: null, stopping: true }), { action: 'none', reason: 'stopping' })
+})
+
+test('dataDirInUseNotice: the dialog shows the daemon\'s refusal, which names the running one and how to stop it', () => {
+  const refusal = 'TurboLLM is already running for /home/u/.turbollm (pid 4242, http://127.0.0.1:6996).\n' +
+    'Use that one, stop it first with `turbollm --stop`, or start this one with its own --config.'
+  const notice = dataDirInUseNotice(`${refusal}\n`)
+  assert.equal(notice.title, 'TurboLLM is already running')
+  assert.match(notice.message, /Another TurboLLM is already using your TurboLLM data folder/)
+  assert.match(notice.message, /Stop that one, then open the app again\./)
+  assert.equal(notice.detail, refusal)
+
+  // Nothing read from its stderr: the dialog still says how to stop the other one.
+  for (const nothing of ['', '  \n', undefined]) {
+    assert.match(dataDirInUseNotice(nothing).detail, /`turbollm --stop` stops it/)
+  }
 })
 
 test('decideOnDaemonExit: exit 75 while running asks for a respawn', () => {
@@ -120,6 +156,25 @@ test('a requested restart (exit 75) is respawned and the new daemon is the one t
   assert.equal(launches.count, 2, 'no daemon is spawned after stop()')
   assert.equal(readPids(dir).length, 2, 'nothing is respawned after stop()')
   assert.deepEqual(lost, [])
+  settled(dir)
+})
+
+test('a daemon refused for its data dir is not respawned: the app is told why, once', async () => {
+  const dir = newDir()
+  const lost = []
+  const launches = countingSpawner(fakeDaemon(dir, '73'))
+  const child = supervise({
+    spawnDaemon: launches.spawnDaemon,
+    onDaemonLost: (reason, details) => lost.push({ reason, details })
+  }).start()
+  const exited = once(child, 'exit')
+
+  await waitUntil(() => lost.length === 1, DEADLINE_MS, 'the daemon to be reported lost')
+  await exited
+  assert.equal(launches.count, 1, 'a refused daemon is never respawned')
+  assert.deepEqual(lost, [
+    { reason: 'refused: another TurboLLM holds its data dir (exit 73)', details: { dataDirInUse: true } }
+  ])
   settled(dir)
 })
 

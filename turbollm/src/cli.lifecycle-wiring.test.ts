@@ -141,7 +141,7 @@ test('pidfile removal is owner-scoped and a second daemon on the data dir is ref
   for (const sideEffect of ['reapStaleEngines(store.dir())', 'reconcileTailscale(', 'sweepInteractiveCliRuns(cliInteractiveSweepDeps)']) {
     assert.ok(guard < CLI.indexOf(sideEffect), `the guard must run before ${sideEffect}`)
   }
-  assert.match(CLI.slice(guard, guard + 600), /if \(runningDaemon\) \{[\s\S]*process\.exit\(1\)/)
+  assert.match(CLI.slice(guard, guard + 600), /if \(runningDaemon\) \{[\s\S]*process\.exit\(DATA_DIR_IN_USE_EXIT_CODE\)/)
 })
 
 // Two daemons started together both passed findRunningDaemon (no pidfile until the bind). The
@@ -150,7 +150,7 @@ test('the start guard claims the data dir first and gives the claim up once the 
   const claim = CLI.indexOf('const claimHolder = claimDataDir(store.dir())')
   const guard = CLI.indexOf('const runningDaemon = await findRunningDaemon(store.dir())')
   assert.ok(claim > CLI.indexOf("if (hasFlag('--stop')) {") && claim < guard, 'claimed after --stop, before the pidfile is read')
-  assert.match(CLI.slice(claim, guard), /if \(claimHolder\) \{[\s\S]*process\.exit\(1\)[\s\S]*process\.on\('exit', \(\) => releaseDataDirClaim\(store\.dir\(\)\)\)/)
+  assert.match(CLI.slice(claim, guard), /if \(claimHolder\) \{[\s\S]*process\.exit\(DATA_DIR_IN_USE_EXIT_CODE\)[\s\S]*process\.on\('exit', \(\) => releaseDataDirClaim\(store\.dir\(\)\)\)/)
   const listen = blockFrom(LISTEN)
   const write = listen.indexOf('writePidfile(store.dir(), process.pid, info.port, info.address)')
   assert.ok(write > 0 && listen.indexOf('releaseDataDirClaim(store.dir())', write) > write, 'released only after the pidfile is written')

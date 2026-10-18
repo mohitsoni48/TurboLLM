@@ -1,17 +1,22 @@
 // daemon-supervisor.js — owns the desktop daemon's lifetime across restarts (ADR-442).
 // Electron-free on purpose, so it can be tested with real child processes under plain `node --test`.
 // A daemon exits RESTART_REQUESTED_EXIT_CODE to ask for a fresh one; any other exit means the daemon is gone.
-// The constant mirrors turbollm/src/daemon-restart.ts, and daemon-supervisor.test.js pins that.
+// It exits DATA_DIR_IN_USE_EXIT_CODE when its start guard refused it because another TurboLLM holds its data
+// dir (a CLI daemon on ~/.turbollm): gone too, but the app tells the user why (main.js onDaemonLost).
+// The constants mirror turbollm/src/daemon-restart.ts and turbollm/src/daemon-pid.ts, and
+// daemon-supervisor.test.js pins that.
 
 const { spawnSync } = require('node:child_process')
 
 const RESTART_REQUESTED_EXIT_CODE = 75 // mirrors turbollm/src/daemon-restart.ts
+const DATA_DIR_IN_USE_EXIT_CODE = 73 // mirrors turbollm/src/daemon-pid.ts
 
 /**
  * Tracks exactly one live daemon: respawns it on a requested restart, reports any other exit as lost
- * (once), and on stop() ends whichever daemon is live now.
+ * (once), and on stop() ends whichever daemon is live now. A loss says whether the daemon was refused
+ * because another TurboLLM holds its data dir (dataDirInUse).
  * @param {{ spawnDaemon: () => import('node:child_process').ChildProcess,
- *           onDaemonLost: (reason: string) => void,
+ *           onDaemonLost: (reason: string, details: { dataDirInUse: boolean }) => void,
  *           log?: Pick<Console,'log'|'error'>,
  *           killGraceMs?: number,
  *           platform?: NodeJS.Platform,
@@ -38,7 +43,7 @@ function createDaemonSupervisor ({
     if (child !== current) return
     const decision = decideOnDaemonExit({ code, signal, stopping: state !== 'running' })
     if (decision.action === 'respawn') respawn()
-    else if (decision.action === 'lost') lose(decision.reason)
+    else if (decision.action === 'lost') lose(decision.reason, decision.dataDirInUse === true)
   }
 
   // Node may emit 'error' without 'exit' (a spawn that never started), or both.
@@ -56,10 +61,10 @@ function createDaemonSupervisor ({
     }
   }
 
-  function lose (reason) {
+  function lose (reason, dataDirInUse = false) {
     if (state !== 'running') return
     state = 'lost'
-    onDaemonLost(reason)
+    onDaemonLost(reason, { dataDirInUse })
   }
 
   function stop () {
@@ -103,14 +108,38 @@ function taskkillTreeSync (pid) {
 /**
  * Pure.
  * @param {{ code: number | null, signal: string | null, stopping: boolean }} exit
- * @returns {{ action: 'respawn'|'lost'|'none', reason: string }}
+ * @returns {{ action: 'respawn'|'lost'|'none', reason: string, dataDirInUse?: true }}
  */
 function decideOnDaemonExit ({ code, signal, stopping }) {
   if (stopping) return { action: 'none', reason: 'stopping' }
   if (code === RESTART_REQUESTED_EXIT_CODE) {
     return { action: 'respawn', reason: `restart requested (exit ${RESTART_REQUESTED_EXIT_CODE})` }
   }
+  if (code === DATA_DIR_IN_USE_EXIT_CODE) {
+    return {
+      action: 'lost',
+      reason: `refused: another TurboLLM holds its data dir (exit ${DATA_DIR_IN_USE_EXIT_CODE})`,
+      dataDirInUse: true
+    }
+  }
   return { action: 'lost', reason: `exited (code=${code}, signal=${signal ?? 'none'})` }
+}
+
+/**
+ * Pure. The dialog the app shows before it quits when its daemon was refused because another TurboLLM
+ * holds the data dir. The daemon's own refusal (its stderr) names that one, its pid and address, and
+ * how to stop it, so it is the detail; without it the dialog still says what to do.
+ * @param {string} daemonStderr
+ * @returns {{ title: string, message: string, detail: string }}
+ */
+function dataDirInUseNotice (daemonStderr) {
+  const refusal = String(daemonStderr || '').trim()
+  return {
+    title: 'TurboLLM is already running',
+    message: 'Another TurboLLM is already using your TurboLLM data folder, so the app cannot start its own. ' +
+      'Stop that one, then open the app again.',
+    detail: refusal || 'If it was started with `turbollm` in a terminal, `turbollm --stop` stops it.'
+  }
 }
 
 /** Pure. Still running iff it has neither an exit code nor a terminating signal.
@@ -119,4 +148,11 @@ function isRunning (child) {
   return !!child && child.exitCode === null && child.signalCode === null
 }
 
-module.exports = { RESTART_REQUESTED_EXIT_CODE, decideOnDaemonExit, isRunning, createDaemonSupervisor }
+module.exports = {
+  RESTART_REQUESTED_EXIT_CODE,
+  DATA_DIR_IN_USE_EXIT_CODE,
+  dataDirInUseNotice,
+  decideOnDaemonExit,
+  isRunning,
+  createDaemonSupervisor
+}

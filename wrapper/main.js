@@ -1,12 +1,12 @@
 // main.js — TurboLLM Desktop native wrapper
 // Spawns the TurboLLM daemon (bundled under resources/daemon/), waits for /healthz,
 // then opens a native window pointed at http://localhost:6996.
-const { app, BrowserWindow, session, shell } = require('electron')
+const { app, BrowserWindow, dialog, session, shell } = require('electron')
 const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
-const { createDaemonSupervisor } = require('./daemon-supervisor')
+const { createDaemonSupervisor, dataDirInUseNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
@@ -168,11 +168,36 @@ function daemonLaunchSpec (port) {
   }
 }
 
+// The last of each daemon's stderr, for the dialog onDaemonLost shows when the daemon was refused. Bounded: a
+// daemon that runs for days writes far more than a dialog shows.
+const STDERR_TAIL_BYTES = 4096
+// How long that dialog waits for the rest of it: 'exit' can come before the last of a child's stderr has been
+// read, while the stream's 'close' cannot. A process that kept the pipe open must not hold the dialog back.
+const STDERR_SETTLE_MS = 2000
+const daemonStderr = new WeakMap()
+
 function spawnDaemonFrom (spec) {
   const child = spawn(spec.node, spec.args, spec.options)
+  let tail = Buffer.alloc(0)
+  const closed = new Promise((resolve) => child.stderr.once('close', resolve))
+  daemonStderr.set(child, { closed, text: () => tail.toString('utf8') })
   child.stdout.on('data', (data) => { process.stdout.write(data) })
-  child.stderr.on('data', (data) => { process.stderr.write(data) })
+  child.stderr.on('data', (data) => {
+    process.stderr.write(data)
+    tail = Buffer.concat([tail, data]).subarray(-STDERR_TAIL_BYTES)
+  })
   return child
+}
+
+function stderrOf (child) {
+  const stderr = child && daemonStderr.get(child)
+  if (!stderr) return Promise.resolve('')
+  let timer
+  const settled = new Promise((resolve) => { timer = setTimeout(resolve, STDERR_SETTLE_MS) })
+  return Promise.race([stderr.closed, settled]).then(() => {
+    clearTimeout(timer)
+    return stderr.text()
+  })
 }
 
 // PORT until a port change in Settings moves the live daemon and then the window (window-guards.js
@@ -182,9 +207,24 @@ function daemonPort () {
   return daemonPortFor(url, APP_ORIGIN, PORT)
 }
 
-function onDaemonLost (reason) {
+// Set once the daemon was refused because another TurboLLM holds the data dir: from then on the dialog below
+// decides when the app quits, and no window opens.
+let daemonRefused = false
+
+function onDaemonLost (reason, { dataDirInUse = false } = {}) {
   console.error(`TurboLLM daemon ${reason}`)
-  setImmediate(() => app.quit())
+  if (!dataDirInUse) {
+    setImmediate(() => app.quit())
+    return
+  }
+  // The daemon's start guard refused it (turbollm/src/cli.ts): a CLI daemon already uses ~/.turbollm, or another
+  // start there is still under way. The app quit here at once, as after a crash, so to the user it opened and
+  // vanished, and the refusal, which names that daemon and how to stop it, went to a stderr no one sees.
+  daemonRefused = true
+  stderrOf(supervisor && supervisor.current())
+    .then((stderr) => dialog.showMessageBox({ type: 'error', buttons: ['Quit'], ...dataDirInUseNotice(stderr) }))
+    .catch((err) => console.error('Could not show why the daemon was refused:', err.message))
+    .finally(() => app.quit())
 }
 
 // Keeps links and permission requests from turning this window into a browser (window-guards.js).
@@ -243,6 +283,8 @@ app.whenReady().then(() => {
   setupAutoUpdate()
 
   waitForDaemon().then(() => {
+    // Refused (onDaemonLost): whatever answers on the port is not this app's daemon.
+    if (daemonRefused) return
     mainWindow = new BrowserWindow({
       width: 1200,
       height: 800,
@@ -263,6 +305,7 @@ app.whenReady().then(() => {
       mainWindow.webContents.openDevTools()
     }
   }).catch((err) => {
+    if (daemonRefused) return // the dialog quits the app once it is answered
     console.error('Daemon failed to start:', err.message)
     app.quit()
   })

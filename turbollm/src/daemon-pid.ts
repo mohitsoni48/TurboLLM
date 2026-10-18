@@ -94,6 +94,17 @@ export function daemonReachHost(host: string | undefined): string {
   return host.includes(':') && !host.startsWith('[') ? `[${host}]` : host
 }
 
+/** Exit status of a start refused because another TurboLLM holds its data dir: one running there
+ *  (findRunningDaemon) or still starting or moving to a new address there (claimDataDir).
+ *  MIRRORED in wrapper/daemon-supervisor.js; change both or neither (both test suites pin it).
+ *  The desktop app's daemon is refused this way when a CLI daemon already uses ~/.turbollm; on
+ *  exit 1 the app could not tell that from a crash, so it quit with the refusal, which names the
+ *  running daemon and how to stop it, in a stderr no one sees. On this status it shows it.
+ *  73 = sysexits EX_CANTCREAT (this start cannot claim the data dir): outside Node's reserved exit
+ *  codes (1,3-7,9,10,12,13), below the 128+signal range, not the restart status (75), and produced
+ *  by no other path. */
+export const DATA_DIR_IN_USE_EXIT_CODE = 73
+
 /** The daemon that already owns <dir>/daemon.pid and is alive, or null. Alive means the same
  *  proof {@link stopDaemon} demands before it kills anything: the PID exists AND a TurboLLM
  *  answers on the recorded address and port — so a stale pidfile, a recycled PID or a daemon

@@ -57,7 +57,7 @@ import { GenerationGate } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
-import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost } from './daemon-pid'
+import { writePidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonPort, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE } from './daemon-pid'
 import { isDesktopSupervised, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
@@ -365,13 +365,17 @@ setGithubTokenProvider(() => store.snapshot().gh?.token ?? '')
 // released once this daemon's pidfile is written (the listen callback), and it is taken BEFORE
 // the pidfile is read, so a start that gets it after that release sees this daemon's pidfile. An
 // in-place rebind takes it again until its new pidfile is written (deps.rebind).
+//
+// Both refusals exit DATA_DIR_IN_USE_EXIT_CODE, not 1: the desktop app's daemon is refused here
+// when a CLI daemon already uses the data dir, and the app shows these lines to the user on that
+// status (wrapper/main.js) instead of quitting as if its daemon had crashed.
 const claimHolder = claimDataDir(store.dir())
 if (claimHolder) {
   console.error(
     `TurboLLM is already starting, or moving to a new address, for ${store.dir()}${claimHolder.pid ? ` (pid ${claimHolder.pid})` : ''}.\n` +
       `Use that one once it is up, or start this one with its own --config.`,
   )
-  process.exit(1)
+  process.exit(DATA_DIR_IN_USE_EXIT_CODE)
 }
 // Also released on any exit that comes before the listen callback's release: a refused start
 // just below, a failed bind, a crash during boot. Owner-scoped: never another start's claim.
@@ -382,7 +386,7 @@ if (runningDaemon) {
     `TurboLLM is already running for ${store.dir()} (pid ${runningDaemon.pid}, http://${daemonReachHost(runningDaemon.host)}:${runningDaemon.port}).\n` +
       `Use that one, stop it first with \`turbollm --stop\`, or start this one with its own --config.`,
   )
-  process.exit(1)
+  process.exit(DATA_DIR_IN_USE_EXIT_CODE)
 }
 
 // Reap any engine processes orphaned by a previous daemon that didn't shut down

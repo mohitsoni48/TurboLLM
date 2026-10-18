@@ -18,10 +18,12 @@ import {
   daemonReachHost,
   resolveDaemonPort,
   stopDaemon,
+  DATA_DIR_IN_USE_EXIT_CODE,
   type ClaimHooks,
   type ClaimRecord,
   type StopHooks,
 } from './daemon-pid.js'
+import { RESTART_REQUESTED_EXIT_CODE } from './daemon-restart.js'
 import { tmpDir } from './test-support/tmp'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -369,6 +371,15 @@ test('--stop counts a daemon that exited but was not reaped (a zombie) as stoppe
 })
 
 // ── Second daemon on the same data dir (owner-scoped pidfile + start guard) ─────────
+
+// The desktop app tells this refusal from a crash by its status alone (wrapper/daemon-supervisor.js,
+// whose suite pins the same value), so it must be one no other exit can produce.
+test('a start refused for an in-use data dir exits 73: not a Node-reserved, signal or restart status', () => {
+  assert.equal(DATA_DIR_IN_USE_EXIT_CODE, 73)
+  assert.ok(![0, 1, 3, 4, 5, 6, 7, 9, 10, 12, 13].includes(DATA_DIR_IN_USE_EXIT_CODE))
+  assert.ok(DATA_DIR_IN_USE_EXIT_CODE < 128)
+  assert.notEqual(DATA_DIR_IN_USE_EXIT_CODE, RESTART_REQUESTED_EXIT_CODE)
+})
 
 test('removeOwnPidfile: leaves another daemon\'s pidfile alone, removes its own', () => {
   const { dir, cleanup } = makeTmpDir()

@@ -108,8 +108,13 @@ test('main.js does not run electron-updater on macOS (no zip, unsigned: it canno
 
 // Runs the real main.js against a stand-in for electron (and for child_process and http, so no
 // daemon or window is started), to check how it wires the daemon's port to the window's.
-function loadMain () {
+// healthz 'ok': /healthz answers at once, so main.js opens its window; 'held': it answers only on
+// answerHealthz(). Dialogs are recorded and answered by the test.
+function loadMain ({ healthz = 'ok' } = {}) {
   const spawned = []
+  const dialogs = []
+  const heldHealthz = []
+  let quits = 0
   let windowUrl = ''
   let ready = null
   class FakeWindow {
@@ -125,11 +130,16 @@ function loadMain () {
     app: {
       isPackaged: false,
       on () {},
-      quit () {},
+      quit () { quits += 1 },
       requestSingleInstanceLock: () => true,
       whenReady: () => ({ then (f) { ready = f } }),
     },
     BrowserWindow: FakeWindow,
+    dialog: {
+      showMessageBox (options) {
+        return new Promise((resolve) => dialogs.push({ options, answer: () => resolve({ response: 0 }) }))
+      },
+    },
     session: { defaultSession: { setPermissionRequestHandler () {}, setPermissionCheckHandler () {} } },
     shell: { openExternal () {} },
   }
@@ -141,11 +151,11 @@ function loadMain () {
       return child
     },
   }
-  // /healthz answers at once, so main.js opens its window.
   const http = {
     get (_url, _opts, onResponse) {
       const req = new EventEmitter()
-      req.end = () => setImmediate(() => onResponse({ statusCode: 200 }))
+      const answer = () => onResponse({ statusCode: 200 })
+      req.end = () => (healthz === 'ok' ? setImmediate(answer) : heldHealthz.push(answer))
       return req
     },
   }
@@ -163,8 +173,18 @@ function loadMain () {
     Module._load = load
     if (port !== undefined) process.env.TURBOLLM_PORT = port
   }
-  return { spawned, ready: () => ready(), windowUrl: () => windowUrl, setWindowUrl: (url) => { windowUrl = url } }
+  return {
+    spawned,
+    dialogs,
+    ready: () => ready(),
+    quits: () => quits,
+    answerHealthz: () => heldHealthz.splice(0).forEach((answer) => answer()),
+    windowUrl: () => windowUrl,
+    setWindowUrl: (url) => { windowUrl = url },
+  }
 }
+
+const turns = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)) }
 
 const portArgs = (args) => args.slice(args.indexOf('--port'), args.indexOf('--port') + 4)
 
@@ -191,5 +211,65 @@ test('main.js: a respawn after a requested restart binds the port the window is 
     assert.ok(main.spawned[1].args.includes('--no-open'))
   } finally {
     console.log = log
+  }
+})
+
+// A CLI daemon already on ~/.turbollm makes the daemon's start guard refuse the app's daemon. The app
+// quit at once, as after a crash: it opened and vanished, and the refusal, which names the running
+// daemon and how to stop it, went to a stderr no one sees.
+test('main.js: a daemon refused because another TurboLLM holds the data dir is shown in a dialog before the app quits', async () => {
+  const refusal = 'TurboLLM is already running for /home/u/.turbollm (pid 4242, http://127.0.0.1:7000).\n' +
+    'Use that one, stop it first with `turbollm --stop`, or start this one with its own --config.\n'
+  const main = loadMain({ healthz: 'held' })
+  const error = console.error
+  console.error = () => {} // main.js logs the loss
+  try {
+    main.ready()
+    const daemon = main.spawned[0].child
+    daemon.exitCode = 73
+    daemon.emit('exit', 73, null) // the start guard's status; its stderr can still be on the way
+    const write = process.stderr.write
+    process.stderr.write = () => true // main.js passes the daemon's stderr through
+    try {
+      daemon.stderr.emit('data', Buffer.from(refusal))
+    } finally {
+      process.stderr.write = write
+    }
+    daemon.stderr.emit('close')
+    await turns()
+
+    assert.equal(main.dialogs.length, 1, 'the refusal is shown')
+    const [{ options, answer }] = main.dialogs
+    assert.equal(options.type, 'error')
+    assert.match(options.message, /Another TurboLLM is already using your TurboLLM data folder/)
+    assert.equal(options.detail, refusal.trim(), 'the dialog names the running daemon and how to stop it')
+    assert.equal(main.quits(), 0, 'the app stays until the dialog is answered')
+    main.answerHealthz() // whatever answers on the port now is not this app's daemon
+    await turns()
+    assert.equal(main.windowUrl(), '', 'no window opens')
+
+    answer()
+    await turns()
+    assert.equal(main.quits(), 1)
+    assert.equal(main.spawned.length, 1, 'a refused daemon is not respawned')
+  } finally {
+    console.error = error
+  }
+})
+
+test('main.js: a daemon that crashes still quits the app at once, with no dialog', async () => {
+  const main = loadMain({ healthz: 'held' })
+  const error = console.error
+  console.error = () => {}
+  try {
+    main.ready()
+    const daemon = main.spawned[0].child
+    daemon.exitCode = 1
+    daemon.emit('exit', 1, null)
+    await turns()
+    assert.equal(main.quits(), 1)
+    assert.deepEqual(main.dialogs, [])
+  } finally {
+    console.error = error
   }
 })
