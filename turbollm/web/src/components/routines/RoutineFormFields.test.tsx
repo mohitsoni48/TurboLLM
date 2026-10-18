@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoutineFormFields } from './RoutineFormFields'
-import { emptyRoutineDraft, type RoutineDraft } from '../../lib/routine-form'
+import { emptyRoutineDraft, ROUTINE_MAX_INTERVAL_MS, type RoutineDraft } from '../../lib/routine-form'
 import type { ModelEntry } from '../../lib/types'
 
 const MODEL_A: Partial<ModelEntry> = { key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }
@@ -303,6 +303,21 @@ describe('RoutineFormFields — interval minutes', () => {
     expect(onRule).toHaveBeenLastCalledWith(60_000)
     fireEvent.blur(input)
     expect(input.value).toBe('1')
+  })
+
+  // The server now refuses an interval over a year with a 400 (validateScheduleRule). The field
+  // committed any number typed, and the server took it: a routine whose next fire passed the year
+  // 9999 then fired on every tick, and one past Date's range could not be confirmed (a 500).
+  it('never commits more than a year, and shows the committed value once the field is left', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    expect(input.max).toBe('525600')
+    await userEvent.clear(input)
+    await userEvent.type(input, '600000')
+    expect(onRule).toHaveBeenLastCalledWith(ROUTINE_MAX_INTERVAL_MS)
+    fireEvent.blur(input)
+    expect(input.value).toBe('525600')
   })
 })
 

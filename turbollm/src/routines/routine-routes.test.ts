@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import { createHash } from 'node:crypto'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { registerRoutineRoutes, validateCreate, CODE_GATE_MESSAGE, TEXT_CLASSIFIER_ROUTINE_MODEL_MESSAGE } from './routine-routes'
+import { ROUTINE_MAX_INTERVAL_MS } from './schedule'
 import { RoutineScheduler } from './scheduler'
 import { executeRoutine } from './execute'
 import type { Deps } from '../deps'
@@ -273,6 +274,37 @@ test('POST rejects everyMs of 0 or negative (would make the routine permanently 
     assert.equal(res.status, 400, `everyMs: ${everyMs}`)
     assert.equal(await errorCode(res), 'invalid_routine')
   }
+})
+
+// A huge everyMs was accepted: next_fire_at = now + everyMs then passed Date's range, so /confirm
+// and /resume threw a RangeError out of toISOString (a 500), and the routine could never be
+// armed. One that stayed in range but passed the year 9999 serialized as '+011533-…', which
+// sorts BEFORE every 4-digit year in listDueRoutines' string comparison: due on every tick.
+test('POST rejects an everyMs longer than a year, and a year still confirms', async () => {
+  const { app, db } = testApp()
+  for (const everyMs of [1e16, 3e14, ROUTINE_MAX_INTERVAL_MS + 1]) {
+    const res = await post(app, { scheduleRule: { kind: 'interval', everyMs } })
+    assert.equal(res.status, 400, `everyMs: ${everyMs}`)
+    assert.equal(await errorCode(res), 'invalid_routine')
+  }
+  const res = await post(app, { scheduleRule: { kind: 'interval', everyMs: ROUTINE_MAX_INTERVAL_MS } })
+  assert.equal(res.status, 201)
+  const { id } = (await res.json()) as { id: string }
+  const confirmed = await app.request(`/api/v1/routines/${id}/confirm`, { method: 'PUT' })
+  assert.equal(confirmed.status, 200)
+  assert.match(((await confirmed.json()) as { nextFireAt: string }).nextFireAt, /^\d{4}-/)
+  assert.equal(db.listDueRoutines(new Date().toISOString()).length, 0, 'not due until a year from now')
+})
+
+test('PUT rejects an everyMs longer than a year instead of persisting it', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scheduleRule: { kind: 'interval', everyMs: 1e16 } }),
+  })
+  assert.equal(res.status, 400)
+  assert.deepEqual(db.getRoutine(created.id)?.scheduleRule, { kind: 'interval', everyMs: 60_000 })
 })
 
 test('POST rejects a non-numeric everyMs', async () => {

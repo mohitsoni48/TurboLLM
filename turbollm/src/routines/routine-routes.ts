@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
 import { isLocalRequest, verifyPresentedKey } from '../auth'
-import { computeNextFireTime } from './schedule'
+import { computeNextFireTime, ROUTINE_MAX_INTERVAL_MS } from './schedule'
 import { resumeRoutineRun } from './execute'
 import { parsePendingToolCall } from './approval'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE, MCP_ROUTINE_REFUSED_MESSAGE } from '../tools/tool-registry'
@@ -54,6 +54,10 @@ export function validateScheduleRule(rule: unknown): string | null {
   if (r.kind === 'interval') {
     if (typeof r.everyMs !== 'number' || !Number.isFinite(r.everyMs) || r.everyMs <= 0) {
       return 'scheduleRule.everyMs must be a positive number of milliseconds.'
+    }
+    // A longer one could never be confirmed or resumed, or was due on every tick (see the constant).
+    if (r.everyMs > ROUTINE_MAX_INTERVAL_MS) {
+      return `scheduleRule.everyMs must be at most ${ROUTINE_MAX_INTERVAL_MS} milliseconds (one year).`
     }
     return null
   }

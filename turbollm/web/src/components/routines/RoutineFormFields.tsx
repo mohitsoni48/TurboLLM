@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { unsetPermissionModeLabel, type RoutineDraft } from '../../lib/routine-form'
+import { ROUTINE_MAX_INTERVAL_MS, unsetPermissionModeLabel, type RoutineDraft } from '../../lib/routine-form'
 import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
@@ -23,11 +23,14 @@ const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const inputCls = 'w-full rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint'
 const labelCls = 'text-[12px] font-medium text-muted'
 
+const MAX_INTERVAL_MINUTES = ROUTINE_MAX_INTERVAL_MS / 60_000
+
 /** "Every N minutes" with a text draft while focused — the same idea as SettingsScreen's
  *  NumberField. Rendering the rule's own value on every keystroke snapped an emptied field back
  *  to "1" under the caret (`Math.max(1, Number(''))`), so selecting "60" and typing "30" gave
- *  130. Now the field shows what was typed; each finite value commits (clamped to ≥1, so the
- *  rule stays valid), and an empty field keeps the last committed value. */
+ *  130. Now the field shows what was typed; each finite value commits (clamped to 1 minute up to
+ *  a year, so the rule stays valid: the server answers a longer one with a 400, see
+ *  ROUTINE_MAX_INTERVAL_MS), and an empty field keeps the last committed value. */
 function IntervalMinutesInput({ everyMs, disabled, className, onCommit }: {
   everyMs: number; disabled?: boolean; className: string; onCommit: (everyMs: number) => void
 }) {
@@ -37,6 +40,7 @@ function IntervalMinutesInput({ everyMs, disabled, className, onCommit }: {
       disabled={disabled}
       type="number"
       min={1}
+      max={MAX_INTERVAL_MINUTES}
       aria-label="Minutes between runs"
       className={className}
       value={text ?? String(Math.round(everyMs / 60_000))}
@@ -44,7 +48,7 @@ function IntervalMinutesInput({ everyMs, disabled, className, onCommit }: {
         const raw = e.target.value
         setText(raw)
         const n = Number(raw)
-        if (raw.trim() !== '' && Number.isFinite(n)) onCommit(Math.max(1, n) * 60_000)
+        if (raw.trim() !== '' && Number.isFinite(n)) onCommit(Math.min(MAX_INTERVAL_MINUTES, Math.max(1, n)) * 60_000)
       }}
       onBlur={() => setText(null)}
     />

@@ -78,20 +78,26 @@ export function describeScheduleRule(rule: ScheduleRule): string {
   return `Runs ${days} at ${time}`
 }
 
+/** The daemon's ROUTINE_MAX_INTERVAL_MS (src/routines/schedule.ts), a year: `validateScheduleRule`
+ *  refuses a longer `everyMs` with a 400. Past it next_fire_at could not be written, or was
+ *  written with a six-digit year that the scheduler read as due on every tick. The panel's
+ *  minutes field clamps to it and {@link isRoutineDraftComplete} checks it. */
+export const ROUTINE_MAX_INTERVAL_MS = 365 * 24 * 60 * 60_000
+
 /** Confirm stays disabled until every flavor-required field resolves — spec 20 §3's "creation
  *  is never silent" rule, tested at the component level per spec 21 §3. The schedule checks
- *  mirror routine-routes.ts's `validateScheduleRule` check-for-check (finite positive `everyMs`;
- *  integer `hour` 0-23 and `minute` 0-59; a non-empty `daysOfWeek` of integers 0-6) so the gate
- *  never enables a submit the server would answer with a 400. A non-positive `everyMs` is the
- *  dangerous one: that route's own comment notes it yields a routine whose next fire is
- *  permanently in the past. The type signature alone does not cover these — `routineToDraft`
- *  seeds the draft from whatever the server holds, which includes routines a model authored via
- *  `create_routine` with an arbitrary `everyMs`. */
+ *  mirror routine-routes.ts's `validateScheduleRule` check-for-check (finite positive `everyMs`
+ *  of at most {@link ROUTINE_MAX_INTERVAL_MS}; integer `hour` 0-23 and `minute` 0-59; a
+ *  non-empty `daysOfWeek` of integers 0-6) so the gate never enables a submit the server would
+ *  answer with a 400. A non-positive `everyMs` is the dangerous one: that route's own comment
+ *  notes it yields a routine whose next fire is permanently in the past. The type signature
+ *  alone does not cover these — `routineToDraft` seeds the draft from whatever the server holds,
+ *  which includes routines a model authored via `create_routine` with an arbitrary `everyMs`. */
 export function isRoutineDraftComplete(d: RoutineDraft): boolean {
   if (!d.prompt.trim() || !d.modelKey.trim()) return false
   const rule = d.scheduleRule
   if (rule.kind === 'interval') {
-    if (!Number.isFinite(rule.everyMs) || rule.everyMs <= 0) return false
+    if (!Number.isFinite(rule.everyMs) || rule.everyMs <= 0 || rule.everyMs > ROUTINE_MAX_INTERVAL_MS) return false
   } else {
     if (!Number.isInteger(rule.hour) || rule.hour < 0 || rule.hour > 23) return false
     if (!Number.isInteger(rule.minute) || rule.minute < 0 || rule.minute > 59) return false
