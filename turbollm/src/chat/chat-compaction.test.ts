@@ -37,22 +37,25 @@ function makeConv(overrides: Partial<Conversation> = {}): Conversation {
 }
 
 // ── withCurrentDate (moved here from chat-routes.ts, unchanged behavior) ───────────────
+// The date line is the machine's LOCAL date, so these tests take local noon on 9 Sep: the instant
+// 2026-09-09T12:00:00Z they used is already 10 Sep at UTC+12 and beyond (New Zealand, Fiji, Tonga,
+// Kiribati), where all three failed. Local noon is 9 Sep in every zone, and no clock change skips it.
 
 test('withCurrentDate: appends a date line to a non-empty prompt', () => {
-  const now = new Date('2026-09-09T12:00:00Z')
+  const now = new Date(2026, 8, 9, 12)
   const out = withCurrentDate('Be helpful.', now)
   assert.match(out, /^Be helpful\.\n\nToday's date is 2026-09-09\./)
 })
 
 test('withCurrentDate: strips a stale baked-in date line before appending the fresh one', () => {
-  const now = new Date('2026-09-09T12:00:00Z')
+  const now = new Date(2026, 8, 9, 12)
   const out = withCurrentDate("Today's date is 2026-01-01. Use it only when needed.\n\nBe helpful.", now)
   assert.equal((out.match(/Today's date is/g) ?? []).length, 1)
   assert.match(out, /2026-09-09/)
 })
 
 test('withCurrentDate: an empty prompt yields just the date line', () => {
-  const now = new Date('2026-09-09T12:00:00Z')
+  const now = new Date(2026, 8, 9, 12)
   assert.equal(withCurrentDate('', now), "Today's date is 2026-09-09. Use it only when the request depends on the current date; otherwise ignore it.")
 })
 
