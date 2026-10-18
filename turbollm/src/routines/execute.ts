@@ -31,7 +31,7 @@ import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
 import { claudePermissionModeChoices } from '../terminal/agent-modes'
 import { engineIsIdle } from '../engines/update-scheduler'
 import type { GenerationGate } from '../agents/gate'
-import { runCliInteractiveRoutine, terminalLookupsBySession, agentLabel, CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, type CliInteractiveDeps } from './cli-interactive-runner'
+import { runCliInteractiveRoutine, closeInteractiveRun, terminalLookupsBySession, agentLabel, CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, type CliInteractiveDeps } from './cli-interactive-runner'
 import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-routes'
 
 /** The binary a terminal-harness routine needs installed. Falls back to `claude` for a routine with
@@ -393,6 +393,15 @@ export async function executeRoutine(
   }
 }
 
+/** A run's configSnapshot, or undefined when it does not parse. */
+function parseSnapshot(configSnapshot: string): Routine | undefined {
+  try {
+    return JSON.parse(configSnapshot) as Routine
+  } catch {
+    return undefined
+  }
+}
+
 /** Resume a stalled run after an approve/deny decision (routine-routes.ts's new .../approve and
  *  .../deny endpoints, Task 9). Never called by scheduler.ts's tick()/runNow() — a standalone
  *  entry point Task 9's REST routes call directly with a `run` they already fetched via
@@ -420,6 +429,24 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
   if (!current || current.status !== 'needs_approval') return { ok: false, code: 'not_stalled', message: 'This run is not awaiting approval.' }
   const pending = parsePendingToolCall(current.pendingToolCall)
   if (!pending) {
+    // A terminal (CLI) routine's run parks at 'needs_approval' with no pendingToolCall while its
+    // CLI runs in its own terminal, which is also where it asks, in ask mode
+    // (cli-interactive-runner.ts). Approve and Deny have nothing to decide there; reaching one ends
+    // the run, and it must end the way the run's other ends do: writing 'errored' alone left the
+    // CLI running and the user's model swapped out.
+    const snapshot = parseSnapshot(current.configSnapshot)
+    if (snapshot?.flavor === 'code' && isTerminalCodingAgent(snapshot.codingAgent)) {
+      const message = `Closed by ${decision === 'allow' ? 'Approve' : 'Deny'}: this run's ${agentLabel(snapshot)} CLI runs in its own terminal, so it had no tool call to decide.`
+      closeInteractiveRun({
+        store: d.db,
+        loadExplicit: (modelKey, overrides, opts) => d.modelRouter.loadExplicit(modelKey, overrides, opts),
+        reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
+        now: () => new Date(),
+        releaseParked: d.routineScheduler ? (routineId, runId) => d.routineScheduler!.releaseParked(routineId, runId) : undefined,
+        killTerminal: terminalLookupsBySession(() => getTerminalManager(d)).killTerminal,
+      }, current, message)
+      return { ok: false, code: 'no_pending_call', message }
+    }
     // Permanently unresolvable (verified real gap found by a live-execution review of Task 9's
     // scheduler-side double-fire fix): no FUTURE approve/deny call could ever parse this
     // pendingToolCall either, since it's the same corrupt column value every time. Leaving the

@@ -1010,6 +1010,49 @@ test('a Deny ends a stalled pi Code run at once while another caller holds the g
   await denied
 })
 
+// A terminal routine's run parks at needs_approval with no pendingToolCall while its CLI runs (and,
+// in ask mode, asks) in its own terminal. Approve or Deny on it wrote 'errored' and nothing else:
+// the CLI went on running in the workspace, and the user's model, swapped out for the run, was
+// never put back (the sweep only looks at parked runs). Real TerminalManager and
+// createAgentTerminal; only the PTY is faked. The routine runs in auto mode, where its CLI never
+// asks anything, so the run's error does not say it does.
+test('Approve or Deny on a parked terminal routine run closes its CLI and restores the user model', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  t.mock.method(PTYSession, 'spawn', () => {
+    let exited = false
+    return {
+      onData: () => {}, onExit: () => {}, getPid: () => 0, write: () => {}, resize: () => {}, getScrollback: () => '',
+      dispose: () => { exited = true }, isExited: () => exited,
+    }
+  })
+  for (const decision of ['allow', 'deny'] as const) {
+    const { d, db, loadCalls } = fakeDeps({ loadedKey: 'user-model' })
+    const released: string[] = []
+    ;(d as unknown as { routineScheduler: unknown }).routineScheduler = { releaseParked: (_routineId: string, runId: string) => { released.push(runId) } }
+    const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'routine-model', workspacePath: tmpDir('execute-terminal-decide-'), codingAgent: 'opencode_cli', permissionMode: 'auto' })
+    const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+    assert.equal(await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => runCliInteractiveRoutine(r, rr, { ...deps, isAvailable: async () => true })), 'needs_approval')
+    const tm = getTerminalManager(d)
+    const codeSessionId = db.getRoutineRun(run.id)!.codeSessionId!
+    const terminalId = tm.findByCodeSessionId(codeSessionId)
+    assert.ok(terminalId)
+    try {
+      const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, decision)
+      await new Promise((r) => setImmediate(r)) // the restore is started, not awaited (finalizeInteractiveRun)
+      assert.equal(res.ok, false)
+      assert.equal((res as { code: string }).code, 'no_pending_call')
+      const final = db.getRoutineRun(run.id)!
+      assert.equal(final.status, 'errored', decision)
+      assert.match(final.error ?? '', decision === 'allow' ? /^Closed by Approve: this run's opencode CLI runs in its own terminal, / : /^Closed by Deny: /)
+      assert.ok(final.endedAt)
+      assert.equal(tm.findByCodeSessionId(codeSessionId), null, `${decision}: the CLI's terminal is closed`)
+      assert.deepEqual(loadCalls, ['routine-model', 'user-model'], `${decision}: the user's model is restored`)
+      assert.deepEqual(released, [run.id], `${decision}: the routine is released`)
+    } finally {
+      tm.kill(terminalId)
+    }
+  }
+})
+
 // withPinnedModel can report 'skip-comfyui-busy' without ever running fn. resumeRoutineRun
 // used to fall through to {ok:true}, leaving its claim at 'running' forever (and every retry 409).
 test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', async () => {

@@ -259,6 +259,22 @@ function finalizeInteractiveRun(
   }
 }
 
+/** Ends a parked interactive run that an Approve or Deny reached (execute.ts resumeRoutineRun).
+ *  Such a run has no structured call to decide (its CLI runs, and in ask mode asks, in its own
+ *  terminal), and the decision used to write the run's end and nothing else: its CLI kept
+ *  running in the workspace behind a released routine, and the user's model, kept in
+ *  `pendingRestore`, was never put back, since the sweep only looks at parked runs. It now closes
+ *  the session as the sweep's wall-clock bound does: the terminal and its CLI are killed, then
+ *  finalizeInteractiveRun writes the end, releases the parked guard and restores the model. */
+export function closeInteractiveRun(
+  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'reloadAfterRender' | 'now' | 'releaseParked' | 'killTerminal'>,
+  run: RoutineRun,
+  error: string,
+): void {
+  if (run.codeSessionId) deps.killTerminal(run.codeSessionId)
+  finalizeInteractiveRun(deps, run, { status: 'errored', error })
+}
+
 /** Everything `sweepInteractiveCliRuns` actually touches — a `Pick` of `CliInteractiveDeps`
  *  rather than the whole interface, so a caller (cli.ts) doesn't have to fabricate unused
  *  kickoff-only fields (`gate`, `getLoadedModelKey`, `getEngineIdle`, `isAvailable`,
