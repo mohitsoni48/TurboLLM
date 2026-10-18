@@ -7,6 +7,7 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import {
   ConfigStore,
+  configAccessProblem,
   configuredDaemonPort,
   defaultConfigPath,
   resolveConfiguredCtx,
@@ -297,13 +298,48 @@ if (hasFlag('--help', '-h')) {
   process.exit(0)
 }
 
+// ── --stop ────────────────────────────────────────────────────────────────────
+// Before daemon startup so we never spin up two daemons, and before the config is loaded: --stop
+// needs only the data dir's pidfile. A load could save config.json, and `sudo turbollm --stop` (a
+// daemon started elevated) left it owned by root, mode 0600: the owner's next start could not read
+// it. The data dir is the config file's (ConfigStore.dir()).
+if (hasFlag('--stop')) {
+  const result = await stopDaemon(dirname(argValue('--config', defaultConfigPath())))
+  process.stdout.write(result.message + '\n')
+  // 1 only when the daemon it found is still running (StopResult.failed), so `turbollm --stop &&
+  // …` does not carry on beside it; nothing to stop is still 0.
+  process.exit(result.failed ? 1 : 0)
+}
+
 // ── Config + registry ─────────────────────────────────────────────────────────
 // Default location → relocate any pre-0.x state into ~/.turbollm first. A
 // `--config` override is an explicit choice (dev/preview), so leave it untouched.
 if (!process.argv.includes('--config')) migrateLegacyDataDir()
-const store = ConfigStore.load(argValue('--config', defaultConfigPath()))
+const configPath = argValue('--config', defaultConfigPath())
+// A config.json this user may not read or write (another user's, as `sudo turbollm` leaves it)
+// ends the start with what to do about it, not an uncaught EACCES (configAccessProblem).
+const store = (() => {
+  try {
+    return ConfigStore.load(configPath)
+  } catch (e) {
+    const problem = configAccessProblem(configPath, e)
+    if (!problem) throw e
+    console.error(problem)
+    return process.exit(1)
+  }
+})()
 if (store.brokenBackup()) {
-  console.warn(`config was reset; previous file backed up at ${store.brokenBackup()}`)
+  // One of another user's is not reset by the load (ConfigStore.load never writes it), but any
+  // update() of this run still saves the defaults over it, as this user: often the boot's own, as
+  // its first telemetry event mints a machineId (the defaults have none). So the warning says
+  // that, and neither that it was reset nor that it is left as it is.
+  console.warn(
+    store.brokenLeftInPlace()
+      ? `config ${store.path()} could not be parsed and belongs to another user (a copy is at ` +
+          `${store.brokenBackup()}): this run uses the default settings, and any save it ` +
+          `makes (such as of the telemetry id it mints) writes them over the file as this user`
+      : `config was reset; previous file backed up at ${store.brokenBackup()}`,
+  )
 }
 
 // Make the user's configured GitHub token available to EVERY GitHub call in the process
@@ -311,17 +347,6 @@ if (store.brokenBackup()) {
 // Read through the store on each call so a token saved in Settings takes effect immediately,
 // with no daemon restart.
 setGithubTokenProvider(() => store.snapshot().gh?.token ?? '')
-
-// ── --stop ────────────────────────────────────────────────────────────────────
-// Must come after ConfigStore.load so we have store.dir() for the pidfile path,
-// but before daemon startup so we never spin up two daemons.
-if (hasFlag('--stop')) {
-  const result = await stopDaemon(store.dir())
-  process.stdout.write(result.message + '\n')
-  // 1 only when the daemon it found is still running (StopResult.failed), so `turbollm --stop &&
-  // …` does not carry on beside it; nothing to stop is still 0.
-  process.exit(result.failed ? 1 : 0)
-}
 
 // ── One daemon per data dir ───────────────────────────────────────────────────
 // A second daemon on this data dir must stop HERE, before the boot side effects below: it would

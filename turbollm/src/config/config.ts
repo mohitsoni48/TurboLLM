@@ -3,7 +3,7 @@
 // so no locking is needed. Unknown JSON fields ride along on `data` and are
 // preserved across round-trips for free.
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
@@ -827,12 +827,50 @@ export function configuredDaemonPort(configPath: string): number {
  *  it as before. */
 const CONFIG_FILE_MODE = 0o600
 
+/** Whether the file `st` describes belongs to another user than the one running this process.
+ *  Windows has no uid to compare (process.getuid is undefined there): never. */
+function ownedByAnotherUser(st: { uid: number }): boolean {
+  const uid = process.getuid?.()
+  return uid !== undefined && st.uid !== uid
+}
+
+/** The message a start prints, instead of crashing, when it may not read or write config.json
+ *  (EACCES or EPERM from ConfigStore.load); undefined for any other error. A `sudo turbollm …` run
+ *  with the owner's HOME (macOS keeps it) leaves files there that are root's: before load() stopped
+ *  rewriting a file of another user's, `sudo turbollm --stop` replaced config.json with one root
+ *  owned, mode 0600, and the owner's next start died with an uncaught EACCES on the read. So it
+ *  says whose the file (or its folder) is and how to give it back. */
+export function configAccessProblem(path: string, e: unknown): string | undefined {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  if (code !== 'EACCES' && code !== 'EPERM') return undefined
+  const uid = process.getuid?.()
+  let hint = 'Check that this user may read and write it and its folder.'
+  for (const [what, p] of [['It', path], ['Its folder', dirname(path)]] as const) {
+    let owner: number
+    try {
+      owner = statSync(p).uid
+    } catch {
+      continue
+    }
+    if (uid !== undefined && owner !== uid) {
+      // Single-quoted for the shell, so a path with a `"`, `$` or backtick in it pastes as itself.
+      const quoted = `'${p.replace(/'/g, `'\\''`)}'`
+      hint =
+        `${what} belongs to another user (uid ${owner}; this is uid ${uid}), as after running turbollm with sudo. ` +
+        `Give it back to this user with:\n  sudo chown "$(id -un)" ${quoted}`
+      break
+    }
+  }
+  return `TurboLLM cannot read or write its config file ${path} (${(e as Error).message}).\n${hint}`
+}
+
 /** Remove the `<config>.<pid>.tmp` files (see ConfigStore.save) whose process is gone. A save
  *  writes the whole config, the HF and GitHub tokens and tunnel tokens included, to its tmp and
  *  then renames it into place; a process killed in between left it, and no later save overwrites
  *  another pid's, so each kept a copy of those tokens for good, after the user rotated or removed
- *  them. Run by every load (each daemon start, `--stop`). A live pid's is left: that process may
- *  be between its write and its rename (EPERM counts as live). Best-effort — never throws. */
+ *  them. Run by every load (each daemon start, a refused one too). A live pid's is left: that
+ *  process may be between its write and its rename (EPERM counts as live). Best-effort — never
+ *  throws. */
 function sweepDeadSaveTmps(configPath: string): void {
   const dir = dirname(configPath)
   const prefix = `${basename(configPath)}.`
@@ -845,17 +883,22 @@ function sweepDeadSaveTmps(configPath: string): void {
   for (const name of names) {
     if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue
     const middle = name.slice(prefix.length, -'.tmp'.length)
-    // Our own pid's is overwritten by our first save. No pid (an older version's shared
-    // `config.json.tmp`, which a daemon of that version may be writing), or anything but the
-    // decimal pid save writes (Number() would read `0x1F` or `1e3` as one): not ours to judge.
+    // No pid (an older version's shared `config.json.tmp`, which a daemon of that version may be
+    // writing), or anything but the decimal pid save writes (Number() would read `0x1F` or `1e3`
+    // as one): not ours to judge.
     if (!/^[1-9]\d*$/.test(middle)) continue
     const pid = Number(middle)
-    if (pid === process.pid) continue
-    try {
-      process.kill(pid, 0)
-      continue
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code === 'EPERM') continue
+    // Our own pid's is a leftover too, of an earlier process that had this pid (killed between its
+    // write and its rename): a save of ours runs in one synchronous call, so none is under way
+    // now. It was left for our first save to remove, and a load that has nothing to save (a config
+    // already in saved form) left it, tokens and all, until the first update().
+    if (pid !== process.pid) {
+      try {
+        process.kill(pid, 0)
+        continue
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EPERM') continue
+      }
     }
     try { rmSync(join(dir, name), { force: true }) } catch { /* best-effort */ }
   }
@@ -866,6 +909,7 @@ export class ConfigStore {
     private data: Config,
     private filePath: string,
     private brokenPath = '',
+    private brokenKept = false,
   ) {}
 
   static load(path: string): ConfigStore {
@@ -880,6 +924,12 @@ export class ConfigStore {
     // hand-edited config to the reset below.
     const bytes = readFileSync(path)
     const text = decodeConfigText(bytes)
+    // A file of another user's is never rewritten or chmodded by a load. A save creates
+    // config.json anew, owned by whoever saves, mode 0600: run as root (`sudo turbollm …` with the
+    // owner's HOME, as macOS keeps it), every load did that, and the owner's next start could not
+    // read its own config (an uncaught EACCES). The data stays in memory for this process.
+    const st = statSync(path)
+    const foreign = ownedByAnotherUser(st)
     try {
       raw = JSON.parse(text) as Record<string, unknown>
     } catch {
@@ -887,15 +937,27 @@ export class ConfigStore {
       // The file's own bytes: a decoded copy of a file in another encoding mangles its non-ASCII text.
       // Owner-only like config.json: it is a full copy, tokens included.
       writeFileSync(backup, bytes, { mode: CONFIG_FILE_MODE })
-      const store = new ConfigStore(defaultConfig(), path, backup)
-      store.save()
+      // Another user's is left as it is by the load (see above): this process runs on the defaults,
+      // and says so (brokenLeftInPlace) rather than that the file was reset. Its first update() (a
+      // start's first telemetry event mints a machineId) still saves them over it, as the reset
+      // did.
+      const store = new ConfigStore(defaultConfig(), path, backup, foreign)
+      if (!foreign) store.save()
       return store
     }
     const version = typeof raw.version === 'number' ? raw.version : 0
     const cfg = version < SCHEMA_VERSION ? migrate(raw, version) : (raw as unknown as Config)
     normalize(cfg)
     const store = new ConfigStore(cfg, path)
-    store.save() // persist migration/normalization
+    if (foreign) return store
+    // An existing install's 0644 file (written before CONFIG_FILE_MODE) is tightened in place, not
+    // by a rewrite. Best-effort: a read-only mount still starts.
+    if (process.platform !== 'win32' && (st.mode & 0o777) !== CONFIG_FILE_MODE) {
+      try { chmodSync(path, CONFIG_FILE_MODE) } catch { /* best-effort */ }
+    }
+    // Persist migration/normalization, when they changed anything: a config already in the form
+    // save() writes is left as it is.
+    if (JSON.stringify(cfg, null, 2) !== text) store.save()
     return store
   }
 
@@ -921,20 +983,26 @@ export class ConfigStore {
   brokenBackup(): string {
     return this.brokenPath
   }
+  /** An unparsable config.json of another user's: backed up (brokenBackup) but not reset on disk,
+   *  as a load never writes one; this process runs on the defaults, and its first update() writes
+   *  them over the file. */
+  brokenLeftInPlace(): boolean {
+    return this.brokenKept
+  }
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    // A tmp file of this process's own. Every process that loads the config saves it (load()
-    // persists its migration), so `turbollm --stop` or a refused second start writes the RUNNING
-    // daemon's config.json too; with one shared `config.json.tmp`, a Settings save interleaving
-    // with that had its tmp overwritten with the other process's older snapshot (which then
-    // became config.json), or found it already renamed away and threw ENOENT.
+    // A tmp file of this process's own. A process that loads the config can save it (load()
+    // persists its migration), so a refused second start can write the RUNNING daemon's
+    // config.json too; with one shared `config.json.tmp`, a Settings save interleaving with that
+    // had its tmp overwritten with the other process's older snapshot (which then became
+    // config.json), or found it already renamed away and threw ENOENT.
     const tmp = `${this.filePath}.${process.pid}.tmp`
     // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after
-    // every save, and load() always saves, so an existing install's 0644 file is 0600 from its next
-    // start (or `turbollm --stop`) on, with no separate chmod. A mode applies only to a file
-    // the write creates, so one left under this pid (pid reuse after a kill; the sweep keeps a
-    // live pid's) is removed first rather than written through with its old mode.
+    // every save (load() tightens an existing install's 0644 file in place). A mode applies only
+    // to a file the write creates, so one left under this pid (pid reuse after a kill, one the
+    // load's best-effort sweep did not remove) is removed first rather than written through with
+    // its old mode.
     rmSync(tmp, { force: true })
     writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
     try {

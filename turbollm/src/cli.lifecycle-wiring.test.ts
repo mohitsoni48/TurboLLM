@@ -112,7 +112,26 @@ test('signal shutdown and restart drop open terminal WebSockets before close() (
 // as a failure is daemon-pid.test.ts's "stopDaemon: failed only when …" test.
 test('--stop exits 1 when the daemon it found is still running, 0 otherwise', () => {
   const stop = blockFrom("if (hasFlag('--stop')) {")
-  assert.match(stop, /const result = await stopDaemon\(store\.dir\(\)\)[\s\S]*process\.exit\(result\.failed \? 1 : 0\)/)
+  assert.match(stop, /const result = await stopDaemon\([\s\S]*process\.exit\(result\.failed \? 1 : 0\)/)
+})
+
+// A load could save config.json, as whoever ran it: `sudo turbollm --stop` left the file root's,
+// mode 0600, and the owner's next start crashed with an uncaught EACCES on the read. How a load
+// treats another user's file is config.test.ts's "a config.json of another user's" test.
+test('--stop never loads config.json, and a start that may not read or write it says why', () => {
+  const stop = blockFrom("if (hasFlag('--stop')) {")
+  assert.ok(CLI.indexOf("if (hasFlag('--stop')) {") < CLI.indexOf('ConfigStore.load('), '--stop comes before the config load')
+  assert.ok(!stop.includes('store.'), '--stop uses no ConfigStore')
+  assert.ok(stop.includes("stopDaemon(dirname(argValue('--config', defaultConfigPath()))"), "the data dir is the config file's")
+  assert.match(
+    CLI,
+    /try \{\n\s*return ConfigStore\.load\(configPath\)\n\s*\} catch \(e\) \{\n\s*const problem = configAccessProblem\(configPath, e\)\n\s*if \(!problem\) throw e\n\s*console\.error\(problem\)\n\s*return process\.exit\(1\)/,
+  )
+  // An unparsable one of another user's is not reset by the load: the start must not say it was
+  // reset, nor that it stays, as a save of the run (such as of the telemetry id it mints)
+  // replaces it.
+  assert.match(CLI, /store\.brokenLeftInPlace\(\)\n\s*\? `config \$\{store\.path\(\)\} could not be parsed and belongs to another user \(a copy is at /)
+  assert.match(CLI, /any save it ` \+\n\s*`makes \(such as of the telemetry id it mints\) writes them over the file as this user`/)
 })
 
 test('pidfile removal is owner-scoped and a second daemon on the data dir is refused before boot side effects', () => {
