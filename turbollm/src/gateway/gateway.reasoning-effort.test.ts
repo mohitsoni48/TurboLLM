@@ -150,9 +150,10 @@ test("a Code-session override to 'off' clears a client-sent real effort cleanly 
   assert.equal(kwargs?.reasoning_effort, undefined, "no stale reasoning_effort:'medium' left over from the client's value")
 })
 
-// The same precedence on /v1/messages, where Claude Code says "off" as thinking {type:'disabled'}: mapped to off it
-// sent budget 0 and enable_thinking false beside the session's reasoning_effort, so the session's effort produced no
-// reasoning at all.
+// On /v1/messages Claude Code says "off" as thinking {type:'disabled'}. A session's effort is a level, not an on
+// switch: it used to replace that 'disabled' with thinking on the default budget, and the web sets an effort for every
+// terminal session it opens (its default xhigh until the user picks another), so Claude Code's off never reached the
+// engine from one. The off now stays off, and no level is sent beside it.
 async function postMessagesAs(app: Hono, token: string, body: Record<string, unknown>) {
   const capture = captureOutboundFetch()
   try {
@@ -165,7 +166,20 @@ async function postMessagesAs(app: Hono, token: string, body: Record<string, unk
   return capture.calls[0]?.body
 }
 
-test("/v1/messages: a Code-session override to a real effort clears a client's thinking 'disabled' cleanly", async () => {
+test("/v1/messages: a client's thinking 'disabled' stays off in a terminal the web opened at its default effort", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-disabled-default-effort')
+  // What CodeSessionScreen's open-time sync sets for a terminal session whose effort the user never picked.
+  sessionAuth.setReasoningEffort('sess-disabled-default-effort', 'xhigh')
+
+  const outbound = await postMessagesAs(app, token, { thinking: { type: 'disabled' } })
+
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.deepEqual(outbound?.chat_template_kwargs, { enable_thinking: false })
+})
+
+test("/v1/messages: a client's thinking 'disabled' stays off in a Code session whose effort is set to a level", async () => {
   const app = new Hono()
   registerGateway(app, fakeDeps())
   const token = sessionAuth.mint('sess-conflict-messages')
@@ -173,10 +187,34 @@ test("/v1/messages: a Code-session override to a real effort clears a client's t
 
   const outbound = await postMessagesAs(app, token, { thinking: { type: 'disabled' } })
 
-  const kwargs = outbound?.chat_template_kwargs as Record<string, unknown> | undefined
-  assert.equal(kwargs?.reasoning_effort, 'low', "the session's override must win")
-  assert.equal(kwargs?.enable_thinking, undefined, "no stale enable_thinking:false left over from the client's 'disabled'")
-  assert.equal(outbound?.thinking_budget_tokens, 16000, "no stale budget 0: the default budget of a thinking request with none (half of max_tokens)")
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.deepEqual(outbound?.chat_template_kwargs, { enable_thinking: false })
+})
+
+test("/v1/messages: a Code session's effort level still applies when the client thinks", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-effort-adaptive')
+  sessionAuth.setReasoningEffort('sess-effort-adaptive', 'low')
+
+  // Claude Code's own request shape (see anthropic.ts): adaptive, no budget.
+  const outbound = await postMessagesAs(app, token, { thinking: { type: 'adaptive', display: 'omitted' } })
+
+  assert.equal(outbound?.thinking_budget_tokens, 16000, 'the default budget of a thinking request with none (half of max_tokens)')
+  assert.deepEqual(outbound?.chat_template_kwargs, { reasoning_effort: 'low' })
+})
+
+test("/v1/messages: the thinking slider's Off stays off beside a Code session's effort level, which is not sent", async () => {
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const token = sessionAuth.mint('sess-slider-off-effort')
+  sessionAuth.setThinkingBudget('sess-slider-off-effort', 0)
+  sessionAuth.setReasoningEffort('sess-slider-off-effort', 'xhigh')
+
+  const outbound = await postMessagesAs(app, token, { thinking: { type: 'adaptive', display: 'omitted' } })
+
+  assert.equal(outbound?.thinking_budget_tokens, 0)
+  assert.deepEqual(outbound?.chat_template_kwargs, { enable_thinking: false })
 })
 
 test("/v1/messages: a client's thinking 'disabled' still turns thinking off in a Code session with no effort override", async () => {

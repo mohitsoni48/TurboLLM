@@ -258,10 +258,6 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         thinkingOff = override === 0
       }
       effortOverride = sessionAuth.getReasoningEffortForToken(anthropicToken)
-      // A real effort replaces a client's thinking off, as on the OpenAI passthrough (a session effort there clears a
-      // client's 'off'): mapped to off, {type:'disabled'} would send budget 0 and enable_thinking false beside
-      // reasoning_effort. It is read as thinking with no budget, so it gets mapToOpenAI's default (half of max_tokens).
-      if (req.thinking?.type === 'disabled' && effortOverride !== null && effortOverride !== 'off') req.thinking = { type: 'enabled' }
     }
 
     if (!req.max_tokens) {
@@ -336,10 +332,16 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // is injected into the already-mapped OpenAI-shaped body's chat_template_kwargs instead.
     // 'off' collapses onto enable_thinking/thinking_budget_tokens instead of the literal
     // string "off" — see reasoning-effort.ts.
+    // A level (low/medium/xhigh) says how hard to think, not whether: thinking turned off, by the client's own
+    // {type:'disabled'} (mapToOpenAI's budget 0 plus enable_thinking false) or by the slider's Off, stays off, and the
+    // level is not sent beside it. A level used to replace the client's 'disabled' with thinking on the default budget,
+    // and the web sets one for every terminal session it opens (its default xhigh, the template's own default, until
+    // the user picks another), so Claude Code's off never reached the engine from a terminal opened there.
+    const thinkingIsOff = thinkingOff || req.thinking?.type === 'disabled'
     if (effortOverride === 'off') {
       oaiBody.thinking_budget_tokens = 0
       oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false }
-    } else if (effortOverride !== null) {
+    } else if (effortOverride !== null && !thinkingIsOff) {
       oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: effortOverride }
     }
     // The hard half of the loop breaker. pi refuses to EXECUTE the repeated call; the gateway is
