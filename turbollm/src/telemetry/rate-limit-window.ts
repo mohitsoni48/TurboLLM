@@ -29,19 +29,72 @@ export const IP_LIMIT = 5000
 // IP_LIMIT bounds a minute, not a day: one IP (or IPv6 /64) holding it for a
 // day writes 7.2M D1 rows, quarantined ones included, of up to MAX_EVENT_BYTES
 // (4 KB) each, ~29 GB, which fills a D1 database (10 GB at most) within
-// hours, after which storing real events fails silently. This caps the day
-// at 20 full queue drains (MAX_BATCH), so a machine catching up or a shared
-// NAT keeps room, and one key's worst case is ~40 MB a day.
-export const IP_DAILY_LIMIT = 10_000
+// hours, after which storing real events fails silently. So every request also
+// counts against a daily allowance, kept per install rather than only per IP:
+// with 10,000 a day for the whole IP, one install flushing a full queue every
+// 5 minutes used it up in under 2 hours and every other install behind that
+// IP (an office, a campus, a carrier NAT) got 429 for the rest of the 24 h.
+//
+// MACHINE_DAILY_LIMIT is one install's day: 20 full queue drains (MAX_BATCH),
+// the whole IP's former allowance, so an install alone on its address keeps
+// what it had. Most events are daily rollups or one per model load; the
+// largest real day is a heavy Full-level user's ui_action, one per click, a
+// few thousand. IP_DAILY_LIMIT stays as the ceiling for everything from one
+// IP: installs, rows with no validated machineId to charge (consent_choice,
+// quarantined rows, all-invalid batches) and an attacker minting fresh ids.
+// At 10x one install's day it takes ten installs at their cap, or dozens of
+// heavy real ones, to reach it, while one address's worst case stays ~400 MB
+// a day: 25 days to fill a D1 database instead of hours.
+export const MACHINE_DAILY_LIMIT = 10_000
+export const IP_DAILY_LIMIT = 100_000
 
-/** The IP tiers the Worker charges, in order, each on its own rate-limiter
- *  key (`<key>:<ip hash>`) with accepted plus quarantined events, at least 1.
- *  Exported, like the limits above, so the regression test runs the Worker's
- *  own tiers rather than a copy of them. */
-export const IP_TIERS: readonly { key: string; limit: number; periodSeconds: number }[] = [
-  { key: 'ip', limit: IP_LIMIT, periodSeconds: 60 },
-  { key: 'ipday', limit: IP_DAILY_LIMIT, periodSeconds: 86_400 },
-]
+const DAY_SECONDS = 86_400
+
+/** One rate-limiter key a request is charged, with what it may hold in a
+ *  window of `periodSeconds` and how much this request costs it. */
+export interface RateLimitCharge {
+  key: string
+  limit: number
+  periodSeconds: number
+  amount: number
+}
+
+/**
+ * Every rate-limiter key one request is charged, in the order the Worker
+ * charges them; it stops at the first that refuses and then stores nothing.
+ * Exported, like the limits above, so the regression test runs the Worker's
+ * own keys and order rather than a copy of them.
+ *
+ * - `ip:<ip hash>`, per minute, accepted plus quarantined events, at least 1:
+ *   it also bounds raw request frequency, whatever the payload.
+ * - `machine:<id>` per minute and `machineday:<id>` per day, for each
+ *   validated machineId, accepted events: one install's own share.
+ * - `ipday:<ip hash>`, per day, the same charge as `ip`: the IP's ceiling,
+ *   which bounds D1 writes per address.
+ *
+ * The ceiling comes last so that an install refused at its own limit, which
+ * keeps its queue and retries every flush, never spends the allowance the
+ * other installs behind its IP share. The reverse cost remains: while the
+ * ceiling refuses, each install's retries still count against its own day.
+ * Key names are kept across changes: a renamed key hands every caller a fresh
+ * window at the deploy.
+ */
+export function rateLimitCharges(
+  ip: string,
+  machineIds: readonly string[],
+  accepted: number,
+  quarantined: number,
+): RateLimitCharge[] {
+  const charge = Math.max(1, accepted + quarantined)
+  return [
+    { key: `ip:${ip}`, limit: IP_LIMIT, periodSeconds: 60, amount: charge },
+    ...machineIds.flatMap((id) => [
+      { key: `machine:${id}`, limit: MACHINE_LIMIT, periodSeconds: 60, amount: accepted },
+      { key: `machineday:${id}`, limit: MACHINE_DAILY_LIMIT, periodSeconds: DAY_SECONDS, amount: accepted },
+    ]),
+    { key: `ipday:${ip}`, limit: IP_DAILY_LIMIT, periodSeconds: DAY_SECONDS, amount: charge },
+  ]
+}
 
 export interface RateLimitCheck {
   /** The window state to persist, or `null` if nothing should be written. */

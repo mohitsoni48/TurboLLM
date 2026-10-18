@@ -13,7 +13,7 @@
  */
 
 import { analyticsIdentity, flattenForAnalytics, handleIngest, type IngestDeps } from '../../turbollm/src/telemetry/ingest'
-import { MACHINE_LIMIT, IP_TIERS, ipRateLimitSubject } from '../../turbollm/src/telemetry/rate-limit-window'
+import { ipRateLimitSubject, rateLimitCharges } from '../../turbollm/src/telemetry/rate-limit-window'
 import { RateLimiterDO } from './rate-limiter-do'
 
 export { RateLimiterDO }
@@ -40,13 +40,12 @@ interface Env {
   POSTHOG_HOST?: string
 }
 
-// MACHINE_LIMIT / IP_TIERS live in rate-limit-window.ts, not here — imported
-// rather than duplicated so they can't silently drift apart from the
-// regression test that pins them to MAX_BATCH the way the old request-scale
-// limits (20/100) drifted from reality once charging switched to event count
-// (found in pre-release review). PERIOD_SECONDS is the machine tier's window;
-// each IP tier carries its own.
-const PERIOD_SECONDS = 60
+// The tiers (keys, limits, windows, order) live in rate-limit-window.ts
+// (rateLimitCharges), not here — imported rather than duplicated so they
+// can't silently drift apart from the regression test that pins them to
+// MAX_BATCH the way the old request-scale limits (20/100) drifted from
+// reality once charging switched to event count (found in pre-release
+// review).
 
 // A real client's queue caps at MAX_QUEUED_EVENTS=500 (queue.ts) and always
 // flushes one machine's own events, so a batch never legitimately carries
@@ -61,7 +60,7 @@ async function checkLimit(
   key: string,
   limit: number,
   amount: number,
-  periodSeconds = PERIOD_SECONDS,
+  periodSeconds: number,
 ): Promise<boolean> {
   const stub = ns.get(ns.idFromName(key))
   const res = await stub.fetch(`https://rate-limiter/?limit=${limit}&period=${periodSeconds}&amount=${amount}`)
@@ -95,24 +94,19 @@ function makeDeps(env: Env): IngestDeps {
         // Quarantined rows are charged here too: each one is a D1 write, and
         // uncharged they let one IP fill the quarantine table without limit.
         // The per-minute tier alone still let one IP fill D1 within hours, so
-        // a daily tier follows it (IP_TIERS). Over either, the request gets
-        // 429 and nothing is written; a real client keeps its queue and retries.
-        const ip = await ipKey(req)
-        const charge = Math.max(1, events.length + quarantined)
-        for (const tier of IP_TIERS) {
-          const ipOk = await checkLimit(env.RATE_LIMITER, `${tier.key}:${ip}`, tier.limit, charge, tier.periodSeconds)
-          if (!ipOk) return false
-        }
-
+        // each install has a daily tier and the IP a daily ceiling after it
+        // (rateLimitCharges). Over any tier, the request gets 429 and nothing
+        // is written; a real client keeps its queue and retries.
+        //
         // consent_choice carries no machineId by design, so it is rate-limited
         // by IP alone. That is a known, accepted weakness (ADR-299 Decision 5):
         // the opt-out count it produces is directional, not exact.
         const ids = new Set(events.map((e) => e.machineId).filter((v): v is string => typeof v === 'string'))
         if (ids.size > MAX_DISTINCT_MACHINE_IDS) return false
 
-        for (const id of ids) {
-          const machineOk = await checkLimit(env.RATE_LIMITER, `machine:${id}`, MACHINE_LIMIT, events.length)
-          if (!machineOk) return false
+        const ip = await ipKey(req)
+        for (const c of rateLimitCharges(ip, [...ids], events.length, quarantined)) {
+          if (!(await checkLimit(env.RATE_LIMITER, c.key, c.limit, c.amount, c.periodSeconds))) return false
         }
         return true
       } catch (err) {
