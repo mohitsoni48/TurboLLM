@@ -63,6 +63,18 @@ jobs:
         run: npm test
         working-directory: turbollm/web
 
+      # The npm package was first built by npm-publish.yml or desktop-release.yml, which run on
+      # a published release, after the tag and the GitHub Release exist: a break in tsup.config.ts
+      # or its post-build steps showed up only then. Built here from the web build above (`npm run
+      # build` copies src/webdist into dist/), and its launcher run once.
+      - name: Build the npm package
+        run: npm run build
+        working-directory: turbollm
+
+      - name: The built CLI starts
+        run: node bin/turbollm.mjs --help
+        working-directory: turbollm
+
   # tsup.android.config.ts is a separate build pass whose only consumer is the APK, and
   # nothing in CI built it: the regression it fixes (bundling `puppeteer-core` dragged
   # @puppeteer/browsers' yargs in, whose ESM shim redeclares `__dirname` and made the phone
@@ -109,6 +121,43 @@ jobs:
             exit 1
           fi
         working-directory: turbollm
+
+  # scripts/release.mjs's guards (the publish gate, the merge and post-merge CI checks) have
+  # their own tests, which no job ran: a break there showed up only during a release. They need
+  # no install: each test builds a throwaway git repo and stubs gh and npm.
+  release-script:
+    name: Release script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with: { node-version: '22' }
+      - run: node --test scripts/release.test.mjs
+
+  # The External Chat API's TypeScript client is its own package, with its own lockfile.
+  ts-client:
+    name: TS client typecheck & tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: clients/ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: clients/ts
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: clients/ts
+
+      - name: Unit tests
+        run: npm test
+        working-directory: clients/ts
 
   wrapper:
     name: Desktop wrapper unit tests
