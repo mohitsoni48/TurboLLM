@@ -407,6 +407,19 @@ export function foldTurnUsage(
 // read-only and never gated. bash has no path argument, so containment can't confine it —
 // the mode system is its only guard (ask = approval, plan = not in toolset, auto = unconfined).
 export const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
+// The routine tool calls that act on one of the owner's routines with no person in the loop, so
+// ASK mode asks for them as it does for edit/write/bash: run_routine_now fires a confirmed routine
+// (a paused one too), and update_routine/delete_routine with `confirm: true` apply the change or
+// the delete. That flag is an argument the MODEL passes, not a human step: without this an
+// ask-mode session (a prompt-injected README is enough) rewrote a confirmed code routine's
+// prompt, workspacePath and permissionMode 'auto' and fired it, running bash/edit/write
+// unattended in the same session that asks before a single bash. Their previews (no `confirm:
+// true`) and list_routines change nothing and stay free; create_routine always lands in
+// pending_confirmation, which only a person arms. `input` is the validated args pi hands the tool.
+function routineActionNeedsApproval(toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName === 'run_routine_now') return true
+  return (toolName === 'update_routine' || toolName === 'delete_routine') && input.confirm === true
+}
 // Tools whose path argument routes through the containment gate below (plan §3b) — not all of
 // them are actually BLOCKED by it, see WRITE_PATH_TOOLS. bash is deliberately absent — it takes
 // `command`, not `path` (see risk flag 1).
@@ -1426,7 +1439,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // 2. Mode-based approval.
       //    auto  → containment only, no approval await (built above).
       //    plan  → mutating tools aren't in the toolset at all, so nothing reaches here to gate.
-      //    ask   → write/edit/bash get an approval gate; reads pass straight through.
+      //    ask   → write/edit/bash, MCP tools and the routine actions (routineActionNeedsApproval)
+      //            get an approval gate; reads pass straight through.
       //
       // Re-read the mode FRESH from the DB on every tool_call (a cheap single-row
       // read) instead of using the closed-over `mode` param, so a mid-run switch
@@ -1448,7 +1462,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // gate as edit/write/bash — see mcpToolDefs' own comment for why they're treated as
       // mutating despite not being in the hardcoded MUTATING_TOOLS set (their names are dynamic,
       // resolved per-run from whatever MCP servers are currently connected).
-      if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName))) {
+      if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName) || routineActionNeedsApproval(toolName, input))) {
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
         // With the tool's name, which the approve route (chat-routes.ts) checks as well as the
         // toolName its caller sends: an MCP call approved as "bash" is still an MCP call.
@@ -1808,9 +1822,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Routine tools (Phase 4) — the SAME shared executor chat's ToolRegistry uses
       // (tools.executeTool), not a second implementation. Registered unconditionally like
       // web_search/fetch_url/run_code above: none of these touch the filesystem or this session's
-      // containment root, and update_routine/delete_routine's own `confirm: true` two-phase gate
-      // (routine-tools.ts) already stands in for Code's ask-mode approval. They're likewise NOT
-      // added to MUTATING_TOOLS for that reason. Plan mode's allowlist (toolsForMode) keeps only
+      // containment root. update_routine/delete_routine's `confirm: true` two-phase step
+      // (routine-tools.ts) is NOT a human approval: the model supplies `confirm` itself, and
+      // run_routine_now has no second step at all. So in ask mode the tool_call hook asks for
+      // run_routine_now, and for update_routine/delete_routine with confirm: true, through the
+      // same waitForToolApproval as edit/write/bash (routineActionNeedsApproval); their previews
+      // and list_routines stay free. Plan mode's allowlist (toolsForMode) keeps only
       // list_routines — the others create, change, or start routines.
       //
       // Every call passes isCodeAuthorized = true (executeTool's 2nd arg, which FAILS CLOSED to
