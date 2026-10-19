@@ -634,8 +634,17 @@ export function RemoteAccessSection() {
             What the access token minted the next time you turn this on is allowed to do.
           </p>
           <p className="text-[11px] text-faint">
-            A scoped token can chat and manage conversations; it cannot see full engine/model
-            status detail or change settings.
+            A scoped token can chat with the model loaded here and manage conversations; it cannot
+            see full engine/model status detail, change settings, or load or eject a model from
+            Chat's model picker.
+          </p>
+          {/* What the two load capabilities really do for this token (auth.ts requiredCapability,
+              which maps neither /api/v1/engine/start nor /stop): offering them under the old copy
+              alone read as "this token may load models from the web UI", which nothing allows. */}
+          <p className="text-[11px] text-faint">
+            models:load lets a request to the OpenAI-compatible /v1 API load the model it names in
+            place of the loaded one, and lets the token change a model's saved load settings.
+            models:unload has no effect on this token.
           </p>
           <div className="mt-1 flex flex-col gap-1">
             {REMOTE_TOKEN_CAPABILITIES.map((cap) => (

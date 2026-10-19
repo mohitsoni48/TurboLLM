@@ -373,6 +373,13 @@ describe('RemoteAccessSection', () => {
     expect(screen.getByRole('radio', { name: /^ngrok$/i }).getAttribute('aria-checked')).toBe('false')
   })
 
+  it('says what models:load and models:unload do for this token, and that Chat cannot load or eject with it', async () => {
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/cannot see full engine\/model status detail, change settings, or load or eject a model from Chat.s model picker/i)).toBeTruthy()
+    expect(screen.getByText(/models:load lets a request to the OpenAI-compatible \/v1 API load the model it names/i)).toBeTruthy()
+    expect(screen.getByText(/models:unload has no effect on this token/i)).toBeTruthy()
+  })
+
   it('reverts a token-permission change when its save fails', async () => {
     const apiLib = await import('../../lib/api')
     vi.mocked(apiLib.saveSettings).mockRejectedValueOnce(new ApiError('internal', 'Daemon restarting.', 500))

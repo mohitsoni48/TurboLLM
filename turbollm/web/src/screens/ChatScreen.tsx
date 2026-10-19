@@ -4,12 +4,13 @@ import { ArrowDown, Copy, Download, Loader2, PanelLeft, Paperclip, Search, SendH
 import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
-import { useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
+import { queryKeys, useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { isAndroidOs } from '../lib/platform'
 import { copyToClipboard } from '../lib/clipboard'
 import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
+import { classifyStatusError } from '../lib/connection-state'
 import { useWorkspaceSidebarOpen } from '../lib/workspace-sidebar'
 import { useBackableOverlay } from '../lib/use-backable-overlay'
 import { Button } from '../components/ui/button'
@@ -21,7 +22,7 @@ import {
   DropdownMenuTrigger,
 } from '../components/ui/dropdown-menu'
 import { toast } from '../components/ui/sonner'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
 import { cn, writeLastChatConvId } from '../lib/utils'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
@@ -90,18 +91,11 @@ function isFindShortcut(e: KeyboardEvent): boolean {
 }
 
 export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; convIdOverride?: string } = {}) {
-  const { data: status } = useStatus()
+  const statusQ = useStatus()
+  const status = statusQ.data
   const model = status?.model
   const engineState = status?.engine.state
   const { query: settingsQ } = useSettings()
-
-  // The loaded model's resolved sampling defaults, for the Thread settings sliders
-  // (LoadedModel itself carries no sampling — it lives on the per-engine LoadProfile,
-  // same source ModelDetailDialog reads/writes; see ADR discussion in that file).
-  const enginesQ = useEngines()
-  const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
-  const modelDetailQ = useModelDetail(model?.key ?? null, activeEngine?.id)
-  const modelSampling = modelDetailQ.data?.profile.sampling
 
   // Route params: /chat/:convId?readonly=1
   const { convId: routeConvId } = useParams<{ convId?: string }>()
@@ -267,6 +261,39 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const modelsQ = useModels()
   const showAllEngineModels = useShowAllEngineModels()
   const modelActions = useModelActions()
+  // A remote-access token (ADR-422) is never given config:read, so GET /api/v1/status answers it
+  // 403 for good (connection-state.ts's scopedTokenLimited) and `model`/`engineState` above stay
+  // unset, while the chat itself is open to it (models:use). Reading a loaded model only from
+  // /status kept such a token's composer off ("Load a model to start chatting") with a model loaded
+  // on the host. The model list is readable with models:use, so for that caller the first loaded
+  // chat model in it stands in. Its `loaded` is wider than the engine chat answers from (the
+  // primary, once running): an embedding model runs in its own slot beside a chat model (ADR-389)
+  // and is skipped here, as isChatModel skips a Laya or Jev one. Not told apart: a host load still
+  // starting reads loaded, and so does a model in a gateway keep-N extra slot, so with two chat
+  // models loaded the first one listed is named, not always the one that answers. A send while
+  // nothing runs there gets the daemon's 409 model_not_loaded, which send() answers by putting the
+  // text back.
+  const { scopedTokenLimited } = classifyStatusError(statusQ.isError, statusQ.error)
+  const tokenModel = scopedTokenLimited ? (modelsQ.data?.models ?? []).find((m) => m.loaded && !m.embedding && isChatModel(m)) : undefined
+  const loadedChatModel: { key: string; name: string } | undefined = model ?? tokenModel
+  // The list polls on its own only while something is loaded or /status says a load is starting
+  // (models-poll.ts), and this caller has no /status: re-read it while nothing is loaded, so a
+  // model the host loads after the page opened turns the composer on without a reload. Not while
+  // the tab is in the background, as the list's own poll (refetchIntervalInBackground: false).
+  const listPolls = (modelsQ.data?.models ?? []).some((m) => m.loaded)
+  useEffect(() => {
+    if (!scopedTokenLimited || listPolls) return
+    const t = setInterval(() => { if (focusManager.isFocused()) void qc.invalidateQueries({ queryKey: queryKeys.models }) }, 4000)
+    return () => clearInterval(t)
+  }, [scopedTokenLimited, listPolls, qc])
+
+  // The loaded model's resolved sampling defaults, for the Thread settings sliders
+  // (LoadedModel itself carries no sampling — it lives on the per-engine LoadProfile,
+  // same source ModelDetailDialog reads/writes; see ADR discussion in that file).
+  const enginesQ = useEngines()
+  const activeEngine = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
+  const modelDetailQ = useModelDetail(loadedChatModel?.key ?? null, activeEngine?.id)
+  const modelSampling = modelDetailQ.data?.profile.sampling
 
   const convQ = useConversation(activeId)
   const conv = convQ.data
@@ -304,7 +331,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // identity is stable across unrelated re-renders (composer typing, etc.) — the dialog
   // resyncs its local state whenever this object changes identity.
   const hasConv = !!conv
-  const modelLoaded = !!model
+  const modelLoaded = !!loadedChatModel
   const draft: ConversationSettingsDraft | undefined = useMemo(() => {
     if (hasConv || !modelLoaded) return undefined
     return {
@@ -397,7 +424,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     : null
   // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
   // is a slim subset without capability flags, so look the full ModelEntry up by key.
-  const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === model?.key)?.reasoningEffort ?? false
+  const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === loadedChatModel?.key)?.reasoningEffort ?? false
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||
@@ -936,7 +963,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         const newConv = await mut.create.mutateAsync({
           // The model this conversation was STARTED with, for the sidebar label. A remote
           // machine's qualified id is the honest value there — it is what answered.
-          modelKey: activeRemoteId ?? model?.key ?? '',
+          modelKey: activeRemoteId ?? loadedChatModel?.key ?? '',
           systemPrompt: finalSystemPrompt || undefined,
           toolPolicy: selectedPersonaId === 'research' ? 'force_web_search' : undefined,
           skillIds: initialSkillIds.length ? initialSkillIds : undefined,
@@ -1116,7 +1143,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
   // Chatting with a linked machine needs nothing loaded HERE. Requiring it is precisely
   // what made every remote row unusable.
-  const ready = activeRemoteId ? true : engineState === 'running' && !!model
+  const ready = activeRemoteId ? true : scopedTokenLimited ? !!tokenModel : engineState === 'running' && !!model
 
   // At most one tool call awaits interactive approval at a time (the tool loop is sequential).
   // Read from the timeline — the actual live-updated source — not a separate tracked array.
@@ -1244,8 +1271,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           )}
           <ModelLoadMenu
             models={allModels}
-            loadedKey={activeRemoteId ?? model?.key ?? null}
-            loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (model?.name ?? null)}
+            loadedKey={activeRemoteId ?? loadedChatModel?.key ?? null}
+            loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (loadedChatModel?.name ?? null)}
             pending={modelBusy}
             ejecting={modelActions.eject.isPending}
             onLoad={handleLoadModel}
@@ -1254,6 +1281,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             screen="chat"
             links={linksQ.data ?? []}
             remoteModels={remoteModelsQ.data ?? []}
+            // Load and Eject post /api/v1/engine/start and /stop, which no remote-access token may
+            // reach whatever its capabilities (auth.ts requiredCapability maps neither).
+            blockedReason={scopedTokenLimited ? 'This access token can chat with the model loaded on the host, but cannot load or eject one. Do that on the host.' : undefined}
           />
           {/* Load settings are a LOCAL engine concern — there is nothing on this machine to
               configure for a model running on another one. */}
@@ -1413,9 +1443,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             {/* Empty state */}
             {messages.length === 0 && !live && (
               <div className="flex flex-col items-center gap-4 py-16">
-                {model ? (
+                {loadedChatModel ? (
                   <>
-                    <p className="text-[15px] font-medium text-ink">{model.name}</p>
+                    <p className="text-[15px] font-medium text-ink">{loadedChatModel.name}</p>
                     <AgentPicker selected={selectedPersonaId} onChange={handlePersonaChange} agents={allAgents} />
                     <div className="flex flex-wrap justify-center gap-2">
                       {['Explain something to me', 'Help me write', 'Review this code'].map((s) => (
@@ -1431,7 +1461,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     </div>
                   </>
                 ) : (
-                  <p className="text-[14px] text-muted">Select a model above to begin</p>
+                  <p className="text-[14px] text-muted">{scopedTokenLimited ? 'Load a model on the host to begin' : 'Select a model above to begin'}</p>
                 )}
               </div>
             )}
@@ -1633,8 +1663,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     activeId && (live?.compacting || mut.compact.isPending)
                       ? 'Compacting conversation…'
                       : ready
-                        ? `Message ${truncateName(remoteChoice?.name ?? model?.name ?? 'the model')}`
-                        : 'Load a model to start chatting'
+                        ? `Message ${truncateName(remoteChoice?.name ?? loadedChatModel?.name ?? 'the model')}`
+                        : scopedTokenLimited ? 'Load a model on the host to chat' : 'Load a model to start chatting'
                   }
                   value={input}
                   disabled={!ready || !!live || !!editingId || mut.compact.isPending}
@@ -1675,9 +1705,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
             </div>
             {/* No-model hint lives in the textarea placeholder above — don't repeat it here.
                 Hidden ≤720px per spec 11 §4 (the spec value is 720, not the md 768 breakpoint). */}
-            {model && (
+            {loadedChatModel && (
               <p className="mt-1.5 px-1 text-[11px] text-faint max-[720px]:hidden">
-                {model.name} · Enter to send · Shift+Enter for newline
+                {loadedChatModel.name} · Enter to send · Shift+Enter for newline
               </p>
             )}
           </div>
