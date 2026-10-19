@@ -176,6 +176,7 @@ test('POST /build/run: a successful rebuild replaces the engine and deletes the 
   assert.equal(eng?.name, 'Fork')
   assert.equal(eng?.version, '200 (4567def)', 'the new build is registered')
   assert.equal(h.registry.list().engines.length, 1, 'it replaced the old registration')
+  assert.equal(h.build.get().activated, true, 'the status says the rebuilt engine is the selected one')
   await eventually(() => assert.deepEqual(h.leftBeside(), [], 'the parked previous build is deleted'))
 })
 
@@ -321,4 +322,78 @@ test('POST /build/run: a successful rebuild deletes the build it replaced off th
   assert.equal(deletedSync.mock.calls.filter(isParked).length, 0, 'and not with rmSync')
   await deletes[0].result
   assert.deepEqual(h.leftBeside(), [])
+})
+
+// A successful rebuild always made the new build the selected engine. Rebuild is a source-built card's update, and an
+// update makes its engine the selected one only when it was: a rebuild of a card the user had not selected took the
+// selection from the engine the user had picked, and a switch made while the build ran was undone. The next automatic
+// load (a gateway auto-swap, a routine, the boot resume, an Engines Start) then ran on the rebuilt engine. The build
+// status says which it is (`activated`): the web UI's toast told the user every finished build was now their active
+// engine.
+function addOther(h: ReturnType<typeof harness>): void {
+  h.store.update((c) => {
+    c.engines.push({ id: 'other', name: 'Other', binPath: '/opt/other/llama-server', kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '' })
+  })
+}
+
+test('POST /build/run: a successful rebuild of an engine the user has not selected leaves the selection alone', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  addOther(h)
+  h.registry.activate('other')
+  assert.equal(await h.rebuild(), 'ok')
+  const rebuilt = h.registry.list().engines.find((e) => e.binPath === h.binPath)
+  assert.equal(rebuilt?.version, '200 (4567def)', 'the new build is registered')
+  assert.equal(h.registry.active()?.id, 'other', 'the engine the user selected stays selected')
+  assert.equal(h.build.get().activated, false, 'the status does not say the rebuilt engine is the selected one')
+})
+
+test('POST /build/run: with no engine selected, a successful rebuild leaves none selected', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  h.store.update((c) => { c.activeEngineId = '' }) // the selected engine was Disabled
+  assert.equal(await h.rebuild(), 'ok')
+  assert.equal(h.registry.list().engines.find((e) => e.binPath === h.binPath)?.version, '200 (4567def)')
+  assert.equal(h.registry.active(), undefined, 'no engine is selected for the user')
+  assert.equal(h.build.get().activated, false)
+})
+
+test('POST /build/run: a successful rebuild keeps a switch the user made during the compile', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  addOther(h)
+  const phase = h.build.phase.bind(h.build)
+  h.build.phase = (p) => {
+    if (p === 'compiling') h.registry.activate('other') // the user picks another engine in Engines
+    phase(p)
+  }
+  assert.equal(await h.rebuild(), 'ok')
+  assert.equal(h.registry.list().engines.find((e) => e.binPath === h.binPath)?.version, '200 (4567def)')
+  assert.equal(h.registry.active()?.id, 'other', "the user's switch stands")
+  assert.equal(h.build.get().activated, false)
+})
+
+test('POST /build/run: a successful rebuild keeps a switch the user made while its new binary was probed', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  addOther(h)
+  const add = h.registry.add.bind(h.registry)
+  h.registry.add = async (...args: Parameters<Registry['add']>) => {
+    h.registry.activate('other') // remove() left no engine selected: the user picks 'other'
+    return add(...args)
+  }
+  assert.equal(await h.rebuild(), 'ok')
+  assert.equal(h.registry.active()?.id, 'other', "the user's switch stands")
+  assert.equal(h.build.get().activated, false)
+})
+
+test('POST /build/run: a first build, or one of a Disabled build, is made the selected engine, as an install is', { skip: posixOnly }, async () => {
+  const h = harness('builds')
+  addOther(h)
+  // The source build is on disk but not registered (Disabled), and the user runs on another engine.
+  h.store.update((c) => {
+    c.engines = c.engines.filter((e) => e.id !== 'fork')
+    c.activeEngineId = 'other'
+  })
+  assert.equal(await h.rebuild(), 'ok')
+  const eng = h.registry.active()
+  assert.equal(eng?.binPath, h.binPath, 'the new build is the selected engine')
+  assert.equal(eng?.version, '200 (4567def)')
+  assert.equal(h.build.get().activated, true, 'and the status says so')
 })

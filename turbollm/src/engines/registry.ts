@@ -70,10 +70,11 @@ export class Registry {
   }
 
   /** Probe and register a llama-server build; the first one registered while no engine is selected becomes the
-   *  selected one (a first install, Add, Enable, a rebuild). Not with `fillEmptySelection: false`, which a llama.cpp
-   *  update passes for the new build it registers under a new id: that build takes the selection only from the build
-   *  it replaces (keepActiveAfterUpdate), and with none selected the auto-update of a build merely installed made it
-   *  the selected engine, which the next automatic load then ran on. */
+   *  selected one (a first install, Add, Enable, a first build, the rebuild of the selected engine). Not with
+   *  `fillEmptySelection: false`, which a llama.cpp update passes for the new build it registers under a new id: that
+   *  build takes the selection only from the build it replaces (keepActiveAfterUpdate), and with none selected the
+   *  auto-update of a build merely installed made it the selected engine, which the next automatic load then ran on.
+   *  A source rebuild of an engine that was not the selected one passes it too (POST /api/v1/build/run). */
   async add(
     name: string,
     binPath: string,

@@ -100,6 +100,10 @@ export type EngineBuild = {
   /** The run installs a build tool (the CUDA Toolkit download, a build guide prerequisite) and builds no engine.
    *  Absent from daemons that predate it: see isToolInstall. */
   toolInstall?: boolean
+  /** The finished build ('done') is the selected engine: false after a rebuild of an engine the user had not selected,
+   *  which leaves the selection as it was. Absent from daemons that predate it, which made every build they registered
+   *  the selected engine. */
+  activated?: boolean
 }
 
 /** Live running-session stats (B4), from GET /api/v1/status. Null unless the

@@ -893,7 +893,8 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // 1-click compile-from-source (ADR-100, Windows/Linux + CUDA, or macOS + Metal). Clones the
-  // repo, runs cmake, compiles llama-server, then registers + activates the built binary.
+  // repo, runs cmake, compiles llama-server, then registers the built binary (the selected engine after a first build,
+  // or a rebuild of the selected engine: see the success path).
   // Long-running; 202 immediately + live phase/log via GET /status engineBuild. It executes a
   // compiler from a user-supplied repo, so — same rule as Code's own host execution — a remote
   // caller only reaches this with a verified API key (ADR-394); an OPEN, keyless LAN still
@@ -1022,12 +1023,15 @@ export function registerApi(app: Hono, d: Deps): void {
               if (engine) removed = { engine, active, index, activeAfter: d.registry.active()?.id }
             } catch { /* already gone */ }
           }
+          // An empty selection is filled only by a first build (or one of a Disabled build: an install) or by the
+          // rebuild of the selected engine, which remove() just left with none selected. With no engine selected,
+          // the rebuild of another one must not select it for the user.
           eng = (await d.registry.add(chooseEngineName(name, prior?.name), out.binPath, {
             sourceRepo: repoUrl,
             sourceBranch: branch,
             sourceCommit: commit,
             sourcePatchUrl: patchUrl,
-          })).engine
+          }, { fillEmptySelection: !prior || !!removed?.active })).engine
         } catch (e) {
           // The new binary does not run here (its probe failed: a CUDA build on a box without the driver, a fork tip
           // that crashes at start) or could not take the name. It sits where the build it replaced ran from, so that
@@ -1049,7 +1053,12 @@ export function registerApi(app: Hono, d: Deps): void {
         // The binary passed its probe: boot recovery and the next build's sweep keep this build from now on.
         markBuildComplete(out.buildRoot)
         replaced = out.prevBuildRoot
-        d.registry.activate(eng.id)
+        // A first build, or one of a Disabled build, is made the selected engine, as an install is. A rebuild is the
+        // source-built card's update, and like every update (keepActiveAfterUpdate) it stays the selected engine
+        // only when it was, and never over a switch the user made while it compiled or probed (the reinstate check
+        // above): activating it unconditionally took the selection from the engine the user had picked, and the
+        // next automatic load ran on the rebuilt one.
+        if (!prior || (removed?.active && d.registry.active()?.id === removed.activeAfter)) d.registry.activate(eng.id)
         // A genuinely custom repo (not one of the catalog's own known projects) needs its
         // identity remembered independent of the live registration — see recordCustomSource's
         // own doc comment. A catalog repo already gets equivalent treatment from the /catalog
@@ -1058,7 +1067,8 @@ export function registerApi(app: Hono, d: Deps): void {
           d.registry.recordCustomSource({ name: eng.name, binPath: eng.binPath, kind: eng.kind, sourceRepo: repoUrl, sourceBranch: branch, sourceCommit: commit, sourcePatchUrl: patchUrl })
         }
         d.build.log(`Registered "${eng.name}" — built from ${out.commit.slice(0, 8)}.`)
-        d.build.done()
+        // Whether it is the selected engine now, for the web UI's toast, which said so after every build.
+        d.build.done({ activated: d.registry.active()?.id === eng.id })
       } catch (e) {
         // Registration/probe failed AFTER a successful build: tell the user it built yet couldn't be
         // registered so they can retry/inspect. The binary is kept (no GC) unless it replaced a build

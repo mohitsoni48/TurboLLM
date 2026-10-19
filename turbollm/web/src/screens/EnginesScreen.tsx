@@ -633,7 +633,11 @@ function EngineHeaderBar({
     if (wasBuilding.current && !buildActive && eb) {
       build.refresh()
       if (eb.phase === 'done' && eb.engine && !isToolInstall(eb)) {
-        toast.success(`${eb.engine} built and added — it's now your active engine.`)
+        // "Now your active engine" only when it is: a rebuild of an engine the user had not selected, or one the user
+        // switched away from while it compiled, leaves the selection as it was, and the toast said otherwise.
+        toast.success(
+          eb.activated === false ? `${eb.engine} built and added.` : `${eb.engine} built and added — it's now your active engine.`,
+        )
       } else if (eb.phase === 'error' && eb.error && !(eb.engine === 'CUDA Toolkit' && isToolInstall(eb))) {
         // Only the CUDA Toolkit download stays quiet here (the build guide shows its error); a failed build the user
         // named "CUDA Toolkit" has its toast, as any other build does.

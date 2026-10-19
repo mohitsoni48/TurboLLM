@@ -195,6 +195,27 @@ describe('EnginesScreen — the build-settled toast', () => {
     view.rerender(tree())
     expect(h.toastSuccess).toHaveBeenCalledWith("ik_llama.cpp built and added — it's now your active engine.")
   })
+
+  // A rebuild of an engine the user had not selected leaves the selection as it was, and the toast still said the
+  // rebuilt engine was now the active one.
+  it('says the build is the active engine only when the daemon made it one', () => {
+    const settled = (active: boolean, activated: boolean) => ({
+      ...run(active, active ? 'compiling' : 'done', 'ik_llama.cpp'),
+      engineBuild: { ...run(active, active ? 'compiling' : 'done', 'ik_llama.cpp').engineBuild, toolInstall: false, activated },
+    })
+    h.status = settled(true, false)
+    const view = render(tree())
+    h.status = settled(false, false)
+    view.rerender(tree())
+    expect(h.toastSuccess).toHaveBeenCalledWith('ik_llama.cpp built and added.')
+
+    h.toastSuccess.mockClear()
+    h.status = settled(true, false)
+    view.rerender(tree())
+    h.status = settled(false, true)
+    view.rerender(tree())
+    expect(h.toastSuccess).toHaveBeenCalledWith("ik_llama.cpp built and added — it's now your active engine.")
+  })
 })
 
 describe('EnginesScreen — card actions while engine work runs', () => {

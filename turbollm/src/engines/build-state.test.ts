@@ -21,3 +21,16 @@ test('BuildState.get(): says whether the run is a tool install, whatever its lab
   b.fail('apt-get exited with code 100')
   assert.deepEqual([b.get().phase, b.get().toolInstall], ['error', true], 'its end still says what it was')
 })
+
+// The web UI's toast said every finished build was now the user's active engine; a rebuild of an engine the user had
+// not selected leaves the selection as it was, and the toast reads `activated` to say which.
+test('BuildState.get(): says whether the finished build is the selected engine, for that run only', () => {
+  const b = new BuildState()
+  b.start('ik_llama.cpp')
+  b.done({ activated: true })
+  assert.equal(b.get().activated, true)
+  b.start('ik_llama.cpp')
+  assert.equal(b.get().activated, false, 'the next run starts without it')
+  b.done()
+  assert.equal(b.get().activated, false, 'a rebuild that left the selection as it was')
+})
