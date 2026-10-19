@@ -49,7 +49,8 @@ export interface LaunchContext {
   /** The WHOLE model library, not just the loaded model.
    *
    *  Why it must be the whole library: claude gets a real model picker for free — the gateway
-   *  advertises every model on `/v1/models` and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` tells
+   *  advertises the library on `/v1/models` (a model the selected engine can't run only while it runs
+   *  or Settings shows every engine's models) and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` tells
    *  Claude Code to read it. Config-file harnesses have no such discovery channel: they can only see
    *  what we WRITE into their config. Writing only the loaded model (as this did originally) left
    *  `/model` in pi showing a single entry — founder-reported as "I can't see turbollm models" — while

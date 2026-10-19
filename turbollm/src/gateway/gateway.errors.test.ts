@@ -19,14 +19,14 @@ import type { Manager, StartOpts, Status } from '../engines/manager'
 import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 
-const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' }]
+const LIBRARY = [{ key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B', format: 'gguf' }]
 
 /** Minimal Deps double routing every request to `target` — a genuinely unreachable host
  *  by default, so the real fetch() call throws for real (no network mocking needed). */
 function fakeDeps(target = 'http://engine.invalid.local:1'): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
-    modelRouter: { targetEntry: () => undefined, route: async () => ({ target }) },
+    modelRouter: { targetEntry: () => undefined, route: async () => ({ target }), loadedModelKeys: () => new Set<string>() },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false } }), dir: () => '/tmp/turbollm-test-data' },
     manager: {
       status: () => ({ state: 'stopped', model: null }),

@@ -8,6 +8,7 @@ import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
 import { linkHeaders, proxyStream } from '../link/link-proxy'
@@ -872,18 +873,26 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const jevEndpoint = jevEndpointFor(c.req.method, pathname)
   if (jevEndpoint) return handleJevRequest(c, d, jevEndpoint, opts)
 
-  // GET /v1/models: always synthesise the list from the WHOLE local library (not just
-  // the loaded model), regardless of whether an engine is running — real key entries for
-  // OpenAI-style consumers. The `claude-<key>` alias (whose id passes Claude Code's
+  // GET /v1/models: synthesise the list from the local library (not just the loaded model),
+  // regardless of whether an engine is running — real key entries for OpenAI-style
+  // consumers. The `claude-<key>` alias (whose id passes Claude Code's
   // discovery filter — it keeps only claude*/anthropic* ids — and which /v1/messages
   // strips back to the real key before routing) is only added when gateway.autoSwap is
   // on: picking a model from Claude Code's /model always requires a swap, so advertising
   // it while auto-swap is off would let the user pick a model that silently never loads.
   // A text classification model (Jev or Laya) is marked `kind: "jev"` / `kind: "laya"` with
   // `task: "text-classification"` and gets no alias: it never chats, so Claude Code can't use it.
+  // A model the selected engine is not expected to run is left out, as the Models screen and the pickers leave it out
+  // (registry.ts unlistedForLoading), unless Settings shows every engine's models or the model is running (route()
+  // serves a running model before any check). Listed, with its alias, it was a pick the auto-swap refuses with a
+  // permanent 503: a .litertlm model under llama.cpp in Claude Code's /model failed every turn.
   if (c.req.method === 'GET' && pathname === '/v1/models') {
-    const autoSwap = d.store.snapshot().gateway.autoSwap
-    const data: Array<Record<string, unknown>> = d.scanner.list().models.flatMap((m) => [
+    const cfg = d.store.snapshot()
+    const autoSwap = cfg.gateway.autoSwap
+    const unlisted = unlistedForLoading(cfg.showAllEngineModels, d.registry)
+    const running = d.modelRouter.loadedModelKeys()
+    const listed = d.scanner.list().models.filter((m) => running.has(m.key) || running.has(m.path) || !unlisted(m))
+    const data: Array<Record<string, unknown>> = listed.flatMap((m) => [
       { id: m.key, object: 'model', owned_by: 'turbollm', ...textClassifierListing(m) },
       ...(autoSwap && !isTextClassifier(m) ? [{ id: `claude-${m.key}`, object: 'model', display_name: `${m.name} — TurboLLM` }] : []),
     ])

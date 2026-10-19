@@ -11,8 +11,8 @@ import { gatewayV1Handler } from '../gateway/gateway'
 import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
-import { modelIncompatibility, type Incompatibility } from '../engines/compat'
-import { engineForModel } from '../engines/registry'
+import type { Incompatibility } from '../engines/compat'
+import { unlistedForLoading } from '../engines/registry'
 import type { ModelEntry } from '../models/scanner'
 import {
   enqueueDownload,
@@ -157,28 +157,16 @@ async function objectBody(
 }
 
 /** A predicate giving why the host hides a model from a peer, or null when the peer sees it: the host's own rule for
- *  what is listed for loading (listedForLoading, model-kind.ts), applied here because a peer has neither the host's
- *  compatibility field nor its Settings. A model the engine it loads on cannot run (modelIncompatibility of
- *  engineForModel's engine, as the host's /api/v1/models marks it) is hidden unless the host's owner shows every
- *  engine's models (`showAllEngineModels`); with no engine selected nothing is. The façade listed every model, and its
- *  load mounts startEngine, a manual load that starts on the selected engine whatever the model: a peer's Load of a
- *  .litertlm bundle under llama.cpp, or of a GGUF on vLLM, cancelled the host's auto-tune, aborted its chats, stopped
- *  its model and recorded that model as its last loaded, for a start that then failed. The peer's user never chose
- *  to show such models; the host's owner did not either.
- *  Built once per request, not per model: the config snapshot and every registry lookup (each one a snapshot too)
- *  is a structuredClone of the whole config, and every linked peer polls the list every 15 s. The registry lookups
- *  are lazy and memoized, as overlayShared's are for the host's own /api/v1/models (routes.ts). */
+ *  what is listed for loading (registry.ts unlistedForLoading, web model-kind.ts listedForLoading), applied here
+ *  because a peer has neither the host's compatibility field nor its Settings. A model the engine it loads on cannot
+ *  run is hidden unless the host's owner shows every engine's models (`showAllEngineModels`); with no engine selected
+ *  nothing is. The façade listed every model, and its load mounts startEngine, a manual load that starts on the
+ *  selected engine whatever the model: a peer's Load of a .litertlm bundle under llama.cpp, or of a GGUF on vLLM,
+ *  cancelled the host's auto-tune, aborted its chats, stopped its model and recorded that model as its last loaded,
+ *  for a start that then failed. The peer's user never chose to show such models; the host's owner did not either.
+ *  Built once per request, not per model (unlistedForLoading memoizes its registry lookups). */
 function hiddenFromPeer(d: Deps): (e: ModelEntry) => Incompatibility | null {
-  if (d.store.snapshot().showAllEngineModels) return () => null
-  const once = <T>(f: () => T): (() => T) => {
-    let v: { r: T } | undefined
-    return () => (v ??= { r: f() }).r
-  }
-  const registry = { active: once(() => d.registry.active()), layaEngine: once(() => d.registry.layaEngine()) }
-  return (e) => {
-    const engine = engineForModel(registry, e)
-    return engine ? modelIncompatibility(engine.kind, e) : null
-  }
+  return unlistedForLoading(d.store.snapshot().showAllEngineModels, d.registry)
 }
 
 /** Thrown inside `PATCH /api/link/v1/config`'s `store.update` callback when the second

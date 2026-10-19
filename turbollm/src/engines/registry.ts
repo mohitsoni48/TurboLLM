@@ -7,6 +7,7 @@ import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
+import { modelIncompatibility, type Incompatibility } from './compat'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -631,4 +632,29 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
 export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
   if (entry.laya) return registry.layaEngine() || registry.active()
   return registry.active()
+}
+
+/** A predicate giving why a list of models to load leaves a model out, or null when it lists it: the rule the Models
+ *  screen and the pickers follow (web model-kind.ts listedForLoading), for a list whose reader has neither the model's
+ *  compatibility field nor the Settings. A model the engine it loads on (engineForModel) is not expected to run
+ *  (modelIncompatibility, as /api/v1/models marks it) is left out unless Settings shows every engine's models
+ *  (`showAllEngineModels`); with no engine selected none is. The Turbo Link façade's list and load (link-routes.ts
+ *  hiddenFromPeer) and the gateway's GET /v1/models use it.
+ *  Built once per list, not per model: every registry lookup is a snapshot, a structuredClone of the whole config, and
+ *  a linked peer polls its list every 15 s. The lookups are lazy and memoized, as overlayShared's are for the host's own
+ *  /api/v1/models (routes.ts). */
+export function unlistedForLoading(
+  showAllEngineModels: boolean,
+  registry: Pick<Registry, 'active' | 'layaEngine'>,
+): (e: Parameters<typeof modelIncompatibility>[1]) => Incompatibility | null {
+  if (showAllEngineModels) return () => null
+  const once = <T>(f: () => T): (() => T) => {
+    let v: { r: T } | undefined
+    return () => (v ??= { r: f() }).r
+  }
+  const memo = { active: once(() => registry.active()), layaEngine: once(() => registry.layaEngine()) }
+  return (e) => {
+    const engine = engineForModel(memo, e)
+    return engine ? modelIncompatibility(engine.kind, e) : null
+  }
 }
