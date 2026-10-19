@@ -453,6 +453,14 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
           interactive: false,
           agentAllowedTools: [],
           isCodeAuthorized: false, // no HTTP request to authorize against here (§5.1) — fail closed
+          // A tenant's run may not author, edit or fire a chat routine on an agent that lists one of
+          // the owner's MCP tools, nor create such an agent, as a routine's own unattended run may
+          // not (chat-runner.ts): the routine then runs that MCP tool with no approval. Without it a
+          // tenant whose install had update_routine and run_routine_now on Allow rewrote the
+          // prompt of the owner's MCP routine and fired it, running an MCP tool left on Ask (which
+          // the tenant could not call itself) on the tenant's prompt, then on every later fire.
+          // MCP tools themselves still run under their own policy.
+          refuseMcpAgentsAndRoutines: true,
         })
         hooks.onToolCall({ id: tc.id, name: tc.name, args, result: approved.error ? undefined : approved.result, error: approved.error })
         messages.push({ role: 'tool', content: approved.result, tool_call_id: tc.id })

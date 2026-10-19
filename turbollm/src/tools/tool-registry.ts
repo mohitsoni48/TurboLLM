@@ -264,7 +264,8 @@ export class ToolRegistry {
    *  unattended run sets it (chat-runner.ts), as it leaves isCodeAuthorized false for code
    *  routines: it has no caller to check, and whoever created or approved a step of it may be one
    *  `refuseMcp` covers. Without it such a caller's routine on a plain agent listing
-   *  update_routine and run_routine_now rewrote the owner's MCP routine's prompt and fired it. */
+   *  update_routine and run_routine_now rewrote the owner's MCP routine's prompt and fired it.
+   *  An External Chat API tenant's run sets it too (ext/generation.ts), for the same rewrite. */
   async executeTool(call: ToolCall, isCodeAuthorized = false, opts: { refuseMcp?: boolean; refuseMcpAgentsAndRoutines?: boolean } = {}): Promise<string> {
     const name = call.name
     const args = call.args

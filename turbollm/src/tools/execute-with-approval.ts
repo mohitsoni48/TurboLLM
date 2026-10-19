@@ -40,9 +40,9 @@ export async function executeToolCallWithApproval(params: {
   /** Live chat: this turn's caller may not act on the host, so MCP server tools are refused
    *  (ToolRegistry.executeTool's `refuseMcp`). Unset elsewhere, which leaves them as before. */
   refuseMcp?: boolean
-  /** A routine's unattended run: refuse create_agent with an MCP tool and the routine tools on a
-   *  chat routine whose agent lists one, but run MCP tools themselves (ToolRegistry.executeTool's
-   *  `refuseMcpAgentsAndRoutines`). */
+  /** A routine's unattended run and an External Chat API tenant's run: refuse create_agent with an
+   *  MCP tool and the routine tools on a chat routine whose agent lists one, but run MCP tools
+   *  themselves (ToolRegistry.executeTool's `refuseMcpAgentsAndRoutines`). */
   refuseMcpAgentsAndRoutines?: boolean
 }): Promise<{ result: string; error?: string }> {
   const { tools, sink, convId, id, name, args, globalPolicies, convOverrides, signal, interactive, agentAllowedTools, autoAllowAll } = params
