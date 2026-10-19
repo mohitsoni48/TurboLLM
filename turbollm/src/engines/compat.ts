@@ -31,8 +31,9 @@ export function modelIncompatibility(
 }
 
 /** What refuses a load the user asks for by hand (a Models screen Load, the Load dialog, a model picker, an Engines
- *  Start: POST /api/v1/engine/start, which the Turbo Link façade's load mounts too) before it starts: only a Laya model
- *  with no Laya engine installed, since a Laya model never loads on the selected engine (registry.engineForModel).
+ *  Start: POST /api/v1/engine/start, which the Turbo Link façade's load mounts too for a model it lists to the peer,
+ *  link-routes.ts hiddenFromPeer) before it starts: only a Laya model with no Laya engine installed, since a Laya
+ *  model never loads on the selected engine (registry.engineForModel).
  *  Every other model is started on the selected engine whatever modelIncompatibility says of it, and if that engine
  *  cannot load it the load fails with the engine's own error (the load-failure banner): the user chose both the engine
  *  and the model, and nothing may pick or suggest another engine for them. The pre-refusal ("activate the LiteRT-LM

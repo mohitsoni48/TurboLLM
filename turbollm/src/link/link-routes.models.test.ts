@@ -18,7 +18,8 @@ function entry(overrides: Partial<ModelEntry>): ModelEntry {
   } as unknown as ModelEntry
 }
 
-function mkDeps(keys: ApiKey[], models: ModelEntry[], loadedKey: string | null = null): Deps {
+/** `engineKind`: the kind of the host's selected engine; null for none. */
+function mkDeps(keys: ApiKey[], models: ModelEntry[], loadedKey: string | null = null, engineKind: string | null = 'llama-server'): Deps {
   const cfg: Record<string, unknown> = {
     apiKeys: keys, links: [], daemon: { lanBind: true, requireApiKey: true, machineId: 'machine-abc', experimental: { turboLink: true } },
   }
@@ -27,6 +28,10 @@ function mkDeps(keys: ApiKey[], models: ModelEntry[], loadedKey: string | null =
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
     manager: { status: () => ({ model: loadedKey ? { key: loadedKey } : null }) },
+    registry: {
+      active: () => (engineKind ? { id: 'eng-1', kind: engineKind, name: engineKind, binPath: 'x', capabilities: { flags: [] } } : undefined),
+      layaEngine: () => undefined,
+    },
   } as unknown as Deps
 }
 
@@ -87,4 +92,51 @@ test('the payload carries no filesystem paths', async () => {
   const text = await res.text()
   assert.ok(!text.includes(':\\'))
   assert.ok(!text.includes('D:\\models\\qwen3-35b.gguf'))
+})
+
+// The host hides a model its selected engine cannot run (its Models screen and the pickers), unless its owner shows
+// every engine's models (Settings → Models). The façade listed every model to a peer, which has no such setting and no
+// compatibility field to filter by, with Load offered: a .litertlm bundle under KoboldCpp, a GGUF on vLLM.
+test('a model the host\'s selected engine cannot run is left out, unless the host shows every engine\'s models', async () => {
+  const models = [entry({ key: 'qwen3-35b' }), entry({ key: 'gemma-3n', format: 'litertlm' }), entry({ key: 'qwen3-hf', format: 'mlx' })]
+  const list = async (d: Deps) => {
+    const res = await app(d).request('/api/link/v1/models', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+    return ((await res.json()) as { models: Array<{ key: string }> }).models.map((m) => m.key)
+  }
+  const keys = () => [key('tllm-a', ['models:use', 'models:load'])]
+
+  const kobold = mkDeps(keys(), models, null, 'koboldcpp')
+  assert.deepEqual(await list(kobold), ['qwen3-35b'])
+  assert.deepEqual(await list(mkDeps(keys(), models, null, 'vllm')), ['qwen3-hf'])
+  // No engine selected: every model, as the host's own list shows.
+  assert.deepEqual(await list(mkDeps(keys(), models, null, null)), ['qwen3-35b', 'gemma-3n', 'qwen3-hf'])
+
+  kobold.store.update((c) => { c.showAllEngineModels = true })
+  assert.deepEqual(await list(kobold), ['qwen3-35b', 'gemma-3n', 'qwen3-hf'])
+})
+
+test('the list takes the config snapshot and registry lookups once per request, not once per model', async () => {
+  // Each snapshot (and each registry lookup, which takes one) is a structuredClone of the whole config, and every
+  // linked peer polls this list every 15 s; per row, that is two clones per model on every poll.
+  const count = async (n: number) => {
+    const models = Array.from({ length: n }, (_, i) =>
+      entry({ key: `m${i}`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
+    const d = mkDeps([key('tllm-a', ['models:use'])], models)
+    const calls = { snapshot: 0, active: 0, laya: 0 }
+    const { store, registry } = d as unknown as {
+      store: { snapshot: () => unknown }
+      registry: { active: () => unknown; layaEngine: () => unknown }
+    }
+    const [snapshot, active, layaEngine] = [store.snapshot, registry.active, registry.layaEngine]
+    store.snapshot = () => (calls.snapshot++, snapshot())
+    registry.active = () => (calls.active++, active())
+    registry.layaEngine = () => (calls.laya++, layaEngine())
+    const res = await app(d).request('/api/link/v1/models', { headers: { 'X-TurboLLM-Auth': 'tllm-a' } })
+    assert.equal(res.status, 200)
+    return calls
+  }
+  const one = await count(3)
+  const many = await count(30)
+  assert.deepEqual(many, one)
+  assert.ok(one.active <= 1 && one.laya <= 1, JSON.stringify(one))
 })

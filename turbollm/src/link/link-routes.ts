@@ -11,6 +11,9 @@ import { gatewayV1Handler } from '../gateway/gateway'
 import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
+import { modelIncompatibility, type Incompatibility } from '../engines/compat'
+import { engineForModel } from '../engines/registry'
+import type { ModelEntry } from '../models/scanner'
 import {
   enqueueDownload,
   listDownloads,
@@ -153,6 +156,31 @@ async function objectBody(
   return isJsonObject(parsed) ? parsed : {}
 }
 
+/** A predicate giving why the host hides a model from a peer, or null when the peer sees it: the host's own rule for
+ *  what is listed for loading (listedForLoading, model-kind.ts), applied here because a peer has neither the host's
+ *  compatibility field nor its Settings. A model the engine it loads on cannot run (modelIncompatibility of
+ *  engineForModel's engine, as the host's /api/v1/models marks it) is hidden unless the host's owner shows every
+ *  engine's models (`showAllEngineModels`); with no engine selected nothing is. The façade listed every model, and its
+ *  load mounts startEngine, a manual load that starts on the selected engine whatever the model: a peer's Load of a
+ *  .litertlm bundle under llama.cpp, or of a GGUF on vLLM, cancelled the host's auto-tune, aborted its chats, stopped
+ *  its model and recorded that model as its last loaded, for a start that then failed. The peer's user never chose
+ *  to show such models; the host's owner did not either.
+ *  Built once per request, not per model: the config snapshot and every registry lookup (each one a snapshot too)
+ *  is a structuredClone of the whole config, and every linked peer polls the list every 15 s. The registry lookups
+ *  are lazy and memoized, as overlayShared's are for the host's own /api/v1/models (routes.ts). */
+function hiddenFromPeer(d: Deps): (e: ModelEntry) => Incompatibility | null {
+  if (d.store.snapshot().showAllEngineModels) return () => null
+  const once = <T>(f: () => T): (() => T) => {
+    let v: { r: T } | undefined
+    return () => (v ??= { r: f() }).r
+  }
+  const registry = { active: once(() => d.registry.active()), layaEngine: once(() => d.registry.layaEngine()) }
+  return (e) => {
+    const engine = engineForModel(registry, e)
+    return engine ? modelIncompatibility(engine.kind, e) : null
+  }
+}
+
 /** Thrown inside `PATCH /api/link/v1/config`'s `store.update` callback when the second
  *  `applyScopedPatch` pass disagrees with the dry-run. Unreachable today; it exists so that
  *  if it ever DOES happen it aborts the write and surfaces as a 500, rather than committing
@@ -209,8 +237,10 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
   linkApp.get('/api/link/v1/models', requireCapability('models:use'), (c) => {
     const key = c.get('linkKey')
     const loadedKey = d.manager.status().model?.key ?? null
+    // A model the host hides from its own Models screen and pickers (hiddenFromPeer) is left out here too.
+    const hidden = hiddenFromPeer(d)
     const models = d.scanner.list().models
-      .filter((e) => allowsModel(key, e.key))
+      .filter((e) => allowsModel(key, e.key) && !hidden(e))
       .map((e) => ({
         key: e.key,
         name: e.name,
@@ -249,7 +279,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  nothing here adds a second lock: `startEngine` already goes through
    *  `modelRouter.withSwapLock`, so a second remote load queues behind an in-flight one.
    *
-   *  Three checks run BEFORE delegating, and all three are façade concerns the local route
+   *  Four checks run BEFORE delegating, and all four are façade concerns the local route
    *  has no business carrying:
    *   1. `modelKey` is REQUIRED. `startEngine` treats an empty request as "re-load
    *      `lastLoaded`" (the Engines "Start" button) — a peer must never trigger that by
@@ -261,6 +291,11 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *      code for "you named a model I don't have", and one whose branch a remote caller
    *      must never reach at all (it launches a caller-named FILESYSTEM PATH; ADR-139).
    *      Passing `{ modelKey }` alone — never the peer's raw body — is what forecloses it.
+   *   4. A model the host hides from the peer (hiddenFromPeer, which GET /api/link/v1/models
+   *      filters with too) is 409 `engine_model_mismatch` with the reason, before anything
+   *      on the host is stopped: `startEngine` loads it as the host's own Load of a model its
+   *      owner chose to show, on the selected engine whatever it is, which a peer never
+   *      chose. The gateway's auto-swap refuses the same model for the peer's chat.
    *
    *  The body it returns is `startEngine`'s own `{ ok: true }` / typed error, which carries
    *  no filesystem detail (see engine-lifecycle.ts). */
@@ -274,9 +309,12 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     if (!allowsModel(key, modelKey)) {
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${modelKey}'.` } }, 403)
     }
-    if (!d.scanner.get(modelKey)) {
+    const entry = d.scanner.get(modelKey)
+    if (!entry) {
       return c.json({ error: { code: 'no_such_model', message: `No model '${modelKey}' on this machine.` } }, 404)
     }
+    const hidden = hiddenFromPeer(d)(entry)
+    if (hidden) return c.json({ error: { code: 'engine_model_mismatch', message: hidden.message } }, 409)
     return startEngine(c, d, { modelKey })
   })
 
