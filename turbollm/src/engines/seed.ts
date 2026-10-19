@@ -1,7 +1,7 @@
 // Auto-provision a default engine on first run (ADR-024 + ADR-025). Detects the
 // GPU vendor, downloads the fastest llama.cpp backend it supports, and registers
 // it — trying the recommended backend, then Vulkan, then CPU if one won't probe.
-// No-ops if any engine is already configured. Never throws.
+// No-ops if any engine is already configured, or once it has seeded (Config.defaultEngineSeeded). Never throws.
 import { existsSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -108,12 +108,30 @@ export async function ensureAndroidBundledEngine(registry: Registry): Promise<vo
   }
 }
 
+/** Installs and selects the default llama.cpp build on a first run only (Config.defaultEngineSeeded). It ran on every
+ *  start that found no engine registered, so once the user had removed every engine (Disabled or Deleted the only one,
+ *  or deleted a managed build's folder by hand, which the start unregisters) the next start registered the default
+ *  build again, the one on disk or a fresh download, and selected it: the next automatic load ran on an engine the user
+ *  never selected. An engine registered before this runs (Android's bundled ones) marks the seed as done too. */
 export async function seedDefaultEngines(
   registry: Registry,
   enginesRoot: string,
   provision: ProvisionState,
+  store: Pick<ConfigStore, 'snapshot' | 'update'>,
 ): Promise<void> {
-  if (registry.list().engines.length > 0) return
+  // Best-effort, as the seed never throws: a config that cannot be saved seeds again at the next start, as before.
+  const markSeeded = () => {
+    try {
+      store.update((c) => { c.defaultEngineSeeded = true })
+    } catch (e) {
+      console.warn(`seed: could not record the first-run seed (${e instanceof Error ? e.message : e})`)
+    }
+  }
+  if (registry.list().engines.length > 0) {
+    if (!store.snapshot().defaultEngineSeeded) markSeeded()
+    return
+  }
+  if (store.snapshot().defaultEngineSeeded) return
 
   const tag = LLAMA_BUILD
   const sys = getSysInfo()
@@ -161,6 +179,7 @@ export async function seedDefaultEngines(
       process.stdout.write('\n')
       // registry.add() probes the binary; a GPU build with no runtime throws here.
       await registry.add(`llama.cpp ${tag} (${backend.id})`, binPath)
+      markSeeded()
       provision.done()
       console.log(`seeded default engine: llama.cpp ${tag} (${backend.id})`)
       return

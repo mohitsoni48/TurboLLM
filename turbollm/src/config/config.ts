@@ -553,6 +553,12 @@ export interface Config {
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
   activeEngineId: string
+  /** The first-run seed (engines/seed.ts seedDefaultEngines) has run: it installed and selected the default llama.cpp
+   *  build, or the config had an engine (or a custom engine's identity) when it was loaded. The seed runs only while
+   *  this is false: a start that found no engine registered seeded again, so a user who had removed every engine got
+   *  the default build registered and selected without choosing it (and downloaded when its folder was gone). A seed
+   *  that fails (offline) leaves it false, so the next start tries again. */
+  defaultEngineSeeded: boolean
   modelDirs: string[]
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
    *  modelDirs, the FIRST entry in modelDirs is the effective default. */
@@ -759,6 +765,7 @@ export function defaultConfig(): Config {
     engines: [],
     customEngineSources: [],
     activeEngineId: '',
+    defaultEngineSeeded: false,
     modelDirs: [],
     primaryModelDir: '',
     modelProfiles: {},
@@ -1124,6 +1131,9 @@ function normalize(c: Config): void {
   c.links ??= []
   c.engines ??= []
   c.customEngineSources ??= []
+  // A config from before the key, or one that gained an engine since the seed was recorded, has had engines set up:
+  // once the user removes them all, the next start must not install and select the default build for them.
+  c.defaultEngineSeeded = c.defaultEngineSeeded === true || c.engines.length > 0 || c.customEngineSources.length > 0
   c.modelDirs ??= []
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.

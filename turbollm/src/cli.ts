@@ -468,7 +468,7 @@ const enginesDir = join(store.dir(), 'engines')
 // gate so a repaired/first-registered Android engine correctly short-circuits the
 // network-download seed path instead of racing it.
 void ensureAndroidBundledEngine(registry)
-  .then(() => seedDefaultEngines(registry, enginesDir, provision))
+  .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
   .then(() => registry.ensureProbed())
 const manager = new Manager(store)
 const scanner = new Scanner(store)
