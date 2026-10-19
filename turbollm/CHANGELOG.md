@@ -29,10 +29,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
   existing LiteRT-LM config, warm-up and request handling apply unchanged; it is not updated from PyPI (it updates
   with the app) and needs no Python preflight.
-- `.litertlm` models load on the LiteRT-LM engine once it is the selected engine (Engines). Like every model, they load
-  only on the engine the user selected, and no path starts LiteRT-LM on its own: under another engine they are hidden
-  from the Models screen and the pickers, and a Load asked for anyway is started on the selected engine, whose own
-  error says it could not load the file.
+- `.litertlm` models load on the LiteRT-LM engine once it is the selected engine (Engines). Like every model but a Laya
+  one (a Laya model loads on the Laya engine, which is never the selected engine), they load only on the engine the
+  user selected, and no path starts LiteRT-LM on its own: under another engine they are hidden from the Models screen
+  and the pickers, and a Load asked for anyway is started on the selected engine, whose own error says it could not
+  load the file.
 - **Show models for every engine** (Settings → Models & loading, off by default) lists every model in the Models screen,
   the model pickers and the gateway's `GET /v1/models` (Claude Code's `/model`), also those the selected engine is not
   expected to run; with it off, that list leaves them out too, unless one is running. A model shown that way still
