@@ -5,6 +5,7 @@ import type { EngineError, Status } from '../lib/types'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
 import { track, loadModel } from '../lib/api'
+import { BUNDLED_ENGINE_TITLES } from '../lib/engine-groups'
 import { LoadFailureRecovery } from './LoadFailureRecovery'
 
 /** Every distinct `errInfo` the backend produces (`manager.ts` — `onTerminated`,
@@ -19,9 +20,11 @@ function errorKey(error: EngineError | undefined): string | null {
 
 /** Which engine could not load which model, as the daemon names them (the load that failed: a model listed by "Show
  *  models for every engine" starts on the selected engine and fails with that engine's own error, which named
- *  neither). "Model load failed" from an older daemon, which sends neither name. */
+ *  neither). The Android app's own engines read as the selector names them, not by their registered names
+ *  ("litert-lm-android"). "Model load failed" from an older daemon, which sends neither name. */
 function failureTitle(error: EngineError): string {
-  return error.engineName && error.modelName ? `${error.engineName} could not load ${error.modelName}` : 'Model load failed'
+  if (!error.engineName || !error.modelName) return 'Model load failed'
+  return `${BUNDLED_ENGINE_TITLES[error.engineName]?.label ?? error.engineName} could not load ${error.modelName}`
 }
 
 /**

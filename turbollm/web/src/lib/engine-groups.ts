@@ -85,14 +85,29 @@ const GROUP_LABEL: Record<string, string> = {
   laya: 'Laya',
 }
 
+/** The engines the packaged Android app registers itself (turbollm engines/seed.ts), by their fixed registered names:
+ *  `title` and `detail` head their Built-in card, `label` is their row in the "Running now" selector. Each is a
+ *  user-added group (`user:<id>`), whose label fell back to that registered name, so the selector read
+ *  "litert-lm-android" — and a model loads only on the engine the user selected, so that is a choice made there. */
+export const BUNDLED_ENGINE_TITLES: Readonly<Record<string, { title: string; detail: string; label: string }>> =
+  // No prototype: it is looked up by any engine's name, and one named "constructor" or "toString" would otherwise
+  // find Object's own function and read as a Built-in engine titled undefined.
+  Object.assign(Object.create(null) as Record<string, { title: string; detail: string; label: string }>, {
+    'llama-server-android': { title: 'llama.cpp', detail: 'CPU', label: 'llama.cpp (CPU)' },
+    'llama-server-android-vulkan': { title: 'llama.cpp', detail: 'Vulkan GPU', label: 'llama.cpp (Vulkan GPU)' },
+    'litert-lm-android': { title: 'LiteRT-LM', detail: 'CPU · GPU', label: 'LiteRT-LM' },
+  })
+
 /** Display label for a logical-engine group. Per-backend llama.cpp groups read as
- *  "llama.cpp (CUDA)"; user-added engines fall back to the engine's own name. */
+ *  "llama.cpp (CUDA)"; the Android app's own engines by BUNDLED_ENGINE_TITLES; other
+ *  user-added engines fall back to the engine's own name. */
 export function groupLabel(key: string, members: Engine[]): string {
   if (key.startsWith('official-llama-')) {
     const backend = key.slice('official-llama-'.length)
     return `llama.cpp (${BACKEND_LABEL[backend] ?? backend.toUpperCase()})`
   }
-  return GROUP_LABEL[key] ?? members[0]?.name ?? key
+  const name = members[0]?.name
+  return GROUP_LABEL[key] ?? (name !== undefined ? BUNDLED_ENGINE_TITLES[name]?.label : undefined) ?? name ?? key
 }
 
 const BACKEND_LABEL: Record<string, string> = {

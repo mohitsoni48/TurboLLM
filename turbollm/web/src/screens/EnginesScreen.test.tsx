@@ -16,6 +16,7 @@ const installLitertLmMutate = vi.fn()
 const updateLitertLmMutate = vi.fn()
 const updateMlxMutate = vi.fn()
 const getEngineUpdatesMock = vi.fn()
+const activateMutate = vi.fn()
 
 function engine(over: Partial<Engine> & { id: string; name: string }): Engine {
   return {
@@ -46,7 +47,7 @@ const LAYA_FIT: EngineFit = {
   recommended: false,
 }
 
-const state: { engines: Engine[]; activeEngineId: string; catalog: CatalogEngine[]; fits: EngineFit[]; updates: Record<string, unknown>; policies: Record<string, string>; status?: Status } = {
+const state: { engines: Engine[]; activeEngineId: string; catalog: CatalogEngine[]; fits: EngineFit[]; updates: Record<string, unknown>; policies: Record<string, string>; status?: Status; sys?: Record<string, unknown> } = {
   engines: [], activeEngineId: '', catalog: [], fits: [], updates: {}, policies: {},
 }
 
@@ -62,7 +63,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
       isLoading: false,
     }),
     useEngineUpdates: () => ({ data: { updates: state.updates, policies: state.policies } }),
-    useSysInfo: () => ({ data: { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
+    useSysInfo: () => ({ data: state.sys ?? { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
     useStatus: () => ({ data: state.status }),
     useBuild: () => ({
       start: { mutate: vi.fn(), isPending: false }, cancel: { mutate: vi.fn() },
@@ -72,7 +73,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
     useUpdatePolicyMutation: () => ({ mutate: vi.fn() }),
     useEngineMutations: () => {
       const noop = { mutate: vi.fn(), isPending: false }
-      return { add: noop, rename: noop, remove: noop, disableCustom: noop, purge: noop, deleteBuild: noop, forgetCustomSource: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop }
+      return { add: noop, rename: noop, remove: noop, disableCustom: noop, purge: noop, deleteBuild: noop, forgetCustomSource: noop, activate: { mutate: activateMutate, isPending: false }, reprobe: noop, start: noop, stop: noop, restart: noop }
     },
     useBackendInstall: () => {
       const noop = { mutate: vi.fn(), isPending: false }
@@ -119,6 +120,8 @@ beforeEach(() => {
   state.updates = {}
   state.policies = {}
   state.status = undefined
+  state.sys = undefined
+  activateMutate.mockClear()
   installLayaMutate.mockClear()
   installLitertLmMutate.mockClear()
   updateLitertLmMutate.mockClear()
@@ -190,6 +193,56 @@ describe('EnginesScreen — the engine running the model, when it is not the act
     expect(screen.getByText('Running now')).toBeTruthy()
     expect(screen.getByText('Gemma 3n')).toBeTruthy()
     expect(screen.queryByText(/ — on /)).toBeNull()
+  })
+})
+
+// In the packaged Android app the LiteRT-LM card said ".litertlm models load on it automatically" and offered no "Use",
+// though a model loads only on the engine the user selected: the selector, which read "litert-lm-android", was the only
+// way to pick it.
+describe('EnginesScreen — the Android app\'s built-in engines', () => {
+  const LLAMA_ANDROID = engine({ id: 'llama-a', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' })
+  const LITERT_ANDROID = engine({ id: 'litert-a', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so', version: '0.8.0' })
+  const androidApp = () => {
+    state.sys = { os: 'android/android', cpu: '', cores: 8, ramMB: 8000, gpus: [], bundledEnginesOnly: true }
+    state.engines = [LLAMA_ANDROID, LITERT_ANDROID]
+  }
+  const card = (title: string) => screen.getByText(title, { selector: 'span.font-semibold' }).closest('div.rounded-xl') as HTMLElement
+
+  it('offers Use on the LiteRT-LM card and says it runs .litertlm models once it is selected', async () => {
+    androidApp()
+    state.activeEngineId = LLAMA_ANDROID.id
+    renderScreen()
+
+    const litert = card('LiteRT-LM')
+    expect(within(litert).getByText('Runs .litertlm models once it is selected')).toBeTruthy()
+    expect(screen.queryByText(/load on it automatically/)).toBeNull()
+    await userEvent.click(within(litert).getByRole('button', { name: 'Use' }))
+    expect(activateMutate).toHaveBeenCalledWith(LITERT_ANDROID.id, expect.anything())
+  })
+
+  it('shows the LiteRT-LM card In use while it is the selected engine', () => {
+    androidApp()
+    state.activeEngineId = LITERT_ANDROID.id
+    renderScreen()
+
+    const litert = card('LiteRT-LM')
+    expect((within(litert).getByRole('button', { name: 'In use' }) as HTMLButtonElement).disabled).toBe(true)
+    expect(within(card('llama.cpp')).getByRole('button', { name: 'Use' })).toBeTruthy()
+  })
+
+  it('names the built-in engines in the selector, not by their registered names', async () => {
+    androidApp()
+    state.activeEngineId = LITERT_ANDROID.id
+    renderScreen()
+
+    const trigger = screen.getByText('Running now').closest('div')!.querySelector('button[aria-haspopup="menu"]')!
+    expect(trigger.textContent).toContain('LiteRT-LM')
+    expect(screen.getByText('LiteRT-LM · CPU · GPU')).toBeTruthy()
+    await userEvent.click(trigger)
+    const menu = await screen.findByRole('menu')
+    expect(within(menu).getByText('llama.cpp (CPU)')).toBeTruthy()
+    expect(within(menu).getByText('LiteRT-LM')).toBeTruthy()
+    expect(screen.queryByText(/litert-lm-android|llama-server-android/)).toBeNull()
   })
 })
 

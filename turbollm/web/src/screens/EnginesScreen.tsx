@@ -106,6 +106,7 @@ import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
+  BUNDLED_ENGINE_TITLES,
   customSourceKey,
   groupEngines,
   memberToActivate,
@@ -160,6 +161,9 @@ function buildContextFor(e: Engine, backends: EngineBackends | undefined): strin
     const active = backends?.backends.find((b) => b.active)
     return active ? `llama.cpp · ${active.label}` : 'llama.cpp'
   }
+  // The Android app's own engines, which read as their registered names ("litert-lm-android") under the selector.
+  const bundled = BUNDLED_ENGINE_TITLES[e.name]
+  if (bundled) return `${bundled.title} · ${bundled.detail}`
   return e.name
 }
 
@@ -2155,13 +2159,6 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
   )
 }
 
-/** Display names for the engines the Android app registers itself (turbollm engines/seed.ts). */
-const BUNDLED_ENGINE_TITLES: Record<string, { title: string; detail: string }> = {
-  'llama-server-android': { title: 'llama.cpp', detail: 'CPU' },
-  'llama-server-android-vulkan': { title: 'llama.cpp', detail: 'Vulkan GPU' },
-  'litert-lm-android': { title: 'LiteRT-LM', detail: 'CPU · GPU' },
-}
-
 function BundledEngineCard({
   engine: e,
   isActive,
@@ -2238,11 +2235,12 @@ function BundledEngineCard({
 
       <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
         <span className="text-[11px] text-muted">
-          {isLitert ? '.litertlm models load on it automatically' : 'Updates with the app'}
+          {isLitert ? 'Runs .litertlm models once it is selected' : 'Updates with the app'}
         </span>
-        {/* No "Use" for LiteRT-LM: .litertlm models reach it on their own, and making it the active engine would send
-            every GGUF model to it, where they cannot load. */}
-        {isLitert ? null : isActive ? (
+        {/* LiteRT-LM is selected here like the others. A model loads only on the engine the user selected, so a
+            .litertlm model reaches LiteRT-LM only once it is; the card offered no "Use" and said those models loaded
+            on it automatically, which left the selector's raw "litert-lm-android" row as the only way to pick it. */}
+        {isActive ? (
           <Button size="sm" variant="outline" disabled>
             In use
           </Button>
