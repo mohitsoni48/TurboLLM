@@ -60,19 +60,54 @@ test('koboldcppProfileToArgs: non-NVIDIA GPU → usevulkan', () => {
   assert.deepEqual(args, ['--contextsize', '4096', '--gpulayers', '40', '--usevulkan'])
 })
 
-test('koboldcppProfileToArgs: no GPU → nogpu, no gpulayers flag', () => {
+// KoboldCpp has no --nogpu: its argparse exited 2 ("unrecognized arguments: --nogpu") on every
+// CPU launch. CPU is --usecpu, with --gpulayers 0 because the default is -1 (autofit), which
+// --usecpu does not reset on macOS. Also when the profile has GPU layers but no GPU was detected.
+test('koboldcppProfileToArgs: no GPU → usecpu, gpulayers 0', () => {
   const args = koboldcppProfileToArgs({ ctx: 2048, ngl: 0 }, 'unknown', false)
-  assert.deepEqual(args, ['--contextsize', '2048', '--nogpu'])
+  assert.deepEqual(args, ['--contextsize', '2048', '--gpulayers', '0', '--usecpu'])
+  assert.deepEqual(koboldcppProfileToArgs({ ctx: 2048, ngl: 99 }, 'unknown', false), ['--contextsize', '2048', '--gpulayers', '0', '--usecpu'])
 })
 
-test('koboldcppProfileToArgs: ngl 0 on a GPU box still means CPU (nogpu, no gpulayers)', () => {
+test('koboldcppProfileToArgs: ngl 0 on a GPU box still means CPU (usecpu, gpulayers 0)', () => {
   const args = koboldcppProfileToArgs({ ctx: 2048, ngl: 0 }, 'nvidia', true)
-  assert.deepEqual(args, ['--contextsize', '2048', '--nogpu'])
+  assert.deepEqual(args, ['--contextsize', '2048', '--gpulayers', '0', '--usecpu'])
+})
+
+test('koboldcppProfileToArgs: never emits --nogpu, which KoboldCpp does not accept', () => {
+  for (const [ngl, vendor, hasGpu] of [[0, 'unknown', false], [99, 'unknown', false], [0, 'apple', true], [0, 'amd', true]] as const) {
+    const args = koboldcppProfileToArgs({ ctx: 4096, ngl }, vendor, hasGpu)
+    assert.ok(!args.includes('--nogpu'), `--nogpu in ${args.join(' ')}`)
+    assert.ok(args.includes('--usecpu'), `no --usecpu in ${args.join(' ')}`)
+  }
 })
 
 test('koboldcppProfileToArgs: user extraArgs pass through last', () => {
   const args = koboldcppProfileToArgs({ ctx: 4096, ngl: 10, extraArgs: ['--flashattention'] }, 'nvidia', true)
   assert.deepEqual(args.slice(-1), ['--flashattention'])
+})
+
+// The backend flags are one argparse mutually exclusive group: ours next to the user's exited 2
+// ("argument --usevulkan: not allowed with argument --usecuda") before the model loaded.
+test('koboldcppProfileToArgs: a backend named in the user extraArgs replaces ours instead of joining it', () => {
+  const backends = ['--usecuda', '--usecublas', '--usehipblas', '--usevulkan', '--useclblast', '--usecpu', '--noblas']
+  const cases = [
+    { extraArgs: ['--usevulkan'], vendor: 'nvidia', hasGpu: true, ngl: 99 },
+    { extraArgs: ['--usecuda', '0'], vendor: 'unknown', hasGpu: false, ngl: 99 },
+    { extraArgs: ['--usecublas', 'lowvram'], vendor: 'amd', hasGpu: true, ngl: 40 },
+    { extraArgs: ['--usevulkan=1'], vendor: 'nvidia', hasGpu: true, ngl: 0 },
+    { extraArgs: ['--noblas'], vendor: 'nvidia', hasGpu: true, ngl: 99 },
+  ] as const
+  for (const c of cases) {
+    const args = koboldcppProfileToArgs({ ctx: 4096, ngl: c.ngl, extraArgs: [...c.extraArgs] }, c.vendor, c.hasGpu)
+    const named = args.filter((x) => backends.some((f) => x === f || x.startsWith(`${f}=`)))
+    assert.equal(named.length, 1, `two backends in ${args.join(' ')}`)
+    assert.deepEqual(args.slice(-c.extraArgs.length), [...c.extraArgs])
+  }
+  // Their GPU layers stand: no GPU detected, but they asked for CUDA, so ngl 99 is not zeroed.
+  assert.deepEqual(koboldcppProfileToArgs({ ctx: 4096, ngl: 99, extraArgs: ['--usecuda'] }, 'unknown', false), [
+    '--contextsize', '4096', '--gpulayers', '99', '--usecuda',
+  ])
 })
 
 test('koboldcppAssetName: Windows x64 picks CUDA vs nocuda build by GPU', () => {

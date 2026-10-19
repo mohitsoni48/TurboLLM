@@ -9,13 +9,14 @@
 // with KoboldCpp's OWN flag names (--model/--port/--host/--gpulayers/--contextsize plus
 // a GPU-backend selector). Its /health is llama.cpp's, so the shared probeReady() works.
 //
-// CLI flags verified against the KoboldCpp README + wiki (LostRuins/koboldcpp), v1.115.x:
+// CLI flags checked against koboldcpp.py's argparse parser (LostRuins/koboldcpp v1.115, v1.123.1):
 //   --model <path>        load a GGUF
 //   --port <n>            listen port (default 5001)
 //   --host <addr>         bind address
-//   --gpulayers <n>       layers to offload to GPU VRAM
+//   --gpulayers <n>       layers to offload to GPU VRAM (default -1: autofit, every layer that fits)
 //   --contextsize <n>     context window
-//   --usecuda / --usevulkan / --nogpu   GPU backend selection
+//   --usecuda / --usevulkan / --usecpu   GPU backend selection (one mutually exclusive group)
+// argparse exits 2 on an option it does not know, so a wrong flag name fails every launch.
 // OpenAI-compatible API served at /v1 (the model field is ignored — a single loaded
 // model — so no served-model alias is needed, unlike vLLM).
 import { chmodSync, existsSync, mkdirSync } from 'node:fs'
@@ -136,7 +137,7 @@ export async function ensureKoboldcpp(
  * Command + args to launch KoboldCpp's server for a model. Mirrors mlx/vllm
  * ServerCommand shape. `extraArgs` carries the model's KoboldCpp load flags built by
  * {@link koboldcppProfileToArgs}; the manager injects nothing else for this kind.
- * The GPU-backend flag (--usecuda/--usevulkan/--nogpu) is decided from the detected
+ * The GPU-backend flag (--usecuda/--usevulkan/--usecpu) is decided from the detected
  * vendor and lives in `extraArgs` too (see koboldcppProfileToArgs).
  *
  * `--quiet`: without it KoboldCpp prints every request's generation input (`Input: {...}`,
@@ -166,13 +167,20 @@ export function koboldcppServerCommand(
   }
 }
 
+/** KoboldCpp's backend selectors, one argparse mutually exclusive group: --usecublas and
+ *  --usehipblas are --usecuda's aliases, --noblas is the hidden old spelling of --usecpu, and
+ *  --useclblast is in older releases (v1.100 and earlier). Two of them on one command line exit 2
+ *  ("argument --usecuda: not allowed with argument --usecpu") before anything loads. */
+const KOBOLDCPP_BACKEND_FLAGS = ['--usecuda', '--usecublas', '--usehipblas', '--usevulkan', '--useclblast', '--usecpu', '--noblas']
+
 /** Map a load profile's relevant fields to KoboldCpp CLI flags. KoboldCpp uses its own
  *  flag names, so this is a small, explicit mapping (not the llama-server arg-map):
  *    ctx  → --contextsize
- *    ngl  → --gpulayers   (only when > 0; 0 = CPU, emit nothing)
+ *    ngl  → --gpulayers   (always; 0 = CPU, and 0 whenever --usecpu is ours)
  *  Plus the GPU backend selector from the detected vendor:
- *    nvidia → --usecuda ; any other GPU → --usevulkan ; no GPU → --nogpu
- *  User `extraArgs` pass through last so they can override anything. */
+ *    nvidia → --usecuda ; any other GPU → --usevulkan ; no GPU, or ngl 0 → --usecpu
+ *  User `extraArgs` pass through last so they can override anything; one that names a
+ *  backend replaces ours rather than joining it. */
 export function koboldcppProfileToArgs(
   p: { ctx: number; ngl: number; extraArgs?: string[] },
   vendor: GpuVendor,
@@ -180,12 +188,23 @@ export function koboldcppProfileToArgs(
 ): string[] {
   const a: string[] = []
   if (p.ctx > 0) a.push('--contextsize', String(p.ctx))
-  if (p.ngl > 0) a.push('--gpulayers', String(p.ngl))
   // GPU backend: KoboldCpp's nocuda/portable build still accepts --usevulkan; the CUDA
-  // build accepts --usecuda. We pick by vendor and fall back to Vulkan for any GPU.
-  if (!hasGpu || p.ngl <= 0) a.push('--nogpu')
-  else if (vendor === 'nvidia') a.push('--usecuda')
-  else a.push('--usevulkan')
+  // build accepts --usecuda. We pick by vendor and fall back to Vulkan for any GPU. CPU
+  // is --usecpu: this used to pass --nogpu, which KoboldCpp has never had, so argparse
+  // refused every launch on a machine with no GPU, or with GPU layers 0, before it loaded.
+  // A backend the user named in their extra args is the one they want: adding ours too
+  // would trip the mutually exclusive group, so the model would not start either.
+  const userBackend = p.extraArgs?.some((x) => KOBOLDCPP_BACKEND_FLAGS.some((f) => x === f || x.startsWith(`${f}=`)))
+  const cpu = !userBackend && (!hasGpu || p.ngl <= 0)
+  // --gpulayers defaults to -1 (autofit), not 0, so leaving it out does not mean CPU. --usecpu
+  // sets it to 0 itself except on macOS, where -1, or the profile's layers when no GPU was
+  // detected, would still go to Metal: a CPU launch passes 0.
+  a.push('--gpulayers', String(!cpu && p.ngl > 0 ? p.ngl : 0))
+  if (!userBackend) {
+    if (cpu) a.push('--usecpu')
+    else if (vendor === 'nvidia') a.push('--usecuda')
+    else a.push('--usevulkan')
+  }
   if (p.extraArgs?.length) a.push(...p.extraArgs)
   return a
 }

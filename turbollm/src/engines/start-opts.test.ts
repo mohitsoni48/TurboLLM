@@ -28,11 +28,11 @@ test('a safetensors model-directory load carries the resume trigger it was built
   assert.equal(opts.trigger, 'resume')
 })
 
-test('koboldcpp gets KoboldCpp flags, including --nogpu on a machine with no GPU', () => {
+test('koboldcpp gets KoboldCpp flags, including --usecpu on a machine with no GPU', () => {
   const opts = resumeLoad(ggufModel(), 'koboldcpp')
 
   assert.deepEqual(opts.extraArgs, koboldcppProfileToArgs(opts.profile!, primaryVendor(NO_GPU_MACHINE), false))
-  assert.ok(opts.extraArgs.includes('--nogpu'))
+  assert.ok(opts.extraArgs.includes('--usecpu'))
   assert.ok(!opts.extraArgs.includes('-c'))
 })
 
