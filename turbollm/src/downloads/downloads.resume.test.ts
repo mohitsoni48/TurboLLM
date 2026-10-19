@@ -7,7 +7,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { DownloadManager, type DownloadError } from './downloads'
@@ -258,6 +258,7 @@ async function interruptedRawDownload(
 ) {
   const validatorHeaders = typeof etag === 'string' ? { etag } : etag
   const { modelDir, stateDir } = newDirs()
+  let partPath = '' // the row's .part, known once enqueue returns
   const real = globalThis.fetch
   globalThis.fetch = (async () => {
     let pulls = 0
@@ -265,7 +266,7 @@ async function interruptedRawDownload(
       async pull(c) {
         if (pulls++ === 0) return c.enqueue(new Uint8Array(oldFile.subarray(0, prefixLen)))
         if (how === 'killed') return new Promise<void>(() => {}) // the process is gone: nothing more happens
-        await new Promise((r) => setTimeout(r, 30)) // let the prefix reach the .part first
+        await untilPartHolds(() => partPath, prefixLen) // the drop comes after the prefix is on disk
         c.error(new Error('ECONNRESET'))
       },
     })
@@ -275,6 +276,7 @@ async function interruptedRawDownload(
     const first = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
     const [rec] = await first.enqueue({ url: 'https://mirror.example/model.gguf' })
     const part = `${rec.dest}.part`
+    partPath = part
     if (how === 'error') {
       await waitSettled(first, rec.id)
       assert.equal(first.list()[0].status, 'error')
@@ -288,6 +290,19 @@ async function interruptedRawDownload(
     return { modelDir, stateDir, id: rec.id, dest: rec.dest, dm: first }
   } finally {
     globalThis.fetch = real
+  }
+}
+
+/** Waits, for about 2 s at most, until the file at `path()` holds exactly `size` bytes. A fake body
+ *  that drops its connection waits for this first: a fixed 30 ms sleep raced the DownloadManager's
+ *  open of the .part (createWriteStream opens it on the threadpool). On a loaded machine the drop
+ *  came before that open finished, the pipeline destroyed the stream with the bytes still buffered,
+ *  and the .part was left empty ("the first attempt left its prefix in the .part", 0 !== 60). */
+async function untilPartHolds(path: () => string, size: number) {
+  for (let i = 0; i < 400; i++) {
+    const p = path()
+    if (p && statSync(p, { throwIfNoEntry: false })?.size === size) return
+    await new Promise((r) => setTimeout(r, 5))
   }
 }
 
@@ -710,16 +725,18 @@ test('resume: a 206 with a weak ETag still continues a .part written under the s
 
 /** A server whose replies carry no ETag or Last-Modified: it answers `status` (a 206 of the rest
  *  of `file` from the Range offset, or a 200 of all of it), sends `n` bytes of that and then
- *  drops the connection. */
-function noValidatorThenDrops(file: Buffer, status: 200 | 206, n: number) {
+ *  drops the connection, once they are in `part` (the row's .part: the offset plus `n` after a
+ *  206, `n` alone after a 200). */
+function noValidatorThenDrops(file: Buffer, status: 200 | 206, n: number, part: string) {
   return (async (_url: string, init: { headers: Record<string, string> }) => {
     const from = status === 206 ? Number(/bytes=(\d+)-/.exec(init.headers.Range ?? '')?.[1] ?? 0) : 0
     const rest = file.subarray(from)
+    const sent = rest.subarray(0, n)
     let pulls = 0
     const body = new ReadableStream<Uint8Array>({
       async pull(c) {
-        if (pulls++ === 0) return c.enqueue(new Uint8Array(rest.subarray(0, n)))
-        await new Promise((r) => setTimeout(r, 30)) // let the bytes reach the .part first
+        if (pulls++ === 0) return c.enqueue(new Uint8Array(sent))
+        await untilPartHolds(() => part, from + sent.length) // the drop comes after the bytes are on disk
         c.error(new Error('ECONNRESET'))
       },
     })
@@ -733,13 +750,17 @@ test('resume: a reply with no validator keeps the stored one on a 206 and drops 
   // it. A 200 replaces the .part with a version nothing names: keeping the old validator would
   // vouch for bytes it never described.
   const ranged = await interruptedRawDownload(OLD_FILE, 60, '"strong1"')
-  const partial = await resumeAfterRestart(ranged.stateDir, ranged.modelDir, ranged.id, noValidatorThenDrops(OLD_FILE, 206, 20))
+  const partial = await resumeAfterRestart(
+    ranged.stateDir, ranged.modelDir, ranged.id, noValidatorThenDrops(OLD_FILE, 206, 20, `${ranged.dest}.part`),
+  )
   assert.equal(partial.status, 'error')
   assert.equal(readFileSync(`${ranged.dest}.part`).length, 80, 'the 206 continued the .part')
   assert.deepEqual(manifestEntries(ranged.stateDir).map((e) => e.validator), ['"strong1"'])
 
   const whole = await interruptedRawDownload(OLD_FILE, 60, '"strong1"')
-  const restarted = await resumeAfterRestart(whole.stateDir, whole.modelDir, whole.id, noValidatorThenDrops(OLD_FILE, 200, 20))
+  const restarted = await resumeAfterRestart(
+    whole.stateDir, whole.modelDir, whole.id, noValidatorThenDrops(OLD_FILE, 200, 20, `${whole.dest}.part`),
+  )
   assert.equal(restarted.status, 'error')
   assert.equal(readFileSync(`${whole.dest}.part`).length, 20, 'the 200 started the .part again')
   assert.deepEqual(manifestEntries(whole.stateDir).map((e) => e.validator), [undefined])
