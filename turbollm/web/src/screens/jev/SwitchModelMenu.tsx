@@ -11,7 +11,10 @@ import { TextClassificationRuntimeLabel } from '../../components/TextClassificat
 import { toast } from '../../components/ui/sonner'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
-const NOTHING_LOADABLE = 'Nothing else here can load on the active engine. Change it on the Engines screen.'
+// Nothing here suggests another engine: a model loads only on the one the user selected. The setting lists the rest.
+const NOTHING_LOADABLE =
+  'Nothing else here can load on the selected engine. Settings → Models & loading → "Show models for every engine" lists every model.'
+const NOTHING_LOADABLE_SHOWING_ALL = 'Nothing else here can be loaded.'
 
 type SwitchDeps = {
   stopEngine(key: string): Promise<unknown>
@@ -35,7 +38,7 @@ export function SwitchModelMenu({
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border p-3">
       {loadable.length === 0 ? (
-        <p className="text-[13px] text-muted">{NOTHING_LOADABLE}</p>
+        <p className="text-[13px] text-muted">{showAllEngineModels ? NOTHING_LOADABLE_SHOWING_ALL : NOTHING_LOADABLE}</p>
       ) : (
         <>
           <ModelGroup title="Chat models" models={loadable.filter((m) => !isSystemOneModel(m))} onPick={onPick} />

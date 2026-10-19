@@ -73,4 +73,47 @@ describe('EngineLoadErrorBanner', () => {
     expect(screen.getByText(/Model load failed/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Open Engines' })).toBeNull()
   })
+
+  // The banner said "Model load failed: <message>", naming neither the engine nor the model, and offered remedies
+  // that suit a model the engine runs, also for one it cannot: a model "Show models for every engine" lists loads only
+  // on the selected engine. Nothing may suggest another engine.
+  describe('a failed load the daemon names', () => {
+    const archFailure: EngineError = {
+      code: 'engine_exited',
+      message: "unknown model architecture: 'qwen3next'",
+      exitCode: 1,
+      logTail: [],
+      failReason: 'unsupported_arch',
+      engineName: 'llama.cpp (b6000)',
+      modelName: 'Qwen3 Next 80B',
+      expectedToLoad: true,
+    }
+
+    it('names the engine and the model', () => {
+      renderBanner(statusWith('error', archFailure))
+      expect(screen.getByText("llama.cpp (b6000) could not load Qwen3 Next 80B: unknown model architecture: 'qwen3next' (exit 1)")).toBeTruthy()
+      expect(screen.queryByText(/Model load failed/)).toBeNull()
+    })
+
+    it('offers no other engine for an unknown architecture', () => {
+      renderBanner(statusWith('error', archFailure))
+      expect(screen.queryByRole('button', { name: 'Try an engine that supports it' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'Choose a different model' })).toBeTruthy()
+    })
+
+    it('offers no engine advice and no re-download for a model the engine is not expected to load', () => {
+      renderBanner(statusWith('error', {
+        ...archFailure,
+        message: "gguf_init_from_file_impl: invalid magic characters: 'LITE', expected 'GGUF'",
+        failReason: 'bad_gguf',
+        modelName: 'Gemma 3n',
+        expectedToLoad: false,
+      }))
+      const buttons = screen.getAllByRole('button').map((b) => b.textContent)
+      expect(buttons).not.toContain('Re-download the model')
+      expect(buttons).not.toContain('Check for an engine update')
+      expect(buttons).toContain('Choose a different model')
+      expect(screen.getByText("The selected engine isn't expected to load this model.")).toBeTruthy()
+    })
+  })
 })

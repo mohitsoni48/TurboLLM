@@ -133,16 +133,25 @@ describe('SwitchModelMenu', () => {
 
   // Both groups can empty at once — a library of GGUF chat models plus one safetensors Jev
   // model under vLLM leaves nothing loadable — and an empty bordered box explains nothing.
+  // It pointed at the Engines screen, to change engines; nothing may suggest another engine. Settings' "Show models
+  // for every engine" is what lists the rest.
   it('says where to go when nothing here can load', () => {
     renderMenu([model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false })])
-    expect(screen.getByText('Nothing else here can load on the active engine. Change it on the Engines screen.')).toBeTruthy()
+    expect(screen.getByText('Nothing else here can load on the selected engine. Settings → Models & loading → "Show models for every engine" lists every model.')).toBeTruthy()
+    expect(screen.queryByText(/Engines screen/)).toBeNull()
     expect(screen.queryByText('Chat models')).toBeNull()
     expect(screen.queryByText('Text classification models')).toBeNull()
   })
 
+  it('does not point at the setting once it is on', () => {
+    renderMenu([model({ key: 'embed', name: 'An embedder', embedding: true })], CURRENT, true)
+    expect(screen.getByText('Nothing else here can be loaded.')).toBeTruthy()
+    expect(screen.queryByText(/Show models for every engine/)).toBeNull()
+  })
+
   it('says nothing of the sort once there is something to pick', () => {
     renderMenu([CHAT])
-    expect(screen.queryByText(/Engines screen/)).toBeNull()
+    expect(screen.queryByText(/Show models for every engine|Nothing else/)).toBeNull()
   })
 
   it('hands the picked model back whole', async () => {

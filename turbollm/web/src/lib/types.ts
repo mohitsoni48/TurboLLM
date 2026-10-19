@@ -31,6 +31,14 @@ export type EngineError = {
    *  Optional because a daemon older than the field simply omits it — the UI
    *  then falls back to `other`, which still offers a next action. */
   failReason?: LoadFailure
+  /** Name of the engine the failed load ran on, and of the model it tried ('' when no load is recorded). Absent from an
+   *  older daemon: the banner then reads "Model load failed". */
+  engineName?: string
+  modelName?: string
+  /** False when that engine is not expected to load that model (the Models screen's compatibleWithActiveEngine for
+   *  it): a model "Show models for every engine" lists loads only on the selected engine, so the recovery offers no
+   *  engine advice and no re-download for it. Absent from an older daemon (read as true). */
+  expectedToLoad?: boolean
 }
 
 /** Active engine runtime state from GET /api/v1/status (spec 02 §1). */

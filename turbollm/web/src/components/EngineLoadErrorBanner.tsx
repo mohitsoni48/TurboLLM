@@ -17,6 +17,13 @@ function errorKey(error: EngineError | undefined): string | null {
   return `${error.code}:${error.message}:${error.exitCode ?? ''}:${(error.logTail ?? []).join('\n')}`
 }
 
+/** Which engine could not load which model, as the daemon names them (the load that failed: a model listed by "Show
+ *  models for every engine" starts on the selected engine and fails with that engine's own error, which named
+ *  neither). "Model load failed" from an older daemon, which sends neither name. */
+function failureTitle(error: EngineError): string {
+  return error.engineName && error.modelName ? `${error.engineName} could not load ${error.modelName}` : 'Model load failed'
+}
+
 /**
  * Global banner for a failed model load (`status.engine.state === 'error'`,
  * GitHub #85's second report). Chat/Code only ever rendered a transient
@@ -71,7 +78,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
     >
       <div className="flex items-center gap-2 text-[13px]">
         <span className="flex-1 font-medium" style={{ color: 'var(--err)' }}>
-          Model load failed: {error.message}
+          {failureTitle(error)}: {error.message}
           {error.exitCode != null && ` (exit ${error.exitCode})`}
         </span>
         {!pathname.startsWith('/engines') && (
@@ -108,6 +115,7 @@ export function EngineLoadErrorBanner({ status }: { status: Status | undefined }
           return ok
         }}
         onShowLaunchCommand={() => setShowLaunch((v) => !v)}
+        expectedToLoad={error.expectedToLoad ?? true}
       />
       {showLaunch && status?.engine.launchCommand && (
         <pre

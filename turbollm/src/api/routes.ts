@@ -101,6 +101,7 @@ import { registerOnboardingRoutes } from './onboarding-routes'
 import { restartEngine, startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
+import { failedLoadView } from './failed-load-view'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
 import { textClassificationStatus } from './text-classification-status'
@@ -221,7 +222,11 @@ export function registerApi(app: Hono, d: Deps): void {
     // Unlike `logTail` this is a closed enum and carries no path or free text, so it is
     // safe by construction; it rides with `error` only because that is the thing it
     // describes.
-    if (ms.err) engine.error = { ...ms.err, failReason: classifyLoadFailure(ms.err) }
+    //
+    // `engineName`, `modelName` and `expectedToLoad` (failed-load-view.ts): which engine could
+    // not load which model, and whether it was expected to. The banner named neither, and its
+    // remedies suited a model the engine runs even for one it cannot.
+    if (ms.err) engine.error = { ...ms.err, failReason: classifyLoadFailure(ms.err), ...failedLoadView(d) }
     if (launchCommand) engine.launchCommand = launchCommand
     return c.json({
       version: d.version,
