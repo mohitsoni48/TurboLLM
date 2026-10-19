@@ -235,8 +235,9 @@ test('a load of a model the host\'s selected engine cannot run is 409 and leaves
   const bundle = entry({ key: 'gemma-3n|litertlm|1', name: 'Gemma 3n', format: 'litertlm', path: 'D:\\models\\gemma-3n.litertlm' })
   const safetensors = entry({ key: 'qwen3-8b-hf', format: 'mlx', path: 'D:\\models\\qwen3-8b-hf' })
   const cases: Array<[string, ModelEntry, string]> = [
-    ['llama-server', bundle, 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.'],
-    ['vllm', entry({ key: 'qwen3-8b' }), 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'],
+    // The reason names the host's engine and what it cannot run, and no engine the peer could not switch to anyway.
+    ['llama-server', bundle, "llama.cpp can't run this .litertlm model."],
+    ['vllm', entry({ key: 'qwen3-8b' }), "vLLM can't run this GGUF model."],
   ]
   for (const [engineKind, model, message] of cases) {
     const h = mkDeps([key('tllm-a', ['models:use', 'models:load'])], [entry({ key: 'qwen3-8b' }), bundle, safetensors], { engineKind })

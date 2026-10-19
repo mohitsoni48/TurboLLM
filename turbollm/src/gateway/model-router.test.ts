@@ -21,6 +21,7 @@ import type { Scanner, ModelEntry } from '../models/scanner'
 import { runAutoLoad } from '../engines/auto-load'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
+import { modelIncompatibility } from '../engines/compat'
 
 /** A Manager double exposing only status() (all the tested paths read). */
 function fakeManager(state: Status['state'], modelKey: string | null): Manager {
@@ -396,6 +397,10 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
 // An auto-swap to a model the active engine cannot load answers 503 with the same message the
 // manual load guard uses, before anything is evicted or loaded. That includes the audio check. It is permanent (the
 // gateway sends `x-should-retry: false`): only the owner changing engines clears it, so a retry only delays the message.
+// The refusal names the selected engine and what it cannot run, then says the setting under which an automatic load
+// starts it anyway; it named another engine to activate or switch to, advice the owner's rule forbids.
+const SHOW_ALL_HINT = 'Automatic loads start it there only with Settings → Models & loading → "Show models for every engine" on.'
+
 function recordingPrimary() {
   const loads: unknown[] = []
   const manager = {
@@ -423,7 +428,8 @@ test('route: an audio-tower model on Rapid-MLX is refused with the audio message
   assert.deepEqual(result, {
     status: 503,
     message:
-      'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.',
+      'Rapid-MLX cannot load models with an audio tower — the audio encoder fails due to an upstream mlx-vlm bug in the sanitizer for these architectures. ' +
+      SHOW_ALL_HINT,
     permanent: true,
   })
   assert.deepEqual(loads, [])
@@ -446,9 +452,29 @@ test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and
 
   assert.deepEqual(result, {
     status: 503,
-    message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+    message: `llama.cpp can't run this Jev model. ${SHOW_ALL_HINT}`,
     permanent: true,
   })
+  assert.deepEqual(loads, [])
+})
+
+// No engine the user can select runs either model, so these two refusals say nothing of the setting: a Laya model with
+// no Laya engine is refused whatever Settings shows, and a ggmlc GGUF, which with every engine's models shown an
+// automatic load does start on the selected engine, fails there. The Settings sentence would be advice that cannot make
+// either load, and after the ggmlc one's "it runs on the Laya engine" its "start it there" would name the Laya engine.
+test('route: a ggmlc GGUF, or a Laya model with no Laya engine, is refused without the Settings sentence', async () => {
+  const { manager, loads } = recordingPrimary()
+  const ggmlc = { ...fakeEntry('laya-ggmlc'), format: 'gguf', arch: 'ggmlc' } as ModelEntry
+  const ggmlcResult = await autoSwapRouter('llama-server', ggmlc, manager).route('laya-ggmlc')
+  const { r, laya } = litertRouter(manager, undefined, [], { activeKind: 'llama-server' })
+  const layaResult = await r.route(laya.key)
+
+  assert.deepEqual([ggmlcResult, layaResult], [
+    { status: 503, message: modelIncompatibility('llama-server', ggmlc)?.message, permanent: true },
+    { status: 503, message: modelIncompatibility('llama-server', laya)?.message, permanent: true },
+  ])
+  assert.match(String('message' in ggmlcResult && ggmlcResult.message), /ggmlc/)
+  assert.match(String('message' in layaResult && layaResult.message), /Install Laya/)
   assert.deepEqual(loads, [])
 })
 
@@ -476,7 +502,7 @@ function litertRouter(
 
 const LITERT_REFUSAL = {
   status: 503,
-  message: 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.',
+  message: `KoboldCpp can't run this .litertlm model. ${SHOW_ALL_HINT}`,
   permanent: true,
 }
 

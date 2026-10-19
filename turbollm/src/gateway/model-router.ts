@@ -8,13 +8,20 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
-import { manualLoadRefusal, modelIncompatibility, type Incompatibility } from '../engines/compat'
+import { manualLoadRefusal, modelIncompatibility, refusedOnEveryEngine, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { parseRemoteId } from '../link/model-id'
 import type { RemoteCatalog } from '../link/remote-catalog'
 import { modelLoadsRefused } from '../auth'
+
+/** Appended to an automatic load's refusal of a model the selected engine is not expected to run: with Settings showing
+ *  every engine's models, every load starts such a model on the selected engine (ModelRouter.loadRefusal). Not to a
+ *  refusal of a model no engine the user can select runs (compat.ts refusedOnEveryEngine: a Laya model, a ggmlc GGUF),
+ *  which turning the setting on cannot make load. */
+export const AUTOMATIC_LOAD_HINT =
+  'Automatic loads start it there only with Settings → Models & loading → "Show models for every engine" on.'
 
 /** loadExplicit's options. `restoreAfter`: the load is a routine's restore of the model its swap displaced (routines/
  *  model-swap.ts, cli-routine.ts, cli-interactive-runner.ts), and this is that swap's own result. A restore that finds
@@ -566,8 +573,13 @@ export class ModelRouter {
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
     const inc = this.loadRefusal(engine, entry, explicit?.manual)
-    // Stays so until the owner installs or switches to an engine that runs it; a retry only delays the message.
-    if (inc) return { status: 503, message: inc.message, permanent: true }
+    // Stays so until the owner installs or selects an engine that runs it, or shows every engine's models; a retry only
+    // delays the message. Anything but a Laya model is refused only by an automatic load with that setting off, which
+    // the message says (compat.ts's messages name no other engine and give no advice), unless no engine runs it.
+    if (inc) {
+      const message = refusedOnEveryEngine(inc) ? inc.message : `${inc.message} ${AUTOMATIC_LOAD_HINT}`
+      return { status: 503, message, permanent: true }
+    }
 
     const opts = this.buildOpts(entry, engine, overrides)
     if (!opts) return { status: 503, message: 'Model is incomplete or unreadable.' }
