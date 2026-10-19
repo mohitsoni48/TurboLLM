@@ -27,6 +27,7 @@ import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
 import { servingEngineKind } from '../engines/serving'
+import type { PinnedRoute } from './model-swap'
 
 /** Mirrors chat-routes.ts's own MAX_TOOL_ITER (16) — same headroom reasoning: a handful of
  *  web_search/fetch_url/run_code rounds plus a final answer round. A ceiling, not a target. */
@@ -88,8 +89,10 @@ function buildResumeMessages(agent: CustomChatAgent, conv: Conversation): WireMe
 
 /** Runs one Chat Routine fire to completion (or a stall/error), starting a FRESH conversation
  *  each time — a routine run is always a new task, never a continued thread (spec 20 §1's Chat
- *  Routine description). `signal` combines the caller's wall-clock deadline with cancellation. */
-export async function runChatRoutine(d: Deps, routine: Routine, run: RoutineRun, signal: AbortSignal): Promise<ChatRunOutcome> {
+ *  Routine description). `signal` combines the caller's wall-clock deadline with cancellation.
+ *  `route`: where withPinnedModel's swap loaded the routine's model, absent when no swap was needed
+ *  (the model was already in the primary); see runChatRoundLoop. */
+export async function runChatRoutine(d: Deps, routine: Routine, run: RoutineRun, signal: AbortSignal, route?: PinnedRoute): Promise<ChatRunOutcome> {
   const agent = findAgent(d, routine)
   if (!agent) return { status: 'errored', error: `Chat agent "${routine.agentId}" no longer exists.` }
 
@@ -103,7 +106,7 @@ export async function runChatRoutine(d: Deps, routine: Routine, run: RoutineRun,
   d.db.updateRoutineRun(run.id, { conversationId: conv.id })
   d.db.addMessage(conv.id, 'user', routine.prompt)
 
-  return runChatRoundLoop(d, run, agent, conv.id, signal, { messages: buildInitialMessages(agent, routine.prompt), toolLoop: new ToolLoopTracker(), iter: 0 })
+  return runChatRoundLoop(d, run, agent, conv.id, signal, { messages: buildInitialMessages(agent, routine.prompt), toolLoop: new ToolLoopTracker(), iter: 0 }, routine.modelKey, route)
 }
 
 /** Resume a stalled Chat Routine after an approve/deny decision. `pending` is the exact resume
@@ -112,7 +115,7 @@ export async function runChatRoutine(d: Deps, routine: Routine, run: RoutineRun,
  *  owns its own tool loop end-to-end (no live pi/subprocess in the middle), resuming here is a
  *  literal continuation from the exact blocked point — no fresh-turn approximation needed. */
 export async function resumeChatRoutine(
-  d: Deps, routine: Routine, run: RoutineRun, pending: PendingRoutineToolCall, decision: 'allow' | 'deny', signal: AbortSignal,
+  d: Deps, routine: Routine, run: RoutineRun, pending: PendingRoutineToolCall, decision: 'allow' | 'deny', signal: AbortSignal, route?: PinnedRoute,
 ): Promise<ChatRunOutcome> {
   const agent = findAgent(d, routine)
   if (!agent) return { status: 'errored', error: `Chat agent "${routine.agentId}" no longer exists.` }
@@ -166,15 +169,28 @@ export async function resumeChatRoutine(
   ]
   d.db.addMessage(pending.convId, 'assistant', pending.assistantContent || '', { toolCalls: roundToolCalls })
 
-  return runChatRoundLoop(d, run, agent, pending.convId, signal, { messages, toolLoop: new ToolLoopTracker(), iter: 0 })
+  return runChatRoundLoop(d, run, agent, pending.convId, signal, { messages, toolLoop: new ToolLoopTracker(), iter: 0 }, routine.modelKey, route)
 }
 
-async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent, convId: string, signal: AbortSignal, state: LoopState): Promise<ChatRunOutcome> {
+/** Every turn goes to `route`, where the routine's swap loaded its model, shaped for the engine serving it there as the
+ *  gateway shapes a request from its route. With keep-N 2 or more the swap loads the routine's model into a pool slot
+ *  and leaves the user's in the primary. The turns went to the primary with the primary's model all the same, so the
+ *  routine ran on the user's model and its run was recorded 'ok'; a routine pinned to a model already in a pool slot
+ *  did so on every run. A route to the primary carries no engine and reads the primary's (its engine, model path and
+ *  key). Without a route (no swap: the model was already in the primary) the turns go to the primary. A Turbo Link
+ *  route is not followed: its requests need the link's token, which this runner does not send. `modelKey` is the
+ *  routine's pinned model. */
+async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent, convId: string, signal: AbortSignal, state: LoopState, modelKey: string, route?: PinnedRoute): Promise<ChatRunOutcome> {
+  const local = route && !route.remote ? route : undefined
   const ms = d.manager.status()
-  const target = d.manager.target?.() ?? null
-  if (ms.state !== 'running' || !ms.model || !target) return { status: 'errored', error: 'No model loaded.' }
+  const target = local ? local.target : d.manager.target?.() ?? null
+  // The `model` fallback below: on a pool slot (its route carries the slot's engine) the routine's own key, since the
+  // primary holds another model; on the primary, with or without a route to it, the primary's own key, as before.
+  const servedKey = local?.engineKind ? modelKey : ms.state === 'running' ? ms.model?.key : undefined
+  if (!target || !servedKey) return { status: 'errored', error: 'No model loaded.' }
 
-  const engineKind = servingEngineKind(d)
+  const engineKind = local?.engineKind ?? servingEngineKind(d)
+  const modelPath = local?.modelPath ?? d.manager.currentOpts()?.modelPath
   const baseToolDefs = d.tools ? (await d.tools.buildToolDefinitions()).filter((t) => agent.tools.includes(t.function.name)) : []
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
 
@@ -182,12 +198,14 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     state.iter++
     if (signal.aborted) return { status: 'errored', error: 'Routine run timed out or was cancelled.' }
 
-    // `?? ms.model.key` is a should-never-happen fallback for mlx-vlm: the `state !== 'running'`
-    // guard above already implies `currentOpts()` is set, so engineModelAlias('mlx-vlm', ...)
-    // always resolves a real path here. If it were ever hit, TurboLLM's internal display-name
-    // key would go out as the `model` field and mlx_vlm.server would 400 with a clear "Failed to
-    // load model" error rather than silently misbehaving — acceptable as a last-resort guard.
-    const reqBody: Record<string, unknown> = { model: engineModelAlias(engineKind, d.manager.currentOpts()?.modelPath) ?? ms.model.key, messages: state.messages, stream: false }
+    // `?? servedKey` is a should-never-happen fallback for mlx-vlm: the `!target || !servedKey`
+    // guard above already implies a model path (on the primary servedKey needs a running engine,
+    // so `currentOpts()` is set; a pool slot's route carries its own modelPath), so
+    // engineModelAlias('mlx-vlm', ...) always resolves a real path here. If it were ever hit,
+    // TurboLLM's internal display-name key would go out as the `model` field and mlx_vlm.server
+    // would 400 with a clear "Failed to load model" error rather than silently misbehaving —
+    // acceptable as a last-resort guard.
+    const reqBody: Record<string, unknown> = { model: engineModelAlias(engineKind, modelPath) ?? servedKey, messages: state.messages, stream: false }
     // Same gate as chat-routes / ext/generation (PR #271 review): litert-lm serve has nothing
     // showing it honors a `tools` array, so a routine whose agent allows tools runs its turns
     // without them — like a plain chat on this engine already does — instead of a request that

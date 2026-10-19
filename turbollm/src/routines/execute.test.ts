@@ -13,6 +13,7 @@ import { GenerationGate } from '../agents/gate'
 import { CodeRunManager, type CodeSessionRunner } from '../code/code-run-manager'
 import type { RoutineRunStatus } from './schema'
 import { tmpDir } from '../test-support/tmp'
+import { realEngineSetUp } from '../test-support/stand-in-engine'
 import { TerminalManager } from '../terminal/terminal-manager'
 import { isTerminalBackendAvailable, getTerminalManager } from '../terminal/terminal-routes'
 import { PTYSession } from '../terminal/pty-session'
@@ -1090,4 +1091,80 @@ test('resumeRoutineRun reverts its claim when ComfyUI blocks the model swap', as
   assert.equal((res as { code: string }).code, 'model_busy')
   assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval', 'the claim must be reverted so Approve can be retried')
   assert.deepEqual(reloadCalls, [['other', 'm']], "the render's release reloads the user's model, not the routine's")
+})
+
+// ── keep-N 2: a chat routine runs on its own model, in its pool slot ─────────────────────────────
+// Against a real ConfigStore, Manager and ModelRouter and a stand-in llama-server. With keep-N 2 or more the routine's
+// swap loads its model into a pool slot and the user's model stays in the primary, but every turn went to the primary
+// with the primary's model: the routine's result was the user's model's answer, recorded 'ok'. A routine pinned to a
+// model already in a pool slot did the same on every run (the swap finds it there and changes nothing).
+async function keepN2ChatRoutine(t: Parameters<typeof realEngineSetUp>[0], reply: () => Record<string, unknown>) {
+  const set = await realEngineSetUp(t)
+  t.after(() => set.modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+  set.store.update((c) => { c.gateway.keepN = 2; c.customAgents = [AGENT] })
+  assert.ok('target' in await set.modelRouter.loadExplicit(set.userModel.key))
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const d = { db, manager: set.manager, modelRouter: set.modelRouter, registry: set.registry, store: set.store } as unknown as Deps
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: set.routineModel.key, agentId: 'agent-1' })
+  // Only the turns are answered here; the Manager's own /health polls reach the stand-in.
+  const calls: Array<{ url: string; model: unknown }> = []
+  const original = globalThis.fetch
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    if (!url.endsWith('/v1/chat/completions')) return original(input, init)
+    calls.push({ url, model: (JSON.parse(init?.body as string) as { model: unknown }).model })
+    return new Response(JSON.stringify(reply()), { status: 200 })
+  }) as typeof fetch
+  t.after(() => { globalThis.fetch = original })
+  // Where the routine's model serves, read back from the router after the run (doLoad's slot fast path; runningOnly
+  // loads nothing), not from its saved profile's port: a slot whose pinned port is taken as it spawns comes up on the
+  // 8081+ walk instead.
+  const routineTarget = async () => {
+    const r = await set.modelRouter.loadExplicit(set.routineModel.key, undefined, { runningOnly: true })
+    assert.ok('target' in r && r.engineKind, `the routine's model is not in a pool slot: ${JSON.stringify(r)}`)
+    assert.notEqual(r.target, set.manager.target(), 'the pool slot is not the primary')
+    return `${r.target}/v1/chat/completions`
+  }
+  return { ...set, d, db, routine, calls, routineTarget }
+}
+
+test("with keep-N 2 a chat routine's turns go to its own model in its pool slot, not the user's in the primary", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { d, db, manager, userModel, routineModel, routine, calls, routineTarget } = await keepN2ChatRoutine(t, () => ({ choices: [{ message: { content: 'done' } }] }))
+  const userTarget = manager.target()
+
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  assert.equal(await executeRoutine(d, routine, run), 'ok')
+  assert.deepEqual(calls, [{ url: await routineTarget(), model: routineModel.key }], `the user's model is at ${userTarget}`)
+  assert.equal(manager.status().model?.key, userModel.key, "the primary kept the user's model")
+})
+
+test('with keep-N 2 a chat routine whose model is already in a pool slot runs there, not in the primary', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { d, db, manager, modelRouter, userModel, routineModel, routine, calls, routineTarget } = await keepN2ChatRoutine(t, () => ({ choices: [{ message: { content: 'done' } }] }))
+  // The swap finds the routine's model in its slot (doLoad's fast path) and changes nothing.
+  assert.ok('target' in await modelRouter.loadExplicit(routineModel.key))
+  assert.equal(manager.status().model?.key, userModel.key)
+
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  assert.equal(await executeRoutine(d, routine, run), 'ok')
+  assert.deepEqual(calls, [{ url: await routineTarget(), model: routineModel.key }], `the user's model is at ${manager.target()}`)
+})
+
+test("with keep-N 2 an Approve resumes a chat routine on its own model in its pool slot", {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  let turn = 0
+  const { d, db, routineModel, routine, calls, routineTarget } = await keepN2ChatRoutine(t, () => (turn++ === 0
+    ? { choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }] }
+    : { choices: [{ message: { content: 'done' } }] }))
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  assert.equal(await executeRoutine(d, routine, run), 'needs_approval')
+
+  assert.deepEqual(await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'allow'), { ok: true })
+  assert.equal(db.getRoutineRun(run.id)!.status, 'ok')
+  const slot = await routineTarget()
+  assert.deepEqual(calls, [{ url: slot, model: routineModel.key }, { url: slot, model: routineModel.key }])
 })

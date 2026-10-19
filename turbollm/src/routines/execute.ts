@@ -17,7 +17,7 @@
 // RoutineRunStatus it wrote, satisfying the caller's contract either way.
 import type { Deps } from '../deps'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
-import { withPinnedModel, type ModelSwapOutcome, type SwapGate } from './model-swap'
+import { withPinnedModel, type ModelSwapOutcome, type PinnedRoute, type SwapGate } from './model-swap'
 import { createRunDeadline, ROUTINE_RUN_TIMEOUT_MS } from './runaway-guard'
 import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-runner'
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
@@ -43,8 +43,10 @@ function terminalHarnessBin(routine: Routine): string {
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
 
-async function dispatchRoutine(d: Deps, routine: Routine, run: RoutineRun, signal: AbortSignal): Promise<RoutineOutcome> {
-  if (routine.flavor === 'chat') return runChatRoutine(d, routine, run, signal)
+/** `route`: where withPinnedModel's swap loaded the routine's model (see runChatRoutine). A pi Code routine's session
+ *  does not take it: its turns go through resolveChatUpstream, which reads the primary. */
+async function dispatchRoutine(d: Deps, routine: Routine, run: RoutineRun, signal: AbortSignal, route?: PinnedRoute): Promise<RoutineOutcome> {
+  if (routine.flavor === 'chat') return runChatRoutine(d, routine, run, signal, route)
   if (routine.flavor === 'code' && routine.codingAgent === 'pi') return runCodeRoutine(d, routine, run, signal)
   // CLI-flavor Code Routines (codingAgent: 'claude_cli') are deliberately NOT handled here:
   // `runCliCodeRoutine` is a fully self-contained orchestrator (own model-conflict handling, own
@@ -54,8 +56,8 @@ async function dispatchRoutine(d: Deps, routine: Routine, run: RoutineRun, signa
   return { status: 'errored', error: `Routine execution for flavor "${routine.flavor}"/codingAgent "${routine.codingAgent ?? 'none'}" is not implemented yet.` }
 }
 
-async function dispatchResume(d: Deps, routine: Routine, run: RoutineRun, pending: NonNullable<ReturnType<typeof parsePendingToolCall>>, decision: 'allow' | 'deny', signal: AbortSignal): Promise<RoutineOutcome> {
-  if (routine.flavor === 'chat') return resumeChatRoutine(d, routine, run, pending, decision, signal)
+async function dispatchResume(d: Deps, routine: Routine, run: RoutineRun, pending: NonNullable<ReturnType<typeof parsePendingToolCall>>, decision: 'allow' | 'deny', signal: AbortSignal, route?: PinnedRoute): Promise<RoutineOutcome> {
+  if (routine.flavor === 'chat') return resumeChatRoutine(d, routine, run, pending, decision, signal, route)
   return resumeCodeRoutine(d, routine, run, pending, decision, signal)
 }
 
@@ -381,8 +383,8 @@ export async function executeRoutine(
     }
     try {
       let ranStatus: RoutineRunStatus = 'errored'
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async () => {
-        const outcome = await dispatchRoutine(d, routine, run, deadline.signal)
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async (route) => {
+        const outcome = await dispatchRoutine(d, routine, run, deadline.signal, route)
         ranStatus = finalizeOutcome(d, run.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
       return finalizeSwapOutcome(d, run.id, swap, ranStatus)
@@ -494,8 +496,8 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       return { ok: false, code: 'gate_timeout', message: 'Timed out waiting for the model server.' }
     }
     try {
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async () => {
-        const outcome = await dispatchResume(d, routine, current, pending, decision, deadline.signal)
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async (route) => {
+        const outcome = await dispatchResume(d, routine, current, pending, decision, deadline.signal, route)
         finalizeOutcome(d, current.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
       if (swap.outcome === 'skip-busy') { revertClaim(); return { ok: false, code: 'model_busy', message: 'The model server is busy — try approving again shortly.' } }

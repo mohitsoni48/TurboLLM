@@ -72,6 +72,43 @@ test('runChatRoutine sends manager.currentOpts().modelPath as the request model 
   } finally { fetchStub.restore() }
 })
 
+// With keep-N 2 or more a routine's swap loads its model into a pool slot, which keeps the engine it was loaded on,
+// and the user's model stays in the primary. The turns went to the primary, shaped for the primary's engine.
+test("runChatRoutine sends every turn to the swap's pool slot, shaped for that slot's engine", async () => {
+  const { d, db } = fakeDeps({ engineKind: 'llama-server', modelPath: '/models/user-model.gguf' })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const original = globalThis.fetch
+  const urls: string[] = []
+  const models: unknown[] = []
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    urls.push(String(input))
+    models.push((JSON.parse(init?.body as string) as { model: unknown }).model)
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'All PRs are green.' } }] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    const outcome = await runChatRoutine(d, r, run, new AbortController().signal, { target: 'http://slot.invalid.local:2', engineKind: 'mlx-vlm', modelPath: '/models/qwen2-vl-7b-mlx' })
+    assert.equal(outcome.status, 'ok')
+    assert.deepEqual(urls, ['http://slot.invalid.local:2/v1/chat/completions'])
+    assert.deepEqual(models, ['/models/qwen2-vl-7b-mlx'], "mlx-vlm's model field is the slot's model path, not the primary's")
+  } finally { globalThis.fetch = original }
+})
+
+// A swap into the primary (keep-N 1, or keep-N 2 with nothing loaded) hands a route with no engine. Its `model` fallback
+// is the primary's own key, as with no route, not the routine's key as stored (a model name or part of one).
+test("a route to the primary names the primary's model, as with no route", async () => {
+  const { d, db } = fakeDeps({ engineKind: 'llama-server', modelPath: '/models/m.gguf' })
+  const r = db.createRoutine({ flavor: 'chat', prompt: 'Summarize my open PRs', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'M', agentId: 'agent-1' })
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+  try {
+    for (const route of [{ target: 'http://engine.invalid.local:1' }, undefined]) {
+      const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+      assert.equal((await runChatRoutine(d, r, run, new AbortController().signal, route)).status, 'ok')
+    }
+    assert.deepEqual(fetchStub.calls.map((b) => b.model), ['m', 'm'])
+  } finally { fetchStub.restore() }
+})
+
 // PR #271 re-review: the tools gating from the first review covered chat-routes and
 // ext/generation only — the routines path still sent `tools` to litert-lm, so an agent with
 // tools allowed (AGENT has run_code, which buildToolDefinitions() offers unconditionally)

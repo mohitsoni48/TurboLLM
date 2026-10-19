@@ -29,6 +29,10 @@ export interface ModelSwapDeps {
   modelRouter: ModelRouter
 }
 
+/** Where the swap loaded the routine's model: its loadExplicit() result. With keep-N 2 or more that is a pool slot
+ *  (RouteResult's engineKind, modelPath), and the user's model stays in the primary. */
+export type PinnedRoute = Extract<RouteResult, { target: string }>
+
 /** For a caller that took the GenerationGate for the swap decision but must not hold it while `fn`
  *  runs (a pi Code routine: its session takes the gate before every provider request). */
 export interface SwapGate {
@@ -44,7 +48,9 @@ export interface SwapGate {
  * Resolve the model-conflict decision for `pinnedModel` and run `fn` under it:
  *  - 'run': the pinned model is already loaded — call `fn()` directly, no swap.
  *  - 'swap-then-run': load the pinned model (capturing whatever was loaded before), call
- *    `fn()`, then restore the prior model (a no-op if nothing was loaded before).
+ *    `fn(route)` with the swap's route, then restore the prior model (a no-op if nothing was loaded
+ *    before). The run must go to `route`: with keep-N 2 or more it is a pool slot, and the primary
+ *    still serves the user's model.
  *  - 'skip-busy': a different model is loaded and the engine is actively generating — `fn` is
  *    never called; the caller logs "skipped — model busy" (spec 20 §6).
  * Restoration is best-effort and attempted after `fn` (even if it throws), and after a pinned model
@@ -54,7 +60,7 @@ export interface SwapGate {
  * taken again around the restore (see {@link SwapGate}); a restore that cannot take it back does
  * not load, so it never stops the engine under the generation that still holds it.
  */
-export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: () => Promise<void>, gate?: SwapGate): Promise<ModelSwapOutcome> {
+export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: (route?: PinnedRoute) => Promise<void>, gate?: SwapGate): Promise<ModelSwapOutcome> {
   const currentlyLoaded = deps.manager.status().model?.key ?? null
   const action = decideModelAction({ pinnedModel, currentlyLoaded, engineIdle: engineIsIdle(deps.manager) })
 
@@ -89,7 +95,7 @@ export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, 
 
   try {
     gate?.release()
-    await fn()
+    await fn(swapResult)
   } finally {
     if (currentlyLoaded) {
       // The restore stops the engine as the swap did, so it waits for the gate as the swap did. A

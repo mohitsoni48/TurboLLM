@@ -42,6 +42,17 @@ test('different model loaded, engine idle -> swap, run, restore', async () => {
   assert.equal(deps.manager.status().model?.key, 'b')
 })
 
+// The run goes where the swap loaded the routine's model: with keep-N 2 or more a pool slot, while the primary keeps
+// the user's model. fn was handed nothing, and the chat runner sent every turn to the primary.
+test("fn is handed the swap's route, and none when the pinned model was already loaded", async () => {
+  const swapped = fakeDeps({ loadedKey: 'b' })
+  const routes: unknown[] = []
+  assert.equal((await withPinnedModel(swapped.deps, 'a', async (route) => { routes.push(route) })).outcome, 'ran')
+  const already = fakeDeps({ loadedKey: 'a' })
+  assert.equal((await withPinnedModel(already.deps, 'a', async (route) => { routes.push(route) })).outcome, 'ran')
+  assert.deepEqual(routes, [{ target: 'http://127.0.0.1:8081' }, undefined])
+})
+
 test('different model loaded and busy -> skip-busy, fn never called', async () => {
   const { deps, loadCalls } = fakeDeps({ loadedKey: 'b', activeRequests: 1 })
   let called = false
