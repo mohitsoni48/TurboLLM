@@ -26,6 +26,13 @@ vi.mock('../lib/queries', () => ({
 vi.mock('../lib/api', async (orig) => ({ ...(await orig<typeof import('../lib/api')>()), track: () => {} }))
 
 describe('CustomizeScreen — MCP server edit', () => {
+  // The describes below replace the module's mcpServers and never put it back, so this one passed
+  // only by running first: in any other order it opened their server and found no '/bad/path'.
+  beforeEach(() => {
+    mcpServers = [filesServer]
+    updateMutate.mockClear()
+  })
+
   it('sends an emptied args list and env map, so the last arg / env var can actually be removed', async () => {
     render(<MemoryRouter initialEntries={['/customize?tab=mcp']}><CustomizeScreen /></MemoryRouter>)
     await userEvent.click(screen.getByRole('button', { name: /Connected/ }))
