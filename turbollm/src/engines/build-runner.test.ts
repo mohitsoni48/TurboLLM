@@ -961,6 +961,25 @@ test('restoreInterruptedBuilds: a tree still marked unfinished is not the workin
   assert.equal(existsSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER)), false)
 })
 
+// A rebuild of a catalog repo (no custom source recorded) cut off by a daemon exit while its new binary was probed: the
+// route had already unregistered the engine, so nothing claimed the directory, and the parked working build stayed
+// hidden. A tree still marked unfinished is never a working build, so its parked build goes back claimed or not; an
+// unclaimed directory with no marker is still left as it is (the test above).
+test('restoreInterruptedBuilds: a directory nothing claims that is still marked unfinished gets its previous build back', () => {
+  const buildDir = join(tmpDir('tllm-boot-restore-'), 'engines', 'build')
+  const name = 'ikawrakow-ik_llama.cpp-main'
+  mkdirSync(join(buildDir, name, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'unprobed build')
+  writeFileSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER), '')
+  mkdirSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin'), { recursive: true })
+  writeFileSync(join(buildDir, `.${name}-1700000000000.prev`, 'build', 'bin', 'llama-server'), 'last working build')
+  const logs: string[] = []
+  restoreInterruptedBuilds(join(buildDir, '..'), [], (l) => logs.push(l))
+  assert.equal(readFileSync(join(buildDir, name, 'build', 'bin', 'llama-server'), 'utf8'), 'last working build')
+  assert.equal(existsSync(join(buildDir, name, BUILD_INCOMPLETE_MARKER)), false)
+  assert.ok(logs.some((l) => l.startsWith('Put back the previous build')))
+})
+
 // ── Windows Cancel kills the compiler tree, not just cmd.exe ─────────────────────────────────────
 // spawn's `signal` only TerminateProcess-es the direct child, which for the configure/compile steps
 // is cmd.exe; cmake/ninja/cl/nvcc kept compiling. Faked here on POSIX with a `taskkill` stand-in.

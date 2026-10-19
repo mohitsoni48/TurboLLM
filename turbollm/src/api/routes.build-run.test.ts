@@ -35,7 +35,7 @@ const PREVIOUS_BUILD = '#!/bin/sh\necho "version: 100 (0123abc)"\n'
 /** What the stand-in toolchain does: no cmake at all, a compile that fails, a build that works, or one whose
  *  llama-server does not run here (it fails the probe, as a CUDA build on a box without the driver does) — with the
  *  parked previous build gone too, for a put-back that cannot happen. */
-type Toolchain = 'no-cmake' | 'compile-error' | 'builds' | 'builds-broken' | 'builds-broken-unparked' | 'cut-short'
+type Toolchain = 'no-cmake' | 'compile-error' | 'builds' | 'builds-broken' | 'builds-broken-unparked' | 'cut-short' | 'exit-in-probe'
 
 /** `cmake --build`'s stand-in for a llama-server that cannot start here. */
 const BROKEN_SERVER = String.raw`mkdir -p "$2/bin" && printf '#!/bin/sh\necho "libcuda.so.1: cannot open shared object file" >&2\nexit 127\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server"`
@@ -48,10 +48,17 @@ function script(dir: string, name: string, lines: string[]): void {
 /** `git clone` writes a CMakeLists.txt, configure does nothing, and `cmake --build` writes a llama-server that reports
  *  version 200 — or prints a compiler error and fails, like an upstream tip that no longer compiles. 'cut-short': the
  *  link has written part of a llama-server when the daemon dies; what the daemon leaves on disk then is copied to
- *  `<dir>/snapshot/build` (as the engines folder's build/), and the compile fails so the live build cleans up. */
+ *  `<dir>/snapshot/build` (as the engines folder's build/), and the compile fails so the live build cleans up.
+ *  'exit-in-probe': the build works, and its llama-server's first run (the probe's --version) copies the data dir's
+ *  config.json and engines/ to `<dir>/snapshot`, which is what a daemon exit while the new binary is probed leaves. */
 function fakeToolchain(dir: string, toolchain: Toolchain): string {
   const bin = join(dir, 'fakebin')
   mkdirSync(bin)
+  const snapshot = join(dir, 'snapshot')
+  script(bin, 'probe-snapshotting-server', [
+    `if [ ! -e "${snapshot}" ]; then mkdir -p "${snapshot}" && cp -a "${join(dir, 'config.json')}" "${join(dir, 'engines')}" "${snapshot}/"; fi`,
+    'echo "version: 200 (4567def)"',
+  ])
   script(bin, 'git', [
     'case "$1" in',
     '  --version) echo "git version 2.43.0" ;;',
@@ -72,7 +79,9 @@ function fakeToolchain(dir: string, toolchain: Toolchain): string {
           ? `  --build) ${BROKEN_SERVER} && rm -rf "$2"/../../.*.prev ;;`
           : toolchain === 'cut-short'
             ? `  --build) mkdir -p "$2/bin" "${join(dir, 'snapshot')}" && printf '#!/bin/sh\\necho "vers' > "$2/bin/llama-server" && cp -a "$2/../.." "${join(dir, 'snapshot', 'build')}" && exit 1 ;;`
-            : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
+            : toolchain === 'exit-in-probe'
+              ? `  --build) mkdir -p "$2/bin" && cp "${join(bin, 'probe-snapshotting-server')}" "$2/bin/llama-server" ;;`
+              : String.raw`  --build) mkdir -p "$2/bin" && printf '#!/bin/sh\necho "version: 200 (4567def)"\n' > "$2/bin/llama-server" && chmod 755 "$2/bin/llama-server" ;;`,
     'esac',
   ])
   script(bin, 'nvcc', ['echo "Cuda compilation tools, release 12.6, V12.6.20"'])
@@ -82,11 +91,11 @@ function fakeToolchain(dir: string, toolchain: Toolchain): string {
 
 /** A registered, active source build of REPO_URL@main whose binary sits where a rebuild lands, and the route over a
  *  real BuildState. `rebuild` returns once the build has settled and the route's own cleanup after it has run. */
-function harness(toolchain: Toolchain) {
+function harness(toolchain: Toolchain, repoUrl = REPO_URL) {
   const dir = tmpDir('tllm-build-run-')
   const fakeBin = fakeToolchain(dir, toolchain)
   const store = ConfigStore.load(join(dir, 'config.json'))
-  const buildRoot = join(store.dir(), 'engines', 'build', buildDirName(REPO_URL, 'main'))
+  const buildRoot = join(store.dir(), 'engines', 'build', buildDirName(repoUrl, 'main'))
   const binPath = join(buildRoot, 'build', 'bin', 'llama-server')
   mkdirSync(dirname(binPath), { recursive: true })
   writeFileSync(binPath, PREVIOUS_BUILD)
@@ -101,7 +110,7 @@ function harness(toolchain: Toolchain) {
       version: '100 (0123abc)',
       capabilities: { kvTypes: [], flags: [] },
       addedAt: '',
-      sourceRepo: REPO_URL,
+      sourceRepo: repoUrl,
       sourceBranch: 'main',
     }
     c.engines.push(fork)
@@ -124,7 +133,7 @@ function harness(toolchain: Toolchain) {
     const res = await app.request('/api/v1/build/run', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ repoUrl: REPO_URL, branch: 'main' }),
+      body: JSON.stringify({ repoUrl, branch: 'main' }),
     })
     assert.equal(res.status, 202)
     const outcome = await settled
@@ -396,4 +405,24 @@ test('POST /build/run: a first build, or one of a Disabled build, is made the se
   assert.equal(eng?.binPath, h.binPath, 'the new build is the selected engine')
   assert.equal(eng?.version, '200 (4567def)')
   assert.equal(h.build.get().activated, true, 'and the status says so')
+})
+
+// Once the new build compiles, the route unregisters the engine it replaces (saved at once) and only then probes the new
+// binary. A catalog repo records no custom source, so for those seconds nothing on disk claims the build directory, and
+// boot recovery put a parked build back only for a directory something claims: after a daemon exit in that window the
+// working build stayed hidden as `.prev`, and the catalog card offered the unprobed tree in its place.
+test('POST /build/run: a daemon exit while a catalog rebuild probes its new binary gets the previous build back at boot', { skip: posixOnly }, async () => {
+  const h = harness('exit-in-probe', 'https://github.com/ikawrakow/ik_llama.cpp')
+  assert.equal(await h.rebuild(), 'ok', 'the live rebuild goes on')
+  const snapshot = join(h.dir, 'snapshot')
+  const atExit = ConfigStore.load(join(snapshot, 'config.json')).snapshot()
+  // The boot's claims (cli.ts), at the snapshot's paths.
+  const claimed = [...atExit.engines, ...atExit.customEngineSources].map((e) => join(snapshot, relative(h.dir, e.binPath)))
+  assert.deepEqual(claimed, [], 'nothing claims the build directory at that moment')
+  const bin = join(snapshot, relative(h.dir, h.binPath))
+  assert.equal(fs.existsSync(join(dirname(dirname(dirname(bin))), BUILD_INCOMPLETE_MARKER)), true, 'the new tree is unprobed')
+  const logs: string[] = []
+  restoreInterruptedBuilds(join(snapshot, 'engines'), claimed, (l) => logs.push(l))
+  assert.equal(readFileSync(bin, 'utf8'), PREVIOUS_BUILD, 'boot put the previous build back')
+  assert.ok(logs.some((l) => l.startsWith('Put back the previous build')), logs.join('\n'))
 })

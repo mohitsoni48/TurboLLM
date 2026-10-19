@@ -1158,7 +1158,11 @@ function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { 
  *  engine pointed at a missing binary until the next build of that same directory put it back (sweepParkedBuilds),
  *  which a SIGKILL or crash mid-build left the same way. Only puts back: the partial tree is moved aside, and it and
  *  other leftovers are swept by that directory's next build, so a multi-GB delete does not hold up startup. A
- *  directory nothing claims is left to its next build too. */
+ *  directory nothing claims is left to its next build too, unless it still carries BUILD_INCOMPLETE_MARKER: such a
+ *  tree is never a working build, and a finished `.prev` beside it is the build a rebuild parked and never got to put
+ *  back or discard. A catalog repo's build records no custom source, and the build route unregisters the engine it
+ *  replaces before it probes the new binary, so a daemon exit during that probe left nothing claiming the directory:
+ *  the working build stayed hidden and the catalog card offered the unprobed tree in its place. */
 export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: string[], log: (l: string) => void): void {
   const buildDir = join(enginesRoot, 'build')
   let names: string[]
@@ -1173,8 +1177,9 @@ export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: s
     if (m) roots.add(join(buildDir, m[1]))
   }
   for (const buildRoot of roots) {
+    const claimed = claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))
     // Puts back synchronously; with sweep false nothing is deleted, so there is nothing to wait for.
-    if (claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))) void sweepParkedBuilds(buildRoot, log, { sweep: false })
+    if (claimed || existsSync(join(buildRoot, BUILD_INCOMPLETE_MARKER))) void sweepParkedBuilds(buildRoot, log, { sweep: false })
   }
 }
 
