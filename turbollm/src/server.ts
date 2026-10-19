@@ -237,24 +237,40 @@ export function registerSpaFallback(app: Hono, webRoot: string = WEB_ROOT): void
     }
     if (!existsSync(file)) return c.text('web ui not built — run `npm run build:web`', 500)
     const headers: Record<string, string> = { 'Content-Type': contentType(file) }
-    if (process.env.TURBOLLM_APP_SECRET && headers['Content-Type'].startsWith('text/html')) {
-      headers['Content-Security-Policy'] = APP_SECRET_CSP
+    if (headers['Content-Type'].startsWith('text/html')) {
+      // No site may frame the UI (see NO_FRAMING_CSP). One CSP header: on Android the frame rule
+      // rides in APP_SECRET_CSP, so the page is never under two policies.
+      headers['X-Frame-Options'] = 'DENY'
+      headers['Content-Security-Policy'] = process.env.TURBOLLM_APP_SECRET ? APP_SECRET_CSP : NO_FRAMING_CSP
     }
     return new Response(readFileSync(file), { status: 200, headers })
   })
 }
 
-/** Sent on the UI's HTML only when `TURBOLLM_APP_SECRET` is set (TurboLLM-Android, see auth.ts).
- *  The app's WebView blocks requests to other 127.0.0.1 ports, but `shouldInterceptRequest` never
+/** Sent, with `X-Frame-Options: DENY` for browsers that predate frame-ancestors, on every HTML
+ *  response of the UI. The browser defences on /api (Fetch Metadata and Origin checks on writes,
+ *  the Host check) key on where a request comes from, and a page that FRAMES the UI makes its
+ *  requests from the UI's own origin: same-origin, an Origin matching the Host, and on the
+ *  default loopback bind full keyless host trust. So any site could load
+ *  http://127.0.0.1:6996/settings in a transparent iframe and turn a few lured clicks into real
+ *  ones (LAN on, "Require an API key" off, a key minted, a model deleted). Nothing legitimate
+ *  frames the UI: the desktop app and the Android WebView load it top-level, and the artifact
+ *  iframes are srcdoc documents, which have no response of their own for either header to
+ *  apply to (Chromium was checked to still run and read them under this policy). */
+const NO_FRAMING_CSP = "frame-ancestors 'none'"
+
+/** Sent on the UI's HTML in place of NO_FRAMING_CSP, whose frame rule it ends with, when
+ *  `TURBOLLM_APP_SECRET` is set (TurboLLM-Android, see auth.ts). The app's WebView blocks
+ *  requests to other 127.0.0.1 ports, but `shouldInterceptRequest` never
  *  sees redirect hops: an https image in a model card or chat reply could 302 to
  *  `http://127.0.0.1:<another app's port>` and carry the host-only `turbollm_app` cookie there.
- *  CSP is re-checked on every hop and `'self'` is port-exact, so these two directives close that.
+ *  CSP is re-checked on every hop and `'self'` is port-exact, so its first two directives close that.
  *  Plain-http images (model cards, markdown in replies) still load: a port-less `http://*` matches
  *  only the scheme's default port, 80, which an Android app cannot bind without root — and Chromium
  *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
  *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
- *  scripts, and the UI's own fetches are same-origin. */
-const APP_SECRET_CSP = "img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:"
+ *  scripts (frame-ancestors is never applied to them), and the UI's own fetches are same-origin. */
+const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; ${NO_FRAMING_CSP}`
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
  *  `createApp()`, before the server starts accepting connections. NOT folded into
