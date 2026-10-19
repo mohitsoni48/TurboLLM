@@ -277,6 +277,67 @@ test('launchCli auto-load with empty library: returns 1 with friendly message', 
   }
 })
 
+/** A daemon with nothing loaded, serving `models` and `lastLoaded` on /status; every engine/start it is sent is
+ *  recorded in `started`, and the next status poll reports that model running. */
+function libraryFetch(models: object[], lastLoaded: string | null): { started: string[]; fetch: typeof fetch } {
+  const started: string[] = []
+  const fn = async (input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    const runningKey = started.at(-1)
+    if (url.includes('/api/v1/status')) {
+      const body = runningKey
+        ? { engine: { state: 'running' }, model: { key: runningKey, name: runningKey }, lastLoaded: { modelKey: lastLoaded } }
+        : { engine: { state: 'idle' }, model: null, lastLoaded: { modelKey: lastLoaded } }
+      return { ok: true, status: 200, json: async () => body } as Response
+    }
+    if (url.includes('/api/v1/models')) return { ok: true, status: 200, json: async () => ({ models }) } as Response
+    if (url.includes('/api/v1/engine/start')) {
+      started.push((JSON.parse((await init?.body?.toString()) ?? '{}') as { modelKey: string }).modelKey)
+      return { ok: true, status: 202, json: async () => ({ ok: true }) } as Response
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as Response
+  }
+  return { started, fetch: fn as unknown as typeof fetch }
+}
+
+// The pick is automatic, but POST /api/v1/engine/start is a manual load that starts on the selected engine whatever
+// the model. A last-used or first-listed .litertlm bundle under llama.cpp was started there, failed, and stayed last
+// loaded, so every later launch (every Code terminal too) failed the same way while the GGUF could have loaded.
+const BUNDLE = { key: 'Gemma 3n E2B|litertlm|1', name: 'Gemma 3n E2B', compatibleWithActiveEngine: false }
+const GGUF = { key: 'qwen3-8b', name: 'Qwen3 8B', compatibleWithActiveEngine: true }
+
+test('launchCli auto-load skips a model the selected engine cannot run, also when it was the last loaded', async () => {
+  for (const lastLoaded of [null, BUNDLE.key]) {
+    const { calls, fn } = makeSpawn()
+    const daemon = libraryFetch([BUNDLE, GGUF], lastLoaded)
+    const unsilence = silenceOutput()
+    try {
+      const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch)
+      assert.equal(code, 0, `lastLoaded ${lastLoaded}`)
+      assert.deepEqual(daemon.started, [GGUF.key], `lastLoaded ${lastLoaded}`)
+      assert.equal(calls[0].env['ANTHROPIC_MODEL'], GGUF.key)
+    } finally {
+      unsilence()
+    }
+  }
+})
+
+test('launchCli auto-load with no library model the selected engine runs: returns 1 and starts none', async () => {
+  const { calls, fn } = makeSpawn()
+  const daemon = libraryFetch([BUNDLE], BUNDLE.key)
+  const unsilence = silenceOutput()
+  let stderrOutput = ''
+  process.stderr.write = ((s: string) => { stderrOutput += s; return true }) as typeof process.stderr.write
+  try {
+    const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch)
+    assert.equal(code, 1)
+    assert.deepEqual([daemon.started, calls.length], [[], 0])
+    assert.match(stderrOutput, /no model is loaded and no model in the library runs on the selected engine/)
+  } finally {
+    unsilence()
+  }
+})
+
 test('launchCli --model already loaded with same key: skips load and launches', async () => {
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()

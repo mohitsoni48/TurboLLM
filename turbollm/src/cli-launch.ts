@@ -321,6 +321,9 @@ export interface ModelEntry {
    *  at 163328 advertised the wrong window until it happened to be the loaded one. Undefined when
    *  the model has no saved profile, where nativeCtx is the honest remaining answer. */
   configuredCtx?: number
+  /** false when the selected engine cannot run this model (`/api/v1/models`, modelIncompatibility): the Models
+   *  screen hides it unless every engine's models are shown. Absent from a daemon that predates the field. */
+  compatibleWithActiveEngine?: boolean
 }
 
 /** The context window to advertise for one model, best-known first:
@@ -1533,11 +1536,25 @@ export async function launchCli(
       )
       return 1
     }
+    // Only a model the selected engine runs. This pick is automatic, like the daemon's boot resume, which skips a
+    // model the engine cannot run, but it goes through POST /api/v1/engine/start, a manual load that starts on the
+    // selected engine whatever the model: a last-used (or first-listed) .litertlm bundle under llama.cpp was
+    // started there, failed, and stayed last loaded, so every later launch, and every Code terminal, failed the
+    // same way while a GGUF in the library would have loaded. Whether the Models screen shows every engine's
+    // models does not matter here: that is for a Load the user picks.
+    const loadable = models.filter((m) => m.compatibleWithActiveEngine !== false)
+    if (loadable.length === 0) {
+      process.stderr.write(
+        `TurboLLM is running, but no model is loaded and no model in the library runs on the selected engine.\n` +
+          `Open ${base} → Models → add or load a model, then run this again.\n`,
+      )
+      return 1
+    }
     // Prefer the true last-used model (exposed on /status as lastLoaded) when it's still
     // in the library; otherwise fall back to the first model in the list, which matches
     // the order the UI presents models.
     const lastKey = status?.lastLoaded?.modelKey
-    const autoKey = lastKey && models.some((m) => m.key === lastKey) ? lastKey : models[0].key
+    const autoKey = lastKey && loadable.some((m) => m.key === lastKey) ? lastKey : loadable[0].key
     const outcome = await awaitModelRunning(base, autoKey, status, `▸ Auto-loading model "${autoKey}"…\n`, _fetch)
     if (!outcome) {
       process.stderr.write(
