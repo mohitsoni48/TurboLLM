@@ -1103,8 +1103,16 @@ export async function prepareHermes(base: string, _apiKey: string, modelKey: str
   return { ok: true }
 }
 
+/** A load the daemon refused before starting it: POST /api/v1/engine/start's typed error (`{error: {code, message}}`),
+ *  or its bare status when the body carries none. */
+interface LoadRefused {
+  refused: { code: string; message: string }
+}
+
 /**
  * POST /api/v1/engine/start with a modelKey, then wait for it to become the running model.
+ * A refusal (409 no_active_engine with no engine selected, comfyui_busy, …) comes back as the daemon worded it: read as
+ * a load that never finished, it was reported as "did not finish loading within 180 s" at once, never the reason.
  *
  * `_fetch` is injectable for tests.
  */
@@ -1113,7 +1121,7 @@ async function loadAndWait(
   modelKey: string,
   timeoutMs = 180_000,
   _fetch: typeof fetch = fetch,
-): Promise<boolean> {
+): Promise<boolean | LoadRefused> {
   // POST the load request (fire-and-forget on the daemon side — returns 202).
   const loadRes = await _fetch(`${base}/api/v1/engine/start`, {
     method: 'POST',
@@ -1121,8 +1129,20 @@ async function loadAndWait(
     body: JSON.stringify({ modelKey }),
     signal: AbortSignal.timeout(5000),
   })
-  if (!loadRes.ok) return false
+  if (!loadRes.ok) {
+    const body = (await loadRes.json().catch(() => null)) as { error?: { code?: unknown; message?: unknown } } | null
+    const code = typeof body?.error?.code === 'string' ? body.error.code : ''
+    const message = typeof body?.error?.message === 'string' ? body.error.message : `HTTP ${loadRes.status}.`
+    return { refused: { code, message } }
+  }
   return waitForRunning(base, modelKey, timeoutMs, _fetch)
+}
+
+/** What the launcher prints for a refused load: the daemon's own reason, and with no engine selected, where to pick
+ *  one (an engine the launcher never picks for the user). */
+function refusedLoadMessage(base: string, { refused }: LoadRefused): string {
+  const next = refused.code === 'no_active_engine' ? `Open ${base} → Engines and select an engine, then run this again.\n` : ''
+  return `TurboLLM refused the load: ${refused.message}\n${next}`
 }
 
 /**
@@ -1168,19 +1188,21 @@ function isLoadingKey(status: DaemonStatus | null, key: string): boolean {
 /** Bring `key` to the running model, whichever way it gets there: wait for a load already in
  *  flight (ADR-425 D-G2, AC11), or start one ourselves. Prints exactly one banner. On success,
  *  returns the refreshed status — or the caller's own `status`, when the final poll had nothing
- *  newer to report. On failure, returns null; the caller prints its own message and exits. */
+ *  newer to report. On failure, returns null (a timeout or an engine error: the caller prints its own message and
+ *  exits), or the daemon's refusal of the load, which the caller prints instead (refusedLoadMessage). */
 async function awaitModelRunning(
   base: string,
   key: string,
   status: DaemonStatus | null,
   loadingBanner: string,
   _fetch: typeof fetch,
-): Promise<{ status: DaemonStatus | null } | null> {
+): Promise<{ status: DaemonStatus | null } | LoadRefused | null> {
   const waiting = isLoadingKey(status, key)
   process.stdout.write(waiting ? `▸ Waiting for model "${key}" to finish loading…\n` : loadingBanner)
   const ready = waiting
     ? await waitForRunning(base, key, 180_000, _fetch)
     : await loadAndWait(base, key, 180_000, _fetch)
+  if (typeof ready === 'object') return ready
   if (!ready) return null
   return { status: (await fetchStatus(base, _fetch)) ?? status }
 }
@@ -1514,6 +1536,10 @@ export async function launchCli(
       // Fall through to launch.
     } else {
       const outcome = await awaitModelRunning(base, resolvedKey, status, `▸ Loading model "${resolvedKey}"…\n`, _fetch)
+      if (outcome && 'refused' in outcome) {
+        process.stderr.write(refusedLoadMessage(base, outcome))
+        return 1
+      }
       if (!outcome) {
         process.stderr.write(
           `Model did not finish loading within 180 s. ` +
@@ -1565,6 +1591,10 @@ export async function launchCli(
     const lastKey = status?.lastLoaded?.modelKey
     const autoKey = lastKey && loadable.some((m) => m.key === lastKey) ? lastKey : loadable[0].key
     const outcome = await awaitModelRunning(base, autoKey, status, `▸ Auto-loading model "${autoKey}"…\n`, _fetch)
+    if (outcome && 'refused' in outcome) {
+      process.stderr.write(refusedLoadMessage(base, outcome))
+      return 1
+    }
     if (!outcome) {
       process.stderr.write(
         `Model did not finish loading within 180 s. ` +

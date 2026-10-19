@@ -338,6 +338,61 @@ test('launchCli auto-load with no library model the selected engine runs: return
   }
 })
 
+// With no engine selected (the selected one was Disabled or Deleted), POST /api/v1/engine/start answers 409
+// no_active_engine. The launcher read any non-ok answer as a load that never finished, and printed "Model did not finish
+// loading within 180 s" at once, never the reason; every Code terminal (it passes no --model) did the same.
+function refusingFetch(code: string, message: string): { started: string[]; fetch: typeof fetch } {
+  const started: string[] = []
+  const fn = async (input: string | URL | globalThis.Request, init?: RequestInit): Promise<Response> => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+    if (url.includes('/api/v1/status')) {
+      return { ok: true, status: 200, json: async () => ({ engine: { state: 'stopped' }, model: null }) } as Response
+    }
+    if (url.includes('/api/v1/models')) return { ok: true, status: 200, json: async () => ({ models: [GGUF] }) } as Response
+    if (url.includes('/api/v1/engine/start')) {
+      started.push((JSON.parse((await init?.body?.toString()) ?? '{}') as { modelKey: string }).modelKey)
+      return { ok: false, status: 409, json: async () => ({ error: { code, message } }) } as Response
+    }
+    return { ok: false, status: 404, json: async () => ({}) } as Response
+  }
+  return { started, fetch: fn as unknown as typeof fetch }
+}
+
+test('launchCli says why the daemon refused the load, not that it timed out, with and without --model', async () => {
+  for (const modelFlag of [undefined, GGUF.key]) {
+    const { calls, fn } = makeSpawn()
+    const daemon = refusingFetch('no_active_engine', 'Register and select an engine first.')
+    const unsilence = silenceOutput()
+    let stderrOutput = ''
+    process.stderr.write = ((s: string) => { stderrOutput += s; return true }) as typeof process.stderr.write
+    try {
+      const code = await launchCli('claude', 6996, [], fn, modelFlag, daemon.fetch)
+      assert.equal(code, 1, `--model ${modelFlag}`)
+      assert.deepEqual([daemon.started, calls.length], [[GGUF.key], 0])
+      assert.match(stderrOutput, /TurboLLM refused the load: Register and select an engine first\./)
+      assert.match(stderrOutput, /Open http:\/\/127\.0\.0\.1:6996 → Engines and select an engine, then run this again\./)
+      assert.doesNotMatch(stderrOutput, /180 s/)
+    } finally {
+      unsilence()
+    }
+  }
+})
+
+test('launchCli passes any other refused load through as the daemon worded it', async () => {
+  const { fn } = makeSpawn()
+  const daemon = refusingFetch('comfyui_busy', 'ComfyUI is rendering — try again once its queue finishes.')
+  const unsilence = silenceOutput()
+  let stderrOutput = ''
+  process.stderr.write = ((s: string) => { stderrOutput += s; return true }) as typeof process.stderr.write
+  try {
+    assert.equal(await launchCli('claude', 6996, [], fn, undefined, daemon.fetch), 1)
+    assert.match(stderrOutput, /TurboLLM refused the load: ComfyUI is rendering — try again once its queue finishes\./)
+    assert.doesNotMatch(stderrOutput, /180 s|→ Engines/)
+  } finally {
+    unsilence()
+  }
+})
+
 test('launchCli --model already loaded with same key: skips load and launches', async () => {
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
