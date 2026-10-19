@@ -138,6 +138,20 @@ export async function ensureKoboldcpp(
  * {@link koboldcppProfileToArgs}; the manager injects nothing else for this kind.
  * The GPU-backend flag (--usecuda/--usevulkan/--nogpu) is decided from the detected
  * vendor and lives in `extraArgs` too (see koboldcppProfileToArgs).
+ *
+ * `--quiet`: without it KoboldCpp prints every request's generation input (`Input: {...}`,
+ * the whole prompt: a Code session's or `turbollm launch` agent's files and tool output,
+ * .env contents included) and every reply (`Output: ...`) to its console, which the manager
+ * writes into the engine log. That log is readable by every caller lanAuth lets in
+ * (GET /api/v1/engine/logs and its stream), keyless open-LAN and Serve callers among them,
+ * the same callers the request log refuses captured bodies to (REQUEST_BODIES_HOST_ONLY).
+ * Quiet mode hides all of KoboldCpp's per-request output: those prints, and also the live
+ * "Processing Prompt (n / m tokens)" and "Generating (n / m tokens)" progress, the EOS and
+ * stop-token notes, the SmartCache slot notes and the tool-call reasoning, so the engine log
+ * no longer shows a generation's progress. The startup lines, load and CUDA errors and each
+ * request's CtxLimit timing line stay; readiness is probed over HTTP and nothing here parses
+ * any of the hidden lines. User `extraArgs` still come last, so a model's own
+ * `--debugmode 1` turns the prints back on.
  */
 export function koboldcppServerCommand(
   binPath: string,
@@ -148,7 +162,7 @@ export function koboldcppServerCommand(
 ): { cmd: string; args: string[] } {
   return {
     cmd: binPath,
-    args: ['--model', model, '--host', host, '--port', String(port), '--skiplauncher', ...extraArgs],
+    args: ['--model', model, '--host', host, '--port', String(port), '--skiplauncher', '--quiet', ...extraArgs],
   }
 }
 

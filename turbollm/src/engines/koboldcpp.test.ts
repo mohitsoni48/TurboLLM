@@ -31,10 +31,23 @@ test('koboldcppServerCommand passes model/host/port + skiplauncher and appends e
     '--port',
     '8081',
     '--skiplauncher',
+    '--quiet',
     '--contextsize',
     '8192',
     '--usecuda',
   ])
+})
+
+// Without --quiet KoboldCpp prints each request's prompt (`Input: {...}`) and reply (`Output: ...`)
+// to its console, which the manager writes into the engine log, and GET /api/v1/engine/logs serves
+// that log to keyless open-LAN and Serve callers that the request log refuses captured bodies to.
+test('koboldcppServerCommand launches KoboldCpp quiet, so prompts and replies stay out of the engine log', () => {
+  const { args } = koboldcppServerCommand('/bin/koboldcpp', '/models/x.gguf', 8081, '127.0.0.1')
+  assert.ok(args.includes('--quiet'), `--quiet missing from ${args.join(' ')}`)
+  // With a model's own flags the fixed --quiet comes before them, so a user `--debugmode 1` still wins.
+  const withExtra = koboldcppServerCommand('/bin/koboldcpp', '/models/x.gguf', 8081, '127.0.0.1', ['--debugmode', '1'])
+  assert.ok(withExtra.args.indexOf('--quiet') < withExtra.args.indexOf('--debugmode'))
+  assert.deepEqual(withExtra.args.slice(-2), ['--debugmode', '1'])
 })
 
 test('koboldcppProfileToArgs: NVIDIA GPU → contextsize + gpulayers + usecuda', () => {
