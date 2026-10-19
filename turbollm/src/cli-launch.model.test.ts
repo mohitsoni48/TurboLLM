@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { launchCli, clampAutoCompactWindow } from './cli-launch.js'
+import { launchCli, clampAutoCompactWindow, type ConfigFs } from './cli-launch.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -22,6 +22,22 @@ function makeSpawn(): { calls: CapturedSpawn[]; fn: Parameters<typeof launchCli>
     return ee
   }
   return { calls, fn }
+}
+
+/** launchCli('claude') writes its MCP config (writeClaudeMcpConfig) through this fs. Left out, it
+ *  is the real one, and every run of this file wrote ~/.turbollm/mcp-launch-config.json on the
+ *  machine running it. In memory, as cli-launch.test.ts does, the launch is otherwise the same. */
+function memFs(): ConfigFs {
+  const files = new Map<string, string>()
+  return {
+    home: '/home/tester',
+    readFile: async (p) => {
+      if (!files.has(p)) throw new Error('ENOENT')
+      return files.get(p)!
+    },
+    writeFile: async (p, data) => { files.set(p, data) },
+    mkdir: async () => {},
+  }
 }
 
 /** Silence launchCli's own banner output during a call, WITHOUT eating node:test's results.
@@ -115,6 +131,8 @@ test('launchCli already-loaded model: spawns without calling engine/start', asyn
       'claude', 6996, [], fn,
       undefined, // no --model flag
       makeFetch('running', MODELS[0].key),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1, 'spawn should be called once')
@@ -131,6 +149,8 @@ test('launchCli --model exact key: loads matching model and launches', async () 
       'claude', 6996, [], fn,
       'llama-3-70b', // exact key of second model
       makeFetch('idle'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1)
@@ -149,6 +169,8 @@ test('launchCli --model exact name: resolves by name and launches', async () => 
       'claude', 6996, [], fn,
       'Llama 3 70B', // exact name of second model
       makeFetch('idle'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1)
@@ -165,6 +187,8 @@ test('launchCli --model partial case-insensitive name: resolves and launches', a
       'claude', 6996, [], fn,
       'qwen3', // partial, case-insensitive match of "Qwen3 8B"
       makeFetch('idle'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1)
@@ -185,6 +209,8 @@ test('launchCli --model not found: prints error listing models, returns 1', asyn
       'claude', 6996, [], fn,
       'nonexistent-model-xyz',
       makeFetch('idle'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 1)
     assert.match(stderrOutput, /not found/i)
@@ -203,6 +229,8 @@ test('launchCli auto-load when no model loaded: loads first model and launches',
       'claude', 6996, [], fn,
       undefined, // no --model
       makeFetch('idle'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1, 'spawn should be called once after auto-load')
@@ -238,7 +266,7 @@ test('launchCli auto-load prefers lastLoaded.modelKey over the first library mod
     return { ok: false, status: 404, json: async () => ({}) } as Response
   }) as unknown as typeof fetch
   try {
-    const code = await launchCli('claude', 6996, [], fn, undefined, lastUsedFetch)
+    const code = await launchCli('claude', 6996, [], fn, undefined, lastUsedFetch, undefined, memFs())
     assert.equal(code, 0)
     assert.equal(startedKey, MODELS[1].key, 'should auto-load the last-used model, not the first')
     // We always pin ANTHROPIC_MODEL to the loaded model's key — even without --model.
@@ -268,7 +296,7 @@ test('launchCli auto-load with empty library: returns 1 with friendly message', 
   }) as unknown as typeof fetch
 
   try {
-    const code = await launchCli('claude', 6996, [], fn, undefined, emptyFetch)
+    const code = await launchCli('claude', 6996, [], fn, undefined, emptyFetch, undefined, memFs())
     assert.equal(code, 1)
     assert.match(stderrOutput, /no model is loaded and no models are in the library/i)
   } finally {
@@ -312,7 +340,7 @@ test('launchCli auto-load skips a model the selected engine cannot run, also whe
     const daemon = libraryFetch([BUNDLE, GGUF], lastLoaded)
     const unsilence = silenceOutput()
     try {
-      const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch)
+      const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch, undefined, memFs())
       assert.equal(code, 0, `lastLoaded ${lastLoaded}`)
       assert.deepEqual(daemon.started, [GGUF.key], `lastLoaded ${lastLoaded}`)
       assert.equal(calls[0].env['ANTHROPIC_MODEL'], GGUF.key)
@@ -329,7 +357,7 @@ test('launchCli auto-load with no library model the selected engine runs: return
   let stderrOutput = ''
   process.stderr.write = ((s: string) => { stderrOutput += s; return true }) as typeof process.stderr.write
   try {
-    const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch)
+    const code = await launchCli('claude', 6996, [], fn, undefined, daemon.fetch, undefined, memFs())
     assert.equal(code, 1)
     assert.deepEqual([daemon.started, calls.length], [[], 0])
     assert.match(stderrOutput, /no model is loaded and no model in the library runs on the selected engine/)
@@ -412,6 +440,8 @@ test('launchCli --model already loaded with same key: skips load and launches', 
       'claude', 6996, [], fn,
       MODELS[0].key, // --model same as currently loaded
       trackingFetch,
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(startCalls, 0, 'engine/start should NOT be called when model already loaded')
@@ -429,6 +459,8 @@ test('launchCli without --model: pins ANTHROPIC_MODEL to the loaded model key', 
       'claude', 6996, [], fn,
       undefined, // no --model flag
       makeFetch('running', MODELS[0].key),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls.length, 1)
@@ -454,7 +486,7 @@ test('launchCli prefers the model key over its display name for ANTHROPIC_MODEL'
     return { ok: false, status: 404, json: async () => ({}) } as Response
   }) as unknown as typeof fetch
   try {
-    const code = await launchCli('claude', 6996, [], fn, undefined, keyVsName)
+    const code = await launchCli('claude', 6996, [], fn, undefined, keyVsName, undefined, memFs())
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'qwen3-8b', 'the key, not the display name, must be pinned')
   } finally {
@@ -470,6 +502,8 @@ test('launchCli with --model: pins ANTHROPIC_MODEL to the resolved model', async
       'claude', 6996, [], fn,
       MODELS[0].key, // explicit --model
       makeFetch('running', MODELS[0].key),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], MODELS[0].key, '--model must pin ANTHROPIC_MODEL')
@@ -506,7 +540,7 @@ test('launchCli caps concurrent subagents at the engine\'s slot count', async ()
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(1))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(1), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '1')
   } finally {
     unsilence()
@@ -517,7 +551,7 @@ test('launchCli passes a multi-slot engine\'s real capacity through, not a hardc
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(4))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(4), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], '4')
   } finally {
     unsilence()
@@ -531,7 +565,7 @@ test('launchCli sets NO cap when the engine advertises no slot count', async () 
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(undefined))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithSlots(undefined), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS'], undefined)
   } finally {
     unsilence()
@@ -586,7 +620,7 @@ test('launchCli pins CLAUDE_CODE_AUTO_COMPACT_WINDOW to the real loaded ctx and 
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(200_000))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(200_000), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], '200000')
     assert.equal(calls[0].env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'], '80')
   } finally {
@@ -598,7 +632,7 @@ test('launchCli clamps CLAUDE_CODE_AUTO_COMPACT_WINDOW to the CLI-documented 100
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(8192))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(8192), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], '100000')
   } finally {
     unsilence()
@@ -611,7 +645,7 @@ test('launchCli sets NO CLAUDE_CODE_AUTO_COMPACT_WINDOW when the daemon reports 
   const { calls, fn } = makeSpawn()
   const unsilence = silenceOutput()
   try {
-    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(undefined))
+    await launchCli('claude', 6996, [], fn, undefined, fetchWithCtx(undefined), undefined, memFs())
     assert.equal(calls[0].env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'], undefined)
     // The 80% override is independent of knowing ctx — it only ever lowers the CLI's own
     // threshold within whatever window it ends up using, so it's always safe to set.

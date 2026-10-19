@@ -8,7 +8,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
-import { launchCli } from './cli-launch.js'
+import { launchCli, type ConfigFs } from './cli-launch.js'
 
 interface CapturedSpawn {
   cmd: string
@@ -25,6 +25,22 @@ function makeSpawn(): { calls: CapturedSpawn[]; fn: Parameters<typeof launchCli>
     return ee
   }
   return { calls, fn }
+}
+
+/** launchCli('claude') writes its MCP config (writeClaudeMcpConfig) through this fs. Left out, it
+ *  is the real one, and every run of this file wrote ~/.turbollm/mcp-launch-config.json on the
+ *  machine running it. In memory, as cli-launch.test.ts does, the launch is otherwise the same. */
+function memFs(): ConfigFs {
+  const files = new Map<string, string>()
+  return {
+    home: '/home/tester',
+    readFile: async (p) => {
+      if (!files.has(p)) throw new Error('ENOENT')
+      return files.get(p)!
+    },
+    writeFile: async (p, data) => { files.set(p, data) },
+    mkdir: async () => {},
+  }
 }
 
 /** Same rationale as cli-launch.model.test.ts: swallow only launchCli's own '▸' banner
@@ -95,6 +111,8 @@ test('--model <machine>/<model> pins the qualified id and loads nothing locally'
       'claude', 6996, [], fn,
       'workstation/Qwen3-35B',
       makeFetch(['qwen3-8b', 'workstation/Qwen3-35B'], hits),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0, 'launch must succeed with NO local model loaded')
     assert.equal(calls.length, 1)
@@ -119,6 +137,8 @@ test('a qualified id the daemon does not advertise fails loudly instead of falli
       'claude', 6996, [], fn,
       'workstation/Qwen3-35B',
       makeFetch(['qwen3-8b'], hits),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 1)
     assert.equal(calls.length, 0, 'nothing may be spawned')
@@ -147,7 +167,7 @@ test('a LOCAL key containing a slash still resolves locally, unchanged', async (
     return { ok: false, status: 404, json: async () => ({}) } as Response
   }) as unknown as typeof fetch
   try {
-    const code = await launchCli('claude', 6996, [], fn, 'unsloth/Qwen3-GGUF', fetchImpl)
+    const code = await launchCli('claude', 6996, [], fn, 'unsloth/Qwen3-GGUF', fetchImpl, undefined, memFs())
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'unsloth/Qwen3-GGUF')
     assert.equal(hits.engineStart, 0, 'already loaded — no reload')
@@ -173,6 +193,8 @@ test('no --model: the daemon-side remote selection is used, and NOTHING is loade
       'claude', 6996, [], fn,
       undefined,
       makeFetch(['qwen3-8b', 'workstation/Qwen3-35B'], hits, 'idle', 'workstation/Qwen3-35B'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'workstation/Qwen3-35B')
@@ -194,6 +216,8 @@ test('the remote selection wins over a model that happens to be loaded locally',
       'claude', 6996, [], fn,
       undefined,
       makeFetch(['qwen3-8b', 'workstation/Qwen3-35B'], hits, 'running', 'workstation/Qwen3-35B'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'workstation/Qwen3-35B')
@@ -214,6 +238,8 @@ test('a STALE selection (its machine went offline) falls back to the local path'
       'claude', 6996, [], fn,
       undefined,
       makeFetch(['qwen3-8b'], hits, 'running', 'workstation/Qwen3-35B'),
+      undefined,
+      memFs(),
     )
     assert.equal(code, 0)
     assert.equal(calls[0].env['ANTHROPIC_MODEL'], 'qwen3-8b', 'falls back to the loaded local model')
