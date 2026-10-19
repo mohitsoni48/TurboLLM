@@ -604,7 +604,9 @@ export interface Config {
   /** Settings → Models, "Show models for every engine" (off by default): the Models screen and the model pickers list
    *  every model, not only those the selected engine can run. A model listed that way still loads only on the selected
    *  engine (registry.engineForModel): a Load starts it there, and if the engine cannot load it the load fails with the
-   *  engine's own error (compat.ts manualLoadRefusal). Nothing switches engines or suggests another. */
+   *  engine's own error (compat.ts manualLoadRefusal). While it is on, the automatic loads (the gateway's auto-swap, a
+   *  routine's swap and restore, the boot resume, ComfyUI's reload) start such a model there too, where with it off
+   *  they refuse it. Nothing switches engines or suggests another. */
   showAllEngineModels: boolean
   hf: HF
   gh: GitHub

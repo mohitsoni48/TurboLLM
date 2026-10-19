@@ -164,6 +164,19 @@ test('a Jev last model on a non-vLLM engine skips because it needs vLLM', () => 
   }))
 })
 
+// With Settings → "Show models for every engine" on, a model is always started on the selected engine, and fails there
+// if that engine cannot load it: the boot resume skipped it as engine-incompatible (or loaded devModel in its place).
+test('with "Show models for every engine" on, a GGUF last model on vLLM plans a load onto vLLM', () => {
+  const vllm = engineOfKind('vllm', 'vLLM')
+  const lastModel = entry()
+  const { plan } = planFor({
+    cfg: resumableConfig({ showAllEngineModels: true, devModel: DEV_MODEL }), engine: vllm,
+    findModel: recordingLibrary(lastModel).findModel,
+  })
+
+  assert.deepEqual(plan, { kind: 'load-model', entry: lastModel, engine: vllm })
+})
+
 test('a loadable GGUF last model on llama-server plans a load onto the active engine', () => {
   const lastModel = entry()
   const { plan } = planFor({ engine: LLAMA_SERVER, findModel: recordingLibrary(lastModel).findModel })

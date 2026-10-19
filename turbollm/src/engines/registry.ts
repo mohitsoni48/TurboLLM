@@ -626,7 +626,8 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
  *  Engines Start, a gateway auto-swap, a routine's swap or restore and the boot resume all started LiteRT-LM on their
  *  own while the user had KoboldCpp or llama.cpp selected, and the Models screen listed the model as loadable there.
  *  Now a load the user asks for by hand starts it on the active engine, which fails with its own error, and an
- *  automatic one is refused by the active engine's compat check (compat.ts manualLoadRefusal, modelIncompatibility). */
+ *  automatic one is refused by the active engine's compat check (compat.ts manualLoadRefusal, modelIncompatibility),
+ *  unless Settings shows every engine's models: then it is started there too (model-router.ts loadRefusal). */
 export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
   if (entry.laya) return registry.layaEngine() || registry.active()
   return registry.active()

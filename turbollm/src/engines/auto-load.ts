@@ -10,7 +10,7 @@ import type { ModelRouter } from '../gateway/model-router'
 import type { ModelEntry, Scanner } from '../models/scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import type { ComfyGuard } from './comfy-guard'
-import { modelIncompatibility } from './compat'
+import { manualLoadRefusal, modelIncompatibility } from './compat'
 import type { Manager, StartOpts } from './manager'
 import type { Registry } from './registry'
 import { buildStartOpts } from './start-opts'
@@ -75,7 +75,8 @@ export interface AutoLoadPlanInput {
   /** `registry.active()`. A resume loads onto the active engine, never `lastLoaded.engineId`, and never onto another
    *  engine the model's format would suit (registry.engineForModel): a `.litertlm` model resumes only while LiteRT-LM
    *  is the active engine, and is skipped as engine-incompatible under any other. A resume is not the user's own
-   *  load, so it does not start a model there that the engine cannot run (compat.ts manualLoadRefusal). */
+   *  load, so it does not start a model there that the engine cannot run (compat.ts manualLoadRefusal), unless
+   *  Settings shows every engine's models (showAllEngineModels): then it does, as a manual Load would. */
   engine: Engine | undefined
   /** `comfy.isBlocked()` */
   comfyBlocked: boolean
@@ -152,7 +153,7 @@ function resolveLastModel({ cfg, engine, findModel }: LocalResumeInput): LastMod
   const entry = findModel(modelKey)
   if (!entry) return unresolved({ code: 'model-not-in-library', modelKey })
   if (entry.incomplete || entry.parseError) return unresolved({ code: 'model-not-loadable', modelKey })
-  const detail = incompatibilityDetail(engine, entry)
+  const detail = incompatibilityDetail(engine, entry, cfg.showAllEngineModels)
   if (detail) {
     const { name: engineName, kind: engineKind } = engine
     return unresolved({ code: 'engine-incompatible', modelKey, engineName, engineKind, detail })
@@ -165,9 +166,12 @@ function unresolved(reason: AutoLoadSkipReason): LastModelResolution {
 }
 
 /** Why `engine` can't load `entry`, or '' when it can. The format and audio wordings predate
- *  the shared rule and are pinned by the boot skip lines, so they stay byte-identical. */
-function incompatibilityDetail(engine: Engine, entry: ModelEntry): string {
-  const inc = modelIncompatibility(engine.kind, entry)
+ *  the shared rule and are pinned by the boot skip lines, so they stay byte-identical.
+ *  `showAll`: Settings shows every engine's models (showAllEngineModels). The model is then resumed on the selected
+ *  engine as a manual Load starts it (compat.ts manualLoadRefusal), and fails there if that engine cannot load it:
+ *  once the user shows such models, one is always started on the selected engine. */
+function incompatibilityDetail(engine: Engine, entry: ModelEntry, showAll: boolean): string {
+  const inc = showAll ? manualLoadRefusal(engine.kind, entry) : modelIncompatibility(engine.kind, entry)
   if (!inc) return ''
   if (inc.code === 'format') return `format ${entry.format}`
   if (inc.code === 'audio') return 'audio tower not supported'

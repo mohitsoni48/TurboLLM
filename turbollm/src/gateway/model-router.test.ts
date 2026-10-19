@@ -454,18 +454,24 @@ test('route: a Jev model on llama.cpp is refused with the needs-vLLM message and
 
 // A model loads only on the engine the user selected: a .litertlm model went to the registered LiteRT-LM engine whenever
 // another kind was active, so a gateway auto-swap, a routine's swap or a side model's Load started LiteRT-LM on its own.
-function litertRouter(primary: Manager, comfy?: ConstructorParameters<typeof ModelRouter>[4], updates: unknown[] = []) {
+function litertRouter(
+  primary: Manager,
+  comfy?: ConstructorParameters<typeof ModelRouter>[4],
+  updates: unknown[] = [],
+  { showAllEngineModels = false, activeKind = 'koboldcpp' } = {},
+) {
   const bundle = { ...fakeEntry('gemma-litert'), format: 'litertlm', path: '/models/gemma.litertlm' } as ModelEntry
   const gguf = { ...fakeEntry('routine-gguf'), format: 'gguf', path: '/models/routine.gguf' } as ModelEntry
-  const models = [bundle, gguf]
+  const laya = { ...fakeEntry('laya'), format: 'gguf', path: '/models/laya', laya: { version: 1 } } as unknown as ModelEntry
+  const models = [bundle, gguf, laya]
   const scanner = { list: () => ({ models }), get: (k: string) => models.find((m) => m.key === k) } as unknown as Scanner
   const litert = { id: 'litert-1', kind: 'litert-lm', capabilities: { flags: [] } } as unknown as Engine
-  const registry = { active: () => fakeEngine('koboldcpp'), litertLmEngine: () => litert, layaEngine: () => undefined } as unknown as Registry
+  const registry = { active: () => fakeEngine(activeKind), litertLmEngine: () => litert, layaEngine: () => undefined } as unknown as Registry
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {}, showAllEngineModels }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => { const c = {}; fn(c); updates.push(c) },
   } as unknown as ConfigStore
-  return { r: new ModelRouter(store, registry, primary, scanner, comfy), bundle, gguf }
+  return { r: new ModelRouter(store, registry, primary, scanner, comfy), bundle, gguf, laya }
 }
 
 const LITERT_REFUSAL = {
@@ -510,6 +516,69 @@ test("reloadAfterRender: a routine's restore of a .litertlm model under KoboldCp
 
   assert.deepEqual(handed, [])
   assert.deepEqual(updates, [], 'nothing recorded as the model last loaded')
+})
+
+// With Settings → "Show models for every engine" on, a model the user chose to show is always started on the selected
+// engine, and if it fails there it fails: the owner's rule. Only the manual loads read it so; the gateway's auto-swap
+// (a Claude Code /model pick, any /v1 client), the Jev endpoints (routeTo) and a routine's swap and restore refused it
+// with 503 permanent and the advice to activate another engine, and never started it.
+test('with "Show models for every engine" on, every load starts a .litertlm model on KoboldCpp; off, they refuse it', async () => {
+  for (const showAllEngineModels of [false, true]) {
+    const { manager, loads } = recordingPrimary()
+    const { r, bundle } = litertRouter(manager, undefined, [], { showAllEngineModels })
+    const results = [
+      await r.route(bundle.key),
+      await r.routeTo(bundle),
+      await r.loadExplicit(bundle.key), // a routine's swap
+      await r.loadExplicit(bundle.key, undefined, { restoreAfter: { target: 'http://primary.invalid' } }), // its restore
+    ]
+    if (!showAllEngineModels) {
+      for (const result of results) assert.deepEqual(result, LITERT_REFUSAL)
+      assert.deepEqual(loads, [], 'off: nothing is loaded')
+      continue
+    }
+    for (const result of results) assert.notDeepEqual(result, LITERT_REFUSAL)
+    assert.deepEqual(
+      (loads as StartOpts[]).map((o) => [o.engine.kind, o.modelPath]),
+      Array(4).fill(['koboldcpp', bundle.path]),
+      'on: each load starts on the selected engine, never on LiteRT-LM',
+    )
+  }
+})
+
+test('with "Show models for every engine" on, a GGUF under vLLM is started on vLLM by an auto-swap', async () => {
+  const { manager, loads } = recordingPrimary()
+  const { r, gguf } = litertRouter(manager, undefined, [], { showAllEngineModels: true, activeKind: 'vllm' })
+
+  await r.route(gguf.key)
+
+  assert.deepEqual((loads as StartOpts[]).map((o) => [o.engine.kind, o.modelPath]), [['vllm', gguf.path]])
+})
+
+test('with "Show models for every engine" on, a Laya model with no Laya engine is still refused before anything loads', async () => {
+  const { manager, loads } = recordingPrimary()
+  const { r, laya } = litertRouter(manager, undefined, [], { showAllEngineModels: true })
+
+  const result = await r.route(laya.key)
+
+  assert.equal('status' in result && result.status, 503)
+  assert.match('message' in result ? result.message : '', /Laya/)
+  assert.deepEqual(loads, [])
+})
+
+test("with \"Show models for every engine\" on, a routine's restore of a .litertlm model under KoboldCpp is handed to the render's release", async () => {
+  const { manager } = recordingPrimary()
+  const handed: unknown[][] = []
+  const comfy = {
+    reloadOnReleaseInstead: (...args: unknown[]) => (handed.push(args), true),
+  } as unknown as ConstructorParameters<typeof ModelRouter>[4]
+  const { r, bundle, gguf } = litertRouter(manager, comfy, [], { showAllEngineModels: true })
+
+  r.reloadAfterRender(bundle.key, gguf.key)
+
+  assert.deepEqual(handed.map(([key, opts]) => [key, (opts as StartOpts).engine.kind, (opts as StartOpts).modelPath]), [
+    [gguf.key, 'koboldcpp', bundle.path],
+  ])
 })
 
 // A load that an acquire overtook while it waited (for the load gate or ComfyUI's /free) is refused by the guard's

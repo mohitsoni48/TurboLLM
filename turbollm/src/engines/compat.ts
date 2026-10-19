@@ -38,8 +38,11 @@ export function modelIncompatibility(
  *  cannot load it the load fails with the engine's own error (the load-failure banner): the user chose both the engine
  *  and the model, and nothing may pick or suggest another engine for them. The pre-refusal ("activate the LiteRT-LM
  *  engine to load it" for a .litertlm model under KoboldCpp) did. The automatic loads (the gateway's auto-swap, a
- *  routine's swap and restore, the boot resume, ComfyUI's reload) keep modelIncompatibility's refusal: started anyway,
- *  each would unload the running model for a load that cannot succeed, with nobody asking for it. */
+ *  routine's swap and restore, the boot resume, ComfyUI's reload) keep modelIncompatibility's refusal while Settings
+ *  lists only the models the selected engine runs: started anyway, each would unload the running model for a load
+ *  that cannot succeed, with nobody asking for it. With "Show models for every engine" on (showAllEngineModels) they
+ *  take this refusal too: once the user shows such models, one is always started on the selected engine, and if it
+ *  fails there it fails (model-router.ts loadRefusal, auto-load.ts). */
 export function manualLoadRefusal(
   engineKind: string,
   entry: Parameters<typeof modelIncompatibility>[1],

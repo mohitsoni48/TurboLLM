@@ -36,7 +36,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Show models for every engine** (Settings → Models & loading, off by default) lists every model in the Models screen
   and the model pickers, also those the selected engine is not expected to run. A model shown that way still loads only
   on the selected engine: its Load starts there and, if that engine cannot load it, fails with the engine's own error.
-  Nothing switches to another engine or suggests one.
+  While it is on, the automatic loads (the gateway's auto-swap for Claude Code and other API clients, routines, the
+  boot resume) start such a model on the selected engine too; with it off they refuse it and unload nothing. Nothing
+  switches to another engine or suggests one.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.

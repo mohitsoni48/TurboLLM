@@ -8,7 +8,7 @@ import type { Registry } from '../engines/registry'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import type { ComfyGuard } from '../engines/comfy-guard'
 import type { LoadProfile } from '../models/profile'
-import { manualLoadRefusal, modelIncompatibility } from '../engines/compat'
+import { manualLoadRefusal, modelIncompatibility, type Incompatibility } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import { getSysInfo } from '../sysinfo/sysinfo'
@@ -26,7 +26,8 @@ import { modelLoadsRefused } from '../auth'
  *  `manual`: the user asked for this load by hand (startEngine's side models: an embedding or Laya model's Load). It
  *  starts on the selected engine even when that engine is not expected to run the model, and fails with the engine's
  *  own error, as startEngine's chat-model load does (compat.ts manualLoadRefusal). Every other load (route(), a
- *  routine's swap and restore, the boot resume) is refused for such a model before anything is unloaded. */
+ *  routine's swap and restore, the boot resume) is refused for such a model before anything is unloaded, unless
+ *  Settings shows every engine's models (showAllEngineModels): then each one is started as a manual load is. */
 export interface LoadExplicitOpts {
   restoreAfter?: RouteResult
   runningOnly?: boolean
@@ -291,7 +292,7 @@ export class ModelRouter {
     const routineEntry = this.resolveEntry(routineModelKey)
     if (!entry || !routineEntry) return
     const engine = engineForModel(this.registry, entry)
-    if (!engine || modelIncompatibility(engine.kind, entry)) return
+    if (!engine || this.loadRefusal(engine, entry)) return
     const opts = this.buildOpts(entry, engine)
     if (!opts || !this.comfy.reloadOnReleaseInstead(routineEntry.key, opts)) return
     // The routine's swap recorded its own model as the one last loaded (doLoad), and release() starts this one on the
@@ -522,6 +523,19 @@ export class ModelRouter {
     return { status: 503, message: `'${entry.name}' is not loaded, and this access token may not load models.`, permanent: true }
   }
 
+  /** What refuses a load of `entry` on `engine` before anything is unloaded. A manual load, and with Settings showing
+   *  every engine's models (showAllEngineModels) every load, is refused only for a Laya model with no Laya engine
+   *  (compat.ts manualLoadRefusal): the owner's rule is that once the user shows such models, one is always started on
+   *  the selected engine, and if that engine cannot load it the load fails with the engine's own error. Only the manual
+   *  loads read it so: the gateway's auto-swap (a Claude Code /model pick, any /v1 client), the Jev endpoints and a
+   *  routine's swap and restore refused a model the user had shown, and a hand-loaded model that ran fine there could
+   *  not be reached again once evicted. With the setting off they keep modelIncompatibility's refusal. */
+  private loadRefusal(engine: Engine, entry: ModelEntry, manual?: boolean): Incompatibility | null {
+    return manual || this.store.snapshot().showAllEngineModels
+      ? manualLoadRefusal(engine.kind, entry)
+      : modelIncompatibility(engine.kind, entry)
+  }
+
   /** `explicit`: loadExplicit's options, absent for route(). */
   private async doLoad(entry: ModelEntry, overrides?: Partial<LoadProfile>, explicit?: LoadExplicitOpts): Promise<RouteResult> {
     // Re-check after acquiring the lock — another queued request may have already
@@ -551,7 +565,7 @@ export class ModelRouter {
 
     const engine = engineForModel(this.registry, entry)
     if (!engine) return { status: 503, message: 'No active engine. Set one up in TurboLLM.' }
-    const inc = explicit?.manual ? manualLoadRefusal(engine.kind, entry) : modelIncompatibility(engine.kind, entry)
+    const inc = this.loadRefusal(engine, entry, explicit?.manual)
     // Stays so until the owner installs or switches to an engine that runs it; a retry only delays the message.
     if (inc) return { status: 503, message: inc.message, permanent: true }
 
