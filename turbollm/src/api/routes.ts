@@ -125,12 +125,23 @@ function err(c: Context, status: Status, code: string, message: string) {
  *  body captured", and with requireApiKey off nothing else asks that browser for a key. */
 const REQUEST_BODIES_HOST_ONLY = 'Captured prompts and responses can only be read on this machine or with a valid API key.'
 
-async function body<T>(c: Context): Promise<T> {
+/** The request's JSON body as sent, any JSON type; {} when it does not parse. */
+async function jsonBody(c: Context): Promise<unknown> {
   try {
-    return (await c.req.json()) as T
+    return await c.req.json()
   } catch {
-    return {} as T
+    return {}
   }
+}
+
+/** The request's JSON body as the route's object of fields: {} when it does not parse or is not an object. A JSON
+ *  `null` used to reach the handlers, and the first field read threw (startEngine's `b.modelKey`, the MCP server's
+ *  `b.transport`, a key's `b.name`): the caller got Hono's bare text/plain 500 instead of the route's own 400 or 409.
+ *  For a route that reads only fields of the body, an array or a primitive read as {} already (each field undefined).
+ *  A route that refuses a body that is not an object reads jsonBody instead (PATCH /settings, the profile PUT). */
+async function body<T>(c: Context): Promise<T> {
+  const b = await jsonBody(c)
+  return (typeof b === 'object' && b !== null && !Array.isArray(b) ? b : {}) as T
 }
 
 /** Whether a /engines/zip upload request is currently extracting/probing — module-level
@@ -2787,7 +2798,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const key = c.req.param('key')
     const e = d.scanner.get(key)
     if (!e) return err(c, 404, 'no_such_model', 'No model with that key.')
-    const p = await body<LoadProfile>(c)
+    // jsonBody, not body(): validateLoadProfileFields refuses a body that is not an object ('profile must be a JSON
+    // object.'), which body() would hand over as {} and get the 'ctx' refusal for instead.
+    const p = await jsonBody(c) as LoadProfile
     // Field validation lives in profile-validate.ts because the preset routes are a SECOND way
     // into the same storage and must reject exactly the same things (ADR-353) — a bad field here
     // reaches profileToArgs and the engine command line.
@@ -2855,7 +2868,8 @@ export function registerApi(app: Hono, d: Deps): void {
   app.get('/api/v1/settings', (c) => c.json(settingsPayload(d)))
 
   app.patch('/api/v1/settings', async (c) => {
-    const b = await body<{
+    // jsonBody, not body(): a body that is not an object is refused below, not taken as an empty patch.
+    const b = await jsonBody(c) as {
       idleTtlMinutes?: number
       port?: number
       theme?: string
@@ -2898,7 +2912,7 @@ export function registerApi(app: Hono, d: Deps): void {
         custom?: { publicUrl?: string }
         tokenGrant?: { capabilities?: string[]; models?: string[] }
       }
-    }>(c)
+    }
 
     // The types above are what the Settings screen sends, not a check. A JSON `null` body threw
     // at the first field read below, and a wrong JSON type in a field read with a string or array
