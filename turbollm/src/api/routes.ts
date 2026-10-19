@@ -491,6 +491,8 @@ export function registerApi(app: Hono, d: Deps): void {
     if (def.downloadBaseUrl)
       return err(c, 409, 'no_update_source', 'This build has no automatic update source: upstream llama.cpp publishes no Android build.')
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
+    // Not under auto-tune: the update stops this build's users and hands its place to a new id (autoTuneUpdateBlock).
+    { const tuning = autoTuneUpdateBlock(d, (t) => t.binPath === oldBin); if (tuning) return err(c, 409, 'engine_in_use', tuning) }
     // Honest upstream check FIRST: resolve the real latest tag. Offline → clear 503.
     // Resolved in the INSTALLED tag's own format via the shared resolver: `releases/latest`
     // returns llama.cpp's semver release (`v0.4.0`), which publishes no per-backend assets, so
@@ -958,6 +960,9 @@ export function registerApi(app: Hono, d: Deps): void {
     const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, buildRoot))
     if (running && engineBusy(d))
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before rebuilding it — the rebuild replaces its files.`)
+    // Nor the engine auto-tune is running on, which engineBusy reads as idle between two probes: runBuild parks this
+    // folder's build before it clones, so the run's next probe found no binary (autoTuneUpdateBlock).
+    { const tuning = autoTuneUpdateBlock(d, (t) => isEngineInBuildDir(t.binPath, buildRoot), 'rebuilding this engine'); if (tuning) return err(c, 409, 'engine_in_use', tuning) }
     // Reserve the build slot SYNCHRONOUSLY (before returning 202) so two near-simultaneous
     // POSTs can't both pass the busy-check and race on the same buildRoot / clobber buildAbort.
     const ac = new AbortController()
@@ -1334,6 +1339,11 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    // An update swaps the build auto-tune may be running on (the same engine as `cur` below; autoTuneUpdateBlock).
+    if (upgrade) {
+      const tuning = autoTuneUpdateBlock(d, (t) => isEngineInBuildDir(t.binPath, join(root, 'turboquant')))
+      if (tuning) return err(c, 409, 'engine_in_use', tuning)
+    }
     // Cancellable from the provision banner, like the backend install: the download takes the
     // signal, and an update only swaps the staged release in once it has fully arrived.
     const ac = new AbortController()
@@ -1453,6 +1463,11 @@ export function registerApi(app: Hono, d: Deps): void {
     { const busy = engineWorkBusy(d); if (busy) return err(c, 409, 'engine_already_running', busy) }
     const root = join(d.store.dir(), 'engines')
     const upgrade = c.req.query('update') === '1'
+    // As for TurboQuant: not the binary auto-tune is running on (the same engine as `cur` below).
+    if (upgrade) {
+      const tuning = autoTuneUpdateBlock(d, (t) => t.kind === 'llamafile' && t.binPath === llamafileBinPath(root))
+      if (tuning) return err(c, 409, 'engine_in_use', tuning)
+    }
     const ac = new AbortController() // cancellable, as KoboldCpp above
     provisionAbort = ac
     void (async () => {
@@ -1650,9 +1665,10 @@ export function registerApi(app: Hono, d: Deps): void {
     const replaceBlocked = (): string | null => {
       // The loaded model's engine counts too: an install or Enable activates another engine without stopping it.
       const r = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e && isEngineInBuildDir(e.binPath, targetDir))
-      return r && engineBusy(d)
-        ? `Stop "${r.name}" before replacing its files — the upload extracts over its build folder.`
-        : null
+      if (r && engineBusy(d)) return `Stop "${r.name}" before replacing its files — the upload extracts over its build folder.`
+      // Nor the engine auto-tune is running on, which engineBusy reads as idle between two probes: the same-named
+      // re-upload refreshes it in place (autoTuneUpdateBlock).
+      return autoTuneUpdateBlock(d, (t) => claims(t.binPath), "replacing this engine's files")
     }
     const early = replaceBlocked()
     if (early) return err(c, 409, 'engine_in_use', early)
@@ -1819,7 +1835,9 @@ export function registerApi(app: Hono, d: Deps): void {
         const reason = releaseSwapBlockReason(d, occupantEngine)
         if (reason) return reason
       }
-      return null
+      // Nor the engine auto-tune is running on, which releaseSwapBlockReason reads as idle between two probes: a newer
+      // tag of an installed release lands in its folder, an update in place (autoTuneUpdateBlock).
+      return autoTuneUpdateBlock(d, (t) => claims(t.binPath))
     }
     const early = replaceBlocked()
     if (early) return err(c, 409, 'engine_in_use', early)
@@ -2074,6 +2092,8 @@ export function registerApi(app: Hono, d: Deps): void {
     const running = [d.registry.active(), d.manager.currentOpts()?.engine].find((e) => e?.id === id)
     if (engineBusy(d) && running)
       return err(c, 409, 'engine_in_use', `Stop "${running.name}" before updating it.`)
+    // Nor the engine auto-tune is running on, which engineBusy reads as idle between two probes (autoTuneUpdateBlock).
+    { const tuning = autoTuneUpdateBlock(d, (t) => t.id === id); if (tuning) return err(c, 409, 'engine_in_use', tuning) }
     const engine = d.registry.get(id)
     if (!engine) return err(c, 404, 'engine_not_found', 'No engine with that id.')
     // So does an extra pool slot on it, whatever the primary is doing, as for delete (engineDeleteBlocked): every
@@ -4228,6 +4248,20 @@ export function engineWorkBusy(d: Deps, opts: { engineChange?: boolean } = {}): 
   if (d.provision.get().active) return 'An engine download is in progress — wait for it to finish.'
   if (d.build.isActive() && (!opts.engineChange || d.build.isEngineBuildActive())) return 'A build is in progress — wait for it to finish.'
   return null
+}
+
+/** Why replacing the files of the engine `isTarget` picks out must wait for auto-tune, or null. A run stops its model
+ *  between two probes, which the update routes' engineBusy and the scheduler's engineIsIdle read as idle, so an update
+ *  of the engine being tuned got through mid-run: it stopped the probe it caught, and swapped the build under the rest
+ *  of the run (later probes ran the new build with the old one's tune, or a binary it had deleted; a llama.cpp
+ *  backend's new id stopped the run as "another engine was selected"). Refused while the run lasts, as the activate
+ *  route refuses a switch, by every route that replaces an engine's files in place: its update, a newer release tag
+ *  installed into its folder, a same-named zip re-upload and a rebuild. Only that engine: a run launches nothing else,
+ *  so another engine's update, and every other download, build and upload (engineWorkBusy's callers), still goes ahead
+ *  during a tune. */
+function autoTuneUpdateBlock(d: Pick<Deps, 'bench'>, isTarget: (tuned: Engine) => boolean, doing = 'updating this engine'): string | null {
+  const tuned = d.bench?.tuningEngine()
+  return tuned && isTarget(tuned) ? `Stop auto-tune before ${doing}.` : null
 }
 
 function hfErr(c: Context, e: unknown) {

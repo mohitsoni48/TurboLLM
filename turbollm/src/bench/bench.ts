@@ -239,6 +239,12 @@ export class BenchRunner {
     return this.state.running
   }
 
+  /** The engine a running run tunes (the one start() took), or null when none runs. Its model is stopped between two
+   *  probes, so an engine update reads it as idle there: the update routes and the scheduler ask this instead. */
+  tuningEngine(): Engine | null {
+    return this.state.running ? this.engine : null
+  }
+
   /** Cancel the active run: aborts the in-flight measurement immediately, stops after the
    *  current step, leaves the engine stopped, and keeps the partial results gathered so far
    *  (AC#3). A no-op when nothing is running. */

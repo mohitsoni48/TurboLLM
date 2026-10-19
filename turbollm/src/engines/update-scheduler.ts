@@ -23,6 +23,10 @@ export interface UpdateSchedulerDeps {
   /** Apply the rollback-safe update for one engine (Layer 2). Provided by the wiring
    *  layer; the scheduler only calls it when decideAutoUpdate() returns true. */
   applyUpdate: (engine: Engine) => Promise<void>
+  /** The engine a running auto-tune tunes, or null (BenchRunner.tuningEngine). Its model is stopped between two probes,
+   *  which engineIsIdle reads as idle, so an auto-update stopped the probe it caught and swapped the build under the
+   *  rest of the run. That engine is skipped while the run lasts, and retried at the next check, as a busy one is. */
+  tuningEngine?: () => Pick<Engine, 'id'> | null
 }
 
 /** Is the engine idle (safe to auto-apply an update)? Idle = not currently generating.
@@ -77,7 +81,7 @@ export class UpdateScheduler {
         const policy = normalizeUpdatePolicy(e.updatePolicy)
         const status = this.deps.updates.get(e.id)
         const hasUpdate = !!status?.hasUpdate
-        const idle = engineIsIdle(this.deps.manager)
+        const idle = engineIsIdle(this.deps.manager) && this.deps.tuningEngine?.()?.id !== e.id
         if (decideAutoUpdate({ policy, hasUpdate, idle })) {
           const latest = status?.latest ?? ''
           if (this.failedProbe.get(e.id) === latest) continue

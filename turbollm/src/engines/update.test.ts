@@ -461,6 +461,33 @@ test('UpdateScheduler: a version whose auto-update failed its probe is not appli
   assert.deepEqual(applied.slice(3), ['tq@b300', 'other@b300'])
 })
 
+// Auto-tune stops its model between two probes, which engineIsIdle reads as idle (the manager is stopped there), so an
+// `auto` engine's update was applied mid-run to the very engine being tuned: it stopped the probe it caught and swapped
+// the build under the rest of the run. Only that engine waits; the next check after the run applies it.
+test('UpdateScheduler: the engine auto-tune is running on is not auto-updated until the run ends; another engine is', async () => {
+  const tuned = eng({ id: 'cuda', updatePolicy: 'auto' })
+  const other = eng({ id: 'other', updatePolicy: 'auto' })
+  let tuning: Engine | null = tuned
+  const applied: string[] = []
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => ({ engines: [tuned, other], activeEngineId: 'cuda' }) } as unknown as Registry,
+    manager: managerStub('stopped'), // between two probes
+    updates: {
+      prune() {},
+      checkAll: async () => {},
+      get: () => ({ installed: 'b100', latest: 'b200', hasUpdate: true, checkedAt: '', comparable: true }),
+    } as unknown as UpdateChecker,
+    tuningEngine: () => tuning,
+    applyUpdate: async (e) => { applied.push(e.id) },
+  })
+  await scheduler.runOnce()
+  assert.deepEqual(applied, ['other'], 'the tuned engine is left alone; the other is updated')
+  tuning = null // the run ended
+  await scheduler.runOnce()
+  assert.deepEqual(applied.slice(1), ['cuda', 'other'])
+})
+
 // ─── source-built engines (ADR-088): commit-hash update detection ─────────────
 
 test('parseGitRepo: https / .git / trailing-slash variants → owner/repo', () => {

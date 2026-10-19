@@ -1033,12 +1033,13 @@ if (lastUpdateResult) {
 // Background auto-update checker (ADR-085, Phase 6): runs shortly after boot + every
 // ~24h. Refreshes per-engine update status; for 'auto' engines with an available update
 // AND an idle engine it applies the rollback-safe update. 'notify' just keeps the badge
-// fresh; 'off' is skipped. Don't auto-apply while ComfyUI holds the GPU.
+// fresh; 'off' is skipped. Don't auto-apply while ComfyUI holds the GPU, nor to the engine auto-tune is running on.
 const updateScheduler = new UpdateScheduler({
   store,
   registry,
   manager,
   updates,
+  tuningEngine: () => bench.tuningEngine(),
   applyUpdate: async (engine) => {
     if (comfy.isBlocked()) return // ComfyUI owns the GPU — don't swap engines under it
     await applyEngineUpdate({ store, registry, manager, provision, updates, modelRouter, workBusy: () => engineWorkBusy(deps) }, engine)

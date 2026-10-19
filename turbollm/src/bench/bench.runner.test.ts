@@ -251,6 +251,41 @@ test('auto-tune stops when its engine is removed during the run, and says so', a
   assert.match(bench.status().error ?? '', /its engine was removed during the run/)
 })
 
+// The update routes and the scheduler read the manager, which is stopped between two probes, so an update of the engine
+// being tuned got through mid-run. They now ask the run which engine it tunes: named between its probes too, and none
+// once the run has ended.
+test('auto-tune names the engine it tunes while it runs, between its probes too, and none once it ends', async () => {
+  const cuda = { id: 'cuda', name: 'llama.cpp CUDA', kind: 'llama-server', binPath: '/e/llama-server', version: 'b1', capabilities: CAPS }
+  const manager = {
+    start: async (_opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => { await hooks?.beforeStart?.() },
+    stopAndWait: async () => {},
+    status: () => ({ state: 'stopped', err: null }),
+    logPath: () => null,
+    target: () => null,
+  }
+  const m = model({ blockCount: 2 })
+  const store = { snapshot: () => ({ modelProfiles: {}, vramHeadroomMb: 1024, modelDirs: [] }) }
+  const scanner = { get: (key: string) => (key === m.key ? m : undefined) }
+  const bench = new BenchRunner(manager as never, store as never, scanner as never, { active: () => cuda } as never, 'test', {} as never)
+  const r = bench as unknown as RunnerInternals
+  r.settleGpu = async () => {}
+  let betweenProbes: unknown = 'not reached'
+  r.denseSearch = async (e, s, p, caps, results) => {
+    await r.probeVram(e, s, { ...p, ngl: 1 }, caps)
+    betweenProbes = bench.tuningEngine()?.id
+    await r.probeVram(e, s, { ...p, ngl: 2 }, caps)
+    return r.benchAt(e, s, { ...p, ngl: 2 }, caps, results, 'ngl=2')
+  }
+
+  assert.equal(bench.tuningEngine(), null, 'none before a run')
+  bench.start(m.key)
+  assert.equal(bench.tuningEngine()?.id, 'cuda')
+  while (bench.isRunning()) await new Promise((res) => setTimeout(res, 20))
+
+  assert.equal(betweenProbes, 'cuda')
+  assert.equal(bench.tuningEngine(), null, 'none once the run has ended')
+})
+
 test('saved auto-tune result is queued even when the CPU/GPU names are not identifier-safe', () => {
   // `@` (pre-12th-gen Intel), `w/` (Ryzen APUs) and lspci's `[.../...]` fail bench_result's
   // identifier check, which used to drop the event before it was ever queued.
