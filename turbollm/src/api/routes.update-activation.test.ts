@@ -178,3 +178,15 @@ for (const c of CASES) {
     assert.equal(h.registry.active()?.binPath, h.engine()?.binPath, 'an install activates the engine')
   })
 }
+
+// Disabling or Deleting the selected engine leaves none selected (Registry.remove). An update re-registers the engine in
+// place, which filled the empty selection: updating an engine merely installed made it the selected one.
+for (const c of CASES) {
+  test(`POST /engines/${c.route}?update=1 with no engine selected leaves none selected`, { skip: c.skip }, async (t) => {
+    const h = harness(t, c)
+    h.registry.remove('cuda') // the selected engine, Disabled
+    assert.equal(await h.run('?update=1'), null)
+    assert.equal(h.engine()?.version, c.updatedVersion, 'the update ran')
+    assert.equal(h.registry.active(), undefined, 'an update must not select the engine it updated')
+  })
+}

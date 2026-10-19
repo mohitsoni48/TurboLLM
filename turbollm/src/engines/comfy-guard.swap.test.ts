@@ -26,6 +26,20 @@ process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1500))
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+/** The config, with ComfyUI on, and the engine every model here runs on ('fake') registered and selected, as it is
+ *  while one of them runs: release() reloads a model only on the selected engine. */
+function comfyStore(dir: string): ConfigStore {
+  const store = ConfigStore.load(join(dir, 'config.json'))
+  store.update((c) => {
+    c.comfyui.enabled = true
+    c.engines = [{
+      id: 'fake', name: 'Fake', binPath: join(dir, 'llama-server'), kind: 'llama-server', version: '', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+    }]
+    c.activeEngineId = 'fake'
+  })
+  return store
+}
+
 test('a render that starts while a swap is stopping the old model kills it, and the new model is not loaded under it', {
   skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
 }, async (t) => {
@@ -42,8 +56,7 @@ test('a render that starts while a swap is stopping the old model kills it, and 
     extraArgs: [],
     preferredPort: port,
   })
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -89,8 +102,7 @@ test('a paused load the release resumes is refused again by an acquire that land
     extraArgs: [],
     preferredPort: port,
   })
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -152,8 +164,7 @@ test('an acquire during the reload\'s engine preflight: the model does not come 
   const dir = tmpDir('tllm-comfy-preflight-')
   const bin = fakeVllmPython(dir)
   const port = await freePort()
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -184,8 +195,7 @@ test('a paused load the release resumes is refused right before its spawn by an 
   const dir = tmpDir('tllm-comfy-preflight-resume-')
   const bin = fakeVllmPython(dir)
   const port = await freePort()
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -221,8 +231,7 @@ test('a load a render paused, in its pre-start hook or right before its spawn, i
   const dir = tmpDir('tllm-comfy-paused-report-')
   const bin = fakeVllmPython(dir)
   const port = await freePort()
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -282,8 +291,7 @@ test('a load a render stops while it starts is not reported as a failed load; th
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-stopped-report-')
   const opts = slowListenEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -327,8 +335,7 @@ test('a release landing while the render kills a starting load still has the rel
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-kill-release-report-')
   const opts = slowListenEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -393,8 +400,7 @@ test('an engine purged during a render: release does not start its missing binar
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-purged-')
   const e = fakeLlamaEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -424,8 +430,7 @@ test('a paused load whose engine was purged during the render is not started, an
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-purged-paused-')
   const e = fakeLlamaEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -452,8 +457,7 @@ test('an engine updated to a binary at a new path during a render: release reloa
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-moved-')
   const e = fakeLlamaEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -479,8 +483,7 @@ test('a paused load whose engine moved to a new path during the render is starte
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-moved-paused-')
   const e = fakeLlamaEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -503,8 +506,7 @@ test('an engine moved to a binary that is missing during a render: release does 
 }, async (t) => {
   const dir = tmpDir('tllm-comfy-moved-missing-')
   const e = fakeLlamaEngine(dir, await freePort())
-  const store = ConfigStore.load(join(dir, 'config.json'))
-  store.update((c) => { c.comfyui.enabled = true })
+  const store = comfyStore(dir)
   const manager = new Manager(store)
   t.after(() => manager.stopAndWait({ force: true }))
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))

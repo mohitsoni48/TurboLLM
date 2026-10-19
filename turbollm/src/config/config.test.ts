@@ -151,6 +151,37 @@ test('v2→v3 migration preserves other v2 config data (no data loss on version 
   }
 })
 
+// The engine selection on load. An empty one was filled with the first engine on every load, so a config left with no
+// engine selected (the selected one Disabled or Deleted, Registry.remove) came back with one the user never picked. It
+// stays empty, a dangling one is cleared, and only a file with no selection on record starts on the first engine.
+test('ConfigStore.load keeps an empty engine selection empty and starts a file with none on record on the first engine', () => {
+  const path = tmpConfigPath()
+  try {
+    const engine = (id: string) => ({
+      id, name: id, binPath: `/opt/${id}/llama-server`, kind: 'llama-server', version: 'b1', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+    })
+    const write = (over: Record<string, unknown>, drop?: string) => {
+      const raw: Record<string, unknown> = { ...defaultConfig(), engines: [engine('kobold'), engine('llama')], ...over }
+      if (drop) delete raw[drop]
+      writeFileSync(path, JSON.stringify(raw))
+    }
+    const loaded = () => ConfigStore.load(path).snapshot().activeEngineId
+    // The current schema (normalize only) and an older one (migrate first).
+    for (const version of [SCHEMA_VERSION, 2]) {
+      write({ version, activeEngineId: '' })
+      assert.equal(loaded(), '', `v${version}: none selected stays so`)
+      write({ version, activeEngineId: 'gone' })
+      assert.equal(loaded(), '', `v${version}: a selected engine that is gone leaves none selected`)
+      write({ version, activeEngineId: 'llama' })
+      assert.equal(loaded(), 'llama', `v${version}: a selection is kept`)
+      write({ version }, 'activeEngineId')
+      assert.equal(loaded(), 'kobold', `v${version}: a file with no selection on record starts on the first engine`)
+    }
+  } finally {
+    cleanup(path)
+  }
+})
+
 test('getModelProfile: exact-engine match wins over any fallback', () => {
   const cfg = defaultConfig()
   const engineA = 'aaaa'

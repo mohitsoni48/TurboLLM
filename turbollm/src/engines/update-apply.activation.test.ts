@@ -175,3 +175,17 @@ for (const c of CASES) {
     }
   })
 }
+
+// Disabling or Deleting the selected engine leaves none selected (Registry.remove). These updates re-register the
+// engine in place, which filled an empty selection: the scheduler's auto-update of an engine merely installed made it
+// the selected one, and the next automatic load (the boot resume, a gateway auto-swap, a routine) ran on it.
+for (const c of CASES) {
+  test(`${c.label} update with no engine selected leaves none selected`, { skip: c.skip }, async (t) => {
+    const { d, updated } = setup(t, c, false)
+    d.registry.remove('cuda') // the selected engine, Disabled
+    await update(c, d, updated)
+    const after = d.registry.list().engines.find((e) => e.binPath === updated.binPath)
+    assert.equal(after?.version, c.updatedVersion, 'the update ran')
+    assert.equal(d.registry.active(), undefined, 'an update must not select the engine it updated')
+  })
+}

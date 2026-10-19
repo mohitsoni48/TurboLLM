@@ -75,6 +75,10 @@ export async function realEngineSetUp(t: { after: (fn: () => unknown) => void },
     c.comfyui.enabled = opts.comfy ?? false
     c.comfyui.reverseGate = true
     c.comfyui.url = 'http://comfyui.invalid'
+    // Registered and selected, as the registry double below has it: ComfyGuard's release() reloads a model only on
+    // the selected engine.
+    c.engines = [engine]
+    c.activeEngineId = engine.id
   })
   const manager = new Manager(store)
   const comfyFree: { hook: (() => Promise<void>) | null } = { hook: null }

@@ -84,6 +84,18 @@ test('POST /backends/:id/update of a backend that is not the active engine keeps
   assert.equal(updated.updatePolicy, 'auto')
 })
 
+// With none selected (the selected engine Disabled or Deleted), the new build, registered under a new id, filled the
+// empty selection: updating a backend merely installed made it the selected engine.
+test('POST /backends/:id/update with no engine selected leaves none selected', { skip: posixOnly }, async (t) => {
+  const h = harness(t, WORKING_SERVER)
+  h.registry.remove('cuda') // the selected engine, Disabled
+  const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })
+  assert.equal(res.status, 202)
+  assert.equal(await h.finished, null)
+  assert.ok(h.registry.list().engines.some((e) => e.binPath === h.newBin), 'the new build is registered')
+  assert.equal(h.registry.active(), undefined, 'the new build is not selected')
+})
+
 test('POST /backends/:id/update whose new build fails its probe removes it, so Enable still finds the working build', { skip: posixOnly }, async (t) => {
   const h = harness(t, BROKEN_SERVER)
   const res = await h.app.request(`/api/v1/engines/backends/${backend.id}/update`, { method: 'POST' })

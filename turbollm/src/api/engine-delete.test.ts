@@ -10,16 +10,20 @@ import { test } from 'node:test'
 import fs, { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Hono } from 'hono'
 import { engineWorkBusy, registerApi } from './routes'
 import type { Deps } from '../deps'
+import { ConfigStore, type Engine } from '../config/config'
+import { planAutoLoad } from '../engines/auto-load'
 import { availableBackends } from '../engines/download'
 import { BuildState } from '../engines/build-state'
 import { ProvisionState } from '../engines/provision-state'
 import { writeReleaseMarker } from '../engines/release-install'
 import { ZIP_BUILD_MARKER } from '../engines/zip-install'
 import { ProbeError } from '../engines/probe'
+import { Registry } from '../engines/registry'
+import type { ModelEntry } from '../models/scanner'
 import { tmpDir } from '../test-support/tmp'
 
 function harness(busy: 'download' | 'build' | null) {
@@ -768,3 +772,46 @@ async function eventually(check: () => void): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 20))
   }
 }
+
+// KoboldCpp selected, llama.cpp CUDA also installed, nothing loaded: Disabling KoboldCpp made llama.cpp the selected
+// engine without asking (Registry.remove selected the first other engine), and the boot resume, a gateway auto-swap, a
+// routine or an Engines Start then loaded the last model on it. Real ConfigStore and Registry.
+test('DELETE /engines/:id of the selected engine leaves none selected: an Engines Start and the boot resume load nothing', async () => {
+  const path = join(tmpDir('tllm-engine-delete-selected-'), 'config.json')
+  const store = ConfigStore.load(path)
+  const engine = (id: string, name: string, kind: string): Engine => ({
+    id, name, kind, binPath: join(dirname(path), id, 'server'), version: 'b1', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+  } as Engine)
+  const model = { key: 'm|Q4_K_M|1', name: 'm', format: 'gguf', laya: false, incomplete: false, parseError: null } as unknown as ModelEntry
+  store.update((c) => {
+    c.engines = [engine('kobold', 'KoboldCpp', 'koboldcpp'), engine('llama', 'llama.cpp CUDA', 'llama-server')]
+    c.activeEngineId = 'kobold'
+    c.autoLoadOnStart = true
+    c.lastLoaded = { modelKey: model.key, engineId: 'kobold' }
+  })
+  const registry = new Registry(store)
+  const scanner = { get: (key: string) => (key === model.key ? model : undefined) }
+  const d = {
+    version: 'test',
+    store,
+    registry,
+    scanner,
+    manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), currentOpts: () => null },
+    provision: new ProvisionState(),
+    build: new BuildState(),
+    modelRouter: { poolEngineIds: () => new Set<string>() },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  assert.equal((await app.request('/api/v1/engines/kobold', { method: 'DELETE' })).status, 200)
+  const list = (await (await app.request('/api/v1/engines')).json()) as { activeEngineId: string }
+  assert.equal(list.activeEngineId, '', 'no engine is selected, not llama.cpp')
+  assert.equal(ConfigStore.load(path).snapshot().activeEngineId, '', 'nor once the config is loaded again')
+
+  const start = await app.request('/api/v1/engine/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
+  assert.equal(start.status, 409)
+  assert.equal(await errorCode(start), 'no_active_engine')
+  const plan = planAutoLoad({ cfg: store.snapshot(), engine: registry.active(), comfyBlocked: false, findModel: scanner.get })
+  assert.deepEqual(plan, { kind: 'skip', reason: { code: 'no-active-engine' } })
+})

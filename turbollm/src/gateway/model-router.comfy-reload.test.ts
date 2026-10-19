@@ -59,6 +59,9 @@ async function setUp(t: { after: (fn: () => unknown) => void }, keepN: number) {
     c.gateway.autoSwap = true
     c.gateway.keepN = keepN
     c.modelProfiles[model.key] = { [engine.id]: { profile: { port }, updatedAt: '' } }
+    // Registered and selected, as the registry double has it: release() reloads a model only on the selected engine.
+    c.engines = [engine]
+    c.activeEngineId = engine.id
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))
@@ -178,6 +181,9 @@ async function setUpVllm(t: { after: (fn: () => unknown) => void }, keepN: numbe
     c.gateway.keepN = keepN
     c.modelProfiles[a.key] = { [engine.id]: { profile: { port: portA }, updatedAt: '' } }
     c.modelProfiles[b.key] = { [engine.id]: { profile: { port: portB }, updatedAt: '' } }
+    // Registered and selected, as the registry double has it: release() reloads a model only on the selected engine.
+    c.engines = [engine]
+    c.activeEngineId = engine.id
   })
   const manager = new Manager(store)
   const guard = new ComfyGuard(store, manager, 30, async () => ({ ok: true, status: 200 }))

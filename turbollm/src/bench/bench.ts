@@ -156,8 +156,10 @@ const TOTAL_BUDGET_MS = 45 * 60_000
 // during graph capture once the allocation failed). Treat all of these as OOM so the search
 // offloads more and the result reads as a fit problem rather than a mystery crash.
 const OOM_RE = /out of memory|cudaMalloc|failed to allocate|unable to allocate|device not ready|CUDA error/i
-// The run's result when another engine was selected while it ran (see BenchRunner.startEngine).
+// The run's result when another engine was selected while it ran, or its engine was removed (Disable, Delete), which
+// leaves none selected (Registry.remove). See BenchRunner.startEngine.
 const ENGINE_SWITCHED = 'Auto-tune stopped: another engine was selected during the run. Run it again to tune that engine.'
+const ENGINE_REMOVED = 'Auto-tune stopped: its engine was removed during the run. Select an engine to tune this model again.'
 
 // Auto-tune may also sweep the KV-cache quant — but only ever SELECTS a quality-preserving type:
 // full-precision f16, near-lossless q8_0, and (on TurboQuant forks) turbo4 (≈ q8_0 quality). This
@@ -194,9 +196,10 @@ export class BenchRunner {
   private state: BenchState = { running: false }
   private cancelled = false
   // The engine this run tunes, taken once by start(): every probe launches on it, and its caps and the id the result is
-  // saved under are its own. `engineSwitched`: the run stopped because another engine was selected (startEngine).
+  // saved under are its own. `engineSwitched`: the run stopped because its engine is no longer the selected one, and
+  // why (ENGINE_SWITCHED or ENGINE_REMOVED, startEngine).
   private engine: Engine | null = null
-  private engineSwitched = false
+  private engineSwitched: string | null = null
   private deadline = 0
   // Aborts the in-flight measurement request the instant cancel() is called, so a
   // stop/restart/load (kill switches) interrupts auto-tune immediately rather than
@@ -320,15 +323,17 @@ export class BenchRunner {
    *  build measured, and the winner saved and pinned under the engine the run started on. The activate route now
    *  refuses a switch during a run; an install or Enable that activates another engine still can make one, and the
    *  run then stops here as a cancel does, with ENGINE_SWITCHED as its error, rather than load a model on an engine
-   *  the user has just left. */
+   *  the user has just left. A Disable or Delete of the run's engine between two probes leaves no engine selected
+   *  (Registry.remove): the run stops the same way, with ENGINE_REMOVED. */
   private startEngine(opts: StartOpts): Promise<void> {
     return this.manager.start(opts, {
       beforeStart: async () => {
         if (this.cancelled) throw new Error('Auto-tune was cancelled.')
-        if (this.registry.active()?.id !== opts.engine.id) {
-          this.engineSwitched = true
+        const selected = this.registry.active()
+        if (selected?.id !== opts.engine.id) {
+          this.engineSwitched = selected ? ENGINE_SWITCHED : ENGINE_REMOVED
           this.cancelled = true
-          throw new Error(ENGINE_SWITCHED)
+          throw new Error(this.engineSwitched)
         }
       },
     })
@@ -401,7 +406,7 @@ export class BenchRunner {
 
     this.cancelled = false
     this.engine = active
-    this.engineSwitched = false
+    this.engineSwitched = null
     this.abort = new AbortController()
     this.winning = null
     this.runLog = []
@@ -515,7 +520,7 @@ export class BenchRunner {
         // not the same signal as one whose load broke — same reasoning already
         // applied to download outcomes (ADR-299).
         this.reportFirstLoad('cancelled')
-        this.state = { running: false, modelKey, done: true, candidates: results, ...(this.engineSwitched ? { error: ENGINE_SWITCHED } : {}) }
+        this.state = { running: false, modelKey, done: true, candidates: results, ...(this.engineSwitched ? { error: this.engineSwitched } : {}) }
         return
       }
       const profile =
@@ -561,7 +566,7 @@ export class BenchRunner {
       // say so with the context size so the fix (lower ctx) is obvious — rather than a vague crash.
       const memoryBound = results.length > 0 && results.every((r) => r.outcome === 'oom')
       const err = this.cancelled
-        ? this.engineSwitched ? ENGINE_SWITCHED : undefined
+        ? this.engineSwitched ?? undefined
         : memoryBound
           ? `This model doesn't fit on your GPU at ${baseProfile.ctx.toLocaleString()} context — even with maximum CPU offload it ran out of VRAM. Lower the context length and try again.`
           : 'No candidate completed successfully.'

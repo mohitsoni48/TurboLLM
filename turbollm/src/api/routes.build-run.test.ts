@@ -277,7 +277,7 @@ test('POST /build/run: a failed rebuild puts the engine back without undoing a s
   })
   const add = h.registry.add.bind(h.registry)
   h.registry.add = async (...args: Parameters<Registry['add']>) => {
-    h.registry.activate('third') // remove() made 'other' active in the old engine's place: the user picks 'third'
+    h.registry.activate('third') // remove() left no engine selected: the user picks 'third'
     return add(...args)
   }
   assert.equal(await h.rebuild(), 'fail')

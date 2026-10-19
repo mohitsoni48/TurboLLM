@@ -215,7 +215,10 @@ async function applyLlamaCppUpdate(d: UpdateApplyDeps, engine: Engine, root: str
     let newEng = d.registry.list().engines.find((e) => e.binPath === newBin)
     if (!newEng) {
       try {
-        newEng = (await d.registry.add(`llama.cpp ${latestTag} (${backendId})`, newBin)).engine
+        // Never into an empty selection: the new build is selected only in place of the old one
+        // (keepActiveAfterUpdate). With none selected (the selected engine was Disabled or Deleted), the auto-update
+        // of a build merely installed made it the selected engine, and the next automatic load ran on it.
+        newEng = (await d.registry.add(`llama.cpp ${latestTag} (${backendId})`, newBin, undefined, { fillEmptySelection: false })).engine
       } catch (e) {
         // The new build doesn't run here (its probe failed). Remove it: left on disk with its
         // completion marker, the newest-tag-wins lookups (installedBackendBuild) would pick it

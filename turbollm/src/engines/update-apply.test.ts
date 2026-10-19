@@ -100,6 +100,18 @@ test('llama.cpp update of the active engine keeps a switch the user made while i
   assert.ok(d.registry.list().engines.some((e) => e.binPath === join(newDir, 'llama-server')), 'the update still happened')
 })
 
+// Disabling or Deleting the selected engine leaves none selected (Registry.remove). The new build, registered under a
+// new id, filled that empty selection: the scheduler's auto-update of a backend merely installed made it the selected
+// engine, and the next automatic load ran on it.
+test('llama.cpp update with no engine selected leaves none selected', { skip: posixOnly }, async (t) => {
+  const { d, newDir, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
+  d.registry.remove('cuda') // the selected engine, Disabled
+  await applyEngineUpdate(d, oldEngine)
+  assert.ok(d.registry.list().engines.some((e) => e.binPath === join(newDir, 'llama-server')), 'the new build is registered')
+  assert.equal(d.registry.get('old'), undefined, 'the old build is unregistered')
+  assert.equal(d.registry.active(), undefined, 'the new build is not selected')
+})
+
 test('llama.cpp update started by the user is recorded as user_update', { skip: posixOnly }, async (t) => {
   const { d, oldEngine } = llamaCppUpdate(t, WORKING_SERVER)
   const starts: string[] = []

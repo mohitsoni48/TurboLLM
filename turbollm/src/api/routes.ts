@@ -525,7 +525,8 @@ export function registerApi(app: Hono, d: Deps): void {
         let newEng = d.registry.list().engines.find((e) => e.binPath === newBin)
         if (!newEng) {
           try {
-            newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin)).engine
+            // Selected only in place of the old build, below: never into an empty selection (see update-apply.ts).
+            newEng = (await d.registry.add(`llama.cpp ${latestTag} (${def.id})`, newBin, undefined, { fillEmptySelection: false })).engine
           } catch (e) {
             // The new build doesn't run here: remove it. Left on disk with its completion marker,
             // installedBackendBuild (newest tag wins) would pick it over the working build, so
@@ -1005,7 +1006,8 @@ export function registerApi(app: Hono, d: Deps): void {
           sourceCommit: commit,
           defaultBranch: out.defaultBranch,
         })
-        // `activeAfter`: the engine remove() made active in its place, to tell a later switch by the user from it.
+        // `activeAfter`: the engine active once remove() has run (none when it removed the active one: no engine is
+        // selected while the new build probes), to tell a later switch by the user from it.
         let removed: { engine: Engine; active: boolean; index: number; activeAfter: string | undefined } | undefined
         let eng: Engine
         try {

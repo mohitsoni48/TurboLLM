@@ -776,7 +776,8 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
 // back. Composed with a real ComfyGuard, so the router's answer follows what release() does.
 for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
   test(`${path}: during a render that paused a load, a models:use token may retry that model, not the unloaded one`, async () => {
-    const optsFor = (entry: typeof MODEL) => ({ model: { key: entry.key, name: entry.name } }) as unknown as StartOpts
+    const optsFor = (entry: typeof MODEL) =>
+      ({ engine: { id: 'e' }, model: { key: entry.key, name: entry.name } }) as unknown as StartOpts
     let state: Status['state'] = 'running'
     let err: Status['err'] = null
     let recorded = optsFor(OTHER)
@@ -787,7 +788,11 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
       restartOpts: () => recorded,
       stopAndWait: async () => { state = 'stopped' },
     }
-    const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' } }), dir: () => '/tmp/turbollm-test-data' }
+    // The engine the opts name is the selected one: release() reloads a model only on the selected engine.
+    const comfyStore = {
+      snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
+      dir: () => '/tmp/turbollm-test-data',
+    }
     const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
     try {
       await guard.acquire() // suspends OTHER, which was running
@@ -820,7 +825,7 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
 for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
   for (const [label, paused] of [['the model a render unloaded', false], ['the load a render paused', true]] as const) {
     test(`${path}: while release() reloads ${label}, a models:use token asking for it may retry`, async () => {
-      const opts = { model: { key: MODEL.key, name: MODEL.name } } as unknown as StartOpts
+      const opts = { engine: { id: 'e' }, model: { key: MODEL.key, name: MODEL.name } } as unknown as StartOpts
       let state: Status['state'] = paused ? 'stopped' : 'running'
       let err: Status['err'] = null
       let spawn!: () => void
@@ -840,7 +845,11 @@ for (const path of ['/v1/messages', '/v1/chat/completions'] as const) {
         start: reloadsAfterSpawn,
         restart: reloadsAfterSpawn,
       }
-      const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' } }), dir: () => '/tmp/turbollm-test-data' }
+      // The engine the opts name is the selected one: release() reloads a model only on the selected engine.
+      const comfyStore = {
+        snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g' }, activeEngineId: 'e' }),
+        dir: () => '/tmp/turbollm-test-data',
+      }
       const guard = new ComfyGuard(comfyStore as never, primary as unknown as Manager, 30, async () => ({ ok: true, status: 200 }))
       try {
         await guard.acquire()

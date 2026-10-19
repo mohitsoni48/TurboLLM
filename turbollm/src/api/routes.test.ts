@@ -530,7 +530,7 @@ test('POST /api/v1/comfyui/release answers once loads are unblocked, before the 
   const starts: unknown[] = []
   const manager = {
     status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
-    currentOpts: () => (state === 'running' || state === 'starting' ? { model: { key: 'llama-8b' } } : null),
+    currentOpts: () => (state === 'running' || state === 'starting' ? { engine: { id: 'e' }, model: { key: 'llama-8b' } } : null),
     target: () => null,
     stopAndWait: async () => { state = 'stopped' },
     start: async (opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
@@ -541,7 +541,11 @@ test('POST /api/v1/comfyui/release answers once loads are unblocked, before the 
       state = 'running'
     },
   }
-  const comfyStore = { snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false } }), dir: () => '/tmp' }
+  // The model's engine is the selected one: release() reloads a model only on the selected engine.
+  const comfyStore = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false }, activeEngineId: 'e' }),
+    dir: () => '/tmp',
+  }
   const comfy = new ComfyGuard(comfyStore as never, manager as never)
   await comfy.acquire()
   const app = new Hono()

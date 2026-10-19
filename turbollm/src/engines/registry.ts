@@ -2,7 +2,7 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
+import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
@@ -69,10 +69,16 @@ export class Registry {
     return c.activeEngineId ? findEngine(c.engines, c.activeEngineId) : undefined
   }
 
+  /** Probe and register a llama-server build; the first one registered while no engine is selected becomes the
+   *  selected one (a first install, Add, Enable, a rebuild). Not with `fillEmptySelection: false`, which a llama.cpp
+   *  update passes for the new build it registers under a new id: that build takes the selection only from the build
+   *  it replaces (keepActiveAfterUpdate), and with none selected the auto-update of a build merely installed made it
+   *  the selected engine, which the next automatic load then ran on. */
   async add(
     name: string,
     binPath: string,
     source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string; release?: ReleaseProvenance },
+    opts: { fillEmptySelection?: boolean } = {},
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
     this.assertNameFree(finalName, source)
@@ -102,7 +108,7 @@ export class Registry {
       const holder = this.nameHolder(c.engines, finalName)
       if (holder) throw new NameTakenError(holder, source)
       c.engines.push(eng)
-      if (!c.activeEngineId) c.activeEngineId = eng.id
+      if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = eng.id
     })
     return { engine: eng, warning: pr.version === 'unknown' ? 'no_version' : undefined }
   }
@@ -138,8 +144,12 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        // Only a new registration fills an empty selection (a first install). Re-registering the entry in place is an
+        // update (applyPipUpdate, the install route's ?update=1), which leaves the selection as it is: with none
+        // selected (the selected engine was Disabled or Deleted), the auto-update of an engine merely installed made
+        // it the selected one, and the next automatic load ran on it.
+        if (!c.activeEngineId) c.activeEngineId = eng.id
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -165,8 +175,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -191,8 +201,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -217,8 +227,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -242,8 +252,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -320,8 +330,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -376,12 +386,18 @@ export class Registry {
     return out!
   }
 
+  /** Unregister an engine (Disable, Delete, a purge, an update's hand-over). Removing the selected engine leaves no
+   *  engine selected: it used to select the first other engine that can be active, without asking, and every automatic
+   *  load after it (the boot resume, a gateway auto-swap, a routine, an Engines Start) then ran on an engine the user
+   *  never picked. Every load but a Laya model's (on the Laya engine, which is never the selected one) now refuses, as
+   *  with no engine registered ("Register and select an engine first.", the gateway's "No active engine."), until the
+   *  user picks one in Engines, whose selector reads "No engine active". */
   remove(id: string): void {
     this.store.update((c) => {
       const i = c.engines.findIndex((e) => e.id === id)
       if (i < 0) throw new NotFoundError()
       c.engines.splice(i, 1)
-      if (c.activeEngineId === id) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
+      if (c.activeEngineId === id) c.activeEngineId = ''
     })
   }
 

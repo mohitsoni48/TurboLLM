@@ -56,7 +56,8 @@ function fakeManager(initial: { state: Status['state']; opts: StartOpts | null }
 }
 
 /** ConfigStore double returning a fixed comfyui config snapshot. `url`/`reverseGate`
- *  default off so the existing forward-gate tests are unaffected by the reverse gate. */
+ *  default off so the existing forward-gate tests are unaffected by the reverse gate. The selected engine is OPTS'
+ *  one, as it is while one of its models runs: release() reloads a model only on the selected engine. */
 function fakeStore(comfyui: {
   enabled: boolean
   gatePath: string
@@ -66,7 +67,7 @@ function fakeStore(comfyui: {
 }) {
   const full = { url: '', reverseGate: false, cachePersist: false, ...comfyui }
   return {
-    snapshot: () => ({ comfyui: full }),
+    snapshot: () => ({ comfyui: full, activeEngineId: 'e' }),
     // slot-cache helpers ask the store for the data dir to compute the slot-cache path.
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
@@ -120,6 +121,28 @@ test('release does not reload the model on an engine the user left during the re
   await g2.acquire()
   await g2.release()
   assert.equal(again.calls.starts.length, 1)
+})
+
+// A Disable or Delete of the selected engine during the render leaves no engine selected (Registry.remove), and every
+// load but a Laya model's (never on the primary) then refuses until the user picks one. An empty selection read as
+// "reload": a model on an engine still registered came back with no engine selected, and modelKeyLoadedOnRelease
+// named it.
+test('release does not reload the model once the user removed the selected engine during the render', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+
+  await g.acquire()
+  activeEngineId = ''
+  assert.equal(g.modelKeyLoadedOnRelease(), null)
+  await g.release()
+
+  assert.equal(calls.starts.length, 0, 'nothing loads with no engine selected')
+  assert.equal(g.isBlocked(), false)
 })
 
 // The same for a load the render paused, after an engine install or Enable activated another engine (they do not
@@ -660,7 +683,7 @@ test("cachePersist: the reload's restore keeps the file a save made during it wr
     return { ok: true, status: 200 }
   }
   const store = {
-    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true } }),
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true }, activeEngineId: 'e' }),
     dir: () => dataDir,
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
   const g = new ComfyGuard(store, mgr as never, undefined, http)

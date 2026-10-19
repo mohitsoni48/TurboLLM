@@ -1057,6 +1057,9 @@ function migrate(raw: Record<string, unknown>, from: number): Config {
       ;(cfg as unknown as Record<string, unknown>)[k] = v
     }
   }
+  // A file with no selection on record (and no pre-v1 engine, selected above) is one normalize() starts on the first
+  // engine: defaultConfig's '' would read as a selection the user cleared.
+  if (typeof raw.activeEngineId !== 'string' && !old?.binPath) delete (cfg as Partial<Config>).activeEngineId
   // v3→v4 (ADR-299, revised by the ADR-299-Decision-4 supersession on 2026-08-01): every
   // pre-existing config already has telemetry.level stored as 'off', because
   // normalizeTelemetryLevel() has coerced any missing/legacy value to 'off' since
@@ -1478,8 +1481,12 @@ function normalize(c: Config): void {
     // → 'notify' (the safe default — surface updates, never silently auto-apply).
     e.updatePolicy = e.updatePolicy === 'off' || e.updatePolicy === 'auto' ? e.updatePolicy : 'notify'
   }
+  // A selected engine that is gone leaves none selected, as Registry.remove does, and an empty selection stays empty:
+  // filling it with the first engine on every load selected one the user never picked. Only a file with no selection
+  // on record at all (hand-written, or from before the key) starts on the first engine that can be active. A first run
+  // starts with '' and selects the first engine it installs (Registry.add fills an empty selection).
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) c.activeEngineId = ''
-  if (!c.activeEngineId) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
+  if (typeof c.activeEngineId !== 'string') c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
   // A primary that no longer exists in modelDirs (folder removed/renamed) falls
   // back to the effective default (first dir) — reset rather than throw.
   if (c.primaryModelDir && !c.modelDirs.includes(c.primaryModelDir)) c.primaryModelDir = ''

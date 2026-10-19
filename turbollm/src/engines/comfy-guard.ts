@@ -421,11 +421,13 @@ export class ComfyGuard {
   /** Whether release() may load `o`: a model loads only on the engine the user selected (registry.engineForModel).
    *  The render leaves the primary stopped, so the Engines screen lets the user select another engine meanwhile, and
    *  the reload then brought the model back on the one they had just left. It stays unloaded instead, as the switch
-   *  leaves a stopped primary; a paused load's refusal is cleared with it. An engine still selected, or no selection
-   *  on record, reloads. */
+   *  leaves a stopped primary; a paused load's refusal is cleared with it. Only an engine still selected reloads. A
+   *  Disable or Delete of the selected engine during the render leaves none selected (Registry.remove), and every load
+   *  then refuses until the user picks one (but a Laya model's, which never takes the primary): so does this one,
+   *  which an empty selection used to let through (a model on an engine still registered came back with no engine
+   *  selected; on the removed one, refuse() stopped it). */
   private isOnSelectedEngine(o: StartOpts): boolean {
-    const selected = this.store.snapshot().activeEngineId
-    return !selected || selected === o.engine.id
+    return this.store.snapshot().activeEngineId === o.engine.id
   }
 
   /** The primary is in 'error' with our pre-start hook's refusal: release() resumes that load. */
@@ -436,9 +438,9 @@ export class ComfyGuard {
 
   /** Key of the model release() loads when this render ends, as release() decides it: the load it paused, else the
    *  model it unloaded. null when it loads none (also when the user has selected another engine than that model's
-   *  since, which release() then leaves unloaded), or no render claims the GPU. The gateway uses it to tell a caller
-   *  that may not load models whether waiting brings its model up, and the router whether a refused restore is
-   *  brought back. */
+   *  since, or removed the selected one, which release() then leaves unloaded), or no render claims the GPU. The
+   *  gateway uses it to tell a caller that may not load models whether waiting brings its model up, and the router
+   *  whether a refused restore is brought back. */
   modelKeyLoadedOnRelease(): string | null {
     if (!this.gpuClaimed()) return null
     const loads = this.hasPausedLoad() ? this.manager.restartOpts() : this.suspended
