@@ -31,10 +31,12 @@
 // (`profile.ts:531`) — so on vLLM/mlx-lm/koboldcpp `capacity === Infinity` and `inFlight < capacity`
 // is unconditionally true, making 'skip-busy' dead code.
 //
-// So `engineIdle` comes primarily from `getEngineIdle()`, which production wires to the SAME
-// `engineIsIdle(manager)` (`update-scheduler.ts:31`) that `model-swap.ts:43` — the Chat/pi path —
-// already uses; that one reads `manager.sessionStats().activeRequests`, i.e. the counter
-// `chat-routes.ts:800` increments, so it DOES see the chat turn. The gate snapshot is kept AND-ed
+// So `engineIdle` comes primarily from `getEngineIdle()`, which production wires to execute.ts's
+// `engineFreeForRoutine`: the SAME `engineIsIdle(manager)` (`update-scheduler.ts:31`) that
+// `model-swap.ts:43` — the Chat/pi path — already uses, AND-ed with no auto-tune run (as there too:
+// a tune's probes never raise that counter). `engineIsIdle` reads
+// `manager.sessionStats().activeRequests`, i.e. the counter `chat-routes.ts:800` increments, so it
+// DOES see the chat turn. The gate snapshot is kept AND-ed
 // on top (`getEngineIdle() && inFlight < capacity`) because the two signals observe overlapping but
 // non-identical work: the gate additionally sees queued/in-flight agent + gateway acquisitions
 // (`memory.ts`, `code-session.ts`, `gateway.ts`, `execute.ts`) that may not yet have reached
@@ -79,7 +81,8 @@ export interface CliRoutineDeps {
   getLoadedModelKey: () => string | null
   /** Is the engine free to have its model swapped out right now? Wire this to
    *  `engineIsIdle(manager)` (`engines/update-scheduler.ts`) — the SAME call `model-swap.ts:43`
-   *  makes for the Chat/pi path — and nothing else: it reads
+   *  makes for the Chat/pi path — AND-ed with nothing but "no auto-tune run", as there
+   *  (execute.ts's `engineFreeForRoutine`): it reads
    *  `manager.sessionStats().activeRequests`, which is the only signal that observes the main
    *  in-app chat stream (`chat-routes.ts:800`'s `manager.generationStart()`). Do NOT substitute a
    *  `gate.stats()` read here; see this module's `engineIdle` design note for why that alone would

@@ -20,7 +20,7 @@ import { PTYSession } from '../terminal/pty-session'
 
 const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
 
-function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate }): { d: Deps; db: ConversationStore; loadCalls: string[]; reloadCalls: string[][] } {
+function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gate?: GenerationGate; autotuneRunning?: boolean }): { d: Deps; db: ConversationStore; loadCalls: string[]; reloadCalls: string[][] } {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const loadCalls: string[] = []
   // withPinnedModel's restore hands a restore a ComfyUI render refused to reloadAfterRender (model-swap.ts).
@@ -48,6 +48,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
       dir: () => tmpDir('execute-test-terminals-'),
     },
     gate: opts.gate,
+    bench: { isRunning: () => opts.autotuneRunning ?? false },
   } as unknown as Deps
   return { d, db, loadCalls, reloadCalls }
 }
@@ -303,6 +304,63 @@ test('executeRoutine keeps permissionMode "auto" on the one-shot branch, never t
   )
   assert.equal(cliBranchCalled, true)
   assert.equal(status, 'ok')
+})
+
+// Auto-tune runs its probes on the primary and never raises activeRequests, so engineIsIdle() read idle all through a
+// tune, and a routine that came due swapped the probe's model out: the tune failed, its stopEngine() stopped the
+// routine's model mid-run, and the restore left the tuned model loaded with the router's flags as the model last
+// loaded. A running tune reads busy on every routine path.
+test('a chat routine that comes due during auto-tune skips with model_busy and never swaps', async () => {
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'tuned-model', autotuneRunning: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  let fetchCalled = false
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => { fetchCalled = true; return new Response('{}', { status: 200 }) }) as typeof fetch
+  let status: RoutineRunStatus
+  try {
+    status = await executeRoutine(d, routine, run)
+  } finally { globalThis.fetch = original }
+  assert.equal(status, 'skipped')
+  assert.equal(db.getRoutineRun(run.id)!.skipReason, 'model_busy')
+  assert.deepEqual(loadCalls, [])
+  assert.equal(fetchCalled, false)
+})
+
+test('an Approve during auto-tune answers model_busy and leaves the run awaiting approval', async () => {
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'tuned-model', autotuneRunning: true })
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const conv = db.createConversation({ kind: 'agent', modelKey: 'm' })
+  stallRoutineRun(db, run.id, { convId: conv.id, assistantContent: '', precedingCalls: [], call: { id: 'c1', name: 'not_allowed_tool', args: {} } })
+
+  const res = await resumeRoutineRun(d, db.getRoutineRun(run.id)!, 'allow')
+
+  assert.equal(res.ok, false)
+  assert.equal((res as { code: string }).code, 'model_busy')
+  assert.equal(db.getRoutineRun(run.id)!.status, 'needs_approval')
+  assert.deepEqual(loadCalls, [])
+})
+
+test('both CLI branches read a running auto-tune as busy', async () => {
+  const freeGate = { stats: () => ({ inFlight: 0, queued: 0, capacity: 1 }) } as unknown as GenerationGate
+  const capture = async (autotuneRunning: boolean): Promise<boolean[]> => {
+    const { d, db } = fakeDeps({ loadedKey: 'tuned-model', gate: freeGate, autotuneRunning })
+    const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: 'ask' })
+    const idle: boolean[] = []
+    await runCliRoutineBranch(d, routine, db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) }), async (_r, deps) => {
+      idle.push(deps.getEngineIdle())
+      deps.store.updateRoutineRun(deps.existingRun!.id, { status: 'ok', endedAt: new Date().toISOString() })
+    })
+    await runCliInteractiveBranch(d, routine, db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) }), async (_r, rr, deps) => {
+      idle.push(deps.getEngineIdle())
+      deps.store.updateRoutineRun(rr.id, { status: 'ok', endedAt: new Date().toISOString() })
+      return 'ok'
+    })
+    return idle
+  }
+  assert.deepEqual(await capture(true), [false, false], 'a tune in progress must read as BUSY')
+  assert.deepEqual(await capture(false), [true, true])
 })
 
 // The CLI restores pass `restoreAfter` (ModelRouter.undoSwapRecord): a wiring that drops it left a keep-N 2 restore

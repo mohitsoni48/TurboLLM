@@ -111,17 +111,29 @@ function pinnedGate(d: Deps, routine: Routine, release: () => void): SwapGate | 
  *  treats a missing gate (`if (d.gate)` below), and is never used when a real gate exists. */
 const ABSENT_GATE = { stats: () => ({ inFlight: 0, queued: 0, capacity: Infinity }) } as unknown as GenerationGate
 
+/** Whether an auto-tune run holds the engine: every routine path treats it as busy (see withPinnedModel). A narrow
+ *  Deps double with no BenchRunner has no tune running. */
+function autotuneRunning(d: Deps): boolean {
+  return d.bench?.isRunning() ?? false
+}
+
+/** The engine is free for a routine's swap: no in-app generation (engineIsIdle) and no auto-tune run. */
+function engineFreeForRoutine(d: Deps): boolean {
+  return engineIsIdle(d.manager) && !autotuneRunning(d)
+}
+
 /** CLI-flavor Code Routines (`codingAgent: 'claude_cli'`, Phase 3). Builds `runCliCodeRoutine`'s
  *  dependency bundle from the daemon's real `Deps` and returns the terminal status the run
  *  actually reached.
  *
  *  Two things here are load-bearing and easy to get subtly wrong:
- *   - `getEngineIdle` MUST be `engineIsIdle(d.manager)` (the same call model-swap.ts makes for the
- *     Chat/pi path), NOT a `gate.stats()` read: only the Manager's `activeRequests` counter sees
- *     the main in-app chat stream (`chat-routes.ts`'s `manager.generationStart()`), which never
+ *   - `getEngineIdle` MUST read `engineIsIdle(d.manager)` (the same call model-swap.ts makes for
+ *     the Chat/pi path), NOT a `gate.stats()` read: only the Manager's `activeRequests` counter
+ *     sees the main in-app chat stream (`chat-routes.ts`'s `manager.generationStart()`), which never
  *     touches the gate. Substituting the gate here would let a routine hot-swap the model out from
  *     under a live foreground chat — exactly what spec 20 §5 forbids. cli-routine.ts's own
- *     `getEngineIdle` doc comment states this requirement explicitly.
+ *     `getEngineIdle` doc comment states this requirement explicitly. It is
+ *     `engineFreeForRoutine(d)`: that call AND-ed with no auto-tune run, as on the Chat/pi path.
  *   - `existingRun` MUST be the `run` the scheduler already created and handed to
  *     `executeRoutine`; without it `runCliCodeRoutine` would create a SECOND row and every fire
  *     would show up twice in the run history.
@@ -148,7 +160,7 @@ export async function runCliRoutineBranch(
     store: d.db,
     gate: d.gate ?? ABSENT_GATE,
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
-    getEngineIdle: () => engineIsIdle(d.manager),
+    getEngineIdle: () => engineFreeForRoutine(d),
     loadExplicit: (modelKey, overrides, opts) => d.modelRouter.loadExplicit(modelKey, overrides, opts),
     reloadAfterRender: (modelKey, routineModelKey) => d.modelRouter.reloadAfterRender(modelKey, routineModelKey),
     now: () => new Date(),
@@ -254,7 +266,7 @@ export async function runCliInteractiveBranch(
     store: d.db,
     gate: d.gate ?? ABSENT_GATE,
     getLoadedModelKey: () => d.manager.status().model?.key ?? null,
-    getEngineIdle: () => engineIsIdle(d.manager),
+    getEngineIdle: () => engineFreeForRoutine(d),
     // The kickoff bound is paused while a model loads, then re-armed in full for the steps after
     // it. A healthy load can take far longer than the bound (manager.ts allows each load
     // READINESS_TIMEOUT_MS, 600 s, and has seen a 65 GB model take over 120 s); counting it made
@@ -383,7 +395,7 @@ export async function executeRoutine(
     }
     try {
       let ranStatus: RoutineRunStatus = 'errored'
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async (route) => {
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d) }, routine.modelKey, async (route) => {
         const outcome = await dispatchRoutine(d, routine, run, deadline.signal, route)
         ranStatus = finalizeOutcome(d, run.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
@@ -496,7 +508,7 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       return { ok: false, code: 'gate_timeout', message: 'Timed out waiting for the model server.' }
     }
     try {
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter }, routine.modelKey, async (route) => {
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d) }, routine.modelKey, async (route) => {
         const outcome = await dispatchResume(d, routine, current, pending, decision, deadline.signal, route)
         finalizeOutcome(d, current.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))

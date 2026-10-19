@@ -62,6 +62,20 @@ test('different model loaded and busy -> skip-busy, fn never called', async () =
   assert.equal(loadCalls.length, 0)
 })
 
+// Auto-tune runs its probes on the primary and never raises activeRequests, so engineIsIdle() read idle during a probe
+// (and the primary is stopped between probes): a routine that came due swapped the probe's model out from under the
+// tune.
+test('auto-tune running -> skip-busy, during a probe and between probes, fn never called', async () => {
+  for (const loaded of [{ loadedKey: 'b' }, { loadedKey: null, state: 'stopped' }]) {
+    const { deps, loadCalls } = fakeDeps(loaded)
+    let called = false
+    const result = await withPinnedModel({ ...deps, isAutotuneRunning: () => true }, 'a', async () => { called = true })
+    assert.equal(result.outcome, 'skip-busy', JSON.stringify(loaded))
+    assert.equal(called, false)
+    assert.equal(loadCalls.length, 0)
+  }
+})
+
 test('nothing loaded before -> swap in, run, nothing to restore', async () => {
   const { deps, loadCalls } = fakeDeps({ loadedKey: null, state: 'stopped' })
   const result = await withPinnedModel(deps, 'a', async () => {})

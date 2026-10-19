@@ -12,7 +12,8 @@
 // (never Manager.acquire()-style blocking). Phase 3's plan computes the same input via
 // GenerationGate.stats() instead; both are non-blocking, but they are not the same signal for a
 // multi-slot engine (capacity > 1) — see this plan's own Self-review notes for the reconciliation
-// this leaves open.
+// this leaves open. A running auto-tune reads busy too (ModelSwapDeps.isAutotuneRunning): its
+// measurements never raise activeRequests, and a swap would stop its probe (see withPinnedModel).
 import type { Manager } from '../engines/manager'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { engineIsIdle } from '../engines/update-scheduler'
@@ -27,6 +28,9 @@ export type ModelSwapOutcome =
 export interface ModelSwapDeps {
   manager: Manager
   modelRouter: ModelRouter
+  /** BenchRunner.isRunning(): an auto-tune run owns the engine, and a swap would stop its probe (see withPinnedModel).
+   *  Absent: no tune is ever running. */
+  isAutotuneRunning?: () => boolean
 }
 
 /** Where the swap loaded the routine's model: its loadExplicit() result. With keep-N 2 or more that is a pool slot
@@ -51,8 +55,9 @@ export interface SwapGate {
  *    `fn(route)` with the swap's route, then restore the prior model (a no-op if nothing was loaded
  *    before). The run must go to `route`: with keep-N 2 or more it is a pool slot, and the primary
  *    still serves the user's model.
- *  - 'skip-busy': a different model is loaded and the engine is actively generating — `fn` is
- *    never called; the caller logs "skipped — model busy" (spec 20 §6).
+ *  - 'skip-busy': a different model is loaded and the engine is actively generating, or an
+ *    auto-tune run is under way — `fn` is never called; the caller logs "skipped — model busy"
+ *    (spec 20 §6).
  * Restoration is best-effort and attempted after `fn` (even if it throws), and after a pinned model
  * that fails to load or a swap a ComfyUI render refused: either may already have stopped the user's
  * model. A restore a render refuses is left to that render's release (ModelRouter.reloadAfterRender).
@@ -62,7 +67,14 @@ export interface SwapGate {
  */
 export async function withPinnedModel(deps: ModelSwapDeps, pinnedModel: string, fn: (route?: PinnedRoute) => Promise<void>, gate?: SwapGate): Promise<ModelSwapOutcome> {
   const currentlyLoaded = deps.manager.status().model?.key ?? null
-  const action = decideModelAction({ pinnedModel, currentlyLoaded, engineIdle: engineIsIdle(deps.manager) })
+  // Auto-tune starts each probe on the primary through Manager.start() and sends its measurements straight to the
+  // engine, so activeRequests stays 0 and engineIsIdle() reads idle while a probe runs (between probes the primary is
+  // stopped). A routine that came due swapped the probe's model out: the measurement failed and counted as a crash,
+  // the tune's stopEngine() after it stopped the routine's model mid-run, and the restore loaded the tuned model with
+  // the router's flags and recorded it as the model last loaded. A manual Load, Stop or Restart cancels the tune
+  // (engine-lifecycle.ts); a routine, which nobody waits on, treats it as a busy engine instead.
+  const engineIdle = engineIsIdle(deps.manager) && !deps.isAutotuneRunning?.()
+  const action = decideModelAction({ pinnedModel, currentlyLoaded, engineIdle })
 
   if (action === 'skip-busy') return { outcome: 'skip-busy' }
   if (action === 'run') {
