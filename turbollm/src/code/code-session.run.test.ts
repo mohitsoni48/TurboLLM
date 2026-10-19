@@ -92,6 +92,18 @@ function harness(base: string, mode: CodeMode, extraDeps: Record<string, unknown
 const toolNames = (b: Body) => (b.tools ?? []).map((t) => t.function.name)
 const within = <T>(p: Promise<T>, ms: number) => Promise.race([p, new Promise<'timeout'>((r) => setTimeout(() => r('timeout'), ms))])
 
+/** `find()`'s first truthy answer, polled every 10 ms, or 'timeout' after `ms`, when it stops polling. The approval waits
+ *  were a bare `for (;;)` raced against within(): once within() gave up, the test failed but the loop went on setting
+ *  timers, so a frame that never came kept the file's process alive and `npm test` hung instead of reporting it. */
+async function poll<T>(find: () => T, ms: number): Promise<NonNullable<T> | 'timeout'> {
+  for (const until = Date.now() + ms; Date.now() < until;) {
+    const found = find()
+    if (found) return found as NonNullable<T>
+    await new Promise((r) => setTimeout(r, 10))
+  }
+  return 'timeout'
+}
+
 test('a Stop that lands before pi has a run (during turn setup) still stops the turn: the model is never called', { timeout: 30_000 }, async () => {
   const engine = await stubEngine([text('should never be asked')])
   try {
@@ -343,14 +355,7 @@ async function approveAfterSwap(script: (write: Reply) => Reply[]) {
     const outside = tmpDir('tllm-code-run-outside-')
     mkdirSync(join(h.repoRoot, 'sub'))
     const settled = h.turn('write it', new AbortController().signal)
-    const awaiting = async () => {
-      for (;;) {
-        const f = h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval')
-        if (f) return f
-        await new Promise((r) => setTimeout(r, 10))
-      }
-    }
-    const f = await within(awaiting(), 10_000)
+    const f = await poll(() => h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval'), 10_000)
     if (f === 'timeout') assert.fail('the write is awaiting approval')
     rmSync(join(h.repoRoot, 'sub'), { recursive: true })
     // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
@@ -407,15 +412,10 @@ async function approveTwoWritesAfterSwap(script: (twoWrites: Reply) => Reply[]) 
     const outside = tmpDir('tllm-code-run-outside-')
     mkdirSync(join(h.repoRoot, 'sub'))
     const settled = h.turn('write both', new AbortController().signal)
-    const awaiting = async (id: string) => {
-      for (;;) {
-        if (h.frames.some((x) => x.event === 'tool_call' && x.data.id === id && x.data.status === 'awaiting_approval')) return
-        await new Promise((r) => setTimeout(r, 10))
-      }
-    }
-    assert.notEqual(await within(awaiting('call_a'), 10_000), 'timeout', 'the first write is awaiting approval')
+    const awaiting = (id: string) => poll(() => h.frames.some((x) => x.event === 'tool_call' && x.data.id === id && x.data.status === 'awaiting_approval'), 10_000)
+    assert.notEqual(await awaiting('call_a'), 'timeout', 'the first write is awaiting approval')
     assert.ok(resolveToolApproval(`${h.convId}:call_a`, 'allow'))
-    assert.notEqual(await within(awaiting('call_b'), 10_000), 'timeout', 'the second write is awaiting approval')
+    assert.notEqual(await awaiting('call_b'), 'timeout', 'the second write is awaiting approval')
     // Read before the swap removes it: a first write that was refused, or that only runs once the
     // whole batch is prepared, has written nothing here yet.
     const firstInside = join(h.repoRoot, 'sub', 'a.txt')
@@ -455,14 +455,7 @@ async function pendingNameOfWrite(script: (write: Reply) => Reply[]): Promise<st
     const h = harness(engine.base, 'ask')
     const ac = new AbortController()
     const settled = h.turn('write it', ac.signal)
-    const awaiting = async () => {
-      for (;;) {
-        const f = h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval')
-        if (f) return f
-        await new Promise((r) => setTimeout(r, 10))
-      }
-    }
-    const f = await within(awaiting(), 10_000)
+    const f = await poll(() => h.frames.find((x) => x.event === 'tool_call' && x.data.name === 'write' && x.data.status === 'awaiting_approval'), 10_000)
     if (f === 'timeout') assert.fail('the write is awaiting approval')
     // The frame goes out just before the wait registers the call: give it a few ticks to.
     const key = `${h.convId}:${String(f.data.id)}`
