@@ -18,7 +18,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpDir } from './test-support/tmp'
 import {
@@ -29,6 +29,7 @@ import {
   detectInstall,
   progressFromResult,
   realPathOr,
+  resetNpmRootCache,
   helperPath,
   spawnUpdateHelper,
   AppUpdateProgressState,
@@ -47,6 +48,7 @@ function signals(over: Partial<InstallSignals> = {}): InstallSignals {
     desktopEnv: false,
     inContainer: false,
     npmGlobalRoot: null,
+    globalInstallWritable: true,
     sourceCheckout: false,
     ...over,
   }
@@ -62,6 +64,24 @@ test('classifyInstall: a global npm install offers the self-update', () => {
   assert.equal(info.method, 'npm_global')
   assert.equal(info.canSelfUpdate, true)
   assert.equal(info.command, 'npm i -g turbollm@latest')
+})
+
+// A root-owned prefix (`sudo npm i -g turbollm`: Node from apt or NodeSource, the nodejs.org pkg on
+// macOS): "Update & restart" stopped the daemon, the helper's `npm install -g` failed with EACCES,
+// and the old version came back detached, the dialog reading only "npm exited with code 243".
+test('classifyInstall: a global install this user cannot write offers the sudo command, not the self-update', () => {
+  const info = classifyInstall(
+    signals({
+      entry: '/usr/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/usr/lib/node_modules',
+      globalInstallWritable: false,
+    }),
+  )
+  assert.equal(info.method, 'npm_global')
+  assert.equal(info.canSelfUpdate, false)
+  assert.equal(info.command, 'sudo npm i -g turbollm@latest')
+  assert.match(info.note, /cannot write/)
+  assert.match(info.note, /sudo npm i -g turbollm@latest/)
 })
 
 test('classifyInstall: global detection is case-insensitive and separator-agnostic on Windows', () => {
@@ -322,6 +342,56 @@ test('realPathOr: a global install run through its <prefix>/bin symlink classifi
     // A path that can't be resolved is returned unchanged rather than throwing.
     assert.equal(realPathOr(join(prefix, 'missing')), join(prefix, 'missing'))
   }
+})
+
+test('detectInstall: a global install through a <prefix>/bin link whose folders this user cannot write is not offered the self-update', async (t) => {
+  if (process.platform === 'win32') return t.skip('the writability check is for macOS and Linux')
+  // The real layout, under a prefix `npm root -g` reports (npm_config_prefix).
+  const prefix = tmpDir('tllm-global-ro-')
+  const root = join(prefix, 'lib', 'node_modules')
+  const pkgBin = join(root, 'turbollm', 'bin')
+  mkdirSync(pkgBin, { recursive: true })
+  writeFileSync(join(pkgBin, 'turbollm.mjs'), '')
+  const bin = join(prefix, 'bin')
+  mkdirSync(bin)
+  const link = join(bin, 'turbollm')
+  symlinkSync(join('..', 'lib', 'node_modules', 'turbollm', 'bin', 'turbollm.mjs'), link)
+  chmodSync(root, 0o555)
+  let readOnly = true
+  try { accessSync(root, fsConstants.W_OK); readOnly = false } catch { /* what this test needs */ }
+  if (!readOnly) {
+    chmodSync(root, 0o755)
+    return t.skip('this user can write a 0555 folder (root with CAP_DAC_OVERRIDE)')
+  }
+  const argv1 = process.argv[1]
+  const envPrefix = process.env.npm_config_prefix
+  t.after(() => {
+    process.argv[1] = argv1
+    if (envPrefix === undefined) delete process.env.npm_config_prefix
+    else process.env.npm_config_prefix = envPrefix
+    resetNpmRootCache()
+    chmodSync(root, 0o755)
+    chmodSync(bin, 0o755)
+  })
+  process.argv[1] = link
+  process.env.npm_config_prefix = prefix
+  resetNpmRootCache()
+
+  const ro = await detectInstall()
+  assert.equal(ro.method, 'npm_global')
+  assert.equal(ro.canSelfUpdate, false, 'the global node_modules folder is not writable')
+  assert.equal(ro.command, 'sudo npm i -g turbollm@latest')
+
+  // The bin folder the link sits in, which `npm i -g` rewrites the link in, counts too.
+  chmodSync(root, 0o755)
+  chmodSync(bin, 0o555)
+  assert.equal((await detectInstall()).canSelfUpdate, false, 'the bin folder is not writable')
+
+  chmodSync(bin, 0o755)
+  const rw = await detectInstall()
+  assert.equal(rw.method, 'npm_global')
+  assert.equal(rw.canSelfUpdate, true, 'both writable')
+  assert.equal(rw.command, 'npm i -g turbollm@latest')
 })
 
 // The relaunched daemon's stdout goes to update.log, and one started with --print-token or

@@ -20,7 +20,7 @@
 // reproduced by running the test suite in the environment it happens to run in.
 
 import { execFile, spawn } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
+import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { packagedAndroidApp } from './engines/zip-install'
@@ -64,6 +64,11 @@ export interface InstallSignals {
   /** `npm root -g`, or null when it couldn't be resolved (no npm on PATH — itself a
    *  strong hint this is not an npm install). */
   npmGlobalRoot: string | null
+  /** Whether this user may write what `npm i -g` replaces: the global root (the package folder is
+   *  renamed in and out of it) and the bin folder its link sits in. False on a root-owned prefix
+   *  (`sudo npm i -g turbollm`: Node from apt or NodeSource under /usr, the nodejs.org pkg under
+   *  /usr/local on macOS). Checked on macOS and Linux only; true on Windows and with no root. */
+  globalInstallWritable: boolean
   /** A repo marker (`.git`, or the monorepo's own `turbollm/src`) sits above the entry
    *  script — i.e. this is `tsx src/cli.ts` in a checkout, not an installed package. */
   sourceCheckout: boolean
@@ -135,6 +140,21 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
   }
 
   if (s.npmGlobalRoot && isUnder(s.entry, s.npmGlobalRoot, s.platform === 'win32')) {
+    // Offered on a prefix this user cannot write, "Update & restart" stopped the daemon, the
+    // helper's `npm install -g` failed with EACCES, and the old version came back detached from
+    // the terminal, the dialog reading only "npm exited with code 243" (npm's own EACCES text
+    // went to update.log). Since symlinked installs on macOS/Linux are detected (realPathOr),
+    // that is every `sudo npm i -g` install; before, those were all `unknown`.
+    if (!s.globalInstallWritable) {
+      return {
+        method: 'npm_global',
+        canSelfUpdate: false,
+        command: 'sudo npm i -g turbollm@latest',
+        // Names the command itself: the dialog shows this note above its command box, and POST
+        // /api/v1/app/update's 409 carries the note alone.
+        note: "TurboLLM was installed into a global npm folder this user cannot write (installed with sudo), so it can't update itself. Update it with sudo npm i -g turbollm@latest.",
+      }
+    }
     return { method: 'npm_global', canSelfUpdate: true, command: 'npm i -g turbollm@latest', note: '' }
   }
 
@@ -243,19 +263,35 @@ export function realPathOr(p: string): string {
   }
 }
 
+/** May this user write `dir`? A missing one, or any other failure, reads as not writable. */
+function writable(dir: string): boolean {
+  try {
+    accessSync(dir, fsConstants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Classify the running daemon. Async only because `npm root -g` is a subprocess; every
  *  other signal is a cheap local read. Never throws. */
 export async function detectInstall(): Promise<InstallInfo> {
-  const entry = realPathOr(resolve(process.argv[1] ?? ''))
+  const link = resolve(process.argv[1] ?? '')
+  const entry = realPathOr(link)
   // Resolved too, so a prefix that itself sits behind a symlink still contains the entry.
-  const root = await npmGlobalRoot()
+  const raw = await npmGlobalRoot()
+  const root = raw && realPathOr(raw)
   return classifyInstall({
     platform: process.platform,
     androidApp: packagedAndroidApp(),
     entry,
     desktopEnv: process.env.TURBOLLM_DESKTOP === '1',
     inContainer: detectContainer(),
-    npmGlobalRoot: root && realPathOr(root),
+    npmGlobalRoot: root,
+    // The bin folder is the one argv[1] names before it is resolved: <prefix>/bin for the link
+    // a global install runs through. Windows has no root-owned prefix to speak of (npm's global
+    // folder is under the user's AppData), and its folder ACLs are not what access() reads.
+    globalInstallWritable: process.platform === 'win32' || !root || (writable(root) && writable(dirname(link))),
     sourceCheckout: detectSourceCheckout(entry),
   })
 }
