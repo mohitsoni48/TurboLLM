@@ -26,11 +26,10 @@ import { track, type KeyCheck } from '../lib/api'
  *  showed but took no click, focus or typing, and only Escape or Back, closing the modal, got
  *  out. Opened later, the prompt is the top layer instead: it gets the pointer events, the focus
  *  trap and the Escape key, and the older modal is the one hidden, until the prompt closes.
- *  Radix's Root is used directly, not ui/dialog's: under that one's hardware-back handling, every
- *  open ui/dialog closes on the same popstate, so one Back would put off a "Not now" prompt and
- *  close the modal under it together, and a 401's prompt, which Back cannot close, would be left
- *  having spent its history entry. As before, Back with the prompt up closes the modal under it,
- *  if any, not the prompt. */
+ *  Radix's Root is used directly, not ui/dialog's: under that one's hardware-back handling, Back
+ *  would go to the prompt, the newest overlay, and a 401's prompt, which Back cannot close, would
+ *  be left having spent its history entry. As before, Back with the prompt up closes the modal
+ *  under it, if any, not the prompt. */
 export function AuthGate({ onConnect, onDismiss, fullKeyNeeded = false }: {
   onConnect: (key: string) => void | Promise<KeyCheck | void>
   onDismiss?: () => void
