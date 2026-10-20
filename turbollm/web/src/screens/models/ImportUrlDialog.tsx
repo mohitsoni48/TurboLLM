@@ -177,11 +177,19 @@ export function ImportUrlDialog({
         </SheetHeader>
 
         <div className="flex flex-col gap-3">
+          {/* Enter's keydown is cancelled: a repo link opens the repo's sheet within this keydown,
+              and on a phone that sheet takes focus to its Close button before the same Enter's
+              keypress is sent, which then went to that button and clicked it, closing the repo
+              sheet as it opened. A cancelled keydown sends no keypress. */}
           <Input
             autoFocus
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && submit()}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return
+              e.preventDefault()
+              submit()
+            }}
             placeholder="https://huggingface.co/owner/repo  ·  or …/resolve/main/model.Q4_K_M.gguf  ·  …/model.litertlm"
             className="font-mono text-[12px]"
           />

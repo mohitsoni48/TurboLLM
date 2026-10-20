@@ -2,7 +2,8 @@
 // model-page link closes the Import sheet and opens the repo's own full-screen sheet in the same
 // update. Both are ui/sheet overlays with a history entry each for Back (use-backable-overlay.ts),
 // and the Import sheet's entry being dropped used to close the repo sheet as well, so the user saw
-// the dialog close and nothing open.
+// the dialog close and nothing open. Submitted with Enter, that Enter's keypress also went on to the
+// repo sheet's Close button once the sheet had taken focus, and closed it.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -78,5 +79,17 @@ describe('DiscoverTab — Import from URL on a phone', () => {
     await settle()
     expect(screen.queryByText(`Details of ${REPO}`)).not.toBeInTheDocument()
     expect(atPage()).toBe(true)
+  })
+
+  it('opens the repo when the link is submitted with Enter', async () => {
+    const user = userEvent.setup()
+    render(<DiscoverTab />)
+    await user.click(screen.getByTitle('Import from URL'))
+    await settle()
+    await user.type(screen.getByPlaceholderText(/huggingface\.co\/owner\/repo/), `https://huggingface.co/${REPO}{Enter}`)
+    await settle()
+
+    expect(screen.queryByText('Import from URL')).not.toBeInTheDocument()
+    expect(screen.getByText(`Details of ${REPO}`)).toBeInTheDocument()
   })
 })
