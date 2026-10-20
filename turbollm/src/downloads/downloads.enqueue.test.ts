@@ -8,9 +8,12 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DownloadManager, DownloadError, MAX_FOLDER_FILES } from './downloads'
+import { DownloadManager, DownloadError, MAX_FOLDER_FILES, setDownloadGetForTests } from './downloads'
 import type { HfModelFiles } from '../hf/hf'
 import { tmpDir } from '../test-support/tmp'
+
+// run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
+setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 
 /** Minimal ConfigStore stand-in: only the two members DownloadManager touches. */
 function fakeStore(modelDir: string, stateDir: string) {

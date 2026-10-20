@@ -24,6 +24,7 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
 import type { HfModelFiles } from '../hf/hf'
+import { httpGet, type DownloadGet } from './http-get'
 
 export type DownloadStatus = 'queued' | 'downloading' | 'paused' | 'done' | 'error' | 'cancelled'
 
@@ -84,6 +85,17 @@ export interface ProvenanceEntry {
 }
 
 const MAX_CONCURRENT = 2
+
+/** What run() requests a model file with: {@link httpGet} over node:http/https, never the global
+ *  fetch, whose undici parser crashed the daemon on a server that closes the connection (see
+ *  http-get.ts). */
+let downloadGet: DownloadGet = httpGet
+
+/** Test seam: run()'s requests go to `get` instead (the download tests point it at their
+ *  globalThis.fetch doubles). */
+export function setDownloadGetForTests(get: DownloadGet): void {
+  downloadGet = get
+}
 
 /** Statuses whose record still owns its .part (writing it, or able to resume from it) — the
  *  same set {@link DownloadManager.hasLiveDest} treats as live. */
@@ -564,7 +576,7 @@ export class DownloadManager {
       let hash = rec.sha256 ? createHash('sha256') : null
       if (hash && startAt > 0) {
         for await (const chunk of createReadStream(part, { end: startAt - 1 })) {
-          if (ac.signal.aborted) break // cancelled mid-hash: the fetch below rejects with AbortError
+          if (ac.signal.aborted) break // cancelled mid-hash: the GET below rejects with AbortError
           hash.update(chunk as Buffer)
         }
       }
@@ -582,7 +594,7 @@ export class DownloadManager {
         if (rec.validator) headers['If-Range'] = rec.validator
       }
 
-      let res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+      let res = await downloadGet(rec.url, { headers, signal: ac.signal })
       // A 416 to a resume: the .part is as long as the server's file or longer, so no byte of
       // `bytes=<.part size>-` exists (the file shrank on the server while paused, or the daemon
       // died after the last write but before the rename below). Thrown as a plain HTTP error with
@@ -611,7 +623,7 @@ export class DownloadManager {
         if (hash) hash = createHash('sha256')
         delete headers.Range
         delete headers['If-Range']
-        res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
+        res = await downloadGet(rec.url, { headers, signal: ac.signal })
       }
       if (res.status === 401) throw new DownloadError('hf_unauthorized', 'Your Hugging Face token was rejected.')
       if (res.status === 403) throw new DownloadError('hf_gated', 'This repository is gated — accept its license and add your token.')

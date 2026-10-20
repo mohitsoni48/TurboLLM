@@ -10,10 +10,13 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
-import { DownloadManager, type DownloadError } from './downloads'
+import { DownloadManager, setDownloadGetForTests, type DownloadError } from './downloads'
 import { registerApi } from '../api/routes'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
+
+// run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
+setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {

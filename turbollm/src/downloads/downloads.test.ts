@@ -7,9 +7,12 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { existsSync, mkdirSync, readdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { DownloadManager, DownloadError } from './downloads'
+import { DownloadManager, DownloadError, setDownloadGetForTests } from './downloads'
 import { toDownloadFailure } from '../api/download-lifecycle'
 import { tmpDir } from '../test-support/tmp'
+
+// run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
+setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {
