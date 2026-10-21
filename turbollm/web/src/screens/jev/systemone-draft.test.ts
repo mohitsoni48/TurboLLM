@@ -3,7 +3,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { MAX_BODY_CHARS } from '../../lib/systemone-types'
 import type { Question, SystemOneRequest } from '../../lib/systemone-types'
-import { draftRequest, stateFromText } from './systemone-draft'
+import { draftFromRequest, draftRequest, stateFromText } from './systemone-draft'
+import { SYSTEMONE_EXAMPLES } from './systemone-examples'
 import type { DraftProblem, SystemOneDraft } from './systemone-draft'
 import { arraysNestedDeep } from './json-test-text'
 
@@ -115,6 +116,35 @@ describe('stateFromText', () => {
 
   it('does not throw on a state nested 20,000 deep', () => {
     expect(Array.isArray(stateFromText(arraysNestedDeep(20000)))).toBe(true)
+  })
+})
+
+// A page that comes back to a run the daemon kept (the playground's job) shows the request it answered in the editors.
+describe('draftFromRequest', () => {
+  const asks = (request: SystemOneRequest) => {
+    const drafted = draftRequest(request.model, draftFromRequest(request))
+    expect(drafted.ok).toBe(true)
+    return drafted.ok ? drafted.request : undefined
+  }
+
+  it('gives back each example\'s own texts for the request it drafts', () => {
+    for (const example of SYSTEMONE_EXAMPLES) {
+      const drafted = draftRequest(MODEL, example)
+      if (!drafted.ok) throw new Error(`${example.id} is not a valid draft`)
+      expect(draftFromRequest(drafted.request)).toEqual({ stateText: example.stateText, questionsText: example.questionsText })
+    }
+  })
+
+  it.each<[string, SystemOneRequest['state']]>([
+    ['plain text', 'I was charged twice.'],
+    ['text that reads as a number', '42'],
+    ['a JSON object', { ticket: { text: STATE_URGENT } }],
+    ['a JSON array', ['a', 'b']],
+    ['a string that is itself JSON text', '{"a":1}'],
+    ['a string with quotes in it', '"quoted"'],
+  ])('asks exactly the same request again, for a state that is %s', (_kind, state) => {
+    const request: SystemOneRequest = { state, model: MODEL, questions: { q: Q_NOUL } }
+    expect(asks(request)).toEqual(request)
   })
 })
 

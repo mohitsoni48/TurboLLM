@@ -824,6 +824,10 @@ export function requiredCapability(method: string, path: string): LinkCapability
   if (path === '/api/v1/memory' || path.startsWith('/api/v1/memory/')) return 'models:use'
   if (path === '/api/v1/folders' || path.startsWith('/api/v1/folders/')) return 'models:use'
   if (path === '/api/v1/conversations' || path.startsWith('/api/v1/conversations/')) return 'models:use'
+  // The text classification playground's run (api/systemone-job.ts): /v1/systemone as a job the page can leave, so
+  // held to what /v1/* is. GET reads the last answer, so it takes the same capability as asking: a token that may
+  // not ask may not read what someone else asked either.
+  if (path === '/api/v1/jev/playground/run') return 'models:use'
   return null
 }
 

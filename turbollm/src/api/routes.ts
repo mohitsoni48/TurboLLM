@@ -99,6 +99,7 @@ import { readSentLog } from '../telemetry/log'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyLoadFailure, classifyProvisionFailure } from '../telemetry/classify'
 import { registerOnboardingRoutes } from './onboarding-routes'
+import { registerSystemOneJobRoutes } from './systemone-job'
 import { restartEngine, startEngine, stopEngine, type EngineStartBody, type EngineStopBody } from './engine-lifecycle'
 import { enqueueDownload, listDownloads, removeDownload, toDownloadFailure } from './download-lifecycle'
 import { buildModelStatus } from './status-view'
@@ -3917,6 +3918,8 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // ---- onboarding (spec 25 §9.2) ----
   registerOnboardingRoutes(app, { store: d.store, telemetry: d.telemetry })
+  // The text classification playground's run, as a job a page closing does not stop (systemone-job.ts).
+  registerSystemOneJobRoutes(app, d)
 }
 
 /** What {@link overlayModel} reads from the config and the registry, taken once per request by

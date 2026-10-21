@@ -52,38 +52,45 @@ interface Scores {
   inputTokens: number
 }
 
+/** What a System One request is answered with: a Jev model's answers, or the Laya engine's own response. */
+export type SystemOneAnswer = SystemOneResponse | LayaSystemOneResponse
+
 /** One System One request. It never takes the generation gate (classification is not a generation), does not
- *  count as active work, and writes no request-log or usage entry. */
+ *  count as active work, and writes no request-log or usage entry. It lives as long as its client: a disconnect
+ *  aborts the engine call (clientAbort), as on every `/v1/*` route. The web playground runs the same answer as a
+ *  daemon job instead (api/systemone-job.ts), which a page closing does not stop. */
 export async function handleSystemOne(c: Context, d: Deps, fetchImpl: typeof fetch = fetch): Promise<Response> {
   try {
     const parsed = parseSystemOneBody(await jsonBodyOf(c))
     if (!parsed.ok) return jevErrorResponse(c, unprocessable(parsed.problem))
-    return c.json(await answerSystemOne(c, d, parsed.input, fetchImpl))
+    return c.json(await answerSystemOne(d, parsed.input, clientAbort(c).signal, fetchImpl))
   } catch (error) {
     return jevErrorResponse(c, refusalFor(error))
   }
 }
 
 /** The model is resolved and the request planned before `routeTo`, which may load a model: a request that is
- *  refused must never cost a load, and only a request that will be served counts as the owner using the machine. */
-async function answerSystemOne(
-  c: Context,
+ *  refused must never cost a load, and only a request that will be served counts as the owner using the machine.
+ *  `signal` is the whole request's: the client's disconnect for /v1/systemone, the job's own Cancel for the
+ *  playground. A failure is thrown, as a JevEndpointError for every refusal (refusalFor reads it). */
+export async function answerSystemOne(
   d: Deps,
   input: SystemOneInput,
+  signal: AbortSignal,
   fetchImpl: typeof fetch,
-): Promise<SystemOneResponse | LayaSystemOneResponse> {
+): Promise<SystemOneAnswer> {
   const named = resolveLocalModel(d, requestedModelName(d, input.model))
   if (named.laya) {
     noteLocalActivity()
     const target = await routeToJevModel(d, named)
-    return answerWithLaya(named, input, target, clientAbort(c).signal, fetchImpl)
+    return answerWithLaya(named, input, target, signal, fetchImpl)
   }
   const { entry, nliTemplate } = jevModelFrom(named)
   const plan = planSystemOne(input)
   requireWithinBudget(plan)
   noteLocalActivity()
   const target = await routeToJevModel(d, entry)
-  const engine: EngineConnection = { target, signal: clientAbort(c).signal, fetchImpl }
+  const engine: EngineConnection = { target, signal, fetchImpl }
   const { entailment, inputTokens } = await scoreInChunks(entry, engineInputsOf(plan, nliTemplate), engine)
   return {
     model: entry.key,
@@ -123,7 +130,8 @@ function requestedModelName(d: Deps, model: string): string {
   return latest.key
 }
 
-function unprocessable(problem: RequestProblem): JevHttpError {
+/** A body parseSystemOneBody refused, as the 422 both /v1/systemone and the playground's job route answer. */
+export function unprocessable(problem: RequestProblem): JevHttpError {
   return { status: 422, code: 'invalid_request', type: 'invalid_request_error', message: problem.message }
 }
 

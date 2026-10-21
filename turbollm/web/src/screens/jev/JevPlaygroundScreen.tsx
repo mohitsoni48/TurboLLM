@@ -6,17 +6,23 @@
 //
 // It holds no conversation and no history. Its left column is the Workspace's own: the mode control
 // and the library's text classification models, so the page is a starting point, not only a destination.
+//
+// A run is the daemon's, not the page's (src/api/systemone-job.ts): Run starts it and the screen follows
+// it, so closing, reloading or leaving the screen mid-run no longer throws it away. Leaving only stops
+// the watching; the screen that comes back shows the run still going, or its answer and the request it
+// answered. Only Cancel stops it.
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { WorkspaceModeTabs } from '../../components/WorkspaceModeTabs'
 import { Button } from '../../components/ui/button'
 import { ApiError, stopEngine, track } from '../../lib/api'
-import { systemone } from '../../lib/jev-api'
+import { cancelPlaygroundRun, getPlaygroundRun, startPlaygroundRun, type PlaygroundRun } from '../../lib/jev-api'
 import { CHAT_PATH, hasTextClassifier, jevPresence, modelsOnceScanned, type JevPresence } from '../../lib/jev-mode'
 import { isSystemOneModel } from '../../lib/model-kind'
 import { useModelLoader, type LoadTarget } from '../../lib/model-loader'
 import { servingElsewhere, useModelActions, useModels, useShowAllEngineModels, useStatus } from '../../lib/queries'
 import { loadedSystemOneModel } from '../../lib/systemone-model'
+import type { SystemOneRequest } from '../../lib/systemone-types'
 import type { LoadedJev, ModelEntry, Status } from '../../lib/types'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { AnswerList } from './AnswerList'
@@ -26,7 +32,7 @@ import { QuestionsField } from './QuestionsField'
 import { ResponsePanel, type SystemOneRun } from './ResponsePanel'
 import { SwitchModelMenu, ejectModel, switchToModel } from './SwitchModelMenu'
 import { TextClassificationModelList } from './TextClassificationModelList'
-import { draftRequest, type DraftProblem, type SystemOneDraft } from './systemone-draft'
+import { draftFromRequest, draftRequest, type DraftProblem, type SystemOneDraft } from './systemone-draft'
 import { SYSTEMONE_EXAMPLES } from './systemone-examples'
 
 const NOTICE = 'Chat, Code and Routines are unavailable while a text classification model is loaded.'
@@ -35,6 +41,14 @@ const DRAFT_STORAGE_KEY = 'tllm.jev.systemone.draft'
 const DRAFT_SAVE_DELAY_MS = 400
 
 const DISCOVER_PATH = '/models?tab=discover'
+
+/** How long to wait before each look at a running run: soon at first, since most runs take well under a
+ *  second, then every half second until it ends. */
+const POLL_DELAYS_MS = [100, 250, 500] as const
+
+/** The run the screen followed is not the one the daemon holds: the daemon restarted (it keeps runs in
+ *  memory only), or another tab cancelled it and started its own. */
+const RUN_LOST = 'The server no longer has this run. It may have restarted; run it again.'
 
 export function JevPlaygroundScreen() {
   const statusQ = useStatus()
@@ -52,6 +66,9 @@ export function JevPlaygroundScreen() {
   const [run, setRun] = useState<SystemOneRun | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
+  // The daemon run being followed, for Cancel; null while none is (or its start is still being posted).
+  const [followedId, setFollowedId] = useState<string | null>(null)
+  const [cancelled, setCancelled] = useState(false)
   const [exampleId, setExampleId] = useState(SYSTEMONE_EXAMPLES[0].id)
   const [switchOpen, setSwitchOpen] = useState(false)
   // False while the questions form shows a question or an option the text cannot hold (a repeated id
@@ -68,6 +85,80 @@ export function JevPlaygroundScreen() {
   const inFlight = useRef(false)
   // And only the latest run asked may answer: an answer the screen has moved on from is dropped.
   const currentRun = useRef(0)
+  // False once the screen has gone: following stops there, and nothing cancels the run.
+  const watching = useRef(true)
+  // Ends the wait before the next look at the run early (after a Cancel, so the screen does not read
+  // Running… for another half second).
+  const lookNow = useRef<() => void>(() => {})
+
+  useEffect(() => {
+    watching.current = true
+    return () => { watching.current = false }
+  }, [])
+
+  // The run the daemon holds when the screen opens: one still going is followed, a finished one shows its
+  // answer and the request it answered. The editors take that request only if they hold nothing the user
+  // typed (empty, or still the first example); otherwise they are left alone. A daemon that cannot answer
+  // leaves the screen as it opens without a run.
+  useEffect(() => {
+    let live = true
+    getPlaygroundRun().then(
+      (current) => {
+        if (!live || inFlight.current || current.state === 'idle') return
+        if (current.request) restoreDraftFrom(current.request)
+        if (current.state === 'running') void follow(current, currentRun.current)
+        else showOutcome(current)
+      },
+      () => {},
+    )
+    return () => { live = false }
+    // Once, on mount: what the daemon holds when the screen opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  function restoreDraftFrom(request: SystemOneRequest) {
+    setDraft((current) => (holdsNothingTyped(current) ? draftFromRequest(request) : current))
+  }
+
+  /** What a run that has ended leaves on screen. A cancelled one leaves the answers that were there (and
+   *  clears a "run already in progress" line about the run it followed). */
+  function showOutcome(ended: PlaygroundRun) {
+    if (ended.state === 'done' && ended.request && ended.response) {
+      setRun({ request: ended.request, response: ended.response, ms: durationOf(ended) })
+      setError(null)
+    } else if (ended.state === 'error') {
+      setError(ended.error?.message ?? 'The request failed.')
+    } else if (ended.state === 'cancelled') {
+      setError(null)
+      setCancelled(true)
+    }
+  }
+
+  /** Watch the daemon's run until it ends, then show how it ended if the screen still wants it (`asked`). */
+  async function follow(started: PlaygroundRun, asked: number) {
+    inFlight.current = true
+    setRunning(true)
+    setFollowedId(started.id ?? null)
+    let current = started
+    for (let look = 0; current.state === 'running'; look++) {
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, POLL_DELAYS_MS[Math.min(look, POLL_DELAYS_MS.length - 1)])
+        lookNow.current = () => { clearTimeout(timer); resolve() }
+      })
+      if (!watching.current) return
+      try {
+        const seen = await getPlaygroundRun()
+        current = seen.id === started.id ? seen : { state: 'error', error: { code: 'run_lost', message: RUN_LOST } }
+      } catch (e) {
+        // A daemon that does not answer for a moment (a dropped connection) is waited for; one that refuses is not.
+        if (e instanceof ApiError) current = { state: 'error', error: { code: e.code, message: e.message } }
+      }
+    }
+    inFlight.current = false
+    setRunning(false)
+    setFollowedId(null)
+    if (asked === currentRun.current) showOutcome(current)
+  }
 
   async function runDraft(key: string) {
     if (inFlight.current || !questionsFormValid) return
@@ -77,17 +168,32 @@ export function JevPlaygroundScreen() {
     inFlight.current = true
     setRunning(true)
     setError(null)
-    const started = performance.now()
+    setCancelled(false)
     try {
-      const response = await systemone(drafted.request)
-      const ms = Math.round(performance.now() - started)
-      if (asked === currentRun.current) setRun({ request: drafted.request, response, ms })
+      await follow(await startPlaygroundRun(drafted.request), asked)
     } catch (e) {
-      if (asked === currentRun.current) setError(failureMessage(e))
-    } finally {
       inFlight.current = false
       setRunning(false)
+      if (asked !== currentRun.current) return
+      setError(failureMessage(e))
+      // Another tab or device's run holds the daemon's one run: say so, and follow that run as opening the
+      // screen would, so Run comes back once it ends.
+      if (e instanceof ApiError && e.code === 'run_in_progress') {
+        const current = await getPlaygroundRun().catch(() => null)
+        if (current?.state === 'running' && watching.current && !inFlight.current) void follow(current, asked)
+      }
     }
+  }
+
+  async function cancelRun() {
+    if (followedId === null) return
+    try {
+      await cancelPlaygroundRun(followedId)
+    } catch (e) {
+      setError(failureMessage(e))
+      return
+    }
+    lookNow.current()
   }
 
   // The listener is on the window so the shortcut works with the focus anywhere on the page,
@@ -137,10 +243,11 @@ export function JevPlaygroundScreen() {
   function dropCurrentRun() {
     currentRun.current += 1
     setRun(null)
+    setCancelled(false)
   }
 
   // Loading an example replaces the draft and never runs it. The run in flight, if any, is not
-  // cancelled (there is nothing to cancel it with): it settles unseen, and Run waits for it.
+  // cancelled (Cancel does that): it settles unseen, and Run waits for it.
   function pickExample(id: string) {
     const example = SYSTEMONE_EXAMPLES.find((candidate) => candidate.id === id)
     if (!example) return
@@ -199,6 +306,11 @@ export function JevPlaygroundScreen() {
               >
                 {running ? 'Running…' : 'Run'}
               </Button>
+              {running && followedId !== null && (
+                <Button type="button" variant="outline" onClick={() => void cancelRun()}>
+                  Cancel
+                </Button>
+              )}
               <span className="text-[12px] text-muted">⌘/Ctrl+Enter</span>
               <select
                 aria-label="Example"
@@ -221,7 +333,7 @@ export function JevPlaygroundScreen() {
             )}
             <AnswerList answers={run?.response.answers ?? null} stale={running && run !== null} laya={jev.checkpoints !== undefined} />
             <ResponsePanel run={run} origin={window.location.origin} />
-            <p role="status" className="sr-only">{announcementOf({ running, error, run })}</p>
+            <p role="status" className="sr-only">{announcementOf({ running, error, run, cancelled })}</p>
           </section>
         </div>
       </div>
@@ -331,8 +443,9 @@ function failureMessage(e: unknown): string {
 
 /** What a screen reader hears about the run. A failed run says nothing here: the alert carries it,
  *  and the answers still on screen belong to an earlier run. */
-function announcementOf({ running, error, run }: { running: boolean; error: string | null; run: SystemOneRun | null }): string {
+function announcementOf({ running, error, run, cancelled }: { running: boolean; error: string | null; run: SystemOneRun | null; cancelled: boolean }): string {
   if (running) return 'The request is running.'
+  if (cancelled) return 'The run was cancelled.'
   if (error !== null || run === null) return ''
   const answered = Object.keys(run.response.answers).length
   return `Answered ${answered} ${answered === 1 ? 'question' : 'questions'} in ${run.ms} ms.`
@@ -341,6 +454,19 @@ function announcementOf({ running, error, run }: { running: boolean; error: stri
 function firstDraft(): SystemOneDraft {
   const { stateText, questionsText } = SYSTEMONE_EXAMPLES[0]
   return { stateText, questionsText }
+}
+
+/** Empty, or still the first example the screen opens on: nothing a returning run's request would overwrite. */
+function holdsNothingTyped(draft: SystemOneDraft): boolean {
+  const first = firstDraft()
+  const empty = draft.stateText.trim() === '' && draft.questionsText.trim() === ''
+  return empty || (draft.stateText === first.stateText && draft.questionsText === first.questionsText)
+}
+
+/** How long the daemon took, start to end, as the footer reports it. */
+function durationOf(ended: PlaygroundRun): number {
+  const ms = Date.parse(ended.finishedAt ?? '') - Date.parse(ended.startedAt ?? '')
+  return Number.isFinite(ms) && ms >= 0 ? ms : 0
 }
 
 /** The draft the user left, or null when there is none worth showing: a private window or blocked

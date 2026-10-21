@@ -60,6 +60,19 @@ export function stateFromText(text: string): StateValue {
   }
 }
 
+/** The editors' texts for a request that ran, so a page that comes back to a run can show what it
+ *  asked: `draftRequest` of the result asks exactly `request` again. A string state is shown as typed
+ *  unless that text would read back as something else (`{"a":1}` typed as a quoted string), which is
+ *  then shown quoted; JSON is pretty-printed as the examples are. */
+export function draftFromRequest(request: Pick<SystemOneRequest, 'state' | 'questions'>): SystemOneDraft {
+  const { state, questions } = request
+  const asTyped = typeof state === 'string' && stateFromText(state) === state
+  return {
+    stateText: asTyped ? state : JSON.stringify(state, null, 2),
+    questionsText: JSON.stringify(questions, null, 2),
+  }
+}
+
 /** At most one problem per group, in the order state, questions, request (model, body). The body
  *  size is measured only once nothing else is wrong: it is the rule that stringifies everything. */
 function checkedRequest(model: string, draft: SystemOneDraft): DraftResult {
