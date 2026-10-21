@@ -833,7 +833,7 @@ export class DownloadManager {
         if ((rec.status as DownloadStatus) !== 'done') rec.status = 'cancelled'
       } else {
         rec.status = 'error'
-        rec.error = e instanceof Error ? e.message : String(e)
+        rec.error = errorText(e)
       }
       this.persist()
       // A user who abandons a download is a different signal from one whose
@@ -993,6 +993,15 @@ function onAndroidSharedStorage(path: string): boolean {
     return false // os.homedir() throws when neither HOME nor the user database names one
   }
   return !!home && path.startsWith(`${join(home, 'storage')}/`)
+}
+
+/** The message a failed run leaves on its row. A full disk (or a used-up quota) came through as
+ *  Node's own "ENOSPC: no space left on device, write", which says nothing of what to do; the
+ *  .part is kept, so Resume continues once space is freed. */
+function errorText(e: unknown): string {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  if (code === 'ENOSPC' || code === 'EDQUOT') return 'Storage is full. Free some space, then Resume.'
+  return e instanceof Error ? e.message : String(e)
 }
 
 /** Writes `data` to `path` through a sibling temp file, fsynced and then renamed over it, as the

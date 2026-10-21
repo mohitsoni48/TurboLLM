@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { createRequire } from 'node:module'
@@ -859,5 +859,59 @@ test('a download from a Hugging Face commit whose CDN tag changed over the same 
     })
   } finally {
     await hf.close()
+  }
+})
+
+test('a full disk mid-download says so, keeps the .part, and Resume continues once space is freed', async (t) => {
+  // The row showed Node's own "ENOSPC: no space left on device, write".
+  const full = file(2_000_000)
+  const state: FileState = { body: full, etag: '"v1"' }
+  const server = await fileServer(state)
+  try {
+    const { modelDir, stateDir } = newDirs()
+    // The .part's writes fail with ENOSPC once 100 kB or more are on disk, as a phone's full
+    // storage does.
+    const partFds = new Set<number>()
+    let room = 100_000
+    const realOpen = fs.open
+    t.mock.method(fs, 'open', (path: string, ...rest: unknown[]) => {
+      const cb = rest.pop() as (err: Error | null, fd: number) => void
+      return (realOpen as (...a: unknown[]) => void)(path, ...rest, (err: Error | null, fd: number) => {
+        if (!err && String(path).endsWith('.part')) partFds.add(fd)
+        cb(err, fd)
+      })
+    })
+    const enospc = () => Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC', errno: -28, syscall: 'write' })
+    const realWrite = fs.write
+    t.mock.method(fs, 'write', (fd: number, buf: Buffer, ...rest: unknown[]) => {
+      const cb = rest.at(-1) as (err: Error | null) => void
+      if (partFds.has(fd) && room <= 0) return void setImmediate(() => cb(enospc()))
+      if (partFds.has(fd)) room -= buf.length
+      return (realWrite as (...a: unknown[]) => void)(fd, buf, ...rest)
+    })
+    const realWritev = fs.writev
+    t.mock.method(fs, 'writev', (fd: number, bufs: Buffer[], ...rest: unknown[]) => {
+      const cb = rest.at(-1) as (err: Error | null) => void
+      if (partFds.has(fd) && room <= 0) return void setImmediate(() => cb(enospc()))
+      if (partFds.has(fd)) room -= bufs.reduce((n, b) => n + b.length, 0)
+      return (realWritev as (...a: unknown[]) => void)(fd, bufs, ...rest)
+    })
+
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await dm.enqueue({ url: `${server.origin}/model.gguf` })
+    const row = await settled(dm, rec.id)
+    assert.equal(row.status, 'error')
+    assert.equal(row.error, 'Storage is full. Free some space, then Resume.')
+    const kept = readFileSync(`${rec.dest}.part`).length
+    assert.ok(kept >= 100_000 && kept < full.length, `the bytes that fit are kept (${kept})`)
+
+    room = Infinity // space freed
+    assert.equal(dm.resume(rec.id), true)
+    const resumed = await settled(dm, rec.id)
+    assert.equal(resumed.status, 'done', resumed.error ?? '')
+    assert.equal(server.seen.at(-1)?.range, `bytes=${kept}-`)
+    assert.deepEqual(readFileSync(rec.dest), full)
+  } finally {
+    await server.close()
   }
 })
