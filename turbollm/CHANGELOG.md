@@ -51,6 +51,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - `GET /api/v1/conversations/:id` reports `runningReplyId` (the reply whose turn holds the chat, or `null`) and
   `compacting` (a manual compaction holds it), and each `GET /api/v1/conversations` row reports `running`, so a page
   or device that did not start the turn can tell what is running.
+- `GET /api/v1/conversations/:id/stream` follows a chat's running reply: its frames from the start, then live, to any
+  page that opens it (`?run=<reply id>&fromSeq=<n>` resumes one it was following). The turn streams carry each frame's
+  seq as `id:` and an SSE keepalive comment every 20 s. `POST /api/v1/chat/stop` takes the `messageId` of the reply to
+  stop and answers `stopped`.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
@@ -82,6 +86,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   kernel where the vendor lets apps read it.
 
 ### Changed
+- **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
+  dropped connection no longer stops a reply, a Regenerate or a Save & Resend, their auto-compaction, their tool calls
+  or a call waiting for approval: the daemon finishes and saves the reply, and gives it its title and memory facts. A
+  page that opens the chat again, on this device or another, shows the reply live with its Stop and any approval card,
+  and after a reload or Back the chat screen reopens the chat whose reply is running. Stop, Eject, deleting the chat,
+  loading, stopping or restarting the engine, turning LAN access off (for a reply another device sent over the LAN)
+  and stopping remote access (for one sent through it) still stop it. Revoking the key a reply was sent with (a
+  remote-access token included), or turning "Require an API key" on for one a keyless device sent over an open LAN,
+  now stops it too; before, it ran on. Stop names the reply it stops and frees the chat at once.
 - The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
   Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
   Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.

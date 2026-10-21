@@ -17,6 +17,11 @@ export class IngressListener implements RemoteIngress {
   private _server: Server | null = null
   private port: number | undefined
 
+  /** `onStop` runs each time a bound listener is stopped, once its connections are closed: the requests that came
+   *  through it can no longer be answered, and work that outlives its request (a chat turn) is stopped there
+   *  (RemoteAccessManager passes auth.ts endTunneledTurns). */
+  constructor(private readonly onStop?: () => void) {}
+
   ingressPort(): number | undefined {
     return this.port
   }
@@ -68,6 +73,7 @@ export class IngressListener implements RemoteIngress {
       } catch {
         /* best-effort */
       }
+      this.onStop?.()
       s.close(() => resolve())
       setTimeout(resolve, 3_000).unref() // never hang a shutdown on a stuck stream
     })

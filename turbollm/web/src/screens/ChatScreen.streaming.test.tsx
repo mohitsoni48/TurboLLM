@@ -57,7 +57,8 @@ let skills: unknown[] = []
 let updateMutateAsync = vi.fn((): Promise<unknown> => Promise.resolve())
 /** The chat a manual Compact is running for (mut.compact pending with it), or null. */
 let compactingConv: string | null = null
-const stopSpy = vi.fn((_id: string) => Promise.resolve())
+// POST /api/v1/chat/stop names the reply it stops; the daemon answers whether it stopped it.
+const stopSpy = vi.fn((_v: { convId: string; messageId?: string }) => Promise.resolve({ ok: true, stopped: true }))
 const regenerateSpy = vi.fn((_id: string) => Promise.resolve())
 const editMsgMutate = vi.fn()
 // Every ConvItem (and the sidebar itself, the screen and the settings dialog) calls this once per
@@ -236,7 +237,7 @@ describe('ChatScreen — Escape while a reply is running', () => {
     await sendText('write me an essay')
     await screen.findByTitle('Stop generation (Esc)')
     await act(async () => { fireEvent.keyDown(document.body, { key: 'Escape' }) })
-    expect(stopSpy).toHaveBeenCalledWith('c1')
+    expect(stopSpy).toHaveBeenCalledWith({ convId: 'c1', messageId: 'a1' })
   })
 
   it('an Escape from the composer the message was just sent from (now disabled) still stops it', async () => {
@@ -247,7 +248,7 @@ describe('ChatScreen — Escape while a reply is running', () => {
     const ta = await composer()
     expect(ta).toBeDisabled()
     await act(async () => { fireEvent.keyDown(ta, { key: 'Escape' }) })
-    expect(stopSpy).toHaveBeenCalledWith('c1')
+    expect(stopSpy).toHaveBeenCalledWith({ convId: 'c1', messageId: 'a1' })
   })
 })
 
@@ -547,7 +548,7 @@ describe('ChatScreen — Regenerate', () => {
       await stream.push({ event: 'delta', data: { delta: ' streams on' } } as ChatSseEvent)
       expect(screen.getByText(/Second answer streams on/)).toBeInTheDocument()
       await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
-      expect(stopSpy).toHaveBeenCalledWith('c1')
+      expect(stopSpy).toHaveBeenCalledWith({ convId: 'c1', messageId: 'a1' })
       expect((continueCalls[0][1] as AbortSignal).aborted).toBe(true)
     } finally {
       toastError.mockRestore()
@@ -575,7 +576,7 @@ describe('ChatScreen — Regenerate', () => {
       await stream.push({ event: 'delta', data: { delta: ' streams on' } } as ChatSseEvent)
       expect(screen.getByText(/Second answer streams on/)).toBeInTheDocument()
       await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
-      expect(stopSpy).toHaveBeenCalledWith('c1')
+      expect(stopSpy).toHaveBeenCalledWith({ convId: 'c1', messageId: 'a1' })
     } finally {
       refuse()
     }
@@ -601,7 +602,7 @@ describe('ChatScreen — Regenerate', () => {
       await stream.push(meta)
       await stream.push({ event: 'delta', data: { delta: 'Second answer' } } as ChatSseEvent)
       await act(async () => { fireEvent.click(screen.getByTitle('Stop generation (Esc)')) })
-      expect(stopSpy).toHaveBeenCalledWith('c1')
+      expect(stopSpy).toHaveBeenCalledWith({ convId: 'c1', messageId: 'a1' })
       expect((continueCalls[0][1] as AbortSignal).aborted).toBe(true)
     } finally {
       toastError.mockRestore()

@@ -96,6 +96,7 @@ function bootDaemon(config: Config, args: string[], overrides: Record<string, un
     claimDataDir: () => null,
     releaseDataDirClaim: () => {},
     dropStaleTerminalSockets: () => {},
+    endLanTurns: () => {},
     console: {
       log: (...a: unknown[]) => logs.push(a.join(' ')),
       warn: (...a: unknown[]) => logs.push(a.join(' ')),
@@ -258,6 +259,26 @@ test('a LAN toggle moves an --addr host even where daemon.host already asks for 
     d.deps.rebind!()
     await until('the port rebind is up', () => listening(d) === 3)
     assert.equal(boundAt(d), `0.0.0.0:${q}`)
+  } finally {
+    await d.stop()
+  }
+})
+
+// The behaviour itself is chat-routes.detached.test.ts's LAN-off test. A chat reply runs in the daemon, not in its
+// request, so the old listener closing its connections no longer stopped one a LAN peer sent.
+test('every bind, the LAN-off one included, stops the chat turns LAN peers sent once it has recorded its address', async () => {
+  const [p] = await freePorts(1)
+  const seen: Array<string | undefined> = []
+  const d = bootDaemon(config({ lanBind: true, port: p }), [], { endLanTurns: (deps: Daemon['deps']) => { seen.push(deps.bindHost) } })
+  try {
+    await until('the boot listener is up', () => listening(d) === 1)
+    assert.deepEqual(seen, ['0.0.0.0'])
+
+    d.config.daemon.lanBind = false
+    d.deps.rebind!()
+    await until('the LAN-off rebind is up', () => listening(d) === 2)
+    assert.equal(boundAt(d), `127.0.0.1:${p}`)
+    assert.deepEqual(seen, ['0.0.0.0', '127.0.0.1'], 'the LAN-off bind must stop them, after recording the loopback address (isLanExposed reads it)')
   } finally {
     await d.stop()
   }

@@ -396,8 +396,8 @@ export async function compactConversation(
   return { summary, upToMessageId: picked.cutMessageId, tokensBefore }
 }
 
-/** Called from both turn-starting routes (chat-routes.ts) right after the 'meta' SSE
- *  event, BEFORE the new turn's messages are built — so a successful compaction is
+/** Called from both turn-starting routes (chat-routes.ts) right after the turn's 'meta'
+ *  frame (its run's frame 0), BEFORE the new turn's messages are built — so a successful compaction is
  *  reflected in the very same turn's prompt. `conv` is mutated in place with the fresh
  *  compaction fields on success so the caller's own buildEngineMessages call (right after
  *  this returns) sees them without a second DB read. Best-effort, same contract as
@@ -444,7 +444,7 @@ export async function maybeAutoCompact(
   // Known, accepted cost: `createdAt` is a reply's turn START, so after an auto-compaction INSIDE
   // a turn, that turn's (post-compaction) reading is skipped too — at most a one-turn delay.
   if (compactedSinceReading && shown === conv) return
-  try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
+  try { await emitCompactionEvent('start') } catch { /* a failing writer — same best-effort contract as the compaction call below */ }
   try {
     // The caller's snapshot, never a re-read — see compactConversation's `activeMessages`.
     const result = await compactConversation(d, convId, { upstream, signal, activeMessages: messages, ...(fetchImpl ? { fetchImpl } : {}) })
@@ -454,5 +454,5 @@ export async function maybeAutoCompact(
   } catch {
     // Best-effort — see doc comment above.
   }
-  try { await emitCompactionEvent('end') } catch { /* client gone */ }
+  try { await emitCompactionEvent('end') } catch { /* a failing writer */ }
 }

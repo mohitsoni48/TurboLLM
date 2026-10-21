@@ -1208,6 +1208,79 @@ export function holdOpen<T extends { abort(): void }>(c: Context, cb: (stream: T
   }
 }
 
+/** A chat turn the daemon runs on after its request has been answered (chat-routes.ts startDetachedTurn), kept with
+ *  how its request was let in, so what ends a held stream also ends the turn that caller started. */
+interface HeldTurn {
+  admission: Admission | undefined
+  /** The hash of the key the request presented, if it presented one. */
+  keyHash?: string
+  /** It came through remote access: the ingress socket (isTunneled, as a request whose local port can't be read
+   *  while remote access is live is judged). */
+  tunneled: boolean
+  /** It came from another machine on the main listener: not tunneled, and its peer is not on this machine's loopback
+   *  (or could not be read, which counts as another machine, as isLocalRequest judges it). Only the LAN lets it in. */
+  lanPeer: boolean
+  stop(): void
+}
+
+/** Every chat turn holdTurn keeps that could still be stopped, until it has unwound. */
+const heldTurns = new Set<HeldTurn>()
+
+/** Keep a chat turn that outlives its request (the turn routes answer at once and the daemon runs the turn) so that it
+ *  can be stopped once what let its request in is gone, as a held stream is ended (holdOpen): endStaleStreams stops a
+ *  turn started on a key that is no longer accepted, or keyless on an open LAN once a key is required;
+ *  endTunneledTurns, called when the remote-access ingress closes, stops every turn that came through it (a remote
+ *  token's, a Tailscale Serve identity's, a Cloudflare Access login's, a key sent through the tunnel); and
+ *  endLanTurns, called after every bind, stops every turn another machine sent to the main listener once the daemon
+ *  is no longer LAN-exposed (LAN access turned off). The last two keep what a turn's disconnect did while it ran in
+ *  its request (remote access's Stop and the LAN-off rebind close their listener's connections). The first is new:
+ *  a turn's POST was never a held stream, so revoking the key it was sent with (a remote-access token included), or
+ *  requiring a key of the keyless open-LAN peer that sent it, left it running. The host's own turns (and any where
+ *  no lanAuth judged the request) are not kept: nothing here stops those. `stop` runs at most once; call the returned
+ *  function once the turn has unwound. */
+export function holdTurn(c: Context, d: Deps, stop: () => void): () => void {
+  const admission = admissions.get(c.req.raw)
+  const tunneled = isTunneled(c, d)
+  if (!tunneled && (!admission || admission.by === 'local')) return () => {}
+  const raw = presentedKey(c)
+  const lanPeer = !tunneled && isLoopback(c) !== true
+  const held: HeldTurn = { admission, keyHash: raw ? hashKey(raw) : undefined, tunneled, lanPeer, stop }
+  heldTurns.add(held)
+  return () => { heldTurns.delete(held) }
+}
+
+/** Stop every held turn (holdTurn) that came through remote access, and return how many. Called when the ingress
+ *  listener stops (remote access turned off, its tunnel given up on, a new ingress started), which closes those
+ *  callers' connections: a turn no longer ends with its connection, so it is stopped here. */
+export function endTunneledTurns(): number {
+  let ended = 0
+  for (const t of heldTurns) {
+    if (!t.tunneled) continue
+    heldTurns.delete(t)
+    t.stop()
+    ended++
+  }
+  return ended
+}
+
+/** Stop every held turn (holdTurn) that another machine sent to the main listener, once the daemon is no longer
+ *  LAN-exposed (isLanExposed, which follows the address really bound), and return how many. Turning LAN access off
+ *  rebinds the listener in place and the old one closes its connections, which ended such a turn while it ran in its
+ *  request; a turn no longer ends with its connection, so a LAN peer's reply ran on (and its Allow tool rounds, and
+ *  its wait for approval) after the daemon stopped listening to the LAN. The same rule dropStaleTerminalSockets
+ *  applies to a LAN peer's terminal. cli.ts calls this after every bind; a bind still LAN-exposed stops nothing. */
+export function endLanTurns(d: Deps): number {
+  if (isLanExposed(d)) return 0
+  let ended = 0
+  for (const t of heldTurns) {
+    if (!t.lanPeer) continue
+    heldTurns.delete(t)
+    t.stop()
+    ended++
+  }
+  return ended
+}
+
 /** End each held stream (holdOpen) whose way in is gone, and return how many. lanAuth and codeAuth
  *  checked its credential only when it opened, and it then ran until its client went away: a LAN
  *  client kept the engine log, the request log or a Code session's running turn after the key it
@@ -1218,7 +1291,8 @@ export function holdOpen<T extends { abort(): void }>(c: Context, cb: (stream: T
  *    still accepted.
  *  What else lets a request in is the bind and the ingress, and those end these streams already: a
  *  rebind and remote access's Stop close the old listener's connections (closeAllConnections),
- *  unlike a Code terminal's upgraded socket (dropStaleTerminalSockets). Called where a key is
+ *  unlike a Code terminal's upgraded socket (dropStaleTerminalSockets) or a chat turn that runs on
+ *  after its request (endLanTurns, endTunneledTurns). Called where a key is
  *  removed (DELETE /api/v1/keys/:id, Connect's re-mint) and when PATCH /api/v1/settings turns the
  *  requirement on. */
 export function endStaleStreams(d: Deps): number {
@@ -1229,6 +1303,17 @@ export function endStaleStreams(d: Deps): number {
     if (keyOk || (s.admission.by === 'open' && !keyRequired)) continue
     heldStreams.delete(s)
     s.end()
+    ended++
+  }
+  // The chat turns those callers started (holdTurn), on the same rule. One let in by a Serve identity or an Access
+  // login presented no key that could go: endTunneledTurns stops it with remote access.
+  for (const t of heldTurns) {
+    const by = t.admission?.by
+    if (by !== 'open' && by !== 'key') continue
+    const keyOk = t.keyHash !== undefined && keyHashStillAccepted(t.keyHash, d, t.admission?.by === 'key' ? t.admission : undefined)
+    if (keyOk || (by === 'open' && !keyRequired)) continue
+    heldTurns.delete(t)
+    t.stop()
     ended++
   }
   return ended

@@ -1,13 +1,13 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useParams, useSearchParams } from 'react-router-dom'
 import { ArrowDown, Copy, Download, Loader2, PanelLeft, Paperclip, Search, SendHorizontal, Share2, Shrink, SlidersHorizontal, Square, UserRound, X } from 'lucide-react'
-import { continueConversation, fetchSysInfo, listMemoryFacts, sendMessage } from '../lib/chat-api'
+import { continueConversation, fetchSysInfo, followChatTurn, getConversation, listMemoryFacts, sendMessage } from '../lib/chat-api'
 import { extractPdfText } from '../lib/pdf-extract'
 import { chatKeys, useConversation, useConversationMutations } from '../lib/chat-queries'
 import { queryKeys, useBuiltinAgentOverrides, useChatAgents, useEngines, useModelActions, useModelDetail, useModels, useSettings, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { isAndroidOs } from '../lib/platform'
 import { copyToClipboard } from '../lib/clipboard'
-import type { ChatSseEvent, Conversation, LiveToolCall, Message } from '../lib/chat-types'
+import type { ChatFrame, Conversation, LiveToolCall, Message } from '../lib/chat-types'
 import { appendTextDelta, upsertToolCall, type LiveBlock } from '../lib/live-timeline'
 import { ApiError, downloadChatExport, getDebugSnapshot, getShareUrl, importChat, track } from '../lib/api'
 import { classifyStatusError } from '../lib/connection-state'
@@ -24,7 +24,7 @@ import {
 import { toast } from '../components/ui/sonner'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
-import { cn, writeLastChatConvId } from '../lib/utils'
+import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
 import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
@@ -241,8 +241,25 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const allAgents = resolveAgents(customAgentsQ.data ?? [], builtinOverridesQ.data ?? {})
   const selectedAgent = allAgents.find((a) => a.id === selectedPersonaId)
   // Keyed by convId — generations can run concurrently across conversations now that
-  // switching away no longer aborts them (b6d84f3).
+  // switching away no longer aborts them (b6d84f3). Each is the stream this page follows a
+  // chat's reply with: aborting it only stops following (the daemon runs the reply; Stop, Eject
+  // and deleting the chat stop it there).
   const abortRefs = useRef<Record<string, AbortController>>({})
+  // The turns whose POST the daemon has not answered yet, by their controller (followChatTurn's
+  // onAccepted, through `accepting`, takes each out): until then the message may exist nowhere.
+  // Leaving the chat screen lets such a send go on rather than cancel it, and lets go of its reply
+  // once the daemon has it (`unmounted`). Cancelled, the message was lost: a large image going
+  // up over a slow tunnel, say, with no composer left to put the text back in.
+  const posting = useRef<Set<AbortController>>(new Set())
+  const unmounted = useRef(false)
+  // The replies this page saw end (their done or error, or its own Stop): a conversation read
+  // before the end still names one as running, and the attach effect must not follow it again.
+  const finishedReplies = useRef<Set<string>>(new Set())
+  // When an attach to a chat's running reply last gave up (its resumes ran out), by chat: it is
+  // tried again only once the conversation has been read again after that, so a daemon that
+  // cannot be reached is not asked again on every render. An attach says nothing when it fails
+  // (the poll tries again): a toast per poll would bury the chat.
+  const attachGaveUp = useRef<Record<string, number>>({})
   const deltaTimestamps = useRef<Record<string, number[]>>({})
   const scrollerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -679,8 +696,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
   }
 
-  // The currently-open conversation was deleted — abort any live generation and
-  // close it (clear activeId) so we don't hold a dangling reference.
+  // The currently-open conversation was deleted — stop following its live generation (the
+  // DELETE stopped it in the daemon) and close it (clear activeId) so we don't hold a
+  // dangling reference.
   const handleActiveDeleted = (id: string) => {
     if (id !== activeId) return
     abortRefs.current[id]?.abort()
@@ -698,11 +716,43 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     setSelectedPersonaId(getDefaultAgentId(isAndroid))
   }
 
+  // Stop is what stops a reply now that leaving or closing the page does not: it names the reply
+  // this page shows running (its stream's, or the one the daemon reports before the attach
+  // lands), so a newer reply another tab or device started since is left alone. Only once the
+  // daemon has answered does the page stop following it: a Stop that failed leaves the reply
+  // running, and the page shows it with its Stop still there. `stopped: false` (it had ended, or
+  // was stopped elsewhere) is the same for this page, with no toast.
   const handleStop = async () => {
-    if (activeId) {
-      abortRefs.current[activeId]?.abort()
-      await mut.stop.mutateAsync(activeId).catch(() => {})
+    const convId = activeId
+    if (!convId) return
+    const replyId = liveByConv[convId]?.assistantId ?? (conv?.id === convId ? conv.runningReplyId ?? undefined : undefined)
+    let res: { stopped?: boolean } | undefined
+    try {
+      res = await mut.stop.mutateAsync({ convId, messageId: replyId })
+    } catch {
+      toast.error('Could not stop the reply.')
+      return
     }
+    if (replyId) finishedReplies.current.add(replyId)
+    // The text so far into the cached reply before the live view goes, so the bubble does not
+    // fall back to the empty placeholder until the conversation is read again; and the chat no
+    // longer reads as running, so the attach effect does not follow it again meanwhile.
+    setLiveByConv((prev) => {
+      const l = prev[convId]
+      qc.setQueryData<Conversation>(chatKeys.detail(convId), (old) => old
+        ? { ...old, runningReplyId: null, messages: l ? (old.messages ?? []).map((m) => (m.id === l.assistantId ? { ...m, content: l.content, reasoning: l.reasoning } : m)) : old.messages }
+        : old)
+      if (!(convId in prev)) return prev
+      const next = { ...prev }
+      delete next[convId]
+      return next
+    })
+    abortRefs.current[convId]?.abort()
+    delete abortRefs.current[convId]
+    // A stopped reply is saved as its turn unwinds, usually at once (a tool call that ignores the
+    // abort runs to its end first): read it a moment later rather than catch the placeholder.
+    if (res?.stopped) setTimeout(() => void qc.invalidateQueries({ queryKey: chatKeys.detail(convId) }), 400)
+    else void qc.invalidateQueries({ queryKey: chatKeys.detail(convId) })
   }
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -751,42 +801,56 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const updateLive = (convId: string, updater: (l: LiveState) => LiveState) => {
     setLiveByConv((prev) => (prev[convId] ? { ...prev, [convId]: updater(prev[convId]) } : prev))
   }
-  const clearLive = (convId: string) => {
+  /** Drops convId's live entry, only while it is reply `replyId`'s: a stream that ends after the
+   *  page moved on to a newer reply of the chat (another tab's, attached meanwhile) leaves that
+   *  one's text and Stop alone. */
+  const clearLive = (convId: string, replyId: string | undefined) => {
     setLiveByConv((prev) => {
-      if (!(convId in prev)) return prev
+      if (!(convId in prev) || prev[convId].assistantId !== replyId) return prev
       const next = { ...prev }
       delete next[convId]
       return next
     })
   }
 
-  // Shared SSE consumer: drives live streaming state for either a fresh send or a continue.
-  // Every setLiveByConv/abortRefs access below targets `convId` — the parameter — not
-  // `activeId`, because by the time an event arrives the user may have navigated to a
-  // different conversation while this generation keeps running in the background.
+  // Shared SSE consumer: drives live streaming state for a fresh send, a continue, or a reply
+  // this page attaches to (followChatTurn: the daemon runs the reply, and a dropped connection
+  // resumes by GET). Every setLiveByConv/abortRefs access below targets `convId` — the
+  // parameter — not `activeId`, because by the time an event arrives the user may have
+  // navigated to a different conversation while this generation keeps running in the background.
   // Resolves to whether the turn STARTED (a `meta` frame arrived): the daemon sends meta only
   // after it has stored the user message, so `false` means the message exists nowhere.
   // `on.start` runs when the turn starts; `on.refused` when it fails before it started, with the
-  // error (not for an abort).
-  // `ac` is this request's own controller. The chat's abort entry (what Stop, Eject and delete
-  // abort, and what holds back a second Regenerate or Save & Resend) is the turn that started, so
-  // meta takes it, and only this request's own entry is removed when it ends: a send refused
-  // while a Regenerate was starting removed the Regenerate's, and Stop then left its request open.
-  const streamFrom = async (convId: string, ac: AbortController, gen: AsyncGenerator<ChatSseEvent>, on?: { start?: () => void; refused?: (e: unknown) => void }): Promise<boolean> => {
+  // error (not for an abort). `on.quiet` (an attach): a failure is not toasted, and `on.gaveUp`
+  // runs instead.
+  // `ac` is this request's own controller. The chat's abort entry (what Eject and delete abort,
+  // and what holds back a second Regenerate or Save & Resend) is the turn that started, so meta
+  // takes it, and only this request's own entry is removed when it ends: a send refused while a
+  // Regenerate was starting removed the Regenerate's, and Stop then left its request open.
+  const streamFrom = async (convId: string, ac: AbortController, gen: AsyncGenerator<ChatFrame>, on?: { start?: () => void; refused?: (e: unknown) => void; quiet?: boolean; gaveUp?: () => void }): Promise<boolean> => {
     let started = false
+    /** The reply this stream follows (its meta's). */
+    let own: string | undefined
     try {
       for await (const evt of gen) {
         if (evt.event === 'meta') {
           started = true
+          own = evt.data.assistantMessageId
           abortRefs.current[convId] = ac
           on?.start?.()
-          deltaTimestamps.current[convId] = []
-          setLiveByConv((prev) => ({
-            ...prev,
-            [convId]: { assistantId: evt.data.assistantMessageId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [], compacting: false },
-          }))
+          const replyId = own
+          setLiveByConv((prev) => {
+            // A resume or an attach sends the meta again (the daemon's, then the run's frame 0):
+            // the text so far is kept; a `reset` clears it when the replay starts the reply over.
+            if (prev[convId]?.assistantId === replyId) return prev
+            deltaTimestamps.current[convId] = []
+            return { ...prev, [convId]: { assistantId: replyId, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [], compacting: false } }
+          })
           // Optimistically reflect the new/last user msg in the UI by invalidating
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+        } else if (evt.event === 'reset') {
+          deltaTimestamps.current[convId] = []
+          updateLive(convId, (l) => ({ ...l, content: '', reasoning: '', progress: null, liveGenTps: 0, genTokens: 0, timeline: [], compacting: false }))
         } else if (evt.event === 'compaction') {
           updateLive(convId, (l) => ({ ...l, compacting: evt.data.phase === 'start' }))
         } else if (evt.event === 'progress') {
@@ -803,23 +867,32 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }
           updateLive(convId, (l) => ({ ...l, timeline: upsertToolCall(l.timeline, call) }))
         } else if (evt.event === 'done') {
-          // Patch the final content into the cache BEFORE clearing live state (pre-release
-          // review, Finding A): clearLive un-hides the placeholder synchronously, but the real
-          // content only arrives via the async invalidateQueries refetch below — without this
-          // patch, the now-visible placeholder would briefly render with its stale empty
-          // content (a "This message is empty." flash) in that window. Reading the live
-          // snapshot via setLiveByConv's own functional updater guarantees it isn't stale, even
-          // though React may batch prior delta/reasoning updates that haven't rendered yet.
+          if (own) finishedReplies.current.add(own)
+          // Patch the reply into the cache BEFORE clearing live state (pre-release review,
+          // Finding A): clearLive un-hides the placeholder synchronously, but the real row only
+          // arrives via the async invalidateQueries refetch below — without this patch, the
+          // now-visible placeholder would briefly render with its stale empty content (a "This
+          // message is empty." flash) in that window. The daemon's `done` carries the reply as it
+          // saved it, which is the whole reply even when this page attached after the start of a
+          // long one fell out of what the daemon keeps; without it (the reply was deleted
+          // meanwhile), the live text. Reading the live snapshot via setLiveByConv's own
+          // functional updater guarantees it isn't stale, even though React may batch prior
+          // delta/reasoning updates that haven't rendered yet.
+          const saved = evt.data.message ?? undefined
           setLiveByConv((prev) => {
             const l = prev[convId]
-            if (l) {
+            if (l && l.assistantId === own) {
               qc.setQueryData<Conversation>(['conversation', convId], (old) =>
                 old
-                  ? { ...old, messages: (old.messages ?? []).map((m) => (m.id === l.assistantId ? { ...m, content: l.content, reasoning: l.reasoning } : m)) }
+                  ? {
+                      ...old,
+                      runningReplyId: old.runningReplyId === own ? null : old.runningReplyId,
+                      messages: (old.messages ?? []).map((m) => (m.id !== l.assistantId ? m : saved?.id === m.id ? { ...m, ...saved } : { ...m, content: l.content, reasoning: l.reasoning })),
+                    }
                   : old,
               )
             }
-            if (!(convId in prev)) return prev
+            if (!(convId in prev) || prev[convId].assistantId !== own) return prev
             const next = { ...prev }
             delete next[convId]
             return next
@@ -833,29 +906,53 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           // background completion must not yank the conversation being looked at.
           if (convId === activeIdRef.current) setTimeout(() => scrollToBottom(), 80)
         } else if (evt.event === 'error') {
-          clearLive(convId)
+          if (own) finishedReplies.current.add(own)
+          clearLive(convId, own)
           if (convId !== activeIdRef.current) setRecentlyCompletedIds((prev) => new Set(prev).add(convId))
           void qc.invalidateQueries({ queryKey: ['conversation', convId] })
           toast.error(evt.data.message)
         }
       }
-      // Stream ended without an explicit done/error (e.g. network cut, silent close)
-      if (started) clearLive(convId)
+      // The stream ended without done or error: the daemon has no reply to follow (it ended, or
+      // it is past what the daemon keeps); the conversation has the rest.
+      if (started) clearLive(convId, own)
       void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } catch (e) {
       // Only a turn that started has a live entry of its own (set at its meta). One refused before
       // that (a 409 while another turn from this view runs) cleared THAT turn's: its streamed text
       // and Stop vanished while it kept running.
-      if (started) clearLive(convId)
-      if ((e as Error)?.name !== 'AbortError') {
-        toast.error(e instanceof ApiError ? e.message : 'Request failed.')
+      if (started) clearLive(convId, own)
+      const aborted = (e as Error)?.name === 'AbortError'
+      if (!aborted) {
+        if (on?.quiet) on.gaveUp?.()
+        else toast.error(e instanceof ApiError ? e.message : 'Request failed.')
         if (!started) on?.refused?.(e)
       }
-      void qc.invalidateQueries({ queryKey: ['conversation', convId] })
+      // Also how a send refused because a reply already runs (409 generation_in_flight: another
+      // tab's, or one this page has not attached to yet) shows that reply: the conversation read
+      // again names it, and the attach effect follows it. Not for a stream Stop let go of
+      // (handleStop marked its reply finished): handleStop reads the chat itself a moment later,
+      // and a read now can land before the stopped reply is saved, putting the empty placeholder
+      // back over the text it kept in the bubble.
+      if (!(aborted && own && finishedReplies.current.has(own))) void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } finally {
+      posting.current.delete(ac)
       if (abortRefs.current[convId] === ac) delete abortRefs.current[convId]
     }
     return started
+  }
+
+  /** The `onAccepted` a turn's POST runs once the daemon has answered it (followChatTurn's), for
+   *  the turn `ac` follows: until then the turn is `posting`, which leaving the screen spares. A
+   *  send the daemon takes after the screen has gone is let go of at once: the reply runs on in the
+   *  daemon, and coming back attaches to it. */
+  const accepting = (ac: AbortController, accepted: () => void) => {
+    posting.current.add(ac)
+    return () => {
+      posting.current.delete(ac)
+      accepted()
+      if (unmounted.current) ac.abort()
+    }
   }
 
   // Manual compaction (ADR-420), the header button AND `/compact` (below) both dispatch
@@ -872,7 +969,73 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // composer was held back: those stayed clickable, and each click toasted the refusal over a chat
   // showing the Compacting banner and no Stop. Treated like `live` for them. Scoped to the chat
   // being compacted, as the daemon's refusal is: another chat opened meanwhile takes all of it.
-  const compactingHere = !!activeId && mut.compact.isPending && mut.compact.variables?.convId === activeId
+  // A manual compaction started from another tab or device, or before this page was opened, is the
+  // daemon's to report (GET /conversations/:id `compacting`).
+  const compactingHere = !!activeId && ((mut.compact.isPending && mut.compact.variables?.convId === activeId) || (conv?.id === activeId && !!conv.compacting))
+
+  // A reply runs in the daemon whatever page started it, so the open chat follows the one the
+  // daemon says holds it (`runningReplyId`, read on open and every 4 s): after a reload or a
+  // reopened app, back from another screen, on another tab or device, or once a resume gave up.
+  // Keyed on the id, not on "something runs": a reply that ends and a newer one from another
+  // device between two reads is a new reply to follow. Not while this page's own send or
+  // Regenerate is still starting (its POST holds the chat's entry and has no meta yet), nor for a
+  // reply it already follows or saw end. One that it follows but that no longer holds the chat
+  // (stopped elsewhere, still unwinding) gives way to the one that does. Only the open chat is
+  // followed: the others show their running dot from the list, which keeps a page well under a
+  // browser's 6 connections per host.
+  const runningReplyId = conv?.id === activeId ? conv?.runningReplyId ?? null : null
+  const liveReplyId = live?.assistantId
+  const convReadAt = convQ.dataUpdatedAt
+  useEffect(() => {
+    const convId = activeId
+    if (!convId || !runningReplyId || finishedReplies.current.has(runningReplyId)) return
+    const busy = abortRefs.current[convId]
+    if (busy) {
+      if (!liveReplyId || liveReplyId === runningReplyId) return
+      busy.abort()
+      delete abortRefs.current[convId]
+    }
+    const gaveUpAt = attachGaveUp.current[convId]
+    if (gaveUpAt !== undefined && !(convReadAt > gaveUpAt)) return
+    delete attachGaveUp.current[convId]
+    const ac = new AbortController()
+    abortRefs.current[convId] = ac
+    void streamFrom(convId, ac, followChatTurn(convId, null, ac.signal), { quiet: true, gaveUp: () => { attachGaveUp.current[convId] = Date.now() } })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId, runningReplyId, liveReplyId, convReadAt])
+
+  // Leaving the chat screen only stops following its replies (they run on in the daemon), and lets
+  // their connections go; coming back follows them again from the daemon's frames. Not a send the
+  // daemon has not answered yet (`posting`): it goes on, and is let go of once it is taken. Set
+  // back on mount: StrictMode runs this cleanup once on a screen that stays.
+  useEffect(() => {
+    unmounted.current = false
+    return () => {
+      unmounted.current = true
+      for (const ac of Object.values(abortRefs.current)) if (!posting.current.has(ac)) ac.abort()
+      abortRefs.current = {}
+    }
+  }, [])
+
+  // A page opened on the chat screen with no chat named (Android always loads `/`, and the address
+  // never names the chat after its first send) opens the chat this page last showed, when the
+  // daemon says a reply of it still runs: closing the app, a reload or Back mid-reply lands back on
+  // that reply, live, rather than on a blank chat. Otherwise it opens blank, as before. New chat
+  // leaves that key as it is (the Workspace Chat tab reads it the same way), so a blank chat left
+  // while the previous chat's reply runs comes back as that chat, for as long as the reply runs.
+  useEffect(() => {
+    if (embedded || convIdOverride || routeConvId || activeIdRef.current) return
+    const last = readLastChatConvId()
+    if (!last) return
+    let cancelled = false
+    getConversation(last).then((c) => {
+      if (cancelled || activeIdRef.current || !c.runningReplyId) return
+      qc.setQueryData(chatKeys.detail(c.id), c)
+      handleSelect(c.id)
+    }, () => { /* gone, or unreadable: stay on a blank chat */ })
+    return () => { cancelled = true }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const send = async (overrideInput?: string) => {
     const rawText = (overrideInput ?? input).trim()
@@ -1001,7 +1164,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
       if (!abortRefs.current[convId]) abortRefs.current[convId] = ac
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
-      const started = await streamFrom(convId, ac, sendMessage(convId, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined))
+      const sendTo = convId
+      const started = await streamFrom(convId, ac, followChatTurn(convId, (accepted) => sendMessage(sendTo, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, accepting(ac, accepted)), ac.signal))
       // streamFrom toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !ac.signal.aborted) restoreComposer()
@@ -1058,7 +1222,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const started = await streamFrom(
       convId,
       ac,
-      continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }),
+      followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }, accepting(ac, accepted)), ac.signal),
       { start: closeEdit, refused: (e) => { refusal = e } },
     )
     // The question's version switcher gained an entry (or, on a stale refusal, changed elsewhere).
@@ -1088,7 +1252,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // /continue was then refused. It names the reply clicked: when another tab or device has
     // added a turn since, the daemon refuses it as stale_message instead of replacing a reply
     // this view never showed, and streamFrom shows why and refetches the chat.
-    await streamFrom(activeId, ac, continueConversation(activeId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId))
+    const convId = activeId
+    await streamFrom(convId, ac, followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId, undefined, accepting(ac, accepted)), ac.signal))
     // The new reply joined the old one's version group, whose switcher list is cached (and a
     // stale refusal means it may have changed elsewhere).
     void qc.invalidateQueries({ queryKey: ['message-variants'] })
@@ -1174,7 +1339,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // and the still-empty placeholder row rendered as a red "This message is empty." error.
   // It is engine-wide and carries no conversation id, which is why MessageBubble additionally
   // requires the row itself to be an unfinalized placeholder (isAwaitingGeneration).
-  const daemonGenerating = !!status?.liveGeneration
+  // `runningReplyId` covers what that signal cannot: a Turbo Link turn (another machine's engine
+  // generates it) and the moment before this page has attached to the reply.
+  const daemonGenerating = !!status?.liveGeneration || (conv?.id === activeId && !!conv?.runningReplyId)
 
   // Close the gap between "the daemon stopped generating" (status poll, 1–2s) and "this client
   // has the finished message" (useConversation's 4s poll). Without this, a passive viewer's
@@ -1617,7 +1784,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                   AUTO path (already disabled via the `!!live` checks below, since it's a real
                   turn); `mut.compact.isPending` covers manual, which is a standalone POST with
                   no `live` state of its own. */}
-              {activeId && (live?.compacting || mut.compact.isPending) && (
+              {activeId && (live?.compacting || mut.compact.isPending || compactingHere) && (
                 <div
                   className="flex items-center gap-2 border-b px-3 py-2 text-[13px] font-medium"
                   style={{ borderColor: 'var(--instruction-border)', background: 'var(--status-banner-bg)', color: 'var(--accent)' }}
@@ -1631,7 +1798,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                 <button
                   type="button"
                   onClick={() => { track('chat', 'attach_file'); fileInputRef.current?.click() }}
-                  disabled={!ready || !!live || mut.compact.isPending}
+                  disabled={!ready || !!live || mut.compact.isPending || compactingHere}
                   className="grid h-9 w-9 shrink-0 place-items-center rounded-md hover:bg-panel-2 disabled:opacity-40"
                   title="Attach image or document"
                 >
@@ -1661,14 +1828,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
                     // `live.compacting` is the AUTO path (an SSE event mid-turn); the manual
                     // button is a plain POST with no stream, so it needs its own in-flight
                     // flag or half the trigger surface shows no compacting state at all.
-                    activeId && (live?.compacting || mut.compact.isPending)
+                    activeId && (live?.compacting || mut.compact.isPending || compactingHere)
                       ? 'Compacting conversation…'
                       : ready
                         ? `Message ${truncateName(remoteChoice?.name ?? loadedChatModel?.name ?? 'the model')}`
                         : scopedTokenLimited ? 'Load a model on the host to chat' : 'Load a model to start chatting'
                   }
                   value={input}
-                  disabled={!ready || !!live || !!editingId || mut.compact.isPending}
+                  disabled={!ready || !!live || !!editingId || mut.compact.isPending || compactingHere}
                   onChange={(e) => { setInput(e.target.value); autoResize() }}
                   onKeyDown={(e) => {
                     if (skillPickerOpen) {

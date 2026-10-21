@@ -424,19 +424,18 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
     const conv = h.store.createConversation()
     const send = () => h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi' }))
     const resA = await send()
-    // The client reads A's stream as it arrives: unread SSE writes back-pressure the turn before it
-    // ever reaches the tool.
-    const readerA = resA.body!.getReader()
-    void (async () => { try { while (!(await readerA.read()).done) { /* drain */ } } catch { /* cancelled */ } })()
+    void resA.body!.cancel() // the page is gone: the turn runs in the daemon on its own
     await inTool // turn A is now inside slow_tool
     const replyA = h.store.getMessages(conv.id).find((m) => m.role === 'assistant')!.id
-    await readerA.cancel() // Stop: the client aborts its fetch first (stream.onAbort)
-    await waitFor(() => inFlightChatIds().length === 0, 'turn A\'s onAbort to drop its entry')
-    const resB = await send() // ...and immediately sends a follow-up
+    // Stop (the page's only way to stop a reply): it aborts A and frees the chat at once.
+    const stop = await (await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id, messageId: replyA }))).json()
+    assert.deepEqual(stop, { ok: true, stopped: true })
+    assert.deepEqual(inFlightChatIds(), [], 'Stop drops A\'s entry')
+    const resB = await send() // ...and the page immediately sends a follow-up
     assert.equal(resB.status, 200)
     toolDone() // turn A's tool returns; A sees its abort and unwinds through its finally
     // A's reply is saved right after runGeneration's finally (its first stale release); the rest of
-    // its route callback, up to the second stale release, settles within the next macrotask.
+    // its turn body, up to the second stale release, settles within the next macrotask.
     await waitFor(() => h.store.getMessage(replyA)?.stats.totalMs !== undefined, 'turn A to unwind and save its reply')
     await new Promise((r) => setImmediate(r))
     assert.deepEqual(inFlightChatIds(), [conv.id], 'turn B is still generating and must stay tracked')
@@ -452,11 +451,12 @@ test('a stale turn unwinding after Stop never removes the NEXT turn\'s in-flight
   }
 })
 
-test('a turn that throws before generating releases its in-flight entry (no stuck 409)', async () => {
+test('a turn that throws before generating releases its in-flight entry (no stuck 409) and tells its viewer', async () => {
   const h = inFlightHarness()
   const engine = fakeEngine()
   const originalError = console.error
-  console.error = () => {} // Hono logs the callback's throw
+  const logged: unknown[][] = []
+  console.error = (...args: unknown[]) => { logged.push(args) } // the turn's failure is logged
   try {
     const conv = h.store.createConversation()
     const url = `/api/v1/conversations/${conv.id}/messages`
@@ -469,7 +469,11 @@ test('a turn that throws before generating releases its in-flight entry (no stuc
     }) as typeof h.store.getConversation
     const bad = await h.app.request(url, json({ content: 'hi' }))
     assert.equal(bad.status, 200, 'the throw must come from inside the turn')
-    await bad.text() // ends only after the callback (and its release) settles: Hono closes the stream in run()'s finally
+    // The turn runs in the daemon; its viewer's stream ends once the run has (after the release).
+    // A rejection nobody handled would fail this file (the test runner reports it).
+    const text = await bad.text()
+    assert.match(text, /event: error\ndata: \{"code":"turn_failed","message":"The reply could not be generated\."\}/)
+    assert.ok(logged.some((args) => String(args[0]).startsWith('[chat] turn for')), 'logged')
     assert.deepEqual(inFlightChatIds(), [])
     h.store.getConversation = getConversation
     const ok = await h.app.request(url, json({ content: 'hi again' }))

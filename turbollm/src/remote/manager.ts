@@ -5,6 +5,7 @@
 // child exit it nulled its handle and went silent, which is the direct cause of the
 // "cloudflare sessions end after some time" report this feature exists to answer.
 import type { Hono } from 'hono'
+import { endTunneledTurns } from '../auth'
 import { IngressListener } from './ingress'
 import type { RemoteIngress } from './ingress-types'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
@@ -27,7 +28,9 @@ export interface RemoteAccessOptions {
 }
 
 export class RemoteAccessManager implements RemoteIngress {
-  private ingress = new IngressListener()
+  // A chat turn that came through remote access is stopped when the ingress closes (auth.ts holdTurn): it no longer
+  // ends with its connection, which closing the ingress drops.
+  private ingress = new IngressListener(() => { endTunneledTurns() })
   private provider: RemoteProvider | null = null
   private current: RemoteState = { kind: 'off' }
   private failures = 0

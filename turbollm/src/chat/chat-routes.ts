@@ -2,13 +2,14 @@
 import type { Context, Hono, MiddlewareHandler } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
-import { resolveKey, grantKind, hostGate, isLocalOrAuthenticated } from '../auth'
+import { resolveKey, grantKind, holdOpen, holdTurn, hostGate, isLocalOrAuthenticated } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
-import { sseSink, type EmitSink } from './emit-sink.js'
+import type { EmitSink } from './emit-sink.js'
+import { chatRuns, type ChatRun, type ChatRunMeta } from './chat-runs.js'
 import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
@@ -76,8 +77,8 @@ export function inFlightChatIds(): string[] {
   return [...inflight.keys()]
 }
 
-/** Removes `convId`'s entry only while it is still `ac`'s own. A client disconnect or a kill
- *  switch drops the entry at once, but the aborted turn can keep unwinding for a long time
+/** Removes `convId`'s entry only while it is still `ac`'s own. Stop or a kill switch drops the
+ *  entry at once, but the aborted turn can keep unwinding for a long time
  *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong
  *  to the NEXT turn, which an unconditional delete would leave untracked: unreachable by Stop
  *  and the kill switches, invisible to inFlightChatIds, and no longer a 409 guard. */
@@ -111,7 +112,7 @@ function slotState(convId: string): { runningReplyId: string | null; compacting:
  *  compaction stores its summary over an Undo made meanwhile, as a manual one does. */
 const autoCompactions = new WeakSet<AbortController>()
 /** A turn's maybeAutoCompact phase callback: tags the turn's entry while its compaction runs,
- *  then tells the client. Tagged first, so a write that fails (client gone) still tags it;
+ *  then tells the turn's viewers. Tagged first, so a write that fails still tags it;
  *  maybeAutoCompact sends 'end' after every 'start', the compaction failed or not. */
 function autoCompactionPhase(ac: AbortController, write: (phase: 'start' | 'end') => Promise<void>) {
   return (phase: 'start' | 'end') => {
@@ -130,13 +131,84 @@ function inflightRefusal(c: Context, convId: string, turnMessage: string) {
   return err(c, 409, 'generation_in_flight', turnMessage)
 }
 
-/** A turn route's streamSSE callback, releasing its in-flight entry however the callback
- *  exits: runGeneration's own finally only covers a turn that reached it, and a throw before
- *  that (e.g. a malformed request body) left the chat answering 409 until a restart. */
-function releasingInflight<T>(convId: string, ac: AbortController, cb: (stream: T) => Promise<void>): (stream: T) => Promise<void> {
-  return async (stream) => {
-    try { await cb(stream) } finally { releaseInflight(convId, ac) }
+/** A turn's body, releasing its in-flight entry however the body exits: runGeneration's own
+ *  finally only covers a turn that reached it, and a throw before that (e.g. a malformed request
+ *  body) left the chat answering 409 until a restart. */
+function releasingInflight<T>(convId: string, ac: AbortController, cb: (arg: T) => Promise<void>): (arg: T) => Promise<void> {
+  return async (arg) => {
+    try { await cb(arg) } finally { releaseInflight(convId, ac) }
   }
+}
+
+/** Stops a turn as POST /chat/stop does: aborts it and frees the chat at once. The turn's own
+ *  unwind (a tool call that ignores the abort runs to its end) then releases nothing of the next
+ *  turn's (releaseInflight's identity check). */
+function stopTurn(convId: string, ac: AbortController): void {
+  ac.abort()
+  releaseInflight(convId, ac)
+}
+
+/** Runs a turn in the daemon (the owner's rule: the web UI is a frontend, and closing, reloading
+ *  or leaving the page, Android's Back or a dropped connection never stops a reply). Its in-flight
+ *  entry and its run (chat-runs.ts) own it, not the request: the request that started it, like
+ *  every GET .../stream after it, is only a viewer of the run's frames (respondWithChatRun). What
+ *  stops it: Stop, deleting the chat, the engine kill switches (abortAllInFlightChats), and its
+ *  caller's way in going away (holdTurn): LAN access turned off or remote access stopped, which
+ *  used to end the request and, with it, the turn, and now also the key revoked or a key now
+ *  required, which never stopped a turn while it ran in its request. `c` is read here, before the
+ *  response: the body must not read it (runGeneration and maybeAutoCompact take no Context). A
+ *  throw before the turn reached runGeneration (which saves on every path) is told to the viewers
+ *  as an `error` frame rather than becoming an unhandled rejection. */
+function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortController, meta: ChatRunMeta, body: (sink: EmitSink) => Promise<void>): ChatRun {
+  const { run, sink } = chatRuns.start(convId, ac, meta)
+  const release = holdTurn(c, d, () => stopTurn(convId, ac))
+  void releasingInflight(convId, ac, body)(sink)
+    .catch(async (e) => {
+      console.error(`[chat] turn for ${convId} failed`, e)
+      await sink({ event: 'error', data: { code: 'turn_failed', message: 'The reply could not be generated.' } })
+    })
+    .finally(() => {
+      release()
+      chatRuns.end(run)
+    })
+  return run
+}
+
+/** How often a viewer's stream gets an SSE comment while no frame is due (a turn waiting on an
+ *  approval or a long tool call): a tunnel or proxy that cuts idle streams (Cloudflare's is about
+ *  100 s) then leaves it open, instead of the page reconnecting every time. */
+const KEEPALIVE_MS = 20_000
+
+/** A run's frames as this response's SSE: from `fromSeq` (ChatRuns.subscribe's rules), then live
+ *  until the run ends. Each frame carries its seq as `id:`, the page's resume cursor. Closing the
+ *  response stops only this viewer. holdOpen ends the viewer once its own way in goes (a revoked
+ *  key), as for Code's run stream; the turn is held to its own caller's (startDetachedTurn).
+ *  `synthMeta`: a viewer attaching to a run already under way gets the run's meta first, un-id'd
+ *  (as Code's stream does), so it can tell which reply the frames belong to even when frame 0 has
+ *  left the window. A viewer that falls too far behind gets a `lagged` frame and is ended: it
+ *  resumes from its cursor. `run` null: nothing to attach to, an empty stream. */
+function respondWithChatRun(c: Context, run: ChatRun | null, fromSeq: number, opts: { synthMeta: boolean }): Response {
+  return streamSSE(c, holdOpen(c, async (stream) => {
+    if (!run) return
+    const sub = chatRuns.subscribe(run, fromSeq)
+    stream.onAbort(() => { sub.close() })
+    let writing = false
+    const write = async (msg: { id?: string; event: string; data: string }) => {
+      writing = true
+      try { await stream.writeSSE(msg) } finally { writing = false }
+    }
+    // Only between frames: a write still waiting (a stalled socket) needs no keepalive, and none
+    // queues up behind it.
+    const keepalive = setInterval(() => { if (!writing) void stream.write(': keepalive\n\n') }, KEEPALIVE_MS)
+    keepalive.unref()
+    try {
+      if (opts.synthMeta && !run.ended) await write({ event: 'meta', data: JSON.stringify(run.meta) })
+      for await (const ev of sub) await write({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
+      if (sub.lagged()) await write({ event: 'lagged', data: '{}' })
+    } finally {
+      clearInterval(keepalive)
+    }
+  }))
 }
 
 // 503 joined the set with Turbo Link: a linked machine that is offline, or no longer
@@ -540,19 +612,16 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // here. Call the named function; never re-inline the expression (see its doc comment, I1).
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
-      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
-
-      // Emit meta event
-      await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }) })
-
+    // The turn runs in the daemon (startDetachedTurn); this response is its first viewer. Its
+    // `meta` (frame 0) is the run's own, pushed before anything else.
+    const run = startDetachedTurn(c, d, convId, ac, { userMessageId: userMsg.id, assistantMessageId: assistantMsg.id }, async (sink) => {
       // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
       // `upstream` is THIS turn's already-resolved upstream (local or linked host) and `ac`
       // is its abort — both are handed down rather than re-derived, so a Turbo Link chat
       // summarizes on the host it is actually talking to and Stop can interrupt the wait.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) })))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
 
       // Build messages array for engine (chat-compaction.ts — folds in the compaction
       // summary + cut when one is resolvable; a plain passthrough when not).
@@ -562,8 +631,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
-    }))
+      await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), userText: content, isCodeAuthorized })
+    })
+    return respondWithChatRun(c, run, 0, { synthMeta: false })
   })
 
   // ── continue (regenerate last assistant response for the existing last user
@@ -661,17 +731,13 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.
     const isCodeAuthorized = chatCodeAuthorization(c, d)
 
-    return streamSSE(c, releasingInflight(convId, ac, async (stream) => {
-      stream.onAbort(() => { ac.abort(); releaseInflight(convId, ac) })
-
-      // Emit meta event (no new user message — reuse the existing last user message id)
-      await stream.writeSSE({ event: 'meta', data: JSON.stringify({ userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }) })
-
+    // Run in the daemon, as the /messages route's (its meta reuses the existing last user message id).
+    const run = startDetachedTurn(c, d, convId, ac, { userMessageId: lastUser.id, assistantMessageId: assistantMsg.id }, async (sink) => {
       // Auto-compact (ADR-420): checked BEFORE this turn's messages are built, using the
       // history as it stood before this turn's own user+placeholder rows were added —
       // exactly the "last completed turn's usage" the 80% threshold is meant to judge.
       // Same upstream/abort hand-down as the /messages route above — see its comment.
-      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, (phase) => stream.writeSSE({ event: 'compaction', data: JSON.stringify({ phase }) })))
+      await maybeAutoCompact(d, convId, conv, upstream, ac.signal, autoCompactionPhase(ac, async (phase) => { await sink({ event: 'compaction', data: { phase } }) }))
 
       // Build messages array for engine from the existing (already-trimmed) history
       // (chat-compaction.ts — folds in the compaction summary + cut when one is
@@ -681,19 +747,51 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
       const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
 
-      await runGeneration(d, sseSink(stream), { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
-    }))
+      await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
+    })
+    return respondWithChatRun(c, run, 0, { synthMeta: false })
   })
 
   // ── stop (spec 07 §2) ──────────────────────────────────────────────────────
 
+  // Stop is the one thing that stops a reply from a page now that closing or reloading it does not
+  // (startDetachedTurn), so it also frees the chat at once, as the page's own disconnect did: a
+  // message sent right after Stop would otherwise get 409 until a slow tool call returned.
+  // `messageId` (what the web UI sends): stop only that reply, and only while it still holds the
+  // chat; a turn another tab or device started since is not this caller's to stop. Without it (an
+  // older page, an API client) whatever holds the chat is stopped, as before. `stopped` says
+  // whether anything was.
   app.post('/api/v1/chat/stop', async (c) => {
-    const b = await body<{ conversationId?: string }>(c)
+    const b = await body<{ conversationId?: string; messageId?: string }>(c)
+    const notString = nonStringField(b, ['conversationId', 'messageId'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const convId = b.conversationId
     if (!convId) return err(c, 400, 'invalid_input', 'conversationId required.')
     const ac = inflight.get(convId)
-    if (ac) ac.abort()
-    return c.json({ ok: true })
+    const target = ac && (b.messageId === undefined || (!compactions.has(ac) && turnReplies.get(ac) === b.messageId)) ? ac : undefined
+    if (target) stopTurn(convId, target)
+    return c.json({ ok: true, stopped: !!target })
+  })
+
+  // A viewer of a chat's running reply (the page reopened, reloaded, or on another tab or device),
+  // or the rest of one it was following (a dropped connection; ?run=<reply id>&fromSeq=<next seq>).
+  // Inherits conversationGate and models:use (auth.ts), as every route under the chat: a caller
+  // attaches only where it can already read the chat. Without `run`, it attaches only to a turn
+  // that still holds the chat: a stopped turn still unwinding in a tool call is not shown as
+  // running, since its Stop has been answered, and a finished one is in the conversation already
+  // (an empty stream). With `run`, it follows that reply to its end while the daemon still has it
+  // (30 s after the end), and gets an empty stream after.
+  app.get('/api/v1/conversations/:id/stream', (c) => {
+    const convId = c.req.param('id')
+    if (!db.getConversation(convId)) return err(c, 404, 'not_found', 'Conversation not found.')
+    const runId = c.req.query('run') || undefined
+    const n = Number.parseInt(c.req.query('fromSeq') ?? '', 10)
+    const fromSeq = Number.isFinite(n) && n >= 0 ? n : 0
+    const latest = chatRuns.latestRun(convId)
+    const run = runId !== undefined
+      ? chatRuns.find(convId, runId) ?? null
+      : latest && !latest.ended && inflight.get(convId) === latest.ac ? latest : null
+    return respondWithChatRun(c, run, fromSeq, { synthMeta: true })
   })
 
   // ── message actions B2 ─────────────────────────────────────────────────────
@@ -1150,10 +1248,13 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
   }
 }
 
-/** Wraps an emit sink so a DEAD CLIENT can never cost us generated output (GitHub #177).
+/** Wraps an emit sink so a failing sink can never cost us generated output (GitHub #177).
  *
- *  Every `await emit(...)` in runGeneration writes to a live SSE stream, and writing to a
- *  torn-down stream REJECTS. Any one of those rejections used to unwind the whole function —
+ *  The turn routes' sink is now the turn's run (chat-runs.ts), whose push never throws: a viewer
+ *  that goes away only closes its own subscription. This stays the seam's guard for a sink that
+ *  can fail, as the live SSE stream it was written for did. Every `await emit(...)` in
+ *  runGeneration wrote to that stream, and writing to a torn-down stream REJECTS. Any one of those
+ *  rejections used to unwind the whole function —
  *  past the single `db.updateMessage(...)` that persists `fullContent` at the end — leaving the
  *  placeholder assistant row (inserted empty, `stats: { aborted: false }`, before the first
  *  token) permanently blank with `aborted: false`. That is exactly the reporter's third bucket:
@@ -1164,9 +1265,9 @@ function reportChatBenchResult(d: Deps, ms: ModelInfo, stats: Partial<MessageSta
  *  So the guard belongs on the SEAM, not on individual call sites: the first failure latches the
  *  client as gone and every later emit becomes a no-op. A dead client degrades to "keep
  *  generating, keep persisting, stop writing to the socket" instead of unwinding. Abort semantics
- *  are untouched — a real Stop click aborts via the AbortController (and a client disconnect via
- *  `stream.onAbort`), which is what sets `aborted: true`; this only stops write failures from
- *  being fatal. PURE-ish and exported so the latch behaviour is pinned by tests. */
+ *  are untouched — Stop aborts via the AbortController, which is what sets `aborted: true`; this
+ *  only stops write failures from being fatal. PURE-ish and exported so the latch behaviour is
+ *  pinned by tests. */
 export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => boolean } {
   let gone = false
   const wrapped = async (ev: { event: string; data: unknown }): Promise<void> => {
@@ -1174,8 +1275,8 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
     try {
       await sink(ev)
     } catch {
-      // Client is gone (cancelled turn / closed tab / reloaded). Nothing to flush to, ever
-      // again on this stream — and an unhandled rejection here would crash the daemon.
+      // The sink is gone. Nothing to flush to, ever again — and an unhandled rejection here
+      // would crash the daemon.
       gone = true
     }
   }
@@ -1209,9 +1310,9 @@ export function engineErrorText(d: Pick<Deps, 'manager' | 'store'>, engineKind: 
 
 /** The whole generation turn: engine call(s), tool loop, and the ONE write-back that persists
  *  the reply. Exported ONLY so tests can drive it with a sink of their own — the persistence
- *  invariant this function owns (GitHub #177: generated output must survive a client that has
- *  gone away, an engine that dies mid-stream, and a Stop click) is not reachable through the
- *  route, whose sink is hard-wired to the live SSE stream. Not part of any public API. */
+ *  invariant this function owns (GitHub #177: generated output must survive a failing sink, an
+ *  engine that dies mid-stream, and a Stop click) is not reachable through the route, whose sink
+ *  is the turn's run (chat-runs.ts), which never fails. Not part of any public API. */
 export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationCtx): Promise<void> {
   const { db } = d
   const { convId, conv, assistantMsg, upstream, ac, thinkingBudget, reasoningEffort } = ctx
@@ -2018,7 +2119,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       try {
         const code = e instanceof EngineStreamError ? 'engine_error' : 'engine_stopped'
         await emit({ event: 'error', data: { code, message: (e as Error).message } })
-      } catch { /* client gone — the message is still persisted below */ }
+      } catch { /* a failing sink — the message is still persisted below */ }
     }
   } finally {
     if (localAccounting) d.manager.generationEnd()
@@ -2052,7 +2153,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   const thinkMs = thinkStart && thinkEnd ? thinkEnd - thinkStart : 0
   const ctxMax = upstream.ctxMax
 
-  // An aborted stream (Stop clicked, or the client disconnected mid-generation) can be cut off
+  // An aborted turn (Stop, deleting the chat, an engine kill switch) can be cut off
   // before the engine's final usage/timings chunk ever arrives, leaving completion_tokens at its
   // default 0 — even though real output WAS generated, IS persisted (fullContent below), and WILL
   // sit in context for the next turn. liveOut (incremented per streamed delta, above) is the one
@@ -2155,13 +2256,13 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   }
 
   const finalMsg = db.getMessage(assistantMsg.id)!
-  // The client may have already disconnected (cancelled turn / closed tab); writing to a
-  // torn-down stream rejects. Swallow it — the assistant message is persisted above
-  // regardless, and an unhandled rejection here would crash the daemon (and orphan the
-  // engine), which is the root of the reported "requests never end / model stays loaded".
+  // A sink that can fail (not the turn's run, which never does) may reject here. Swallow it —
+  // the assistant message is persisted above regardless, and an unhandled rejection here would
+  // crash the daemon (and orphan the engine), which is the root of the reported "requests never
+  // end / model stays loaded".
   try {
     await emit({ event: 'done', data: { message: finalMsg } })
-  } catch { /* client gone — nothing to flush to */ }
+  } catch { /* a failing sink — nothing to flush to */ }
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
     setTimeout(() => { void autoTitle(d, convId, ctx.engineMessages, fullContent, upstream) }, 1000)

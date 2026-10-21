@@ -367,8 +367,10 @@ export const ConversationSidebar = memo(function ConversationSidebar({
   onToggle?: () => void
   /** True when a generation is streaming in the active conversation. */
   generating?: boolean
-  /** Ids of every conversation currently streaming a generation (including ones the
-   *  user has navigated away from) — drives the spinning in-progress indicator. */
+  /** Ids of every conversation this page is streaming a generation for (including ones
+   *  the user has navigated away from) — drives the spinning in-progress indicator, as
+   *  does a row's own `running` (the daemon's word: a reply another tab or device, or this
+   *  page before a reload, started). */
   generatingIds?: Set<string>
   /** Ids of conversations whose generation finished while the user was elsewhere —
    *  drives the "new result" dot until the user visits that conversation. */
@@ -663,7 +665,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                     onSelect={onSelect}
                     onDelete={onDelete}
                     onMove={onMove}
-                    generating={generatingIds?.has(conv.id)}
+                    generating={generatingIds?.has(conv.id) || !!conv.running}
                     recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
                   />
                 ))}
@@ -710,7 +712,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                     onSelect={onSelect}
                     onDelete={onDelete}
                     onMove={onMove}
-                    generating={generatingIds?.has(conv.id)}
+                    generating={generatingIds?.has(conv.id) || !!conv.running}
                     recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
                   />
                 ))}
@@ -913,7 +915,7 @@ function FolderSection({
                 onSelect={onSelect}
                 onDelete={onDelete}
                 onMove={onMove}
-                generating={generatingIds?.has(conv.id)}
+                generating={generatingIds?.has(conv.id) || !!conv.running}
                 recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
               />
             ))

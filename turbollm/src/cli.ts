@@ -63,7 +63,7 @@ import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
 import { registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal/terminal-routes'
 import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/terminal-manager'
-import { provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
+import { endLanTurns, provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost, parseListenAddr } from './net'
 import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
 import { reconcileTailscale } from './remote/providers/tailscale'
@@ -1157,6 +1157,9 @@ function listen(attempt = 0): void {
     // A terminal WebSocket from another machine outlives the listener it came in on: after LAN
     // access is turned off, drop it once this bind is no longer LAN-exposed (see the function).
     dropStaleTerminalSockets(deps)
+    // So does a chat reply another machine sent (it runs in the daemon, not in the request the old
+    // listener's close ended): stopped on the same rule (auth.ts endLanTurns).
+    endLanTurns(deps)
     // An IPv6 host bracketed, as a URL needs it: `--addr ::1:6996` printed http://::1:6996.
     const displayHost = host === '0.0.0.0' ? '0.0.0.0 (LAN)' : host.includes(':') ? `[${host}]` : host
     const uiUrl = `http://${daemonReachHost(host)}:${info.port}` // loopback for 0.0.0.0 and ::

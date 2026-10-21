@@ -183,5 +183,14 @@ export type ChatSseEvent =
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
   | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
-  | { event: 'done';      data: { message: Message } }
+  /** `message`: the reply as the daemon saved it (null when it was deleted meanwhile). */
+  | { event: 'done';      data: { message?: Message | null } }
   | { event: 'error';     data: { code: string; message: string } }
+
+/** A frame of a turn's run as a page follows it (chat-api.ts followChatTurn): the daemon's frames carry their seq
+ *  (the SSE `id:`), except the meta it sends a viewer attaching to a reply already under way. `reset` is
+ *  followChatTurn's own: what follows replays the reply from the start of what the daemon still has, so the view
+ *  starts the reply over. */
+export type ChatFrame =
+  | (ChatSseEvent & { seq?: number })
+  | { event: 'reset'; data: Record<string, never>; seq?: undefined }
