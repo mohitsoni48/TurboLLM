@@ -23,6 +23,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'nod
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import type { ConfigStore } from '../config/config'
+import { ggufCutShort } from '../gguf/gguf'
 import type { HfModelFiles } from '../hf/hf'
 import { httpGet, type DownloadGet } from './http-get'
 
@@ -756,6 +757,18 @@ export class DownloadManager {
           rmSync(part, { force: true })
           throw new DownloadError('checksum_failed', 'Checksum failed — the downloaded file was corrupt.')
         }
+      }
+      // A reply that names no length (no Content-Length, not chunked) ends when the server closes
+      // the connection, and so does one a proxy timed out or a server that died mid-body cut off:
+      // with no length to check, the cut-off file was marked done and listed, and failed only at
+      // load. A GGUF's header says how long the file must be (GgufMeta.dataEnd), so one whose
+      // length was never known is checked before it is finished. The .part holds a good prefix and
+      // is kept, so Resume asks for the rest. Other files of unknown length cannot be checked.
+      if (rec.total <= 0 && /\.gguf$/i.test(rec.dest) && ggufCutShort(part, rec.received)) {
+        throw new DownloadError(
+          'download_incomplete',
+          'The server closed the connection before the whole file arrived. Resume to download the rest.',
+        )
       }
 
       this.finish(rec, part)

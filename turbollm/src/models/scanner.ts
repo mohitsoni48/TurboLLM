@@ -113,7 +113,9 @@ interface CacheRow {
 // 6: reasoningEffort (Qwen3.8's low/medium/xhigh chat-template reasoning-depth control) —
 // a row cached by an older build predates the field and would otherwise replay `false`
 // forever for a model that genuinely supports it.
-const CACHE_VERSION = 6
+// 7: dataEnd (the length a GGUF needs to hold its tensors) — a row cached by an older build
+// predates it, so a file already cut short when it was scanned would keep reading complete.
+const CACHE_VERSION = 7
 
 /** Optional attention-layout metadata the GGUF parser surfaces (ADR-223).
  *
@@ -433,7 +435,7 @@ export class Scanner {
 
       for (const f of singles) {
         const mmproj = resolveMmproj(f, mmprojFiles)
-        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, false))
+        entries.push(await this.entryFor(f.path, f.size, f.size, f.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, false))
         await tick()
       }
       for (const { shards, total } of splits.values()) {
@@ -457,7 +459,7 @@ export class Scanner {
             }
         }
         const mmproj = resolveMmproj(first, mmprojFiles)
-        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, incomplete))
+        entries.push(await this.entryFor(first.path, totalSize, first.size, first.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, incomplete))
         await tick()
       }
     }
@@ -468,6 +470,8 @@ export class Scanner {
   private async entryFor(
     path: string,
     sizeBytes: number,
+    /** The size of `path` itself: `sizeBytes` is a split's total. */
+    fileBytes: number,
     mtimeMs: number,
     dir: string,
     mmprojPath: string | null,
@@ -488,6 +492,13 @@ export class Scanner {
         parseError = e instanceof GgufError ? e.message : (e as Error).message
       }
     }
+
+    // A GGUF whose tensors' data runs past its end is cut short (a download that stopped early
+    // with no length to check it against, a copy that did not finish): flagged like a split with
+    // a missing part, so the Library shows it and nothing tries to load it, where it listed as
+    // complete and failed only at load ("tensor '…' data is not within the file bounds"). Only
+    // the parsed file is checked: for a split, the first shard.
+    const cutShort = !!meta && meta.dataEnd > fileBytes
 
     const fileName = basename(path)
     // Filename wins over the GGUF's own `general.file_type` when it parses (issue: Q2/IQ2 dynamic
@@ -553,7 +564,7 @@ export class Scanner {
       hasChatTemplate: meta?.hasChatTemplate ?? false,
       reasoningEffort: meta?.reasoningEffort ?? false,
       embedding: isEmbeddingModel(arch, fileName),
-      incomplete,
+      incomplete: incomplete || cutShort,
       parseError,
       loaded: false, // overlaid live by the API layer
       hasProfile: false, // overlaid live by the API layer

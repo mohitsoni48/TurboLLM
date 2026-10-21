@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { DownloadManager, setDownloadGetForTests, type DownloadRecord } from './downloads'
 import { httpGet } from './http-get'
+import { ggufFile, ggufVocabOnly } from '../test-support/gguf-file'
 import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
@@ -517,6 +518,84 @@ test('resume: a row from a manifest written before the change detector resumes a
     assert.equal(row.status, 'done', row.error ?? '')
     assert.deepEqual(server.seen, [{ range: 'bytes=100000-', ifRange: undefined, status: 206 }])
     assert.deepEqual(readFileSync(dest), A)
+  } finally {
+    await server.close()
+  }
+})
+
+/** A server that answers a plain GET as `python3 -m http.server` behind a proxy that timed out
+ *  would: a 200 with no Content-Length and no chunked encoding (the body ends when the connection
+ *  closes), and only the first `sent` bytes of `body` before a clean close. A ranged request gets a
+ *  206 of the rest. */
+async function closeDelimited(body: Buffer, sent: number) {
+  const seen: string[] = []
+  const server = await serve((req, res) => {
+    const range = /^bytes=(\d+)-$/.exec(req.headers.range ?? '')
+    seen.push(req.headers.range ?? 'whole')
+    if (range) {
+      const from = Number(range[1])
+      res.writeHead(206, { 'Content-Length': body.length - from, 'Content-Range': `bytes ${from}-${body.length - 1}/${body.length}` })
+      return res.end(body.subarray(from))
+    }
+    req.socket.write('HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n')
+    req.socket.end(body.subarray(0, sent))
+  })
+  return { ...server, seen }
+}
+
+const WEIGHTS = ggufFile([{ name: 'token_embd.weight', dims: [100_000], type: 0 }], [['general.architecture', 'llama']])
+
+test('a GGUF of unknown length that the server cut off is not marked done, and Resume fetches the rest', async () => {
+  // The early close looks like the end of the body, and with total 0 there was no size check:
+  // the 150 kB of a 400 kB model were marked done and listed, and failed only at load.
+  const server = await closeDelimited(WEIGHTS, 150_000)
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await dm.enqueue({ url: `${server.origin}/model.gguf` })
+    const row = await settled(dm, rec.id)
+    assert.equal(row.status, 'error', 'not done with 150000 of its bytes')
+    assert.equal(row.error, 'The server closed the connection before the whole file arrived. Resume to download the rest.')
+    assert.equal(existsSync(rec.dest), false, 'the cut-off file never reaches the library')
+    assert.equal(readFileSync(`${rec.dest}.part`).length, 150_000, 'the good prefix is kept')
+
+    assert.equal(dm.resume(rec.id), true)
+    const resumed = await settled(dm, rec.id)
+    assert.equal(resumed.status, 'done', resumed.error ?? '')
+    assert.deepEqual(server.seen, ['whole', 'bytes=150000-'])
+    assert.deepEqual(readFileSync(rec.dest), WEIGHTS)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a whole GGUF of unknown length is finished as before', async () => {
+  const server = await closeDelimited(WEIGHTS, WEIGHTS.length)
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await dm.enqueue({ url: `${server.origin}/model.gguf` })
+    const row = await settled(dm, rec.id)
+    assert.equal(row.status, 'done', row.error ?? '')
+    assert.deepEqual(readFileSync(rec.dest), WEIGHTS)
+  } finally {
+    await server.close()
+  }
+})
+
+test('a whole vocab-only GGUF of unknown length is finished, not taken for cut short', async () => {
+  // No tensors and no padding after the header, as llama.cpp's ggml-vocab-*.gguf: its padded data
+  // offset lies past its end, which failed the download "closed the connection before the whole
+  // file arrived" on every Resume.
+  const vocab = ggufVocabOnly([['general.architecture', 'llama'], ['tokenizer.ggml.model', 'gpt2']])
+  const server = await closeDelimited(vocab, vocab.length)
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await dm.enqueue({ url: `${server.origin}/ggml-vocab-llama.gguf` })
+    const row = await settled(dm, rec.id)
+    assert.equal(row.status, 'done', row.error ?? '')
+    assert.deepEqual(readFileSync(rec.dest), vocab)
   } finally {
     await server.close()
   }
