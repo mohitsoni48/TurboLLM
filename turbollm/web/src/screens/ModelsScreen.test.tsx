@@ -9,9 +9,9 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ModelsScreen } from './ModelsScreen'
-import type { JevInfo, ModelEntry } from '../lib/types'
+import type { DownloadRecord, JevInfo, ModelEntry } from '../lib/types'
 
-const state: { models: ModelEntry[]; status: unknown; sys?: unknown; showAll?: boolean } = { models: [], status: undefined }
+const state: { models: ModelEntry[]; status: unknown; sys?: unknown; showAll?: boolean; downloads?: Partial<DownloadRecord>[] } = { models: [], status: undefined }
 const requestLoad = vi.fn()
 
 vi.mock('../lib/queries', () => ({
@@ -29,6 +29,7 @@ vi.mock('../lib/queries', () => ({
   useStatus: () => ({ data: state.status ?? { engine: { state: 'stopped' }, model: null } }),
   useSysInfo: () => ({ data: state.sys }),
   useShowAllEngineModels: () => state.showAll ?? false,
+  useDownloads: () => ({ data: state.downloads ? { downloads: state.downloads } : undefined }),
 }))
 vi.mock('../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad, isPending: false, pendingKey: undefined }),
@@ -97,6 +98,7 @@ beforeEach(() => {
   state.sys = undefined
   state.showAll = undefined
   state.models = [entry()]
+  state.downloads = undefined
   requestLoad.mockClear()
 })
 
@@ -302,5 +304,52 @@ describe('ModelsScreen — inside the Android app', () => {
   it('shows no import control outside the app', () => {
     renderScreen()
     expect(screen.queryByRole('button', { name: /Import model file/ })).toBeNull()
+  })
+})
+
+// Models opens on the Library, and download progress shows only under Discover: after reopening
+// the app, a download a restart had left paused was out of sight. The Library says so in one line,
+// only while a download is running, queued, paused or errored, and "Show" opens Discover.
+describe('ModelsScreen — the Library says when downloads are waiting', () => {
+  const dl = (id: string, status: DownloadRecord['status']) => ({ id, name: `${id}.gguf`, status, received: 0, total: 100 })
+  const notice = () => screen.queryByRole('button', { name: 'Show downloads' })
+
+  it('counts running (with queued), paused and failed downloads in one line', () => {
+    state.downloads = [dl('a', 'downloading'), dl('b', 'queued'), dl('c', 'paused'), dl('d', 'error'), dl('e', 'done')]
+    renderScreen()
+    expect(screen.getByText('2 downloads running · 1 paused · 1 failed')).toBeTruthy()
+    expect(notice()).toBeTruthy()
+  })
+
+  it('names the first count it shows: one paused download alone', () => {
+    state.downloads = [dl('c', 'paused'), dl('e', 'cancelled')]
+    renderScreen()
+    expect(screen.getByText('1 download paused')).toBeTruthy()
+  })
+
+  it('shows nothing while every download is done or cancelled, or there are none', () => {
+    state.downloads = [dl('e', 'done'), dl('f', 'cancelled')]
+    const { unmount } = renderScreen()
+    expect(notice()).toBeNull()
+    unmount()
+    state.downloads = undefined
+    renderScreen()
+    expect(notice()).toBeNull()
+  })
+
+  it('"Show" opens Discover, where the Downloads panel is', async () => {
+    state.downloads = [dl('c', 'paused')]
+    renderScreen()
+    expect(screen.getByText(/GGUF models discovered in your folders/)).toBeTruthy()
+    await userEvent.click(notice()!)
+    expect(screen.getByText(/Find and download GGUF models from Hugging Face/)).toBeTruthy()
+    expect(notice()).toBeNull()
+  })
+
+  it('shows on an empty library too', () => {
+    state.models = []
+    state.downloads = [dl('a', 'downloading')]
+    renderScreen()
+    expect(screen.getByText('1 download running')).toBeTruthy()
   })
 })

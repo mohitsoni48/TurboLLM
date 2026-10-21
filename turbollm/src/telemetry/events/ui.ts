@@ -627,6 +627,7 @@ export const UI_ACTIONS = [
 
   'resume_download', 'cancel_download', 'remove_download',
   'pause_download', 'pause_all_downloads', 'resume_all_downloads', 'discard_download',
+  'show_downloads_from_library',
 
   'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
 

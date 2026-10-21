@@ -83,6 +83,7 @@ import { MachineFilter, MachineNotes, OriginBadge } from '../components/fleet'
 import { RemoteModelRow } from './models/RemoteModelRow'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { DiscoverTab } from './models/DiscoverTab'
+import { LibraryDownloadsNotice } from './models/LibraryDownloadsNotice'
 import { HfRepoDialog } from './models/HfRepoDialog'
 import { FsBrowser } from './engines/FsBrowser'
 
@@ -463,6 +464,7 @@ export function ModelsScreen() {
           onDiscover={onDiscover}
           isPinned={isPinned}
           togglePinned={togglePinned}
+          onShowDownloads={() => setTab('discover')}
         />
       )}
 
@@ -540,6 +542,7 @@ function LibraryTab({
   onDiscover,
   isPinned,
   togglePinned,
+  onShowDownloads,
 }: {
   modelsQ: ReturnType<typeof useModels>
   actions: ReturnType<typeof useModelActions>
@@ -582,6 +585,8 @@ function LibraryTab({
   onDiscover: (m: ModelEntry) => void
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
+  /** Opens Discover, whose Downloads panel is at its top. */
+  onShowDownloads: () => void
 }) {
   // Inside the packaged Android app: model files in shared storage cannot be read, so they are imported instead.
   const inAndroidApp = !!useSysInfo().data?.bundledEnginesOnly
@@ -650,6 +655,9 @@ function LibraryTab({
           </Button>
         </div>
       </div>
+
+      {/* "2 downloads running · 1 paused — Show": the downloads panel is in Discover only. */}
+      <LibraryDownloadsNotice onShow={onShowDownloads} />
 
       {hiddenCount > 0 && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">

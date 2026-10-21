@@ -42,6 +42,7 @@ vi.mock('../lib/queries', () => ({
   useStatus: () => ({ data: { engine: { state: 'stopped' }, model: null } }),
   useSysInfo: () => ({ data: undefined }),
   useShowAllEngineModels: () => false,
+  useDownloads: () => ({ data: undefined }),
 }))
 vi.mock('../lib/model-loader', () => ({ useModelLoader: () => ({ requestLoad: vi.fn(), isPending: false, pendingKey: undefined }) }))
 vi.mock('../lib/link-queries', () => ({

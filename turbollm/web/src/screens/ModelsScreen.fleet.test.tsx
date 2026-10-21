@@ -31,6 +31,7 @@ vi.mock('../lib/queries', () => ({
   }),
   useStatus: () => ({ data: { engine: { state: 'stopped' }, model: null } }),
   useSysInfo: () => ({ data: undefined }),
+  useDownloads: () => ({ data: undefined }),
 }))
 vi.mock('../lib/onboarding-queries', () => ({ useOnboardingState: () => ({ data: undefined }) }))
 vi.mock('../lib/usePinnedModels', () => ({ usePinnedModels: () => ({ isPinned: () => false, togglePinned: vi.fn() }) }))
