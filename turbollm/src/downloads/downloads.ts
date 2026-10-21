@@ -430,6 +430,9 @@ export class DownloadManager {
       rec.received = startAt
 
       const headers: Record<string, string> = { ...this.authHeaders() }
+      // The HF token is for Hugging Face alone: a raw import from any other host must not
+      // receive it, or pasting a model link from some site hands that site the user's token.
+      if (!isHfHost(rec.url)) delete headers.Authorization
       if (startAt > 0) headers.Range = `bytes=${startAt}-`
 
       const res = await fetch(rec.url, { headers, redirect: 'follow', signal: ac.signal })
@@ -657,6 +660,17 @@ function safePathname(u: string): string {
 function hfBaseUrl(): string {
   const override = process.env.TURBOLLM_HF_BASE?.trim()
   return override ? override.replace(/\/+$/, '') : 'https://huggingface.co'
+}
+
+/** True when `u` points at Hugging Face itself (the configured HF base, or the hf.co short
+ *  domain), the only hosts the user's HF token may be sent to. Anything unparsable is not HF. */
+export function isHfHost(u: string): boolean {
+  try {
+    const host = new URL(u).hostname.toLowerCase()
+    return host === new URL(hfBaseUrl()).hostname.toLowerCase() || host === 'huggingface.co' || host === 'hf.co'
+  } catch {
+    return false
+  }
 }
 
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file
