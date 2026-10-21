@@ -6,7 +6,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { mkdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { DownloadManager, DownloadError } from './downloads'
+import { DownloadManager, DownloadError, isHfHost } from './downloads'
 import { tmpDir } from '../test-support/tmp'
 
 function fakeStore(modelDir: string, stateDir: string) {
@@ -145,4 +145,59 @@ test('a non-HF URL import with a climbing subdir also stays inside the model fol
   } finally {
     restore()
   }
+})
+
+// ── HF token scope ────────────────────────────────────────────────────────────
+// The download fetch carried the HF token to whatever host a raw import URL named, so pasting
+// a model link from any other site handed that site the user's Hugging Face token.
+
+/** Record each download fetch's URL + headers; never resolve, so nothing leaves the machine. */
+function captureFetch(): { calls: Array<{ url: string; headers: Record<string, string> }>; restore: () => void } {
+  const real = globalThis.fetch
+  const calls: Array<{ url: string; headers: Record<string, string> }> = []
+  globalThis.fetch = ((url: string, init?: RequestInit) => {
+    calls.push({ url: String(url), headers: { ...(init?.headers as Record<string, string>) } })
+    return new Promise(() => {})
+  }) as unknown as typeof fetch
+  return { calls, restore: () => { globalThis.fetch = real } }
+}
+
+async function headersSentFor(url: string): Promise<Record<string, string>> {
+  const cap = captureFetch()
+  try {
+    const root = tmpDir('tllm-dl-token-')
+    const modelDir = join(root, 'models')
+    const stateDir = join(root, 'state')
+    mkdirSync(modelDir, { recursive: true })
+    mkdirSync(stateDir, { recursive: true })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({ 'User-Agent': 'TurboLLM/test', Authorization: 'Bearer hf_secret' }))
+    const [rec] = await dm.enqueue({ url })
+    for (let i = 0; i < 200 && !cap.calls.some((c) => c.url === rec.url); i++) await new Promise((r) => setTimeout(r, 5))
+    const call = cap.calls.find((c) => c.url === rec.url)
+    assert.ok(call, `no download fetch was made for ${rec.url}`)
+    return call.headers
+  } finally {
+    cap.restore()
+  }
+}
+
+test('a raw import from a non-HF host is fetched without the HF token', async () => {
+  const headers = await headersSentFor('https://example.invalid/files/model-Q4_K_M.gguf')
+  assert.equal(headers.Authorization, undefined)
+  assert.equal(headers['User-Agent'], 'TurboLLM/test')
+})
+
+test('a Hugging Face download still sends the HF token, so gated repos keep working', async () => {
+  const headers = await headersSentFor('https://huggingface.co/owner/repo/resolve/main/model-Q4_K_M.gguf')
+  assert.equal(headers.Authorization, 'Bearer hf_secret')
+})
+
+test('isHfHost accepts only Hugging Face hosts', () => {
+  assert.equal(isHfHost('https://huggingface.co/owner/repo/resolve/main/m.gguf'), true)
+  assert.equal(isHfHost('https://hf.co/owner/repo/resolve/main/m.gguf'), true)
+  assert.equal(isHfHost('https://HuggingFace.co/x.gguf'), true)
+  assert.equal(isHfHost('https://huggingface.co.evil.example/x.gguf'), false)
+  assert.equal(isHfHost('https://evilhuggingface.co/x.gguf'), false)
+  assert.equal(isHfHost('https://example.invalid/huggingface.co/x.gguf'), false)
+  assert.equal(isHfHost('not a url'), false)
 })

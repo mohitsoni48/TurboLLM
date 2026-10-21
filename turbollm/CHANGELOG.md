@@ -36,6 +36,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   limited to GGUF repos while LiteRT-LM is the active engine.
 
 ### Fixed
+- **Your Hugging Face token is only sent to Hugging Face.** A model imported by URL from any other host was downloaded
+  with the HF token attached, so that host received it. Downloads from huggingface.co (and hf.co) still send the token,
+  so gated repos keep working; every other host now gets no credentials. Every platform.
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
