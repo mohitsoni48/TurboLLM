@@ -26,6 +26,16 @@ interface PendingInstall {
   discard: (binPath: string) => Promise<unknown>
 }
 
+/** Two release installs share a dir when their binaries sit in one folder, ignoring case: the
+ *  daemon spells the dir as the repo was typed, so on Windows/macOS `Owner/repo` and `owner/repo`
+ *  land in one physical folder, and a newer tag may rename the binary inside it. (On Linux the two
+ *  can be real case-variant dirs; the GC collects the abandoned one only while no engine claims its
+ *  twin, since the daemon's ownership check ignores case.) */
+function sameInstallDir(a: string, b: string): boolean {
+  const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, '').toLowerCase()
+  return dirOf(a) === dirOf(b)
+}
+
 /** Guided "Add your own engine" flow (engine overhaul, Phase 3). A 2-step journey:
  *  (1) pick a FOLDER (or the binary directly), upload a .zip, or browse — we scan for the
  *  server binary; (2) confirm the auto-detected version + a pre-filled name, then Add.
@@ -163,18 +173,28 @@ export function AddEngineDialog({
   // A finished release install joins the shared confirm step like any other result.
   const applyReleaseResult = (res: EngineScanResult) => {
     // A new release install supersedes an unconfirmed one (zip or release), as a fresh scan or
-    // upload does, unless it replaced that same dir in place (discarding would delete the new build).
-    // Same dir is compared by folder, ignoring case: the daemon spells the dir as the repo was typed,
-    // so on Windows/macOS `Owner/repo` and `owner/repo` land in one physical folder, and a newer tag
-    // may rename the binary inside it. (On Linux the two can be real case-variant dirs; the GC collects
-    // the abandoned one only while no engine claims its twin, since the daemon's ownership check
-    // ignores case.)
-    const dirOf = (p: string) => p.replace(/[\\/][^\\/]*$/, '').toLowerCase()
+    // upload does, unless it replaced that same dir in place (discarding would delete the new build;
+    // see sameInstallDir).
     const prev = pendingInstall.current
-    if (prev && !(res.found && dirOf(res.binPath) === dirOf(prev.binPath))) discardPendingInstall()
+    if (prev && !(res.found && sameInstallDir(res.binPath, prev.binPath))) discardPendingInstall()
     applyScanResult(res)
     if (pendingInstall.current) pendingInstall.current.discard = discardReleaseInstall
     setFromRelease(true)
+  }
+
+  // The release source offered a finished install nobody added (its dialog was dismissed, or its
+  // page reloaded, while it ran) and the user started another install instead. The daemon's job
+  // now holds that one, so nothing else can reach the offered build: it used to stay on disk until
+  // the daemon's GC. It becomes this dialog's unconfirmed install, which the new result supersedes
+  // as above (unless it landed in the same folder) and dismissing the dialog discards. An
+  // unconfirmed install already here in that folder is the same build (the confirm step's Back led
+  // here); one in another folder is dropped, as a new scan or upload drops it.
+  const adoptSupersededOffer = (res: EngineScanResult) => {
+    if (!res.found) return
+    const prev = pendingInstall.current
+    if (prev && sameInstallDir(res.binPath, prev.binPath)) return
+    discardPendingInstall()
+    pendingInstall.current = { binPath: res.binPath, discard: discardReleaseInstall }
   }
 
   // Run the read-only scan on the chosen path, then route to confirm / notfound.
@@ -342,6 +362,7 @@ export function AddEngineDialog({
               initialRepo={defaultReleaseRepo}
               onReady={applyReleaseResult}
               onCancel={() => setStep('choose')}
+              onOfferSuperseded={adoptSupersededOffer}
             />
           </>
         )}
@@ -533,14 +554,24 @@ function ReleaseStep({
   initialRepo,
   onReady,
   onCancel,
+  onOfferSuperseded,
 }: {
   initialRepo?: string
   onReady: (res: EngineScanResult) => void
   onCancel: () => void
+  onOfferSuperseded: (res: EngineScanResult) => void
 }) {
   const catalog = useEngineCatalog(false).data
   const knownRepos = (catalog?.engines ?? [])
     .filter((e) => e.releaseInstall && e.supportedHere && e.repo)
     .map((e) => ({ name: e.name, repo: e.repo as string }))
-  return <ReleaseSourcePanel initialRepo={initialRepo} knownRepos={knownRepos} onReady={onReady} onCancel={onCancel} />
+  return (
+    <ReleaseSourcePanel
+      initialRepo={initialRepo}
+      knownRepos={knownRepos}
+      onReady={onReady}
+      onCancel={onCancel}
+      onOfferSuperseded={onOfferSuperseded}
+    />
+  )
 }

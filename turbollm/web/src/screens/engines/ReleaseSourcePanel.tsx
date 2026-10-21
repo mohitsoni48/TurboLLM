@@ -18,17 +18,26 @@ const LOST_INSTALL_MESSAGE = 'The install was interrupted. Start again.'
  *  GitHub release. repo (type it or tap a known fork) -> assets (ranked for this machine)
  *  -> installing (live progress, Cancel). The finished install is handed to `onReady` in
  *  the same shape the folder scan and zip upload use, so the dialog's confirm step is shared.
- *  Nothing is fetched until the user acts (ADR-396: GitHub quota). */
+ *  Nothing is fetched from GitHub until the user acts (ADR-396: GitHub quota).
+ *
+ *  The install is the daemon's job, not this panel's: it runs on when the dialog is dismissed,
+ *  the app navigates away or the page is reloaded or closed, and only a Cancel stops it (this
+ *  panel's, or the engine provision banner's). So on mount the panel asks the daemon for its job
+ *  first: a running one shows its progress (and Cancel), and a finished one nobody added yet is
+ *  offered for Add. */
 export function ReleaseSourcePanel({
   initialRepo,
   knownRepos,
   onReady,
   onCancel,
+  onOfferSuperseded,
 }: {
   initialRepo?: string
   knownRepos: { name: string; repo: string }[]
   onReady: (res: EngineScanResult) => void
   onCancel: () => void
+  /** The finished install offered on opening (see `waiting`), passed over for another install. */
+  onOfferSuperseded?: (res: EngineScanResult) => void
 }) {
   // Opening with a repo (from a card's "Install prebuilt") is itself the explicit user action.
   const [step, setStep] = useState<Step>(initialRepo ? 'assets' : 'repo')
@@ -39,27 +48,62 @@ export function ReleaseSourcePanel({
   const [confirmingIncompatible, setConfirmingIncompatible] = useState(false)
   const [error, setError] = useState<PanelError | null>(null)
 
-  const listing = useReleaseAssets(submittedRepo, step !== 'repo')
-  const { start, job } = useReleaseInstall(step === 'installing')
+  // The daemon's job as it stands when the panel opens (see the component's doc), read once and
+  // before anything else, so a running job shows its progress instead of the repo or builds step,
+  // whose Install would only be refused while it runs. Opened with no repo of its own, the panel
+  // fetches no release list for that install; opened from a card, it fetches that card's list
+  // meanwhile, which Cancel lands on. A failed read (an older daemon, a device the host gate
+  // refuses) just starts the panel as before.
+  const [checkingJob, setCheckingJob] = useState(true)
+  // A finished install nobody added: its dialog was dismissed while it ran, or its page was
+  // reloaded or closed while it ran or on its confirm step (dismissing the confirm step itself
+  // discards the build, AddEngineDialog's reset). Offered for Add until another install starts,
+  // which hands it to the dialog (onOfferSuperseded).
+  const [waiting, setWaiting] = useState<EngineScanResult | null>(null)
+
+  const listing = useReleaseAssets(submittedRepo, step !== 'repo' && !checkingJob)
+  const { start, job } = useReleaseInstall(step === 'installing' || checkingJob)
   const qc = useQueryClient()
 
-  // A job still running when the panel goes away (dialog dismissed) is aborted, and one that finished unseen is
-  // discarded (abortInstall). `unmounted` is re-cleared on every mount so StrictMode's dev mount -> cleanup -> mount
-  // cannot leave it true.
-  const installing = useRef(false)
+  // The plan of the install shown, for Cancel's discard check (abortInstall).
   const installPlan = useRef<ReleaseInstallPlan | null>(null)
+  // Leaving the panel stops nothing (only Cancel does): this only keeps a start request answered
+  // after the panel is gone from updating it. Re-cleared on every mount so StrictMode's dev
+  // mount -> cleanup -> mount cannot leave it true.
   const unmounted = useRef(false)
   useEffect(() => {
     unmounted.current = false
     return () => {
       unmounted.current = true
-      if (installing.current) abortInstall(installPlan.current)
     }
   }, [])
 
+  useEffect(() => {
+    if (!checkingJob) return
+    if (job.isError) {
+      setCheckingJob(false)
+      return
+    }
+    const view = job.data
+    if (!view) return
+    setCheckingJob(false)
+    if (view.state === 'running') {
+      // Cancel aborts it as it would this panel's own install. With no repo of its own (opened
+      // from the source list, not a card) the panel then offers that install's repo to look up,
+      // rather than fetching its release list unasked.
+      installPlan.current = view.plan ?? null
+      if (view.plan && !submittedRepo) setRepoInput(view.plan.repo)
+      setStep('installing')
+    } else if (view.state === 'ready' && view.result?.found) {
+      setWaiting(view.result)
+    }
+    // An `updated`, `error` or `idle` job is not picked up: an update has nothing to Add (the engine
+    // list shows it), and a failure is reported on the engine provision banner.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- reacts to the mount read only
+  }, [checkingJob, job.data, job.isError])
+
   const leaveInstalling = () => {
-    installing.current = false
-    setStep('assets')
+    setStep(submittedRepo ? 'assets' : 'repo')
   }
 
   useEffect(() => {
@@ -71,7 +115,6 @@ export function ReleaseSourcePanel({
         leaveInstalling()
         return
       }
-      installing.current = false
       if (view.state === 'updated') {
         // A registered engine was refreshed in place with no Add to follow (as a zip re-upload's
         // `updated`): refetch what shows its version and tag.
@@ -119,17 +162,20 @@ export function ReleaseSourcePanel({
     setError(null)
     track('engines', 'install_release_asset')
     const plan = { repo: data.repo, tag: data.tag, asset: chosenAsset.name }
-    // mutateAsync, not per-call mutate callbacks: those are skipped once the panel unmounts, so a
-    // dialog dismissed before the 202 would leave the job running headless. The abort sent here
-    // goes out after the 202, when the daemon has registered the job's abort handle.
+    // mutateAsync, not per-call mutate callbacks: TanStack skips those once the panel unmounts. A
+    // dialog dismissed before the 202 leaves the install running, as one dismissed after it does:
+    // only Cancel stops it, and the panel opened next shows it.
     void start.mutateAsync(plan).then(
       () => {
-        if (unmounted.current) {
-          void discardReleaseInstall().catch(() => {})
-          return
-        }
-        installing.current = true
+        // The job now holds this install, not the finished one that was offered, so nothing could
+        // reach that build again: it stayed on disk until the daemon's GC. The dialog takes it as
+        // its unconfirmed install, which this install's result supersedes (unless it lands in the
+        // same folder) and dismissing the dialog discards. Before the unmounted check: the dialog
+        // outlives this panel.
+        if (waiting?.found) onOfferSuperseded?.(waiting)
+        if (unmounted.current) return
         installPlan.current = plan
+        setWaiting(null)
         setStep('installing')
       },
       (e: unknown) => {
@@ -156,9 +202,14 @@ export function ReleaseSourcePanel({
     )
   }
 
+  const waitingOffer = waiting?.found && !start.isPending ? <WaitingInstall result={waiting} onAdd={() => onReady(waiting)} /> : null
+
   if (step === 'repo') {
     return (
       <div className="flex flex-col gap-3">
+        {waitingOffer}
+        {/* A picked-up install (see checkingJob) that failed, opened with no repo of its own. */}
+        {error && <ErrorLine error={error} />}
         <label className="flex flex-col gap-1.5">
           <span className="text-[13px] font-medium text-ink">GitHub repository</span>
           <Input
@@ -188,7 +239,8 @@ export function ReleaseSourcePanel({
 
   return (
     <div className="flex flex-col gap-3">
-      {listing.isLoading && (
+      {waitingOffer}
+      {(checkingJob || listing.isLoading) && (
         <div className="flex items-center gap-3 rounded-lg border border-border bg-panel p-4 text-[13px] text-muted">
           <Loader2 size={18} className="shrink-0 animate-spin text-ink" />
           Looking up the newest release…
@@ -219,10 +271,11 @@ export function ReleaseSourcePanel({
   )
 }
 
-/** Abort this panel's install job, then discard its build if the job had already finished. A job that ended after the
- *  last poll never reached the dialog's confirm step (whose dismissal discards the build), and the abort does nothing to
- *  a finished job: the build would stay on disk until the daemon's GC, a day later at the earliest. Only a `ready`
- *  result of this same plan is discarded (`updated` replaced a registered engine's build in place). */
+/** Cancel: abort this panel's install job, then discard its build if the job had already finished. A job that ended
+ *  after the last poll never reached the dialog's confirm step (whose dismissal discards the build), and the abort does
+ *  nothing to a finished job: the build would stay on disk until the daemon's GC, a day later at the earliest. Only a
+ *  `ready` result of this same plan is discarded (`updated` replaced a registered engine's build in place). Leaving the
+ *  panel any other way calls nothing: the install is the daemon's, and the panel opened next picks it up. */
 function abortInstall(plan: ReleaseInstallPlan | null): void {
   void discardReleaseInstall()
     .then(() => getReleaseInstall())
@@ -366,6 +419,17 @@ function AssetRow({
         {asset.reason && <span className="text-[12px]" style={{ color: 'var(--warn)' }}>{asset.reason}</span>}
       </span>
     </label>
+  )
+}
+
+/** A finished install that nobody added yet (see `waiting`). Add hands it to the dialog's
+ *  confirm step, where dismissing the dialog discards it as for any install. */
+function WaitingInstall({ result, onAdd }: { result: Extract<EngineScanResult, { found: true }>; onAdd: () => void }) {
+  return (
+    <div className="flex items-center gap-3 rounded-lg border border-border bg-panel p-3 text-[13px] text-ink">
+      <span className="min-w-0 flex-1">{result.suggestedName} finished installing and has not been added yet.</span>
+      <Button size="sm" onClick={onAdd}>Add it</Button>
+    </div>
   )
 }
 

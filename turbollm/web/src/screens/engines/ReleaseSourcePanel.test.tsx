@@ -88,7 +88,11 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(listReleaseAssets).mockResolvedValue(LISTING)
   vi.mocked(startReleaseInstall).mockResolvedValue({ accepted: true })
+  // The panel reads the daemon's job once on mount (an install it may pick up): no job there, then
+  // `running` for every poll of the install a test starts, unless the test says otherwise.
+  vi.mocked(getReleaseInstall).mockReset()
   vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
+  vi.mocked(getReleaseInstall).mockResolvedValueOnce({ state: 'idle' })
   vi.mocked(discardReleaseInstall).mockResolvedValue({ ok: true })
   vi.mocked(getStatus).mockResolvedValue({
     engineProvision: { active: true, phase: 'downloading', backend: 'github-release', pct: 0.5, part: 2, parts: 2, error: null },
@@ -185,17 +189,6 @@ describe('ReleaseSourcePanel', () => {
   // daemon's 24 h GC.
   const FINISHED: ReleaseJobView = { state: 'ready', plan: { repo: LISTING.repo, tag: LISTING.tag, asset: CUDA }, result: FOUND }
 
-  it('dismissed after the job finished but before the poll saw it: the finished build is discarded', async () => {
-    const { unmount } = wrap({ initialRepo: 'a/b' })
-    await screen.findByText(CUDA)
-    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
-    await screen.findByText(/part 2\/2/)
-    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
-    unmount()
-    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
-    expect(vi.mocked(discardReleaseInstall).mock.calls[0]).toEqual([])
-  })
-
   it('Cancel after the job finished but before the poll saw it discards the finished build', async () => {
     const { onReady } = wrap({ initialRepo: 'a/b' })
     await screen.findByText(CUDA)
@@ -207,22 +200,162 @@ describe('ReleaseSourcePanel', () => {
     expect(onReady).not.toHaveBeenCalled()
   })
 
-  it('dismissed while installing: a finished job of another install, or an in-place update, is not discarded', async () => {
+  it('Cancel while installing: a finished job of another install, or an in-place update, is not discarded', async () => {
     for (const view of [
       { ...FINISHED, plan: { ...FINISHED.plan!, asset: CPU } },
       { ...FINISHED, state: 'updated', updated: { id: 'e1', name: 'Prism' } },
     ] as ReleaseJobView[]) {
+      vi.mocked(getReleaseInstall).mockReset()
       vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
+      vi.mocked(getReleaseInstall).mockResolvedValueOnce({ state: 'idle' })
       const { unmount } = wrap({ initialRepo: 'a/b' })
       await screen.findByText(CUDA)
       await userEvent.click(screen.getByRole('button', { name: 'Install' }))
       await screen.findByText(/part 2\/2/)
       vi.mocked(getReleaseInstall).mockResolvedValue(view)
       const polls = vi.mocked(getReleaseInstall).mock.calls.length
-      unmount()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
       await waitFor(() => expect(vi.mocked(getReleaseInstall).mock.calls.length).toBe(polls + 1))
       await new Promise((r) => setTimeout(r, 20))
+      expect(discardReleaseInstall).toHaveBeenCalledWith()
       expect(discardReleaseInstall).not.toHaveBeenCalledWith(FOUND.binPath)
+      unmount()
+      vi.mocked(discardReleaseInstall).mockClear()
+    }
+  })
+
+  // The install is the daemon's job, not the panel's: it runs on when the dialog is dismissed, the app navigates
+  // away or the page is reloaded or closed, and only Cancel stops it. The panel used to abort it on unmount (and
+  // discard a build that finished unseen), and never read the job when it opened, so a reopened dialog offered a
+  // fresh install next to one still running, and a build that finished meanwhile was never offered for Add.
+  const WAITING = 'Prism (b10770) finished installing and has not been added yet.'
+  const RUNNING: ReleaseJobView = { state: 'running', plan: FINISHED.plan }
+
+  it('opened while an install runs in the daemon, it shows that install, fetches no release list, and Cancel aborts it', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue(RUNNING)
+    wrap()
+    expect(await screen.findByText(/part 2\/2/)).toBeTruthy()
+    expect(screen.getByText('50%')).toBeTruthy()
+
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+    // Back on the repo step, with the repo that install came from ready to look up again.
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe(LISTING.repo)
+    expect(listReleaseAssets).not.toHaveBeenCalled()
+  })
+
+  it('an install picked up on opening that then fails shows its error on the repo step', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'error', plan: FINISHED.plan, error: { code: 'bad_zip', message: 'That archive is damaged.' } })
+    vi.mocked(getReleaseInstall).mockResolvedValueOnce(RUNNING)
+    wrap()
+    await screen.findByText(/part 2\/2/)
+    expect(await screen.findByText('That archive is damaged.', {}, { timeout: 2500 })).toBeTruthy()
+    expect((screen.getByRole('textbox') as HTMLInputElement).value).toBe(LISTING.repo)
+  })
+
+  it('opened from a card while an install runs, Cancel lands on the builds of that card', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue(RUNNING)
+    wrap({ initialRepo: 'a/b' })
+    await screen.findByText(/part 2\/2/)
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+    expect(await screen.findByText(CUDA)).toBeTruthy()
+    expect(listReleaseAssets).toHaveBeenCalledWith('a/b')
+  })
+
+  it('opened with a finished install nobody added, it offers it, and Add hands the build to onReady', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    const { onReady } = wrap()
+    expect(await screen.findByText(WAITING)).toBeTruthy()
+    expect(screen.getByRole('textbox')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: 'Add it' }))
+    expect(onReady).toHaveBeenCalledWith(FOUND)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  // The daemon's job then holds the new install, so the panel is the last place that knows of the
+  // offered build: it hands it to the dialog, which discards it unless the new build replaces it.
+  it('installing another build instead of the one offered drops the offer and hands that build to the dialog', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue(RUNNING)
+    vi.mocked(getReleaseInstall).mockResolvedValueOnce(FINISHED)
+    const onOfferSuperseded = vi.fn()
+    const { onReady } = wrap({ initialRepo: 'a/b', onOfferSuperseded })
+    await screen.findByText(WAITING)
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    expect(onOfferSuperseded).toHaveBeenCalledWith(FOUND)
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await screen.findByText(CUDA)
+    expect(screen.queryByText(WAITING)).toBeNull()
+    expect(onReady).not.toHaveBeenCalled()
+    expect(onOfferSuperseded).toHaveBeenCalledTimes(1)
+  })
+
+  it('a start refused while a build is offered keeps the offer and hands nothing over', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    vi.mocked(startReleaseInstall).mockRejectedValue(new ApiError('engine_already_running', 'An engine install is already running.', 409))
+    const onOfferSuperseded = vi.fn()
+    wrap({ initialRepo: 'a/b', onOfferSuperseded })
+    await screen.findByText(WAITING)
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    expect(await screen.findByText('An engine install is already running.')).toBeTruthy()
+    expect(screen.getByText(WAITING)).toBeTruthy()
+    expect(onOfferSuperseded).not.toHaveBeenCalled()
+  })
+
+  it('unmounted while installing, the install is not aborted, and the panel opened next shows it', async () => {
+    const first = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    first.unmount()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    wrap()
+    expect(await screen.findByText(/part 2\/2/)).toBeTruthy()
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  it('unmounted after the job finished but before the poll saw it, the build is kept and the next panel offers it', async () => {
+    const first = wrap({ initialRepo: 'a/b' })
+    await screen.findByText(CUDA)
+    await userEvent.click(screen.getByRole('button', { name: 'Install' }))
+    await screen.findByText(/part 2\/2/)
+    first.unmount()
+    vi.mocked(getReleaseInstall).mockResolvedValue(FINISHED)
+    await new Promise((r) => setTimeout(r, 50))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    const { onReady } = wrap()
+    await userEvent.click(await screen.findByRole('button', { name: 'Add it' }))
+    expect(onReady).toHaveBeenCalledWith(FOUND)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  it('a job that ended in an update or an error, or a read of it that fails, is not picked up on opening', async () => {
+    for (const answer of [
+      () => vi.mocked(getReleaseInstall).mockResolvedValueOnce({ ...FINISHED, state: 'updated', updated: { id: 'e1', name: 'Prism' } }),
+      () => vi.mocked(getReleaseInstall).mockResolvedValueOnce({ state: 'error', plan: FINISHED.plan, error: { code: 'bad_zip', message: 'That archive is damaged.' } }),
+      () => vi.mocked(getReleaseInstall).mockRejectedValueOnce(new ApiError('forbidden', 'Needs a key.', 403)),
+    ]) {
+      vi.mocked(getReleaseInstall).mockReset()
+      answer()
+      const { onReady, unmount } = wrap({ initialRepo: 'a/b' })
+      await screen.findByText(CUDA)
+      expect(screen.queryByText(/finished installing/)).toBeNull()
+      expect(screen.queryByText('That archive is damaged.')).toBeNull()
+      expect(screen.getByRole('button', { name: 'Install' })).toBeTruthy()
+      expect(onReady).not.toHaveBeenCalled()
+      unmount()
     }
   })
 

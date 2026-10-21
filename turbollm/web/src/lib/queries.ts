@@ -652,8 +652,10 @@ export function useReleaseAssets(repo: string, enabled: boolean) {
 }
 
 /** The release-install job: `start` kicks it off, `job` polls its view once a second while it
- *  runs. `job` is only fetched while `polling` is true so no other step spends requests. Starting
- *  resets the cached view so a previous attempt's `error`/`ready` is never mistaken for this one. */
+ *  runs. `job` is only fetched while `polling` is true (the panel's read of the job on opening,
+ *  which picks up an install its dialog did not see finish, and its installing step) so no other
+ *  step spends requests. Starting resets the cached view so a previous attempt's `error`/`ready`
+ *  is never mistaken for this one. */
 export function useReleaseInstall(polling: boolean) {
   const qc = useQueryClient()
   const start = useMutation({
