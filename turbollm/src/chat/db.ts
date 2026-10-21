@@ -1495,6 +1495,20 @@ export class ConversationStore {
     return ((this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
+  /** On daemon startup: a chat reply still as its turn's placeholder left it (empty, `{"aborted":false}`, the exact
+   *  stats only the two chat turn routes insert) belongs to a turn of a previous process, which died before its one
+   *  save at the end. It stayed that way for good, shown as "This message is empty." with nothing to say why, so it is
+   *  marked stopped. A placeholder edited by hand since (PUT, which leaves stats alone) keeps its text and stats. Code
+   *  sessions (kind 'code') are Code's own: its run reconcile marks them, and a finished Code turn can carry those same
+   *  stats. Returns how many replies were marked. */
+  abortUnfinishedReplies(): number {
+    return ((this.db.prepare(
+      `UPDATE messages SET stats = '{"aborted":true}'
+        WHERE role = 'assistant' AND stats = '{"aborted":false}' AND content = ''
+          AND conv_id IN (SELECT id FROM conversations WHERE kind <> 'code')`,
+    ).run() as unknown) as Changes).changes
+  }
+
   /** Most-recent assistant gen t/s per model (spec 04 §5 `lastTps`). For each
    *  model_key, takes the newest assistant message that recorded a positive
    *  `stats.tps` and returns its value. Rows with NULL model_key (pre-v2) or no

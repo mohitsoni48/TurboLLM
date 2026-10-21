@@ -190,6 +190,10 @@ function branchEditedQuestion(db: ConversationStore, convId: string, msg: Messag
 
 export function registerChatRoutes(app: Hono, d: Deps): void {
   const { db } = d
+  // Startup reconcile (createApp, before the daemon listens), as Code's runs.reconcileOnStartup: a reply whose turn
+  // died with the previous process (a restart, a crash, Android killing the app) was left an empty placeholder.
+  const cutOff = db.abortUnfinishedReplies()
+  if (cutOff > 0) console.log(`[chat] marked ${cutOff} ${cutOff === 1 ? 'reply' : 'replies'} cut off by the last daemon exit as stopped`)
 
   // ── folders CRUD (v10) ─────────────────────────────────────────────────────
   // Flat folders for grouping conversations in the sidebar. Grouping itself is done

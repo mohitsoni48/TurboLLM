@@ -60,6 +60,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
   and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set
   to Allow. The reply is now saved as stopped, and no tool call starts once a reply is stopped.
+- A chat reply cut off by a daemon restart, a crash or Android closing the app before any of its text was saved now
+  reads "Generation failed or was stopped." instead of "This message is empty." for good.
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
