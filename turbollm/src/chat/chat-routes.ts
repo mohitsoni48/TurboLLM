@@ -92,6 +92,20 @@ function releaseInflight(convId: string, ac: AbortController): void {
 const compactions = new WeakSet<AbortController>()
 const COMPACTING_MESSAGE = 'This chat is being compacted. Try again when it finishes.'
 
+/** The reply each turn's in-flight entry generates (its placeholder's id). Keyed by the entry, as
+ *  `compactions` is, so it goes with it. Read by slotState. */
+const turnReplies = new WeakMap<AbortController, string>()
+
+/** What holds `convId`'s in-flight slot, as GET /conversations(/:id) report it, so a page opened or
+ *  reopened on the chat (another tab or device) can tell a running reply, and which one, from a manual
+ *  compaction: the page's own state knew that only for the turns and compactions it started. */
+function slotState(convId: string): { runningReplyId: string | null; compacting: boolean } {
+  const held = inflight.get(convId)
+  if (!held) return { runningReplyId: null, compacting: false }
+  if (compactions.has(held)) return { runningReplyId: null, compacting: true }
+  return { runningReplyId: turnReplies.get(held) ?? null, compacting: false }
+}
+
 /** The in-flight entries of turns whose own auto-compaction (maybeAutoCompact) is running. Only
  *  compaction Undo reads it (the other routes answer such a turn as a running one), since that
  *  compaction stores its summary over an Undo made meanwhile, as a manual one does. */
@@ -276,7 +290,9 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
   app.get('/api/v1/conversations', (c) => {
     const q = c.req.query('q')
-    return c.json({ conversations: db.listConversations(q, 'chat') })
+    // `running`: a turn holds the chat's slot (slotState), for the sidebar of a page that did not start it.
+    const conversations = db.listConversations(q, 'chat').map((conv) => ({ ...conv, running: slotState(conv.id).runningReplyId !== null }))
+    return c.json({ conversations })
   })
 
   app.post('/api/v1/conversations', async (c) => {
@@ -319,7 +335,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
     // daemon's auto-compaction gate can judge this branch larger than that reading: see
     // maybeAutoCompact, which raises it to the estimated size of the full history replayed.)
     const shown = setAsideFrozenCut(db, conv)
-    return c.json({ ...shown, messages: forClient(shown.messages ?? []) })
+    return c.json({ ...shown, messages: forClient(shown.messages ?? []), ...slotState(conv.id) })
   })
 
   app.patch('/api/v1/conversations/:id', async (c) => {
@@ -510,6 +526,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     const ac = new AbortController()
     inflight.set(convId, ac)
+    turnReplies.set(ac, assistantMsg.id)
 
     // Phase 4 / C1: the code-flavor routine gate, decided HERE because this is the last point
     // that still has the Hono Context. `chatCodeAuthorization` wraps routine-routes.ts's own
@@ -634,6 +651,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
 
     const ac = new AbortController()
     inflight.set(convId, ac)
+    turnReplies.set(ac, assistantMsg.id)
 
     // Same per-request code-routine gate as the /messages route above — a regenerated turn can
     // emit tool calls too, so it must not be a softer door onto code-flavor routine authoring.

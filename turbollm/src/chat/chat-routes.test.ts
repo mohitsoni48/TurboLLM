@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import { readFileSync, rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { stripThinkingBlocks, needsExtraPass } from './think-utils.js'
-import { recentTitleTurns, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { recentTitleTurns, abortAllInFlightChats, chatCodeAuthorization, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
@@ -1146,6 +1146,111 @@ test('a manual compaction holds the in-flight slot: turns, edits and switches ar
     assert.equal((await put(a2b.id, 'fixed reply')).status, 200, 'the chat takes edits again')
   } finally {
     finish()
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+// A page that did not start the chat's turn (another tab or device, a reload) could not tell a running reply from a
+// finished one, nor which reply was running, nor a running manual compaction: only the page that started it knew.
+type SlotView = { runningReplyId: string | null; compacting: boolean }
+function slotViews(h: ReturnType<typeof inFlightHarness>) {
+  return {
+    state: async (convId: string): Promise<SlotView> => {
+      const b = await (await h.app.request(`/api/v1/conversations/${convId}`)).json() as SlotView
+      return { runningReplyId: b.runningReplyId, compacting: b.compacting }
+    },
+    listed: async (): Promise<Record<string, boolean>> => {
+      const b = await (await h.app.request('/api/v1/conversations')).json() as { conversations: Array<{ id: string; running: boolean }> }
+      return Object.fromEntries(b.conversations.map((c) => [c.id, c.running]))
+    },
+  }
+}
+
+/** Ends the turn or compaction a test still holds and waits until its slot is free, so a failed assertion does not
+ *  leave an in-flight entry behind for the tests after it. */
+async function endHeldTurn(release: () => void): Promise<void> {
+  release()
+  abortAllInFlightChats()
+  await waitFor(() => inFlightChatIds().length === 0, 'the held turn to end').catch(() => {})
+}
+
+test('a conversation names the reply its turn generates, and its list row says running, until the turn ends', async () => {
+  const h = inFlightHarness()
+  const engine = holdEngineReply()
+  const { state, listed } = slotViews(h)
+  try {
+    const conv = h.store.createConversation()
+    const other = h.store.createConversation()
+    assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
+    const res = await h.app.request(`/api/v1/conversations/${conv.id}/messages`, json({ content: 'hi' }))
+    const reply = h.store.getMessages(conv.id).find((m) => m.role === 'assistant')!
+    assert.deepEqual(await state(conv.id), { runningReplyId: reply.id, compacting: false })
+    assert.deepEqual(await listed(), { [conv.id]: true, [other.id]: false })
+    engine.finish()
+    await res.text()
+    assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
+    assert.deepEqual(await listed(), { [conv.id]: false, [other.id]: false })
+  } finally {
+    await endHeldTurn(engine.finish)
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a conversation says it is compacting while a manual compaction holds it, with no running reply', async () => {
+  const h = inFlightHarness()
+  let finish!: () => void
+  const held = new Promise<void>((r) => { finish = r })
+  const engine = fakeEngine(async () => {
+    await held
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'The user asked twice about x.' } }] }), { status: 200, headers: { 'content-type': 'application/json' } })
+  })
+  const { state, listed } = slotViews(h)
+  try {
+    const conv = h.store.createConversation()
+    const long = 'x'.repeat(6000)
+    for (const role of ['user', 'assistant', 'user', 'assistant'] as const) h.store.addMessage(conv.id, role, long)
+    const compacting = h.app.request(`/api/v1/conversations/${conv.id}/compact`, json({}))
+    await waitFor(() => engine.bodies.length === 1, 'the summary call to start')
+    assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: true })
+    assert.deepEqual(await listed(), { [conv.id]: false }, 'a compaction is not a running reply')
+    finish()
+    assert.equal((await compacting).status, 200)
+    assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
+  } finally {
+    await endHeldTurn(finish)
+    engine.restore()
+    h.cleanup()
+  }
+})
+
+test('a Regenerate names its new reply as running, and a Stop clears it once the turn ends', async () => {
+  const h = inFlightHarness()
+  const engine = fakeEngine((init, n) => {
+    if (n === 1) return sseReply('a1')
+    // the Regenerate: a long generation, held open until it is aborted
+    const signal = init?.signal
+    return new Response(new ReadableStream({
+      start(c) { signal?.addEventListener('abort', () => c.error(Object.assign(new Error('aborted'), { name: 'AbortError' }))) },
+    }), { status: 200 })
+  })
+  const { state, listed } = slotViews(h)
+  try {
+    const conv = h.store.createConversation()
+    const base = `/api/v1/conversations/${conv.id}`
+    await (await h.app.request(`${base}/messages`, json({ content: 'q1' }))).text()
+    const res = await h.app.request(`${base}/continue`, json({ regenerate: true }))
+    const newReply = h.store.getMessages(conv.id).at(-1)!
+    assert.equal(newReply.role, 'assistant')
+    assert.equal(newReply.content, '', 'the new placeholder, not the reply it replaces')
+    assert.deepEqual(await state(conv.id), { runningReplyId: newReply.id, compacting: false })
+    await h.app.request('/api/v1/chat/stop', json({ conversationId: conv.id }))
+    await res.text()
+    assert.deepEqual(await state(conv.id), { runningReplyId: null, compacting: false })
+    assert.deepEqual(await listed(), { [conv.id]: false })
+  } finally {
+    await endHeldTurn(() => {})
     engine.restore()
     h.cleanup()
   }

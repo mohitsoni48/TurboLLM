@@ -148,6 +148,14 @@ export interface Conversation {
   createdAt: string
   updatedAt: string
   messages?: Message[]
+  /** GET /conversations/:id: the reply whose turn holds the chat now (its assistant message id), or
+   *  null. Null while a manual compaction holds it (`compacting`). Set by the daemon, whichever page,
+   *  tab or device started the turn. */
+  runningReplyId?: string | null
+  /** GET /conversations/:id: a manual compaction holds the chat. */
+  compacting?: boolean
+  /** GET /conversations rows: a turn holds the chat. */
+  running?: boolean
 }
 
 /** A durable fact extracted from the user's own chat messages (Release 3, auto-memory). */

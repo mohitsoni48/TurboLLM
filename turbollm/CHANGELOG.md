@@ -48,6 +48,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   page and device. A hidden model keeps its files and settings, stays listed while it is loaded, and still loads when it
   is named (an API client, a routine pinned to it, `turbollm launch --model`); the gateway's `GET /v1/models` still
   lists it. A model picker with nothing to show says how many models you hid and links to that switch.
+- `GET /api/v1/conversations/:id` reports `runningReplyId` (the reply whose turn holds the chat, or `null`) and
+  `compacting` (a manual compaction holds it), and each `GET /api/v1/conversations` row reports `running`, so a page
+  or device that did not start the turn can tell what is running.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
