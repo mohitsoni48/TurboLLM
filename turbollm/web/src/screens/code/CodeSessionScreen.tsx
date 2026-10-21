@@ -552,6 +552,13 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
   // ever fires for AUTO-compaction's SSE event mid-turn; the manual command is a separate,
   // non-streaming POST with no live state of its own until now.
   const [manualCompacting, setManualCompacting] = useState(false)
+  // The compaction runs to the end in the daemon even when the page that sent it is closed or
+  // reloaded, and the daemon refuses a turn, /clear, /resume, /revert and another /compact until
+  // it settles. So the session detail's `compacting` drives the same hint, held-back composer and
+  // hidden Revert: a reopened page (or another tab) otherwise showed an idle composer whose sends
+  // all failed with 409. The detail's poll clears it, and brings in the compacted transcript, once
+  // it is done.
+  const compacting = manualCompacting || !!detailQ.data?.compacting
   const runCompact = async (text: string) => {
     if (!effectiveSessionId) return
     // `text` is always a /compact input here (send() dispatched on it) — read its captured
@@ -561,7 +568,6 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     setManualCompacting(true)
     try {
       const result = await compactCodeSession(effectiveSessionId, instructions, activeRemoteId ?? undefined)
-      void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
       toast.success(`Compacted — ${result.tokensBefore.toLocaleString()} tokens of history summarized.`)
     } catch (e) {
       setInput(text) // restore so the command isn't lost
@@ -569,6 +575,9 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       else toast.error(e instanceof ApiError ? e.message : 'Could not compact.')
     } finally {
       setManualCompacting(false)
+      // After a failure too: a poll that ran meanwhile may have seen the daemon's `compacting`,
+      // and the restored /compact would sit in a composer held back until the next one (6 s).
+      void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) })
     }
   }
 
@@ -1055,7 +1064,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                     messages={transcriptMessages}
                     liveAssistantId={live?.assistantId}
                     live={live ? { timeline: live.timeline, reasoning: live.reasoning, compacting: live.compacting, retry: live.retry, prefill: live.prefill } : null}
-                    onRevert={live || queued.length > 0 ? undefined : openRevertConfirm}
+                    onRevert={live || queued.length > 0 || compacting ? undefined : openRevertConfirm}
                     queued={queued}
                     onSendNowQueued={(id) => void handleSendNow(id)}
                     shellRuns={shellRuns}
@@ -1095,7 +1104,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                 // instrumentation batch must NOT add a second track() call there.
                 onSubmit={(kind) => { track('code', 'send_code_message'); void send(kind) }}
                 placeholder={live ? 'Queue a follow-up…' : 'Send a follow-up…'}
-                textareaDisabled={manualCompacting}
+                textareaDisabled={compacting}
                 mode={modeInfo}
                 onModeChange={handleModeChange}
                 models={allModels}
@@ -1121,7 +1130,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                 lastGenTps={lastRealStats?.tps}
                 live={!!live}
                 onStop={() => void handleStop()}
-                sendDisabled={!input.trim() || manualCompacting}
+                sendDisabled={!input.trim() || compacting}
                 onAddContext={() => setContextBrowserOpen(true)}
                 contextFiles={contextFiles}
                 onRemoveContextFile={(p) => setContextFiles((cf) => cf.filter((x) => x !== p))}
@@ -1130,7 +1139,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
                   ...(skillsQ.data ?? []).map((s) => ({ id: s.id, description: s.description })),
                 ]}
                 statusText={
-                  manualCompacting || live?.compacting
+                  compacting || live?.compacting
                     ? 'Compacting conversation…'
                     : live
                       ? (queued.length ? `${queued.length} queued · Enter to queue another` : 'Running — Enter to queue a follow-up')

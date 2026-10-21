@@ -92,6 +92,10 @@ export interface CodeSessionDetail {
   /** Turns waiting behind the active one (server-side queue) — restores the "Queued" chips
    *  after a reload/reconnect. */
   queued: QueuedTurn[]
+  /** True while a manual /compact runs in the daemon, whichever page started it: the daemon
+   *  refuses a turn, /clear, /resume and another /compact meanwhile (409 compaction_in_progress),
+   *  so a reopened page shows the compaction and holds the composer back. */
+  compacting: boolean
   /** The live turn's current checklist, if the run is active — reflects the daemon's in-memory
    *  state (reset per turn), same reconnect-resilience purpose as `queued`. */
   todos: TodoItem[]

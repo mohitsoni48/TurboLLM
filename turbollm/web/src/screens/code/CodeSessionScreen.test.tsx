@@ -47,6 +47,7 @@ vi.mock('../../lib/code-session-client', () => ({
 const getCodeSessionMock = vi.fn()
 const startCodeRunMock = vi.fn()
 const stopCodeSessionMock = vi.fn()
+const compactCodeSessionMock = vi.fn()
 
 vi.mock('../../lib/code-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/code-api')>()
@@ -55,6 +56,7 @@ vi.mock('../../lib/code-api', async (importOriginal) => {
     getCodeSession: (...args: unknown[]) => getCodeSessionMock(...args),
     startCodeRun: (...args: unknown[]) => startCodeRunMock(...args),
     stopCodeSession: (...args: unknown[]) => stopCodeSessionMock(...args),
+    compactCodeSession: (...args: unknown[]) => compactCodeSessionMock(...args),
   }
 })
 
@@ -88,8 +90,13 @@ vi.mock('./CodeGitDialog', () => ({ CodeGitDialog: () => null }))
 vi.mock('../models/ModelDetailDialog', () => ({ ModelDetailDialog: () => null }))
 vi.mock('../engines/FsBrowser', () => ({ FsBrowser: () => null }))
 vi.mock('../chat/ToolApprovalBar', () => ({ ToolApprovalBar: () => null }))
+// The transcript's Revert, as the screen offers it (undefined when it is hidden).
+let revertOfferedByTranscript: unknown = null
 vi.mock('./CodeTranscript', () => ({
-  CodeTranscript: () => null,
+  CodeTranscript: (props: { onRevert?: unknown }) => {
+    revertOfferedByTranscript = props.onRevert
+    return null
+  },
   CodeTranscriptSkeleton: () => null,
   TodoChecklist: () => null,
 }))
@@ -100,12 +107,13 @@ let modelsHiddenFromTerminalToolbar: unknown = null
 // A minimal, interactive stand-in for the real composer — exposes exactly the two triggers these
 // tests need (a plain send and a steer send) without depending on its own internal state machine.
 vi.mock('./CodeComposer', () => ({
-  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void; models: Array<Partial<ModelEntry>>; modelsHidden?: unknown }) => {
+  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void; models: Array<Partial<ModelEntry>>; modelsHidden?: unknown; statusText?: string; textareaDisabled?: boolean }) => {
     modelsOfferedByComposer = props.models
     modelsHiddenFromComposer = props.modelsHidden
     return (
       <div>
-        <textarea aria-label="composer" value={props.value} onChange={(e) => props.onValueChange(e.target.value)} />
+        {props.statusText && <p>{props.statusText}</p>}
+        <textarea aria-label="composer" value={props.value} disabled={props.textareaDisabled} onChange={(e) => props.onValueChange(e.target.value)} />
         <button onClick={() => props.onSubmit()}>Send</button>
         <button onClick={() => props.onSubmit('steer')}>Steer</button>
       </div>
@@ -168,7 +176,7 @@ function detail(overrides: Partial<CodeSessionDetail> = {}): CodeSessionDetail {
 
 function renderScreen() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(
+  return Object.assign(render(
     <QueryClientProvider client={qc}>
       <MemoryRouter initialEntries={['/workspace/code/sess-1']}>
         <Routes>
@@ -176,7 +184,7 @@ function renderScreen() {
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>,
-  )
+  ), { qc })
 }
 
 // Lazily resolved so the module-level mocks above are guaranteed registered first.
@@ -282,6 +290,57 @@ describe('CodeSessionScreen — toast-on-send', () => {
     await user.type(screen.getByLabelText('composer'), 'go')
     await user.click(screen.getByRole('button', { name: 'Send' }))
     await waitFor(() => expect(connectSpy).toHaveBeenCalled())
+  })
+})
+
+// A manual /compact runs to the end in the daemon even when the page that sent it is closed or
+// reloaded, and the daemon refuses a turn or a revert meanwhile (409 compaction_in_progress). A
+// page opened mid-compaction showed an idle composer whose every send failed, and offered Revert;
+// it now reads the session detail's `compacting`.
+describe('CodeSessionScreen — a compaction running in the daemon', () => {
+  beforeEach(async () => {
+    connectSpy.mockClear()
+    getCodeSessionMock.mockReset()
+    compactCodeSessionMock.mockReset()
+    revertOfferedByTranscript = null
+    ScreenComp = await importScreen()
+  })
+
+  it('a session reopened while its /compact runs shows the compaction and holds the composer back', async () => {
+    getCodeSessionMock.mockResolvedValue(detail({ compacting: true }))
+    renderScreen()
+    expect(await screen.findByText('Compacting conversation…')).toBeInTheDocument()
+    expect(screen.getByLabelText('composer')).toBeDisabled()
+    expect(revertOfferedByTranscript, 'no Revert while the history is being summarized').toBeUndefined()
+  })
+
+  it('shows neither once the daemon reports the compaction done', async () => {
+    getCodeSessionMock.mockResolvedValue(detail({ compacting: false }))
+    renderScreen()
+    await waitFor(() => expect(revertOfferedByTranscript).toBeTypeOf('function'))
+    expect(screen.queryByText('Compacting conversation…')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('composer')).toBeEnabled()
+  })
+
+  it("a /compact of this page's that fails gives the composer back at once, though a poll saw it running", async () => {
+    getCodeSessionMock.mockResolvedValue(detail({ compacting: false }))
+    let fail!: (e: unknown) => void
+    compactCodeSessionMock.mockReturnValue(new Promise((_resolve, reject) => { fail = reject }))
+    const { qc } = renderScreen()
+    const user = userEvent.setup()
+    await user.type(await screen.findByLabelText('composer'), '/compact')
+    await user.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => expect(compactCodeSessionMock).toHaveBeenCalled())
+
+    // The 6 s poll lands while the summary call runs, then the compaction fails in the daemon.
+    getCodeSessionMock.mockResolvedValue(detail({ compacting: true }))
+    await qc.refetchQueries({ type: 'active' })
+    getCodeSessionMock.mockResolvedValue(detail({ compacting: false }))
+    fail(new ApiError('compact_failed', 'engine fell over', 500))
+
+    await waitFor(() => expect(screen.getByLabelText('composer')).toBeEnabled())
+    expect(screen.getByLabelText('composer')).toHaveValue('/compact')
+    expect(screen.queryByText('Compacting conversation…')).not.toBeInTheDocument()
   })
 })
 

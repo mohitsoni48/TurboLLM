@@ -172,6 +172,17 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   const runs = codeRuns ?? new CodeRunManager(d)
   runs.reconcileOnStartup()
 
+  // Sessions whose manual /compact is still running (POST /compact below). That call runs to the
+  // end whatever happens to the page that asked for it, but it was known only to that page's own
+  // state: a page reopened (or another tab) mid-compaction showed no sign of it, and a turn, a
+  // /clear, a /resume, a /revert or a second /compact sent meanwhile was accepted against the
+  // history being summarized. GET /sessions/:id reports it, and those routes answer 409
+  // compaction_in_progress until it settles. A `!` command's output (/exec) is still stored: it
+  // lands after the cut the compaction is computing, and stays as it is.
+  const compacting = new Set<string>()
+  const compactionInProgress = (c: Context) =>
+    err(c, 409, 'compaction_in_progress', 'This session is being compacted. Wait for the compaction to finish.')
+
   // ── create a session ─────────────────────────────────────────────────────────
   app.post('/api/v1/code/sessions', async (c) => {
     const b = await body<{
@@ -321,6 +332,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       // can be a stale 'running' from a crashed process — reconcileOnStartup fixes those, but
       // this is the authoritative signal the frontend uses to decide whether to reconnect).
       running: runs.isActive(run.id),
+      // A manual /compact still running (see `compacting` above), so a reopened page shows it
+      // and holds the composer back until it settles.
+      compacting: compacting.has(run.id),
       // Tasks waiting behind the active turn — the server-side message queue, so its chips
       // survive a page reload / reconnect.
       queued: runs.queued(run.id),
@@ -544,6 +558,13 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       const ms = d.manager.status()
       if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
     }
+    // Checked and claimed with no await in between, so two /compact calls racing past the body
+    // read above cannot both start one. A turn is asked about again here: the check at the top ran
+    // before that read, and a turn sent during it was taken (nothing was claimed yet), so this
+    // compaction would have run beside it.
+    if (compacting.has(id)) return compactionInProgress(c)
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
+    compacting.add(id)
     try {
       const result = await compactCodeSession({
         d, convId: run.convId, sessionId: id, repoRoot: agentCwd(run),
@@ -556,6 +577,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       if (message === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Nothing to compact yet — history is already short enough.')
       if (message === 'session_cleared') return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
       return err(c, 500, 'compact_failed', message)
+    } finally {
+      compacting.delete(id)
     }
   })
 
@@ -577,6 +600,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before clearing.')
+    if (compacting.has(id)) return compactionInProgress(c)
     if (run.revertedFromMessageId) return err(c, 409, 'session_reverted', 'Resume this session before clearing — it currently has a reverted message pending.')
     const conv = db.getConversation(run.convId, true)
     const lastMsg = (conv?.messages ?? []).at(-1)
@@ -598,6 +622,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before resuming.')
+    if (compacting.has(id)) return compactionInProgress(c)
     // Undoes whichever of the two independent resumable hidden-states is active (v33) — they're
     // mutually exclusive (see /clear and /revert's own guards), so at most one is ever set.
     if (run.revertedFromMessageId) {
@@ -648,6 +673,10 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before reverting.')
+    // Same reason as during a run: a revert now would hide messages the compaction is summarizing,
+    // and its cut (stored when it settles) would then point at a hidden message, so the next turn
+    // would get the summary of the reverted steps back alongside every message still shown.
+    if (compacting.has(id)) return compactionInProgress(c)
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before reverting — it currently has cleared messages pending.')
     // A second revert while one is already pending SUPERSEDES it rather than 409ing (founder
     // feedback, 2026-07-24 — the earlier hard stop cost real friction on "revert, try again,
@@ -862,6 +891,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const conv = db.getConversation(run.convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    // Before anything is stored: a turn queued now would run on the history the compaction is
+    // about to replace, and its message would land past the cut it is computing.
+    if (compacting.has(id)) return compactionInProgress(c)
     if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
     const notString = nonStringField(b, ['content', 'promptOverride', 'model'])
     if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
