@@ -177,6 +177,9 @@ export class DownloadError extends Error {
 export class DownloadManager {
   private records = new Map<string, DownloadRecord>()
   private controllers = new Map<string, AbortController>()
+  /** Each row's run() until it has returned, which is after its write stream has closed the
+   *  .part (pipeline() settles only once every stream has): what {@link dropPart} waits on. */
+  private runs = new Map<string, Promise<void>>()
   private manifestPath: string
   private provenancePath: string
   private provenanceList: ProvenanceEntry[] = []
@@ -560,9 +563,9 @@ export class DownloadManager {
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
     if (rec.status !== 'done') {
-      if (!this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
       rec.status = 'cancelled'
       rec.bytesPerSec = 0
+      this.dropPart(rec)
     }
     this.persist()
     this.pump()
@@ -619,11 +622,37 @@ export class DownloadManager {
     if (!rec) return false
     this.controllers.get(id)?.abort()
     this.controllers.delete(id)
-    if (rec.status !== 'done' && !this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
+    if (rec.status !== 'done') this.dropPart(rec)
     this.records.delete(id)
     this.persist()
     this.pump()
     return true
+  }
+
+  /** Delete the .part of a row being cancelled or removed, unless another live row holds the
+   *  same file: at once, and again once the row's run(), if one is still ending, has returned.
+   *  At once alone left an empty .part behind when the aborted run() had not opened it yet: the
+   *  open waits in libuv's thread pool, which other file work (a resume hashing its prefix, a
+   *  model scan) can keep busy, so the .part did not exist when it was deleted, and the
+   *  destroyed write stream then created it and closed it empty, under a row that read cancelled
+   *  (or no row at all) until the next import of that file. At once still keeps a run() that has
+   *  yet to move the .part into place (its 416 path awaits before finish()) from finishing a
+   *  cancelled row. The caller sets the row's status at once either way. */
+  private dropPart(rec: DownloadRecord): void {
+    const drop = (): void => {
+      if (!this.sharesDest(rec, LIVE)) rmSync(`${rec.dest}.part`, { force: true })
+    }
+    drop()
+    const run = this.runs.get(rec.id)
+    if (!run) return
+    const later = (): void => {
+      try {
+        drop()
+      } catch {
+        // Best effort, as nothing awaits it: the next import of this file replaces the .part.
+      }
+    }
+    void run.then(later, later)
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -665,7 +694,14 @@ export class DownloadManager {
       // Not while a run of this row is still ending (paused, then resumed before its aborted
       // stream closed the .part): two runs would append to one file. That run's own pump()
       // starts it once it has ended.
-      if (rec.status === 'queued' && !this.controllers.has(rec.id)) void this.run(rec)
+      if (rec.status === 'queued' && !this.controllers.has(rec.id)) {
+        const run = this.run(rec)
+        this.runs.set(rec.id, run)
+        const ended = (): void => {
+          if (this.runs.get(rec.id) === run) this.runs.delete(rec.id) // not a run started since
+        }
+        void run.then(ended, ended)
+      }
     }
   }
 

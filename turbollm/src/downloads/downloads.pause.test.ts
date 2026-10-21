@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readFileSync, statSync } from 'node:fs'
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
@@ -262,6 +262,96 @@ test('DELETE of a done row keeps the model file; of a paused row it deletes the 
     assert.equal(dm.list().some((r) => r.id === other.id), false)
     assert.equal(existsSync(part), false)
   } finally {
+    await srv.close()
+  }
+})
+
+/** Holds every open of a .part (the write stream's) until release(), as a busy libuv thread pool
+ *  does: the open waits in its queue while the response's bytes still reach the main thread.
+ *  `requested` counts the opens asked for, `opened` those that have created the file. */
+function holdPartOpens() {
+  const open = fs.open as (...a: unknown[]) => void
+  const held: Array<() => void> = []
+  const state = { requested: 0, opened: 0 }
+  fs.open = ((path: unknown, ...rest: unknown[]) => {
+    if (!String(path).endsWith('.part')) return open(path, ...rest)
+    const done = rest.pop() as (err: Error | null, fd?: number) => void
+    state.requested++
+    held.push(() =>
+      open(path, ...rest, (err: Error | null, fd?: number) => {
+        state.opened++
+        done(err, fd)
+      }),
+    )
+  }) as typeof fs.open
+  return {
+    state,
+    release: () => {
+      for (const go of held.splice(0)) go()
+    },
+    restore: () => {
+      fs.open = open as typeof fs.open
+    },
+  }
+}
+
+// A Cancel or a Discard can end a run() whose .part is not open yet: its open waits in libuv's
+// thread pool (four threads, which a resume hashing its prefix or a model scan keeps busy) while
+// the bytes keep arriving. Deleting the .part at once found nothing, the open then created it,
+// and the destroyed write stream closed it empty: a cancelled row (or none) and a 0-byte .part
+// on disk until the next import of that file.
+test('a Cancel while the .part is still being opened leaves no .part behind, and the row reads cancelled at once', async () => {
+  const srv = await serveFile()
+  const opens = holdPartOpens()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const outcomes: string[] = []
+    dm.onSettled = (o) => outcomes.push(o)
+    const [rec] = await dm.enqueue({ url: srv.url, sha256: SHA })
+    const part = `${rec.dest}.part`
+    await waitFor('the first bytes, with the .part still opening', () =>
+      opens.state.requested === 1 && row(dm, rec.id).received > 0 ? true : undefined,
+    )
+    assert.equal(dm.cancel(rec.id), true)
+    assert.equal(row(dm, rec.id).status, 'cancelled')
+    opens.release()
+    await waitFor('the held open to create the .part', () => (opens.state.opened === 1 ? true : undefined))
+    await waitFor('run() to settle', () => (outcomes.length > 0 ? true : undefined))
+    await waitFor('the .part to be deleted', () => (existsSync(part) ? undefined : true), 2000)
+    assert.deepEqual(outcomes, ['cancelled'])
+    assert.equal(row(dm, rec.id).status, 'cancelled')
+  } finally {
+    opens.restore()
+    await srv.close()
+  }
+})
+
+test('a Discard while the .part is still being opened leaves no .part behind, of a running download and of one paused a moment before', async () => {
+  const srv = await serveFile(() => true)
+  const opens = holdPartOpens()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const app = new Hono()
+    registerApi(app, { downloads: dm } as unknown as Deps)
+    const [running] = await dm.enqueue({ url: srv.url })
+    const [paused] = await dm.enqueue({ url: srv.url.replace('model', 'other') })
+    await waitFor('the first bytes of both, with their .parts still opening', () =>
+      opens.state.requested === 2 && row(dm, running.id).received > 0 && row(dm, paused.id).received > 0 ? true : undefined,
+    )
+    assert.equal(dm.pause(paused.id), true)
+    for (const r of [running, paused]) {
+      assert.equal((await app.request(`/api/v1/downloads/${r.id}`, { method: 'DELETE' })).status, 200)
+    }
+    assert.deepEqual(dm.list(), [])
+    opens.release()
+    await waitFor('the held opens to create both .parts', () => (opens.state.opened === 2 ? true : undefined))
+    for (const r of [running, paused]) {
+      await waitFor(`the .part of ${r.name} to be deleted`, () => (existsSync(`${r.dest}.part`) ? undefined : true), 2000)
+    }
+  } finally {
+    opens.restore()
     await srv.close()
   }
 })
