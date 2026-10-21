@@ -915,3 +915,37 @@ test('a full disk mid-download says so, keeps the .part, and Resume continues on
     await server.close()
   }
 })
+
+test('a stalled download stops showing its last speed after a few seconds without bytes', async (t) => {
+  // bytesPerSec was updated only when bytes arrived: a transfer that stalled kept reporting its
+  // last speed in the web panel and the Android notification until bytes flowed again.
+  const server = await serve((_req, res) => {
+    res.writeHead(200, { 'Content-Length': 10_000_000 })
+    res.write(file(65_536))
+    setTimeout(() => res.write(file(65_536)), 600) // a speed is measured over 500 ms or more
+    // and then nothing, with the connection open
+  })
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [rec] = await dm.enqueue({ url: `${server.origin}/stalls.gguf` })
+    const speed = await waitFor('a measured speed', () => {
+      const r = dm.list()[0]
+      return r.bytesPerSec > 0 ? r.bytesPerSec : undefined
+    })
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() })
+    try {
+      t.mock.timers.tick(2000)
+      assert.equal(dm.list()[0].bytesPerSec, speed, 'two seconds without bytes: still the last speed')
+      t.mock.timers.tick(1000)
+      const row = dm.list()[0]
+      assert.equal(row.status, 'downloading')
+      assert.equal(row.bytesPerSec, 0, 'three seconds without bytes: stalled')
+    } finally {
+      t.mock.timers.reset()
+    }
+    dm.cancel(rec.id)
+  } finally {
+    await server.close()
+  }
+})

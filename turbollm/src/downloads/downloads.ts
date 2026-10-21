@@ -102,6 +102,11 @@ export interface ProvenanceEntry {
 
 const MAX_CONCURRENT = 2
 
+/** How long a downloading row may receive no bytes before {@link DownloadManager.list} reads its
+ *  speed as 0. The speed is measured over at least 500 ms as bytes arrive, so a few seconds of
+ *  nothing is a stall, not a slow chunk. */
+const SPEED_STALE_MS = 3000
+
 /** What run() requests a model file with: {@link httpGet} over node:http/https, never the global
  *  fetch, whose undici parser crashed the daemon on a server that closes the connection (see
  *  http-get.ts). */
@@ -176,6 +181,8 @@ export class DownloadManager {
   private provenancePath: string
   private provenanceList: ProvenanceEntry[] = []
   private nextSeq = 0
+  /** When each row being streamed last received body bytes (Date.now()), for list()'s stall check. */
+  private lastDataAt = new Map<string, number>()
 
   /** Optional observer for a download's terminal outcome, wired in cli.ts to
    *  the `model_downloaded` event (spec 23 §4 — promoted out of
@@ -229,6 +236,15 @@ export class DownloadManager {
   }
 
   list(): DownloadRecord[] {
+    // bytesPerSec is only updated when bytes arrive, so a transfer that stalled kept reporting its
+    // last speed (the web panel, the Android notification) until bytes flowed again. Read here,
+    // where every caller gets the rows, rather than by a timer per row.
+    const now = Date.now()
+    for (const r of this.records.values()) {
+      if (r.status === 'downloading' && r.bytesPerSec > 0 && now - (this.lastDataAt.get(r.id) ?? 0) >= SPEED_STALE_MS) {
+        r.bytesPerSec = 0
+      }
+    }
     return [...this.records.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))
   }
 
@@ -779,11 +795,13 @@ export class DownloadManager {
 
       let lastTick = Date.now()
       let lastBytes = startAt
+      this.lastDataAt.set(rec.id, lastTick)
       const body = Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0])
       body.on('data', (chunk: Buffer) => {
         rec.received += chunk.length
         if (verifyHash) hash!.update(chunk)
         const now = Date.now()
+        this.lastDataAt.set(rec.id, now)
         const dt = now - lastTick
         if (dt >= 500) {
           rec.bytesPerSec = ((rec.received - lastBytes) / dt) * 1000
@@ -841,6 +859,7 @@ export class DownloadManager {
       // onboarding funnel reads a deliberate choice as a product defect.
       this.settle(rec.status === 'cancelled' ? 'cancelled' : 'fail')
     } finally {
+      this.lastDataAt.delete(rec.id)
       this.pump()
     }
   }
