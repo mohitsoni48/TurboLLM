@@ -102,10 +102,10 @@ describe('CodeHomeScreen — model picker offers chat models only', () => {
   it('tells the composer how many chat models it left out for the selected engine, and none with every engine shown', async () => {
     const { unmount } = await renderScreen()
     await waitFor(() => expect(modelsOfferedByComposer).not.toBeNull())
-    expect(modelsHiddenFromComposer).toEqual({ byEngine: 1 })
+    expect(modelsHiddenFromComposer).toEqual({ byEngine: 1, byUser: 0 })
     unmount()
     mockShowAll = true
     await renderScreen()
-    await waitFor(() => expect(modelsHiddenFromComposer).toEqual({ byEngine: 0 }))
+    await waitFor(() => expect(modelsHiddenFromComposer).toEqual({ byEngine: 0, byUser: 0 }))
   })
 })

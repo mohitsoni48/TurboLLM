@@ -581,6 +581,16 @@ export interface Config {
   /** Pinned preset per model (ADR-353 D4): modelKey → preset id. Cleared by a manual profile
    *  save, a profile reset, and deleting the pinned preset. */
   lastPresetId: Record<string, string>
+  /** Models the user hid by hand (Models → Library, a model's "Hide"), by the model key modelProfiles and modelPresets
+   *  use, oldest first. Kept here, not in the browser, so the choice holds on every page and device. The web UI leaves
+   *  a hidden model out of the Library list (until its "Show hidden models" switch is on) and out of every model picker
+   *  but ModelDetailDialog's draft-model select (a small draft is what one hides from the chat pickers), unless it is
+   *  loaded. Nothing else changes: it keeps its files and settings, and it still loads when it is named (an API client,
+   *  a routine or preset pinned to it, `turbollm launch --model`); the gateway's /v1/models and the Turbo Link listing
+   *  still list it. Separate from the automatic hiding of models the selected engine cannot run (showAllEngineModels).
+   *  A key no scanned model has is ignored. Bounded: PUT /api/v1/models/:key/hidden adds only a scanned model's key,
+   *  deleting a model through TurboLLM drops its key, and normalize keeps the newest {@link HIDDEN_MODELS_CAP}. */
+  hiddenModels: string[]
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -771,6 +781,7 @@ export function defaultConfig(): Config {
     modelProfiles: {},
     modelPresets: {},
     lastPresetId: {},
+    hiddenModels: [],
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
@@ -1367,6 +1378,11 @@ function normalize(c: Config): void {
     cleanedPins[modelKey] = pin
   }
   c.lastPresetId = cleanedPins
+  // Hidden models: absent in older configs → []. Non-empty strings only, each once, the newest HIDDEN_MODELS_CAP kept,
+  // so a hand-edited list cannot carry junk or grow without bound.
+  c.hiddenModels = Array.isArray(c.hiddenModels)
+    ? [...new Set(c.hiddenModels.filter((k): k is string => typeof k === 'string' && k !== ''))].slice(-HIDDEN_MODELS_CAP)
+    : []
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
   const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
@@ -1577,6 +1593,23 @@ function validate(c: Config): void {
 /** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
  *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
 export const MODEL_PRESET_CAP = 50
+
+/** At most this many hidden model keys (Config.hiddenModels); past it the oldest is dropped, and that model shows again.
+ *  Far above any library, so only a list no library could fill reaches it. */
+export const HIDDEN_MODELS_CAP = 2000
+
+/** Hide `modelKey` by hand, or unhide it (Config.hiddenModels). Hiding a hidden model, or unhiding a shown one, changes
+ *  nothing; a newly hidden key goes last, so the cap drops the oldest. */
+export function setModelHidden(cfg: Config, modelKey: string, hidden: boolean): void {
+  const keys = cfg.hiddenModels ?? []
+  if (hidden === keys.includes(modelKey)) return
+  cfg.hiddenModels = hidden ? [...keys, modelKey].slice(-HIDDEN_MODELS_CAP) : keys.filter((k) => k !== modelKey)
+}
+
+/** Whether the user hid `modelKey` by hand (Config.hiddenModels). */
+export function isModelHidden(cfg: Pick<Config, 'hiddenModels'>, modelKey: string): boolean {
+  return (cfg.hiddenModels ?? []).includes(modelKey)
+}
 
 function validateModelPresets(c: Config): void {
   for (const [modelKey, presets] of Object.entries(c.modelPresets)) {
@@ -1815,7 +1848,7 @@ export function setModelProfile(cfg: Config, modelKey: string, engineId: string,
 }
 
 /** Move every piece of state keyed on `oldKey` to `newKey` — profiles, presets, the preset pin,
- *  the bench result, and `lastLoaded` — and returns whether anything actually moved.
+ *  the bench result, the hand-hidden flag, and `lastLoaded` — and returns whether anything actually moved.
  *
  *  Exists for one reason: `modelKey` embeds the scanner's derived quant label
  *  (`name|quant|sizeBytes`), so fixing how that label is derived changes the key for any model
@@ -1849,6 +1882,13 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
   if (cfg.benchResults[oldKey] && !cfg.benchResults[newKey]) {
     cfg.benchResults[newKey] = { ...cfg.benchResults[oldKey], modelKey: newKey }
     delete cfg.benchResults[oldKey]
+    moved = true
+  }
+  // A model hidden by hand stays hidden under its corrected key.
+  if (isModelHidden(cfg, oldKey)) {
+    cfg.hiddenModels = isModelHidden(cfg, newKey)
+      ? cfg.hiddenModels.filter((k) => k !== oldKey)
+      : cfg.hiddenModels.map((k) => (k === oldKey ? newKey : k))
     moved = true
   }
   if (cfg.lastLoaded.modelKey === oldKey) {

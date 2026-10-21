@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoutineFormFields } from './RoutineFormFields'
 import { emptyRoutineDraft, ROUTINE_MAX_INTERVAL_MS, type RoutineDraft } from '../../lib/routine-form'
@@ -393,5 +394,41 @@ describe('RoutineFormFields — no models', () => {
     renderForm()
     expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Model')).not.toHaveAttribute('aria-describedby')
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): no picker offers it. A routine already pinned to one keeps it: it still runs.
+describe('RoutineFormFields — models hidden by the user', () => {
+  const HIDDEN: Partial<ModelEntry> = { ...MODEL_A, key: 'model-h', name: 'Model H', path: 'D:\\models\\h.gguf', hidden: true, loaded: false }
+
+  afterEach(() => { mockLibrary = [MODEL_A] })
+
+  function renderRouted(draft: RoutineDraft) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    return render(<QueryClientProvider client={qc}><MemoryRouter><RoutineFormFields draft={draft} onChange={vi.fn()} /></MemoryRouter></QueryClientProvider>)
+  }
+
+  it('leaves a hidden model out of the select', () => {
+    mockLibrary = [MODEL_A, HIDDEN]
+    renderForm()
+    expect(screen.getByRole('option', { name: /Model A/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /Model H/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps a stored hidden model selected, marked hidden', () => {
+    mockLibrary = [MODEL_A, HIDDEN]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: 'model-h' }, vi.fn())
+    expect((screen.getByLabelText('Model') as HTMLSelectElement).value).toBe('model-h')
+    expect(screen.getByRole('option', { name: /Model H · Q4_0 — .* \(hidden\)/ })).toBeInTheDocument()
+    expect(screen.queryByText(/not in the current catalog/)).not.toBeInTheDocument()
+  })
+
+  it('counts them under an empty select, with the way to list them', () => {
+    mockLibrary = [HIDDEN]
+    renderRouted(emptyRoutineDraft())
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Show hidden models' })).toHaveAttribute('href', '/models?hidden=1')
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
   })
 })

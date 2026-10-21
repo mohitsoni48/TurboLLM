@@ -9,7 +9,7 @@ import { usePinnedModels } from '../lib/usePinnedModels'
 import type { PickerHidden } from '../lib/model-kind'
 import { track } from '../lib/api'
 import { toast } from './ui/sonner'
-import { NoModelsHint } from './NoModelsHint'
+import { NoModelsHint, type HintLinkProps } from './NoModelsHint'
 import { cn } from '../lib/utils'
 import {
   DropdownMenu,
@@ -20,8 +20,10 @@ import {
 
 /** Key of the Eject row in the keyboard highlight; NUL cannot occur in a model key or remote id. */
 const EJECT_KEY = '\u0000eject'
+/** Key of the empty state's "Show hidden models" link (NoModelsHint) in the keyboard highlight. */
+const SHOW_HIDDEN_KEY = '\u0000show-hidden'
 
-type PickTarget = ModelChoice | typeof EJECT_KEY
+type PickTarget = ModelChoice | typeof EJECT_KEY | typeof SHOW_HIDDEN_KEY
 
 const ROW_CLASS =
   'flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-[13px] outline-none data-[active]:bg-panel-2'
@@ -81,6 +83,7 @@ export function ModelLoadMenu({
   const [activeKey, setActiveKey] = useState<string | null>(null)
   const handoffRef = useRef(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const showHiddenRef = useRef<HTMLAnchorElement>(null)
   const idPrefix = useId()
   // Pinned models float to the top (same convention as the library list in ModelsScreen),
   // stable otherwise so unpinned order is unaffected.
@@ -119,11 +122,16 @@ export function ModelLoadMenu({
   const searching = query.trim() !== ''
   const { groups: shown, choices } = filterModelGroups(groups, query, repoByKey)
   const nothingMatches = searching && shown.length === 0
-  const targets: PickTarget[] = loadedKey ? [...choices, EJECT_KEY] : choices
+  // The empty state's "Show hidden models" link, while it shows (no local model listed, some hidden by the user), is a
+  // target like the rows: focus stays in the search box and a Radix menu cancels Tab, so the keyboard could reach it
+  // no other way. It comes first, where it renders: the local group leads.
+  const hintLinked = (hidden?.byUser ?? 0) > 0 && shown.some((g) => g.kind === 'local' && g.choices.length === 0)
+  const targets: PickTarget[] = [...(hintLinked ? [SHOW_HIDDEN_KEY] as const : []), ...choices, ...(loadedKey ? [EJECT_KEY] as const : [])]
   const targetKeys = targets.map(keyOfTarget)
-  const disabledKeys = new Set(choices.filter((c) => c.disabled).map((c) => c.id))
-  const activeIndex = resolveActiveIndex(activeKey, targetKeys, choices.length, searching, disabledKeys)
-  const activeDescendantId = activeIndex < 0 ? undefined : domIdOfTarget(idPrefix, activeIndex, choices.length)
+  // The link loads nothing, so it is never the default highlight: only where the user arrows or hovers.
+  const disabledKeys = new Set([SHOW_HIDDEN_KEY, ...choices.filter((c) => c.disabled).map((c) => c.id)])
+  const activeIndex = resolveActiveIndex(activeKey, targetKeys, targets.length - (loadedKey ? 1 : 0), searching, disabledKeys)
+  const activeDescendantId = activeIndex < 0 ? undefined : domIdOfTarget(idPrefix, targetKeys[activeIndex], activeIndex)
 
   useEffect(() => {
     if (activeDescendantId) document.getElementById(activeDescendantId)?.scrollIntoView({ block: 'nearest' })
@@ -160,6 +168,12 @@ export function ModelLoadMenu({
 
   function pick(target: PickTarget | undefined, { alt }: { alt: boolean }) {
     if (target === undefined) return
+    if (target === SHOW_HIDDEN_KEY) {
+      // Clicks the link itself, so Enter goes where a click goes (the Library, "Show hidden models" on); its onClick
+      // closes the menu.
+      showHiddenRef.current?.click()
+      return
+    }
     if (target === EJECT_KEY) {
       track(screen, 'eject_model')
       onEject()
@@ -193,6 +207,15 @@ export function ModelLoadMenu({
 
   function highlightOnMouseMove(key: string) {
     return () => { if (activeKey !== key) setActiveKey(key) }
+  }
+
+  const hintLinkProps: HintLinkProps = {
+    id: showHiddenId(idPrefix),
+    ref: showHiddenRef,
+    'data-active': targetKeys[activeIndex] === SHOW_HIDDEN_KEY ? '' : undefined,
+    onMouseMove: highlightOnMouseMove(SHOW_HIDDEN_KEY),
+    onMouseDown: keepFocusInBox,
+    onClick: () => setOpenAndReset(false),
   }
 
   function renderChoice(choice: ModelChoice) {
@@ -301,7 +324,7 @@ export function ModelLoadMenu({
               ) : (
                 <div className="px-2 py-1.5">
                   <div className="text-[13px] text-ink">No models found.</div>
-                  <NoModelsHint hidden={hidden} className="mt-1" />
+                  <NoModelsHint hidden={hidden} className="mt-1" linkProps={hintLinkProps} />
                 </div>
               ))}
               {(shown[0]?.choices ?? []).map(renderChoice)}
@@ -327,7 +350,7 @@ export function ModelLoadMenu({
                 {g.kind === 'local' && g.choices.length === 0 && (
                   <div className="px-2 pb-1.5">
                     <div className="text-[11px] text-faint">No local models found.</div>
-                    <NoModelsHint hidden={hidden} offerDownload={false} className="mt-0.5 text-[11px]" />
+                    <NoModelsHint hidden={hidden} offerDownload={false} className="mt-0.5 text-[11px]" linkProps={hintLinkProps} />
                   </div>
                 )}
                 {g.choices.map(renderChoice)}
@@ -403,7 +426,7 @@ function PickerSearch({
 }
 
 function keyOfTarget(target: PickTarget): string {
-  return target === EJECT_KEY ? EJECT_KEY : target.id
+  return typeof target === 'string' ? target : target.id
 }
 
 function optionId(idPrefix: string, index: number): string {
@@ -414,12 +437,18 @@ function ejectId(idPrefix: string): string {
   return `${idPrefix}-eject`
 }
 
+function showHiddenId(idPrefix: string): string {
+  return `${idPrefix}-show-hidden`
+}
+
 function listIdOf(idPrefix: string): string {
   return `${idPrefix}-list`
 }
 
-function domIdOfTarget(idPrefix: string, index: number, choiceCount: number): string {
-  return index < choiceCount ? optionId(idPrefix, index) : ejectId(idPrefix)
+function domIdOfTarget(idPrefix: string, key: string, index: number): string {
+  if (key === EJECT_KEY) return ejectId(idPrefix)
+  if (key === SHOW_HIDDEN_KEY) return showHiddenId(idPrefix)
+  return optionId(idPrefix, index)
 }
 
 /** Pressing a row must not move focus from the search box onto the (tabIndex -1) row: a disabled

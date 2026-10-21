@@ -776,6 +776,11 @@ export type ModelEntry = {
    *  (Linux or WSL2)'), or null when it can. The daemon owns the wording so every
    *  surface says the same thing. */
   incompatibleReason?: string | null
+  /** Hidden by the user (Models → Library, the model's "Hide"; the daemon keeps it per model key). The web UI leaves
+   *  it out of the Library list until "Show hidden models" is on, and out of every model picker but the draft-model
+   *  select in Load settings (a small draft is what one hides from the chat pickers), unless it is loaded
+   *  (lib/model-kind.ts hiddenByUser). Absent from an older daemon (read as shown). */
+  hidden?: boolean
   mtime: string
 }
 

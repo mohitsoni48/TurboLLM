@@ -120,6 +120,7 @@ import {
   restartDaemon,
   restartEngine,
   saveModelProfile,
+  setModelHidden,
   saveSettings,
   startEngine,
   stopEngine,
@@ -909,6 +910,17 @@ export function useModelActions() {
     eject: useMutation({
       mutationFn: (modelKey?: string) => stopEngine(modelKey),
       onSuccess: invalidate,
+    }),
+    /** Hide a model by hand, or unhide it (Models → Library). The list is updated in place at once, so the row leaves
+     *  (or rejoins) the Library and the pickers without waiting for the next poll, then re-read. */
+    setHidden: useMutation({
+      mutationFn: (v: { key: string; hidden: boolean }) => setModelHidden(v.key, v.hidden),
+      onSuccess: (_d, v) => {
+        qc.setQueryData<ModelsList>(queryKeys.models, (prev) =>
+          prev && { ...prev, models: prev.models.map((m) => (m.key === v.key ? { ...m, hidden: v.hidden } : m)) })
+        invalidate()
+        void qc.invalidateQueries({ queryKey: ['model', v.key] })
+      },
     }),
   }
 }

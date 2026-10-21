@@ -41,6 +41,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   own error. While it is on, the automatic loads (the gateway's auto-swap for Claude Code and other API clients,
   routines, the boot resume) start such a model on the selected engine too; with it off they refuse it and unload
   nothing. Nothing switches to another engine or suggests one.
+- **Hide a model** (Models → Library, a model's ⋯ menu → Hide): it leaves the Library list and every model picker until
+  it is unhidden, but for the draft-model select in Load settings (a small draft model is what one hides from the chat
+  pickers); **Show hidden models** under the list shows them again, each marked, with an Unhide. The daemon keeps the
+  choice (`PUT /api/v1/models/:key/hidden`, and `hidden` on each model of `GET /api/v1/models`), so it holds on every
+  page and device. A hidden model keeps its files and settings, stays listed while it is loaded, and still loads when it
+  is named (an API client, a routine pinned to it, `turbollm launch --model`); the gateway's `GET /v1/models` still
+  lists it. A model picker with nothing to show says how many models you hid and links to that switch.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.

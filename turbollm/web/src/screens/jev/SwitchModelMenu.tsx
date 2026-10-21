@@ -6,9 +6,10 @@
 // model picked here has replaced its own.
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
-import { isSystemOneModel, loadOffered } from '../../lib/model-kind'
+import { hiddenByUser, hiddenByUserCount, isSystemOneModel, loadOffered } from '../../lib/model-kind'
 import { TextClassificationRuntimeLabel } from '../../components/TextClassificationRuntimeLabel'
 import { toast } from '../../components/ui/sonner'
+import { NoModelsHint } from '../../components/NoModelsHint'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
 // Nothing here suggests another engine: a model loads only on the one the user selected. The setting lists the rest.
@@ -33,12 +34,18 @@ export function SwitchModelMenu({
   /** Settings → Models, "Show models for every engine" (useShowAllEngineModels). */
   showAllEngineModels?: boolean
 }) {
-  const loadable = models.filter((m) => canLoad(m, current, showAllEngineModels))
+  // Not a model the user hid by hand (Models → Library "Hide"), as no picker offers one; with nothing else, they are counted.
+  const offered = models.filter((m) => canLoad(m, current, showAllEngineModels))
+  const loadable = offered.filter((m) => !hiddenByUser(m))
+  const hiddenByYou = hiddenByUserCount(offered)
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border p-3">
       {loadable.length === 0 ? (
-        <p className="text-[13px] text-muted">{showAllEngineModels ? NOTHING_LOADABLE_SHOWING_ALL : NOTHING_LOADABLE}</p>
+        <div className="flex flex-col gap-1">
+          <p className="text-[13px] text-muted">{showAllEngineModels ? NOTHING_LOADABLE_SHOWING_ALL : NOTHING_LOADABLE}</p>
+          <NoModelsHint hidden={{ byEngine: 0, byUser: hiddenByYou }} offerDownload={false} />
+        </div>
       ) : (
         <>
           <ModelGroup title="Chat models" models={loadable.filter((m) => !isSystemOneModel(m))} onPick={onPick} />

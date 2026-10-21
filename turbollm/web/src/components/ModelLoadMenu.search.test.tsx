@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { ModelLoadMenu } from './ModelLoadMenu'
 import { Dialog, DialogContent, DialogTitle } from './ui/dialog'
 import type { LinkRecord } from '../lib/link-api'
@@ -727,5 +728,88 @@ describe('empty state', () => {
     await openMenu({ hidden: { byEngine: 3 } })
     expect(screen.queryByText(ENGINE_HINT)).not.toBeInTheDocument()
     expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+  })
+})
+
+// Models hidden by hand (Models → Library "Hide"): the empty picker counts them and links to the Library's switch.
+describe('empty state with models hidden by the user', () => {
+  function Where() {
+    const { pathname, search } = useLocation()
+    return <div data-testid="where">{pathname + search}</div>
+  }
+
+  function renderInRouter(props: Partial<MenuProps>) {
+    render(
+      <MemoryRouter initialEntries={['/workspace/chat']}>
+        <Routes>
+          <Route path="/workspace/chat" element={menu(props).element()} />
+          <Route path="/models" element={<Where />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+  const showHiddenLink = () => screen.getByRole('link', { name: 'Show hidden models' })
+
+  it('counts them and links to the Library with "Show hidden models" on', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 1, byUser: 2 } })
+    await userEvent.click(trigger())
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(/^2 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden: the selected engine can't run it/)).toBeInTheDocument()
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('link', { name: 'Show hidden models' }))
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+  })
+
+  // Focus stays in the search box and a Radix menu cancels Tab, so only the picker's own highlight can reach the link.
+  it('lets the keyboard reach the link: ArrowDown highlights it, and Enter opens the Library with the switch on', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 0, byUser: 1 } })
+    await userEvent.click(trigger())
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(activeRows()).toEqual([])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    expect(searchBox()).toHaveAttribute('aria-activedescendant', showHiddenLink().id)
+    expect(searchBox()).toHaveFocus()
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('reaches the link first, where it shows above the linked machines\' models, then the models and Eject', async () => {
+    const { onLoad, onEject } = menu()
+    renderInRouter({
+      models: [],
+      hidden: { byEngine: 0, byUser: 1 },
+      links: onlineLink(),
+      remoteModels: [remoteRow(true)],
+      loadedKey: GEMMA,
+      loadedName: 'Gemma 27B',
+      onLoad,
+      onEject,
+    })
+    await userEvent.click(trigger())
+    expect(screen.getByText('No local models found.')).toBeInTheDocument()
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{ArrowUp}{ArrowUp}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onEject).not.toHaveBeenCalled()
+  })
+
+  it('highlights the link on hover, while focus stays in the box', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 0, byUser: 1 } })
+    await userEvent.click(trigger())
+    await userEvent.hover(showHiddenLink())
+    expect(activeRows()).toEqual([showHiddenLink()])
+    expect(searchBox()).toHaveFocus()
   })
 })

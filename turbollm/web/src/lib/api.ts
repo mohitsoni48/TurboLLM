@@ -726,6 +726,15 @@ export function deleteModel(key: string): Promise<{ ok: true; deleted: string[] 
   })
 }
 
+/** Hide a model by hand, or unhide it (Models → Library). The daemon keeps the flag per model key, for every page and
+ *  device; GET /models then marks the model `hidden`. 404 `no_such_model` for a key the library no longer has. */
+export function setModelHidden(key: string, hidden: boolean): Promise<{ key: string; hidden: boolean }> {
+  return request<{ key: string; hidden: boolean }>(`/api/v1/models/${encodeURIComponent(key)}/hidden`, {
+    method: 'PUT',
+    json: { hidden },
+  })
+}
+
 // ── Load profiles + load flow (A4, spec 05) ──────────────────────────────────
 // Profiles are per-engine (issue #35): pass the installed engine's id so reads/writes
 // hit that engine's slot. Omitting engineId on read lets the server fall back to the

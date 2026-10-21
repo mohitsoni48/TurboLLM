@@ -111,3 +111,18 @@ describe('ModelStep — "Use a model I already have" offers what the selected en
     expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB', 'Gemma 3n · INT4 · 3.1 GB'])
   })
 })
+
+// Hidden by hand (Models → Library "Hide"): no picker offers it, onboarding's included.
+describe('ModelStep — "Use a model I already have" leaves out a model the user hid', () => {
+  it('lists the shown model only, and the hidden one once it is loaded', () => {
+    const hidden: Partial<ModelEntry> = { key: 'gemma-270m', name: 'Gemma 270M', quant: 'Q4_K_M', sizeLabel: '0.3 GB', compatibleWithActiveEngine: true, hidden: true }
+    modelsMock.data = { models: [chatModel, hidden] }
+    const { unmount } = renderStep()
+    const options = () => within(screen.getByRole('combobox')).getAllByRole('option').map((o) => o.textContent)
+    expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB'])
+    unmount()
+    modelsMock.data = { models: [chatModel, { ...hidden, loaded: true }] }
+    renderStep()
+    expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB', 'Gemma 270M · Q4_K_M · 0.3 GB'])
+  })
+})

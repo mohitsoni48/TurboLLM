@@ -297,7 +297,16 @@ describe('ChatScreen — model picker offers chat models only', () => {
   it('tells the picker how many chat models it left out for the selected engine', async () => {
     await renderScreen()
     await waitFor(() => expect(modelsOfferedByPicker).not.toBeNull())
-    expect(modelsHiddenFromPicker).toEqual({ byEngine: 1 })
+    expect(modelsHiddenFromPicker).toEqual({ byEngine: 1, byUser: 0 })
+  })
+
+  // Hidden by hand (Models → Library "Hide"): left out of the picker, and counted as the user's.
+  it('leaves a model the user hid out of the picker and counts it', async () => {
+    mockLibrary = [chatModel, { ...chatModel, key: 'gemma-270m', name: 'Gemma 270M', hidden: true, loaded: false }]
+    await renderScreen()
+    await waitFor(() => expect(modelsOfferedByPicker).not.toBeNull())
+    expect(modelsOfferedByPicker?.map((m) => m.key)).toEqual(['qwen3-8b'])
+    expect(modelsHiddenFromPicker).toEqual({ byEngine: 0, byUser: 1 })
   })
 })
 

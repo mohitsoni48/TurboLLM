@@ -4,7 +4,7 @@ import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
-import { isChatModel } from '../../lib/model-kind'
+import { hiddenByUser, hiddenByUserCount, isChatModel } from '../../lib/model-kind'
 import { NoModelsHint } from '../NoModelsHint'
 
 // Labels say plainly which one runs in-process and which shell out — the distinction that the
@@ -106,7 +106,9 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
   const catalog = modelsQ.data?.models ?? []
-  const models = catalog.filter(isChatModel)
+  // Not a model the user hid by hand (Models → Library "Hide"), as no picker offers one; the empty state counts them.
+  const models = catalog.filter((m) => isChatModel(m) && !hiddenByUser(m))
+  const hiddenByYou = hiddenByUserCount(catalog.filter(isChatModel))
   const agents = agentsQ.data ?? []
   // A controlled <select> whose value matches no <option> falls back to the first one — here the
   // placeholder — so the field would read as unset while the draft still holds a real value and
@@ -118,10 +120,12 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   // A routine saved before Jev detection existed can name a model that is now a Jev model: it IS in
   // the catalog, it just cannot run a routine, so it gets its own text rather than "not in the catalog".
   const storedJevModel = storedModel && !isChatModel(storedModel) ? storedModel : null
+  // A routine already pinned to a model the user since hid keeps it, and still runs on it: shown as its own option.
+  const storedHiddenModel = storedModel && isChatModel(storedModel) && hiddenByUser(storedModel) ? storedModel : null
   const orphanModelKey = draft.modelKey && !storedModel ? draft.modelKey : null
   const orphanAgentId = draft.agentId && !agents.some((a) => a.id === draft.agentId) ? draft.agentId : null
   // Once the catalog has answered, an empty one says so under the select: it offered only its placeholder, an empty
-  // drop-down with no word of where a model comes from. Routines list every engine's models, so none is hidden here.
+  // drop-down with no word of where a model comes from. Routines list every engine's models, so the engine hides none.
   const noModels = modelsQ.data !== undefined && models.length === 0
   // Ids so each <label> actually points at its control — these are plain selects/inputs, not
   // wrapped controls, so without htmlFor a screen reader reads them as unlabelled.
@@ -182,6 +186,11 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
           <option value="">Choose a model…</option>
           {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
           {storedJevModel && <option value={storedJevModel.key}>{storedJevModel.name} (a text classification model — it can&apos;t run a routine)</option>}
+          {storedHiddenModel && (
+            <option value={storedHiddenModel.key} title={storedHiddenModel.path}>
+              {storedHiddenModel.name} · {storedHiddenModel.quant} — {storedHiddenModel.dir} (hidden)
+            </option>
+          )}
           {/* Quant + dir, not just name: the catalog can hold several entries with the SAME
               display name (different quant, or the same quant re-downloaded to a different
               path) — without this an option like "Qwen3.6-35B-A3B" is ambiguous among 4+ real
@@ -195,7 +204,7 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
         {noModels && (
           <div id={id('model-none')} className="text-[12px] text-muted">
             <div className="text-ink">No models found.</div>
-            <NoModelsHint />
+            <NoModelsHint hidden={{ byEngine: 0, byUser: hiddenByYou }} />
           </div>
         )}
       </div>

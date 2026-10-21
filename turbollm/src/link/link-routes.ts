@@ -225,7 +225,9 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
   linkApp.get('/api/link/v1/models', requireCapability('models:use'), (c) => {
     const key = c.get('linkKey')
     const loadedKey = d.manager.status().model?.key ?? null
-    // A model the host hides from its own Models screen and pickers (hiddenFromPeer) is left out here too.
+    // A model the host hides from its own Models screen and pickers because its engine cannot run it (hiddenFromPeer) is
+    // left out here too. Not one the host's user hid by hand (config.ts hiddenModels): that hides it from the host's own
+    // Library and pickers only, and a peer still lists it.
     const hidden = hiddenFromPeer(d)
     const models = d.scanner.list().models
       .filter((e) => allowsModel(key, e.key) && !hidden(e))

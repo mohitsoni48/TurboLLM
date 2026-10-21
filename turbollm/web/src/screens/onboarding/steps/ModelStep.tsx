@@ -5,7 +5,7 @@ import { useOnboardingRecommendation } from '../../../lib/onboarding-queries'
 import { useDownloadMutations, useModels, useShowAllEngineModels, useSysInfo } from '../../../lib/queries'
 import { loadModel, track } from '../../../lib/api'
 import { pickOnboardingModel } from '../../../lib/onboarding-pick'
-import { isChatModel, listedForLoading } from '../../../lib/model-kind'
+import { hiddenByUser, isChatModel, listedForLoading } from '../../../lib/model-kind'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
 import type { StepComponentProps } from '../OnboardingScreen'
 
@@ -30,8 +30,9 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
 
   const showAllEngineModels = useShowAllEngineModels()
   // Only what the selected engine can run, as every other picker offers (unless Settings asks for every engine's
-  // models): "use a model I already have" listed a .litertlm bundle under llama.cpp, whose load then failed.
-  const existingModels = (modelsQuery.data?.models ?? []).filter((m) => isChatModel(m) && listedForLoading(m, showAllEngineModels))
+  // models): "use a model I already have" listed a .litertlm bundle under llama.cpp, whose load then failed. Nor a
+  // model the user hid by hand (Models → Library "Hide").
+  const existingModels = (modelsQuery.data?.models ?? []).filter((m) => isChatModel(m) && !hiddenByUser(m) && listedForLoading(m, showAllEngineModels))
 
   const useExisting = async () => {
     const entry = existingModels.find((m) => m.key === selectedKey)

@@ -4,6 +4,7 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import { SwitchModelMenu, ejectModel, switchToModel } from './SwitchModelMenu'
 import type { JevStatus, ModelEntry } from '../../lib/types'
 
@@ -282,5 +283,34 @@ describe('ejectModel', () => {
     const stopEngine = vi.fn(async () => { throw new ApiError('engine_busy', 'The engine is still generating.', 409) })
     await ejectModel(LAYA, { stopEngine })
     expect(h.toastError).toHaveBeenCalledWith('Could not eject model: The engine is still generating.')
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): no picker offers it, and with nothing else on offer it is counted.
+describe('SwitchModelMenu with models hidden by the user', () => {
+  it('leaves a hidden model out', () => {
+    renderMenu([CHAT, { ...OTHER_JEV, hidden: true }])
+    expect(screen.getByRole('button', { name: 'Gemma 27B' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Other NLI' })).not.toBeInTheDocument()
+  })
+
+  it('counts them, with the way to list them, when nothing else can be picked', () => {
+    render(
+      <MemoryRouter>
+        <SwitchModelMenu current={CURRENT} models={[{ ...CHAT, hidden: true }]} onPick={vi.fn()} />
+      </MemoryRouter>,
+    )
+    expect(screen.queryByRole('button', { name: 'Gemma 27B' })).not.toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Show hidden models' })).toHaveAttribute('href', '/models?hidden=1')
+  })
+
+  it('counts a hidden model in two folders once', () => {
+    render(
+      <MemoryRouter>
+        <SwitchModelMenu current={CURRENT} models={[{ ...CHAT, hidden: true }, { ...CHAT, hidden: true, path: '/more/gemma.gguf' }]} onPick={vi.fn()} />
+      </MemoryRouter>,
+    )
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
   })
 })

@@ -9,7 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
 import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
@@ -2792,6 +2792,9 @@ export function registerApi(app: Hono, d: Deps): void {
     }
     try {
       const deleted = await d.scanner.delete(key)
+      // A model hidden by hand that is gone drops its key (config.ts hiddenModels): a copy downloaded again later shows.
+      // Not while another copy of the same file still holds the key.
+      if (!d.scanner.get(key) && isModelHidden(d.store.snapshot(), key)) d.store.update((cfg) => setModelHidden(cfg, key, false))
       return c.json({ ok: true, deleted })
     } catch (e2) {
       if (e2 instanceof ScannerError) return err(c, e2.code === 'unsafe_model_delete' ? 409 : 404, e2.code, e2.message)
@@ -2852,6 +2855,21 @@ export function registerApi(app: Hono, d: Deps): void {
       }
     })
     return c.json(p)
+  })
+
+  // Hide a model by hand, or unhide it (Models → Library): a flag the daemon keeps per model (config.ts hiddenModels), so
+  // it holds on every page and device. The web UI leaves a hidden model out of the Library list and its model pickers;
+  // nothing else changes. Held to what the profile PUT above is: a remote token needs models:load (auth.ts
+  // requiredCapability gives this route and the profile PUT that capability), and anyone else who may change a model's
+  // profile may hide it. Only a scanned model's key is stored, so the list cannot be filled with keys no library has.
+  app.put('/api/v1/models/:key/hidden', async (c) => {
+    const key = c.req.param('key')
+    if (!d.scanner.get(key)) return err(c, 404, 'no_such_model', 'No model with that key.')
+    const b = await body<{ hidden?: unknown }>(c)
+    if (typeof b.hidden !== 'boolean') return err(c, 400, 'invalid_config_value', 'hidden must be true or false.')
+    const hidden = b.hidden
+    if (isModelHidden(d.store.snapshot(), key) !== hidden) d.store.update((cfg) => setModelHidden(cfg, key, hidden))
+    return c.json({ key, hidden })
   })
 
   app.post('/api/v1/models/:key/profile/reset', (c) => {
@@ -3949,9 +3967,11 @@ function overlayModel(
   // advertised the wrong window until it happened to be loaded. Undefined when the model has no
   // profile for this engine — the caller then falls back to nativeCtx, which is the honest answer.
   const configuredCtx = resolveConfiguredCtx(snap, e.key, engine?.id ?? '')
+  // Hidden by hand (Models → Library "Hide", config.ts hiddenModels): the web UI leaves it out of its lists and pickers.
+  const hidden = isModelHidden(snap, e.key)
   return {
     ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps,
-    compatibleWithActiveEngine, incompatibleReason, sourceRepo,
+    compatibleWithActiveEngine, incompatibleReason, sourceRepo, hidden,
   }
 }
 

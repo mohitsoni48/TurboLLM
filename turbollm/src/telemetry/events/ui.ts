@@ -540,6 +540,8 @@ export const UI_ACTIONS = [
   'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
   'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
   'browse_model_dir', 'add_model_dir', 'import_model_file',
+  // Hiding a model by hand, and the Library's "Show hidden models" switch.
+  'hide_model', 'unhide_model', 'toggle_hidden_models',
 
   'switch_customize_tab', 'close_mcp_panel', 'connect_mcp_server', 'add_local_mcp_server',
   'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
