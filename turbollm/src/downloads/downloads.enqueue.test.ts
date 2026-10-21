@@ -347,6 +347,26 @@ test('enqueue: an HF resolve URL honours the linked revision (not main) + decode
   }
 })
 
+test('enqueue: an HF repo download fetches from the commit the expander read its files at', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const commit = '499bc8821c6b12b4e53c5bffcb21ec206f212d81'
+    const expand = async (_repo: string, rfilename: string): Promise<HfModelFiles> => ({
+      dir: '',
+      files: [{ rfilename, size: 10, sha256: 'a', mmproj: false }],
+      commit,
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+    const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+    assert.equal(rec.url, `https://huggingface.co/owner/repo/resolve/${commit}/model.gguf`)
+    assert.equal(rec.name, 'model.gguf', 'the row still shows the file name')
+    assert.equal(rec.repo, 'owner/repo')
+  } finally {
+    restore()
+  }
+})
+
 test('enqueue: a /blob/ HF URL normalizes to resolve and gets the repo-download path', async () => {
   const restore = stubFetch()
   try {

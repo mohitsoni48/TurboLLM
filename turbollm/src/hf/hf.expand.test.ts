@@ -274,3 +274,90 @@ test('expandModelFiles: a split group straddling a tree page boundary still expa
     globalThis.fetch = real
   }
 })
+
+/** Stub global.fetch with a repo whose `rev` names the commit `sha` (`sha` undefined: the
+ *  revision lookup fails with a 500) and whose tree is `tree` at any revision. */
+function withCommit(sha: string | undefined, tree: TreeEntry[], fn: (urls: string[]) => Promise<void>): Promise<void> {
+  const real = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = String(url)
+    urls.push(u)
+    if (u.includes('/revision/')) {
+      return sha ? new Response(JSON.stringify({ id: 'owner/repo', sha }), { status: 200 }) : new Response('boom', { status: 500 })
+    }
+    return new Response(JSON.stringify(u.includes('/tree/') ? tree : []), { status: 200 })
+  }) as typeof fetch
+  return fn(urls).finally(() => {
+    globalThis.fetch = real
+  })
+}
+
+const COMMIT = '499bc8821c6b12b4e53c5bffcb21ec206f212d81'
+
+test('expandModelFiles: the files are read at the commit the revision names now, and that commit is returned', async () => {
+  // A download fetches from this commit, so a Resume after the branch moved on still gets the
+  // bytes the tree's sha256 describes.
+  const tree: TreeEntry[] = [{ type: 'file', path: 'model-Q4_K_M.gguf', lfs: { oid: 'aaa', size: 100 } }]
+  await withCommit(COMMIT, tree, async (urls) => {
+    const out = await client().expandModelFiles('owner/repo', 'model-Q4_K_M.gguf')
+    assert.equal(out.commit, COMMIT)
+    assert.deepEqual(out.files.map((f) => f.sha256), ['aaa'])
+    assert.deepEqual(urls, [
+      'https://huggingface.co/api/models/owner/repo/revision/main?expand%5B%5D=sha',
+      `https://huggingface.co/api/models/owner/repo/tree/${COMMIT}?recursive=true`,
+    ])
+  })
+})
+
+test('expandModelFiles: without a commit from Hugging Face the tree is read at the revision as before', async () => {
+  const tree: TreeEntry[] = [{ type: 'file', path: 'model-Q4_K_M.gguf', lfs: { oid: 'aaa', size: 100 } }]
+  await withCommit(undefined, tree, async (urls) => {
+    const out = await client().expandModelFiles('owner/repo', 'model-Q4_K_M.gguf', 'v2.0')
+    assert.equal(out.commit, undefined)
+    assert.equal(urls.at(-1), 'https://huggingface.co/api/models/owner/repo/tree/v2.0?recursive=true')
+    assert.deepEqual(out.files.map((f) => f.rfilename), ['model-Q4_K_M.gguf'])
+  })
+  // A revision that is a commit already is not looked up.
+  await withCommit('f'.repeat(40), tree, async (urls) => {
+    const out = await client().expandModelFiles('owner/repo', 'model-Q4_K_M.gguf', COMMIT)
+    assert.equal(out.commit, COMMIT)
+    assert.deepEqual(urls, [`https://huggingface.co/api/models/owner/repo/tree/${COMMIT}?recursive=true`])
+  })
+})
+
+test('expandModelFiles: a file pushed while the commit lookup is cached is read at the commit that has it', async () => {
+  // The revision's commit is cached for five minutes, apart from the repo page's own listing of the
+  // branch. After a push inside that window the page listed a file the cached commit did not have
+  // yet, which fell back to size 0, no sha256 and the branch URL: no disk or integrity check.
+  const C1 = '1'.repeat(40)
+  const C2 = '2'.repeat(40)
+  const old: TreeEntry = { type: 'file', path: 'old-Q4_K_M.gguf', lfs: { oid: 'old', size: 100 } }
+  const pushed: TreeEntry = { type: 'file', path: 'new-Q4_K_M.gguf', lfs: { oid: 'new', size: 200 } }
+  const trees: Record<string, TreeEntry[]> = { [C1]: [old], [C2]: [old, pushed] }
+  let head = C1
+  const real = globalThis.fetch
+  const urls: string[] = []
+  globalThis.fetch = (async (url: string | URL) => {
+    const u = String(url)
+    urls.push(u)
+    if (u.includes('/revision/main')) return new Response(JSON.stringify({ id: 'owner/repo', sha: head }), { status: 200 })
+    const rev = /\/tree\/([^?]+)/.exec(u)?.[1]
+    return new Response(JSON.stringify(trees[rev === 'main' ? head : (rev ?? '')] ?? []), { status: 200 })
+  }) as typeof fetch
+  try {
+    const hf = client()
+    assert.equal((await hf.expandModelFiles('owner/repo', 'old-Q4_K_M.gguf')).commit, C1)
+    head = C2 // the push; the page's listing of main now has the new file
+    const before = urls.length
+    const out = await hf.expandModelFiles('owner/repo', 'new-Q4_K_M.gguf')
+    assert.equal(out.commit, C2)
+    assert.deepEqual(out.files.map((f) => [f.rfilename, f.size, f.sha256]), [['new-Q4_K_M.gguf', 200, 'new']])
+    assert.deepEqual(urls.slice(before), [
+      'https://huggingface.co/api/models/owner/repo/revision/main?expand%5B%5D=sha',
+      `https://huggingface.co/api/models/owner/repo/tree/${C2}?recursive=true`,
+    ], 'the commit asked again, uncached, and the tree at it')
+  } finally {
+    globalThis.fetch = real
+  }
+})

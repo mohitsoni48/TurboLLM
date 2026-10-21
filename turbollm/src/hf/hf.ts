@@ -158,6 +158,11 @@ export interface HfDownloadFile {
 export interface HfModelFiles {
   dir: string
   files: HfDownloadFile[]
+  /** The commit the files (and their sizes and sha256s) were read at: the one the requested
+   *  revision pointed at then. The download manager fetches the files from it, so a download
+   *  paused while its branch moves on still resumes the bytes it started. Absent when Hugging Face
+   *  could not say, or the file was not found in the listing (the revision is used as given). */
+  commit?: string
 }
 
 interface CacheRow {
@@ -353,12 +358,27 @@ export class HfClient {
    *  itself an mmproj, none is paired. */
   async expandModelFiles(repo: string, rfilename: string, rev = 'main'): Promise<HfModelFiles> {
     const wantBase = base(rfilename).toLowerCase()
+    // A branch moves: a repo updated in place on `main` while a download was paused served another
+    // file to the Resume, whose sha256 (read from the tree before) could never match it. So the
+    // tree is read at the commit `rev` points at now, and the files are fetched from that commit.
+    let commit = await this.commitOf(repo, rev)
+    const treeAt = (r: string) =>
+      this.getJson<RawTreeEntry[]>(`${BASE}/api/models/${repo}/tree/${encodeURIComponent(r)}?recursive=true`, TREE_MAX_PAGES)
     let tree: RawTreeEntry[]
     try {
-      tree = await this.getJson<RawTreeEntry[]>(
-        `${BASE}/api/models/${repo}/tree/${encodeURIComponent(rev)}?recursive=true`,
-        TREE_MAX_PAGES,
+      tree = await treeAt(commit ?? rev)
+      // The commit is cached for CACHE_TTL_MS apart from the repo page's own listing of the branch
+      // (getRepo's tree/main). After a push inside that window the page can list a file the cached
+      // commit does not have yet, which fell back below to size 0, no sha256 and the branch URL: no
+      // disk check and no integrity check. Asked again, uncached, the branch names a commit that has
+      // it. A file the repo does not have costs this one lookup and falls back as before.
+      const listed = tree.some(
+        (e) => e.type === 'file' && (e.path === rfilename || base(e.path).toLowerCase() === wantBase),
       )
+      if (!listed && commit !== undefined && commit !== rev) {
+        commit = await this.commitOf(repo, rev, true)
+        tree = await treeAt(commit ?? rev)
+      }
     } catch {
       return { dir: dirOf(rfilename), files: [{ rfilename, size: 0, mmproj: wantBase.includes('mmproj') }] }
     }
@@ -399,6 +419,7 @@ export class HfClient {
             mmproj: false,
           },
         ],
+        ...(chosen && commit ? { commit } : {}),
       }
     }
 
@@ -443,7 +464,23 @@ export class HfClient {
       const best = (sameDir.length ? sameDir : projectors).sort((a, b) => sizeOf(b) - sizeOf(a))[0]
       if (best) files.push({ rfilename: best.path, size: sizeOf(best), sha256: best.lfs?.oid, mmproj: true })
     }
-    return { dir: modelDir, files }
+    return { dir: modelDir, files, ...(commit ? { commit } : {}) }
+  }
+
+  /** The commit `rev` (a branch, a tag or a commit) of `repo` names now, from the model info's
+   *  `sha` (asked for alone: `expand[]=sha`), or undefined when Hugging Face cannot say, which
+   *  leaves the revision as given. Gated repos answer it without a token. `fresh` skips the
+   *  cached answer. */
+  private async commitOf(repo: string, rev: string, fresh = false): Promise<string | undefined> {
+    if (/^[0-9a-f]{40}$/.test(rev)) return rev
+    const url = `${BASE}/api/models/${repo}/revision/${encodeURIComponent(rev)}?expand%5B%5D=sha`
+    if (fresh) this.cache.delete(url)
+    try {
+      const info = await this.getJson<{ sha?: unknown }>(url)
+      return typeof info?.sha === 'string' && /^[0-9a-f]{40}$/.test(info.sha) ? info.sha : undefined
+    } catch {
+      return undefined
+    }
   }
 
   /** Public model-card fetch (ADR-099): the cleaned README for `owner/repo`, or '' when

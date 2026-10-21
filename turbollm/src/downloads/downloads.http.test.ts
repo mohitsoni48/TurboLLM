@@ -13,6 +13,7 @@ import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { DownloadManager, setDownloadGetForTests, type DownloadRecord } from './downloads'
+import type { HfModelFiles } from '../hf/hf'
 import { httpGet } from './http-get'
 import { ggufFile, ggufVocabOnly } from '../test-support/gguf-file'
 import { tmpDir } from '../test-support/tmp'
@@ -598,5 +599,265 @@ test('a whole vocab-only GGUF of unknown length is finished, not taken for cut s
     assert.deepEqual(readFileSync(rec.dest), vocab)
   } finally {
     await server.close()
+  }
+})
+
+/** A stand-in for Hugging Face holding one file of owner/repo, `m.gguf`: `/owner/repo/resolve/<rev>/m.gguf`
+ *  serves the bytes `revs[rev]` names (a test moves `main` on by replacing its entry). Every reply has a strong
+ *  ETag of those bytes, as the CDN's content hash is (after `etagPrefix`, which stands for the CDN's own tag
+ *  changing over the same bytes). Like that CDN (checked with curl), a Range gets a 206 of the current bytes
+ *  whatever If-Range says, unless `honourIfRange`. `dropAfter` cuts the next reply's connection after that many
+ *  body bytes, once they are in `part` ({@link Drop}). */
+async function hfStub(revs: Record<string, Buffer>, opts: { honourIfRange?: boolean; etagPrefix?: string } & Drop = {}) {
+  const seen: Array<{ path: string; range?: string; ifRange?: string; status: number }> = []
+  const server = await serve((req, res) => {
+    const rev = /^\/owner\/repo\/resolve\/([^/]+)\/m\.gguf$/.exec(req.url ?? '')?.[1]
+    const body = rev === undefined ? undefined : revs[rev]
+    if (!body) {
+      res.writeHead(404)
+      return res.end()
+    }
+    const etag = `"${opts.etagPrefix ?? ''}${sha256(body).slice(0, 32)}"`
+    const range = /^bytes=(\d+)-$/.exec(req.headers.range ?? '')
+    const ifRange = req.headers['if-range'] as string | undefined
+    const ranged = !!range && (!opts.honourIfRange || !ifRange || ifRange === etag)
+    const from = ranged ? Number(range![1]) : 0
+    seen.push({ path: req.url!, range: req.headers.range, ifRange, status: ranged ? 206 : 200 })
+    res.writeHead(ranged ? 206 : 200, {
+      'Content-Length': body.length - from,
+      ETag: etag,
+      ...(ranged ? { 'Content-Range': `bytes ${from}-${body.length - 1}/${body.length}` } : {}),
+    })
+    const drop = opts.dropAfter
+    opts.dropAfter = undefined
+    if (drop === undefined) return res.end(body.subarray(from))
+    res.write(body.subarray(from, from + drop))
+    dropOnceWritten(req, opts, from + drop)
+  })
+  return { ...server, seen }
+}
+
+/** Runs `fn` with run()'s HF origin pointed at `origin`. */
+async function withHfBase<T>(origin: string, fn: () => Promise<T>): Promise<T> {
+  const before = process.env.TURBOLLM_HF_BASE
+  process.env.TURBOLLM_HF_BASE = origin
+  try {
+    return await fn()
+  } finally {
+    if (before === undefined) delete process.env.TURBOLLM_HF_BASE
+    else process.env.TURBOLLM_HF_BASE = before
+  }
+}
+
+const COMMIT_A = 'a'.repeat(40)
+const COMMIT_B = 'b'.repeat(40)
+const OLD_GGUF = file(300_000)
+const NEW_GGUF = Buffer.from(OLD_GGUF.map((x) => x ^ 0x5a))
+
+test('a paused Hugging Face download resumes the commit it started from after the repo moved on', async () => {
+  // The tree said sha256(OLD) at COMMIT_A; while the download was paused, main moved to a new
+  // upload. Fetched from main, the Resume got the new file: refused, or downloaded whole and
+  // failed the checksum. Fetched from the commit, it finishes the file it started.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF, [COMMIT_A]: OLD_GGUF }
+  const drop: Drop = { dropAfter: 100_000 }
+  const hf = await hfStub(revs, drop)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { modelDir, stateDir } = newDirs()
+      const expand = async (): Promise<HfModelFiles> => ({
+        dir: '',
+        files: [{ rfilename: 'm.gguf', size: OLD_GGUF.length, sha256: sha256(OLD_GGUF), mmproj: false }],
+        commit: COMMIT_A,
+      })
+      const first = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+      const [rec] = await first.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf' })
+      drop.part = `${rec.dest}.part`
+      assert.equal((await settled(first, rec.id)).status, 'error', 'the first attempt lost its connection')
+      Object.assign(revs, { main: NEW_GGUF, [COMMIT_B]: NEW_GGUF })
+
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+      assert.equal(dm.resume(rec.id), true)
+      const row = await settled(dm, rec.id)
+      assert.equal(row.status, 'done', row.error ?? '')
+      assert.equal(hf.seen.at(-1)?.path, `/owner/repo/resolve/${COMMIT_A}/m.gguf`)
+      assert.equal(hf.seen.at(-1)?.status, 206, 'resumed from the .part')
+      assert.deepEqual(readFileSync(rec.dest), OLD_GGUF)
+    })
+  } finally {
+    await hf.close()
+  }
+})
+
+/** A sha256 row of `m.gguf` on main (a folder file, or a download whose commit could not be read)
+ *  whose first attempt got 100 kB of OLD_GGUF from the stub `opts` drives, then main moved to
+ *  NEW_GGUF and the daemon restarted: the restored manager, the first one, and the row. */
+async function shaRowThenMoved(revs: Record<string, Buffer>, opts: { honourIfRange?: boolean } & Drop) {
+  const { modelDir, stateDir } = newDirs()
+  opts.dropAfter = 100_000
+  const first = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+  const [rec] = await first.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf', size: OLD_GGUF.length, sha256: sha256(OLD_GGUF) })
+  opts.part = `${rec.dest}.part`
+  assert.equal((await settled(first, rec.id)).status, 'error', 'the first attempt lost its connection')
+  revs.main = NEW_GGUF
+  const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+  return { dm, first, rec, modelDir, stateDir }
+}
+
+const CHANGED = 'The file changed on the server since this download started. Download it again from Discover.'
+
+test('a sha256 row whose file changed on the server stops with a clear message, without downloading it again', async () => {
+  // A server that honours If-Range answers the Resume with a 200 of the new file. Taken as a restart,
+  // every Resume downloaded all of it and then failed "Checksum failed — the downloaded file was
+  // corrupt.", blaming the transfer.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF }
+  const opts = { honourIfRange: true }
+  const hf = await hfStub(revs, opts)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { dm, rec } = await shaRowThenMoved(revs, opts)
+      assert.equal(dm.resume(rec.id), true)
+      const row = await settled(dm, rec.id)
+      assert.equal(hf.seen.at(-1)?.status, 200, 'the If-Range missed')
+      assert.equal(row.status, 'error')
+      assert.equal(row.error, CHANGED)
+      assert.equal(row.received, 0, 'its body was not read')
+      assert.equal(existsSync(`${rec.dest}.part`), false)
+
+      // The next Resume asks for the whole file and is refused at once again.
+      assert.equal(dm.resume(rec.id), true)
+      const again = await settled(dm, rec.id)
+      assert.equal(again.error, CHANGED)
+      assert.equal(again.received, 0)
+      assert.deepEqual(hf.seen.map((r) => [r.range, r.status]), [[undefined, 200], ['bytes=100000-', 200], [undefined, 200]])
+      assert.equal(existsSync(rec.dest), false)
+    })
+  } finally {
+    await hf.close()
+  }
+})
+
+test('a sha256 row whose file changed on a server that ignores If-Range stops with the same message', async () => {
+  // Hugging Face's CDN answers the Resume with a 206 of the new file under its own ETag: refused as
+  // "does not continue the partial file ... resume to download it again", and that Resume then
+  // downloaded the whole new file and failed the checksum.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF }
+  const opts: Drop = {}
+  const hf = await hfStub(revs, opts)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { dm, rec } = await shaRowThenMoved(revs, opts)
+      assert.equal(dm.resume(rec.id), true)
+      const row = await settled(dm, rec.id)
+      assert.equal(hf.seen.at(-1)?.status, 206)
+      assert.equal(row.error, CHANGED)
+      assert.equal(dm.resume(rec.id), true)
+      const again = await settled(dm, rec.id)
+      assert.equal(again.error, CHANGED, 'and the Resume after it is refused too, not downloaded whole')
+      assert.equal(again.received, 0)
+    })
+  } finally {
+    await hf.close()
+  }
+})
+
+test('a new download of a changed file over an errored row\'s .part still finishes the new file', async () => {
+  // The new row's sha256 is the new file's (a fresh listing): it does not take over the .part of
+  // the old version, and its own first reply is not taken for a change.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF }
+  const opts = { honourIfRange: true }
+  const hf = await hfStub(revs, opts)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { first, rec } = await shaRowThenMoved(revs, opts)
+      const [fresh] = await first.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf', size: NEW_GGUF.length, sha256: sha256(NEW_GGUF) })
+      const row = await settled(first, fresh.id)
+      assert.equal(hf.seen.at(-1)?.range, undefined, 'the whole new file')
+      assert.equal(row.status, 'done', row.error ?? '')
+      assert.deepEqual(readFileSync(rec.dest), NEW_GGUF)
+    })
+  } finally {
+    await hf.close()
+  }
+})
+
+test('a Hugging Face file downloaded again after the repo got a new commit continues the errored row\'s .part', async () => {
+  // A repo row names the commit its branch was at when it was queued. After any new commit to the
+  // repo (a README edit, another quant), the same file downloaded again from Discover named another
+  // URL, did not take over the errored row's .part, deleted it and fetched the file from byte 0.
+  // Its sha256 is the errored row's, so the bytes are the same: it continues the .part from the
+  // errored row's commit, as that row's Resume would.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF, [COMMIT_A]: OLD_GGUF, [COMMIT_B]: OLD_GGUF }
+  const drop: Drop = { dropAfter: 100_000 }
+  const hf = await hfStub(revs, drop)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { modelDir, stateDir } = newDirs()
+      let commit = COMMIT_A
+      const expand = async (): Promise<HfModelFiles> => ({
+        dir: '',
+        files: [{ rfilename: 'm.gguf', size: OLD_GGUF.length, sha256: sha256(OLD_GGUF), mmproj: false }],
+        commit,
+      })
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+      const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf' })
+      drop.part = `${rec.dest}.part`
+      assert.equal((await settled(dm, rec.id)).status, 'error', 'the first attempt lost its connection')
+      commit = COMMIT_B
+
+      const [again] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf' })
+      assert.equal(again.url, rec.url, 'it fetches from the errored row\'s commit')
+      const row = await settled(dm, again.id)
+      assert.equal(row.status, 'done', row.error ?? '')
+      assert.deepEqual(
+        hf.seen.map((r) => [r.path, r.range, r.status]),
+        [
+          [`/owner/repo/resolve/${COMMIT_A}/m.gguf`, undefined, 200],
+          [`/owner/repo/resolve/${COMMIT_A}/m.gguf`, 'bytes=100000-', 206],
+        ],
+        'resumed from the .part',
+      )
+      assert.deepEqual(readFileSync(rec.dest), OLD_GGUF)
+    })
+  } finally {
+    await hf.close()
+  }
+})
+
+test('a download from a Hugging Face commit whose CDN tag changed over the same bytes still finishes', async () => {
+  // A commit's bytes never change, but the CDN's ETag for them can (the file moved to another
+  // storage backend). Taken for a changed file, the row was refused "The file changed on the
+  // server" on every Resume and could never finish. Refused as "does not continue" once (the 206
+  // names another ETag than the .part was written under), the next Resume downloads it again from
+  // byte 0 and the sha256 passes it.
+  const revs: Record<string, Buffer> = { main: OLD_GGUF, [COMMIT_A]: OLD_GGUF }
+  const opts: { etagPrefix?: string } & Drop = { dropAfter: 100_000 }
+  const hf = await hfStub(revs, opts)
+  try {
+    await withHfBase(hf.origin, async () => {
+      const { modelDir, stateDir } = newDirs()
+      const expand = async (): Promise<HfModelFiles> => ({
+        dir: '',
+        files: [{ rfilename: 'm.gguf', size: OLD_GGUF.length, sha256: sha256(OLD_GGUF), mmproj: false }],
+        commit: COMMIT_A,
+      })
+      const first = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+      const [rec] = await first.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf' })
+      opts.part = `${rec.dest}.part`
+      assert.equal((await settled(first, rec.id)).status, 'error', 'the first attempt lost its connection')
+      opts.etagPrefix = 'xet-'
+
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+      assert.equal(dm.resume(rec.id), true)
+      const refused = await settled(dm, rec.id)
+      assert.equal(hf.seen.at(-1)?.status, 206)
+      assert.match(refused.error ?? '', /does not continue the partial file/)
+      assert.equal(dm.resume(rec.id), true)
+      const row = await settled(dm, rec.id)
+      assert.equal(row.status, 'done', row.error ?? '')
+      assert.equal(hf.seen.at(-1)?.path, `/owner/repo/resolve/${COMMIT_A}/m.gguf`)
+      assert.deepEqual(readFileSync(rec.dest), OLD_GGUF)
+    })
+  } finally {
+    await hf.close()
   }
 })

@@ -315,7 +315,7 @@ export class DownloadManager {
     // structure), so a model's shards + mmproj sit together for the scanner to group and
     // two quants that share a shard basename never collide. A .litertlm bundle is one
     // self-contained file with no siblings to group (handled inside the expander).
-    const { dir: modelDir, files } = await this.expand(repo, rfilename, rev)
+    const { dir: modelDir, files, commit } = await this.expand(repo, rfilename, rev)
     // The expander's dir is HF-derived (or, on its fallbacks, the caller's own rfilename) —
     // sanitised like the repo id so it can never leave the model folder.
     const destDir = join(dir, repoSubdir(repo), repoSubdir(modelDir))
@@ -350,7 +350,9 @@ export class DownloadManager {
       targets.map(({ f, dest }) => ({
         name: basename(f.rfilename),
         repo,
-        url: hfResolveUrl(repo, rev, f.rfilename),
+        // From the commit the expander read the files at (sizes, sha256s), not the branch: a
+        // Resume after the repo moved on then still gets the bytes it started.
+        url: hfResolveUrl(repo, commit ?? rev, f.rfilename),
         dest,
         total: f.size || 0,
         sha256: f.sha256,
@@ -424,7 +426,8 @@ export class DownloadManager {
         id,
         name: t.name,
         repo: t.repo,
-        url: t.url,
+        // The errored rows' URL when their .part is taken over at another commit of the repo.
+        url: carried?.url ?? t.url,
         dest: t.dest,
         total: carried?.total ?? t.total,
         received: 0,
@@ -451,7 +454,7 @@ export class DownloadManager {
    *  upstream since the failure was spliced onto the old prefix and marked done. The .part is
    *  kept only under the checks Resume of the errored row would apply: every errored row for
    *  this file (one of them wrote it; no live row does, or the caller would not be here) has
-   *  this URL and one strong validator, which the new row sends as If-Range and checks the 206
+   *  one URL and one strong validator, which the new row sends as If-Range and checks the 206
    *  against, with their full length when the new row knows none or the same one, and their
    *  fileVersion, which the new row checks the 206 against too: given the validator alone, a 206
    *  of a changed file that carried only its Last-Modified, where the .part was written under an
@@ -459,27 +462,32 @@ export class DownloadManager {
    *  sha256, or the one they have: a .part written for another hash holds another version of the
    *  file than the new row wants, and one written for none (a repo file queued while its listing
    *  could not be read) a version its hash may not name, which could only be refused at its first
-   *  206 or fail the checksum.
-   *  Anything else (no validator, another URL or sha256, rows that disagree, an orphan .part with
-   *  no row) says nothing about which bytes the .part holds, or says they are not the new row's,
-   *  so the new row starts from byte 0. Decided here, not in run(): a row left queued behind the
-   *  concurrency cap comes back from a restart as paused and is resumed from whatever .part it
-   *  finds. */
+   *  206 or fail the checksum. Their URL is the new row's, or, for a Hugging Face file whose
+   *  sha256 is the new row's, the same file of the repo at another revision: a repo row names the
+   *  commit its branch was at when it was queued, so after any new commit to the repo (a README
+   *  edit, another quant) the same file downloaded again from Discover names another URL for the
+   *  same bytes, which would otherwise cost it the .part. The new row then fetches from their
+   *  URL, as their Resume would. Anything else (no validator, another URL or sha256, rows that
+   *  disagree, an orphan .part with no row) says nothing about which bytes the .part holds, or
+   *  says they are not the new row's, so the new row starts from byte 0. Decided here, not in
+   *  run(): a row left queued behind the concurrency cap comes back from a restart as paused and
+   *  is resumed from whatever .part it finds. */
   private takeOverPart(t: {
     url: string
     dest: string
     total: number
     sha256?: string
-  }): { validator: string; fileVersion?: FileVersion; total: number } | undefined {
+  }): { url: string; validator: string; fileVersion?: FileVersion; total: number } | undefined {
     const part = `${t.dest}.part`
     if (!existsSync(part)) return undefined
     const errored = [...this.records.values()].filter((r) => r.status === 'error' && sameDest(r.dest, t.dest))
     const first = errored[0]
     if (
       first?.validator !== undefined &&
+      (first.url === t.url || (t.sha256 !== undefined && first.sha256 === t.sha256 && sameHfFile(first.url, t.url))) &&
       errored.every(
         (r) =>
-          r.url === t.url &&
+          r.url === first.url &&
           r.validator === first.validator &&
           r.total === first.total &&
           sameFileVersion(r.fileVersion, first.fileVersion) &&
@@ -487,7 +495,12 @@ export class DownloadManager {
       ) &&
       (t.total <= 0 || first.total <= 0 || t.total === first.total)
     ) {
-      return { validator: first.validator, fileVersion: first.fileVersion, total: t.total > 0 ? t.total : first.total }
+      return {
+        url: first.url,
+        validator: first.validator,
+        fileVersion: first.fileVersion,
+        total: t.total > 0 ? t.total : first.total,
+      }
     }
     rmSync(part, { force: true })
     for (const r of errored) r.received = 0 // their Resume starts from byte 0 now too
@@ -663,6 +676,39 @@ export class DownloadManager {
       if (res.status === 403) throw new DownloadError('hf_gated', 'This repository is gated — accept its license and add your token.')
       if (!res.ok && res.status !== 206) throw new DownloadError('download_failed', `Download failed (HTTP ${res.status}).`)
       if (!res.body) throw new DownloadError('download_failed', 'Empty response body.')
+
+      // A row with a sha256 can only ever finish as the version of the file that hash names: the
+      // one its first reply came from (fileVersion is this row's first reply's, or that of the
+      // errored row whose .part it took over, which takeOverPart carries only between rows of one
+      // sha256). A reply that names another version, 200 or 206, resumed or not, can never pass
+      // the checksum. Taken as a restart, every Resume downloaded the whole new file and failed
+      // "Checksum failed — the downloaded file was corrupt.", blaming the transfer for a file that
+      // changed on the server (a repo updated on its branch while the download was paused).
+      // Refused before its body is read, with the .part, which holds the old version, removed;
+      // the row keeps its fileVersion, so a later Resume is refused the same way at once. A row
+      // restored from an older manifest has no fileVersion to compare: the first reply it accepts
+      // gives it one, the new file's when the file changed, and it still fails the checksum on
+      // each Resume that downloads that file, as before. Seeded from the stored validator, it would
+      // be stopped, but so would every Resume of an unchanged one whose CDN tag changed (a move to
+      // another storage backend). Not for a row fetched from a Hugging Face commit: a commit's
+      // bytes never change, so another ETag there (the CDN's own, after the file moved to another
+      // storage backend) says nothing about them, and this would stop that row with a false
+      // message on every Resume. Its 206 under another ETag is still refused by the checks below,
+      // and the 200 after that is checked by the sha256.
+      if (
+        rec.sha256 &&
+        rec.fileVersion !== undefined &&
+        !isHfCommitUrl(rec.url) &&
+        versionChanged(rec.fileVersion, res.headers)
+      ) {
+        await res.body.cancel().catch(() => {})
+        rmSync(part, { force: true })
+        rec.received = 0
+        throw new DownloadError(
+          'file_changed',
+          `The file changed on the server since this download started. ${rec.repo ? 'Download it again from Discover.' : 'Import it again.'}`,
+        )
+      }
 
       // A 200 (not 206) means the server ignored Range → restart from scratch.
       const resuming = res.status === 206
@@ -1095,6 +1141,30 @@ function isHfOrigin(u: string): boolean {
   } catch {
     return false
   }
+}
+
+/** True when `u` is a Hugging Face resolve URL at a commit (`<owner>/<repo>/resolve/<40 hex>/…`),
+ *  as enqueue builds for a repo file whose commit the expander read: its bytes never change. */
+function isHfCommitUrl(u: string): boolean {
+  if (!isHfOrigin(u)) return false
+  const parts = new URL(u).pathname.split('/').filter(Boolean)
+  const ri = parts.indexOf('resolve')
+  return ri >= 2 && /^[0-9a-f]{40}$/.test(parts[ri + 1] ?? '')
+}
+
+/** True when `a` and `b` are Hugging Face resolve URLs of one file of one repo, at any revisions
+ *  (`<owner>/<repo>/resolve/<rev>/<path…>`), as rows queued at two commits of the repo name it. */
+function sameHfFile(a: string, b: string): boolean {
+  const file = (u: string): string | undefined => {
+    if (!isHfOrigin(u)) return undefined
+    const parts = new URL(u).pathname.split('/').filter(Boolean)
+    const ri = parts.indexOf('resolve')
+    if (ri < 2 || parts.length < ri + 3) return undefined
+    // A space cannot occur in a URL's path, so it keeps the repo apart from the file path.
+    return `${parts.slice(0, ri).join('/')} ${parts.slice(ri + 2).join('/')}`
+  }
+  const fa = file(a)
+  return fa !== undefined && fa === file(b)
 }
 
 /** Recognise an HF resolve URL and pull out the repo + revision + repo-relative file
