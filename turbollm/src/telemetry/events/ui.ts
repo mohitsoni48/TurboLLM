@@ -626,7 +626,7 @@ export const UI_ACTIONS = [
   'commit_code_git', 'push_code_git', 'close_code_git_dialog',
 
   'resume_download', 'cancel_download', 'remove_download',
-  'pause_download', 'pause_all_downloads', 'resume_all_downloads',
+  'pause_download', 'pause_all_downloads', 'resume_all_downloads', 'discard_download',
 
   'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
 

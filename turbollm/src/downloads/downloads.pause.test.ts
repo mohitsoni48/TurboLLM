@@ -236,3 +236,32 @@ test('Pause and Resume from two clients at once leave one writer, and the file i
     await srv.close()
   }
 })
+
+// What the Downloads panel's words rest on: "Dismiss" (a done or cancelled row, and "Dismiss all")
+// only forgets the row, while "Discard" (a paused or errored row) deletes its partial file too.
+test('DELETE of a done row keeps the model file; of a paused row it deletes the partial', async () => {
+  const srv = await serveFile((n) => n === 1 || n === 3)
+  try {
+    const { dm, rec, part } = await pausedMidBody(srv)
+    const app = new Hono()
+    registerApi(app, { downloads: dm } as unknown as Deps)
+    const del = (id: string) => app.request(`/api/v1/downloads/${id}`, { method: 'DELETE' })
+
+    assert.equal(dm.resume(rec.id), true)
+    assert.equal((await settled(dm, rec.id)).status, 'done')
+    assert.equal((await del(rec.id)).status, 200)
+    assert.deepEqual(readFileSync(rec.dest), FULL, 'Dismiss leaves the finished model in the library')
+    assert.equal(dm.list().some((r) => r.id === rec.id), false)
+
+    const [other] = await dm.enqueue({ url: srv.url.replace('model', 'other') })
+    await waitFor('the first bytes', () => (statSync(`${other.dest}.part`, { throwIfNoEntry: false })?.size === 65_536 ? true : undefined))
+    assert.equal(dm.pause(other.id), true)
+    await new Promise((r) => setTimeout(r, 50))
+    assert.equal((await del(other.id)).status, 200)
+    assert.equal(existsSync(`${other.dest}.part`), false, 'Discard deletes the partial')
+    assert.equal(dm.list().some((r) => r.id === other.id), false)
+    assert.equal(existsSync(part), false)
+  } finally {
+    await srv.close()
+  }
+})

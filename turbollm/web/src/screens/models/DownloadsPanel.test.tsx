@@ -328,10 +328,10 @@ describe('DownloadsPanel — merged fleet', () => {
       expect(writes()).toHaveLength(0)
     })
 
-    it('shows Dismiss all once a download is done, and it dismisses every local terminal row', async () => {
+    it('shows Dismiss all once a download is done, and it dismisses every local finished row', async () => {
       state.local = [
         { ...localDl, id: 'd1', name: 'done.gguf', status: 'done', received: 100 },
-        { ...localDl, id: 'd2', name: 'errored.gguf', status: 'error' },
+        { ...localDl, id: 'd2', name: 'cancelled.gguf', status: 'cancelled' },
       ]
       renderPanel()
       await screen.findByText('done.gguf')
@@ -340,6 +340,24 @@ describe('DownloadsPanel — merged fleet', () => {
       expect(localRemove).toHaveBeenCalledWith('d1')
       expect(localRemove).toHaveBeenCalledWith('d2')
       expect(localRemove).toHaveBeenCalledTimes(2)
+    })
+
+    it('leaves an errored or paused row out of Dismiss all: removing it would delete the partial it can resume from', async () => {
+      state.local = [
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip', received: 62_652_416 },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused', received: 62_652_416 },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Dismiss all' }))
+      expect(localRemove).toHaveBeenCalledTimes(1)
+      expect(localRemove).toHaveBeenCalledWith('fin')
+    })
+
+    it('offers no Dismiss all for an errored row alone', () => {
+      state.local = [{ ...localDl, status: 'error', error: 'network blip' }]
+      renderPanel()
+      expect(screen.queryByRole('button', { name: 'Dismiss all' })).toBeNull()
     })
 
     it('leaves a remote terminal row out of Dismiss all — removal is local-only housekeeping', async () => {
@@ -369,8 +387,8 @@ describe('DownloadsPanel — merged fleet', () => {
       renderPanel()
       expect(buttons('run')).toEqual(['Pause', 'Cancel'])
       expect(buttons('wait')).toEqual(['Pause', 'Cancel'])
-      expect(buttons('held')).toEqual(['Resume', 'Cancel'])
-      expect(buttons('broke')).toEqual(['Resume', 'Dismiss'])
+      expect(buttons('held')).toEqual(['Resume', 'Discard'])
+      expect(buttons('broke')).toEqual(['Resume', 'Discard'])
       expect(buttons('fin')).toEqual(['Dismiss'])
       // A paused row is not counted as active.
       expect(screen.getByText('· 2 active')).toBeTruthy()
@@ -531,6 +549,62 @@ describe('DownloadsPanel — merged fleet', () => {
       expect(localCancel).not.toHaveBeenCalled()
       await userEvent.click(within(dialog).getByRole('button', { name: 'Delete downloads' }))
       expect(localCancel.mock.calls.map((c) => c[0])).toEqual(['a', 'b'])
+    })
+  })
+
+  describe('discard', () => {
+    const rowEl = (id: string) => document.querySelector(`[data-testid="download-row-${id}"]`) as HTMLElement
+
+    it('names the way out of an errored or paused row "Discard", and of a finished one "Dismiss"', () => {
+      state.local = [
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+        { ...localDl, id: 'gone', name: 'gone.gguf', status: 'cancelled' },
+      ]
+      renderPanel()
+      for (const id of ['broke', 'held']) {
+        expect(within(rowEl(id)).getByRole('button', { name: 'Discard' })).toBeTruthy()
+        expect(within(rowEl(id)).queryByRole('button', { name: /^(Dismiss|Cancel)$/ })).toBeNull()
+      }
+      for (const id of ['fin', 'gone']) {
+        expect(within(rowEl(id)).getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+        expect(within(rowEl(id)).queryByRole('button', { name: 'Discard' })).toBeNull()
+      }
+    })
+
+    it('Discard of more than 50 MB asks first, and only "Discard" in the question removes the row', async () => {
+      state.local = [{ ...localDl, status: 'error', error: 'network blip', received: 62_652_416, total: 1e9 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      const dialog = await screen.findByRole('alertdialog')
+      expect(dialog.textContent).toContain('Discard this download?')
+      expect(dialog.textContent).toContain('local.gguf: the 63 MB downloaded so far will be deleted. Resume continues from there instead.')
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Keep it' }))
+      await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+      expect(localRemove).not.toHaveBeenCalled()
+
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      await userEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Discard' }))
+      expect(localRemove).toHaveBeenCalledWith('local-1')
+      expect(localCancel).not.toHaveBeenCalled()
+    })
+
+    it('Discard of a small partial removes the row at once', async () => {
+      state.local = [{ ...localDl, status: 'paused', received: 1_000_000, total: 1e9 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      expect(screen.queryByRole('alertdialog')).toBeNull()
+      expect(localRemove).toHaveBeenCalledWith('local-1')
+    })
+
+    it('keeps Cancel, not Discard, on a remote paused row: removal is local-only', async () => {
+      state.links = [link()]
+      state.queues = { l1: [{ ...remoteDl, status: 'paused' }] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      expect(within(rowEl('remote-1')).getByRole('button', { name: 'Cancel' })).toBeTruthy()
+      expect(within(rowEl('remote-1')).queryByRole('button', { name: 'Discard' })).toBeNull()
     })
   })
 })

@@ -15,7 +15,7 @@
 // back from the host renders inline through `describeRemoteFailure`, never as a toast.
 
 import { Fragment, useState } from 'react'
-import { CheckCircle2, Download, Pause, RotateCw, X } from 'lucide-react'
+import { CheckCircle2, Download, Pause, RotateCw, Trash2, X } from 'lucide-react'
 import { useDownloads, useDownloadMutations } from '../../lib/queries'
 import { useLinks, useRemoteDownloads, useRemoteDownloadActions } from '../../lib/link-queries'
 import { mergeFleet, fleetMachines, type FleetMachine, type FleetOrigin, type FleetRow } from '../../lib/fleet'
@@ -42,8 +42,8 @@ import {
 import { FleetAction, FleetFailure, MachineNotes, OriginBadge } from '../../components/fleet'
 import { track } from '../../lib/api'
 
-/** A Cancel that would delete more than this much already downloaded asks first: on a phone a
- *  partial is often gigabytes of metered data, and Pause now keeps it instead. */
+/** A Cancel or Discard that would delete more than this much already downloaded asks first: on a
+ *  phone a partial is often gigabytes of metered data, and Pause or Resume keeps it instead. */
 const CONFIRM_CANCEL_BYTES = 50e6
 
 export function DownloadsPanel() {
@@ -75,6 +75,13 @@ export function DownloadsPanel() {
     )
   /** The Cancel (one row's, or Cancel all's rows) waiting on "Delete the downloaded part?". */
   const [pendingCancel, setPendingCancel] = useState<FleetRow<FleetDownload>[] | null>(null)
+  /** The paused or errored row whose Discard waits on the same question. */
+  const [pendingDiscard, setPendingDiscard] = useState<FleetDownload | null>(null)
+  /** Discard: remove the row and its partial file (DELETE deletes the .part of a row not done). */
+  const onDiscard = (d: FleetDownload) => {
+    if (d.received > CONFIRM_CANCEL_BYTES) setPendingDiscard(d)
+    else mut.remove.mutate(d.id)
+  }
 
   const local = dlQ.data?.downloads ?? []
   const sources = sourcesByLink(links, remote.rows, (r) => r.linkId).map((s) => ({
@@ -179,8 +186,11 @@ export function DownloadsPanel() {
   const pausableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'downloading' || r.row.status === 'queued'))
   const resumableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'paused' || r.row.status === 'error'))
   // Dismiss is local-only housekeeping (see the per-row note below), so "all" means
-  // all of THIS machine's terminal rows, not the fleet's.
-  const dismissableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'done' || r.row.status === 'error' || r.row.status === 'cancelled'))
+  // all of THIS machine's finished rows, not the fleet's. Done and cancelled only: an errored
+  // row still has its partial file to resume from, and removing a row that is not done deletes
+  // it, so "Dismiss all" (meant to clear finished rows) threw away resumable gigabytes in one
+  // tap. An errored row is discarded on purpose, with its own Discard.
+  const dismissableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'done' || r.row.status === 'cancelled'))
 
   const onCancelAll = () => {
     track('models', 'cancel_all_downloads')
@@ -275,6 +285,7 @@ export function DownloadsPanel() {
             onCancel={() => askCancel([r])}
             onRetryCancel={() => onCancel(r)}
             onRemove={() => mut.remove.mutate(r.row.id)}
+            onDiscard={() => onDiscard(r.row)}
             onResume={() => onResume(r.row.id)}
             onPause={() => mut.pause.mutate(r.row.id)}
             resumeError={r.origin.kind === 'local' ? resumeErrors[r.row.id] : undefined}
@@ -308,6 +319,24 @@ export function DownloadsPanel() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      <AlertDialog open={pendingDiscard !== null} onOpenChange={(open) => { if (!open) setPendingDiscard(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Discard this download?</AlertDialogTitle>
+            <AlertDialogDescription>
+              <span className="font-medium text-ink">{pendingDiscard?.name}</span>: the {fmtSize(pendingDiscard?.received ?? 0)}{' '}
+              downloaded so far will be deleted. Resume continues from there instead.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep it</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { if (pendingDiscard) mut.remove.mutate(pendingDiscard.id); setPendingDiscard(null) }}>
+              Discard
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -320,6 +349,7 @@ function DownloadRow({
   onCancel,
   onRetryCancel,
   onRemove,
+  onDiscard,
   onResume,
   onPause,
   resumeError,
@@ -335,6 +365,8 @@ function DownloadRow({
   onCancel: () => void
   onRetryCancel: () => void
   onRemove: () => void
+  /** Remove a paused or errored row together with its partial file (it may ask first). */
+  onDiscard: () => void
   onResume: () => void
   onPause: () => void
   resumeError: string | undefined
@@ -354,6 +386,11 @@ function DownloadRow({
   const canResume = isLocal && (d.status === 'paused' || isError)
   // Stops the transfer and keeps the .part for Resume — LOCAL only, like Resume.
   const canPause = isLocal && (d.status === 'downloading' || d.status === 'queued')
+  // A local paused or errored row's way out says what it does: "Discard" removes the row AND
+  // deletes its partial file. It used to be "Cancel" on a paused row and "Dismiss" (the finished
+  // rows' word) on an errored one, which deleted the partial just the same.
+  const canDiscard = isLocal && (d.status === 'paused' || isError)
+  const showCancel = isLocal ? d.status === 'downloading' || d.status === 'queued' : inFlight
 
   const cancelState = actionState('downloads:write', origin, link)
   const barColor = isError ? 'var(--err)' : isDone ? 'var(--ok)' : 'var(--accent)'
@@ -403,7 +440,7 @@ function DownloadRow({
           </Button>
         )}
 
-        {inFlight && (
+        {showCancel && (
           <FleetAction state={cancelState} onClick={onCancel} busy={cancelling} variant="outline" label="Cancel">
             <X size={13} />
             <ActionLabel>Cancel</ActionLabel>
@@ -414,7 +451,7 @@ function DownloadRow({
             target — so clearing a finished multipart download is one tap per row instead of
             hunting for a small X icon. Local only: a remote row's terminal entry belongs to
             the host's own list, so there is nothing here to remove. */}
-        {isLocal && (isDone || isError || isCancelled) && (
+        {isLocal && (isDone || isCancelled) && (
           <Button
             size="sm"
             variant="outline"
@@ -423,6 +460,19 @@ function DownloadRow({
           >
             <X size={13} />
             <ActionLabel>Dismiss</ActionLabel>
+          </Button>
+        )}
+
+        {canDiscard && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => { track('models', 'discard_download'); onDiscard() }}
+            title="Delete what is downloaded and remove this download"
+            aria-label="Discard"
+          >
+            <Trash2 size={13} />
+            <ActionLabel>Discard</ActionLabel>
           </Button>
         )}
       </div>
