@@ -8,8 +8,11 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DownloadManager, DownloadError, MAX_FOLDER_FILES, setDownloadGetForTests } from './downloads'
+import { DownloadManager, DownloadError, MAX_FOLDER_FILES, setDownloadGetForTests, type DownloadRecord } from './downloads'
+import { Hono } from 'hono'
 import type { HfModelFiles } from '../hf/hf'
+import { registerApi } from '../api/routes'
+import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
 // run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
@@ -400,6 +403,96 @@ test('enqueue: a concurrent duplicate (same dest) is not enqueued twice', async 
     // No two live records share a dest.
     const dests = dm.list().map((r) => r.dest)
     assert.equal(new Set(dests).size, dests.length)
+  } finally {
+    restore()
+  }
+})
+
+// A file a live row (downloading, queued or paused) already holds queues nothing new, and the
+// request is answered with that row in `held` (the route's `existing`): returning nothing at all
+// left onboarding with no download to follow after a restart had paused its own, and Import from
+// URL closing without a word.
+test('enqueue: a file a live row already holds is answered with that row, a raw URL, a subdir file or an expanded model alike', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand([
+      { rfilename: 'mmproj-F16.gguf', size: 5, sha256: 'p', mmproj: true },
+    ]))
+    const ids = (rows: { id: string }[]) => rows.map((r) => r.id)
+    for (const input of [
+      { url: 'https://mirror.example/raw.gguf' },
+      { repo: 'owner/st', rfilename: 'config.json', subdir: 'st' },
+      { repo: 'owner/repo', rfilename: 'model.gguf' },
+    ]) {
+      const first = await dm.enqueue(input)
+      assert.ok(first.length > 0)
+      dm.pause(first[0].id) // the first row paused (or queued), the rest still downloading
+      const held: DownloadRecord[] = []
+      assert.deepEqual(await dm.enqueue(input, held), [], JSON.stringify(input))
+      assert.deepEqual(ids(held), ids(first), 'every row that holds a requested file comes back')
+      assert.equal(held[0].status, 'paused')
+    }
+    const dests = dm.list().map((r) => r.dest)
+    assert.equal(new Set(dests).size, dests.length, 'still one row per file')
+  } finally {
+    restore()
+  }
+})
+
+// A raw URL lands flat in the model folder, so another URL saving the same file name meets the first one's row: it was
+// answered as that row, and the page resumed the other URL's download, whose model then landed in the library.
+test('enqueue: a raw URL whose file name a live row of another URL holds is refused, holding nothing; the same URL still gets its row', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [a] = await dm.enqueue({ url: 'http://h1.example/x/ggml-model-q4_0.gguf' })
+    dm.pause(a.id)
+    const held: DownloadRecord[] = []
+    await assert.rejects(dm.enqueue({ url: 'http://h2.example/y/ggml-model-q4_0.gguf' }, held), (e: unknown) => {
+      assert.equal((e as DownloadError).code, 'download_in_progress')
+      assert.equal((e as Error).message, 'Another download is already saving ggml-model-q4_0.gguf in this folder. Discard it in Downloads, or wait for it to finish.')
+      return true
+    })
+    assert.deepEqual(held, [], 'the other URL\'s row is not handed back')
+    assert.equal(dm.list().length, 1, 'nothing queued')
+    assert.equal(dm.list()[0].status, 'paused', 'and the paused row is left as it was')
+
+    const again: DownloadRecord[] = []
+    assert.deepEqual(await dm.enqueue({ url: 'http://h1.example/x/ggml-model-q4_0.gguf' }, again), [])
+    assert.deepEqual(again.map((r) => r.id), [a.id], 'the same URL is answered with its own row')
+  } finally {
+    restore()
+  }
+})
+
+test('POST /downloads answers a file a paused row holds with that row in `existing`, queuing nothing', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const app = new Hono()
+    registerApi(app, { downloads: dm } as unknown as Deps)
+    const post = async () => {
+      const res = await app.request('/api/v1/downloads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo: 'owner/repo', rfilename: 'm.gguf' }),
+      })
+      assert.equal(res.status, 202)
+      return (await res.json()) as { downloads: Array<{ id: string }>; existing: Array<{ id: string; status: string }> }
+    }
+    const first = await post()
+    assert.equal(first.downloads.length, 1)
+    assert.deepEqual(first.existing, [])
+    assert.equal(dm.pause(first.downloads[0].id), true)
+    const again = await post()
+    assert.deepEqual(again.downloads, [])
+    // Its id, name and status only: the rest of the row is a read (see the remote-token test in
+    // server.download-pause.test.ts).
+    assert.deepEqual(again.existing, [{ id: first.downloads[0].id, name: 'm.gguf', status: 'paused' }])
+    assert.equal(dm.list().length, 1)
   } finally {
     restore()
   }

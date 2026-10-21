@@ -659,7 +659,7 @@ export const UI_ACTIONS = [
   'skip_onboarding_payoff', 'skip_onboarding_tune_offer',
   'choose_profile', 'start_model_download', 'use_existing_models', 'open_discover_handoff',
   'pick_different_model', 'accept_autotune', 'decline_autotune', 'finish_onboarding',
-  'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action',
+  'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action', 'resume_model_download',
 
   // Turbo Link phase 3 (ADR-376): fleet control on the Models screen. `UI_ACTIONS` is a
   // CLOSED enum — `uiAction` validates against it and `POST /api/v1/telemetry/ui` drops an

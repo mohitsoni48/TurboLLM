@@ -47,7 +47,9 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
       // effect advances once it lands. `expectedModelKey` is required, not
       // optional: without it, LoadStep advanced the instant ANY model was
       // already loaded (a leftover from prior use), found by adversarial QA.
-      patchCtx({ downloadDone: true, expectedModelKey: entry.key })
+      // No download to follow either: a "Download this" stamped earlier (and kept across a
+      // closed tab) would otherwise send a reopened Load step after that file instead.
+      patchCtx({ downloadDone: true, expectedModelKey: entry.key, expectedDownloadId: null })
       await loadModel(entry.key)
       onContinue()
     } catch (e) {
@@ -123,14 +125,21 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
       // query cache, so LoadStep can mount on the very next render still seeing the
       // pre-download empty list. `useDownloadMutations().enqueue`'s `onSuccess: invalidate`
       // refreshes downloads/models/status immediately, closing that window.
-      const { downloads } = await downloadMutations.enqueue.mutateAsync({ repo: picked.repo, rfilename: picked.file, excludeMmproj: true })
+      const { downloads, existing } = await downloadMutations.enqueue.mutateAsync({ repo: picked.repo, rfilename: picked.file, excludeMmproj: true })
       // Stamp the specific download record LoadStep should wait for — its eventual model
       // key isn't known yet (the file doesn't exist to scan), unlike `expectedModelKey`
       // below, so this is a download ID instead. Without it, LoadStep's fallback ("the
       // most recent finished download in the whole history") can match an older, unrelated,
       // already-loaded model while THIS download is still in flight — found live driving a
       // real, non-instant download against real HuggingFace.
-      const primary = downloads.find((d) => d.name === picked.file) ?? downloads[0]
+      //
+      // A file a row already holds (still downloading from an earlier visit, or left paused by
+      // a restart) gets no new row: the daemon answers that row in `existing`, and the mutation
+      // has resumed it if it was paused. Followed like a new one. Reading `downloads` alone, a
+      // second "Download this" after a restart stamped nothing and the Load step froze on
+      // "Downloading" beside a paused row it offered no way to resume.
+      const rows = [...downloads, ...existing]
+      const primary = rows.find((d) => d.name === picked.file) ?? rows[0]
       if (primary) patchCtx({ expectedDownloadId: primary.id })
       onContinue()
     } catch (e) {
@@ -159,6 +168,10 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
             // recommendation like the shared link below) — a distinct event from
             // `pick_different_model` so the two are segmentable in the funnel.
             track('onboarding', 'open_discover_handoff')
+            // The model comes from Discover now: stop following an earlier "Download this" (kept
+            // across leaving onboarding), as "Use this model" does, or the Load step "Resume setup"
+            // returns to waits for and loads that file instead of the one picked there.
+            patchCtx({ expectedDownloadId: null })
             onContinue()
             navigate('/models?tab=discover')
           }}
@@ -257,6 +270,7 @@ export default function ModelStep({ onContinue, ctx }: StepComponentProps) {
           type="button"
           onClick={() => {
             track('onboarding', 'pick_different_model')
+            patchCtx({ expectedDownloadId: null }) // as Open Discover above
             onContinue()
             navigate('/models?tab=discover')
           }}

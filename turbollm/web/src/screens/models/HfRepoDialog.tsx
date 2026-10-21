@@ -27,6 +27,7 @@ import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
 import { downloadSubdir } from '../../lib/download-subdir'
+import { sayIfAlreadyListed } from '../../lib/download-listed'
 import { gpuBudgetMb } from '../../lib/vram'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
@@ -248,7 +249,12 @@ export function HfRepoContent({
         // it open while browsing" per this file's own convention above) — closing here
         // used to kick the user out of DiscoverTab's permanent detail pane on every
         // download, and out of the Sheet before they could pick another quant to queue.
-        onSuccess: () => { toast.success(`Downloading ${selectedFile.name}`) },
+        // A quant already in the download list queued nothing new: say so (a paused one has
+        // just been resumed by the mutation) rather than "Downloading" as if it had started.
+        onSuccess: (out) => {
+          if (out.downloads.length === 0 && out.existing.length > 0) sayIfAlreadyListed(out)
+          else toast.success(`Downloading ${selectedFile.name}`)
+        },
       },
     )
   }

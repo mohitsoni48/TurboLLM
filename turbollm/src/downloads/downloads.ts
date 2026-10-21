@@ -119,7 +119,7 @@ export function setDownloadGetForTests(get: DownloadGet): void {
 }
 
 /** Statuses whose record still owns its .part (writing it, or able to resume from it) — the
- *  same set {@link DownloadManager.hasLiveDest} treats as live. */
+ *  same set {@link DownloadManager.liveAt} treats as live. */
 const LIVE: DownloadStatus[] = ['queued', 'downloading', 'paused']
 
 /** The most files a whole-folder download's `folder` may list. The web sends a model folder's
@@ -252,8 +252,14 @@ export class DownloadManager {
    *  queue. Returns every record created — a single file for a raw non-HF URL, or the
    *  whole model (all split shards + the shared mmproj) for an HF repo file. Throws
    *  DownloadError for caller-actionable failures (no dir set, bad URL, insufficient
-   *  disk). */
-  async enqueue(input: EnqueueInput): Promise<DownloadRecord[]> {
+   *  disk).
+   *
+   *  A file a live row (downloading, queued or paused) already holds gets no second row; that
+   *  row is pushed to `held`, so a caller can follow it. Returning nothing for it alone left
+   *  the caller nothing to show: onboarding's "Download this" of a model a restart had left
+   *  paused set no download to wait for and froze on "Downloading", and Import from URL closed
+   *  without a word. */
+  async enqueue(input: EnqueueInput, held: DownloadRecord[] = []): Promise<DownloadRecord[]> {
     const dir = this.primaryDir()
     if (!dir) throw new DownloadError('no_model_dir', 'Add a model folder in Settings before downloading.')
 
@@ -288,7 +294,19 @@ export class DownloadManager {
         mkdirSync(destDir, { recursive: true })
         if ((input.size ?? 0) > 0) this.assertDisk(dir, input.size!)
         const dest = join(destDir, filename)
-        if (this.hasLiveDest(dest)) return []
+        const live = this.liveAt(dest)
+        if (live) {
+          // A raw URL lands flat in the folder, so the row holding that file can be another URL's that saves the same
+          // file name (two hosts' ggml-model-q4_0.gguf). Answered as this one's, the page resumed it and the other
+          // URL's model landed in the library. Only the same URL is this download; another is refused, holding
+          // nothing. The message names no host: DownloadError text reaches remote callers, while `existing` carries
+          // no URL.
+          if (live.url !== u) {
+            throw new DownloadError('download_in_progress', `Another download is already saving ${filename} in this folder. Discard it in Downloads, or wait for it to finish.`)
+          }
+          held.push(live)
+          return []
+        }
         return this.commit([{ name: filename, repo: '', url: u, dest, total: input.size ?? 0, sha256: input.sha256 }])
       }
     }
@@ -317,7 +335,11 @@ export class DownloadManager {
       assertInsideModelDir(dir, destDir)
       mkdirSync(destDir, { recursive: true })
       const dest = join(destDir, filename)
-      if (this.hasLiveDest(dest)) return []
+      const live = this.liveAt(dest)
+      if (live) {
+        held.push(live)
+        return []
+      }
       // A whole-folder download's files each check what is left of the folder, not their own
       // size: checked one by one, three 18 GB shards on a disk with 30 GB free all passed
       // (19.8 GB each) and the folder could never finish. Never less than this file's own size.
@@ -347,7 +369,11 @@ export class DownloadManager {
       .filter(({ f, dest }) => {
         // An in-flight/queued job already owns this exact file — never enqueue a second
         // writer for the same .part (double-click, or two quants sharing one mmproj).
-        if (this.hasLiveDest(dest)) return false
+        const live = this.liveAt(dest)
+        if (live) {
+          held.push(live)
+          return false
+        }
         // A shared mmproj already on disk: keep it only if it looks incomplete (size
         // known and mismatched) — otherwise adding a second quant shouldn't re-pull it.
         if (f.mmproj && existsSync(dest)) {
@@ -379,18 +405,18 @@ export class DownloadManager {
     )
   }
 
-  /** True when a queued/downloading/paused record already targets this dest (as the file
-   *  system compares names, {@link sameDest}) — the guard against two concurrent writers
+  /** The queued/downloading/paused record that already targets this dest (as the file
+   *  system compares names, {@link sameDest}), if any — the guard against two concurrent writers
    *  corrupting one file. Terminal records (done/cancelled/error) don't block a fresh attempt. */
-  private hasLiveDest(dest: string): boolean {
+  private liveAt(dest: string): DownloadRecord | undefined {
     for (const r of this.records.values()) {
-      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return true
+      if (sameDest(r.dest, dest) && (r.status === 'queued' || r.status === 'downloading' || r.status === 'paused')) return r
     }
-    return false
+    return undefined
   }
 
   /** What is left to fetch of the whole-folder download `folder` names: the total of its files
-   *  that no live row already holds. Their own requests add nothing (hasLiveDest), as the GGUF
+   *  that no live row already holds. Their own requests add nothing (liveAt), as the GGUF
    *  path drops its live shards before totalling them. Counted whole, a folder clicked again
    *  while some of its files are still downloading would be checked as if every byte were
    *  still to come: of three 10 GB shards with 1 and 3 still writing and 20 GB free, shard 2
@@ -401,7 +427,7 @@ export class DownloadManager {
    *
    *  The live dests are collected once, keyed as {@link sameDest} compares them (exactly, or
    *  lowercased where the record's dest {@link foldsCase}), so each file is a lookup: calling
-   *  hasLiveDest per file scanned every record for every file, and one request listing 20000
+   *  liveAt per file scanned every record for every file, and one request listing 20000
    *  files against 2000 rows held the daemon's event loop for nearly 3 s. */
   private folderToFetch(dir: string, folder: EnqueueInput['folder']): number {
     const files = folder?.files
@@ -422,7 +448,7 @@ export class DownloadManager {
     return need
   }
 
-  /** True when ANOTHER record with one of `statuses` targets this record's dest. hasLiveDest
+  /** True when ANOTHER record with one of `statuses` targets this record's dest. liveAt
    *  lets a fresh enqueue through while an errored row for the same file remains, so two rows
    *  can share one .part: the stale row must neither delete it under the live one (cancel /
    *  remove) nor start a second writer on it (resume). */

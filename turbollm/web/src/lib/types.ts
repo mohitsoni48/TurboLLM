@@ -1277,6 +1277,11 @@ export type DownloadsList = {
   downloads: DownloadRecord[]
 }
 
+/** A download the daemon names in a download request's `existing` (a row already holding a file
+ *  the request asked for): what following or resuming it takes, not the whole row, which is the
+ *  host's and a read a token that may only write downloads is refused. */
+export type HeldDownload = Pick<DownloadRecord, 'id' | 'name' | 'status'>
+
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
 // Mirrors turbollm/src/observability/request-log.ts's `RequestLogEntry` — kept as a hand-written
 // twin rather than a generated/shared type, matching every other daemon↔web type pair in this

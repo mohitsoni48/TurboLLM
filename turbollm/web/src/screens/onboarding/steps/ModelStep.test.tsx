@@ -17,15 +17,17 @@ const trackMock = vi.hoisted(() => vi.fn())
 const patchCtxMock = vi.hoisted(() => vi.fn())
 const onContinueMock = vi.hoisted(() => vi.fn())
 const showAllMock = vi.hoisted(() => ({ value: false }))
+const enqueueMock = vi.hoisted(() => vi.fn())
+const recommendationMock = vi.hoisted(() => ({ isLoading: false, data: undefined as unknown }))
 
 vi.mock('../../../lib/queries', () => ({
   useModels: () => modelsMock,
   useShowAllEngineModels: () => showAllMock.value,
   useSysInfo: () => ({ isLoading: false, data: undefined }),
-  useDownloadMutations: () => ({ enqueue: { mutateAsync: vi.fn() } }),
+  useDownloadMutations: () => ({ enqueue: { mutateAsync: enqueueMock } }),
 }))
 vi.mock('../../../lib/onboarding-queries', () => ({
-  useOnboardingRecommendation: () => ({ isLoading: false, data: undefined }),
+  useOnboardingRecommendation: () => recommendationMock,
 }))
 vi.mock('../../../lib/api', () => ({ loadModel: loadModelMock, track: trackMock }))
 vi.mock('../../../lib/onboarding/useOnboardingMachine', () => ({
@@ -48,10 +50,10 @@ const jevModel: Partial<ModelEntry> = {
   jev: { labels: ['contradiction', 'entailment', 'neutral'], nliTemplate: 'Premise: {premise} Hypothesis: {hypothesis}', architecture: 'Qwen3_5ForSequenceClassification', verified: true },
 }
 
-function renderStep() {
+function renderStep(over: Partial<OnboardingCtx> = {}) {
   return render(
     <MemoryRouter>
-      <ModelStep onContinue={onContinueMock} onSkip={vi.fn()} ctx={ctx} />
+      <ModelStep onContinue={onContinueMock} onSkip={vi.fn()} ctx={{ ...ctx, ...over }} />
     </MemoryRouter>,
   )
 }
@@ -60,6 +62,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   loadModelMock.mockResolvedValue(undefined)
   showAllMock.value = false
+  recommendationMock.data = undefined
 })
 
 describe('ModelStep — "Use a model I already have" offers chat models only', () => {
@@ -77,7 +80,7 @@ describe('ModelStep — "Use a model I already have" offers chat models only', (
     await user.selectOptions(screen.getByRole('combobox'), 'qwen3-8b')
     await user.click(screen.getByRole('button', { name: 'Use this model' }))
     await waitFor(() => expect(loadModelMock).toHaveBeenCalledWith('qwen3-8b'))
-    expect(patchCtxMock).toHaveBeenCalledWith({ downloadDone: true, expectedModelKey: 'qwen3-8b' })
+    expect(patchCtxMock).toHaveBeenCalledWith({ downloadDone: true, expectedModelKey: 'qwen3-8b', expectedDownloadId: null })
     expect(onContinueMock).toHaveBeenCalled()
   })
 
@@ -124,5 +127,56 @@ describe('ModelStep — "Use a model I already have" leaves out a model the user
     modelsMock.data = { models: [chatModel, { ...hidden, loaded: true }] }
     renderStep()
     expect(options()).toEqual(['Choose a model…', 'Qwen3 8B · Q4_K_M · 4.7 GB', 'Gemma 270M · Q4_K_M · 0.3 GB'])
+  })
+})
+
+// "Download this" for a model a row already holds (a restart left it paused, or it is still
+// downloading from an earlier visit) queues nothing new: the daemon answers that row in
+// `existing`, and the Load step must follow it. Reading only the rows created, it followed
+// nothing and froze on "Downloading".
+describe('ModelStep — "Download this" follows the download that already holds the file', () => {
+  const FILE = 'gemma-4-E4B-it-Q4_K_M.gguf'
+  const row = (id: string, name: string, status: string) => ({ id, name, status })
+
+  beforeEach(() => {
+    modelsMock.data = { models: [] }
+    recommendationMock.data = {
+      recommendation: { kind: 'entry', entry: { id: 'T0-A', role: 'general', repo: 'unsloth/gemma-4-E4B-it-GGUF', file: FILE, bytes: 4_977_171_584 }, speculative: 'off' },
+      isT0: true,
+    }
+  })
+
+  it('stamps the existing row of the picked file when nothing new was queued', async () => {
+    const held = row('dl-held', FILE, 'queued')
+    enqueueMock.mockResolvedValueOnce({ downloads: [], existing: [held], resumed: [held] })
+    renderStep()
+    await userEvent.click(screen.getByRole('button', { name: 'Download this' }))
+    await waitFor(() => expect(onContinueMock).toHaveBeenCalled())
+    expect(enqueueMock).toHaveBeenCalledWith({ repo: 'unsloth/gemma-4-E4B-it-GGUF', rfilename: FILE, excludeMmproj: true })
+    expect(patchCtxMock).toHaveBeenCalledWith({ expectedDownloadId: 'dl-held' })
+  })
+
+  it('still stamps a newly created row first', async () => {
+    enqueueMock.mockResolvedValueOnce({ downloads: [row('dl-new', FILE, 'queued')], existing: [], resumed: [] })
+    renderStep()
+    await userEvent.click(screen.getByRole('button', { name: 'Download this' }))
+    await waitFor(() => expect(patchCtxMock).toHaveBeenCalledWith({ expectedDownloadId: 'dl-new' }))
+  })
+
+  // The followed id is kept across leaving onboarding, so a model picked in Discover instead
+  // must clear it, as "Use this model" does: kept, "Resume setup" waited for and loaded the file
+  // "Download this" started earlier, not the one downloaded in Discover.
+  it('"Pick a different model" stops following an earlier "Download this"', async () => {
+    renderStep()
+    await userEvent.click(screen.getByRole('button', { name: 'Pick a different model →' }))
+    expect(patchCtxMock).toHaveBeenCalledWith({ expectedDownloadId: null })
+    expect(onContinueMock).toHaveBeenCalled()
+  })
+
+  it('"Open Discover" (Pro) stops following an earlier "Download this"', async () => {
+    renderStep({ profile: 'pro' })
+    await userEvent.click(screen.getByRole('button', { name: /Open Discover/ }))
+    expect(patchCtxMock).toHaveBeenCalledWith({ expectedDownloadId: null })
+    expect(onContinueMock).toHaveBeenCalled()
   })
 })

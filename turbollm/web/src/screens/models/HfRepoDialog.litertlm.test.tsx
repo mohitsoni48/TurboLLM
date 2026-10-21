@@ -18,6 +18,7 @@ import type { HfRepoDetail, HfRepoFile } from '../../lib/types'
 const enqueue = vi.fn()
 const requestLoad = vi.fn()
 const toastSuccess = vi.fn()
+const toastInfo = vi.fn()
 
 function bundle(name: string, variant: string, sizeBytes: number, sha256: string, quant = '?'): HfRepoFile {
   return { name, quant, variant, sizeBytes, parts: 1, mmproj: false, litertlm: true, sha256, url: `u/${name}` }
@@ -55,11 +56,11 @@ vi.mock('../../lib/queries', () => ({
   useStatus: () => ({ data: { engine: { kind: 'litert-lm' } } }),
   // mutate records the input AND runs the caller's onSuccess, so a download's toast
   // fires the way it does against the real mutation (the single-file path toasts there).
+  // `enqueue` may return the mutation's result; by default one new row was created.
   useDownloadMutations: () => ({
     enqueue: {
-      mutate: (input: unknown, opts?: { onSuccess?: () => void }) => {
-        enqueue(input)
-        opts?.onSuccess?.()
+      mutate: (input: unknown, opts?: { onSuccess?: (out: unknown) => void }) => {
+        opts?.onSuccess?.(enqueue(input) ?? { downloads: [{ id: 'new' }], existing: [], resumed: [] })
       },
       isPending: false,
       error: null,
@@ -82,7 +83,7 @@ vi.mock('../../lib/model-loader', () => ({
 }))
 // Wrapped rather than passed directly: a `vi.mock` factory is hoisted above the `const`.
 vi.mock('../../components/ui/sonner', () => ({
-  toast: { success: (m: string) => toastSuccess(m), error: () => {} },
+  toast: { success: (m: string) => toastSuccess(m), info: (m: string) => toastInfo(m), error: () => {} },
 }))
 vi.mock('../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/api')>()),
@@ -114,6 +115,7 @@ beforeEach(() => {
   enqueue.mockClear()
   requestLoad.mockClear()
   toastSuccess.mockClear()
+  toastInfo.mockClear()
   remoteStart.mockReset()
 })
 
@@ -167,6 +169,28 @@ describe('HfRepoContent — a .litertlm repo', () => {
       },
     ])
     expect(toastSuccess).toHaveBeenCalledWith('Downloading gemma-4-E2B-it-gpu.litertlm')
+  })
+
+  it('says "Resumed", not "Downloading", for a bundle a paused download already holds', async () => {
+    const held = { id: 'dl-held', name: 'gemma-4-E2B-it-gpu.litertlm', status: 'queued' }
+    enqueue.mockReturnValueOnce({ downloads: [], existing: [held], resumed: [held] })
+    const user = userEvent.setup()
+    renderContent()
+    await pickVariant(/^GPU/)
+    await user.click(screen.getByRole('button', { name: /Download/ }))
+    expect(toastSuccess).toHaveBeenCalledWith('Resumed gemma-4-E2B-it-gpu.litertlm')
+    expect(toastSuccess).not.toHaveBeenCalledWith('Downloading gemma-4-E2B-it-gpu.litertlm')
+  })
+
+  it('says "Already downloading" for a bundle still downloading', async () => {
+    const held = { id: 'dl-held', name: 'gemma-4-E2B-it-gpu.litertlm', status: 'downloading' }
+    enqueue.mockReturnValueOnce({ downloads: [], existing: [held], resumed: [] })
+    const user = userEvent.setup()
+    renderContent()
+    await pickVariant(/^GPU/)
+    await user.click(screen.getByRole('button', { name: /Download/ }))
+    expect(toastInfo).toHaveBeenCalledWith('Already downloading gemma-4-E2B-it-gpu.litertlm')
+    expect(toastSuccess).not.toHaveBeenCalled()
   })
 
   it('reads the precision from the name beside the variant, matching the library scanner', async () => {

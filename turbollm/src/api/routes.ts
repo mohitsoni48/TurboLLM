@@ -3775,10 +3775,17 @@ export function registerApi(app: Hono, d: Deps): void {
     if (b?.url && !isLocalOrAuthenticated(c, d))
       return err(c, 403, 'api_key_required', 'Importing a model from a URL requires a valid API key.')
     // One request may fan out into several files (split shards + a shared mmproj) —
-    // return every record created so the UI reflects the full queued set.
+    // return every record created so the UI reflects the full queued set. `existing` (additive)
+    // is each live row that already held a requested file and so got no second one: a file
+    // downloading, queued or paused is answered with its row rather than with nothing, so the
+    // caller can follow it, or resume it. Only its id, name and status, which is all that takes:
+    // the row is the host's, not one this request created, and the whole of it (the host's
+    // path, the URL it came from, its progress) is a read that a remote token with
+    // downloads:write but not downloads:read is refused on GET /api/v1/downloads.
     const out = await enqueueDownload(d, b)
     if (!out.ok) return err(c, out.status, out.code, out.message)
-    return c.json({ downloads: out.downloads }, 202)
+    const existing = out.existing.map(({ id, name, status }) => ({ id, name, status }))
+    return c.json({ downloads: out.downloads, existing }, 202)
   })
 
   app.post('/api/v1/downloads/:id/cancel', (c) => {

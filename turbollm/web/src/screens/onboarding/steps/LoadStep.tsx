@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { AlertTriangle, Check, Download, Loader2, Terminal } from 'lucide-react'
+import { AlertTriangle, Check, Download, Loader2, Pause, RotateCw, Terminal } from 'lucide-react'
 import { useDownloadMutations, useDownloads, useModels, useStatus } from '../../../lib/queries'
 import { loadModel, track, trackRecovery, trackRecoveryText } from '../../../lib/api'
 import { useOnboardingMachine } from '../../../lib/onboarding/useOnboardingMachine'
@@ -27,7 +27,9 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   const statusQuery = useStatus()
   const [loadTriggered, setLoadTriggered] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
+  const [resumeError, setResumeError] = useState<string | null>(null)
   const advancedRef = useRef(false)
+  const mountedAt = useRef(Date.now())
   // A retry is only worth measuring once we know whether it WORKED, and that answer
   // arrives on a later render (the model comes up, or the download reaches a terminal
   // status). This holds the in-flight attempt until then — `onboarding_recovery`'s whole
@@ -62,10 +64,29 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   // in history purely because THIS run's own download hadn't finished yet — got matched
   // instead, advancing the wizard to the wrong model while the real download was still in
   // flight.
-  const relevantDownloads = ctx.expectedDownloadId
-    ? downloadsQuery.data?.downloads.filter((d) => d.id === ctx.expectedDownloadId)
-    : downloadsQuery.data?.downloads
-  const activeDownload = relevantDownloads?.find((d) => d.status === 'downloading' || d.status === 'queued' || d.status === 'paused')
+  //
+  // The id is kept across a closed tab (useOnboardingMachine) and can outlive its row: a
+  // daemon restart drops finished rows from the list, and Dismiss removes one. Once a list
+  // fetched after this step opened has no such row, the step goes on as with no id; followed
+  // anyway, it read "Downloading" with nothing to download. A list from before the step
+  // opened proves nothing: right after "Download this" it may predate the new row.
+  // A cancelled row is followed no further either, from any list (a cancelled row never runs
+  // again): cancelled in Models (Cancel, Cancel all) between "Download this" and "Resume
+  // setup", it is neither active, finished nor errored, and the step froze on "Downloading"
+  // with no way on but Back.
+  const allDownloads = downloadsQuery.data?.downloads
+  const followedRow = ctx.expectedDownloadId ? allDownloads?.find((d) => d.id === ctx.expectedDownloadId) : undefined
+  const followedCancelled = followedRow?.status === 'cancelled'
+  const followedGone = Boolean(allDownloads && downloadsQuery.dataUpdatedAt > mountedAt.current && !followedRow)
+  const followedId = ctx.expectedDownloadId && !followedGone && !followedCancelled ? ctx.expectedDownloadId : null
+  const relevantDownloads = followedId ? allDownloads?.filter((d) => d.id === followedId) : allDownloads
+  // A paused row is waited on only when it is the one this step follows, and then it is shown
+  // as paused with a Resume (below). Counted as downloading, a row a restart left paused froze
+  // the step on "Downloading" with a still bar and no way on, and with no id to follow, any
+  // unrelated row paused in Discover did the same.
+  const activeDownload = relevantDownloads?.find((d) =>
+    d.status === 'downloading' || d.status === 'queued' || (followedId !== null && d.status === 'paused'))
+  const pausedDownload = activeDownload?.status === 'paused' ? activeDownload : undefined
   // Most-recent-first: `erroredDownload`/`finishedDownload` must reflect the LATEST event of
   // each kind, not just the first one `.find()` happens to hit in array order. Matters both
   // for which one wins below (a fresh failure must still surface even with an old, unrelated
@@ -129,7 +150,7 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   const loadedModel = statusQuery.data?.model
 
   // Second bug the re-verification pass found: a reload resets `ctx` to
-  // INITIAL_CTX (only `currentStepId` survives, by this file's own deliberate
+  // INITIAL_CTX (only `currentStepId` and the followed download's id survive, by
   // design — see useOnboardingMachine.tsx's header comment), but restores
   // `currentStepId` to 'load' from localStorage regardless. That combination
   // — landing on Load with `expectedModelKey` wiped and no download to match
@@ -143,7 +164,7 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   // narrower version of the "any model counts" behaviour bug #3 removed:
   // it only engages when there is nothing left to compare against, never
   // when a real expectation or download is actually in flight.
-  // `!ctx.expectedDownloadId` too: if ModelStep's real download flow stamped one, we are
+  // `!followedId` too: if ModelStep's real download flow stamped one, we are
   // DEFINITELY waiting on something even if the (possibly still-stale) downloads cache
   // hasn't caught up yet — "nothing to load" is never the right read in that case. Found
   // by an Opus release-review pass, live-traced: `ModelStep.startDownload()`'s raw
@@ -153,7 +174,7 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   // "Nothing to load yet" flash immediately after the user clicks Download, on the primary
   // happy path. See ModelStep.tsx's own fix (switched to the invalidating mutation) for the
   // other half of this.
-  const resumedWithNoTrail = !ctx.expectedModelKey && !ctx.expectedDownloadId && !activeDownload && !finishedDownload && !erroredDownload
+  const resumedWithNoTrail = !ctx.expectedModelKey && !followedId && !activeDownload && !finishedDownload && !erroredDownload
   const isLoaded = Boolean(
     loadedModel && ((expectedKey && loadedModel.key === expectedKey) || resumedWithNoTrail),
   )
@@ -350,15 +371,22 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
   }
 
   if (nothingToLoad) {
+    // Said for what is there: "You haven't picked a model yet" was wrong for a download the user
+    // cancelled, and for one paused in Models (with no "Download this" to follow, a paused row
+    // does not hold this step, as an unrelated one would freeze it), which Models resumes.
+    const pausedElsewhere = Boolean(allDownloads?.some((d) => d.status === 'paused'))
     return (
       <div className="space-y-6">
         <div className="flex items-center gap-3 mb-2">
           <AlertTriangle size={20} className="text-amber-400" />
-          <h3 className="text-lg font-semibold text-ink">Nothing to load yet</h3>
+          <h3 className="text-lg font-semibold text-ink">{followedCancelled ? 'Your download was cancelled' : 'Nothing to load yet'}</h3>
         </div>
         <p className="text-sm text-muted">
-          You haven't picked a model yet — head back and choose one, or download the
-          recommended one.
+          {followedCancelled
+            ? 'Nothing of it was kept — head back to download it again, or choose another model.'
+            : pausedElsewhere
+              ? 'A download is paused in Models — resume it there, or head back and choose a model.'
+              : "You haven't picked a model yet — head back and choose one, or download the recommended one."}
         </p>
         <div className="flex items-center gap-3">
           <button
@@ -370,7 +398,7 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
           </button>
           <button
             type="button"
-            onClick={() => navigate('/models')}
+            onClick={() => navigate(pausedElsewhere ? '/models?tab=discover' : '/models')}
             className="text-sm text-accent hover:text-accent-hover"
           >
             Open Models →
@@ -380,36 +408,67 @@ export default function LoadStep({ onContinue, ctx }: StepComponentProps) {
     )
   }
 
+  // "Download complete" only once nothing this step waits on is still downloading: an older
+  // finished row in the list (no id to follow) said so while gigabytes were still coming.
+  const downloadComplete = Boolean(finishedDownload) && !activeDownload
+
+  const onResume = () => {
+    if (!pausedDownload) return
+    track('onboarding', 'resume_model_download')
+    setResumeError(null)
+    downloadMutations.resume.mutate(pausedDownload.id, {
+      onError: (e) => setResumeError(e instanceof Error ? e.message : String(e)),
+    })
+  }
+
   return (
     <div className="space-y-6">
       <div className="flex items-center gap-3 mb-2">
-        <Loader2 size={20} className="text-accent animate-spin" />
-        <h3 className="text-lg font-semibold text-ink">Loading your model</h3>
+        {pausedDownload
+          ? <Pause size={20} className="text-accent" />
+          : <Loader2 size={20} className="text-accent animate-spin" />}
+        <h3 className="text-lg font-semibold text-ink">{pausedDownload ? 'Your download is paused' : 'Loading your model'}</h3>
       </div>
       <p className="text-sm text-muted mb-6">
-        Don't close this tab — your progress is saved either way.
+        {pausedDownload
+          ? 'What is downloaded so far is kept. Resume to finish it and load your model.'
+          : "Don't close this tab — your progress is saved either way."}
       </p>
 
       <div className="space-y-3">
         <div className="flex items-center gap-4 rounded-lg border border-accent/30 bg-accent/5 p-3">
           <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center">
-            {finishedDownload ? (
+            {downloadComplete ? (
               <Check size={16} className="text-accent" />
             ) : (
               <Download size={16} className="text-accent" />
             )}
           </div>
-          <div className="flex-1">
+          <div className="flex-1 min-w-0">
             <span className="text-sm text-ink">
-              {finishedDownload ? 'Download complete' : 'Downloading'}
+              {downloadComplete ? 'Download complete' : pausedDownload ? `Paused${downloadPct !== null ? ` at ${downloadPct}%` : ''}` : 'Downloading'}
             </span>
-            {!finishedDownload && downloadPct !== null && (
+            {!downloadComplete && downloadPct !== null && (
               <div className="mt-1 h-1.5 rounded-full bg-panel overflow-hidden">
                 <div className="h-full bg-accent rounded-full" style={{ width: `${downloadPct}%` }} />
               </div>
             )}
           </div>
+          {pausedDownload && (
+            <button
+              type="button"
+              onClick={onResume}
+              disabled={downloadMutations.resume.isPending}
+              className="flex-shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-accent bg-accent/10 text-accent px-3 py-1.5 text-sm font-medium hover:bg-accent/20 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            >
+              <RotateCw size={14} />
+              Resume
+            </button>
+          )}
         </div>
+        {resumeError && pausedDownload && (
+          <p role="alert" className="text-xs text-red-400">{resumeError}</p>
+        )}
 
         <div className={`flex items-center gap-4 rounded-lg border p-3 ${loadTriggered ? 'border-accent/30 bg-accent/5' : 'border-transparent'}`}>
           <div className="flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center">

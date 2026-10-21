@@ -139,7 +139,9 @@ import { useJevLoadStore } from '../stores/jev-load'
 import type {
   BenchState,
   BuildPrereqs,
+  DownloadRecord,
   DownloadsList,
+  HeldDownload,
   Engine,
   EngineBackends,
   EngineCatalog,
@@ -1119,6 +1121,10 @@ export function useDownloads(): UseQueryResult<DownloadsList> {
   })
 }
 
+/** What a download request did: the rows it created, the rows already holding files it named
+ *  (`existing`, with a paused one shown as queued once resumed), and which of those it resumed. */
+export type EnqueueResult = { downloads: DownloadRecord[]; existing: HeldDownload[]; resumed: HeldDownload[] }
+
 export function useDownloadMutations() {
   const qc = useQueryClient()
   const invalidate = () => {
@@ -1129,8 +1135,27 @@ export function useDownloadMutations() {
   }
   return {
     enqueue: useMutation({
-      mutationFn: (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; folder?: { files: { path: string; size: number }[] }; excludeMmproj?: boolean }) =>
-        enqueueDownload(input),
+      mutationFn: async (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; folder?: { files: { path: string; size: number }[] }; excludeMmproj?: boolean }): Promise<EnqueueResult> => {
+        const out = await enqueueDownload(input)
+        // A file a row already holds gets no second row; the daemon answers that row instead.
+        // Asking again for a paused one means "go on", so it is resumed here, for every caller
+        // (Discover, Import from URL, onboarding's "Download this"): until now the request
+        // queued nothing, said nothing, and the download stayed paused.
+        const existing: HeldDownload[] = []
+        const resumed: HeldDownload[] = []
+        for (const d of out.existing ?? []) {
+          if (d.status !== 'paused') { existing.push(d); continue }
+          try {
+            await resumeDownload(d.id)
+            const row: HeldDownload = { ...d, status: 'queued' }
+            existing.push(row)
+            resumed.push(row)
+          } catch {
+            existing.push(d) // left paused; its row still offers Resume
+          }
+        }
+        return { downloads: out.downloads, existing, resumed }
+      },
       onSuccess: invalidate,
     }),
     cancel: useMutation({ mutationFn: (id: string) => cancelDownload(id), onSuccess: invalidate }),

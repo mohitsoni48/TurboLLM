@@ -22,7 +22,7 @@ import type { OnboardingCtx } from '../../../lib/onboarding/types'
 //    accepted, which would have made the event a near-constant 'ok' — exactly
 //    the class of defect the telemetry audit existed to remove.
 
-const downloadsMock = vi.hoisted(() => ({ data: undefined as { downloads: unknown[] } | undefined, isSuccess: true }))
+const downloadsMock = vi.hoisted(() => ({ data: undefined as { downloads: unknown[] } | undefined, isSuccess: true, dataUpdatedAt: 0 }))
 const modelsMock = vi.hoisted(() => ({ data: undefined as { models: unknown[] } | undefined }))
 const statusMock = vi.hoisted(() => ({ data: undefined as { model?: { key: string } | null } | undefined, isSuccess: true }))
 const resumeMock = vi.hoisted(() => ({ isPending: false, mutate: vi.fn() }))
@@ -32,6 +32,8 @@ const trackRecoveryMock = vi.hoisted(() => vi.fn())
 const trackRecoveryTextMock = vi.hoisted(() => vi.fn())
 const advanceMock = vi.hoisted(() => vi.fn())
 const patchCtxMock = vi.hoisted(() => vi.fn())
+const goToStepMock = vi.hoisted(() => vi.fn())
+const navigateMock = vi.hoisted(() => vi.fn())
 
 vi.mock('../../../lib/queries', () => ({
   useDownloads: () => downloadsMock,
@@ -46,9 +48,9 @@ vi.mock('../../../lib/api', () => ({
   trackRecoveryText: trackRecoveryTextMock,
 }))
 vi.mock('../../../lib/onboarding/useOnboardingMachine', () => ({
-  useOnboardingMachine: () => ({ advance: advanceMock, patchCtx: patchCtxMock, goToStep: vi.fn() }),
+  useOnboardingMachine: () => ({ advance: advanceMock, patchCtx: patchCtxMock, goToStep: goToStepMock }),
 }))
-vi.mock('react-router-dom', () => ({ useNavigate: () => vi.fn() }))
+vi.mock('react-router-dom', () => ({ useNavigate: () => navigateMock }))
 
 const MODEL_KEY = 'llama-3-8b-q4'
 const MODEL_FILE = 'llama-3-8b-q4.gguf'
@@ -81,6 +83,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   downloadsMock.data = { downloads: [finishedDownload()] }
   downloadsMock.isSuccess = true
+  downloadsMock.dataUpdatedAt = 0
   modelsMock.data = { models: [{ key: MODEL_KEY, name: MODEL_FILE, path: MODEL_PATH }] }
   statusMock.data = { model: null }
   statusMock.isSuccess = true
@@ -168,5 +171,80 @@ describe('LoadStep recovery', () => {
 
     await waitFor(() => expect(trackRecoveryTextMock).toHaveBeenCalledTimes(1))
     expect(trackRecoveryTextMock).toHaveBeenCalledWith('404 fetching release asset', 'resume', 'ok')
+  })
+})
+
+// After a daemon restart (the row comes back paused), a closed tab (the step reopens with only
+// what useOnboardingMachine kept), or both: the step follows its own download and says what it
+// is doing, instead of a frozen "Downloading" or a "Download complete" that is not.
+describe('LoadStep — its own download after a restart or a reopen', () => {
+  const row = (over: Record<string, unknown>) => ({ ...finishedDownload(), ...over })
+
+  it('shows its own paused download as paused, and Resume resumes that row', async () => {
+    downloadsMock.data = { downloads: [row({ id: 'dl-2', status: 'paused', received: 30, total: 100, dest: 'C:/models/other.gguf' })] }
+    modelsMock.data = { models: [] }
+    renderStep({ expectedDownloadId: 'dl-2', downloadDone: false })
+    expect(screen.getByText('Your download is paused')).toBeTruthy()
+    expect(screen.getByText('Paused at 30%')).toBeTruthy()
+    expect(screen.queryByText('Downloading')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    expect(resumeMock.mutate).toHaveBeenCalledWith('dl-2', expect.anything())
+    expect(trackMock).toHaveBeenCalledWith('onboarding', 'resume_model_download')
+  })
+
+  it('with no download of its own to follow, an unrelated paused row does not hold the step', async () => {
+    downloadsMock.data = { downloads: [row({ id: 'dl-discover', status: 'paused', received: 30, total: 100, dest: 'C:/models/other.gguf' })] }
+    modelsMock.data = { models: [] }
+    renderStep({ expectedDownloadId: null, downloadDone: false })
+    expect(screen.getByText('Nothing to load yet')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+    // Said as it is, not "You haven't picked a model yet", and Models opens where it resumes.
+    expect(screen.getByText(/A download is paused in Models/)).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: 'Open Models →' }))
+    expect(navigateMock).toHaveBeenCalledWith('/models?tab=discover')
+  })
+
+  it('stops following its own download once it is cancelled, says so, and offers the model step', async () => {
+    // Cancelled in Models between "Download this" and "Resume setup". Any list shows it: a
+    // cancelled row never runs again, so even one from before the step opened is enough.
+    downloadsMock.data = { downloads: [row({ id: 'dl-x', status: 'cancelled', received: 30, total: 100, dest: 'C:/models/other.gguf' })] }
+    modelsMock.data = { models: [] }
+    renderStep({ expectedDownloadId: 'dl-x', downloadDone: false })
+    expect(screen.getByText('Your download was cancelled')).toBeTruthy()
+    expect(screen.queryByText('Downloading')).toBeNull()
+    expect(screen.queryByText('Loading your model')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Choose a model' }))
+    expect(goToStepMock).toHaveBeenCalledWith('model')
+  })
+
+  it('says "Downloading", not "Download complete", while a download runs beside an older finished one', () => {
+    downloadsMock.data = {
+      downloads: [
+        finishedDownload({ id: 'dl-old', createdAt: '2026-08-01T10:00:00.000Z' }),
+        row({ id: 'dl-new', status: 'downloading', received: 40, total: 100, createdAt: '2026-08-20T10:00:00.000Z', dest: 'C:/models/new.gguf' }),
+      ],
+    }
+    renderStep({ expectedDownloadId: null, downloadDone: false })
+    expect(screen.getByText('Downloading')).toBeTruthy()
+    expect(screen.queryByText('Download complete')).toBeNull()
+    expect(loadModelMock).not.toHaveBeenCalled()
+  })
+
+  it('stops following a kept id whose row a fresh list no longer has, and goes on as with none', () => {
+    // A daemon restart drops finished rows, so the reopened step's id names nothing.
+    downloadsMock.data = { downloads: [] }
+    downloadsMock.dataUpdatedAt = Date.now() + 60_000 // fetched after the step opened
+    modelsMock.data = { models: [] }
+    renderStep({ expectedDownloadId: 'dl-gone', downloadDone: false })
+    expect(screen.getByText('Nothing to load yet')).toBeTruthy()
+  })
+
+  it('keeps following its id while the list may predate its row (right after "Download this")', () => {
+    downloadsMock.data = { downloads: [] }
+    downloadsMock.dataUpdatedAt = 1 // fetched before the step opened
+    modelsMock.data = { models: [] }
+    renderStep({ expectedDownloadId: 'dl-new', downloadDone: false })
+    expect(screen.getByText('Loading your model')).toBeTruthy()
+    expect(screen.queryByText('Nothing to load yet')).toBeNull()
   })
 })

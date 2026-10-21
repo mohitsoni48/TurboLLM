@@ -8,6 +8,7 @@ import type {
   ChatMessage,
   DownloadRecord,
   DownloadsList,
+  HeldDownload,
   Engine,
   EngineBackends,
   EngineCatalog,
@@ -1322,7 +1323,9 @@ export function listDownloads(): Promise<DownloadsList> {
 
 /** Enqueue a download: an HF repo file {repo, rfilename} OR a raw {url}. A single HF
  *  request can fan out into several files (split shards + a shared mmproj projector), so
- *  the response carries every record created. */
+ *  the response carries every record created. `existing`: the rows already downloading,
+ *  queued or paused that hold files the request names (they get no second row), by id, name
+ *  and status; absent from a daemon older than it. */
 export function enqueueDownload(input: {
   repo?: string
   rfilename?: string
@@ -1339,8 +1342,8 @@ export function enqueueDownload(input: {
    *  projector a blessed catalog GGUF would otherwise expand into — "never pull mmproj-*.gguf
    *  — pure added download before first token." Discover's own manual picks never set this. */
   excludeMmproj?: boolean
-}): Promise<{ downloads: DownloadRecord[] }> {
-  return request<{ downloads: DownloadRecord[] }>('/api/v1/downloads', { method: 'POST', json: input })
+}): Promise<{ downloads: DownloadRecord[]; existing?: HeldDownload[] }> {
+  return request<{ downloads: DownloadRecord[]; existing?: HeldDownload[] }>('/api/v1/downloads', { method: 'POST', json: input })
 }
 
 export function cancelDownload(id: string): Promise<{ ok: true }> {

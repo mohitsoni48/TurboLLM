@@ -3,12 +3,14 @@
 // (.gguf or .litertlm — the self-contained formats) on any host — which covers HF
 // resolve links too, with blob links normalized to them first; on submit it enqueues
 // a raw-URL download via useDownloadMutations and closes — the item then appears in
-// the DownloadsPanel.
+// the DownloadsPanel. A file already in the download list gets no second row: a toast
+// says it is already downloading, or that its paused row was resumed.
 
 import { useEffect, useMemo, useState } from 'react'
 import { Link2 } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { useDownloadMutations } from '../../lib/queries'
+import { sayIfAlreadyListed } from '../../lib/download-listed'
 import { SINGLE_FILE_MODEL_RE } from '../../lib/single-file-model'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -148,7 +150,10 @@ export function ImportUrlDialog({
     mut.enqueue.mutate(
       { url: normalized },
       {
-        onSuccess: () => close(),
+        onSuccess: (out) => {
+          close()
+          sayIfAlreadyListed(out)
+        },
       },
     )
   }
