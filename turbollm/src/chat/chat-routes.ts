@@ -1659,6 +1659,14 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
         }
       }
       ac.signal.removeEventListener('abort', cancelReader)
+      // A Stop does not always reach this loop as an AbortError: with the request log on (the default)
+      // the turn reads one branch of a tee'd body (callChatUpstream), and cancelling it on abort ENDS the
+      // pending read (done: true) instead; Node 18's fetch body (the Android app's runtime) does the same
+      // with the log off. Read as the end of the round, a stopped reply was saved as finished (title,
+      // memory and bench result included) and a tool call it was streaming still ran, one set to Allow
+      // without asking. Thrown as the abort it is, before the flush below, so the catch and the drain
+      // after it handle it as they handle an AbortError.
+      ac.signal.throwIfAborted()
 
       // Flush lookahead buffer at end-of-stream. Clearing `pendingParse` first is what stops the
       // interrupted-turn drain after the try/catch from flushing this same buffer a SECOND time
@@ -1691,6 +1699,10 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
         })
 
         for (const tc of roundToolCalls) {
+          // No call starts once the turn is stopped. A tool that does not honour the abort (fetch_url,
+          // run_code, MCP) runs to its end when Stop comes during it, and the round's next call then
+          // started after the Stop, a tool set to Allow included.
+          ac.signal.throwIfAborted()
           let parsedArgs: Record<string, unknown>
           try { parsedArgs = JSON.parse(tc.argsBuffer || '{}') as Record<string, unknown> }
           catch { parsedArgs = {} }
@@ -1956,6 +1968,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
           }
         }
         ac.signal.removeEventListener('abort', cancelReader)
+        ac.signal.throwIfAborted() // a quiet end on Stop, as in the round loop above
         pendingParse = null
         for (const ev of flushState(parseState)) {
           if (ev.type === 'reasoning') {
@@ -1969,7 +1982,9 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       }
     }
   } catch (e: unknown) {
-    const isAbort = (e as Error)?.name === 'AbortError'
+    // Whatever was thrown once the turn was stopped is the Stop's doing (a linked host's leg cut off
+    // under it, a body that errors otherwise than with an AbortError): not an engine failure.
+    const isAbort = (e as Error)?.name === 'AbortError' || ac.signal.aborted
     aborted = isAbort
     if (!isAbort) {
       engineFailed = true
@@ -1987,6 +2002,9 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
     if (localAccounting) d.manager.generationEnd()
     releaseInflight(convId, ac)
   }
+  // A Stop that came after the last read (while the round's last text was being sent on) is still a
+  // Stop: the reply is saved and reported as stopped, and gets no title, memory or bench result.
+  if (ac.signal.aborted && !engineFailed) aborted = true
   // The placeholder is gone and the old reply back (restoreReplaced): nothing to fill in, title or
   // count.
   if (restored) return

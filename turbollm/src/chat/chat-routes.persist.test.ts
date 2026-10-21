@@ -80,10 +80,11 @@ function sseLine(obj: unknown): string {
   return `data: ${JSON.stringify(obj)}\n\n`
 }
 
-/** A fake llama.cpp stream. `script` runs against the controller; `onSignal` mirrors what a real
- *  fetch does on abort — it ERRORS the in-flight body with an AbortError, which is the only way
- *  runGeneration can tell a user Stop from an ordinary end-of-stream. */
-function fakeUpstream(script: (c: ReadableStreamDefaultController<Uint8Array>) => void | Promise<void>): {
+/** A fake llama.cpp stream. `script` runs against the controller; on abort it mirrors what Node 22's
+ *  plain fetch body does — it ERRORS the in-flight body with an AbortError. `onAbort: 'end'` mirrors
+ *  the bodies that END instead (done: true): the tee'd branch the request log hands the turn, and
+ *  Node 18's fetch body (the Android app's runtime). */
+function fakeUpstream(script: (c: ReadableStreamDefaultController<Uint8Array>) => void | Promise<void>, opts: { onAbort?: 'error' | 'end' } = {}): {
   restore: () => void
 } {
   const original = globalThis.fetch
@@ -93,7 +94,10 @@ function fakeUpstream(script: (c: ReadableStreamDefaultController<Uint8Array>) =
     const body = new ReadableStream<Uint8Array>({
       start(controller) {
         const onAbort = () => {
-          try { controller.error(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })) } catch { /* already closed */ }
+          try {
+            if (opts.onAbort === 'end') controller.close()
+            else controller.error(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }))
+          } catch { /* already closed */ }
         }
         signal?.addEventListener('abort', onAbort, { once: true })
         const write = (s: string) => controller.enqueue(enc.encode(s))
@@ -228,6 +232,93 @@ test('a real Stop click still records aborted:true, with the text generated so f
     const row = h.store.getMessage(seeded.assistantMsg.id)!
     assert.equal(row.stats.aborted, true, 'a user Stop must still be recorded as an abort')
     assert.equal(row.content, 'half an ans')
+  } finally {
+    f.restore()
+    h.cleanup()
+  }
+})
+
+test('a Stop whose read ENDS instead of failing (a tee\'d or Node 18 body) still records aborted:true', async () => {
+  const h = mkHarness()
+  const f = fakeUpstream(async (c) => {
+    const s = c as Scripted
+    s.write(sseLine({ choices: [{ delta: { content: 'half an ans' } }] }))
+  }, { onAbort: 'end' })
+  const events: string[] = []
+  try {
+    const seeded = seed(h.store)
+    const ac = new AbortController()
+    const done = runGeneration(h.d, (ev) => { events.push(ev.event) }, ctxFor(seeded, ac) as never)
+    await tick()
+    ac.abort()  // POST .../stop: the pending read resolves done:true
+    await done
+    const row = h.store.getMessage(seeded.assistantMsg.id)!
+    assert.equal(row.stats.aborted, true, 'a Stop is a Stop however the read ended')
+    assert.equal(row.content, 'half an ans')
+    assert.ok(!events.includes('error'), 'and not an engine failure')
+  } finally {
+    f.restore()
+    h.cleanup()
+  }
+})
+
+test('a Stop whose read ends quietly while a tool call streams starts no tool call', async () => {
+  const h = mkHarness()
+  const executed: string[] = []
+  ;(h.d as { tools?: unknown }).tools = {
+    buildToolDefinitions: async () => [{ type: 'function', function: { name: 'run_code', description: '', parameters: { type: 'object', properties: {} } } }],
+    executeTool: async (call: { name: string }) => { executed.push(call.name); return '42' },
+  }
+  ;(h.d.store.snapshot() as { tools: { toolPolicies: Record<string, string> } }).tools.toolPolicies = { run_code: 'allow' }
+  const f = fakeUpstream(async (c) => {
+    const s = c as Scripted
+    // The whole call has streamed; the model has not finished the round yet.
+    s.write(sseLine({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'tc1', function: { name: 'run_code', arguments: '{"code":"6*7"}' } }] } }] }))
+  }, { onAbort: 'end' })
+  try {
+    const seeded = seed(h.store)
+    const ac = new AbortController()
+    const done = runGeneration(h.d, () => {}, ctxFor(seeded, ac) as never)
+    await tick()
+    ac.abort()
+    await done
+    assert.deepEqual(executed, [], 'the call set to Allow does not run after Stop')
+    const row = h.store.getMessage(seeded.assistantMsg.id)!
+    assert.equal(row.stats.aborted, true)
+    assert.deepEqual(row.toolCalls ?? [], [])
+  } finally {
+    f.restore()
+    h.cleanup()
+  }
+})
+
+test('a Stop during one tool call of a round starts none of the round\'s later calls', async () => {
+  const h = mkHarness()
+  const ac = new AbortController()
+  const executed: string[] = []
+  ;(h.d as { tools?: unknown }).tools = {
+    buildToolDefinitions: async () => ['first', 'second'].map((name) => ({ type: 'function', function: { name, description: '', parameters: { type: 'object', properties: {} } } })),
+    // Stop comes while the first call runs; it does not honour the abort and returns its result.
+    executeTool: async (call: { name: string }) => { executed.push(call.name); if (call.name === 'first') ac.abort(); return 'ok' },
+  }
+  ;(h.d.store.snapshot() as { tools: { autoAllowAll: boolean } }).tools.autoAllowAll = true
+  const f = fakeUpstream(async (c) => {
+    const s = c as Scripted
+    s.write(sseLine({ choices: [{ delta: { tool_calls: [
+      { index: 0, id: 'tc1', function: { name: 'first', arguments: '{}' } },
+      { index: 1, id: 'tc2', function: { name: 'second', arguments: '{}' } },
+    ] } }] }))
+    s.write(sseLine({ choices: [{ delta: {}, finish_reason: 'tool_calls' }] }))
+    s.write('data: [DONE]\n\n')
+    s.close()
+  })
+  try {
+    const seeded = seed(h.store)
+    await runGeneration(h.d, () => {}, ctxFor(seeded, ac) as never)
+    assert.deepEqual(executed, ['first'], 'the second call does not start after Stop')
+    const row = h.store.getMessage(seeded.assistantMsg.id)!
+    assert.equal(row.stats.aborted, true)
+    assert.deepEqual(row.toolCalls?.map((t) => t.name), ['first'], 'the call that ran is kept')
   } finally {
     f.restore()
     h.cleanup()

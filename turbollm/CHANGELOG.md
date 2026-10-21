@@ -53,6 +53,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   limited to GGUF repos while LiteRT-LM is the active engine.
 
 ### Fixed
+- **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
+  a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
+  and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set
+  to Allow. The reply is now saved as stopped, and no tool call starts once a reply is stopped.
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
