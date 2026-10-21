@@ -5,11 +5,14 @@
 // a failed job sets status='error' with a message and never crashes the daemon.
 import { createHash } from 'node:crypto'
 import {
+  closeSync,
   createReadStream,
   createWriteStream,
   existsSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
@@ -887,7 +890,7 @@ export class DownloadManager {
 
   private saveProvenance(): void {
     try {
-      writeFileSync(this.provenancePath, JSON.stringify({ version: 1, entries: this.provenanceList }, null, 2))
+      writeFileAtomic(this.provenancePath, JSON.stringify({ version: 1, entries: this.provenanceList }, null, 2))
     } catch {
       /* provenance is a convenience — never fatal */
     }
@@ -913,9 +916,9 @@ export class DownloadManager {
       })
     }
     try {
-      writeFileSync(this.manifestPath, JSON.stringify({ version: 1, entries }, null, 2))
+      writeFileAtomic(this.manifestPath, JSON.stringify({ version: 1, entries }, null, 2))
     } catch {
-      /* manifest is a convenience — never fatal */
+      /* manifest is a convenience — never fatal; the previous one stays whole */
     }
   }
 
@@ -990,6 +993,40 @@ function onAndroidSharedStorage(path: string): boolean {
     return false // os.homedir() throws when neither HOME nor the user database names one
   }
   return !!home && path.startsWith(`${join(home, 'storage')}/`)
+}
+
+/** Writes `data` to `path` through a sibling temp file, fsynced and then renamed over it, as the
+ *  chat database is flushed (chat/store/sql-js-database.ts). Rewritten in place, a manifest torn
+ *  by a kill mid-write failed to parse, so restore() brought back no rows: every paused download
+ *  was gone, its .part orphaned (and deleted by the next import of the file). A failed write
+ *  leaves the previous file whole and throws, with the temp file removed; one a kill leaves
+ *  behind is never read, and the next write replaces it. */
+function writeFileAtomic(path: string, data: string): void {
+  const tmp = `${path}.tmp`
+  try {
+    const fd = openSync(tmp, 'w')
+    try {
+      writeFileSync(fd, data)
+      fsyncSync(fd)
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, path)
+  } catch (e) {
+    rmSync(tmp, { force: true })
+    throw e
+  }
+  // The rename is durable across a power loss only once the directory is synced. Best-effort:
+  // Windows cannot open a directory this way, and the file is already in place.
+  let dir: number | undefined
+  try {
+    dir = openSync(dirname(path), 'r')
+    fsyncSync(dir)
+  } catch {
+    /* unsupported here */
+  } finally {
+    if (dir !== undefined) closeSync(dir)
+  }
 }
 
 function gb(bytes: number): string {

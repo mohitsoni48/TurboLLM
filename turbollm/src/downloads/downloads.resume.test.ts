@@ -7,7 +7,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { DownloadManager, setDownloadGetForTests, type DownloadError } from './downloads'
@@ -851,4 +852,70 @@ test('a finished download carries finishedAt, already set when the rescan is req
   } finally {
     globalThis.fetch = real
   }
+})
+
+/** Runs `fn` with every writeFileSync writing only the first half of its data and then throwing,
+ *  as a daemon killed mid-write leaves a file. */
+function tornWrites(t: { mock: { method: typeof import('node:test').mock.method } }, fn: () => void): void {
+  const real = fs.writeFileSync
+  const torn = t.mock.method(fs, 'writeFileSync', (target: Parameters<typeof real>[0], data: string) => {
+    real(target, data.slice(0, Math.floor(data.length / 2)))
+    throw new Error('killed mid-write')
+  })
+  syncBuiltinESMExports()
+  try {
+    fn()
+  } finally {
+    torn.mock.restore()
+    syncBuiltinESMExports()
+  }
+}
+
+test('a kill while the download list is saved keeps the paused rows', async (t) => {
+  // The manifest was rewritten in place: torn, it failed to parse, restore() brought back no rows,
+  // and every paused download was gone with its .part orphaned.
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dest = seedInterruptedDownload(modelDir, stateDir)
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    tornWrites(t, () => assert.equal(dm.resume('dl-restored-1'), true)) // resume() saves the list
+    const downloads = join(stateDir, 'downloads')
+    assert.deepEqual(readdirSync(downloads).sort(), ['manifest.json'], 'the torn write went to a temp file, removed')
+
+    const after = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    assert.deepEqual(after.list().map((r) => [r.id, r.status, r.received]), [['dl-restored-1', 'paused', 1024]])
+    assert.equal(after.list()[0].dest, dest)
+  } finally {
+    restore()
+  }
+})
+
+test('a temp file left by a kill does not stop the download list from loading, and the next save replaces it', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    seedInterruptedDownload(modelDir, stateDir)
+    const tmp = join(stateDir, 'downloads', 'manifest.json.tmp')
+    writeFileSync(tmp, '{"version":1,"entries":[{"id":"dl-hal') // the daemon died writing it
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    assert.deepEqual(dm.list().map((r) => r.id), ['dl-restored-1'])
+    assert.equal(dm.resume('dl-restored-1'), true)
+    assert.equal(existsSync(tmp), false)
+    assert.deepEqual(manifestEntries(stateDir).map((e) => e.total), [4096])
+  } finally {
+    restore()
+  }
+})
+
+test('a kill while the provenance is saved keeps the record of earlier downloads', (t) => {
+  const { modelDir, stateDir } = newDirs()
+  const earlier = { repo: 'owner/repo', filename: 'a.gguf', sha256: 'aa', dest: join(modelDir, 'a.gguf'), at: new Date().toISOString() }
+  writeFileSync(join(stateDir, 'downloads', 'provenance.json'), JSON.stringify({ version: 1, entries: [earlier] }))
+  const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+  const internals = dm as unknown as { provenanceList: unknown[]; saveProvenance(): void }
+  internals.provenanceList.push({ ...earlier, filename: 'b.gguf', dest: join(modelDir, 'b.gguf') })
+  tornWrites(t, () => internals.saveProvenance())
+  const after = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+  assert.deepEqual(after.provenance(), [earlier])
 })
