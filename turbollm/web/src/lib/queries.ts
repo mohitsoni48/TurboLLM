@@ -186,13 +186,16 @@ export const queryKeys = {
 
 /** Which terminal-agent CLIs are installed. Refetched on window focus so installing one in a
  *  terminal outside TurboLLM is picked up without a reload; the daemon caches the probe briefly so
- *  this staying live costs almost nothing. */
+ *  this staying live costs almost nothing. Polled every 2 s while the daemon reports an install
+ *  running: a page that did not start it (reloaded mid-install, another tab) has no request of its
+ *  own to wait on, and learns that it ended only from this. */
 export function useAgentAvailability() {
   return useQuery({
     queryKey: queryKeys.agentAvailability,
     queryFn: getAgentAvailability,
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+    refetchInterval: (q) => (q.state.data?.agents.some((a) => a.installing) ? 2000 : false),
   })
 }
 

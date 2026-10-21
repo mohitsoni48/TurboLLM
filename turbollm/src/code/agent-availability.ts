@@ -27,6 +27,10 @@ export interface AgentAvailability {
   /** The exact command that installs it — taken from the launcher's own registry so this can never
    *  drift from the hint `turbollm launch <cli>` prints on ENOENT. */
   installCommand: string
+  /** An install of it is running in this daemon right now (installAgent), whichever page or tab
+   *  started it — so a page reloaded mid-install shows it as installing instead of offering a
+   *  second Install. */
+  installing: boolean
 }
 
 // A probe spawns a process per harness, so a naive implementation would fire three spawns every
@@ -34,30 +38,64 @@ export interface AgentAvailability {
 // answer genuinely CHANGES when the user installs one (that is the whole point of the install
 // button), so a permanent cache would leave the UI insisting the CLI is still missing.
 const TTL_MS = 5_000
-let cache: { at: number; value: AgentAvailability[] } | null = null
+type Probed = Omit<AgentAvailability, 'installing'>
+let cache: { at: number; value: Probed[] } | null = null
+// Bumped by every invalidation, so a probe can tell that an install ended while it ran.
+let generation = 0
 
 /** Drop the cache — called right after an install so the UI reflects it immediately instead of
  *  waiting out the TTL. */
 export function invalidateAvailabilityCache(): void {
   cache = null
+  generation++
 }
 
-export async function agentAvailability(now = () => Date.now()): Promise<AgentAvailability[]> {
-  if (cache && now() - cache.at < TTL_MS) return cache.value
-  const value = await Promise.all(
-    TERMINAL_AGENT_IDS.map(async (id) => {
-      const spec = cliSpecInfo(id)
-      // An unknown id can't be probed OR installed; report it uninstalled with no command rather
-      // than throwing, so one bad entry can't take down the whole picker.
-      if (!spec) return { id, installed: false, installCommand: '' }
-      return { id, installed: await isCliAvailable(spec.bin), installCommand: spec.install }
-    }),
-  )
-  cache = { at: now(), value }
-  return value
+/** `probe` is `isCliAvailable` but for a test, which needs a probe still running when an install
+ *  ends. */
+export async function agentAvailability(
+  now = () => Date.now(),
+  probe = isCliAvailable,
+): Promise<AgentAvailability[]> {
+  let probed = cache && now() - cache.at < TTL_MS ? cache.value : null
+  if (!probed) {
+    const probeAll = () => Promise.all(
+      TERMINAL_AGENT_IDS.map(async (id): Promise<Probed> => {
+        const spec = cliSpecInfo(id)
+        // An unknown id can't be probed OR installed; report it uninstalled with no command rather
+        // than throwing, so one bad entry can't take down the whole picker.
+        if (!spec) return { id, installed: false, installCommand: '' }
+        return { id, installed: await probe(spec.bin), installCommand: spec.install }
+      }),
+    )
+    // An install that ended while this probe ran (its end invalidates the cache) may have been
+    // probed before its CLI existed. That answer used to be cached over the invalidation, and
+    // returned with `installing` already false: GET /code/agents said "not installed" for 5 s
+    // after the install succeeded, so a page polling for the install's end (useAgentAvailability)
+    // stopped on it and kept offering Install, and the page that ran it could get the same answer
+    // right after its "installed" toast. Such a probe is run again, and only an answer no install
+    // ended under is cached.
+    let gen = generation
+    probed = await probeAll()
+    if (gen !== generation) {
+      gen = generation
+      probed = await probeAll()
+    }
+    if (gen === generation) cache = { at: now(), value: probed }
+  }
+  // Read on every call, never cached: it changes the moment an install starts or ends.
+  return probed.map((a) => ({ ...a, installing: installsInFlight.has(a.id) }))
 }
 
 export type InstallResult = { ok: true } | { ok: false; message: string }
+
+/** One install per agent id at a time: the install running for each id. Without it a page could
+ *  hold hundreds of concurrent npm processes open (each up to `timeoutMs`), which is a trivial
+ *  local resource-exhaustion vector. A call while one runs JOINS it and gets its result, rather
+ *  than an error: the install outlives the page that asked for it (nothing aborts it), so a page
+ *  reloaded mid-install, or a second tab, that asks again is waiting for the same install. The
+ *  entry is claimed before the first await — it used to be added only after two dynamic imports,
+ *  so a double click passed the check twice and ran two `npm install -g` side by side. */
+const installsInFlight = new Map<string, Promise<InstallResult>>()
 
 /** Run a harness's own documented install command.
  *
@@ -68,11 +106,7 @@ export type InstallResult = { ok: true } | { ok: false; message: string }
  *
  *  `npm` itself is a `.cmd` shim on Windows, which Node refuses to spawn without a shell, so that
  *  one case resolves the shim explicitly instead of reaching for `shell: true`. */
-/** One install per agent id at a time. Without it a page could hold hundreds of concurrent npm
- *  processes open (each up to `timeoutMs`), which is a trivial local resource-exhaustion vector. */
-const installsInFlight = new Set<string>()
-
-export async function installAgent(
+export function installAgent(
   id: string,
   _spawn: typeof spawn = spawn,
   timeoutMs = 180_000,
@@ -81,11 +115,20 @@ export async function installAgent(
   // `cliSpecInfo` also knows kilo/openclaw/hermes, which no UI surfaces, so accepting them widened
   // the reachable install set for no benefit.
   if (!(TERMINAL_AGENT_IDS as readonly string[]).includes(id)) {
-    return { ok: false, message: `Unknown coding agent "${id}".` }
+    return Promise.resolve({ ok: false, message: `Unknown coding agent "${id}".` })
   }
+  const running = installsInFlight.get(id)
+  if (running) return running
+  // Dropped before the result reaches any caller, so one that re-reads availability on it sees
+  // the install over.
+  const install = runInstall(id, _spawn, timeoutMs).finally(() => { installsInFlight.delete(id) })
+  installsInFlight.set(id, install)
+  return install
+}
+
+async function runInstall(id: string, _spawn: typeof spawn, timeoutMs: number): Promise<InstallResult> {
   const spec = cliSpecInfo(id)
   if (!spec) return { ok: false, message: `Unknown coding agent "${id}".` }
-  if (installsInFlight.has(id)) return { ok: false, message: `An install of "${id}" is already running.` }
 
   const parts = spec.install.split(/\s+/).filter(Boolean)
   if (parts.length < 2) return { ok: false, message: `No install command is registered for "${id}".` }
@@ -96,11 +139,10 @@ export async function installAgent(
   const resolved = resolveExecutable(bin)
   const needsShell = requiresShell(resolved)
 
-  installsInFlight.add(id)
   return await new Promise<InstallResult>((resolve) => {
     let stderr = ''
     let settled = false
-    const done = (r: InstallResult) => { if (!settled) { settled = true; installsInFlight.delete(id); invalidateAvailabilityCache(); resolve(r) } }
+    const done = (r: InstallResult) => { if (!settled) { settled = true; invalidateAvailabilityCache(); resolve(r) } }
     try {
       // Same call shape as cli-launch.ts's realRunCommand, and for the same reason. The previous
       // version passed an ARGS ARRAY together with `shell: true`, which Node joins with plain

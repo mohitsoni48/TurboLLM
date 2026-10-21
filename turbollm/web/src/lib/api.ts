@@ -196,7 +196,14 @@ export function getHwStats(): Promise<HwUsage> {
 /** Whether each terminal-agent CLI is actually installed on this machine, and the command that
  *  installs it. Label/description deliberately are NOT here — those live in code-types.ts's
  *  CODE_AGENTS so that copy has exactly one owner. */
-export type AgentAvailability = { id: string; installed: boolean; installCommand: string }
+export type AgentAvailability = {
+  id: string
+  installed: boolean
+  installCommand: string
+  /** An install of it is running in the daemon, whichever page started it: the install goes on
+   *  when that page closes or reloads, and a second Install joins it rather than starting another. */
+  installing: boolean
+}
 
 export function getAgentAvailability(): Promise<{ agents: AgentAvailability[] }> {
   return request<{ agents: AgentAvailability[] }>('/api/v1/code/agents')
