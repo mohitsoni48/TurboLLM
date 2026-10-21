@@ -1,7 +1,7 @@
 // Built-in tool definitions and execution (v0.7.0).
 // Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox, isolated in a worker thread).
 import { Worker } from 'node:worker_threads'
-import { checkSsrf } from './security.js'
+import { ssrfSafeFetch } from './security.js'
 import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
 import { type SearchConfig } from './search-providers.js'
 import {
@@ -236,13 +236,15 @@ export async function backfillPublishedDates(results: ResearchResult[]): Promise
 
   await Promise.allSettled(
     missing.map(async (r) => {
-      if (await checkSsrf(r.url)) return // same guard as fetch_url; never probe internal hosts
       let resp: Response
       try {
-        resp = await fetch(r.url, {
+        // Same guard as fetch_url, on every redirect hop: never probe internal hosts.
+        const r2 = await ssrfSafeFetch(r.url, {
           headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
           signal: AbortSignal.timeout(DATE_PROBE_TIMEOUT_MS),
         })
+        if (typeof r2 === 'string') return
+        resp = r2
       } catch {
         return
       }
@@ -483,15 +485,15 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   if (!url) return 'Error: url is required.'
   if (!/^https?:\/\//i.test(url)) return 'Error: URL must start with http:// or https://'
 
-  const ssrfErr = await checkSsrf(url)
-  if (ssrfErr) return ssrfErr
-
   let resp: Response
   try {
-    resp = await fetch(url, {
+    // checkSsrf runs on the URL and on every redirect it leads to (ssrfSafeFetch).
+    const r = await ssrfSafeFetch(url, {
       headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
       signal: AbortSignal.timeout(15_000),
     })
+    if (typeof r === 'string') return r
+    resp = r
   } catch (e) {
     return `Error: could not fetch URL — ${(e as Error).message}`
   }

@@ -36,6 +36,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   limited to GGUF repos while LiteRT-LM is the active engine.
 
 ### Fixed
+- **Web fetch checks every redirect, not just the first link.** `fetch_url` refused private and loopback addresses only
+  for the URL it was given; a page that redirected was then followed wherever it pointed, including this machine and the
+  local network. Each redirect is now checked the same way before it is followed (up to 5), as is the published-date
+  probe on research results, and `0.0.0.0` plus private IPv6 ranges are blocked too. Every platform.
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
