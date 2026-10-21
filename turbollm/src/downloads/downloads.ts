@@ -47,11 +47,22 @@ export interface DownloadRecord {
   /** The server's strong validator (ETag, else Last-Modified) for the version of the file the
    *  .part holds — sent as If-Range on resume. */
   validator?: string
+  /** What the reply the .part was started from said about its version: its ETag, weak or strong,
+   *  and its Last-Modified. The change detector a 206 is checked against, kept apart from
+   *  `validator` because If-Range may carry only a strong one, while a weak ETag or a date that
+   *  differs still proves the file changed. Absent on a row from an older manifest. */
+  fileVersion?: FileVersion
   createdAt: string
   /** When the record became 'done' (ISO), set in the same tick that requests the rescan. A
    *  models list whose lastScanAt is later has scanned this file: the web stops waiting for it
    *  to get a row then (a deleted model, an orphaned mmproj never will). */
   finishedAt?: string
+}
+
+/** The ETag and Last-Modified a reply named, each only when it carried one. */
+export interface FileVersion {
+  etag?: string
+  lastModified?: string
 }
 
 /** Persisted manifest shape (spec 10 §5). Live runtime fields (controller, timers)
@@ -65,6 +76,7 @@ interface ManifestEntry {
   total: number
   sha256?: string
   validator?: string
+  fileVersion?: FileVersion
   createdAt: string
 }
 
@@ -420,6 +432,7 @@ export class DownloadManager {
         bytesPerSec: 0,
         sha256: t.sha256,
         validator: carried?.validator,
+        fileVersion: carried?.fileVersion,
         createdAt: new Date().toISOString(),
       }
       this.records.set(id, rec)
@@ -438,22 +451,42 @@ export class DownloadManager {
    *  kept only under the checks Resume of the errored row would apply: every errored row for
    *  this file (one of them wrote it; no live row does, or the caller would not be here) has
    *  this URL and one strong validator, which the new row sends as If-Range and checks the 206
-   *  against, with their full length when the new row knows none or the same one. Anything else
-   *  (no validator, another URL, rows that disagree, an orphan .part with no row) says nothing
-   *  about which bytes the .part holds, so the new row starts from byte 0. Decided here, not in
-   *  run(): a row left queued behind the concurrency cap comes back from a restart as paused and
-   *  is resumed from whatever .part it finds. */
-  private takeOverPart(t: { url: string; dest: string; total: number }): { validator: string; total: number } | undefined {
+   *  against, with their full length when the new row knows none or the same one, and their
+   *  fileVersion, which the new row checks the 206 against too: given the validator alone, a 206
+   *  of a changed file that carried only its Last-Modified, where the .part was written under an
+   *  ETag and a date, said nothing to it and was spliced. And only when the new row has no
+   *  sha256, or the one they have: a .part written for another hash holds another version of the
+   *  file than the new row wants, and one written for none (a repo file queued while its listing
+   *  could not be read) a version its hash may not name, which could only be refused at its first
+   *  206 or fail the checksum.
+   *  Anything else (no validator, another URL or sha256, rows that disagree, an orphan .part with
+   *  no row) says nothing about which bytes the .part holds, or says they are not the new row's,
+   *  so the new row starts from byte 0. Decided here, not in run(): a row left queued behind the
+   *  concurrency cap comes back from a restart as paused and is resumed from whatever .part it
+   *  finds. */
+  private takeOverPart(t: {
+    url: string
+    dest: string
+    total: number
+    sha256?: string
+  }): { validator: string; fileVersion?: FileVersion; total: number } | undefined {
     const part = `${t.dest}.part`
     if (!existsSync(part)) return undefined
     const errored = [...this.records.values()].filter((r) => r.status === 'error' && sameDest(r.dest, t.dest))
     const first = errored[0]
     if (
       first?.validator !== undefined &&
-      errored.every((r) => r.url === t.url && r.validator === first.validator && r.total === first.total) &&
+      errored.every(
+        (r) =>
+          r.url === t.url &&
+          r.validator === first.validator &&
+          r.total === first.total &&
+          sameFileVersion(r.fileVersion, first.fileVersion) &&
+          (t.sha256 === undefined || r.sha256 === t.sha256),
+      ) &&
       (t.total <= 0 || first.total <= 0 || t.total === first.total)
     ) {
-      return { validator: first.validator, total: t.total > 0 ? t.total : first.total }
+      return { validator: first.validator, fileVersion: first.fileVersion, total: t.total > 0 ? t.total : first.total }
     }
     rmSync(part, { force: true })
     for (const r of errored) r.received = 0 // their Resume starts from byte 0 now too
@@ -640,14 +673,20 @@ export class DownloadManager {
       }
       // A server that ignores If-Range (Hugging Face's own CDN does), or a row with no validator
       // to send, can still return another file's tail as a 206. It shows when the 206 names
-      // another strong validator than the one the .part was written under, or when its
-      // Content-Range starts elsewhere, stops before the end of the file or names another full
-      // length. Checked before rec.total is overwritten with this reply's length, which would
-      // make the size check below pass for any splice or truncation.
+      // another strong validator than the one the .part was written under, another ETag (weak or
+      // strong) or Last-Modified than the reply the .part was started from (fileVersion), or when
+      // its Content-Range starts elsewhere, stops before the end of the file or names another full
+      // length. The fileVersion check is the one that sees a same-length file replaced in place on
+      // a server that sends a weak ETag and a date (Express, serve-static: no If-Range can be
+      // sent, so its 206 of the new file was spliced onto the old prefix and marked done), and a
+      // 206 that carries only a date where the .part was written under an ETag. Checked before
+      // rec.total is overwritten with this reply's length, which would make the size check below
+      // pass for any splice or truncation.
       const got = strongValidator(res.headers)
       if (
         resuming &&
         ((rec.validator !== undefined && validatorChanged(rec.validator, res.headers)) ||
+          (rec.fileVersion !== undefined && versionChanged(rec.fileVersion, res.headers)) ||
           !rangeContinues(res.headers.get('content-range'), startAt, rec.total))
       ) {
         await res.body.cancel().catch(() => {})
@@ -664,13 +703,17 @@ export class DownloadManager {
       // than its own Content-Range for the whole file.
       const rangeFull = resuming ? contentRangeFull(res.headers.get('content-range')) : 0
       const total = rangeFull > 0 ? rangeFull : clen > 0 ? (resuming ? startAt + clen : clen) : rec.total
-      // Remember which version of the file the .part now holds (for If-Range and the check
+      // Remember which version of the file the .part now holds (for If-Range and the checks
       // above) and its full length (for the Content-Range check), persisted at once: a daemon
       // restart mid-download is exactly when they are needed, and nothing else writes the
-      // manifest until this run ends. A raw URL is enqueued with total 0.
+      // manifest until this run ends. A raw URL is enqueued with total 0. A 206 that passed those
+      // checks continues the version the row already names (one with none yet, from an older
+      // manifest, takes the 206's); a 200 starts the .part again under its own.
       const validator = got ?? (resuming ? rec.validator : undefined)
-      if (validator !== rec.validator || total !== rec.total) {
+      const fileVersion = resuming ? (rec.fileVersion ?? fileVersionOf(res.headers)) : fileVersionOf(res.headers)
+      if (validator !== rec.validator || total !== rec.total || !sameFileVersion(fileVersion, rec.fileVersion)) {
         rec.validator = validator
+        rec.fileVersion = fileVersion
         rec.total = total
         this.persist()
       }
@@ -806,6 +849,7 @@ export class DownloadManager {
         total: r.total,
         sha256: r.sha256,
         validator: r.validator,
+        fileVersion: r.fileVersion,
         createdAt: r.createdAt,
       })
     }
@@ -846,6 +890,7 @@ export class DownloadManager {
         bytesPerSec: 0,
         sha256: e.sha256,
         validator: e.validator,
+        fileVersion: e.fileVersion,
         createdAt: e.createdAt,
       })
     }
@@ -904,8 +949,8 @@ function strongValidator(h: Headers): string | undefined {
 /** True when a 206 names another version of the file than `stored` (the strongValidator the
  *  .part was written under). Only like is compared with like: a stored date with the 206's
  *  Last-Modified, a stored ETag with its strong ETag. A 206 that carries only the other kind (an
- *  ETag on the 200 and only a date on the 206, or the reverse) says nothing either way and is
- *  left to the Content-Range check. */
+ *  ETag on the 200 and only a date on the 206, or the reverse) says nothing here and is left to
+ *  {@link versionChanged}, which knows both of the first reply's, and the Content-Range check. */
 function validatorChanged(stored: string, h: Headers): boolean {
   let theirs: string | undefined
   // An HTTP-date (any of RFC 9110's three forms) starts with a day name and has a time; an
@@ -916,6 +961,50 @@ function validatorChanged(stored: string, h: Headers): boolean {
     theirs = etag?.startsWith('W/') ? undefined : etag
   }
   return !!theirs && theirs !== stored
+}
+
+/** The {@link FileVersion} a reply names, or undefined when it carries neither header. */
+function fileVersionOf(h: Headers): FileVersion | undefined {
+  const etag = h.get('etag')?.trim()
+  const lastModified = h.get('last-modified')?.trim()
+  if (!etag && !lastModified) return undefined
+  return { ...(etag ? { etag } : {}), ...(lastModified ? { lastModified } : {}) }
+}
+
+function sameFileVersion(a: FileVersion | undefined, b: FileVersion | undefined): boolean {
+  return a?.etag === b?.etag && a?.lastModified === b?.lastModified
+}
+
+/** True when a 206 names another version of the file than `stored`, the {@link fileVersionOf}
+ *  the reply the .part was started from: an ETag whose opaque-tag differs, compared weakly (RFC
+ *  9110 §8.8.3.2: a W/ on either side does not matter), or another Last-Modified. Each is compared
+ *  only when both sides carry it. Weak means "may not be byte-identical", so a weak ETag that
+ *  matches lets nothing through that the other checks refuse; one that differs, like a date that
+ *  differs, says the server's file is no longer the one the .part was started from. Two strong
+ *  ETags that match are the exception: a strong ETag changes with every change of the bytes
+ *  (§8.8.1), so they name the same file and the date is not compared. A server that dates every
+ *  reply anew (Last-Modified: now, a dynamic endpoint) under one strong ETag still resumes. */
+function versionChanged(stored: FileVersion, h: Headers): boolean {
+  const etag = h.get('etag')?.trim()
+  if (stored.etag && etag) {
+    if (opaqueTag(stored.etag) !== opaqueTag(etag)) return true
+    if (!stored.etag.startsWith('W/') && !etag.startsWith('W/')) return false
+  }
+  const lastModified = h.get('last-modified')?.trim()
+  return !!stored.lastModified && !!lastModified && !sameHttpDate(stored.lastModified, lastModified)
+}
+
+/** An entity tag without its weakness indicator. */
+function opaqueTag(etag: string): string {
+  return etag.startsWith('W/') ? etag.slice(2) : etag
+}
+
+/** Two Last-Modified values name one time, compared as times when both parse (a server may
+ *  format one date two ways), else as text. */
+function sameHttpDate(a: string, b: string): boolean {
+  const ta = Date.parse(a)
+  const tb = Date.parse(b)
+  return Number.isNaN(ta) || Number.isNaN(tb) ? a === b : ta === tb
 }
 
 /** True when a 206's Content-Range continues the .part to the end of the file: it starts at
