@@ -949,3 +949,54 @@ test('a stalled download stops showing its last speed after a few seconds withou
     await server.close()
   }
 })
+
+test('a row whose partial was removed after a failed size or checksum check counts no bytes, and Resume starts over', async () => {
+  // Both checks remove the .part, but the row kept the bytes it had counted: it read "150 kB of
+  // 400 kB" or the whole file as downloaded, the Downloads panel's Discard question named them as
+  // what would be lost, and a Resume then started from byte 0.
+  const cut = await closeDelimited(WEIGHTS, 150_000)
+  try {
+    await withHfBase(cut.origin, async () => {
+      // A repo row knows the length from the listing; a 200 a proxy cut off fails the size check.
+      const { modelDir, stateDir } = newDirs()
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+      const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf', size: WEIGHTS.length })
+      const row = await settled(dm, rec.id)
+      assert.equal(row.status, 'error')
+      assert.equal(row.error, 'Download corrupt — size did not match. Removed the partial file: resume to download it again.')
+      assert.equal(existsSync(`${rec.dest}.part`), false)
+      assert.equal(row.received, 0, 'none of the removed bytes are counted')
+      assert.equal(row.total, WEIGHTS.length, 'the length of the file is still known')
+
+      assert.equal(dm.resume(rec.id), true)
+      assert.equal((await settled(dm, rec.id)).received, 0)
+      assert.deepEqual(cut.seen, ['whole', 'whole'], 'the Resume asked for the whole file')
+    })
+  } finally {
+    await cut.close()
+  }
+
+  const revs: Record<string, Buffer> = { main: OLD_GGUF }
+  const hf = await hfStub(revs)
+  try {
+    await withHfBase(hf.origin, async () => {
+      // The whole file arrived and its hash is not the listing's.
+      const { modelDir, stateDir } = newDirs()
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+      const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'm.gguf', size: OLD_GGUF.length, sha256: sha256(NEW_GGUF) })
+      const row = await settled(dm, rec.id)
+      assert.equal(row.status, 'error')
+      assert.equal(row.error, 'Checksum failed — the downloaded file was corrupt. Removed the partial file: resume to download it again.')
+      assert.equal(existsSync(`${rec.dest}.part`), false)
+      assert.equal(row.received, 0, 'none of the removed bytes are counted')
+
+      const restarted = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+      assert.equal(restarted.list()[0].received, 0, 'and none after a restart')
+      assert.equal(dm.resume(rec.id), true)
+      assert.equal((await settled(dm, rec.id)).received, 0)
+      assert.deepEqual(hf.seen.map((r) => r.range), [undefined, undefined], 'the Resume asked for the whole file')
+    })
+  } finally {
+    await hf.close()
+  }
+})

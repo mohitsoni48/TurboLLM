@@ -813,16 +813,28 @@ export class DownloadManager {
       const out = createWriteStream(part, startAt > 0 ? { flags: 'a' } : { flags: 'w' })
       await pipeline(body, out, { signal: ac.signal })
 
-      // Integrity: size (spec 10 §5/§8) + sha256 when fully streamed.
+      // Integrity: size (spec 10 §5/§8) + sha256 when fully streamed. Either failure removes the
+      // .part, so the row counts none of its bytes any more, as every other path here that removes
+      // it does: left at the bytes counted, the errored row read as that much downloaded (to the
+      // Downloads panel) while nothing was on disk and its Resume started from byte 0. Not in the
+      // manifest: restore() counts the .part on disk.
       if (rec.total > 0 && rec.received !== rec.total) {
         rmSync(part, { force: true })
-        throw new DownloadError('size_mismatch', 'Download corrupt — size did not match. Removed the partial file.')
+        rec.received = 0
+        throw new DownloadError(
+          'size_mismatch',
+          'Download corrupt — size did not match. Removed the partial file: resume to download it again.',
+        )
       }
       if (verifyHash && rec.sha256) {
         const got = hash!.digest('hex')
         if (got !== rec.sha256) {
           rmSync(part, { force: true })
-          throw new DownloadError('checksum_failed', 'Checksum failed — the downloaded file was corrupt.')
+          rec.received = 0
+          throw new DownloadError(
+            'checksum_failed',
+            'Checksum failed — the downloaded file was corrupt. Removed the partial file: resume to download it again.',
+          )
         }
       }
       // A reply that names no length (no Content-Length, not chunked) ends when the server closes
