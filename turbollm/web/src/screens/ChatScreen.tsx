@@ -37,7 +37,7 @@ import { readSavedSidebarWidth, SIDEBAR_MIN_W, sidebarMaxW, SidebarResizeHandle 
 import { ModelLoadMenu } from '../components/ModelLoadMenu'
 import { useLinks, useLinkStatus, useRemoteModels } from '../lib/link-queries'
 import { describeRemoteHost, findRemoteChoice, selectModel } from '../lib/remote-models'
-import { isChatModel, listedForLoading } from '../lib/model-kind'
+import { chatModelsForPicker, isChatModel } from '../lib/model-kind'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { ConversationSettingsDialog, type ConversationSettingsDraft } from './chat/ConversationSettingsDialog'
 import { useUiStore } from '../stores/ui'
@@ -385,7 +385,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // llama.cpp, safetensors under MLX/vLLM, .litertlm under LiteRT-LM — unless Settings asks for every engine's models
   // (lib/model-kind.ts listedForLoading). A model listed that way still loads only on the selected engine: its Load
   // starts there and, if that engine cannot load it, fails with the engine's own error (the load-failure banner).
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => listedForLoading(m, showAllEngineModels) && isChatModel(m))
+  const { listed: allModels, hidden: modelsHidden } = chatModelsForPicker(modelsQ.data?.models ?? [], showAllEngineModels)
   // Turbo Link (ADR-376 §6.3): models living on other machines, grouped under their machine
   // in the picker below. Both queries fail soft (`?? []`) — a host-gated 403 or a daemon
   // with no links must leave the chat screen exactly as it was, not error it.
@@ -1271,6 +1271,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           )}
           <ModelLoadMenu
             models={allModels}
+            hidden={modelsHidden}
             loadedKey={activeRemoteId ?? loadedChatModel?.key ?? null}
             loadedName={remoteChoice ? `${remoteChoice.name} — ${remoteChoice.machine}` : (loadedChatModel?.name ?? null)}
             pending={modelBusy}

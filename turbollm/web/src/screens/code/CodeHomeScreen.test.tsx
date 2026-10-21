@@ -55,9 +55,11 @@ vi.mock('../models/ModelDetailDialog', () => ({ ModelDetailDialog: () => null })
 vi.mock('./CodeActivityHeatmap', () => ({ CodeActivityHeatmap: () => null }))
 
 let modelsOfferedByComposer: Array<Partial<ModelEntry>> | null = null
+let modelsHiddenFromComposer: unknown = null
 vi.mock('./CodeComposer', () => ({
-  CodeComposer: (props: { models: Array<Partial<ModelEntry>> }) => {
+  CodeComposer: (props: { models: Array<Partial<ModelEntry>>; modelsHidden?: unknown }) => {
     modelsOfferedByComposer = props.models
+    modelsHiddenFromComposer = props.modelsHidden
     return null
   },
 }))
@@ -94,5 +96,16 @@ describe('CodeHomeScreen — model picker offers chat models only', () => {
     await renderScreen()
     await waitFor(() => expect(modelsOfferedByComposer).not.toBeNull())
     expect(modelsOfferedByComposer?.map((m) => m.key)).toEqual(['qwen3-8b', 'gguf-on-vllm'])
+  })
+
+  // For the picker's empty state, which counts them.
+  it('tells the composer how many chat models it left out for the selected engine, and none with every engine shown', async () => {
+    const { unmount } = await renderScreen()
+    await waitFor(() => expect(modelsOfferedByComposer).not.toBeNull())
+    expect(modelsHiddenFromComposer).toEqual({ byEngine: 1 })
+    unmount()
+    mockShowAll = true
+    await renderScreen()
+    await waitFor(() => expect(modelsHiddenFromComposer).toEqual({ byEngine: 0 }))
   })
 })

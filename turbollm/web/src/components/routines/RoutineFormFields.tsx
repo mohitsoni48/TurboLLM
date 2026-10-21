@@ -5,6 +5,7 @@ import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
 import { isChatModel } from '../../lib/model-kind'
+import { NoModelsHint } from '../NoModelsHint'
 
 // Labels say plainly which one runs in-process and which shell out — the distinction that the
 // value names encode with the `_cli` suffix (routine-types.ts).
@@ -119,6 +120,9 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   const storedJevModel = storedModel && !isChatModel(storedModel) ? storedModel : null
   const orphanModelKey = draft.modelKey && !storedModel ? draft.modelKey : null
   const orphanAgentId = draft.agentId && !agents.some((a) => a.id === draft.agentId) ? draft.agentId : null
+  // Once the catalog has answered, an empty one says so under the select: it offered only its placeholder, an empty
+  // drop-down with no word of where a model comes from. Routines list every engine's models, so none is hidden here.
+  const noModels = modelsQ.data !== undefined && models.length === 0
   // Ids so each <label> actually points at its control — these are plain selects/inputs, not
   // wrapped controls, so without htmlFor a screen reader reads them as unlabelled.
   const uid = useId()
@@ -167,7 +171,14 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
 
       <div className="flex flex-col gap-1.5">
         <label className={labelCls} htmlFor={id('model')}>Model</label>
-        <select id={id('model')} disabled={disabled} className={inputCls} value={draft.modelKey} onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}>
+        <select
+          id={id('model')}
+          disabled={disabled}
+          className={inputCls}
+          value={draft.modelKey}
+          onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}
+          aria-describedby={noModels ? id('model-none') : undefined}
+        >
           <option value="">Choose a model…</option>
           {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
           {storedJevModel && <option value={storedJevModel.key}>{storedJevModel.name} (a text classification model — it can&apos;t run a routine)</option>}
@@ -181,6 +192,12 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
             </option>
           ))}
         </select>
+        {noModels && (
+          <div id={id('model-none')} className="text-[12px] text-muted">
+            <div className="text-ink">No models found.</div>
+            <NoModelsHint />
+          </div>
+        )}
       </div>
 
       {draft.flavor === 'chat' ? (

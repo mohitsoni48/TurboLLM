@@ -1582,6 +1582,11 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
         ))}
       </select>
       {scoped && <p className="text-[11px] text-faint">From {sourceRepo} — the source repo usually ships the matching draft.</p>}
+      {/* Its placeholder alone read as an empty drop-down. Not the pickers' engine hint: Settings' "Show models for every
+          engine" does not reach this list (above). */}
+      {modelsQ.data !== undefined && all.length === 0 && (
+        <p className="text-[11px] text-faint">No models found. A draft is a GGUF chat model the selected engine runs.</p>
+      )}
     </div>
   )
 }

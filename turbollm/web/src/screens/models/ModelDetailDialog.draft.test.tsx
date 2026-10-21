@@ -139,4 +139,14 @@ describe('ModelDetailDialog — the draft-model picker', () => {
     expect(within(select).getByText('llama-1b · Q8_0 — /models')).toBeTruthy()
     expect(within(select).queryByText(/not in the current library/)).toBeNull()
   })
+
+  // Its placeholder alone read as an empty drop-down.
+  it('says no model can be a draft when none qualifies, and nothing while one does', async () => {
+    const { unmount } = renderDialog(DRAFT_MODE, { models: MODELS.models.filter((m) => (m as Record<string, unknown>).key !== 'qwen-0.6b') })
+    expect(await screen.findByText('No models found. A draft is a GGUF chat model the selected engine runs.')).toBeTruthy()
+    unmount()
+    renderDialog(DRAFT_MODE)
+    await screen.findByText('Draft model')
+    expect(screen.queryByText(/No models found/)).toBeNull()
+  })
 })

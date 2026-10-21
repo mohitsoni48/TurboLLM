@@ -11,7 +11,7 @@ import { ApiError, track } from '../../lib/api'
 import { useGitBranch, useModelActions, useModels, useShowAllEngineModels, useStatus } from '../../lib/queries'
 import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
-import { isChatModel, listedForLoading } from '../../lib/model-kind'
+import { chatModelsForPicker } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
@@ -156,7 +156,7 @@ export function CodeHomeScreen() {
   const modelsQ = useModels()
   const showAllEngineModels = useShowAllEngineModels()
   const modelActions = useModelActions()
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => listedForLoading(m, showAllEngineModels) && isChatModel(m))
+  const { listed: allModels, hidden: modelsHidden } = chatModelsForPicker(modelsQ.data?.models ?? [], showAllEngineModels)
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||
@@ -511,6 +511,7 @@ export function CodeHomeScreen() {
           mode={mode}
           onModeChange={setMode}
           models={allModels}
+          modelsHidden={modelsHidden}
           links={linksQ.data ?? []}
           remoteModels={remoteModelsQ.data ?? []}
           loadedKey={activeRemoteId ?? model?.key ?? null}

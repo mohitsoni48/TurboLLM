@@ -95,11 +95,14 @@ vi.mock('./CodeTranscript', () => ({
 }))
 let modelsOfferedByComposer: Array<Partial<ModelEntry>> = []
 let modelsOfferedByTerminalToolbar: Array<Partial<ModelEntry>> = []
+let modelsHiddenFromComposer: unknown = null
+let modelsHiddenFromTerminalToolbar: unknown = null
 // A minimal, interactive stand-in for the real composer — exposes exactly the two triggers these
 // tests need (a plain send and a steer send) without depending on its own internal state machine.
 vi.mock('./CodeComposer', () => ({
-  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void; models: Array<Partial<ModelEntry>> }) => {
+  CodeComposer: (props: { value: string; onValueChange: (v: string) => void; onSubmit: (kind?: 'followUp' | 'steer') => void; models: Array<Partial<ModelEntry>>; modelsHidden?: unknown }) => {
     modelsOfferedByComposer = props.models
+    modelsHiddenFromComposer = props.modelsHidden
     return (
       <div>
         <textarea aria-label="composer" value={props.value} onChange={(e) => props.onValueChange(e.target.value)} />
@@ -116,8 +119,9 @@ vi.mock('./TerminalView', async () => {
   return { TerminalView: forwardRef(() => null) }
 })
 vi.mock('./TerminalToolbar', () => ({
-  TerminalToolbar: (props: { models: Array<Partial<ModelEntry>> }) => {
+  TerminalToolbar: (props: { models: Array<Partial<ModelEntry>>; modelsHidden?: unknown }) => {
     modelsOfferedByTerminalToolbar = props.models
+    modelsHiddenFromTerminalToolbar = props.modelsHidden
     return null
   },
 }))
@@ -315,5 +319,20 @@ describe('CodeSessionScreen — model picker offers chat models only', () => {
     renderScreen()
     await waitFor(() => expect(modelsOfferedByTerminalToolbar.length).toBeGreaterThan(0))
     expect(modelsOfferedByTerminalToolbar.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+
+  // For the picker's empty state, which counts them.
+  it('tells the composer and the terminal toolbar how many chat models were left out for the selected engine', async () => {
+    getCodeSessionMock.mockResolvedValue(detail())
+    const { unmount } = renderScreen()
+    await screen.findByLabelText('composer')
+    expect(modelsHiddenFromComposer).toEqual({ byEngine: 1 })
+    unmount()
+    const terminalSession = detail()
+    terminalSession.session.codeAgent = 'claude'
+    getCodeSessionMock.mockResolvedValue(terminalSession)
+    renderScreen()
+    await waitFor(() => expect(modelsOfferedByTerminalToolbar.length).toBeGreaterThan(0))
+    expect(modelsHiddenFromTerminalToolbar).toEqual({ byEngine: 1 })
   })
 })

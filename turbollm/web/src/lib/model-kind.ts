@@ -16,6 +16,28 @@ export function listedForLoading(m: Pick<ModelEntry, 'compatibleWithActiveEngine
   return showAllEngineModels || m.compatibleWithActiveEngine
 }
 
+/** How many chat models a model picker leaves out, and why: what its empty state tells the user to change. */
+export type PickerHidden = {
+  /** Left out because the selected engine cannot run them and Settings' "Show models for every engine" is off. */
+  byEngine: number
+}
+
+/** The chat models a model picker (Chat's, the Code composer's and the terminal toolbar's ModelLoadMenu) lists for
+ *  loading, and what it leaves out. The pickers filtered the list themselves and handed ModelLoadMenu only what was
+ *  left, so a library holding only models the selected engine cannot run (a .litertlm bundle under llama.cpp, GGUFs
+ *  under LiteRT-LM) opened a picker reading "No models found" over nothing, with no word that they were hidden or how
+ *  to show them. Counted once per key, as the picker lists one row per key, and only over the copies it can list. */
+export function chatModelsForPicker(models: ModelEntry[], showAllEngineModels: boolean): { listed: ModelEntry[]; hidden: PickerHidden } {
+  const chat = models.filter(isChatModel)
+  const listed = chat.filter((m) => listedForLoading(m, showAllEngineModels))
+  const listedKeys = new Set(listed.map((m) => m.key))
+  // Only what a picker could list at all: ModelLoadMenu drops an unfinished download and a file that failed to parse,
+  // whatever the engine, so counting those would name a setting that lists nothing.
+  const pickable = chat.filter((m) => !m.incomplete && !m.parseError)
+  const byEngine = new Set(pickable.filter((m) => !listedKeys.has(m.key)).map((m) => m.key)).size
+  return { listed, hidden: { byEngine } }
+}
+
 /** Whether `m`'s Load is offered: always when the selected engine runs it, and once the user shows every model (that
  *  setting, or the Models screen's "Show all") also when it does not, since such a load starts on the selected engine
  *  and fails there with its error rather than being refused up front. A Laya model never runs on the selected engine

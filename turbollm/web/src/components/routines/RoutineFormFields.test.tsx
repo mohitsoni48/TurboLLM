@@ -9,13 +9,15 @@ import type { ModelEntry } from '../../lib/types'
 
 const MODEL_A: Partial<ModelEntry> = { key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }
 let mockLibrary: Array<Partial<ModelEntry>> = [MODEL_A]
+/** False while the catalog query has not answered yet (its data is undefined). */
+let mockModelsAnswered = true
 
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
   return {
     ...actual,
     useChatAgents: () => ({ data: [{ id: 'agent-1', name: 'Research Agent', description: '', systemPrompt: '', skillIds: [], tools: [] }] }),
-    useModels: () => ({ data: { models: mockLibrary } }),
+    useModels: () => ({ data: mockModelsAnswered ? { models: mockLibrary } : undefined }),
   }
 })
 
@@ -362,5 +364,34 @@ describe('RoutineFormFields — model picker offers chat models only', () => {
     renderControlled({ ...emptyRoutineDraft(), modelKey: 'deleted-model' }, vi.fn())
     expect(screen.getByRole('option', { name: /deleted-model \(not in the current catalog\)/ })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /a text classification model/ })).not.toBeInTheDocument()
+  })
+})
+
+// An empty catalog left the select with only its placeholder, a drop-down with nothing in it and no word of why.
+describe('RoutineFormFields — no models', () => {
+  afterEach(() => { mockLibrary = [MODEL_A]; mockModelsAnswered = true })
+
+  it('says no models were found, and where to get one, under an empty model select', () => {
+    mockLibrary = []
+    renderForm()
+    expect(screen.getByLabelText('Model')).toHaveAccessibleDescription('No models found. Download one in Models → Discover.')
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+  })
+
+  it('counts a library of text classification models as no models, since none can run a routine', () => {
+    mockLibrary = [{ ...MODEL_A, laya: { checkpoints: ['english'] } }]
+    renderForm()
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+  })
+
+  it('says nothing while the catalog is still loading, or once it lists a model', () => {
+    mockModelsAnswered = false
+    const { unmount } = renderForm()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+    unmount()
+    mockModelsAnswered = true
+    renderForm()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Model')).not.toHaveAttribute('aria-describedby')
   })
 })

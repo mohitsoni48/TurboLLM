@@ -6,8 +6,10 @@ import type { ModelEntry } from '../lib/types'
 import type { LinkRecord } from '../lib/link-api'
 import { groupModelChoices, isFlat, type ModelChoice, type RemoteModelRow } from '../lib/remote-models'
 import { usePinnedModels } from '../lib/usePinnedModels'
+import type { PickerHidden } from '../lib/model-kind'
 import { track } from '../lib/api'
 import { toast } from './ui/sonner'
+import { NoModelsHint } from './NoModelsHint'
 import { cn } from '../lib/utils'
 import {
   DropdownMenu,
@@ -45,6 +47,7 @@ export function ModelLoadMenu({
   blockedReason,
   links,
   remoteModels,
+  hidden,
 }: {
   models: ModelEntry[]
   loadedKey?: string | null
@@ -66,6 +69,9 @@ export function ModelLoadMenu({
    *  `grantedCapabilities`, never from a local guess about what a link "probably" allows. */
   links?: LinkRecord[]
   remoteModels?: RemoteModelRow[]
+  /** The models the caller left out of `models` (lib/model-kind.ts chatModelsForPicker), which the empty state counts
+   *  and says how to list. */
+  hidden?: PickerHidden
 }) {
   const { isPinned } = usePinnedModels()
   const [open, setOpen] = useState(false)
@@ -290,9 +296,14 @@ export function ModelLoadMenu({
           {nothingMatches && <div className={SECTION_LABEL_CLASS}>No matching models</div>}
           {flat ? (
             <>
-              {!nothingMatches && (
-                <div className={SECTION_LABEL_CLASS}>{total ? 'Load a model' : 'No models found'}</div>
-              )}
+              {!nothingMatches && (total ? (
+                <div className={SECTION_LABEL_CLASS}>Load a model</div>
+              ) : (
+                <div className="px-2 py-1.5">
+                  <div className="text-[13px] text-ink">No models found.</div>
+                  <NoModelsHint hidden={hidden} className="mt-1" />
+                </div>
+              ))}
               {(shown[0]?.choices ?? []).map(renderChoice)}
             </>
           ) : (
@@ -314,7 +325,10 @@ export function ModelLoadMenu({
                   </div>
                 )}
                 {g.kind === 'local' && g.choices.length === 0 && (
-                  <div className="px-2 pb-1.5 text-[11px] text-faint">No local models found.</div>
+                  <div className="px-2 pb-1.5">
+                    <div className="text-[11px] text-faint">No local models found.</div>
+                    <NoModelsHint hidden={hidden} offerDownload={false} className="mt-0.5 text-[11px]" />
+                  </div>
                 )}
                 {g.choices.map(renderChoice)}
               </div>

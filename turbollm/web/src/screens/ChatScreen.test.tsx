@@ -84,9 +84,11 @@ vi.mock('./chat/ConversationSettingsDialog', () => ({ ConversationSettingsDialog
 vi.mock('./models/ModelDetailDialog', () => ({ ModelDetailDialog: () => null }))
 
 let modelsOfferedByPicker: Array<Partial<ModelEntry>> | null = null
+let modelsHiddenFromPicker: unknown = null
 vi.mock('../components/ModelLoadMenu', () => ({
-  ModelLoadMenu: (props: { models: Array<Partial<ModelEntry>> }) => {
+  ModelLoadMenu: (props: { models: Array<Partial<ModelEntry>>; hidden?: unknown }) => {
     modelsOfferedByPicker = props.models
+    modelsHiddenFromPicker = props.hidden
     return null
   },
 }))
@@ -289,6 +291,13 @@ describe('ChatScreen — model picker offers chat models only', () => {
     await renderScreen()
     await waitFor(() => expect(modelsOfferedByPicker).not.toBeNull())
     expect(modelsOfferedByPicker?.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+
+  // Its empty state counts them: a picker handed only what was kept said "No models found" and no more.
+  it('tells the picker how many chat models it left out for the selected engine', async () => {
+    await renderScreen()
+    await waitFor(() => expect(modelsOfferedByPicker).not.toBeNull())
+    expect(modelsHiddenFromPicker).toEqual({ byEngine: 1 })
   })
 })
 

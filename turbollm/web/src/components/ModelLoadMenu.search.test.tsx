@@ -224,7 +224,7 @@ describe('search box', () => {
   it('is shown even with no models', async () => {
     await openMenu({ models: [] })
     expect(searchBox()).toBeInTheDocument()
-    expect(screen.getByText('No models found')).toBeInTheDocument()
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
   })
 
   it('never appears for a blocked picker', async () => {
@@ -695,5 +695,37 @@ describe('duplicate model keys', () => {
     await userEvent.keyboard('{Enter}')
     expect(onEject).toHaveBeenCalledTimes(1)
     expect(onLoad).not.toHaveBeenCalled()
+  })
+})
+
+// With nothing to offer the picker showed only a faint "No models found" heading over an empty list: a library of
+// models the selected engine cannot run looked like no library, with no word of the setting that lists them.
+describe('empty state', () => {
+  const ENGINE_HINT = /hidden: the selected engine can't run (it|them) — Settings → Models & loading → Show models for every engine\./
+
+  it('says where to get a model when the library has none', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 0 } })
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText('Download one in Models → Discover.')).toBeInTheDocument()
+  })
+
+  it('counts the models the selected engine cannot run and names the setting that lists them', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 2 } })
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(ENGINE_HINT)).toHaveTextContent(/^2 hidden: the selected engine can't run them/)
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+  })
+
+  it('counts them under "No local models found." when linked machines fill the list, and offers no download', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 1 }, links: onlineLink(), remoteModels: [remoteRow(false)] })
+    expect(screen.getByText('No local models found.')).toBeInTheDocument()
+    expect(screen.getByText(ENGINE_HINT)).toHaveTextContent(/^1 hidden: the selected engine can't run it/)
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+  })
+
+  it('says nothing of hidden models while some are listed', async () => {
+    await openMenu({ hidden: { byEngine: 3 } })
+    expect(screen.queryByText(ENGINE_HINT)).not.toBeInTheDocument()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
   })
 })

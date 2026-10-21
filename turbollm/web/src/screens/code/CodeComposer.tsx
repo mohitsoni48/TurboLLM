@@ -15,6 +15,7 @@ import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/Re
 import { toast } from '../../components/ui/sonner'
 import { browseFs, track } from '../../lib/api'
 import type { ModelEntry } from '../../lib/types'
+import type { PickerHidden } from '../../lib/model-kind'
 import type { LinkRecord } from '../../lib/link-api'
 import type { RemoteModelRow } from '../../lib/remote-models'
 import { cn } from '../../lib/utils'
@@ -195,6 +196,8 @@ export interface CodeComposerProps {
    *  exactly as it did before Turbo Link existed. */
   links?: LinkRecord[]
   remoteModels?: RemoteModelRow[]
+  /** The models left out of `models`, for ModelLoadMenu's empty state (lib/model-kind.ts chatModelsForPicker). */
+  modelsHidden?: PickerHidden
   loadedKey: string | null
   loadedName: string | null
   modelPending: boolean
@@ -278,7 +281,7 @@ export interface CodeComposerProps {
 export function CodeComposer({
   inputRef, value, onValueChange, onSubmit, placeholder, textareaDisabled,
   repo, repoRoot, repoBranch, mode, onModeChange,
-  models, links, remoteModels, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
+  models, links, remoteModels, modelsHidden, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, live, onStop, sendDisabled,
   onAddContext, contextFiles, onRemoveContextFile, hintText, statusText, slashCommands = [],
   thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange, onImagesChange, lastPromptTokens, lastGenTokens,
@@ -840,6 +843,7 @@ export function CodeComposer({
             models={models}
             links={links}
             remoteModels={remoteModels}
+            hidden={modelsHidden}
             loadedKey={loadedKey}
             loadedName={loadedName}
             pending={modelPending}
