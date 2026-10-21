@@ -2751,8 +2751,11 @@ export function registerApi(app: Hono, d: Deps): void {
 
   // Cancel the active run: stops after the current step, leaves the engine stopped,
   // keeps the partial results (spec 09 AC#3). Always 200 (no-op when none running).
+  // The user's own Cancel, from the auto-tune card during a run and from the results dialog after one, so it also
+  // discards a finished run's unsaved result. The engine kill switches call bench.cancel() alone, which keeps it.
   app.post('/api/v1/bench/cancel', (c) => {
     d.bench.cancel()
+    d.bench.discardResult()
     return c.json({ ok: true })
   })
 

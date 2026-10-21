@@ -9,7 +9,8 @@
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
 // recorded and the sweep continues).
 import { execFile } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore, type ModelPreset } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
@@ -182,6 +183,20 @@ const KV_BYTES: Record<string, number> = {
   q4_0: 0.5, q4_1: 0.5, iq4_nl: 0.5, turbo4: 0.5, turbo3: 0.375, turbo2: 0.25,
 }
 
+/** A finished run's winner, held for the results dialog's Save/Cancel (BenchRunner.winning). */
+type Winning = { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
+
+/** The held result on disk (BenchRunner.writeHeld): the winner without its scanner entry, which a restore looks up
+ *  again, and what GET /status showed of the finished run. */
+interface HeldResultFile {
+  version: 1
+  winning: Omit<Winning, 'entry'>
+  state: Pick<BenchState, 'modelKey' | 'bestTps' | 'result' | 'candidates'>
+}
+
+/** The held result's file, in the config dir beside config.json. */
+const HELD_RESULT_FILE = 'bench-result.json'
+
 export class BenchError extends Error {
   constructor(
     public code: string,
@@ -208,10 +223,13 @@ export class BenchRunner {
   private runLog: BenchLogEntry[] = []
   private runLogMeta: { modelKey: string; startedAt: string; sys: SysInfo } | null = null
   private logWinner: BenchLogWinner | null = null
-  // The finished run's winning candidate, held (not persisted) until the user clicks Save.
-  private winning:
-    | { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
-    | null = null
+  // The finished run's winning candidate, held until the user clicks Save or Cancel (or a new run starts). Kept on
+  // disk too (writeHeld), so it outlives the process: the Android app's service stops once nothing is loaded and
+  // nothing runs, and a finished tune leaves the engine stopped, so a result held only in memory was lost with the
+  // process Android then freezes and kills, and with Quit or a daemon restart. `restored`: one read back from disk
+  // whose model the scanner has not listed yet (resolveRestored).
+  private winning: Winning | null = null
+  private restored: HeldResultFile | null = null
 
   constructor(
     private manager: Manager,
@@ -221,7 +239,9 @@ export class BenchRunner {
     private version: string,
     /** Used to fetch the model's HF card for card-derived sampling (ADR-099). */
     private hf: HfClient,
-  ) {}
+  ) {
+    this.restoreHeld()
+  }
 
   /** Journey telemetry (ADR-299 `model_first_load`). Set post-construction in
    *  cli.ts, matching `Manager.onLoadSettled`'s wiring — the Emitter is built
@@ -231,6 +251,7 @@ export class BenchRunner {
 
   /** Live state for GET /status. */
   status(): BenchState {
+    this.resolveRestored()
     return this.state
   }
 
@@ -247,13 +268,90 @@ export class BenchRunner {
 
   /** Cancel the active run: aborts the in-flight measurement immediately, stops after the
    *  current step, leaves the engine stopped, and keeps the partial results gathered so far
-   *  (AC#3). A no-op when nothing is running. */
+   *  (AC#3). A no-op when nothing is running.
+   *
+   *  This is the kill switch every engine stop, model load and restart runs (engine-lifecycle.ts), and a ComfyUI
+   *  render's: it stops running work only. A finished run's unsaved result is NOT dropped here, though it used to be:
+   *  those callers fire with no run left to stop (the Eject, a model load or restart, a Turbo Link unload), so a tune
+   *  that finished while the page was closed was gone before the user saw its results dialog. Save writes config and
+   *  needs no engine. Only the user's own Cancel (POST /bench/cancel: discardResult) and a new run
+   *  (start) discard it. A run cancelled here holds no result: run() re-checks `cancelled` before it takes a winner. */
   cancel(): void {
-    this.winning = null // discard any unsaved result too
-    this.state = { ...this.state, result: undefined } // don't re-show the results dialog
     if (!this.state.running) return
     this.cancelled = true
     this.abort?.abort()
+  }
+
+  /** Drop a finished run's unsaved result (the results dialog's Cancel, through POST /bench/cancel), so the dialog is
+   *  not shown again and Save answers 409 no_bench_result. A no-op when no result is held. */
+  discardResult(): void {
+    this.winning = null
+    this.dropHeld()
+    if (this.state.result) this.state = { ...this.state, result: undefined }
+  }
+
+  private heldPath(): string {
+    return join(this.store.dir(), HELD_RESULT_FILE)
+  }
+
+  /** Write the held result to disk (see `winning`), as the daemon's other state files are written: a temp file of this
+   *  process's own, renamed over the last one, so a kill mid-write leaves the previous file whole. Best-effort: a
+   *  failed write leaves the result held in memory, as before. */
+  private writeHeld(): void {
+    const w = this.winning
+    if (!w) return
+    let tmp = ''
+    try {
+      const { entry: _entry, ...winning } = w
+      const { modelKey, bestTps, result, candidates } = this.state
+      const held: HeldResultFile = { version: 1, winning, state: { modelKey, bestTps, result, candidates } }
+      const path = this.heldPath()
+      tmp = `${path}.${process.pid}.tmp`
+      writeFileSync(tmp, JSON.stringify(held))
+      renameSync(tmp, path)
+    } catch {
+      if (tmp) rmSync(tmp, { force: true })
+    }
+  }
+
+  /** Delete the held result's file (Save, Cancel, a new run, or its model gone). */
+  private dropHeld(): void {
+    this.restored = null
+    try {
+      rmSync(this.heldPath(), { force: true })
+    } catch { /* no config dir: nothing was written */ }
+  }
+
+  /** Read back a held result an earlier process wrote (writeHeld). Its model is looked up again (resolveRestored). */
+  private restoreHeld(): void {
+    try {
+      const held = JSON.parse(readFileSync(this.heldPath(), 'utf8')) as HeldResultFile
+      if (held?.version !== 1 || !held.winning?.modelKey || !held.state?.result) {
+        this.dropHeld()
+        return
+      }
+      this.restored = held
+    } catch {
+      return // none held (or no config dir)
+    }
+    this.resolveRestored()
+  }
+
+  /** A result read back from disk becomes the held one once the scanner lists its model, which Save reports with, as
+   *  after a run. The daemon constructs the runner before its first model scan has finished, so until a scan has
+   *  finished it waits; one that finished without the model drops it (the model was deleted or its folder removed). */
+  private resolveRestored(): void {
+    const r = this.restored
+    if (!r || this.state.running) return
+    const entry = this.scanner.get(r.winning.modelKey)
+    if (entry) {
+      this.restored = null
+      this.winning = { ...r.winning, entry }
+      this.state = { running: false, done: true, ...r.state }
+      return
+    }
+    const scan = this.scanner.list?.()
+    if (scan && !scan.scanning && scan.lastScanAt) this.dropHeld()
   }
 
   /** Report a sweep's conclusion (ADR-299; `model_load` config capture is
@@ -348,11 +446,13 @@ export class BenchRunner {
   /** Persist the finished run's winning profile (the user clicked Save). Returns false if there is
    *  nothing to save (no completed run, or it was already saved / discarded). */
   saveResult(): boolean {
+    this.resolveRestored()
     const w = this.winning
     if (!w) return false
     const record = this.persistBest(w.modelKey, w.profile, w.cand, w.engineId)
     this.queueTelemetry(record, w.entry, w.sys, this.version, w.engineVersion)
     this.winning = null
+    this.dropHeld()
     this.state = { ...this.state, result: undefined } // consumed — don't re-show the dialog
     return true
   }
@@ -415,6 +515,7 @@ export class BenchRunner {
     this.engineSwitched = null
     this.abort = new AbortController()
     this.winning = null
+    this.dropHeld()
     this.runLog = []
     this.runLogMeta = null
     this.logWinner = null
@@ -519,8 +620,8 @@ export class BenchRunner {
         await this.stopEngine() // in case the LLM fallback loaded a model
       }
       // A cancel DURING extraction (the LLM fallback can run for minutes) must not resurrect the
-      // results dialog or re-hold a profile the user just discarded: cancel() cleared winning +
-      // result, but couldn't stop this still-running run. Re-check before committing the winner.
+      // results dialog or hold a profile the user (or a kill switch) just cancelled: cancel() only
+      // flags this still-running run, so re-check before committing the winner.
       if (this.cancelled) {
         // A user who backs out of their FIRST sweep before a profile committed is
         // not the same signal as one whose load broke — same reasoning already
@@ -566,6 +667,7 @@ export class BenchRunner {
         },
         candidates: results,
       }
+      this.writeHeld()
     } else {
       // No candidate measured successfully — keep the partial results, surface a soft error
       // (every candidate's outcome is visible in `candidates`). When every trial ran out of VRAM,
