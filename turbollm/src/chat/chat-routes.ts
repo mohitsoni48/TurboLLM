@@ -5,6 +5,7 @@ import type { Deps } from '../deps'
 import { resolveKey, grantKind, holdOpen, holdTurn, hostGate, isLocalOrAuthenticated } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import { clampMaxTokens } from '../config/config'
+import { CHAT_APPROVAL_WAIT_MINUTES } from '../config/config-bounds'
 import { feedChunk, flushState, initParseState, type ParseState } from './parser'
 import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
@@ -16,7 +17,7 @@ import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMe
 import { checkReply } from '../tools/research-referee.js'
 import { buildSnapshot } from './chat-export'
 import type { ExportFormat } from './chat-export'
-import { executeToolCallWithApproval } from '../tools/execute-with-approval'
+import { executeToolCallWithApproval, newApprovalWaitBudget } from '../tools/execute-with-approval'
 import { pendingToolApprovalName, resolveToolApproval } from '../tools/approval-gate'
 import { isMcpToolName, listsMcpTool, MCP_APPROVAL_REFUSED_MESSAGE } from '../tools/tool-registry'
 import { buildSaveSkillTool } from '../agents/agent-tools'
@@ -1417,6 +1418,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // a ceiling, not a target — ordinary chats still finish in 1–2 rounds and are unaffected.
   const MAX_TOOL_ITER = 16
   let toolIter = 0
+  /** The reply's wait for its tool-call approvals, shared by all its calls (ApprovalWaitBudget). */
+  const approvalWait = newApprovalWaitBudget()
   /** Number of web_search tool calls made this turn (caps the confidence re-loop). */
   let searchCallCount = 0
   /** Confidence-driven refinement passes taken this turn (capped at MAX_CONFIDENCE_RETRIES). */
@@ -1887,6 +1890,12 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
               autoAllowAll: d.store.snapshot().tools.autoAllowAll ?? false,
               signal: ac.signal,
               interactive: true,
+              // How long the reply waits for its answers (Settings → Tool permissions), read as its
+              // first call reaches its wait and shared by its calls (approvalBudget): a reply whose
+              // calls nobody answers then goes on as after a deny instead of holding the chat (and on
+              // Android the model and the wake lock), after one wait however often the model asks.
+              approvalWaitMinutes: d.store.snapshot().tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
+              approvalBudget: approvalWait,
               // The real per-request trust decision this handler's route computed from its Hono
               // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
               isCodeAuthorized: ctx.isCodeAuthorized,

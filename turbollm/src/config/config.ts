@@ -9,6 +9,7 @@ import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
+import { CHAT_APPROVAL_WAIT_MINUTES } from './config-bounds'
 
 export const SCHEMA_VERSION = 4
 
@@ -256,6 +257,12 @@ export interface ToolsConfig {
    *  instead. Only silences a resolved 'ask' — an explicit 'deny' (global or
    *  per-conversation) is still honored; see resolveToolPolicy. */
   autoAllowAll?: boolean
+  /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
+   *  together, in whole minutes (Settings → Tool permissions; CHAT_APPROVAL_WAIT_MINUTES's bounds,
+   *  default 30). Past it the call still waiting, and every later one of the reply, is not run and
+   *  the turn goes on as after a deny. 0 waits until answered. Chat turns only: Code's ask mode
+   *  waits until answered. normalize always sets it. */
+  chatApprovalWaitMinutes?: number
 }
 
 /** One MCP server the daemon manages as a tool provider (v0.7.0). */
@@ -795,7 +802,7 @@ export function defaultConfig(): Config {
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
     gateway: { autoSwap: true, keepN: 1 },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
-    tools: {},
+    tools: { chatApprovalWaitMinutes: CHAT_APPROVAL_WAIT_MINUTES.default },
     mcp: { servers: [] },
     agents: { agents: [] },
     customAgents: [],
@@ -1285,6 +1292,13 @@ function normalize(c: Config): void {
   }
   c.tools.toolPolicies = toolPolicies
   c.tools.autoAllowAll = tl.autoAllowAll === true
+  // Absent in configs written before the setting, or hand-edited out of range: the default (30
+  // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
+  const wait = tl.chatApprovalWaitMinutes
+  c.tools.chatApprovalWaitMinutes =
+    typeof wait === 'number' && Number.isFinite(wait) && wait >= CHAT_APPROVAL_WAIT_MINUTES.min && wait <= CHAT_APPROVAL_WAIT_MINUTES.max
+      ? Math.floor(wait)
+      : CHAT_APPROVAL_WAIT_MINUTES.default
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {

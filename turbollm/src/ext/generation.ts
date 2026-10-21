@@ -30,8 +30,9 @@
 //     `interactive: true` unconditionally — there is no ctx field that reaches it. Every tool
 //     defaults to 'ask' policy unless explicitly configured (tools/tool-policy.ts's own doc
 //     comment), so routing a public run through it would, by default, hang forever on the first
-//     tool call waiting on `waitForToolApproval` (tools/approval-gate.ts has no timeout) — an
-//     approval endpoint no external caller can ever reach.
+//     tool call waiting on `waitForToolApproval` (a chat turn's wait ends only after Settings'
+//     chatApprovalWaitMinutes, and never at 0) — an approval endpoint no external caller can ever
+//     reach.
 //
 // This is exactly the problem routines/chat-runner.ts already solved for a different detached
 // caller (Chat Routines), and its own header comment says as much: "NOT a reuse of

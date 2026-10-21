@@ -55,6 +55,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   page that opens it (`?run=<reply id>&fromSeq=<n>` resumes one it was following). The turn streams carry each frame's
   seq as `id:` and an SSE keepalive comment every 20 s. `POST /api/v1/chat/stop` takes the `messageId` of the reply to
   stop and answers `stopped`.
+- **A chat reply waits a set time for its tool-call approvals** (Settings → Tool permissions → Wait for an answer, 30
+  minutes by default, `chatApprovalWaitMinutes` 0-1440 on `PATCH /api/v1/settings`; 0 waits until answered). The time
+  is the reply's, all its calls together: a call set to Ask that gets no answer within what is left of it is not run,
+  reads "No answer within N minutes; the call was not run." and the reply goes on as after a Deny; the reply's later
+  calls set to Ask are then answered the same way at once. Code's ask mode still waits until answered.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.

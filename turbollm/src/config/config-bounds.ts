@@ -23,7 +23,9 @@
  *  true). Fields the remote scope does not expose at all — `port`,
  *  `idleTtlMinutes`, `vramHeadroomMb`, `comfyui.url` — keep their validation in
  *  api/routes.ts, because sharing a bound for a path only one side can write would imply a
- *  symmetry that does not exist.
+ *  symmetry that does not exist. `tools.chatApprovalWaitMinutes` is one of them too (the scope
+ *  never exposes `tools`); its numbers are below, outside the shared table, because config.ts's
+ *  normalize reads them as well as the settings route.
  *
  *  ## The invariant
  *
@@ -118,4 +120,23 @@ export function coerceBounded(path: BoundedConfigPath, raw: unknown): number | n
 export function isBoundedNumber(path: BoundedConfigPath, v: unknown): boolean {
   const b = CONFIG_BOUNDS[path]
   return typeof v === 'number' && Number.isInteger(v) && v >= b.min && v <= b.max
+}
+
+/** Settings → Tool permissions, "Wait for an answer": how long a chat reply waits for its tool
+ *  calls' approvals, all its calls together, before the call still waiting and the reply's later
+ *  ones are answered as not run (Config.tools.chatApprovalWaitMinutes, execute-with-approval.ts
+ *  ApprovalWaitBudget). Whole minutes; 0 waits until answered. Local only (see "What is NOT
+ *  here" above): the settings route refuses a value outside it with `message`, and normalize loads
+ *  a hand-edited one outside it as `default`. 1440 (a day) keeps the timer far below setTimeout's
+ *  2^31-1 ms limit. */
+export const CHAT_APPROVAL_WAIT_MINUTES = {
+  min: 0,
+  max: 1440,
+  default: 30,
+  message: 'chatApprovalWaitMinutes must be a whole number of minutes, 0–1440 (0 waits until answered).',
+} as const
+
+/** Whether `v` is a chatApprovalWaitMinutes the settings route takes: a whole JSON number in range. */
+export function isChatApprovalWaitMinutes(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= CHAT_APPROVAL_WAIT_MINUTES.min && v <= CHAT_APPROVAL_WAIT_MINUTES.max
 }

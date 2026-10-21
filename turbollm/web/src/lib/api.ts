@@ -953,6 +953,10 @@ export type DaemonSettings = {
    *  call that would show an "awaiting approval" prompt runs immediately instead.
    *  Only silences a resolved 'ask' — an explicit 'deny' is still honored. */
   autoAllowAll: boolean
+  /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
+   *  together, in whole minutes (0-1440, default 30); past it they are not run and the reply goes
+   *  on. 0 waits until answered. Optional: a daemon from before the setting does not send it. */
+  chatApprovalWaitMinutes?: number
   /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
    *  published themselves — not a secret, just an id, echoed back as-is. */
   cloudDeploy: { runpodTemplateId: string }

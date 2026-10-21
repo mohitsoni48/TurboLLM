@@ -10,7 +10,7 @@ import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
-import { CONFIG_BOUNDS, coerceBounded, isConfigTheme } from '../config/config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { stripBodies } from '../observability/request-log'
@@ -2933,6 +2933,7 @@ export function registerApi(app: Hono, d: Deps): void {
       code?: { agentsMdProjectCandidates?: string[]; agentsMdGlobalCandidates?: string[]; defaultAgent?: string }
       toolPolicies?: Record<string, string>
       autoAllowAll?: boolean
+      chatApprovalWaitMinutes?: number
       cloudDeploy?: { runpodTemplateId?: string }
       experimental?: { memory?: boolean; cloudDeploy?: boolean; routines?: boolean; turboLink?: boolean; remoteAccess?: boolean }
       remoteAccess?: {
@@ -3200,6 +3201,12 @@ export function registerApi(app: Hono, d: Deps): void {
       }
       toolPolicies = validated
     }
+    // How long a chat reply waits for its tool calls' approvals (execute-with-approval.ts). Open to the
+    // same callers as idleTtlMinutes, not hostGate'd like toolPolicies: the wait running out runs
+    // nothing (the call is answered as not run), so no value of it lets a tool run.
+    if (b.chatApprovalWaitMinutes !== undefined && !isChatApprovalWaitMinutes(b.chatApprovalWaitMinutes)) {
+      return err(c, 400, 'invalid_config_value', CHAT_APPROVAL_WAIT_MINUTES.message)
+    }
 
     // Remote-access provider changes only while no tunnel is up. Saved mid-session, the new
     // provider is what the next crash/health restart (or boot) starts — publishing the box
@@ -3236,6 +3243,7 @@ export function registerApi(app: Hono, d: Deps): void {
       if (defaultAgent !== undefined) cfg.code.defaultAgent = defaultAgent
       if (toolPolicies !== undefined) cfg.tools.toolPolicies = toolPolicies
       if (b.autoAllowAll !== undefined) cfg.tools.autoAllowAll = !!b.autoAllowAll
+      if (b.chatApprovalWaitMinutes !== undefined) cfg.tools.chatApprovalWaitMinutes = b.chatApprovalWaitMinutes
       if (b.autoLoadOnStart !== undefined) cfg.autoLoadOnStart = !!b.autoLoadOnStart
       if (b.showAllEngineModels !== undefined) cfg.showAllEngineModels = !!b.showAllEngineModels
       if (vramHeadroomMb !== undefined) cfg.vramHeadroomMb = vramHeadroomMb
@@ -4095,6 +4103,7 @@ function settingsPayload(d: Deps) {
     // Not secret — echoed back directly so Settings can render Tool Permissions.
     toolPolicies: cfg.tools.toolPolicies ?? {},
     autoAllowAll: cfg.tools.autoAllowAll ?? false,
+    chatApprovalWaitMinutes: cfg.tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
     // Remote access (ADR-422). Secrets are WRITE-ONLY: the booleans say whether one is
     // stored, never what it is — same posture as hfToken/ghToken/tavilyApiKey.
     remoteAccess: {
