@@ -143,6 +143,88 @@ test('cleanupIdle: a terminal created with its own idle TTL (a routine run) uses
   assert.equal(ttl.has('t5'), false)
 })
 
+// ── Output while nobody watches: an agent still printing its work is not idle ─────────────
+// Regression: the idle clock counted only from the moment the last viewer left, so an agent CLI
+// working on a long task with every tab closed was killed 5 minutes in, mid-task, exactly like an
+// abandoned terminal. Output now restarts the clock while no viewer is attached, up to a 6-hour
+// cap after the last viewer left (a TUI repainting on a timer must still be reaped), and never
+// for a terminal with its own idle TTL (a routine's run decides). onOutput is what create()'s PTY
+// onData calls; it is driven directly here, as the rest of this file drives the bookkeeping.
+
+type OutputPrivates = { onOutput(id: string, data: string): void; lastOutput: Map<string, number> }
+const output = (m: SeededManager) => m as unknown as OutputPrivates
+
+test('cleanupIdle: an unwatched terminal that is still printing is kept past maxAgeMs', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 'o1')
+  m.idleSince.set('o1', Date.now() - 400_000) // the last viewer left over six minutes ago
+
+  output(m).onOutput('o1', 'Compiling…\r\n')
+  m.cleanupIdle(300_000)
+
+  assert.equal(session.wasDisposed(), false, 'output just now: the agent is working, not abandoned')
+  assert.ok(m.infoMap.has('o1'))
+})
+
+test('cleanupIdle: an unwatched terminal quiet for maxAgeMs since its last output is killed', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 'o2')
+  m.idleSince.set('o2', Date.now() - 20 * 60_000)
+  output(m).onOutput('o2', 'done\r\n')
+  output(m).lastOutput.set('o2', Date.now() - 6 * 60_000) // that output was six minutes ago
+
+  m.cleanupIdle(300_000)
+
+  assert.equal(session.wasDisposed(), true, 'five minutes without output still reaps it')
+  assert.equal(output(m).lastOutput.has('o2'), false)
+})
+
+test('cleanupIdle: output keeps an unwatched terminal for at most 6 hours after its last viewer left', () => {
+  const m = seededManager()
+  const session = seedTerminal(m, 'o3')
+  m.idleSince.set('o3', Date.now() - (6 * 60 - 1) * 60_000)
+  output(m).onOutput('o3', '\x1b[H12:00:01')
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), false, 'still within the cap')
+
+  m.idleSince.set('o3', Date.now() - (6 * 60 + 1) * 60_000)
+  output(m).onOutput('o3', '\x1b[H12:00:02') // a TUI repainting on a timer never goes quiet
+  m.cleanupIdle(300_000)
+  assert.equal(session.wasDisposed(), true, 'past the cap it is reaped although it keeps printing')
+})
+
+test('cleanupIdle: output does not extend a terminal created with its own idle TTL', () => {
+  const m = seededManager()
+  const ttl = (m as unknown as { idleTtl: Map<string, number> }).idleTtl
+  const session = seedTerminal(m, 'o4')
+  ttl.set('o4', 35 * 60_000)
+  m.idleSince.set('o4', Date.now() - 36 * 60_000)
+
+  output(m).onOutput('o4', 'still going\r\n')
+  m.cleanupIdle(300_000)
+
+  assert.equal(session.wasDisposed(), true, "a routine's run, not its output, decides when its terminal ends")
+})
+
+test('onOutput: output reaches every attached viewer and starts no clock while one is attached', () => {
+  const m = seededManager()
+  seedTerminal(m, 'o5')
+  const received: string[] = []
+  const handler: Handler = { onData: (d) => received.push(d) }
+  m.registerWsListener('o5', handler as { onData: (d: string) => void })
+
+  output(m).onOutput('o5', 'hello')
+  assert.deepEqual(received, ['hello'])
+  assert.equal(output(m).lastOutput.has('o5'), false)
+
+  m.unregisterWsListener('o5', handler)
+  output(m).onOutput('o5', 'unseen')
+  assert.deepEqual(received, ['hello'], 'a viewer that left gets nothing more')
+  assert.equal(output(m).lastOutput.has('o5'), true)
+  m.registerWsListener('o5', handler as { onData: (d: string) => void })
+  assert.equal(output(m).lastOutput.has('o5'), false, 'a viewer attaching clears it with the idle clock')
+})
+
 test('registerWsListener: two listeners on the same id both receive broadcast data', () => {
   const m = new TerminalManager()
   const received1: string[] = []

@@ -165,6 +165,13 @@ export interface TerminalSessionInfo {
  *  running much past its actual TTL. */
 const IDLE_SWEEP_MS = 60_000
 
+/** How long output alone can keep a terminal alive after its last viewer left (see
+ *  cleanupIdle). An agent CLI working on a long task with every tab closed keeps printing, and
+ *  must not be killed 5 minutes in; but a TUI that repaints on a timer (a clock, a spinner left
+ *  running) prints forever, and would otherwise hold its PTY and CLI process until the daemon
+ *  restarts. */
+const UNWATCHED_OUTPUT_CAP_MS = 6 * 60 * 60_000
+
 export class TerminalManager {
   private sessions = new Map<string, PTYSession>()
   private infoMap = new Map<string, TerminalSessionInfo>()
@@ -177,6 +184,12 @@ export class TerminalManager {
   private idleSince = new Map<string, number>()
   /** A terminal's own idle TTL, used by cleanupIdle instead of its default; see create(). */
   private idleTtl = new Map<string, number>()
+  /** When each terminal last printed while nobody was watching it: cleanupIdle counts a
+   *  terminal's quiet time from this, not from when its last viewer left, so an agent CLI still
+   *  working after every tab closed is not killed mid-task. Only for terminals without their own
+   *  idleTtl (a routine's run decides when its terminal ends), and only up to
+   *  UNWATCHED_OUTPUT_CAP_MS after the last viewer left. Deleted when a viewer attaches. */
+  private lastOutput = new Map<string, number>()
 
   /** `dataDir` — the daemon's own data directory (ConfigStore.dir()), for the orphan-safety
    *  pidfile tracking above. Terminal-manager unit tests never spawn a real PTY (see
@@ -220,12 +233,7 @@ export class TerminalManager {
     const shellPid = session.getPid()
     if (shellPid) writeTerminalPid(this.dataDir, shellPid)
 
-    // Pipe PTY output → every attached WebSocket (a Code session can be open in more than
-    // one browser tab at once — see broadcast()).
-    session.onData((data: string) => {
-      const ev = this.infoMap.get(id)
-      if (ev) this.broadcast(id, (h) => h.onData?.(data))
-    })
+    session.onData((data: string) => this.onOutput(id, data))
 
     // On exit, close every attached WebSocket and clean up
     session.onExit(() => {
@@ -234,6 +242,7 @@ export class TerminalManager {
       this.infoMap.delete(id)
       this.idleSince.delete(id)
       this.idleTtl.delete(id)
+      this.lastOutput.delete(id)
       if (shellPid) clearTerminalPid(this.dataDir, shellPid)
       // The CLI subprocess exited on its own (e.g. `exit` typed in-shell) rather than via the
       // kill endpoint below — revoke its session-scoped auth token here too, otherwise it only
@@ -257,6 +266,17 @@ export class TerminalManager {
     if (idleTtlMs !== undefined) this.idleTtl.set(id, idleTtlMs)
 
     return id
+  }
+
+  /** PTY output: pipe it to every attached WebSocket (a Code session can be open in more than
+   *  one browser tab at once — see broadcast()). With nobody attached it restarts the quiet
+   *  clock instead (see lastOutput): until this existed, an agent CLI still printing its work
+   *  was killed 5 minutes after the last tab closed, exactly like an abandoned one. */
+  private onOutput(id: string, data: string): void {
+    if (!this.infoMap.has(id)) return
+    this.broadcast(id, (h) => h.onData?.(data))
+    // idleSince is present only while no viewer is attached (registerWsListener deletes it).
+    if (this.idleSince.has(id) && !this.idleTtl.has(id)) this.lastOutput.set(id, Date.now())
   }
 
   /**
@@ -292,6 +312,7 @@ export class TerminalManager {
       this.infoMap.delete(id)
       this.idleSince.delete(id)
       this.idleTtl.delete(id)
+      this.lastOutput.delete(id)
       // Also cleared by the onExit handler in create() once the process actually exits —
       // idempotent (force:true), so clearing eagerly here too just closes the window between
       // "we told it to die" and "it actually did" a little sooner.
@@ -367,6 +388,11 @@ export class TerminalManager {
    * only genuine, sustained abandonment does. A terminal with at least one listener currently
    * attached is never a candidate, no matter how long it's been running. A terminal created
    * with its own `idleTtlMs` (see create()) uses that instead of `maxAgeMs`.
+   *
+   * Output while nobody watches restarts the clock (see onOutput), so it is `maxAgeMs` of
+   * silence that reaps a terminal: an agent still printing its work is kept, a quiet one goes
+   * as before. That extension ends UNWATCHED_OUTPUT_CAP_MS after the last viewer left, and it
+   * never applies to a terminal with its own `idleTtlMs`.
    */
   cleanupIdle(maxAgeMs = 300_000): void {
     const now = Date.now()
@@ -376,7 +402,13 @@ export class TerminalManager {
       // "never kill something being watched" invariant doesn't depend on that bookkeeping
       // staying perfectly in sync everywhere it's touched.
       if ((this.listeners.get(id)?.size ?? 0) > 0) continue
-      if (now - since > (this.idleTtl.get(id) ?? maxAgeMs)) this.kill(id)
+      const ownTtl = this.idleTtl.get(id)
+      if (ownTtl !== undefined) {
+        if (now - since > ownTtl) this.kill(id)
+        continue
+      }
+      const quietSince = Math.max(since, this.lastOutput.get(id) ?? since)
+      if (now - quietSince > maxAgeMs || now - since > UNWATCHED_OUTPUT_CAP_MS) this.kill(id)
     }
   }
 
@@ -424,6 +456,7 @@ export class TerminalManager {
     // At least one live viewer again — stop the idle clock. Covers both a reconnect after a
     // brief gap (switching Code sessions and back) and the very first connect after create().
     this.idleSince.delete(id)
+    this.lastOutput.delete(id)
   }
 
   /**
