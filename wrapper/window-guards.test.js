@@ -1,7 +1,8 @@
 // window-guards.test.js — plain `node --test`, Node built-ins only.
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readFileSync } = require('node:fs')
+const { existsSync, mkdtempSync, readFileSync, rmSync } = require('node:fs')
+const { tmpdir } = require('node:os')
 const { join } = require('node:path')
 const Module = require('node:module')
 const { EventEmitter } = require('node:events')
@@ -107,14 +108,23 @@ test('main.js does not run electron-updater on macOS (no zip, unsigned: it canno
 })
 
 // Runs the real main.js against a stand-in for electron (and for child_process and http, so no
-// daemon or window is started), to check how it wires the daemon's port to the window's.
-// healthz 'ok': /healthz answers at once, so main.js opens its window; 'held': it answers only on
-// answerHealthz(). Dialogs are recorded and answered by the test.
-function loadMain ({ healthz = 'ok' } = {}) {
+// daemon or window is started), to check how it wires the daemon's port to the window's, and what
+// closing, reopening and quitting do. healthz 'ok': /healthz answers at once, so main.js opens its
+// window; 'held': it answers only on answerHealthz(). Dialogs are recorded and answered by the test.
+// main.js reads process.platform when it is called: run a test under another one with withPlatform.
+// userData: the folder app.getPath('userData') names (the tray notice's file goes there); by default
+// a fresh one, removed after the tests.
+const userDataDirs = []
+test.after(() => { for (const dir of userDataDirs) rmSync(dir, { recursive: true, force: true }) })
+
+function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
   const spawned = []
   const dialogs = []
   const heldHealthz = []
   const windows = []
+  const trays = []
+  const notifications = []
+  const iconPaths = []
   const appHandlers = {}
   let quits = 0
   let windowUrl = ''
@@ -124,34 +134,82 @@ function loadMain ({ healthz = 'ok' } = {}) {
       this.webContents = { setWindowOpenHandler () {}, on () {}, openDevTools () {}, getURL: () => windowUrl }
       this.url = ''
       this.destroyed = false
+      this.visible = true
+      this.minimized = false
+      this.focused = 0
+      this.handlers = {}
       windows.push(this)
     }
 
     loadURL (url) { windowUrl = url; this.url = url }
     isDestroyed () { return this.destroyed }
+    on (event, handler) { this.handlers[event] = handler }
+    hide () { this.visible = false }
+    show () { this.visible = true }
+    focus () { this.focused += 1 }
+    isMinimized () { return this.minimized }
+    restore () { this.minimized = false }
+    // What Electron does on the title bar's X, Alt+F4 or a quit: emit 'close', and destroy the
+    // window unless a handler prevented it. 'hidden' or 'closed'.
+    close () {
+      let prevented = false
+      if (this.handlers.close) this.handlers.close({ preventDefault () { prevented = true } })
+      if (!prevented) this.destroyed = true
+      return prevented ? 'hidden' : 'closed'
+    }
+
     static getAllWindows () { return windows.filter((w) => !w.destroyed) }
   }
+  class FakeTray {
+    constructor (image) {
+      this.image = image
+      this.handlers = {}
+      this.balloons = []
+      trays.push(this)
+    }
+
+    setToolTip (text) { this.toolTip = text }
+    setContextMenu (menu) { this.menu = menu }
+    on (event, handler) { this.handlers[event] = handler }
+    displayBalloon (options) { this.balloons.push(options) }
+    // The tray menu item labelled `label`, clicked.
+    clickItem (label) { this.menu.find((item) => item.label === label).click() }
+  }
+  class FakeNotification {
+    constructor (options) { this.options = options }
+    show () { notifications.push(this.options) }
+    static isSupported () { return true }
+  }
+  const fakeImage = () => ({ isEmpty: () => false, resize: () => fakeImage(), addRepresentation () {}, toPNG: () => Buffer.alloc(0) })
   const electron = {
     app: {
       isPackaged: false,
+      getPath: (name) => (name === 'userData' ? userData : ''),
       on (event, handler) { appHandlers[event] = handler },
       quit () { quits += 1 },
       requestSingleInstanceLock: () => true,
       whenReady: () => ({ then (f) { ready = f } }),
     },
     BrowserWindow: FakeWindow,
+    Menu: { buildFromTemplate: (template) => template },
+    Notification: FakeNotification,
+    Tray: FakeTray,
     dialog: {
       showMessageBox (options) {
         return new Promise((resolve) => dialogs.push({ options, answer: () => resolve({ response: 0 }) }))
       },
     },
+    nativeImage: { createFromPath: (path) => { iconPaths.push(path); return fakeImage() } },
     session: { defaultSession: { setPermissionRequestHandler () {}, setPermissionCheckHandler () {} } },
     shell: { openExternal () {} },
   }
   const childProcess = {
     spawn (_node, args) {
       const child = new EventEmitter()
-      Object.assign(child, { stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, kill () {} })
+      const signals = []
+      Object.assign(child, {
+        stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, signals, kill (signal) { signals.push(signal) },
+      })
       spawned.push({ args, child })
       return child
     },
@@ -186,8 +244,28 @@ function loadMain ({ healthz = 'ok' } = {}) {
     answerHealthz: () => heldHealthz.splice(0).forEach((answer) => answer()),
     emit: (event, ...args) => appHandlers[event](...args),
     windows: () => FakeWindow.getAllWindows(),
+    allWindows: () => windows,
+    trays: () => trays,
+    notifications,
+    iconPaths,
     windowUrl: () => windowUrl,
     setWindowUrl: (url) => { windowUrl = url },
+  }
+}
+
+function scratchUserData () {
+  const dir = mkdtempSync(join(tmpdir(), 'tllm-user-data-'))
+  userDataDirs.push(dir)
+  return dir
+}
+
+async function withPlatform (platform, fn) {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')
+  Object.defineProperty(process, 'platform', { ...descriptor, value: platform })
+  try {
+    return await fn()
+  } finally {
+    Object.defineProperty(process, 'platform', descriptor)
   }
 }
 
@@ -348,3 +426,132 @@ test('main.js: the Dock icon clicked while the daemon starts opens no window; th
   assert.equal(main.windows().length, 1)
   assert.equal(main.windows()[0].url, 'http://127.0.0.1:6996')
 })
+
+// Closing the window on Windows and Linux quit the app (window-all-closed → app.quit()), and the
+// quit stopped the daemon (before-quit → supervisor.stop()): every reply, Code run, download,
+// build, auto-tune and routine ended with the window. The daemon is a server; the window only its
+// frontend.
+for (const platform of ['win32', 'linux']) {
+  test(`main.js: on ${platform} closing the window hides it to the tray; the app and the daemon keep running`, () => withPlatform(platform, async () => {
+    const main = loadMain()
+    main.ready()
+    await turns()
+    const daemon = main.spawned[0].child
+    const [win] = main.windows()
+    assert.equal(main.trays().length, 1, 'the tray icon is there from launch')
+    const [tray] = main.trays()
+    assert.deepEqual(main.iconPaths, [join(__dirname, 'build', 'icon.png')])
+    assert.ok(existsSync(main.iconPaths[0]), 'the dev run loads the icon from wrapper/build')
+
+    assert.equal(win.close(), 'hidden', 'the close is cancelled')
+    assert.equal(win.visible, false)
+    main.emit('window-all-closed') // were the window destroyed some other way: still no quit
+    assert.equal(main.quits(), 0, 'the app keeps running')
+    assert.deepEqual(daemon.signals, [], 'the daemon is not stopped')
+
+    tray.clickItem('Open TurboLLM')
+    assert.equal(win.visible, true, 'the tray menu shows the same window again')
+    win.close()
+    tray.handlers.click()
+    assert.equal(win.visible, true, 'and so does a click on the icon')
+    win.close()
+    win.minimized = true
+    main.emit('second-instance')
+    assert.equal(win.visible, true, 'and so does launching the app again')
+    assert.equal(win.minimized, false, 'a minimized window is restored')
+    assert.equal(win.focused, 3, 'each one focuses it')
+    assert.equal(main.allWindows().length, 1, 'never a second window')
+  }))
+}
+
+// A quit closes the windows, and a close that hides the window instead cancels the quit, so Quit
+// would only hide the window and leave the daemon running. Nor may anything open a window while
+// the quit closes them.
+test('main.js: Quit in the tray stops the daemon, and nothing re-hides or reopens a window during the quit', () => withPlatform('win32', async () => {
+  const main = loadMain()
+  main.ready()
+  await turns()
+  const daemon = main.spawned[0].child
+  const [win] = main.windows()
+  const [tray] = main.trays()
+  assert.deepEqual(tray.menu.map((item) => item.label || item.type), ['Open TurboLLM', 'separator', 'Quit TurboLLM'])
+
+  tray.clickItem('Quit TurboLLM')
+  assert.equal(main.quits(), 1)
+  main.emit('before-quit') // what Electron's app.quit() emits first, before it closes the windows
+  assert.deepEqual(daemon.signals, ['SIGTERM'], 'the daemon is stopped as before')
+  assert.equal(win.close(), 'closed', 'the window closes, so the quit goes on')
+  assert.deepEqual(tray.balloons, [], 'no "still running" notice for a quit')
+
+  tray.clickItem('Open TurboLLM')
+  tray.handlers.click()
+  main.emit('second-instance')
+  assert.equal(main.allWindows().length, 1, 'no window opens during the quit')
+  assert.deepEqual(main.windows(), [])
+}))
+
+test('main.js: a quit while the daemon starts opens no window when it answers', () => withPlatform('linux', async () => {
+  const main = loadMain({ healthz: 'held' })
+  main.ready()
+  main.emit('before-quit')
+  main.answerHealthz()
+  await turns()
+  assert.deepEqual(main.allWindows(), [])
+}))
+
+test('main.js: the first close to the tray shows one notice, remembered in userData across launches', async () => {
+  const userData = scratchUserData()
+  await withPlatform('win32', async () => {
+    const main = loadMain({ userData })
+    main.ready()
+    await turns()
+    const [win] = main.windows()
+    const [tray] = main.trays()
+    win.close()
+    main.emit('second-instance')
+    win.close()
+    assert.deepEqual(tray.balloons, [{ title: 'TurboLLM', content: 'TurboLLM is still running. Quit it from the tray icon.' }])
+    assert.deepEqual(JSON.parse(readFileSync(join(userData, 'tray-notice.json'), 'utf8')), { shown: true })
+  })
+  await withPlatform('linux', async () => {
+    const main = loadMain({ userData }) // the next launch: the notice was shown already
+    main.ready()
+    await turns()
+    main.windows()[0].close()
+    assert.deepEqual(main.notifications, [])
+  })
+  rmSync(join(userData, 'tray-notice.json'))
+  await withPlatform('linux', async () => {
+    const main = loadMain({ userData })
+    main.ready()
+    await turns()
+    main.windows()[0].close()
+    main.windows()[0].close()
+    assert.deepEqual(main.notifications, [{ title: 'TurboLLM', body: 'TurboLLM is still running. Quit it from the tray icon.' }],
+      'on Linux a desktop notification, once')
+  })
+})
+
+// macOS keeps its Dock: no tray icon, a close closes the window and the app stays. A second launch
+// that starts a second process (from a terminal, or open -n) then returned without opening anything
+// (second-instance only showed a window that still existed); one from the Finder or the Dock reuses
+// the running app (activate) and already opened one.
+test('main.js: on macOS a close keeps the app in the Dock, and a second launch or the Dock opens a new window', () => withPlatform('darwin', async () => {
+  const main = loadMain()
+  main.ready()
+  await turns()
+  assert.deepEqual(main.trays(), [], 'no tray icon on macOS')
+  const daemon = main.spawned[0].child
+  assert.equal(main.windows()[0].close(), 'closed')
+  main.emit('window-all-closed')
+  assert.equal(main.quits(), 0)
+  assert.deepEqual(daemon.signals, [])
+  assert.deepEqual(main.notifications, [])
+
+  main.emit('second-instance')
+  assert.equal(main.windows().length, 1, 'a second launch opens a window again')
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:6996')
+  main.emit('activate')
+  main.emit('second-instance')
+  assert.equal(main.windows().length, 1, 'the open window is shown, not duplicated')
+}))

@@ -1,13 +1,19 @@
 // main.js — TurboLLM Desktop native wrapper
 // Spawns the TurboLLM daemon (bundled under resources/daemon/), waits for /healthz,
-// then opens a native window pointed at http://localhost:6996.
-const { app, BrowserWindow, dialog, session, shell } = require('electron')
+// then opens a native window pointed at http://localhost:6996. Closing the window leaves
+// the app and its daemon running (a tray icon on Windows and Linux, the Dock on macOS);
+// only quitting the app stops the daemon (window-lifecycle.js).
+const { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, session, shell } = require('electron')
 const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
 const { createDaemonSupervisor, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
+const {
+  TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction, quitsWhenAllClosed,
+  trayMenuTemplate, usesTray,
+} = require('./window-lifecycle')
 
 const PORT = process.env.TURBOLLM_PORT || 6996
 const APP_ORIGIN = appOriginFor(PORT)
@@ -92,7 +98,10 @@ function setupAutoUpdate () {
   // Download in the background, install when the user quits anyway (spec 29 D5: desktop
   // defaults to auto-download / notify-to-install). Deliberately NOT autoInstallOnAppQuit
   // = false + a modal: interrupting someone mid-session to ask about an update is the
-  // behaviour that trains people to dismiss update prompts forever.
+  // behaviour that trains people to dismiss update prompts forever. "Quits" is an explicit
+  // Quit (tray, menu) or one of the app's own: closing the window only hides it to the tray
+  // (window-lifecycle.js), and a Windows logoff or shutdown emits no 'quit', so an update
+  // downloaded meanwhile waits for the next Quit.
   autoUpdater.autoDownload = true
   autoUpdater.autoInstallOnAppQuit = true
   // Unsigned builds (D6): electron-updater on Windows otherwise refuses to apply an update
@@ -247,20 +256,109 @@ function guardWindow (win) {
 
 // ── App lifecycle ─────────────────────────────────────────────────────────────
 let mainWindow = null
+// Set once the daemon first answered /healthz: from then on a request to open the window opens one
+// (window-lifecycle.js openAction).
+let daemonReady = false
+// Set in before-quit: from then on a close lets the window close, so the quit goes on, and nothing
+// reopens a window (window-lifecycle.js closeAction, openAction).
+let quitting = false
+// Windows and Linux. Kept referenced for the app's lifetime: a Tray that is garbage-collected takes
+// its icon with it.
+let tray = null
+let trayNotice = null
+
+// The one place a window is opened or brought back: the tray's Open, a click on the tray icon, a
+// second launch, a Dock click and the startup window once the daemon answers.
+function openMainWindow () {
+  const hasWindow = mainWindow !== null && !mainWindow.isDestroyed()
+  const action = openAction({ quitting, refused: daemonRefused, daemonReady, hasWindow })
+  if (action === 'show') {
+    if (mainWindow.isMinimized()) mainWindow.restore()
+    mainWindow.show()
+    mainWindow.focus()
+    return
+  }
+  if (action !== 'create') return
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 800,
+    minHeight: 600,
+    title: 'TurboLLM',
+    backgroundColor: '#0a0a0a',
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+  })
+  guardWindow(mainWindow)
+  const win = mainWindow
+  // Windows and Linux: a close hides the window into the tray and the daemon keeps running; Quit is
+  // what stops it. During a quit the close goes through (see window-lifecycle.js closeAction).
+  win.on('close', (event) => {
+    if (closeAction({ platform: process.platform, quitting, hasTray: tray !== null }) !== 'hide') return
+    event.preventDefault()
+    win.hide()
+    showTrayNoticeOnce()
+  })
+
+  mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
+
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.webContents.openDevTools()
+  }
+}
+
+// The app's icon at tray size: 16 px with a 32 px rendering for 200% displays on Windows, 32 px on
+// Linux, whose panels scale it to their own size. See window-lifecycle.js TRAY_ICON for the file.
+function trayImage () {
+  const iconPath = app.isPackaged ? join(process.resourcesPath, TRAY_ICON.packaged) : join(__dirname, TRAY_ICON.source)
+  const source = nativeImage.createFromPath(iconPath)
+  if (source.isEmpty()) return source
+  if (process.platform !== 'win32') return source.resize({ width: 32, height: 32, quality: 'best' })
+  const image = source.resize({ width: 16, height: 16, quality: 'best' })
+  image.addRepresentation({ scaleFactor: 2, buffer: source.resize({ width: 32, height: 32, quality: 'best' }).toPNG() })
+  return image
+}
+
+// Windows and Linux. A tray that cannot be created leaves tray null, and closing the window then quits
+// the app as before (window-lifecycle.js closeAction): a hidden window with no icon to bring it back
+// would only be reachable by launching the app again.
+function createTray () {
+  try {
+    tray = new Tray(trayImage())
+    tray.setToolTip('TurboLLM')
+    tray.setContextMenu(Menu.buildFromTemplate(trayMenuTemplate({ open: () => openMainWindow(), quit: () => app.quit() })))
+    tray.on('click', () => openMainWindow())
+  } catch (err) {
+    console.error('Could not create the tray icon; closing the window quits TurboLLM:', err.message)
+    tray = null
+  }
+}
+
+// The first time the window goes to the tray, say once that the app is still running and where Quit
+// is: until now closing the window was how the app was quit. A tray balloon on Windows (it needs no
+// Start-menu shortcut registered for the app, as an Electron Notification there does), a desktop
+// notification on Linux.
+function showTrayNoticeOnce () {
+  try {
+    if (!trayNotice) trayNotice = createTrayNotice(join(app.getPath('userData'), TRAY_NOTICE_FILE))
+    if (!trayNotice.take()) return
+    if (process.platform === 'win32') tray.displayBalloon({ title: TRAY_NOTICE.title, content: TRAY_NOTICE.body })
+    else if (Notification.isSupported()) new Notification({ title: TRAY_NOTICE.title, body: TRAY_NOTICE.body }).show()
+  } catch (err) {
+    console.error('Could not show the tray notice:', err.message)
+  }
+}
 
 // One app at a time. A second launch (a double-click while the first window still waits on
 // /healthz) would start a second daemon on the same data dir, which fails to bind and exits, taking
-// the second window with it. The running app gets the focus instead.
+// the second window with it. The running app shows its window instead, also from the tray or after
+// the window was closed on macOS.
 const isPrimaryInstance = app.requestSingleInstanceLock()
 if (!isPrimaryInstance) app.quit()
 
-app.on('second-instance', () => {
-  // No window yet: the daemon is still starting, and the window appears on its own once it answers.
-  if (!mainWindow || mainWindow.isDestroyed()) return
-  if (mainWindow.isMinimized()) mainWindow.restore()
-  mainWindow.show()
-  mainWindow.focus()
-})
+app.on('second-instance', () => openMainWindow())
 
 app.whenReady().then(() => {
   // Quitting already (see requestSingleInstanceLock above): start no daemon and open no window.
@@ -285,56 +383,41 @@ app.whenReady().then(() => {
 
   setupAutoUpdate()
 
+  // From launch, so Quit is in reach while the daemon starts too.
+  if (usesTray(process.platform)) createTray()
+
   waitForDaemon().then(() => {
     // Refused (onDaemonLost): whatever answers on the port is not this app's daemon.
     if (daemonRefused) return
-    mainWindow = new BrowserWindow({
-      width: 1200,
-      height: 800,
-      minWidth: 800,
-      minHeight: 600,
-      title: 'TurboLLM',
-      backgroundColor: '#0a0a0a',
-      webPreferences: {
-        nodeIntegration: false,
-        contextIsolation: true,
-      },
-    })
-    guardWindow(mainWindow)
-
-    mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
-
-    if (process.env.NODE_ENV === 'development') {
-      mainWindow.webContents.openDevTools()
-    }
+    daemonReady = true
+    openMainWindow()
   }).catch((err) => {
     if (daemonRefused) return // the dialog quits the app once it is answered
     console.error('Daemon failed to start:', err.message)
     app.quit()
   })
 
-  // macOS: double-click dock icon
-  app.on('activate', () => {
-    // No window yet: the daemon is still starting, and the window appears on its own once it answers (as for a
-    // second launch). One opened here loaded the port before anything listened on it, showing a connection error,
-    // and the startup window then opened beside it. Refused (onDaemonLost): no window opens at all.
-    if (!mainWindow || daemonRefused) return
-    if (BrowserWindow.getAllWindows().length === 0) {
-      mainWindow = new BrowserWindow({
-        width: 1200, height: 800, minWidth: 800, minHeight: 600,
-        title: 'TurboLLM', backgroundColor: '#0a0a0a',
-        webPreferences: { nodeIntegration: false, contextIsolation: true },
-      })
-      guardWindow(mainWindow)
-      mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
-    }
-  })
+  // macOS: a Dock click. Opens no window while the daemon starts (window-lifecycle.js openAction).
+  app.on('activate', () => openMainWindow())
 
+  // Closing the window no longer quits the app: the tray (Windows, Linux) or the Dock (macOS) keeps
+  // it, and its daemon, running until it is quit. Without this listener Electron quits here on its own.
   app.on('window-all-closed', () => {
-    if (process.platform !== 'darwin') app.quit()
+    if (quitsWhenAllClosed({ platform: process.platform, hasTray: tray !== null })) app.quit()
   })
 
+  // Every quit comes through here: the tray's Quit, the app menu's Quit (File > Exit on Windows),
+  // Cmd+Q / Ctrl+Q, a logoff or shutdown on macOS, a shutdown on Linux (systemd's SIGTERM, which
+  // Electron's shutdown-signal handler turns into a quit), and the app's own quits (a daemon lost, a
+  // refusal dialog answered). It is what stops the daemon. Electron emits it before it closes the
+  // windows, so the flag is set before any close. A Linux logoff comes here only where the desktop,
+  // or logind with KillUserProcesses, sends the session's processes SIGTERM (or SIGHUP, which that
+  // handler takes the same way): a session that only drops its display connection ends Electron
+  // without before-quit, so the daemon is not stopped here, as before the tray. A Windows logoff or
+  // shutdown emits no before-quit either: the system ends the app and its daemon with the session,
+  // as it did before the tray.
   app.on('before-quit', () => {
+    quitting = true
     supervisor?.stop()
   })
 })
