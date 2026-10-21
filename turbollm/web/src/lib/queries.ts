@@ -86,6 +86,7 @@ import {
   listDownloads,
   listEngines,
   loadModel,
+  pauseDownload,
   removeDownload,
   resumeDownload,
   removeEngine,
@@ -1135,6 +1136,9 @@ export function useDownloadMutations() {
     cancel: useMutation({ mutationFn: (id: string) => cancelDownload(id), onSuccess: invalidate }),
     remove: useMutation({ mutationFn: (id: string) => removeDownload(id), onSuccess: invalidate }),
     resume: useMutation({ mutationFn: (id: string) => resumeDownload(id), onSuccess: invalidate }),
+    // Refreshed either way: a refused Pause (the row finished, or another client paused it first)
+    // is answered by showing the row as it now is.
+    pause: useMutation({ mutationFn: (id: string) => pauseDownload(id), onSettled: invalidate }),
   }
 }
 

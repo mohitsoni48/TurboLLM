@@ -7,15 +7,15 @@
 // The remote half is deliberately NARROWER than the local one, and that asymmetry is the
 // point rather than an omission:
 //   · Cancel exists on both, gated by `actionState('downloads:write', …)`.
-//   · Resume and Remove are LOCAL ONLY. `resumeDownload`/`removeDownload` are local routes
-//     with no façade verb behind them, so a remote Resume button could only ever be a
-//     silent no-op or a 404 — exactly the "looks wired and is not" failure this feature has
-//     already shipped once.
+//   · Pause, Resume and Remove are LOCAL ONLY. `pauseDownload`/`resumeDownload`/
+//     `removeDownload` are local routes with no façade verb behind them, so a remote Pause or
+//     Resume button could only ever be a silent no-op or a 404 — exactly the "looks wired and
+//     is not" failure this feature has already shipped once.
 // Every disabled control carries the reason from `actionState`; every refusal that comes
 // back from the host renders inline through `describeRemoteFailure`, never as a toast.
 
-import { useState } from 'react'
-import { CheckCircle2, Download, RotateCw, X } from 'lucide-react'
+import { Fragment, useState } from 'react'
+import { CheckCircle2, Download, Pause, RotateCw, X } from 'lucide-react'
 import { useDownloads, useDownloadMutations } from '../../lib/queries'
 import { useLinks, useRemoteDownloads, useRemoteDownloadActions } from '../../lib/link-queries'
 import { mergeFleet, fleetMachines, type FleetMachine, type FleetOrigin, type FleetRow } from '../../lib/fleet'
@@ -29,8 +29,22 @@ import { actionState } from '../../lib/capability-ui'
 import { describeRemoteFailure, type RemoteFailure } from '../../lib/remote-failure'
 import type { LinkSummary } from '../../lib/link-api'
 import { Button } from '../../components/ui/button'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '../../components/ui/alert-dialog'
 import { FleetAction, FleetFailure, MachineNotes, OriginBadge } from '../../components/fleet'
 import { track } from '../../lib/api'
+
+/** A Cancel that would delete more than this much already downloaded asks first: on a phone a
+ *  partial is often gigabytes of metered data, and Pause now keeps it instead. */
+const CONFIRM_CANCEL_BYTES = 50e6
 
 export function DownloadsPanel() {
   const dlQ = useDownloads()
@@ -51,11 +65,16 @@ export function DownloadsPanel() {
   const [failures, setFailures] = useState<Record<string, RemoteFailure>>({})
   /** A local Resume the daemon refused (another row is writing the same file), by download id. */
   const [resumeErrors, setResumeErrors] = useState<Record<string, string>>({})
+  // Each call's own promise, not mutate()'s per-call callbacks: those run for the LAST call only
+  // (one observer, whose next mutate() replaces them), so with Resume all firing one per row, a
+  // refusal of any row but the last was never shown on it.
   const onResume = (id: string) =>
-    mut.resume.mutate(id, {
-      onError: (e) => setResumeErrors((m) => ({ ...m, [id]: e instanceof Error ? e.message : String(e) })),
-      onSuccess: () => setResumeErrors((m) => { const n = { ...m }; delete n[id]; return n }),
-    })
+    mut.resume.mutateAsync(id).then(
+      () => setResumeErrors((m) => { const n = { ...m }; delete n[id]; return n }),
+      (e: unknown) => setResumeErrors((m) => ({ ...m, [id]: e instanceof Error ? e.message : String(e) })),
+    )
+  /** The Cancel (one row's, or Cancel all's rows) waiting on "Delete the downloaded part?". */
+  const [pendingCancel, setPendingCancel] = useState<FleetRow<FleetDownload>[] | null>(null)
 
   const local = dlQ.data?.downloads ?? []
   const sources = sourcesByLink(links, remote.rows, (r) => r.linkId).map((s) => ({
@@ -98,7 +117,9 @@ export function DownloadsPanel() {
     d.status === 'downloading' || d.status === 'queued' || d.status === 'paused' ? 0
       : d.status === 'error' ? 1 : 2
   const ordered = [...rows].sort((a, b) => rank(a.row) - rank(b.row))
-  const activeCount = rows.filter((r) => rank(r.row) === 0).length
+  // A paused row is not active: nothing is moving, and it waits for a Resume.
+  const activeCount = rows.filter((r) => r.row.status === 'downloading' || r.row.status === 'queued').length
+  const pausedCount = rows.filter((r) => r.row.status === 'paused').length
 
   const linkFor = (origin: FleetOrigin): LinkSummary | undefined =>
     origin.kind === 'remote' ? links.find((l) => l.id === origin.linkId) : undefined
@@ -116,6 +137,12 @@ export function DownloadsPanel() {
       : remoteActions.cancel.isPending &&
         remoteActions.cancel.variables?.linkId === r.origin.linkId &&
         remoteActions.cancel.variables?.downloadId === r.row.id
+
+  /** Cancel `targets`, first asking when they hold more than CONFIRM_CANCEL_BYTES between them. */
+  const askCancel = (targets: FleetRow<FleetDownload>[]) => {
+    if (targets.reduce((n, r) => n + r.row.received, 0) > CONFIRM_CANCEL_BYTES) setPendingCancel(targets)
+    else targets.forEach((r) => onCancel(r))
+  }
 
   const onCancel = (row: FleetRow<FleetDownload>) => {
     const { origin, row: d } = row
@@ -143,15 +170,37 @@ export function DownloadsPanel() {
   // cancellable here if its OWN `actionState` says so — a remote row without
   // `downloads:write` is silently skipped rather than firing a request that just
   // becomes another inline failure, the same gate `FleetAction` applies per-row.
-  const cancellableRows = ordered.filter((r) => rank(r.row) === 0 && actionState('downloads:write', r.origin, linkFor(r.origin)).enabled)
+  // A paused row is left out: pausing is how a download is kept for later, so "Cancel all"
+  // (stop what is downloading) must not delete it with the rest. Its own Cancel still can.
+  const cancellableRows = ordered.filter((r) =>
+    (r.row.status === 'downloading' || r.row.status === 'queued') &&
+    actionState('downloads:write', r.origin, linkFor(r.origin)).enabled)
+  // Pause and Resume are local only (see the module note), as their per-row buttons are.
+  const pausableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'downloading' || r.row.status === 'queued'))
+  const resumableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'paused' || r.row.status === 'error'))
   // Dismiss is local-only housekeeping (see the per-row note below), so "all" means
   // all of THIS machine's terminal rows, not the fleet's.
   const dismissableRows = ordered.filter((r) => r.origin.kind === 'local' && (r.row.status === 'done' || r.row.status === 'error' || r.row.status === 'cancelled'))
 
   const onCancelAll = () => {
     track('models', 'cancel_all_downloads')
-    cancellableRows.forEach((r) => onCancel(r))
+    askCancel(cancellableRows)
   }
+  const onPauseAll = async () => {
+    track('models', 'pause_all_downloads')
+    // The queued rows first, and the running ones once those pauses have settled: a running row's pause frees its slot,
+    // and the daemon then starts the next queued row at once, so paused in list order every queued row was started (its
+    // request sent) a moment before its own pause arrived.
+    const queued = pausableRows.filter((r) => r.row.status === 'queued')
+    const running = pausableRows.filter((r) => r.row.status !== 'queued')
+    await Promise.allSettled(queued.map((r) => mut.pause.mutateAsync(r.row.id)))
+    running.forEach((r) => mut.pause.mutate(r.row.id))
+  }
+  const onResumeAll = () => {
+    track('models', 'resume_all_downloads')
+    resumableRows.forEach((r) => onResume(r.row.id))
+  }
+  const pendingBytes = pendingCancel?.reduce((n, r) => n + r.row.received, 0) ?? 0
   const onDismissAll = () => {
     track('models', 'dismiss_all_downloads')
     dismissableRows.forEach((r) => mut.remove.mutate(r.row.id))
@@ -159,11 +208,31 @@ export function DownloadsPanel() {
 
   return (
     <div className="mb-5 rounded-lg border border-border bg-panel-2 p-4">
-      <div className="mb-3 flex items-center gap-2 text-[13px] font-medium text-ink">
+      {/* Wraps at phone width: the bulk actions drop below the title instead of squeezing it. */}
+      <div className="mb-3 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px] font-medium text-ink">
         <Download size={14} className="text-muted" />
         Downloads
         {activeCount > 0 && <span className="text-[12px] font-normal text-muted">· {activeCount} active</span>}
-        <div className="ml-auto flex items-center gap-3">
+        {pausedCount > 0 && <span className="text-[12px] font-normal text-muted">· {pausedCount} paused</span>}
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
+          {pausableRows.length > 0 && (
+            <button
+              type="button"
+              onClick={onPauseAll}
+              className="text-[12px] font-medium text-accent hover:underline"
+            >
+              Pause all
+            </button>
+          )}
+          {resumableRows.length > 0 && (
+            <button
+              type="button"
+              onClick={onResumeAll}
+              className="text-[12px] font-medium text-accent hover:underline"
+            >
+              Resume all
+            </button>
+          )}
           {cancellableRows.length > 0 && (
             <button
               type="button"
@@ -203,15 +272,42 @@ export function DownloadsPanel() {
             link={linkFor(r.origin)}
             showOrigin={links.length > 0}
             failure={failures[rowKey(r.origin, r.row.id)]}
-            onCancel={() => onCancel(r)}
+            onCancel={() => askCancel([r])}
+            onRetryCancel={() => onCancel(r)}
             onRemove={() => mut.remove.mutate(r.row.id)}
             onResume={() => onResume(r.row.id)}
+            onPause={() => mut.pause.mutate(r.row.id)}
             resumeError={r.origin.kind === 'local' ? resumeErrors[r.row.id] : undefined}
             cancelling={isCancelling(r)}
             resuming={mut.resume.isPending}
+            pausing={mut.pause.isPending && mut.pause.variables === r.row.id}
           />
         ))}
       </div>
+
+      <AlertDialog open={pendingCancel !== null} onOpenChange={(open) => { if (!open) setPendingCancel(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {pendingCancel && pendingCancel.length > 1 ? `Cancel ${pendingCancel.length} downloads?` : 'Cancel this download?'}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {pendingCancel?.length === 1 && <><span className="font-medium text-ink">{pendingCancel[0].row.name}</span>: the </>}
+              {pendingCancel?.length !== 1 && 'The '}
+              {fmtSize(pendingBytes)} downloaded so far will be deleted.{' '}
+              {pendingCancel?.some((r) => r.row.status !== 'paused')
+                ? `Pause keeps ${pendingCancel.length > 1 ? 'them' : 'it'}, to resume later.`
+                : `Leave ${pendingCancel && pendingCancel.length > 1 ? 'them' : 'it'} paused to resume later.`}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep it</AlertDialogCancel>
+            <AlertDialogAction onClick={() => { pendingCancel?.forEach((r) => onCancel(r)); setPendingCancel(null) }}>
+              {pendingCancel && pendingCancel.length > 1 ? 'Delete downloads' : 'Delete download'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }
@@ -222,22 +318,29 @@ function DownloadRow({
   showOrigin,
   failure,
   onCancel,
+  onRetryCancel,
   onRemove,
   onResume,
+  onPause,
   resumeError,
   cancelling,
   resuming,
+  pausing,
 }: {
   row: FleetRow<FleetDownload>
   link: LinkSummary | undefined
   showOrigin: boolean
   failure: RemoteFailure | undefined
+  /** Cancel as clicked (it may ask first); `onRetryCancel` repeats a refused one as it was. */
   onCancel: () => void
+  onRetryCancel: () => void
   onRemove: () => void
   onResume: () => void
+  onPause: () => void
   resumeError: string | undefined
   cancelling: boolean
   resuming: boolean
+  pausing: boolean
 }) {
   const { origin, row: d } = row
   const isLocal = origin.kind === 'local'
@@ -249,6 +352,8 @@ function DownloadRow({
   // paused (a restart-restored job) or errored (a network hiccup) both have a .part file on
   // disk and can continue from that byte offset via Range — LOCAL only; see the module note.
   const canResume = isLocal && (d.status === 'paused' || isError)
+  // Stops the transfer and keeps the .part for Resume — LOCAL only, like Resume.
+  const canPause = isLocal && (d.status === 'downloading' || d.status === 'queued')
 
   const cancelState = actionState('downloads:write', origin, link)
   const barColor = isError ? 'var(--err)' : isDone ? 'var(--ok)' : 'var(--accent)'
@@ -261,11 +366,28 @@ function DownloadRow({
             {isDone && <CheckCircle2 size={13} style={{ color: 'var(--ok)' }} className="shrink-0" />}
             <span data-testid="download-name" className="truncate text-[13px] font-medium text-ink">{d.name}</span>
           </div>
-          <div className="mt-0.5 flex items-center gap-2 truncate text-[11px] text-muted">
+          {/* Wraps rather than truncates: at phone width a long status (an error message, a
+              size in GB with a speed) cut off its end, and the row's buttons below are
+              icon-only there for the same reason. */}
+          <div className="mt-0.5 flex min-w-0 flex-wrap items-center gap-x-2 text-[11px] text-muted">
             {showOrigin && <OriginBadge origin={origin} />}
             <StatusLine d={d} pct={pct} />
           </div>
         </div>
+
+        {canPause && (
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => { track('models', 'pause_download'); onPause() }}
+            disabled={pausing}
+            title="Stop for now and keep what is downloaded, to resume later"
+            aria-label="Pause"
+          >
+            <Pause size={13} />
+            <ActionLabel>Pause</ActionLabel>
+          </Button>
+        )}
 
         {canResume && (
           <Button
@@ -274,15 +396,17 @@ function DownloadRow({
             onClick={() => { track('models', 'resume_download'); onResume() }}
             disabled={resuming}
             title="Resume from where it left off"
+            aria-label="Resume"
           >
             <RotateCw size={13} />
-            Resume
+            <ActionLabel>Resume</ActionLabel>
           </Button>
         )}
 
         {inFlight && (
-          <FleetAction state={cancelState} onClick={onCancel} busy={cancelling} variant="outline">
-            Cancel
+          <FleetAction state={cancelState} onClick={onCancel} busy={cancelling} variant="outline" label="Cancel">
+            <X size={13} />
+            <ActionLabel>Cancel</ActionLabel>
           </FleetAction>
         )}
 
@@ -295,9 +419,10 @@ function DownloadRow({
             size="sm"
             variant="outline"
             onClick={() => { track('models', 'remove_download'); onRemove() }}
+            aria-label="Dismiss"
           >
             <X size={13} />
-            Dismiss
+            <ActionLabel>Dismiss</ActionLabel>
           </Button>
         )}
       </div>
@@ -312,7 +437,7 @@ function DownloadRow({
       )}
 
       {/* A refusal from the host, inline on the row that caused it. */}
-      {failure && <FleetFailure failure={failure} onRetry={onCancel} />}
+      {failure && <FleetFailure failure={failure} onRetry={onRetryCancel} />}
       {/* A refused local Resume, e.g. "Another download is already writing this file." */}
       {canResume && resumeError && (
         <div role="alert" className="mt-1.5 text-[11px]" style={{ color: 'var(--err)' }}>{resumeError}</div>
@@ -321,21 +446,42 @@ function DownloadRow({
   )
 }
 
+/** A row action's visible label: beside its icon from the `sm` width up, hidden below it (the
+ *  button keeps its name through aria-label). At phone width two labelled buttons left the
+ *  status line about 140 px: a running row read "45% · 109 MB of 240 MB ·", without its speed,
+ *  and a paused one "Paused · 71 MB of 2". */
+function ActionLabel({ children }: { children: string }) {
+  return <span className="hidden sm:inline">{children}</span>
+}
+
 /** The detail line under the name: progress + speed while active, the completion
- *  confirmation when done, the error text on failure. */
+ *  confirmation when done, the error text on failure. Its parts wrap as wholes, so a line
+ *  too long for the row breaks between "45%", "· 109 MB of 240 MB" and "· 2.4 MB/s", not
+ *  inside one. */
 function StatusLine({ d, pct }: { d: FleetDownload; pct: number }) {
   if (d.status === 'done') return <span style={{ color: 'var(--ok)' }}>✓ added to library</span>
   // For a remote row this is `REMOTE_DOWNLOAD_ERROR`, a fixed string — the host's own
   // message never crosses, because for an fs failure it is a full absolute path.
-  if (d.status === 'error') return <span style={{ color: 'var(--err)' }}>{d.error ?? 'Download failed'}</span>
+  if (d.status === 'error') {
+    return <span className="min-w-0 [overflow-wrap:anywhere]" style={{ color: 'var(--err)' }}>{d.error ?? 'Download failed'}</span>
+  }
   if (d.status === 'cancelled') return <>Cancelled</>
-  if (d.status === 'paused') return <>Paused · {fmtSize(d.received)} of {d.total > 0 ? fmtSize(d.total) : '?'}</>
+  const of = `${fmtSize(d.received)} of ${d.total > 0 ? fmtSize(d.total) : '?'}`
+  if (d.status === 'paused') return <StatusParts parts={['Paused', `· ${of}`]} />
   if (d.status === 'queued') return <>Queued…</>
+  return <StatusParts parts={[`${pct}%`, `· ${of}`, ...(d.bytesPerSec > 0 ? [`· ${fmtSpeed(d.bytesPerSec)}`] : [])]} />
+}
+
+function StatusParts({ parts }: { parts: string[] }) {
   return (
-    <>
-      {pct}% · {fmtSize(d.received)} of {d.total > 0 ? fmtSize(d.total) : '?'}
-      {d.bytesPerSec > 0 ? ` · ${fmtSpeed(d.bytesPerSec)}` : ''}
-    </>
+    <span>
+      {parts.map((p, i) => (
+        <Fragment key={i}>
+          {i > 0 && ' '}
+          <span className="whitespace-nowrap">{p}</span>
+        </Fragment>
+      ))}
+    </span>
   )
 }
 

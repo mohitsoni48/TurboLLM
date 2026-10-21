@@ -3787,6 +3787,16 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true })
   })
 
+  // Stop a download but keep its partial file, for /resume to continue. Held to what cancel and
+  // resume are (requiredCapability maps every /api/v1/downloads write to downloads:write). A row
+  // that is neither downloading nor queued answers as resume answers a row it cannot resume.
+  app.post('/api/v1/downloads/:id/pause', (c) => {
+    if (!d.downloads.pause(c.req.param('id'))) {
+      return err(c, 404, 'no_such_download', 'No downloading or queued download with that id.')
+    }
+    return c.json({ ok: true })
+  })
+
   app.post('/api/v1/downloads/:id/resume', (c) => {
     let ok: boolean
     try {

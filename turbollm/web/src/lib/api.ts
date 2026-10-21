@@ -1354,6 +1354,14 @@ export function removeDownload(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
 
+/** Stop a downloading or queued download but keep its partial file, for {@link resumeDownload}. */
+export function pauseDownload(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}/pause`, {
+    method: 'POST',
+    json: {},
+  })
+}
+
 export function resumeDownload(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}/resume`, {
     method: 'POST',

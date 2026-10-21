@@ -543,10 +543,34 @@ export class DownloadManager {
     return true
   }
 
+  /** Pause a downloading or queued job: stop its transfer but keep the .part, the validator and
+   *  the full length, so {@link resume} continues it with Range + If-Range, as it continues a
+   *  row a restart brought back paused (a paused row stays in the manifest and restore() brings
+   *  it back paused). A queued row becomes paused without starting. Until this existed the only
+   *  way to stop a download was Cancel, which deletes the .part: a phone on metered data could
+   *  only throw away the gigabytes it already had. False when there is no downloading or queued
+   *  row with that id.
+   *
+   *  The aborted run() keeps the .part open until its last write has landed and the file is
+   *  closed. Its controller stays until then (run() drops it), and pump() starts no run for a
+   *  row that still has one, so a Resume pressed at once, here or from another client, starts
+   *  the next writer only after that one has closed the file. */
+  pause(id: string): boolean {
+    const rec = this.records.get(id)
+    if (!rec || (rec.status !== 'downloading' && rec.status !== 'queued')) return false
+    // Set before the abort, so the run() it ends sees a paused row, not a cancelled one.
+    rec.status = 'paused'
+    rec.bytesPerSec = 0
+    this.controllers.get(id)?.abort()
+    this.persist()
+    this.pump() // its slot is free for the next queued row
+    return true
+  }
+
   /** Resume a paused or errored job (spec 10 §5): re-queue it so pump() picks it back
    *  up. run() already resumes from the .part file's byte offset via a Range request —
    *  this just flips the status so the queue actually starts it again. A restart-
-   *  restored job comes back as 'paused' with no automatic way back to 'downloading'
+   *  restored or paused job stays 'paused' with no automatic way back to 'downloading'
    *  until this is called. False when there is no paused or errored row with that id; throws
    *  DownloadError('download_in_progress') when the row exists but cannot start. */
   resume(id: string): boolean {
@@ -612,7 +636,10 @@ export class DownloadManager {
     if (this.activeCount() >= MAX_CONCURRENT) return
     for (const rec of this.list()) {
       if (this.activeCount() >= MAX_CONCURRENT) break
-      if (rec.status === 'queued') void this.run(rec)
+      // Not while a run of this row is still ending (paused, then resumed before its aborted
+      // stream closed the .part): two runs would append to one file. That run's own pump()
+      // starts it once it has ended.
+      if (rec.status === 'queued' && !this.controllers.has(rec.id)) void this.run(rec)
     }
   }
 
@@ -816,8 +843,9 @@ export class DownloadManager {
       // Integrity: size (spec 10 §5/§8) + sha256 when fully streamed. Either failure removes the
       // .part, so the row counts none of its bytes any more, as every other path here that removes
       // it does: left at the bytes counted, the errored row read as that much downloaded (to the
-      // Downloads panel) while nothing was on disk and its Resume started from byte 0. Not in the
-      // manifest: restore() counts the .part on disk.
+      // Downloads panel, and to its question before a large partial is discarded) while nothing
+      // was on disk and its Resume started from byte 0. Not in the manifest: restore() counts the
+      // .part on disk.
       if (rec.total > 0 && rec.received !== rec.total) {
         rmSync(part, { force: true })
         rec.received = 0
@@ -854,6 +882,19 @@ export class DownloadManager {
     } catch (e) {
       this.controllers.delete(rec.id)
       rec.bytesPerSec = 0
+      // pause() ended this run (and a Resume may have queued the row again since): the row keeps
+      // its status and its .part, and is not settled, as it has not ended. Its byte count becomes
+      // what the closed .part holds, which can be less than what was counted on the way in.
+      const now = rec.status as DownloadStatus // widened, as below
+      if (now === 'paused' || now === 'queued') {
+        try {
+          rec.received = statSync(part, { throwIfNoEntry: false })?.size ?? 0
+        } catch {
+          rec.received = 0
+        }
+        this.persist()
+        return
+      }
       // A user cancel/remove already set a terminal status (and may have dropped the
       // record) — never clobber it back to 'error'. Aborts land here too.
       const terminal: DownloadStatus[] = ['cancelled', 'done']

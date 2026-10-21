@@ -102,10 +102,15 @@ test('resume: an errored job can also be resumed (a network hiccup, not just a r
       files: [{ rfilename: 'model.gguf', size: 10, mmproj: false }],
     }))
     const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
-    // Simulate a failed attempt without waiting on the frozen fetch.
-    const asAny = dm as unknown as { records: Map<string, { status: string; error: string | null }> }
+    // Simulate a failed attempt without waiting on the frozen fetch: what run()'s catch leaves,
+    // the row errored and its run's controller gone (pump() starts no row whose run has not ended).
+    const asAny = dm as unknown as {
+      records: Map<string, { status: string; error: string | null }>
+      controllers: Map<string, AbortController>
+    }
     asAny.records.get(rec.id)!.status = 'error'
     asAny.records.get(rec.id)!.error = 'network blip'
+    asAny.controllers.delete(rec.id)
 
     const ok = dm.resume(rec.id)
     assert.equal(ok, true)
