@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
-import { abortAllInFlightChats, chatHoldsEngine, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { chatRuns } from './chat-runs.js'
 import { ConversationStore, type Message } from './db.js'
 import { activeWork } from '../api/active-work.js'
@@ -506,6 +506,70 @@ it('(i) the engine kill switches and deleting the chat stop a turn no page is wa
     await waitFor(() => callB.gone, 'deleting the chat to reach the engine')
     await waitFor(() => inFlightChatIds().length === 0, 'the deleted chat\'s turn to unwind')
   } finally {
+    h.cleanup()
+    await engine.close()
+  }
+})
+
+it('(i) a daemon stop closes the store once the replies it stopped are saved, one still in a tool call included', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url)
+  let toolStarted = false
+  // A tool call does not end at the stop: this one, like a short run_code, ends 100 ms after it started.
+  ;(h.d.tools as { executeTool: unknown }).executeTool = async () => {
+    toolStarted = true
+    await new Promise((r) => setTimeout(r, 100))
+    return '42'
+  }
+  try {
+    const conv = h.store.createConversation()
+    await sendAndLeave(h.app, conv.id, 'compute 6*7')
+    const round1 = await engine.call(1)
+    round1.word(LONG)
+    round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
+    round1.finish('tool_calls')
+    await waitFor(() => toolStarted, 'the tool call to start')
+    // As cli.ts's teardowns do: stop every reply, then close the store once the engine's shutdown (here one with
+    // nothing to stop, as for a Turbo Link chat) and the stopped turns have ended.
+    abortAllInFlightChats()
+    await Promise.all([Promise.resolve(), chatTurnsEnded()])
+    const r = reply(h.store, conv.id)
+    assert.equal(r.stats.aborted, true, 'saved as stopped before the store closes')
+    assert.equal(r.content, LONG)
+    assert.equal(engine.calls.length, 1, 'no round after the stop')
+  } finally {
+    h.cleanup()
+    await engine.close()
+  }
+})
+
+it('(i) chatTurnsEnded waits no longer than its bound for a turn held by a tool call that ignores the stop', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url)
+  let releaseTool: (() => void) | undefined
+  ;(h.d.tools as { executeTool: unknown }).executeTool = async () => {
+    await new Promise<void>((r) => { releaseTool = r })
+    return '42'
+  }
+  try {
+    const conv = h.store.createConversation()
+    await sendAndLeave(h.app, conv.id, 'compute 6*7')
+    const round1 = await engine.call(1)
+    round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
+    round1.finish('tool_calls')
+    await waitFor(() => releaseTool !== undefined, 'the tool call to start')
+    abortAllInFlightChats()
+    const started = Date.now()
+    await Promise.race([chatTurnsEnded(200), new Promise((r) => setTimeout(r, 5_000))])
+    const waited = Date.now() - started
+    assert.ok(waited >= 150 && waited < 2_000, `waited ${waited} ms`)
+    assert.equal(chatRuns.latestRun(conv.id)?.ended, false, 'the turn still runs its tool call')
+    releaseTool!()
+    await chatTurnsEnded(5_000)
+    assert.equal(chatRuns.latestRun(conv.id)?.ended, true)
+    assert.equal(reply(h.store, conv.id).stats.aborted, true)
+  } finally {
+    releaseTool?.()
     h.cleanup()
     await engine.close()
   }

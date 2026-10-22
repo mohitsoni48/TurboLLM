@@ -46,7 +46,7 @@ import { HashStore } from './models/hashes'
 import { estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
-import { chatHoldsEngine } from './chat/chat-routes'
+import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded } from './chat/chat-routes'
 import { preloadSqlJs } from './chat/store/sqlite-adapter'
 import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
@@ -1442,6 +1442,12 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   if (restarting) return
   restarting = true
   const plan = planRestartExit({ exitOnly: opts?.exitOnly === true, supervised: supervisedByDesktop })
+  // Every running chat reply is stopped first, as Stop does, so each is saved as stopped with its text while the
+  // store is still open (and starts no tool call); the store closes once they have ended, a tool call they were
+  // running included, up to 3 s (chatTurnsEnded, beside the engine's shutdown below). Left to the engine's exit, a
+  // reply ended as a finished one (`aborted: false`), cut short. A reply waiting for an approval reads "Denied by
+  // user.", as after a Stop.
+  abortAllInFlightChats()
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
   clearInterval(cliInteractiveSweepTimer)
@@ -1475,7 +1481,7 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1530,12 +1536,15 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry — only our
     // own: never another daemon's on this data dir.
     try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
+    // Every running chat reply is stopped first, as requestRestart does: saved as stopped, with its text, while the
+    // store is open, which closes once they have ended, up to 3 s (chatTurnsEnded, beside the engine's shutdown).
+    abortAllInFlightChats()
     updateScheduler.stop()
     routineScheduler.stop()
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), remote.disable()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {

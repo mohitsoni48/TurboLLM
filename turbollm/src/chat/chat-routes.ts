@@ -220,7 +220,7 @@ function stopTurn(convId: string, ac: AbortController): void {
 function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortController, meta: ChatRunMeta, body: (sink: EmitSink) => Promise<void>): ChatRun {
   const { run, sink } = chatRuns.start(convId, ac, meta)
   const release = holdTurn(c, d, () => stopTurn(convId, ac))
-  void releasingInflight(convId, ac, body)(sink)
+  const turn: Promise<void> = releasingInflight(convId, ac, body)(sink)
     .catch(async (e) => {
       console.error(`[chat] turn for ${convId} failed`, e)
       await sink({ event: 'error', data: { code: 'turn_failed', message: 'The reply could not be generated.' } })
@@ -228,8 +228,36 @@ function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortControl
     .finally(() => {
       release()
       chatRuns.end(run)
+      runningTurns.delete(turn)
     })
+  runningTurns.add(turn)
   return run
+}
+
+/** The running turns (startDetachedTurn), each until it has ended: its reply saved, its run ended. Read by
+ *  chatTurnsEnded. */
+const runningTurns = new Set<Promise<void>>()
+
+/** How long chatTurnsEnded waits at most by default: well inside `turbollm --stop`'s 10 s and the restart's 14 s
+ *  watchdog. A stopped turn that is streaming saves its reply at once; only a tool call it is running holds it. */
+const TURNS_END_WAIT_MS = 3_000
+
+/** Resolves once every turn running now has ended, or after `maxMs`, whichever is first. The daemon's teardowns
+ *  (cli.ts) wait for it, beside the engine's shutdown, before they close the store. A turn abortAllInFlightChats
+ *  stopped saves its reply as it unwinds, and one running a tool call unwinds only once the call ends (a tool call
+ *  does not end at the abort): the store closed as soon as the engine had stopped, at once with no local engine (a
+ *  Turbo Link chat), so such a reply kept only its last 10 s save. Bounded: a stop does not wait out a long tool
+ *  call; the next start marks that reply stopped (db.ts abortUnfinishedReplies). */
+export function chatTurnsEnded(maxMs = TURNS_END_WAIT_MS): Promise<void> {
+  if (runningTurns.size === 0) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, maxMs)
+    timer.unref?.()
+    void Promise.allSettled([...runningTurns]).then(() => {
+      clearTimeout(timer)
+      resolve()
+    })
+  })
 }
 
 /** How often a reply's text so far is saved into its placeholder while its turn runs, when it changed since the
