@@ -77,6 +77,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   to Allow. The reply is now saved as stopped, and no tool call starts once a reply is stopped.
 - A chat reply cut off by a daemon restart, a crash or Android closing the app before any of its text was saved now
   reads "Generation failed or was stopped." instead of "This message is empty." for good.
+- **Android: chats are written to disk about a second after they change**, not every 10 s, so Quit (which ends the
+  app's process) or Android closing the app no longer loses a reply that finished seconds before, or a new chat. A
+  burst of changes is still written once, and at least every 10 s while changes keep coming. `POST
+  /api/v1/daemon/flush` writes the database at once and answers when it is on disk (`flushed: false` on the desktop,
+  whose database is written as it changes); the app calls it before it quits.
 - The idle timeout (Settings → Idle timeout) no longer unloads the model while a chat still needs it: during a reply's
   auto-compaction, a manual compaction, or its title and memory calls just after it. Once the timeout had passed since
   the model was loaded or an API client last used it, the compaction failed and the title and memory were lost.

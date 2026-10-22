@@ -2769,5 +2769,11 @@ export class ConversationStore {
     this.db.prepare(`DELETE FROM agent_skills WHERE agent_id = $a`).run({ $a: agentId } as P)
   }
 
+  /** Writes the database to disk now, where the backend holds it in memory (sql.js, Android:
+   *  POST /api/v1/daemon/flush, before the app's Quit kills the process or its service stops).
+   *  true: everything written so far is on disk; false: the write failed (it is retried); null:
+   *  nothing to do, as node:sqlite writes every change to the file itself. */
+  flush(): boolean | null { return this.db.flush ? this.db.flush() : null }
+
   close(): void { this.db.close() }
 }

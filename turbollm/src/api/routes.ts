@@ -2510,6 +2510,17 @@ export function registerApi(app: Hono, d: Deps): void {
     return c.json({ ok: true, restarting: true }, 202)
   })
 
+  // Writes the chat database to disk now and answers once it is there. Android's sql.js keeps it in
+  // memory and writes it soon after changes (sql-js-database.ts); the app calls this before its Quit
+  // kills the process, and before its service stops, so a reply that finished a moment before is not
+  // lost. Same gate as /daemon/restart. node:sqlite (desktop) writes every change itself: nothing to do.
+  app.post('/api/v1/daemon/flush', (c) => {
+    const onDisk = d.db.flush()
+    if (onDisk === null) return c.json({ ok: true, flushed: false })
+    if (!onDisk) return err(c, 500, 'flush_failed', 'The chat database could not be written to disk.')
+    return c.json({ ok: true })
+  })
+
   app.get('/api/v1/engine/logs', (c) => {
     const tail = Math.min(Number(c.req.query('tail')) || 200, 2000)
     return c.json({ lines: readTail(d.manager.logPath(), tail) })
