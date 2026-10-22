@@ -26,8 +26,10 @@ interface Pin {
 const SPAWNING_DEPENDENCIES: Record<string, Pin> = {
   '@earendil-works/pi-coding-agent': {
     version: '0.80.6',
-    reason: 'bash: replaced by code/robust-bash.ts. rg and fd (grep, find): raw, until TurboLLM runs its own. ' +
-      'Extension exec, clipboard, editors, browser, rpc: interactive-mode and extension paths TurboLLM does not run.',
+    reason: 'bash: replaced by code/robust-bash.ts. rg and fd (grep, find): replaced by code/search-tools.ts, whose ' +
+      'execute is TurboLLM\'s port with the search tethered; pi\'s own runs only once, over an empty directory, to ' +
+      'download a missing rg or fd (short-lived). Extension exec: no extension loads from a repository or agentDir ' +
+      '(noExtensions at every loader). Clipboard, editors, browser, rpc: interactive-mode paths TurboLLM does not run.',
     files: {
       'dist/core/exec.js': 1, 'dist/core/footer-data-provider.js': 1, 'dist/core/resolve-config-value.js': 1,
       'dist/core/tools/bash.js': 1, 'dist/core/tools/find.js': 1, 'dist/core/tools/grep.js': 1,

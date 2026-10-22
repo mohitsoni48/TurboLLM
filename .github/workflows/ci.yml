@@ -28,6 +28,11 @@ jobs:
         run: npm run typecheck
         working-directory: turbollm
 
+      # code/search-tools.test.ts runs TurboLLM's grep and find against pi's own on real rg and fd (Debian names
+      # it fdfind, which both look for); without them those cases are skipped.
+      - name: Install ripgrep and fd
+        run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find
+
       - name: Unit tests
         run: npm test
         working-directory: turbollm
@@ -183,8 +188,12 @@ jobs:
         run: npm ci
         working-directory: turbollm
 
+      - name: Install ripgrep and fd
+        if: runner.os == 'macOS'
+        run: brew install ripgrep fd
+
       - name: Tether tests
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts
         working-directory: turbollm
 
       - name: A routine run's end releases its session's held jobs

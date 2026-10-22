@@ -35,6 +35,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { estimateTokens, calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { createRobustBashOperations } from './robust-bash'
+import { searchToolsFor } from './search-tools'
 import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works/pi-ai'
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
@@ -985,6 +986,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
+      // pi otherwise loads a repository's own extensions (every `<repo>/.pi/extensions/*.js`; the in-memory
+      // settings count the project as trusted) and those under agentDir into THIS process: opening a repo in Code
+      // ran its code inside the daemon, with no approval, outside every tie and guard (an extension's spawn had
+      // ppid 1 once the daemon died). Only the inline extensionFactories above still load. Same at all 5 loaders
+      // in this file; raw-spawn-guard.test.ts requires it at every `new DefaultResourceLoader(` in src.
+      noExtensions: true,
     })
     await skillResourceLoader.reload()
 
@@ -1005,7 +1012,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Same ctx-scaled auto-compaction settings as the outer session (compactionSettingsFor) —
       // a skill sub-session shares the same model/contextWindow, so the same defaults apply.
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [skillBash, ...sequentialWriteTools(repoRoot)],
+      customTools: [skillBash, ...searchToolsFor(repoRoot, skillTools), ...sequentialWriteTools(repoRoot)],
       ...(skillTools ? { tools: skillTools } : {}),
     })
 
@@ -1181,6 +1188,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
+      // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+      noExtensions: true,
     })
     await subResourceLoader.reload()
 
@@ -1195,7 +1204,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       resourceLoader: subResourceLoader,
       sessionManager: SessionManager.inMemory(repoRoot),
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [subBash, ...sequentialWriteTools(repoRoot)],
+      customTools: [subBash, ...searchToolsFor(repoRoot, subTools), ...sequentialWriteTools(repoRoot)],
       ...(subTools ? { tools: subTools } : {}),
       // No invoke_skill / delegate_task / web / mcp / lsp tools registered → depth-1, bounded set.
     })
@@ -2004,6 +2013,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await resourceLoader.reload()
 
@@ -2035,7 +2046,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     resourceLoader,
     sessionManager,
     settingsManager,
-    customTools: [robustBash, ...sequentialWriteTools(repoRoot)],
+    customTools: [robustBash, ...searchToolsFor(repoRoot, tools), ...sequentialWriteTools(repoRoot)],
     ...(tools ? { tools } : {}),
   })
 
@@ -2261,6 +2272,8 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await compactResourceLoader.reload()
 
@@ -2418,6 +2431,8 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await lookbackResourceLoader.reload()
 

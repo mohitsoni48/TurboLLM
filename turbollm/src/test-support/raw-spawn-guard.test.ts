@@ -8,13 +8,13 @@
 // (raw-spawn-sites.ts) uses the TypeScript AST and sees every route to child_process and node-pty: static and
 // dynamic imports, require, createRequire, process.getBuiltinModule, promisify wrappers and aliases.
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { readFileSync, writeFileSync } from 'node:fs'
+import { join, relative, sep } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { allRawSpawnSites, rawSpawnSites } from './raw-spawn-sites'
+import ts from 'typescript'
+import { allRawSpawnSites, rawSpawnSites, sourceFilesUnder, untimedCalls } from './raw-spawn-sites'
 import { tmpDir } from './tmp'
-import { untimedCalls } from './raw-spawn-sites'
 
 const SRC_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
@@ -183,4 +183,31 @@ function h(spawner: typeof spawn = spawn) { return spawner }
     'fixture.ts#g:run',
     'fixture.ts#h:spawn',
   ])
+})
+
+// Code that pi loads from a repository (`.pi/extensions/*.js`) or from its agentDir runs inside the
+// daemon, where neither the spawn guard above nor the tether sees what it starts. Every pi resource loader in src
+// must refuse them; only the inline extensionFactories TurboLLM passes load.
+test('every pi resource loader in src loads no extensions from the repository (noExtensions: true)', () => {
+  const loaders: string[] = []
+  const offenders: string[] = []
+  for (const file of sourceFilesUnder(SRC_ROOT)) {
+    const text = readFileSync(file, 'utf8')
+    if (!text.includes('DefaultResourceLoader')) continue
+    const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+    const visit = (n: ts.Node): void => {
+      if (ts.isNewExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'DefaultResourceLoader') {
+        const at = `${relative(SRC_ROOT, file).split(sep).join('/')}:${sf.getLineAndCharacterOfPosition(n.getStart()).line + 1}`
+        loaders.push(at)
+        const opts = n.arguments?.[0]
+        const off = !opts || !ts.isObjectLiteralExpression(opts) || !opts.properties.some((p) =>
+          ts.isPropertyAssignment(p) && ts.isIdentifier(p.name) && p.name.text === 'noExtensions' && p.initializer.kind === ts.SyntaxKind.TrueKeyword)
+        if (off) offenders.push(at)
+      }
+      ts.forEachChild(n, visit)
+    }
+    visit(sf)
+  }
+  assert.ok(loaders.length >= 5, `found the Code sessions' loaders (${loaders.join(', ')})`)
+  assert.deepEqual(offenders, [], 'pass `noExtensions: true` (a literal) to these DefaultResourceLoaders')
 })
