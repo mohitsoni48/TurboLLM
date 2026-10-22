@@ -179,6 +179,7 @@ function appWithPrimary(primaryKey: string | null) {
     },
     modelRouter: {
       aliveSlots: () => (primaryKey ? [{ modelKey: primaryKey, state: 'running', primary: true, lastUsedMs: 1 }] : []),
+      poolModelCount: () => 0,
     },
     scanner: { get: (key: string) => library.get(key) },
     registry: { active: () => ({ id: 'eng-1', name: 'vLLM', kind: 'vllm', binPath: 'engine' }) },

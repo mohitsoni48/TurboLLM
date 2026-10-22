@@ -369,3 +369,15 @@ test('a Laya model is never reported twice by aliveSlots', async () => {
   gate.resolve()
   await loading
 })
+
+// GET /api/v1/status's poolModels: a load in flight into a pool slot counts, and a Laya load's slot is that same load.
+test('poolModelCount counts a Laya load in flight once', async () => {
+  const gate = deferred()
+  const { r } = routerWithSlots(gate.promise)
+  const loading = r.loadExplicit(LAYA_MODEL.key)
+  await tick()
+  assert.equal(r.poolModelCount(), 1, 'loading')
+  gate.resolve()
+  assert.deepEqual(await loading, { target: 'http://laya-slot' })
+  assert.equal(r.poolModelCount(), 1, 'loaded')
+})

@@ -260,6 +260,12 @@ export function registerApi(app: Hono, d: Deps): void {
       // The alive Laya model, if any (ADR-443): the System One playground runs against it. It never changes the
       // Workspace — a Laya model runs beside the chat model.
       laya: layaStatus(d),
+      // How many models are loaded beside the primary: alive pool slots (running, starting or stopping), an embedding
+      // model's and a Laya load's included, and a model still loading into a pool slot (ModelRouter.poolModelCount).
+      // Local-only, like `jev` and `laya`. The Android app keeps its service while any model is loaded; it read only
+      // the primary engine, jev and laya, so with notifications off it stopped (and its process could be killed) under
+      // an embedding model loaded, or still loading, beside an ejected chat model.
+      poolModels: d.modelRouter.poolModelCount(),
       // The alive text classification model, Jev or Laya (ADR-444): the one field the UI reads for the feature.
       // A Jev one wins when both are alive, as `jev ?? laya` did.
       textClassification: textClassificationStatus(d),

@@ -257,6 +257,19 @@ export class ModelRouter {
     return slots
   }
 
+  /** How many models are loaded beside the primary (GET /api/v1/status's `poolModels`): the alive pool slots, and a
+   *  load in flight into a pool slot (loadingSlot), which aliveSlots() leaves out (a slot is registered only once it
+   *  has loaded). That load counts for its whole length, whatever its manager reads: a new slot's reads 'stopped'
+   *  while the load waits for the load gate. A Laya load is in aliveSlots() already, so it counts once. The Android
+   *  app keeps its service while this is above zero: with notifications off it stopped (and its process could be
+   *  killed) under an embedding model still loading after the chat model beside it was ejected, since /api/v1/activity
+   *  covers only the primary's load. */
+  poolModelCount(): number {
+    const alive = this.aliveSlots().filter((s) => !s.primary).length
+    const loading = this.loadingSlot !== undefined && !(this.loadingKey !== undefined && this.layaLoads.has(this.loadingKey))
+    return alive + (loading ? 1 : 0)
+  }
+
   /** Load `modelKey` unconditionally — used by a Routine's pinned-model swap (spec 20 §5), which
    *  is an explicit per-routine decision made once at creation time and must NOT be silently
    *  skipped just because the user's own, unrelated chat auto-swap preference

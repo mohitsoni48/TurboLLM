@@ -30,7 +30,7 @@ function app(provision: ProvisionState, dir: string) {
       sessionStats: () => null,
       liveGeneration: () => null,
     },
-    modelRouter: { aliveSlots: () => [] },
+    modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
     scanner: { get: () => undefined },
     registry: { active: () => undefined, list: () => ({ engines: [], activeEngineId: '' }) },
     bench: { status: () => ({ state: 'idle' }) },
