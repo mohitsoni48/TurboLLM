@@ -69,6 +69,22 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
+- **Pause a download** (Models → Discover → Downloads): Pause on a running or queued download, Pause all and Resume
+  all (`POST /api/v1/downloads/:id/pause`). A paused download keeps what it has downloaded, also across a restart, and
+  Resume continues from there. Cancel all leaves paused downloads alone, and a Cancel that would delete more than
+  50 MB asks first.
+- The Library shows one line while downloads are running, paused or failed ("2 downloads running · 1 paused · 1
+  failed"), with Show, which opens the Downloads panel.
+- `POST /api/v1/downloads` also answers `existing` (the id, name and status of a download already holding a requested
+  file). Asking again for a file whose download is paused (Discover, Import from URL, onboarding) resumes it, and
+  Import from URL and the quant dialog say "Resumed" or "Already downloading". Import from URL of another link that
+  would save the same file name in the folder is refused while that download is running, queued or paused (409
+  `download_in_progress`), instead of resuming the other link's download.
+- `GET /api/v1/code/sessions/:id` reports `compacting`, and each agent of `GET /api/v1/code/agents` reports
+  `installing`.
+- `GET /api/v1/status` reports `poolModels`, the number of models loaded or loading beside the primary (an embedding
+  model's pool slot, a Laya load). The Android app keeps its service while one is; before, with notifications off, it
+  stopped under an embedding model left loaded, or still loading, after the chat model was ejected.
 
 ### Fixed
 - **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
@@ -109,6 +125,51 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - Android (app and Termux): the CPU name comes from the SoC, the core count includes cores outside the app's cpuset,
   CPU usage falls back to TurboLLM's own processes where /proc/stat is closed to apps, and GPU load is read from the
   kernel where the vendor lets apps read it.
+- **The idle timeout counts from the model's last use** (Settings → Idle timeout). A chat reply, a Code turn and the
+  chat work that holds the model (a compaction, a wait for a tool-call approval, a reply's title or memory call)
+  restart it, as an API request does. It counted from the load, so a model in active chat use was unloaded between two
+  replies once the timeout had passed since it was loaded, and the next send answered "Load a model first.".
+- A chat reply running when the daemon is stopped or restarted (Ctrl+C, `turbollm --stop`, Settings → Restart daemon,
+  an app update, the desktop app's Quit on Linux and macOS) is saved as stopped, with the text it had written, instead
+  of as a finished reply cut short. A call it was waiting to have approved reads "Denied by user.", as after a Stop.
+- **A finished auto-tune result survives an engine stop and a restart.** Eject, loading a model, a restart or a Turbo
+  Link unload no longer throw away a tune that finished unsaved, and the result is kept on disk, so Quit, a daemon
+  restart or the Android app's service stopping keep it too: the results dialog offers it the next time that model's
+  dialog is opened, while the model is still in the library, and Save still writes it. Its Cancel, or a new run,
+  discards it. A run still in flight is cancelled as before.
+- An agent terminal in Code that is still printing with no tab watching it is no longer killed 5 minutes after its
+  last viewer left. It is reaped after 5 minutes without output, and at most 6 hours after the last viewer left. A
+  routine's terminal keeps its own limit.
+- Code: a running /compact shows as "Compacting conversation…" on a reloaded or reopened page or another tab. A turn,
+  /clear, /resume, /revert or another /compact sent meanwhile is refused (409 `compaction_in_progress`) instead of
+  running beside it. While it runs, the idle timeout no longer unloads the model under it, and `GET /api/v1/activity`
+  reports the engine as generating.
+- Code: an agent CLI install (Settings → Code agent → Install) that is still running shows "Installing…" after a
+  reload, and a second Install waits for it instead of starting another `npm install -g`.
+- Downloads: Dismiss all clears only finished and cancelled downloads; it used to delete a failed one's partial file.
+  A paused or failed download's own button is Discard, which deletes its partial file and asks first above 50 MB.
+- Downloads: resuming a file that changed on the server (another ETag, weak or strong, or another Last-Modified)
+  starts it again instead of joining the old file's start to the new file's end.
+- Downloads: a `.gguf` download of unknown length that the server cut short is no longer marked done, and Resume
+  fetches the rest. A GGUF in a model folder that is shorter than its tensors is listed incomplete.
+- Downloads: Hugging Face downloads fetch from the commit the repo was at when they were queued, so a paused download
+  finishes after the repo is updated. A download whose file changed on the server stops with "The file changed on the
+  server since this download started. Download it again from Discover." instead of downloading it all again and
+  failing the checksum.
+- Downloads: a kill while the download list or the provenance record is being saved no longer loses paused downloads
+  or the "Downloaded" marks.
+- Downloads: running out of storage says "Storage is full. Free some space, then Resume." and keeps the partial file.
+  A stalled download stops showing its last speed after 3 s. A download that failed its size or checksum check no
+  longer counts the removed bytes as downloaded. Cancel and Discard no longer leave an empty `.part` behind.
+- Onboarding: the Load step finds its download again after a closed tab or a restart, shows it as paused with Resume,
+  and says when it was cancelled.
+- A model picker with nothing to offer (Chat's, the Code composer's and the terminal toolbar's) says why under "No
+  models found.": "N hidden: the selected engine can't run them — Settings → Models & loading → Show models for every
+  engine.", or with none hidden "Download one in Models → Discover.". It showed only a faint "No models found" heading
+  over an empty list, so a library of models the selected engine cannot run looked like no library at all. An empty
+  model select in the routine form says where to get a model, and an empty draft-model select what a draft must be.
+- The web app keeps working while the browser reports itself offline (Wi-Fi off with TurboLLM on the same machine):
+  sends, replies and polls no longer wait for the browser to come back online.
 
 ### Changed
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
@@ -123,6 +184,22 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
   Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
   Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.
+- **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
+  Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
+  (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app
+  update is installed then. The first close shows a one-time notice. Launching the app again opens the window; on
+  macOS a second launch from a terminal (or `open -n`) after the window was closed now opens one too, where it opened
+  nothing. On a Linux desktop without a tray, launching the app again is the way back, and the window's File menu has
+  Quit.
+- **The text-classification playground's run continues in the daemon** (`POST`, `GET`, `DELETE ?id=` on
+  `/api/v1/jev/playground/run`). Closing, reloading or leaving the page no longer stops it, a page that comes back
+  shows it running or its answer, and a Cancel button stops it. A second run while one runs is refused and followed.
+  As for a chat reply, revoking the key a run was started with, requiring a key of the keyless open-LAN device that
+  started it, turning LAN access off or stopping remote access cancels it; the host's runs are not touched.
+  `/v1/systemone` is unchanged.
+- **A GitHub release install** (Add engine → From a GitHub release, or a card's Install prebuilt) continues when the
+  dialog is dismissed, the Engines screen is left or the page is reloaded or closed. Opening it again shows its
+  progress or offers the finished build for Add. Cancel stops it.
 
 ## [1.14.5] - 2026-10-04
 
