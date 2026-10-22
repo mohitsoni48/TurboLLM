@@ -87,6 +87,10 @@
 // say so), and both settle on 'exit' plus the end of stdout and stderr, or STDIO_IDLE_MS without data after the exit
 // (pi's waitForChildProcess rule), never on 'close'. A timeout or an abort never leaves a group held.
 //
+// ── Code terminals ─────────────────────────────────────────────────────────────────────────────────────────────
+// node-pty forks a terminal's shell itself, so it gets a stand-alone watcher instead (tetherTerminal, PTY_WATCH):
+// closing the terminal, its shell exiting, or the daemon ending, however it ends, ends everything started in it.
+//
 // ── Android ────────────────────────────────────────────────────────────────────────────────────────────────────
 // The app ships libtether_exec.so, which arms PR_SET_PDEATHSIG(SIGKILL) and execs the program in place. A boot
 // self-test (tetherReady) must see a program running under the helper, then see it die when the helper's parent
@@ -953,12 +957,14 @@ export async function releaseTetherScope(scope: string, graceMs = 3000): Promise
   await endGroups(held, graceMs)
 }
 
-/** For the restart keeper: every lifeline closed now, held or not, so each watcher fires its end mode. */
+/** For the restart keeper: every lifeline closed now, held or not, so each watcher fires its end mode, and every
+ *  Code terminal released. */
 export function closeAllLifelines(): void {
   for (const e of [...entries]) {
     e.noHold = true
     closeLifeline(e)
   }
+  for (const t of [...terminals]) releaseTerminal(t)
 }
 
 /** The default Windows tree kill: one taskkill for every root, sent while they are alive. */
@@ -970,7 +976,8 @@ function win32TreeKill(pids: number[]): void {
 /** Graceful shutdown, for every tethered child except engines and tunnels, which their owners stop:
  *   - POSIX: SIGTERM to each group (term mode: to the program alone), and every held scope is released; after
  *     `graceMs` the lifelines still open are closed, a group SIGKILL, though never for term mode (the daemon's exit
- *     sends that one its SIGTERM again);
+ *     sends that one its SIGTERM again). Every Code terminal is released: its shell is hung up, and what is left of
+ *     its session is killed 1 s later;
  *   - Windows: each tree is ended while its root is alive (taskkill /T /F). No SIGTERM step: there it would be a
  *     TerminateProcess of the root alone, and the root's children would be cut loose.
  *  `deps` is for the tests: the platform, and the Windows tree kill. */
@@ -989,7 +996,7 @@ export async function stopTethered(graceMs = 3000, deps: { platform?: NodeJS.Pla
     return
   }
   const tied = all.filter((e) => e.exited && e.lifelineOpen && !e.stopping) // held, or being counted
-  await endGroups([...live, ...tied], graceMs)
+  await Promise.all([endGroups([...live, ...tied], graceMs), releaseTerminals(graceMs)])
 }
 
 /** The 'exit' handler's belt, synchronous. POSIX, by end mode: kill → group SIGKILL; term-then-kill → group
@@ -1021,6 +1028,83 @@ export function killTetheredSync(): void {
     if (e.exited && !e.lifelineOpen) continue
     signalGroup(e, e.end === 'kill' ? 'SIGKILL' : 'SIGTERM')
   }
+}
+
+// ── Code terminals ─────────────────────────────────────────────────────────────────────────────────────────────
+
+/** A Code terminal's stand-alone watcher. node-pty forks the shell itself, so the shell cannot be given a lifeline
+ *  fd; it is a session leader (node-pty calls setsid), so its pid names its session and its own process group.
+ *  The watcher blocks on fd 3, whose other end only the daemon holds. When the daemon closes it (the terminal was
+ *  closed, its shell exited, a graceful stop) or dies, it hangs up the shell, which forwards the hangup to its jobs,
+ *  then after 1 s kills the shell's group (a launched agent CLI that ignores the hangup) and every process left in
+ *  the session: background jobs in their own job-control groups, `nohup` jobs, a `(trap "" HUP; …) &`. Linux and
+ *  Termux read the session from /proc/<pid>/stat (field 6), macOS asks pkill. The watcher is detached, a session of
+ *  its own, so its sweep never reaches itself. A program that starts a session of its own (`setsid`) escapes the
+ *  sweep (Known); git's automatic gc, the common case, runs in the foreground in a terminal (util/git-gc.ts). It
+ *  unsets TMOUT first: where /bin/sh is bash (macOS, Fedora), bash's read takes an exported TMOUT for a timeout, and
+ *  the terminal was ended TMOUT seconds after it opened. */
+export const PTY_WATCH = 'SID=$1; unset TMOUT; trap "" HUP INT TERM; exec </dev/null >/dev/null 2>&1; ' +
+  'while read -r _; do :; done <&3; ' +
+  'kill -s HUP "$SID"; sleep 1; kill -s KILL -- -"$SID"; ' +
+  'if [ -d /proc/self ]; then for d in /proc/[0-9]*; do read -r s < "$d/stat" || continue; ' +
+  'set -- ${s##*) }; [ "$4" = "$SID" ] && kill -s KILL "${d#/proc/}"; done; ' +
+  'else pkill -KILL -s "$SID"; fi'
+
+interface TerminalTie {
+  socket: Socket | null
+  released: boolean
+  /** Resolves when the watcher has exited: it fired, or never started. */
+  gone: Promise<void>
+}
+const terminals = new Set<TerminalTie>()
+
+function releaseTerminal(t: TerminalTie): void {
+  if (t.released) return
+  t.released = true
+  t.socket?.destroy()
+}
+
+/** Tie a Code terminal's shell, and everything started in it, to the daemon (decision a: what a terminal started
+ *  ends when the terminal is closed or the daemon ends, `nohup` and background jobs included). `release()` ends
+ *  them now: call it when the terminal is closed or its shell exits. A graceful stop (stopTethered) and the
+ *  restart keeper (closeAllLifelines) release every terminal; a daemon that dies releases them by itself. On
+ *  Windows a terminal is not tied yet: it keeps today's behaviour (the 'exit' handler's taskkill /T). */
+export function tetherTerminal(shellPid: number): { release(): void } {
+  if (process.platform === 'win32' || !Number.isInteger(shellPid) || shellPid <= 0) return { release: noop }
+  let watcher: ChildProcess
+  try {
+    watcher = spawn(nodeShell(), ['-c', PTY_WATCH, 'sh', String(shellPid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })
+  } catch (err) {
+    console.warn(`[tether] terminal ${shellPid}: no watcher (${(err as Error).message}); what it starts is not tied to the daemon`)
+    return { release: noop }
+  }
+  const socket = (watcher.stdio[3] as Socket | null) ?? null
+  socket?.on('error', noop)
+  const t: TerminalTie = {
+    socket,
+    released: false,
+    gone: new Promise<void>((resolve) => {
+      watcher.once('exit', () => resolve())
+      watcher.once('error', (err) => {
+        console.warn(`[tether] terminal ${shellPid}: no watcher (${err.message}); what it starts is not tied to the daemon`)
+        resolve()
+      })
+    }),
+  }
+  terminals.add(t)
+  void t.gone.then(() => {
+    terminals.delete(t)
+    socket?.destroy()
+  })
+  return { release: () => releaseTerminal(t) }
+}
+
+/** Release every terminal, and wait (at most `ms`) for their watchers to finish their sweep. */
+async function releaseTerminals(ms: number): Promise<void> {
+  const all = [...terminals]
+  if (all.length === 0) return
+  for (const t of all) releaseTerminal(t)
+  await Promise.race([Promise.all(all.map((t) => t.gone)), sleep(ms)])
 }
 
 // ── Android: the helper and its self-test ──────────────────────────────────────────────────────────────────────

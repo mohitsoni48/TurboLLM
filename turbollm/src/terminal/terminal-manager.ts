@@ -28,7 +28,12 @@ import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-star
 //
 // Tracks the PTY's own shell pid (powershell.exe/bash) — the launched CLI (claude.exe
 // etc.) is a CHILD of that shell, so a `taskkill /T` (Windows) or process-group signal
-// (POSIX) on the shell's pid takes the CLI down with it.
+// (POSIX) on the shell's pid takes the CLI down with it. On POSIX the shell leads its own
+// session and process group (node-pty calls setsid), recorded as `group`, and these kills
+// signal the group: before, they killed the shell's pid alone, which left the CLI running.
+// The pidfile is the last net: while the daemon lives, and the moment it dies however it
+// dies, the terminal's own watcher (util/tether.ts tetherTerminal, pty-session.ts) ends the
+// whole session, background and `nohup` jobs included.
 
 function terminalPidDir(dataDir: string): string {
   return join(dataDir, 'run')
@@ -40,8 +45,8 @@ function writeTerminalPid(dataDir: string, pid: number): void {
   try {
     mkdirSync(terminalPidDir(dataDir), { recursive: true })
     // `startedAt` is what lets the next startup tell this shell apart from an unrelated process
-    // that later got the same pid (see reapStaleTerminals).
-    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now() }))
+    // that later got the same pid (see reapStaleTerminals); `group`, that the shell leads a process group of its own.
+    writeFileSync(terminalPidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now(), group: process.platform !== 'win32' }))
   } catch {
     /* best-effort — tracking is a safety net, never block a launch on it */
   }
@@ -62,7 +67,24 @@ function pidAlive(pid: number): boolean {
     return (e as NodeJS.ErrnoException).code === 'EPERM'
   }
 }
-function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; file: string }> {
+/** SIGKILL a terminal's shell: on POSIX its whole process group when it leads one (the pid alone as the fallback, and
+ *  for a pidfile written before `group` was), on Windows its tree. */
+function killShell(pid: number, group: boolean): void {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
+    return
+  }
+  if (group) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+      return
+    } catch {
+      /* no such group: the pid alone */
+    }
+  }
+  process.kill(pid, 'SIGKILL')
+}
+function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; group: boolean; file: string }> {
   const dir = terminalPidDir(dataDir)
   let names: string[]
   try {
@@ -70,13 +92,13 @@ function readTerminalPidFiles(dataDir: string): Array<{ pid: number; owner: numb
   } catch {
     return [] // no run dir yet
   }
-  const out: Array<{ pid: number; owner: number; startedAt?: number; file: string }> = []
+  const out: Array<{ pid: number; owner: number; startedAt?: number; group: boolean; file: string }> = []
   for (const name of names) {
     const file = join(dir, name)
     try {
-      const { pid, owner, startedAt } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number; startedAt?: number }
+      const { pid, owner, startedAt, group } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; owner?: number; startedAt?: number; group?: boolean }
       if (typeof pid === 'number' && pid > 0) {
-        out.push({ pid, owner: typeof owner === 'number' ? owner : 0, startedAt: typeof startedAt === 'number' ? startedAt : undefined, file })
+        out.push({ pid, owner: typeof owner === 'number' ? owner : 0, startedAt: typeof startedAt === 'number' ? startedAt : undefined, group: group === true, file })
       } else rmSync(file, { force: true })
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
@@ -100,12 +122,11 @@ export function reapStaleTerminals(dataDir: string): number {
   const orphans = readTerminalPidFiles(dataDir).filter(({ owner }) => !(owner && pidAlive(owner))) // else still managed by a live daemon
   const started = processStartTimes(orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid))
   let killed = 0
-  for (const { pid, startedAt, file } of orphans) {
+  for (const { pid, startedAt, group, file } of orphans) {
     const actual = started.get(pid)
     if (startedAt !== undefined && actual !== undefined && Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
       try {
-        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-        else process.kill(pid, 'SIGKILL')
+        killShell(pid, group)
         killed++
       } catch {
         /* already gone */
@@ -121,11 +142,10 @@ export function reapStaleTerminals(dataDir: string): number {
  *  Owner-scoped so a daemon exiting during a restart overlap never kills the incoming
  *  daemon's terminal. */
 export function killTrackedTerminalsSync(dataDir: string): void {
-  for (const { pid, owner, file } of readTerminalPidFiles(dataDir)) {
+  for (const { pid, owner, group, file } of readTerminalPidFiles(dataDir)) {
     if (owner !== process.pid) continue
     try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      else process.kill(pid, 'SIGKILL')
+      killShell(pid, group)
     } catch {
       /* already gone */
     }

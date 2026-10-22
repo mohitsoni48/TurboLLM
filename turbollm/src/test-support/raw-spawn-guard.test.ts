@@ -42,6 +42,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/tether.ts#startTethered:spawn': 'the implementation: the lifeline wrapper, and the plain Windows spawn in libuv\'s job',
   'util/tether.ts#startUnwrapped:spawn': 'the implementation: a program the resolver cannot find, so Node reports ENOENT/EACCES as before (a pid is registered and logged)',
   'util/tether.ts#startUnderHelper:spawn': 'the implementation: the Android helper, which arms PR_SET_PDEATHSIG and execs the program',
+  'util/tether.ts#tetherTerminal:spawn': 'the implementation: a Code terminal\'s stand-alone watcher, which ends the terminal\'s session when the daemon closes its lifeline or dies',
   'util/tether.ts#selfTestHelper:spawn': 'the Android helper\'s boot self-test: a `sh` and a `sleep` it kills by pid whatever the outcome',
   'util/tether.ts#countGroupMembers:execFile': 'macOS group counts (`ps -A -o pgid=,stat=`): instant',
   'util/tether.ts#killTetheredSync:spawnSync': WIN_KILL,
@@ -60,8 +61,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'engines/build-runner.ts#killTreeSync:spawnSync': WIN_KILL,
   'remote/child-process.ts#ChildTunnel.forceKill:execFile': WIN_KILL,
   'remote/child-process.ts#killSync:spawnSync': WIN_KILL,
-  'terminal/terminal-manager.ts#killTrackedTerminalsSync:spawnSync': WIN_KILL,
-  'terminal/terminal-manager.ts#reapStaleTerminals:spawnSync': WIN_KILL,
+  'terminal/terminal-manager.ts#killShell:spawnSync': WIN_KILL,
 
   // ── Synchronous calls ──
   'api/routes.ts#git:execFileSync': SYNC,
@@ -78,8 +78,8 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'terminal/pty-session.ts#resolveWindowsShell:execFileSync': LOOKUP,
   'util/process-start-time.ts#processStartTimes:spawnSync': SYNC,
 
-  // ── Not tethered yet ──
-  'terminal/pty-session.ts#PTYSession.doSpawn:ptyModule.spawn': `a Code terminal's shell (node-pty forks it, so it cannot get a lifeline fd); ${UNTIED}`,
+  // ── Tied another way ──
+  'terminal/pty-session.ts#PTYSession.doSpawn:ptyModule.spawn': 'a Code terminal\'s shell: node-pty forks it, so it cannot get a lifeline fd; tetherTerminal (util/tether.ts) gives it a stand-alone watcher that ends its whole session (POSIX; Windows keeps the exit handler\'s taskkill /T)',
 }
 
 test('every raw spawn in src is a listed call site, and every listed one still exists', () => {

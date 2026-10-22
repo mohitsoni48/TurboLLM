@@ -17,6 +17,8 @@
 import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
 import { execFileSync } from 'node:child_process'
+import { withForegroundGitGc } from '../util/git-gc'
+import { tetherTerminal } from '../util/tether'
 
 const require = createRequire(import.meta.url)
 
@@ -50,6 +52,13 @@ export class PTYSession {
   private exited = false
   private exitCode: number | null = null
   private processId: number | null = null
+  // The shell's tie to the daemon (util/tether.ts tetherTerminal): released when the terminal is killed or its
+  // shell exits, and by the daemon's own end, however it ends. Everything started in the terminal then ends with
+  // it: the launched agent CLI even when it ignores the hangup, background and `nohup` jobs. Before, those were
+  // cut loose: a daemon SIGKILL, or the terminal's own close, left a `nohup` server or a hangup-proof CLI running,
+  // parented to init (the 'exit' handler and the next start's reaper kill only the shell). Windows terminals keep
+  // today's behaviour until the job sentinel ties them.
+  private tether: { release(): void } | null = null
   // Every byte the PTY has ever written, capped — replayed to a NEWLY connecting WebSocket
   // client (terminal-manager.ts's registerWsListener) so a reconnect (tab reload, WS drop,
   // navigating away and back) shows the terminal's actual current state instead of a blank
@@ -82,15 +91,18 @@ export class PTYSession {
       cols,
       rows,
       cwd,
-      env: {
+      // git's automatic gc daemonizes with setsid, out of the terminal's session and so out of its tie: here it
+      // runs in the foreground instead (util/git-gc.ts).
+      env: withForegroundGitGc({
         ...process.env,
         TERM: 'xterm-256color',
         COLORTERM: 'truecolor',
-      } as Record<string, string>,
+      }) as Record<string, string>,
     })
 
     const termPty = this.pty!
     this.processId = termPty.pid
+    this.tether = tetherTerminal(termPty.pid)
 
     // termPty is non-null here (captured from `this.pty!` above).
     termPty.onData((data: string) => {
@@ -104,6 +116,8 @@ export class PTYSession {
     termPty.onExit(({ exitCode, signal }: { exitCode?: number; signal?: number }) => {
       this.exited = true
       this.exitCode = exitCode ?? signal ?? 1
+      // The shell is gone; what it left running in its session goes too.
+      this.tether?.release()
       this.emitter.emit('exit', { exitCode: this.exitCode, signal })
     })
   }
@@ -122,10 +136,12 @@ export class PTYSession {
     try { this.pty.resize(cols, rows) } catch { /* best-effort */ }
   }
 
-  /** Kill the PTY and all child processes. */
+  /** Kill the PTY and all child processes: the shell gets its hangup, and 1 s later everything left in its
+   *  session is killed (tetherTerminal). */
   kill(): void {
     if (!this.pty || this.exited) return
     try { this.pty.kill() } catch { /* best-effort */ }
+    this.tether?.release()
     this.exited = true
   }
 
