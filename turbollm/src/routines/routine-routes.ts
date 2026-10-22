@@ -415,7 +415,7 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
     if (chatAgentUsesMcp(d, routine?.flavor, routine?.agentId) && codeGateBlocks(c, d)) return mcpRoutineRefused(c)
     let result: ResumeResult
     try {
-      result = await resumeRoutineRun(d, run, 'allow')
+      result = await resumeApproved(d, run)
     } catch (e) {
       return internalError(c, run.id, e)
     }
@@ -442,6 +442,19 @@ export function registerRoutineRoutes(app: Hono, d: Deps): void {
 }
 
 type ResumeResult = Awaited<ReturnType<typeof resumeRoutineRun>>
+
+/** An Approve's resumeRoutineRun, with the run listed as running meanwhile (scheduler.markResuming):
+ *  it runs the approved call and the rest of the run on the engine, and the active-work probe left
+ *  it out as a parked run until it settled, so Android's EngineService let the phone sleep under
+ *  it. A Deny runs nothing on the engine (execute.ts) and is not marked. */
+async function resumeApproved(d: Deps, run: RoutineRun): Promise<ResumeResult> {
+  d.routineScheduler?.markResuming(run.routineId)
+  try {
+    return await resumeRoutineRun(d, run, 'allow')
+  } finally {
+    d.routineScheduler?.unmarkResuming(run.routineId)
+  }
+}
 
 /** I3 fix: resumeRoutineRun re-throws (after reverting its claim — see its own doc comment) on a
  *  genuine internal error (e.g. an unexpected failure from the underlying runner plumbing), which

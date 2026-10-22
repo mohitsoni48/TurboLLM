@@ -660,6 +660,61 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
   assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'still guarded — a retryable failure must not release the parked slot')
 })
 
+// The active-work probe leaves a parked run out (it waits on the user), but an Approve resumes it on
+// the engine: the approved call, then the rest of the run. Android's EngineService reads the probe as
+// "busy", so the run is listed while the Approve resumes it, and not after.
+test('a parked run an Approve is resuming is listed as running until the resume returns', async () => {
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'm' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
+  } as unknown as Manager
+  const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
+  const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
+  let holdGate: Promise<void> = Promise.resolve()
+  const gate = { acquire: async () => { await holdGate; return () => {} } } as unknown as GenerationGate
+  const d = {
+    db, manager, modelRouter, gate,
+    registry: { active: () => ({ kind: 'llama-server' }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+  } as unknown as Deps
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+
+  const originalFetch = globalThis.fetch
+  let stalled = false
+  globalThis.fetch = (async () => {
+    if (!stalled) {
+      stalled = true
+      return new Response(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'All done.' }, finish_reason: 'stop' }] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    await scheduler.tick()
+    await new Promise((resolve) => setImmediate(resolve))
+    const [run] = db.listRoutineRuns(routine.id)
+    assert.equal(run.status, 'needs_approval')
+    assert.deepEqual(scheduler.runningRoutineIds(), [], 'parked: it waits on the user')
+
+    let openGate!: () => void
+    holdGate = new Promise<void>((resolve) => { openGate = resolve })
+    const approving = app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(scheduler.runningRoutineIds(), [routine.id], 'resuming: it runs on the engine again')
+    openGate()
+    const res = await approving
+    assert.equal(res.status, 200)
+    assert.equal(db.getRoutineRun(run.id)?.status, 'ok')
+    assert.deepEqual(scheduler.runningRoutineIds(), [], 'settled: no longer running')
+  } finally { globalThis.fetch = originalFetch }
+})
+
 // ── I2: run-now/approve/deny must honor the same code-flavor auth gate as create/update ────
 // codeGateBlocks' own doc comment used to flag this as "an open decision for whoever ships
 // Phase 2's execution" — run-now triggers real bash/edit/write on demand, and approve executes

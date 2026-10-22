@@ -549,6 +549,69 @@ it('(l) the activity probe keeps listing the chat after its page has gone, until
   }
 })
 
+it('(l) a call waiting for approval moves the chat from the probe\'s items to waiting, and back once answered', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url, { toolPolicy: 'ask' })
+  // The engine's generation count, as the manager keeps it: a local turn holds one from its first request to its end.
+  let generations = 0
+  Object.assign(h.d.manager, { generationStart: () => { generations++ }, generationEnd: () => { generations-- }, sessionStats: () => ({ activeRequests: generations }) })
+  try {
+    const conv = h.store.createConversation()
+    await sendAndLeave(h.app, conv.id, 'compute 6*7')
+    const round1 = await engine.call(1)
+    assert.deepEqual(activeWork(h.d).items.map((i) => [i.kind, i.id]), [['chat', conv.id]], 'generating: an item')
+    assert.equal(activeWork(h.d).engineGenerating, true)
+    round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
+    round1.finish('tool_calls')
+    await waitFor(() => activeWork(h.d).waiting.length === 1, 'the chat to be waiting')
+    // Waiting on a person: Android's EngineService (items and engineGenerating only) lets the phone sleep.
+    assert.deepEqual(activeWork(h.d).items, [])
+    assert.equal(activeWork(h.d).engineGenerating, false, 'nor an engine generation, though its turn holds the count')
+    assert.equal(generations, 1)
+    assert.deepEqual(activeWork(h.d).waiting.map((i) => [i.kind, i.id]), [['chat', conv.id]])
+    assert.deepEqual(inFlightChatIds(), [conv.id], 'still in flight: a load or Stop ends it')
+    const approve = await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_code', decision: 'allow' }))
+    assert.equal(approve.status, 200)
+    const round2 = await engine.call(2)
+    assert.deepEqual(activeWork(h.d).items.map((i) => [i.kind, i.id]), [['chat', conv.id]], 'answered: an item again')
+    assert.deepEqual(activeWork(h.d).waiting, [])
+    assert.equal(activeWork(h.d).engineGenerating, true)
+    round2.word('The answer is 42.')
+    round2.finish()
+    await waitFor(saved(h.store, conv.id), 'the reply to be saved')
+    await waitFor(() => activeWork(h.d).items.length === 0, 'the chat to leave the probe')
+  } finally {
+    h.cleanup()
+    await engine.close()
+  }
+})
+
+it('(l) a reply whose auto-title call is still pending keeps the chat in the probe\'s items until the call settles', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url, { titles: true })
+  const release = engine.holdNonStreamReplies('A Generated Title')
+  try {
+    const conv = h.store.createConversation()
+    await sendAndLeave(h.app, conv.id, 'tell me a story')
+    const call = await engine.call(1)
+    call.word('Once upon a time.')
+    call.finish()
+    await waitFor(saved(h.store, conv.id), 'the reply to be saved')
+    assert.deepEqual(inFlightChatIds(), [], 'the turn has ended')
+    // From done, before the title call has even started (1 s on), and while the engine answers it.
+    assert.deepEqual(activeWork(h.d).items.map((i) => [i.kind, i.id]), [['chat', conv.id]], 'still busy: the title call needs the model')
+    await waitFor(() => engine.nonStream.length === 1, 'the title call', 4000)
+    assert.deepEqual(activeWork(h.d).items.map((i) => [i.kind, i.id]), [['chat', conv.id]])
+    release()
+    await waitFor(() => h.store.getConversation(conv.id)!.title === 'A Generated Title', 'the auto-title')
+    await waitFor(() => activeWork(h.d).items.length === 0, 'the chat to leave the probe once the title settled')
+  } finally {
+    release()
+    h.cleanup()
+    await engine.close()
+  }
+})
+
 // ── (p) ──────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 it('(p) a viewer gets an SSE keepalive comment every 20 s while nothing else is sent', async (t) => {

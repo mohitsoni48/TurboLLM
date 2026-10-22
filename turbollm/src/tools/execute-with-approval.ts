@@ -56,6 +56,10 @@ export async function executeToolCallWithApproval(params: {
   /** Interactive only: the reply's wait, shared by its calls (ApprovalWaitBudget). Without one,
    *  the call waits as a reply of one call would. */
   approvalBudget?: ApprovalWaitBudget
+  /** Interactive only: told `true` as an 'ask' starts waiting for its answer and `false` as the
+   *  wait ends, however it ends (before the call runs, if it was allowed). The chat turn marks
+   *  itself parked meanwhile (chat-routes.ts parkedChatIds). */
+  onApprovalWait?: (waiting: boolean) => void
   /** For background agent runs only: the tool names this agent was explicitly configured
    *  to use. A human already approved this list when setting up the agent, so it stands
    *  in for the interactive approval a background run can never get. */
@@ -119,11 +123,13 @@ export async function executeToolCallWithApproval(params: {
       }
       await sink({ event: 'tool_call', data: { id, name, args, status: 'awaiting_approval' } })
       const waitStarted = Date.now()
+      params.onApprovalWait?.(true)
       let decision: 'allow' | 'deny' | 'timeout'
       try {
         decision = await waitForToolApproval(`${convId}:${id}`, signal, name, leftMs)
       } finally {
         budget.waitedMs += Date.now() - waitStarted
+        params.onApprovalWait?.(false)
       }
       if (decision === 'timeout') {
         // Recorded like a deny (the model reads it as the call's result and the turn goes on),

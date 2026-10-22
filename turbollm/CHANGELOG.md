@@ -60,6 +60,12 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   is the reply's, all its calls together: a call set to Ask that gets no answer within what is left of it is not run,
   reads "No answer within N minutes; the call was not run." and the reply goes on as after a Deny; the reply's later
   calls set to Ask are then answered the same way at once. Code's ask mode still waits until answered.
+- `GET /api/v1/activity` also lists a model loading (`load`), an auto-tune run (`tune`), a skill being written
+  (`skill`), a routine run an Approve is resuming, and a chat whose finished reply's auto-title or memory call is still
+  pending. A chat whose reply waits for a tool-call approval is listed apart, in `waiting`, and counts in neither
+  `items` nor `engineGenerating`. The Android app keeps the model loaded and the phone awake for all of that work
+  (before, it could unload the model under a load, an auto-tune, a skill or a reply's title), and lets the phone sleep
+  while a reply waits for an approval. Loading a text-classification model names each in its confirmation.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.

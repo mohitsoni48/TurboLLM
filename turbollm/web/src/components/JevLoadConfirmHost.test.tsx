@@ -75,6 +75,36 @@ describe('JevLoadConfirmHost', () => {
     expect(screen.getByText('the routine "Morning digest"')).toBeTruthy()
   })
 
+  it('names a model load, an auto-tune and a skill being written', () => {
+    openConfirm({
+      items: [
+        { kind: 'load', id: 'm1', label: 'Gemma 27B' },
+        { kind: 'tune', id: 'm2', label: 'Qwen3 8B' },
+        { kind: 'skill', id: 't1', label: 'Learning skills from a folder' },
+      ],
+      engineGenerating: false,
+    })
+    render(<JevLoadConfirmHost />)
+    expect(screen.getByText('the load of "Gemma 27B"')).toBeTruthy()
+    expect(screen.getByText('the auto-tune of "Qwen3 8B"')).toBeTruthy()
+    expect(screen.getByText('a skill being written ("Learning skills from a folder")')).toBeTruthy()
+  })
+
+  // A reply parked on a tool-call approval waits on the user, so the daemon lists it apart from the work in
+  // progress; the load still stops it (its call is denied), so it is named.
+  it('names a reply waiting for an approval, alone or after the work in progress', () => {
+    openConfirm({ items: [], waiting: [{ kind: 'chat', id: 'c2', label: 'Taxes' }], engineGenerating: false })
+    const { unmount } = render(<JevLoadConfirmHost />)
+    expect(screen.getByText('a reply in "Taxes" waiting for your approval')).toBeTruthy()
+    unmount()
+    openConfirm({ items: [{ kind: 'chat', id: 'c1', label: 'Kitchen test' }], waiting: [{ kind: 'chat', id: 'c2', label: 'Taxes' }], engineGenerating: true })
+    render(<JevLoadConfirmHost />)
+    expect(screen.getAllByRole('listitem').map((li) => li.textContent)).toEqual([
+      'a reply in "Kitchen test"',
+      'a reply in "Taxes" waiting for your approval',
+    ])
+  })
+
   // A routine has no name of its own — the activity probe labels it with its prompt, which can
   // be a whole paragraph. This dialog is a list of what stops, not a transcript.
   it('cuts a routine prompt down to one line', () => {

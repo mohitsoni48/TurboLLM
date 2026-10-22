@@ -242,7 +242,7 @@ test('registerApi registers GET /api/v1/activity', async () => {
   const res = await app.request('/api/v1/activity')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(await res.json(), { items: [], engineGenerating: false })
+  assert.deepEqual(await res.json(), { items: [], waiting: [], engineGenerating: false })
 })
 
 // ADR-444: Discover's "Text classification" category is `?category=text-classification` on the same search route.

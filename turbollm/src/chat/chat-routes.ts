@@ -78,6 +78,53 @@ export function inFlightChatIds(): string[] {
   return [...inflight.keys()]
 }
 
+/** The in-flight entries of turns parked on a tool-call approval (execute-with-approval.ts's
+ *  wait, from its awaiting_approval frame until the wait ends). Keyed by the entry, as
+ *  `compactions` is, so the mark goes with it. Read by parkedChatIds. */
+const approvalWaits = new WeakSet<AbortController>()
+
+/** The chats whose turn is parked on a tool-call approval: those of inFlightChatIds() that wait on
+ *  a person, not the engine. The active-work probe lists them apart, in `waiting`:
+ *  Android's EngineService counts only `items`, so the phone may sleep while a person is awaited,
+ *  as routines.scheduler's runningRoutineIds leaves a parked routine run out. They are still in
+ *  flight: a load, Stop or the approval wait running out ends them (a denied call). */
+export function parkedChatIds(): string[] {
+  return [...inflight].filter(([, ac]) => approvalWaits.has(ac)).map(([convId]) => convId)
+}
+
+/** How many of the engine's in-progress generations (manager.generationStart, which a local turn
+ *  holds from its first request to its end) are turns parked on an approval: no request of theirs
+ *  is on the engine meanwhile. The active-work probe takes them out of `engineGenerating`, which
+ *  Android's EngineService reads as busy as it does `items`. */
+let parkedLocalTurns = 0
+export function parkedEngineTurns(): number {
+  return parkedLocalTurns
+}
+
+/** Chats whose auto-title or auto-memory call is still pending, from their reply's `done` until
+ *  the call settles; a count per chat, as both can be. Each call starts 1 s or 1.5 s after the
+ *  reply, outside the turn's in-flight entry and with no generationStart, so nothing said the
+ *  engine was still wanted: on Android with notifications off EngineService read idle in that
+ *  second and unloaded the model under the call, and the title and memory were lost.
+ *  The active-work probe lists them as `chat` items. Read by afterReplyChatIds. */
+const afterReply = new Map<string, number>()
+
+/** Runs `call` `delayMs` after now, the chat counted in afterReply from now until it settles. */
+function afterReplyCall(convId: string, delayMs: number, call: () => Promise<void>): void {
+  afterReply.set(convId, (afterReply.get(convId) ?? 0) + 1)
+  const settled = () => {
+    const left = (afterReply.get(convId) ?? 1) - 1
+    if (left > 0) afterReply.set(convId, left)
+    else afterReply.delete(convId)
+  }
+  setTimeout(() => { void call().finally(settled) }, delayMs)
+}
+
+/** The chats whose reply's auto-title or auto-memory call is still pending (afterReply). */
+export function afterReplyChatIds(): string[] {
+  return [...afterReply.keys()]
+}
+
 /** Removes `convId`'s entry only while it is still `ac`'s own. Stop or a kill switch drops the
  *  entry at once, but the aborted turn can keep unwinding for a long time
  *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong
@@ -1896,6 +1943,12 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
               // Android the model and the wake lock), after one wait however often the model asks.
               approvalWaitMinutes: d.store.snapshot().tools.chatApprovalWaitMinutes ?? CHAT_APPROVAL_WAIT_MINUTES.default,
               approvalBudget: approvalWait,
+              // Parked on the approval meanwhile: the activity probe lists the chat as waiting.
+              onApprovalWait: (waiting) => {
+                if (waiting) approvalWaits.add(ac)
+                else approvalWaits.delete(ac)
+                if (localAccounting) parkedLocalTurns += waiting ? 1 : -1
+              },
               // The real per-request trust decision this handler's route computed from its Hono
               // Context (see the `chatCodeAuthorization(c, d)` call sites) — never a hardcoded true.
               isCodeAuthorized: ctx.isCodeAuthorized,
@@ -2274,7 +2327,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   } catch { /* a failing sink — nothing to flush to */ }
 
   if (!aborted && conv.title === 'New chat' && d.store.snapshot().daemon.autoGenerateTitles) {
-    setTimeout(() => { void autoTitle(d, convId, ctx.engineMessages, fullContent, upstream) }, 1000)
+    afterReplyCall(convId, 1000, () => autoTitle(d, convId, ctx.engineMessages, fullContent, upstream))
   }
 
   // Release 3, auto-memory: extract durable facts from the just-typed user text (never
@@ -2288,7 +2341,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // hide its settings UI while extraction keeps running underneath.
   const daemonCfg = d.store.snapshot().daemon
   if (!aborted && ctx.userText && daemonCfg.experimental.memory && daemonCfg.autoMemoryEnabled) {
-    setTimeout(() => { void extractMemoryFacts(d, convId, ctx.userText!, upstream) }, 1500)
+    afterReplyCall(convId, 1500, () => extractMemoryFacts(d, convId, ctx.userText!, upstream))
   }
 }
 

@@ -883,15 +883,21 @@ export type RerankResponse = {
   usage: { prompt_tokens: number; total_tokens: number }
 }
 
-/** One thing a model load would interrupt right now (ADR-434 (i)(3)). */
+/** One thing a model load would interrupt right now (ADR-434 (i)(3)). `load`: a model loading;
+ *  `tune`: an auto-tune run; `skill`: a skill being written. */
 export type ActiveWorkItem = {
-  kind: 'chat' | 'code' | 'routine'
+  kind: 'chat' | 'code' | 'routine' | 'load' | 'tune' | 'skill'
   id: string
   label: string
 }
 
 export type ActiveWork = {
+  /** Work in progress on the engine. */
   items: ActiveWorkItem[]
+  /** Chats parked on a tool-call approval: they wait on a person, so they are not in `items`, but
+   *  a load still interrupts them. Absent from a daemon before it (a page left open across an
+   *  update), read as none. */
+  waiting?: ActiveWorkItem[]
   /** A generation running through the gateway. It has no item of its own: the daemon
    *  knows a request is in flight, not whose it is. */
   engineGenerating: boolean

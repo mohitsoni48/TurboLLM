@@ -156,6 +156,8 @@ async function readActiveWork(): Promise<ActiveWork | null> {
   }
 }
 
+/** Anything a load would interrupt: work in progress, a reply parked on an approval (the load
+ *  denies its call), or an API client's generation. */
 function isBusy(work: ActiveWork): boolean {
-  return work.items.length > 0 || work.engineGenerating
+  return work.items.length > 0 || (work.waiting ?? []).length > 0 || work.engineGenerating
 }

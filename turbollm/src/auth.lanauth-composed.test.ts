@@ -1711,7 +1711,7 @@ function agentRoutineApp(mutate: (cfg: ReturnType<typeof defaultConfig>) => void
     db,
     scanner: { list: () => ({ models: [{ key: 'm', name: 'M' }], scanning: false, lastScanAt: '' }) },
     gate: { acquire: async () => { throw new Error('busy') } },
-    routineScheduler: { runNow: (id: string) => { fired.push(id); return { ok: true } }, releaseParked: () => {} },
+    routineScheduler: { runNow: (id: string) => { fired.push(id); return { ok: true } }, releaseParked: () => {}, markResuming: () => {}, unmarkResuming: () => {} },
   })
   const app = new Hono()
   app.use('*', lanAuth(d))
