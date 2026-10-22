@@ -85,6 +85,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - `GET /api/v1/status` reports `poolModels`, the number of models loaded or loading beside the primary (an embedding
   model's pool slot, a Laya load). The Android app keeps its service while one is; before, with notifications off, it
   stopped under an embedding model left loaded, or still loading, after the chat model was ejected.
+- `GET /api/v1/status` reports `serving`: `lan` (the daemon listens beyond loopback), `remote` (remote access is up,
+  or starting or reconnecting: a tunnel, or Tailscale Serve or Funnel) and `linkPeers` (how many Turbo Link tokens this
+  machine has minted for other machines, 0 while Turbo Link is off). The Android app keeps the daemon running through
+  a close of the app while any of them is on.
 
 ### Fixed
 - **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,

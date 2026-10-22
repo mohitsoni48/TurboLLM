@@ -106,6 +106,7 @@ import { buildModelStatus } from './status-view'
 import { failedLoadView } from './failed-load-view'
 import { jevStatus } from './jev-status'
 import { layaStatus } from './laya-status'
+import { servingStatus } from './serving-status'
 import { textClassificationStatus } from './text-classification-status'
 import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
@@ -266,6 +267,11 @@ export function registerApi(app: Hono, d: Deps): void {
       // the primary engine, jev and laya, so with notifications off it stopped (and its process could be killed) under
       // an embedding model loaded, or still loading, beside an ejected chat model.
       poolModels: d.modelRouter.poolModelCount(),
+      // Which server features are on (serving-status.ts): `lan` (the listener is bound beyond loopback), `remote`
+      // (remote access is up or coming up) and `linkPeers` (the Turbo Link peers this daemon hosts). Local-only, like
+      // `poolModels`. The Android app quits the daemon when it is closed with nothing running, and counts these as
+      // running: models and work alone left out a daemon serving LAN clients, a remote-access URL or linked machines.
+      serving: servingStatus(d),
       // The alive text classification model, Jev or Laya (ADR-444): the one field the UI reads for the feature.
       // A Jev one wins when both are alive, as `jev ?? laya` did.
       textClassification: textClassificationStatus(d),
