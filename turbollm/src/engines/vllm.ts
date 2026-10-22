@@ -10,6 +10,7 @@
 // attempts `uv pip install vllm`, which fails loudly on an unsupported platform.
 import { existsSync } from 'node:fs'
 import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { hostname, machine, release, version as kernelBuild } from 'node:os'
 import { join } from 'node:path'
 import { ensureUv } from './mlx'
@@ -46,6 +47,8 @@ export async function ensureVllmEnv(root: string, onProgress?: (p: ProvisionProg
   const uv = await ensureUv(root, onProgress)
   const envDir = join(root, 'vllm', 'venv')
   const py = venvPython(envDir)
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
@@ -57,13 +60,14 @@ export async function ensureVllmEnv(root: string, onProgress?: (p: ProvisionProg
   // generous buffer + no timeout (pip resolves + compiles for minutes).
   // `-U` forces an upgrade to the latest release when requested.
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['-U'] : []), 'vllm']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '-U', reinstall }), 'vllm']
   await execFileP(uv, installArgs, {
     cwd: root,
     maxBuffer: 64 * 1024 * 1024,
   })
 
   const version = await probeVllm(py)
+  finishPyEnvInstall(envDir)
   return { python: py, version }
 }
 

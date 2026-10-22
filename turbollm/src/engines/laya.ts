@@ -8,6 +8,7 @@
 // uv pick the PyTorch build (CUDA, ROCm or CPU) that matches the machine.
 import { existsSync } from 'node:fs'
 import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
@@ -91,8 +92,8 @@ function venvPython(envDir: string): string {
   return process.platform === 'win32' ? join(envDir, 'Scripts', 'python.exe') : join(envDir, 'bin', 'python')
 }
 
-export function layaInstallArgs(python: string, upgrade: boolean): string[] {
-  return ['pip', 'install', '--python', python, '--torch-backend=auto', ...(upgrade ? ['--upgrade'] : []), LAYA_PACKAGE]
+export function layaInstallArgs(python: string, upgrade: boolean, reinstall = false): string[] {
+  return ['pip', 'install', '--python', python, '--torch-backend=auto', ...pyInstallFlags({ upgrade, upgradeFlag: '--upgrade', reinstall }), LAYA_PACKAGE]
 }
 
 /** Provision an isolated Laya runtime: uv → venv → `uv pip install laya[serve]`. When `upgrade` is true, passes
@@ -105,13 +106,17 @@ export async function ensureLayaEnv(
   const uv = await ensureUv(root, onProgress)
   const envDir = join(root, 'laya', 'venv')
   const python = venvPython(envDir)
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, python)
   onProgress?.({ phase: 'extracting', pct: -1 })
   if (!existsSync(python)) {
     const venvArgs = ['venv', '--python', LAYA_PYTHON, ...(existsSync(envDir) ? ['--clear'] : []), envDir]
     await execFileP(uv, venvArgs, { cwd: root })
   }
-  await execFileP(uv, layaInstallArgs(python, upgrade), { cwd: root, maxBuffer: 16 * 1024 * 1024 })
-  return { python, version: await probeLaya(python) }
+  await execFileP(uv, layaInstallArgs(python, upgrade, reinstall), { cwd: root, maxBuffer: 16 * 1024 * 1024 })
+  const version = await probeLaya(python)
+  finishPyEnvInstall(envDir)
+  return { python, version }
 }
 
 /** Read the installed laya version (also a smoke test that it imports). */

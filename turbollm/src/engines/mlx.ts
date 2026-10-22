@@ -8,6 +8,7 @@
 // cross-platform and independently testable; `ensureMlxEnv` guards on darwin.
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
 import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
 import { downloadFile, extractArchive, findFile, type ProvisionProgress } from './download'
 
@@ -92,6 +93,8 @@ export async function ensureMlxEnv(root: string, onProgress?: (p: ProvisionProgr
     } catch { /* treat as incompatible — will recreate */ }
     if (!compatible) rmSync(envDir, { recursive: true, force: true })
   }
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
@@ -110,13 +113,14 @@ export async function ensureMlxEnv(root: string, onProgress?: (p: ProvisionProgr
   // Install (or no-op if already satisfied) mlx-lm into the venv.
   // `--upgrade` forces an upgrade to the latest release when requested.
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['--upgrade'] : []), 'mlx-lm']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '--upgrade', reinstall }), 'mlx-lm']
   await execFileP(uv, installArgs, {
     cwd: root,
     maxBuffer: 16 * 1024 * 1024,
   })
 
   const version = await probeMlx(py)
+  finishPyEnvInstall(envDir)
   return { python: py, version }
 }
 

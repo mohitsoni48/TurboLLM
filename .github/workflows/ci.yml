@@ -212,6 +212,12 @@ jobs:
         run: npx tsx --test --test-name-pattern="left running|background jobs" src/routines/code-runner.test.ts
         working-directory: turbollm
 
+      # The MLX engines provision on macOS only, so the ubuntu job skips their cases.
+      - name: The MLX engines redo only an unfinished install
+        if: runner.os == 'macOS'
+        run: npx tsx --test src/engines/py-env-marker.test.ts
+        working-directory: turbollm
+
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}

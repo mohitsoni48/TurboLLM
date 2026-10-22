@@ -9,6 +9,7 @@
 // same classifier, which treats only Windows as a hard platform block.
 import { existsSync } from 'node:fs'
 import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
 import { ensureUv } from './mlx'
 import { UvloopPreflight } from './py-engine-blocker'
@@ -39,16 +40,19 @@ export async function ensureSglangEnv(root: string, onProgress?: (p: ProvisionPr
   const uv = await ensureUv(root, onProgress)
   const envDir = join(root, 'sglang', 'venv')
   const py = venvPython(envDir)
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
     await execFileP(uv, ['venv', '--python', SGLANG_PYTHON, envDir], { cwd: root })
   }
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['-U'] : []), 'sglang[all]']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '-U', reinstall }), 'sglang[all]']
   await execFileP(uv, installArgs, { cwd: root, maxBuffer: 64 * 1024 * 1024 })
 
   const version = await probeSglang(py)
+  finishPyEnvInstall(envDir)
   return { python: py, version }
 }
 

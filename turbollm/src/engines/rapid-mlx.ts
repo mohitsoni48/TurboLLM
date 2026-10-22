@@ -11,6 +11,7 @@
 // than Rapid-MLX's separate alias/download system.
 import { existsSync, rmSync } from 'node:fs'
 import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
@@ -65,6 +66,8 @@ export async function ensureRapidMlxEnv(
     } catch { /* treat as incompatible — will recreate */ }
     if (!compatible) rmSync(envDir, { recursive: true, force: true })
   }
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
@@ -74,10 +77,11 @@ export async function ensureRapidMlxEnv(
   }
 
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['--upgrade'] : []), 'rapid-mlx']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '--upgrade', reinstall }), 'rapid-mlx']
   await execFileP(uv, installArgs, { cwd: root, maxBuffer: 16 * 1024 * 1024 })
 
   const version = await probeRapidMlx(bin)
+  finishPyEnvInstall(envDir)
   return { bin, version }
 }
 
