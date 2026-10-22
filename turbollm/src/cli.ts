@@ -1488,7 +1488,7 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   try {
     // stopTethered: everything else tethered (routine runs, Code commands, git, …) gets SIGTERM, then its group
     // is killed after 3 s; engines and tunnels are their owners' to stop, just above.
-    void Promise.all([manager.shutdown(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
+    void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1551,7 +1551,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
+    void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {

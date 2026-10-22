@@ -184,7 +184,7 @@ jobs:
         working-directory: turbollm
 
       - name: Tether tests
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts
         working-directory: turbollm
 
   wrapper:

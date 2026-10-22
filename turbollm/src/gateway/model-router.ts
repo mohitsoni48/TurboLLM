@@ -423,6 +423,20 @@ export class ModelRouter {
     await Promise.all(stopping)
   }
 
+  /** The daemon's shutdown (both teardowns in cli.ts, beside the primary's manager.shutdown()): every pool-slot engine
+   *  is stopped as the primary is, SIGTERM then the force kill after its grace, and resolves once they have exited.
+   *  Only the primary was stopped there, so a pool slot (keep-N 2 or more, an embedding model beside a chat model) was
+   *  never told to stop: a Settings restart's replacement started while it still held its VRAM, and on any graceful
+   *  stop it was only SIGKILLed by the exit handler's pidfile net. */
+  async shutdownPool(): Promise<void> {
+    const stopping: Promise<unknown>[] = []
+    for (const p of this.poolProcesses()) {
+      if (p.slotKey !== undefined) this.dropSlot(p.slotKey)
+      stopping.push(p.manager.stopAndWait())
+    }
+    await Promise.all(stopping)
+  }
+
   /** Every pool-slot manager whose engine process may be alive, with the engine ids it holds: the registered slots
    *  (`slotKey`), the ejected ones still exiting, and the slot a load runs in (see loadingSlot: on its new engine, and
    *  on its evicted model's while that model still runs or stops). */

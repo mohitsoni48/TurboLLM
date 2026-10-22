@@ -10,7 +10,7 @@
 // shape other tests use — since there's no public seeder that doesn't drive a real load.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync } from 'node:fs'
+import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { ModelRouter } from './model-router'
@@ -1307,4 +1307,29 @@ test('an embedding model loaded with nothing else running takes the primary and 
   assert.ok('target' in embedding, JSON.stringify(embedding))
   assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[embedModel.key, true]])
   assert.deepEqual(store.snapshot().lastLoaded, { modelKey: embedModel.key, engineId: 'fake' })
+})
+
+// ── The daemon's shutdown stops the pool slots too ───────────────────────────────────────────────────────────────
+// Both teardowns in cli.ts stopped only the primary (manager.shutdown()): an engine in a pool slot was never told to
+// stop, so a Settings restart's replacement started while it still held its VRAM, and a graceful stop left it to the
+// exit handler's SIGKILL.
+test('shutdownPool() stops every pool slot\'s engine and waits for it to exit', {
+  skip: process.platform === 'win32' && 'uses a POSIX shell wrapper as the fake engine binary',
+}, async (t) => {
+  const { store, modelRouter, userModel, embedModel } = await realEngineSetUp(t)
+  t.after(() => modelRouter.stopPoolSlotsOnEngine('fake', { force: true }))
+  assert.ok('target' in (await modelRouter.loadExplicit(userModel.key)))
+  assert.ok('target' in (await modelRouter.loadExplicit(embedModel.key)))
+  assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[userModel.key, true], [embedModel.key, false]])
+  const enginePids = () => readdirSync(join(store.dir(), 'run')).filter((n) => /^engine-\d+\.pid$/.test(n)).map((n) => Number(/\d+/.exec(n)![0]))
+  const before = enginePids()
+  assert.equal(before.length, 2)
+
+  await modelRouter.shutdownPool()
+
+  assert.deepEqual(modelRouter.aliveSlots().map((s) => [s.modelKey, s.primary]), [[userModel.key, true]], 'the primary is the Manager\'s own shutdown')
+  const after = enginePids()
+  assert.equal(after.length, 1)
+  const slotPid = before.find((p) => !after.includes(p))!
+  assert.throws(() => process.kill(slotPid, 0), 'the slot\'s engine has exited')
 })

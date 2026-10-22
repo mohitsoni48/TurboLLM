@@ -264,3 +264,11 @@ test('boot waits for the tether (the Android helper\'s self-test) before anythin
     assert.ok(ready < CLI.indexOf(later), `before ${later}`)
   }
 })
+
+// The behaviour is gateway/model-router.test.ts's "shutdownPool() stops every pool slot's engine and waits for it to
+// exit".
+test('both teardowns stop the pool slots\' engines beside the primary\'s', () => {
+  const WITH_POOL = /Promise\.all\(\[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bmodelRouter\.shutdownPool\(\)[^\]]*\]\)\.finally\(/
+  assert.match(blockFrom('if (!packagedAndroidApp()) deps.requestRestart = ('), WITH_POOL, 'the restart teardown')
+  assert.match(blockFrom(SIGNALS), WITH_POOL, 'the signal teardown')
+})

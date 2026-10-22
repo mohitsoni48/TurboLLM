@@ -1,7 +1,7 @@
 // Engine lifecycle state machine (A2, spec 03 §4): stopped → starting → running
 // → stopping → stopped, plus error. Owns the single running engine process.
 // Ports the verified Go manager to node:child_process.
-import { ChildProcess, execFile, spawn, spawnSync } from 'node:child_process'
+import { ChildProcess, execFile, spawnSync } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
@@ -14,6 +14,8 @@ import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
+import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
 import {
@@ -468,13 +470,17 @@ export class Manager {
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath, litertConfigPath)
-    // The UNWRAPPED command (before the POSIX-llamafile shell-quoting workaround below) is
-    // what a human would actually type in their own terminal — stored for "copy exact launch
-    // command" (GitHub Discord ask). Not logged before now: the file only ever had a port-only
-    // header line, never the real argv.
+    // The command as a human would type it in their own terminal — stored for "copy exact launch command" (GitHub
+    // Discord ask). Not logged before now: the file only ever had a port-only header line, never the real argv.
     this.lastCommand = { cmd, args }
-    const spawned = needsShellWrapper(opts.engine.kind) ? shellWrapped(cmd, args) : { cmd, args }
-    const child = spawn(spawned.cmd, spawned.args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) })
+    // Tethered (util/tether.ts): the engine, and every worker it starts in its process group (vLLM's and SGLang's
+    // Python workers, a pool slot's own), end the moment the daemon does, however it ends. A SIGKILLed, crashed or
+    // out-of-memory-killed daemon used to leave llama-server running, parented to init, holding the model's VRAM and
+    // its port until the next start's reaper found it, and one still loading (no port open yet) not even then. On
+    // POSIX the wrapper is a `/bin/sh` that execs the engine, so a llamafile (an Actually Portable Executable that
+    // execve refuses with ENOEXEC) runs through sh as the old shellWrapped did. Windows spawns it as before, in libuv's
+    // kill-on-close job.
+    const child = spawnTethered(cmd, args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) }, { kind: 'engine' })
     // end:false — otherwise whichever of stdout/stderr closes first would end the
     // shared log stream and drop the other's output. We close it in onTerminated.
     child.stdout?.pipe(logStream, { end: false })
@@ -493,8 +499,16 @@ export class Manager {
     // Track the OS process on disk so a daemon that dies WITHOUT running its signal
     // handlers (terminal window closed, killed, crashed) can't leave llama-server
     // orphaned: the next startup reaps it (reapStaleEngines), and the exit handler
-    // kills it synchronously (killTrackedEnginesSync). Cleared in onTerminated.
-    if (this.pid) writeEnginePid(this.store.dir(), this.pid, port)
+    // kills it synchronously (killTrackedEnginesSync). Cleared at the engine's exit, not only at its 'close' (in
+    // onTerminated): a worker left holding its stdout holds 'close' back for as long as it lives, and in that window
+    // the exit handler's kill (taskkill /T on Windows, the bare pid as the fallback on POSIX) named a pid Node had
+    // already reaped, which may name another process by then.
+    if (this.pid) {
+      writeEnginePid(this.store.dir(), this.pid, port, isTetheredGroupLeader(child))
+      const pid = this.pid
+      const dir = this.store.dir()
+      child.once('exit', () => clearEnginePid(dir, pid))
+    }
     this.child = child
     this.startedAt = Date.now()
     this.errInfo = null
@@ -754,6 +768,10 @@ export class Manager {
 
   async shutdown(): Promise<void> {
     const child = this.child
+    // A stop already under way (a Stop, an eject, the idle unload, a restart's teardown: SIGTERM sent) is waited out.
+    // Returning at once let the daemon exit about 1.5 s into that stop's 8 s grace, and the exit handler SIGKILLed the
+    // engine's group before it could exit by itself. gracefulStop's own force kill bounds the wait, waitForExit too.
+    if (child && this.state === 'stopping') return this.waitForExit(this.exited)
     const running = this.state === 'running' || this.state === 'starting'
     if (!child || !running) return
     this.state = 'stopping'
@@ -906,26 +924,6 @@ export class Manager {
 }
 
 // ---- helpers ---------------------------------------------------------------
-
-/** True when `kind`'s binary needs shell interpretation to run correctly on this platform.
- *  llamafile ships as an "Actually Portable Executable" (Cosmopolitan libc) — a polyglot whose
- *  leading bytes look like a DOS/PE header, which a POSIX shell dispatches to the right native
- *  format for the current OS. Node's `spawn()` calls `execve()` directly (no shell), which fails
- *  with ENOEXEC on macOS/Linux for this format — confirmed live on macOS: the daemon accepted
- *  the start request but the process never spawned, while running the identical binary through
- *  a shell worked immediately. Windows already recognizes the leading MZ/PE header natively, so
- *  no wrapping is needed there. */
-export function needsShellWrapper(kind: string): boolean {
-  return kind === 'llamafile' && process.platform !== 'win32'
-}
-
-/** Wrap cmd+args to run through /bin/sh with no manual argument quoting/escaping needed: `"$0"`
- *  and `"$@"` are populated from spawn's own argv array (never string-concatenated), so a path
- *  or flag containing spaces/special characters passes through unmangled with no shell-injection
- *  risk from argument content. */
-export function shellWrapped(cmd: string, args: string[]): { cmd: string; args: string[] } {
-  return { cmd: '/bin/sh', args: ['-c', 'exec "$0" "$@"', cmd, ...args] }
-}
 
 /** Build the spawn command for an engine, branching on its kind (spec 03 §2b).
  *  `slotSavePath` (F-014) is appended only for llama.cpp; mlx/vllm don't support it. */
@@ -1198,9 +1196,14 @@ function signalTerm(child: ChildProcess): void {
 function forceKill(child: ChildProcess): void {
   if (!child.pid) return
   if (process.platform === 'win32') {
+    // Not once Node has seen the engine exit (a worker holding its stdout keeps 'close', and so the stop, waiting):
+    // libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may name another
+    // process tree by then, as in killTetheredTree (util/tether.ts). An exited root is no tree for taskkill anyway.
+    if (child.exitCode !== null || child.signalCode !== null) return
     execFile('taskkill', ['/PID', String(child.pid), '/F', '/T'], () => {})
   } else {
-    child.kill('SIGKILL')
+    // The engine's whole group (its workers too); the pid alone when it leads none (the Android helper).
+    killTetheredTree(child, 'SIGKILL')
   }
 }
 
@@ -1223,6 +1226,10 @@ interface EnginePidRecord {
   pid: number
   port: number
   owner: number
+  /** When the engine was spawned (epoch ms). Absent in a pidfile written before it was recorded. */
+  startedAt?: number
+  /** The engine leads a process group of its own (util/tether.ts), so a kill takes its workers too. */
+  group: boolean
   file: string
 }
 
@@ -1230,13 +1237,15 @@ function enginePidDir(dataDir: string): string {
   return join(dataDir, 'run')
 }
 
-function writeEnginePid(dataDir: string, pid: number, port: number): void {
+function writeEnginePid(dataDir: string, pid: number, port: number, group: boolean): void {
   try {
     const dir = enginePidDir(dataDir)
     mkdirSync(dir, { recursive: true })
     // owner = this daemon's pid, so another instance can tell "managed by a live daemon"
-    // apart from "true orphan whose daemon is gone".
-    writeFileSync(join(dir, `engine-${pid}.pid`), JSON.stringify({ pid, port, owner: process.pid }))
+    // apart from "true orphan whose daemon is gone". `startedAt` lets the next start's reaper tell this engine apart
+    // from an unrelated process that later got the same pid (util/process-start-time.ts); `group` that it can take
+    // the engine's whole process group.
+    writeFileSync(join(dir, `engine-${pid}.pid`), JSON.stringify({ pid, port, owner: process.pid, startedAt: Date.now(), group }))
   } catch {
     /* best-effort — tracking is a safety net, never block a load on it */
   }
@@ -1276,9 +1285,14 @@ function readEnginePidFiles(dataDir: string): EnginePidRecord[] {
   for (const name of names) {
     const file = join(dir, name)
     try {
-      const { pid, port, owner } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; port?: number; owner?: number }
+      const { pid, port, owner, startedAt, group } = JSON.parse(readFileSync(file, 'utf8')) as {
+        pid?: number; port?: number; owner?: number; startedAt?: number; group?: boolean
+      }
       if (typeof pid === 'number' && pid > 0) {
-        out.push({ pid, port: typeof port === 'number' ? port : 0, owner: typeof owner === 'number' ? owner : 0, file })
+        out.push({
+          pid, port: typeof port === 'number' ? port : 0, owner: typeof owner === 'number' ? owner : 0,
+          startedAt: typeof startedAt === 'number' ? startedAt : undefined, group: group === true, file,
+        })
       } else rmSync(file, { force: true })
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
@@ -1310,15 +1324,29 @@ function portAlive(port: number, timeoutMs = 600): Promise<boolean> {
  *  cleanly. Called once at startup BEFORE anything loads a model. An engine is an orphan
  *  ONLY if its owner daemon is gone — an engine still owned by a live daemon (another
  *  running instance, or the outgoing daemon during a restart overlap) is left untouched.
- *  Among true orphans we still kill only when the recorded engine port is alive, so we
- *  never kill a recycled pid; otherwise just clear the stale file. Returns orphans killed. */
+ *  An orphan is killed only when it is provably the engine that was recorded, so a recycled
+ *  pid is never killed:
+ *   - a pidfile with `startedAt`: when the pid's process started then, whether or not its port
+ *     is open. The port rule alone left an engine killed by its daemon mid-load (no port open
+ *     yet) running, holding its VRAM, until it finished loading and nothing ever reaped it;
+ *     a start time that does not match is not killed;
+ *   - a pidfile from before `startedAt` was recorded, or a live pid whose start time cannot be read (no `ps`, as
+ *     in a slim container image; PowerShell failing on Windows): when the recorded engine port is alive, the rule
+ *     every record had before.
+ *  Either way the stale file is cleared. Returns orphans killed. */
 export async function reapStaleEngines(dataDir: string): Promise<number> {
   let killed = 0
-  for (const { pid, port, owner, file } of readEnginePidFiles(dataDir)) {
-    // Owner still running → a live daemon manages this engine; not ours to reap.
-    if (owner && pidAlive(owner)) continue
-    if (await portAlive(port)) {
-      killPidTree(pid)
+  const orphans = readEnginePidFiles(dataDir).filter(({ owner }) => !(owner && pidAlive(owner)))
+  const started = processStartTimes(orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid))
+  for (const { pid, port, startedAt, group, file } of orphans) {
+    const actual = startedAt !== undefined ? started.get(pid) : undefined
+    if (startedAt !== undefined && actual !== undefined) {
+      if (Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
+        killPidTree(pid, group)
+        killed++
+      }
+    } else if ((startedAt === undefined || pidAlive(pid)) && await portAlive(port)) {
+      killPidTree(pid, startedAt !== undefined && group)
       killed++
     }
     try { rmSync(file, { force: true }) } catch { /* best-effort */ }
@@ -1331,13 +1359,13 @@ export async function reapStaleEngines(dataDir: string): Promise<number> {
  *  startup reap is the real guarantee. Owner-scoped so a daemon exiting during a restart
  *  overlap never kills the incoming daemon's engine. */
 export function killTrackedEnginesSync(dataDir: string): void {
-  for (const { pid, owner, file } of readEnginePidFiles(dataDir)) {
+  for (const { pid, owner, group, file } of readEnginePidFiles(dataDir)) {
     if (owner !== process.pid) continue // not ours — leave another daemon's engine + file alone
     try {
       if (process.platform === 'win32') {
         spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
       } else {
-        process.kill(pid, 'SIGKILL')
+        killPosix(pid, group)
       }
     } catch {
       /* process already gone */
@@ -1346,13 +1374,27 @@ export function killTrackedEnginesSync(dataDir: string): void {
   }
 }
 
+/** SIGKILL an engine on POSIX: its whole process group when it leads one (its workers go with it), with the pid
+ *  alone as the fallback. */
+function killPosix(pid: number, group: boolean): void {
+  if (group) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+      return
+    } catch {
+      /* no such group: the pid alone */
+    }
+  }
+  try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+}
+
 /** Kill a process tree by pid (async, fire-and-forget). taskkill /T on Windows takes
- *  the whole tree; SIGKILL on POSIX. */
-function killPidTree(pid: number): void {
+ *  the whole tree; on POSIX the engine's process group when the pidfile says it leads one. */
+function killPidTree(pid: number, group: boolean): void {
   if (process.platform === 'win32') {
     execFile('taskkill', ['/PID', String(pid), '/F', '/T'], () => {})
   } else {
-    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    killPosix(pid, group)
   }
 }
 

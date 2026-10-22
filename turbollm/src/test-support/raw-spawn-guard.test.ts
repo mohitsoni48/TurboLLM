@@ -80,7 +80,6 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/process-start-time.ts#processStartTimes:spawnSync': SYNC,
 
   // ── Not tethered yet ──
-  'engines/manager.ts#Manager.startInternal:spawn': `engines and pool slots; ${UNTIED}`,
   'remote/child-process.ts#ChildTunnel.spawnAndWait:spawn': `remote-access tunnels; ${UNTIED}`,
   'remote/providers/tailscale.ts#runTailscale:execFile': `the tailscale CLI; ${UNTIED}`,
   'routines/cli-process.ts#defaultRawSpawn:spawn': `a routine's headless claude; ${UNTIED}`,
