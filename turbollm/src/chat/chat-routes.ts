@@ -232,6 +232,25 @@ function startDetachedTurn(c: Context, d: Deps, convId: string, ac: AbortControl
   return run
 }
 
+/** How often a reply's text so far is saved into its placeholder while its turn runs, when it changed since the
+ *  last save (runGeneration's partial saves). Each save is one UPDATE of the row, about 1 ms on Android's sql.js with
+ *  2,000 messages (Node 18.20.4), and on Android the export it then brings about a second later (sql-js-database.ts):
+ *  about 11 ms for a 5 MB database and 47 ms for 24 MB on an idle disk here, a few hundred ms under heavy I/O. Every
+ *  10 s that is under 1% of the time and a few MB written per 10 s of streaming, while a kill loses at most the last
+ *  10 s of a reply. */
+const PARTIAL_SAVE_MS = 10_000
+
+/** The running turns' partial saves: runGeneration adds its savePartial while its turn runs and removes it as the
+ *  turn ends. POST /api/v1/daemon/flush runs them first (saveRunningReplies), so the database it writes holds each
+ *  running reply's text up to that moment. The Android app calls the flush before its Quit ends the process; without
+ *  this, a reply running at Quit kept only what its last 10 s save had written. */
+const runningReplySaves = new Set<() => void>()
+
+/** Saves every running reply's text so far into its placeholder now (see runningReplySaves). */
+export function saveRunningReplies(): void {
+  for (const save of runningReplySaves) save()
+}
+
 /** How often a viewer's stream gets an SSE comment while no frame is due (a turn waiting on an
  *  approval or a long tool call): a tunnel or proxy that cuts idle streams (Cloudflare's is about
  *  100 s) then leaves it open, instead of the page reconnecting every time. */
@@ -1576,6 +1595,22 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // keyboard, which is exactly what the wake ledger records.
   noteLocalActivity()
   if (localAccounting) d.manager.generationStart()
+  // The reply's text so far (and its reasoning and finished tool calls) is saved into its placeholder every
+  // PARTIAL_SAVE_MS while the turn runs, when it changed. It was written only at the end of the turn, so a daemon
+  // or Android process killed mid-reply lost everything it had streamed, and the restart reconcile then marked an
+  // empty reply stopped. The stats stay the placeholder's `{"aborted":false}` until the end-of-turn save below,
+  // which is what tells that reconcile (db.ts abortUnfinishedReplies) the reply never finished.
+  let partial = { content: '', reasoning: '', toolCalls: 0 }
+  const savePartial = () => {
+    if (fullContent === partial.content && fullReasoning === partial.reasoning && allToolCalls.length === partial.toolCalls) return
+    partial = { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls.length }
+    try {
+      db.updateMessage(assistantMsg.id, { content: fullContent, reasoning: fullReasoning, toolCalls: allToolCalls })
+    } catch { /* best-effort: the end-of-turn save writes it all */ }
+  }
+  const partialSaves = setInterval(savePartial, PARTIAL_SAVE_MS)
+  partialSaves.unref?.()
+  runningReplySaves.add(savePartial)
   try {
     // Get tool definitions once (or empty for engines that don't support tools)
     // MCP server tools are left out (and refused below) for a caller that may not act on the host:
@@ -2194,6 +2229,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       } catch { /* a failing sink — the message is still persisted below */ }
     }
   } finally {
+    clearInterval(partialSaves)
+    runningReplySaves.delete(savePartial)
     if (localAccounting) d.manager.generationEnd()
     releaseInflight(convId, ac)
   }

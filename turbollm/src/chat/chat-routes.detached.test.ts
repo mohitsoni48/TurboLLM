@@ -724,6 +724,63 @@ it('(p) a viewer gets an SSE keepalive comment every 20 s while nothing else is 
   }
 })
 
+// ── (q) ──────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+it('(q) a reply\'s text is saved while it streams: a kill leaves it, the restart marks it stopped, and the end replaces it', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] }) // the partial saves' 10 s
+  const engine = await standInEngine()
+  const h = routes(engine.url)
+  const dir = (h.d.store as unknown as { dir(): string }).dir()
+  try {
+    const conv = h.store.createConversation()
+    const { assistantMessageId } = await sendAndLeave(h.app, conv.id, 'write an essay')
+    const viewer = sseFrames(await h.app.request(`/api/v1/conversations/${conv.id}/stream`))
+    const call = await engine.call(1)
+    call.word(`Paragraph one, ${LONG}`)
+    await viewer.until((f) => f.event === 'delta' && viewer.text().includes('Paragraph one'), 'the first words')
+    assert.equal(reply(h.store, conv.id).content, '', 'nothing saved before the interval')
+
+    t.mock.timers.tick(10_000)
+    assert.ok(reply(h.store, conv.id).content.startsWith('Paragraph one'), 'saved while it streams')
+    assert.deepEqual(reply(h.store, conv.id).stats, { aborted: false }, 'still the placeholder\'s stats')
+    call.word(`Paragraph two, ${LONG}`)
+    await viewer.until(() => viewer.text().includes('Paragraph two'), 'more words')
+    t.mock.timers.tick(10_000)
+    assert.ok(reply(h.store, conv.id).content.includes('Paragraph two'), 'the next save has the newer text')
+
+    // What a daemon killed now leaves, read as the next process does: its startup reconcile marks the reply stopped and
+    // keeps the text.
+    const restarted = new ConversationStore(dir)
+    try {
+      const log = console.log
+      console.log = () => {}
+      try {
+        registerChatRoutes(new Hono(), { db: restarted, store: h.d.store } as unknown as Deps)
+      } finally {
+        console.log = log
+      }
+      const left = restarted.getMessage(assistantMessageId)!
+      assert.deepEqual(left.stats, { aborted: true })
+      assert.ok(left.content.startsWith('Paragraph one') && left.content.includes('Paragraph two'))
+    } finally {
+      restarted.close()
+    }
+
+    // This process's turn goes on, and its end-of-turn save replaces the partial one.
+    call.word('The end.')
+    call.finish()
+    await waitFor(saved(h.store, conv.id), 'the reply to be saved')
+    const final = reply(h.store, conv.id)
+    assert.ok(final.content.endsWith('The end.'))
+    assert.equal(final.stats.aborted, false)
+    assert.equal(typeof final.stats.totalMs, 'number')
+    await viewer.cancel()
+  } finally {
+    h.cleanup()
+    await engine.close()
+  }
+})
+
 // ── (k) (m): through lanAuth, as the daemon judges callers ───────────────────────────────────────────────────────
 
 const RAW_A = 'tllm-detachedturnsdetachedturnsdetachedta1'

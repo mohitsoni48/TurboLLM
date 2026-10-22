@@ -86,7 +86,8 @@ function useFollowStreamingText(block: RefObject<HTMLElement | null>, following:
 
 // ── Stats row ─────────────────────────────────────────────────────────────────
 
-function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
+/** `errorShown`: the bubble shows the error card ("Generation failed or was stopped.") in place of its content. */
+function StatsRow({ stats, errorShown }: { stats: Partial<MessageStats>; errorShown: boolean }) {
   const parts: string[] = []
   if (stats.tps)          parts.push(`${stats.tps.toFixed(1)} tok/s`)
   if (stats.promptTps)    parts.push(`${stats.promptTps.toFixed(0)} tok/s prefill`)
@@ -98,7 +99,10 @@ function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
   }
   if (stats.totalMs)      parts.push(`${(stats.totalMs / 1000).toFixed(1)}s total`)
 
-  if (!parts.length) return null
+  // A reply cut off by a daemon kill after one of its partial saves is reconciled to exactly `{"aborted":true}` with
+  // its text kept (db.ts abortUnfinishedReplies): no numbers to list, so the row showed nothing and the reply read as
+  // finished. It shows the stopped mark alone, unless the error card above already says it was stopped.
+  if (!parts.length && !(stats.aborted && !errorShown)) return null
 
   const tooltip = [
     stats.model       ? `Model: ${stats.model}` : '',
@@ -111,7 +115,7 @@ function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
   return (
     <div className="mt-2 text-[11px] text-faint" title={tooltip}>
       {parts.join(' · ')}
-      {stats.aborted && <span className="ml-2" style={{ color: 'var(--warn)' }}>· aborted</span>}
+      {stats.aborted && <span className={parts.length ? 'ml-2' : ''} style={{ color: 'var(--warn)' }}>{parts.length ? '· aborted' : 'Stopped'}</span>}
     </div>
   )
 }
@@ -991,7 +995,7 @@ export function MessageBubble({
       {/* F-021: sources panel */}
       {rm && <SourcesPanel meta={rm} />}
       <div className="flex items-center gap-1.5">
-        <StatsRow stats={message.stats} />
+        <StatsRow stats={message.stats} errorShown={hasError && !isEditing} />
         {/* GitHub #52: only ever set by an explicit in-place edit, never by generation. */}
         {message.edited && <span className="text-[11px] text-faint">· Edited</span>}
       </div>

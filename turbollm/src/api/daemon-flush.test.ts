@@ -3,12 +3,17 @@
 // is that its gate is /daemon/restart's, and that the file is on disk by the time it answers.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { createServer, type ServerResponse } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { createApp } from '../server'
 import { hashKey, provisionRemoteApiKey } from '../auth'
 import { defaultConfig, type Config } from '../config/config'
+import { registerChatRoutes } from '../chat/chat-routes'
 import { ConversationStore } from '../chat/db'
 import { openSqlJsDatabaseSync, preload } from '../chat/store/sql-js-database'
+import { preloadSqlJs } from '../chat/store/sqlite-adapter'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
@@ -119,5 +124,92 @@ test('on sql.js (Android) it answers once the database is on disk, and says so w
     assert.equal(((await refused.json()) as { error: { code: string } }).error.code, 'flush_failed')
   } finally {
     sqljs.close()
+  }
+})
+
+test('a reply still streaming is saved first: the file on disk holds the text it has streamed', async (t) => {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actual }))
+  await preloadSqlJs()
+  // A stand-in engine that streams what the test writes and ends when told; well under the 10 s partial save.
+  let gotRequest!: (res: ServerResponse) => void
+  const engineRequest = new Promise<ServerResponse>((resolve) => { gotRequest = resolve })
+  const engine = createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      gotRequest(res)
+    })
+  })
+  await new Promise<void>((resolve) => engine.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise<void>((resolve) => { engine.closeAllConnections(); engine.close(() => resolve()) }))
+
+  const dir = tmpDir('daemon-flush-streaming-')
+  const store = new ConversationStore(dir)
+  const flushApp = createApp(mkDeps(store).d)
+  const chatCfg = {
+    modelDefaults: { maxTokens: 0 },
+    gateway: { autoSwap: true },
+    daemon: { autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false },
+    tools: { toolPolicies: {}, autoAllowAll: false },
+  }
+  const chat = new Hono()
+  registerChatRoutes(chat, {
+    db: store,
+    store: { snapshot: () => chatCfg, update: (fn: (c: never) => void) => fn(chatCfg as never), dir: () => dir },
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
+    registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'gemma-27b', name: 'Gemma 27B', ctx: 8192 } }),
+      sessionStats: () => ({ activeRequests: 0 }),
+      target: () => `http://127.0.0.1:${(engine.address() as AddressInfo).port}`,
+      currentOpts: () => null,
+      generationStart: () => {},
+      generationEnd: () => {},
+      setLiveGen: () => {},
+      recordCompletion: () => {},
+    },
+  } as unknown as Deps)
+
+  const conv = store.createConversation({})
+  const page = await chat.request(`/api/v1/conversations/${conv.id}/messages`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'write me a long story' }),
+  })
+  const reader = page.body!.getReader()
+  const dec = new TextDecoder()
+  let seen = ''
+  const readUntil = async (what: string) => {
+    while (!seen.includes(what)) {
+      const { done, value } = await reader.read()
+      if (done) throw new Error(`the stream ended before ${what}`)
+      seen += dec.decode(value, { stream: true })
+    }
+  }
+  const reply = () => store.getMessages(conv.id).filter((m) => m.role === 'assistant').at(-1)!
+  const engineRes = await engineRequest
+  try {
+    const streamed = 'Once upon a time, a reply ran long enough to be cut off by Quit. '.repeat(4)
+    engineRes.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: streamed } }] })}\n\n`)
+    await readUntil('cut off by Quit')
+    // Every word so far has reached the page; the reply's own 10 s save has not run yet.
+    const res = await flushApp.request('/api/v1/daemon/flush', { method: 'POST' }, {
+      incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } },
+    } as never)
+    assert.equal(res.status, 200)
+    assert.deepEqual(await res.json(), { ok: true })
+    const copy = openSqlJsDatabaseSync(join(dir, 'turbollm.db'))
+    const row = copy.prepare('SELECT content, stats FROM messages WHERE id = ?').get(reply().id) as { content: string; stats: string }
+    copy.close()
+    // What the page was shown, less at most the parser's few characters of lookahead.
+    assert.ok(row.content.includes('cut off by Quit') && streamed.startsWith(row.content), `on disk: ${JSON.stringify(row.content)}`)
+    assert.deepEqual(JSON.parse(row.stats), { aborted: false }, 'still unfinished: the restart reconcile marks it stopped')
+  } finally {
+    // The turn ends here even when an assertion failed, and is saved before the store closes.
+    engineRes.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`)
+    engineRes.end('data: [DONE]\n\n')
+    await readUntil('event: done').catch(() => {})
+    await reader.cancel().catch(() => {})
+    store.close()
   }
 })

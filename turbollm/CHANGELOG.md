@@ -82,6 +82,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   burst of changes is still written once, and at least every 10 s while changes keep coming. `POST
   /api/v1/daemon/flush` writes the database at once and answers when it is on disk (`flushed: false` on the desktop,
   whose database is written as it changes); the app calls it before it quits.
+- A chat reply's text is saved every 10 s while it streams, so a daemon crash or kill, or Android closing the app,
+  mid-reply keeps what it had written by then (the reply then reads as stopped, with Stopped under its text) instead
+  of an empty reply. `POST /api/v1/daemon/flush` saves a running reply's text first, so the Android app's Quit keeps
+  all of it.
 - A reload (or Ctrl+R in the desktop app) keeps the chat that was open: the address names it (`/workspace/chat/<id>`)
   from a new chat's first send and whenever another chat is picked, without adding a Back step per chat.
 - The idle timeout (Settings → Idle timeout) no longer unloads the model while a chat still needs it: during a reply's

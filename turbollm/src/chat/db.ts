@@ -1495,16 +1495,20 @@ export class ConversationStore {
     return ((this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
   }
 
-  /** On daemon startup: a chat reply still as its turn's placeholder left it (empty, `{"aborted":false}`, the exact
-   *  stats only the two chat turn routes insert) belongs to a turn of a previous process, which died before its one
-   *  save at the end. It stayed that way for good, shown as "This message is empty." with nothing to say why, so it is
-   *  marked stopped. A placeholder edited by hand since (PUT, which leaves stats alone) keeps its text and stats. Code
-   *  sessions (kind 'code') are Code's own: its run reconcile marks them, and a finished Code turn can carry those same
+  /** On daemon startup: a chat reply still with its turn's placeholder stats (`{"aborted":false}`, the exact stats
+   *  only the two chat turn routes insert, and which only the save at the end of the turn replaces) belongs to a turn
+   *  of a previous process, which died before that save. It stayed that way for good, shown as "This message is
+   *  empty." (or, with the text the turn saved while it streamed, as a finished reply) with nothing to say why, so it
+   *  is marked stopped, its text kept. A placeholder edited by hand since keeps its text and stats: the two message
+   *  edits, the only writers of `edited` (this app's PUT route and the External Chat API's PATCH, through
+   *  sqlite-chat-store over this table), set it and leave stats alone, while the turn's saves as it streams never
+   *  set it, so `edited` is what tells the two apart now that an unfinished reply can have text. Code sessions
+   *  (kind 'code') are Code's own: its run reconcile marks them, and a finished Code turn can carry those same
    *  stats. Returns how many replies were marked. */
   abortUnfinishedReplies(): number {
     return ((this.db.prepare(
       `UPDATE messages SET stats = '{"aborted":true}'
-        WHERE role = 'assistant' AND stats = '{"aborted":false}' AND content = ''
+        WHERE role = 'assistant' AND stats = '{"aborted":false}' AND edited = 0
           AND conv_id IN (SELECT id FROM conversations WHERE kind <> 'code')`,
     ).run() as unknown) as Changes).changes
   }

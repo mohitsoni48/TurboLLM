@@ -109,6 +109,7 @@ import { textClassificationStatus } from './text-classification-status'
 import { engineDeleteBlocked, modelDeleteBlocked } from './delete-guards'
 import { annotateCheckpoint } from '../hf/checkpoints'
 import { registerActivityRoutes } from './active-work'
+import { saveRunningReplies } from '../chat/chat-routes'
 import { stopEngineUsers } from '../engines/serving'
 import { stopRemoteAccess } from '../remote/routes'
 
@@ -2515,6 +2516,9 @@ export function registerApi(app: Hono, d: Deps): void {
   // kills the process, and before its service stops, so a reply that finished a moment before is not
   // lost. Same gate as /daemon/restart. node:sqlite (desktop) writes every change itself: nothing to do.
   app.post('/api/v1/daemon/flush', (c) => {
+    // A running reply's text first: it reaches its row only every 10 s while it streams (runGeneration's partial
+    // saves), and the Android app ends the process right after this answers.
+    saveRunningReplies()
     const onDisk = d.db.flush()
     if (onDisk === null) return c.json({ ok: true, flushed: false })
     if (!onDisk) return err(c, 500, 'flush_failed', 'The chat database could not be written to disk.')

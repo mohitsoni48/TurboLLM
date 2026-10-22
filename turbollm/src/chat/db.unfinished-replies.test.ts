@@ -21,7 +21,7 @@ function seed(store: ConversationStore) {
   const stopped = store.addMessage(store.createConversation().id, 'assistant', 'half an', { stats: { aborted: true, totalMs: 300 } })
   const editedConv = store.createConversation()
   const edited = store.addMessage(editedConv.id, 'assistant', '', { stats: { aborted: false } })
-  store.updateMessage(edited.id, { content: 'typed by hand' }) // PUT /messages/:id on a placeholder: stats stay
+  store.updateMessage(edited.id, { content: 'typed by hand', edited: true }) // as PUT /messages/:id writes it: stats stay
   const routineRun = store.addMessage(store.createConversation({ kind: 'agent' }).id, 'assistant', '', { stats: { aborted: false } })
   const code = store.addMessage(store.createConversation({ kind: 'code' }).id, 'assistant', '', { stats: { aborted: false } })
   return { chat, cutOff, finished, stopped, edited, routineRun, code }
@@ -40,6 +40,53 @@ function checkReconcile(store: ConversationStore) {
   assert.deepEqual(stats(s.code.id), { aborted: false }, 'a Code session is Code\'s own reconcile\'s')
   assert.equal(store.abortUnfinishedReplies(), 0, 'nothing left to mark')
 }
+
+/** A reply whose turn saved its text so far while it streamed (runGeneration's partial saves), then died with the
+ *  daemon: its text, reasoning and finished tool calls are there, its stats still the placeholder's. */
+function checkPartial(store: ConversationStore) {
+  const conv = store.createConversation()
+  store.addMessage(conv.id, 'user', 'write an essay')
+  const partial = store.addMessage(conv.id, 'assistant', '', { stats: { aborted: false } })
+  store.updateMessage(partial.id, { content: 'Paragraph one. Paragraph', reasoning: 'outline first', toolCalls: [{ id: 'call_1', name: 'web_search', args: { q: 'x' }, result: 'r' }] })
+  const editedConv = store.createConversation()
+  const edited = store.addMessage(editedConv.id, 'assistant', '', { stats: { aborted: false } })
+  store.updateMessage(edited.id, { content: 'typed by hand', edited: true })
+
+  assert.equal(store.abortUnfinishedReplies(), 1)
+  const after = store.getMessage(partial.id)!
+  assert.deepEqual(after.stats, { aborted: true }, 'stopped')
+  assert.equal(after.content, 'Paragraph one. Paragraph', 'with the text it had saved')
+  assert.equal(after.reasoning, 'outline first')
+  assert.deepEqual(after.toolCalls.map((c) => c.id), ['call_1'])
+  assert.deepEqual(store.getMessage(edited.id)!.stats, { aborted: false }, 'one edited by hand is not')
+  assert.equal(store.getMessage(edited.id)!.content, 'typed by hand')
+}
+
+test('a reply partly saved while it streamed is marked stopped too, and keeps its text; one edited by hand is not', () => {
+  const dir = tmpDir('tllm-unfinished-partial-')
+  const store = new ConversationStore(dir)
+  try {
+    checkPartial(store)
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('the same on Android\'s sql.js store', async (t) => {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actual }))
+  await preloadSqlJs()
+  const dir = tmpDir('tllm-unfinished-partial-sqljs-')
+  const store = new ConversationStore(dir)
+  try {
+    checkPartial(store)
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 test('abortUnfinishedReplies marks a chat reply left as its turn\'s placeholder, and nothing else', () => {
   const dir = tmpDir('tllm-unfinished-')
