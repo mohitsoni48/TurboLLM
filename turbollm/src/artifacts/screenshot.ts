@@ -6,9 +6,23 @@
 // the html2canvas export. Self-contained artifacts only: the page carries the on-screen iframe's
 // own `default-src 'none'` CSP (see ARTIFACT_CSP), and the browser is launched with no network at
 // all (see NO_NETWORK_ARGS), since the artifact's scripts run here too.
-import { existsSync } from 'node:fs'
-import { execFileSync } from 'node:child_process'
+//
+// The browser is started through util/tether.ts, not puppeteer.launch, and puppeteer attaches to it over Chrome's
+// --remote-debugging-pipe (connect with a transport of our own; ConnectOptions.transport is public API). launch()
+// started Chrome as a plain child, so a daemon that died during an export (SIGKILL, a crash, an out-of-memory kill)
+// left its 9 processes running, a spinning renderer pegging a core, measured alive 11 s later; and it registered a
+// SIGINT handler that called process.exit(130), so Ctrl+C during an export cut the daemon's graceful shutdown short.
+// Now Chrome's whole group ends with the daemon (and Chrome also exits when its CDP pipe closes), and no handler of
+// puppeteer's is registered. --disable-crashpad-for-testing keeps Chrome's two crash handlers from starting: they
+// daemonize into sessions of their own, out of the group, and outlived Chrome by 1-4 s. The profile lives in
+// `<dataDir>/run/chrome-<daemon pid>-<random>`, removed once Chrome has exited, and reapStaleChromeProfiles removes
+// one a daemon that died left behind.
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { execFileSync, type ChildProcess } from 'node:child_process'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { Readable, Writable } from 'node:stream'
+import { killTetheredTree, spawnTethered } from '../util/tether'
 
 /** Candidate executables for the platform, in preference order (Chrome → Edge → Chromium). */
 function chromeCandidates(): string[] {
@@ -102,8 +116,89 @@ export const RENDER_DEADLINE_MS = 20_000
  *  deadline above on its own. A full-page screenshot of a long artifact takes a few seconds. */
 const PROTOCOL_TIMEOUT_MS = 15_000
 
-/** Launch flags apart from the sandbox ones. */
-const BASE_ARGS = ['--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars', ...NO_NETWORK_ARGS]
+/** Launch flags apart from the sandbox ones. CDP goes over the pipe (fds 3 and 4), so no debugging port is open to
+ *  other local processes, and no crash handler starts (see the header). */
+const BASE_ARGS = ['--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars', ...NO_NETWORK_ARGS, '--remote-debugging-pipe', '--disable-crashpad-for-testing']
+
+/** After Browser.close, how long Chrome may take to exit before its group is killed. */
+const CLOSE_GRACE_MS = 2_000
+
+/** A profile directory's name: `chrome-<pid of the daemon that made it>-<random>`. */
+const PROFILE_NAME = /^chrome-(\d+)-[A-Za-z0-9]{6}$/
+
+/** CDP over Chrome's --remote-debugging-pipe: requests are written to its fd 3, replies read from its fd 4, each
+ *  message NUL-terminated. The same framing as puppeteer's own PipeTransport (internal to it): a message is decoded
+ *  only once whole, so a multibyte character split across two reads is not mangled, and each is dispatched on its
+ *  own turn. Exported for its test. */
+export class ChromePipeTransport {
+  onmessage?: (message: string) => void
+  onclose?: () => void
+  #pending: Buffer[] = []
+  #closed = false
+  constructor(private readonly toChrome: Writable, fromChrome: Readable) {
+    fromChrome.on('data', (chunk: Buffer) => this.#dispatch(chunk))
+    fromChrome.on('close', () => this.onclose?.())
+    fromChrome.on('error', () => { /* the 'close' that follows ends the connection */ })
+    toChrome.on('error', () => { /* Chrome has gone: its reply pipe closes too */ })
+  }
+  send(message: string): void {
+    if (this.#closed) return
+    this.toChrome.write(message)
+    this.toChrome.write('\0')
+  }
+  #dispatch(chunk: Buffer): void {
+    if (this.#closed) return
+    let start = 0
+    for (let end = chunk.indexOf(0); end !== -1; end = chunk.indexOf(0, start)) {
+      this.#pending.push(chunk.subarray(start, end))
+      const message = Buffer.concat(this.#pending).toString('utf8')
+      this.#pending = []
+      setImmediate(() => this.onmessage?.(message))
+      start = end + 1
+    }
+    if (start < chunk.length) this.#pending.push(chunk.subarray(start))
+  }
+  close(): void {
+    this.#closed = true
+  }
+}
+
+const exited = (child: ChildProcess, ms: number): Promise<boolean> => new Promise((resolve) => {
+  if (child.exitCode !== null || child.signalCode !== null) return resolve(true)
+  const timer = setTimeout(() => resolve(false), ms)
+  child.once('exit', () => { clearTimeout(timer); resolve(true) })
+})
+
+/** Remove every export profile in `runDir` whose daemon is gone (or is this process: at boot no export runs), which a
+ *  daemon that died during an export left behind. Returns how many. Called once at boot. */
+export function reapStaleChromeProfiles(runDir: string): number {
+  let names: string[]
+  try {
+    names = readdirSync(runDir)
+  } catch {
+    return 0
+  }
+  let removed = 0
+  for (const name of names) {
+    const m = PROFILE_NAME.exec(name)
+    if (!m) continue
+    const pid = Number(m[1])
+    let alive = pid !== process.pid
+    if (alive) {
+      try {
+        process.kill(pid, 0)
+      } catch (e) {
+        alive = (e as NodeJS.ErrnoException).code === 'EPERM'
+      }
+    }
+    if (alive) continue
+    try {
+      rmSync(join(runDir, name), { recursive: true, force: true, maxRetries: 2 })
+      removed++
+    } catch { /* still in use: the next start tries again */ }
+  }
+  return removed
+}
 
 /** Runs `launch` with Chrome's sandbox on, and only falls back to `--no-sandbox` where Chrome
  *  cannot set one up. The export runs the artifact's (model-written, possibly prompt-injected)
@@ -128,6 +223,8 @@ export interface ShotOpts {
   width: number
   /** CSS-px height of the render viewport — `vh` units resolve against this. */
   height: number
+  /** Where the browser's profile directory goes: the daemon passes `<dataDir>/run`, which its boot sweeps. */
+  runDir?: string
 }
 
 /** Render `html` headless and return a full-page PNG buffer at 2× scale, or null if no browser
@@ -142,24 +239,66 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
   } catch {
     return null // dependency missing / failed to load
   }
-  type Browser = Awaited<ReturnType<typeof puppeteer.launch>>
-  const live: { browser?: Browser } = {}
+  type Browser = Awaited<ReturnType<typeof puppeteer.connect>>
+  const runDir = opts.runDir ?? join(tmpdir(), 'turbollm-chrome')
+  let profileDir: string
+  try {
+    mkdirSync(runDir, { recursive: true })
+    profileDir = mkdtempSync(join(runDir, `chrome-${process.pid}-`))
+  } catch {
+    return null
+  }
+  const removeProfile = () => { try { rmSync(profileDir, { recursive: true, force: true, maxRetries: 2 }) } catch { /* the boot sweep */ } }
+  const live: { browser?: Browser; child?: ChildProcess } = {}
   let expired = false
   let timer: NodeJS.Timeout | undefined
+  /** Close the browser, kill its group if it has not exited CLOSE_GRACE_MS later, then remove its profile. Browser.close
+   *  of a wedged Chrome would wait out the protocol timeout; the kill closes the pipe, which ends that wait. */
+  const retire = async (): Promise<void> => {
+    const { browser, child } = live
+    const closing = browser?.close().catch(() => {})
+    if (child && !(await exited(child, CLOSE_GRACE_MS))) {
+      killTetheredTree(child, 'SIGKILL')
+      await exited(child, CLOSE_GRACE_MS)
+    }
+    await closing
+    removeProfile()
+  }
+  /** Chrome, tied to the daemon, with puppeteer attached over its CDP pipe. A Chrome that exits at start (no usable
+   *  sandbox) closes its pipe, so the connect rejects and launchSandboxedFirst retries. */
+  const start = async (noSandbox: boolean): Promise<{ browser: Browser; child: ChildProcess }> => {
+    const args = await puppeteer.defaultArgs({
+      browser: 'chrome',
+      headless: true,
+      userDataDir: profileDir,
+      args: [...(noSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : []), ...BASE_ARGS],
+    })
+    const child = spawnTethered(exe, args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: true }, { kind: 'chrome' })
+    child.on('error', () => { /* its pipes close, so the connect below rejects */ })
+    try {
+      const browser = await puppeteer.connect({
+        transport: new ChromePipeTransport(child.stdio[3] as Writable, child.stdio[4] as Readable),
+        protocolTimeout: PROTOCOL_TIMEOUT_MS,
+        defaultViewport: null,
+      })
+      return { browser, child }
+    } catch (e) {
+      if (child.exitCode === null && child.signalCode === null) killTetheredTree(child, 'SIGKILL') // started, never answered
+      await exited(child, CLOSE_GRACE_MS)
+      throw e
+    }
+  }
   const render = async (): Promise<Buffer | null> => {
-    const browser = await launchSandboxedFirst(async (noSandbox) => {
+    const started = await launchSandboxedFirst(async (noSandbox) => {
       // A sandboxed launch that failed after the deadline gets no retry: nobody waits for it.
       if (expired) throw new Error('export deadline passed')
-      return puppeteer.launch({
-        executablePath: exe,
-        headless: true,
-        protocolTimeout: PROTOCOL_TIMEOUT_MS,
-        args: [...(noSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : []), ...BASE_ARGS],
-      })
+      return start(noSandbox)
     })
-    live.browser = browser
+    live.browser = started.browser
+    live.child = started.child
+    const browser = started.browser
     // The deadline passed during the launch: nothing else will close this one.
-    if (expired) { void browser.close().catch(() => {}); return null }
+    if (expired) { void retire(); return null }
     const page = await browser.newPage()
     await page.setViewport({
       width: Math.max(360, Math.round(opts.width)),
@@ -184,7 +323,8 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
   }
   try {
     return await Promise.race([
-      render().catch(() => null),
+      // No browser came up at all (both launches failed): nothing else removes its profile.
+      render().catch(() => { if (!live.child) removeProfile(); return null }),
       new Promise<null>((resolve) => {
         timer = setTimeout(() => { expired = true; resolve(null) }, deadlineMs)
       }),
@@ -194,8 +334,8 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
     // Past the deadline the close is not awaited, so the export returns at the deadline. A
     // spinning renderer does not hold the close up (the browser process ends its renderers, in
     // about 0.1 s against a for(;;){} page), and Browser.close runs under the protocol timeout
-    // above; when it fails, puppeteer kills the browser's process tree (taskkill /T on Windows).
-    if (expired) void live.browser?.close().catch(() => {})
-    else try { await live.browser?.close() } catch { /* ignore */ }
+    // above; a Chrome still running CLOSE_GRACE_MS after it has its group killed (taskkill /T on
+    // Windows). A launch still in flight at the deadline is retired by render itself.
+    if (expired) { if (live.child) void retire() } else if (live.child) await retire()
   }
 }

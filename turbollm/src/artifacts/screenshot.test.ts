@@ -6,7 +6,13 @@ import assert from 'node:assert/strict'
 import { createSocket } from 'node:dgram'
 import { createServer, type AddressInfo } from 'node:net'
 import { networkInterfaces } from 'node:os'
-import { findChrome, launchSandboxedFirst, RENDER_DEADLINE_MS, screenshotArtifact, withArtifactCsp } from './screenshot'
+import { spawnSync } from 'node:child_process'
+import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { PassThrough } from 'node:stream'
+import { ChromePipeTransport, findChrome, launchSandboxedFirst, reapStaleChromeProfiles, RENDER_DEADLINE_MS, screenshotArtifact, withArtifactCsp } from './screenshot'
+import { isGone, killRecorded, record, srcUrl, startStandInDaemon, waitGone } from '../test-support/stand-in-daemon'
+import { tmpDir } from '../test-support/tmp'
 
 const CSP_START = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\';'
 
@@ -120,4 +126,187 @@ test('screenshotArtifact: a script that never yields ends within the render dead
   // A normal export right after still renders.
   const again = await screenshotArtifact('<!doctype html><body><h1>ok</h1></body>', { width: 800, height: 600 })
   assert.ok(again && again.subarray(1, 4).toString() === 'PNG')
+})
+
+// ── The export browser is tied to the daemon (util/tether.ts) ───────────────────────────────────────────────────────
+// puppeteer.launch started Chrome as a plain child: a daemon that died during an export left its 9 processes running
+// (a spinning renderer pegging a core), and puppeteer's SIGINT handler called process.exit(130) in the middle of the
+// daemon's graceful shutdown. Chrome's two crash handlers daemonized out of its process group. Every Chrome test is in
+// this one file, so they never run alongside each other: a Chrome process that appears during one is that test's.
+
+const CHROME = findChrome()
+const noChrome = !CHROME ? 'no Chrome/Chromium/Edge found' : process.platform === 'win32' ? 'POSIX process groups (Windows ties Chrome through its job sentinel)' : false
+const SPIN = '<html><body>spin<script>for(;;){}</script></body></html>'
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** Where every process of this Chrome lives: the .app bundle on macOS, the executable's directory elsewhere. */
+function chromeRoot(exe: string): string {
+  const real = realpathSync(exe)
+  const app = real.indexOf('.app/')
+  return app >= 0 ? real.slice(0, app + 5) : dirname(real) + '/'
+}
+
+/** Every live process whose executable is inside Chrome's install (crash handlers included), with its group. */
+function chromeProcesses(): Array<{ pid: number; pgid: number; ppid: number; cmd: string }> {
+  const root = chromeRoot(CHROME as string)
+  const out: Array<{ pid: number; pgid: number; ppid: number; cmd: string }> = []
+  if (process.platform === 'linux') {
+    for (const d of readdirSync('/proc').filter((n) => /^\d+$/.test(n))) {
+      try {
+        if (!readlinkSync(`/proc/${d}/exe`).startsWith(root)) continue
+        const stat = readFileSync(`/proc/${d}/stat`, 'utf8')
+        const f = stat.slice(stat.lastIndexOf(')') + 2).split(' ')
+        if (f[0] === 'Z' || f[0] === 'X') continue
+        out.push({ pid: Number(d), ppid: Number(f[1]), pgid: Number(f[2]), cmd: readFileSync(`/proc/${d}/cmdline`, 'utf8').split('\0').join(' ') })
+      } catch { /* not ours to read, or gone */ }
+    }
+    return out
+  }
+  const r = spawnSync('ps', ['-A', '-o', 'pid=,ppid=,pgid=,stat=,comm='], { encoding: 'utf8' })
+  for (const line of String(r.stdout ?? '').split('\n')) {
+    const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line)
+    if (!m || m[4].startsWith('Z') || !m[5].startsWith(root)) continue
+    out.push({ pid: Number(m[1]), ppid: Number(m[2]), pgid: Number(m[3]), cmd: m[5] })
+  }
+  return out
+}
+
+/** The Chrome processes that appeared since `before`, once the browser under `daemonPid` and a renderer are up. */
+async function newChrome(before: Set<number>, daemonPid: number): Promise<{ root: number; all: Array<{ pid: number; pgid: number; cmd: string }> }> {
+  const deadline = Date.now() + 20_000
+  for (;;) {
+    const all = chromeProcesses().filter((p) => !before.has(p.pid))
+    const root = all.find((p) => p.ppid === daemonPid)
+    if (root && all.some((p) => /--type=renderer/.test(p.cmd) || /Renderer/.test(p.cmd))) {
+      await sleep(500) // let every helper start: a crash handler shows up after the browser
+      return { root: root.pid, all: chromeProcesses().filter((p) => !before.has(p.pid)) }
+    }
+    if (Date.now() >= deadline) throw new Error(`no browser and renderer under ${daemonPid}: ${JSON.stringify(all)}`)
+    await sleep(50)
+  }
+}
+
+function sandboxNote(rootPid: number): string {
+  const cmd = process.platform === 'linux' ? readFileSync(`/proc/${rootPid}/cmdline`, 'utf8') : String(spawnSync('ps', ['-o', 'args=', '-p', String(rootPid)], { encoding: 'utf8' }).stdout)
+  return cmd.includes('--no-sandbox') ? 'Chrome ran with --no-sandbox' : 'Chrome ran sandboxed'
+}
+
+test('a daemon SIGKILLed during a spinning export takes every Chrome process with it; none was outside its group', { skip: noChrome, timeout: 60_000 }, async (t) => {
+  const runDir = tmpDir('tllm-chrome-run-')
+  const before = new Set(chromeProcesses().map((p) => p.pid))
+  const d = await startStandInDaemon(`
+import { screenshotArtifact } from ${srcUrl('artifacts/screenshot.ts')}
+void screenshotArtifact(${JSON.stringify(SPIN)}, { width: 800, height: 600, runDir: ${JSON.stringify(runDir)} }, 120_000)
+report({ started: true })
+setInterval(() => {}, 1e9)
+`, { env: { CHROME_PATH: CHROME as string } })
+  let pids: number[] = []
+  try {
+    await d.next()
+    const { root, all } = await newChrome(before, d.pid)
+    pids = all.map((p) => p.pid)
+    record(...pids)
+    t.diagnostic(`${sandboxNote(root)}; ${all.length} Chrome processes`)
+    assert.deepEqual(all.filter((p) => p.pgid !== root).map((p) => p.cmd.slice(0, 120)), [], 'every Chrome process is in the browser\'s group: no crash handler outside it')
+    assert.ok(all.length >= 3, `the browser and its helpers (${all.length})`)
+    await d.kill('SIGKILL')
+    assert.deepEqual(await waitGone(pids, 2000), [], 'all gone within 2 s')
+    // The profile it was using stays until the next start sweeps it.
+    const left = readdirSync(runDir).filter((n) => n.startsWith('chrome-'))
+    assert.equal(left.length, 1, 'the dead daemon\'s profile is left behind')
+    assert.equal(reapStaleChromeProfiles(runDir), 1)
+    assert.deepEqual(readdirSync(runDir), [])
+  } finally {
+    killRecorded(d.pid, ...pids)
+  }
+})
+
+test('Ctrl+C during an export runs the daemon\'s own graceful shutdown, which ends Chrome: no exit 130', { skip: noChrome, timeout: 60_000 }, async () => {
+  const runDir = tmpDir('tllm-chrome-sigint-')
+  const before = new Set(chromeProcesses().map((p) => p.pid))
+  // The daemon's own SIGINT handler (cli.ts): its graceful sequence, then exit 0.
+  const d = await startStandInDaemon(`
+import { screenshotArtifact } from ${srcUrl('artifacts/screenshot.ts')}
+import { stopTethered } from ${srcUrl('util/tether.ts')}
+process.on('SIGINT', () => { void stopTethered().then(() => process.exit(0)) })
+void screenshotArtifact(${JSON.stringify(SPIN)}, { width: 800, height: 600, runDir: ${JSON.stringify(runDir)} }, 120_000)
+report({ started: true })
+setInterval(() => {}, 1e9)
+`, { env: { CHROME_PATH: CHROME as string } })
+  let pids: number[] = []
+  try {
+    await d.next()
+    pids = (await newChrome(before, d.pid)).all.map((p) => p.pid)
+    record(...pids)
+    d.child.kill('SIGINT')
+    const { code, signal } = await d.exited
+    assert.deepEqual({ code, signal }, { code: 0, signal: null }, 'the graceful shutdown finished (puppeteer\'s handler exited 130)')
+    assert.deepEqual(await waitGone(pids, 2000), [], 'and Chrome is gone')
+  } finally {
+    killRecorded(d.pid, ...pids)
+  }
+})
+
+test('an export returns a PNG, and afterwards no Chrome and no profile is left; the deadline path leaves none either', { skip: noChrome, timeout: 90_000 }, async () => {
+  const runDir = tmpDir('tllm-chrome-normal-')
+  const before = new Set(chromeProcesses().map((p) => p.pid))
+  const png = await screenshotArtifact('<!doctype html><body style="background:#09f"><h1>hello</h1></body>', { width: 800, height: 600, runDir })
+  assert.ok(png && png.subarray(1, 4).toString() === 'PNG')
+  const spawned = () => chromeProcesses().filter((p) => !before.has(p.pid)).map((p) => p.pid)
+  assert.deepEqual(await waitGone(spawned(), 3000), [], 'no Chrome left')
+  assert.deepEqual(readdirSync(runDir), [], 'its profile is removed')
+
+  const deadline = 6_000
+  const t0 = Date.now()
+  assert.equal(await screenshotArtifact(SPIN, { width: 800, height: 600, runDir }, deadline), null)
+  assert.ok(Date.now() - t0 < deadline + 2_000, 'it returns at the deadline')
+  const after = spawned()
+  record(...after)
+  try {
+    // Browser.close, then the group kill if Chrome is still there 2 s later.
+    assert.deepEqual(await waitGone(after, 6000), [], 'no Chrome left after the deadline')
+    for (let i = 0; i < 40 && readdirSync(runDir).length > 0; i++) await sleep(50)
+    assert.deepEqual(readdirSync(runDir), [], 'its profile is removed too')
+  } finally {
+    killRecorded(...after)
+  }
+})
+
+test('ChromePipeTransport: NUL-framed messages, whole even when a character or a message is split across reads', async () => {
+  const toChrome = new PassThrough()
+  const fromChrome = new PassThrough()
+  const tr = new ChromePipeTransport(toChrome, fromChrome)
+  const got: string[] = []
+  tr.onmessage = (m) => got.push(m)
+  let closed = false
+  tr.onclose = () => { closed = true }
+  const text = Buffer.from('{"a":"é€"}\0{"b":1}\0{"c":', 'utf8')
+  const cut = text.indexOf(0xa9) // inside é's two bytes
+  fromChrome.write(text.subarray(0, cut))
+  fromChrome.write(text.subarray(cut))
+  fromChrome.write(Buffer.from('2}\0', 'utf8'))
+  await sleep(20)
+  assert.deepEqual(got, ['{"a":"é€"}', '{"b":1}', '{"c":2}'])
+  const sent: Buffer[] = []
+  toChrome.on('data', (b: Buffer) => sent.push(b))
+  tr.send('{"id":1}')
+  await sleep(5)
+  assert.equal(Buffer.concat(sent).toString(), '{"id":1}\0')
+  fromChrome.destroy()
+  await sleep(5)
+  assert.ok(closed, 'the reply pipe\'s close ends the connection')
+})
+
+test('reapStaleChromeProfiles removes the profiles of daemons that are gone (and this one\'s, from a reused pid), and nothing else', () => {
+  const runDir = tmpDir('tllm-chrome-reap-')
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))'], { encoding: 'utf8' })
+  const deadPid = Number(dead.stdout)
+  assert.ok(isGone(deadPid))
+  for (const name of [`chrome-${deadPid}-AbC123`, `chrome-${process.pid}-xyz789`, `chrome-${process.ppid}-keep01`, 'engine-1.pid.d', 'chrome-notapid-ab']) {
+    mkdirSync(join(runDir, name))
+  }
+  assert.equal(reapStaleChromeProfiles(runDir), 2)
+  assert.deepEqual(readdirSync(runDir).sort(), [`chrome-${process.ppid}-keep01`, 'chrome-notapid-ab', 'engine-1.pid.d'].sort())
+  assert.equal(reapStaleChromeProfiles(join(runDir, 'missing')), 0)
+  assert.ok(existsSync(runDir))
 })

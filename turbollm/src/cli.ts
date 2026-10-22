@@ -68,6 +68,7 @@ import { reapStaleTerminals, killTrackedTerminalsSync } from './terminal/termina
 import { endLanTurns, provisionBootstrapApiKey, provisionTunnelApiKey } from './auth'
 import { getAdvertisedHost, parseListenAddr } from './net'
 import { reapStaleTunnels, killTrackedTunnelsSync } from './remote/child-process'
+import { reapStaleChromeProfiles } from './artifacts/screenshot'
 import { reconcileTailscale } from './remote/providers/tailscale'
 import { RemoteAccessManager } from './remote/manager'
 import { makeProvider } from './remote/providers/factory'
@@ -448,6 +449,11 @@ const reconcileTailscalePromise = reconcileTailscale(bootIngressPort).then((acte
 try {
   const reapedTerminals = reapStaleTerminals(store.dir())
   if (reapedTerminals > 0) console.log(`reaped ${reapedTerminals} orphaned terminal-agent process(es) from a previous run`)
+} catch { /* best-effort */ }
+// The export browser's profile (artifacts/screenshot.ts) that a daemon which died mid-export left in <dataDir>/run.
+try {
+  const removedProfiles = reapStaleChromeProfiles(join(store.dir(), 'run'))
+  if (removedProfiles > 0) console.log(`removed ${removedProfiles} export browser profile(s) left by a previous run`)
 } catch { /* best-effort */ }
 
 const registry = new Registry(store)

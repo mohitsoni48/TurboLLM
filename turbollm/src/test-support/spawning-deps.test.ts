@@ -52,7 +52,8 @@ const SPAWNING_DEPENDENCIES: Record<string, Pin> = {
     version: '18.0.5', reason: 'its command-line bin: never run', files: { 'bin/main.js': 1 },
   },
   '@puppeteer/browsers': {
-    version: '3.2.4', reason: 'Chrome through launch(), which artifacts/screenshot.ts calls; its CLI and installer are not run',
+    version: '3.2.4', reason: 'Chrome through launch(), which nothing in src calls (artifacts/screenshot.ts spawns Chrome ' +
+      'through util/tether.ts and attaches with connect({ transport }); the test below keeps it so); its CLI and installer are not run',
     files: { 'lib/CLI.js': 1, 'lib/browser-data/chrome.js': 1, 'lib/fileUtil.js': 1, 'lib/install.js': 1, 'lib/launch.js': 2 },
   },
   'cross-spawn': { version: '7.0.6', reason: 'a spawn wrapper pi uses on interactive paths', files: { 'index.js': 1 } },
@@ -120,4 +121,14 @@ test('the runtime dependencies that can spawn are exactly the pinned ones, at th
   assert.deepEqual(actual, pinned,
     'a runtime dependency\'s spawning changed. Check what it now starts and whether it can outlive the daemon, then ' +
     're-pin it in SPAWNING_DEPENDENCIES (version, per-file counts, reason).')
+})
+
+// puppeteer.launch starts Chrome as a plain child, outside the tether, and registers a SIGINT handler that calls
+// process.exit(130) during the daemon's graceful shutdown. artifacts/screenshot.ts spawns Chrome through the tether
+// and attaches with connect({ transport }); a launch() anywhere in src would bring both back.
+test('nothing in src starts a browser with puppeteer.launch', async () => {
+  const { sourceFilesUnder } = await import('./raw-spawn-sites')
+  const src = join(PKG_ROOT, 'src')
+  const launches = sourceFilesUnder(src).filter((f) => /\.launch\(/.test(readFileSync(f, 'utf8').replace(/\/\/.*$/gm, '')) && /puppeteer/.test(readFileSync(f, 'utf8')))
+  assert.deepEqual(launches.map((f) => f.slice(src.length + 1)), [])
 })

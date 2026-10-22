@@ -337,7 +337,7 @@ export function registerApi(app: Hono, d: Deps): void {
     if (!html || typeof html !== 'string') return err(c, 400, 'bad_request', 'html is required')
     const w = Math.max(360, Math.min(Math.round(width || 1000), 1280))
     const h = Math.max(480, Math.round((w * 800) / 1280))
-    const png = await screenshotArtifact(html, { width: w, height: h })
+    const png = await screenshotArtifact(html, { width: w, height: h, runDir: join(d.store.dir(), 'run') })
     if (!png) return err(c, 503, 'no_browser', 'No system Chrome/Chromium/Edge found.')
     return new Response(png, { status: 200, headers: { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' } })
   })

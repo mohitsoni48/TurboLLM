@@ -272,3 +272,14 @@ test('both teardowns stop the pool slots\' engines beside the primary\'s', () =>
   assert.match(blockFrom('if (!packagedAndroidApp()) deps.requestRestart = ('), WITH_POOL, 'the restart teardown')
   assert.match(blockFrom(SIGNALS), WITH_POOL, 'the signal teardown')
 })
+
+// The export browser's profile lives in <dataDir>/run (artifacts/screenshot.ts), and a daemon that died during an
+// export left it there; the boot sweeps it, before anything can export again. reapStaleChromeProfiles' own behaviour is
+// screenshot.test.ts's.
+test('the boot sweeps the export browser\'s leftover profiles from the run dir the export route uses', () => {
+  const sweep = CLI.indexOf("reapStaleChromeProfiles(join(store.dir(), 'run'))")
+  assert.ok(sweep > 0, 'cli.ts sweeps <dataDir>/run')
+  assert.ok(sweep < CLI.indexOf('void runAutoLoad({'), 'at boot')
+  const ROUTES = readFileSync(join(HERE, 'api', 'routes.ts'), 'utf8')
+  assert.ok(ROUTES.includes("screenshotArtifact(html, { width: w, height: h, runDir: join(d.store.dir(), 'run') })"), 'the export route puts the profile there')
+})

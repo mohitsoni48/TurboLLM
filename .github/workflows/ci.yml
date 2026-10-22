@@ -193,7 +193,7 @@ jobs:
         run: brew install ripgrep fd
 
       - name: Tether tests
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts src/artifacts/screenshot.test.ts
         working-directory: turbollm
 
       # npmGlobalRoot builds cmd.exe's `npm root -g` line itself, as tetheredExecFile takes no `shell`. Every run holds
