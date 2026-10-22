@@ -40,6 +40,9 @@ import { constants } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { getShellConfig } from '@earendil-works/pi-coding-agent'
 import type { BashOperations } from '@earendil-works/pi-coding-agent'
+import { spawnHeld } from '../util/tether'
+import { withForegroundGitGc } from '../util/git-gc'
+import { killTetheredTree } from '../util/tether'
 
 const EXIT_STDIO_GRACE_MS = 100
 
@@ -166,18 +169,40 @@ const VERIFY_GRACE_MS = 800
 const VERIFY_POLL_MS = 100
 const FINAL_VERIFY_MS = 1500
 
-/** Kill `pid`'s whole process tree and VERIFY it actually died instead of firing-and-trusting —
+/** Whether Node has seen `child` exit. From then on its pid may name another process: Node has
+ *  reaped it (on Windows, libuv has closed the handle that kept the number from being reused). */
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null
+}
+
+/** Kill the command's whole process tree and VERIFY it actually died instead of firing-and-trusting —
  *  see the module comment for why: pi's own equivalent (killProcessTree) is correct in mechanism
  *  but intermittently ineffective against a Git-Bash-rooted tree on Windows. Escalates to a
- *  WMI-based descendant kill only when the fast path doesn't verify within `VERIFY_GRACE_MS`. */
-async function killProcessTreeVerified(pid: number, sessionLabel: string): Promise<void> {
+ *  WMI-based descendant kill only when the fast path doesn't verify within `VERIFY_GRACE_MS`.
+ *
+ *  Stop or the timeout can come after the shell itself has exited: a job it left that still writes
+ *  to its output keeps the command waiting (waitForChildProcess), for as long as it writes at least
+ *  every EXIT_STDIO_GRACE_MS. Node has reaped the shell by then, so its pid may name another process:
+ *  a `taskkill /F /T /PID` of it, the group kill's bare-pid fallback or the escalation would end that
+ *  one, or its tree. Then the tether's own force path (killTetheredTree, util/tether.ts) ends what it
+ *  can without the pid: the command's group while its watcher still pins the group id, or on Windows
+ *  the command's job, where it has one. The same holds for the verification: a shell Node has seen
+ *  exit is dead, whatever a reused pid answers. */
+async function killProcessTreeVerified(child: ChildProcess, sessionLabel: string): Promise<void> {
+  const pid = child.pid
+  if (!pid) return
+  if (hasExited(child)) {
+    killTetheredTree(child, 'SIGKILL')
+    return
+  }
   killProcessTreeFast(pid)
+  const gone = () => hasExited(child) || !isAlive(pid)
   const deadline = Date.now() + VERIFY_GRACE_MS
   while (Date.now() < deadline) {
-    if (!isAlive(pid)) return
+    if (gone()) return
     await sleep(VERIFY_POLL_MS)
   }
-  if (!isAlive(pid)) return
+  if (gone()) return
   console.warn(`[code-session:${sessionLabel}] bash process ${pid} still alive ${VERIFY_GRACE_MS}ms after abort — escalating to WMI-based descendant kill`)
   if (process.platform === 'win32') {
     const killed = await killDescendantsViaWmi(pid)
@@ -186,7 +211,7 @@ async function killProcessTreeVerified(pid: number, sessionLabel: string): Promi
     try { process.kill(pid, 'SIGKILL') } catch { /* already dead */ }
   }
   await sleep(FINAL_VERIFY_MS)
-  if (isAlive(pid)) {
+  if (!gone()) {
     console.warn(`[code-session:${sessionLabel}] bash process ${pid} SURVIVED the WMI escalation — giving up, it may still be running orphaned`)
   }
 }
@@ -195,8 +220,19 @@ async function killProcessTreeVerified(pid: number, sessionLabel: string): Promi
  *  escalating kill on abort/timeout instead of a fire-and-forget one. Everything else (shell
  *  resolution, spawn shape, streaming, stdio wiring, exit-vs-close draining) matches pi's own
  *  implementation — only the kill path changes. `sessionLabel` is purely for the warning logs
- *  above (a Code session id), so a recurrence is traceable to which session hit it. */
-export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string }): BashOperations {
+ *  above (a Code session id), so a recurrence is traceable to which session hit it.
+ *
+ *  Each command is tethered to the daemon (util/tether.ts) and held in the Code session's scope
+ *  (`code-session:<sessionId>`; a skill or delegate sub-session passes its parent's id, and without one
+ *  the label is the scope): what a command leaves running in the background (`npm run dev &`, a `nohup`
+ *  server) keeps running after the command returns, until the session is archived or deleted, a
+ *  routine's run ends, or the daemon stops, however it stops. Before, it was cut loose: a SIGKILLed or
+ *  crashed daemon left it running, parented to init, and even a graceful stop never ended it. A command
+ *  that left nothing running holds nothing. Stop and the timeout still kill the command's whole group,
+ *  also once the shell has exited while a job it left still writes to its output (through the tether,
+ *  never the shell's pid). */
+export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string; sessionId?: string }): BashOperations {
+  const scope = `code-session:${options?.sessionId ?? options?.sessionLabel ?? 'unknown'}`
   return {
     exec: async (command, cwd, { onData, signal, timeout, env }) => {
       if (signal?.aborted) throw new Error('aborted')
@@ -207,16 +243,19 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
         throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`)
       }
       const commandFromStdin = shellConfig.commandTransport === 'stdin'
-      const child = spawn(
+      // The command leads a process group of its own (the tether makes it one, as `detached` did), which is what
+      // killProcessTreeVerified's group kill needs. git's automatic gc runs in the foreground, inside that group:
+      // daemonized (setsid), it escaped the tie (util/git-gc.ts).
+      const { child } = spawnHeld(
         shellConfig.shell,
         commandFromStdin ? shellConfig.args : [...shellConfig.args, command],
         {
           cwd,
-          detached: process.platform !== 'win32',
-          env: env ?? process.env,
+          env: withForegroundGitGc(env ?? process.env),
           stdio: [commandFromStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
           windowsHide: true,
         },
+        { kind: 'code-bash', hold: scope },
       )
       if (commandFromStdin) {
         child.stdin?.on('error', () => { /* best-effort */ })
@@ -225,13 +264,13 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
 
       let timedOut = false
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-      const onAbort = () => { if (child.pid) void killProcessTreeVerified(child.pid, options?.sessionLabel ?? 'unknown') }
+      const onAbort = () => { void killProcessTreeVerified(child, options?.sessionLabel ?? 'unknown') }
 
       try {
         if (timeout !== undefined && timeout > 0) {
           timeoutHandle = setTimeout(() => {
             timedOut = true
-            if (child.pid) void killProcessTreeVerified(child.pid, options?.sessionLabel ?? 'unknown')
+            void killProcessTreeVerified(child, options?.sessionLabel ?? 'unknown')
           }, timeout * 1000)
         }
         child.stdout?.on('data', onData)

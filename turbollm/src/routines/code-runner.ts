@@ -19,6 +19,7 @@ import type { CodeMode } from '../code/persona'
 import { toolsForMode } from '../code/persona'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
 import { resolveToolApproval } from '../tools/approval-gate'
+import { releaseTetherScope } from '../util/tether'
 
 export type CodeRunOutcome =
   | { status: 'ok'; result: string }
@@ -57,6 +58,14 @@ export async function runCodeRoutine(d: Deps, routine: Routine, run: RoutineRun,
 export async function resumeCodeRoutine(
   d: Deps, routine: Routine, run: RoutineRun, pending: PendingRoutineToolCall, decision: 'allow' | 'deny', signal: AbortSignal,
 ): Promise<CodeRunOutcome> {
+  const sessionId = pending.sessionId ?? pending.convId
+  // A resume that ends the run before driveCodeSession runs a turn (a Deny, or a session it can no
+  // longer continue) ends it all the same: what the stalled turn's bash commands left running,
+  // kept in the session's scope for this resume, ends with it, as at the end of any other run.
+  const ended = (outcome: CodeRunOutcome): CodeRunOutcome => {
+    void releaseTetherScope(`code-session:${sessionId}`)
+    return outcome
+  }
   if (decision === 'deny') {
     // M2: clear the stall's resume point — leaving a stale pendingToolCall on an otherwise-
     // terminal (denied) run lets a later reader mistake "already denied" for "still awaiting a
@@ -65,19 +74,18 @@ export async function resumeCodeRoutine(
     // itself (the 'ok' path below doesn't either) — this only clears the field this file itself
     // owns writing (stallRoutineRun's own pendingToolCall column).
     d.db.updateRoutineRun(run.id, { pendingToolCall: '' })
-    return { status: 'errored', error: `Tool call "${pending.call.name}" denied by user.` }
+    return ended({ status: 'errored', error: `Tool call "${pending.call.name}" denied by user.` })
   }
-  if (!d.codeRuns) return { status: 'errored', error: 'Code execution is not available (codeRuns not wired).' }
+  if (!d.codeRuns) return ended({ status: 'errored', error: 'Code execution is not available (codeRuns not wired).' })
 
-  const sessionId = pending.sessionId ?? pending.convId
   const agentRun = d.db.getAgentRun(sessionId)
-  if (!agentRun) return { status: 'errored', error: "The routine's session no longer exists." }
+  if (!agentRun) return ended({ status: 'errored', error: "The routine's session no longer exists." })
   const conv = d.db.getConversation(pending.convId)
-  if (!conv) return { status: 'errored', error: "The routine's conversation no longer exists." }
+  if (!conv) return ended({ status: 'errored', error: "The routine's conversation no longer exists." })
   // M1: an empty repoRoot would silently become the containment root (isContainedFromRoot('', ''))
   // rather than failing loudly — error out instead of falling back to ''.
   const repoRoot = agentRun.repoRoot ?? routine.workspacePath
-  if (!repoRoot) return { status: 'errored', error: "The routine's session has no workspace path." }
+  if (!repoRoot) return ended({ status: 'errored', error: "The routine's session has no workspace path." })
 
   // C1 fix (superseding an earlier, REJECTED fix that widened conv.agentMode to 'auto' for the
   // whole resumed turn — reviewer found that unsafe: it granted the model unlimited unapproved
@@ -125,7 +133,24 @@ function sameArgs(a: Record<string, unknown>, b: Record<string, unknown>): boole
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
+/** One routine turn of the session (driveTurn), then, unless it stalled for an approval (a resume continues the same
+ *  session), the end of what the run's bash commands left running in the background. A routine creates a fresh
+ *  session for each fire and nothing ever archives or deletes it, so a daily routine that starts a server would
+ *  otherwise pile up one server a day, held in sessions nobody closes, until TurboLLM stops. */
 async function driveCodeSession(
+  d: Deps, run: RoutineRun, sessionId: string, convId: string, repoRoot: string, task: string, userMsgId: string, signal: AbortSignal,
+  approvedCall?: { name: string; args: Record<string, unknown> },
+): Promise<CodeRunOutcome> {
+  let outcome: CodeRunOutcome | undefined
+  try {
+    outcome = await driveTurn(d, run, sessionId, convId, repoRoot, task, userMsgId, signal, approvedCall)
+    return outcome
+  } finally {
+    if (outcome?.status !== 'needs_approval') void releaseTetherScope(`code-session:${sessionId}`)
+  }
+}
+
+async function driveTurn(
   d: Deps, run: RoutineRun, sessionId: string, convId: string, repoRoot: string, task: string, userMsgId: string, signal: AbortSignal,
   approvedCall?: { name: string; args: Record<string, unknown> },
 ): Promise<CodeRunOutcome> {

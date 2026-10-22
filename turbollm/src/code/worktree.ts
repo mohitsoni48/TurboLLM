@@ -20,10 +20,11 @@
 //   • A worktree nested in its own repo could in principle contain itself. It cannot here:
 //     `.turbollm/` is untracked, so it is not part of any branch, so a checkout of that branch
 //     never materialises it. Verified empirically, not reasoned about.
-import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { appendFile, readFile, readlink, mkdir, realpath } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
+import { endTetheredGroup, spawnHeld } from '../util/tether'
+import { NO_AUTO_GC_ARGS } from '../util/git-gc'
 
 /** Where a repo's session worktrees live, relative to the repo root. */
 export const WORKTREES_SUBDIR = join('.turbollm', 'worktrees')
@@ -47,7 +48,14 @@ export interface GitResult {
 /** Run git with an ARGUMENT ARRAY and no shell. Branch names and paths are user-supplied, and this
  *  is the one place they reach a process boundary — no shell means no quoting rules to get wrong
  *  and no metacharacter can act (see util/shell-command.ts for what the shell path has to do
- *  instead). Never throws: a missing git binary comes back as ok:false like any other failure. */
+ *  instead). Never throws: a missing git binary comes back as ok:false like any other failure.
+ *
+ *  Tethered and held as git-actions.ts's calls are (util/tether.ts): SIGTERM and 2 s when the daemon dies,
+ *  so git drops its locks; a helper git leaves running on purpose (the credential cache) held until the
+ *  daemon stops. So it settles at git's exit plus the end of its output, never on 'close', which a held
+ *  lifeline holds back: waiting for 'close', a git call that had succeeded reported "timed out after
+ *  30000ms" whenever a credential cache was running. A timeout ends git's whole group (TERM, the grace,
+ *  KILL) and holds nothing, so a hung credential helper does not stay. No automatic gc (util/git-gc.ts). */
 export function runGit(cwd: string, args: string[], timeoutMs = 30_000): Promise<GitResult> {
   return new Promise<GitResult>((resolve) => {
     let stdout = ''
@@ -55,15 +63,27 @@ export function runGit(cwd: string, args: string[], timeoutMs = 30_000): Promise
     let settled = false
     const done = (r: GitResult) => { if (!settled) { settled = true; resolve(r) } }
     try {
-      const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+      const { child, settled: exited } = spawnHeld('git', [...NO_AUTO_GC_ARGS, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] }, {
+        kind: 'git', end: 'term-then-kill', hold: 'daemon',
+      })
       const timer = setTimeout(() => {
         try { child.kill() } catch { /* already gone */ }
+        endTetheredGroup(child)
         done({ ok: false, stdout, stderr: stderr || `git ${args[0]} timed out after ${timeoutMs}ms` })
       }, timeoutMs)
       child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
       child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8') })
-      child.on('error', (e) => { clearTimeout(timer); done({ ok: false, stdout, stderr: (e as Error).message }) })
-      child.on('close', (code) => { clearTimeout(timer); done({ ok: code === 0, stdout, stderr }) })
+      child.on('error', () => { /* a failed spawn rejects `exited` below */ })
+      exited.then(({ code }) => {
+        clearTimeout(timer)
+        // A helper git left running may still hold the pipes: nothing more is read from them.
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        done({ ok: code === 0, stdout, stderr })
+      }, (e: Error) => {
+        clearTimeout(timer)
+        done({ ok: false, stdout, stderr: e.message })
+      })
     } catch (e) {
       done({ ok: false, stdout: '', stderr: (e as Error).message })
     }

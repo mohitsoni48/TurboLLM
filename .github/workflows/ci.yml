@@ -184,7 +184,11 @@ jobs:
         working-directory: turbollm
 
       - name: Tether tests
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts
+        working-directory: turbollm
+
+      - name: A routine run's end releases its session's held jobs
+        run: npx tsx --test --test-name-pattern="left running|background jobs" src/routines/code-runner.test.ts
         working-directory: turbollm
 
   wrapper:

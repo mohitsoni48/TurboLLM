@@ -35,6 +35,7 @@ import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
 import { nonStringField } from '../util/string-fields'
+import { releaseTetherScope } from '../util/tether'
 
 // 503 is Turbo Link's (ADR-376): a linked machine that went offline between the picker
 // listing it and this turn being submitted. Deliberately not 409 — nothing about THIS
@@ -160,8 +161,16 @@ function toSidebarRow(run: AgentRun) {
   }
 }
 
-export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager): void {
+/** What a Code session's agent left running in the background (its bash commands' jobs, util/tether.ts holds them in
+ *  the session's scope) ends when the session is archived or deleted. */
+export function releaseCodeSessionProcesses(sessionId: string): Promise<void> {
+  return releaseTetherScope(`code-session:${sessionId}`)
+}
+
+/** `seams` is for the route tests: what the delete route removes the session's worktree with. */
+export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager, seams: { removeSessionWorktree?: typeof removeSessionWorktree } = {}): void {
   const { db } = d
+  const removeWorktree = seams.removeSessionWorktree ?? removeSessionWorktree
 
   // The daemon-owned run registry for this app instance — either the shared instance a caller
   // already constructed (cli.ts, so Routine execution and this UI observe the same sessions), or
@@ -493,6 +502,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // never blocked.
     if (archived && runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before archiving this session.')
     db.setAgentRunArchived(id, archived)
+    // An archived session's background jobs end (SIGTERM, then the group kill after 3 s): it is closed, as a
+    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop.
+    if (archived) void releaseCodeSessionProcesses(id)
     return c.json({ ok: true, archived })
   })
 
@@ -506,6 +518,10 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
     disposeLspClientsForConv(run.convId)
+    // Its agent's background jobs end first, and are gone before the worktree is removed: one whose cwd is the
+    // worktree stops Windows from removing the directory, and on POSIX it could keep writing into it, so `git
+    // worktree remove` (without --force) refused for its untracked files.
+    await releaseCodeSessionProcesses(id)
 
     // Clean up the session's worktree, but never at the cost of unmerged work. `git worktree
     // remove` (deliberately without --force) refuses while the worktree has modified or untracked
@@ -513,7 +529,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // session. Committed work is safe either way — removing a worktree does not delete its branch.
     let worktreeNote: string | undefined
     if (run.worktreePath && run.repoRoot) {
-      const removed = await removeSessionWorktree(run.repoRoot, run.worktreePath)
+      const removed = await removeWorktree(run.repoRoot, run.worktreePath)
       if (!removed.ok) worktreeNote = removed.message
     }
 

@@ -993,7 +993,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // Same verified-kill bash tool the main session uses (see its own registration above for the
     // full root-cause writeup) — a skill sub-session runs real bash calls too and deserves the
     // same reliable Stop behavior, not just the outer session.
-    const skillBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:skill:${skill.id}` }) })
+    const skillBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:skill:${skill.id}`, sessionId }) })
     const { session: skillSession } = await createAgentSession({
       cwd: repoRoot,
       agentDir: skillAgentDir,
@@ -1185,7 +1185,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     await subResourceLoader.reload()
 
     const subTools = toolsForMode(subMode)
-    const subBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:delegate` }) })
+    const subBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:delegate`, sessionId }) })
     const { session: subSession } = await createAgentSession({
       cwd: repoRoot,
       agentDir: subAgentDir,
@@ -2024,7 +2024,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // live, repeated, timed testing): pi's own bash tool already wires abort correctly, but its
   // Windows kill (taskkill /F /T against a Git-Bash-rooted process tree) intermittently fails to
   // actually kill the spawned process — this swaps in a verified, escalating kill instead.
-  const robustBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: sessionId }) })
+  const robustBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: sessionId, sessionId }) })
 
   const { session } = await createAgentSession({
     cwd: repoRoot,

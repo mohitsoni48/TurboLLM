@@ -594,6 +594,47 @@ test('the wall-clock timeout is an ABSOLUTE ceiling that post-exit output cannot
   }
 })
 
+// The CLI has exited while a descendant still holds its pipes (the pi#5303 shape), and the timeout or the caller's
+// abort comes in that window. Node has seen the exit, so the pid may name another process by now: the sweep
+// (`taskkill /F /T /PID`, or a group kill that falls back to the bare pid) could end an unrelated one. What the CLI
+// started went with its tie at its exit (util/tether.ts).
+test('a CLI that has already exited is not swept or killed when the timeout or an abort comes', async () => {
+  const actual = process.platform
+  for (const platform of [actual, 'win32'] as const) {
+    for (const end of ['timeout', 'abort'] as const) {
+      Object.defineProperty(process, 'platform', { value: platform })
+      try {
+        const child = fakeChild()
+        const killedTrees: number[] = []
+        const ac = new AbortController()
+        const resultPromise = runClaudeCliProcess(
+          ['-p'],
+          { cwd: '/repo', env: {}, timeoutMs: end === 'timeout' ? 50 : 60_000, signal: ac.signal },
+          () => child,
+          (pid, onDone) => { killedTrees.push(pid); onDone?.() },
+        )
+        child.emit('exit', 0, null) // stdout and stderr stay open: a descendant holds them
+        const chatter = setInterval(() => { child.stdout.write('still here\n') }, 20) // re-arms the post-exit grace
+        try {
+          if (end === 'abort') {
+            await new Promise((r) => setTimeout(r, 30))
+            ac.abort()
+          }
+          const result = await resultPromise
+          assert.deepEqual(killedTrees, [], `${platform}, ${end}: no sweep of the exited pid`)
+          assert.equal(child.killed, false, `${platform}, ${end}: no kill of the exited child`)
+          assert.equal(result.exitCode, 0)
+          assert.equal(result.timedOut, end === 'timeout')
+        } finally {
+          clearInterval(chatter)
+        }
+      } finally {
+        Object.defineProperty(process, 'platform', { value: actual })
+      }
+    }
+  }
+})
+
 test('a stream-level error (EPIPE) is recorded rather than thrown out of band', async () => {
   const child = fakeChild()
   const { spy } = killSpy()

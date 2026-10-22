@@ -8,6 +8,8 @@ import { parsePendingToolCall, type PendingRoutineToolCall } from './approval'
 import type { Deps } from '../deps'
 import type { CodeSessionRunner } from '../code/code-run-manager'
 import { waitForToolApproval } from '../tools/approval-gate'
+import { releaseTetherScope, spawnHeld } from '../util/tether'
+import { isGone, killRecorded, record, waitGone } from '../test-support/stand-in-daemon'
 
 function freshStore(): ConversationStore {
   return new ConversationStore(IN_MEMORY_DATA_DIR)
@@ -284,4 +286,83 @@ test('resumeCodeRoutine does not mistake a still-unwinding previous stall for it
   const outcome2 = await resumeCodeRoutine(d, routine, run, pending!, 'allow', new AbortController().signal)
   assert.equal(outcome2.status, 'ok')
   assert.ok(executed.includes('turn2-ran'), 'the resumed turn must actually have run, not been discarded')
+})
+
+// ── A routine run's end closes its session's background jobs ─────────────────────────────────────────────────────
+// A routine creates a fresh Code session for each fire and nothing ever archives or deletes it, so what its bash
+// commands left running in the background (held per session by util/tether.ts) would otherwise pile up, one server
+// a day for a daily routine, until TurboLLM stops. A run stalled for an approval keeps them: its resume continues the
+// same session.
+
+/** A fake runCodeSession whose turn leaves a background job held in its session's scope, as robust-bash does. */
+function runnerLeavingAJob(jobs: number[], events: Array<{ event: string; data: unknown }> = [], opts: { hang?: boolean } = {}): CodeSessionRunner {
+  return (async (params) => {
+    const { child, settled } = spawnHeld('sh', ['-c', 'sleep 300 >/dev/null 2>&1 & echo $!'], { stdio: ['ignore', 'pipe', 'ignore'] }, { kind: 'code-bash', hold: `code-session:${params.sessionId}` })
+    record(child.pid)
+    let out = ''
+    child.stdout?.on('data', (b: Buffer) => { out += b.toString() })
+    await settled
+    jobs.push(Number(out.trim()))
+    record(...jobs)
+    for (const ev of events) await params.sink(ev)
+    if (opts.hang) {
+      await new Promise<void>((resolve) => params.signal.addEventListener('abort', () => resolve(), { once: true }))
+      return { finalText: '', contextUsed: 0, contextMax: 0, aborted: true }
+    }
+    return { finalText: 'done', contextUsed: 0, contextMax: 0, aborted: false }
+  }) as CodeSessionRunner
+}
+
+const posixHold = { skip: process.platform === 'win32' ? 'POSIX held groups' : false }
+
+test('a routine run that ends ends what its session\'s commands left running', posixHold, async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store)
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const jobs: number[] = []
+  const d = depsWith(store, runnerLeavingAJob(jobs))
+  try {
+    const outcome = await runCodeRoutine(d, routine, run, new AbortController().signal)
+    assert.equal(outcome.status, 'ok')
+    assert.equal(jobs.length, 1)
+    assert.deepEqual(await waitGone(jobs, 2000), [], 'released at the run\'s end')
+  } finally {
+    killRecorded()
+  }
+})
+
+test('a routine run stalled for an approval keeps its session\'s background jobs for the resume', posixHold, async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store, { permissionMode: 'ask' })
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const jobs: number[] = []
+  const d = depsWith(store, runnerLeavingAJob(jobs, [{ event: 'tool_call', data: { id: 'c1', name: 'bash', args: { command: 'ls' }, status: 'awaiting_approval' } }], { hang: true }))
+  try {
+    const outcome = await runCodeRoutine(d, routine, run, new AbortController().signal)
+    assert.deepEqual(outcome, { status: 'needs_approval' })
+    await new Promise((r) => setTimeout(r, 500))
+    assert.equal(isGone(jobs[0]), false, 'kept')
+    await releaseTetherScope(`code-session:${store.getRoutineRun(run.id)?.codeSessionId}`)
+    assert.deepEqual(await waitGone(jobs, 2000), [])
+  } finally {
+    killRecorded()
+  }
+})
+
+test('a routine run denied at its approval ends what its stalled turn\'s commands left running', posixHold, async () => {
+  const store = freshStore()
+  const routine = codeRoutine(store, { permissionMode: 'ask' })
+  const run = store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const jobs: number[] = []
+  const d = depsWith(store, runnerLeavingAJob(jobs, [{ event: 'tool_call', data: { id: 'c1', name: 'bash', args: { command: 'ls' }, status: 'awaiting_approval' } }], { hang: true }))
+  try {
+    assert.deepEqual(await runCodeRoutine(d, routine, run, new AbortController().signal), { status: 'needs_approval' })
+    const pending = parsePendingToolCall(store.getRoutineRun(run.id)?.pendingToolCall)
+    assert.ok(pending)
+    const outcome = await resumeCodeRoutine(d, routine, run, pending, 'deny', new AbortController().signal)
+    assert.equal(outcome.status, 'errored')
+    assert.deepEqual(await waitGone(jobs, 2000), [], 'a Deny ends the run, and its session\'s held job with it')
+  } finally {
+    killRecorded()
+  }
 })

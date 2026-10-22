@@ -41,6 +41,7 @@ import { spawn, type SpawnOptions, type StdioOptions } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
 import { resolveExecutable, requiresShell } from '../util/resolve-executable'
 import { buildShellCommand } from '../util/shell-command'
+import { spawnTethered } from '../util/tether'
 
 /** 10 minutes. Deliberately the same value as runaway-guard.ts's `ROUTINE_RUN_TIMEOUT_MS`, which
  *  carries the reasoning for the number and is the ceiling the Chat-flavor path uses; the two are
@@ -162,7 +163,12 @@ function assertShellSafeArg(arg: string): void {
  *  `shell: true` is deprecated — DEP0190, shell-command.ts:4-8). */
 type RawSpawn = (cmd: string, args: string[] | null, opts: SpawnOptions) => CliChildProcess
 
-const defaultRawSpawn: RawSpawn = (cmd, args, opts) => (args === null ? spawn(cmd, opts) : spawn(cmd, args, opts))
+/** Tethered (util/tether.ts): `claude` and every tool process it starts end the moment the daemon does, however it
+ *  ends. The 10-minute timeout above is a daemon timer: a SIGKILLed or crashed daemon left a routine's `claude` (and
+ *  its tool children) running, parented to init, with nothing left to enforce it. On POSIX the command-string form
+ *  becomes `sh -c <command>` inside the wrapper, so an unresolved `claude` still gives sh's own "not found" and exit
+ *  127; on Windows it is spawned as before. */
+const defaultRawSpawn: RawSpawn = (cmd, args, opts) => spawnTethered(cmd, args, opts, { kind: 'routine-cli' })
 
 /** Seams for `realSpawnCliProcess`'s own tests: the shell-vs-direct decision is security-relevant
  *  (see C1 in the module comment) and its two branches are otherwise only reachable by having a
@@ -185,9 +191,10 @@ export function realSpawnCliProcess(
   // Resolved against the env the CHILD will actually run under, not the daemon's own: a service
   // with a minimal PATH would otherwise resolve one binary form here and execute another.
   const resolved = resolve(cmd, opts.env)
-  // `detached` on POSIX only — same as robust-bash.ts:215. It is what gives the child its own
-  // process group, which is the precondition for killCliProcessTree's group SIGKILL reaching the
-  // tool subprocesses `claude` spawns rather than just `claude` itself.
+  // `detached` on POSIX only. It is what gives the child its own process group, which is the
+  // precondition for killCliProcessTree's group SIGKILL reaching the tool subprocesses `claude`
+  // spawns rather than just `claude` itself (the default spawn's tether makes it a group leader on
+  // POSIX in any case; on Windows a detached child would leave libuv's kill-on-close job).
   const base: SpawnOptions = {
     cwd: opts.cwd,
     env: opts.env,
@@ -316,7 +323,14 @@ export function runClaudeCliProcess(
       // asynchronously-started taskkill runs, so the real CLI under a `claude.cmd` shim — or any
       // tool process claude started — survived the "terminated" run.
       const killDirect = () => { try { child.kill('SIGKILL') } catch { /* already dead */ } }
-      if (process.platform === 'win32' && child.pid) {
+      if (exited) {
+        // The CLI has exited and a descendant still holds its pipes (the timeout or the abort came
+        // in the post-exit grace). Node has seen the exit, so the pid may name another process by
+        // now, which the sweep's `taskkill /T /PID` or its group kill's bare-pid fallback would end.
+        // What the CLI started went with its tie at that exit (util/tether.ts: its group; on
+        // Windows its job, where it has one), and a `taskkill /T` of an exited root reaches none
+        // of it anyway.
+      } else if (process.platform === 'win32' && child.pid) {
         _killTree(child.pid, killDirect)
       } else {
         killDirect()

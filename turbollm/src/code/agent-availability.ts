@@ -12,8 +12,10 @@
 //
 // Probing is `<bin> --version` (cli-preflight.ts), the same check the Routines preflight uses, so
 // the picker and a scheduled run can never disagree about whether a harness is usable.
-import { spawn } from 'node:child_process'
+import type { spawn } from 'node:child_process'
+import type { SpawnOptions } from 'node:child_process'
 import { cliSpecInfo } from '../cli-launch'
+import { spawnTethered } from '../util/tether'
 import { isCliAvailable } from '../routines/cli-preflight'
 
 /** The launch targets a Code session can use. `turbollm` is the built-in in-process agent and has
@@ -97,6 +99,14 @@ export type InstallResult = { ok: true } | { ok: false; message: string }
  *  so a double click passed the check twice and ran two `npm install -g` side by side. */
 const installsInFlight = new Map<string, Promise<InstallResult>>()
 
+/** spawn() for an install, tethered (util/tether.ts): `npm install -g`, and the postinstall scripts it runs, end the
+ *  moment the daemon does. Its 180 s timeout is a daemon timer, so a killed daemon left the install running. Both of
+ *  spawn's forms runInstall uses: (command, options) with `shell: true`, and (file, args, options). */
+const tetheredInstallSpawn = ((file: string, argsOrOptions?: readonly string[] | SpawnOptions, options?: SpawnOptions) =>
+  Array.isArray(argsOrOptions)
+    ? spawnTethered(file, argsOrOptions, options ?? {}, { kind: 'agent-install' })
+    : spawnTethered(file, null, (argsOrOptions as SpawnOptions | undefined) ?? {}, { kind: 'agent-install' })) as unknown as typeof spawn
+
 /** Run a harness's own documented install command.
  *
  *  Deliberately parsed from the registry string rather than accepting a command from the client:
@@ -108,7 +118,7 @@ const installsInFlight = new Map<string, Promise<InstallResult>>()
  *  one case resolves the shim explicitly instead of reaching for `shell: true`. */
 export function installAgent(
   id: string,
-  _spawn: typeof spawn = spawn,
+  _spawn: typeof spawn = tetheredInstallSpawn,
   timeoutMs = 180_000,
 ): Promise<InstallResult> {
   // Restricted to the ids the picker actually OFFERS, not everything in the launcher registry —

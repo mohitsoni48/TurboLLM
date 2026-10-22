@@ -19,13 +19,20 @@
 //  - A detached HEAD can commit (git allows it) but is refused for push — `git push` from a
 //    detached HEAD needs an explicit `<remote> HEAD:<branch>` refspec, extra complexity/risk this
 //    pass doesn't add; surfaced as a distinct, actionable error instead of a confusing generic one.
-import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { isAbsolute, resolve } from 'node:path'
-import { promisify } from 'node:util'
 import { isInsideAny } from './containment'
+import { tetheredExecFile } from '../util/tether'
+import { NO_AUTO_GC_ARGS } from '../util/git-gc'
 
-const execFileAsync = promisify(execFile)
+// Tethered (util/tether.ts), as promisify(execFile) was used before. The timeouts below are daemon timers, which
+// nothing enforces once the daemon is gone: a SIGKILLed daemon left a hung push running, and a git killed outright
+// leaves .git/index.lock behind, which fails the next git command in that repository. So git gets SIGTERM and 2 s
+// (it removes its locks from its signal handler), then its group a SIGKILL. A helper git leaves running on purpose
+// (the credential cache) is held until the daemon stops, not killed the moment the push returns. The call settles at
+// git's exit, not when such a helper lets go of the pipes. TurboLLM's own git runs no automatic gc (util/git-gc.ts):
+// gc daemonizes out of every group, and a foreground one could turn a commit into "timed out".
+const execFileAsync = tetheredExecFile({ kind: 'git', end: 'term-then-kill', hold: 'daemon' })
 
 // Local, read-only/local-mutation ops (status, add, commit) — bounded short since nothing here
 // touches the network.
@@ -61,7 +68,7 @@ export class GitError extends Error {
 
 async function git(args: string[], cwd: string, timeoutMs = GIT_TIMEOUT_MS): Promise<string> {
   try {
-    const { stdout } = await execFileAsync('git', args, {
+    const { stdout } = await execFileAsync('git', [...NO_AUTO_GC_ARGS, ...args], {
       cwd,
       timeout: timeoutMs,
       maxBuffer: GIT_MAX_BUFFER,

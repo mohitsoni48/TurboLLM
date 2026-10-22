@@ -79,14 +79,6 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/process-start-time.ts#processStartTimes:spawnSync': SYNC,
 
   // ── Not tethered yet ──
-  'routines/cli-process.ts#defaultRawSpawn:spawn': `a routine's headless claude; ${UNTIED}`,
-  'code/robust-bash.ts#exec:spawn': `a Code agent's bash command; ${UNTIED}`,
-  'code/git-actions.ts#<module>:execFile': `Code's git commit and push; ${UNTIED}`,
-  'code/git-actions.ts#git:execFileAsync': `Code's git commit and push; ${UNTIED}`,
-  'code/worktree.ts#runGit:spawn': `Code's worktree git calls; ${UNTIED}`,
-  'code/agent-availability.ts#installAgent:spawn': `an agent CLI install; ${UNTIED}`,
-  'cli-launch.ts#realRunCommand:spawn': `a CLI version probe or config command; ${UNTIED}`,
-  'terminal/agent-modes.ts#realHelpRunner:spawn': `\`claude --help\`; ${UNTIED}`,
   'code/lsp-client.ts#LspClient.doStart:spawn': `a language server; ${UNTIED}`,
   'code/lsp-client.ts#resolveFallbackTsserverPath:spawn': `the tsserver path probe; ${UNTIED}`,
   'tools/mcp-client.ts#StdioMcpClient.start:spawn': `a stdio MCP server; ${UNTIED}`,

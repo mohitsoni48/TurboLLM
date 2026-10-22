@@ -21,6 +21,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
+import { spawnTethered } from './util/tether'
 import { isQualifiedId } from './link/model-id'
 import { isTextClassifier } from './models/text-classifier'
 import { localDaemonOrigin } from './daemon-pid'
@@ -1069,10 +1070,13 @@ export const realRunCommand: RunCommand = (bin, args) =>
     // which quotes each argument — so this keeps the property the no-shell choice was originally
     // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
     // Quoting is what makes that safe, not the absence of a shell.
+    //
+    // Tethered (util/tether.ts): the daemon runs this (the Routines preflight, prepareHermes), and a hung CLI must not
+    // outlive it.
     const resolved = resolveExecutable(bin)
     const child = requiresShell(resolved)
-      ? spawn(buildShellCommand(bin, args), { shell: true, stdio: 'ignore' })
-      : spawn(resolved ?? bin, args, { stdio: 'ignore' })
+      ? spawnTethered(buildShellCommand(bin, args), null, { shell: true, stdio: 'ignore' }, { kind: 'probe' })
+      : spawnTethered(resolved ?? bin, args, { stdio: 'ignore' }, { kind: 'probe' })
     child.on('error', () => resolve(false))
     child.on('exit', (code) => resolve(code === 0))
   })
