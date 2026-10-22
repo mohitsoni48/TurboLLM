@@ -565,6 +565,12 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (compacting.has(id)) return compactionInProgress(c)
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
     compacting.add(id)
+    // A local compaction's summary call goes straight to this machine's engine (code-upstream.ts), and nothing else
+    // held the engine's generation count meanwhile, as a turn does: the idle watchdog could unload the model under it,
+    // and GET /api/v1/activity's engineGenerating (which the Android app reads as busy) said idle. A Turbo Link one
+    // runs on the linked machine.
+    const local = !remoteRoute
+    if (local) d.manager.generationStart()
     try {
       const result = await compactCodeSession({
         d, convId: run.convId, sessionId: id, repoRoot: agentCwd(run),
@@ -579,6 +585,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       return err(c, 500, 'compact_failed', message)
     } finally {
       compacting.delete(id)
+      if (local) d.manager.generationEnd()
     }
   })
 

@@ -60,6 +60,8 @@ async function holdingEngine() {
 function makeApp(base: string) {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const dataDir = tmpDir('tllm-code-compacting-')
+  /** The engine's generation count as the routes move it (Manager.generationStart/End). */
+  const generations = { held: 0 }
   const repoRoot = tmpDir('tllm-code-compacting-repo-')
   const d = {
     db,
@@ -72,8 +74,8 @@ function makeApp(base: string) {
       status: () => ({ state: 'running', model: { key: 'test-model', name: 'Test', ctx: 8192 } }),
       target: () => base,
       currentOpts: () => undefined,
-      generationStart: () => {},
-      generationEnd: () => {},
+      generationStart: () => { generations.held++ },
+      generationEnd: () => { generations.held-- },
     },
     registry: { active: () => undefined },
     scanner: { get: () => undefined },
@@ -101,7 +103,7 @@ function makeApp(base: string) {
     db.addMessage(conv.id, 'user', `Step ${i}: ${'explain the parser in detail. '.repeat(140)}`)
     db.addMessage(conv.id, 'assistant', `Answer ${i}: ${'the parser reads tokens one at a time. '.repeat(100)}`)
   }
-  return { app, db, convId: conv.id, sessionId: run.id, started }
+  return { app, db, convId: conv.id, sessionId: run.id, started, generations }
 }
 
 const post = (app: Hono, path: string, body: unknown = {}) =>
@@ -213,5 +215,29 @@ test('a turn taken while /compact still reads its body holds that /compact back'
     assert.equal(res.status, 409, await res.clone().text())
     assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'run_active')
     assert.equal((await sessionDetail(app, sessionId)).compacting, false)
+  } finally { await engine.close() }
+})
+
+// The summary call goes straight to the engine, and nothing held the engine's generation count meanwhile: the idle
+// watchdog could unload the model under a running /compact, and /api/v1/activity's engineGenerating said idle.
+test('a local /compact holds the engine\'s generation count while its summary call runs, and lets go once it settles', { timeout: 60_000 }, async () => {
+  const engine = await holdingEngine()
+  try {
+    const { app, sessionId, generations } = makeApp(engine.base)
+    const s = `/api/v1/code/sessions/${sessionId}`
+    assert.equal(generations.held, 0)
+    const compaction = post(app, `${s}/compact`)
+    assert.notEqual(await within(engine.firstRequest, 30_000), 'timeout', 'the summary call reached the engine')
+    assert.equal(generations.held, 1, 'held while the summary call runs')
+
+    engine.answer((res) => sseText(res, 'The user and the assistant went through the parser step by step.'))
+    const done = await within(compaction, 30_000)
+    assert.notEqual(done, 'timeout', 'the compaction finished')
+    assert.equal((done as Response).status, 200)
+    assert.equal(generations.held, 0, 'let go once it settled')
+
+    // A refused one (nothing new to compact) holds nothing either.
+    await post(app, `${s}/compact`)
+    assert.equal(generations.held, 0)
   } finally { await engine.close() }
 })
