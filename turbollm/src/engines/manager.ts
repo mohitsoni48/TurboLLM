@@ -215,8 +215,9 @@ export class Manager {
    *  alone missed the auto-compaction a turn runs before its first request, a manual compaction, and those calls
    *  after the turn's end, none of which holds a generationStart: once the TTL had passed since the load (or the
    *  last gateway request) the watchdog unloaded the model under them, the compaction failed, and the reply's
-   *  title and memory were lost. Unset (a pool slot, a test), the watchdog reads only the generation count, as
-   *  before. */
+   *  title and memory were lost. While either holds, each watchdog tick restarts the idle clock, so the timeout
+   *  counts from when the last of that work let go (to within the watchdog's minute). Unset (a pool slot, a test),
+   *  the watchdog reads only the generation count, as before. */
   holdsEngine?: () => boolean
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
@@ -727,12 +728,17 @@ export class Manager {
   logPath(): string {
     return this.logPathStr
   }
+  /** A turn's generation (a chat or Code turn, a gateway or extension request) starts or ends. Both restart the idle
+   *  clock (lastActivity): only a load and a gateway request (touch) did, so the idle timeout counted from the load
+   *  and unloaded a model in active chat use between two replies, once the timeout had passed since it was loaded. */
   generationStart(): void {
     this.generation++
+    this.lastActivity = Date.now()
   }
   generationEnd(): void {
     this.generation = Math.max(0, this.generation - 1)
     if (this.generation === 0) this.liveGen = null
+    this.lastActivity = Date.now()
   }
 
   /** Publish live progress for the in-flight completion (cheap; called per chunk).
@@ -889,8 +895,13 @@ export class Manager {
   private watchdogTick(): void {
     const ttl = this.store.snapshot().daemon.idleTtlMinutes
     if (ttl <= 0) return
-    const idle = this.state === 'running' && Date.now() - this.lastActivity > ttl * 60_000 && this.generation === 0
-    if (idle && !this.holdsEngine?.()) this.stop()
+    // In use: a generation, or work the count cannot see (holdsEngine: a compaction, an approval wait, a reply's title
+    // call). The clock restarts, so the timeout counts from when that work let go, not from the load.
+    if (this.generation > 0 || this.holdsEngine?.()) {
+      this.lastActivity = Date.now()
+      return
+    }
+    if (this.state === 'running' && Date.now() - this.lastActivity > ttl * 60_000) this.stop()
   }
 }
 

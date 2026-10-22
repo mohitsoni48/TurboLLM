@@ -1,6 +1,7 @@
 // The idle unload (Settings → Idle timeout, daemon.idleTtlMinutes): the watchdog stops a model nothing has used for
 // that long, and never while work it cannot see in the engine's generation count still needs the model, as
-// `holdsEngine` reports (cli.ts wires the chat's: a turn holding its slot, or a reply's title or memory call).
+// `holdsEngine` reports (cli.ts wires the chat's: a turn holding its slot, or a reply's title or memory call). A
+// turn's generation and that work restart its clock: the timeout counts from the model's last use.
 // Driven on a real Manager and a stand-in llama-server; the watchdog's minute and the clock are mocked.
 import assert from 'node:assert/strict'
 import { chmodSync, writeFileSync } from 'node:fs'
@@ -63,7 +64,27 @@ test('a chat that holds the engine keeps the model past the idle timeout; once i
 
   held = false
   t.mock.timers.tick(MINUTE)
-  assert.notEqual(manager.status().state, 'running', 'the next watchdog tick unloads it, as before')
+  assert.equal(manager.status().state, 'running', 'the timeout counts from when it let go, not from the load')
+  t.mock.timers.tick(MINUTE)
+  assert.notEqual(manager.status().state, 'running', 'a full timeout after it let go, the watchdog unloads it')
+})
+
+// The clock restarted only at a load and a gateway request, so a model in active chat use was unloaded between two
+// replies once the timeout had passed since it was loaded, and the next send answered "Load a model first.".
+test('a chat or Code turn restarts the idle clock: a turn just before the timeout keeps the model, a full timeout after its end unloads it', {
+  skip: process.platform === 'win32' && 'the stand-in engine is a POSIX shell wrapper',
+}, async (t) => {
+  const manager = await idleManager(t, 1)
+  manager.holdsEngine = () => false
+
+  t.mock.timers.tick(50_000)
+  manager.generationStart() // a reply, 50 s after the load
+  t.mock.timers.tick(5_000)
+  manager.generationEnd() // it ends 55 s after the load
+  t.mock.timers.tick(MINUTE + 5_000 - 55_000) // the watchdog's tick at a minute after the load, the TTL + 5 s
+  assert.equal(manager.status().state, 'running', 'used 10 s ago: kept')
+  t.mock.timers.tick(MINUTE)
+  assert.notEqual(manager.status().state, 'running', 'the next tick, more than a full timeout after the reply ended, unloads it')
 })
 
 test('with nothing held the idle timeout unloads the model as before, and 0 never does', {
