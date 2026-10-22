@@ -25,6 +25,7 @@ import { toast } from '../components/ui/sonner'
 import { focusManager, useQuery, useQueryClient } from '@tanstack/react-query'
 import { skillKeys, fetchSkills } from '../lib/agent-api'
 import { cn, readLastChatConvId, writeLastChatConvId } from '../lib/utils'
+import { useChatInAddress } from '../lib/chat-address'
 import { ThinkingBudgetSlider } from '../components/ThinkingBudgetSlider'
 import { DEFAULT_REASONING_EFFORT, ReasoningEffortSelect, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 import { MessageBubble, StreamingBubble } from './chat/MessageBubble'
@@ -114,6 +115,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // an embedded routine-run view is not "the chat you were in", and letting it win would make
   // switching back to Chat mode land on whatever routine run you last looked at.
   useEffect(() => { if (!embedded && activeId) writeLastChatConvId(activeId) }, [embedded, activeId])
+  // And in the address, so a reload or Ctrl+R reopens it, and Back to the chat screen lands on it: replaced as a new chat
+  // gets its id and as another is picked, never pushed (chat-address.ts).
+  useChatInAddress(activeId, !embedded)
+  // Bumped by every chat the user picks (a chat, or New chat), so a late answer to the mount's reopen read (below) does
+  // not take the page back to the chat it names.
+  const chatChoices = useRef(0)
   // streamFrom's async loop outlives the render that started it, so it needs the CURRENT
   // activeId (not the one closed over when the generation began) to tell whether a
   // 'done'/'error' event landed on the conversation the user is still looking at.
@@ -663,6 +670,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   }
 
   const handleNew = () => {
+    chatChoices.current++
     saveScrollOffset()
     setActiveId(null)
     // Like handleSelect: an edit left open in the old chat would keep this one's composer
@@ -682,6 +690,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // Preserve scroll (spec 07 §7): save the outgoing conversation's offset now —
     // before the content swap clamps it — and capture the target's saved offset for
     // the restore effect to apply once the target's messages have rendered.
+    chatChoices.current++
     saveScrollOffset()
     pendingScrollRestore.current = { id, top: scrollOffsets.current[id] ?? null }
     setActiveId(id)
@@ -1017,19 +1026,21 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
   }, [])
 
-  // A page opened on the chat screen with no chat named (Android always loads `/`, and the address
-  // never names the chat after its first send) opens the chat this page last showed, when the
-  // daemon says a reply of it still runs: closing the app, a reload or Back mid-reply lands back on
-  // that reply, live, rather than on a blank chat. Otherwise it opens blank, as before. New chat
-  // leaves that key as it is (the Workspace Chat tab reads it the same way), so a blank chat left
-  // while the previous chat's reply runs comes back as that chat, for as long as the reply runs.
+  // A page opened on the chat screen with no chat named (Android always loads `/`, which lands on
+  // /workspace/chat) opens the chat this page last showed, when the daemon says a reply of it still
+  // runs: closing the app mid-reply lands back on that reply, live, rather than on a blank chat.
+  // Otherwise it opens blank, as before. New chat leaves that key as it is (the Workspace Chat tab
+  // reads it the same way), so a blank chat left while the previous chat's reply runs comes back as
+  // that chat, for as long as the reply runs. Not once the user has picked a chat or New chat while
+  // the read was on its way: its late answer took the page back to the chat it named.
   useEffect(() => {
     if (embedded || convIdOverride || routeConvId || activeIdRef.current) return
     const last = readLastChatConvId()
     if (!last) return
     let cancelled = false
+    const choice = chatChoices.current
     getConversation(last).then((c) => {
-      if (cancelled || activeIdRef.current || !c.runningReplyId) return
+      if (cancelled || activeIdRef.current || chatChoices.current !== choice || !c.runningReplyId) return
       qc.setQueryData(chatKeys.detail(c.id), c)
       handleSelect(c.id)
     }, () => { /* gone, or unreadable: stay on a blank chat */ })

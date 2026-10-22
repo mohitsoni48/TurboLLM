@@ -82,6 +82,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   burst of changes is still written once, and at least every 10 s while changes keep coming. `POST
   /api/v1/daemon/flush` writes the database at once and answers when it is on disk (`flushed: false` on the desktop,
   whose database is written as it changes); the app calls it before it quits.
+- A reload (or Ctrl+R in the desktop app) keeps the chat that was open: the address names it (`/workspace/chat/<id>`)
+  from a new chat's first send and whenever another chat is picked, without adding a Back step per chat.
 - The idle timeout (Settings → Idle timeout) no longer unloads the model while a chat still needs it: during a reply's
   auto-compaction, a manual compaction, or its title and memory calls just after it. Once the timeout had passed since
   the model was loaded or an API client last used it, the compaction failed and the title and memory were lost.

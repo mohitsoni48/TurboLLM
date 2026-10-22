@@ -91,6 +91,13 @@ function heldEntries(): number {
   return typeof depth === 'number' ? depth : 0
 }
 
+/** Whether the current history entry is one pushed for an open overlay (closing it goes back to the entry under
+ *  it). For code that rewrites the current entry's address (chat-address.ts): the entry under it still has the old
+ *  one until the history lands there. */
+export function onOverlayEntry(): boolean {
+  return heldEntries() > 0
+}
+
 function openOverlay(overlay: OpenOverlay) {
   if (!listening) {
     listening = true

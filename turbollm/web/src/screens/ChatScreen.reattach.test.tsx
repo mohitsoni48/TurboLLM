@@ -4,7 +4,7 @@
 // Renders the REAL screen with the REAL sidebar, conversation queries and chat client; the daemon is stubbed at the
 // fetch boundary with real SSE bodies (the other data hooks are stubbed at theirs, as in ChatScreen.streaming.test.tsx).
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { MemoryRouter, Route, Routes, useNavigate, type NavigateFunction } from 'react-router-dom'
+import { BrowserRouter, MemoryRouter, Route, Routes, useNavigate, type NavigateFunction } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { toast } from '../components/ui/sonner'
@@ -35,7 +35,9 @@ vi.mock('../lib/agent-api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/agent-api')>()
   return { ...actual, fetchSkills: () => Promise.resolve([]) }
 })
-vi.mock('../lib/useIsDesktop', () => ({ useIsDesktop: () => true }))
+// A phone's layout (the conversation drawer) where a test says so.
+const layout = vi.hoisted(() => ({ desktop: true }))
+vi.mock('../lib/useIsDesktop', () => ({ useIsDesktop: () => layout.desktop }))
 vi.mock('../lib/pdf-extract', () => ({ extractPdfText: vi.fn() }))
 vi.mock('./models/ModelDetailDialog', () => ({ ModelDetailDialog: () => null }))
 vi.mock('../components/ModelLoadMenu', () => ({ ModelLoadMenu: () => null }))
@@ -110,6 +112,8 @@ let streams: Stream[] = []
 let posts: Array<Stream | Response | HeldPost> = []
 /** POST /api/v1/chat/stop's answers, in order (then `{ ok: true, stopped: true }`). */
 let stopAnswers: Response[] = []
+/** The id POST /api/v1/conversations gives the next chat it creates. */
+let nextChatId = 'c9'
 const calls: Array<{ method: string; url: string; body?: unknown }> = []
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
@@ -129,6 +133,8 @@ beforeEach(() => {
   streams = []
   posts = []
   stopAnswers = []
+  nextChatId = 'c9'
+  layout.desktop = true
   calls.length = 0
   vi.stubGlobal('fetch', vi.fn(async (input: string, init?: RequestInit) => {
     const url = String(input)
@@ -139,6 +145,11 @@ beforeEach(() => {
       return json({ conversations: [...details.values()].map(({ messages: _m, runningReplyId: _r, compacting: _c, ...row }) => ({ ...row, running: !!running[row.id] })) })
     }
     if (method === 'GET' && path === '/api/v1/folders') return json({ folders: [] })
+    if (method === 'POST' && path === '/api/v1/conversations') {
+      const created = conversation(nextChatId, [], null)
+      details.set(created.id, created)
+      return json(created, 201)
+    }
     let m = /^\/api\/v1\/conversations\/([^/]+)\/stream$/.exec(path)
     if (method === 'GET' && m) {
       const next = streams.shift()
@@ -188,6 +199,41 @@ async function renderScreen(path: string) {
   /** The next 4 s poll of the open chat, now. */
   const poll = () => act(async () => { await qc.refetchQueries({ queryKey: ['conversation'] }); await settle() })
   return { ...view, qc, poll }
+}
+
+/** The screen in the app's own router (main.tsx's BrowserRouter) over jsdom's history, at its current address. */
+async function renderInBrowser() {
+  const { ChatScreen } = await import('./ChatScreen')
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+  const view = render(
+    <QueryClientProvider client={qc}>
+      <BrowserRouter>
+        <NavProbe />
+        <Routes>
+          <Route path="/workspace/chat" element={<ChatScreen />} />
+          <Route path="/workspace/chat/:convId" element={<ChatScreen />} />
+          <Route path="/models" element={<p>Models screen</p>} />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>,
+  )
+  const poll = () => act(async () => { await qc.refetchQueries({ queryKey: ['conversation'] }); await settle() })
+  return { ...view, qc, poll }
+}
+
+/** jsdom traverses history a few timer tasks after back(), and use-backable-overlay.ts may start another traversal from
+ *  the popstate that fires: waits until no popstate has come for 100 ms (as use-backable-overlay.test.tsx does). */
+async function historySettled() {
+  await act(() => new Promise<void>((resolve) => {
+    const done = () => { window.removeEventListener('popstate', onPop); resolve() }
+    let quiet = setTimeout(done, 100)
+    function onPop() { clearTimeout(quiet); quiet = setTimeout(done, 100) }
+    window.addEventListener('popstate', onPop)
+  }))
+}
+async function pressBack() {
+  await act(async () => { history.back() })
+  await historySettled()
 }
 
 const streamGets = () => calls.filter((c) => c.method === 'GET' && c.url.includes('/stream'))
@@ -448,5 +494,133 @@ describe('ChatScreen — a reply that runs in the daemon', () => {
     const row = (await screen.findByText('Chat c2')).closest('div')!.parentElement!
     expect(within(row).getByLabelText('Generating')).toBeInTheDocument()
     expect(within(screen.getByText('Chat c1').closest('div')!.parentElement!).queryByLabelText('Generating')).toBeNull()
+  })
+})
+
+describe('ChatScreen — the open chat in the address', () => {
+  // Each test starts from a page of its own: the address it opened on, with /models before it in the history.
+  beforeEach(() => {
+    history.replaceState(null, '', '/models')
+  })
+  afterEach(() => {
+    history.replaceState(null, '', '/')
+  })
+  const openAt = (path: string) => history.pushState(null, '', path)
+  const sendFromComposer = async (text: string) => {
+    const ta = await screen.findByPlaceholderText(/^Message /)
+    fireEvent.change(ta, { target: { value: text } })
+    await act(async () => { fireEvent.keyDown(ta, { key: 'Enter' }) })
+  }
+
+  it('a new chat is named in the address once it has its id, with no history entry of its own; a reload opens it', async () => {
+    openAt('/workspace/chat')
+    const entries = history.length
+    const post = liveStream()
+    posts = [post]
+    const view = await renderInBrowser()
+    await sendFromComposer('hello there')
+    await waitFor(() => expect(location.pathname).toBe('/workspace/chat/c9'))
+    details.set('c9', conversation('c9', [message('u1', 1, 'user', 'hello there'), message('a1', 2, 'assistant', '', { aborted: false })], 'a1'))
+    await post.push(metaOf('a1', 0), delta(1, 'Hi!'), doneWith(2, message('a1', 2, 'assistant', 'Hi!', { aborted: false, totalMs: 5 })))
+    expect(history.length).toBe(entries)
+
+    // A reload (or the desktop app's Ctrl+R): a fresh page at the same address.
+    details.set('c9', conversation('c9', [message('u1', 1, 'user', 'hello there'), message('a1', 2, 'assistant', 'Hi!', { aborted: false, totalMs: 5 })], null))
+    view.unmount()
+    await renderInBrowser()
+    expect(await screen.findByText('hello there')).toBeInTheDocument()
+    expect(screen.getByText('Hi!')).toBeInTheDocument()
+  })
+
+  it('picking a chat and New chat replace the address; Back then leaves the chat screen instead of walking through chats', async () => {
+    details.set('c1', conversation('c1', [message('u1', 1, 'user', 'first chat')], null))
+    details.set('c2', conversation('c2', [message('u2', 1, 'user', 'second chat')], null))
+    openAt('/workspace/chat/c1')
+    const entries = history.length
+    await renderInBrowser()
+    expect(await screen.findByText('first chat')).toBeInTheDocument()
+
+    await act(async () => { fireEvent.click(await screen.findByText('Chat c2')) })
+    expect(await screen.findByText('second chat')).toBeInTheDocument()
+    expect(location.pathname).toBe('/workspace/chat/c2')
+    await act(async () => { fireEvent.click(screen.getByTitle('New chat (Ctrl+N)')) })
+    expect(location.pathname).toBe('/workspace/chat')
+    expect(history.length).toBe(entries)
+
+    await pressBack()
+    expect(location.pathname).toBe('/models')
+    expect(screen.getByText('Models screen')).toBeInTheDocument()
+  })
+
+  it('on a phone, Back still closes the conversation drawer, and a chat picked in it is the one the address names after', async () => {
+    layout.desktop = false
+    details.set('c1', conversation('c1', [message('u1', 1, 'user', 'first chat')], null))
+    details.set('c2', conversation('c2', [message('u2', 1, 'user', 'second chat')], null))
+    openAt('/workspace/chat/c1')
+    const entries = history.length
+    await renderInBrowser()
+    expect(await screen.findByText('first chat')).toBeInTheDocument()
+
+    // Back closes the open drawer and stays in the chat.
+    await act(async () => { fireEvent.click(screen.getByLabelText('Open conversations')) })
+    await historySettled()
+    expect(history.length).toBe(entries + 1)
+    await pressBack()
+    expect(location.pathname).toBe('/workspace/chat/c1')
+    expect(screen.getByText('first chat')).toBeInTheDocument()
+
+    // A chat picked in the drawer closes it; the entry the history lands on names that chat.
+    await act(async () => { fireEvent.click(screen.getByLabelText('Open conversations')) })
+    await historySettled()
+    await act(async () => { fireEvent.click(await screen.findByText('Chat c2')) })
+    await historySettled()
+    expect(await screen.findByText('second chat')).toBeInTheDocument()
+    expect(location.pathname).toBe('/workspace/chat/c2')
+    expect((history.state as { tllmOverlay?: number } | null)?.tllmOverlay).toBeUndefined()
+
+    await pressBack()
+    expect(location.pathname).toBe('/models')
+  })
+
+  it('Back to the chat screen before the daemon has answered a new chat\'s first send shows its reply once it runs', async () => {
+    openAt('/workspace/chat')
+    const held = heldPost()
+    const post = liveStream()
+    const back = liveStream()
+    posts = [held]
+    streams = [back]
+    const view = await renderInBrowser()
+    await sendFromComposer('write a poem')
+    await waitFor(() => expect(postsSent()).toHaveLength(1))
+    await act(async () => { navigate('/models'); await settle() })
+    expect(screen.getByText('Models screen')).toBeInTheDocument()
+
+    await pressBack()
+    // The daemon takes the send only now: the reply runs.
+    details.set('c9', conversation('c9', [message('u1', 1, 'user', 'write a poem'), message('a1', 2, 'assistant', '', { aborted: false })], 'a1'))
+    await held.answer(post)
+    expect(await screen.findByText('write a poem')).toBeInTheDocument()
+    await view.poll() // the open chat's 4 s poll names the running reply
+    await waitFor(() => expect(streamGets()).toHaveLength(1))
+    await back.push(metaOf('a1'), metaOf('a1', 0), delta(1, 'Roses are red'))
+    expect(await screen.findByText(/Roses are red/)).toBeInTheDocument()
+    expect(stopButton()).toBeInTheDocument()
+    expect(postsSent()).toHaveLength(1)
+  })
+
+  it('New chat pressed while the reopen read is on its way is not undone by its answer', async () => {
+    runningChat()
+    localStorage.setItem('tllm-last-chat-conv', 'c1')
+    let release!: () => void
+    holdDetail = new Promise<void>((r) => { release = r })
+    openAt('/workspace/chat')
+    await renderInBrowser()
+    await waitFor(() => expect(calls.some((c) => c.url === '/api/v1/conversations/c1')).toBe(true))
+    await act(async () => { fireEvent.click(await screen.findByTitle('New chat (Ctrl+N)')) })
+    await act(async () => { release(); await settle() })
+    await act(settle)
+    expect(screen.queryByText('tell me a story')).toBeNull()
+    expect(streamGets()).toHaveLength(0)
+    expect(location.pathname).toBe('/workspace/chat')
   })
 })
