@@ -15,8 +15,8 @@
 // Serve is tailnet-only and injects Tailscale-User-Login identity headers. Funnel is public
 // and deliberately injects none — Tailscale's own security choice, since public traffic is
 // unauthenticated and there is no identity to assert. Phase 5 relies on exactly that split.
-import { execFile, type ExecFileException } from 'node:child_process'
 import type { PreflightState, RemoteProvider } from '../types'
+import { tetheredExecFile } from '../../util/tether'
 
 export type TailscalePublicPort = 443 | 8443 | 10000
 
@@ -37,18 +37,32 @@ export type RunTailscale = (args: string[]) => Promise<{ code: number; stdout: s
 // 10s is generous rather than tight.
 const TAILSCALE_TIMEOUT_MS = 10_000
 
+// Tethered (util/tether.ts): the 10 s timeout above is a daemon timer, which nothing enforces once the daemon is
+// gone, so a `tailscale` call hung on a wedged tailscaled outlived a killed daemon. Killing it mid-request leaves
+// tailscaled consistent: the CLI only asks the daemon over its socket.
+//
+// Kind 'tunnel', as cloudflared's and ngrok's: the remote-access manager stops its own CLI, and stopTethered (the
+// graceful stop) leaves that kind to its owner. Both teardowns in cli.ts run stopTethered beside the remote-access
+// manager's teardown, which starts the `serve|funnel --https=<port> off` synchronously, so under any other kind
+// stopTethered would SIGTERM that `off` (Windows: end its job) before it ran, and a graceful stop or a Settings
+// restart would leave tailscaled's serve, or the PUBLIC Funnel, pointed at the ingress port after TurboLLM was gone.
+// A hung CLI stays bounded: its 10 s timeout, the 'exit' handler's killTetheredSync (every kind), and the lifeline
+// when the daemon dies.
+const execTailscale = tetheredExecFile({ kind: 'tunnel' })
+
 export const runTailscale: RunTailscale = (args) =>
-  new Promise((resolve, reject) => {
-    execFile('tailscale', args, { windowsHide: true, timeout: TAILSCALE_TIMEOUT_MS }, (err: ExecFileException | null, stdout, stderr) => {
-      if (err && err.code === 'ENOENT') return reject(err)
+  execTailscale('tailscale', args, { windowsHide: true, timeout: TAILSCALE_TIMEOUT_MS }).then(
+    ({ stdout, stderr }) => ({ code: 0, stdout, stderr }),
+    (err: { code?: unknown; stdout?: string; stderr?: string }) => {
+      if (err.code === 'ENOENT') throw err
       // execFile's error.code carries the real process exit code for a non-spawn failure
       // (it is only ever a STRING like 'ENOENT' when the process failed to spawn at all,
       // which is handled above) — surface the real number rather than collapsing every
       // failure to a hardcoded 1, so a caller that wants to branch on the specific code can.
-      const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0
-      resolve({ code, stdout: stdout ?? '', stderr: stderr ?? '' })
-    })
-  })
+      const code = typeof err.code === 'number' ? err.code : 1
+      return { code, stdout: err.stdout ?? '', stderr: err.stderr ?? '' }
+    },
+  )
 
 /** A non-zero exit's message for the user/log: prefer the CLI's own stderr (Tailscale's CLI
  *  reports real reasons there — a permission refusal, a rejected Funnel grant), falling back

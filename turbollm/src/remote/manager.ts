@@ -216,6 +216,24 @@ export class RemoteAccessManager implements RemoteIngress {
     await own
   }
 
+  /** disable(), and every disable() still running from before it: what a shutdown waits for.
+   *  A disable() that finds the provider already taken by an earlier one (a remote-access Stop,
+   *  a provider switch, the flag turned off, a restart's teardown) ends at once, while that
+   *  one's `tailscale serve|funnel … off` still runs. A shutdown that waited for its own only
+   *  then exited, and the 'exit' handler's killTetheredSync killed the `off` mid-call: Serve, or
+   *  the PUBLIC Funnel, stayed on after TurboLLM was gone. disable() itself is unchanged (it
+   *  still ends once its own part is done; an enable() waits for stopInFlight). Bounded by each
+   *  stop's own bound: the CLI's 10 s timeout, a child provider's 8 s grace, the ingress's 3 s. */
+  async disableAll(): Promise<void> {
+    const own = this.disable()
+    const all = this.stopInFlight // every earlier disable() and this one; never rejects
+    try {
+      await own
+    } finally {
+      await all
+    }
+  }
+
   /** disable()'s body. Its first statements, the generation bump included, run synchronously
    *  when disable() is called. */
   private async takeDown(): Promise<void> {

@@ -59,8 +59,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'engines/build-runner.ts#onAbort:execFile': WIN_KILL,
   'engines/build-runner.ts#killTreeSync:spawnSync': WIN_KILL,
   'remote/child-process.ts#ChildTunnel.forceKill:execFile': WIN_KILL,
-  'remote/child-process.ts#killTrackedTunnelsSync:spawnSync': WIN_KILL,
-  'remote/child-process.ts#reapStaleTunnels:spawnSync': WIN_KILL,
+  'remote/child-process.ts#killSync:spawnSync': WIN_KILL,
   'terminal/terminal-manager.ts#killTrackedTerminalsSync:spawnSync': WIN_KILL,
   'terminal/terminal-manager.ts#reapStaleTerminals:spawnSync': WIN_KILL,
 
@@ -80,8 +79,6 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/process-start-time.ts#processStartTimes:spawnSync': SYNC,
 
   // ── Not tethered yet ──
-  'remote/child-process.ts#ChildTunnel.spawnAndWait:spawn': `remote-access tunnels; ${UNTIED}`,
-  'remote/providers/tailscale.ts#runTailscale:execFile': `the tailscale CLI; ${UNTIED}`,
   'routines/cli-process.ts#defaultRawSpawn:spawn': `a routine's headless claude; ${UNTIED}`,
   'code/robust-bash.ts#exec:spawn': `a Code agent's bash command; ${UNTIED}`,
   'code/git-actions.ts#<module>:execFile': `Code's git commit and push; ${UNTIED}`,

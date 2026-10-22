@@ -5,10 +5,11 @@
 // The pidfile-with-owner orphan safety matters MORE here than it does for engines, not less:
 // a leaked provider process keeps a PUBLIC URL alive pointing at a port that may be serving
 // something else entirely.
-import { type ChildProcess, execFile, spawn, spawnSync } from 'node:child_process'
+import { type ChildProcess, execFile, spawnSync } from 'node:child_process'
 import { mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
+import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
 
 function pidDir(dataDir: string): string {
   return join(dataDir, 'run')
@@ -21,13 +22,14 @@ function pidFile(dataDir: string, pid: number): string {
  *  can get its predecessor's pid, and the predecessor's leftover pidfiles then name it as their
  *  owner. Kept in memory rather than compared by time, so a wall-clock step can't disown one. */
 const spawnedHere = new Set<number>()
-function writePid(dataDir: string, pid: number): void {
+function writePid(dataDir: string, pid: number, group: boolean): void {
   spawnedHere.add(pid)
   try {
     mkdirSync(pidDir(dataDir), { recursive: true })
     // `startedAt` is what lets the next startup tell this provider apart from an unrelated
-    // process that later got the same pid (see reapStaleTunnels).
-    writeFileSync(pidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now() }))
+    // process that later got the same pid (see reapStaleTunnels); `group`, that the provider
+    // leads a process group of its own (util/tether.ts), so a kill takes what it started too.
+    writeFileSync(pidFile(dataDir, pid), JSON.stringify({ pid, owner: process.pid, startedAt: Date.now(), group }))
   } catch {
     /* best-effort — tracking is a safety net, never block a start on it */
   }
@@ -53,25 +55,43 @@ function pidAlive(pid: number): boolean {
 function spawnedByUs({ pid, owner }: { pid: number; owner: number }): boolean {
   return owner === process.pid && spawnedHere.has(pid)
 }
-function readPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; file: string }> {
+/** SIGKILL a provider: on POSIX its whole process group when it leads one (the pid alone as the fallback), on
+ *  Windows its tree. Synchronous, for the exit handler and the startup reap. */
+function killSync(pid: number, group: boolean): void {
+  if (process.platform === 'win32') {
+    spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
+    return
+  }
+  if (group) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+      return
+    } catch {
+      /* no such group: the pid alone */
+    }
+  }
+  process.kill(pid, 'SIGKILL')
+}
+function readPidFiles(dataDir: string): Array<{ pid: number; owner: number; startedAt?: number; group: boolean; file: string }> {
   let names: string[]
   try {
     names = readdirSync(pidDir(dataDir)).filter((n) => /^tunnel-\d+\.pid$/.test(n))
   } catch {
     return []
   }
-  const out: Array<{ pid: number; owner: number; startedAt?: number; file: string }> = []
+  const out: Array<{ pid: number; owner: number; startedAt?: number; group: boolean; file: string }> = []
   for (const name of names) {
     const file = join(pidDir(dataDir), name)
     try {
-      const { pid, owner, startedAt } = JSON.parse(readFileSync(file, 'utf8')) as {
-        pid?: number; owner?: number; startedAt?: number
+      const { pid, owner, startedAt, group } = JSON.parse(readFileSync(file, 'utf8')) as {
+        pid?: number; owner?: number; startedAt?: number; group?: boolean
       }
       if (typeof pid === 'number' && pid > 0) {
         out.push({
           pid,
           owner: typeof owner === 'number' ? owner : 0,
           startedAt: typeof startedAt === 'number' ? startedAt : undefined,
+          group: group === true,
           file,
         })
       } else rmSync(file, { force: true })
@@ -106,12 +126,11 @@ export function reapStaleTunnels(dataDir: string): number {
     orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid),
   )
   let killed = 0
-  for (const { pid, startedAt, file } of orphans) {
+  for (const { pid, startedAt, group, file } of orphans) {
     const actual = started.get(pid)
     if (startedAt !== undefined && actual !== undefined && Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
       try {
-        if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-        else process.kill(pid, 'SIGKILL')
+        killSync(pid, group)
         killed++
       } catch {
         /* already gone */
@@ -132,10 +151,9 @@ export function reapStaleTunnels(dataDir: string): number {
 export function killTrackedTunnelsSync(dataDir: string): void {
   for (const rec of readPidFiles(dataDir)) {
     if (!spawnedByUs(rec)) continue // not ours, or a predecessor's with our pid: reapStaleTunnels checks those
-    const { pid, file } = rec
+    const { pid, group, file } = rec
     try {
-      if (process.platform === 'win32') spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
-      else process.kill(pid, 'SIGKILL')
+      killSync(pid, group)
     } catch {
       /* already gone */
     }
@@ -183,12 +201,15 @@ export class ChildTunnel {
   ): Promise<string> {
     await this.stop()
     return new Promise<string>((resolve, reject) => {
-      const child = spawn(binPath, args, {
+      // Tethered (util/tether.ts): the provider, and whatever it starts in its process group, end the moment the
+      // daemon does, however it ends. A SIGKILLed daemon left cloudflared or ngrok running, keeping a PUBLIC URL alive
+      // to a port that may be serving something else, until the next start's reaper found it.
+      const child = spawnTethered(binPath, args, {
         windowsHide: true,
         ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
-      })
+      }, { kind: 'tunnel' })
       this.child = child
-      writePid(this.dataDir, child.pid ?? 0)
+      writePid(this.dataDir, child.pid ?? 0, isTetheredGroupLeader(child))
 
       let settled = false
       let buf = ''
@@ -274,6 +295,6 @@ export class ChildTunnel {
   private forceKill(child: ChildProcess): void {
     if (!child.pid) return
     if (process.platform === 'win32') execFile('taskkill', ['/PID', String(child.pid), '/F', '/T'], () => {})
-    else child.kill('SIGKILL')
+    else killTetheredTree(child, 'SIGKILL') // its group: what it started goes too
   }
 }
