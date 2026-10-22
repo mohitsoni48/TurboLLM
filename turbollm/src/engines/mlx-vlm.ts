@@ -20,13 +20,13 @@
 // `<bootstrapped uv binary> pip install --python <root>/mlx-vlm/venv/bin/python torch
 // torchvision` — see catalog.ts's mlx-vlm `note` for the user-facing version of this.
 import { existsSync, rmSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 export interface MlxVlmRuntime {
   /** venv python interpreter path */

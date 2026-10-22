@@ -5,6 +5,7 @@ import { basename, delimiter, join, relative } from 'node:path'
 import fs, { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import fsp from 'node:fs/promises'
 import { syncBuiltinESMExports } from 'node:module'
+import childProcess from 'node:child_process'
 import { tmpDir } from '../test-support/tmp'
 import { BUILD_INCOMPLETE_MARKER, copyCudaRuntimeLibs, discardParkedBuild, restoreInterruptedBuilds, runBuild, runPrereqInstall, runStep } from './build-runner'
 import { checkBuildPrereqs } from './build-prereqs'
@@ -1053,6 +1054,69 @@ test('runStep on Windows: the daemon exit runs taskkill /PID <pid> /T /F synchro
     try { if (pid) process.kill(Number(pid), 'SIGKILL') } catch { /* already gone */ }
     await step.catch(() => {})
   }
+})
+
+// Once Node has seen a step exit while something it left still holds its pipes (so 'close', and the step, wait), libuv
+// has closed the process handle that kept the pid from being reused: Cancel's and the daemon exit's `taskkill /PID <pid>
+// /T /F` could end another process tree that got the number. Runs on every OS: the platform and taskkill are faked.
+test('runStep on Windows: once the step has exited, Cancel and the daemon exit send no taskkill for its pid', async (t) => {
+  const dir = tmpDir('tllm-exited-step-')
+  const holderFile = join(dir, 'holder.pid')
+  const taskkills: unknown[] = []
+  const realExecFile = childProcess.execFile as (...a: unknown[]) => unknown
+  const realSpawnSync = childProcess.spawnSync as (...a: unknown[]) => unknown
+  t.mock.method(childProcess, 'execFile', (file: string, ...rest: unknown[]) => {
+    if (file !== 'taskkill') return realExecFile(file, ...rest)
+    taskkills.push(rest[0])
+    const done = rest.find((r) => typeof r === 'function') as ((e: Error | null) => void) | undefined
+    process.nextTick(() => done?.(null))
+    return {}
+  })
+  t.mock.method(childProcess, 'spawnSync', (file: string, ...rest: unknown[]) => {
+    if (file !== 'taskkill') return realSpawnSync(file, ...rest)
+    taskkills.push(rest[0])
+    return { status: 0 }
+  })
+  syncBuiltinESMExports() // build-runner imports both by name
+  const before = process.listeners('exit')
+  const actualPlatform = process.platform
+  const ac = new AbortController()
+  let pid = 0
+  // The step leaves a detached process holding its stdout and stderr, prints its pid, and exits.
+  const script = `const h = require('child_process').spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], { stdio: ['ignore', 'inherit', 'inherit'], detached: true })
+require('fs').writeFileSync(${JSON.stringify(holderFile)}, String(h.pid))
+h.unref()
+console.log(process.pid)`
+  let step: Promise<string>
+  Object.defineProperty(process, 'platform', { value: 'win32' })
+  try {
+    step = runStep(process.execPath, ['-e', script], { env: { ...process.env }, signal: ac.signal, onLine: (l) => { pid ||= Number(l.trim()) } })
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+  }
+  const gone = (p: number) => { try { process.kill(p, 0); return false } catch { return true } }
+  let holder = 0
+  try {
+    for (let i = 0; i < 500 && !(pid && existsSync(holderFile)); i++) await new Promise((r) => setTimeout(r, 10))
+    holder = Number(readFileSync(holderFile, 'utf8'))
+    for (let i = 0; i < 500 && !gone(pid); i++) await new Promise((r) => setTimeout(r, 10))
+    assert.ok(gone(pid), 'the step has exited')
+    await new Promise((r) => setTimeout(r, 200)) // and Node has seen it exit
+    const added = process.listeners('exit').filter((l) => !before.includes(l))
+    assert.equal(added.length, 1, 'no close yet: what the step left holds its pipes')
+    ;(added[0] as () => void)() // the daemon's exit
+    ac.abort() // Cancel
+    await assert.rejects(step, { name: 'AbortError' })
+    assert.deepEqual(taskkills, [], 'no taskkill names the pid of a step Node has seen exit')
+  } finally {
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+    try { if (holder) process.kill(holder, 'SIGKILL') } catch { /* already gone */ }
+    await step.catch(() => {})
+  }
+  // The exit listener still goes with the step, at its close.
+  for (let i = 0; i < 500 && process.listeners('exit').some((l) => !before.includes(l)); i++) await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(process.listeners('exit').filter((l) => !before.includes(l)), [])
 })
 
 // ── Linux/macOS Cancel kills the whole step, not just cmake ─────────────────────────────────────

@@ -7,13 +7,13 @@
 // the host and port we choose. Unlike MLX it runs on every desktop platform: `--torch-backend=auto` has
 // uv pick the PyTorch build (CUDA, ROCm or CPU) that matches the machine.
 import { existsSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 /** The launcher calls laya's Router and create_app directly, so it is pinned to the line it was written against. */
 export const LAYA_PACKAGE = 'laya[serve]>=0.3.20,<0.4'

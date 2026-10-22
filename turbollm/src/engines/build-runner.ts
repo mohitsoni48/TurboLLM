@@ -14,12 +14,11 @@
 //
 // The toolchain PATH override (build-prereqs.ts `buildEnv`) is applied so a conda-env /
 // custom-path CUDA Toolkit (and a user-provided ninja) are found. Windows or Linux + CUDA only.
-import { execFile, spawn, spawnSync } from 'node:child_process'
+import { execFile, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { basename, delimiter, dirname, join, normalize } from 'node:path'
-import { promisify } from 'node:util'
 import {
   buildEnv,
   checkBuildPrereqs,
@@ -33,8 +32,11 @@ import {
 } from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
+import type { Readable } from 'node:stream'
+import { spawnTethered, tetheredExecFile } from '../util/tether'
 
-const execFileP = promisify(execFile)
+// The ldconfig and vswhere probes, tied to the daemon (util/tether.ts): their timeouts are daemon timers.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 /** Locate libcuda.so's directory when it lives OUTSIDE the CUDA Toolkit's own search path —
  *  the common shape on an NVIDIA-container-runtime GPU box (Kaggle, RunPod, generic
@@ -57,8 +59,8 @@ const execFileP = promisify(execFile)
  *  cover — the driver is mounted under a completely separate `/usr/local/nvidia/` prefix, the
  *  standard nvidia-container-runtime convention. Best-effort either way: a missing `ldconfig`,
  *  an empty cache, or no match just means the build proceeds without the override, exactly like
- *  before this existed — never blocks a build that would otherwise have worked. */
-async function findLibcudaDir(signal: AbortSignal): Promise<string | null> {
+ *  before this existed — never blocks a build that would otherwise have worked. Exported for its tether test. */
+export async function findLibcudaDir(signal: AbortSignal): Promise<string | null> {
   try {
     const { stdout } = await execFileP('ldconfig', ['-p'], {
       timeout: 5000,
@@ -748,6 +750,14 @@ async function findVcvarsall(): Promise<string | null> {
   }
 }
 
+/** Windows: MSBuild, should a step run it (CMake does not with the Ninja and NMake generators used here, but a
+ *  project's own build scripts may), keeps its worker nodes running after the build for a later one to reuse. They
+ *  are grandchildren, which libuv's job lets break away, so they outlived the step and the daemon.
+ *  MSBUILDDISABLENODEREUSE=1 makes them end with their build. Exported for its test. */
+export function buildNodeReuseEnv(platform: NodeJS.Platform): { MSBUILDDISABLENODEREUSE?: string } {
+  return platform === 'win32' ? { MSBUILDDISABLENODEREUSE: '1' } : {}
+}
+
 /** The Windows command interpreter to spawn for our vcvars `.bat` steps. Windows always sets
  *  `ComSpec` to the full path of cmd.exe (e.g. `C:\Windows\System32\cmd.exe`), which is the
  *  portable, drive-agnostic way to reach it (Windows may not be on C:). Spawning the bare string
@@ -761,7 +771,7 @@ function winComSpec(): string {
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
  *  spawn error; aborting `signal` kills the child and everything under it (on Linux/macOS with `killTree: false`,
  *  only the child, with SIGTERM) and rejects with an AbortError. The daemon's exit kills the same tree (on
- *  Linux/macOS with `killTree: false`, nothing).
+ *  Linux/macOS with `killTree: false`, nothing). On Windows neither sends a kill once the child has exited.
  *  Exported for tests. */
 export function runStep(
   cmd: string,
@@ -789,7 +799,12 @@ export function runStep(
     const killGroupOnAbort = !isWindows && opts.killTree !== false
     const aborted = () => Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
     if (opts.signal.aborted) return reject(aborted())
-    const child = spawn(cmd, args, {
+    // Tied to the daemon (util/tether.ts), so a step the daemon does not live to see ends with it: a build step's
+    // whole group is killed (cmake, ninja and every compiler job), however the daemon dies; before, only the 'exit'
+    // handler below did that, and a SIGKILLed or crashed daemon left the compile running, parented to init. A
+    // package manager's step (killTree false) gets 'term' mode: SIGTERM to the program alone, never a kill, and
+    // it stays in the daemon's process group (sudo -n keeps the terminal's ticket).
+    const child = spawnTethered(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
       detached: killGroupOnAbort,
@@ -797,7 +812,7 @@ export function runStep(
       signal: isWindows || killGroupOnAbort ? undefined : opts.signal,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    }, opts.killTree === false ? { kind: 'install', end: 'term' } : { kind: 'build' }) as ChildProcessByStdio<null, Readable, Readable>
     const killGroup = () => {
       try {
         process.kill(-child.pid!, 'SIGKILL')
@@ -805,12 +820,18 @@ export function runStep(
         /* the group is already gone */
       }
     }
+    // Windows: no taskkill once Node has seen the step exit (something it left still holds its pipes, so 'close', and
+    // the step, wait): libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may
+    // name another process tree by then, as in manager.ts's forceKill. An exited root is no tree for taskkill anyway;
+    // with the job sentinel, what it left was ended with its job at that exit (util/tether.ts).
+    const exited = () => child.exitCode !== null || child.signalCode !== null
     const onAbort = () => {
       if (!child.pid) return reject(aborted())
       if (killGroupOnAbort) {
         killGroup()
         return reject(aborted())
       }
+      if (exited()) return reject(aborted())
       execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => reject(aborted()))
     }
     if (isWindows || killGroupOnAbort) opts.signal.addEventListener('abort', onAbort, { once: true })
@@ -821,6 +842,7 @@ export function runStep(
     // llama-server.exe nothing had probed into the directory the engine runs from. An exit handler cannot wait for
     // an async kill, so taskkill runs synchronously there.
     const killTreeSync = () => {
+      if (exited()) return // as onAbort
       try {
         spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
       } catch {
@@ -1195,7 +1217,7 @@ async function buildFromSource(
   // Force git to FAIL fast instead of blocking on an interactive credential prompt (a
   // private/typo'd URL would otherwise hang the build with stdin ignored). GCM_INTERACTIVE
   // disables the Git Credential Manager GUI on Windows.
-  const env = { ...buildEnv(req.toolchainDirs), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
+  const env = { ...buildEnv(req.toolchainDirs), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', ...buildNodeReuseEnv(process.platform) }
 
   // Fail fast with actionable guidance if the toolchain isn't usable, rather than a deep
   // cryptic cmake error. CUDA is required on Windows/Linux (-DGGML_CUDA=ON); macOS builds

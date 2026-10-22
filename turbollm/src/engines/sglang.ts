@@ -8,14 +8,14 @@
 // Windows are unsupported upstream. Same uvloop preflight as vLLM — literally the
 // same classifier, which treats only Windows as a hard platform block.
 import { existsSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import { UvloopPreflight } from './py-engine-blocker'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 const SGLANG_PYTHON = '3.12'
 

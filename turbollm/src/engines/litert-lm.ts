@@ -26,13 +26,14 @@
 // this engine is only reachable when TurboLLM itself runs inside Termux.
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { basename, dirname, join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a uv/pip install or a probe the daemon does not live to see ends with it,
+// instead of running on, parented to init (its timeout is a daemon timer).
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 const LITERT_LM_PYTHON = '3.12'
 

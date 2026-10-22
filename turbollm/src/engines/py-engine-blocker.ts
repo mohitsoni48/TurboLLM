@@ -1,8 +1,9 @@
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { homedir } from 'node:os'
-import { promisify } from 'node:util'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a probe's timeout is a daemon timer, so one the daemon does not live to see
+// ended only by itself.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 const DETAIL_LIMIT = 200
 

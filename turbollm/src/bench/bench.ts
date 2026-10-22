@@ -8,7 +8,7 @@
 // profile (tunedBy:'bench'), persists a benchResults row, and — when telemetry is on — queues an
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
 // recorded and the sweep continues).
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -2164,24 +2164,15 @@ export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | n
   return total > 0 ? total : null
 }
 
+// The GPU memory probes below run around every benchmark load, tied to the daemon (util/tether.ts): their timeouts
+// are daemon timers, so a probe hung on a wedged driver outlived a daemon that died meanwhile.
+const probeExecFile = tetheredExecFile({ kind: 'probe' })
+
 /** Best-effort current NVIDIA VRAM use in MB (sum across GPUs, or one `card`). Null on non-NVIDIA
  *  or when nvidia-smi is absent — never throws (spec 09 §1). */
 function readNvidiaVramMb(card?: VramCard): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile(
-        'nvidia-smi',
-        ['--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-        { timeout: 8000, windowsHide: true },
-        (err, stdout) => {
-          if (err || !stdout) return resolve(null)
-          resolve(parseNvidiaVramUsed(stdout, card))
-        },
-      )
-    } catch {
-      resolve(null)
-    }
-  })
+  return probeExecFile('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseNvidiaVramUsed(stdout, card) : null), () => null)
 }
 
 /** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
@@ -2211,15 +2202,8 @@ export function parseRocmVramUsed(memJson: string, card?: VramCard): number | nu
  *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
  *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
 function readRocmVramMb(card?: VramCard): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
-        resolve(err || !stdout ? null : parseRocmVramUsed(stdout, card))
-      })
-    } catch {
-      resolve(null)
-    }
-  })
+  return probeExecFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseRocmVramUsed(stdout, card) : null), () => null)
 }
 
 /** Best-effort current GPU VRAM use in MB (sum across GPUs — or, given a single-GPU profile `p`,
@@ -2263,37 +2247,27 @@ let wddmSharedUnsupported = false
 
 function readWddmSharedMb(): Promise<number | null> {
   if (process.platform !== 'win32' || wddmSharedUnsupported) return Promise.resolve(null)
-  return new Promise((resolve) => {
-    try {
-      execFile(
-        'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS],
-        { timeout: 10_000, windowsHide: true },
-        (err, stdout) => {
-          if (err) {
-            // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
-            // NOT latch: this runs immediately around a model load, when the machine is under peak
-            // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
-            // is long-lived, so latching on that would silently disable spill detection until
-            // restart — reverting to exactly the fit-only behaviour this release exists to fix.
-            // A missing interpreter (ENOENT) or the script's own `exit 1` (counter unresolvable) are
-            // permanent for this process and worth latching.
-            if (!err.killed) wddmSharedUnsupported = true
-            return resolve(null)
-          }
-          const mb = parseFloat((stdout || '').trim())
-          if (!Number.isFinite(mb) || mb < 0) {
-            wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
-            return resolve(null)
-          }
-          resolve(Math.round(mb))
-        },
-      )
-    } catch {
-      wddmSharedUnsupported = true // could not spawn at all
-      resolve(null)
-    }
-  })
+  return probeExecFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS], { timeout: 10_000, windowsHide: true }).then(
+    ({ stdout }) => {
+      const mb = parseFloat((stdout || '').trim())
+      if (!Number.isFinite(mb) || mb < 0) {
+        wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
+        return null
+      }
+      return Math.round(mb)
+    },
+    (err: Error & { killed?: boolean }) => {
+      // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
+      // NOT latch: this runs immediately around a model load, when the machine is under peak
+      // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
+      // is long-lived, so latching on that would silently disable spill detection until
+      // restart — reverting to exactly the fit-only behaviour this release exists to fix.
+      // A missing interpreter (ENOENT, or a spawn that could not start at all) or the script's own
+      // `exit 1` (counter unresolvable) are permanent for this process and worth latching.
+      if (!err.killed) wddmSharedUnsupported = true
+      return null
+    },
+  )
 }
 
 /** Pure parser for `rocm-smi --showmeminfo gtt --json`, split out for direct testing. GTT is the
@@ -2319,16 +2293,8 @@ export function parseRocmGttUsed(memJson: string): number | null {
 /** Best-effort AMD host-backed (GTT) memory in MB via rocm-smi. Null when rocm-smi is absent or
  *  unparseable — never throws. */
 function readRocmGttMb(): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('rocm-smi', ['--showmeminfo', 'gtt', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
-        if (err || !stdout) return resolve(null)
-        resolve(parseRocmGttUsed(stdout))
-      })
-    } catch {
-      resolve(null)
-    }
-  })
+  return probeExecFile('rocm-smi', ['--showmeminfo', 'gtt', '--json'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseRocmGttUsed(stdout) : null), () => null)
 }
 
 /** Host-backed GPU memory in MB, or null where the platform exposes no such accounting.

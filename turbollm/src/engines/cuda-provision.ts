@@ -9,14 +9,15 @@
 // manifest mapping every component to a per-platform { relative_path, sha256, size }.
 //
 // Windows + x86_64 only, matching the guided build's scope (Linux/macOS build is parked).
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { downloadFile, extractArchive, renameWithRetry } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a probe's timeout is a daemon timer, so one the daemon does not live to see
+// ended only by itself.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 const REDIST_BASE = 'https://developer.download.nvidia.com/compute/cuda/redist/'
 

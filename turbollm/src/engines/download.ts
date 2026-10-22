@@ -6,16 +6,18 @@
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { execFile, execFileSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import { basename, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { promisify } from 'node:util'
+import { tetheredExecFile } from '../util/tether'
 import type { GpuVendor } from '../sysinfo/sysinfo'
 import { quotePowerShellArg } from '../util/shell-command'
 import { extractZipAll } from './zip-reader'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an extraction the daemon does not live to see ends with it. Its errors
+// name the real program (tar, powershell), as execFile's did.
+const execFileP = tetheredExecFile({ kind: 'extract' })
 
 /** Build standard GitHub API headers, injecting a token so authenticated requests
  *  get 5,000 req/hour instead of the 60/hour unauthenticated limit.

@@ -19,7 +19,8 @@
 // makes install-method detection testable at all — none of the six cases can be
 // reproduced by running the test suite in the environment it happens to run in.
 
-import { execFile, spawn } from 'node:child_process'
+import { spawn } from 'node:child_process'
+import { tetheredExecFile, type TetheredExecFileOptions } from './util/tether'
 import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -224,23 +225,37 @@ function detectSourceCheckout(entry: string): boolean {
   return false
 }
 
+/** What npmGlobalRoot runs `npm root -g` with: the OS and environment, and the exec. Tests only. */
+export interface NpmRootDeps {
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
+  exec?: (file: string, args: readonly string[], options: TetheredExecFileOptions) => Promise<{ stdout: string }>
+}
+
 /** `npm root -g`, or null when npm isn't reachable. Cached for the process lifetime —
  *  it cannot change without a restart, and spawning npm on every status poll would be
  *  absurd. Never throws. */
 let npmRootCache: { value: string | null } | null = null
-export async function npmGlobalRoot(): Promise<string | null> {
+export async function npmGlobalRoot(deps: NpmRootDeps = {}): Promise<string | null> {
   if (npmRootCache) return npmRootCache.value
   const value = await new Promise<string | null>((res) => {
     // On Windows npm is a `.cmd` shim, which Node refuses to spawn without a shell (EINVAL since
     // the CVE-2024-27980 fix — thrown synchronously, so it read as "no npm" and every global
     // install as `unknown`). The command is a fixed literal, so cmd.exe gets the whole line and
     // no args array (an args array with `shell` is DEP0190 and quotes nothing).
-    const isWin = process.platform === 'win32'
-    execFile(isWin ? 'npm root -g' : 'npm', isWin ? [] : ['root', '-g'], { timeout: 10_000, windowsHide: true, shell: isWin }, (e, stdout) => {
-      if (e) return res(null)
-      const out = String(stdout).trim()
-      res(out || null)
-    })
+    // Tied to the daemon (util/tether.ts): its timeout is a daemon timer. tetheredExecFile takes no `shell`, so on
+    // Windows this is what Node's `shell: true` runs (normalizeSpawnArguments): %ComSpec%, else cmd.exe, and for
+    // cmd.exe /d /s /c "<line>" with its arguments verbatim (another shell gets -c <line>). app-update-apply.test.ts
+    // compares the two.
+    const isWin = (deps.platform ?? process.platform) === 'win32'
+    const shell = (deps.env ?? process.env).ComSpec || 'cmd.exe'
+    const cmd = /^(?:.*\\)?cmd(?:\.exe)?$/i.test(shell)
+    const [file, args, verbatim] = !isWin ? ['npm', ['root', '-g'], false]
+      : cmd ? [shell, ['/d', '/s', '/c', '"npm root -g"'], true] : [shell, ['-c', 'npm root -g'], false]
+    ;(deps.exec ?? tetheredExecFile({ kind: 'probe' }))(file, args, { timeout: 10_000, windowsHide: true, windowsVerbatimArguments: verbatim }).then(
+      ({ stdout }) => res(String(stdout).trim() || null),
+      () => res(null),
+    )
   }).catch(() => null)
   npmRootCache = { value }
   return value

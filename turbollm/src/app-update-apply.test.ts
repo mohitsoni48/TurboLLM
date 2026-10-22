@@ -17,7 +17,7 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { ChildProcess, spawn } from 'node:child_process'
 import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpDir } from './test-support/tmp'
@@ -27,6 +27,7 @@ import {
   classifyInstall,
   classifyUpdateFailure,
   detectInstall,
+  npmGlobalRoot,
   progressFromResult,
   realPathOr,
   resetNpmRootCache,
@@ -392,6 +393,90 @@ test('detectInstall: a global install through a <prefix>/bin link whose folders 
   assert.equal(rw.method, 'npm_global')
   assert.equal(rw.canSelfUpdate, true, 'both writable')
   assert.equal(rw.command, 'npm i -g turbollm@latest')
+})
+
+/** What Node's own `spawn(command, { shell: true })` would run on Windows (normalizeSpawnArguments), on any OS:
+ *  process.platform is faked for the one synchronous call, and ChildProcess#spawn, which receives the normalized
+ *  options, is stubbed so that nothing runs. */
+function nodeWindowsShellLine(command: string, comspec: string | undefined): { file: string; args: string[]; verbatim: boolean } {
+  type Normalized = { file: string; args: string[]; windowsVerbatimArguments?: boolean }
+  const proto = ChildProcess.prototype as unknown as { spawn: (o: Normalized) => number }
+  const realSpawn = proto.spawn
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const saved = process.env.comspec
+  let seen: { file: string; args: string[]; verbatim: boolean } | undefined
+  proto.spawn = (o) => {
+    seen = { file: o.file, args: o.args.slice(1), verbatim: o.windowsVerbatimArguments === true }
+    return 0
+  }
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  if (comspec === undefined) delete process.env.comspec
+  else process.env.comspec = comspec
+  try {
+    spawn(command, { shell: true })
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+    proto.spawn = realSpawn
+    if (saved === undefined) delete process.env.comspec
+    else process.env.comspec = saved
+  }
+  assert.ok(seen, 'Node normalized the spawn')
+  return seen
+}
+
+// npmGlobalRoot runs through tetheredExecFile, which takes no `shell`, so on Windows it builds cmd.exe's line itself.
+// That line broke once already (the CVE-2024-27980 EINVAL that read every global install as `unknown`), and no CI job
+// runs this file on Windows, so the line is held to the one Node's own `shell: true` builds.
+test('npmGlobalRoot on Windows runs `npm root -g` as Node\'s own shell: true does (%ComSpec% /d /s /c, verbatim), and reads its output as before', async (t) => {
+  t.after(() => resetNpmRootCache())
+  const printed = 'C:\\Users\\owner\\AppData\\Roaming\\npm\\node_modules'
+  for (const comSpec of ['C:\\WINDOWS\\system32\\cmd.exe', undefined, 'C:\\tools\\tcc.exe']) {
+    const calls: { file: string; args: string[]; verbatim: boolean }[] = []
+    resetNpmRootCache()
+    const root = await npmGlobalRoot({
+      platform: 'win32',
+      env: comSpec === undefined ? {} : { ComSpec: comSpec },
+      exec: async (file, args, options) => {
+        calls.push({ file, args: [...args], verbatim: options.windowsVerbatimArguments === true })
+        return { stdout: `${printed}\r\n` }
+      },
+    })
+    assert.equal(root, printed, 'trimmed, its CRLF too')
+    assert.deepEqual(calls, [nodeWindowsShellLine('npm root -g', comSpec)], `ComSpec ${comSpec ?? 'unset'}`)
+  }
+  assert.deepEqual(nodeWindowsShellLine('npm root -g', undefined), { file: 'cmd.exe', args: ['/d', '/s', '/c', '"npm root -g"'], verbatim: true })
+
+  resetNpmRootCache()
+  assert.equal(await npmGlobalRoot({ platform: 'win32', env: {}, exec: async () => ({ stdout: '\r\n' }) }), null, 'nothing printed')
+  resetNpmRootCache()
+  const einval = Object.assign(new Error('spawn EINVAL'), { code: 'EINVAL' })
+  assert.equal(await npmGlobalRoot({ platform: 'win32', env: {}, exec: async () => { throw einval } }), null, 'a failed run')
+  resetNpmRootCache()
+  const posix: string[][] = []
+  await npmGlobalRoot({ platform: 'linux', env: {}, exec: async (file, args, options) => {
+    posix.push([file, ...args, String(options.windowsVerbatimArguments)])
+    return { stdout: '/usr/lib/node_modules\n' }
+  } })
+  assert.deepEqual(posix, [['npm', 'root', '-g', 'false']], 'elsewhere npm itself, no shell')
+})
+
+test('npmGlobalRoot reads the global folder from a real `npm root -g` (on Windows through cmd.exe)', async (t) => {
+  // npm prints <prefix>\node_modules on Windows and <prefix>/lib/node_modules elsewhere, for the prefix
+  // npm_config_prefix names. On Windows this runs the cmd.exe line above for real.
+  const prefix = tmpDir('tllm-npm-root-')
+  const expected = process.platform === 'win32' ? join(prefix, 'node_modules') : join(prefix, 'lib', 'node_modules')
+  mkdirSync(expected, { recursive: true })
+  const envPrefix = process.env.npm_config_prefix
+  t.after(() => {
+    if (envPrefix === undefined) delete process.env.npm_config_prefix
+    else process.env.npm_config_prefix = envPrefix
+    resetNpmRootCache()
+  })
+  process.env.npm_config_prefix = prefix
+  resetNpmRootCache()
+  const root = await npmGlobalRoot()
+  assert.ok(root, 'npm answered')
+  assert.equal(realPathOr(root), realPathOr(expected))
 })
 
 // The relaunched daemon's stdout goes to update.log, and one started with --print-token or

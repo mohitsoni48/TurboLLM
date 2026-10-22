@@ -7,12 +7,12 @@
 // Runtime is macOS-only (mlx-lm needs Apple Metal). The uv *bootstrap* is
 // cross-platform and independently testable; `ensureMlxEnv` guards on darwin.
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { downloadFile, extractArchive, findFile, type ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 // Pinned uv release (astral-sh/uv). Bump deliberately.
 export const UV_VERSION = '0.11.21'

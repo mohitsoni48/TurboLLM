@@ -9,15 +9,15 @@
 // platform (ADR-044) — the catalog surfaces support level and the install simply
 // attempts `uv pip install vllm`, which fails loudly on an unsupported platform.
 import { existsSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { hostname, machine, release, version as kernelBuild } from 'node:os'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import { UvloopPreflight } from './py-engine-blocker'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 // Python line vLLM supports. uv fetches a matching interpreter if absent, so the
 // user needs no system Python. Bump deliberately as vLLM's support window moves.

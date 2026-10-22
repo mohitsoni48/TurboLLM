@@ -108,3 +108,21 @@ test('extractArchive: a corrupt archive fails with code extract_failed naming th
     return true
   })
 })
+
+// The extraction runs through util/tether.ts's tetheredExecFile: its error still names the real tool, never the
+// /bin/sh wrapper, and carries the tool's own stderr, which is what the user reads in the install's failure.
+test('extractArchive: a failed extraction names tar, not a wrapper, and carries tar\'s own words', async (t) => {
+  if (process.platform === 'win32') return t.skip('the system tar.exe path; POSIX tar here')
+  const dir = tmpDir('extract-tar-')
+  const archive = join(dir, 'y.tar.gz')
+  writeFileSync(archive, randomBytes(64))
+  await assert.rejects(extractArchive(archive, dir), (e: unknown) => {
+    const err = e as Error & { cause?: Error & { cmd?: string; stderr?: string } }
+    assert.match(err.message, /^Could not extract y\.tar\.gz: Command failed: tar -xzf /)
+    assert.ok(!/\/bin\/sh|sh -c/.test(err.message), err.message)
+    assert.equal(err.cause?.cmd, `tar -xzf ${archive} -C ${dir}`)
+    assert.ok(err.cause?.stderr?.trim(), 'tar said why')
+    assert.ok(err.message.includes(err.cause!.stderr!.trim().split('\n')[0]), 'and the message carries it')
+    return true
+  })
+})
