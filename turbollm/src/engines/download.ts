@@ -65,7 +65,9 @@ export function githubHeaders(
 export function stripMacOsQuarantine(dir: string): void {
   if (process.platform !== 'darwin') return
   try {
-    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir])
+    // Synchronous on the daemon's event loop, so bounded: a large engine tree on a slow disk held the daemon for as
+    // long as the filesystem took. What xattr prints is not the daemon's to log (execFileSync passes stderr on).
+    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir], { timeout: 30_000, stdio: 'ignore' })
   } catch {
     // xattr exits non-zero when the attribute is absent — not an error
   }

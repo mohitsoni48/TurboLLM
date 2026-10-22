@@ -1,4 +1,5 @@
 import { hideChildConsoleWindows } from './util/hide-console-windows'
+import { killTetheredSync, stopTethered, tetherReady } from './util/tether'
 import { openOwnerOnlyLog } from './util/owner-only-log'
 import { spawn } from 'node:child_process'
 import { closeSync, openSync, readFileSync } from 'node:fs'
@@ -94,6 +95,10 @@ import { markEverLoadedModel } from './api/onboarding-routes'
 // of its own. Must run before anything spawns — patches the shared low-level
 // spawn path, so it covers the external pi SDK's named spawn import too.
 hideChildConsoleWindows()
+// Every long-lived child is started through util/tether.ts, which ties it to this process's life. On the Android
+// app that first runs libtether_exec.so's self-test (at most 3 s), so the first engine already starts under the
+// helper when it passes; everywhere else this resolves at once.
+await tetherReady()
 
 // Entrypoint for the TurboLLM daemon (npm bin "turbollm"): wiring + graceful
 // shutdown. ADR-023 (Node/TS stack).
@@ -1481,7 +1486,9 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   const watchdog = setTimeout(finish, 14_000)
   watchdog.unref()
   try {
-    void Promise.all([manager.shutdown(), remote.disable(), chatTurnsEnded()]).finally(() => {
+    // stopTethered: everything else tethered (routine runs, Code commands, git, …) gets SIGTERM, then its group
+    // is killed after 3 s; engines and tunnels are their owners' to stop, just above.
+    void Promise.all([manager.shutdown(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1544,7 +1551,7 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
     clearInterval(cliInteractiveSweepTimer)
     comfy.stop()
     toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), remote.disable(), chatTurnsEnded()]).finally(() => {
+    void Promise.all([manager.shutdown(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1573,6 +1580,9 @@ for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 // covers exits that bypass them so llama-server can never outlive the daemon. The
 // startup reap is the backstop for the truly abrupt kills that skip 'exit' too.
 process.on('exit', () => {
+  // Every tethered child, by its end mode: a group SIGKILL, git's SIGTERM (its watcher finishes the job once this
+  // process is gone), a package manager's SIGTERM. Held groups (a Code session's background jobs) included.
+  try { killTetheredSync() } catch { /* best-effort */ }
   try { killTrackedEnginesSync(store.dir()) } catch { /* best-effort */ }
   // Same last-resort net for a cloudflared tunnel — a leaked one keeps a PUBLIC URL
   // alive pointing at a port nothing may be serving anymore, worse than a leaked engine.

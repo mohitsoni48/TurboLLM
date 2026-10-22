@@ -159,6 +159,34 @@ jobs:
         run: npm test
         working-directory: clients/ts
 
+  # util/tether.ts ties every child the daemon starts to the daemon's life. On macOS it rests on things the ubuntu
+  # job cannot show: /bin/sh's own fd and job handling, SIP stripping DYLD_* from /bin/sh, libuv's posix_spawn PATH
+  # walk (the resolver must name the program it runs), and the `ps` group counts that replace /proc. These run the
+  # wrapper for real there and kill stand-in daemons.
+  tether:
+    name: Process tether (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Tether tests
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts
+        working-directory: turbollm
+
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}

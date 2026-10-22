@@ -240,3 +240,27 @@ test('the interactive-routine sweep maps Code session ids to terminal ids', () =
   assert.ok(!/getTerminalManager\(deps\)\.(isActive|isAgentExited|getExitCode|kill)\(codeSessionId\)/.test(CLI),
     'TerminalManager is keyed by terminal id, not the Code session id')
 })
+
+// util/tether.ts ties every tethered child to this process; these pin where cli.ts drives it. The behaviour itself
+// is util/tether.test.ts's: "stopTethered: SIGTERM first, then a group kill after the grace" and the daemon-SIGKILL
+// tests.
+test('both teardowns stop the tethered children beside the engine, and the exit handler kills them first', () => {
+  const WITH_TETHER = /Promise\.all\(\[[^\]]*\bmanager\.shutdown\(\)[^\]]*\bstopTethered\(\)[^\]]*\]\)\.finally\(/
+  assert.match(blockFrom('if (!packagedAndroidApp()) deps.requestRestart = ('), WITH_TETHER, 'the restart teardown')
+  assert.match(blockFrom(SIGNALS), WITH_TETHER, 'the signal teardown')
+  const exit = CLI.indexOf("process.on('exit', () => {\n  // Every tethered child")
+  assert.ok(exit > 0, "the last-resort 'exit' handler")
+  const firstCall = CLI.indexOf('try {', exit)
+  assert.equal(CLI.slice(firstCall, CLI.indexOf('\n', firstCall)), 'try { killTetheredSync() } catch { /* best-effort */ }', 'killTetheredSync runs first')
+})
+
+test('boot waits for the tether (the Android helper\'s self-test) before anything is spawned', () => {
+  const hide = CLI.indexOf('\nhideChildConsoleWindows()\n')
+  const ready = CLI.indexOf('\nawait tetherReady()\n')
+  assert.ok(hide > 0 && ready > hide, 'after hideChildConsoleWindows()')
+  const between = CLI.slice(hide + '\nhideChildConsoleWindows()\n'.length, ready + 1).split('\n').filter((l) => l.trim() && !l.trim().startsWith('//'))
+  assert.deepEqual(between, [], 'right after it, with nothing but comments between')
+  for (const later of ['reapStaleEngines(store.dir())', 'reconcileTailscale(', 'void runAutoLoad({']) {
+    assert.ok(ready < CLI.indexOf(later), `before ${later}`)
+  }
+})
