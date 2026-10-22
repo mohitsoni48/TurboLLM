@@ -79,9 +79,6 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/process-start-time.ts#processStartTimes:spawnSync': SYNC,
 
   // ── Not tethered yet ──
-  'code/lsp-client.ts#LspClient.doStart:spawn': `a language server; ${UNTIED}`,
-  'code/lsp-client.ts#resolveFallbackTsserverPath:spawn': `the tsserver path probe; ${UNTIED}`,
-  'tools/mcp-client.ts#StdioMcpClient.start:spawn': `a stdio MCP server; ${UNTIED}`,
   'engines/build-runner.ts#<module>:execFile': `the build probes; ${UNTIED}`,
   'engines/build-runner.ts#findLibcudaDir:execFileP': `\`ldconfig -p\`; ${UNTIED}`,
   'engines/build-runner.ts#findVcvarsall:execFileP': `vswhere; ${UNTIED}`,

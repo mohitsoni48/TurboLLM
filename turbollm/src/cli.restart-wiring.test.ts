@@ -170,3 +170,12 @@ test('restart.log is made owner-only at boot, before any restart can write to it
   )
   assert.ok(CLI.indexOf(RESTART_LOG_PREPARED) < CLI.indexOf(RESTART_HANDLER_OPENING), 'before the restart handler is defined')
 })
+
+// The signal shutdown disconnects every MCP server before its teardown; a restart did not, so each stdio server was
+// left to notice its stdin's EOF after the exit, and one that ignores it ran on beside the replacement's own.
+test('a restart disconnects the MCP servers before its teardown, as the signal shutdown does', () => {
+  const restartHandler = blockFrom(RESTART_HANDLER_OPENING)
+  const disconnect = restartHandler.indexOf('toolRegistry.disconnectAll()')
+  assert.ok(disconnect > 0, 'the restart handler must call toolRegistry.disconnectAll()')
+  assert.ok(disconnect < restartHandler.indexOf('void Promise.all(['), 'before the teardown')
+})

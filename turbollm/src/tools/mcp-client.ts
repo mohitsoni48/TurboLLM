@@ -1,6 +1,7 @@
 // MCP host/client. Implements stdio (subprocess JSON-RPC) and Streamable HTTP
 // (MCP 2025-03-26) transports. All modern hosted MCPs use Streamable HTTP.
-import { spawn, type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
+import { spawnTethered } from '../util/tether'
 
 // ── MCP protocol types ────────────────────────────────────────────────────
 
@@ -93,13 +94,17 @@ export class StdioMcpClient implements IMcpClient {
     const isWin = process.platform === 'win32'
     const file = isWin ? 'cmd.exe' : this.command
     const args = isWin ? ['/c', this.command, ...this.args] : this.args
-    const proc = spawn(file, args, {
+    // Tied to the daemon (util/tether.ts): a server that does not exit when its stdin closes, and whatever it
+    // started (an `npx` server's node child, a `uvx` server's Python), ended only when TurboLLM's own teardown
+    // killed it, so a daemon that died without one left them running, parented to init. Now the whole group ends
+    // the moment the daemon does, and cleanup()'s kill below takes the group with the server.
+    const proc = spawnTethered(file, args, {
       env: { ...process.env, ...this.env },
       // stderr is discarded, not piped: nothing reads it, and once an unread pipe fills (~128 KB of
       // logging — the Python MCP SDK logs every request at INFO) the server blocks on its next
       // stderr write and every later request times out.
       stdio: ['pipe', 'pipe', 'ignore'],
-    })
+    }, { kind: 'mcp' })
     this.proc = proc
     this.buf = ''
 

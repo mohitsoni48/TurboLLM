@@ -1457,6 +1457,10 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
   clearInterval(cliInteractiveSweepTimer)
   comfy.stop() // don't let a tick reload a model mid-teardown
+  // The MCP servers stop first, as on a signal (their pending calls fail as "disconnected"): the replacement starts
+  // its own. Before, a restart left each stdio server to notice its stdin's EOF after the exit, and one that
+  // ignores it ran on beside the replacement's copy.
+  toolRegistry.disconnectAll()
   let finished = false
   const finish = () => {
     if (finished) return
