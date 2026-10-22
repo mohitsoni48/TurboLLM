@@ -8,7 +8,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import type { AddressInfo } from 'node:net'
 import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
-import { abortAllInFlightChats, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
+import { abortAllInFlightChats, chatHoldsEngine, inFlightChatIds, registerChatRoutes } from './chat-routes.js'
 import { chatRuns } from './chat-runs.js'
 import { ConversationStore, type Message } from './db.js'
 import { activeWork } from '../api/active-work.js'
@@ -605,6 +605,77 @@ it('(l) a reply whose auto-title call is still pending keeps the chat in the pro
     release()
     await waitFor(() => h.store.getConversation(conv.id)!.title === 'A Generated Title', 'the auto-title')
     await waitFor(() => activeWork(h.d).items.length === 0, 'the chat to leave the probe once the title settled')
+  } finally {
+    release()
+    h.cleanup()
+    await engine.close()
+  }
+})
+
+/** Counts the engine's generations on `h`'s manager double, as the real Manager does (generationStart/End). */
+function countGenerations(h: ReturnType<typeof routes>): () => number {
+  let generations = 0
+  Object.assign(h.d.manager, { generationStart: () => { generations++ }, generationEnd: () => { generations-- } })
+  return () => generations
+}
+
+it('(l) the idle unload\'s hold covers a turn\'s auto-compaction, which the engine\'s generation count does not', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url)
+  const generations = countGenerations(h)
+  const release = engine.holdNonStreamReplies('The user asked twice about x.')
+  try {
+    const conv = h.store.createConversation()
+    const long = 'x'.repeat(6000)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long)
+    h.store.addMessage(conv.id, 'user', long)
+    h.store.addMessage(conv.id, 'assistant', long, { stats: { ctxUsed: 7500, ctxMax: 8192 } }) // 92% of the window
+    assert.equal(chatHoldsEngine(), false)
+    await sendAndLeave(h.app, conv.id, 'q3')
+    await waitFor(() => engine.nonStream.length === 1, 'the summary call')
+    assert.equal(generations(), 0, 'the summary call holds no generation')
+    assert.equal(chatHoldsEngine(), true, 'the compaction needs the model')
+    release()
+    const call = await engine.call(1)
+    assert.equal(chatHoldsEngine(), true)
+    call.word('a3')
+    call.finish()
+    await waitFor(saved(h.store, conv.id), 'the reply to be saved')
+    await waitFor(() => !chatHoldsEngine(), 'the hold to end with the turn')
+  } finally {
+    release()
+    h.cleanup()
+    await engine.close()
+  }
+})
+
+it('(l) the idle unload\'s hold covers an approval wait and the reply\'s title call, and ends once the title settles', async () => {
+  const engine = await standInEngine()
+  const h = routes(engine.url, { titles: true, toolPolicy: 'ask' })
+  const generations = countGenerations(h)
+  const release = engine.holdNonStreamReplies('A Generated Title')
+  try {
+    const conv = h.store.createConversation()
+    await sendAndLeave(h.app, conv.id, 'compute 6*7')
+    const round1 = await engine.call(1)
+    assert.equal(chatHoldsEngine(), true, 'generating')
+    round1.toolCall('call_1', 'run_code', '{"code":"6*7"}')
+    round1.finish('tool_calls')
+    await waitFor(() => activeWork(h.d).waiting.length === 1, 'the approval wait')
+    assert.equal(chatHoldsEngine(), true, 'waiting for an approval within its wait')
+    const approve = await h.app.request(`/api/v1/conversations/${conv.id}/tool-calls/call_1/approve`, json({ toolName: 'run_code', decision: 'allow' }))
+    assert.equal(approve.status, 200)
+    const round2 = await engine.call(2)
+    round2.word('The answer is 42.')
+    round2.finish()
+    await waitFor(saved(h.store, conv.id), 'the reply to be saved')
+    await waitFor(() => engine.nonStream.length === 1, 'the title call', 4000)
+    assert.equal(generations(), 0, 'the turn has ended: no generation')
+    assert.equal(chatHoldsEngine(), true, 'the title call needs the model')
+    release()
+    await waitFor(() => h.store.getConversation(conv.id)!.title === 'A Generated Title', 'the auto-title')
+    await waitFor(() => !chatHoldsEngine(), 'the hold to end once the title settled')
   } finally {
     release()
     h.cleanup()

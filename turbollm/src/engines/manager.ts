@@ -208,6 +208,16 @@ export class Manager {
    *  returned before that assignment and reported the PREVIOUS load's config
    *  for a failure that had nothing to do with it. */
   onLoadSettled?: (ok: boolean, err: ErrInfo | null, opts: StartOpts) => void
+  /** Whether work the idle watchdog cannot see still needs the loaded model, wired in cli.ts on the primary
+   *  Manager: a chat whose turn holds its slot (generating, compacting, or waiting for a tool-call approval
+   *  within Settings' approval wait), or whose finished reply's auto-title or memory call is still pending
+   *  (chat-routes.ts chatHoldsEngine). The watchdog does not unload while it says so. The generation count
+   *  alone missed the auto-compaction a turn runs before its first request, a manual compaction, and those calls
+   *  after the turn's end, none of which holds a generationStart: once the TTL had passed since the load (or the
+   *  last gateway request) the watchdog unloaded the model under them, the compaction failed, and the reply's
+   *  title and memory were lost. Unset (a pool slot, a test), the watchdog reads only the generation count, as
+   *  before. */
+  holdsEngine?: () => boolean
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
@@ -880,7 +890,7 @@ export class Manager {
     const ttl = this.store.snapshot().daemon.idleTtlMinutes
     if (ttl <= 0) return
     const idle = this.state === 'running' && Date.now() - this.lastActivity > ttl * 60_000 && this.generation === 0
-    if (idle) this.stop()
+    if (idle && !this.holdsEngine?.()) this.stop()
   }
 }
 

@@ -125,6 +125,16 @@ export function afterReplyChatIds(): string[] {
   return [...afterReply.keys()]
 }
 
+/** Whether a chat still needs the engine's model: a turn holds its chat's slot (generating, its
+ *  auto-compaction, a manual compaction, or waiting for a tool-call approval within its wait), or a
+ *  finished reply's auto-title or memory call is pending. The idle watchdog asks it
+ *  (Manager.holdsEngine, wired in cli.ts) and does not unload meanwhile. A Turbo Link turn counts
+ *  too, though it runs on its host: the in-flight entry does not say where a turn runs, and the
+ *  local model then waits a reply longer for its TTL. */
+export function chatHoldsEngine(): boolean {
+  return inflight.size > 0 || afterReply.size > 0
+}
+
 /** Removes `convId`'s entry only while it is still `ac`'s own. Stop or a kill switch drops the
  *  entry at once, but the aborted turn can keep unwinding for a long time
  *  (a tool call is not interrupted by the abort) — by the time it does, the entry may belong

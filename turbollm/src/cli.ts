@@ -46,6 +46,7 @@ import { HashStore } from './models/hashes'
 import { estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { ConversationStore } from './chat/db'
+import { chatHoldsEngine } from './chat/chat-routes'
 import { preloadSqlJs } from './chat/store/sqlite-adapter'
 import { buildChatStore } from './chat/store/startup'
 import { HfClient } from './hf/hf'
@@ -471,6 +472,10 @@ void ensureAndroidBundledEngine(registry)
   .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
   .then(() => registry.ensureProbed())
 const manager = new Manager(store)
+// The idle unload (Settings → Idle timeout) waits while a chat needs the model (chatHoldsEngine). The engine's
+// generation count covers a turn's requests and approval waits, not the auto-compaction before them, a manual
+// compaction, or the reply's title and memory calls after it. The desktop daemon and the Android app both start here.
+manager.holdsEngine = chatHoldsEngine
 const scanner = new Scanner(store)
 // First-run seed (ADR-092): if no model dirs are configured and the HF hub cache
 // exists, adopt it as the default so pre-existing HF models show up. One-time only;
