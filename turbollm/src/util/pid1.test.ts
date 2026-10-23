@@ -42,28 +42,65 @@ const SLOW_SH = "const cp = require('node:child_process'); const spawn = cp.spaw
   "cp.spawn = (cmd, args, o) => spawn(cmd, cmd === '/bin/sh' ? [args[0], args[1] + '; sleep 0.5'] : args, o); " +
   "require('node:module').syncBuiltinESMExports(); "
 
+/** The unshares of namespaces still running, by pid, ended at exit if a test left one (it never should). */
+const liveUnshares = new Set<number>()
+/** SIGKILL an unshare: --kill-child then SIGKILLs the namespace's PID 1, which ends every process in it. As root
+ *  directly; under sudo through `sudo -n kill`, which signals unshare itself. A SIGTERM to sudo, for it to relay,
+ *  ended nothing: sudo relays no signal sent from a process in its own process group, and the `sudo -n kill` was
+ *  in it (both sudos are started in this file's group); and unshare --fork blocks SIGTERM and SIGINT while it
+ *  waits for its child (SigBlk 0x4002). `tail -f /dev/null` as PID 1 never exits by itself, so its namespace lived
+ *  on, its pipes held this file's process open, and the test run never ended: CI's runner is a non-root user with
+ *  passwordless sudo, and its unit test job hung for hours after this file. */
+function killUnshare(pid: number): void {
+  if (via?.length) spawnSync('sudo', ['-n', 'kill', '-KILL', String(pid)], { stdio: 'ignore', timeout: 10_000 })
+  else { try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ } }
+}
+process.once('exit', () => { for (const pid of liveUnshares) killUnshare(pid) })
+
 /** Run `pid1` (argv) as PID 1 of a new pid namespace; --kill-child ends the namespace when unshare ends. Returns
- *  what the check printed, once it printed its RESULT line. */
+ *  what the check printed, once it printed its RESULT line. Whatever happens, by the time this returns or throws
+ *  the namespace has ended (unshare, sudo and every process in it, which all hold the output pipes), or it throws
+ *  saying so, having let go of the pipes so that this file's process can still exit. */
 async function inNamespace(pid1: string[]): Promise<string> {
-  const argv = [...(via as string[]), 'unshare', '--pid', '--fork', '--kill-child', '--mount-proc', ...pid1]
+  const unshare = ['unshare', '--pid', '--fork', '--kill-child', '--mount-proc', ...pid1]
+  // Under sudo the child is sudo, so a shell between them says unshare's pid before it execs it (sudo may run it
+  // under a monitor process of its own, use_pty, so sudo's own child is not always unshare).
+  const argv = via?.length ? [...via, 'sh', '-c', 'echo "UNSHARE $$"; exec "$@"', 'sh', ...unshare] : unshare
   const child = spawn(argv[0], argv.slice(1), { stdio: ['ignore', 'pipe', 'pipe'] })
+  const closed = new Promise<void>((resolve) => child.once('close', () => resolve()))
   let out = ''
   child.stdout.on('data', (d: Buffer) => { out += d.toString() })
   child.stderr.on('data', (d: Buffer) => { out += d.toString() })
+  let unsharePid = via?.length ? undefined : child.pid
+  const learnUnsharePid = () => {
+    const said = unsharePid === undefined ? /^UNSHARE (\d+)$/m.exec(out) : null
+    if (said) unsharePid = Number(said[1])
+    if (unsharePid !== undefined) liveUnshares.add(unsharePid)
+  }
+  learnUnsharePid()
   try {
     const deadline = Date.now() + 30_000
     while (!/RESULT \S+/.test(out)) {
+      learnUnsharePid()
       if (Date.now() > deadline || child.exitCode !== null) throw new Error(`no result; it printed:\n${out}`)
       await new Promise((resolve) => setTimeout(resolve, 50))
     }
     return out
   } finally {
-    // unshare --kill-child SIGKILLs the namespace's PID 1 when unshare ends, which ends every process in it. Under
-    // sudo the signal goes to sudo, which relays it to unshare.
-    if (child.exitCode === null) {
-      if (via?.length) spawnSync('sudo', ['-n', 'kill', '-TERM', String(child.pid)])
-      else child.kill('SIGKILL')
+    learnUnsharePid()
+    // A namespace whose PID 1 is the check's node ends by itself once it has printed; tail's never does.
+    if (child.exitCode === null && child.signalCode === null && unsharePid !== undefined) killUnshare(unsharePid)
+    let timer: NodeJS.Timeout | undefined
+    const late = new Promise<boolean>((resolve) => { timer = setTimeout(resolve, 10_000, false) })
+    const ended = await Promise.race([closed.then(() => true), late])
+    clearTimeout(timer)
+    if (!ended) {
+      child.stdout.destroy()
+      child.stderr.destroy()
+      child.unref()
+      throw new Error(`the namespace (unshare ${unsharePid ?? 'of unknown pid'}) did not end within 10 s of its kill; it printed:\n${out}`)
     }
+    if (unsharePid !== undefined) liveUnshares.delete(unsharePid)
   }
 }
 
