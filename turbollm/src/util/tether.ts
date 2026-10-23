@@ -1149,14 +1149,16 @@ export function killTetheredTree(child: ChildProcess, signal: NodeJS.Signals): v
 
 /** Release a hold scope: SIGTERM each held group, then close its lifeline once only its watcher is left, or after
  *  `graceMs`. A command of that scope still running is not held when it exits. Resolves once those groups are gone
- *  (bounded), so a caller can remove the directory they ran in next. */
+ *  (bounded), so a caller can remove the directory they ran in next. A group still being counted at its program's
+ *  exit ('deciding') is ended as a held one is: its count (through `ps` on macOS, tens of milliseconds) used to come
+ *  back after this had returned, and only then ended it. */
 export async function releaseTetherScope(scope: string, graceMs = 3000): Promise<void> {
   const held: Entry[] = []
   const idles: Promise<void>[] = []
   for (const e of entries) {
     if (e.hold !== scope) continue
     e.noHold = true
-    if (e.state === 'held') held.push(e)
+    if (e.state === 'held' || e.state === 'deciding') held.push(e)
     if (e.job?.idling) idles.push(e.job.idling)
   }
   const jobs = held.filter((e) => e.job)

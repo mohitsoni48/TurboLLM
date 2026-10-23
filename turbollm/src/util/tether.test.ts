@@ -806,6 +806,31 @@ test('hold: a group with a background job is kept after the program exits, and i
   }
 })
 
+// At its program's exit a held group is counted before it is held: synchronously on Linux, but through `ps` on macOS,
+// which takes tens of milliseconds. A release in that window passed the group by, so deleting a Code session right
+// after a command left a job ended that job only once the count came back, after the release had returned and the
+// session's worktree had been removed (CI's macOS run of code-routes.release.test.ts). Here the release comes from an
+// 'exit' listener behind the tether's own, while the group is being counted, on any OS.
+test('hold: a release while the exited program\'s group is still being counted ends its job before it returns', posixOnly, async () => {
+  try {
+    const pidFile = join(tmpDir('tllm-tether-deciding-'), 'job.pid')
+    const { child, settled } = spawnHeld('sh', ['-c', `sleep 300 >/dev/null 2>&1 & echo $! > '${pidFile}'`], { stdio: 'ignore' }, { kind: 'code-bash', hold: 'test:deciding' })
+    record(child.pid)
+    let job = 0
+    const released = new Promise<void>((resolve, reject) => child.once('exit', () => {
+      job = Number(readFileSync(pidFile, 'utf8').trim())
+      record(job)
+      releaseTetherScope('test:deciding').then(resolve, reject)
+    }))
+    await settled
+    await released
+    assert.equal(isGone(job), true, 'the job was gone when the release returned')
+    assert.deepEqual(groupMembers(child.pid!), [], 'and so was its group, the watcher included')
+  } finally {
+    cleanup()
+  }
+})
+
 test('hold: a command that left nothing running is not held: its watcher goes at once', posixOnly, async () => {
   try {
     const { child, settled } = spawnHeld('sh', ['-c', 'echo plain'], { stdio: ['ignore', 'pipe', 'pipe'] }, { kind: 'code-bash', hold: 'test:plain' })
