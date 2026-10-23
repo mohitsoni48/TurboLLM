@@ -207,8 +207,10 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
     spawn (_node, args) {
       const child = new EventEmitter()
       const signals = []
+      // stdin: the daemon's lifeline (daemon-supervisor.js daemonSpawnSpec); `stdinEnded` once Quit ended it.
+      const stdin = Object.assign(new EventEmitter(), { end () { child.stdinEnded = true } })
       Object.assign(child, {
-        stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, signals, kill (signal) { signals.push(signal) },
+        stdin, stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, signals, stdinEnded: false, kill (signal) { signals.push(signal) },
       })
       spawned.push({ args, child })
       return child
@@ -271,6 +273,11 @@ async function withPlatform (platform, fn) {
 
 const turns = async (n = 5) => { for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve)) }
 
+/** A before-quit event: `prevented` once a handler held the quit. */
+function quitEvent () {
+  return { prevented: false, preventDefault () { this.prevented = true } }
+}
+
 const portArgs = (args) => args.slice(args.indexOf('--port'), args.indexOf('--port') + 4)
 
 // A port change in Settings moves the live daemon and then the window. The daemon's --port is read
@@ -301,15 +308,18 @@ test('main.js: a respawn after a requested restart binds the port the window is 
 
 // A CLI daemon already on ~/.turbollm makes the daemon's start guard refuse the app's daemon. The app
 // quit at once, as after a crash: it opened and vanished, and the refusal, which names the running
-// daemon and how to stop it, went to a stderr no one sees.
-test('main.js: a daemon refused because another TurboLLM holds the data dir is shown in a dialog before the app quits', async () => {
+// daemon and how to stop it, went to a stderr no one sees. A refusal in the first 15 s after the app's
+// start is retried first (the next test): here the app has been up longer than that.
+test('main.js: a daemon refused because another TurboLLM holds the data dir is shown in a dialog before the app quits', async (t) => {
   const refusal = 'TurboLLM is already running for /home/u/.turbollm (pid 4242, http://127.0.0.1:7000).\n' +
     'Use that one, stop it first with `turbollm --stop`, or start this one with its own --config.\n'
+  t.mock.timers.enable({ apis: ['Date'], now: 1_000_000 })
   const main = loadMain({ healthz: 'held' })
   const error = console.error
   console.error = () => {} // main.js logs the loss
   try {
     main.ready()
+    t.mock.timers.tick(15_000)
     const daemon = main.spawned[0].child
     daemon.exitCode = 73
     daemon.emit('exit', 73, null) // the start guard's status; its stderr can still be on the way
@@ -338,6 +348,38 @@ test('main.js: a daemon refused because another TurboLLM holds the data dir is s
     assert.equal(main.quits(), 1)
     assert.equal(main.spawned.length, 1, 'a refused daemon is not respawned')
   } finally {
+    console.error = error
+  }
+})
+
+// A relaunch right after a Quit (macOS does not wait for the daemon) finds the previous daemon still shutting down,
+// which holds the data dir: the app said "TurboLLM is already running" and quit, for a TurboLLM that was going away.
+test('main.js: a daemon refused for its data dir within 15 s of the app\'s start is started again each second, then shown', async (t) => {
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: 1_000_000 })
+  const main = loadMain({ healthz: 'held' })
+  const log = console.log
+  const error = console.error
+  console.log = () => {} // the supervisor's "starting it again" lines
+  console.error = () => {}
+  try {
+    main.ready()
+    for (let second = 0; second < 15; second++) {
+      const daemon = main.spawned.at(-1).child
+      daemon.exitCode = 73
+      daemon.emit('exit', 73, null)
+      assert.equal(main.dialogs.length, 0, `no dialog yet (${second} s)`)
+      t.mock.timers.tick(1000)
+      assert.equal(main.spawned.length, second + 2, `started again after a second (${second + 1} s)`)
+    }
+    const last = main.spawned.at(-1).child
+    last.exitCode = 73
+    last.emit('exit', 73, null)
+    last.stderr.emit('close')
+    await turns()
+    assert.equal(main.dialogs.length, 1, 'after 15 s the refusal is shown')
+    assert.equal(main.spawned.length, 16)
+  } finally {
+    console.log = log
     console.error = error
   }
 })
@@ -478,8 +520,8 @@ test('main.js: Quit in the tray stops the daemon, and nothing re-hides or reopen
 
   tray.clickItem('Quit TurboLLM')
   assert.equal(main.quits(), 1)
-  main.emit('before-quit') // what Electron's app.quit() emits first, before it closes the windows
-  assert.deepEqual(daemon.signals, ['SIGTERM'], 'the daemon is stopped as before')
+  main.emit('before-quit', quitEvent()) // what Electron's app.quit() emits first, before it closes the windows
+  assert.equal(daemon.stdinEnded, true, 'the daemon is stopped, gracefully: its stdin lifeline ends')
   assert.equal(win.close(), 'closed', 'the window closes, so the quit goes on')
   assert.deepEqual(tray.balloons, [], 'no "still running" notice for a quit')
 
@@ -493,7 +535,7 @@ test('main.js: Quit in the tray stops the daemon, and nothing re-hides or reopen
 test('main.js: a quit while the daemon starts opens no window when it answers', () => withPlatform('linux', async () => {
   const main = loadMain({ healthz: 'held' })
   main.ready()
-  main.emit('before-quit')
+  main.emit('before-quit', quitEvent())
   main.answerHealthz()
   await turns()
   assert.deepEqual(main.allWindows(), [])
@@ -554,4 +596,49 @@ test('main.js: on macOS a close keeps the app in the Dock, and a second launch o
   main.emit('activate')
   main.emit('second-instance')
   assert.equal(main.windows().length, 1, 'the open window is shown, not duplicated')
+}))
+
+// Quit stopped the daemon with kill('SIGTERM'), a TerminateProcess on Windows: no teardown ran there (replies not
+// saved as stopped, the store not closed, an engine's tree cut loose), and Electron's exit took the daemon through
+// its job object anyway. On Linux the AppImage's mount went away with Electron, under a daemon still shutting down.
+// Now Quit ends the daemon's stdin and holds the quit until the daemon has exited.
+for (const platform of ['win32', 'linux']) {
+  test(`main.js: on ${platform} Quit holds the quit until the daemon has shut down by itself, then quits`, () => withPlatform(platform, async () => {
+    const main = loadMain()
+    main.ready()
+    await turns()
+    const daemon = main.spawned[0].child
+    const first = quitEvent()
+    main.emit('before-quit', first)
+    assert.equal(first.prevented, true, 'the quit waits')
+    assert.equal(daemon.stdinEnded, true, 'the daemon\'s stdin lifeline ends: its own graceful shutdown runs')
+    assert.deepEqual(daemon.signals, [], 'no signal: on Windows any kill is a TerminateProcess')
+    const again = quitEvent()
+    main.emit('before-quit', again) // another Quit meanwhile
+    assert.equal(again.prevented, true)
+    assert.equal(main.quits(), 0)
+
+    daemon.exitCode = 0
+    daemon.emit('exit', 0, null)
+    await turns()
+    assert.equal(main.quits(), 1, 'the app quits once the daemon has exited')
+    const last = quitEvent()
+    main.emit('before-quit', last)
+    assert.equal(last.prevented, false, 'and that quit goes through')
+    assert.equal(main.spawned.length, 1, 'nothing respawned')
+  }))
+}
+
+// A quit prevented during a macOS logout or shutdown cancels the logout. The daemon finishes by itself from the
+// .app on disk (its watcher caps that at 15 s).
+test('main.js: on macOS Quit never holds the quit; it only ends the daemon\'s stdin', () => withPlatform('darwin', async () => {
+  const main = loadMain()
+  main.ready()
+  await turns()
+  const daemon = main.spawned[0].child
+  const event = quitEvent()
+  main.emit('before-quit', event)
+  assert.equal(event.prevented, false, 'a logout is not cancelled')
+  assert.equal(daemon.stdinEnded, true)
+  assert.deepEqual(daemon.signals, [])
 }))

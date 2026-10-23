@@ -8,7 +8,7 @@ const { join } = require('path')
 const { spawn } = require('child_process')
 const http = require('http')
 const { existsSync } = require('fs')
-const { createDaemonSupervisor, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
+const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
 const {
   TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction, quitsWhenAllClosed,
@@ -156,25 +156,23 @@ function daemonLaunchSpec (port) {
 
   const cliPath = join(daemonDir, 'bin', 'turbollm.mjs')
 
-  return {
+  const daemon = {
     node,
     // --no-open: this window IS the UI. Without it the daemon also opens the system browser on
     // every launch and on every respawn after a requested restart. Passed even though the daemon
     // has its own openBrowserOnStart setting, which a user may have left on for CLI use.
     args: [cliPath, '--port', String(port), '--addr', `127.0.0.1:${port}`, '--no-open'],
-    options: {
-      cwd: daemonDir,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true, // hide the console window on Windows
-      // The daemon's install-method detection (spec 29 B.1) reads this. It can infer the
-      // desktop case from `resources/daemon` in its own path, but that is a heuristic over a
-      // packaging layout; this is the wrapper stating the fact outright. It matters because
-      // getting it wrong means the daemon offering `npm i -g` inside an app bundle, which
-      // would "succeed" against an entirely different copy of TurboLLM. It is also what tells
-      // the daemon this app will respawn it after a restart (daemon-supervisor.js).
-      env: { ...process.env, TURBOLLM_DESKTOP: '1' },
-    },
   }
+  // POSIX: behind a watcher that ends the daemon if this app dies (a crash, a kill), and a stdin
+  // lifeline; Windows: in this app's kill-on-close job (daemon-supervisor.js daemonSpawnSpec). The
+  // env says TURBOLLM_DESKTOP=1: the daemon's install-method detection (spec 29 B.1) reads it. It
+  // can infer the desktop case from `resources/daemon` in its own path, but that is a heuristic over
+  // a packaging layout; this is the wrapper stating the fact outright. It matters because getting it
+  // wrong means the daemon offering `npm i -g` inside an app bundle, which would "succeed" against
+  // an entirely different copy of TurboLLM. It is also what tells the daemon this app will respawn it
+  // after a restart (daemon-supervisor.js). The daemon reads both once and removes them from its
+  // environment, so nothing it starts inherits them (turbollm/src/util/boot-env.ts).
+  return daemonSpawnSpec({ platform: process.platform, node: daemon.node, args: daemon.args, cwd: daemonDir, env: process.env, appPid: process.pid })
 }
 
 // The last of each daemon's stderr, for the dialog onDaemonLost shows when the daemon was refused. Bounded: a
@@ -413,11 +411,34 @@ app.whenReady().then(() => {
   // windows, so the flag is set before any close. A Linux logoff comes here only where the desktop,
   // or logind with KillUserProcesses, sends the session's processes SIGTERM (or SIGHUP, which that
   // handler takes the same way): a session that only drops its display connection ends Electron
-  // without before-quit, so the daemon is not stopped here, as before the tray. A Windows logoff or
-  // shutdown emits no before-quit either: the system ends the app and its daemon with the session,
-  // as it did before the tray.
-  app.on('before-quit', () => {
+  // without before-quit, and the daemon then ends by its lifeline (its stdin ends with the app). A
+  // Windows logoff or shutdown emits no before-quit either: the system ends the app and its daemon
+  // with the session, as it did before the tray.
+  //
+  // supervisor.stop() ends the daemon's stdin, which runs the daemon's own graceful shutdown, and
+  // resolves at its exit (at most 15 s, then it ends the daemon). Where the quit waits for it:
+  // - Windows: the quit is held until the daemon has exited, then quits again. Electron's exit would
+  //   end the daemon through its job object (daemonSpawnSpec) before its shutdown could run.
+  // - Linux: the same. The AppImage's mount (electron-builder.config.cjs) goes away when Electron
+  //   exits, and the daemon's node and node_modules live on it: it must finish while they are there.
+  // - macOS: never held. A quit prevented during a logout or a shutdown cancels the logout. The
+  //   daemon finishes by itself from the .app on disk, and its watcher caps that at 15 s.
+  let daemonStopped = false
+  let stoppingDaemon = false
+  app.on('before-quit', (event) => {
     quitting = true
-    supervisor?.stop()
+    if (daemonStopped || !supervisor) return
+    if (process.platform === 'darwin') {
+      daemonStopped = true
+      supervisor.stop()
+      return
+    }
+    event.preventDefault()
+    if (stoppingDaemon) return
+    stoppingDaemon = true
+    supervisor.stop().finally(() => {
+      daemonStopped = true
+      app.quit()
+    })
   })
 })
