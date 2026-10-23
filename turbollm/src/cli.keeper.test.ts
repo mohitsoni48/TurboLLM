@@ -374,6 +374,25 @@ test('after a restart, closing the terminal ends the keeper and its replacement'
   }
 })
 
+// The same terminal closed before any restart. The hangup's shutdown printed "shutting down" to the hung-up tty: the
+// write failed with EIO, no 'error' listener was there to take it, and the uncaught exception ended the daemon
+// within milliseconds, its teardown never run (replies not saved as stopped, engines SIGKILLed by the exit handler).
+test('closing the terminal of a daemon that was never restarted runs its graceful shutdown', { skip: posix, timeout: 90_000 }, async () => {
+  const d = await boot()
+  try {
+    const at = Date.now()
+    ;(d.term as unknown as { destroy(): void }).destroy()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const e = await Promise.race([d.exit, new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), SLOW_MS + 10_000) })])
+    clearTimeout(timer)
+    assert.ok(e, 'the daemon ended')
+    assert.equal(e.exitCode, 0, 'it exited by its own shutdown, not by an uncaught write error (exit 1)')
+    assert.ok(d.exitedAt() - at >= SLOW_MS - 100, `after its graceful shutdown (${d.exitedAt() - at} ms)`)
+  } finally {
+    killRecorded()
+  }
+})
+
 test('a restart whose teardown stalls: the keeper kills what the old daemon left (a wedged engine) before the replacement starts, and binds nothing itself', { skip: posix, timeout: 120_000 }, async () => {
   const d = await boot({ TURBOLLM_TEST_STALL_RESTART: '1' })
   let engine = 0

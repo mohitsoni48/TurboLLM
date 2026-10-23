@@ -190,6 +190,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - A Settings restart under `npm start` works: the new daemon could not load its TypeScript, and TurboLLM ended.
 - Ctrl+C under `npm start` shuts TurboLLM down gracefully even while it is busy, and Ctrl+Break on Windows does too;
   both used to end it at once. Ctrl+C during an artifact export no longer cuts the shutdown short.
+- Closing the terminal TurboLLM runs in shuts it down gracefully (replies saved as stopped, engines stopped). It
+  ended within milliseconds instead, its shutdown cut short by the write of "shutting down" to the closed terminal.
+  A TurboLLM whose output pipe or terminal is gone without a hangup (`turbollm | tee log` with `tee` killed) runs on
+  with its output lost, where it exited at its next log line.
 - Desktop app: Quit shuts the daemon down gracefully on Windows (replies saved as stopped, engines stopped), where it
   was killed outright. If the app crashes or is killed, its daemon shuts down by itself. Opening the app again right
   after a Quit waits for the previous daemon to finish instead of saying TurboLLM is already running. A TurboLLM

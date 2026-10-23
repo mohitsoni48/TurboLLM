@@ -102,9 +102,7 @@ import { markEverLoadedModel } from './api/onboarding-routes'
 const boot = takeBootEnvironment()
 // The parent's lifeline (the desktop app, or the restart keeper): it holds this daemon's stdin, so stdin ends when
 // the parent ends, however it ends, and this daemon then shuts down gracefully. A paused stdin never emits 'end', so
-// it is resumed. Before the shutdown handler exists (the parent died during boot), it exits at once. stdout and
-// stderr may belong to a terminal that went away with the parent: an EPIPE at the next console.log must not cut the
-// shutdown short.
+// it is resumed. Before the shutdown handler exists (the parent died during boot), it exits at once.
 let beginShutdown: ((reason: string) => void) | null = null
 if (boot.stdinLifeline) {
   const reason = boot.keeperPid !== null ? 'the keeper ended' : 'the desktop app closed'
@@ -119,9 +117,14 @@ if (boot.stdinLifeline) {
   process.stdin.once('close', onEnd)
   process.stdin.once('error', onEnd)
   process.stdin.resume()
-  process.stdout.on('error', () => { /* the parent's terminal is gone */ })
-  process.stderr.on('error', () => { /* the parent's terminal is gone */ })
 }
+// stdout and stderr may be a terminal that is gone (closed: the next write to the hung-up tty fails with EIO), or a
+// parent's that went away with it (EPIPE). With no 'error' listener that write error is thrown as an uncaught
+// exception: closing the terminal ended the daemon within milliseconds of its hangup, at the "shutting down" line,
+// with none of its graceful shutdown run (replies not saved as stopped, engines SIGKILLed by the exit handler).
+// `launch` and `mcp-server` get them too, and still end with their child and their stdin.
+process.stdout.on('error', () => { /* the terminal is gone */ })
+process.stderr.on('error', () => { /* the terminal is gone */ })
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -1525,8 +1528,6 @@ function becomeKeeper(): void {
   try { db.close() } catch { /* already closed */ }
   try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
   for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const) process.removeAllListeners(sig)
-  process.stdout.on('error', () => { /* a terminal that went away */ })
-  process.stderr.on('error', () => { /* a terminal that went away */ })
 
   let replacement: ChildProcess | null = null
   // Told to end (6.): a 75 that comes after it starts no next replacement.
