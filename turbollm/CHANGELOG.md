@@ -262,7 +262,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   warns at boot when nothing reaps its orphaned processes (no init, or a PID 1 such as `tail`).
 - Windows: a program that explicitly asks to break away from its job object fails to start under a TurboLLM tree. A
   Code bash command starts a few milliseconds later, once its job exists.
-- The export browser writes no crash reports and opens no DevTools port.
+- The export browser opens no DevTools port, and on Linux it starts no crash handler (on macOS Chrome starts one
+  whatever it is told; it ends with the browser).
 
 ## [1.14.5] - 2026-10-04
 

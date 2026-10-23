@@ -131,8 +131,9 @@ test('screenshotArtifact: a script that never yields ends within the render dead
 // ── The export browser is tied to the daemon (util/tether.ts) ───────────────────────────────────────────────────────
 // puppeteer.launch started Chrome as a plain child: a daemon that died during an export left its 9 processes running
 // (a spinning renderer pegging a core), and puppeteer's SIGINT handler called process.exit(130) in the middle of the
-// daemon's graceful shutdown. Chrome's two crash handlers daemonized out of its process group. Every Chrome test is in
-// this one file, so they never run alongside each other: a Chrome process that appears during one is that test's.
+// daemon's graceful shutdown. Chrome's two crash handlers daemonized out of its process group (on macOS Chrome still
+// starts one: see the SIGKILL test). Every Chrome test is in this one file, so they never run alongside each other: a
+// Chrome process that appears during one is that test's.
 
 const CHROME = findChrome()
 const noChrome = !CHROME ? 'no Chrome/Chromium/Edge found' : process.platform === 'win32' ? 'POSIX process groups (Windows ties Chrome through its job sentinel)' : false
@@ -207,10 +208,19 @@ setInterval(() => {}, 1e9)
     pids = all.map((p) => p.pid)
     record(...pids)
     t.diagnostic(`${sandboxNote(root)}; ${all.length} Chrome processes`)
-    assert.deepEqual(all.filter((p) => p.pgid !== root).map((p) => p.cmd.slice(0, 120)), [], 'every Chrome process is in the browser\'s group: no crash handler outside it')
+    // On macOS Chrome starts its crash handler (chrome_crashpad_handler, msedge_crashpad_handler) whatever its flags:
+    // --disable-crashpad-for-testing, and puppeteer's --disable-breakpad and --disable-crash-reporter, keep it from
+    // starting on Linux only (macos-latest, Chrome 155). It is started outside the browser's group, as the Linux ones
+    // were, and ends by itself once the browser and its helpers have: so there it may be outside the group, and it
+    // must be gone with the rest below.
+    const outside = all.filter((p) => p.pgid !== root)
+    const macCrashHandler = (p: { cmd: string }) => process.platform === 'darwin' && /\/[a-z]+_crashpad_handler$/.test(p.cmd)
+    assert.deepEqual(outside.filter((p) => !macCrashHandler(p)).map((p) => `${p.cmd} (group ${p.pgid}, the browser's ${root})`), [],
+      'every Chrome process is in the browser\'s group: no crash handler outside it (on macOS, none but the one Chrome always starts)')
+    t.diagnostic(`outside the browser's group: ${outside.length ? outside.map((p) => p.cmd.split('/').pop()).join(', ') : 'none'}`)
     assert.ok(all.length >= 3, `the browser and its helpers (${all.length})`)
     await d.kill('SIGKILL')
-    assert.deepEqual(await waitGone(pids, 2000), [], 'all gone within 2 s')
+    assert.deepEqual(await waitGone(pids, 2000), [], 'all gone within 2 s, a crash handler outside the group included')
     // The profile it was using stays until the next start sweeps it.
     const left = readdirSync(runDir).filter((n) => n.startsWith('chrome-'))
     assert.equal(left.length, 1, 'the dead daemon\'s profile is left behind')

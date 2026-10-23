@@ -13,8 +13,10 @@
 // left its 9 processes running, a spinning renderer pegging a core, measured alive 11 s later; and it registered a
 // SIGINT handler that called process.exit(130), so Ctrl+C during an export cut the daemon's graceful shutdown short.
 // Now Chrome's whole group ends with the daemon (and Chrome also exits when its CDP pipe closes), and no handler of
-// puppeteer's is registered. --disable-crashpad-for-testing keeps Chrome's two crash handlers from starting: they
-// daemonize into sessions of their own, out of the group, and outlived Chrome by 1-4 s. The profile lives in
+// puppeteer's is registered. --disable-crashpad-for-testing keeps Chrome's two crash handlers from starting on Linux:
+// they daemonize into sessions of their own, out of the group, and outlived Chrome by 1-4 s. On macOS Chrome starts its
+// crash handler whatever its flags (that one, and puppeteer's --disable-breakpad and --disable-crash-reporter, all
+// passed): it runs outside the group and ends by itself once the browser and its helpers have. The profile lives in
 // `<dataDir>/run/chrome-<daemon pid>-<random>`, removed once Chrome has exited, and reapStaleChromeProfiles removes
 // one a daemon that died left behind.
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
@@ -117,7 +119,7 @@ export const RENDER_DEADLINE_MS = 20_000
 const PROTOCOL_TIMEOUT_MS = 15_000
 
 /** Launch flags apart from the sandbox ones. CDP goes over the pipe (fds 3 and 4), so no debugging port is open to
- *  other local processes, and no crash handler starts (see the header). */
+ *  other local processes, and no crash handler starts on Linux (see the header). */
 const BASE_ARGS = ['--disable-gpu', '--disable-dev-shm-usage', '--hide-scrollbars', ...NO_NETWORK_ARGS, '--remote-debugging-pipe', '--disable-crashpad-for-testing']
 
 /** After Browser.close, how long Chrome may take to exit before its group is killed. */
