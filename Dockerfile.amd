@@ -35,7 +35,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
-        libgomp1 && \
+        libgomp1 \
+        libvulkan1 \
+        mesa-vulkan-drivers \
+        libdrm2 \
+        libx11-6 \
+        libxext6 \
+        libegl1 && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*

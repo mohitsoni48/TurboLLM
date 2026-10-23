@@ -9,8 +9,9 @@ services:
       dockerfile: Dockerfile.nvidia
     image: turbollm-nvidia:latest
     container_name: turbollm-nvidia
-    ports:
-      - "6996:6996"
+    # network_mode: "host" enables loopback (127.0.0.1) requests directly from the host,
+    # allowing in-browser workspace and filesystem browsing (which is gated to local requests).
+    network_mode: "host"
     volumes:
       # Persists config.json, the chat SQLite DB, downloaded engines/models, and logs
       # across container restarts/rebuilds (this is ~/.turbollm inside the container).
@@ -19,6 +20,8 @@ services:
       # flip lanBind back to false while this port is published — that reopens the
       # port to unauthenticated access.
       - turbollm-data:/root/.turbollm
+      # Mount host directory so TurboLLM workspace browser and coding agents can access project files
+      - ~/workspace:/root/workspace
 
     # --- NVIDIA GPU passthrough (requires the NVIDIA Container Toolkit on the host) ---
     # Delete this whole "environment" + "deploy" block if you're running CPU-only —

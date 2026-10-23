@@ -31,7 +31,7 @@ RUN npm prune --omit=dev
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libvulkan1 libgomp1 \
+      curl ca-certificates libvulkan1 libgomp1 libx11-6 libxext6 libegl1 \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
