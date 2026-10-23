@@ -174,6 +174,29 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   model select in the routine form says where to get a model, and an empty draft-model select what a draft must be.
 - The web app keeps working while the browser reports itself offline (Wi-Fi off with TurboLLM on the same machine):
   sends, replies and polls no longer wait for the browser to come back online.
+- **Nothing TurboLLM starts outlives it.** Engines, their Python workers and the models loaded beside the primary stop
+  the moment TurboLLM stops, by any means, a kill, a crash or an out-of-memory kill included, and an engine killed
+  while it was still loading is no longer left running after the next start. So do a tunnel and the `tailscale` CLI,
+  routine runs of `claude`, agent CLI installs, MCP and language servers (with whatever they started), engine builds,
+  prerequisite and Python engine installs, archive extraction, version and GPU probes, the usage monitor, the export
+  browser (its crash handlers included) and the Code agent's grep and find, even a search over the whole disk. Some
+  of them used to run on forever. On Windows, the children of these programs' own children (a Git Bash command's,
+  an engine's workers, a compiler tree) end with TurboLLM too. On the Android app, engines start through the app's
+  `libtether_exec.so` when the app ships it and a boot self-test has seen it work, so the kernel ends them with the
+  app.
+- git commands get SIGTERM and 2 s when TurboLLM dies in the middle of one, so they drop their locks
+  (`.git/index.lock` no longer blocks the next command). A helper git leaves running on purpose, such as the
+  credential cache, ends with TurboLLM, and TurboLLM's own git runs no automatic gc, so none is left behind.
+- A Settings restart under `npm start` works: the new daemon could not load its TypeScript, and TurboLLM ended.
+- Ctrl+C under `npm start` shuts TurboLLM down gracefully even while it is busy, and Ctrl+Break on Windows does too;
+  both used to end it at once. Ctrl+C during an artifact export no longer cuts the shutdown short.
+- Desktop app: Quit shuts the daemon down gracefully on Windows (replies saved as stopped, engines stopped), where it
+  was killed outright. If the app crashes or is killed, its daemon shuts down by itself. Opening the app again right
+  after a Quit waits for the previous daemon to finish instead of saying TurboLLM is already running. A TurboLLM
+  started from a terminal inside the desktop app no longer takes itself for the app's own daemon.
+- Python engines: Install redoes an environment only when an earlier install did not finish. LiteRT-LM redid a
+  finished one on every Install, and the others never redid a broken one.
+- Error messages of the commands TurboLLM runs name the real program (`tar`, not a wrapper).
 
 ### Changed
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
@@ -204,6 +227,33 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **A GitHub release install** (Add engine → From a GitHub release, or a card's Install prebuilt) continues when the
   dialog is dismissed, the Engines screen is left or the page is reloaded or closed. Opening it again shows its
   progress or offers the finished build for Add. Cancel stops it.
+- **A Settings restart started from a terminal stays in that terminal.** Ctrl+C, `docker stop`, `turbollm --stop` or
+  closing the terminal ends TurboLLM gracefully, and the new daemon's output (a fresh `--print-token` included)
+  appears there instead of in `restart.log`, which is no longer written. The first process stays as a small keeper
+  until TurboLLM stops. A restart stops running Code turns, as Stop does, and pauses running downloads, which keep
+  what they have and show as paused, as after any restart. `npm start` runs `node --import tsx src/cli.ts`.
+- **Code: what an agent's bash command starts in the background keeps running** after the command returns, until
+  its Code session is archived or deleted, TurboLLM stops, or for a routine, its run ends; Stop still ends it, and
+  deleting a session ends it before its worktree is removed. Before, a graceful stop never ended it, and it ran on
+  after any stop. git's automatic gc inside Code's commands and terminals runs in the foreground (about 0.5 s longer
+  for a commit that triggers it).
+- **Closing a Code terminal, or its shell exiting, ends everything started in it**, `nohup` jobs and agent CLIs that
+  ignore the hangup included, and on Windows the programs started from it, GUI ones included.
+- **A repository's own pi extensions (`.pi/extensions`) no longer load into TurboLLM.** Opening a repository in Code
+  ran that code inside the daemon, with no approval.
+- A TurboLLM started from a terminal can no longer have ssh ask for a key passphrase or a host key in that terminal
+  during a git push: ssh uses the desktop's askpass dialog when there is one, otherwise it fails at once instead of
+  waiting 30 s for an answer nobody sees. ssh-agent keys are unaffected.
+- Prerequisite installs (apt, dnf, pacman, zypper, brew) get SIGTERM from TurboLLM, never a kill, as Cancel does;
+  under sudo one may finish its transaction after TurboLLM is gone.
+- Desktop app: on Windows and Linux Quit waits for the daemon to finish, up to 15 s. On macOS Quit never waits, so a
+  logout or shutdown is not cancelled, and the daemon finishes within 15 s after the app.
+- **Docker:** the images, the RunPod one included, start `tini` as PID 1, which reaps what TurboLLM leaves and passes
+  `docker stop` on to it; the RunPod image runs the installed `turbollm` under it rather than `npx turbollm`. TurboLLM
+  warns at boot when nothing reaps its orphaned processes (no init, or a PID 1 such as `tail`).
+- Windows: a program that explicitly asks to break away from its job object fails to start under a TurboLLM tree. A
+  Code bash command starts a few milliseconds later, once its job exists.
+- The export browser writes no crash reports and opens no DevTools port.
 
 ## [1.14.5] - 2026-10-04
 
