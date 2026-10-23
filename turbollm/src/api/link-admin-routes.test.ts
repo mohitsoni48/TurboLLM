@@ -277,6 +277,19 @@ test('inbound lists granted keys with their capabilities and last-used, never a 
   assert.ok(!body.includes('hash'))
 })
 
+test('inbound leaves out remote-access tokens: they are not linked machines', async () => {
+  const { app, cfg } = mkApp()
+  await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))
+  ;(cfg.apiKeys as unknown[]).push({
+    id: 'remote-key', name: 'remote-2026-10-23T09:00:00.000Z', hash: 'h', prefix: 'tllm_x',
+    createdAt: '2026-10-23T09:00:00.000Z', lastUsedAt: null,
+    grant: { kind: 'remote', capabilities: ['models:use'] },
+  })
+  const res = await app.request('/api/v1/links/inbound')
+  const { inbound } = await res.json() as { inbound: { id: string; name: string }[] }
+  assert.deepEqual(inbound.map((k) => k.name), ['laptop'])
+})
+
 // ── Regression coverage: review findings on `models` validation and the
 // machineId-change latch (see apply-probe.ts).
 

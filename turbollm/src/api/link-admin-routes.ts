@@ -1,6 +1,6 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
-import { generateApiKey, hostGate, isLanExposed } from '../auth'
+import { generateApiKey, grantKind, hostGate, isLanExposed } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
@@ -196,11 +196,13 @@ export function registerLinkAdminRoutes(
     return c.json({ keyId, linkString: encodeLinkString(baseUrl, full) })
   })
 
-  // ── Host side: who is linked to me.
+  // ── Host side: who is linked to me. Link grants only: a remote-access token (ADR-422)
+  //    carries a grant too, but it is the owner's own URL, not a machine; Developer → API
+  //    Keys lists it.
   app.get('/api/v1/links/inbound', (c) => {
     const denied = gate(c, VIEW)
     if (denied) return denied
-    const keys = d.store.snapshot().apiKeys.filter((k) => k.grant)
+    const keys = d.store.snapshot().apiKeys.filter((k) => grantKind(k) === 'link')
     return c.json({
       inbound: keys.map((k) => ({
         id: k.id,

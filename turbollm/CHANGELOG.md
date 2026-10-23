@@ -197,6 +197,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - Python engines: Install redoes an environment only when an earlier install did not finish. LiteRT-LM redid a
   finished one on every Install, and the others never redid a broken one.
 - Error messages of the commands TurboLLM runs name the real program (`tar`, not a wrapper).
+- Turbo Link's list of machines linked to this one no longer shows remote-access tokens, which are not machines;
+  they stay listed in Developer → API Keys.
 
 ### Changed
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
