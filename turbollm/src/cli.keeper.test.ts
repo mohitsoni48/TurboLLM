@@ -84,6 +84,28 @@ async function boot(env: NodeJS.ProcessEnv = {}, config: Record<string, unknown>
   return d
 }
 
+/** Windows: let go of a ConPTY whose process has exited. node-pty then closes only its output socket: its input
+ *  socket, the pseudoconsole and the worker thread that reads its output stay until kill(), and they kept this file's
+ *  process alive after its last case, so the run never moved past this file (CI's Windows job waited for hours).
+ *  kill() itself would also kill the console's process list, by pids that may name other processes once the console's
+ *  own have exited, so this does the rest of what it does (node-pty 1.1.0's WindowsPtyAgent.kill; spawning-deps.test.ts
+ *  pins the version), and unrefs the worker in case its dispose does not end it. */
+function releaseConpty(term: Pty): void {
+  if (process.platform !== 'win32') return
+  const agent = (term as unknown as { _agent?: {
+    _pty: number
+    _useConptyDll: boolean
+    _ptyNative: { kill(pty: number, useConptyDll: boolean): void }
+    _inSocket?: { destroy(): void }
+    _conoutSocketWorker?: { dispose(): void; _worker?: { unref(): void } }
+  } })._agent
+  if (!agent) return
+  try { agent._inSocket?.destroy() } catch { /* already closed */ }
+  try { agent._ptyNative.kill(agent._pty, agent._useConptyDll) } catch { /* already closed */ }
+  try { agent._conoutSocketWorker?.dispose() } catch { /* already disposed */ }
+  try { agent._conoutSocketWorker?._worker?.unref() } catch { /* gone */ }
+}
+
 function listening(d: Daemon): number {
   return d.out().match(/listening on http/g)?.length ?? 0
 }
@@ -566,5 +588,6 @@ test('Windows: after a restart, ConPTY Ctrl+C ends the replacement gracefully, a
     assert.match(d.out(), /shutting down/, 'the replacement ran its graceful shutdown')
   } finally {
     killRecorded()
+    releaseConpty(d.term)
   }
 })
