@@ -6,10 +6,16 @@ on:
   pull_request:
     branches: [main]
 
+# Every job that runs tests has a timeout-minutes well above its normal time, and every daemon test step passes node
+# --test-timeout=600000 (the unit step through package.json's "test" script): a test, or a test file whose process
+# does not exit, then fails after 10 minutes with its name. A pid namespace left by pid1.test.ts under sudo held the
+# unit job, and a hung file each tether job, for 2.5 hours until the run was cancelled, with no name in the log.
 jobs:
   test:
     name: Typecheck & Unit tests
     runs-on: ubuntu-latest
+    # About 6 minutes.
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v7
@@ -41,6 +47,7 @@ jobs:
   web:
     name: Web build & unit tests
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -134,6 +141,7 @@ jobs:
   release-script:
     name: Release script tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -144,6 +152,7 @@ jobs:
   ts-client:
     name: TS client typecheck & tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -173,6 +182,8 @@ jobs:
   tether:
     name: Process tether (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A few minutes of tests on each OS.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -196,7 +207,7 @@ jobs:
 
       - name: Tether tests
         if: runner.os == 'macOS'
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts src/artifacts/screenshot.test.ts src/terminal/pty-session.tether.test.ts src/cli.keeper.test.ts src/util/boot-env.test.ts src/util/win-job-sentinel.test.ts
+        run: npx tsx --test --test-timeout=600000 src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts src/artifacts/screenshot.test.ts src/terminal/pty-session.tether.test.ts src/cli.keeper.test.ts src/util/boot-env.test.ts src/util/win-job-sentinel.test.ts
         working-directory: turbollm
 
       # The job sentinel for real (its jobs, its pid-reuse guard, its death, a failed end, its start time over 5 starts,
@@ -204,39 +215,41 @@ jobs:
       # the gate, a ConPTY shell's job, node and PowerShell trees in a job and a refused breakaway, the protocol tests,
       # and the restart keeper under ConPTY Ctrl+C on the real cli.ts. Also the Code agent's rg/fd lookup against
       # libuv's own Windows spawn search (a copy of node.exe stands in for rg; the grep and find equivalence cases skip
-      # without rg and fd, which this step does not install), and the export browser's Windows launch: the runner's
+      # without rg and fd, which this job does not install: the file passes without them, and its Windows lookup cases
+      # are what it runs here for), and the export browser's Windows launch: the runner's
       # Chrome (Program Files\Google\Chrome\Application) spawned with its CDP pipe on fds 3 and 4.
       - name: Windows job sentinel and keeper tests
         if: runner.os == 'Windows'
-        run: npx tsx --test src/util/win-job-sentinel.test.ts src/util/tether.test.ts src/util/boot-env.test.ts src/cli.keeper.test.ts src/code/search-tools.test.ts src/artifacts/screenshot.test.ts
+        run: npx tsx --test --test-timeout=600000 src/util/win-job-sentinel.test.ts src/util/tether.test.ts src/util/boot-env.test.ts src/cli.keeper.test.ts src/code/search-tools.test.ts src/artifacts/screenshot.test.ts
         working-directory: turbollm
 
       # npmGlobalRoot builds cmd.exe's `npm root -g` line itself, as tetheredExecFile takes no `shell`. Every run holds
       # it to the line Node's own `shell: true` builds; on a Windows runner the real `npm root -g` runs through it.
       - name: npm root -g through the tether
-        run: npx tsx --test --test-name-pattern="npm root -g" src/app-update-apply.test.ts
+        run: npx tsx --test --test-timeout=600000 --test-name-pattern="npm root -g" src/app-update-apply.test.ts
         working-directory: turbollm
 
       # A build step's Cancel and the daemon's exit send no taskkill once Node has seen the step exit: its pid may name
       # another process tree by then. Faked on every OS; on a Windows runner the step and what it leaves are real ones.
       - name: A build step that has exited gets no taskkill
-        run: npx tsx --test --test-name-pattern="once the step has exited" src/engines/build-runner.test.ts
+        run: npx tsx --test --test-timeout=600000 --test-name-pattern="once the step has exited" src/engines/build-runner.test.ts
         working-directory: turbollm
 
       - name: A routine run's end releases its session's held jobs
         if: runner.os != 'Windows'
-        run: npx tsx --test --test-name-pattern="left running|background jobs" src/routines/code-runner.test.ts
+        run: npx tsx --test --test-timeout=600000 --test-name-pattern="left running|background jobs" src/routines/code-runner.test.ts
         working-directory: turbollm
 
       # The MLX engines provision on macOS only, so the ubuntu job skips their cases.
       - name: The MLX engines redo only an unfinished install
         if: runner.os == 'macOS'
-        run: npx tsx --test src/engines/py-env-marker.test.ts
+        run: npx tsx --test --test-timeout=600000 src/engines/py-env-marker.test.ts
         working-directory: turbollm
 
   wrapper:
     name: Desktop wrapper unit tests
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
