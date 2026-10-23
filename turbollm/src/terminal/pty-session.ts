@@ -19,6 +19,7 @@ import { createRequire } from 'node:module'
 import { execFileSync } from 'node:child_process'
 import { withForegroundGitGc } from '../util/git-gc'
 import { tetherTerminal } from '../util/tether'
+import { ensurePtySpawnHelper } from './pty-spawn-helper'
 
 const require = createRequire(import.meta.url)
 
@@ -76,6 +77,8 @@ export class PTYSession {
   }
 
   private doSpawn(cwd: string, rows: number, cols: number, launchCommand?: string): void {
+    // On macOS node-pty 1.1.0's prebuilt spawn-helper comes without its exec bit, and no pty could start.
+    ensurePtySpawnHelper()
     const ptyModule = require('node-pty')
 
     const win32 = process.platform === 'win32'

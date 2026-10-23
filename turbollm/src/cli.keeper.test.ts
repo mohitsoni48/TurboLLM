@@ -19,6 +19,7 @@ import { createServer } from 'node:net'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { ensurePtySpawnHelper } from './terminal/pty-spawn-helper'
 import { ggufVocabOnly } from './test-support/gguf-file'
 import { isGone, killRecorded, pidWrittenTo, record, waitGone } from './test-support/stand-in-daemon'
 import { tmpDir } from './test-support/tmp'
@@ -56,6 +57,8 @@ function freePort(): Promise<number> {
 }
 
 async function boot(env: NodeJS.ProcessEnv = {}, config: Record<string, unknown> = {}): Promise<Daemon> {
+  // The step every PTYSession takes: on macOS node-pty's prebuilt spawn-helper has no exec bit as installed.
+  ensurePtySpawnHelper()
   const pty = require('node-pty') as typeof import('node-pty')
   const root = tmpDir('tllm-keeper-')
   const dataDir = join(root, 'data')

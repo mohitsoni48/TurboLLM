@@ -203,6 +203,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - Error messages of the commands TurboLLM runs name the real program (`tar`, not a wrapper).
 - Turbo Link's list of machines linked to this one no longer shows remote-access tokens, which are not machines;
   they stay listed in Developer → API Keys.
+- macOS: Code terminals and interactive routine terminals open. Every one failed with "posix_spawnp failed.": the
+  helper program node-pty starts them through is installed without permission to run. TurboLLM now gives it that
+  before its first terminal, and the desktop app ships it so.
 
 ### Changed
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
