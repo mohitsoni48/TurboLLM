@@ -85,3 +85,38 @@ for (const name of IMAGES) {
     assert.equal(ConfigStore.load(path).snapshot().apiKeys.length, 1)
   })
 }
+
+// With `ENTRYPOINT ["node", …]` the daemon was PID 1, and node reaps no orphan: every one TurboLLM leaves (each
+// tethered child's watcher, util/tether.ts) stayed a zombie, and under a pids limit TurboLLM could no longer start a
+// process. The official RunPod image (deploy/runpod, behind Developer → Cloud Deploy, rebuilt weekly by
+// .github/workflows/runpod-image.yml) ran `npx` as PID 1, which reaps none either: on a GPU pod the usage monitor's
+// nvidia-smi poll left one a second while the UI was open. The test images ran node as PID 1 for a whole E2E run or
+// manual session. Each runtime stage installs tini from the distribution's archive at build time (nothing is
+// downloaded at runtime) and runs the daemon under it; util/pid1.test.ts shows tini reaping where node and `tail` do
+// not. A new image without an init fails here.
+const TINI = ['/usr/bin/tini', '-s', '--']
+const UNDER_TINI: Array<{ name: string; entrypoint: string[]; cmd?: string[] }> = [
+  { name: 'Dockerfile.nvidia', entrypoint: [...TINI, 'node', 'bin/turbollm.mjs'] },
+  { name: 'Dockerfile.amd', entrypoint: [...TINI, 'node', 'bin/turbollm.mjs'] },
+  // `turbollm` is the bin its `npm install -g turbollm` put on PATH.
+  { name: 'deploy/runpod/Dockerfile', entrypoint: [...TINI, 'turbollm', '--tunnel', '--no-open'] },
+  // The test images keep their CMD, which tini runs.
+  { name: 'Dockerfile.test', entrypoint: TINI, cmd: ['node', '/fixtures/entrypoint.mjs'] },
+  { name: 'Dockerfile.test.gpu', entrypoint: TINI, cmd: ['node', '/fixtures/entrypoint.mjs'] },
+  { name: 'Dockerfile.test-port', entrypoint: TINI, cmd: ['node', '/src/dist/cli.js', '--addr', '0.0.0.0:6997'] },
+]
+for (const { name, entrypoint, cmd } of UNDER_TINI) {
+  test(`${name}: the runtime stage installs tini and runs the daemon under it, as a subreaper too (-s)`, () => {
+    const text = readFileSync(join(REPO_ROOT, name), 'utf8').replace(/\r\n/g, '\n').replace(/\\\n/g, ' ')
+    const runtime = text.slice(text.lastIndexOf('\nFROM '))
+    const install = /apt-get install -y --no-install-recommends ([^&]*)&&/.exec(runtime)
+    assert.ok(install, `${name}'s runtime stage installs its packages with apt-get`)
+    assert.ok(install[1].trim().split(/\s+/).includes('tini'), `the first apt-get install of ${name}'s runtime stage installs tini`)
+    const entrypoints = [...runtime.matchAll(/^ENTRYPOINT (\[.*\])$/gm)].map((m) => JSON.parse(m[1]) as string[])
+    assert.deepEqual(entrypoints, [entrypoint])
+    if (cmd) {
+      const cmds = [...runtime.matchAll(/^CMD (\[.*\])$/gm)].map((m) => JSON.parse(m[1]) as string[])
+      assert.deepEqual(cmds, [cmd], `${name}'s CMD is what tini runs`)
+    }
+  })
+}

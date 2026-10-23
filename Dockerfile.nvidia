@@ -31,7 +31,7 @@ RUN npm prune --omit=dev
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libvulkan1 libgomp1 \
+      curl ca-certificates libvulkan1 libgomp1 tini \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -82,7 +82,12 @@ RUN (node bin/turbollm.mjs --no-open --addr 127.0.0.1:6996 &) \
 
 EXPOSE 6996/tcp
 
-ENTRYPOINT ["node", "bin/turbollm.mjs"]
+# tini is PID 1: it reaps every orphan TurboLLM leaves (each tethered child's watcher is one) and forwards
+# `docker stop`'s SIGTERM to the daemon, which shuts down gracefully. With node itself as PID 1 every one of them
+# stayed a zombie, and under a pids limit TurboLLM could no longer start a process. -s: tini is a subreaper when
+# it is not PID 1 itself (docker run --init, compose init: true), so either way they are reaped. The daemon warns
+# at boot when nothing reaps them (turbollm/src/util/pid1.ts).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "node", "bin/turbollm.mjs"]
 # --addr 0.0.0.0:... required in a container (default bind is loopback-only).
 # --no-open because there's no browser inside the container.
 # --print-token: with the named volume above persisting ~/.turbollm (including apiKeys)

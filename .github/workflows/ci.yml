@@ -29,9 +29,10 @@ jobs:
         working-directory: turbollm
 
       # code/search-tools.test.ts runs TurboLLM's grep and find against pi's own on real rg and fd (Debian names
-      # it fdfind, which both look for); without them those cases are skipped.
-      - name: Install ripgrep and fd
-        run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find
+      # it fdfind, which both look for); without them those cases are skipped. util/pid1.test.ts runs tini as PID 1
+      # of a pid namespace (sudo -n unshare), as the Docker images do.
+      - name: Install ripgrep, fd and tini
+        run: sudo apt-get update && sudo apt-get install -y ripgrep fd-find tini
 
       - name: Unit tests
         run: npm test

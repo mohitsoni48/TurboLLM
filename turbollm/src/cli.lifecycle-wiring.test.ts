@@ -284,3 +284,14 @@ test('the boot sweeps the export browser\'s leftover profiles from the run dir t
   const ROUTES = readFileSync(join(HERE, 'api', 'routes.ts'), 'utf8')
   assert.ok(ROUTES.includes("screenshotArtifact(html, { width: w, height: h, runDir: join(d.store.dir(), 'run') })"), 'the export route puts the profile there')
 })
+
+// A container whose PID 1 is node itself, or `tail`, reaps no orphan, and every tethered child's watcher is one: the
+// boot checks it (util/pid1.ts, util/pid1.test.ts) and warns, off the boot path.
+test('the boot checks whether anything reaps orphans, once the server listens, without waiting for it', () => {
+  const at = CLI.indexOf('void checkOrphansReaped()')
+  assert.ok(at > 0, 'cli.ts runs checkOrphansReaped(), not awaited')
+  assert.ok(at > CLI.indexOf('\nlisten()\n'), 'after the first listen() call')
+  // Outside the listen-through-rebind code that cli.rebind.test.ts runs on its own.
+  assert.ok(at > CLI.indexOf('\n}\n', CLI.indexOf('deps.rebind = () => {')), 'after deps.rebind')
+  assert.ok(CLI.includes("import { checkOrphansReaped } from './util/pid1'"))
+})

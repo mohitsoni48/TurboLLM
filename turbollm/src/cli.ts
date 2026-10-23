@@ -1,6 +1,7 @@
 import { takeBootEnvironment } from './util/boot-env'
 import { hideChildConsoleWindows } from './util/hide-console-windows'
 import { closeAllLifelines, killTetheredSync, refuseNewTetheredSpawns, stopTethered, tetherReady } from './util/tether'
+import { checkOrphansReaped } from './util/pid1'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { constants as osConstants } from 'node:os'
@@ -1413,6 +1414,10 @@ deps.rebind = () => {
   old.close(reopen)
   setTimeout(reopen, 3_000).unref() // don't wait forever on a stuck stream
 }
+
+// Whether anything reaps TurboLLM's orphans, its tethered children's watchers among them (util/pid1.ts): a container
+// whose PID 1 is node itself, or `tail`, leaves every one of them a zombie. Linux only, off the boot path; it warns.
+void checkOrphansReaped()
 
 // ── Self-restart (spec 08 §2) ──────────────────────────────────────────────────
 // POST /api/v1/daemon/restart re-execs the daemon so port / LAN-bind changes take

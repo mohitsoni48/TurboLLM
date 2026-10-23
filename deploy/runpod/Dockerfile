@@ -19,7 +19,9 @@ FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 # runtime dependency of the llama.cpp binaries themselves — without it the server
 # fails to even start ("error while loading shared libraries: libgomp.so.1"),
 # caught by actually building and running this image locally before shipping it.
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libvulkan1 libgomp1 \
+# tini (Ubuntu jammy universe, installed at build time) is the container's PID 1:
+# see the ENTRYPOINT below.
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates libvulkan1 libgomp1 tini \
   && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
   && apt-get install -y --no-install-recommends nodejs \
   && rm -rf /var/lib/apt/lists/*
@@ -50,4 +52,12 @@ RUN (turbollm --no-open --port 6996 &) \
 # notation, which belongs in the RunPod Template's ports config, not here).
 EXPOSE 6996/tcp
 
-ENTRYPOINT ["npx", "turbollm", "--tunnel", "--no-open"]
+# tini is PID 1: it reaps every orphan TurboLLM leaves (each tethered child's watcher is
+# one, and on a GPU pod the usage monitor's nvidia-smi poll makes one a second while the
+# UI is open) and forwards `docker stop`'s SIGTERM to the daemon, which shuts down
+# gracefully. With `npx` as PID 1 every one of them stayed a zombie, and under a pids
+# limit TurboLLM could no longer start a process. -s: tini is a subreaper when it is not
+# PID 1 itself (docker run --init). The daemon warns at boot when nothing reaps them
+# (turbollm/src/util/pid1.ts). `turbollm` is the bin `npm install -g` put on PATH above
+# (the seeding step runs it too): no npm and sh layers between tini and the daemon.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "turbollm", "--tunnel", "--no-open"]
