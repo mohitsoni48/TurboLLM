@@ -7,7 +7,7 @@ import { createSocket } from 'node:dgram'
 import { createServer, type AddressInfo } from 'node:net'
 import { networkInterfaces } from 'node:os'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { ChromePipeTransport, findChrome, launchSandboxedFirst, reapStaleChromeProfiles, RENDER_DEADLINE_MS, screenshotArtifact, withArtifactCsp } from './screenshot'
@@ -49,10 +49,14 @@ test('withArtifactCsp: the policy matches the on-screen iframe (connect-src fall
 // don't cover: popups (window.open, a target=_blank form and link) and WebRTC (STUN over UDP,
 // TURN over TCP), aimed at listeners on loopback and on this machine's LAN address. Only the
 // browser's launch flags stop them. Needs an installed Chrome/Chromium/Edge (or CHROME_PATH).
+// It is this file's first Chrome start: on a fresh CI machine a cold one, which took 16 s on
+// macos-latest (the next ones about 1.5 s) and outlasted RENDER_DEADLINE_MS on windows-latest,
+// where the export came back null. This case is about the network, not the deadline (the
+// never-yielding case below is), so it gives the export a minute.
 test('screenshotArtifact: neither the artifact nor a popup it opens reaches loopback or the LAN', {
   skip: findChrome() ? false : 'no Chrome/Chromium/Edge found',
-  timeout: 60_000,
-}, async () => {
+  timeout: 120_000,
+}, async (t) => {
   const hits: string[] = []
   const closers: Array<() => void> = []
   try {
@@ -75,12 +79,38 @@ test('screenshotArtifact: neither the artifact nor a popup it opens reaches loop
 `
       if (host === '127.0.0.1') script += `window.open('${url.replace('127.0.0.1', 'localhost')}/localhost')\n`
     }
-    const png = await screenshotArtifact(`${page}<script>${script}</script></body>`, { width: 800, height: 600 })
-    assert.ok(png && png.subarray(1, 4).toString() === 'PNG', 'the export still renders')
+    const logged: string[] = []
+    const t0 = Date.now()
+    const png = await screenshotArtifact(`${page}<script>${script}</script></body>`, { width: 800, height: 600, log: (l) => logged.push(l) }, 60_000)
+    t.diagnostic(`the export took ${Date.now() - t0} ms`)
+    assert.ok(png && png.subarray(1, 4).toString() === 'PNG', `the export still renders; it logged: ${logged.join(' | ') || 'nothing'}`)
     await new Promise((resolve) => setTimeout(resolve, 500))
     assert.deepEqual(hits, [])
   } finally {
     for (const close of closers) close()
+  }
+})
+
+// A failed export used to fall back without a word: a CI run's export came back null with nothing to say why. A
+// "browser" that cannot start (as Chrome without a usable display or sandbox exits) shows what is now logged.
+test('a failed export says why: the step, how Chrome ended, and the end of its stderr', { skip: process.platform === 'win32' && 'a POSIX stand-in for Chrome' }, async () => {
+  const dir = tmpDir('tllm-chrome-fails-')
+  const fake = join(dir, 'chrome')
+  writeFileSync(fake, '#!/bin/sh\necho "starting" >&2\necho "fake chrome: cannot open the display" >&2\nexit 3\n')
+  chmodSync(fake, 0o755)
+  const before = process.env.CHROME_PATH
+  process.env.CHROME_PATH = fake
+  try {
+    const logged: string[] = []
+    assert.equal(await screenshotArtifact('<p>x</p>', { width: 800, height: 600, runDir: join(dir, 'run'), log: (l) => logged.push(l) }, 10_000), null)
+    const last = logged[logged.length - 1] ?? ''
+    assert.match(last, /^\[artifacts\] the export browser failed: .+: Chrome --no-sandbox exited \(3\); its stderr ended "starting fake chrome: cannot open the display" \(at starting the browser, \d+ ms in\); the export falls back to the in-page one$/)
+    if (process.getuid?.() !== 0) assert.match(logged[0], /^\[artifacts\] the export browser's sandboxed start failed \(.+: Chrome exited \(3\); its stderr ended "starting fake chrome: cannot open the display"\); trying once with --no-sandbox$/)
+    assert.equal(logged.length, process.getuid?.() === 0 ? 1 : 2, logged.join(' | '))
+    assert.deepEqual(readdirSync(join(dir, 'run')), [], 'its profile is removed')
+  } finally {
+    if (before === undefined) delete process.env.CHROME_PATH
+    else process.env.CHROME_PATH = before
   }
 })
 
@@ -119,10 +149,13 @@ test('screenshotArtifact: a script that never yields ends within the render dead
 }, async () => {
   const deadline = 6_000
   const started = Date.now()
-  const png = await screenshotArtifact('<html><body>hi<script>for(;;){}</script></body></html>', { width: 800, height: 600 }, deadline)
+  const logged: string[] = []
+  const png = await screenshotArtifact('<html><body>hi<script>for(;;){}</script></body></html>', { width: 800, height: 600, log: (l) => logged.push(l) }, deadline)
   const took = Date.now() - started
   assert.equal(png, null, 'falls back like any other failed export')
   assert.ok(took < deadline + 2_000, `took ${took} ms`)
+  assert.ok(logged.some((l) => /^\[artifacts\] the export browser did not finish within 6000 ms \(at [a-z ]+, \d+ ms in\); the export falls back to the in-page one$/.test(l)),
+    `the deadline is logged with the step it stopped at: ${logged.join(' | ')}`)
   // A normal export right after still renders.
   const again = await screenshotArtifact('<!doctype html><body><h1>ok</h1></body>', { width: 800, height: 600 })
   assert.ok(again && again.subarray(1, 4).toString() === 'PNG')

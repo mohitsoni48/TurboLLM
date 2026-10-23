@@ -207,18 +207,22 @@ export function reapStaleChromeProfiles(runDir: string): number {
  *  scripts, and the sandbox is what keeps a renderer exploit in them away from the user's files;
  *  every export used to launch with `--no-sandbox`. Chrome refuses a sandboxed start as root, so
  *  root goes straight to `--no-sandbox`; elsewhere a sandboxed launch that fails (a container
- *  without user namespaces or the setuid helper) is retried once without it. */
+ *  without user namespaces or the setuid helper) is retried once without it, after `onRetry` is told why. */
 export async function launchSandboxedFirst<T>(
   launch: (noSandbox: boolean) => Promise<T>,
   root: boolean = process.getuid?.() === 0,
+  onRetry: (e: unknown) => void = () => {},
 ): Promise<T> {
   if (root) return launch(true)
   try {
     return await launch(false)
-  } catch {
+  } catch (e) {
+    onRetry(e)
     return launch(true)
   }
 }
+
+const messageOf = (e: unknown) => (e instanceof Error ? e.message : String(e))
 
 export interface ShotOpts {
   /** CSS-px width of the render viewport (a stable desktop width, e.g. 360–1280). */
@@ -227,7 +231,12 @@ export interface ShotOpts {
   height: number
   /** Where the browser's profile directory goes: the daemon passes `<dataDir>/run`, which its boot sweeps. */
   runDir?: string
+  /** Where a failed export says why (the daemon's log, console.warn, by default). */
+  log?: (line: string) => void
 }
+
+/** How much of Chrome's stderr a failed export quotes: its last lines say why it could not start. */
+const STDERR_TAIL = 600
 
 /** Render `html` headless and return a full-page PNG buffer at 2× scale, or null if no browser
  *  is available, rendering fails or it outlasts `deadlineMs` (caller then falls back to the
@@ -254,6 +263,13 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
   const live: { browser?: Browser; child?: ChildProcess } = {}
   let expired = false
   let timer: NodeJS.Timeout | undefined
+  // A failed export used to fall back to the in-page export without a word: a Windows CI run's export came back null
+  // at its deadline with nothing to say which step it was on. Now it logs the step, the time, the error, and how
+  // Chrome ended with the last of its stderr.
+  const log = opts.log ?? ((line: string) => console.warn(line))
+  const began = Date.now()
+  let step = 'starting the browser'
+  const failed = (why: string) => log(`[artifacts] the export browser ${why} (at ${step}, ${Date.now() - began} ms in); the export falls back to the in-page one`)
   /** Close the browser, kill its group if it has not exited CLOSE_GRACE_MS later, then remove its profile. Browser.close
    *  of a wedged Chrome would wait out the protocol timeout; the kill closes the pipe, which ends that wait. */
   const retire = async (): Promise<void> => {
@@ -275,8 +291,12 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
       userDataDir: profileDir,
       args: [...(noSandbox ? ['--no-sandbox', '--disable-setuid-sandbox'] : []), ...BASE_ARGS],
     })
-    const child = spawnTethered(exe, args, { stdio: ['ignore', 'ignore', 'ignore', 'pipe', 'pipe'], windowsHide: true }, { kind: 'chrome' })
-    child.on('error', () => { /* its pipes close, so the connect below rejects */ })
+    const child = spawnTethered(exe, args, { stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe'], windowsHide: true }, { kind: 'chrome' })
+    let stderr = ''
+    child.stderr?.on('data', (b: Buffer) => { stderr = (stderr + b.toString()).slice(-4 * STDERR_TAIL) })
+    child.stderr?.on('error', () => {})
+    let spawnError: Error | undefined
+    child.on('error', (e) => { spawnError = e /* its pipes close, so the connect below rejects */ })
     try {
       const browser = await puppeteer.connect({
         transport: new ChromePipeTransport(child.stdio[3] as Writable, child.stdio[4] as Readable),
@@ -285,9 +305,13 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
       })
       return { browser, child }
     } catch (e) {
-      if (child.exitCode === null && child.signalCode === null) killTetheredTree(child, 'SIGKILL') // started, never answered
+      // Its pipe closes as it exits: a moment for that exit to be seen, so it is told from one that never answered.
+      const ended = await exited(child, 500)
+      if (!ended) killTetheredTree(child, 'SIGKILL') // started, never answered
       await exited(child, CLOSE_GRACE_MS)
-      throw e
+      const how = spawnError ? `could not start (${spawnError.message})` : !ended ? 'did not answer on its pipe' : `exited (${child.exitCode ?? child.signalCode})`
+      const said = stderr.replace(/\s+/g, ' ').trim().slice(-STDERR_TAIL)
+      throw new Error(`${messageOf(e)}: Chrome${noSandbox ? ' --no-sandbox' : ''} ${how}${said ? `; its stderr ended "${said}"` : ''}`)
     }
   }
   const render = async (): Promise<Buffer | null> => {
@@ -295,12 +319,13 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
       // A sandboxed launch that failed after the deadline gets no retry: nobody waits for it.
       if (expired) throw new Error('export deadline passed')
       return start(noSandbox)
-    })
+    }, undefined, (e) => { if (!expired) log(`[artifacts] the export browser's sandboxed start failed (${messageOf(e)}); trying once with --no-sandbox`) })
     live.browser = started.browser
     live.child = started.child
     const browser = started.browser
     // The deadline passed during the launch: nothing else will close this one.
     if (expired) { void retire(); return null }
+    step = 'opening the page'
     const page = await browser.newPage()
     await page.setViewport({
       width: Math.max(360, Math.round(opts.width)),
@@ -316,19 +341,26 @@ export async function screenshotArtifact(html: string, opts: ShotOpts, deadlineM
       if (u.startsWith('data:') || u.startsWith('blob:') || u.startsWith('about:')) void req.continue()
       else void req.abort()
     })
+    step = 'loading the artifact'
     await page.setContent(withArtifactCsp(html), { waitUntil: 'load', timeout: 8000 }).catch(() => {})
     // Wait for web-font readiness (string form avoids needing the DOM lib in this Node module).
+    step = 'waiting for its fonts'
     await page.evaluate('document.fonts && document.fonts.ready').catch(() => {})
     await new Promise((r) => setTimeout(r, 150))
+    step = 'taking the screenshot'
     const buf = await page.screenshot({ type: 'png', fullPage: true })
     return Buffer.from(buf)
   }
   try {
     return await Promise.race([
       // No browser came up at all (both launches failed): nothing else removes its profile.
-      render().catch(() => { if (!live.child) removeProfile(); return null }),
+      render().catch((e) => {
+        if (!expired) failed(`failed: ${messageOf(e)}`)
+        if (!live.child) removeProfile()
+        return null
+      }),
       new Promise<null>((resolve) => {
-        timer = setTimeout(() => { expired = true; resolve(null) }, deadlineMs)
+        timer = setTimeout(() => { expired = true; failed(`did not finish within ${deadlineMs} ms`); resolve(null) }, deadlineMs)
       }),
     ])
   } finally {
