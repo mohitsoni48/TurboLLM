@@ -606,7 +606,19 @@ async function endGroups(list: Entry[], graceMs: number): Promise<void> {
 /** The helper the Android self-test passed, or null (no helper, not Android, or it failed). */
 let androidHelper: string | null = null
 
+/** Set by refuseNewTetheredSpawns: this process is a restart keeper, and starts nothing more. */
+let refusing = false
+
+/** For the restart keeper (cli.ts becomeKeeper), after closeAllLifelines: every later tethered spawn throws, and a
+ *  terminal gets no tie. The keeper is the old daemon's process, and whatever of its work was still in flight (an
+ *  engine install's extraction, a build step) would otherwise start children tied to the keeper alone, which the
+ *  replacement neither sees nor stops. */
+export function refuseNewTetheredSpawns(): void {
+  refusing = true
+}
+
 function startTethered(file: string, args: readonly string[] | null, options: SpawnOptions, tether: Tether & { hold?: string }): Entry {
+  if (refusing) throw new Error(`spawnTethered(${file}): this process is a restart keeper and starts nothing more`)
   const end = tether.end ?? 'kill'
   if (process.platform === 'win32') {
     // A detached child is outside libuv's kill-on-close job: nothing would end it with the daemon.
@@ -1070,7 +1082,7 @@ function releaseTerminal(t: TerminalTie): void {
  *  restart keeper (closeAllLifelines) release every terminal; a daemon that dies releases them by itself. On
  *  Windows a terminal is not tied yet: it keeps today's behaviour (the 'exit' handler's taskkill /T). */
 export function tetherTerminal(shellPid: number): { release(): void } {
-  if (process.platform === 'win32' || !Number.isInteger(shellPid) || shellPid <= 0) return { release: noop }
+  if (refusing || process.platform === 'win32' || !Number.isInteger(shellPid) || shellPid <= 0) return { release: noop }
   let watcher: ChildProcess
   try {
     watcher = spawn(nodeShell(), ['-c', PTY_WATCH, 'sh', String(shellPid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })

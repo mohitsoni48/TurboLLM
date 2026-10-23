@@ -1,5 +1,5 @@
-// openOwnerOnlyLog: restart.log and update.log carry the API key a daemon started with
-// --print-token or --tunnel prints on every start, so they are owner-only like config.json.
+// openOwnerOnlyLog: update.log carries the API key a daemon started with --print-token or
+// --tunnel prints on every start, so it is owner-only like config.json.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { closeSync, openSync, readFileSync, statSync, writeFileSync, writeSync } from 'node:fs'
@@ -22,7 +22,7 @@ function underUmask022(fn: () => void): void {
 test('openOwnerOnlyLog creates a missing log owner-only, under a umask that gives 0644 otherwise', { skip }, () => {
   underUmask022(() => {
     const dir = tmpDir('tllm-owner-log-')
-    const path = join(dir, 'restart.log')
+    const path = join(dir, 'update.log')
     const fd = openOwnerOnlyLog(path)
     writeSync(fd, '  Token:   tllm-printed\n')
     closeSync(fd)
@@ -44,18 +44,5 @@ test("openOwnerOnlyLog makes an existing 0644 log owner-only and appends to it",
     closeSync(fd)
     assert.equal(statSync(path).mode & 0o777, 0o600)
     assert.equal(readFileSync(path, 'utf8'), '  Token:   tllm-from-an-older-version\nnext\n')
-  })
-})
-
-// cli.ts prepares restart.log this way at boot and leaves spawnReplacement's own default-mode
-// open as shipped (ADR-442): an append open keeps the mode the file already has.
-test('a default-mode append to a log openOwnerOnlyLog prepared keeps it owner-only', { skip }, () => {
-  underUmask022(() => {
-    const path = join(tmpDir('tllm-owner-log-'), 'restart.log')
-    closeSync(openOwnerOnlyLog(path))
-    const fd = openSync(path, 'a')
-    writeSync(fd, '  Token:   tllm-replacement\n')
-    closeSync(fd)
-    assert.equal(statSync(path).mode & 0o777, 0o600)
   })
 })

@@ -1,10 +1,11 @@
-// The log files a detached child's stdout and stderr go to: restart.log (the self-restart's
-// replacement daemon, cli.ts) and update.log (the update helper and the daemon it relaunches,
-// app-update-apply.ts and update-helper.mjs). A daemon started with --print-token or --tunnel
-// prints a fresh API key on every start, so a restart or an update wrote that key into them.
-// Opened with the default mode they were 0644 under the usual umask 022, and in a 0755
+// The log file a detached child's stdout and stderr go to: update.log (the update helper and the
+// daemon it relaunches, app-update-apply.ts and update-helper.mjs). A daemon started with
+// --print-token or --tunnel prints a fresh API key on every start, so an update wrote that key
+// into it. (A Settings restart's replacement used to write to restart.log; it now runs under its
+// keeper and writes to the terminal TurboLLM was started from, cli.ts becomeKeeper.)
+// Opened with the default mode it was 0644 under the usual umask 022, and in a 0755
 // ~/.turbollm (macOS home folders, older Debian/Ubuntu, many servers) every other local account
-// could read them, as config.json was before it was made owner-only (config.ts CONFIG_FILE_MODE).
+// could read it, as config.json was before it was made owner-only (config.ts CONFIG_FILE_MODE).
 import { fchmodSync, openSync } from 'node:fs'
 
 /** Read and write for the owner only. Windows keeps only the write bit of a mode, so there the

@@ -25,7 +25,8 @@ function blockFrom(opening: string): string {
 
 const LISTEN = 'function listen(attempt = 0): void {'
 const REBIND = 'deps.rebind = () => {'
-const SIGNALS = "for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {"
+// The signal shutdown (also run by Ctrl+Break on Windows and by the stdin lifeline).
+const SIGNALS = 'beginShutdown = (reason: string) => {'
 
 test('every listener instance gets the terminal WebSocket upgrade handler (bind retry, rebind, revert)', () => {
   const listen = blockFrom(LISTEN)
@@ -158,7 +159,7 @@ test('the start guard claims the data dir first and gives the claim up once the 
   // find the old process's claim.
   const restart = blockFrom('if (!packagedAndroidApp()) deps.requestRestart = (')
   const release = restart.indexOf('releaseDataDirClaim(store.dir())')
-  assert.ok(release > 0 && release < restart.indexOf('spawnReplacement()') && release < restart.indexOf('process.exit(plan.exitCode)'))
+  assert.ok(release > 0 && release < restart.indexOf('becomeKeeper()') && release < restart.indexOf('process.exit(plan.exitCode)'))
 })
 
 // `--addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1, and these all dialed

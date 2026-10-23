@@ -182,6 +182,25 @@ test('ConfigStore.load keeps an empty engine selection empty and starts a file w
   }
 })
 
+// The restart keeper is the old process, its config as it stood at the restart, and its replacement owns config.json:
+// work of the old process still in flight in the keeper (a Turbo Link heartbeat, an install that ends) wrote that stale
+// copy over what the user had changed in the replacement since.
+test('ConfigStore.stopSaving (the restart keeper): update() changes this copy only and leaves config.json to its new owner', () => {
+  const path = tmpConfigPath()
+  try {
+    const keeper = ConfigStore.load(path)
+    const replacement = ConfigStore.load(path)
+    keeper.stopSaving()
+    replacement.update((c) => { c.daemon.port = 7123 })
+    keeper.update((c) => { c.daemon.port = 7999 })
+    assert.equal(keeper.snapshot().daemon.port, 7999, 'its own copy changes, as before')
+    assert.equal(ConfigStore.load(path).snapshot().daemon.port, 7123, 'the file keeps what its owner saved')
+    assert.equal(existsSync(`${path}.${process.pid}.tmp`), false, 'and no tmp file is left behind')
+  } finally {
+    cleanup(path)
+  }
+})
+
 test('getModelProfile: exact-engine match wins over any fallback', () => {
   const cfg = defaultConfig()
   const engineA = 'aaaa'

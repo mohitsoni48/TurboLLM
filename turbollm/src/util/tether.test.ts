@@ -1283,3 +1283,31 @@ test('Android: the real helper passes the self-test and is used; broken ones fai
     cleanup()
   }
 })
+
+test('after refuseNewTetheredSpawns (the restart keeper) every tethered spawn throws, and a terminal gets no tie', posixOnly, async () => {
+  const d = await startStandInDaemon(`
+import { refuseNewTetheredSpawns, spawnHeld, spawnTethered, tetheredExecFile, tetherTerminal } from ${srcUrl('util/tether.ts')}
+refuseNewTetheredSpawns()
+const outcome = (f: () => unknown) => { try { f(); return 'started' } catch (e) { return (e as Error).message } }
+const exec = await tetheredExecFile({ kind: 'probe' })('true').then(() => 'started', (e: Error) => e.message)
+report({
+  tethered: outcome(() => spawnTethered('sleep', ['300'], { stdio: 'ignore' }, { kind: 'probe' })),
+  held: outcome(() => spawnHeld('sleep', ['300'], { stdio: 'ignore' }, { kind: 'code-bash', hold: 'daemon' })),
+  exec,
+  terminalWatchers: (() => {
+    const children = () => process.getActiveResourcesInfo().filter((r) => r === 'ProcessWrap').length
+    const before = children()
+    tetherTerminal(process.pid)
+    return children() - before
+  })(),
+})
+process.exit(0)
+`)
+  try {
+    const r = await d.next<{ tethered: string; held: string; exec: string; terminalWatchers: number }>()
+    for (const outcome of [r.tethered, r.held, r.exec]) assert.match(outcome, /restart keeper and starts nothing more/)
+    assert.equal(r.terminalWatchers, 0, 'no terminal watcher was started')
+  } finally {
+    killRecorded(d.pid)
+  }
+})

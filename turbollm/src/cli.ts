@@ -1,8 +1,9 @@
+import { takeBootEnvironment } from './util/boot-env'
 import { hideChildConsoleWindows } from './util/hide-console-windows'
-import { killTetheredSync, stopTethered, tetherReady } from './util/tether'
-import { openOwnerOnlyLog } from './util/owner-only-log'
-import { spawn } from 'node:child_process'
-import { closeSync, openSync, readFileSync } from 'node:fs'
+import { closeAllLifelines, killTetheredSync, refuseNewTetheredSpawns, stopTethered, tetherReady } from './util/tether'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { constants as osConstants } from 'node:os'
 import { serve } from '@hono/node-server'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -46,6 +47,8 @@ import { seedDefaultModelDir } from './models/hf-cache'
 import { HashStore } from './models/hashes'
 import { estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
+import { stopUsageMonitor } from './sysinfo/usage'
+import { daemonTick, stopDaemonTicks } from './util/daemon-ticks'
 import { ConversationStore } from './chat/db'
 import { abortAllInFlightChats, chatHoldsEngine, chatTurnsEnded } from './chat/chat-routes'
 import { preloadSqlJs } from './chat/store/sqlite-adapter'
@@ -60,7 +63,7 @@ import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
 import { writePidfile, readPidfile, removeOwnPidfile, findRunningDaemon, claimDataDir, releaseDataDirClaim, stopDaemon, resolveDaemonAddress, localDaemonOrigin, daemonReachHost, DATA_DIR_IN_USE_EXIT_CODE, CONFIG_ACCESS_EXIT_CODE } from './daemon-pid'
-import { isDesktopSupervised, planRestartExit } from './daemon-restart'
+import { RESTART_REQUESTED_EXIT_CODE, planRestartExit } from './daemon-restart'
 import { runMcpServer } from './mcp-server'
 import { createApp, registerCodeRoutesIfSupported, registerSpaFallback } from './server'
 import { registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal/terminal-routes'
@@ -90,6 +93,33 @@ import { appUpdateAvailable, appUpdateApplied, appUpdateFailed } from './telemet
 import { remoteAccessState } from './telemetry/events/remote'
 import { checkDailyQueryRollups } from './telemetry/runtime/daily-query-rollups'
 import { markEverLoadedModel } from './api/onboarding-routes'
+
+// What this daemon's parent promised it (util/boot-env.ts): the desktop app's supervision, a restart keeper, a stdin
+// lifeline. Read first, bound to the parent's pid and removed from process.env, so nothing spawned below inherits
+// them: a TurboLLM run from a Code terminal or bash command is never taken for the app's own daemon.
+const boot = takeBootEnvironment()
+// The parent's lifeline (the desktop app, or the restart keeper): it holds this daemon's stdin, so stdin ends when
+// the parent ends, however it ends, and this daemon then shuts down gracefully. A paused stdin never emits 'end', so
+// it is resumed. Before the shutdown handler exists (the parent died during boot), it exits at once. stdout and
+// stderr may belong to a terminal that went away with the parent: an EPIPE at the next console.log must not cut the
+// shutdown short.
+let beginShutdown: ((reason: string) => void) | null = null
+if (boot.stdinLifeline) {
+  const reason = boot.keeperPid !== null ? 'the keeper ended' : 'the desktop app closed'
+  let ended = false
+  const onEnd = () => {
+    if (ended) return
+    ended = true
+    if (beginShutdown) beginShutdown(reason)
+    else process.exit(0)
+  }
+  process.stdin.once('end', onEnd)
+  process.stdin.once('close', onEnd)
+  process.stdin.once('error', onEnd)
+  process.stdin.resume()
+  process.stdout.on('error', () => { /* the parent's terminal is gone */ })
+  process.stderr.on('error', () => { /* the parent's terminal is gone */ })
+}
 
 // Stop child processes (the agent engine's shell tool, engine binaries, git,
 // etc.) from flashing a console window on Windows when the daemon has no console
@@ -802,8 +832,10 @@ setTimeout(() => {
 // virtually always happens well after the 3-second mark. Every unit test passed
 // because they call flush() directly; nothing exercised the daemon's own
 // scheduling of it. Re-reads the level fresh on every tick (not the value at
-// startup), so a mid-session opt-out is honoured on the very next flush.
-setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 * 60_000).unref()
+// startup), so a mid-session opt-out is honoured on the very next flush. These four are daemonTicks (unref'd):
+// the restart keeper stops them, where they ran on with the consent and counts from before the restart
+// (util/daemon-ticks.ts).
+daemonTick(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 * 60_000)
 // Daily-usage rollover (telemetry-review follow-up): rides the same interval as the
 // queue flush above. Without this, a feature used only on a user's LAST active day
 // would never roll over — `useFeature` only rolls a feature's tally over the next
@@ -811,16 +843,16 @@ setInterval(() => void flush(store.dir(), store.snapshot().telemetry.level), 5 *
 // stops running. Same unref()/best-effort reasoning as the flush interval.
 // daily_active rides it too: boot was its only call, so a daemon left running across
 // midnight never reported the following days (idempotent per day via the ledger).
-setInterval(() => { telemetry.dailyActive(); telemetry.flushDailyUsage() }, 5 * 60_000).unref()
+daemonTick(() => { telemetry.dailyActive(); telemetry.flushDailyUsage() }, 5 * 60_000)
 // ui_daily (spec 23 §3.8): same in-memory-accumulator/periodic-flush shape as
 // feature_used_daily above, just keyed on screen instead of feature.
-setInterval(() => telemetry.flushUiDailyUsage(), 5 * 60_000).unref()
+daemonTick(() => telemetry.flushUiDailyUsage(), 5 * 60_000)
 // chat_daily/gateway_daily/code_daily (spec 23 §3.4-3.6, ADR-333): same rollover
 // reasoning as flushDailyUsage above, but these three are read-only queries over
 // tables that already durably record everything needed (see
 // daily-query-rollups.ts) rather than an in-memory accumulator, so there is no
 // separate "persist what's in progress" call to also wire here.
-setInterval(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000).unref()
+daemonTick(() => checkDailyQueryRollups(store.dir(), db, telemetry), 5 * 60_000)
 
 // Shared Code-session run registry (Task 5): the SAME instance backs both the live Code UI
 // routes (server.ts passes d.codeRuns into registerCodeRoutes) and in-app-pi Code Routine
@@ -1390,52 +1422,147 @@ deps.rebind = () => {
 //      the listen socket open forever and block server.close),
 //   3. close the server so the OLD process releases the port,
 //   4. ONLY THEN finish, the way planRestartExit (daemon-restart.ts) decides:
-//      - npm/CLI: spawn the detached replacement (no port-bind race), then exit 0;
-//      - desktop app (TURBOLLM_DESKTOP=1): spawn nothing and exit 75. The app
-//        supervises this process and starts the fresh daemon itself, as its own
-//        non-detached child; a detached replacement would outlive the app (ADR-442);
+//      - npm/CLI, Docker, a service: this process becomes the keeper of its replacement
+//        (becomeKeeper, below);
+//      - supervised (the desktop app, TURBOLLM_DESKTOP=1, or a keeper): spawn nothing and
+//        exit 75. The supervisor starts the fresh daemon itself, as its own non-detached
+//        child (ADR-442);
 //      - exitOnly (app self-update, below): spawn nothing and exit 0.
 // A watchdog finishes anyway if close hasn't completed in time. Fail-safe: on any
 // thrown error we still finish, so the user is never left daemonless.
+// A signal (Ctrl+C, `docker stop`, a closed terminal) or the stdin lifeline's end during the teardown wins: the
+// shutdown it starts ends this process, finish() then starts and exits nothing (shuttingDown), and no restart starts
+// once a shutdown has. Both teardowns wait on the same engine exits and both end in one server 'close', so finish()
+// used to become the keeper, spawn the replacement and be ended by the shutdown's exit in the same tick: the
+// replacement ran on, parented to init, its lifeline ignored. A supervised one exited 75, and its keeper started
+// another daemon after the Ctrl+C.
 let restarting = false
-// Evaluated once: the environment the parent gave this process cannot change.
-const supervisedByDesktop = isDesktopSupervised(process.env)
-// restart.log gets the replacement's stdout, and a daemon started with --print-token or --tunnel
-// prints a fresh API key there on every restart. spawnReplacement opens it for appending with
-// the default mode (0644 under umask 022: readable by every local account in a 0755 ~/.turbollm),
-// and stays as shipped (ADR-442, cli.restart-wiring.test.ts). An append keeps an existing file's
-// mode, so the file is created, or an older one's mode fixed, owner-only here at boot, before any
-// restart writes to it (util/owner-only-log.ts). Best-effort, like the open in spawnReplacement.
-// Not where no replacement is ever spawned: the packaged Android app and the desktop app.
-if (!packagedAndroidApp() && !supervisedByDesktop) {
-  try {
-    closeSync(openOwnerOnlyLog(join(store.dir(), 'restart.log')))
-  } catch {
-    /* no data dir to write to: spawnReplacement falls back to 'ignore' as well */
+// Bound to this process's parent and evaluated once at boot (util/boot-env.ts): a TurboLLM started from a desktop
+// Code terminal inherits no TURBOLLM_DESKTOP, and exits 75 only to a supervisor that is really there.
+const supervised = boot.desktop || boot.keeperPid !== null
+
+// The restart keeper. The replacement used to be spawned detached, with its output in restart.log: it landed in a
+// session of its own, so npm returned to the prompt, and the new daemon and its engines were beyond Ctrl+C, `docker
+// stop` and the closing of the terminal. It was also spawned without process.execArgv, so under `npm start` (tsx's
+// loader, or `node --import tsx`) it died at once with ERR_MODULE_NOT_FOUND and TurboLLM simply ended.
+//
+// Now the old process stays, as a thin keeper in the terminal's foreground job (or as tini's child in a container),
+// whichever path reached finish() (the teardown, or its 14 s watchdog, which may have got none of it done):
+//   1. the exit net, now: every 'exit' listener once, in order, as process.exit would run them (the tethered kills,
+//      engines, tunnels and terminals by pidfile, the pidfile, the data-dir claim, a build's kill), then every
+//      lifeline closed, held ones included (closeAllLifelines). Whatever a stalled teardown left (a wedged engine)
+//      dies now, and the replacement's reapers find no record whose owner is a live process. The old process's own
+//      work still in flight (the restart stopped its Code runs and paused its downloads) starts no child from here on
+//      (refuseNewTetheredSpawns);
+//   2. nothing of the old process recurs, and nothing of it writes config.json. The restart stopped the routine and
+//      update schedulers, the interactive-run sweep, ComfyUI's guard, a tunnel's health loop and the engines (their
+//      idle watchdogs go with them); the keeper stops the rest: every daemonTick (the telemetry flushes and rollups,
+//      the ext API's reaper, the terminals' idle sweep: util/daemon-ticks.ts), the Turbo Link poll and the usage
+//      monitor, and its config store saves no more (ConfigStore.stopSaving). They ran on here with the old process's
+//      state: the ext reaper's prune on the chat store closed below threw from its timer and ended the keeper (and
+//      TurboLLM with it) 30 s after every such restart with the ext API on; the telemetry flushed with the consent
+//      from before the restart, and a Link heartbeat wrote the stale config over the replacement's. An error thrown
+//      by work of the old process still in flight is logged, not fatal: the keeper's one job is its replacement;
+//   3. the listener and every connection, and the chat store, whatever state the teardown reached, so the
+//      replacement can bind and is not refused as "already running";
+//   4. no listener of the daemon's own is left: its shutdown handler would call server.close on a closed server,
+//      whose callback runs at once and exits, cutting the replacement's own shutdown short;
+//   5. the replacement: the same interpreter, execArgv (as fork does, so `--import tsx` reaches it) and argv, in the
+//      same cwd, NOT detached, its output in this terminal, tied to the keeper by a stdin lifeline bound to the
+//      keeper's pid (util/boot-env.ts);
+//   6. signals: on POSIX SIGINT, SIGTERM and SIGHUP are relayed to the replacement and the keeper waits; on Windows
+//      the console delivers its own event to the replacement, which sits in the keeper's kill-on-close job, so the
+//      keeper ignores them and waits (a child.kill there would be a TerminateProcess);
+//   7. the replacement's exit: 75 starts the next one (a later restart: keepers never chain), unless the keeper was
+//      told to end meanwhile (a signal it relayed, or on Windows one the replacement got too: the replacement's restart
+//      had finished first, and nothing of it is left), which ends it with 0; anything else ends the keeper with that
+//      code, or 128+n for a signal;
+//   8. however the keeper dies, the replacement's stdin ends and it shuts down gracefully.
+function becomeKeeper(): void {
+  for (const listener of process.listeners('exit')) {
+    try {
+      ;(listener as (code: number) => void).call(process, 0)
+    } catch {
+      /* best-effort, as the exit handler itself is */
+    }
   }
+  process.removeAllListeners('exit')
+  closeAllLifelines()
+  refuseNewTetheredSpawns()
+  stopDaemonTicks()
+  deps.links?.stop()
+  stopUsageMonitor()
+  store.stopSaving()
+  process.on('uncaughtException', (e) => console.warn('keeper: an error from the old daemon\'s work (continuing):', e))
+  try {
+    ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
+  } catch {
+    /* best-effort */
+  }
+  try { closeTerminalSockets() } catch { /* best-effort */ }
+  try { server.close() } catch { /* already closed */ }
+  try { db.close() } catch { /* already closed */ }
+  try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
+  for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const) process.removeAllListeners(sig)
+  process.stdout.on('error', () => { /* a terminal that went away */ })
+  process.stderr.on('error', () => { /* a terminal that went away */ })
+
+  let replacement: ChildProcess | null = null
+  // Told to end (6.): a 75 that comes after it starts no next replacement.
+  let ending = false
+  function startReplacement(): void {
+    const child = spawn(process.execPath, [...process.execArgv, ...process.argv.slice(1)], {
+      cwd: process.cwd(),
+      stdio: ['pipe', 'inherit', 'inherit'],
+      env: { ...process.env, TURBOLLM_LIFELINE: `stdin:${process.pid}`, TURBOLLM_SUPERVISOR: `keeper:${process.pid}` },
+      windowsHide: true,
+    })
+    replacement = child
+    child.stdin?.on('error', () => { /* the replacement is gone: its exit is handled below */ })
+    child.once('error', (e) => {
+      console.error(`  Restart: the new TurboLLM could not start (${e.message}).`)
+      process.exit(1)
+    })
+    child.once('exit', (code, signal) => {
+      if (code === RESTART_REQUESTED_EXIT_CODE && !ending) {
+        // Not left to the keeper's uncaughtException handler, which would keep it running with no replacement.
+        try {
+          startReplacement()
+        } catch (e) {
+          console.error(`  Restart: the new TurboLLM could not start (${(e as Error).message}).`)
+          process.exit(1)
+        }
+        return
+      }
+      // A 75 after the keeper was told to end: that replacement's restart had finished first, and nothing of it is left.
+      if (code === RESTART_REQUESTED_EXIT_CODE) process.exit(0)
+      process.exit(code ?? 128 + (signal ? (osConstants.signals[signal] ?? 0) : 0))
+    })
+  }
+  if (process.platform === 'win32') {
+    for (const sig of ['SIGINT', 'SIGBREAK', 'SIGHUP'] as const) process.on(sig, () => { ending = true /* the replacement gets its own */ })
+  } else {
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+      process.on(sig, () => {
+        ending = true
+        try {
+          replacement?.kill(sig)
+        } catch {
+          /* already gone: its exit ends the keeper */
+        }
+      })
+    }
+  }
+  startReplacement()
 }
-function spawnReplacement(): void {
-  // Re-exec with the SAME interpreter + argv (minus argv[0]=node) and cwd, detached
-  // so it outlives this dying parent. `stdio:'ignore'` (NOT 'inherit') is essential:
-  // the parent is exiting, so inheriting its stdio handles would break the child's
-  // streams the moment we exit (and fails outright when the parent was itself launched
-  // detached). `unref()` lets the parent exit immediately. The replacement retries the
-  // port bind, so it survives the brief window where this process still holds it.
-  // Send the replacement's stdout/stderr to a log file (NOT the dead parent's
-  // streams) so a failed restart leaves something to diagnose. Falls back to
-  // 'ignore' if the file can't be opened.
-  let out: number | 'ignore' = 'ignore'
-  try {
-    out = openSync(join(store.dir(), 'restart.log'), 'a')
-  } catch {
-    out = 'ignore'
-  }
-  const child = spawn(process.execPath, process.argv.slice(1), {
-    cwd: process.cwd(),
-    detached: true,
-    stdio: ['ignore', out, out],
-  })
-  child.unref()
+/** Test-only (cli.keeper.test.ts, util/boot-env.ts): a restart's teardown that never settles, so the watchdog
+ *  finishes it. Resolved at once otherwise. */
+function testOnlyRestartStall(): Promise<void> {
+  return boot.testStallRestart ? new Promise<void>(() => { /* never */ }) : Promise.resolve()
+}
+/** Test-only (cli.keeper.test.ts, util/boot-env.ts): a signal shutdown that takes this much longer. */
+function testOnlySlowShutdown(): Promise<void> {
+  return boot.testSlowShutdownMs > 0 ? new Promise<void>((resolve) => setTimeout(resolve, boot.testSlowShutdownMs)) : Promise.resolve()
 }
 // `exitOnly` is the app-self-update mode (spec 29 B.1 step 2): tear down exactly as a
 // restart does — engine stopped, sockets drained, DB closed, port released — but do NOT
@@ -1450,15 +1577,22 @@ function spawnReplacement(): void {
 // "replacement" would be the app's executable, not node. Left unset, the restart and app-update
 // routes answer 501 (and the web UI hides the control there).
 if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean }) => {
-  if (restarting) return
+  // A shutdown under way ends this process: no restart starts after it (see above).
+  if (restarting || shuttingDown) return
   restarting = true
-  const plan = planRestartExit({ exitOnly: opts?.exitOnly === true, supervised: supervisedByDesktop })
+  const plan = planRestartExit({ exitOnly: opts?.exitOnly === true, supervised })
   // Every running chat reply is stopped first, as Stop does, so each is saved as stopped with its text while the
   // store is still open (and starts no tool call); the store closes once they have ended, a tool call they were
   // running included, up to 3 s (chatTurnsEnded, beside the engine's shutdown below). Left to the engine's exit, a
   // reply ended as a finished one (`aborted: false`), cut short. A reply waiting for an approval reads "Denied by
   // user.", as after a Stop.
   abortAllInFlightChats()
+  // Every Code run is stopped too, as Stop does (its turn records 'interrupted' while the store is open), and every
+  // model download is paused (each keeps its .part; the teardown waits for their writers, downloads.pauseAll). The
+  // restart's exit used to cut them off. A restart from a terminal now keeps this process alive as the keeper of its
+  // replacement (becomeKeeper), where they would have run on unseen: an agent's turn still acting on its repository,
+  // a download still writing the .part the replacement shows paused and resumes.
+  for (const id of deps.codeRuns?.activeSessionIds() ?? []) deps.codeRuns?.stop(id)
   updateScheduler.stop() // don't let an update tick fire mid-teardown
   routineScheduler.stop() // don't let a routine tick fire mid-teardown
   clearInterval(cliInteractiveSweepTimer)
@@ -1475,14 +1609,20 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
     // claim again until its new bind writes one (deps.rebind), and a restart can come meanwhile:
     // the replacement must not find this process's start claim.
     releaseDataDirClaim(store.dir())
-    if (plan.kind === 'self-respawn') {
+    // A signal or the lifeline's end came during the teardown: its shutdown ends this process, with 0, and nothing
+    // starts a replacement (see above). Its own server.close or its fallback exits.
+    if (shuttingDown) return
+    if (plan.kind === 'become-keeper') {
       try {
-        spawnReplacement()
+        becomeKeeper()
+        return
       } catch (e) {
-        console.warn(`restart spawn failed: ${e}`)
+        console.warn(`restart: could not start the new daemon: ${e}`)
       }
     } else if (plan.kind === 'supervisor-respawn') {
-      console.log(`  Restarting: exiting with code ${plan.exitCode} so the TurboLLM desktop app starts a fresh daemon (TURBOLLM_DESKTOP=1 is set; outside the desktop app nothing restarts it).`)
+      console.log(boot.desktop
+        ? `  Restarting: exiting with code ${plan.exitCode} so the TurboLLM desktop app starts a fresh daemon.`
+        : `  Restarting: exiting with code ${plan.exitCode} so the keeper (pid ${boot.keeperPid}) starts a fresh daemon.`)
     }
     process.exit(plan.exitCode)
   }
@@ -1497,8 +1637,10 @@ if (!packagedAndroidApp()) deps.requestRestart = (opts?: { exitOnly?: boolean })
   watchdog.unref()
   try {
     // stopTethered: everything else tethered (routine runs, Code commands, git, …) gets SIGTERM, then its group
-    // is killed after 3 s; engines and tunnels are their owners' to stop, just above.
-    void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
+    // is killed after 3 s; engines and tunnels are their owners' to stop, just above. remote.disableAll, not
+    // disable(): a remote-access Stop or a provider switch still turning Tailscale off just before is waited for
+    // too, as its `tailscale … off` would otherwise be killed mid-call by the keeper's exit net.
+    void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), stopTethered(), chatTurnsEnded(), downloads.pauseAll(), testOnlyRestartStall()]).finally(() => {
       try {
         db.close()
       } catch {
@@ -1544,45 +1686,51 @@ void runAutoLoad({
 })
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
+// On a signal, or when the parent's stdin lifeline ends (the desktop app or the restart keeper, above). On Windows
+// Ctrl+Break (SIGBREAK) is graceful too: it used to end the daemon abruptly, with no teardown at all.
 let shuttingDown = false
-for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-  process.on(sig, () => {
-    if (shuttingDown) return
-    shuttingDown = true
-    console.log('shutting down')
-    // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry — only our
-    // own: never another daemon's on this data dir.
-    try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
-    // Every running chat reply is stopped first, as requestRestart does: saved as stopped, with its text, while the
-    // store is open, which closes once they have ended, up to 3 s (chatTurnsEnded, beside the engine's shutdown).
-    abortAllInFlightChats()
-    updateScheduler.stop()
-    routineScheduler.stop()
-    clearInterval(cliInteractiveSweepTimer)
-    comfy.stop()
-    toolRegistry.disconnectAll()
-    void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disable(), stopTethered(), chatTurnsEnded()]).finally(() => {
-      try {
-        db.close()
-      } catch {
-        /* best-effort — must not skip the close below */
-      }
-      // Drop open connections first, as the restart path does: an SSE stream (Monitor/engine
-      // log panel) otherwise holds close() until the 12 s fallback — and `--stop` SIGKILLs at
-      // 10 s, skipping the 'exit' handler's engine/tunnel/terminal kill net.
-      try {
-        ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
-      } catch {
-        /* best-effort */
-      }
-      // An open Code terminal's WebSocket is no longer one of the server's connections, so
-      // closeAllConnections() leaves it, and it holds close() the same way.
-      try { closeTerminalSockets() } catch { /* best-effort */ }
-      server.close(() => process.exit(0))
-    })
-    setTimeout(() => process.exit(0), 12_000).unref()
+beginShutdown = (reason: string) => {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(reason ? `shutting down (${reason})` : 'shutting down')
+  // Remove pidfile on clean shutdown so `turbollm --stop` doesn't find a stale entry — only our
+  // own: never another daemon's on this data dir.
+  try { removeOwnPidfile(store.dir()) } catch { /* best-effort */ }
+  // Every running chat reply is stopped first, as requestRestart does: saved as stopped, with its text, while the
+  // store is open, which closes once they have ended, up to 3 s (chatTurnsEnded, beside the engine's shutdown).
+  abortAllInFlightChats()
+  updateScheduler.stop()
+  routineScheduler.stop()
+  clearInterval(cliInteractiveSweepTimer)
+  comfy.stop()
+  toolRegistry.disconnectAll()
+  // remote.disableAll, not disable(): a remote-access Stop, a provider switch, the flag turned off or a restart's
+  // teardown still running `tailscale serve|funnel … off` is waited for too. This shutdown's own disable() finds the
+  // provider taken and ends at once, and the 'exit' handler's killTetheredSync then killed that `off` mid-call:
+  // Serve, or the public Funnel, stayed on after TurboLLM was gone.
+  void Promise.all([manager.shutdown(), modelRouter.shutdownPool(), remote.disableAll(), stopTethered(), chatTurnsEnded(), testOnlySlowShutdown()]).finally(() => {
+    try {
+      db.close()
+    } catch {
+      /* best-effort — must not skip the close below */
+    }
+    // Drop open connections first, as the restart path does: an SSE stream (Monitor/engine
+    // log panel) otherwise holds close() until the 12 s fallback — and `--stop` SIGKILLs at
+    // 10 s, skipping the 'exit' handler's engine/tunnel/terminal kill net.
+    try {
+      ;(server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.()
+    } catch {
+      /* best-effort */
+    }
+    // An open Code terminal's WebSocket is no longer one of the server's connections, so
+    // closeAllConnections() leaves it, and it holds close() the same way.
+    try { closeTerminalSockets() } catch { /* best-effort */ }
+    server.close(() => process.exit(0))
   })
+  setTimeout(() => process.exit(0), 12_000 + boot.testSlowShutdownMs).unref()
 }
+const shutdownSignals = process.platform === 'win32' ? ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] as const : ['SIGINT', 'SIGTERM', 'SIGHUP'] as const
+for (const sig of shutdownSignals) process.on(sig, () => beginShutdown?.(''))
 
 // Last-resort synchronous safety net: whatever path leads here (clean exit, an
 // unhandled crash that reaches 'exit', a process.exit elsewhere), make sure no engine

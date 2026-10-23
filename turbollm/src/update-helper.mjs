@@ -18,7 +18,9 @@
 //     resolution is identical in both worlds.
 //
 // Contract with the daemon (all via argv[2], one JSON blob — no shared imports):
-//   { pid, dataDir, method, from, to, execPath, argv, cwd, npmCmd }
+//   { pid, alsoWait, dataDir, method, from, to, execPath, argv, cwd, npmCmd }
+// `alsoWait` lists more pids that must be gone first: after a Settings restart from a terminal the daemon runs under
+// its restart keeper (cli.ts becomeKeeper), the old process, which still holds the package's files open.
 // It writes `<dataDir>/update-result.json` on the way out, ALWAYS — success or failure —
 // which is what the restarted daemon reads once on boot and surfaces as a toast. A
 // failed install leaves the old version installed and simply relaunches it.
@@ -85,10 +87,11 @@ function alive(pid) {
   return !isZombie(pid)
 }
 
-async function waitForExit(pid) {
+/** Wait until every one of `pids` has exited, within one WAIT_FOR_EXIT_MS. */
+async function waitForExit(pids) {
   const deadline = Date.now() + WAIT_FOR_EXIT_MS
   while (Date.now() < deadline) {
-    if (!alive(pid)) return true
+    if (!pids.some(alive)) return true
     await new Promise((r) => setTimeout(r, POLL_MS))
   }
   return false
@@ -152,9 +155,10 @@ function relaunch() {
 }
 
 async function main() {
-  log(`update helper starting (pid=${opts.pid}, method=${opts.method}, ${opts.from} → ${opts.to})`)
+  const also = Array.isArray(opts.alsoWait) ? opts.alsoWait.filter((p) => Number.isInteger(p) && p > 0) : []
+  log(`update helper starting (pid=${opts.pid}${also.length ? `, also waiting for ${also.join(', ')}` : ''}, method=${opts.method}, ${opts.from} → ${opts.to})`)
 
-  if (!(await waitForExit(opts.pid))) {
+  if (!(await waitForExit([opts.pid, ...also]))) {
     writeResult(false, 'The running TurboLLM did not shut down in time, so the update was not applied.')
     log('daemon did not exit — aborting without touching anything')
     return

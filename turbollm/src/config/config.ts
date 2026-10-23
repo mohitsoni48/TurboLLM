@@ -938,6 +938,9 @@ function sweepDeadSaveTmps(configPath: string): void {
 }
 
 export class ConfigStore {
+  /** Set by stopSaving() (the restart keeper): config.json belongs to another process from then on. */
+  private saving = true
+
   private constructor(
     private data: Config,
     private filePath: string,
@@ -1004,7 +1007,15 @@ export class ConfigStore {
     fn(work)
     validate(work)
     this.data = work
-    this.save()
+    if (this.saving) this.save()
+  }
+
+  /** For the restart keeper (cli.ts becomeKeeper): from now on update() changes this process's copy only, and never
+   *  writes config.json. The keeper is the old process, its copy as it stood at the restart, and its replacement owns
+   *  the file: work of the old process still in flight there (a Turbo Link probe's heartbeat, an install that ends)
+   *  wrote that stale copy over the replacement's config, undoing what the user had changed since. */
+  stopSaving(): void {
+    this.saving = false
   }
 
   dir(): string {

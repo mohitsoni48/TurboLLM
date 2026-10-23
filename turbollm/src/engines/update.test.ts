@@ -488,6 +488,29 @@ test('UpdateScheduler: the engine auto-tune is running on is not auto-updated un
   assert.deepEqual(applied.slice(1), ['cuda', 'other'])
 })
 
+// A restart from a terminal keeps the old process as the keeper of its replacement (cli.ts becomeKeeper). stop() left
+// the first pass, 30 s after start, pending: a restart within those 30 s had the keeper check, and perhaps apply an
+// engine update, from the old process, beside the replacement's own scheduler.
+test('UpdateScheduler: stop() also cancels the first pass, so a scheduler stopped by a restart runs no pass', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let passes = 0
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => { passes++; return { engines: [], activeEngineId: '' } } } as unknown as Registry,
+    manager: managerStub('stopped'),
+    updates: { prune() {}, checkAll: async () => {}, get: () => undefined } as unknown as UpdateChecker,
+    applyUpdate: async () => {},
+  })
+  scheduler.start()
+  scheduler.stop()
+  t.mock.timers.tick(24 * 60 * 60_000)
+  assert.equal(passes, 0, 'no pass after stop()')
+  scheduler.start()
+  t.mock.timers.tick(30_000)
+  assert.equal(passes, 1, 'started again, the first pass runs')
+  scheduler.stop()
+})
+
 // ─── source-built engines (ADR-088): commit-hash update detection ─────────────
 
 test('parseGitRepo: https / .git / trailing-slash variants → owner/repo', () => {

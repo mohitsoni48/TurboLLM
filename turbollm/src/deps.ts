@@ -77,9 +77,10 @@ export interface Deps {
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).
    *  Gracefully stops the engine and releases the listen socket, then ends one of three
-   *  ways (daemon-restart.ts `planRestartExit`): from a terminal or npm install it spawns
-   *  a detached replacement and exits 0; under the desktop app (TURBOLLM_DESKTOP=1) it
-   *  exits with RESTART_REQUESTED_EXIT_CODE (75) and the app starts the fresh daemon;
+   *  ways (daemon-restart.ts `planRestartExit`): from a terminal or npm install the old
+   *  process becomes the keeper of its replacement (cli.ts becomeKeeper), which stays in
+   *  that terminal; under a supervisor (the desktop app, or a keeper) it exits with
+   *  RESTART_REQUESTED_EXIT_CODE (75) and the supervisor starts the fresh daemon;
    *  with `exitOnly` (app self-update) it exits 0 and spawns nothing. Optional: only
    *  wired in the real `serve()` entrypoint (cli.ts); absent under tests, where the
    *  restart route returns 501. */

@@ -43,6 +43,10 @@ export function engineIsIdle(manager: Manager): boolean {
 
 export class UpdateScheduler {
   private timer: ReturnType<typeof setInterval> | null = null
+  /** The first pass, 30 s after start. stop() cancels it too: a restart from a terminal keeps the old process as the
+   *  keeper of its replacement (cli.ts becomeKeeper), where a pass still pending ran on, a check and perhaps an engine
+   *  update applied from the old process, beside the replacement's own. */
+  private firstPass: ReturnType<typeof setTimeout> | null = null
   private running = false
   /** Per engine, the latest version whose auto-update failed its probe: the new build does not run on this machine,
    *  so applying it again only downloads it again (every check, for good). Skipped until upstream publishes another
@@ -56,12 +60,20 @@ export class UpdateScheduler {
   start(): void {
     if (this.timer) return
     // First pass shortly after boot (let the daemon settle / engines seed first).
-    setTimeout(() => void this.runOnce(), 30_000).unref()
+    this.firstPass = setTimeout(() => {
+      this.firstPass = null
+      void this.runOnce()
+    }, 30_000)
+    this.firstPass.unref()
     this.timer = setInterval(() => void this.runOnce(), UPDATE_CHECK_INTERVAL_MS)
     this.timer.unref()
   }
 
   stop(): void {
+    if (this.firstPass) {
+      clearTimeout(this.firstPass)
+      this.firstPass = null
+    }
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null

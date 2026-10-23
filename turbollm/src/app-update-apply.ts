@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { packagedAndroidApp } from './engines/zip-install'
 import { openOwnerOnlyLog } from './util/owner-only-log'
+import { bootEnvironment } from './util/boot-env'
 
 /** How this daemon was installed. `unknown` is a real, expected answer (an embedding we
  *  don't recognise) and is treated exactly like the refuse-to-self-update methods. */
@@ -300,7 +301,9 @@ export async function detectInstall(): Promise<InstallInfo> {
     platform: process.platform,
     androidApp: packagedAndroidApp(),
     entry,
-    desktopEnv: process.env.TURBOLLM_DESKTOP === '1',
+    // Captured at boot and removed from the environment (util/boot-env.ts), so a TurboLLM run from a desktop Code
+    // terminal is not taken for the app's own daemon.
+    desktopEnv: bootEnvironment().desktop,
     inContainer: detectContainer(),
     npmGlobalRoot: root,
     // The bin folder is the one argv[1] names before it is resolved: <prefix>/bin for the link
@@ -449,7 +452,7 @@ export class AppUpdateProgressState {
 /** What the daemon records at boot so the helper can bring it back EXACTLY as it was
  *  started, rather than reconstructing a plausible command line (spec 29 B.1 step 3).
  *  `argv` is `process.argv.slice(1)` — the script path plus its flags, i.e. what to pass
- *  to `execPath` — matching what cli.ts's own `spawnReplacement` re-execs with. */
+ *  to `execPath` (a restart's keeper adds execArgv in front of it, cli.ts becomeKeeper). */
 export interface RunState {
   pid: number
   execPath: string
@@ -528,6 +531,8 @@ export function spawnUpdateHelper(opts: {
   from: string
   to: string
   run: RunState
+  /** The restart keeper this daemon runs under; util/boot-env.ts's when left out. For the tests. */
+  keeperPid?: number | null
 }): boolean {
   let out: number | 'ignore' = 'ignore'
   try {
@@ -535,8 +540,13 @@ export function spawnUpdateHelper(opts: {
   } catch {
     out = 'ignore'
   }
+  // After a Settings restart from a terminal, this daemon runs under its keeper (cli.ts becomeKeeper), the old
+  // process, which keeps the package's files open (Windows will not let them be replaced) until it exits with this
+  // one: the helper waits for it too.
+  const keeper = opts.keeperPid === undefined ? bootEnvironment().keeperPid : opts.keeperPid
   const payload = JSON.stringify({
     pid: opts.run.pid,
+    alsoWait: keeper ? [keeper] : [],
     dataDir: opts.dataDir,
     method: opts.method,
     from: opts.from,

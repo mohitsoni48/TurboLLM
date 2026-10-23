@@ -43,7 +43,7 @@ test('a restart stops every running chat reply before the engine shuts down', ()
 })
 
 test('a SIGINT, SIGTERM or SIGHUP stops every running chat reply before the engine shuts down', () => {
-  assert.match(untilShutdown("for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {"), /\n\s+abortAllInFlightChats\(\)\n/)
+  assert.match(untilShutdown('beginShutdown = (reason: string) => {'), /\n\s+abortAllInFlightChats\(\)\n/)
 })
 
 test('a restart closes the store only once the chat replies it stopped have ended', () => {
@@ -51,5 +51,5 @@ test('a restart closes the store only once the chat replies it stopped have ende
 })
 
 test('a SIGINT, SIGTERM or SIGHUP closes the store only once the chat replies it stopped have ended', () => {
-  assert.match(untilStoreCloses("for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {"), CLOSE_AFTER_TURNS)
+  assert.match(untilStoreCloses('beginShutdown = (reason: string) => {'), CLOSE_AFTER_TURNS)
 })

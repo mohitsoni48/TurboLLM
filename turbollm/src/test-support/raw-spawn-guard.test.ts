@@ -18,7 +18,6 @@ import { tmpDir } from './tmp'
 
 const SRC_ROOT = fileURLToPath(new URL('..', import.meta.url))
 
-const UNTIED = 'not tethered yet: a daemon that dies while it runs leaves it running'
 const SYNC = 'synchronous and bounded by its own timeout; it blocks the daemon, so it cannot be held, and a daemon killed in the middle of one leaves it to finish (Known)'
 const LOOKUP = 'a synchronous PATH lookup (`which`, `where`) with no timeout of its own: it only reads directories and exits; it blocks the daemon, so it cannot be held, and a daemon killed in the middle of one leaves it to finish (Known)'
 const WIN_KILL = 'a Windows kill helper (taskkill or a WMI walk): bounded, and it only kills'
@@ -31,7 +30,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'update-helper.mjs#relaunch:spawn': 'runs in the update helper after the daemon has exited: the relaunched daemon',
   'update-helper.mjs#spawnNpm:spawn': 'runs in the update helper after the daemon has exited: npm installs the update',
   'update-helper.mjs#isZombie:spawnSync': 'runs in the update helper after the daemon has exited: `ps` reads a pid\'s state',
-  'cli.ts#spawnReplacement:spawn': 'a Settings restart\'s replacement daemon, started detached as the daemon exits; ' + UNTIED,
+  'cli.ts#startReplacement:spawn': 'a Settings restart\'s replacement daemon: the keeper\'s own non-detached child (libuv\'s job on Windows), tied to it by a stdin lifeline bound to its pid, and the keeper relays the terminal\'s signals to it',
 
   // ── Not the daemon ──
   'daemon-pid.ts#isZombie:spawnSync': '`turbollm --stop`, run in the user\'s own terminal: `ps` reads the daemon\'s state',

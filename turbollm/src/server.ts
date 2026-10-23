@@ -23,6 +23,7 @@ import { PublicRunManager } from './ext/run-manager'
 import { createMakeBody } from './ext/generation'
 import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
 import { extErrorHandler } from './ext/errors'
+import { daemonTick } from './util/daemon-ticks'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
@@ -199,7 +200,9 @@ export function createApp(d: Deps): Hono {
       'allow-policy here — see config.json\'s api.ext doc comment.',
     )
   }
-  const extRunsReaper = setInterval(() => {
+  // A daemonTick (unref'd), which the restart keeper stops: its audit prune ran on the chat store the keeper had
+  // closed, threw from its timer, and ended the keeper and TurboLLM with it (util/daemon-ticks.ts).
+  daemonTick(() => {
     extRuns.reapOrphans()
     extRuns.prune(60 * 60_000)
     // Idempotency entries outlive individual runs on purpose (24h default TTL vs the 1h run
@@ -212,7 +215,6 @@ export function createApp(d: Deps): Hono {
     // reaper above — but it still needs its own bound so ext_audit doesn't grow forever.
     ext?.audit.prune(DEFAULT_AUDIT_RETENTION_DAYS)
   }, 30_000)
-  extRunsReaper.unref()
 
   return app
 }

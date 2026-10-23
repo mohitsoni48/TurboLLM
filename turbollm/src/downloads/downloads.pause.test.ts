@@ -355,3 +355,30 @@ test('a Discard while the .part is still being opened leaves no .part behind, of
     await srv.close()
   }
 })
+
+// A Settings restart from a terminal keeps the old process alive as its replacement's keeper (cli.ts becomeKeeper):
+// its downloads, left running, went on writing the .part files the replacement shows paused and resumes (onboarding
+// does at once), two writers on one file. The restart pauses them all first and waits for their writers to close.
+test('pauseAll stops every running and queued download, keeps their .part files, and resolves once their writers have closed', async () => {
+  const srv = await serveFile(() => true)
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const rows: DownloadRecord[] = []
+    for (const n of ['a', 'b', 'c']) rows.push(...(await dm.enqueue({ url: srv.url.replace('model', n) })))
+    await waitFor('two transfers on disk', () =>
+      rows.slice(0, 2).every((r) => statSync(`${r.dest}.part`, { throwIfNoEntry: false })?.size === 65_536) ? true : undefined)
+    assert.equal(row(dm, rows[2].id).status, 'queued')
+    await dm.pauseAll()
+    assert.equal((dm as unknown as { runs: Map<string, unknown> }).runs.size, 0, 'every transfer\'s run() has returned (its .part closed) when it resolves')
+    await waitFor('the server to see them closed', () => (srv.state.open === 0 ? true : undefined))
+    for (const r of rows) assert.equal(row(dm, r.id).status, 'paused')
+    for (const r of rows.slice(0, 2)) assert.equal(statSync(`${r.dest}.part`).size, 65_536, 'the bytes are kept')
+    await new Promise((r) => setTimeout(r, 100))
+    assert.equal(srv.seen.length, 2, 'the queued one never started')
+    const after = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    for (const r of rows) assert.equal(row(after, r.id).status, 'paused', 'and the next start finds them paused')
+  } finally {
+    await srv.close()
+  }
+})

@@ -72,3 +72,38 @@ test('the update helper takes a daemon that exited but was not reaped for gone, 
     parent.kill('SIGKILL')
   }
 })
+
+// After a Settings restart from a terminal the daemon runs under its restart keeper (cli.ts becomeKeeper), the old
+// process, which still holds the package's files open: on Windows `npm i -g` cannot replace them until it exits too.
+test('the update helper waits for every pid it is given (the restart keeper too) before it relaunches', async () => {
+  const dataDir = tmpDir('tllm-update-helper-')
+  const marker = join(dataDir, 'relaunched')
+  const daemon = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 200)'], { stdio: 'ignore' })
+  const keeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1500)'], { stdio: 'ignore' })
+  let keeperGoneAt = 0
+  keeper.once('exit', () => { keeperGoneAt = Date.now() })
+  let helper: ReturnType<typeof spawn> | undefined
+  try {
+    const payload = JSON.stringify({
+      pid: daemon.pid,
+      alsoWait: [keeper.pid],
+      dataDir,
+      method: 'source',
+      from: '1.0.0',
+      to: '1.0.1',
+      execPath: process.execPath,
+      argv: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, String(Date.now()))`],
+      cwd: dataDir,
+    })
+    helper = spawn(process.execPath, [helperPath(), payload], { cwd: dataDir, stdio: 'ignore' })
+    for (let i = 0; i < 500 && !existsSync(marker); i++) await sleep(20)
+    for (let i = 0; i < 50 && readFileSync(marker, 'utf8') === ''; i++) await sleep(20)
+    const relaunchedAt = Number(readFileSync(marker, 'utf8'))
+    assert.ok(keeperGoneAt > 0, 'the keeper had exited when the daemon was relaunched')
+    assert.ok(relaunchedAt >= keeperGoneAt, 'the relaunch came after the keeper was gone')
+  } finally {
+    helper?.kill('SIGKILL')
+    daemon.kill('SIGKILL')
+    keeper.kill('SIGKILL')
+  }
+})

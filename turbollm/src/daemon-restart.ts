@@ -1,5 +1,5 @@
-// Decides how a restart's teardown ends: self-respawn, exit 75 for the desktop supervisor, or exit
-// only (spec 08 §2, ADR-442). Pure on purpose, so it imports nothing.
+// Decides how a restart's teardown ends: the old process becomes the keeper of its replacement, exit 75 for a
+// supervisor, or exit only (spec 08 §2, ADR-442). Pure on purpose, so it imports nothing.
 
 /** Exit status a supervised daemon uses to ask its supervisor to start a fresh one.
  *  MIRRORED in wrapper/daemon-supervisor.js; change both or neither (both test suites pin it).
@@ -7,22 +7,19 @@
  *  exit codes (1,3-7,9,10,12,13), below the 128+signal range, and produced by no other path. */
 export const RESTART_REQUESTED_EXIT_CODE = 75
 
-/** True when the desktop wrapper spawned this daemon and has promised to respawn it on
- *  RESTART_REQUESTED_EXIT_CODE (wrapper/main.js sets TURBOLLM_DESKTOP=1). Strict '1', and
- *  deliberately NOT classifyInstall's `/resources/daemon/` path fallback: supervision is a
- *  promise the parent makes, never something inferred from where the files live. */
-export function isDesktopSupervised(env: NodeJS.ProcessEnv): boolean {
-  return env.TURBOLLM_DESKTOP === '1'
-}
-
 export type RestartExitPlan =
-  | { kind: 'self-respawn'; exitCode: 0 }                                          // npm/CLI: today's path
-  | { kind: 'supervisor-respawn'; exitCode: typeof RESTART_REQUESTED_EXIT_CODE }  // desktop
-  | { kind: 'exit-only'; exitCode: 0 }                                             // app-update helper relaunches
+  // npm/CLI, Docker, a service: the old process stays as a thin keeper in the terminal's (or the container's)
+  // foreground, starts the replacement as its own child, and exits with it (cli.ts becomeKeeper).
+  | { kind: 'become-keeper'; exitCode: 0 }
+  // The desktop app or a keeper supervises this daemon: exit 75, and the supervisor starts the fresh one.
+  | { kind: 'supervisor-respawn'; exitCode: typeof RESTART_REQUESTED_EXIT_CODE }
+  // The app-update helper relaunches the daemon.
+  | { kind: 'exit-only'; exitCode: 0 }
 
-/** Pure. exitOnly wins over supervision (the update path's contract never changes). */
+/** Pure. exitOnly wins over supervision (the update path's contract never changes). `supervised`: the desktop app
+ *  or a restart keeper is this daemon's parent, as util/boot-env.ts bound it at boot. */
 export function planRestartExit(opts: { exitOnly: boolean; supervised: boolean }): RestartExitPlan {
   if (opts.exitOnly) return { kind: 'exit-only', exitCode: 0 }
   if (opts.supervised) return { kind: 'supervisor-respawn', exitCode: RESTART_REQUESTED_EXIT_CODE }
-  return { kind: 'self-respawn', exitCode: 0 }
+  return { kind: 'become-keeper', exitCode: 0 }
 }

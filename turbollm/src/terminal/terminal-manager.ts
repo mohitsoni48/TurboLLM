@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import { PTYSession } from './pty-session'
 import { sessionAuth } from '../code/session-auth'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
+import { daemonTick } from '../util/daemon-ticks'
 
 // ── Orphan-safety pidfile (mirrors tunnel/manager.ts's tunnel-<pid>.pid pattern, which
 // itself mirrors engines/manager.ts) ──────────────────────────────────────────────────
@@ -218,8 +219,9 @@ export class TerminalManager {
     // Found live: cleanupIdle() existed but was never actually scheduled anywhere — a genuinely
     // abandoned terminal (every browser tab closed, nobody coming back) ran forever until the
     // next daemon restart. Self-scheduled here, mirroring Manager's own watchdogTick pattern
-    // (engines/manager.ts) — unref()'d so it never keeps the process alive on its own.
-    setInterval(() => this.cleanupIdle(), IDLE_SWEEP_MS).unref()
+    // (engines/manager.ts) — a daemonTick, unref()'d so it never keeps the process alive on its
+    // own, and stopped by the restart keeper (util/daemon-ticks.ts).
+    daemonTick(() => this.cleanupIdle(), IDLE_SWEEP_MS)
   }
 
   /**

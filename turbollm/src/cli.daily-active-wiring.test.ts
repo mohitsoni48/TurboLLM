@@ -12,6 +12,7 @@ import { dirname, join } from 'node:path'
 
 const CLI = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'cli.ts'), 'utf8')
 
+// A daemonTick: an unref'd setInterval, which the restart keeper stops (util/daemon-ticks.ts).
 test('daily_active is emitted from a recurring timer, not only at boot', () => {
-  assert.match(CLI, /setInterval\(\(\) => \{[^}]*\btelemetry\.dailyActive\(\)[^}]*\}, [^)]*\)\.unref\(\)/)
+  assert.match(CLI, /daemonTick\(\(\) => \{[^}]*\btelemetry\.dailyActive\(\)[^}]*\}, [^)]*\)/)
 })

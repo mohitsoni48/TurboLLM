@@ -596,6 +596,29 @@ export class DownloadManager {
     return true
   }
 
+  /** Pause every downloading and queued job at once, for a Settings restart: each keeps its .part,
+   *  as {@link pause} keeps one, which is how the next start brings it back anyway (restore()), and
+   *  nothing queued starts in its place. Resolves once every transfer it stopped has closed its
+   *  .part. A restart from a terminal keeps the old process alive as its replacement's keeper
+   *  (cli.ts becomeKeeper): left running, its downloads went on writing the .part files the
+   *  replacement shows paused and resumes (onboarding does at once), two writers on one file. */
+  pauseAll(): Promise<void> {
+    const closing: Promise<void>[] = []
+    let changed = false
+    for (const rec of this.records.values()) {
+      if (rec.status !== 'downloading' && rec.status !== 'queued') continue
+      // Set before the abort, as pause() does, so the run() it ends sees a paused row.
+      rec.status = 'paused'
+      rec.bytesPerSec = 0
+      changed = true
+      this.controllers.get(rec.id)?.abort()
+      const run = this.runs.get(rec.id)
+      if (run) closing.push(run.then(() => undefined, () => undefined))
+    }
+    if (changed) this.persist()
+    return Promise.all(closing).then(() => undefined)
+  }
+
   /** Resume a paused or errored job (spec 10 §5): re-queue it so pump() picks it back
    *  up. run() already resumes from the .part file's byte offset via a Range request —
    *  this just flips the status so the queue actually starts it again. A restart-

@@ -38,7 +38,7 @@
   ],
   "scripts": {
     "dev": "tsx watch src/cli.ts",
-    "start": "tsx src/cli.ts",
+    "start": "node --import tsx src/cli.ts",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test \"src/**/*.test.ts\" \"web/src/lib/argv.test.ts\" \"web/src/lib/download-subdir.test.ts\" \"web/src/lib/engine-groups.test.ts\" \"web/src/lib/personas.test.ts\" \"web/src/lib/tool-explain.test.ts\" \"web/src/lib/vram.test.ts\"",
     "build:web": "cd web && npm ci && npm run build",
