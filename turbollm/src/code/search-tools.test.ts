@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import {
   createAgentSession,
   createBashTool,
@@ -19,6 +19,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { createSearchToolDefinitions, findSearchTool, searchToolsFor } from './search-tools'
 import { toolsForMode } from './persona'
+import { stopTethered } from '../util/tether'
 import { isGone, killRecorded, pidWrittenTo, record, srcUrl, startStandInDaemon, waitGone } from '../test-support/stand-in-daemon'
 import { tmpGitRepo } from '../test-support/git-repo'
 import { tmpDir } from '../test-support/tmp'
@@ -67,6 +68,19 @@ async function outcome<T>(p: Promise<T>): Promise<T | { rejected: string }> {
   }
 }
 
+/** `p`, or a rejection naming `what` once `ms` have passed. Every wait in this file is bounded, so a search that never
+ *  settles fails its case instead of holding the file, and every file after it, open: CI's macOS job hung for hours
+ *  here, behind a Stop case that never found its rg and so never stopped it (pidsOf). */
+function within<T>(p: Promise<T>, what: string, ms = 30_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined
+  const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(`${what}: not settled within ${ms} ms`)), ms) })
+  return Promise.race([p, late]).finally(() => clearTimeout(timer))
+}
+
+// Whatever a failed case left running through the tether here (an rg or fd still searching), ended, so this file's
+// process can exit and report.
+after(() => stopTethered(1000))
+
 test('grep returns exactly what pi\'s own grep returns, on every case of the fixture', { skip: noRg }, async () => {
   const restore = sortedRg()
   try {
@@ -97,8 +111,8 @@ test('grep returns exactly what pi\'s own grep returns, on every case of the fix
       ['a path with a leading @', outside, { pattern: 'foo', path: '@src/deep', ignoreCase: true }],
     ]
     for (const [name, cwd, params] of cases) {
-      const pi = await outcome(createGrepToolDefinition(cwd).execute('t', params as never, undefined, undefined, ctx))
-      const ours = await outcome(createSearchToolDefinitions(cwd).grep.execute('t', params as never, undefined, undefined, ctx))
+      const pi = await outcome(within(createGrepToolDefinition(cwd).execute('t', params as never, undefined, undefined, ctx), `pi's grep: ${name}`))
+      const ours = await outcome(within(createSearchToolDefinitions(cwd).grep.execute('t', params as never, undefined, undefined, ctx), `grep: ${name}`))
       assert.deepEqual(ours, pi, `grep: ${name}`)
     }
   } finally {
@@ -137,14 +151,14 @@ test('find returns exactly what pi\'s own find returns, on every case of the fix
     ['a subdirectory', outside, { pattern: '*', path: 'src' }],
   ]
   for (const [name, cwd, params] of cases) {
-    const pi = await outcome(createFindToolDefinition(cwd).execute('t', params as never, undefined, undefined, ctx))
-    const ours = await outcome(createSearchToolDefinitions(cwd).find.execute('t', params as never, undefined, undefined, ctx))
+    const pi = await outcome(within(createFindToolDefinition(cwd).execute('t', params as never, undefined, undefined, ctx), `pi's find: ${name}`))
+    const ours = await outcome(within(createSearchToolDefinitions(cwd).find.execute('t', params as never, undefined, undefined, ctx), `find: ${name}`))
     assert.deepEqual(sortFindText(ours), sortFindText(pi), `find: ${name}`)
   }
   // A limit picks whichever files fd reaches first: the same count, notice and details, each line a real match.
-  const all = new Set(((await createFindToolDefinition(outside).execute('t', { pattern: '*' }, undefined, undefined, ctx)).content[0] as { text: string }).text.split('\n'))
-  const pi = await createFindToolDefinition(outside).execute('t', { pattern: '*', limit: 3 }, undefined, undefined, ctx)
-  const ours = await createSearchToolDefinitions(outside).find.execute('t', { pattern: '*', limit: 3 }, undefined, undefined, ctx)
+  const all = new Set(((await within(createFindToolDefinition(outside).execute('t', { pattern: '*' }, undefined, undefined, ctx), 'pi\'s find: all')).content[0] as { text: string }).text.split('\n'))
+  const pi = await within(createFindToolDefinition(outside).execute('t', { pattern: '*', limit: 3 }, undefined, undefined, ctx), 'pi\'s find: a limit')
+  const ours = await within(createSearchToolDefinitions(outside).find.execute('t', { pattern: '*', limit: 3 }, undefined, undefined, ctx), 'find: a limit')
   assert.deepEqual(ours.details, pi.details)
   const [oursBody, oursNotice] = (ours.content[0] as { text: string }).text.split('\n\n')
   const [piBody, piNotice] = (pi.content[0] as { text: string }).text.split('\n\n')
@@ -214,9 +228,13 @@ test('a Stop during a search kills rg and rejects as pi\'s grep does', { skip: P
     assert.ok(rg > 0, 'rg started')
     record(rg)
     ac.abort()
-    assert.deepEqual(await p, { rejected: 'Operation aborted' })
+    assert.deepEqual(await within(p, 'the stopped search', 5000), { rejected: 'Operation aborted' })
     assert.deepEqual(await waitGone([rg], 1000), [], 'rg is gone')
   } finally {
+    // Whatever failed above, the search is stopped: its rg, reading a FIFO no one writes to, would never end, and
+    // would hold this file's process open.
+    ac.abort()
+    await within(p, 'the stopped search', 5000).catch(() => {})
     killRecorded(rg)
   }
 })
@@ -299,7 +317,7 @@ test('on Windows the lookup finds a program exactly when libuv\'s own spawn does
         for (const PATH of paths) {
           const env = { ...base, PATH, ...(skipCwd ? { NoDefaultCurrentDirectoryInExePath: '1' } : {}) }
           const ours = findSearchTool('rg', { platform: 'win32', binDir: () => join(dir, 'none'), env, daemonCwd: () => cwd }) !== null
-          const libuv = spawnSync('rg', ['--version'], { cwd, env, stdio: 'ignore', windowsHide: true }).error === undefined
+          const libuv = spawnSync('rg', ['--version'], { cwd, env, stdio: 'ignore', windowsHide: true, timeout: 10_000 }).error === undefined
           assert.equal(ours, libuv, `rg at ${at}, PATH=${PATH}${skipCwd ? ', NoDefaultCurrentDirectoryInExePath set' : ''}`)
         }
       }
@@ -326,17 +344,17 @@ test('with no rg anywhere, pi\'s warm-up runs once and the search uses what it i
     },
   }
   writeFileSync(join(dir, 'f.txt'), 'hit\n')
-  const r = await createSearchToolDefinitions(dir, installing).grep.execute('t', { pattern: 'hit' }, undefined, undefined, ctx)
+  const r = await within(createSearchToolDefinitions(dir, installing).grep.execute('t', { pattern: 'hit' }, undefined, undefined, ctx), 'grep after the warm-up')
   assert.deepEqual(warmed, ['rg'])
   assert.deepEqual(r.content, [{ type: 'text', text: 'f.txt:1: hit' }])
-  await createSearchToolDefinitions(dir, installing).grep.execute('t', { pattern: 'hit' }, undefined, undefined, ctx)
+  await within(createSearchToolDefinitions(dir, installing).grep.execute('t', { pattern: 'hit' }, undefined, undefined, ctx), 'grep, found the second time')
   assert.deepEqual(warmed, ['rg'], 'found the second time: no warm-up')
 
   const failing = { binDir: () => join(dir, 'none'), env: { PATH: join(dir, 'empty') }, warmUp: async () => { throw new Error('ripgrep (rg) is not available and could not be downloaded') } }
-  assert.deepEqual(await outcome(createSearchToolDefinitions(dir, failing).grep.execute('t', { pattern: 'x' }, undefined, undefined, ctx)),
+  assert.deepEqual(await outcome(within(createSearchToolDefinitions(dir, failing).grep.execute('t', { pattern: 'x' }, undefined, undefined, ctx), 'grep, a failed warm-up')),
     { rejected: 'ripgrep (rg) is not available and could not be downloaded' })
   const silent = { ...failing, warmUp: async () => {} }
-  assert.deepEqual(await outcome(createSearchToolDefinitions(dir, silent).find.execute('t', { pattern: 'x' }, undefined, undefined, ctx)),
+  assert.deepEqual(await outcome(within(createSearchToolDefinitions(dir, silent).find.execute('t', { pattern: 'x' }, undefined, undefined, ctx), 'find, a silent warm-up')),
     { rejected: 'fd is not available and could not be downloaded' })
 })
 
@@ -346,11 +364,11 @@ test('plan mode gets the tethered grep and find; auto and ask mode\'s tools are 
   const session = async (tools: string[] | undefined) => {
     const agentDir = join(cwd, 'agent')
     const resourceLoader = new DefaultResourceLoader({ cwd, agentDir, settingsManager: SettingsManager.inMemory(), noExtensions: true, noSkills: true, noContextFiles: true, noPromptTemplates: true, noThemes: true })
-    await resourceLoader.reload()
-    const { session: s } = await createAgentSession({
+    await within(resourceLoader.reload(), 'the resource loader')
+    const { session: s } = await within(createAgentSession({
       cwd, agentDir, resourceLoader, sessionManager: SessionManager.inMemory(cwd), settingsManager: SettingsManager.inMemory(),
       customTools: [createBashTool(cwd), ...searchToolsFor(cwd, tools)], ...(tools ? { tools } : {}),
-    })
+    }), 'createAgentSession')
     return s
   }
   const auto = await session(toolsForMode('auto'))
@@ -376,7 +394,7 @@ test('a repository\'s own pi extensions do not load into the daemon; the inline 
       extensionFactories: [{ name: 'turbollm-code', factory: () => { inline++ } }],
       noSkills: true, noContextFiles: true, noPromptTemplates: true, noThemes: true, noExtensions,
     })
-    await loader.reload()
+    await within(loader.reload(), 'the resource loader')
     return loader
   }
   await load(true)
@@ -389,7 +407,7 @@ test('a repository\'s own pi extensions do not load into the daemon; the inline 
 
 /** A FIFO (Node has no mkfifo of its own). */
 function mkfifo(p: string): void {
-  const r = spawnSync('mkfifo', [p])
+  const r = spawnSync('mkfifo', [p], { timeout: 10_000 })
   assert.equal(r.status, 0, `mkfifo ${p}: ${String(r.stderr)}`)
 }
 
@@ -410,13 +428,19 @@ function rgPidsWithArg(marker: string): number[] {
   return pidsOf('rg', marker)
 }
 
-/** Live processes named `comm` (macOS's `comm` is the executable's path) whose command line contains `marker`. */
+/** Live processes named `comm` whose command line contains `marker`: the command lines first, as ps's last column,
+ *  then each match's name, alone in its own (macOS's `comm` is the executable's path). They were read in one
+ *  `pid=,comm=,args=`, but macOS's ps cuts a column that is not the last to its width: Homebrew's rg read
+ *  `/opt/homebrew/bi`, nothing matched, and the Stop case, failing at "rg started", left its search (and its rg)
+ *  running, so this file never ended and CI's macOS job hung behind it. */
 function pidsOf(comm: string, marker: string): number[] {
-  const r = spawnSync('ps', ['-A', '-o', 'pid=,comm=,args='], { encoding: 'utf8' })
+  const r = spawnSync('ps', ['-A', '-o', 'pid=,args='], { encoding: 'utf8', timeout: 10_000 })
   const out: number[] = []
   for (const line of String(r.stdout ?? '').split('\n')) {
-    const m = /^\s*(\d+)\s+(\S+)\s+(.*)$/.exec(line)
-    if (m && basename(m[2]) === comm && m[3].includes(marker) && !isGone(Number(m[1]))) out.push(Number(m[1]))
+    const m = /^\s*(\d+)\s+(.*)$/.exec(line)
+    if (!m || !m[2].includes(marker)) continue
+    const name = String(spawnSync('ps', ['-o', 'comm=', '-p', m[1]], { encoding: 'utf8', timeout: 10_000 }).stdout ?? '').trim()
+    if (basename(name) === comm && !isGone(Number(m[1]))) out.push(Number(m[1]))
   }
   return out
 }
