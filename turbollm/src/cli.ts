@@ -1,6 +1,7 @@
 import { takeBootEnvironment } from './util/boot-env'
 import { hideChildConsoleWindows } from './util/hide-console-windows'
-import { closeAllLifelines, killTetheredSync, refuseNewTetheredSpawns, stopTethered, tetherReady } from './util/tether'
+import { closeAllLifelines, killTetheredSync, refuseNewTetheredSpawns, setJobSentinel, stopTethered, tetherReady } from './util/tether'
+import { JobSentinel } from './util/win-job-sentinel'
 import { checkOrphansReaped } from './util/pid1'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -430,6 +431,21 @@ if (runningDaemon) {
       `Use that one, stop it first with \`turbollm --stop\`, or start this one with its own --config.`,
   )
   process.exit(DATA_DIR_IN_USE_EXIT_CODE)
+}
+
+// Windows: the job sentinel (util/win-job-sentinel.ts) puts every tethered child, and every Code terminal's shell, in
+// a kill-on-close job of its own that allows no breakaway, whose only handle this process holds, so their whole
+// trees end with it however it ends. A plain child, so it sits in libuv's own job and dies with this process too.
+// Without PowerShell or Add-Type it logs one line, and stops fall back to taskkill /T. Started here, on the daemon's
+// path only, before the reapers and the first tethered spawn (reconcileTailscale's CLI); a child spawned while it
+// starts (1-3 s) waits for it. Not at the top of this file: there `launch` (every agent a Code terminal launches),
+// `mcp-server` (every MCP host session), `--help`, `--stop` and a start refused above would each run PowerShell and
+// Add-Type's compile for nothing (none of them needs a job: what a launch starts sits in libuv's job, its plain
+// children and `launch hermes`'s `hermes config set`, a tethered one, which without a sentinel is a plain child there
+// too), and where it is unavailable its line would land in the agent's terminal or the MCP host's stderr.
+if (process.platform === 'win32') startJobSentinel()
+function startJobSentinel(): void {
+  setJobSentinel(new JobSentinel().start())
 }
 
 // Reap any engine processes orphaned by a previous daemon that didn't shut down

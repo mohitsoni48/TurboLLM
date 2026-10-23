@@ -103,16 +103,28 @@
 //
 // ── Windows ────────────────────────────────────────────────────────────────────────────────────────────────────
 // A child is spawned as it is today (never detached: libuv's kill-on-close job, whose only handle the daemon holds,
-// kills the direct children however the daemon dies), and is registered, so a graceful stop ends each tree with
-// `taskkill /T /F` while its root is still alive (a SIGTERM there is a TerminateProcess of the root alone, which cut
-// the root's children loose), and the exit handler ends the rest in one `taskkill`.
+// kills the direct children however the daemon dies), and is registered. libuv's job allows breakaway, and Git for
+// Windows breaks every child it creates away from such a job, so the job sentinel (win-job-sentinel.ts, .ps1) also
+// puts each child, and what it has started, in a kill-on-close job of its own that allows none, whose only handle it
+// hands to the daemon: `add` right after the spawn, with the time window around it for the sentinel's pid-reuse guard.
+// An answer is kept whenever it arrives. When the program exits (or the answer comes after its exit) its job is
+// ended (`end`: what it left dies, as POSIX's group kill does at exit), or, for a hold, closed if it has no live
+// member and held otherwise (`idle`). A graceful stop ends each job, an atomic kill of the whole tree; without one
+// it ends each tree with `taskkill /T /F` while its root is still alive (a SIGTERM there is a TerminateProcess of the
+// root alone, which cut the root's children loose). The exit handler ends the rest in one `taskkill`, and the jobs
+// close with the daemon's handles. A handle is given to `end` or a closing `idle` at most once: a value the OS has
+// since reused for something else is never closed. Nothing more is sent for a handle while an `idle` of it is
+// unanswered: the idle may close it, and the daemon's handle table can give the value out at once to the next job a
+// child is added in, which an `end` sent behind the idle (a release, the shutdown, the keeper) would kill.
 //
-// This module imports only child_process, fs, path and url, so it stays in the Android bundle (Node 18.20.4).
+// This module imports only child_process, fs, path and url (and win-job-sentinel.ts's types), so it stays in the
+// Android bundle (Node 18.20.4).
 import { execFile, spawn, spawnSync, type ChildProcess, type ExecFileOptions, type SpawnOptions, type StdioOptions } from 'node:child_process'
 import { accessSync, closeSync, constants, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs'
 import type { Socket } from 'node:net'
 import { basename, join, resolve as resolvePath } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { AddReply, JobSentinel } from './win-job-sentinel'
 
 export type TetherKind = 'engine' | 'tunnel' | 'routine-cli' | 'code-bash' | 'agent-install' | 'mcp' | 'lsp' | 'build'
   | 'install' | 'provision' | 'extract' | 'usage' | 'chrome' | 'git' | 'probe'
@@ -144,6 +156,25 @@ const RECOUNT_MS = 60_000
 const ANDROID_HELPER_NAME = 'libtether_exec.so'
 
 const noop = () => { /* deliberately empty */ }
+
+/** How long a Windows spawnHeld waits, at most, for its tie (robust-bash's gate holds the command until then). */
+const TIE_WAIT_MS = 2000
+
+let platformOverride: NodeJS.Platform | null = null
+/** The platform the tether acts for: process.platform, or a test's stand-in (its Windows protocol runs on every OS). */
+export function tetherPlatform(): NodeJS.Platform {
+  return platformOverride ?? process.platform
+}
+/** Test-only: act as if on `platform` (null: the real one). */
+export function _setTetherPlatform(platform: NodeJS.Platform | null): void {
+  platformOverride = platform
+}
+
+/** The Windows job sentinel, once cli.ts has started it (tests: a stand-in). */
+let sentinel: JobSentinel | null = null
+export function setJobSentinel(s: JobSentinel | null): void {
+  sentinel = s
+}
 
 // ── The shell, and finding the program ─────────────────────────────────────────────────────────────────────────
 
@@ -367,6 +398,29 @@ interface Entry {
   stopping: boolean
   /** 'deciding': exited, its group being counted. 'held': exited, kept in its scope. */
   state: 'live' | 'deciding' | 'held' | 'closed'
+  /** Windows: its job from the sentinel. */
+  job?: JobTie
+  /** spawnHeld's `tied`. */
+  tied?: Promise<void>
+}
+
+/** A Windows child's job. 'pending': `add` not answered yet. 'tied': the daemon holds the job's handle. 'ended' or
+ *  'closed': the handle was given back (at most once). 'untied': no job (gone, refused, no sentinel). 'lost': the
+ *  sentinel died before it answered an `idle`, which may have closed the handle already: it is never used again, and
+ *  what is left in the job (if anything) ends with the daemon. */
+interface JobTie {
+  state: 'pending' | 'tied' | 'ended' | 'closed' | 'untied' | 'lost'
+  handle: string | null
+  /** An end was asked for while the answer to `add`, or to an `idle`, was pending: carried out when it comes (for an
+   *  idle, unless it closed the job, which then had nothing left to end). */
+  endWanted: boolean
+  /** A tied job's `idle` is unanswered (settles once it is answered and acted on): no `end` or second `idle` is sent
+   *  for the handle meanwhile (see the header). */
+  idling: Promise<void> | null
+}
+
+function jobOpen(e: { job?: JobTie }): boolean {
+  return e.job !== undefined && (e.job.state === 'pending' || e.job.state === 'tied')
 }
 
 /** Every entry whose program runs or whose lifeline is still open. */
@@ -374,7 +428,7 @@ const entries = new Set<Entry>()
 const byChild = new WeakMap<ChildProcess, Entry>()
 
 function forgetIfDone(e: Entry): void {
-  if (e.exited && !e.lifelineOpen) {
+  if (e.exited && !e.lifelineOpen && !jobOpen(e)) {
     e.state = 'closed'
     entries.delete(e)
   }
@@ -448,6 +502,12 @@ function register(e: Entry): void {
 
 function onProgramExit(e: Entry): void {
   e.exited = true
+  if (e.job) {
+    // Windows. An answer still pending acts on the exit when it comes (onJobReply).
+    if (e.job.state === 'tied') actOnJobAtExit(e)
+    else forgetIfDone(e)
+    return
+  }
   if (!e.lifelineOpen) return forgetIfDone(e)
   if (e.stopping) return // endGroups closes it once the group is down to the watcher, or at its grace
   if (e.end === 'term') return quitLifeline(e) // it ended by itself: no SIGTERM for it
@@ -471,6 +531,100 @@ function onProgramExit(e: Entry): void {
   }
   // Whatever the program left in its group dies with it.
   closeLifeline(e)
+}
+
+// ── Windows jobs ───────────────────────────────────────────────────────────────────────────────────────────────
+
+/** The sentinel's answer to `add`, whenever it comes: kept, and acted on as the program's exit would have been when
+ *  the program has exited meanwhile (a Code bash `nohup srv &`, or `cmd /c start srv`, returns within milliseconds
+ *  and leaves srv running). The pid-reuse guard already makes a wrong tie all but impossible. */
+function onJobReply(e: Entry, r: AddReply): void {
+  const j = e.job as JobTie
+  if (r.kind === 'ok') {
+    j.handle = r.handle
+    j.state = 'tied'
+    if (j.endWanted) endJob(e)
+    else if (e.exited) actOnJobAtExit(e)
+    return
+  }
+  j.state = 'untied'
+  if (r.kind === 'refused') {
+    console.warn(`[tether] ${e.child.spawnfile}: the windows job sentinel refused pid ${e.child.pid} (${r.reason}); its children are tied by libuv's job only`)
+  }
+  // 'gone': it exited and its handle was closed before the sentinel opened it; what it started is tied only as
+  // libuv's job ties it (Known). 'unavailable': no sentinel.
+  forgetIfDone(e)
+}
+
+/** Kill the job's whole tree and give its handle back, at most once. False when there is no job to end (no sentinel,
+ *  untied, already ended), or the sentinel cannot be reached now: the caller falls back to a tree kill. While the
+ *  answer to its `add` or to an `idle` of it is pending, the end is carried out when it comes. `s`: the sentinel to
+ *  send it to (an idle's answer goes to the one it was sent to, which the keeper has let go of by then). */
+function endJob(e: { job?: JobTie }, s: JobSentinel | null = sentinel): boolean {
+  const j = e.job
+  if (!j) return false
+  if (j.state === 'pending' || (j.state === 'tied' && j.idling)) {
+    j.endWanted = true
+    return true
+  }
+  if (j.state !== 'tied' || !j.handle || !s || !s.end(j.handle)) return false
+  j.state = 'ended'
+  forgetIfDone(e as Entry)
+  return true
+}
+
+/** The sentinel died before it answered an `idle` of this job, so its handle may be closed already and may since name
+ *  another job of the daemon's: it is never sent again (an `end` or `idle` on it could close that other job), and what
+ *  is left in the job, if anything, ends with the daemon (Known). */
+function loseJob(e: Entry): void {
+  ;(e.job as JobTie).state = 'lost'
+  console.warn(`[tether] ${e.child.spawnfile}: the windows job sentinel died before it said whether pid ${e.child.pid}'s job is empty; what is left in it ends with the daemon`)
+  forgetIfDone(e)
+}
+
+/** The program has exited and its job is tied: what it left dies (`end`), or for a hold, the job is closed when it
+ *  has no live member and held in its scope otherwise (`idle`). */
+function actOnJobAtExit(e: Entry): void {
+  if (e.hold === undefined || e.noHold || e.stopping || !sentinel) {
+    endJob(e)
+    return
+  }
+  e.state = 'deciding'
+  void idleJob(e, sentinel).then((r) => {
+    if (r !== 'held') return
+    // The job is the daemon's until it is released or the daemon ends.
+    e.state = 'held'
+    armRecount()
+  })
+}
+
+/** Send a tied job's `idle` to `s` and act on the answer. 'closed': it had no live member, and the sentinel closed the
+ *  handle, so nothing more is sent for it (an end asked for meanwhile included: the value may name another job by
+ *  now). 'lost': loseJob. 'held', or the sentinel is down: it stays the daemon's, unless an end was asked for
+ *  meanwhile or it may no longer be held (a release, the shutdown, the keeper), and then it is ended now. */
+function idleJob(e: Entry, s: JobSentinel): Promise<'closed' | 'lost' | 'ended' | 'held'> {
+  const j = e.job as JobTie
+  let answered = noop
+  j.idling = new Promise<void>((resolve) => { answered = resolve })
+  return s.idle(j.handle as string).then((r) => {
+    j.idling = null
+    try {
+      if (j.state !== 'tied') return 'ended'
+      if (r === 'closed') {
+        j.state = 'closed'
+        forgetIfDone(e)
+        return 'closed'
+      }
+      if (r === 'lost') {
+        loseJob(e)
+        return 'lost'
+      }
+      if ((j.endWanted || e.noHold) && endJob(e, s)) return 'ended'
+      return 'held'
+    } finally {
+      answered()
+    }
+  })
 }
 
 // ── Group counts ───────────────────────────────────────────────────────────────────────────────────────────────
@@ -528,16 +682,30 @@ function armRecount(): void {
   recountTimer.unref()
 }
 
-/** Close every held group that is down to its watcher. Returns how many were closed. Also run by the tests. */
+/** Close every held group that is down to its watcher (Windows: every held job with no live member). Returns how
+ *  many were closed. Also run by the tests. */
 export async function recountHeld(): Promise<number> {
-  const held = [...entries].filter((e) => e.state === 'held')
-  if (held.length === 0) {
+  const all = [...entries].filter((e) => e.state === 'held')
+  if (all.length === 0) {
     if (recountTimer) clearInterval(recountTimer)
     recountTimer = null
     return 0
   }
-  const counts = await countGroupMembers()
   let closed = 0
+  const jobs = all.filter((e) => e.job)
+  const held = all.filter((e) => !e.job)
+  if (jobs.length > 0 && sentinel) {
+    const s = sentinel
+    await Promise.all(jobs.map(async (e) => {
+      const j = e.job as JobTie
+      if (j.state !== 'tied' || !j.handle || j.idling) return // an idle of it is unanswered: one at a time
+      if ((await idleJob(e, s)) === 'closed') {
+        e.state = 'closed'
+        closed++
+      }
+    }))
+  }
+  const counts = held.length > 0 ? await countGroupMembers() : new Map<number, number>()
   for (const e of held) {
     if (e.state !== 'held') continue
     if ((counts.get(e.child.pid as number) ?? 0) <= 1) {
@@ -554,6 +722,14 @@ export async function recountHeld(): Promise<number> {
 }
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+/** Once every promise in `list` has settled, or after `ms`, whichever is first; the timer never outlives the wait. */
+async function settledWithin(list: Promise<void>[], ms: number): Promise<void> {
+  if (list.length === 0) return
+  let timer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([Promise.all(list), new Promise<void>((resolve) => { timer = setTimeout(resolve, ms) })])
+  clearTimeout(timer)
+}
 
 /** End these groups gracefully: SIGTERM to each (term mode: to the program alone), then close each lifeline once
  *  its program has exited and only the watcher is left, or after `graceMs` (the watcher then fires its end mode: a
@@ -620,12 +796,22 @@ export function refuseNewTetheredSpawns(): void {
 function startTethered(file: string, args: readonly string[] | null, options: SpawnOptions, tether: Tether & { hold?: string }): Entry {
   if (refusing) throw new Error(`spawnTethered(${file}): this process is a restart keeper and starts nothing more`)
   const end = tether.end ?? 'kill'
-  if (process.platform === 'win32') {
+  if (tetherPlatform() === 'win32') {
     // A detached child is outside libuv's kill-on-close job: nothing would end it with the daemon.
     if (options.detached) throw new TypeError(`spawnTethered(${file}): a detached child escapes the daemon's job on Windows`)
+    // The window around the spawn() call: the sentinel's pid-reuse guard checks the child's creation time against it.
+    const startMs = Date.now()
     const child = args === null ? spawn(file, options) : spawn(file, [...args], options)
+    const endMs = Date.now()
     const e: Entry = { child, kind: tether.kind, end, socket: null, lifelineOpen: false, group: false, hold: tether.hold, noHold: false, exited: false, stopping: false, state: 'live' }
-    if (child.pid !== undefined) register(e)
+    if (child.pid !== undefined) {
+      if (sentinel?.available()) {
+        e.job = { state: 'pending', handle: null, endWanted: false, idling: null }
+        const reply = sentinel.add(child.pid, startMs, endMs).then((r) => onJobReply(e, r))
+        e.tied = Promise.race([reply, new Promise<void>((resolve) => setTimeout(resolve, TIE_WAIT_MS).unref())])
+      }
+      register(e)
+    }
     return e
   }
   const { shell, ...opts } = options
@@ -794,14 +980,15 @@ function settleOnExit(child: ChildProcess): Promise<{ code: number | null; signa
 
 /** A tethered spawn that may be held. `settled` resolves on 'exit' plus the end of stdout and stderr, or 100 ms
  *  without data after the exit, never on 'close', and rejects with the spawn's error when it did not start.
- *  `tied` resolves once the child is tied: at once on POSIX and Android, and on Windows until the job sentinel
- *  exists (libuv's job is in place the moment spawn returns). */
+ *  `tied` resolves once the child is tied: at once on POSIX and Android; on Windows once the job sentinel has
+ *  answered for it, or after TIE_WAIT_MS, at once when there is no sentinel (libuv's job is in place the moment
+ *  spawn returns). robust-bash holds a command until then, so whatever it starts is born in its job. */
 export function spawnHeld(file: string, args: readonly string[] | null, options: SpawnOptions, tether: HeldTether):
   { child: ChildProcess; tied: Promise<void>; settled: Promise<{ code: number | null; signal: NodeJS.Signals | null }> } {
   const e = startTethered(file, args, options, tether)
   const settled = settleOnExit(e.child)
   settled.catch(noop) // a caller that only wants `child` must not get an unhandled rejection
-  return { child: e.child, tied: Promise.resolve(), settled }
+  return { child: e.child, tied: e.tied ?? Promise.resolve(), settled }
 }
 
 /** An execFile-shaped rejection: an Error with execFile's extra fields. */
@@ -930,14 +1117,18 @@ export function endTetheredGroup(child: ChildProcess): void {
 
 /** Force path for one tethered child. POSIX: kill(-pid, sig), else the pid; once the program has exited, its group
  *  only while its watcher still pins the id, and never the pid, which Node has reaped (an engine whose stdio an
- *  escaped worker holds open is force-killed after its exit). Windows: taskkill /T /F while the program runs, never
- *  once Node has seen it exit (libuv has then closed its handle, which kept the pid from being reused). */
+ *  escaped worker holds open is force-killed after its exit). Windows: its job ended (the whole tree at once), else
+ *  taskkill /T /F while the program runs, never once Node has seen it exit (libuv has then closed its handle, which
+ *  kept the pid from being reused). */
 export function killTetheredTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  // Windows: a taskkill /T of a pid Node has seen exit could end another process tree that got the number.
-  if (process.platform === 'win32' && (child.exitCode !== null || child.signalCode !== null)) return
   const pid = child.pid
   if (!pid) return
-  if (process.platform === 'win32') {
+  if (tetherPlatform() === 'win32') {
+    const e = byChild.get(child)
+    if (e?.job?.state === 'tied' && endJob(e)) return // the whole tree at once
+    if (e) endJob(e) // an answer still pending ends the job when it comes; the tree kill below does not wait for it
+    // A taskkill /T of a pid Node has seen exit could end another process tree that got the number.
+    if (child.exitCode !== null || child.signalCode !== null) return
     execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, noop)
     return
   }
@@ -961,22 +1152,47 @@ export function killTetheredTree(child: ChildProcess, signal: NodeJS.Signals): v
  *  (bounded), so a caller can remove the directory they ran in next. */
 export async function releaseTetherScope(scope: string, graceMs = 3000): Promise<void> {
   const held: Entry[] = []
+  const idles: Promise<void>[] = []
   for (const e of entries) {
     if (e.hold !== scope) continue
     e.noHold = true
     if (e.state === 'held') held.push(e)
+    if (e.job?.idling) idles.push(e.job.idling)
   }
-  await endGroups(held, graceMs)
+  const jobs = held.filter((e) => e.job)
+  if (jobs.length > 0 || idles.length > 0) {
+    // Windows: each held job ended at once, no SIGTERM step (there it would be a TerminateProcess of one process);
+    // one whose idle is unanswered is ended at the answer (unless that idle closed it), which is waited for, bounded.
+    // A moment for its processes to be gone, so a caller that removes their directory next can.
+    for (const e of jobs) endJob(e)
+    await settledWithin(idles, graceMs)
+    await sleep(200)
+  }
+  await endGroups(held.filter((e) => !e.job), graceMs)
 }
 
 /** For the restart keeper: every lifeline closed now, held or not, so each watcher fires its end mode, and every
- *  Code terminal released. */
-export function closeAllLifelines(): void {
+ *  Code terminal released. Windows: every job ended, held ones included; a running child whose job cannot be ended
+ *  now (its sentinel is restarting) has its tree killed while its root lives, as stopTethered does, rather than
+ *  living on in the keeper. `deps` is for the tests: the Windows tree kill. */
+export function closeAllLifelines(deps: { treeKill?: (pids: number[]) => void } = {}): void {
+  const roots: number[] = []
   for (const e of [...entries]) {
     e.noHold = true
     closeLifeline(e)
+    if (!endJob(e) && e.job?.state === 'tied' && !e.exited && e.child.pid) roots.push(e.child.pid)
   }
+  if (roots.length > 0) (deps.treeKill ?? win32TreeKill)(roots)
   for (const t of [...terminals]) releaseTerminal(t)
+  // Windows: the keeper's replacement starts a sentinel of its own. One whose idle is unanswered is stopped once it is
+  // answered (bounded), so that a held job's end, sent at the answer, still reaches it.
+  if (sentinel) {
+    const s = sentinel
+    sentinel = null
+    const idles = [...entries].map((e) => e.job?.idling).filter((p): p is Promise<void> => !!p)
+    if (idles.length === 0) s.stop()
+    else void settledWithin(idles, 3000).then(() => s.stop())
+  }
 }
 
 /** The default Windows tree kill: one taskkill for every root, sent while they are alive. */
@@ -990,8 +1206,9 @@ function win32TreeKill(pids: number[]): void {
  *     `graceMs` the lifelines still open are closed, a group SIGKILL, though never for term mode (the daemon's exit
  *     sends that one its SIGTERM again). Every Code terminal is released: its shell is hung up, and what is left of
  *     its session is killed 1 s later;
- *   - Windows: each tree is ended while its root is alive (taskkill /T /F). No SIGTERM step: there it would be a
- *     TerminateProcess of the root alone, and the root's children would be cut loose.
+ *   - Windows: each job is ended (the sentinel's `end`, an atomic kill of the whole tree), held ones and Code
+ *     terminals' included; a child with no job has its tree ended while its root is alive (taskkill /T /F). No
+ *     SIGTERM step: there it would be a TerminateProcess of the root alone, and the root's children cut loose.
  *  `deps` is for the tests: the platform, and the Windows tree kill. */
 export async function stopTethered(graceMs = 3000, deps: { platform?: NodeJS.Platform; treeKill?: (pids: number[]) => void } = {}): Promise<void> {
   const platform = deps.platform ?? process.platform
@@ -999,7 +1216,16 @@ export async function stopTethered(graceMs = 3000, deps: { platform?: NodeJS.Pla
   for (const e of all) e.noHold = true // shutting down: nothing new is held
   const live = all.filter((e) => !e.exited && e.kind !== 'engine' && e.kind !== 'tunnel')
   if (platform === 'win32') {
-    const roots = live.map((e) => e.child.pid).filter((p): p is number => typeof p === 'number')
+    // Each job ended (its whole tree at once); a child with none, or whose answer is still pending (it is ended when
+    // the answer comes), its tree with taskkill while its root lives.
+    const roots: number[] = []
+    for (const e of live) {
+      if (e.job?.state === 'tied' && endJob(e)) continue
+      endJob(e)
+      if (e.child.pid) roots.push(e.child.pid)
+    }
+    for (const e of all) if (e.exited) endJob(e) // held jobs, and jobs still being decided
+    for (const t of [...terminals]) releaseTerminal(t)
     if (roots.length > 0) (deps.treeKill ?? win32TreeKill)(roots)
     await Promise.race([
       Promise.all(live.map((e) => (e.exited ? undefined : new Promise<void>((resolve) => e.child.once('exit', () => resolve()))))),
@@ -1013,11 +1239,13 @@ export async function stopTethered(graceMs = 3000, deps: { platform?: NodeJS.Pla
 
 /** The 'exit' handler's belt, synchronous. POSIX, by end mode: kill → group SIGKILL; term-then-kill → group
  *  SIGTERM (its watcher finishes the job once the daemon's end of the lifeline closes); term → SIGTERM to the
- *  program. Held groups included. Windows: one `taskkill /F /T /PID a /PID b …` for the children still running. */
+ *  program. Held groups included. Windows: one `taskkill /F /T /PID a /PID b …` for the children still running
+ *  that are not in a job of their own (those die with the daemon's handles to their jobs). */
 export function killTetheredSync(): void {
   const all = [...entries]
-  if (process.platform === 'win32') {
-    const pids = all.filter((e) => !e.exited).map((e) => e.child.pid).filter((p): p is number => typeof p === 'number')
+  if (tetherPlatform() === 'win32') {
+    // A child in a job of its own dies with the daemon's handle to it, as this process exits.
+    const pids = all.filter((e) => !e.exited && e.job?.state !== 'tied').map((e) => e.child.pid).filter((p): p is number => typeof p === 'number')
     if (pids.length === 0) return
     try {
       spawnSync('taskkill', ['/F', '/T', ...pids.flatMap((p) => ['/PID', String(p)])], { stdio: 'ignore', windowsHide: true, timeout: 10_000 })
@@ -1065,8 +1293,10 @@ export const PTY_WATCH = 'SID=$1; unset TMOUT; trap "" HUP INT TERM; exec </dev/
 interface TerminalTie {
   socket: Socket | null
   released: boolean
-  /** Resolves when the watcher has exited: it fired, or never started. */
+  /** Resolves when the watcher has exited: it fired, or never started (Windows: at once). */
   gone: Promise<void>
+  /** Windows: the shell's job. */
+  job?: JobTie
 }
 const terminals = new Set<TerminalTie>()
 
@@ -1074,15 +1304,40 @@ function releaseTerminal(t: TerminalTie): void {
   if (t.released) return
   t.released = true
   t.socket?.destroy()
+  if (t.job) {
+    endJob(t)
+    terminals.delete(t)
+  }
 }
 
 /** Tie a Code terminal's shell, and everything started in it, to the daemon (decision a: what a terminal started
  *  ends when the terminal is closed or the daemon ends, `nohup` and background jobs included). `release()` ends
  *  them now: call it when the terminal is closed or its shell exits. A graceful stop (stopTethered) and the
  *  restart keeper (closeAllLifelines) release every terminal; a daemon that dies releases them by itself. On
- *  Windows a terminal is not tied yet: it keeps today's behaviour (the 'exit' handler's taskkill /T). */
-export function tetherTerminal(shellPid: number): { release(): void } {
-  if (refusing || process.platform === 'win32' || !Number.isInteger(shellPid) || shellPid <= 0) return { release: noop }
+ *  Windows the shell (ConPTY creates it in the daemon's own process, so the daemon is its parent) gets a job of its
+ *  own from the sentinel, with no breakaway: everything started in it, GUI programs included, is born in that job,
+ *  and release() ends it. `spawnWindow`: the time around the pty's spawn, for the sentinel's pid-reuse guard. */
+export function tetherTerminal(shellPid: number, spawnWindow?: { startMs: number; endMs: number }): { release(): void } {
+  if (refusing || !Number.isInteger(shellPid) || shellPid <= 0) return { release: noop }
+  if (tetherPlatform() === 'win32') {
+    if (!sentinel?.available()) return { release: noop } // today's: the 'exit' handler's taskkill /T
+    const t: TerminalTie = { socket: null, released: false, gone: Promise.resolve(), job: { state: 'pending', handle: null, endWanted: false, idling: null } }
+    terminals.add(t)
+    const window = spawnWindow ?? { startMs: 0, endMs: Date.now() }
+    void sentinel.add(shellPid, window.startMs, window.endMs).then((r) => {
+      const j = t.job as JobTie
+      if (r.kind === 'ok') {
+        j.handle = r.handle
+        j.state = 'tied'
+        if (j.endWanted) endJob(t)
+        return
+      }
+      j.state = 'untied'
+      terminals.delete(t)
+      if (r.kind === 'refused') console.warn(`[tether] terminal ${shellPid}: the windows job sentinel refused it (${r.reason}); what it starts is tied by the 'exit' handler's taskkill /T only`)
+    })
+    return { release: () => releaseTerminal(t) }
+  }
   let watcher: ChildProcess
   try {
     watcher = spawn(nodeShell(), ['-c', PTY_WATCH, 'sh', String(shellPid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })

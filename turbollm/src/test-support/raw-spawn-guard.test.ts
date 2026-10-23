@@ -47,6 +47,7 @@ const RAW_SPAWN_SITES: Record<string, string> = {
   'util/tether.ts#killTetheredSync:spawnSync': WIN_KILL,
   'util/tether.ts#killTetheredTree:execFile': WIN_KILL,
   'util/tether.ts#win32TreeKill:execFile': WIN_KILL,
+  'util/win-job-sentinel.ts#JobSentinel.launch:spawn': 'the Windows job sentinel: a plain child, so it sits in libuv\'s own kill-on-close job and dies with the daemon; it holds no job of its own (the daemon holds every handle)',
   'util/pid1.ts#checkOrphansReaped:spawn': 'the boot check of whether anything reaps orphans: a `sh` that exits at once, leaving the one orphan the check watches',
   'util/hide-console-windows.ts#hideChildConsoleWindows:ChildProcess.prototype': 'patches windowsHide into every spawn on Windows; starts nothing itself',
 

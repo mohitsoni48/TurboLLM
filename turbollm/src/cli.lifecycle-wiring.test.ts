@@ -295,3 +295,25 @@ test('the boot checks whether anything reaps orphans, once the server listens, w
   assert.ok(at > CLI.indexOf('\n}\n', CLI.indexOf('deps.rebind = () => {')), 'after deps.rebind')
   assert.ok(CLI.includes("import { checkOrphansReaped } from './util/pid1'"))
 })
+
+// Windows: a child's own children got out of libuv's job (Git for Windows breaks every child away from a job that
+// allows it), and a Code terminal's shell was in no job at all. The job sentinel ties them; it starts before
+// anything is tied, and a child spawned while it starts waits for it. Only the daemon needs it: `launch` (every agent
+// a Code terminal launches), `mcp-server` (every MCP host session), `--help`, `--stop` and a refused second daemon
+// would each start PowerShell and Add-Type's compile for nothing, and print its "unavailable" line, where it is, into
+// the agent's terminal or the MCP host's stderr.
+test('on Windows the boot starts the job sentinel on the daemon\'s path only, before anything is spawned', () => {
+  const START = "\nif (process.platform === 'win32') startJobSentinel()\n"
+  const start = CLI.indexOf(START)
+  assert.ok(start > 0, 'cli.ts starts the sentinel on Windows')
+  assert.equal([...CLI.matchAll(/\bstartJobSentinel\(\)(?!:)/g)].length, 1, 'and only there')
+  for (const branch of ["if (argv[0] === 'launch') {", "if (argv[0] === 'mcp-server') {", "if (hasFlag('--help', '-h')) {", "if (hasFlag('--stop')) {", 'if (claimHolder) {', 'if (runningDaemon) {']) {
+    const at = CLI.indexOf(`\n${branch}\n`)
+    assert.ok(at > 0, `cli.ts has ${branch}`)
+    assert.ok(CLI.indexOf('\n}\n', at) < start, `after ${branch} … }`)
+  }
+  for (const later of ['reapStaleEngines(store.dir())', 'reapStaleTunnels(store.dir())', 'reconcileTailscale(bootIngressPort)', 'reapStaleTerminals(store.dir())', 'void runAutoLoad({', '\nlisten()\n']) {
+    assert.ok(start < CLI.indexOf(later), `before ${later.trim()}`)
+  }
+  assert.ok(CLI.includes("import { JobSentinel } from './util/win-job-sentinel'"))
+})

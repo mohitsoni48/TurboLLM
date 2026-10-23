@@ -56,8 +56,8 @@ export class PTYSession {
   // shell exits, and by the daemon's own end, however it ends. Everything started in the terminal then ends with
   // it: the launched agent CLI even when it ignores the hangup, background and `nohup` jobs. Before, those were
   // cut loose: a daemon SIGKILL, or the terminal's own close, left a `nohup` server or a hangup-proof CLI running,
-  // parented to init (the 'exit' handler and the next start's reaper kill only the shell). Windows terminals keep
-  // today's behaviour until the job sentinel ties them.
+  // parented to init (the 'exit' handler and the next start's reaper kill only the shell). On Windows the job
+  // sentinel gives the shell a job of its own, with no breakaway (GUI programs started from it included).
   private tether: { release(): void } | null = null
   // Every byte the PTY has ever written, capped — replayed to a NEWLY connecting WebSocket
   // client (terminal-manager.ts's registerWsListener) so a reconnect (tab reload, WS drop,
@@ -86,6 +86,7 @@ export class PTYSession {
       ? (win32 ? ['-NoExit', '-Command', launchCommand] : ['-lc', `${launchCommand}; exec bash`])
       : []
 
+    const spawnStartMs = Date.now()
     this.pty = ptyModule.spawn(shell, args, {
       name: 'xterm-256color',
       cols,
@@ -100,9 +101,10 @@ export class PTYSession {
       }) as Record<string, string>,
     })
 
+    const spawnEndMs = Date.now()
     const termPty = this.pty!
     this.processId = termPty.pid
-    this.tether = tetherTerminal(termPty.pid)
+    this.tether = tetherTerminal(termPty.pid, { startMs: spawnStartMs, endMs: spawnEndMs })
 
     // termPty is non-null here (captured from `this.pty!` above).
     termPty.onData((data: string) => {

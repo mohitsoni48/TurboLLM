@@ -40,11 +40,22 @@ import { constants } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { getShellConfig } from '@earendil-works/pi-coding-agent'
 import type { BashOperations } from '@earendil-works/pi-coding-agent'
-import { spawnHeld } from '../util/tether'
+import { killTetheredTree, spawnHeld, tetherPlatform } from '../util/tether'
 import { withForegroundGitGc } from '../util/git-gc'
-import { killTetheredTree } from '../util/tether'
 
 const EXIT_STDIO_GRACE_MS = 100
+
+/** Windows: what a command waits behind until its job exists (see exec below). Exported for its test. bash's `read`
+ *  takes an exported TMOUT for its timeout when it is given no -t (CIS hardening sets TMOUT=900), and a plain `read`
+ *  then let the command start TMOUT seconds in, untied. So the gate's read has a -t of a day, which keeps TMOUT out of
+ *  it in every bash (3.2, macOS's, on), TMOUT readonly or not, and is never reached: the line is written within 2 s of
+ *  the spawn (TIE_WAIT_MS in util/tether.ts), and the daemon's death gives the read EOF. Reading again after a timeout
+ *  would not do under bash 3.2, whose timed-out read returns 1, as at EOF; nor would `TMOUT= read` where TMOUT is
+ *  readonly (a BASH_ENV can make it so): the assignment fails and the read still times out. The command keeps TMOUT.
+ *  A shellPath set to a shell whose read has no -t (dash) gets the plain read after it, which waits there (dash's read
+ *  takes no TMOUT); its "Illegal option -t" goes to /dev/null, not into the command's output. At EOF the plain read
+ *  returns at once too. */
+export const TIE_GATE = 'IFS= read -t 86400 -r _ 2>/dev/null || IFS= read -r _; exec </dev/null; '
 
 /** Adapted from pi-coding-agent's utils/child-process.js — see module comment above. */
 function waitForChildProcess(child: ChildProcess): Promise<number | null> {
@@ -243,24 +254,31 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
         throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`)
       }
       const commandFromStdin = shellConfig.commandTransport === 'stdin'
+      // Windows: the command starts only once its tie exists. The job sentinel puts the shell in a job of its own
+      // (util/tether.ts), but a command that returns within milliseconds (`nohup srv &`, `cmd //c start srv`) could
+      // leave srv running, born outside that job, before the tie was made. So the shell first waits for one line on
+      // a stdin pipe, which is written once the sentinel has answered for it (or after 2 s; at once without a
+      // sentinel), whatever TMOUT says (TIE_GATE), and then gives the command /dev/null as its stdin, as before. A
+      // shell that takes its command on stdin (WSL's bash) simply gets the command then.
+      const gate = tetherPlatform() === 'win32'
       // The command leads a process group of its own (the tether makes it one, as `detached` did), which is what
       // killProcessTreeVerified's group kill needs. git's automatic gc runs in the foreground, inside that group:
       // daemonized (setsid), it escaped the tie (util/git-gc.ts).
-      const { child } = spawnHeld(
+      const { child, tied } = spawnHeld(
         shellConfig.shell,
-        commandFromStdin ? shellConfig.args : [...shellConfig.args, command],
+        commandFromStdin ? shellConfig.args : [...shellConfig.args, gate ? `${TIE_GATE}${command}` : command],
         {
           cwd,
           env: withForegroundGitGc(env ?? process.env),
-          stdio: [commandFromStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+          stdio: [commandFromStdin || gate ? 'pipe' : 'ignore', 'pipe', 'pipe'],
           windowsHide: true,
         },
         { kind: 'code-bash', hold: scope },
       )
-      if (commandFromStdin) {
-        child.stdin?.on('error', () => { /* best-effort */ })
-        child.stdin?.end(command)
-      }
+      if (commandFromStdin || gate) child.stdin?.on('error', () => { /* best-effort */ })
+      if (commandFromStdin && gate) void tied.then(() => child.stdin?.end(command))
+      else if (commandFromStdin) child.stdin?.end(command)
+      else if (gate) void tied.then(() => child.stdin?.end('\n'))
 
       let timedOut = false
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined

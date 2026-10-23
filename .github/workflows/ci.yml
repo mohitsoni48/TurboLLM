@@ -168,14 +168,15 @@ jobs:
   # util/tether.ts ties every child the daemon starts to the daemon's life. On macOS it rests on things the ubuntu
   # job cannot show: /bin/sh's own fd and job handling, SIP stripping DYLD_* from /bin/sh, libuv's posix_spawn PATH
   # walk (the resolver must name the program it runs), and the `ps` group counts that replace /proc. These run the
-  # wrapper for real there and kill stand-in daemons.
+  # wrapper for real there and kill stand-in daemons. On Windows it rests on the job sentinel (PowerShell, Add-Type,
+  # kernel32 jobs), the Git Bash gate and ConPTY, which only a Windows runner has.
   tether:
     name: Process tether (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest]
+        os: [macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
 
@@ -194,7 +195,20 @@ jobs:
         run: brew install ripgrep fd
 
       - name: Tether tests
-        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts src/artifacts/screenshot.test.ts src/terminal/pty-session.tether.test.ts src/cli.keeper.test.ts src/util/boot-env.test.ts
+        if: runner.os == 'macOS'
+        run: npx tsx --test src/util/tether.test.ts src/util/tether-lookup.test.ts src/engines/manager.tether.test.ts src/engines/manager.reap.test.ts src/remote/child-process.tether.test.ts src/routines/cli-process.tether.test.ts src/code/robust-bash.tether.test.ts src/code/code-routes.release.test.ts src/code/git.tether.test.ts src/code/agent-availability.tether.test.ts src/code/search-tools.test.ts src/tools/mcp-client.tether.test.ts src/code/lsp-client.tether.test.ts src/engines/build-runner.tether.test.ts src/engines/provision.tether.test.ts src/sysinfo/usage.tether.test.ts src/artifacts/screenshot.test.ts src/terminal/pty-session.tether.test.ts src/cli.keeper.test.ts src/util/boot-env.test.ts src/util/win-job-sentinel.test.ts
+        working-directory: turbollm
+
+      # The job sentinel for real (its jobs, its pid-reuse guard, its death, a failed end, its start time over 5 starts,
+      # and the fallback with PowerShell hidden from PATH), a Git Bash `nohup … &` and a `cmd //c start //b` through
+      # the gate, a ConPTY shell's job, node and PowerShell trees in a job and a refused breakaway, the protocol tests,
+      # and the restart keeper under ConPTY Ctrl+C on the real cli.ts. Also the Code agent's rg/fd lookup against
+      # libuv's own Windows spawn search (a copy of node.exe stands in for rg; the grep and find equivalence cases skip
+      # without rg and fd, which this step does not install), and the export browser's Windows launch: the runner's
+      # Chrome (Program Files\Google\Chrome\Application) spawned with its CDP pipe on fds 3 and 4.
+      - name: Windows job sentinel and keeper tests
+        if: runner.os == 'Windows'
+        run: npx tsx --test src/util/win-job-sentinel.test.ts src/util/tether.test.ts src/util/boot-env.test.ts src/cli.keeper.test.ts src/code/search-tools.test.ts src/artifacts/screenshot.test.ts
         working-directory: turbollm
 
       # npmGlobalRoot builds cmd.exe's `npm root -g` line itself, as tetheredExecFile takes no `shell`. Every run holds
@@ -210,6 +224,7 @@ jobs:
         working-directory: turbollm
 
       - name: A routine run's end releases its session's held jobs
+        if: runner.os != 'Windows'
         run: npx tsx --test --test-name-pattern="left running|background jobs" src/routines/code-runner.test.ts
         working-directory: turbollm
 
