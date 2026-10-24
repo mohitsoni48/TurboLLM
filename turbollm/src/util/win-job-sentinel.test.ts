@@ -783,9 +783,19 @@ process.stdin.on('data', (line: string) => {
 })
 
 // What a job allows: node and PowerShell trees run as they always did, and a program that asks to break away from
-// its job (CREATE_BREAKAWAY_FROM_JOB) is refused with ERROR_ACCESS_DENIED (5) (Known). Without the job, libuv's own
-// allows breakaway and the same request succeeds (0).
-const BREAKAWAY_PS1 = `Add-Type -TypeDefinition @'
+// its job (CREATE_BREAKAWAY_FROM_JOB) stays in the sentinel's. Windows' rule for nested jobs ("Nested Jobs"): a child
+// created with the flag breaks away from its creator's immediate job if that job allows it, "and from each job in the
+// parent job chain, moving up the hierarchy until it reaches a job that does not permit breakaway"; an immediate job
+// that does not allow it fails the call with ERROR_ACCESS_DENIED (5). The sentinel's job allows none. So a program
+// whose own job is the sentinel's (here a PowerShell the daemon starts itself, as it starts Git Bash for a command) is
+// refused. But a node program puts itself and each child it starts in a job of its own (libuv's, which allows
+// breakaway: JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK, in libuv's src/win/process.c),
+// nested inside the sentinel's, so a PowerShell a tethered node starts has that job as its own, and its request
+// succeeds (0, as CI's first run of this case found, where it expected 5): its program leaves libuv's job and stops at
+// the sentinel's, where it ends with the job's release and with the daemon. Without the sentinel nothing stops it
+// (the control below). Each ping the script starts this way writes "<CreateProcess's error, 0 for none> <its pid>".
+const BREAKAWAY_PS1 = `param([string]$N)
+Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 public static class Breakaway {
@@ -801,49 +811,102 @@ public static class Breakaway {
   [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
   static extern bool CreateProcessW(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string cwd, ref STARTUPINFO si, out PROCESS_INFORMATION pi);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-  public static int Try() {
+  public static string Try(string cmd) {
     const uint CREATE_BREAKAWAY_FROM_JOB = 0x01000000, CREATE_NO_WINDOW = 0x08000000;
     STARTUPINFO si = new STARTUPINFO();
     si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
     PROCESS_INFORMATION pi;
-    if (CreateProcessW(null, new System.Text.StringBuilder("cmd.exe /c exit 0"), IntPtr.Zero, IntPtr.Zero, false, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, IntPtr.Zero, null, ref si, out pi)) {
+    if (CreateProcessW(null, new System.Text.StringBuilder(cmd), IntPtr.Zero, IntPtr.Zero, false, CREATE_BREAKAWAY_FROM_JOB | CREATE_NO_WINDOW, IntPtr.Zero, null, ref si, out pi)) {
       CloseHandle(pi.hThread);
       CloseHandle(pi.hProcess);
-      return 0;
+      return "0 " + pi.dwProcessId;
     }
-    return Marshal.GetLastWin32Error();
+    return Marshal.GetLastWin32Error() + " 0";
   }
 }
 '@
-[Breakaway]::Try()
+[Breakaway]::Try("ping.exe -n $N 127.0.0.1")
 `
 
-test('Windows: node and PowerShell trees run normally in a job, and a program asking to break away from it gets ERROR_ACCESS_DENIED', { skip: windows }, async () => {
-  const dir = tmpDir('tllm-sentinel-trees-')
+/** A tethered node child that, once its job exists (a line on stdin), runs a node child, a PowerShell child and the
+ *  breakaway script (its ping run `n` times), and prints what each gave as one JSON line. */
+const BREAKAWAY_TREE = "process.stdin.once('data', () => { const { execFileSync } = require('child_process'); const run = (c, a) => execFileSync(c, a, { encoding: 'utf8' }).trim(); " +
+  "console.log(JSON.stringify({ node: run(process.execPath, ['-e', 'console.log(6 * 7)']), " +
+  "powershell: run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '& cmd.exe /c exit 3; Write-Output $LASTEXITCODE']), " +
+  "breakaway: run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', process.argv[1], process.argv[2]]) })) })"
+
+/** A stand-in daemon (with the real sentinel, or none) that runs BREAKAWAY_TREE in a held scope per `trees` entry
+ *  ([scope, ping count]) and, with `direct`, the breakaway script as its own tethered child (its job the sentinel's),
+ *  and reports their output; a line on its stdin then releases scope `a`. */
+function breakawayDaemon(dir: string, o: { sentinel: boolean; trees: Array<[string, string]>; direct?: string }) {
   const ps1 = join(dir, 'breakaway.ps1')
   writeFileSync(ps1, BREAKAWAY_PS1)
-  // The tethered child starts its own children only once its job exists (it waits for a line on stdin).
-  const tree = "process.stdin.once('data', () => { const { execFileSync } = require('child_process'); const run = (c, a) => execFileSync(c, a, { encoding: 'utf8' }).trim(); " +
-    "console.log(JSON.stringify({ node: run(process.execPath, ['-e', 'console.log(6 * 7)']), " +
-    "powershell: run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', '& cmd.exe /c exit 3; Write-Output $LASTEXITCODE']), " +
-    "breakaway: run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', process.argv[1]]) })) })"
-  const d = await startStandInDaemon(`
-import { setJobSentinel, spawnHeld } from ${srcUrl('util/tether.ts')}
+  return startStandInDaemon(`
+import { releaseTetherScope, setJobSentinel, spawnHeld } from ${srcUrl('util/tether.ts')}
 import { JobSentinel } from ${srcUrl('util/win-job-sentinel.ts')}
 const logs: string[] = []
-setJobSentinel(new JobSentinel({ log: (l) => logs.push(l) }).start())
-const { child, tied } = spawnHeld(process.execPath, ['-e', ${JSON.stringify(tree)}, ${JSON.stringify(ps1)}], { stdio: ['pipe', 'pipe', 'inherit'] }, { kind: 'probe', hold: 'daemon' })
-await tied
-let out = ''
-child.stdout?.on('data', (b: Buffer) => { out += b.toString() })
-child.stdin?.end('go\\n')
-await new Promise((r) => child.once('close', r)) // its output read to the end
-report({ out: out.trim(), logs })
+if (${o.sentinel}) setJobSentinel(new JobSentinel({ log: (l) => logs.push(l) }).start())
+const run = async (file: string, args: string[], scope: string): Promise<string> => {
+  const { child, tied } = spawnHeld(file, args, { stdio: ['pipe', 'pipe', 'inherit'] }, { kind: 'probe', hold: scope })
+  await tied
+  let out = ''
+  child.stdout?.on('data', (b: Buffer) => { out += b.toString() })
+  child.stdin?.end('go\\n')
+  await new Promise((r) => child.once('close', r)) // its output read to the end
+  return out.trim()
+}
+const trees = await Promise.all(${JSON.stringify(o.trees)}.map((t: string[]) => run(process.execPath, ['-e', ${JSON.stringify(BREAKAWAY_TREE)}, ${JSON.stringify(ps1)}, t[1]], t[0])))
+// PowerShell waits for the line too: its CreateProcess must come once it is in its job.
+const direct = ${JSON.stringify(o.direct ?? '')} ? await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command',
+  '$null = [Console]::In.ReadLine(); & ' + ${JSON.stringify(`'${ps1}'`)} + ' ' + ${JSON.stringify(o.direct ?? '')}], 'direct') : ''
+report({ trees, direct, logs })
+process.stdin.once('data', async () => { await releaseTetherScope('a'); report({ released: true }) })
 `, { cwd: dir })
+}
+
+/** The ping a breakaway script started: CreateProcess's error and the ping's pid, from its "<error> <pid>" line. */
+function breakawayPing(line: string): { error: string; pid: number } {
+  const [error, pid] = line.split(' ')
+  return { error, pid: Number(pid) }
+}
+
+test('Windows: node and PowerShell trees run normally in a job, and a program asking to break away from it stays in it: refused when its own job is the sentinel\'s, kept in it from a job nested inside, so it ends with the release and with the daemon', { skip: windows }, async () => {
+  const dir = tmpDir('tllm-sentinel-trees-')
+  const d = await breakawayDaemon(dir, { sentinel: true, trees: [['a', '312'], ['b', '313']], direct: '314' })
   try {
-    const { out, logs } = await d.next<{ out: string; logs: string[] }>(120_000)
+    const { trees, direct, logs } = await d.next<{ trees: string[]; direct: string; logs: string[] }>(120_000)
     assert.deepEqual(logs, [], 'the sentinel started')
-    assert.deepEqual(JSON.parse(out), { node: '42', powershell: '3', breakaway: '5' })
+    const [a, b] = trees.map((t) => JSON.parse(t) as { node: string; powershell: string; breakaway: string })
+    const pa = breakawayPing(a.breakaway)
+    const pb = breakawayPing(b.breakaway)
+    record(pa.pid, pb.pid, breakawayPing(direct).pid)
+    assert.deepEqual({ node: a.node, powershell: a.powershell }, { node: '42', powershell: '3' }, 'node and PowerShell trees run normally')
+    assert.deepEqual(breakawayPing(direct), { error: '5', pid: 0 }, 'a program whose own job is the sentinel\'s gets ERROR_ACCESS_DENIED')
+    assert.deepEqual([pa.error, pb.error], ['0', '0'], `from libuv's job nested inside the sentinel's, the breakaway starts (${a.breakaway}; ${b.breakaway})`)
+    assert.deepEqual([pa.pid, pb.pid].filter(isGone), [], 'both pings run')
+    d.child.stdin?.write('release\n')
+    await d.next(10_000)
+    assert.deepEqual(await waitGone([pa.pid], 2000), [], 'the ping that broke away is still in its tree\'s job: it ends with that job\'s release')
+    assert.equal(isGone(pb.pid), false, 'the other tree\'s lives on')
+    spawnSync('taskkill', ['/F', '/PID', String(d.pid)])
+    assert.deepEqual(await waitGone([pb.pid], 2000), [], 'and goes with the daemon')
+  } finally {
+    killRecorded(d.pid)
+  }
+})
+
+test('Windows control: without the sentinel the same breakaway leaves the tree, and its program survives the daemon (the gap the sentinel closes)', { skip: windows }, async () => {
+  const dir = tmpDir('tllm-sentinel-trees-')
+  const d = await breakawayDaemon(dir, { sentinel: false, trees: [['a', '315']] })
+  try {
+    const { trees } = await d.next<{ trees: string[] }>(120_000)
+    const p = breakawayPing((JSON.parse(trees[0]) as { breakaway: string }).breakaway)
+    record(p.pid)
+    assert.equal(p.error, '0', 'the breakaway starts')
+    assert.equal(isGone(p.pid), false, 'its ping runs')
+    spawnSync('taskkill', ['/F', '/PID', String(d.pid)])
+    await sleep(1000)
+    assert.equal(isGone(p.pid), false, 'and outlives the daemon: nothing held it')
   } finally {
     killRecorded(d.pid)
   }

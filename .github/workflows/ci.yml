@@ -212,8 +212,10 @@ jobs:
 
       # The job sentinel for real (its jobs, its pid-reuse guard, its death, a failed end, its start time over 5 starts,
       # and the fallback with PowerShell hidden from PATH), a Git Bash `nohup … &` and a `cmd //c start //b` through
-      # the gate, a ConPTY shell's job, node and PowerShell trees in a job and a refused breakaway, the protocol tests,
-      # and the restart keeper under ConPTY Ctrl+C on the real cli.ts. Also the Code agent's rg/fd lookup against
+      # the gate, a ConPTY shell's job, node and PowerShell trees in a job and a breakaway that stays in it (refused
+      # from the sentinel's own job, kept in it from Node's job nested inside it; a control case shows it leaving
+      # without the sentinel), the protocol tests, and the restart keeper under ConPTY Ctrl+C on the real cli.ts.
+      # Also the Code agent's rg/fd lookup against
       # libuv's own Windows spawn search (a copy of node.exe stands in for rg; the grep and find equivalence cases skip
       # without rg and fd, which this job does not install: the file passes without them, and its Windows lookup cases
       # are what it runs here for), and the export browser's Windows launch: the runner's

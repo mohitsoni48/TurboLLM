@@ -262,8 +262,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Docker:** the images, the RunPod one included, start `tini` as PID 1, which reaps what TurboLLM leaves and passes
   `docker stop` on to it; the RunPod image runs the installed `turbollm` under it rather than `npx turbollm`. TurboLLM
   warns at boot when nothing reaps its orphaned processes (no init, or a PID 1 such as `tail`).
-- Windows: a program that explicitly asks to break away from its job object fails to start under a TurboLLM tree. A
-  Code bash command starts a few milliseconds later, once its job exists.
+- Windows: a program under a TurboLLM tree that asks to break away from its job object stays in TurboLLM's job, and
+  ends with it: it fails to start (access denied) when its own job is TurboLLM's, and from a job nested inside it
+  (Node's own, for what a Node program starts) it leaves only that one. A Code bash command starts a few
+  milliseconds later, once its job exists.
 - The export browser opens no DevTools port, and on Linux it starts no crash handler (on macOS Chrome starts one
   whatever it is told; it ends with the browser).
 
