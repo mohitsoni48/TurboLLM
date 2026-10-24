@@ -20,6 +20,9 @@ import { Hono } from 'hono'
 import { registerApi } from './routes'
 import { defaultConfig, type Config, type ModelPreset } from '../config/config'
 import type { Deps } from '../deps'
+import { automaticProfile } from '../models/profile'
+import type { ModelEntry } from '../models/scanner'
+import { getSysInfo } from '../sysinfo/sysinfo'
 
 const KEY = 'm|q4|1'
 const ENGINE_A = 'engine-a'
@@ -175,4 +178,34 @@ test('PUT /profile: a model key containing % or / is used as sent — the path p
     assert.equal(res.status, 200, key)
     assert.deepEqual(cfg.modelProfiles[key]?.[ENGINE_A]?.profile, PROFILE, key)
   }
+})
+
+// The model dialog saves only what the user set (profile.ts userSetProfile). A preset an earlier build stored holds
+// the dialog's whole draft, the defaults of the day included; "Remember these settings" on the draft that preset
+// filled in now saves only the one thing it changed, which is the same pick and must keep the pin.
+test('PUT /profile: a save of only what the user set keeps the pin of a preset an earlier build stored whole', async () => {
+  const cfg = defaultConfig()
+  const whole = { ...automaticProfile({ key: KEY } as ModelEntry, getSysInfo(), cfg.modelDefaults), flashAttn: 'off' }
+  const pinned = withPinnedPreset(ENGINE_A, whole)
+  const res = await saveProfile(fakeApp(pinned), { flashAttn: 'off', userSetOnly: true }, ENGINE_A)
+  assert.equal(res.status, 200)
+  assert.equal(pinned.lastPresetId[KEY], 'pinned')
+  // A save that changes what the user set still unpins.
+  const other = withPinnedPreset(ENGINE_A, whole)
+  await saveProfile(fakeApp(other), { flashAttn: 'on', userSetOnly: true }, ENGINE_A)
+  assert.equal(other.lastPresetId[KEY], undefined)
+})
+
+test('PUT /profile: a profile of only what the user set may leave the context out; a whole one still may not', async () => {
+  const cfg = defaultConfig()
+  const ok = await saveProfile(fakeApp(cfg), { litertLm: { backend: 'gpu' }, userSetOnly: true }, ENGINE_A)
+  assert.equal(ok.status, 200)
+  assert.deepEqual(cfg.modelProfiles[KEY]?.[ENGINE_A]?.profile, { litertLm: { backend: 'gpu' }, userSetOnly: true })
+  // One key of the GPU split, as the dialog saves a moved control.
+  assert.equal((await saveProfile(fakeApp(cfg), { gpu: { mainGpu: 1 }, userSetOnly: true }, ENGINE_A)).status, 200)
+  assert.equal((await saveProfile(fakeApp(cfg), { gpu: { mainGpu: -5 }, userSetOnly: true }, ENGINE_A)).status, 400)
+  const refused = await saveProfile(fakeApp(cfg), { litertLm: { backend: 'gpu' } }, ENGINE_A)
+  assert.equal(refused.status, 400)
+  assert.equal(((await refused.json()) as { error: { message: string } }).error.message, 'ctx must be at least 256.')
+  assert.equal((await saveProfile(fakeApp(cfg), { gpu: { mainGpu: 1 }, ctx: 4096 }, ENGINE_A)).status, 400, 'a whole profile carries every gpu key')
 })

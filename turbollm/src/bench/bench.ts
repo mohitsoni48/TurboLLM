@@ -17,7 +17,7 @@ import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
-import { deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
+import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
@@ -183,8 +183,10 @@ const KV_BYTES: Record<string, number> = {
   q4_0: 0.5, q4_1: 0.5, iq4_nl: 0.5, turbo4: 0.5, turbo3: 0.375, turbo2: 0.25,
 }
 
-/** A finished run's winner, held for the results dialog's Save/Cancel (BenchRunner.winning). */
-type Winning = { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
+/** A finished run's winner, held for the results dialog's Save/Cancel (BenchRunner.winning). `saved` is what Save
+ *  stores: what the user set and what the tune chose (BenchRunner.run); absent on a result an earlier build held,
+ *  which Save stores whole, as it did. */
+type Winning = { modelKey: string; profile: LoadProfile; saved?: Partial<LoadProfile>; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
 
 /** The held result on disk (BenchRunner.writeHeld): the winner without its scanner entry, which a restore looks up
  *  again, and what GET /status showed of the finished run. */
@@ -449,7 +451,7 @@ export class BenchRunner {
     this.resolveRestored()
     const w = this.winning
     if (!w) return false
-    const record = this.persistBest(w.modelKey, w.profile, w.cand, w.engineId)
+    const record = this.persistBest(w.modelKey, w.saved ?? w.profile, w.cand, w.engineId)
     this.queueTelemetry(record, w.entry, w.sys, this.version, w.engineVersion)
     this.winning = null
     this.dropHeld()
@@ -641,7 +643,24 @@ export class BenchRunner {
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
       this.reportFirstLoad('ok', undefined, active ? { profile, entry, engine: active, sys } : undefined)
-      this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
+      // What Save stores: what the user set (the saved profile's, and the dialog's base, which holds only
+      // that) and what the tune chose: the offload it found, the GPU split it picked, the card's sampling,
+      // and the context it was measured at, since the fit it found holds for that context only. Not the
+      // rest of the resolved winner: the defaults stored with it were the user's choice from then on, so a
+      // later change to Settings > Model Defaults stopped reaching a tuned model's other settings.
+      const auto = automaticProfile(entry, sys, defaults)
+      const userSet = mergeUserSet(userSetProfile(saved, auto), userSetProfile(base, auto))
+      const sampling = { ...(userSet.sampling ?? {}), ...(recommended && hasAnySampling(recommended) ? recommended : {}) }
+      const toSave: Partial<LoadProfile> = {
+        ...userSet,
+        ctx: profile.ctx,
+        ngl: profile.ngl,
+        nCpuMoe: profile.nCpuMoe,
+        ...(JSON.stringify(profile.gpu) !== JSON.stringify(auto.gpu) ? { gpu: profile.gpu } : {}),
+        ...(Object.keys(sampling).length > 0 ? { sampling: sampling as LoadProfile['sampling'] } : {}),
+        userSetOnly: true,
+      }
+      this.winning = { modelKey, profile, saved: toSave, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
       this.logWinner = { params: best.cand.params, tps: best.cand.tps ?? 0, prefillTps: best.cand.prefillTps, ttftMs: best.cand.ttftMs ?? 0, vramMb: best.cand.vramMb }
       this.state = {
         running: false,
@@ -1477,7 +1496,7 @@ export class BenchRunner {
 
   /** Save the winning profile as the model's saved profile (tunedBy:'bench') and
    *  persist a benchResults row. Both via the same ConfigStore the route uses. */
-  private persistBest(modelKey: string, profile: LoadProfile, cand: BenchCandidate, engineId: string): BenchResult {
+  private persistBest(modelKey: string, profile: Partial<LoadProfile>, cand: BenchCandidate, engineId: string): BenchResult {
     const record: BenchResult = {
       modelKey,
       tps: cand.tps ?? 0,
@@ -1486,7 +1505,7 @@ export class BenchRunner {
       params: cand.params,
       ts: new Date().toISOString(),
     }
-    const tuned: LoadProfile = { ...profile, tunedBy: 'bench' }
+    const tuned: Partial<LoadProfile> = { ...profile, tunedBy: 'bench' }
     this.store.update((cfg) => {
       // Per-engine profile (issue #35): a tune is only valid for the engine it ran on, so
       // persist into that engine's slot only. No active engine (engineId '') → '*' fallback.

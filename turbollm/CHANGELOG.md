@@ -214,6 +214,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   10 s is skipped ("Skipped (cli_unavailable)"), without touching the model.
 
 ### Changed
+- **A model's Load settings save only what you changed.** Load, Save, "Remember these settings", Save as… (a preset)
+  and Auto-tune used to send and save the whole panel, so the first save made every default your choice: context 8192,
+  GPU layers 99 and llama.cpp's sampling 0.8 / 0.95 / 40 / 0.05 were stored even when you had changed only the Backend,
+  and a later change to Settings > Model Defaults no longer reached any model saved once. They now send and save only
+  the controls you moved (`userSetOnly` on the stored profile; `GET /api/v1/models/:key` adds `saved` and
+  `autoProfile`), and Auto-tune saves those plus what it tuned (GPU layers / CPU-offloaded experts, the GPU split, the
+  card's sampling and the context it measured at). A profile or preset saved before is read field by field: a field
+  equal to the automatic value counts as not set (the file is not rewritten; move the control to make it yours).
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
   dropped connection no longer stops a reply, a Regenerate or a Save & Resend, their auto-compaction, their tool calls
   or a call waiting for approval: the daemon finishes and saves the reply, and gives it its title and memory facts. A

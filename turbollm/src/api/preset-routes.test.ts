@@ -306,3 +306,18 @@ test('a key naming an Object built-in (constructor, __proto__, toString) is just
     }
   }
 })
+
+// "Save as…" in the model dialog captures only what the user set (profile.ts userSetProfile), marked as such: a
+// preset that leaves the context automatic carries no ctx, which a whole profile still must.
+test('POST /presets: a preset of only what the user set may leave ctx out; a whole one still may not', async () => {
+  const cfg = defaultConfig()
+  const create = (profile: unknown) => fakeApp(cfg).request(`/api/v1/models/${encodeURIComponent(KEY)}/presets`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'GPU', profile }),
+  })
+  const ok = await create({ litertLm: { backend: 'gpu' }, userSetOnly: true })
+  assert.equal(ok.status, 201)
+  assert.deepEqual(((await ok.json()) as { profile: unknown }).profile, { litertLm: { backend: 'gpu' }, userSetOnly: true })
+  assert.equal((await create({ litertLm: { backend: 'gpu' } })).status, 400)
+})

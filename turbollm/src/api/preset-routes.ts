@@ -10,7 +10,7 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import { MODEL_PRESET_CAP, ownEntry, type ModelPreset } from '../config/config'
-import { launchFieldsRefusal, loadsWithNow, validateLoadProfileFields } from './profile-validate'
+import { isUserSetOnly, launchFieldsRefusal, loadsWithNow, validateLoadProfileFields } from './profile-validate'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
@@ -57,7 +57,7 @@ export function registerPresetRoutes(app: Hono, d: Deps): void {
     // Field-level validation, not just shape: a pinned preset's profile is handed verbatim to
     // profileToArgs, so a bad field here becomes a broken engine command line and every later
     // load of that model fails. Must match PUT /models/:key/profile exactly.
-    const invalid = validateLoadProfileFields(b.profile, { requireCtx: true })
+    const invalid = validateLoadProfileFields(b.profile, { requireCtx: !isUserSetOnly(b.profile) })
     if (invalid) return err(c, 400, 'invalid_config_value', invalid)
     const launchRefused = launchFieldsRefusal(c, d, b.profile, loadsWithNow(d, key, typeof b.engineId === 'string' ? b.engineId : ''))
     if (launchRefused) return launchRefused

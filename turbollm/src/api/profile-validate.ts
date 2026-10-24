@@ -9,8 +9,10 @@
 // or a preset can be pinned and make a model unloadable until the pin is cleared by hand.
 //
 // Partial-tolerant by design: every check is skipped when the field is absent, so an older client
-// that omits `gpu`/`nCpuMoe` still writes cleanly. `requireCtx` is the one caller-dependent knob —
-// the profile route demands a usable ctx, a preset patch may legitimately omit it.
+// that omits `gpu`/`nCpuMoe` still writes cleanly, and so is every key of `gpu`, which a profile of
+// only what the user set (userSetOnly) carries one by one. `requireCtx` is the one caller-dependent
+// knob — the profile route demands a usable ctx from a whole profile, a preset patch and a profile of
+// only what the user set may legitimately omit it.
 //
 // Also the one launch-field gate (launchFieldsRefusal) for every route that takes a profile from a
 // client: the two above, POST /api/v1/engine/start's overrides, a preset's /apply and the
@@ -21,6 +23,11 @@ import { isLocalOrAuthenticated } from '../auth'
 import { getModelProfile } from '../config/config'
 import type { Deps } from '../deps'
 import { CACHE_RAM_MAX_MIB, isCacheRamMib, tokenizeExtraArgs } from '../models/profile'
+
+/** Whether `p` holds only what the user set (LoadProfile.userSetOnly): the model dialog's saves and presets. */
+export function isUserSetOnly(p: unknown): boolean {
+  return !!p && typeof p === 'object' && (p as { userSetOnly?: unknown }).userSetOnly === true
+}
 
 /** Returns a human-readable reason the profile is invalid, or `null` when it is acceptable. */
 export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolean }): string | null {
@@ -38,16 +45,18 @@ export function validateLoadProfileFields(p: unknown, opts: { requireCtx: boolea
   if (prof.gpu !== undefined) {
     const g = prof.gpu as Record<string, unknown>
     if (!g || typeof g !== 'object' || Array.isArray(g)) return 'gpu must be a JSON object.'
-    if (!['layer', 'row', 'none'].includes(g.splitMode as string)) {
+    // A whole profile carries every key; one of only what the user set, the keys the user changed.
+    const whole = !isUserSetOnly(p)
+    if ((whole || g.splitMode !== undefined) && !['layer', 'row', 'none'].includes(g.splitMode as string)) {
       return 'gpu.splitMode must be layer, row, or none.'
     }
-    if (!Array.isArray(g.tensorSplit) || g.tensorSplit.some((n) => typeof n !== 'number' || !(n >= 0))) {
+    if ((whole || g.tensorSplit !== undefined) && (!Array.isArray(g.tensorSplit) || g.tensorSplit.some((n) => typeof n !== 'number' || !(n >= 0)))) {
       return 'gpu.tensorSplit must be an array of non-negative numbers.'
     }
-    if (!Number.isInteger(g.mainGpu) || (g.mainGpu as number) < -1) {
+    if ((whole || g.mainGpu !== undefined) && (!Number.isInteger(g.mainGpu) || (g.mainGpu as number) < -1)) {
       return 'gpu.mainGpu must be an integer ≥ -1.'
     }
-    if (!Number.isInteger(g.tensorParallelSize) || (g.tensorParallelSize as number) < 1) {
+    if ((whole || g.tensorParallelSize !== undefined) && (!Number.isInteger(g.tensorParallelSize) || (g.tensorParallelSize as number) < 1)) {
       return 'gpu.tensorParallelSize must be an integer ≥ 1.'
     }
   }

@@ -1,7 +1,7 @@
 // LoadProfile: per-model launch parameters, default derivation, VRAM-fit
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
-import type { Capabilities, ModelDefaults } from '../config/config'
+import { getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
@@ -218,6 +218,12 @@ export interface LoadProfile {
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
   tunedBy?: 'bench' | 'user'
+  /** A saved profile or preset that holds only what the user set (the model dialog sends and saves
+   *  only the controls the user changed, auto-tune only those plus what it tuned): every field it
+   *  carries is the user's, whatever its value. Absent on what earlier builds saved, which held the
+   *  dialog's whole draft, the built-in defaults it was seeded with included: see
+   *  {@link userSetProfile} for how those are read. */
+  userSetOnly?: boolean
 }
 
 export type FitVerdict = 'fits' | 'tight' | 'overflow' | 'cpu' | 'unknown'
@@ -761,6 +767,76 @@ function needsTokenize(entry: string): boolean {
   return false
 }
 
+/** The profile a model loads with when the user has set nothing for it: the built-in heuristics with
+ *  the global model defaults over them. What {@link resolveProfile} merges a saved profile and
+ *  overrides onto, and what {@link userSetProfile} tells an earlier build's saved defaults apart by. */
+export function automaticProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults): LoadProfile {
+  return applyGlobalDefaults(deriveDefault(m, sys), m, sys, defaults)
+}
+
+/** The groups {@link resolveProfile} merges key by key, so a user-set view keeps only their set keys. */
+const NESTED_PROFILE_GROUPS = new Set(['sampling', 'gpu', 'vllm', 'litertLm'])
+
+function sameProfileValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** The fields of a saved profile or preset the user set, against `auto` ({@link automaticProfile}).
+ *
+ *  A profile marked {@link LoadProfile.userSetOnly} (what this build's dialog, presets and auto-tune
+ *  save) is the user's in every field it carries, so it is returned as it is. One saved before
+ *  carries the model dialog's whole draft: the dialog was seeded from the resolved profile and every
+ *  Save, and every Load with "Remember these settings" (on by default), stored all of it, so the
+ *  built-in defaults it was seeded with (context 8192, GPU layers 99, the llama.cpp sampling
+ *  0.8/0.95/40/0.05) sit there beside the one control the user moved. Such a profile's fields that
+ *  equal the automatic profile are read as not set: a value equal to the default it was seeded with
+ *  is all but always an untouched default, and treating it as the user's choice would put one fixed
+ *  llama.cpp set over a model's own defaults (a LiteRT-LM bundle's context and sampler) for every
+ *  user who once saved a backend. Nothing is lost by it: the stored file is never rewritten, a field
+ *  read as not set takes the value it equals wherever the automatic one has not changed, every field
+ *  that differs stays the user's, and moving the control again saves it as the user's for good.
+ *  `tunedBy` is provenance, not a setting, and always kept; the marker itself is left out of the view. */
+export function userSetProfile(saved: Partial<LoadProfile> | undefined, auto: LoadProfile): Partial<LoadProfile> | undefined {
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return undefined
+  const marked = saved.userSetOnly === true
+  const autoFields = auto as unknown as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(saved)) {
+    if (v === undefined || k === 'userSetOnly') continue
+    if (marked || k === 'tunedBy') {
+      out[k] = v
+      continue
+    }
+    if (NESTED_PROFILE_GROUPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      const autoGroup = (autoFields[k] ?? {}) as Record<string, unknown>
+      const group: Record<string, unknown> = {}
+      for (const [gk, gv] of Object.entries(v as unknown as Record<string, unknown>)) {
+        if (gv !== undefined && !sameProfileValue(gv, autoGroup[gk])) group[gk] = gv
+      }
+      if (Object.keys(group).length > 0) out[k] = group
+      continue
+    }
+    const same = k === 'extraArgs' && Array.isArray(v)
+      ? sameProfileValue(tokenizeExtraArgs(v as string[]), tokenizeExtraArgs(auto.extraArgs))
+      : sameProfileValue(v, autoFields[k])
+    if (!same) out[k] = v
+  }
+  return out as Partial<LoadProfile>
+}
+
+/** `b`'s user-set fields over `a`'s, the nested groups key by key (as {@link resolveProfile} merges them). */
+export function mergeUserSet(a: Partial<LoadProfile> | undefined, b: Partial<LoadProfile> | undefined): Partial<LoadProfile> {
+  const out: Record<string, unknown> = { ...(a ?? {}) }
+  for (const [k, v] of Object.entries(b ?? {})) {
+    if (v === undefined) continue
+    const prev = out[k]
+    out[k] = NESTED_PROFILE_GROUPS.has(k) && prev && typeof prev === 'object' && v && typeof v === 'object'
+      ? { ...(prev as Record<string, unknown>), ...(v as unknown as Record<string, unknown>) }
+      : v
+  }
+  return out as Partial<LoadProfile>
+}
+
 /** Merge heuristics <- global defaults <- saved <- overrides (field-level; sampling
  *  deep-merged). Precedence highest→lowest: per-request overrides > saved per-model
  *  profile > global model defaults > built-in heuristics (spec 05 §3). */
@@ -771,11 +847,15 @@ export function resolveProfile(
   overrides?: Partial<LoadProfile>,
   defaults?: ModelDefaults,
 ): LoadProfile {
-  const base = applyGlobalDefaults(deriveDefault(m, sys), m, sys, defaults)
+  const base = automaticProfile(m, sys, defaults)
+  // The marker says how a stored profile is to be read (userSetProfile); it is not a launch setting,
+  // so the resolved profile never carries it.
+  const { userSetOnly: _savedMarker, ...savedFields } = saved ?? {}
+  const { userSetOnly: _overrideMarker, ...overrideFields } = overrides ?? {}
   return {
     ...base,
-    ...(saved ?? {}),
-    ...(overrides ?? {}),
+    ...savedFields,
+    ...overrideFields,
     sampling: { ...base.sampling, ...(saved?.sampling ?? {}), ...(overrides?.sampling ?? {}) },
     // gpu is deep-merged like sampling so a partial override (or an old saved profile
     // missing some fields) keeps the rest of the defaults instead of going undefined.
@@ -797,6 +877,29 @@ export function resolveProfile(
     // no migration, and covers overrides/API callers that never touch the UI.
     extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? saved?.extraArgs ?? base.extraArgs),
   }
+}
+
+/** The context window model `m` would ACTUALLY be loaded with on `engineId`, from its saved profile or
+ *  pinned preset, as opposed to its `nativeCtx`, which is only the ceiling its metadata allows.
+ *  Undefined when it has no profile for that engine (the caller then shows `nativeCtx`, as before).
+ *
+ *  TWO consumers need the identical answer, and they drifted the first time it was written in only
+ *  one of them: the models API overlay (for the UI and for `turbollm launch`, which reads models over
+ *  HTTP) and the daemon's post-load harness-config sync (which reads raw scanner entries). The sync
+ *  then overwrote the launcher's correct value with `nativeCtx` on every load (measured live: pi
+ *  advertised 131072 for `gpt-oss-120b` while its profile configures 32256), and a harness that
+ *  believes a 4x-too-large window fills the context past what the engine allocated.
+ *
+ *  The resolved context ({@link resolveProfile}), not the stored field: a profile saved from the model
+ *  dialog holds a context only when the user set one (userSetOnly), where an earlier build's held the
+ *  automatic one too, so the stored field alone would advertise the ceiling for every model saved
+ *  without touching Context. */
+export function configuredCtx(cfg: Config, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
+  if (!engineId) return undefined
+  const saved = getModelProfile(cfg, m.key, engineId) as Partial<LoadProfile> | undefined
+  if (!saved || typeof saved !== 'object') return undefined
+  const ctx = resolveProfile(m, sys, saved, undefined, cfg.modelDefaults).ctx
+  return Number.isFinite(ctx) && ctx > 0 ? ctx : undefined
 }
 
 /** GitHub #85 / ADR-324: llama.cpp on ROCm hangs loading large models on AMD unified-memory

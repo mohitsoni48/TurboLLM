@@ -14,7 +14,6 @@ import {
   configAccessProblem,
   configuredDaemonPort,
   defaultConfigPath,
-  resolveConfiguredCtx,
   migrateLegacyDataDir,
   resolveIngressPort,
 } from './config/config'
@@ -47,7 +46,7 @@ import { runAutoLoad } from './engines/auto-load'
 import { Scanner } from './models/scanner'
 import { seedDefaultModelDir } from './models/hf-cache'
 import { HashStore } from './models/hashes'
-import { estimateVram } from './models/profile'
+import { configuredCtx, estimateVram } from './models/profile'
 import { getSysInfo } from './sysinfo/sysinfo'
 import { stopUsageMonitor } from './sysinfo/usage'
 import { daemonTick, stopDaemonTicks } from './util/daemon-ticks'
@@ -735,9 +734,10 @@ manager.onLoadSettled = (ok, err, opts) => {
         // overwrote the launcher's correct values with nativeCtx on every single load.
         const activeEngineId = registry.active()?.id ?? ''
         const cfg = store.snapshot()
+        const sys = getSysInfo()
         const models = scanner.list().models.map((m) => ({
           ...m,
-          configuredCtx: resolveConfiguredCtx(cfg, m.key, activeEngineId),
+          configuredCtx: configuredCtx(cfg, m, activeEngineId, sys),
         }))
         for (const target of CONFIG_FILE_HARNESSES) {
           await syncHarnessModelConfig(target, {

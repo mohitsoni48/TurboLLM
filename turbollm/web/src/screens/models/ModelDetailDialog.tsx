@@ -3,7 +3,8 @@ import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Z
 import { ApiError, downloadBenchLog, track } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
-import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
+import type { CardSampling, LoadProfile, ModelPreset, SysGpu, UserSetProfile } from '../../lib/types'
+import { userSetPayload, userSetView, withUserGroupValue, withUserSet, withUserValue } from '../../lib/user-set-profile'
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultLitertLm, defaultVllm } from '../../lib/types'
 import { loadModeFor } from '../../lib/load-mode'
@@ -32,36 +33,19 @@ import { toast } from '../../components/ui/sonner'
  *  `/^[a-z][a-z0-9_-]*$/` (`parseEnumList`, probe.ts), and the space here can't appear in one. */
 const ENGINE_DEFAULT_OPTION = 'engine default'
 
-/** Deep-merges a preset's stored profile onto the current draft. The nested merge is
- *  load-bearing: a preset saved by an older build may be missing fields inside sampling/gpu/vllm,
- *  and a shallow spread would replace a whole nested object — leaving controls that read
- *  draft.sampling.frequencyPenalty facing undefined and white-screening the dialog. */
-function mergePresetIntoDraft(draft: LoadProfile, profile: Partial<LoadProfile> | undefined): LoadProfile {
-  const over = profile ?? {}
-  return {
-    ...draft,
-    ...over,
-    sampling: { ...draft.sampling, ...(over.sampling ?? {}) },
-    gpu: { ...draft.gpu, ...(over.gpu ?? {}) },
-    vllm: { ...draft.vllm, ...(over.vllm ?? {}) },
-    // Same deep-merge as vllm: a preset saved before this field existed (or created from a
-    // partial profile) must not wipe the LiteRT-LM backend choice back to undefined.
-    litertLm: { ...(draft.litertLm ?? defaultLitertLm()), ...(over.litertLm ?? {}) },
-  }
-}
-
 // ── Presets panel (ADR-353) ───────────────────────────────────────────────────
 // Named load configs per model. Selecting a preset pins it (POST /apply) and merges it
 // into the draft — it does NOT load; the Load button stays the only thing that loads.
 function PresetsPanel({
   modelKey,
-  draft,
+  userSet,
   onApplyPreset,
   activeEngineId,
 }: {
   modelKey: string
-  draft: LoadProfile
-  onApplyPreset: (profile: Partial<LoadProfile>) => void
+  /** What the user set in the dialog: all a new preset captures (user-set-profile.ts). */
+  userSet: UserSetProfile
+  onApplyPreset: (profile: UserSetProfile) => void
   activeEngineId?: string
 }) {
   const presetsQ = useModelPresets(modelKey)
@@ -128,7 +112,7 @@ function PresetsPanel({
     if (nameDialog.mode === 'save') {
       track('models', 'create_model_preset')
       m.create.mutate(
-        { name, engineId: activeEngineId ?? '', profile: draft },
+        { name, engineId: activeEngineId ?? '', profile: userSetPayload(userSet) },
         {
           // A just-saved preset IS the panel's current settings, so it becomes the active one —
           // selected in the dropdown AND pinned server-side. Without the pin this desyncs: the
@@ -304,6 +288,9 @@ export function ModelDetailDialog({
   const benchState = useBenchState()
   const [pendingBenchKey, setPendingBenchKey] = useState<string | null>(null)
   const [draft, setDraft] = useState<LoadProfile | null>(null)
+  // What the user set: the saved profile's own fields, then every control moved here. The draft shows
+  // the full profile; Load, Save, Save as… and Auto-tune send only this (user-set-profile.ts).
+  const [userSet, setUserSet] = useState<UserSetProfile>({})
   const [advanced, setAdvanced] = useState(false)
   const [remember, setRemember] = useState(true)
 
@@ -311,7 +298,9 @@ export function ModelDetailDialog({
   const statusQ = useStatus()
   const modelsQ = useModels()
   useEffect(() => {
-    if (detail) setDraft(structuredClone(detail.profile))
+    if (!detail) return
+    setDraft(structuredClone(detail.profile))
+    setUserSet(structuredClone(detail.saved ?? {}))
   }, [detail])
 
   // While the panel is open, mark <html> so the app shell pads to the right by the
@@ -348,7 +337,7 @@ export function ModelDetailDialog({
     // the eject, before the model could possibly have actually stopped.
     const stillLoaded = modelsQ.data?.models.find((m) => m.key === pendingBenchKey)?.loaded ?? true
     if (!stillLoaded) {
-      bench.start.mutate({ key: pendingBenchKey, base: draft ?? undefined })
+      bench.start.mutate({ key: pendingBenchKey, base: userSetPayload(userSet) })
       setPendingBenchKey(null)
     }
   }, [pendingBenchKey, modelsQ.data, bench.start])
@@ -414,17 +403,39 @@ export function ModelDetailDialog({
     return estimateVram(draft, detail, gpuBudgetMb(detail.gpus ?? [], draft.gpu))
   }, [detail, draft])
 
-  const set = <K extends keyof LoadProfile>(k: K, v: LoadProfile[K]) =>
+  // Every control writes the draft (what the dialog shows) and the user's own choice (what it sends).
+  const set = <K extends keyof LoadProfile>(k: K, v: LoadProfile[K]) => {
     setDraft((d) => (d ? { ...d, [k]: v } : d))
-  const setS = <K extends keyof LoadProfile['sampling']>(k: K, v: number) =>
+    setUserSet((u) => withUserValue(u, k, v))
+  }
+  const setS = <K extends keyof LoadProfile['sampling']>(k: K, v: LoadProfile['sampling'][K]) => {
     setDraft((d) => (d ? { ...d, sampling: { ...d.sampling, [k]: v } } : d))
-  const setG = <K extends keyof LoadProfile['gpu']>(k: K, v: LoadProfile['gpu'][K]) =>
+    setUserSet((u) => withUserGroupValue(u, 'sampling', k, v))
+  }
+  const setG = <K extends keyof LoadProfile['gpu']>(k: K, v: LoadProfile['gpu'][K]) => {
     setDraft((d) => (d ? { ...d, gpu: { ...(d.gpu ?? defaultGpu()), [k]: v } } : d))
-  const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) =>
+    setUserSet((u) => withUserGroupValue(u, 'gpu', k, v))
+  }
+  const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) => {
     setDraft((d) => (d ? { ...d, vllm: { ...(d.vllm ?? defaultVllm()), [k]: v } } : d))
+    setUserSet((u) => withUserGroupValue(u, 'vllm', k, v))
+  }
 
-  const setL = <K extends keyof NonNullable<LoadProfile['litertLm']>>(k: K, v: NonNullable<LoadProfile['litertLm']>[K]) =>
+  const setL = <K extends keyof NonNullable<LoadProfile['litertLm']>>(k: K, v: NonNullable<LoadProfile['litertLm']>[K]) => {
     setDraft((d) => (d ? { ...d, litertLm: { ...(d.litertLm ?? defaultLitertLm()), [k]: v } } : d))
+    setUserSet((u) => withUserGroupValue(u, 'litertLm', k, v))
+  }
+
+  // A preset is a whole configuration: what it set over the automatic profile, not over whatever the
+  // dialog held, and only what it set becomes the user's (an earlier build stored presets whole, the
+  // defaults of the day included: userSetView reads those as the daemon does).
+  const applyPreset = (profile: UserSetProfile) => {
+    if (!detail) return
+    const auto = detail.autoProfile ?? detail.profile
+    const u = userSetView(profile, auto)
+    setUserSet(u)
+    setDraft(withUserSet(structuredClone(auto), u))
+  }
 
   const loadError = failureOf(loader.loadError, detail?.key)
 
@@ -460,7 +471,7 @@ export function ModelDetailDialog({
       setPendingBenchKey(detail.key)
       actions.eject.mutate(detail.key)
     } else {
-      bench.start.mutate({ key: detail.key, base: draft ?? undefined })
+      bench.start.mutate({ key: detail.key, base: userSetPayload(userSet) })
     }
   }
 
@@ -525,8 +536,8 @@ export function ModelDetailDialog({
           <div className="flex flex-col gap-4">
             <PresetsPanel
               modelKey={detail.key}
-              draft={draft}
-              onApplyPreset={(profile) => setDraft((d) => (d ? mergePresetIntoDraft(d, profile) : d))}
+              userSet={userSet}
+              onApplyPreset={applyPreset}
               activeEngineId={activeEngine?.id}
             />
 
@@ -824,7 +835,7 @@ export function ModelDetailDialog({
               </Row>
               <ChipListInput
                 value={draft.sampling.stop}
-                onChange={(v) => setDraft((d) => d ? { ...d, sampling: { ...d.sampling, stop: v } } : d)}
+                onChange={(v) => setS('stop', v)}
                 emptyPlaceholder="Type a stop string, press Enter"
               />
               </>)}
@@ -996,9 +1007,11 @@ export function ModelDetailDialog({
                   // at once raced the profile write against the reload. The loader
                   // reports a refusal itself — otherwise a bad param silently stops
                   // the engine and the model "never loads again" with no feedback.
-                  const fireLoad = () => loader.requestLoad(detail, { overrides: draft })
+                  // Only what the user set: a control left alone keeps the model's own or the automatic value.
+                  const chosen = userSetPayload(userSet)
+                  const fireLoad = () => loader.requestLoad(detail, { overrides: chosen })
                   if (remember) {
-                    actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
+                    actions.save.mutate({ key: detail.key, profile: chosen, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
                   } else {
                     fireLoad()
                   }
@@ -1009,7 +1022,7 @@ export function ModelDetailDialog({
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}
               </Button>
-              <Button variant="outline" onClick={() => { track('models', 'save_model_settings'); actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }) }} disabled={actions.save.isPending} title="Save without reloading">
+              <Button variant="outline" onClick={() => { track('models', 'save_model_settings'); actions.save.mutate({ key: detail.key, profile: userSetPayload(userSet), engineId: activeEngine?.id ?? '*' }) }} disabled={actions.save.isPending} title="Save without reloading">
                 <Save size={14} />
                 Save
               </Button>

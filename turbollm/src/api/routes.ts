@@ -9,7 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, resolveConfiguredCtx, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
 import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
@@ -83,7 +83,7 @@ import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
 import { modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
-import { estimateVram, type LoadProfile, resolveProfile } from '../models/profile'
+import { automaticProfile, configuredCtx, estimateVram, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { requestUsage } from '../sysinfo/usage'
 import { HfError, type HfSearchItem, type HfSortOption } from '../hf/hf'
@@ -91,7 +91,7 @@ import { TEXT_CLASSIFICATION_CATEGORY } from '../hf/text-classification-search'
 import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
-import { validateLoadProfileFields, profilesEqual, launchFieldsRefusal, loadsWithNow } from './profile-validate'
+import { validateLoadProfileFields, profilesEqual, launchFieldsRefusal, loadsWithNow, isUserSetOnly } from './profile-validate'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
 import { readQueue, remove as removeQueued } from '../telemetry/queue'
 import { sendConsentChoice } from '../telemetry/consent'
@@ -2843,9 +2843,16 @@ export function registerApi(app: Hono, d: Deps): void {
     const engineId = c.req.query('engine') || d.registry.active()?.id || '*'
     const saved = getModelProfile(snap, e.key, engineId) as Partial<LoadProfile> | undefined
     const profile = resolveProfile(e, sys, saved, undefined, snap.modelDefaults)
+    // What the dialog needs to save only what the user set (userSetProfile): the fields of the saved
+    // profile that are the user's, and the profile the model loads with when nothing is set, which a
+    // preset applied in the dialog is merged onto.
+    const autoProfile = automaticProfile(e, sys, snap.modelDefaults)
     // `gpu` (first GPU) kept for back-compat; `gpus` (full list) drives the multi-GPU
     // split controls (ADR-054).
-    return c.json({ ...overlayModel(e, d), profile, vramFit: estimateVram(profile, e, sys), gpu: sys.gpus[0] ?? null, gpus: sys.gpus, cores: sys.cores })
+    return c.json({
+      ...overlayModel(e, d), profile, saved: userSetProfile(saved, autoProfile) ?? {}, autoProfile,
+      vramFit: estimateVram(profile, e, sys), gpu: sys.gpus[0] ?? null, gpus: sys.gpus, cores: sys.cores,
+    })
   })
 
   app.put('/api/v1/models/:key/profile', async (c) => {
@@ -2858,7 +2865,9 @@ export function registerApi(app: Hono, d: Deps): void {
     // Field validation lives in profile-validate.ts because the preset routes are a SECOND way
     // into the same storage and must reject exactly the same things (ADR-353) — a bad field here
     // reaches profileToArgs and the engine command line.
-    const invalid = validateLoadProfileFields(p, { requireCtx: true })
+    // A profile of only what the user set (userSetOnly, the dialog's) may leave the context out, as it
+    // leaves out every control the user did not move; any other must still carry one.
+    const invalid = validateLoadProfileFields(p, { requireCtx: !isUserSetOnly(p) })
     if (invalid) return err(c, 400, 'invalid_profile_value', invalid)
     // Per-engine profile (issue #35): save into the slot for the engine the client is
     // editing (?engine=<id>), falling back to the active engine, then the '*' fallback.
@@ -2876,13 +2885,17 @@ export function registerApi(app: Hono, d: Deps): void {
       //  - A save identical to the pinned preset is not a divergence. "Remember these settings"
       //    is ON by default and fires exactly this save on the draft the preset just filled in —
       //    unpinning there silently broke "your pick is remembered and auto-applied next load".
+      //    Identical in what the user set (userSetProfile): the dialog saves only that, so a preset
+      //    an earlier build stored whole is the same pick as the dialog's save of it.
       //  - The pin is per-MODEL, this save is per-ENGINE. Clearing a pin belonging to a DIFFERENT
       //    engine drops that engine's tune for an edit unrelated to it (issue #35's contract).
       const pinnedId = ownEntry(cfg.lastPresetId, key)
       if (pinnedId) {
         const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         const thisEngine = !pinned || pinned.engineId === '' || pinned.engineId === engineId
-        if (thisEngine && !(pinned && profilesEqual(pinned.profile, p))) delete cfg.lastPresetId[key]
+        const auto = automaticProfile(e, getSysInfo(), cfg.modelDefaults)
+        const same = !!pinned && profilesEqual(userSetProfile(pinned.profile as Partial<LoadProfile>, auto), userSetProfile(p, auto))
+        if (thisEngine && !same) delete cfg.lastPresetId[key]
       }
     })
     return c.json(p)
@@ -4024,11 +4037,11 @@ function overlayModel(
   // for every model except the one currently loaded, so a 262144-native model configured at 163328
   // advertised the wrong window until it happened to be loaded. Undefined when the model has no
   // profile for this engine — the caller then falls back to nativeCtx, which is the honest answer.
-  const configuredCtx = resolveConfiguredCtx(snap, e.key, engine?.id ?? '')
+  const configuredCtxNow = configuredCtx(snap, e, engine?.id ?? '', getSysInfo())
   // Hidden by hand (Models → Library "Hide", config.ts hiddenModels): the web UI leaves it out of its lists and pickers.
   const hidden = isModelHidden(snap, e.key)
   return {
-    ...e, loaded, hasProfile, configuredCtx, lastTps, liveTps, benchTps,
+    ...e, loaded, hasProfile, configuredCtx: configuredCtxNow, lastTps, liveTps, benchTps,
     compatibleWithActiveEngine, incompatibleReason, sourceRepo, hidden,
   }
 }

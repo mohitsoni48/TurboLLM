@@ -117,13 +117,15 @@ describe('ModelDetailDialog — picking a preset', () => {
     expect(api.applyModelPreset).toHaveBeenCalledWith('qwen-7b', 'p1')
     expect(screen.getByRole('button', { name: 'No preset applied' })).toBeTruthy()
 
+    // Nothing of the preset, and nothing else either: the dialog sends only what the user set.
+    const nothingSet = { userSetOnly: true }
     await userEvent.click(screen.getByTitle('Save without reloading'))
     await waitFor(() => expect(api.saveModelProfile).toHaveBeenCalledTimes(1))
-    expect(api.saveModelProfile).toHaveBeenLastCalledWith('qwen-7b', profile(), 'e1')
+    expect(api.saveModelProfile).toHaveBeenLastCalledWith('qwen-7b', nothingSet, 'e1')
 
     await userEvent.click(screen.getByRole('button', { name: /load model/i }))
-    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('qwen-7b', profile()))
-    expect(api.saveModelProfile).toHaveBeenLastCalledWith('qwen-7b', profile(), 'e1')
+    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('qwen-7b', nothingSet))
+    expect(api.saveModelProfile).toHaveBeenLastCalledWith('qwen-7b', nothingSet, 'e1')
   })
 
   it('a refused pin leaves the preset pinned before it in the dropdown', async () => {

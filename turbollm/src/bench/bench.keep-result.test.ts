@@ -219,3 +219,16 @@ test('a held result waits for the first model scan, and is dropped once a scan h
   assert.equal(existsSync(heldFile(first.store)), false, 'its model was deleted: dropped')
   assert.equal((await gone.post('/api/v1/bench/save')).status, 409)
 })
+
+// Save stores what the user set and what the tune chose, not the whole resolved winner: the defaults that rode along
+// were the user's choice from then on, so a later Settings > Model Defaults change stopped reaching a tuned model's
+// other settings (its sampling, its KV type), and a dialog base of only what the user set came back whole.
+test('Save stores what the user set and what the tune chose: the offload, the context it was measured at', async () => {
+  const h = harness()
+  h.r.denseSearch = async (_e, _s, p) => winner(p)
+  h.bench.start(M.key, { flashAttn: 'off', sampling: { temp: 0.4 } as LoadProfile['sampling'], userSetOnly: true })
+  await h.settled()
+  assert.equal((await h.post('/api/v1/bench/save')).status, 200)
+  const saved = getModelProfile(h.store.snapshot(), M.key, 'cuda') as Partial<LoadProfile>
+  assert.deepEqual(saved, { flashAttn: 'off', sampling: { temp: 0.4 }, ctx: 8192, ngl: 3, nCpuMoe: 0, userSetOnly: true, tunedBy: 'bench' })
+})

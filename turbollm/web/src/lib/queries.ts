@@ -156,7 +156,7 @@ import type {
   HfSearchRows,
   HfSortOption,
   HwUsage,
-  LoadProfile,
+  UserSetProfile,
   ModelDetail,
   ModelDirs,
   ModelPreset,
@@ -866,7 +866,7 @@ export function useModelDetail(key: string | null, engineId?: string): UseQueryR
 
 /** `announceFailure` marks a load the shared loader started, and so the one whose failure the
  *  user hears about from here rather than from the screen that fired it. */
-export type LoadRequest = { key: string; overrides?: Partial<LoadProfile>; announceFailure?: boolean }
+export type LoadRequest = { key: string; overrides?: UserSetProfile; announceFailure?: boolean }
 
 export function useModelActions() {
   const qc = useQueryClient()
@@ -876,7 +876,7 @@ export function useModelActions() {
   }
   return {
     save: useMutation({
-      mutationFn: (v: { key: string; profile: LoadProfile; engineId: string }) => saveModelProfile(v.key, v.profile, v.engineId),
+      mutationFn: (v: { key: string; profile: UserSetProfile; engineId: string }) => saveModelProfile(v.key, v.profile, v.engineId),
       onSuccess: (_d, v) => {
         invalidate()
         // Prefix-match ['model', key] invalidates every engine variant of the detail query.
@@ -995,11 +995,11 @@ export function useModelPresetMutations(modelKey: string) {
   }
   return {
     create: useMutation({
-      mutationFn: (p: { name: string; engineId?: string; profile: Partial<LoadProfile> }) => createModelPreset(modelKey, p),
+      mutationFn: (p: { name: string; engineId?: string; profile: UserSetProfile }) => createModelPreset(modelKey, p),
       onSuccess: refresh,
     }),
     update: useMutation({
-      mutationFn: ({ id, patch }: { id: string; patch: { name?: string; engineId?: string; profile?: Partial<LoadProfile> } }) =>
+      mutationFn: ({ id, patch }: { id: string; patch: { name?: string; engineId?: string; profile?: UserSetProfile } }) =>
         updateModelPreset(modelKey, id, patch),
       onSuccess: refresh,
     }),

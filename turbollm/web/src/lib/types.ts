@@ -1057,6 +1057,18 @@ export type LoadProfile = {
   tunedBy?: string
 }
 
+/** The load-profile fields the user set, as the model dialog sends and saves them (the daemon's
+ *  LoadProfile.userSetOnly marks such a profile): a control the user did not move is absent, so the
+ *  model's own or the automatic value applies there, and a later change to Settings > Model Defaults
+ *  still reaches it. Groups the daemon merges key by key are partial too. */
+export type UserSetProfile = Omit<Partial<LoadProfile>, 'sampling' | 'gpu' | 'vllm' | 'litertLm'> & {
+  sampling?: Partial<Sampling>
+  gpu?: Partial<GpuProfile>
+  vllm?: Partial<VllmProfile>
+  litertLm?: Partial<LitertLmProfile>
+  userSetOnly?: boolean
+}
+
 /** A named saved load-config for a model (ADR-353). Mirrors the backend's ModelPreset;
  *  `profile` is `Partial<LoadProfile>` here since presets saved by older builds may be
  *  missing newer fields — the dialog deep-merges them onto the current draft. */
@@ -1065,7 +1077,7 @@ export type ModelPreset = {
   name: string
   /** Engine this preset was tuned on; '' = any engine. */
   engineId: string
-  profile: Partial<LoadProfile>
+  profile: UserSetProfile
   updatedAt: string
   origin: 'manual' | 'autotune'
   /** tok/s measured by the auto-tune run that minted this (origin === 'autotune'). */
@@ -1140,6 +1152,10 @@ export type SysGpu = { name: string; vramMb: number }
 
 export type ModelDetail = ModelEntry & {
   profile: LoadProfile
+  /** The fields of the saved profile (or pinned preset) the user set, read as the daemon's userSetProfile reads them. */
+  saved?: UserSetProfile
+  /** The profile the model loads with when nothing is set: what a preset applied in the dialog is merged onto. */
+  autoProfile?: LoadProfile
   vramFit: VramFit
   gpu: SysGpu | null
   /** All detected GPUs (ADR-054) — drives the multi-GPU split controls. */

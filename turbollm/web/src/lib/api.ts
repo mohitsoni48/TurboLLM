@@ -30,7 +30,7 @@ import type {
   HfSearchRows,
   HfSortOption,
   HfTokenTest,
-  LoadProfile,
+  UserSetProfile,
   ModelDetail,
   ModelDirs,
   ModelPreset,
@@ -752,8 +752,8 @@ export function getModelDetail(key: string, engineId?: string): Promise<ModelDet
   return request<ModelDetail>(`/api/v1/models/${encodeURIComponent(key)}${q}`)
 }
 
-export function saveModelProfile(key: string, profile: LoadProfile, engineId: string): Promise<LoadProfile> {
-  return request<LoadProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile?engine=${encodeURIComponent(engineId)}`, {
+export function saveModelProfile(key: string, profile: UserSetProfile, engineId: string): Promise<UserSetProfile> {
+  return request<UserSetProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile?engine=${encodeURIComponent(engineId)}`, {
     method: 'PUT',
     json: profile,
   })
@@ -777,7 +777,7 @@ export function fetchModelPresets(modelKey: string): Promise<{ presets: ModelPre
 /** Create a preset from the current draft. 400 `too_many_presets` at the per-model cap. */
 export function createModelPreset(
   modelKey: string,
-  preset: { name: string; engineId?: string; profile: Partial<LoadProfile> },
+  preset: { name: string; engineId?: string; profile: UserSetProfile },
 ): Promise<ModelPreset> {
   return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets`, { method: 'POST', json: preset })
 }
@@ -786,7 +786,7 @@ export function createModelPreset(
 export function updateModelPreset(
   modelKey: string,
   id: string,
-  patch: { name?: string; engineId?: string; profile?: Partial<LoadProfile> },
+  patch: { name?: string; engineId?: string; profile?: UserSetProfile },
 ): Promise<ModelPreset> {
   return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets/${id}`, { method: 'PUT', json: patch })
 }
@@ -801,7 +801,7 @@ export function applyModelPreset(modelKey: string, id: string): Promise<ModelPre
 }
 
 /** Load a model by key, optionally with one-off profile overrides (spec 05 §7). */
-export function loadModel(modelKey: string, profileOverrides?: Partial<LoadProfile>): Promise<{ ok: true }> {
+export function loadModel(modelKey: string, profileOverrides?: UserSetProfile): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/engine/start', {
     method: 'POST',
     json: { modelKey, profileOverrides },
@@ -811,7 +811,7 @@ export function loadModel(modelKey: string, profileOverrides?: Partial<LoadProfi
 // ── Auto-benchmark + auto-tune (spec 09 §1) ──────────────────────────────────
 /** Start an auto-tune sweep for a model. 202; progress polls /status `bench`. Throws
  *  ApiError 409 when a run or the engine is busy (caller stops the engine first). */
-export function startBench(modelKey: string, base?: Partial<LoadProfile>): Promise<{ accepted: true }> {
+export function startBench(modelKey: string, base?: UserSetProfile): Promise<{ accepted: true }> {
   return request<{ accepted: true }>('/api/v1/bench', { method: 'POST', json: { modelKey, base } })
 }
 
