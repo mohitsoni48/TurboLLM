@@ -8,10 +8,10 @@ import { getPersonalization } from '../../lib/personas'
 import { useIsDesktop } from '../../lib/useIsDesktop'
 import { cn, formatDiff } from '../../lib/utils'
 import { ApiError, track } from '../../lib/api'
-import { useGitBranch, useModelActions, useModels, useStatus } from '../../lib/queries'
+import { useGitBranch, useModelActions, useModels, useShowAllEngineModels, useStatus } from '../../lib/queries'
 import { useLinks, useRemoteModels } from '../../lib/link-queries'
 import { findRemoteChoice, selectModel } from '../../lib/remote-models'
-import { isChatModel } from '../../lib/model-kind'
+import { chatModelsForPicker } from '../../lib/model-kind'
 import { useUiStore } from '../../stores/ui'
 import { createCodeSession } from '../../lib/code-api'
 import { useCodeStats } from '../../lib/code-queries'
@@ -154,8 +154,9 @@ export function CodeHomeScreen() {
   // engine-compatible models are offered), so picking a model here triggers a real
   // load (the engine auto-starts), exactly like Chat's own model picker.
   const modelsQ = useModels()
+  const showAllEngineModels = useShowAllEngineModels()
   const modelActions = useModelActions()
-  const allModels = (modelsQ.data?.models ?? []).filter((m) => m.compatibleWithActiveEngine && isChatModel(m))
+  const { listed: allModels, hidden: modelsHidden } = chatModelsForPicker(modelsQ.data?.models ?? [], showAllEngineModels)
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||
@@ -246,12 +247,15 @@ export function CodeHomeScreen() {
     if (isDesktop) inputRef.current?.focus()
   }, [isDesktop])
 
-  // Once the picked repo's branch resolves, default the worktree's base branch to it
-  // (the base a worktree normally branches from) — only when the user hasn't already
-  // picked a different base for this repo.
+  // The worktree's base branch defaults to the picked repo's checked-out branch (the base a
+  // worktree normally branches from), and resets with every repo pick. It used to change only
+  // when a non-empty branch came in, so the base of the previous repo could stay (a repo with a
+  // detached HEAD, or one on a branch of the same name): the session was then asked to branch
+  // off a name this repo may not have, which the daemon refuses (base_unavailable). Empty is the
+  // current checkout.
   useEffect(() => {
-    if (repoBranch) setBaseBranch(repoBranch)
-  }, [repoBranch])
+    setBaseBranch(repoBranch)
+  }, [repoPath, repoBranch])
 
   const chooseRepo = (path: string) => {
     setRepoPath(path)
@@ -507,6 +511,7 @@ export function CodeHomeScreen() {
           mode={mode}
           onModeChange={setMode}
           models={allModels}
+          modelsHidden={modelsHidden}
           links={linksQ.data ?? []}
           remoteModels={remoteModelsQ.data ?? []}
           loadedKey={activeRemoteId ?? model?.key ?? null}

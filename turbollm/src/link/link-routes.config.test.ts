@@ -271,6 +271,19 @@ test('a malformed body is a clean 400', async (t) => {
   assert.equal(noBody.status, 400)
 })
 
+// A body of null threw at the first field read: a bare 500 from Hono's default handler.
+test('a JSON body that is not an object is the malformed-body 400, not a 500, and writes nothing', async (t) => {
+  const h = mkDeps(t, [key('tllm-a', ['config:write'])])
+  const a = app(h.d)
+  const before = stable(h.onDisk())
+  for (const body of [null, 5, 'gateway.keepN', [{ patch: { 'gateway.keepN': 2 } }]]) {
+    const res = await patch(a, 'tllm-a', body)
+    assert.equal(res.status, 400, `${JSON.stringify(body)}: ${await res.clone().text()}`)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_request')
+  }
+  assert.equal(stable(h.onDisk()), before)
+})
+
 test('a legacy key with NO grant still reaches both routes (existing keys are full-access)', async (t) => {
   const h = mkDeps(t, [key('tllm-legacy')])
   const a = app(h.d)

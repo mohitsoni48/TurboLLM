@@ -41,9 +41,11 @@ function sseEventReader(body: ReadableStream<Uint8Array>) {
 }
 
 function fakeApp(requestLog: RequestLog | undefined) {
+  // A loopback-only daemon: the body reads carry hostGate, which reads `daemon.lanBind`. Who may
+  // read bodies is server.settings-gate.test.ts's subject.
   const d = {
     version: 'test',
-    store: { snapshot: () => ({}), update: (fn: (c: unknown) => void) => fn({}) },
+    store: { snapshot: () => ({ daemon: { lanBind: false } }), update: (fn: (c: unknown) => void) => fn({}) },
     manager: { status: () => ({ state: 'stopped', model: null }), logPath: () => '' },
     requestLog,
   } as unknown as Deps
@@ -159,6 +161,31 @@ test('GET /api/v1/requests/stream: a subscriber receives entries as they are sta
   const finalized = await events.next()
   assert.equal(finalized.event, 'entry')
   assert.equal(JSON.parse(finalized.data).status, 200)
+})
+
+test('GET /api/v1/requests/stream: never carries captured bodies (same as the list), but the log keeps them', async () => {
+  const log = new RequestLog()
+  const { app } = fakeApp(log)
+  const res = await app.request('/api/v1/requests/stream')
+  const events = sseEventReader(res.body!)
+
+  const id = log.start({
+    source: 'openai', harness: null, codeSessionId: null, modelKey: 'm',
+    remote: null, stream: false, params: {}, counts: { messages: 1, tools: 0, systemChars: 0 },
+    requestBody: '{"messages":[{"role":"user","content":"a very long prompt"}]}',
+  })
+  const started = JSON.parse((await events.next()).data)
+  assert.equal(started.id, id)
+  assert.equal(started.bodies, null)
+
+  log.finalize(id, { status: 200, promptTokens: 1, completionTokens: 1, responseBody: '{"content":"reply"}' })
+  const finalized = JSON.parse((await events.next()).data)
+  assert.equal(finalized.status, 200)
+  assert.equal(finalized.bodies, null)
+
+  // Stripping is a copy: the stored entry (what GET /requests/:id serves) still has both bodies.
+  assert.match(log.get(id)!.bodies!.request, /a very long prompt/)
+  assert.match(log.get(id)!.bodies!.response, /reply/)
 })
 
 test('every route degrades gracefully when d.requestLog is absent (feature not wired under some embeddings)', async () => {

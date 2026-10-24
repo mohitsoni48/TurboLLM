@@ -32,8 +32,9 @@
 //      already fires when the CLI itself exits, and terminal-manager.ts's `isAgentExited`/
 //      `getExitCode` already record that — zero new plumbing needed for the signal itself.
 //   2. SAFETY NET — `sweepInteractiveCliRuns`, a periodic watchdog (wired in cli.ts alongside the
-//      scheduler), catches every case the fast path can miss: the terminal got idle-killed
-//      (TerminalManager.cleanupIdle — nobody ever opened it) before the CLI reported, the daemon
+//      scheduler), catches every case the fast path can miss: the terminal is gone before the CLI
+//      reported (a human closed it; TerminalManager.cleanupIdle cannot be the cause while the run
+//      is parked, as execute.ts gives the terminal an idle TTL past this module's bound), the daemon
 //      restarted (the PTY is unconditionally dead; nothing else will ever call agent-exited for
 //      it again), or the CLI has been sitting at a prompt for too long even WITH a live terminal
 //      (the hard wall-clock cap spec 20 §6 requires on every execution path).
@@ -52,9 +53,10 @@ import type { AgentRun, ConversationStore } from '../chat/db'
 import type { GenerationGate } from '../agents/gate'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
-import type { RouteResult } from '../gateway/model-router'
+import type { ModelRouter, RouteResult } from '../gateway/model-router'
 import { decideModelAction } from './model-conflict'
-import type { CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import { firstMessageSeedProblem, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
+import type { TerminalManager } from '../terminal/terminal-manager'
 
 /** Generous relative to CLI_ROUTINE_TIMEOUT_MS/ROUTINE_RUN_TIMEOUT_MS's 10 minutes: those bound a
  *  FULLY AUTOMATED run nobody needs to attend. This bounds a run that may genuinely need a human
@@ -68,7 +70,10 @@ export interface CliInteractiveDeps {
   gate: GenerationGate
   getLoadedModelKey: () => string | null
   getEngineIdle: () => boolean
-  loadExplicit: (modelKey: string) => Promise<RouteResult>
+  /** `ModelRouter.loadExplicit`, its arguments passed on (restoreModel passes `restoreAfter`). */
+  loadExplicit: ModelRouter['loadExplicit']
+  /** `ModelRouter.reloadAfterRender` (see restoreModel). */
+  reloadAfterRender: (modelKey: string, routineModelKey: string) => void
   now: () => Date
   isAvailable: () => Promise<boolean>
   /** Spawns the actual terminal for a freshly-created AgentRun — terminal-routes.ts's
@@ -82,18 +87,24 @@ export interface CliInteractiveDeps {
   /** RoutineScheduler.releaseParked — undefined under tests/embedders that don't wire a
    *  scheduler, mirroring `Deps.routineScheduler`'s own optionality. */
   releaseParked?: (routineId: string, runId: string) => void
+  /** Aborted by execute.ts's kickoff bound when it gives up on this start. By then it has already
+   *  written the run's terminal state and the scheduler has released the routine, so a start that
+   *  is still in flight must not go on to launch a CLI behind that 'errored' row (a second fire
+   *  could then run in the same workspace). Undefined under tests that call this directly. */
+  kickoffSignal?: AbortSignal
 }
 
 /** codeSessionId -> the model that was loaded before this run swapped it out, so it can be
- *  restored once the run finalizes (spec 20 §5). In-memory only, same acceptable gap
- *  cli-routine.ts's own restore logic documents for a cold daemon: after a restart there is
- *  nothing left in memory to restore FROM, so `finalizeInteractiveRun` simply skips it — no worse
- *  than the one-shot path's own documented behavior. */
-const pendingRestore = new Map<string, string>()
+ *  restored once the run finalizes (spec 20 §5), the routine's model it swapped in, and the swap's
+ *  own result (see restoreModel). In-memory only, same acceptable gap cli-routine.ts's own restore
+ *  logic documents for a cold daemon: after a restart there is nothing left in memory to restore
+ *  FROM, so `finalizeInteractiveRun` simply skips it — no worse than the one-shot path's own
+ *  documented behavior. */
+const pendingRestore = new Map<string, { previousModel: string; pinnedModel: string; swap: RouteResult | undefined }>()
 
 /** The harness name to use in a user-facing error. This runner now drives claude, opencode and pi,
  *  so a hardcoded "claude" sent the user to debug a CLI that was never involved. */
-function agentLabel(routine: Routine): string {
+export function agentLabel(routine: Routine): string {
   return isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude'
 }
 
@@ -109,10 +120,28 @@ export async function runCliInteractiveRoutine(
 ): Promise<RoutineRunStatus> {
   const finish = (patch: Parameters<ConversationStore['updateRoutineRun']>[1]) =>
     deps.store.updateRoutineRun(run.id, { ...patch, endedAt: deps.now().toISOString() })
+  // See `kickoffSignal`. The caller already wrote this run's row, so an abandoned start returns
+  // without touching it.
+  const abandoned = () => deps.kickoffSignal?.aborted === true
 
-  if (!(await deps.isAvailable())) {
+  const available = await deps.isAvailable()
+  if (abandoned()) return 'errored'
+  if (!available) {
     finish({ status: 'skipped', skipReason: 'cli_unavailable' })
     return 'skipped'
+  }
+
+  // The routine's whole task reaches the CLI only as its opening prompt on the launch command line
+  // (createAgentTerminal). One the command line cannot carry (terminal-routes.ts's
+  // firstMessageSeedProblem: on Windows a double quote, a trailing backslash or over 4000
+  // characters; elsewhere over 64 KiB once quoted for bash; anywhere a control character) used to
+  // open an idle CLI that nobody may ever type into, and the run held the routine's swapped-in
+  // model until the sweep's 30-minute bound. It ends here instead, before any swap, saying why.
+  const harness = isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude'
+  const promptProblem = firstMessageSeedProblem(routine.prompt, harness)
+  if (promptProblem) {
+    finish({ status: 'errored', error: `The routine's prompt cannot be handed to the ${agentLabel(routine)} CLI because ${promptProblem}. Shorten or reword it.` })
+    return 'errored'
   }
 
   const pinnedModel = routine.modelKey
@@ -129,13 +158,23 @@ export async function runCliInteractiveRoutine(
   }
 
   let previousModel: string | null = null
+  let swap: RouteResult | undefined // the swap's own result, set with previousModel (see restoreModel)
   if (action === 'swap-then-run') {
     const swapResult = await deps.loadExplicit(pinnedModel)
     if ('status' in swapResult) {
+      // A load that failed, or a swap a ComfyUI render refused, may already have stopped the
+      // user's model (cli-routine.ts's swap explains when): it is restored, or every run of a
+      // routine whose model cannot start left the engine empty.
+      if (currentlyLoaded) await restoreModel(deps, currentlyLoaded, pinnedModel, swapResult)
       finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
       return 'errored'
     }
     previousModel = currentlyLoaded
+    swap = swapResult
+  }
+  if (abandoned()) {
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
+    return 'errored'
   }
 
   const mode = routine.permissionMode ?? 'ask'
@@ -148,35 +187,48 @@ export async function runCliInteractiveRoutine(
     // terminal harness (claude/opencode/pi), and stamping 'claude' on an opencode routine would
     // make createAgentTerminal build a claude launch command for it. See schema.ts's
     // TERMINAL_CODE_AGENT for why the two vocabularies differ.
-    codeAgent: isTerminalCodingAgent(routine.codingAgent) ? TERMINAL_CODE_AGENT[routine.codingAgent] : 'claude',
+    codeAgent: harness,
   })
   deps.store.updateRoutineRun(run.id, { codeSessionId: agentRun.id })
   deps.store.addMessage(conv.id, 'user', routine.prompt)
 
   // The launch command ALSO seeds this same prompt as the CLI's own opening argument
   // (buildTerminalLaunchCommand) — the addMessage call above is a durable record for the UI/run
-  // history, not the delivery mechanism. `canSeedFirstMessage`'s limits (length, quotes, control
-  // characters) still apply here exactly as they do for a human's first Code-session message: a
-  // prompt that doesn't fit opens an idle CLI instead of a silently-failed one — worse than normal
-  // seeding, but still strictly better than erroring the routine outright, and no one is
-  // guaranteed to be watching to retype it the way a human would.
+  // history, not the delivery mechanism. A prompt the command line cannot carry has already ended
+  // the run above: no one is guaranteed to be watching to retype it the way a human would.
   const result = await deps.createTerminal(agentRun, { mode, firstMessage: routine.prompt })
+  if (abandoned()) {
+    // Abandoned while the terminal was being started. execute.ts's createTerminal refuses to spawn
+    // once the signal is aborted; anything that was spawned anyway is closed again right here.
+    if (result.ok) deps.killTerminal(agentRun.id)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
+    return 'errored'
+  }
   if (!result.ok) {
-    if (previousModel) await restoreModel(deps, previousModel)
+    if (previousModel) await restoreModel(deps, previousModel, pinnedModel, swap)
     finish({ status: 'errored', error: `Could not start the interactive ${agentLabel(routine)} CLI session: ${result.message}` })
     return 'errored'
   }
 
-  if (previousModel) pendingRestore.set(agentRun.id, previousModel)
+  if (previousModel) pendingRestore.set(agentRun.id, { previousModel, pinnedModel, swap })
   // No endedAt: the run has not ended, it's parked. See this module's header comment.
   deps.store.updateRoutineRun(run.id, { status: 'needs_approval' })
   return 'needs_approval'
 }
 
-async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit'>, previousModel: string): Promise<void> {
+/** `swap`: the swap's own result. With keep-N 2 or more the swap took a pool slot and recorded the routine's model as
+ *  the one last loaded, and a restore that finds the user's model still running puts back what that record replaced
+ *  (ModelRouter.undoSwapRecord). */
+async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit' | 'reloadAfterRender'>, previousModel: string, pinnedModel: string, swap: RouteResult | undefined): Promise<void> {
   try {
-    const restoreResult = await deps.loadExplicit(previousModel)
-    if ('status' in restoreResult) {
+    const restoreResult = await deps.loadExplicit(previousModel, undefined, { restoreAfter: swap })
+    // A ComfyUI render that began while the run was parked (or during its swap) keeps the routine's
+    // model for its release() to load, and refuses this restore until it ends. Dropped, the render's
+    // end brought the routine's model back and left the user's unloaded: the render's release reloads
+    // the previous model instead, as model-swap.ts's restore does.
+    if ('status' in restoreResult && restoreResult.message.includes('ComfyUI is rendering')) {
+      deps.reloadAfterRender(previousModel, pinnedModel)
+    } else if ('status' in restoreResult) {
       console.warn(`[routines] failed to restore the previously-loaded model '${previousModel}' after an interactive CLI routine run: ${restoreResult.message}`)
     }
   } catch (e) {
@@ -189,7 +241,7 @@ async function restoreModel(deps: Pick<CliInteractiveDeps, 'loadExplicit'>, prev
  *  'needs_approval', since the fast path and the sweep can race (an agent-exited POST landing in
  *  the same tick the watchdog independently notices the same exit). */
 function finalizeInteractiveRun(
-  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'now' | 'releaseParked'>,
+  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'reloadAfterRender' | 'now' | 'releaseParked'>,
   run: RoutineRun,
   outcome: { status: 'ok' | 'errored'; result?: string; error?: string },
 ): void {
@@ -199,12 +251,28 @@ function finalizeInteractiveRun(
   deps.releaseParked?.(run.routineId, run.id)
   const codeSessionId = current.codeSessionId
   if (codeSessionId) {
-    const previousModel = pendingRestore.get(codeSessionId)
-    if (previousModel) {
+    const pending = pendingRestore.get(codeSessionId)
+    if (pending) {
       pendingRestore.delete(codeSessionId)
-      void restoreModel(deps, previousModel)
+      void restoreModel(deps, pending.previousModel, pending.pinnedModel, pending.swap)
     }
   }
+}
+
+/** Ends a parked interactive run that an Approve or Deny reached (execute.ts resumeRoutineRun).
+ *  Such a run has no structured call to decide (its CLI runs, and in ask mode asks, in its own
+ *  terminal), and the decision used to write the run's end and nothing else: its CLI kept
+ *  running in the workspace behind a released routine, and the user's model, kept in
+ *  `pendingRestore`, was never put back, since the sweep only looks at parked runs. It now closes
+ *  the session as the sweep's wall-clock bound does: the terminal and its CLI are killed, then
+ *  finalizeInteractiveRun writes the end, releases the parked guard and restores the model. */
+export function closeInteractiveRun(
+  deps: Pick<CliInteractiveDeps, 'store' | 'loadExplicit' | 'reloadAfterRender' | 'now' | 'releaseParked' | 'killTerminal'>,
+  run: RoutineRun,
+  error: string,
+): void {
+  if (run.codeSessionId) deps.killTerminal(run.codeSessionId)
+  finalizeInteractiveRun(deps, run, { status: 'errored', error })
 }
 
 /** Everything `sweepInteractiveCliRuns` actually touches — a `Pick` of `CliInteractiveDeps`
@@ -213,8 +281,30 @@ function finalizeInteractiveRun(
  *  `createTerminal`) just to run the watchdog. */
 export type CliInteractiveSweepDeps = Pick<
   CliInteractiveDeps,
-  'store' | 'now' | 'loadExplicit' | 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal' | 'releaseParked'
+  'store' | 'now' | 'loadExplicit' | 'reloadAfterRender' | 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal' | 'releaseParked'
 >
+
+/** The sweep's four terminal lookups over a TerminalManager (cli.ts wires these). The manager is
+ *  keyed by its OWN terminal id, while a parked run records only its Code session id, so every
+ *  lookup maps through `findByCodeSessionId` first. Handing the session id straight through made
+ *  every lookup miss: the first sweep finalized each parked run as errored (releasing the routine,
+ *  restoring the old model) while its CLI kept running, and the timeout kill was a no-op. A lazy
+ *  getter, so nothing constructs the manager until a parked run actually needs it. */
+export function terminalLookupsBySession(
+  getTm: () => Pick<TerminalManager, 'findByCodeSessionId' | 'isActive' | 'isAgentExited' | 'getExitCode' | 'kill'>,
+): Pick<CliInteractiveSweepDeps, 'isTerminalActive' | 'isAgentExited' | 'getExitCode' | 'killTerminal'> {
+  const withTerminal = <T>(codeSessionId: string, fallback: T, fn: (tm: ReturnType<typeof getTm>, terminalId: string) => T): T => {
+    const tm = getTm()
+    const terminalId = tm.findByCodeSessionId(codeSessionId)
+    return terminalId === null ? fallback : fn(tm, terminalId)
+  }
+  return {
+    isTerminalActive: (codeSessionId) => withTerminal(codeSessionId, false, (tm, id) => tm.isActive(id)),
+    isAgentExited: (codeSessionId) => withTerminal(codeSessionId, false, (tm, id) => tm.isAgentExited(id)),
+    getExitCode: (codeSessionId) => withTerminal<number | undefined>(codeSessionId, undefined, (tm, id) => tm.getExitCode(id)),
+    killTerminal: (codeSessionId) => withTerminal(codeSessionId, undefined, (tm, id) => tm.kill(id)),
+  }
+}
 
 /** Periodic safety net (see this module's header) — call on an interval from cli.ts, alongside
  *  the scheduler, AND once synchronously right after `RoutineScheduler.start()` so a run
@@ -254,7 +344,7 @@ export function sweepInteractiveCliRuns(deps: CliInteractiveSweepDeps): void {
       continue
     }
     if (!deps.isTerminalActive(run.codeSessionId)) {
-      // Terminal is gone with no agent-exited report — idle-killed before finishing, or a daemon
+      // Terminal is gone with no agent-exited report — closed before finishing, or a daemon
       // restart (the PTY cannot have survived that either way).
       finalizeInteractiveRun(deps, run, { status: 'errored', error: 'The interactive session ended unexpectedly before completing (its terminal is no longer running).' })
       continue

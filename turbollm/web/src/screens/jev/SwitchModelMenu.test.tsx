@@ -4,6 +4,7 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import { SwitchModelMenu, ejectModel, switchToModel } from './SwitchModelMenu'
 import type { JevStatus, ModelEntry } from '../../lib/types'
 
@@ -55,9 +56,9 @@ function rowOf(name: string): HTMLElement {
   return row
 }
 
-function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT) {
+function renderMenu(models: ModelEntry[], current: JevStatus = CURRENT, showAllEngineModels?: boolean) {
   const onPick = vi.fn()
-  render(<SwitchModelMenu current={current} models={models} onPick={onPick} />)
+  render(<SwitchModelMenu current={current} models={models} onPick={onPick} showAllEngineModels={showAllEngineModels} />)
   return { onPick }
 }
 
@@ -111,6 +112,20 @@ describe('SwitchModelMenu', () => {
     expect(names).toEqual(['Gemma 27B'])
   })
 
+  // Settings → Models, "Show models for every engine" covers this picker too: such a pick loads on the selected engine,
+  // which shows its own error if it cannot. A Laya model never runs there, so with no Laya engine it is still not
+  // offered.
+  it('offers a model the engine cannot run with "Show models for every engine" on', () => {
+    renderMenu([
+      CHAT,
+      model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false }),
+      model({ key: 'laya-off', name: 'Laya, no engine', laya: { checkpoints: ['english'] }, compatibleWithActiveEngine: false }),
+      model({ key: 'embed', name: 'An embedder', embedding: true }),
+    ], CURRENT, true)
+    const names = screen.getAllByRole('button').map((b) => b.textContent)
+    expect(names).toEqual(['Gemma 27B', 'Wrong format'])
+  })
+
   it('does not offer the model that is already loaded', () => {
     renderMenu([CHAT, model({ key: CURRENT.key, name: CURRENT.name, jev: { ...JEV_INFO, labels: [...JEV_INFO.labels] }, loaded: true })])
     expect(screen.queryByText('Text classification models')).toBeNull()
@@ -119,16 +134,25 @@ describe('SwitchModelMenu', () => {
 
   // Both groups can empty at once — a library of GGUF chat models plus one safetensors Jev
   // model under vLLM leaves nothing loadable — and an empty bordered box explains nothing.
+  // It pointed at the Engines screen, to change engines; nothing may suggest another engine. Settings' "Show models
+  // for every engine" is what lists the rest.
   it('says where to go when nothing here can load', () => {
     renderMenu([model({ key: 'gguf', name: 'Wrong format', compatibleWithActiveEngine: false })])
-    expect(screen.getByText('Nothing else here can load on the active engine. Change it on the Engines screen.')).toBeTruthy()
+    expect(screen.getByText('Nothing else here can load on the selected engine. Settings → Models & loading → "Show models for every engine" lists every model.')).toBeTruthy()
+    expect(screen.queryByText(/Engines screen/)).toBeNull()
     expect(screen.queryByText('Chat models')).toBeNull()
     expect(screen.queryByText('Text classification models')).toBeNull()
   })
 
+  it('does not point at the setting once it is on', () => {
+    renderMenu([model({ key: 'embed', name: 'An embedder', embedding: true })], CURRENT, true)
+    expect(screen.getByText('Nothing else here can be loaded.')).toBeTruthy()
+    expect(screen.queryByText(/Show models for every engine/)).toBeNull()
+  })
+
   it('says nothing of the sort once there is something to pick', () => {
     renderMenu([CHAT])
-    expect(screen.queryByText(/Engines screen/)).toBeNull()
+    expect(screen.queryByText(/Show models for every engine|Nothing else/)).toBeNull()
   })
 
   it('hands the picked model back whole', async () => {
@@ -259,5 +283,34 @@ describe('ejectModel', () => {
     const stopEngine = vi.fn(async () => { throw new ApiError('engine_busy', 'The engine is still generating.', 409) })
     await ejectModel(LAYA, { stopEngine })
     expect(h.toastError).toHaveBeenCalledWith('Could not eject model: The engine is still generating.')
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): no picker offers it, and with nothing else on offer it is counted.
+describe('SwitchModelMenu with models hidden by the user', () => {
+  it('leaves a hidden model out', () => {
+    renderMenu([CHAT, { ...OTHER_JEV, hidden: true }])
+    expect(screen.getByRole('button', { name: 'Gemma 27B' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Other NLI' })).not.toBeInTheDocument()
+  })
+
+  it('counts them, with the way to list them, when nothing else can be picked', () => {
+    render(
+      <MemoryRouter>
+        <SwitchModelMenu current={CURRENT} models={[{ ...CHAT, hidden: true }]} onPick={vi.fn()} />
+      </MemoryRouter>,
+    )
+    expect(screen.queryByRole('button', { name: 'Gemma 27B' })).not.toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Show hidden models' })).toHaveAttribute('href', '/models?hidden=1')
+  })
+
+  it('counts a hidden model in two folders once', () => {
+    render(
+      <MemoryRouter>
+        <SwitchModelMenu current={CURRENT} models={[{ ...CHAT, hidden: true }, { ...CHAT, hidden: true, path: '/more/gemma.gguf' }]} onPick={vi.fn()} />
+      </MemoryRouter>,
+    )
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
   })
 })

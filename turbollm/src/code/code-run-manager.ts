@@ -62,6 +62,14 @@ const IDLE_RETAIN_MS = 30_000
 interface PendingTurn {
   task: string
   userMsgId: string
+  /** The user row was stored for this turn alone (POST /messages with content) and has not reached
+   *  the model, so stop() deletes it with the queue entry. False for a re-run of a row that already
+   *  existed (POST /messages with no content): that row can be the active turn's own message or
+   *  one already steered into the live turn, and stays. */
+  ownsUserMsg: boolean
+  /** Asks a user message that was already there again (POST /messages with no content). Its row
+   *  can have replies after it by the time it runs, so its history is what came before it (pump). */
+  rerun: boolean
   /** -1 = unlimited (default), 0 = off, N>0 = a real token cap — see RunCodeParams.thinkingBudget. */
   thinkingBudget: number
   /** See RunCodeParams.reasoningEffort. Undefined = don't send the field. */
@@ -110,6 +118,13 @@ export class CodeRunManager {
   private d: Deps
   private runner: CodeSessionRunner
   private sessions = new Map<string, SessionState>()
+  /** At least every seq any idle-GC'd session buffer handed out. A session's buffer is dropped
+   *  IDLE_RETAIN_MS after it goes idle. The web client resets its seq cursor when its stream ends
+   *  idle or it gives up reconnecting, but a stream client that missed that idle end (or any
+   *  GET /stream consumer that keeps its cursor across turns) still holds the old cursor — a
+   *  replacement buffer restarting at 0 would sit below it, so a mid-turn reconnect
+   *  (?fromSeq=<old cursor>) would replay nothing. New buffers start here instead. */
+  private seqFloor = 0
 
   constructor(d: Deps, opts?: { runner?: CodeSessionRunner }) {
     this.d = d
@@ -177,7 +192,7 @@ export class CodeRunManager {
     if (!s) {
       const emitter = new EventEmitter()
       emitter.setMaxListeners(0) // unbounded: many tabs may watch one session
-      s = { convId, repoRoot, buffer: new RingBuffer(), emitter, queue: [], active: null, replayFloor: 0, todos: [] }
+      s = { convId, repoRoot, buffer: new RingBuffer(undefined, this.seqFloor), emitter, queue: [], active: null, replayFloor: 0, todos: [] }
       this.sessions.set(sessionId, s)
     }
     if (s.cleanupTimer) { clearTimeout(s.cleanupTimer); s.cleanupTimer = undefined }
@@ -191,10 +206,10 @@ export class CodeRunManager {
    *
    * `queued` is true when the turn had to wait (a run was already active), false when it started.
    */
-  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
+  enqueue(sessionId: string, params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; rerun?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; kind?: SteerKind; model?: string }): { queued: boolean } {
     const s = this.ensure(sessionId, params.convId, params.repoRoot)
     const willQueue = s.active !== null
-    s.queue.push({ task: params.task, userMsgId: params.userMsgId, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
+    s.queue.push({ task: params.task, userMsgId: params.userMsgId, ownsUserMsg: params.ownsUserMsg ?? false, rerun: params.rerun ?? false, thinkingBudget: params.thinkingBudget ?? -1, reasoningEffort: params.reasoningEffort, kind: params.kind ?? 'followUp', model: params.model })
     this.emitQueue(sessionId)
     void this.pump(sessionId)
     return { queued: willQueue }
@@ -216,10 +231,15 @@ export class CodeRunManager {
    */
   async steer(
     sessionId: string,
-    params: { convId: string; repoRoot: string; task: string; userMsgId: string; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
+    params: { convId: string; repoRoot: string; task: string; userMsgId: string; ownsUserMsg?: boolean; rerun?: boolean; thinkingBudget?: number; reasoningEffort?: ReasoningEffort; model?: string },
   ): Promise<{ steered: boolean; queued: boolean }> {
     const active = this.sessions.get(sessionId)?.active
-    if (active?.steer) {
+    // Not into a turn that was stopped (Stop, Send now): pi still reports it streaming while it
+    // winds down (a tool being killed) and takes the steer, but every model request left in that
+    // run is aborted, so the message would be stored and never answered. It runs next instead.
+    // The run's own stops (loop breaker, near-overflow) don't fire `ac`: runCodeSession's handle
+    // declines a steer for those itself (returns false), which lands in the same fallback.
+    if (active?.steer && !active.ac.signal.aborted) {
       try {
         if (await active.steer(params.task)) return { steered: true, queued: false }
       } catch {
@@ -293,6 +313,14 @@ export class CodeRunManager {
     const push = (event: string, data: unknown) => {
       const ss = this.sessions.get(sessionId)
       if (!ss) return
+      // A tool_progress frame carries the call's WHOLE output so far (pi's bash re-sends its
+      // cumulative, up-to-50 KB snapshot every ~100 ms) and the client replaces, never appends
+      // (applyToolProgress) — so keep only the latest one per call for replay. Otherwise one
+      // chatty command fills the 6000-event ring with snapshots (hundreds of MB per session).
+      if (event === 'tool_progress') {
+        const id = (data as { id?: unknown }).id
+        ss.buffer.dropLast((e) => e.event === 'tool_progress' && (e.data as { id?: unknown }).id === id)
+      }
       const ev = ss.buffer.push(event, data)
       ss.emitter.emit('event', ev)
     }
@@ -342,6 +370,9 @@ export class CodeRunManager {
           diff: data.diff as string | undefined,
           patch: data.patch as string | undefined,
           firstChangedLine: data.firstChangedLine as number | undefined,
+          // A delegate_task/invoke_skill sub-agent's own call (code-session.ts tags those frames):
+          // kept for the transcript and revert, but never replayed into the parent model's history.
+          ...(data.subagent === true ? { subagent: true } : {}),
         })
         timeline.push({ type: 'tool', id })
       }
@@ -357,6 +388,15 @@ export class CodeRunManager {
       // for the live ask-gate switch); a run that starts with no model loaded fails cleanly below.
       const mode = (this.d.db.getConversation(s.convId)?.agentMode ?? 'auto') as CodeMode
 
+      // A re-run's question can already have replies after it: its earlier answers, the live
+      // turn's placeholder when it re-runs that turn's own message, and the reply of a turn queued
+      // ahead of it for the same message. Leaving out only its own rows replayed those after the
+      // question and then sent the question as the prompt, so the model read the earlier answer
+      // BEFORE the question it answered. Its history is what came before the question.
+      const conversation = turn.rerun ? (this.d.db.getConversation(s.convId, true)?.messages ?? []) : []
+      const questionAt = conversation.findIndex((m) => m.id === turn.userMsgId)
+      const afterQuestion = questionAt === -1 ? [] : conversation.slice(questionAt + 1).map((m) => m.id)
+
       const result = await this.runner({
         d: this.d,
         convId: s.convId,
@@ -366,6 +406,11 @@ export class CodeRunManager {
         thinkingBudget: turn.thinkingBudget,
         reasoningEffort: turn.reasoningEffort,
         task: turn.task,
+        // Not prior history for this turn: its own user message + placeholder, and the follow-ups
+        // still queued behind it (their user rows are already in the DB, ahead of this turn's
+        // placeholder) — see RunCodeParams.excludeFromHistory. For a re-run, everything after its
+        // question too (afterQuestion above).
+        excludeFromHistory: [turn.userMsgId, assistantMsg.id, ...s.queue.map((t) => t.userMsgId), ...afterQuestion],
         model: turn.model,
         signal: ac.signal,
         sink,
@@ -378,12 +423,16 @@ export class CodeRunManager {
         },
       })
 
-      const finalContent = content.trim() || result.finalText
+      // Not for an aborted turn: one stopped before its first token has no text of its own, and
+      // pi's getLastAssistantText() then skips that empty aborted message and returns the PREVIOUS
+      // turn's seeded reply — which must not be saved as this turn's content.
+      const fallbackText = result.aborted ? '' : result.finalText
+      const finalContent = content.trim() || fallbackText
       // Rare fallback: pi's own getLastAssistantText() produced text the delta stream never
       // carried (result.finalText used instead of the empty accumulated `content`). Mirror it
       // into the timeline too so a completed message's timeline text always matches its content
       // — otherwise the interleaved render would silently drop this reply's only content.
-      if (!content.trim() && result.finalText.trim()) timeline.push({ type: 'text', text: result.finalText })
+      if (!content.trim() && fallbackText.trim()) timeline.push({ type: 'text', text: fallbackText })
       const ctxStats = this.reliableContextStats(s.convId, { ctxUsed: result.contextUsed, ctxMax: result.contextMax }, result.aborted)
       this.d.db.updateMessage(assistantMsg.id, {
         content: finalContent,
@@ -399,7 +448,7 @@ export class CodeRunManager {
           ttftMs: result.ttftMs, totalMs: result.totalMs,
         },
       })
-      if (result.finalText.trim()) this.d.db.upsertRunDoc(sessionId, result.finalText.trim())
+      if (fallbackText.trim()) this.d.db.upsertRunDoc(sessionId, fallbackText.trim()) // same aborted-turn rule as `content`
       this.d.db.updateAgentRun(sessionId, { status: result.aborted ? 'interrupted' : 'done', endedAt: new Date().toISOString() })
       push('done', { contextUsed: ctxStats.ctxUsed, contextMax: ctxStats.ctxMax, aborted: result.aborted })
       // Code sessions never go through the chat message endpoint, so nothing else fires
@@ -457,22 +506,37 @@ export class CodeRunManager {
           // transcript; live subscribers get an 'idle' signal to end their loops.
           ss.replayFloor = ss.buffer.head()
           ss.emitter.emit('idle')
-          ss.cleanupTimer = setTimeout(() => { this.sessions.delete(sessionId) }, IDLE_RETAIN_MS)
+          ss.cleanupTimer = setTimeout(() => {
+            this.seqFloor = Math.max(this.seqFloor, ss.buffer.head())
+            this.sessions.delete(sessionId)
+          }, IDLE_RETAIN_MS)
         }
       }
     }
   }
 
   /**
-   * Stop a session's active run and drop everything queued behind it. The active turn's
-   * AbortController fires (runCodeSession aborts pi); the turn's finally records 'interrupted'.
-   * Returns true if there was anything to stop.
+   * Stop a session's active run and drop everything queued behind it, with the user messages
+   * stored for those queued turns (see PendingTurn.ownsUserMsg). The active turn's AbortController
+   * fires (runCodeSession aborts pi); the turn's finally records 'interrupted'. Returns true if
+   * there was anything to stop. Callers: the user's Stop and the web's Eject (POST /stop), and a
+   * routine's deadline and approval stall (routines/code-runner.ts).
    */
   stop(sessionId: string): boolean {
     const s = this.sessions.get(sessionId)
     if (!s) return false
     const had = s.active !== null || s.queue.length > 0
-    if (s.queue.length > 0) { s.queue = []; this.emitQueue(sessionId) }
+    if (s.queue.length > 0) {
+      // POST /messages stores a follow-up's user row before queueing it. Dropped from the queue
+      // only, the row stayed unanswered: the next turn replayed it to the model as something the
+      // user had said, and the transcript showed it once this turn ended, after the UI had already
+      // cleared its chip. Delete it with its queue entry. Only a row the queued turn owns: a POST
+      // with no content queues a re-run of the last user message, which can be the active turn's
+      // own row or one already steered into it, and that one has been delivered.
+      for (const t of s.queue) if (t.ownsUserMsg) this.d.db.deleteMessage(t.userMsgId)
+      s.queue = []
+      this.emitQueue(sessionId)
+    }
     s.active?.ac.abort()
     return had
   }
@@ -506,6 +570,13 @@ export class CodeRunManager {
   subscribe(sessionId: string, fromSeq: number): Subscription {
     const s = this.sessions.get(sessionId)
     if (!s) return subscribeToBuffer(new RingBuffer(), new EventEmitter(), { fromSeq: 0, replayFloor: 0, idleAtStart: true })
+    // A cursor PAST this buffer's head is not one this buffer handed out (buffers of one daemon
+    // only ever continue past each other, see seqFloor): it is from a daemon that has since
+    // restarted, kept by a client whose reconnect succeeded within its retry budget. Replaying from
+    // it skipped every frame the new daemon's turn had already streamed below it, so the live view
+    // lacked that text until the turn's end reloaded the transcript. Such a cursor reads as "from
+    // the start"; replayFloor still limits the replay to the in-flight turn.
+    if (fromSeq > s.buffer.head()) fromSeq = 0
     return subscribeToBuffer(s.buffer, s.emitter, {
       fromSeq,
       replayFloor: s.replayFloor,

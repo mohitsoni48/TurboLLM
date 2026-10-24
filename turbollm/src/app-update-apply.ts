@@ -19,10 +19,14 @@
 // makes install-method detection testable at all — none of the six cases can be
 // reproduced by running the test suite in the environment it happens to run in.
 
-import { execFile, spawn } from 'node:child_process'
-import { existsSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { spawn } from 'node:child_process'
+import { tetheredExecFile, type TetheredExecFileOptions } from './util/tether'
+import { accessSync, constants as fsConstants, existsSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { packagedAndroidApp } from './engines/zip-install'
+import { openOwnerOnlyLog } from './util/owner-only-log'
+import { bootEnvironment } from './util/boot-env'
 
 /** How this daemon was installed. `unknown` is a real, expected answer (an embedding we
  *  don't recognise) and is treated exactly like the refuse-to-self-update methods. */
@@ -43,8 +47,13 @@ export const INSTALL_METHODS: readonly InstallMethod[] = [
 /** The raw environment facts `classifyInstall` decides from. Passed in rather than read,
  *  so a test can present any of the six installs without being one. */
 export interface InstallSignals {
-  /** `process.platform` — 'android' is its own install method (the Play Store app). */
+  /** `process.platform`. */
   platform: string
+  /** The packaged Android app (nodejs-mobile, {@link packagedAndroidApp}): its own install
+   *  method, updated through the Play Store. Not `platform === 'android'` alone: Termux's Node
+   *  reports 'android' too, and there TurboLLM is an ordinary npm install that can update
+   *  itself (the restart it needs is wired there, unlike in the app). */
+  androidApp: boolean
   /** The entry script actually running (`process.argv[1]`), resolved. */
   entry: string
   /** The desktop wrapper sets `TURBOLLM_DESKTOP=1` when it spawns the daemon. The
@@ -57,6 +66,11 @@ export interface InstallSignals {
   /** `npm root -g`, or null when it couldn't be resolved (no npm on PATH — itself a
    *  strong hint this is not an npm install). */
   npmGlobalRoot: string | null
+  /** Whether this user may write what `npm i -g` replaces: the global root (the package folder is
+   *  renamed in and out of it) and the bin folder its link sits in. False on a root-owned prefix
+   *  (`sudo npm i -g turbollm`: Node from apt or NodeSource under /usr, the nodejs.org pkg under
+   *  /usr/local on macOS). Checked on macOS and Linux only; true on Windows and with no root. */
+  globalInstallWritable: boolean
   /** A repo marker (`.git`, or the monorepo's own `turbollm/src`) sits above the entry
    *  script — i.e. this is `tsx src/cli.ts` in a checkout, not an installed package. */
   sourceCheckout: boolean
@@ -89,7 +103,7 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
   // than a Windows branch and a POSIX branch (and so a test can present either shape).
   const entry = s.entry.toLowerCase().replace(/\\/g, '/')
 
-  if (s.platform === 'android') {
+  if (s.androidApp) {
     return {
       method: 'android',
       canSelfUpdate: false,
@@ -103,7 +117,12 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
       method: 'electron',
       canSelfUpdate: false,
       command: '',
-      note: 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
+      // The mac build is an unsigned .dmg, which electron-updater cannot install, so the wrapper
+      // never auto-updates on macOS (wrapper/main.js setupAutoUpdate).
+      note:
+        s.platform === 'darwin'
+          ? 'The TurboLLM desktop app cannot update itself on macOS yet: download the new .dmg from the TurboLLM releases page and replace the app.'
+          : 'The TurboLLM desktop app downloads updates in the background and installs them when you quit.',
     }
   }
 
@@ -123,6 +142,21 @@ export function classifyInstall(s: InstallSignals): InstallInfo {
   }
 
   if (s.npmGlobalRoot && isUnder(s.entry, s.npmGlobalRoot, s.platform === 'win32')) {
+    // Offered on a prefix this user cannot write, "Update & restart" stopped the daemon, the
+    // helper's `npm install -g` failed with EACCES, and the old version came back detached from
+    // the terminal, the dialog reading only "npm exited with code 243" (npm's own EACCES text
+    // went to update.log). Since symlinked installs on macOS/Linux are detected (realPathOr),
+    // that is every `sudo npm i -g` install; before, those were all `unknown`.
+    if (!s.globalInstallWritable) {
+      return {
+        method: 'npm_global',
+        canSelfUpdate: false,
+        command: 'sudo npm i -g turbollm@latest',
+        // Names the command itself: the dialog shows this note above its command box, and POST
+        // /api/v1/app/update's 409 carries the note alone.
+        note: "TurboLLM was installed into a global npm folder this user cannot write (installed with sudo), so it can't update itself. Update it with sudo npm i -g turbollm@latest.",
+      }
+    }
     return { method: 'npm_global', canSelfUpdate: true, command: 'npm i -g turbollm@latest', note: '' }
   }
 
@@ -192,19 +226,37 @@ function detectSourceCheckout(entry: string): boolean {
   return false
 }
 
+/** What npmGlobalRoot runs `npm root -g` with: the OS and environment, and the exec. Tests only. */
+export interface NpmRootDeps {
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
+  exec?: (file: string, args: readonly string[], options: TetheredExecFileOptions) => Promise<{ stdout: string }>
+}
+
 /** `npm root -g`, or null when npm isn't reachable. Cached for the process lifetime —
  *  it cannot change without a restart, and spawning npm on every status poll would be
  *  absurd. Never throws. */
 let npmRootCache: { value: string | null } | null = null
-export async function npmGlobalRoot(): Promise<string | null> {
+export async function npmGlobalRoot(deps: NpmRootDeps = {}): Promise<string | null> {
   if (npmRootCache) return npmRootCache.value
   const value = await new Promise<string | null>((res) => {
-    const cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    execFile(cmd, ['root', '-g'], { timeout: 10_000, windowsHide: true }, (e, stdout) => {
-      if (e) return res(null)
-      const out = String(stdout).trim()
-      res(out || null)
-    })
+    // On Windows npm is a `.cmd` shim, which Node refuses to spawn without a shell (EINVAL since
+    // the CVE-2024-27980 fix — thrown synchronously, so it read as "no npm" and every global
+    // install as `unknown`). The command is a fixed literal, so cmd.exe gets the whole line and
+    // no args array (an args array with `shell` is DEP0190 and quotes nothing).
+    // Tied to the daemon (util/tether.ts): its timeout is a daemon timer. tetheredExecFile takes no `shell`, so on
+    // Windows this is what Node's `shell: true` runs (normalizeSpawnArguments): %ComSpec%, else cmd.exe, and for
+    // cmd.exe /d /s /c "<line>" with its arguments verbatim (another shell gets -c <line>). app-update-apply.test.ts
+    // compares the two.
+    const isWin = (deps.platform ?? process.platform) === 'win32'
+    const shell = (deps.env ?? process.env).ComSpec || 'cmd.exe'
+    const cmd = /^(?:.*\\)?cmd(?:\.exe)?$/i.test(shell)
+    const [file, args, verbatim] = !isWin ? ['npm', ['root', '-g'], false]
+      : cmd ? [shell, ['/d', '/s', '/c', '"npm root -g"'], true] : [shell, ['-c', 'npm root -g'], false]
+    ;(deps.exec ?? tetheredExecFile({ kind: 'probe' }))(file, args, { timeout: 10_000, windowsHide: true, windowsVerbatimArguments: verbatim }).then(
+      ({ stdout }) => res(String(stdout).trim() || null),
+      () => res(null),
+    )
   }).catch(() => null)
   npmRootCache = { value }
   return value
@@ -215,16 +267,49 @@ export function resetNpmRootCache(): void {
   npmRootCache = null
 }
 
+/** `p` with every symlink resolved, or `p` itself when it can't be (missing, no access).
+ *  A global install runs as `<prefix>/bin/turbollm` — a SYMLINK to the package file under
+ *  `npm root -g` on macOS/Linux, and argv[1] is the link, not its target — so the install
+ *  checks compare real paths. Exported for tests. */
+export function realPathOr(p: string): string {
+  try {
+    return realpathSync(p)
+  } catch {
+    return p
+  }
+}
+
+/** May this user write `dir`? A missing one, or any other failure, reads as not writable. */
+function writable(dir: string): boolean {
+  try {
+    accessSync(dir, fsConstants.W_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Classify the running daemon. Async only because `npm root -g` is a subprocess; every
  *  other signal is a cheap local read. Never throws. */
 export async function detectInstall(): Promise<InstallInfo> {
-  const entry = resolve(process.argv[1] ?? '')
+  const link = resolve(process.argv[1] ?? '')
+  const entry = realPathOr(link)
+  // Resolved too, so a prefix that itself sits behind a symlink still contains the entry.
+  const raw = await npmGlobalRoot()
+  const root = raw && realPathOr(raw)
   return classifyInstall({
     platform: process.platform,
+    androidApp: packagedAndroidApp(),
     entry,
-    desktopEnv: process.env.TURBOLLM_DESKTOP === '1',
+    // Captured at boot and removed from the environment (util/boot-env.ts), so a TurboLLM run from a desktop Code
+    // terminal is not taken for the app's own daemon.
+    desktopEnv: bootEnvironment().desktop,
     inContainer: detectContainer(),
-    npmGlobalRoot: await npmGlobalRoot(),
+    npmGlobalRoot: root,
+    // The bin folder is the one argv[1] names before it is resolved: <prefix>/bin for the link
+    // a global install runs through. Windows has no root-owned prefix to speak of (npm's global
+    // folder is under the user's AppData), and its folder ACLs are not what access() reads.
+    globalInstallWritable: process.platform === 'win32' || !root || (writable(root) && writable(dirname(link))),
     sourceCheckout: detectSourceCheckout(entry),
   })
 }
@@ -367,7 +452,7 @@ export class AppUpdateProgressState {
 /** What the daemon records at boot so the helper can bring it back EXACTLY as it was
  *  started, rather than reconstructing a plausible command line (spec 29 B.1 step 3).
  *  `argv` is `process.argv.slice(1)` — the script path plus its flags, i.e. what to pass
- *  to `execPath` — matching what cli.ts's own `spawnReplacement` re-execs with. */
+ *  to `execPath` (a restart's keeper adds execArgv in front of it, cli.ts becomeKeeper). */
 export interface RunState {
   pid: number
   execPath: string
@@ -437,22 +522,31 @@ export function helperPath(): string {
  *  `detached: true` + `unref()` is what makes it outlive the daemon that spawned it — the
  *  whole point. stdio goes to `~/.turbollm/update.log`, NEVER to the parent's streams:
  *  the parent is about to exit, and inheriting handles from a dying (possibly itself
- *  detached) process breaks the child's output immediately. */
+ *  detached) process breaks the child's output immediately. Owner-only (openOwnerOnlyLog):
+ *  the daemon the helper relaunches into the same log prints its --print-token or --tunnel
+ *  key there. */
 export function spawnUpdateHelper(opts: {
   dataDir: string
   method: InstallMethod
   from: string
   to: string
   run: RunState
+  /** The restart keeper this daemon runs under; util/boot-env.ts's when left out. For the tests. */
+  keeperPid?: number | null
 }): boolean {
   let out: number | 'ignore' = 'ignore'
   try {
-    out = openSync(join(opts.dataDir, UPDATE_LOG_FILE), 'a')
+    out = openOwnerOnlyLog(join(opts.dataDir, UPDATE_LOG_FILE))
   } catch {
     out = 'ignore'
   }
+  // After a Settings restart from a terminal, this daemon runs under its keeper (cli.ts becomeKeeper), the old
+  // process, which keeps the package's files open (Windows will not let them be replaced) until it exits with this
+  // one: the helper waits for it too.
+  const keeper = opts.keeperPid === undefined ? bootEnvironment().keeperPid : opts.keeperPid
   const payload = JSON.stringify({
     pid: opts.run.pid,
+    alsoWait: keeper ? [keeper] : [],
     dataDir: opts.dataDir,
     method: opts.method,
     from: opts.from,

@@ -31,6 +31,14 @@ export type EngineError = {
    *  Optional because a daemon older than the field simply omits it — the UI
    *  then falls back to `other`, which still offers a next action. */
   failReason?: LoadFailure
+  /** Name of the engine the failed load ran on, and of the model it tried ('' when no load is recorded). Absent from an
+   *  older daemon: the banner then reads "Model load failed". */
+  engineName?: string
+  modelName?: string
+  /** False when that engine is not expected to load that model (the Models screen's compatibleWithActiveEngine for
+   *  it): a model "Show models for every engine" lists loads only on the selected engine, so the recovery offers no
+   *  engine advice and no re-download for it. Absent from an older daemon (read as true). */
+  expectedToLoad?: boolean
 }
 
 /** Active engine runtime state from GET /api/v1/status (spec 02 §1). */
@@ -42,11 +50,13 @@ export type EngineRuntime = {
   error?: EngineError
   port?: number
   pid?: number
-  /** Id of the engine the loaded model actually runs on ('' when none). Not always `id`: a .litertlm model runs on
-   *  LiteRT-LM whichever engine is active. Absent from older daemons. */
+  /** Id of the engine the loaded model actually runs on ('' when none). Not always `id` (the active engine): an engine
+   *  install or Enable activates another engine without stopping the model. Absent from older daemons. */
   servingId?: string
   /** Kind of the engine in `servingId` ('' when none). Absent from older daemons. */
   servingKind?: string
+  /** Name of the engine in `servingId` ('' when none). Absent from older daemons. */
+  servingName?: string
   /** The exact command last spawned, formatted for copy-paste into a terminal.
    *  Present only while this engine is the one actually running/starting. */
   launchCommand?: string
@@ -71,6 +81,12 @@ export type EngineProvision = {
   part?: number // 1-based current archive (multi-asset backends like CUDA)
   parts?: number // total archives for this backend
   error: string | null
+  /** False when POST /engines/backends/cancel can't stop this run (first-run seed, auto-update,
+   *  uv/pip runtime installs). Absent from daemons that predate it. */
+  cancellable?: boolean
+  /** When this run began (epoch ms), kept on its failure; 0 when idle. Identifies the run, so a dismissed failure
+   *  is told from a retry's. Absent from daemons that predate it. */
+  startedAt?: number
 }
 
 /** In-app compile-from-source status (ADR-100), from GET /api/v1/status. A build streams
@@ -81,6 +97,13 @@ export type EngineBuild = {
   engine: string
   log: string[]
   error: string | null
+  /** The run installs a build tool (the CUDA Toolkit download, a build guide prerequisite) and builds no engine.
+   *  Absent from daemons that predate it: see isToolInstall. */
+  toolInstall?: boolean
+  /** The finished build ('done') is the selected engine: false after a rebuild of an engine the user had not selected,
+   *  which leaves the selection as it was. Absent from daemons that predate it, which made every build they registered
+   *  the selected engine. */
+  activated?: boolean
 }
 
 /** Live running-session stats (B4), from GET /api/v1/status. Null unless the
@@ -692,6 +715,18 @@ export type ModelEntry = {
   nativeCtx: number
   blockCount: number
   headCountKv: number
+  /** Attention/KV layout the daemon's scanner reads from the GGUF (twins of src/models/scanner.ts's
+   *  ModelEntry fields — see there for each one). The daemon always sends `headDim`; the rest only
+   *  when the GGUF declares them. Used only by vram.ts's live estimate, which mirrors the daemon's. */
+  headDim?: number
+  slidingWindow?: number
+  slidingWindowPattern?: boolean[]
+  headDimSwa?: number
+  headCountKvPerLayer?: number[]
+  fullAttentionInterval?: number
+  ssmInnerSize?: number
+  ssmStateSize?: number
+  ssmConvKernel?: number
   moe: boolean
   expertCount: number
   /** >0 when the GGUF carries a built-in NextN multi-token-prediction head. */
@@ -701,6 +736,8 @@ export type ModelEntry = {
    *  tower/encoder, e.g. gemma4's Conformer audio module). Always false for GGUF. */
   audio: boolean
   mmprojPath: string | null
+  /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null) — sizes the projector's VRAM. */
+  mmprojSizeBytes?: number
   hasChatTemplate: boolean
   /** True when the model's chat template supports a `reasoning_effort` control
    *  (low/medium/xhigh) — Qwen3.8's reasoning-depth control. Composers gate the
@@ -739,6 +776,11 @@ export type ModelEntry = {
    *  (Linux or WSL2)'), or null when it can. The daemon owns the wording so every
    *  surface says the same thing. */
   incompatibleReason?: string | null
+  /** Hidden by the user (Models → Library, the model's "Hide"; the daemon keeps it per model key). The web UI leaves
+   *  it out of the Library list until "Show hidden models" is on, and out of every model picker but the draft-model
+   *  select in Load settings (a small draft is what one hides from the chat pickers), unless it is loaded
+   *  (lib/model-kind.ts hiddenByUser). Absent from an older daemon (read as shown). */
+  hidden?: boolean
   mtime: string
 }
 
@@ -841,15 +883,21 @@ export type RerankResponse = {
   usage: { prompt_tokens: number; total_tokens: number }
 }
 
-/** One thing a model load would interrupt right now (ADR-434 (i)(3)). */
+/** One thing a model load would interrupt right now (ADR-434 (i)(3)). `load`: a model loading;
+ *  `tune`: an auto-tune run; `skill`: a skill being written. */
 export type ActiveWorkItem = {
-  kind: 'chat' | 'code' | 'routine'
+  kind: 'chat' | 'code' | 'routine' | 'load' | 'tune' | 'skill'
   id: string
   label: string
 }
 
 export type ActiveWork = {
+  /** Work in progress on the engine. */
   items: ActiveWorkItem[]
+  /** Chats parked on a tool-call approval: they wait on a person, so they are not in `items`, but
+   *  a load still interrupts them. Absent from a daemon before it (a page left open across an
+   *  update), read as none. */
+  waiting?: ActiveWorkItem[]
   /** A generation running through the gateway. It has no item of its own: the daemon
    *  knows a request is in flight, not whose it is. */
   engineGenerating: boolean
@@ -1221,11 +1269,18 @@ export type DownloadRecord = {
   bytesPerSec: number
   sha256?: string
   createdAt: string
+  /** When it became 'done' (ISO; absent before that). */
+  finishedAt?: string
 }
 
 export type DownloadsList = {
   downloads: DownloadRecord[]
 }
+
+/** A download the daemon names in a download request's `existing` (a row already holding a file
+ *  the request asked for): what following or resuming it takes, not the whole row, which is the
+ *  host's and a read a token that may only write downloads is refused. */
+export type HeldDownload = Pick<DownloadRecord, 'id' | 'name' | 'status'>
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
 // Mirrors turbollm/src/observability/request-log.ts's `RequestLogEntry` — kept as a hand-written

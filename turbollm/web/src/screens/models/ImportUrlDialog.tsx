@@ -3,12 +3,14 @@
 // (.gguf or .litertlm — the self-contained formats) on any host — which covers HF
 // resolve links too, with blob links normalized to them first; on submit it enqueues
 // a raw-URL download via useDownloadMutations and closes — the item then appears in
-// the DownloadsPanel.
+// the DownloadsPanel. A file already in the download list gets no second row: a toast
+// says it is already downloading, or that its paused row was resumed.
 
 import { useEffect, useMemo, useState } from 'react'
 import { Link2 } from 'lucide-react'
 import { ApiError, track } from '../../lib/api'
 import { useDownloadMutations } from '../../lib/queries'
+import { sayIfAlreadyListed } from '../../lib/download-listed'
 import { SINGLE_FILE_MODEL_RE } from '../../lib/single-file-model'
 import { Button } from '../../components/ui/button'
 import { Input } from '../../components/ui/input'
@@ -148,7 +150,10 @@ export function ImportUrlDialog({
     mut.enqueue.mutate(
       { url: normalized },
       {
-        onSuccess: () => close(),
+        onSuccess: (out) => {
+          close()
+          sayIfAlreadyListed(out)
+        },
       },
     )
   }
@@ -177,11 +182,19 @@ export function ImportUrlDialog({
         </SheetHeader>
 
         <div className="flex flex-col gap-3">
+          {/* Enter's keydown is cancelled: a repo link opens the repo's sheet within this keydown,
+              and on a phone that sheet takes focus to its Close button before the same Enter's
+              keypress is sent, which then went to that button and clicked it, closing the repo
+              sheet as it opened. A cancelled keydown sends no keypress. */}
           <Input
             autoFocus
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && submit()}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter') return
+              e.preventDefault()
+              submit()
+            }}
             placeholder="https://huggingface.co/owner/repo  ·  or …/resolve/main/model.Q4_K_M.gguf  ·  …/model.litertlm"
             className="font-mono text-[12px]"
           />

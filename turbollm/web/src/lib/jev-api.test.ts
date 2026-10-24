@@ -1,4 +1,4 @@
-// Jev (ADR-434 (c), (d), ADR-439): the systemone client and the copyable curl of the API view.
+// Jev (ADR-434 (c), (d), ADR-439): the playground's run client and the copyable curl of the API view.
 //
 // The curl is the one place the playground hands a user something they will paste into a
 // shell, so two things are asserted byte-for-byte: a single quote inside their own text is
@@ -8,7 +8,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from './api'
 import * as api from './jev-api'
-import { MAX_JEV_INPUTS, buildCurl, getActivity, systemone } from './jev-api'
+import { MAX_JEV_INPUTS, buildCurl, cancelPlaygroundRun, getActivity, getPlaygroundRun, startPlaygroundRun } from './jev-api'
 import type { SystemOneRequest, SystemOneResponse } from './systemone-types'
 import type { ActiveWork } from './types'
 
@@ -135,68 +135,103 @@ const LAYA_REPLY = {
   routing: { model: 'english', reason: 'English Latin text' },
 }
 
-describe('systemone', () => {
-  it('accepts a Laya-shaped response — routing and per-answer extras are not grounds to reject it', async () => {
-    stubFetch(LAYA_REPLY)
-    const res = await systemone(SYSTEMONE_REQUEST)
-    expect(res).toEqual(LAYA_REPLY)
-  })
+/** The daemon's view of a run that ended with `response`, as GET /api/v1/jev/playground/run answers it. */
+const doneRun = (response: unknown) => ({
+  state: 'done', id: 'r1', request: SYSTEMONE_REQUEST, response,
+  startedAt: '2026-10-21T10:00:00.000Z', finishedAt: '2026-10-21T10:00:00.250Z',
+})
 
-  it('posts the request to its own endpoint and returns the parsed answers', async () => {
-    const mock = stubFetch(SYSTEMONE_REPLY)
-    const res = await systemone(SYSTEMONE_REQUEST)
+// The playground runs as a daemon job (src/api/systemone-job.ts) rather than posting /v1/systemone, a route that lives
+// as long as its client: closing or leaving the screen mid-run threw the run away. These replace the tests of the
+// systemone() call it made, which is gone.
+describe('the playground run', () => {
+  it('starts a run by posting the request to the job route, and returns it running', async () => {
+    const running = { state: 'running', id: 'r1', request: SYSTEMONE_REQUEST, startedAt: '2026-10-21T10:00:00.000Z' }
+    const mock = stubFetch(running, 202)
+    const res = await startPlaygroundRun(SYSTEMONE_REQUEST)
     const { path, init, headers } = requestOf(mock)
-    expect(path).toBe('/v1/systemone')
+    expect(path).toBe('/api/v1/jev/playground/run')
     expect(init.method).toBe('POST')
     expect(headers['Content-Type']).toBe('application/json')
     expect(init.body).toBe(JSON.stringify(SYSTEMONE_REQUEST))
-    expect(res).toEqual(SYSTEMONE_REPLY)
+    expect(res).toEqual(running)
+  })
+
+  it('reads the run with a GET of the same route, and cancels it by naming it', async () => {
+    const mock = stubFetch(doneRun(SYSTEMONE_REPLY))
+    expect(await getPlaygroundRun()).toEqual(doneRun(SYSTEMONE_REPLY))
+    expect(requestOf(mock).path).toBe('/api/v1/jev/playground/run')
+    expect(requestOf(mock).init.method).toBeUndefined()
+
+    const cancelMock = stubFetch({ state: 'cancelled', id: 'r 1' })
+    await cancelPlaygroundRun('r 1')
+    expect(requestOf(cancelMock).path).toBe('/api/v1/jev/playground/run?id=r%201')
+    expect(requestOf(cancelMock).init.method).toBe('DELETE')
+  })
+
+  it('accepts a finished run whose response is Laya-shaped — routing and per-answer extras are not grounds to reject it', async () => {
+    stubFetch(doneRun(LAYA_REPLY))
+    expect((await getPlaygroundRun()).response).toEqual(LAYA_REPLY)
   })
 
   it('sends the stored key, so the playground works over the LAN too', async () => {
     storage.set(AUTH_KEY, 'secret-key')
-    const mock = stubFetch(SYSTEMONE_REPLY)
-    await systemone(SYSTEMONE_REQUEST)
+    const mock = stubFetch({ state: 'running', id: 'r1' }, 202)
+    await startPlaygroundRun(SYSTEMONE_REQUEST)
     expect(requestOf(mock).headers['X-TurboLLM-Auth']).toBe('secret-key')
   })
 
   it('turns a 422 refusal into an ApiError that keeps the code and the message', async () => {
     const message = 'questions.q.type must be one of noul, choice, score'
     stubFetch({ error: { code: 'invalid_request', message, type: 'invalid_request_error' } }, 422)
-    const refused = systemone(SYSTEMONE_REQUEST)
+    const refused = startPlaygroundRun(SYSTEMONE_REQUEST)
     await expect(refused).rejects.toMatchObject({ name: 'ApiError', code: 'invalid_request', message, status: 422 })
     await expect(refused).rejects.toBeInstanceOf(ApiError)
   })
 
-  describe('when the server answers 200 with something that is not a System One response', () => {
-    const NOT_A_SYSTEMONE_RESPONSE = 'The server answered, but not with a System One response.'
+  it('turns the 409 of a run already in progress into an ApiError the screen can tell apart', async () => {
+    const message = 'A text classification run is already in progress. Wait for it, or cancel it first.'
+    stubFetch({ error: { code: 'run_in_progress', message }, run: { state: 'running', id: 'r0' } }, 409)
+    await expect(startPlaygroundRun(SYSTEMONE_REQUEST)).rejects.toMatchObject({ code: 'run_in_progress', message, status: 409 })
+  })
 
+  describe('when the server answers 200 with something that is not a run', () => {
+    const NOT_A_RUN = 'The server answered, but not with a text classification run.'
     const stubReply = (respond: () => Response) => vi.stubGlobal('fetch', vi.fn(async () => respond()))
     const jsonReply = (body: unknown) => () => new Response(JSON.stringify(body), {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
 
-    it('rejects an empty body with a readable ApiError instead of returning undefined', async () => {
-      stubReply(() => new Response('', { status: 200 }))
-      const refused = systemone(SYSTEMONE_REQUEST)
-      await expect(refused).rejects.toBeInstanceOf(ApiError)
-      await expect(refused).rejects.toMatchObject({ code: 'bad_response', message: NOT_A_SYSTEMONE_RESPONSE, status: 200 })
-    })
-
     it.each<[string, () => Response]>([
+      ['an empty body', () => new Response('', { status: 200 })],
       ['an html page', () => new Response('<html>Sign in</html>', { status: 200, headers: { 'content-type': 'text/html' } })],
       ['a 204 with no body', () => new Response(null, { status: 204 })],
       ['a JSON null', jsonReply(null)],
-      ['a reply without answers', jsonReply({ model: 'm', usage: { input_tokens: 1, output_tokens: 0 } })],
-      ['a reply without usage', jsonReply({ model: 'm', answers: {} })],
-      ['answers that are an array', jsonReply({ ...SYSTEMONE_REPLY, answers: [] })],
-      ['answers that are a string', jsonReply({ ...SYSTEMONE_REPLY, answers: 'none' })],
-      ['usage that is a string', jsonReply({ ...SYSTEMONE_REPLY, usage: 'many' })],
-      ['usage.input_tokens that is a string', jsonReply({ ...SYSTEMONE_REPLY, usage: { input_tokens: '42', output_tokens: 1 } })],
-    ])('rejects %s the same way', async (_case, respond) => {
+      ['a run in a state the playground does not know', jsonReply({ state: 'queued', id: 'r1' })],
+    ])('rejects %s with a readable ApiError instead of returning it', async (_case, respond) => {
       stubReply(respond)
-      const refused = systemone(SYSTEMONE_REQUEST)
+      const refused = getPlaygroundRun()
+      await expect(refused).rejects.toBeInstanceOf(ApiError)
+      await expect(refused).rejects.toMatchObject({ code: 'bad_response', message: NOT_A_RUN, status: 200 })
+    })
+  })
+
+  describe('when a finished run carries something that is not a System One response', () => {
+    const NOT_A_SYSTEMONE_RESPONSE = 'The server answered, but not with a System One response.'
+
+    it.each<[string, unknown]>([
+      ['no response', undefined],
+      ['a JSON null', null],
+      ['a reply without answers', { model: 'm', usage: { input_tokens: 1, output_tokens: 0 } }],
+      ['a reply without usage', { model: 'm', answers: {} }],
+      ['answers that are an array', { ...SYSTEMONE_REPLY, answers: [] }],
+      ['answers that are a string', { ...SYSTEMONE_REPLY, answers: 'none' }],
+      ['usage that is a string', { ...SYSTEMONE_REPLY, usage: 'many' }],
+      ['usage.input_tokens that is a string', { ...SYSTEMONE_REPLY, usage: { input_tokens: '42', output_tokens: 1 } }],
+    ])('rejects %s the way the /v1/systemone reply was', async (_case, response) => {
+      stubFetch(doneRun(response))
+      const refused = getPlaygroundRun()
       await expect(refused).rejects.toBeInstanceOf(ApiError)
       await expect(refused).rejects.toMatchObject({ code: 'bad_response', message: NOT_A_SYSTEMONE_RESPONSE })
     })
@@ -239,9 +274,10 @@ describe('buildCurl for systemone', () => {
 })
 
 describe('the exported client surface', () => {
-  it('no longer offers a classify or a rerank call, only systemone', () => {
+  it('offers no classify, rerank or direct systemone call: the playground runs as a daemon job', () => {
     expect('classify' in api).toBe(false)
     expect('rerank' in api).toBe(false)
-    expect('systemone' in api).toBe(true)
+    expect('systemone' in api).toBe(false)
+    expect('startPlaygroundRun' in api).toBe(true)
   })
 })

@@ -24,16 +24,66 @@ export function modelIncompatibility(
 ): Incompatibility | null {
   if (entry.format === 'gguf' && entry.arch === GGMLC_ARCH) return GGMLC_GGUF
   if (entry.laya) return engineKind === 'laya' ? null : NEEDS_LAYA
-  if (entry.jev && engineKind !== 'vllm') return NEEDS_VLLM
+  if (entry.jev && engineKind !== 'vllm') return needsVllm(engineKind)
   if (!engineAcceptsFormat(engineKind, entry.format)) return formatIncompatibility(engineKind, entry.format)
   if (entry.audio && engineRejectsAudioModel(engineKind)) return audioIncompatibility(engineKind)
   return null
 }
 
-const NEEDS_VLLM: Incompatibility = {
-  code: 'needs_vllm',
-  label: 'Needs vLLM (Linux or WSL2)',
-  message: 'This is a Jev model — it runs only on vLLM (Linux or WSL2). Activate a vLLM engine to load it.',
+/** What refuses a load the user asks for by hand (a Models screen Load, the Load dialog, a model picker, an Engines
+ *  Start: POST /api/v1/engine/start, which the Turbo Link façade's load mounts too for a model it lists to the peer,
+ *  link-routes.ts hiddenFromPeer) before it starts: only a Laya model with no Laya engine installed, since a Laya
+ *  model never loads on the selected engine (registry.engineForModel).
+ *  Every other model is started on the selected engine whatever modelIncompatibility says of it, and if that engine
+ *  cannot load it the load fails with the engine's own error (the load-failure banner): the user chose both the engine
+ *  and the model, and nothing may pick or suggest another engine for them. The pre-refusal ("activate the LiteRT-LM
+ *  engine to load it" for a .litertlm model under KoboldCpp) did. The automatic loads (the gateway's auto-swap, a
+ *  routine's swap and restore, the boot resume, ComfyUI's reload) keep modelIncompatibility's refusal while Settings
+ *  lists only the models the selected engine runs: started anyway, each would unload the running model for a load
+ *  that cannot succeed, with nobody asking for it. With "Show models for every engine" on (showAllEngineModels) they
+ *  take this refusal too: once the user shows such models, one is always started on the selected engine, and if it
+ *  fails there it fails (model-router.ts loadRefusal, auto-load.ts). */
+export function manualLoadRefusal(
+  engineKind: string,
+  entry: Parameters<typeof modelIncompatibility>[1],
+): Incompatibility | null {
+  return entry.laya ? modelIncompatibility(engineKind, entry) : null
+}
+
+// The refusal messages state what the selected engine cannot run, and nothing else: no other engine, no "activate",
+// "switch to" or "pick" advice. A model loads only on the engine the user selected, and choosing another is the user's
+// alone; the load-failure banner dropped the same advice ("fix(engines): a failed load's banner names the engine,
+// offers no other"). They reach users through the gateway's 503 (Claude Code and other API clients), a routine run's
+// model_unavailable error, the Jev endpoints and the Turbo Link façade's 409, whose peer cannot change the host's engine
+// at all. A Laya model is the exception: it never runs on the selected engine, only on the Laya engine, so NEEDS_LAYA
+// says to install it (and GGMLC_GGUF names the Laya download that runs).
+
+/** The engine a kind names in a refusal: the selected one, since a refusal is only ever for it. */
+const ENGINE_NAMES: Record<string, string> = {
+  'llama-server': 'llama.cpp',
+  llamafile: 'llamafile',
+  koboldcpp: 'KoboldCpp',
+  mlx: 'MLX',
+  'rapid-mlx': 'Rapid-MLX',
+  'mlx-vlm': 'MLX-VLM',
+  vllm: 'vLLM',
+  sglang: 'SGLang',
+  'litert-lm': 'LiteRT-LM',
+  laya: 'The Laya engine',
+}
+
+function engineName(engineKind: string): string {
+  return ENGINE_NAMES[engineKind] ?? 'The selected engine'
+}
+
+const FORMAT_NAMES: Record<ModelFormat, string> = { gguf: 'GGUF', mlx: 'safetensors', litertlm: '.litertlm' }
+
+function needsVllm(engineKind: string): Incompatibility {
+  return {
+    code: 'needs_vllm',
+    label: 'Needs vLLM (Linux or WSL2)',
+    message: `${engineName(engineKind)} can't run this Jev model.`,
+  }
 }
 
 const NEEDS_LAYA: Incompatibility = {
@@ -54,6 +104,17 @@ const GGMLC_GGUF: Incompatibility = {
     'convaiinnovations/laya instead: it runs on the Laya engine.',
 }
 
+/** The refusal of a model no engine the user can select runs: a Laya model with no Laya engine (it runs only on the
+ *  Laya engine, and is refused whatever Settings shows: manualLoadRefusal), or a ggmlc GGUF (refused up front for every
+ *  engine kind; with "Show models for every engine" on, an automatic load starts it on the selected engine, as a
+ *  manual load does, and it fails there). An automatic load's refusal of any other model says which setting lets it
+ *  start on the selected engine (model-router.ts AUTOMATIC_LOAD_HINT); after these two that sentence would be advice
+ *  to turn on a setting that cannot make the model load, and after the ggmlc one's "it runs on the Laya engine" its
+ *  "start it there" would name the Laya engine. */
+export function refusedOnEveryEngine(inc: Incompatibility): boolean {
+  return inc.code === 'needs_laya' || inc === GGMLC_GGUF
+}
+
 const NEEDS_PYTHON_ENGINE_LABEL = 'needs MLX or vLLM'
 
 function formatIncompatibility(engineKind: string, format: ModelFormat): Incompatibility {
@@ -61,25 +122,12 @@ function formatIncompatibility(engineKind: string, format: ModelFormat): Incompa
   return { code: 'format', label, message: formatMismatchMessage(engineKind, format) }
 }
 
-/** User-facing message when the active engine can't load a model's format (ADR-044). */
+/** User-facing message when the active engine can't load a model's format (ADR-044): the engine and the format, no
+ *  advice (see ENGINE_NAMES). It said which engine to activate or switch to ("activate the LiteRT-LM engine to load
+ *  it", "or switch to a llama.cpp engine for GGUF"). */
 function formatMismatchMessage(engineKind: string, format: ModelFormat): string {
-  if (engineKind === 'laya') return 'The Laya engine runs only Laya models — load this one on another engine.'
-  // A .litertlm bundle is loadable by exactly one engine, whatever the active one is.
-  if (format === 'litertlm') return 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.'
-  if (engineKind === 'litert-lm')
-    return 'The active engine is LiteRT-LM — pick a .litertlm model, or switch to the engine this model\'s format needs.'
-  if (engineKind === 'mlx')
-    return 'The active engine is MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'rapid-mlx')
-    return 'The active engine is Rapid-MLX — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'mlx-vlm')
-    return 'The active engine is MLX-VLM — pick a safetensors model, or switch to a llama.cpp engine for GGUF.'
-  if (engineKind === 'vllm')
-    return 'The active engine is vLLM — pick a safetensors / HF model, or switch to a llama.cpp engine for GGUF.'
-  // llama.cpp / fork active, model is a safetensors dir.
-  return format === 'mlx'
-    ? 'This is a safetensors model — activate an MLX or vLLM engine to load it.'
-    : 'The active engine can only load GGUF models.'
+  if (engineKind === 'laya') return 'The Laya engine runs only Laya models.'
+  return `${engineName(engineKind)} can't run this ${FORMAT_NAMES[format]} model.`
 }
 
 function audioIncompatibility(engineKind: string): Incompatibility {
@@ -87,13 +135,13 @@ function audioIncompatibility(engineKind: string): Incompatibility {
   // Rapid-MLX: confirmed live, reproduced end to end (see engineRejectsAudioModel's
   // docblock). MLX-VLM: same underlying mlx_vlm sanitizer bug, but excluded here
   // precautionarily from reading the source, not a fresh live reproduction — say so
-  // rather than stating it as flatly settled. Either way, plain MLX (mlx-lm) never
-  // attempts VLM/audio loading, so it's a safe fallback recommendation for both.
+  // rather than stating it as flatly settled. It no longer ends with "Switch to the MLX
+  // engine instead." (see ENGINE_NAMES).
   const certainty = engineKind === 'mlx-vlm' ? 'is expected to fail' : 'fails'
   return {
     code: 'audio',
     label: NEEDS_PYTHON_ENGINE_LABEL,
-    message: `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures. Switch to the MLX engine instead.`,
+    message: `${engineLabel} cannot load models with an audio tower — the audio encoder ${certainty} due to an upstream mlx-vlm bug in the sanitizer for these architectures.`,
   }
 }
 
@@ -107,6 +155,7 @@ function audioIncompatibility(engineKind: string): Incompatibility {
  *   - MLX-VLM (kind 'mlx-vlm') → the same MLX-format directories, for vision-language models
  *   - vLLM (kind 'vllm') → HF safetensors directories — the same on-disk shape the
  *     scanner tags 'mlx' (config.json + *.safetensors + tokenizer)
+ *   - SGLang (kind 'sglang') → the same HF safetensors directories as vLLM
  *   - LiteRT-LM (kind 'litert-lm') → `.litertlm` bundles, a format no other engine reads
  *   - Laya (kind 'laya') → no plain format: it loads only Laya models, which modelIncompatibility
  *     recognises by `entry.laya` before the format is ever checked
@@ -116,6 +165,7 @@ export function engineAcceptsFormat(engineKind: string, format: ModelFormat): bo
   if (engineKind === 'rapid-mlx') return format === 'mlx'
   if (engineKind === 'mlx-vlm') return format === 'mlx'
   if (engineKind === 'vllm') return format === 'mlx'
+  if (engineKind === 'sglang') return format === 'mlx'
   if (engineKind === 'laya') return false
   // .litertlm is LiteRT-LM's alone, and LiteRT-LM reads nothing else.
   if (engineKind === 'litert-lm') return format === 'litertlm'

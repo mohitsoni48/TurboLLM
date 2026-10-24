@@ -3,7 +3,7 @@
 // fetch/Blob/anchor-download plumbing, mocked at the browser API boundary (fetch, URL.createObjectURL,
 // anchor.click), not the function's own logic.
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { createCodeSession, downloadCodeSessionExport } from './code-api'
+import { createCodeSession, downloadCodeSessionExport, streamCodeSession } from './code-api'
 import { ApiError } from './api'
 
 // jsdom doesn't implement localStorage's methods by default (authHeaders() reads it on every
@@ -82,5 +82,46 @@ describe('downloadCodeSessionExport', () => {
     await expect(downloadCodeSessionExport('missing')).rejects.toThrow(ApiError)
     expect(URL.createObjectURL).not.toHaveBeenCalled()
     expect(HTMLAnchorElement.prototype.click).not.toHaveBeenCalled()
+  })
+})
+
+describe('streamCodeSession', () => {
+  // Exactly hono's writeSSE framing: event, data, THEN id. The old parser yielded on the data
+  // line with whatever an EARLIER id line had set, so during a live tail (one frame per read)
+  // every seq was undefined and the reconnect cursor never advanced — a reconnect replayed the
+  // whole turn and duplicated its text.
+  const frame = (event: string, data: unknown, id?: number) =>
+    [`event: ${event}`, `data: ${JSON.stringify(data)}`, id !== undefined && `id: ${id}`].filter(Boolean).join('\n') + '\n\n'
+  const frames = [
+    frame('meta', { assistantMessageId: 'a1' }), // the route's synthesized meta carries no id
+    frame('meta', { assistantMessageId: 'a1' }, 0),
+    frame('delta', { delta: 'Hel' }, 1),
+    frame('delta', { delta: 'lo' }, 2),
+  ]
+
+  async function seqs(chunks: string[]): Promise<string[]> {
+    const enc = new TextEncoder()
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(new ReadableStream({
+      start(c) { for (const ch of chunks) c.enqueue(enc.encode(ch)); c.close() },
+    }), { status: 200 })))
+    const out: string[] = []
+    for await (const ev of streamCodeSession('s1', 0, new AbortController().signal)) out.push(`${ev.event}@${ev.seq}`)
+    return out
+  }
+
+  const expected = ['meta@undefined', 'meta@0', 'delta@1', 'delta@2']
+
+  it('carries each frame\'s own id as seq during a live tail (one frame per read)', async () => {
+    expect(await seqs(frames)).toEqual(expected)
+  })
+
+  it('carries each frame\'s own id as seq in a replay burst (all frames in one read)', async () => {
+    expect(await seqs([frames.join('')])).toEqual(expected)
+  })
+
+  it('carries each frame\'s own id when a frame is split across reads (before its id line)', async () => {
+    const all = frames.join('')
+    const cut = all.indexOf('id: 1')
+    expect(await seqs([all.slice(0, cut), all.slice(cut, cut + 3), all.slice(cut + 3)])).toEqual(expected)
   })
 })

@@ -10,6 +10,7 @@ import {
   useStatus,
 } from '../../lib/queries'
 import { ApiError, track } from '../../lib/api'
+import { engineBuildRunning } from '../../lib/engine-build-run'
 import type { EngineUpdateStatus, UpdatePolicy } from '../../lib/types'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
@@ -133,6 +134,10 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
   const anyPending = provisioning || install.backend.isPending || install.remove.isPending ||
     install.enableBackend.isPending || install.updateBackend.isPending ||
     engineMutForDisable.remove.isPending
+  // A build from source: the daemon refuses a Download, Disable or Delete meanwhile (an Enable it
+  // takes). Kept out of anyPending, which also closes the row's menu, so Enable and Auto-update
+  // stay usable during a build of many minutes.
+  const buildRunning = engineBuildRunning(status?.engineBuild)
 
   const gpu = data.gpus[0]?.name
 
@@ -233,7 +238,7 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
           </div>
           <div className="flex shrink-0 items-center gap-2">
             {!b.installed ? (
-              <Button size="sm" variant="outline" disabled={anyPending} onClick={() => download(b.id)}>
+              <Button size="sm" variant="outline" disabled={anyPending || buildRunning} onClick={() => download(b.id)}>
                 {provisioning ? (
                   <Loader2 size={13} className="animate-spin" />
                 ) : (
@@ -256,7 +261,7 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
                       <Download size={14} /> {up?.hasUpdate ? 'Update now' : 'Check for update'}
                     </DropdownMenuItem>
                     {b.enabled ? (
-                      <DropdownMenuItem onSelect={() => b.engineId && doDisable(b.engineId, b.label)}>
+                      <DropdownMenuItem disabled={buildRunning} onSelect={() => b.engineId && doDisable(b.engineId, b.label)}>
                         Disable
                       </DropdownMenuItem>
                     ) : (
@@ -287,6 +292,7 @@ export function LlamaCppBackendRows({ filter }: { filter?: 'recommended' | 'othe
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       destructive
+                      disabled={buildRunning}
                       onSelect={() => setDeleteTarget({ id: b.id, label: b.label })}
                     >
                       Delete

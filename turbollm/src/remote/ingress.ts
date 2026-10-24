@@ -1,10 +1,12 @@
 // The dedicated loopback ingress listener (ADR-422, spec 30 §2.1). Every remote-access
-// provider's local leg connects here and nothing else does, which is what makes
-// auth.ts's isTunneled a property of the socket rather than of a forgeable header.
+// provider's local leg connects here, which is what makes auth.ts's isTunneled a property of
+// the socket rather than of a forgeable header. It is NOT only providers: any process on this
+// box, or a DNS-rebinding page, can connect to it as well. So arriving here only ever makes a
+// request stricter (tunneled, never local) and proves nothing about who sent it or its headers
+// (see identity.ts).
 //
-// Bound to 127.0.0.1 explicitly, never 0.0.0.0: this port is reachable only by a provider
-// running on this box. Exposing it on the LAN would create a second, unauthenticated-looking
-// door into the same app.
+// Bound to 127.0.0.1 explicitly, never 0.0.0.0: this port is reachable only from this box.
+// Exposing it on the LAN would create a second, unauthenticated-looking door into the same app.
 import { serve } from '@hono/node-server'
 import type { Hono } from 'hono'
 import type { RemoteIngress } from './ingress-types'
@@ -14,6 +16,11 @@ type Server = ReturnType<typeof serve>
 export class IngressListener implements RemoteIngress {
   private _server: Server | null = null
   private port: number | undefined
+
+  /** `onStop` runs each time a bound listener is stopped, once its connections are closed: the requests that came
+   *  through it can no longer be answered, and work that outlives its request (a chat turn) is stopped there
+   *  (RemoteAccessManager passes auth.ts endTunneledTurns). */
+  constructor(private readonly onStop?: () => void) {}
 
   ingressPort(): number | undefined {
     return this.port
@@ -66,6 +73,7 @@ export class IngressListener implements RemoteIngress {
       } catch {
         /* best-effort */
       }
+      this.onStop?.()
       s.close(() => resolve())
       setTimeout(resolve, 3_000).unref() // never hang a shutdown on a stuck stream
     })

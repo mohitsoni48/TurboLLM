@@ -6,10 +6,11 @@
 // only part that touches the network or the DB write path.
 //
 // The single rule everything else here serves: resolveCompactionCut is re-run against the
-// CURRENT active message list on every prompt build, never cached, and an unresolvable cut
+// CURRENT active message list on every prompt build, never cached, and a deleted cut
 // NEVER silently drops the summary — see resolveCompactionCut's own doc comment. This is a
 // direct port of the fix in code-session.ts's resolveEffectiveHistory, not a re-derivation
-// of it; when in doubt, that function is the reference implementation.
+// of it; when in doubt, that function is the reference implementation. (A cut that was
+// deactivated rather than deleted is set aside first, by setAsideFrozenCut.)
 //
 // Task 3 appends compactConversation/maybeAutoCompact below and extends this import list
 // with callChatUpstream/resolveChatUpstream/ChatUpstream/Deps at that point — NOT
@@ -17,7 +18,7 @@
 // noUnusedLocals: true, so importing them before anything in the file uses them would fail
 // Task 2's OWN typecheck step. Keep this file's imports exactly matched to what's actually
 // referenced at the end of whichever task last touched it.
-import type { Conversation, Message } from './db.js'
+import type { Conversation, ConversationStore, Message } from './db.js'
 import { estimateTokens } from '../ext/context-limit.js'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream.js'
 import type { Deps } from '../deps.js'
@@ -70,21 +71,32 @@ export function shouldAutoCompact(ctxUsed: number, ctxMax: number): boolean {
  *  same source of truth on both sides. A fresh placeholder row (empty stats, mid-generation)
  *  is skipped rather than zeroing the result out. */
 export function lastCtxUsage(messages: Message[]): { ctxUsed: number; ctxMax: number } {
-  const last = [...messages].reverse().find((m) => m.role === 'assistant' && m.stats?.ctxUsed !== undefined)
+  const last = lastMeasuredReply(messages)
   return { ctxUsed: last?.stats?.ctxUsed ?? 0, ctxMax: last?.stats?.ctxMax ?? 0 }
+}
+
+/** The message lastCtxUsage reads its numbers from. A ctxUsed of 0 is skipped like a missing one:
+ *  no prompt is 0 tokens, so it is a turn the engine measured nothing of (a send refused on its
+ *  first round, written as 0 before chat-routes.ts left it out; one that failed or was stopped
+ *  before any usage or prompt progress arrived). Read as a measurement it said "empty", and the
+ *  auto-compaction gate stayed shut for a chat the engine had just refused for its size. */
+function lastMeasuredReply(messages: Message[]): Message | undefined {
+  return [...messages].reverse().find((m) => m.role === 'assistant' && !!m.stats?.ctxUsed)
 }
 
 // ── cut resolution ───────────────────────────────────────────────────────────────────
 
 /** Resolves a conversation's persisted compaction cut against its CURRENT active message
- *  list. Mirrors code-session.ts's resolveEffectiveHistory exactly: an unresolvable cut
- *  (the message was deactivated by a branch switch/edit-freeze, or deleted outright) still
- *  surfaces its summary — replaying every active message alongside a redundant summary
- *  loses nothing, whereas dropping the summary would lose a real (if now unanchored) one.
- *  Never returns a PARTIAL cut. No edit/branch/delete route needs to know this function
- *  exists — it is re-run fresh on every prompt build, purely as a function of
- *  (compactionUpToMessageId, activeMessages), so nothing is ever cleared out from under it
- *  except an explicit undo (clearConversationCompaction) or a new compaction overwriting it. */
+ *  list. Same unresolvable-cut rule as code-session.ts's resolveEffectiveHistory: an
+ *  unresolvable cut (the message was deleted outright) still surfaces its summary —
+ *  replaying every active message alongside a redundant summary loses nothing, whereas
+ *  dropping the summary would lose a real (if now unanchored) one. A cut that was
+ *  DEACTIVATED (edit-freeze, branch switch) never reaches this function — callers pass it
+ *  through setAsideFrozenCut first. Never returns a PARTIAL cut. No edit/branch/delete route
+ *  needs to know this function exists — it is re-run fresh on every prompt build, purely as a
+ *  function of (compactionUpToMessageId, activeMessages), so nothing is ever cleared out from
+ *  under it except an explicit undo (clearConversationCompaction) or a new compaction
+ *  overwriting it. */
 export function resolveCompactionCut(
   conv: Pick<Conversation, 'compactionSummary' | 'compactionUpToMessageId'>,
   activeMessages: Message[],
@@ -95,8 +107,28 @@ export function resolveCompactionCut(
   // reachable if messages after the cut get deleted) would otherwise leave `rest` empty — an
   // engine prompt with a summary and no active turn at all. Same never-lossy treatment as an
   // unresolvable cut: fall back to the full active list rather than send a degenerate prompt.
-  const rest = cutIdx === -1 || cutIdx === activeMessages.length - 1 ? activeMessages : activeMessages.slice(cutIdx + 1)
+  // A cut ON a user turn whose reply follows it (only compactions picked before
+  // pickCompactionCut aligned its tail to a user turn) would open the tail on that reply, right
+  // after the system message — which alternation-enforcing templates reject on every turn. Keep
+  // the cut's user turn in the tail instead: it is also in the summary, so nothing is lost.
+  // (The one place this deliberately differs from resolveEffectiveHistory.)
+  const keepCutTurn = cutIdx !== -1 && activeMessages[cutIdx].role === 'user' && activeMessages[cutIdx + 1]?.role === 'assistant'
+  const rest = cutIdx === -1 || cutIdx === activeMessages.length - 1 ? activeMessages : activeMessages.slice(keepCutTurn ? cutIdx : cutIdx + 1)
   return { summary: conv.compactionSummary, rest }
+}
+
+/** A cut message that still exists but is inactive was frozen by a user-message edit or a
+ *  branch switch: its summary describes the branch the user LEFT, which can contradict the
+ *  active one (and would be folded into it for good by the next compaction's priorSummary).
+ *  Unlike a deleted cut, its summary is not redundant, so this build treats the conversation
+ *  as uncompacted — every active message is replayed. Only this call's copy is cleared; the
+ *  stored fields are untouched, so switching back to that branch applies the summary again
+ *  (unless a compaction on this branch has replaced it — compaction never deletes a message,
+ *  so that branch is then replayed in full, which can exceed the context: maybeAutoCompact
+ *  judges it by that full size, not by a reading taken under its replaced summary). */
+export function setAsideFrozenCut(db: Pick<ConversationStore, 'getMessage'>, conv: Conversation): Conversation {
+  if (!conv.compactionUpToMessageId || db.getMessage(conv.compactionUpToMessageId)?.isActive !== false) return conv
+  return { ...conv, compactionSummary: undefined, compactionUpToMessageId: undefined, compactionTokensBefore: undefined }
 }
 
 // ── prompt assembly ──────────────────────────────────────────────────────────────────
@@ -121,13 +153,42 @@ function effectiveTailText(preserveThinking: boolean, m: Message): string {
     : m.content
 }
 
-export function buildEngineMessages(conv: Conversation, activeMessages: Message[]): { role: string; content: unknown }[] {
+/** A user turn as the engine receives it: the attached documents' text folded ahead of the
+ *  typed text, images as multimodal parts. Shared by POST /messages (a new turn) and
+ *  buildEngineMessages (the turn /continue answers again — Regenerate, edit-and-resend), so a
+ *  re-answered turn carries exactly what its first send did. */
+export function userTurnContent(text: string, docContext: string | undefined, images: string[]): unknown {
+  const fullContent = docContext ? (text ? `${docContext}\n\n${text}` : docContext) : text
+  return images.length
+    ? [
+        ...(fullContent ? [{ type: 'text', text: fullContent }] : []),
+        ...images.map((url) => ({ type: 'image_url', image_url: { url } })),
+      ]
+    : fullContent
+}
+
+/** `answeringUserMessageId` — the user turn this generation answers, when it is already in
+ *  `activeMessages` (/continue): it is rebuilt with its images and documents, as POST
+ *  /messages sends a new turn. Every other turn is resent as text, as POST /messages does. */
+export function buildEngineMessages(conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string): { role: string; content: unknown }[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
   const out: { role: string; content: unknown }[] = []
-  if (conv.systemPrompt) out.push({ role: 'system', content: withCurrentDate(conv.systemPrompt) })
-  if (summary) out.push({ role: 'system', content: `Earlier conversation summary:\n\n${summary}` })
+  // ONE leading system message, with the summary folded in: chat templates that enforce strict
+  // role alternation (Gemma 2/3, older Mistral) take only messages[0] as the system prompt and
+  // raise on a second `system` turn — every post-compaction turn failed on them. The summary
+  // goes after the date-stamped prompt, where it sat as its own message before.
+  const system = [
+    conv.systemPrompt ? withCurrentDate(conv.systemPrompt) : '',
+    summary ? `Earlier conversation summary:\n\n${summary}` : '',
+  ].filter(Boolean).join('\n\n')
+  if (system) out.push({ role: 'system', content: system })
   for (const m of rest) {
-    out.push({ role: m.role, content: effectiveTailText(!!conv.preserveThinking, m) })
+    out.push({
+      role: m.role,
+      content: m.id === answeringUserMessageId
+        ? userTurnContent(m.content, m.docContext, m.attachments)
+        : effectiveTailText(!!conv.preserveThinking, m),
+    })
   }
   return out
 }
@@ -176,7 +237,8 @@ function calibratedTokenScale(pool: Message[], realCtxUsed: number | undefined, 
  *  ~15% of ctxMax (KEEP_RECENT_FRACTION, above) so the very next reply isn't answered from
  *  a summary-only prompt. Always
  *  keeps at least the single most recent message in the tail, even if it alone exceeds
- *  budget — an oversized tail is better than an empty one. Returns null when there is
+ *  budget — an oversized tail is better than an empty one — and the tail always opens on a
+ *  user turn (see the alignment step below). Returns null when there is
  *  nothing worth compacting: too few messages, or the whole pool already fits the tail
  *  budget. `realCtxUsed` — the engine's own last-reported prompt size for this exact pool,
  *  from `lastCtxUsage` — calibrates the estimate; see calibratedTokenScale. `preserveThinking`
@@ -196,6 +258,18 @@ export function pickCompactionCut(pool: Message[], ctxMax: number, realCtxUsed?:
     tailStart--
   }
   if (tailStart <= 0) return null // the whole pool already fits the tail budget
+  // The kept tail must open on a user turn: buildEngineMessages puts it right after the one
+  // system message, and templates that enforce alternation (Gemma, older Mistral) reject an
+  // assistant turn there. Move the cut forward to the next user turn (summarizing a little
+  // more); if the tail holds none, widen it back to the nearest one instead.
+  let userStart = tailStart
+  while (userStart < pool.length && pool[userStart].role !== 'user') userStart++
+  if (userStart === pool.length) {
+    userStart = tailStart
+    while (userStart > 0 && pool[userStart].role !== 'user') userStart--
+  }
+  tailStart = userStart
+  if (tailStart <= 0) return null // the only user turn is the pool's first: nothing left to summarize
   const toSummarize = pool.slice(0, tailStart)
   const tokensBefore = Math.round(estimateTokens(toSummarize.map((m) => ({ role: m.role, content: effectiveTailText(preserveThinking, m) }))) * scale)
   return { toSummarize, cutMessageId: toSummarize[toSummarize.length - 1].id, tokensBefore }
@@ -249,15 +323,22 @@ function buildSummarizationPrompt(priorSummary: string | null, toSummarize: Mess
  *
  *  `opts.signal` is the turn's own AbortController signal, so Stop can actually reach both
  *  halves of the wait (gate queue + summarization call) instead of leaving an uninterruptible
- *  blocking call in the chat turn's critical path. */
+ *  blocking call in the chat turn's critical path.
+ *
+ *  `opts.activeMessages` is a turn route's snapshot of the history from BEFORE it inserted the
+ *  turn's own user row and placeholder (maybeAutoCompact passes it). Re-reading would put both
+ *  in the pool, and pickCompactionCut's "keep the last message" floor would then protect only
+ *  the empty placeholder — the message the user just sent could be summarized before it was
+ *  ever answered, and the cut would land outside the snapshot the turn then builds from. */
 export async function compactConversation(
   d: Deps,
   convId: string,
-  opts?: { upstream?: ChatUpstream; signal?: AbortSignal; fetchImpl?: typeof fetch },
+  opts?: { upstream?: ChatUpstream; signal?: AbortSignal; fetchImpl?: typeof fetch; activeMessages?: Message[] },
 ): Promise<{ summary: string; upToMessageId: string; tokensBefore: number }> {
-  const conv = d.db.getConversation(convId, true)
-  if (!conv) throw new Error('not_found')
-  const activeMessages = conv.messages ?? []
+  const stored = d.db.getConversation(convId, !opts?.activeMessages)
+  if (!stored) throw new Error('not_found')
+  const conv = setAsideFrozenCut(d.db, stored)
+  const activeMessages = opts?.activeMessages ?? conv.messages ?? []
 
   const { summary: priorSummary, rest: pool } = resolveCompactionCut(conv, activeMessages)
 
@@ -315,8 +396,8 @@ export async function compactConversation(
   return { summary, upToMessageId: picked.cutMessageId, tokensBefore }
 }
 
-/** Called from both turn-starting routes (chat-routes.ts) right after the 'meta' SSE
- *  event, BEFORE the new turn's messages are built — so a successful compaction is
+/** Called from both turn-starting routes (chat-routes.ts) right after the turn's 'meta'
+ *  frame (its run's frame 0), BEFORE the new turn's messages are built — so a successful compaction is
  *  reflected in the very same turn's prompt. `conv` is mutated in place with the fresh
  *  compaction fields on success so the caller's own buildEngineMessages call (right after
  *  this returns) sees them without a second DB read. Best-effort, same contract as
@@ -340,16 +421,38 @@ export async function maybeAutoCompact(
   emitCompactionEvent: (phase: 'start' | 'end') => Promise<void>,
   fetchImpl?: typeof fetch,
 ): Promise<void> {
-  const { ctxUsed, ctxMax } = lastCtxUsage(conv.messages ?? [])
+  const messages = conv.messages ?? []
+  const measured = lastMeasuredReply(messages)
+  const compactedSinceReading = !!conv.compactionAppliedAt && !!measured && conv.compactionAppliedAt > measured.createdAt
+  const shown = setAsideFrozenCut(d.db, conv)
+  let { ctxUsed, ctxMax } = lastCtxUsage(messages)
+  // A newer compaction set aside for this branch was stored over whatever compaction this
+  // reading was taken under: this branch's own (replaced by another branch's) or one it shared.
+  // Either way the branch is now replayed in full, which can be several times the reading, and
+  // a turn the engine refuses records no new one, so the reading alone never opens the gate.
+  // The estimated size of that full history is a floor the reading must not undercut.
+  if (compactedSinceReading && shown !== conv) {
+    ctxUsed = Math.max(ctxUsed, estimateTokens(buildEngineMessages(shown, messages) as Array<{ role: string; content: string }>))
+  }
   if (!shouldAutoCompact(ctxUsed, ctxMax)) return
-  try { await emitCompactionEvent('start') } catch { /* client gone — same best-effort contract as the compaction call below */ }
+  // ctxUsed is a measurement compaction never rewrites. A compaction applied after that reply
+  // was measured (typically a manual Compact) has already acted on this reading — compacting
+  // again would summarize the very tail it chose to keep. Same comparison as the context
+  // meter's compactionIsNewerThanMeasurement (ChatScreen.tsx). Not when that compaction is set
+  // aside for this branch (setAsideFrozenCut): it acts on nothing here, so the gate above (the
+  // reading, raised to the full history's estimate) decides.
+  // Known, accepted cost: `createdAt` is a reply's turn START, so after an auto-compaction INSIDE
+  // a turn, that turn's (post-compaction) reading is skipped too — at most a one-turn delay.
+  if (compactedSinceReading && shown === conv) return
+  try { await emitCompactionEvent('start') } catch { /* a failing writer — same best-effort contract as the compaction call below */ }
   try {
-    const result = await compactConversation(d, convId, { upstream, signal, ...(fetchImpl ? { fetchImpl } : {}) })
+    // The caller's snapshot, never a re-read — see compactConversation's `activeMessages`.
+    const result = await compactConversation(d, convId, { upstream, signal, activeMessages: messages, ...(fetchImpl ? { fetchImpl } : {}) })
     conv.compactionSummary = result.summary
     conv.compactionUpToMessageId = result.upToMessageId
     conv.compactionTokensBefore = result.tokensBefore
   } catch {
     // Best-effort — see doc comment above.
   }
-  try { await emitCompactionEvent('end') } catch { /* client gone */ }
+  try { await emitCompactionEvent('end') } catch { /* a failing writer */ }
 }

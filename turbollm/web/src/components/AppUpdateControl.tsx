@@ -16,8 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ArrowUpCircle, Check, ExternalLink, Loader2, TriangleAlert } from 'lucide-react'
 import { applyAppUpdate, getAppUpdateProgress, track } from '../lib/api'
-import { useAppUpdate, useAppUpdatePolicyMutation, useDismissAppUpdateMutation, useStatus, useSysInfo } from '../lib/queries'
-import { isAndroidOs } from '../lib/platform'
+import { useAppUpdate, useAppUpdatePolicyMutation, useDismissAppUpdateMutation, useStatus } from '../lib/queries'
 import type { AppUpdate, UpdatePolicy } from '../lib/types'
 import { Button } from './ui/button'
 import { CopyButton } from './ui/copy-button'
@@ -50,19 +49,20 @@ export function useAppUpdateState(): {
   update: AppUpdate | undefined
   installed: string
   latest: string
-  /** Show the update affordance? False on Android, when the check hasn't landed, when the
-   *  policy is `off`, and when there is simply nothing newer. */
+  /** Show the update affordance? False in the Android app, when the check hasn't landed, when
+   *  the policy is `off`, and when there is simply nothing newer. */
   visible: boolean
 } {
   const { data: update } = useAppUpdate()
   const { data: status } = useStatus()
-  const sys = useSysInfo().data
   const installed = update?.installed || status?.version || ''
   const latest = update?.latest ?? ''
-  // Android's real update path is a Play Store release — there is no terminal to run a
-  // command in and no npm on the device. Suppressed here exactly as AboutSection has
-  // always suppressed it, rather than shown-and-disabled.
-  const visible = !!update?.hasUpdate && !!latest && !isAndroidOs(sys?.os ?? '')
+  // The Android app's real update path is a Play Store release — there is no terminal to run a
+  // command in and no npm on the device. Suppressed here exactly as AboutSection has always
+  // suppressed it, rather than shown-and-disabled. Keyed off the daemon's install method, not
+  // `sys.os`: Termux's os is "android/…" too, and there TurboLLM is an npm install that updates
+  // itself (classifyInstall, app-update-apply.ts).
+  const visible = !!update?.hasUpdate && !!latest && update.method !== 'android'
   return { update, installed, latest, visible }
 }
 

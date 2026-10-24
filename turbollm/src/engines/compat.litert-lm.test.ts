@@ -23,22 +23,25 @@ test('modelIncompatibility: a .litertlm model on LiteRT-LM is loadable', () => {
   assert.equal(modelIncompatibility('litert-lm', LITERT), null)
 })
 
-for (const kind of ['llama-server', 'koboldcpp', 'mlx', 'vllm', 'sglang']) {
-  test(`modelIncompatibility: a .litertlm model on ${kind} points at the LiteRT-LM engine`, () => {
-    assert.deepEqual(modelIncompatibility(kind, LITERT), {
-      code: 'format',
-      label: 'needs LiteRT-LM',
-      message: 'This is a LiteRT-LM model (.litertlm) — activate the LiteRT-LM engine to load it.',
-    })
+// The refusal names the selected engine and the format, never another engine: it said "activate the LiteRT-LM engine
+// to load it", advice the owner's rule forbids (a model loads only on the engine the user selected).
+const LITERT_REFUSALS: Record<string, string> = {
+  'llama-server': "llama.cpp can't run this .litertlm model.",
+  koboldcpp: "KoboldCpp can't run this .litertlm model.",
+  mlx: "MLX can't run this .litertlm model.",
+  vllm: "vLLM can't run this .litertlm model.",
+  sglang: "SGLang can't run this .litertlm model.",
+}
+for (const [kind, message] of Object.entries(LITERT_REFUSALS)) {
+  test(`modelIncompatibility: a .litertlm model on ${kind} is refused in that engine's name, naming no other`, () => {
+    assert.deepEqual(modelIncompatibility(kind, LITERT), { code: 'format', label: 'needs LiteRT-LM', message })
   })
 }
 
-test('modelIncompatibility: GGUF and safetensors models on LiteRT-LM say which engine they need', () => {
-  for (const entry of [GGUF, MLX]) {
-    const inc = modelIncompatibility('litert-lm', entry)
-    assert.equal(inc?.code, 'format')
-    assert.match(inc?.message ?? '', /active engine is LiteRT-LM/)
-  }
+test('modelIncompatibility: GGUF and safetensors models on LiteRT-LM are refused in its name, naming no other engine', () => {
+  assert.equal(modelIncompatibility('litert-lm', GGUF)?.message, "LiteRT-LM can't run this GGUF model.")
+  assert.equal(modelIncompatibility('litert-lm', MLX)?.message, "LiteRT-LM can't run this safetensors model.")
+  for (const entry of [GGUF, MLX]) assert.equal(modelIncompatibility('litert-lm', entry)?.code, 'format')
 })
 
 test('engineModelAlias: LiteRT-LM sends the model path, or null without one', () => {

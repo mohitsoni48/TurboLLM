@@ -30,9 +30,10 @@ import { randomUUID } from 'node:crypto'
 import { chmodSync, existsSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { basename, join, sep } from 'node:path'
 import { asDirName, isEngineInBuildDir } from './build-runner'
+import { renameWithRetry } from './download'
 import { serverBinName, suggestEngineName } from './scan'
 import { probe, type ProbeResult } from './probe'
-import { inflateEntry, isInstallMarkerName, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError, type ArchiveMember, type ZipEntry } from './zip-reader'
+import { assertWithinTotalCap, inflateEntry, isInstallMarkerName, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError, type ArchiveMember, type ZipEntry } from './zip-reader'
 
 export { crc32, extractZipAll, inflateEntry, readZipEntries, RELEASE_INSTALL_MARKER, ZIP_BUILD_MARKER, ZipError } from './zip-reader'
 export type { ArchiveMember, ZipEntry, ZipErrorCode } from './zip-reader'
@@ -147,9 +148,14 @@ export const pickZipFiles = (entries: ZipEntry[], platform?: NodeJS.Platform, bi
 /** The install dir slug under {enginesRoot}/build/ — the uploaded zip's filename stem,
  *  collapsed to a safe single path step by build-runner's asDirName (the one path-safety
  *  rule every other build dir follows), with this flow's own fallback for a stem that
- *  reduces to a path step ("..", "." — or empty). */
+ *  reduces to a path step ("..", "." — or empty). Never a hidden name: leading dots (and
+ *  the dashes asDirName leaves between them) are dropped, because `.<name>.stage`,
+ *  `.<slug>-<id>.tmp` / `.old` and `.<name>-<ms>.prev` are the installs' and builds' own
+ *  work dirs. '.my-build.stage.zip' installed into build/.my-build.stage, which
+ *  gcAbandonedZipInstalls sweeps by age alone, so the registered engine's files were
+ *  deleted a day after the install. */
 export function zipBuildDirName(fileName: string): string {
-  return asDirName(basename(fileName.trim()).replace(/\.zip$/i, ''), 'zip-build')
+  return asDirName(basename(fileName.trim()).replace(/\.zip$/i, ''), '').replace(/^[.-]+/, '') || 'zip-build'
 }
 
 /** Resolve a symlink member to the real member its (validated) link text points at within
@@ -206,15 +212,18 @@ function isLinkToFileInside(path: string, realRoot: string): boolean {
  *  honest can be written, and a genuinely needed library then fails the probe by name. */
 export function extractZipFiles(buf: Buffer, selection: ZipSelection, destDir: string): string {
   mkdirSync(destDir, { recursive: true })
+  // Links are resolved first: each copy counts toward the total cap, checked before any inflate.
+  const copies: Array<[ZipEntry, ZipEntry]> = []
+  for (const entry of selection.files.values()) {
+    const target = entry.symlink ? followLink(buf, selection, entry, 0) : null
+    if (target) copies.push([entry, target])
+  }
+  assertWithinTotalCap([...[...selection.files.values()].filter((e) => !e.symlink), ...copies.map(([, target]) => target)])
   for (const entry of selection.files.values()) {
     if (entry.symlink) continue
     writeFileSync(join(destDir, baseOf(entry.name)), inflateEntry(buf, entry))
   }
-  for (const entry of selection.files.values()) {
-    if (!entry.symlink) continue
-    const target = followLink(buf, selection, entry, 0)
-    if (target) writeFileSync(join(destDir, baseOf(entry.name)), inflateEntry(buf, target))
-  }
+  for (const [link, target] of copies) writeFileSync(join(destDir, baseOf(link.name)), inflateEntry(buf, target))
   const binPath = join(destDir, baseOf(selection.binary.name))
   if (process.platform !== 'win32') {
     try {
@@ -258,7 +267,8 @@ export function missingCudartWarning(fileNames: string[], platform: NodeJS.Platf
  *  staging dirs a crashed release install left behind; those never hold a registered binary
  *  (it only becomes visible after the final rename), so age alone decides. Runs at the start of
  *  every upload; a dir newer than the grace period survives, since another tab may still be
- *  sitting on its confirm step. */
+ *  sitting on its confirm step. A parked previous install that a registered engine still needs
+ *  is first put back (restoreParkedInstalls) and never swept. */
 export function gcAbandonedZipInstalls(
   enginesRoot: string,
   claimedBinPaths: string[],
@@ -267,10 +277,20 @@ export function gcAbandonedZipInstalls(
   const buildRoot = join(enginesRoot, 'build')
   const maxAgeMs = opts.maxAgeMs ?? ZIP_GC_GRACE_MS
   const markers = opts.markers ?? [ZIP_BUILD_MARKER, RELEASE_INSTALL_MARKER]
+  restoreParkedInstalls(enginesRoot, claimedBinPaths, markers)
   try {
     for (const d of readdirSync(buildRoot)) {
+      // A folder a purge or DELETE /engines/build renamed aside (`.<name>.purge-<ms>`, a removed release or zip
+      // install still holds its marker) is theirs to delete, in the background: an rmSync here raced that delete and
+      // held the daemon's thread while it ran. One that stays locked, or whose delete a daemon exit cut short, is
+      // swept only by the next purge or delete in this folder.
+      if (/^\..+\.purge-\d+$/.test(d)) continue
       const dir = join(buildRoot, d)
       if (!existsSync(dir) || !statSync(dir).isDirectory()) continue
+      // Marked and unclaimed (no binPath points into a parked dir), and as old as the install it holds — so without
+      // this the sweep deleted the only build of an engine whose restore just failed again.
+      const parkedFor = parkedSlugOf(d)
+      if (parkedFor !== null && parkedInstallNeeded(buildRoot, parkedFor, claimedBinPaths)) continue
       if (!isStagingDir(d) && !isMarkedUnclaimed(dir, markers, claimedBinPaths)) continue
       if (Date.now() - statSync(dir).mtimeMs < maxAgeMs) continue
       rmSync(dir, { recursive: true, force: true })
@@ -278,6 +298,54 @@ export function gcAbandonedZipInstalls(
   } catch {
     /* unreadable build root or a dir vanished mid-sweep — the next upload tries again */
   }
+}
+
+/** Put a parked previous install (`.<slug>-<id>.old`, promoteProbedInstall's) back as build/<slug> when that folder
+ *  is gone while a registered engine or a remembered custom source still points into it. That is the state a swap
+ *  leaves when both its rename and the move back fail (Windows: both locked past renameWithRetry's ~3 s), or when the
+ *  daemon dies between the park and the swap: the engine points at a missing binary, and its only build sits in a
+ *  hidden folder no binPath claims. The newest parked install (by its marker's time; deleting files from an older
+ *  one bumps that folder's own mtime) wins. A rename that fails leaves it for the next call. Runs at boot and
+ *  before every sweep. */
+export function restoreParkedInstalls(
+  enginesRoot: string,
+  claimedBinPaths: string[],
+  markers: string[] = [ZIP_BUILD_MARKER, RELEASE_INSTALL_MARKER],
+): void {
+  const buildRoot = join(enginesRoot, 'build')
+  const newest = new Map<string, { dir: string; at: number }>()
+  try {
+    for (const d of readdirSync(buildRoot)) {
+      const slug = parkedSlugOf(d)
+      if (slug === null || !parkedInstallNeeded(buildRoot, slug, claimedBinPaths)) continue
+      const dir = join(buildRoot, d)
+      const marker = markers.find((m) => existsSync(join(dir, m)))
+      if (!marker) continue
+      const at = statSync(join(dir, marker)).mtimeMs
+      const best = newest.get(slug)
+      if (!best || at > best.at) newest.set(slug, { dir, at })
+    }
+  } catch {
+    return /* unreadable build root or a dir vanished mid-scan — the next call tries again */
+  }
+  for (const [slug, { dir }] of newest) {
+    try {
+      renameSync(dir, join(buildRoot, slug))
+    } catch {
+      /* still locked — the sweep keeps it (parkedInstallNeeded) and the next call retries */
+    }
+  }
+}
+
+/** The slug of a parked previous install's dir name (`.<slug>-<8 hex>.old`, promoteProbedInstall), else null. */
+function parkedSlugOf(dirName: string): string | null {
+  return /^\.(.+)-[0-9a-f]{8}\.old$/.exec(dirName)?.[1] ?? null
+}
+
+/** build/<slug> is missing although an engine or custom source points into it: its parked install is its only build. */
+function parkedInstallNeeded(buildRoot: string, slug: string, claimedBinPaths: string[]): boolean {
+  const live = join(buildRoot, slug)
+  return !existsSync(live) && claimedBinPaths.some((p) => isEngineInBuildDir(p, live))
 }
 
 function isStagingDir(dirName: string): boolean {
@@ -322,13 +390,14 @@ export async function promoteProbedInstall(o: {
   if (blocked) throw new SwapBlockedError(blocked)
   // Never leave a moment where neither install exists: park the old dir, move the new one
   // in, and delete the old one only once that worked — moving it back if the rename failed
-  // (on Windows a just-probed .exe can stay locked by antivirus for a moment: EPERM/EBUSY).
+  // (on Windows a just-probed .exe can stay locked by antivirus for a moment: EPERM/EBUSY,
+  // which renameWithRetry waits out).
   const parked = existsSync(destDir) ? join(enginesRoot, 'build', `.${slug}-${randomUUID().slice(0, 8)}.old`) : null
-  if (parked) renameSync(destDir, parked)
+  if (parked) await renameWithRetry(destDir, parked)
   try {
-    renameSync(tmpDir, destDir)
+    await renameWithRetry(tmpDir, destDir)
   } catch (e) {
-    if (parked) renameSync(parked, destDir)
+    if (parked) await renameWithRetry(parked, destDir)
     throw e
   }
   if (parked) {
@@ -351,19 +420,21 @@ export async function promoteProbedInstall(o: {
  *  result reports (and suggestEngineName sees) the FINAL path, which is where the engine
  *  will actually run from. Returns the same shape as POST /engines/scan so the Add-engine
  *  dialog's confirm step works unchanged; registration still goes through POST /engines
- *  (which records the custom-source identity). */
+ *  (which records the custom-source identity). `slug` overrides the folder name derived from
+ *  the zip's name: the route passes the spelling an existing install has on disk when the two
+ *  differ only in letter case. */
 export async function installZipEngine(
   enginesRoot: string,
   zipFileName: string,
   bytes: Buffer,
-  opts: { probeFn?: (bin: string) => Promise<ProbeResult>; blockSwap?: () => string | null } = {},
+  opts: { probeFn?: (bin: string) => Promise<ProbeResult>; blockSwap?: () => string | null; slug?: string } = {},
 ): Promise<ZipScanResult> {
   if (bytes.length > MAX_ZIP_BYTES)
     throw new ZipError('zip_too_large', `Engine zips are capped at ${MAX_ZIP_BYTES / (1024 * 1024 * 1024)} GiB.`)
   const entries = readZipEntries(bytes)
   const selection = pickZipFiles(entries)
   if (!selection) return { found: false }
-  const slug = zipBuildDirName(zipFileName)
+  const slug = opts.slug ?? zipBuildDirName(zipFileName)
   const tmpDir = join(enginesRoot, 'build', `.${slug}-${randomUUID().slice(0, 8)}.tmp`)
   try {
     const binPath = extractZipFiles(bytes, selection, tmpDir)
@@ -386,7 +457,13 @@ export async function installZipEngine(
       ...(warning ? { warning } : {}),
     }
   } finally {
-    rmSync(tmpDir, { recursive: true, force: true }) // no-op once renamed into place
+    // Best effort, with retries (as in installReleaseAsset): AV/the indexer can still hold the just-probed files, and
+    // a throw here would mask the real error (a probe failure became a 500). gcAbandonedZipInstalls sweeps leftovers.
+    try {
+      rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) // no-op once renamed into place
+    } catch {
+      /* best effort */
+    }
   }
 }
 

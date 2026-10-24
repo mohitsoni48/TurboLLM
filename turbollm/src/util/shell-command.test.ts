@@ -10,7 +10,7 @@
 // space or a shell metacharacter must survive as ONE argument.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildShellCommand, quotePosixArg, quoteWindowsArg } from './shell-command'
+import { buildShellCommand, quotePosixArg, quotePowerShellArg, quoteWindowsArg } from './shell-command'
 
 // ── the ordinary case: nothing gets quoted that doesn't need it ───────────────
 
@@ -88,4 +88,18 @@ test('the binary itself is quoted too when its path needs it', () => {
 
 test('buildShellCommand with no args is just the quoted binary', () => {
   assert.equal(buildShellCommand('claude', [], 'win32'), 'claude')
+})
+
+// PowerShell's tokenizer treats U+2018–U+201B as single quotes (both to end a string and in the
+// doubled-quote escape), so a smart apostrophe in pasted prose ended the string early and ran the
+// rest of the first message as script. Each must be doubled exactly like ASCII `'`.
+test('quotePowerShellArg: typographic single quotes are doubled like the ASCII one', () => {
+  assert.equal(quotePowerShellArg("it's"), "'it''s'")
+  assert.equal(quotePowerShellArg('Don\u2019t touch'), "'Don\u2019\u2019t touch'")
+  assert.equal(
+    quotePowerShellArg('\u2018a\u2019 \u201Ab\u201B'),
+    "'\u2018\u2018a\u2019\u2019 \u201A\u201Ab\u201B\u201B'",
+  )
+  // Double quotes are literal inside a single-quoted PowerShell string and stay untouched.
+  assert.equal(quotePowerShellArg('say \u201Chi\u201D'), "'say \u201Chi\u201D'")
 })

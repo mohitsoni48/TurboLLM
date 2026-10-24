@@ -137,6 +137,7 @@ export function FleetAction({
   size = 'sm',
   variant,
   title,
+  label,
 }: {
   state: ActionState
   onClick: () => void
@@ -145,6 +146,8 @@ export function FleetAction({
   size?: 'sm' | 'default'
   variant?: 'outline' | 'default'
   title?: string
+  /** The accessible name, for a button whose visible label can be hidden (icon-only). */
+  label?: string
 }) {
   const disabled = !state.enabled
   const reason = state.enabled ? undefined : state.reason
@@ -157,6 +160,7 @@ export function FleetAction({
         onClick={onClick}
         disabled={disabled || busy}
         title={reason ?? title}
+        {...(label ? { 'aria-label': label } : {})}
         {...(reason ? { 'aria-describedby': reasonId } : {})}
       >
         {busy ? <Loader2 size={14} className="animate-spin" /> : null}

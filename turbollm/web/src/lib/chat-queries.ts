@@ -70,14 +70,13 @@ export function useConversation(id: string | null) {
     queryFn: () => getConversation(id!),
     enabled: !!id,
     retry: false,
-    // Multi-device/multi-tab live sync (founder-reported gap, 2026-07-15): a message sent from
-    // one device/tab has no push channel to any OTHER client viewing the same conversation — the
-    // SSE stream in chat-routes.ts's POST .../messages is the direct HTTP response to the ONE
-    // request that sent it, not a subscribable broadcast (unlike Code's RingBuffer+EventEmitter,
-    // which genuinely fans out to multiple subscribers). A passive second client previously had
-    // zero mechanism (no poll, and refetchOnWindowFocus is off globally, main.tsx) to ever notice
-    // a new message short of a manual reload. Polling is the minimal fix — matches the cadence
-    // Code's own session list already uses (code-queries.ts, refetchInterval: 5000).
+    // Multi-device/multi-tab live sync (founder-reported gap, 2026-07-15): refetchOnWindowFocus is
+    // off globally (main.tsx), so a second tab or device viewing the conversation would never
+    // notice a new message, a title or a version switch made elsewhere short of a manual reload.
+    // The poll catches those, and it is how such a page learns a reply is running
+    // (`runningReplyId`): ChatScreen then attaches to the reply's own run, which fans out to every
+    // viewer (GET .../stream, chat-runs.ts), and follows it live. Matches the cadence Code's own
+    // session list already uses (code-queries.ts, refetchInterval: 5000).
     refetchInterval: 4000,
     refetchIntervalInBackground: false,
   })
@@ -104,7 +103,7 @@ update: useMutation({
       onSuccess: invalidateList,
     }),
     stop: useMutation({
-      mutationFn: (convId: string) => stopGeneration(convId),
+      mutationFn: ({ convId, messageId }: { convId: string; messageId?: string }) => stopGeneration(convId, messageId),
     }),
     editMsg: useMutation({
       mutationFn: (v: { convId: string; msgId: string; content: string }) => editMessage(v.convId, v.msgId, v.content),

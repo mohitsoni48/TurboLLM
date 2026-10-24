@@ -107,13 +107,16 @@
   ${Next}
 !macroend
 
-; Called only when something runs. The installer closes gracefully first, so TurboLLM can quit
-; through its own shutdown, then forces what cannot answer a close (no window yet, a cancelled
-; close, a background process left under the install folder). The uninstaller forces at once: a
-; graceful quit lets electron-updater start a downloaded update's installer, which would then run
-; next to this uninstaller (only the installer holds the one-instance mutex). A forced end runs no
-; quit handler. ${_OUT} ends as the last probe: 1 means something still runs after the whole budget,
-; including one bounded extra force-close if settling turns up something the close loops missed.
+; Called only when something runs. The installer closes gracefully first, then forces what cannot
+; answer a close (no window yet, a cancelled close, a background process left under the install
+; folder). A close lets TurboLLM quit through its own shutdown only when it has no tray icon: with
+; one, the close just hides the window to the tray (main.js), so TurboLLM is forced after the grace
+; polls and its quit handler, which ends the daemon's tree, does not run. The uninstaller forces at
+; once: a graceful quit lets electron-updater start a downloaded update's installer, which would
+; then run next to this uninstaller (only the installer holds the one-instance mutex). A forced end
+; runs no quit handler. ${_OUT} ends as the last probe: 1 means something still runs after the whole
+; budget, including one bounded extra force-close if settling turns up something the close loops
+; missed.
 !macro TURBOLLM_CLOSE_ALL _OUT
   StrCpy ${_OUT} 1
   !ifndef BUILD_UNINSTALLER

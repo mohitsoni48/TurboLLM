@@ -11,10 +11,11 @@
 // Reader selection is FIRST MATCH, never a combination: an NVIDIA card beside an Intel iGPU uses
 // nvidia-smi alone, because per ADR-306 the iGPU contributes nothing to the VRAM budget and there
 // is no reason to also pay for the counter stream.
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import os from 'node:os'
 import { availableMemBytes, getSysInfo, type SysInfo } from './sysinfo'
+import { spawnTethered, tetheredExecFile } from '../util/tether'
 import {
   type CpuTimes,
   type DiskCounters,
@@ -67,17 +68,13 @@ export interface DiskReader {
 
 // ── process helper ───────────────────────────────────────────────────────────
 
+// The polled readers (nvidia-smi, ioreg, rocm-smi) and the streamed one (the WDDM counter stream, iostat) are tied
+// to the daemon (util/tether.ts): their timeout is a daemon timer and the stream ends only at stop(), so a daemon
+// that died without its teardown left them running, parented to init (a counter stream for good).
+const probeExecFile = tetheredExecFile({ kind: 'probe' })
+
 function run(cmd: string, args: string[]): Promise<string> {
-  return new Promise((resolve, reject) => {
-    try {
-      execFile(cmd, args, { timeout: READER_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout) => {
-        if (err) reject(err)
-        else resolve(String(stdout ?? ''))
-      })
-    } catch (e) {
-      reject(e as Error)
-    }
-  })
+  return probeExecFile(cmd, args, { timeout: READER_TIMEOUT_MS, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }).then(({ stdout }) => String(stdout ?? ''))
 }
 
 /** Wrap a polled sampler with the failure latch. After {@link MAX_CONSECUTIVE_FAILURES} consecutive
@@ -136,10 +133,10 @@ export function createStreamingReader<T>(
     start() {
       if (child) return
       try {
-        child = spawn(command, args, {
+        child = spawnTethered(command, args, {
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'ignore'],
-        })
+        }, { kind: 'usage' })
       } catch {
         dead = true
         return

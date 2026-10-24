@@ -79,7 +79,7 @@ export function resolveClaudePermissionMode(mode: string, choices: readonly stri
 export type HelpRunner = () => Promise<string>
 
 const realHelpRunner: HelpRunner = async () => {
-  const { spawn } = await import('node:child_process')
+  const { spawnTethered } = await import('../util/tether')
   const { buildShellCommand } = await import('../util/shell-command')
   const { requiresShell, resolveExecutable } = await import('../util/resolve-executable')
   return await new Promise<string>((resolve) => {
@@ -101,9 +101,10 @@ const realHelpRunner: HelpRunner = async () => {
       // for consistency, so there is ONE way the CLI gets spawned rather than two to audit.
       const resolved = resolveExecutable('claude')
       const stdio: ['ignore', 'pipe', 'ignore'] = ['ignore', 'pipe', 'ignore']
+      // Tethered (util/tether.ts), as every daemon-run CLI is: its 5 s timeout is a daemon timer.
       const child = requiresShell(resolved)
-        ? spawn(buildShellCommand('claude', ['--help']), { shell: true, stdio })
-        : spawn(resolved ?? 'claude', ['--help'], { stdio })
+        ? spawnTethered(buildShellCommand('claude', ['--help']), null, { shell: true, stdio }, { kind: 'probe' })
+        : spawnTethered(resolved ?? 'claude', ['--help'], { stdio }, { kind: 'probe' })
       const timer = setTimeout(() => { try { child.kill() } catch { /* already gone */ } ; done('') }, 5000)
       child.stdout?.on('data', (b: Buffer) => { out += b.toString('utf8') })
       child.on('error', () => { clearTimeout(timer); done('') })

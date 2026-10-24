@@ -72,6 +72,43 @@ test('runChatRoutine sends manager.currentOpts().modelPath as the request model 
   } finally { fetchStub.restore() }
 })
 
+// With keep-N 2 or more a routine's swap loads its model into a pool slot, which keeps the engine it was loaded on,
+// and the user's model stays in the primary. The turns went to the primary, shaped for the primary's engine.
+test("runChatRoutine sends every turn to the swap's pool slot, shaped for that slot's engine", async () => {
+  const { d, db } = fakeDeps({ engineKind: 'llama-server', modelPath: '/models/user-model.gguf' })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const original = globalThis.fetch
+  const urls: string[] = []
+  const models: unknown[] = []
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    urls.push(String(input))
+    models.push((JSON.parse(init?.body as string) as { model: unknown }).model)
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'All PRs are green.' } }] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    const outcome = await runChatRoutine(d, r, run, new AbortController().signal, { target: 'http://slot.invalid.local:2', engineKind: 'mlx-vlm', modelPath: '/models/qwen2-vl-7b-mlx' })
+    assert.equal(outcome.status, 'ok')
+    assert.deepEqual(urls, ['http://slot.invalid.local:2/v1/chat/completions'])
+    assert.deepEqual(models, ['/models/qwen2-vl-7b-mlx'], "mlx-vlm's model field is the slot's model path, not the primary's")
+  } finally { globalThis.fetch = original }
+})
+
+// A swap into the primary (keep-N 1, or keep-N 2 with nothing loaded) hands a route with no engine. Its `model` fallback
+// is the primary's own key, as with no route, not the routine's key as stored (a model name or part of one).
+test("a route to the primary names the primary's model, as with no route", async () => {
+  const { d, db } = fakeDeps({ engineKind: 'llama-server', modelPath: '/models/m.gguf' })
+  const r = db.createRoutine({ flavor: 'chat', prompt: 'Summarize my open PRs', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'M', agentId: 'agent-1' })
+  const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+  try {
+    for (const route of [{ target: 'http://engine.invalid.local:1' }, undefined]) {
+      const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+      assert.equal((await runChatRoutine(d, r, run, new AbortController().signal, route)).status, 'ok')
+    }
+    assert.deepEqual(fetchStub.calls.map((b) => b.model), ['m', 'm'])
+  } finally { fetchStub.restore() }
+})
+
 // PR #271 re-review: the tools gating from the first review covered chat-routes and
 // ext/generation only — the routines path still sent `tools` to litert-lm, so an agent with
 // tools allowed (AGENT has run_code, which buildToolDefinitions() offers unconditionally)
@@ -355,6 +392,105 @@ test('C1: resumeChatRoutine replays the just-approved call with isCodeAuthorized
     // and there is still no HTTP request to authorize against on this path.
     assert.deepStrictEqual(seen, [false])
   } finally { fetchStub.restore() }
+})
+
+// ── An unattended run may not author, edit or fire a routine on an MCP agent ────────────────
+// chat-runner.ts runs every tool an agent lists with no approval, and a caller who may not use
+// the owner's MCP tools (a keyless Serve identity, Access JWT or open-LAN peer) may still create a
+// plain agent listing the routine tools, a chat routine on it, confirm it and run it. Its run then
+// rewrote the prompt of the owner's routine on an MCP agent and fired it, running that MCP tool
+// for the caller unapproved. Both runner call sites pass refuseMcpAgentsAndRoutines; these use the
+// real registry over the real routine store, so a call site that drops it fails here.
+
+const MCP_TOOL = 'mcp__srv_1__run'
+const OWNER_MCP_AGENT = { id: 'owner-mcp', name: 'Shell', description: '', systemPrompt: '', skillIds: [], tools: [MCP_TOOL] }
+
+/** The owner's MCP agent with an active chat routine on it, a plain confirmed routine, and a real
+ *  ToolRegistry over the same routine store and agent list chat-runner.ts reads. */
+function mcpRoutineDeps(callerTools: string[]) {
+  const agents = [{ ...AGENT, tools: callerTools }, structuredClone(OWNER_MCP_AGENT)]
+  const { d, db } = fakeDeps({ customAgents: agents })
+  const fired: string[] = []
+  const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
+  const agentStore = { snapshot: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
+  Object.assign(d, { tools: new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never, db, runNow, agentStore as never) })
+  // Created on the MCP agent directly: a stored routine's agentId cannot change (routine() edits).
+  const ownerRoutine = db.createRoutine({ flavor: 'chat', prompt: 'owner prompt', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: OWNER_MCP_AGENT.id })
+  db.confirmRoutine(ownerRoutine.id, '2099-01-01T00:00:00.000Z')
+  const plainRoutine = routine(db, { prompt: 'plain prompt' })
+  db.confirmRoutine(plainRoutine.id, '2099-01-01T00:00:00.000Z')
+  return { d, db, agents, fired, ownerRoutine, plainRoutine }
+}
+
+function toolCallRound(calls: Array<[string, Record<string, unknown>]>) {
+  return { choices: [{ message: { content: null, tool_calls: calls.map(([name, args], i) => ({ id: `c${i + 1}`, function: { name, arguments: JSON.stringify(args) } })) } }] }
+}
+
+test("a routine's run cannot give an agent the owner's MCP tool, or author, edit or run a chat routine on one; the plain routine and the MCP tool itself are untouched", async () => {
+  const { d, db, agents, fired, ownerRoutine, plainRoutine } = mcpRoutineDeps(['create_agent', 'create_routine', 'update_routine', 'run_routine_now'])
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const hourly = { kind: 'interval', everyMs: 3_600_000 }
+  const fetchStub = stubFetch([
+    toolCallRound([
+      ['create_agent', { name: 'Mine', systemPrompt: 'attacker prompt', tools: [MCP_TOOL] }],
+      ['create_routine', { flavor: 'chat', prompt: 'attacker prompt', scheduleDisplay: 'hourly', scheduleRule: hourly, modelKey: 'm', agentId: OWNER_MCP_AGENT.id }],
+      ['update_routine', { routineId: ownerRoutine.id, prompt: 'attacker prompt', confirm: true }],
+      ['run_routine_now', { routineId: ownerRoutine.id }],
+      ['update_routine', { routineId: plainRoutine.id, prompt: 'new plain prompt', confirm: true }],
+      ['run_routine_now', { routineId: plainRoutine.id }],
+    ]),
+    { choices: [{ message: { content: 'done' } }] },
+  ])
+  try {
+    const outcome = await runChatRoutine(d, r, run, new AbortController().signal)
+    assert.equal(outcome.status, 'ok')
+    const results = (fetchStub.calls[1].messages as Array<{ role: string; content: unknown }>).filter((m) => m.role === 'tool').map((m) => String(m.content))
+    assert.equal(results.length, 6)
+    assert.match(results[0], /An agent that uses an MCP server tool/)
+    for (const refused of results.slice(1, 4)) assert.match(refused, /A routine whose agent uses an MCP server tool/)
+    assert.match(results[4], /Updated routine /)
+    assert.match(results[5], /is running now/)
+    assert.deepEqual(agents.map((a) => a.id), [AGENT.id, OWNER_MCP_AGENT.id], 'no agent may be created')
+    assert.equal(db.listRoutines().length, 3, 'no routine may be created')
+    assert.equal(db.getRoutine(ownerRoutine.id)?.prompt, 'owner prompt', "the owner's MCP routine may not be edited")
+    assert.equal(db.getRoutine(plainRoutine.id)?.prompt, 'new plain prompt')
+    assert.deepEqual(fired, [plainRoutine.id], "the owner's MCP routine may not be fired")
+  } finally { fetchStub.restore() }
+
+  // The owner's own MCP routine still runs its MCP tool: it reaches the MCP lookup (no server is
+  // connected here) rather than the refusal a live keyless chat gets.
+  const ownerRun = db.createRoutineRun({ routineId: ownerRoutine.id, configSnapshot: JSON.stringify(ownerRoutine) })
+  const ownerStub = stubFetch([toolCallRound([[MCP_TOOL, {}]]), { choices: [{ message: { content: 'done' } }] }])
+  try {
+    assert.equal((await runChatRoutine(d, db.getRoutine(ownerRoutine.id)!, ownerRun, new AbortController().signal)).status, 'ok')
+    const toolMsg = (ownerStub.calls[1].messages as Array<{ role: string; content: unknown }>).find((m) => m.role === 'tool')
+    assert.match(String(toolMsg?.content), /MCP server "srv-1" not connected/)
+  } finally { ownerStub.restore() }
+})
+
+test("an approved stalled call in a routine's run cannot edit or fire the owner's routine on an MCP agent", async () => {
+  // The run's agent lists no routine tool; the call it stalled on is approved through
+  // /runs/:runId/approve, which a caller who may not use MCP tools may do for a non-MCP call.
+  for (const [name, args] of [['update_routine', { prompt: 'attacker prompt', confirm: true }], ['run_routine_now', {}]] as const) {
+    const { d, db, fired, ownerRoutine } = mcpRoutineDeps(['run_code'])
+    const r = routine(db)
+    const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+    const conv = db.createConversation({ kind: 'agent', modelKey: 'm', systemPrompt: AGENT.systemPrompt, agentId: AGENT.id })
+    db.addMessage(conv.id, 'user', r.prompt)
+    const pending: PendingRoutineToolCall = {
+      convId: conv.id, assistantContent: '', precedingCalls: [],
+      call: { id: 'c1', name, args: { ...args, routineId: ownerRoutine.id } },
+    }
+    const fetchStub = stubFetch([{ choices: [{ message: { content: 'Resumed.' } }] }])
+    try {
+      assert.equal((await resumeChatRoutine(d, r, run, pending, 'allow', new AbortController().signal)).status, 'ok')
+      const toolMsg = (fetchStub.calls[0].messages as Array<{ role: string; content: unknown }>).find((m) => m.role === 'tool')
+      assert.match(String(toolMsg?.content), /A routine whose agent uses an MCP server tool/, name)
+      assert.equal(db.getRoutine(ownerRoutine.id)?.prompt, 'owner prompt', name)
+      assert.deepEqual(fired, [], name)
+    } finally { fetchStub.restore() }
+  }
 })
 
 // ── I3 regression: a mid-request failure/abort must resolve, never throw uncaught ───────────

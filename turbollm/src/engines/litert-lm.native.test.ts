@@ -1,7 +1,7 @@
 // The Android app's bundled LiteRT-LM engine: a native port of `litert-lm serve` shipped in the APK's nativeLibraryDir
 // as liblitertlm_server.so (TurboLLM-Android, engines/litert-lm-server). It keeps the CLI's contract, so the litert-lm
-// kind applies unchanged — these tests pin down only what differs because it is not Python, plus the registration and
-// routing that let the app use it with no setup.
+// kind applies unchanged — these tests pin down only what differs because it is not Python, plus the registration that
+// lets the app use it with no setup once the user selects it.
 import assert from 'node:assert/strict'
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -76,16 +76,17 @@ test('resolveUpdateSource: the bundled server updates with the app, never from P
   assert.equal(resolveUpdateSource(engine({ kind: 'litert-lm', binPath: '/venv/bin/python', version: 'litert-lm 0.18.0' }))?.source, 'pip')
 })
 
-test('engineForModel: a .litertlm model goes to the LiteRT-LM engine while another kind is active', () => {
+// A model loads only on the engine the user selected: a .litertlm one went to the registered LiteRT-LM engine whenever
+// another kind was active, so a Load under KoboldCpp or llama.cpp started LiteRT-LM on its own.
+test('engineForModel: a .litertlm model gets the active engine, never the LiteRT-LM one while another kind is active', () => {
   const llama = engine({ id: 'llama', kind: 'llama-server' })
+  const kobold = engine({ id: 'kobold', kind: 'koboldcpp' })
   const litert = engine({ id: 'litert', kind: 'litert-lm', binPath: '/lib/liblitertlm_server.so' })
-  const reg = registry([llama, litert], 'llama')
-  assert.equal(engineForModel(reg, { format: 'litertlm' })?.id, 'litert')
-  assert.equal(engineForModel(reg, { format: 'gguf' })?.id, 'llama')
-  // No LiteRT-LM engine registered: the active one is still returned, and compat reports the mismatch as before.
-  assert.equal(engineForModel(registry([llama], 'llama'), { format: 'litertlm' })?.id, 'llama')
-  // An active LiteRT-LM engine is used as-is.
-  assert.equal(engineForModel(registry([llama, litert], 'litert'), { format: 'litertlm' })?.id, 'litert')
+  const bundle = litertlmEntryFor('/m/lfm_int8.litertlm', '/m', 1, 0)
+  assert.equal(engineForModel(registry([llama, litert], 'llama'), bundle)?.id, 'llama')
+  assert.equal(engineForModel(registry([kobold, litert], 'kobold'), bundle)?.id, 'kobold')
+  // Selected, LiteRT-LM is the one it loads on.
+  assert.equal(engineForModel(registry([llama, litert], 'litert'), bundle)?.id, 'litert')
 })
 
 test('repairBinPath: a non-llama engine is re-pointed without a llama-server probe', async () => {
@@ -184,15 +185,20 @@ test('availableMemBytes: reads MemAvailable, which counts the page cache Android
   assert.equal(availableMemBytes(meminfo), 3500000 * 1024)
 })
 
-test('planAutoLoad: a last-used .litertlm model resumes on the LiteRT-LM engine while llama.cpp is active', () => {
-  const llama = engine({ id: 'llama', kind: 'llama-server' })
+test('planAutoLoad: a last-used .litertlm model is not resumed while llama.cpp is the active engine', () => {
+  const llama = engine({ id: 'llama', name: 'llama.cpp', kind: 'llama-server' })
   const litert = engine({ id: 'litert', kind: 'litert-lm', binPath: '/lib/liblitertlm_server.so' })
   const store = ConfigStore.load(join(tmpDir('tllm-litert-native-'), 'config.json'))
   store.update((c) => { c.autoLoadOnStart = true; c.lastLoaded = { ...c.lastLoaded, modelKey: 'lfm|INT8|1' } })
   const entry = litertlmEntryFor('/m/lfm_int8.litertlm', '/m', 1, 0)
-  const plan = planAutoLoad({ cfg: store.snapshot(), engine: llama, litertLmEngine: litert, comfyBlocked: false, findModel: () => entry })
-  assert.equal(plan.kind, 'load-model')
-  assert.equal(plan.kind === 'load-model' && plan.engine.id, 'litert')
+  const plan = planAutoLoad({ cfg: store.snapshot(), engine: llama, comfyBlocked: false, findModel: () => entry })
+  assert.deepEqual(plan, {
+    kind: 'skip',
+    reason: { code: 'engine-incompatible', modelKey: 'lfm|INT8|1', engineName: 'llama.cpp', engineKind: 'llama-server', detail: 'format litertlm' },
+  })
+  // With LiteRT-LM selected it resumes there.
+  const selected = planAutoLoad({ cfg: store.snapshot(), engine: litert, comfyBlocked: false, findModel: () => entry })
+  assert.equal(selected.kind === 'load-model' && selected.engine.id, 'litert')
 })
 
 test('servingEngineKind: the engine the loaded model runs on, not the active one', () => {

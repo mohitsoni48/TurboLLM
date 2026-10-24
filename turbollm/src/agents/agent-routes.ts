@@ -28,7 +28,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   app.get('/api/v1/skills', (c) => c.json(skills().list()))
 
   app.post('/api/v1/skills', async (c) => {
-    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Skills can only be authored on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Authoring a skill requires a valid API key from a non-host device.')
     const b = await body<Partial<Skill>>(c)
     if (!b.id?.trim() || !/^[a-z0-9-]+$/.test(b.id)) return err(c, 400, 'invalid_config_value', 'id must be kebab-case (a-z0-9-).')
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
@@ -50,7 +50,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   app.delete('/api/v1/skills/:id', (c) => {
     // Deleting a skill removes a file on disk → local-gate + validate the id can't escape.
-    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Skills can only be modified on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Deleting a skill requires a valid API key from a non-host device.')
     const id = c.req.param('id')
     if (!isValidSkillId(id)) return err(c, 400, 'invalid_config_value', 'invalid skill id.')
     if (isBuiltinSkill(id)) return err(c, 400, 'builtin_skill', 'Built-in skills cannot be deleted.')
@@ -61,7 +61,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
   // Create a skill directly from a raw SKILL.md file's text (the upload path — the
   // same frontmatter + instructions-body format save_skill/learn-folder produce).
   app.post('/api/v1/skills/import', async (c) => {
-    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Skills can only be authored on the machine running TurboLLM.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Authoring a skill requires a valid API key from a non-host device.')
     const b = await body<{ text?: string }>(c)
     const text = b.text?.trim()
     if (!text) return err(c, 400, 'invalid_input', 'text is required.')
@@ -80,7 +80,7 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
 
   // Learn skills from a FOLDER. Local-gated (reads disk). Detached distill → store.
   app.post('/api/v1/skills/learn-folder', async (c) => {
-    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Local host only.')
+    if (!isLocalOrAuthenticated(c, d)) return err(c, 403, 'forbidden', 'Learning skills from a folder requires a valid API key from a non-host device.')
     const b = await body<{ folder?: string }>(c)
     const folder = b.folder?.trim()
     if (!folder) return err(c, 400, 'invalid_input', 'folder is required.')

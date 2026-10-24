@@ -23,6 +23,19 @@ export function isRemoteAccessEnabled(d: Deps): boolean {
   return daemon?.experimental?.remoteAccess === true
 }
 
+/** Boot: clear a persisted `remoteAccess.enabled` found with the experimental flag off, as the
+ *  Settings flag-off does (stopRemoteAccess). Older builds left it set when the flag went off,
+ *  and so can a hand edit. Kept, nothing starts at this boot and turning the flag on later
+ *  starts nothing either, so remote access reads off in the UI, yet the next restart would
+ *  publish the box through the saved provider with no click. Returns whether it cleared it. */
+export function clearEnabledWhileFlagOff(d: Deps): boolean {
+  if (isRemoteAccessEnabled(d) || !d.store.snapshot().remoteAccess.enabled) return false
+  d.store.update((cfg) => {
+    cfg.remoteAccess.enabled = false
+  })
+  return true
+}
+
 /** The typed body every disabled remote-access route answers with. Distinct from a 404 on
  *  purpose: a caller must be able to tell "switched off on this host" from "this build is
  *  too old to have the route at all". */

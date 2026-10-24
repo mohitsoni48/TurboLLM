@@ -77,9 +77,10 @@ export interface Deps {
   startedAt: number
   /** Re-exec the daemon so config changes (port, LAN bind) take effect (spec 08 §2).
    *  Gracefully stops the engine and releases the listen socket, then ends one of three
-   *  ways (daemon-restart.ts `planRestartExit`): from a terminal or npm install it spawns
-   *  a detached replacement and exits 0; under the desktop app (TURBOLLM_DESKTOP=1) it
-   *  exits with RESTART_REQUESTED_EXIT_CODE (75) and the app starts the fresh daemon;
+   *  ways (daemon-restart.ts `planRestartExit`): from a terminal or npm install the old
+   *  process becomes the keeper of its replacement (cli.ts becomeKeeper), which stays in
+   *  that terminal; under a supervisor (the desktop app, or a keeper) it exits with
+   *  RESTART_REQUESTED_EXIT_CODE (75) and the supervisor starts the fresh daemon;
    *  with `exitOnly` (app self-update) it exits 0 and spawns nothing. Optional: only
    *  wired in the real `serve()` entrypoint (cli.ts); absent under tests, where the
    *  restart route returns 501. */
@@ -91,6 +92,14 @@ export interface Deps {
    *  restart — keeps the engine + model loaded. Used for LAN/port changes. Wired only
    *  in the real `serve()` entrypoint (cli.ts); absent under tests. */
   rebind?: () => void
+  /** The host the main listener is actually bound to, recorded by cli.ts on every successful
+   *  bind (initial, retry, rebind, revert). auth.ts treats a non-loopback one as LAN-exposed
+   *  even with `daemon.lanBind` off (`--addr 0.0.0.0:…`, `daemon.host`). Absent under tests. */
+  bindHost?: string
+  /** The port the main listener is actually bound to, recorded alongside `bindHost`. Can differ
+   *  from `daemon.port`: `--port`/`--addr` (the Android app's `--port 7000`) win over config
+   *  until the user changes the configured port. Absent under tests. */
+  bindPort?: number
   /** The daemon-owned Code-session run registry (code-run-manager.ts), shared between the live
    *  Code UI routes and Routine execution (this phase, Task 7) so a routine's in-app-pi run is
    *  the SAME kind of observable session a live one is. Optional: only wired in the real

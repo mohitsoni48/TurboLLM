@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Download, X } from 'lucide-react'
 import type { Status } from '../lib/types'
 import { useBackendInstall } from '../lib/queries'
@@ -32,13 +32,23 @@ function engineLabel(backend: string): string {
  * progress from GET /api/v1/status (polled every 2s).
  */
 export function EngineProvisionBanner({ status }: { status: Status | undefined }) {
-  const [dismissedError, setDismissedError] = useState(false)
   const { cancel } = useBackendInstall()
   const p = status?.engineProvision
+  // Dismissal is keyed to THE failure it was clicked on: this banner is mounted once for the
+  // app's lifetime and is the only place a background install failure shows, so a plain
+  // "dismissed" flag hid every later failure (another engine's, or a retry's) for the session.
+  // The run's start time is part of the key: a retry that failed the same way between two status
+  // polls was never seen running, so the clear below missed it and its failure stayed hidden. A
+  // new run seen starting clears it too (all an older daemon, which sends no startedAt, allows).
+  const errorKey = p?.phase === 'error' ? `${p.startedAt ?? ''}\n${p.backend}\n${p.error ?? ''}` : null
+  const [dismissedError, setDismissedError] = useState<string | null>(null)
+  useEffect(() => {
+    if (p?.active) setDismissedError(null)
+  }, [p?.active])
   if (!p) return null
 
   if (p.phase === 'error') {
-    if (dismissedError) return null
+    if (dismissedError === errorKey) return null
     return (
       <div
         className="flex items-center gap-3 border-b px-4 py-2 text-[13px]"
@@ -47,7 +57,7 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
         <span className="flex-1">{p.error ?? 'Could not set up the default engine.'}</span>
         <button
           type="button"
-          onClick={() => { track('engines', 'dismiss_engine_provision_error'); setDismissedError(true) }}
+          onClick={() => { track('engines', 'dismiss_engine_provision_error'); setDismissedError(errorKey) }}
           className="grid h-6 w-6 place-items-center rounded text-muted hover:text-ink"
           aria-label="Dismiss"
         >
@@ -74,15 +84,19 @@ export function EngineProvisionBanner({ status }: { status: Status | undefined }
         <Download size={14} className="text-accent" />
         <span className="flex-1">{label}</span>
         {pct != null && <span className="tabular-nums text-muted">{pct}%</span>}
-        <Button
-          size="sm"
-          variant="ghost"
-          className="h-6 px-2 text-[12px]"
-          onClick={() => { track('engines', 'cancel_engine_provision'); cancel.mutate() }}
-          disabled={cancel.isPending}
-        >
-          <X size={13} /> Cancel
-        </Button>
+        {/* Only where the daemon can actually stop the run: for the rest (seed, uv/pip installs)
+            the cancel endpoint answers {ok:false} and the button silently did nothing. */}
+        {p.cancellable !== false && (
+          <Button
+            size="sm"
+            variant="ghost"
+            className="h-6 px-2 text-[12px]"
+            onClick={() => { track('engines', 'cancel_engine_provision'); cancel.mutate() }}
+            disabled={cancel.isPending}
+          >
+            <X size={13} /> Cancel
+          </Button>
+        )}
       </div>
       <div
         className="mt-1.5 h-1 w-full overflow-hidden rounded-full"

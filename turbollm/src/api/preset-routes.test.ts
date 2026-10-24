@@ -269,3 +269,40 @@ test('POST /presets: bad profile FIELDS are rejected, not just bad shape', async
     assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(profile)}`)
   }
 })
+
+test('a model key containing % or / reaches the presets as sent — the path param is decoded once', async () => {
+  // The web sends encodeURIComponent(key) and Hono's param() already decodes it; decoding again
+  // threw URIError (a 500) for "100%" and turned "%41" into "A" — another model's key.
+  for (const key of ['qwen 100% uncensored|q4|1', 'odd %41 name|q4|1', 'org/model|q4|1']) {
+    const cfg = defaultConfig()
+    cfg.modelPresets = {
+      [key]: [{ id: 'p1', name: 'P', engineId: '', profile: { ctx: 4096 }, updatedAt: '2026-01-01T00:00:00.000Z', origin: 'manual' }],
+    }
+    const app = fakeApp(cfg)
+    const list = await app.request(`/api/v1/models/${encodeURIComponent(key)}/presets`)
+    assert.equal(list.status, 200, key)
+    assert.deepEqual(((await list.json()) as { presets: Array<{ id: string }> }).presets.map((p) => p.id), ['p1'], key)
+    const apply = await app.request(`/api/v1/models/${encodeURIComponent(key)}/presets/p1/apply`, { method: 'POST' })
+    assert.equal(apply.status, 200, key)
+    assert.equal(cfg.lastPresetId[key], 'p1', key)
+  }
+})
+
+test('a key naming an Object built-in (constructor, __proto__, toString) is just an unknown model', async () => {
+  // The maps are plain objects: `modelPresets["constructor"]` used to be the Object function, so
+  // every route threw (`[...Object]`, `Object.find`) and answered 500.
+  const app = fakeApp(defaultConfig())
+  for (const key of ['constructor', '__proto__', 'toString']) {
+    const list = await app.request(`/api/v1/models/${key}/presets`)
+    assert.equal(list.status, 200, key)
+    assert.deepEqual(await list.json(), { presets: [], pinnedId: null }, key)
+    for (const [method, path] of [['PUT', ''], ['DELETE', ''], ['POST', '/apply']] as const) {
+      const res = await app.request(`/api/v1/models/${key}/presets/x${path}`, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: method === 'DELETE' ? undefined : '{}',
+      })
+      assert.equal(res.status, 404, `${method} ${key}${path}`)
+    }
+  }
+})

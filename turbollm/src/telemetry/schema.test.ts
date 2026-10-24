@@ -129,6 +129,8 @@ test('validateEvent: ui_action accepts the Phase 6c ModelsScreen batch actions',
     'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
     'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
     'browse_model_dir', 'add_model_dir', 'import_model_file',
+    // Hiding a model by hand, and the Library's "Show hidden models" switch.
+    'hide_model', 'unhide_model', 'toggle_hidden_models',
   ]
   for (const action of actions) {
     const r = validateEvent(validEvent({ event: 'ui_action', payload: { screen: 'models', action } }))

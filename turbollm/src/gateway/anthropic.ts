@@ -36,8 +36,9 @@ export interface AnthropicRequest {
   tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string }
   // 'enabled' with an explicit budget_tokens is the documented shape; 'adaptive' (no
   // budget_tokens, plus a display field) is a real shape confirmed live from Claude
-  // Code (2026-07-23) — the type value isn't branched on below, only budget_tokens'
-  // presence/validity, so any thinking-enabled type string is accepted.
+  // Code (2026-07-23) — apart from 'disabled' (the explicit off switch), the type value isn't
+  // branched on below, only budget_tokens' presence/validity, so any thinking-enabled type
+  // string is accepted.
   thinking?: { type: string; budget_tokens?: number; display?: string }
   metadata?: unknown
 }
@@ -276,7 +277,13 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
   //    budget_tokens gets a conservative default: half of max_tokens, guaranteeing the
   //    other half survives for the actual answer regardless of how verbose the model's
   //    reasoning is.
-  if (req.thinking) {
+  // {type:'disabled'} is the protocol's explicit off switch, not a budget-less "on": say off the
+  // way every other off in the daemon does (budget 0 plus enable_thinking false, as gateway.ts's
+  // thinkingOff branch), or a model that thinks by default keeps reasoning on half of max_tokens.
+  if (req.thinking?.type === 'disabled') {
+    oai.thinking_budget_tokens = 0
+    oai.chat_template_kwargs = { enable_thinking: false }
+  } else if (req.thinking) {
     const requested = req.thinking.budget_tokens
     const hasMaxTokens = Number.isFinite(req.max_tokens) && (req.max_tokens ?? 0) > 0
     if (Number.isFinite(requested) && (requested ?? 0) > 0) {
@@ -492,6 +499,9 @@ export interface StreamToAnthropicOptions {
    *  this generator was even constructed — e.g. right when the client's SSE connection opens,
    *  ahead of queueing for an engine slot. Emitting it again here would send message_start twice. */
   skipMessageStart?: boolean
+  /** Applied to an in-stream engine error's text before it reaches the client — gateway.ts hands
+   *  in redactLocalPaths, as it does for describeEngineError. */
+  redact?: (text: string) => string
 }
 
 export async function* streamToAnthropic(
@@ -500,7 +510,7 @@ export async function* streamToAnthropic(
   msgId: string,
   opts: StreamToAnthropicOptions = {},
 ): AsyncGenerator<SseEvent> {
-  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false } = opts
+  const { onUsage, onLive, onToolCalls, pingIntervalMs = DEFAULT_PING_INTERVAL_MS, skipMessageStart = false, redact = (t: string) => t } = opts
   let blockIdx = 0
   let inThinking = false
   let inText = false
@@ -523,6 +533,8 @@ export async function* streamToAnthropic(
   const dec = new TextDecoder()
   let buf = ''
   let failed = false
+  // The engine's final chunk (one with a finish_reason) or its `[DONE]` arrived: the reply is complete.
+  let finished = false
   // Fixed cadence from stream start, NOT reset on every `reader.read()` resolution — see the
   // ADR-342 postmortem below for why that distinction is load-bearing.
   let nextPingAt = Date.now() + pingIntervalMs
@@ -562,7 +574,18 @@ export async function* streamToAnthropic(
         break
       }
       const { done, value } = result
-      if (done) break
+      if (done) {
+        // The body ended with neither a finish_reason nor `[DONE]`: the engine went away mid-reply. A chunked body
+        // cut off by a closed socket rejects the read (the catch below), but a body delimited by the connection's
+        // close (Python's http.server, which mlx-lm's server is built on, sends one) just ends, and so does a chunked
+        // body the engine closed early. It used to end as a clean end_turn, a truncated answer the client took as
+        // complete, as an in-stream error did before (below).
+        if (!finished) {
+          failed = true
+          yield sse('error', { error: { type: 'api_error', message: 'The engine closed the stream before the reply was complete.' } })
+        }
+        break
+      }
       buf += dec.decode(value, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop() ?? ''
@@ -570,13 +593,28 @@ export async function* streamToAnthropic(
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue
         const raw = line.slice(6).trim()
-        if (raw === '[DONE]') break outer
+        if (raw === '[DONE]') {
+          finished = true
+          break outer
+        }
 
         let chunk: Record<string, unknown>
         try {
           chunk = JSON.parse(raw) as Record<string, unknown>
         } catch {
           continue
+        }
+
+        // An error the engine hit AFTER streaming began, sent in-stream before it closes:
+        // llama-server's `data: {"error":{...}}`, LiteRT-LM's `event: response.error` with
+        // `data: {"error":"…"}`. It has no `choices`, so it used to be skipped and the stream
+        // ended as a clean end_turn — a truncated answer the client took as complete.
+        if (chunk.error) {
+          failed = true
+          const e = chunk.error as { message?: unknown } | string
+          const message = typeof e === 'string' ? e : typeof e.message === 'string' ? e.message : 'Engine error.'
+          yield sse('error', { error: { type: 'api_error', message: redact(message) } })
+          break outer
         }
 
         // Prompt-processing progress (return_progress): drives the live prefill % on
@@ -606,12 +644,29 @@ export async function* streamToAnthropic(
         const choices = chunk.choices as Array<{ delta?: OAIDelta; finish_reason?: string | null }> | undefined
         if (!choices?.length) continue
         const choice = choices[0]
-        if (choice.finish_reason) stopReason = FINISH[choice.finish_reason] ?? 'end_turn'
+        if (choice.finish_reason) {
+          stopReason = FINISH[choice.finish_reason] ?? 'end_turn'
+          finished = true
+        }
         const delta: OAIDelta = choice.delta ?? {}
 
+        // At most one block is open at a time: whichever one is open is closed before another kind
+        // starts. Text after a tool call (between parallel calls, or trailing) and reasoning after
+        // text both happen; reusing the open block's index there made Claude Code's accumulator
+        // overwrite the tool_use and then throw "Content block not found" on the stray stop.
         // reasoning_content → thinking block
         if (delta.reasoning_content) {
           if (!inThinking) {
+            if (inText) {
+              yield cbStop(blockIdx)
+              inText = false
+              blockIdx++
+            }
+            if (activeToolIdx >= 0) {
+              yield cbStop(blockIdx)
+              activeToolIdx = -1
+              blockIdx++
+            }
             inThinking = true
             yield cbStart(blockIdx, { type: 'thinking', thinking: '' })
           }
@@ -624,6 +679,11 @@ export async function* streamToAnthropic(
           if (inThinking) {
             yield cbStop(blockIdx)
             inThinking = false
+            blockIdx++
+          }
+          if (activeToolIdx >= 0) {
+            yield cbStop(blockIdx)
+            activeToolIdx = -1
             blockIdx++
           }
           if (!inText) {

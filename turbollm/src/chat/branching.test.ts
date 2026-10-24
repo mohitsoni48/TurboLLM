@@ -311,3 +311,83 @@ test('a regenerated reply nested inside a frozen tail is restored as whichever s
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ── An active row never keeps a branch_of tag ─────────────────────────────────
+// restoreTail used to leave the tag on the rows it brought back, so a reply later regenerated
+// away (or switched away from) inside a restored tail still read as frozen under that anchor
+// and came back next to its replacement. restoreTail now clears it; deactivateMessage and
+// setActiveVariant clear it too, for rows a database already holds from before the fix.
+
+/** Puts back the stale tag the pre-fix restoreTail left on a row it reactivated. */
+function tagAsOldRestore(store: ConversationStore, messageId: string, anchorId: string): void {
+  const raw = (store as unknown as { db: { exec: (sql: string) => void } }).db
+  raw.exec(`UPDATE messages SET branch_of = '${anchorId}' WHERE id = '${messageId}'`)
+}
+
+/** Simulates the edit route on `user`, then the activate route switching back to it. */
+function editThenSwitchBack(store: ConversationStore, convId: string, user: { id: string; seq: number }): void {
+  store.freezeTail(convId, user.seq, user.id)
+  store.deactivateMessage(user.id)
+  const group = store.getMessage(user.id)!.variantGroup!
+  const edited = store.addMessage(convId, 'user', 'edited', { variantGroup: group })
+  store.freezeTail(convId, edited.seq, edited.id)
+  store.restoreTail(user.id)
+  store.setActiveVariant(group, user.id)
+}
+
+test('restoreTail clears the tag on the rows it brings back', () => {
+  const { store, dir } = tempStore()
+  try {
+    const conv = store.createConversation()
+    const a = store.addMessage(conv.id, 'user', 'A')
+    const b = store.addMessage(conv.id, 'assistant', 'B')
+    store.freezeTail(conv.id, a.seq, a.id)
+    store.restoreTail(a.id)
+    assert.equal(store.getMessage(b.id)!.isActive, true)
+    assert.equal(store.getMessage(b.id)!.branchOf, null)
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a reply regenerated away while carrying an old restore tag does not come back with its replacement', () => {
+  const { store, dir } = tempStore()
+  try {
+    const conv = store.createConversation()
+    const a = store.addMessage(conv.id, 'user', 'A')
+    const b = store.addMessage(conv.id, 'assistant', 'B')
+    tagAsOldRestore(store, b.id, a.id)
+    store.deactivateMessage(b.id) // /regenerate
+    store.addMessage(conv.id, 'assistant', 'B2', { variantGroup: store.getMessage(b.id)!.variantGroup! })
+
+    editThenSwitchBack(store, conv.id, a)
+    assert.deepEqual(store.getMessages(conv.id).map((m) => m.content), ['A', 'B2'])
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('a version switched away from while carrying an old restore tag does not come back with the one shown', () => {
+  const { store, dir } = tempStore()
+  try {
+    const conv = store.createConversation()
+    const a = store.addMessage(conv.id, 'user', 'A')
+    const b = store.addMessage(conv.id, 'assistant', 'B')
+    store.deactivateMessage(b.id)
+    const group = store.getMessage(b.id)!.variantGroup!
+    const b2 = store.addMessage(conv.id, 'assistant', 'B2', { variantGroup: group })
+    tagAsOldRestore(store, b2.id, a.id)
+    // The activate route switching B2 -> B.
+    store.freezeTail(conv.id, b2.seq, b2.id)
+    store.restoreTail(b.id)
+    store.setActiveVariant(group, b.id)
+
+    editThenSwitchBack(store, conv.id, a)
+    assert.deepEqual(store.getMessages(conv.id).map((m) => m.content), ['A', 'B'])
+  } finally {
+    store.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

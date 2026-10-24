@@ -31,10 +31,12 @@
 // (`profile.ts:531`) — so on vLLM/mlx-lm/koboldcpp `capacity === Infinity` and `inFlight < capacity`
 // is unconditionally true, making 'skip-busy' dead code.
 //
-// So `engineIdle` comes primarily from `getEngineIdle()`, which production wires to the SAME
-// `engineIsIdle(manager)` (`update-scheduler.ts:31`) that `model-swap.ts:43` — the Chat/pi path —
-// already uses; that one reads `manager.sessionStats().activeRequests`, i.e. the counter
-// `chat-routes.ts:800` increments, so it DOES see the chat turn. The gate snapshot is kept AND-ed
+// So `engineIdle` comes primarily from `getEngineIdle()`, which production wires to execute.ts's
+// `engineFreeForRoutine`: the SAME `engineIsIdle(manager)` (`update-scheduler.ts:31`) that
+// `model-swap.ts:43` — the Chat/pi path — already uses, AND-ed with no auto-tune run (as there too:
+// a tune's probes never raise that counter). `engineIsIdle` reads
+// `manager.sessionStats().activeRequests`, i.e. the counter `chat-routes.ts:800` increments, so it
+// DOES see the chat turn. The gate snapshot is kept AND-ed
 // on top (`getEngineIdle() && inFlight < capacity`) because the two signals observe overlapping but
 // non-identical work: the gate additionally sees queued/in-flight agent + gateway acquisitions
 // (`memory.ts`, `code-session.ts`, `gateway.ts`, `execute.ts`) that may not yet have reached
@@ -65,9 +67,10 @@ import { decideModelAction } from './model-conflict'
 import { CLI_ROUTINE_TIMEOUT_MS, type CliProcessResult } from './cli-process'
 import { parseClaudeCliStreamJson } from './cli-output'
 import { inheritedEnv } from '../cli-launch'
+import { localDaemonOrigin } from '../daemon-pid'
 import { sessionAuth } from '../code/session-auth'
 import { resolveClaudePermissionMode } from '../terminal/agent-modes'
-import type { RouteResult } from '../gateway/model-router'
+import type { ModelRouter, RouteResult } from '../gateway/model-router'
 
 export interface CliRoutineDeps {
   store: ConversationStore
@@ -78,7 +81,8 @@ export interface CliRoutineDeps {
   getLoadedModelKey: () => string | null
   /** Is the engine free to have its model swapped out right now? Wire this to
    *  `engineIsIdle(manager)` (`engines/update-scheduler.ts`) — the SAME call `model-swap.ts:43`
-   *  makes for the Chat/pi path — and nothing else: it reads
+   *  makes for the Chat/pi path — AND-ed with nothing but "no auto-tune run", as there
+   *  (execute.ts's `engineFreeForRoutine`): it reads
    *  `manager.sessionStats().activeRequests`, which is the only signal that observes the main
    *  in-app chat stream (`chat-routes.ts:800`'s `manager.generationStart()`). Do NOT substitute a
    *  `gate.stats()` read here; see this module's `engineIdle` design note for why that alone would
@@ -86,20 +90,27 @@ export interface CliRoutineDeps {
    *  than the whole Manager so tests don't have to fake Manager's full surface. */
   getEngineIdle: () => boolean
   /** `ModelRouter.loadExplicit`, or an equivalent. Returns `{ target }` on success and
-   *  `{ status: 503, message }` on failure — it does not throw for a missing model. */
-  loadExplicit: (modelKey: string) => Promise<RouteResult>
+   *  `{ status: 503, message }` on failure — it does not throw for a missing model. Its arguments are passed on
+   *  (the restore below passes `restoreAfter`). */
+  loadExplicit: ModelRouter['loadExplicit']
+  /** `ModelRouter.reloadAfterRender`: the restore below hands a refusal from a ComfyUI render to that render's
+   *  release, which otherwise reloads the routine's model. */
+  reloadAfterRender: (modelKey: string, routineModelKey: string) => void
   now: () => Date
-  /** The daemon's OWN configured port (`d.store.snapshot().daemon.port`), for ANTHROPIC_BASE_URL —
-   *  the same source `terminal-routes.ts:298` uses and for the same reason: never the incoming
-   *  request's Host, since this spawns a LOCAL subprocess that must reach the real daemon. */
+  /** The daemon's OWN port (`d.bindPort ?? d.store.snapshot().daemon.port`: the bound one), for
+   *  ANTHROPIC_BASE_URL — the same source `createAgentTerminal` uses and for the same reason: never
+   *  the incoming request's Host, since this spawns a LOCAL subprocess that must reach the real daemon. */
   port: number
+  /** The address the daemon's listener is bound to (`d.bindHost`). On a bind to another loopback address alone
+   *  (`--addr [::1]:6996`) nothing answers on 127.0.0.1, so ANTHROPIC_BASE_URL names that one (localDaemonOrigin). */
+  host?: string
   isAvailable: () => Promise<boolean>
   permissionModeChoices: () => Promise<string[]>
   /** `runClaudeCliProcess`, partially applied with its spawn/kill seams. The prompt goes in
    *  `opts.stdin`; it must never be threaded into `args` (see this module's security note). */
   runProcess: (
     args: string[],
-    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number },
+    opts: { cwd: string; env: NodeJS.ProcessEnv; stdin?: string; timeoutMs?: number; signal?: AbortSignal },
   ) => Promise<CliProcessResult>
   /** An already-created run row to write into, instead of creating one here.
    *
@@ -109,6 +120,12 @@ export interface CliRoutineDeps {
    *  scheduler's and this function's) and the run history would show each fire twice. Optional so
    *  a standalone caller (and the smoke test) can still just hand over a routine. */
   existingRun?: RoutineRun
+  /** Aborted by execute.ts's wall-clock bound when it gives up on this run. By then it has already
+   *  written the run's terminal state and the scheduler has released the routine, so a run that is
+   *  still mid-swap must not go on to spawn the CLI behind that 'errored' row (a second fire could
+   *  then run in the same workspace), and a CLI already running is killed (`runProcess`'s
+   *  `signal`). Undefined under tests and standalone callers. */
+  runSignal?: AbortSignal
 }
 
 /** TurboLLM's own fixed, non-interactive invocation. `-p`/`--print` is a BARE boolean flag — it
@@ -126,13 +143,19 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   const run =
     deps.existingRun ??
     deps.store.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  // See `runSignal`. The caller already wrote this run's row, so an abandoned run never writes it
+  // again — the model swap it made is still undone in the finally below.
+  const abandoned = () => deps.runSignal?.aborted === true
   const finish = (patch: Parameters<ConversationStore['updateRoutineRun']>[1]) => {
+    if (abandoned()) return
     deps.store.updateRoutineRun(run.id, { ...patch, endedAt: deps.now().toISOString() })
   }
 
   // Declared OUTSIDE the try so the finally can see it on every exit path — including ones that
   // throw before the swap ever happens, where it must still read `null` so no restore is attempted.
   let previousModel: string | null = null
+  // The swap's own result, which the restore hands back (see the restore in the finally).
+  let swap: RouteResult | undefined
 
   // The exception boundary opens HERE, immediately after the run row exists, and covers the WHOLE
   // body — availability probe, conflict decision, swap, spawn, parse. Anything narrower strands the
@@ -144,7 +167,9 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
   try {
     // 1. Availability precondition (spec 20 §6) — checked BEFORE touching the model or the gate at
     // all: there is no point deciding a swap for a CLI that cannot run anyway.
-    if (!(await deps.isAvailable())) {
+    const available = await deps.isAvailable()
+    if (abandoned()) return
+    if (!available) {
       finish({ status: 'skipped', skipReason: 'cli_unavailable' })
       return
     }
@@ -167,13 +192,21 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
 
     if (action === 'swap-then-run') {
       const swapResult = await deps.loadExplicit(pinnedModel)
+      swap = swapResult
       if ('status' in swapResult) {
-        // The swap never happened, so there is nothing loaded-by-us to restore — same call the
-        // Chat/pi path makes for its own 'skip-load-failed' outcome (model-swap.ts:53).
+        // A load that ran and failed has already stopped the user's model when it took that
+        // model's slot (keep-N 1, or a full pool): Manager.load stops the slot before it starts the
+        // new model. So it is restored in the finally below, as the Chat/pi path restores on its own
+        // 'skip-load-failed' (model-swap.ts); without that every run of a routine whose model
+        // cannot start left the engine empty. A failure that stopped nothing finds the user's model
+        // still running, and the restore is a no-op (doLoad's fast path). A swap a ComfyUI render
+        // refused is restored too: that render may have met the user's model already stopped, or
+        // the routine's model starting, which it kills and keeps for its release() to reload
+        // (model-swap.ts explains both).
+        previousModel = currentlyLoaded
         finish({ status: 'errored', error: `Could not load pinned model '${pinnedModel}': ${swapResult.message}` })
         return
       }
-      // Only recorded AFTER a successful swap: a failed load must not schedule a restore.
       previousModel = currentlyLoaded
     }
 
@@ -184,19 +217,23 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     const permissionMode = routine.permissionMode ? resolveClaudePermissionMode(routine.permissionMode, choices) : null
     const env: NodeJS.ProcessEnv = {
       ...inheritedEnv(),
-      ANTHROPIC_BASE_URL: `http://127.0.0.1:${deps.port}`,
+      ANTHROPIC_BASE_URL: localDaemonOrigin(deps.host, deps.port),
       ANTHROPIC_AUTH_TOKEN: token,
       ANTHROPIC_TIMEOUT: '300000',
       ANTHROPIC_MAX_RETRIES: '0',
       ANTHROPIC_MODEL: pinnedModel,
     }
 
-    // 4. Spawn + wait. cli-process.ts owns the hard wall-clock timeout and never rejects.
+    // 4. Spawn + wait. cli-process.ts owns the hard wall-clock timeout and never rejects. Not once
+    // the run is abandoned (the swap above can outlast execute.ts's bound); an abort after the
+    // spawn kills the CLI.
+    if (abandoned()) return
     const result = await deps.runProcess(buildCliArgs(permissionMode), {
       cwd: routine.workspacePath ?? process.cwd(),
       env,
       stdin: routine.prompt,
       timeoutMs: CLI_ROUTINE_TIMEOUT_MS,
+      signal: deps.runSignal,
     })
 
     if (result.timedOut) {
@@ -230,12 +267,22 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
     // outcome with an unrelated error and leave the caller with no result at all.
     if (previousModel) {
       try {
-        const restoreResult = await deps.loadExplicit(previousModel)
+        // Handed the swap's result: with keep-N 2 or more the swap took a pool slot and recorded the routine's model as
+        // the one last loaded, and a restore that finds the user's model still running puts back what that record
+        // replaced (ModelRouter.undoSwapRecord).
+        const restoreResult = await deps.loadExplicit(previousModel, undefined, { restoreAfter: swap })
         // A restore that RETURNS `{ status: 503 }` is the COMMON failure — a model that has since
         // gone missing is exactly the case `loadExplicit` signals by returning rather than throwing
         // (`model-router.ts:104`). Discarding it would leave the engine sitting on the routine's
         // pinned model with nothing anywhere in the log. Same warn as the throw path, deliberately.
-        if ('status' in restoreResult) {
+        //
+        // A ComfyUI render that began while the CLI ran (or during the swap) keeps the routine's
+        // model for its release() to load, and refuses this restore until it ends. Warned about and
+        // dropped, the render's end brought the routine's model back and left the user's unloaded:
+        // the render's release reloads the previous model instead, as model-swap.ts's restore does.
+        if ('status' in restoreResult && restoreResult.message.includes('ComfyUI is rendering')) {
+          deps.reloadAfterRender(previousModel, routine.modelKey)
+        } else if ('status' in restoreResult) {
           console.warn(`[routines] failed to restore the previously-loaded model '${previousModel}' after a CLI routine run: ${restoreResult.message}`)
         }
       } catch (e) {

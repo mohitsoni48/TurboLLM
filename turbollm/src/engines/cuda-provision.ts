@@ -9,14 +9,15 @@
 // manifest mapping every component to a per-platform { relative_path, sha256, size }.
 //
 // Windows + x86_64 only, matching the guided build's scope (Linux/macOS build is parked).
-import { execFile } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, rmSync } from 'node:fs'
+import { tetheredExecFile } from '../util/tether'
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
-import { downloadFile, extractArchive } from './download'
+import { downloadFile, extractArchive, renameWithRetry } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a probe's timeout is a daemon timer, so one the daemon does not live to see
+// ended only by itself.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 const REDIST_BASE = 'https://developer.download.nvidia.com/compute/cuda/redist/'
 
@@ -42,6 +43,11 @@ export const CUDA_OPTIONAL_COMPONENTS = ['libnvvm', 'cuda_crt']
  *  major.minor the installed driver supports. 12.8+ is required for Blackwell (sm_120);
  *  13.0 for the very newest. Older entries keep things working on older drivers. */
 export const KNOWN_CUDA_VERSIONS = ['13.0.1', '13.0.0', '12.8.1', '12.6.3', '12.4.1']
+
+/** Written into the assembled toolkit just before it is swapped into place, so it is there only in a toolkit this flow
+ *  completed. bin/nvcc.exe alone is no proof: older versions copied the toolkit into place, and an interrupted or
+ *  failed copy left bin/ without the rest of include/ and lib/. */
+const CUDA_COMPLETE_MARKER = '.turbollm-provisioned'
 
 export interface CudaProvisionProgress {
   phase: 'resolving' | 'downloading' | 'extracting' | 'assembling'
@@ -114,9 +120,41 @@ async function resolveVersion(driverMax: string | null, signal: AbortSignal): Pr
   throw new Error('Could not reach NVIDIA to resolve a CUDA Toolkit version (offline?).')
 }
 
+/** Move the assembled toolkit `stage` into place at `dest`, its sibling, by renaming: `dest` is
+ *  then either the old directory or the complete new one. The copy this replaces (~1 GB) wrote
+ *  bin/nvcc.exe before include/ and lib/, so an interrupted one passed provisionCuda's reuse check
+ *  forever. An existing `dest` (an incomplete toolkit that failed that check) is moved aside first,
+ *  since a directory can't be renamed onto an existing one on Windows, and deleted once the new
+ *  one is in place — or moved back if that rename fails. */
+export async function swapInStagedDir(stage: string, dest: string): Promise<void> {
+  const parked = existsSync(dest) ? `${dest}.old` : null
+  if (parked) {
+    // A leftover of an earlier swap whose delete below failed. Retries: Windows AV/indexer locks are brief.
+    rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    await renameWithRetry(dest, parked)
+  }
+  try {
+    // Thousands of files copied in moments ago: AV/the indexer may still hold some open, which blocks
+    // a directory rename on Windows (unlike the copy this replaced, which only read them).
+    await renameWithRetry(stage, dest)
+  } catch (e) {
+    if (parked) await renameWithRetry(parked, dest)
+    throw e
+  }
+  // The new toolkit is in place: deleting the old one is best effort, never a failed install (a leftover
+  // `.old` stays until a later swap of the same version removes it first).
+  if (parked) {
+    try {
+      rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
 /** Download the build component set for a resolved version, extract each, and merge them
- *  into one toolkit root. Idempotent: if `<dataDir>/cuda/<version>/bin/nvcc.exe` already
- *  exists we reuse it. Returns the toolkit (its `bin` dir is a ready build toolchain dir). */
+ *  into one toolkit root. Idempotent: a `<dataDir>/cuda/<version>` this flow completed is
+ *  reused. Returns the toolkit (its `bin` dir is a ready build toolchain dir). */
 export async function provisionCuda(
   dataDir: string,
   onProgress: (p: CudaProvisionProgress) => void,
@@ -135,8 +173,9 @@ export async function provisionCuda(
 
   const root = join(dataDir, 'cuda', version)
   const binDir = join(root, 'bin')
-  // Reuse a complete prior install.
-  if (existsSync(join(binDir, 'nvcc.exe'))) {
+  // Reuse a complete prior install. One without the marker (a copy an older version left half done, or a complete
+  // one from before the marker, which is then downloaded once more) is rebuilt and swapped in over it.
+  if (existsSync(join(root, CUDA_COMPLETE_MARKER)) && existsSync(join(binDir, 'nvcc.exe'))) {
     onProgress({ phase: 'assembling', message: `CUDA ${version} already downloaded — reusing it.` })
     return { root, binDir, version }
   }
@@ -184,14 +223,19 @@ export async function provisionCuda(
     if (!existsSync(join(stageRoot, 'bin', 'nvcc.exe'))) {
       throw new Error('Assembled CUDA toolkit is missing bin/nvcc.exe — the component set may have changed.')
     }
+    writeFileSync(join(stageRoot, CUDA_COMPLETE_MARKER), '')
     // Swap staged → final.
-    rmSync(root, { recursive: true, force: true })
     mkdirSync(join(dataDir, 'cuda'), { recursive: true })
-    cpSync(stageRoot, root, { recursive: true, force: true })
+    await swapInStagedDir(stageRoot, root)
     onProgress({ phase: 'assembling', message: `CUDA ${version} ready.` })
     return { root, binDir, version }
   } finally {
-    rmSync(work, { recursive: true, force: true })
-    rmSync(stageRoot, { recursive: true, force: true })
+    // Best effort, with retries: AV can still hold the just-extracted temp files, and a throw here would fail a completed
+    // install (or mask the swap's error) and skip the stage delete below. The next provision clears `work` first.
+    try { rmSync(work, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* temp leftover is harmless */ }
+    // Best effort too: after a failed swap or download the stage's fresh files can still be locked past the retries,
+    // and a throw here would mask that error (a Cancel's AbortError became "Could not install the cuda engine:
+    // EBUSY"). The next provision clears the stage first.
+    try { rmSync(stageRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) } catch { /* best effort */ }
   }
 }

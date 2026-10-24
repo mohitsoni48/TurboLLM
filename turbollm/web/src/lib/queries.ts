@@ -38,6 +38,7 @@ import {
   deleteEngineBackend,
   enableBackend,
   purgeEngine,
+  deleteEngineBuild,
   forgetCustomEngineSource,
   updateBackend,
   updateVllm,
@@ -85,6 +86,7 @@ import {
   listDownloads,
   listEngines,
   loadModel,
+  pauseDownload,
   removeDownload,
   resumeDownload,
   removeEngine,
@@ -119,6 +121,7 @@ import {
   restartDaemon,
   restartEngine,
   saveModelProfile,
+  setModelHidden,
   saveSettings,
   startEngine,
   stopEngine,
@@ -136,7 +139,9 @@ import { useJevLoadStore } from '../stores/jev-load'
 import type {
   BenchState,
   BuildPrereqs,
+  DownloadRecord,
   DownloadsList,
+  HeldDownload,
   Engine,
   EngineBackends,
   EngineCatalog,
@@ -184,13 +189,16 @@ export const queryKeys = {
 
 /** Which terminal-agent CLIs are installed. Refetched on window focus so installing one in a
  *  terminal outside TurboLLM is picked up without a reload; the daemon caches the probe briefly so
- *  this staying live costs almost nothing. */
+ *  this staying live costs almost nothing. Polled every 2 s while the daemon reports an install
+ *  running: a page that did not start it (reloaded mid-install, another tab) has no request of its
+ *  own to wait on, and learns that it ended only from this. */
 export function useAgentAvailability() {
   return useQuery({
     queryKey: queryKeys.agentAvailability,
     queryFn: getAgentAvailability,
     staleTime: 5_000,
     refetchOnWindowFocus: true,
+    refetchInterval: (q) => (q.state.data?.agents.some((a) => a.installing) ? 2000 : false),
   })
 }
 
@@ -322,6 +330,19 @@ export function useEngines(): UseQueryResult<EnginesList> {
 export function activeEngineOf(list: EnginesList | undefined): Engine | null {
   const activeId = list?.activeEngineId ?? ''
   return list?.engines.find((e) => e.id === activeId) ?? null
+}
+
+/** The name of the engine running the loaded model when it is not the active one (an engine install or Enable activates
+ *  another engine without stopping the model), else null. A screen that names the engine running a model shows this
+ *  in its place, so it never says the selected engine runs a model another engine does. Takes a linked machine's
+ *  status too (RemoteStatus): the Turbo Link façade serves the same engine block, without the serving fields from an
+ *  older host. */
+export function servingElsewhere(
+  status: { engine?: Pick<Status['engine'], 'id' | 'servingId' | 'servingName'> | null } | null | undefined,
+): string | null {
+  const e = status?.engine
+  if (!e?.servingId || e.servingId === e.id) return null
+  return e.servingName || 'another engine'
 }
 
 /** Available llama.cpp backends + the hardware-recommended one (ADR-025).
@@ -572,6 +593,11 @@ export function useEngineMutations() {
       mutationFn: (id: string) => purgeEngine(id),
       onSuccess: invalidate,
     }),
+    /** Delete a DISABLED source build's folder: no live engine to purge, and nothing is probed. */
+    deleteBuild: useMutation({
+      mutationFn: (binPath: string) => deleteEngineBuild(binPath),
+      onSuccess: invalidate,
+    }),
     /** Forget a DISABLED custom engine's remembered identity — no live engine to purge. */
     forgetCustomSource: useMutation({
       mutationFn: (key: string) => forgetCustomEngineSource(key),
@@ -629,8 +655,10 @@ export function useReleaseAssets(repo: string, enabled: boolean) {
 }
 
 /** The release-install job: `start` kicks it off, `job` polls its view once a second while it
- *  runs. `job` is only fetched while `polling` is true so no other step spends requests. Starting
- *  resets the cached view so a previous attempt's `error`/`ready` is never mistaken for this one. */
+ *  runs. `job` is only fetched while `polling` is true (the panel's read of the job on opening,
+ *  which picks up an install its dialog did not see finish, and its installing step) so no other
+ *  step spends requests. Starting resets the cached view so a previous attempt's `error`/`ready`
+ *  is never mistaken for this one. */
 export function useReleaseInstall(polling: boolean) {
   const qc = useQueryClient()
   const start = useMutation({
@@ -696,7 +724,18 @@ export function useModels(): UseQueryResult<ModelsList> {
   const qc = useQueryClient()
   return useQuery({
     queryKey: queryKeys.models,
-    queryFn: getModels,
+    queryFn: async () => {
+      const prev = qc.getQueryData<ModelsList>(queryKeys.models)
+      const next = await getModels()
+      // An HF repo panel's Downloaded/"Load" state is resolved by the daemon against this scanned
+      // library, but `useHfRepo` only re-polls while verifying — so a download finishing while the
+      // panel was open left it offering "Download", and clicking it fetched the file again from
+      // zero. A new scan pass is when that answer changes (a finished download triggers one, after
+      // its record already reads `done` — keying on the record would race the scan), so mark every
+      // repo detail stale; only an open panel actually refetches.
+      if (prev && prev.lastScanAt !== next.lastScanAt) void qc.invalidateQueries({ queryKey: ['hf-repo'] })
+      return next
+    },
     refetchInterval: (q) =>
       modelsRefetchInterval(q.state.data, qc.getQueryData<Status>(queryKeys.status), qc.getQueryData<DownloadsList>(queryKeys.downloads)),
     refetchIntervalInBackground: false,
@@ -787,6 +826,13 @@ export function useSettings() {
   return { query, save }
 }
 
+/** Settings → Models, "Show models for every engine" (DaemonSettings.showAllEngineModels): false until the settings
+ *  have loaded, and from a daemon without the setting. Read with the settings query itself, so a save shows at once. */
+export function useShowAllEngineModels(): boolean {
+  const q = useQuery({ queryKey: ['settings'], queryFn: getSettings, retry: false })
+  return q.data?.showAllEngineModels ?? false
+}
+
 /** Install / uninstall the ComfyUI push-gate node. Both refresh settings (gatePath)
  *  and status (live gate state) so the UI reflects the change immediately. */
 export function useComfyGate() {
@@ -872,6 +918,17 @@ export function useModelActions() {
     eject: useMutation({
       mutationFn: (modelKey?: string) => stopEngine(modelKey),
       onSuccess: invalidate,
+    }),
+    /** Hide a model by hand, or unhide it (Models → Library). The list is updated in place at once, so the row leaves
+     *  (or rejoins) the Library and the pickers without waiting for the next poll, then re-read. */
+    setHidden: useMutation({
+      mutationFn: (v: { key: string; hidden: boolean }) => setModelHidden(v.key, v.hidden),
+      onSuccess: (_d, v) => {
+        qc.setQueryData<ModelsList>(queryKeys.models, (prev) =>
+          prev && { ...prev, models: prev.models.map((m) => (m.key === v.key ? { ...m, hidden: v.hidden } : m)) })
+        invalidate()
+        void qc.invalidateQueries({ queryKey: ['model', v.key] })
+      },
     }),
   }
 }
@@ -1039,9 +1096,23 @@ export function useHfTokenTest() {
 /** Downloads list, polled every 1.5s while any job is active so progress/speed
  *  stay live; otherwise refetched on focus only. */
 export function useDownloads(): UseQueryResult<DownloadsList> {
+  const qc = useQueryClient()
   return useQuery({
     queryKey: queryKeys.downloads,
-    queryFn: listDownloads,
+    queryFn: async () => {
+      const prev = qc.getQueryData<DownloadsList>(queryKeys.downloads)
+      const next = await listDownloads()
+      // A download that just finished means a rescan is under way (the daemon starts it in the same tick that
+      // marks the record `done`, so the list reads `scanning` until it lands). Wake the models list: with no
+      // model loaded its own poll is quiet whenever every finished download is already accounted for by a
+      // row — and shards 2..N of a split GGUF (an MLX/vLLM model's later files) are, by the split's row while
+      // it is still flagged incomplete, so the row would keep reading "incomplete" after the last shard.
+      const wasDone = new Set(prev?.downloads.filter((d) => d.status === 'done').map((d) => d.id))
+      if (prev && next.downloads.some((d) => d.status === 'done' && !wasDone.has(d.id))) {
+        void qc.invalidateQueries({ queryKey: queryKeys.models })
+      }
+      return next
+    },
     refetchInterval: (q) =>
       q.state.data?.downloads.some((dl) => dl.status === 'downloading' || dl.status === 'queued') ? 1500 : false,
     refetchIntervalInBackground: false,
@@ -1049,6 +1120,10 @@ export function useDownloads(): UseQueryResult<DownloadsList> {
     retry: false,
   })
 }
+
+/** What a download request did: the rows it created, the rows already holding files it named
+ *  (`existing`, with a paused one shown as queued once resumed), and which of those it resumed. */
+export type EnqueueResult = { downloads: DownloadRecord[]; existing: HeldDownload[]; resumed: HeldDownload[] }
 
 export function useDownloadMutations() {
   const qc = useQueryClient()
@@ -1060,13 +1135,35 @@ export function useDownloadMutations() {
   }
   return {
     enqueue: useMutation({
-      mutationFn: (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; excludeMmproj?: boolean }) =>
-        enqueueDownload(input),
+      mutationFn: async (input: { repo?: string; rfilename?: string; url?: string; size?: number; sha256?: string; subdir?: string; folder?: { files: { path: string; size: number }[] }; excludeMmproj?: boolean }): Promise<EnqueueResult> => {
+        const out = await enqueueDownload(input)
+        // A file a row already holds gets no second row; the daemon answers that row instead.
+        // Asking again for a paused one means "go on", so it is resumed here, for every caller
+        // (Discover, Import from URL, onboarding's "Download this"): until now the request
+        // queued nothing, said nothing, and the download stayed paused.
+        const existing: HeldDownload[] = []
+        const resumed: HeldDownload[] = []
+        for (const d of out.existing ?? []) {
+          if (d.status !== 'paused') { existing.push(d); continue }
+          try {
+            await resumeDownload(d.id)
+            const row: HeldDownload = { ...d, status: 'queued' }
+            existing.push(row)
+            resumed.push(row)
+          } catch {
+            existing.push(d) // left paused; its row still offers Resume
+          }
+        }
+        return { downloads: out.downloads, existing, resumed }
+      },
       onSuccess: invalidate,
     }),
     cancel: useMutation({ mutationFn: (id: string) => cancelDownload(id), onSuccess: invalidate }),
     remove: useMutation({ mutationFn: (id: string) => removeDownload(id), onSuccess: invalidate }),
     resume: useMutation({ mutationFn: (id: string) => resumeDownload(id), onSuccess: invalidate }),
+    // Refreshed either way: a refused Pause (the row finished, or another client paused it first)
+    // is answered by showing the row as it now is.
+    pause: useMutation({ mutationFn: (id: string) => pauseDownload(id), onSettled: invalidate }),
   }
 }
 

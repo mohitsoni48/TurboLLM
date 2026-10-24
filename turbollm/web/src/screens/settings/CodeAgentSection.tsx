@@ -94,7 +94,10 @@ export function CodeAgentSection() {
         <DropdownMenuContent align="start" className="w-[--radix-dropdown-menu-trigger-width]">
           {agents.map((agent) => {
             const installed = isInstalled(agent.id)
-            const busy = installing === agent.id
+            // The daemon's word too, not only this page's own request: the install runs on when the
+            // page that started it closes or reloads, and the page that comes back must show it
+            // running rather than offer a second Install.
+            const busy = installing === agent.id || !!infoFor(agent.id)?.installing
             return (
               <DropdownMenuItem
                 key={agent.id}

@@ -20,9 +20,9 @@ export function modelDeleteBlocked(d: Pick<Deps, 'manager' | 'modelRouter'>, ent
  *  never active — while a Laya model is alive. */
 export function engineDeleteBlocked(d: Pick<Deps, 'manager' | 'modelRouter' | 'registry' | 'scanner'>, engine: Engine): boolean {
   if (engine.kind === 'laya') return layaStatus(d) !== null
-  // An extra pool slot running on it (a .litertlm model auto-swapped into the pool runs on LiteRT-LM).
+  // An extra pool slot running on it (a slot keeps the engine it was loaded on when another is activated).
   if (d.modelRouter.poolEngineIds().has(engine.id)) return true
-  // The active engine, or the one serving the primary model (a .litertlm model runs on LiteRT-LM whatever is active).
+  // The active engine, or the one serving the primary model (an install or Enable activates another without stopping it).
   if (!engineInUse({ registry: d.registry, manager: d.manager }, engine.id)) return false
   const s = d.manager.status().state
   return s === 'running' || s === 'starting' || s === 'stopping'

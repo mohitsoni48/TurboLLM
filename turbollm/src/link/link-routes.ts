@@ -8,8 +8,12 @@ import type { ApiKey } from '../config/config'
 import { ValueError } from '../config/config'
 import { linkAuth, requireCapability } from './link-auth'
 import { gatewayV1Handler } from '../gateway/gateway'
+import { isJsonObject, NOT_A_JSON_OBJECT } from '../gateway/jev-serving'
 import { buildModelStatus } from '../api/status-view'
 import { startEngine, stopEngine } from '../api/engine-lifecycle'
+import type { Incompatibility } from '../engines/compat'
+import { unlistedForLoading } from '../engines/registry'
+import type { ModelEntry } from '../models/scanner'
 import {
   enqueueDownload,
   listDownloads,
@@ -23,6 +27,7 @@ import { SINGLE_FILE_MODEL_RE } from '../downloads/downloads'
 import { allowsModel, hasCapability } from './capabilities'
 import { applyScopedPatch, scrubConfigForRead } from './config-scope'
 import { canWake, hostIdleState } from './host-idle'
+import { LINK_NO_LOAD_HEADER } from './link-proxy'
 import { FALLBACK_MACHINE_NAME, sanitizeMachineName } from './machine-name'
 import { LINK_API_VERSIONS } from './protocol'
 import { LINK_CAPABILITIES, redactDownload, type HelloResponse } from './types'
@@ -141,6 +146,29 @@ function linkDownloadErr(c: { json: (b: unknown, s: number) => Response }, f: Do
   )
 }
 
+/** The request body when it is a JSON object, else `{}`, so a body that is not JSON at all,
+ *  or JSON that is not an object, falls into the route's own 400 for a missing field. A body
+ *  of `null` threw at the first field read instead: a bare 500 from Hono's default handler. */
+async function objectBody(
+  c: { req: { json: () => Promise<unknown> } },
+): Promise<Record<string, unknown>> {
+  const parsed = await c.req.json().catch(() => ({}))
+  return isJsonObject(parsed) ? parsed : {}
+}
+
+/** A predicate giving why the host hides a model from a peer, or null when the peer sees it: the host's own rule for
+ *  what is listed for loading (registry.ts unlistedForLoading, web model-kind.ts listedForLoading), applied here
+ *  because a peer has neither the host's compatibility field nor its Settings. A model the engine it loads on cannot
+ *  run is hidden unless the host's owner shows every engine's models (`showAllEngineModels`); with no engine selected
+ *  nothing is. The façade listed every model, and its load mounts startEngine, a manual load that starts on the
+ *  selected engine whatever the model: a peer's Load of a .litertlm bundle under llama.cpp, or of a GGUF on vLLM,
+ *  cancelled the host's auto-tune, aborted its chats, stopped its model and recorded that model as its last loaded,
+ *  for a start that then failed. The peer's user never chose to show such models; the host's owner did not either.
+ *  Built once per request, not per model (unlistedForLoading memoizes its registry lookups). */
+function hiddenFromPeer(d: Deps): (e: ModelEntry) => Incompatibility | null {
+  return unlistedForLoading(d.store.snapshot().showAllEngineModels, d.registry)
+}
+
 /** Thrown inside `PATCH /api/link/v1/config`'s `store.update` callback when the second
  *  `applyScopedPatch` pass disagrees with the dry-run. Unreachable today; it exists so that
  *  if it ever DOES happen it aborts the write and surfaces as a 500, rather than committing
@@ -197,8 +225,12 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
   linkApp.get('/api/link/v1/models', requireCapability('models:use'), (c) => {
     const key = c.get('linkKey')
     const loadedKey = d.manager.status().model?.key ?? null
+    // A model the host hides from its own Models screen and pickers because its engine cannot run it (hiddenFromPeer) is
+    // left out here too. Not one the host's user hid by hand (config.ts hiddenModels): that hides it from the host's own
+    // Library and pickers only, and a peer still lists it.
+    const hidden = hiddenFromPeer(d)
     const models = d.scanner.list().models
-      .filter((e) => allowsModel(key, e.key))
+      .filter((e) => allowsModel(key, e.key) && !hidden(e))
       .map((e) => ({
         key: e.key,
         name: e.name,
@@ -237,7 +269,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  nothing here adds a second lock: `startEngine` already goes through
    *  `modelRouter.withSwapLock`, so a second remote load queues behind an in-flight one.
    *
-   *  Three checks run BEFORE delegating, and all three are façade concerns the local route
+   *  Four checks run BEFORE delegating, and all four are façade concerns the local route
    *  has no business carrying:
    *   1. `modelKey` is REQUIRED. `startEngine` treats an empty request as "re-load
    *      `lastLoaded`" (the Engines "Start" button) — a peer must never trigger that by
@@ -249,12 +281,17 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *      code for "you named a model I don't have", and one whose branch a remote caller
    *      must never reach at all (it launches a caller-named FILESYSTEM PATH; ADR-139).
    *      Passing `{ modelKey }` alone — never the peer's raw body — is what forecloses it.
+   *   4. A model the host hides from the peer (hiddenFromPeer, which GET /api/link/v1/models
+   *      filters with too) is 409 `engine_model_mismatch` with the reason, before anything
+   *      on the host is stopped: `startEngine` loads it as the host's own Load of a model its
+   *      owner chose to show, on the selected engine whatever it is, which a peer never
+   *      chose. The gateway's auto-swap refuses the same model for the peer's chat.
    *
    *  The body it returns is `startEngine`'s own `{ ok: true }` / typed error, which carries
    *  no filesystem detail (see engine-lifecycle.ts). */
   linkApp.post('/api/link/v1/models/load', requireCapability('models:load'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { modelKey?: unknown }
+    const body = await objectBody(c)
     const modelKey = typeof body.modelKey === 'string' ? body.modelKey.trim() : ''
     if (!modelKey) {
       return c.json({ error: { code: 'invalid_input', message: 'modelKey is required.' } }, 400)
@@ -262,9 +299,12 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     if (!allowsModel(key, modelKey)) {
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${modelKey}'.` } }, 403)
     }
-    if (!d.scanner.get(modelKey)) {
+    const entry = d.scanner.get(modelKey)
+    if (!entry) {
       return c.json({ error: { code: 'no_such_model', message: `No model '${modelKey}' on this machine.` } }, 404)
     }
+    const hidden = hiddenFromPeer(d)(entry)
+    if (hidden) return c.json({ error: { code: 'engine_model_mismatch', message: hidden.message } }, 409)
     return startEngine(c, d, { modelKey })
   })
 
@@ -301,16 +341,17 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *     fault deeper in.
    *   - `rfilename` must be a `.gguf`/`.litertlm` single-file model with no path traversal in it.
    *
-   *  Three fields of `EnqueueInput` are deliberately DROPPED rather than passed through:
+   *  Four fields of `EnqueueInput` are deliberately DROPPED rather than passed through:
    *   - `subdir` is `join()`ed onto the host's model dir unsanitised — a peer-supplied
    *     `..` there writes outside it.
    *   - `url` makes the host fetch an arbitrary origin (its own LAN, a cloud metadata
    *     endpoint) and, with `subdir`, to an arbitrary filename.
    *   - `excludeMmproj` is onboarding's internal flag, not part of this contract.
+   *   - `folder` sizes a whole-folder download, which needs `subdir`.
    *  `size` and `sha256` ARE accepted: they only ever tighten behaviour (the free-disk
    *  check and the checksum verification). */
   linkApp.post('/api/link/v1/downloads', requireCapability('downloads:write'), async (c) => {
-    const body = await c.req.json().catch(() => ({})) as Record<string, unknown>
+    const body = await objectBody(c)
     const repo = typeof body.repo === 'string' ? body.repo.trim() : ''
     const rfilename = typeof body.rfilename === 'string' ? body.rfilename.trim() : ''
     if (!HF_REPO_ID.test(repo) || !isSafeRepoFile(rfilename)) {
@@ -384,7 +425,7 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
    *  The patch is dry-run against a SNAPSHOT before `store.update` is called at all, so a
    *  refused patch never causes a config.json write. */
   linkApp.patch('/api/link/v1/config', requireCapability('config:write'), async (c) => {
-    const body = await c.req.json().catch(() => ({})) as { patch?: unknown }
+    const body = await objectBody(c)
     const patch = body.patch
     if (typeof patch !== 'object' || patch === null || Array.isArray(patch)) {
       return c.json(
@@ -485,8 +526,41 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
 
   linkApp.post('/api/link/v1/chat/completions', requireCapability('models:use'), async (c) => {
     const key = c.get('linkKey')
-    const body = await c.req.json().catch(() => ({})) as { model?: string; stream?: unknown }
-    const requested = body.model ?? ''
+    const parsed: unknown = await c.req.json().catch(() => ({}))
+    // JSON that is not an object: a null threw at the first field read below, a bare 500 from
+    // Hono's default handler. Refused as the /v1 route this one hands off to refuses it
+    // (gateway.ts), before any gate here reads the body. A body that is not JSON at all still
+    // goes on to that route, as before.
+    if (!isJsonObject(parsed)) {
+      return c.json(
+        {
+          error: {
+            message: NOT_A_JSON_OBJECT,
+            type: 'invalid_request_error',
+            code: 'invalid_type',
+          },
+        },
+        400,
+      )
+    }
+    const body = parsed as { model?: unknown; stream?: unknown }
+    // A model that is not a string threw in resolveRemoteTarget below (its remote-id parse
+    // trims it): a bare 500 from Hono's default handler. Refused as the /v1 route this one
+    // hands off to refuses it (gateway.ts).
+    if (body.model != null && typeof body.model !== 'string') {
+      return c.json(
+        {
+          error: {
+            message: 'model must be a string.',
+            type: 'invalid_request_error',
+            param: 'model',
+            code: 'invalid_type',
+          },
+        },
+        400,
+      )
+    }
+    const requested = (body.model as string | null | undefined) ?? ''
     if (requested && !allowsModel(key, requested)) {
       return c.json({ error: { code: 'forbidden', message: `This link may not use '${requested}'.` } }, 403)
     }
@@ -524,6 +598,27 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     // past the gate and reach the swap machinery anyway.
     const loaded = d.manager.status().model?.key ?? null
     if (requested && requested !== loaded) {
+      // The peer marks a request whose own caller may not load models (link-proxy.ts
+      // LINK_NO_LOAD_HEADER). The link may hold models:load or models:wake, but this request
+      // gets what a link holding neither gets, decided here on the live state: the peer's own
+      // check reads its catalog, which can be a refresh behind an owner's switch. Refused as
+      // that check refuses it: final (a retry is refused the same way), and with the type
+      // gatewayV1Handler gives a route refusal.
+      if (c.req.header(LINK_NO_LOAD_HEADER) !== undefined) {
+        c.header('x-should-retry', 'false')
+        return c.json(
+          {
+            error: {
+              code: 'model_not_loaded',
+              type: 'model_not_loaded',
+              message:
+                `'${requested}' is not loaded on this machine, and the access token ` +
+                `this request came with may not load models.`,
+            },
+          },
+          503,
+        )
+      }
       if (hasCapability(key, 'models:load')) {
         // Unconditional by design: models:load IS the "you may take the machine" grant.
         // Fall through to the normal auto-swap path.
@@ -535,15 +630,35 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
           )
         }
       } else {
+        // Final and typed, like the marked refusal above: untyped, a peer's /v1/messages reads
+        // this 503 as an overloaded host, and its client retries a refusal no retry can change.
+        c.header('x-should-retry', 'false')
         return c.json(
           {
             error: {
               code: 'model_not_loaded',
+              type: 'model_not_loaded',
               message: `'${requested}' is not loaded on this machine, and this link may not load it.`,
             },
           },
           503,
         )
+      }
+    }
+
+    // The allowlist binds the model that ANSWERS, not only the `model` string checked above.
+    // ModelRouter.route() answers with whatever is loaded when `model` is empty, auto-swap is
+    // off, or the name resolves to nothing — so a restricted token could otherwise leave
+    // `model` out and be served a model GET /api/link/v1/models hid from it. targetEntry() is
+    // route()'s own load-free mirror; when it names no entry, route() can only fall back to
+    // the loaded model (or 503 when there is none).
+    if (key?.grant?.models?.length) {
+      const servedKey = d.modelRouter.targetEntry(requested)?.key ?? loaded
+      if (servedKey && !allowsModel(key, servedKey)) {
+        const message = requested
+          ? `This machine would answer '${requested}' with a model this link may not use.`
+          : "This link may use only specific models — name one in 'model'."
+        return c.json({ error: { code: 'forbidden', message } }, 403)
       }
     }
 

@@ -1,20 +1,26 @@
 import { defineConfig } from 'tsup'
 
-// Two independent build passes (not one multi-entry config) — this is load-bearing, not
-// stylistic. tsup/esbuild's `splitting: true` (its default for multi-entry ESM builds)
-// shares code across ALL entries in ONE build pass, grouped by module-graph reachability,
-// not by feature boundaries. Confirmed live (TurboLLM Android, Spike D): code-session.ts's
-// `@earendil-works/pi-coding-agent` imports — already gated behind a platform check and a
-// dynamic `import()` (server.ts's registerCodeRoutesIfSupported, cli.ts's CodeRunManager
-// construction), specifically so that dependency chain (which uses `\p{...}` regex syntax
-// TurboLLM Android's embedded runtime can't even parse) is never touched there — still got
-// pulled into cli.js's own static output. Giving code-routes.ts/code-run-manager.ts their
-// own entry NAMES in the SAME config wasn't enough: esbuild still created one shared chunk
-// file (containing BOTH ordinary utilities cli.ts needs directly, like
-// sweepInteractiveCliRuns, AND code-session.ts's pi-coding-agent imports) because both are
-// reachable from the same single esbuild invocation. A genuinely SEPARATE tsup invocation
-// has no shared-chunk mechanism to leak through at all — the only way to guarantee it.
-const mainEntries = defineConfig({
+// ONE build pass for every entry — this is load-bearing. code-routes.js and code-run-manager.js
+// are loaded at runtime by cli.js (server.ts's registerCodeRoutesIfSupported, cli.ts's
+// CodeRunManager construction) into the SAME process, and they share module-level singletons
+// with it: session-auth.ts's `sessionAuth` (live thinking-budget/effort overrides the gateway
+// reads), approval-gate.ts's pending tool-approval map (Code "ask" mode, approved through
+// chat-routes.ts). These entries used to be a second, separate tsup invocation, which bundled its
+// own copy of every module it reached — a second registry and a second approval map that cli.js
+// never saw, so an approval or an override written on one side was invisible on the other (only
+// in the built package: tsx and the tests share one module graph). In one pass esbuild puts each
+// shared module in a chunk imported by every entry that reaches it, so there is one instance.
+//
+// That separate pass was originally there to keep code-session.ts's
+// `@earendil-works/pi-coding-agent` chain out of cli.js's static output (TurboLLM Android,
+// Spike D: its `\p{...}` regexes do not even parse on the phone's runtime). Splitting cannot leak
+// it: esbuild assigns a module to a chunk by which entries STATICALLY reach it, and cli.js
+// imports only the chunks for modules it reaches itself. The two code entries are loaded through
+// a computed pathToFileURL(join(...)) specifier esbuild cannot follow (see cli.ts/server.ts), and
+// the leak that was seen live came from a static import (ext/run-manager.ts → code-run-manager.ts,
+// since split out to code/run-buffer.ts). Android also no longer uses this output at all — it has
+// its own separate build pass, tsup.android.config.ts.
+export default defineConfig({
   entry: {
     cli: 'src/cli.ts',
     // run-code-worker is a second, independent entry point (not imported/bundled into
@@ -29,6 +35,9 @@ const mainEntries = defineConfig({
     // hook at all and target a real file directly, in both dev/tsx and the built package alike.
     'run-code-worker': 'src/tools/run-code-worker.ts',
     'run-code-sandbox': 'src/tools/run-code-sandbox.ts',
+    // The Code/Agents feature's entries, imported lazily by cli.js (see the top of this file).
+    'code-routes': 'src/code/code-routes.ts',
+    'code-run-manager': 'src/code/code-run-manager.ts',
   },
   format: ['esm'],
   clean: true,
@@ -40,9 +49,8 @@ const mainEntries = defineConfig({
   // node: prefix is preserved in the bundle (esbuild strips it otherwise).
   // pi-ai/pi-coding-agent pull in cross-spawn (dynamic require of child_process)
   // which esbuild cannot bundle; externalizing avoids the "Dynamic require of
-  // child_process is not supported" crash at runtime. They're never actually reached from
-  // this pass's own entries (see the code/agents pass below), external here purely as a
-  // safety net in case something in this pass's graph ever references them again.
+  // child_process is not supported" crash at runtime. Only the code-routes/code-run-manager
+  // entries reach them (cli.js never does — see the top of this file).
   // sql.js (Android's node:sqlite fallback — sqlite-adapter.ts) locates its own .wasm
   // file relative to its OWN package folder at runtime; bundling it into cli.js would
   // break that resolution (the wasm wouldn't be found relative to a single dist/cli.js).
@@ -51,21 +59,3 @@ const mainEntries = defineConfig({
   external: ['node:sqlite', '@earendil-works/pi-ai', '@earendil-works/pi-coding-agent', 'sql.js'],
   noExternal: [],
 })
-
-// The Code/Agents feature's own build pass — entirely separate esbuild invocation from
-// mainEntries above (see the comment at the top of this file for why that separation
-// itself is the fix, not an optimization). `clean: false` so this doesn't wipe out
-// mainEntries' output — both passes write into the same dist/ directory.
-const codeAgentsEntries = defineConfig({
-  entry: {
-    'code-routes': 'src/code/code-routes.ts',
-    'code-run-manager': 'src/code/code-run-manager.ts',
-  },
-  format: ['esm'],
-  clean: false,
-  target: 'node22',
-  external: ['node:sqlite', '@earendil-works/pi-ai', '@earendil-works/pi-coding-agent', 'sql.js'],
-  noExternal: [],
-})
-
-export default [mainEntries, codeAgentsEntries]

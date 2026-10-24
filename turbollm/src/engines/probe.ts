@@ -1,6 +1,6 @@
 // Engine probe (spec 03 §3): run <bin> --version and --help to capture the
 // version + a capability fingerprint. Ports the verified Go probe.
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { closeSync, existsSync, openSync, readSync, statSync } from 'node:fs'
 import { dirname } from 'node:path'
 import type { FlagInfo } from '../config/config'
@@ -62,23 +62,21 @@ function isTimeout(err: Error | null): boolean {
   return e.killed === true && (e.signal === 'SIGTERM' || e.signal != null)
 }
 
+// Tied to the daemon (util/tether.ts): the probe's timeout (up to 60 s) is a daemon timer, so a hung engine binary
+// the daemon did not live to time out ran on, parented to init.
+const probeExecFile = tetheredExecFile({ kind: 'probe' })
+
 function runCaptured(bin: string, arg: string): Promise<{ out: string; err: Error | null }> {
-  return new Promise((resolve) => {
-    // execFile normally reports spawn failures via the callback, but on Windows a
-    // corrupt / wrong-arch binary can make it throw synchronously — catch that so
-    // it folds into a clean `probe_failed` instead of escaping as a 500.
-    try {
-      // macOS Metal binaries JIT-compile their shader library on first run, which
-      // takes 10-30 s depending on the fork's embedded shaders. Use a longer
-      // timeout on macOS so this first-run compilation doesn't fail the probe.
-      const timeoutMs = process.platform === 'darwin' ? 60_000 : 15_000
-      execFile(bin, [arg], { cwd: dirname(bin), env: probeEnv(bin), timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
-        resolve({ out: (stdout || '') + (stderr || ''), err: error })
-      })
-    } catch (e) {
-      resolve({ out: '', err: e as Error })
-    }
-  })
+  // macOS Metal binaries JIT-compile their shader library on first run, which
+  // takes 10-30 s depending on the fork's embedded shaders. Use a longer
+  // timeout on macOS so this first-run compilation doesn't fail the probe.
+  const timeoutMs = process.platform === 'darwin' ? 60_000 : 15_000
+  // A spawn that cannot start (on Windows a corrupt / wrong-arch binary can make spawn throw) rejects like any
+  // other failure, so it folds into a clean `probe_failed` instead of escaping as a 500.
+  return probeExecFile(bin, [arg], { cwd: dirname(bin), env: probeEnv(bin), timeout: timeoutMs, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }).then(
+    ({ stdout, stderr }) => ({ out: (stdout || '') + (stderr || ''), err: null }),
+    (error: Error & { stdout?: string; stderr?: string }) => ({ out: (error.stdout || '') + (error.stderr || ''), err: error }),
+  )
 }
 
 export async function probe(bin: string): Promise<ProbeResult> {

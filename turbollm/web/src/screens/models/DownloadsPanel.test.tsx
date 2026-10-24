@@ -13,20 +13,28 @@ vi.mock('../../lib/api', async (importOriginal) => ({
 
 const localCancel = vi.fn()
 const localRemove = vi.fn()
+const localResume = vi.fn()
+const localPause = vi.fn()
 
 // Only the LOCAL data layer is mocked. `link-queries` is deliberately real — see the note
 // in ModelsScreen.fleet.test.tsx: a mocked mutation can only prove what a click handed off,
 // never what the receiver did with it, and that gap is how this feature shipped a Critical
 // once already. Here a click travels component -> mutation -> link-api -> HTTP, and the
 // assertions are on the request that actually left.
-vi.mock('../../lib/queries', () => ({
-  useDownloads: () => ({ data: { downloads: state.local } }),
-  useDownloadMutations: () => ({
-    cancel: { mutate: localCancel, isPending: false, variables: undefined },
-    remove: { mutate: localRemove, isPending: false },
-    resume: { mutate: vi.fn(), isPending: false },
-  }),
-}))
+vi.mock('../../lib/queries', async () => {
+  const { useMutation } = await import('@tanstack/react-query')
+  return {
+    useDownloads: () => ({ data: { downloads: state.local } }),
+    useDownloadMutations: () => ({
+      cancel: { mutate: localCancel, isPending: false, variables: undefined },
+      remove: { mutate: localRemove, isPending: false },
+      // A real mutation over the mocked request: Resume all fires one per row, and only a real
+      // observer shows which call's outcome reaches which row.
+      resume: useMutation({ mutationFn: (id: string) => localResume(id) }),
+      pause: { mutate: (id: string) => { void localPause(id) }, mutateAsync: (id: string) => localPause(id), isPending: false, variables: undefined },
+    }),
+  }
+})
 
 const localDl: DownloadRecord = {
   id: 'local-1', name: 'local.gguf', repo: 'o/r', url: 'https://x', dest: 'D:\\models\\local.gguf',
@@ -108,6 +116,8 @@ beforeEach(() => {
   calls.length = 0
   localCancel.mockClear()
   localRemove.mockClear()
+  localResume.mockReset()
+  localPause.mockReset()
   installFetch()
 })
 
@@ -270,6 +280,18 @@ describe('DownloadsPanel — merged fleet', () => {
     expect(within(row as HTMLElement).queryByRole('button', { name: /resume/i })).toBeNull()
   })
 
+  it('shows a refused local Resume on its row instead of dropping it', async () => {
+    // The daemon's 409 when another row is already writing the same file.
+    localResume.mockRejectedValue(new Error('Another download is already writing this file.'))
+    state.local = [{ ...localDl, status: 'error', error: 'network blip' }]
+    renderPanel()
+    // Exact match: the header's "Resume all" also renders for this row.
+    await userEvent.click(screen.getByRole('button', { name: 'Resume' }))
+    expect(localResume).toHaveBeenCalledWith('local-1')
+    const row = document.querySelector('[data-testid="download-row-local-1"]') as HTMLElement
+    expect((await within(row).findByRole('alert')).textContent).toBe('Another download is already writing this file.')
+  })
+
   describe('bulk actions', () => {
     it('offers neither bulk button when there is nothing to act on', () => {
       state.local = [{ ...localDl, status: 'queued' }]
@@ -306,10 +328,10 @@ describe('DownloadsPanel — merged fleet', () => {
       expect(writes()).toHaveLength(0)
     })
 
-    it('shows Dismiss all once a download is done, and it dismisses every local terminal row', async () => {
+    it('shows Dismiss all once a download is done, and it dismisses every local finished row', async () => {
       state.local = [
         { ...localDl, id: 'd1', name: 'done.gguf', status: 'done', received: 100 },
-        { ...localDl, id: 'd2', name: 'errored.gguf', status: 'error' },
+        { ...localDl, id: 'd2', name: 'cancelled.gguf', status: 'cancelled' },
       ]
       renderPanel()
       await screen.findByText('done.gguf')
@@ -318,6 +340,24 @@ describe('DownloadsPanel — merged fleet', () => {
       expect(localRemove).toHaveBeenCalledWith('d1')
       expect(localRemove).toHaveBeenCalledWith('d2')
       expect(localRemove).toHaveBeenCalledTimes(2)
+    })
+
+    it('leaves an errored or paused row out of Dismiss all: removing it would delete the partial it can resume from', async () => {
+      state.local = [
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip', received: 62_652_416 },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused', received: 62_652_416 },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Dismiss all' }))
+      expect(localRemove).toHaveBeenCalledTimes(1)
+      expect(localRemove).toHaveBeenCalledWith('fin')
+    })
+
+    it('offers no Dismiss all for an errored row alone', () => {
+      state.local = [{ ...localDl, status: 'error', error: 'network blip' }]
+      renderPanel()
+      expect(screen.queryByRole('button', { name: 'Dismiss all' })).toBeNull()
     })
 
     it('leaves a remote terminal row out of Dismiss all — removal is local-only housekeeping', async () => {
@@ -329,6 +369,242 @@ describe('DownloadsPanel — merged fleet', () => {
       await userEvent.click(screen.getByRole('button', { name: 'Dismiss all' }))
       expect(localRemove).toHaveBeenCalledTimes(1)
       expect(localRemove).toHaveBeenCalledWith('local-1')
+    })
+  })
+
+  describe('pause and resume', () => {
+    const rowEl = (id: string) => document.querySelector(`[data-testid="download-row-${id}"]`) as HTMLElement
+    const buttons = (id: string) => within(rowEl(id)).queryAllByRole('button').map((b) => b.textContent)
+
+    it('offers Pause on a running and a queued row, Resume on a paused and an errored one', () => {
+      state.local = [
+        { ...localDl, id: 'run', name: 'run.gguf' },
+        { ...localDl, id: 'wait', name: 'wait.gguf', status: 'queued', received: 0 },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+      ]
+      renderPanel()
+      expect(buttons('run')).toEqual(['Pause', 'Cancel'])
+      expect(buttons('wait')).toEqual(['Pause', 'Cancel'])
+      expect(buttons('held')).toEqual(['Resume', 'Discard'])
+      expect(buttons('broke')).toEqual(['Resume', 'Discard'])
+      expect(buttons('fin')).toEqual(['Dismiss'])
+      // A paused row is not counted as active.
+      expect(screen.getByText('· 2 active')).toBeTruthy()
+      expect(screen.getByText('· 1 paused')).toBeTruthy()
+    })
+
+    it('Pause pauses its own row', async () => {
+      state.local = [{ ...localDl, id: 'a', name: 'a.gguf' }, { ...localDl, id: 'b', name: 'b.gguf' }]
+      renderPanel()
+      await userEvent.click(within(rowEl('b')).getByRole('button', { name: 'Pause' }))
+      expect(localPause).toHaveBeenCalledTimes(1)
+      expect(localPause).toHaveBeenCalledWith('b')
+      expect(localCancel).not.toHaveBeenCalled()
+    })
+
+    // At phone width a row's buttons are icon-only, so its status line keeps its room: beside a
+    // labelled Pause and Cancel a running row read "45% · 109 MB of 240 MB ·", without its speed.
+    it('keeps every row action named when its label is hidden at phone width', () => {
+      state.local = [
+        { ...localDl, id: 'run', name: 'run.gguf' },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+      ]
+      renderPanel()
+      const actions = [...document.querySelectorAll('[data-testid^="download-row-"] button')]
+      expect(actions.length).toBe(7)
+      for (const b of actions) {
+        const label = b.querySelector('span')
+        expect(label?.className).toBe('hidden sm:inline')
+        expect(b.getAttribute('aria-label')).toBe(label?.textContent)
+      }
+    })
+
+    it('lets a status line too long for the row wrap between its parts instead of cutting it off', () => {
+      state.local = [{ ...localDl, id: 'run', name: 'run.gguf', total: 240e6, received: 109e6, bytesPerSec: 2.4e6 }]
+      renderPanel()
+      const line = within(rowEl('run')).getByTestId('download-name').parentElement!.nextElementSibling as HTMLElement
+      expect(line.className).not.toContain('truncate')
+      expect(line.className).toContain('flex-wrap')
+      expect([...line.querySelectorAll('.whitespace-nowrap')].map((p) => p.textContent)).toEqual(['45%', '· 109 MB of 240 MB', '· 2.4 MB/s'])
+    })
+
+    it('offers no Pause on a remote row — pause is a local-only affordance', async () => {
+      state.links = [link()]
+      state.queues = { l1: [remoteDl] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      expect(within(rowEl('remote-1')).queryByRole('button', { name: /pause/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Pause all' })).toBeNull()
+    })
+
+    it('Pause all pauses every running and queued row here; Resume all resumes every paused and errored one', async () => {
+      state.local = [
+        { ...localDl, id: 'run', name: 'run.gguf' },
+        { ...localDl, id: 'wait', name: 'wait.gguf', status: 'queued', received: 0 },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+      ]
+      state.links = [link()]
+      state.queues = { l1: [remoteDl, { ...remoteDl, id: 'remote-2', name: 'remote-paused.gguf', status: 'paused' }] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      await userEvent.click(screen.getByRole('button', { name: 'Pause all' }))
+      await waitFor(() => expect(localPause.mock.calls.map((c) => c[0])).toEqual(['wait', 'run']))
+      await userEvent.click(screen.getByRole('button', { name: 'Resume all' }))
+      await waitFor(() => expect(localResume.mock.calls.map((c) => c[0])).toEqual(['held', 'broke']))
+      expect(writes()).toHaveLength(0) // neither reaches a linked machine
+    })
+
+    // A running row's pause frees its slot and the daemon starts the next queued row at once: paused in list order, every
+    // queued row was started a moment before its own pause arrived.
+    it('Pause all pauses the queued rows first, and the running ones once those pauses have settled', async () => {
+      let settle!: () => void
+      localPause.mockImplementation((id: string) => (id === 'wait' ? new Promise<void>((r) => { settle = r }) : undefined))
+      state.local = [
+        { ...localDl, id: 'run', name: 'run.gguf' },
+        { ...localDl, id: 'wait', name: 'wait.gguf', status: 'queued', received: 0 },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Pause all' }))
+      expect(localPause.mock.calls.map((c) => c[0])).toEqual(['wait'])
+      await new Promise((r) => setTimeout(r, 20))
+      expect(localPause.mock.calls.map((c) => c[0]), 'the running row waits for the queued row\'s pause').toEqual(['wait'])
+      settle()
+      await waitFor(() => expect(localPause.mock.calls.map((c) => c[0])).toEqual(['wait', 'run']))
+    })
+
+    it('Resume all shows a refused Resume on its own row, not only when it is the last row', async () => {
+      // The daemon's 409 for the first row; the second is taken.
+      localResume.mockImplementation(async (id: string) => {
+        if (id === 'held') throw new Error('Another download is already writing this file.')
+      })
+      state.local = [
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Resume all' }))
+      await waitFor(() => expect(localResume).toHaveBeenCalledTimes(2))
+      expect((await within(rowEl('held')).findByRole('alert')).textContent).toBe('Another download is already writing this file.')
+      expect(within(rowEl('broke')).queryByRole('alert')).toBeNull()
+    })
+
+    it('Cancel all leaves a paused download alone', async () => {
+      state.local = [
+        { ...localDl, id: 'run', name: 'run.gguf' },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel all' }))
+      expect(localCancel).toHaveBeenCalledTimes(1)
+      expect(localCancel).toHaveBeenCalledWith('run')
+    })
+
+    it('offers no Cancel all when every download is paused', () => {
+      state.local = [{ ...localDl, status: 'paused' }]
+      renderPanel()
+      expect(screen.queryByRole('button', { name: 'Cancel all' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'Resume all' })).toBeTruthy()
+    })
+
+    it('Cancel on a download with more than 50 MB so far asks first, and only "Delete download" cancels it', async () => {
+      state.local = [{ ...localDl, received: 1_200_000_000, total: 5_000_000_000 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      const dialog = await screen.findByRole('alertdialog')
+      expect(dialog.textContent).toContain('local.gguf: the 1.20 GB downloaded so far will be deleted. Pause keeps it, to resume later.')
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Keep it' }))
+      await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+      expect(localCancel).not.toHaveBeenCalled()
+
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      await userEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Delete download' }))
+      expect(localCancel).toHaveBeenCalledWith('local-1')
+    })
+
+    it('Cancel on a download with less than 50 MB so far cancels at once', async () => {
+      state.local = [{ ...localDl, received: 40_000_000, total: 5_000_000_000 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(screen.queryByRole('alertdialog')).toBeNull()
+      expect(localCancel).toHaveBeenCalledWith('local-1')
+    })
+
+    it('Cancel all asks first when the downloads it cancels hold more than 50 MB between them', async () => {
+      state.local = [
+        { ...localDl, id: 'a', name: 'a.gguf', received: 30_000_000, total: 1e9 },
+        { ...localDl, id: 'b', name: 'b.gguf', received: 30_000_000, total: 1e9 },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused', received: 900_000_000, total: 1e9 },
+      ]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel all' }))
+      const dialog = await screen.findByRole('alertdialog')
+      expect(within(dialog).getByText('Cancel 2 downloads?')).toBeTruthy()
+      expect(dialog.textContent).toContain('The 60 MB downloaded so far will be deleted. Pause keeps them, to resume later.')
+      expect(localCancel).not.toHaveBeenCalled()
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Delete downloads' }))
+      expect(localCancel.mock.calls.map((c) => c[0])).toEqual(['a', 'b'])
+    })
+  })
+
+  describe('discard', () => {
+    const rowEl = (id: string) => document.querySelector(`[data-testid="download-row-${id}"]`) as HTMLElement
+
+    it('names the way out of an errored or paused row "Discard", and of a finished one "Dismiss"', () => {
+      state.local = [
+        { ...localDl, id: 'broke', name: 'broke.gguf', status: 'error', error: 'network blip' },
+        { ...localDl, id: 'held', name: 'held.gguf', status: 'paused' },
+        { ...localDl, id: 'fin', name: 'fin.gguf', status: 'done', received: 100 },
+        { ...localDl, id: 'gone', name: 'gone.gguf', status: 'cancelled' },
+      ]
+      renderPanel()
+      for (const id of ['broke', 'held']) {
+        expect(within(rowEl(id)).getByRole('button', { name: 'Discard' })).toBeTruthy()
+        expect(within(rowEl(id)).queryByRole('button', { name: /^(Dismiss|Cancel)$/ })).toBeNull()
+      }
+      for (const id of ['fin', 'gone']) {
+        expect(within(rowEl(id)).getByRole('button', { name: 'Dismiss' })).toBeTruthy()
+        expect(within(rowEl(id)).queryByRole('button', { name: 'Discard' })).toBeNull()
+      }
+    })
+
+    it('Discard of more than 50 MB asks first, and only "Discard" in the question removes the row', async () => {
+      state.local = [{ ...localDl, status: 'error', error: 'network blip', received: 62_652_416, total: 1e9 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      const dialog = await screen.findByRole('alertdialog')
+      expect(dialog.textContent).toContain('Discard this download?')
+      expect(dialog.textContent).toContain('local.gguf: the 63 MB downloaded so far will be deleted. Resume continues from there instead.')
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Keep it' }))
+      await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+      expect(localRemove).not.toHaveBeenCalled()
+
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      await userEvent.click(within(await screen.findByRole('alertdialog')).getByRole('button', { name: 'Discard' }))
+      expect(localRemove).toHaveBeenCalledWith('local-1')
+      expect(localCancel).not.toHaveBeenCalled()
+    })
+
+    it('Discard of a small partial removes the row at once', async () => {
+      state.local = [{ ...localDl, status: 'paused', received: 1_000_000, total: 1e9 }]
+      renderPanel()
+      await userEvent.click(screen.getByRole('button', { name: 'Discard' }))
+      expect(screen.queryByRole('alertdialog')).toBeNull()
+      expect(localRemove).toHaveBeenCalledWith('local-1')
+    })
+
+    it('keeps Cancel, not Discard, on a remote paused row: removal is local-only', async () => {
+      state.links = [link()]
+      state.queues = { l1: [{ ...remoteDl, status: 'paused' }] }
+      renderPanel()
+      await screen.findByText('remote.gguf')
+      expect(within(rowEl('remote-1')).getByRole('button', { name: 'Cancel' })).toBeTruthy()
+      expect(within(rowEl('remote-1')).queryByRole('button', { name: 'Discard' })).toBeNull()
     })
   })
 })

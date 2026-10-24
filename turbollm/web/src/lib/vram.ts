@@ -3,6 +3,7 @@
 // only number we show pre-run, always labeled an estimate (ADR-012).
 import type { FitVerdict, HfSearchItem, LoadProfile, ModelEntry, SysGpu } from './types'
 
+// Fallback only, for a model that declares no per-head dimension (headDim 0/absent) — as in the daemon.
 const HEAD_DIM = 128
 
 /** Mirror of the daemon's `gpuBudgetMb` (ADR-054): a layer/row split (and the default)
@@ -156,6 +157,81 @@ function kvBytesPerElem(t: string): number {
   }
 }
 
+// ── Attention-layout-aware KV sizing: a port of src/models/profile.ts's kvCacheElems /
+// ssmStateElems (ADR-223). The old all-layer, headDim-128 formula here over-counted sliding-window
+// (Gemma) and hybrid linear/SSM (Qwen3.5/3.6, Qwen3-Next) models by up to ~10x, so the load
+// dialog's live bar said "overflow" where the daemon's own verdict said "tight". Kept identical to
+// the daemon's (see profile.ts for why every undeclared or unusable layout degrades to the
+// conservative legacy formula); vram-parity.test.ts pins the two to the same numbers.
+
+function isFullAttentionLayer(i: number, interval: number): boolean {
+  return (i + 1) % interval === 0
+}
+
+function hybridInterval(m: ModelEntry, blocks: number): number {
+  const interval = m.fullAttentionInterval ?? 0
+  if (!Number.isInteger(interval) || interval <= 1 || interval > blocks) return 0
+  return interval
+}
+
+function linearLayerCount(m: ModelEntry): number {
+  const blocks = m.blockCount || 1
+  const interval = hybridInterval(m, blocks)
+  if (interval === 0) return 0
+  let n = 0
+  for (let i = 0; i < blocks; i++) if (!isFullAttentionLayer(i, interval)) n++
+  return n
+}
+
+/** Combined K+V cache elements for `ctx` tokens (mirror of the daemon's `kvCacheElems`). A
+ *  sliding layer holds llama.cpp's `pad256(min(ctx, window × swaSeqs + ubatch))` cells. */
+function kvCacheElems(m: ModelEntry, ctx: number, swaSeqs: number, ubatch: number): number {
+  const blocks = m.blockCount || 1
+  const kvHeads = m.headCountKv || 8
+  const headDim = m.headDim || HEAD_DIM
+  const perLayerHeads =
+    m.headCountKvPerLayer?.length === blocks ? m.headCountKvPerLayer : undefined
+  const window = m.slidingWindow ?? 0
+  const swaPattern =
+    window > 0 && m.slidingWindowPattern?.length === blocks ? m.slidingWindowPattern : undefined
+  const swaHeadDim = (m.headDimSwa ?? 0) > 0 ? (m.headDimSwa as number) : headDim
+  const interval = hybridInterval(m, blocks)
+  const hybrid = interval > 0 && swaPattern === undefined
+
+  if (swaPattern === undefined && !hybrid) return 2 * blocks * ctx * kvHeads * headDim
+
+  const swaTokens = Math.ceil(Math.min(ctx, window * swaSeqs + ubatch) / 256) * 256
+  let elems = 0
+  for (let i = 0; i < blocks; i++) {
+    if (hybrid && !isFullAttentionLayer(i, interval)) continue
+    const sliding = swaPattern?.[i] === true
+    const tokens = sliding ? swaTokens : ctx
+    const heads = perLayerHeads?.[i] || kvHeads
+    const dim = sliding ? swaHeadDim : headDim
+    elems += 2 * tokens * heads * dim
+  }
+  return elems
+}
+
+/** K+V elements across all sequences (mirror of the daemon's `profileKvElems`): a non-unified
+ *  cache is `parallel` streams of pad256(ctx / parallel) cells, not `parallel` full contexts. */
+function profileKvElems(m: ModelEntry, p: LoadProfile): number {
+  const seqs = Math.max(1, p.parallel)
+  const ubatch = p.uBatchSize || 512
+  if (p.kvUnified || seqs === 1) return kvCacheElems(m, p.ctx, seqs, ubatch)
+  return kvCacheElems(m, Math.ceil(Math.floor(p.ctx / seqs) / 256) * 256, 1, ubatch) * seqs
+}
+
+/** Elements in the linear/SSM layers' constant recurrent state (mirror of `ssmStateElems`). */
+function ssmStateElems(m: ModelEntry): number {
+  const layers = linearLayerCount(m)
+  const inner = m.ssmInnerSize ?? 0
+  const state = m.ssmStateSize ?? 0
+  if (layers === 0 || inner <= 0 || state <= 0) return 0
+  const conv = Math.max(1, m.ssmConvKernel ?? 1)
+  return layers * inner * (state + conv - 1)
+}
+
 export function estimateVram(
   p: LoadProfile,
   m: ModelEntry,
@@ -166,16 +242,22 @@ export function estimateVram(
   const blocks = m.blockCount || 1
   const gpuFrac = m.moe ? 1 - 0.85 * (p.nCpuMoe / blocks) : Math.min(p.ngl, blocks) / blocks
   const weightsMb = sizeMb * Math.max(0, Math.min(1, gpuFrac))
-  const kvElems = 2 * blocks * p.ctx * (m.headCountKv || 8) * HEAD_DIM
+  // Every sequence's cells, unified or not — see profileKvElems.
+  const kvElems = profileKvElems(m, p)
+  // Recurrent state at f32, not scaled by the KV quant or ctx (llama.cpp keeps it unquantized).
+  const ssmMb = (ssmStateElems(m) * 4) / 1e6
   // KV cache only weighs on VRAM when offloaded to the GPU; in RAM mode (--no-kv-offload) it
   // costs no VRAM. Absent on pre-feature profiles → treated as the GPU default.
   // kvElems is the COMBINED K+V count (×2, identical shape for both) — halved so an
   // asymmetric quant (K=q8_0, V=q4_0) is weighted correctly instead of assuming V
-  // matches K's byte width (mirrors the same split in src/models/profile.ts).
+  // matches K's byte width. Same expression as src/models/profile.ts, so the two round alike.
+  const kvBytesMb = ((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6
+  // The recurrent state is one cell per sequence whether or not the KV cache is unified.
   const kvMb = p.kvOffload === false
     ? 0
-    : ((kvElems / 2) * (kvBytesPerElem(p.kvTypeK) + kvBytesPerElem(p.kvTypeV)) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
-  const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? 600 : 0
+    : kvBytesMb + ssmMb * Math.max(1, p.parallel)
+  // The mmproj's real on-disk size plus ~15% for the vision encoder's buffers, as the daemon does.
+  const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? ((m.mmprojSizeBytes ?? 0) / 1e6) * 1.15 : 0
   const estMb = Math.round(weightsMb + kvMb + 800 + mmprojMb)
   const pct = estMb / totalVramMb
   const verdict: FitVerdict = pct <= 0.8 ? 'fits' : pct <= 0.95 ? 'tight' : 'overflow'

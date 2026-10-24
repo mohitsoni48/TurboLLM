@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
+import { defaultConfig } from '../config/config'
 import type { Deps } from '../deps'
 import { ScannerError } from '../models/scanner'
 import { registerApi } from './routes'
@@ -10,6 +11,8 @@ for (const [code, status] of [['unsafe_model_delete', 409], ['no_such_model', 40
     const app = new Hono()
     const message = 'Real target: /external/model.gguf. Manage it directly at its real location.'
     registerApi(app, {
+      // The host's own request (loopback-only bind): the route's key gate reads the config.
+      store: { snapshot: () => defaultConfig() },
       scanner: {
         get: () => ({ key: 'model', path: '/library/model.gguf' }),
         delete: async () => { throw new ScannerError(code, message) },

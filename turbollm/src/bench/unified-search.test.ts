@@ -29,10 +29,11 @@ function spillAt(ngl: number): number {
   return APU_PROBES[ngl] ?? Math.round(2138 + 186.2 * (ngl - 2))
 }
 
-/** Replays denseSearch's binary search over ngl ∈ [0, blockCount] using the REAL probeVerdict for
- *  every decision — the same loop shape as bench.ts (`fits` ⇒ record and search UP). */
+/** Replays denseSearch's binary search over ngl ∈ [0, blockCount + 1] (the +1 is llama.cpp's output
+ *  layer — see denseSearch) using the REAL probeVerdict for every decision — the same loop shape as
+ *  bench.ts (`fits` ⇒ record and search UP). */
 function runNglSearch(blockCount: number, unified: boolean): { best: number | null; probed: number[] } {
-  let lo = 0, hi = blockCount, best: number | null = null
+  let lo = 0, hi = blockCount + 1, best: number | null = null
   const probed: number[] = []
   while (lo <= hi) {
     const mid = Math.floor((lo + hi) / 2)
@@ -46,15 +47,17 @@ function runNglSearch(blockCount: number, unified: boolean): { best: number | nu
 
 test('REGRESSION: the shipped code rejects all five probes and finds no candidate', () => {
   // Exactly the sequence in the issue: 24 → 11 → 5 → 2 → 0, every one called spill, nothing benched.
-  const { best, probed } = runNglSearch(49, false)
+  // (48 blocks → range [0, 49], whose midpoints are that sequence.)
+  const { best, probed } = runNglSearch(48, false)
   assert.deepEqual(probed, [24, 11, 5, 2, 0])
   assert.equal(best, null, 'this null is the "No candidate completed successfully" the reporter saw')
 })
 
 test('unified=true: the first probe fits, so the search climbs and returns a benchable ngl', () => {
   // With spill detection off, nothing bounds the search but a real OOM (see below), so it walks up
-  // to full offload — the correct answer on a box where "GPU memory" is system memory.
-  const { best, probed } = runNglSearch(49, true)
+  // to full offload — the correct answer on a box where "GPU memory" is system memory. Full offload
+  // is ngl = blockCount + 1: all 48 repeating blocks plus the output layer.
+  const { best, probed } = runNglSearch(48, true)
   assert.equal(probed[0], 24, 'same first probe as the failing run — it just fits this time')
   assert.equal(best, 49)
   // …and it is never null, which is the whole point: a t/s measurement finally happens.

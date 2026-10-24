@@ -13,6 +13,8 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import type { Deps } from '../deps'
 import type { CustomChatAgent, BuiltinAgentOverride } from '../config/config'
+import { isLocalOrAuthenticated } from '../auth'
+import { listsMcpTool, MCP_AGENT_REFUSED_MESSAGE } from '../tools/tool-registry'
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function err(c: any, status: number, code: string, message: string) {
@@ -35,6 +37,9 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
   // take precedence, but this keeps the two resources visually separate too).
   app.get('/api/v1/chat-agents/builtin-overrides', (c) => c.json(d.store.snapshot().builtinAgentOverrides))
 
+  // No MCP-tool rule here, unlike the custom-agent routes below: a built-in agent never backs a
+  // routine (chat-runner.ts resolves customAgents only), and a live chat offers MCP tools only to a
+  // turn whose caller may use them (chat-routes.ts refuseMcp), under the owner's tool policies.
   app.put('/api/v1/chat-agents/builtin-overrides/:id', async (c) => {
     const id = c.req.param('id')
     if (!id.trim()) return err(c, 400, 'invalid_config_value', 'id is required.')
@@ -62,6 +67,14 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
 
   app.post('/api/v1/chat-agents', async (c) => {
     const b = await body<Partial<CustomChatAgent>>(c)
+    // A chat routine runs every tool its agent lists with no approval (chat-runner.ts), so an
+    // agent naming the owner's MCP tool is a standing approval to run it: the isLocalOrAuthenticated
+    // bar adding the MCP server has (listsMcpTool). Without it a keyless Serve identity, Access JWT
+    // or open-LAN peer, or a config:write remote token, refused the tool in its own chat, saved it
+    // here and had a chat routine run it. api_key_required: the web client opens its key prompt.
+    if (listsMcpTool(sanitizeStringArray(b.tools)) && !isLocalOrAuthenticated(c, d)) {
+      return err(c, 403, 'api_key_required', MCP_AGENT_REFUSED_MESSAGE)
+    }
     if (!b.name?.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     if (d.store.snapshot().customAgents.length >= AGENT_CAP) {
       return err(c, 400, 'too_many_agents', `Agent limit reached (${AGENT_CAP}).`)
@@ -80,10 +93,16 @@ export function registerChatAgentRoutes(app: Hono, d: Deps): void {
 
   app.put('/api/v1/chat-agents/:id', async (c) => {
     const id = c.req.param('id')
-    if (!d.store.snapshot().customAgents.some((a) => a.id === id)) {
+    const existing = d.store.snapshot().customAgents.find((a) => a.id === id)
+    if (!existing) {
       return err(c, 404, 'not_found', 'Agent not found.')
     }
     const b = await body<Partial<CustomChatAgent>>(c)
+    // Same rule as the create route, for an edit that adds an MCP tool and for any edit of an agent
+    // that has one: its system prompt and skills are what a chat routine runs that tool under.
+    if ((listsMcpTool(existing.tools) || listsMcpTool(sanitizeStringArray(b.tools))) && !isLocalOrAuthenticated(c, d)) {
+      return err(c, 403, 'api_key_required', MCP_AGENT_REFUSED_MESSAGE)
+    }
     if (b.name !== undefined && !b.name.trim()) return err(c, 400, 'invalid_config_value', 'name is required.')
     d.store.update((cfg) => {
       const a = cfg.customAgents.find((x) => x.id === id)!

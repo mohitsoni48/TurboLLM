@@ -1,5 +1,5 @@
 import type { MiddlewareHandler } from 'hono'
-import { resolveKey, grantKind } from '../auth'
+import { resolveKey, grantKind, isExtOnlyKey } from '../auth'
 import type { Deps } from '../deps'
 import { hasCapability } from './capabilities'
 import { isTurboLinkEnabled, turboLinkDisabled, TURBO_LINK_DISABLED_HOST_MESSAGE } from './gate'
@@ -8,7 +8,8 @@ import type { LinkCapability } from './types'
 /** Turbo Link's gate for /api/link/v1 — an INVERSION of lanAuth, and the reason the
  *  capability model is not decorative (spec §3.3, ADR-376).
  *
- *  lanAuth exempts loopback unconditionally and only enforces a key when lanBind is on.
+ *  lanAuth trusts loopback callers (whose Host names this machine and, on Android, that carry
+ *  the app secret) and lets a LAN peer through keyless when "Require API key" is off.
  *  Correct for its own purpose, catastrophic here:
  *    - a host with LAN open and "Require API key" OFF would let a peer call in with NO
  *      token at all, bypassing the grant entirely; and
@@ -40,8 +41,10 @@ export function linkAuth(d: Deps): MiddlewareHandler {
     // machine, and `resolveKey` matches by hash alone, so it must be excluded here
     // explicitly rather than assumed. Same discipline `hostGate`/`verifyKeyValue` already
     // apply for the reverse direction (auth.ts's C1/N1 fix): a grant minted for one façade
-    // must never silently authenticate a different one it was never issued for.
-    if (!key || grantKind(key) === 'remote') {
+    // must never silently authenticate a different one it was never issued for. Nor an
+    // External Chat API tenant key (isExtOnlyKey): it has no grant, so `hello` would hand it
+    // every capability.
+    if (!key || grantKind(key) === 'remote' || isExtOnlyKey(key)) {
       return c.json(
         { error: { code: 'unauthorized', message: 'A valid Turbo Link token is required.' } },
         401,

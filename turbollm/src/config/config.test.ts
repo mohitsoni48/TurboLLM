@@ -12,16 +12,22 @@
 //      profiles, and a model with no engine-specific profile falls back to the last-used one.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readFileSync, rmSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import { spawnSync } from 'node:child_process'
 import { join } from 'node:path'
 import {
   ANY_ENGINE,
   ConfigStore,
   MODEL_PRESET_CAP,
   SCHEMA_VERSION,
+  configAccessProblem,
+  configuredDaemonPort,
+  decodeConfigText,
   defaultConfig,
   deleteModelProfile,
   getModelProfile,
+  migrateLegacyDataDir,
   migrateModelKey,
   prunePresets,
   setModelProfile,
@@ -145,6 +151,56 @@ test('v2→v3 migration preserves other v2 config data (no data loss on version 
   }
 })
 
+// The engine selection on load. An empty one was filled with the first engine on every load, so a config left with no
+// engine selected (the selected one Disabled or Deleted, Registry.remove) came back with one the user never picked. It
+// stays empty, a dangling one is cleared, and only a file with no selection on record starts on the first engine.
+test('ConfigStore.load keeps an empty engine selection empty and starts a file with none on record on the first engine', () => {
+  const path = tmpConfigPath()
+  try {
+    const engine = (id: string) => ({
+      id, name: id, binPath: `/opt/${id}/llama-server`, kind: 'llama-server', version: 'b1', capabilities: { kvTypes: [], flags: [] }, addedAt: '',
+    })
+    const write = (over: Record<string, unknown>, drop?: string) => {
+      const raw: Record<string, unknown> = { ...defaultConfig(), engines: [engine('kobold'), engine('llama')], ...over }
+      if (drop) delete raw[drop]
+      writeFileSync(path, JSON.stringify(raw))
+    }
+    const loaded = () => ConfigStore.load(path).snapshot().activeEngineId
+    // The current schema (normalize only) and an older one (migrate first).
+    for (const version of [SCHEMA_VERSION, 2]) {
+      write({ version, activeEngineId: '' })
+      assert.equal(loaded(), '', `v${version}: none selected stays so`)
+      write({ version, activeEngineId: 'gone' })
+      assert.equal(loaded(), '', `v${version}: a selected engine that is gone leaves none selected`)
+      write({ version, activeEngineId: 'llama' })
+      assert.equal(loaded(), 'llama', `v${version}: a selection is kept`)
+      write({ version }, 'activeEngineId')
+      assert.equal(loaded(), 'kobold', `v${version}: a file with no selection on record starts on the first engine`)
+    }
+  } finally {
+    cleanup(path)
+  }
+})
+
+// The restart keeper is the old process, its config as it stood at the restart, and its replacement owns config.json:
+// work of the old process still in flight in the keeper (a Turbo Link heartbeat, an install that ends) wrote that stale
+// copy over what the user had changed in the replacement since.
+test('ConfigStore.stopSaving (the restart keeper): update() changes this copy only and leaves config.json to its new owner', () => {
+  const path = tmpConfigPath()
+  try {
+    const keeper = ConfigStore.load(path)
+    const replacement = ConfigStore.load(path)
+    keeper.stopSaving()
+    replacement.update((c) => { c.daemon.port = 7123 })
+    keeper.update((c) => { c.daemon.port = 7999 })
+    assert.equal(keeper.snapshot().daemon.port, 7999, 'its own copy changes, as before')
+    assert.equal(ConfigStore.load(path).snapshot().daemon.port, 7123, 'the file keeps what its owner saved')
+    assert.equal(existsSync(`${path}.${process.pid}.tmp`), false, 'and no tmp file is left behind')
+  } finally {
+    cleanup(path)
+  }
+})
+
 test('getModelProfile: exact-engine match wins over any fallback', () => {
   const cfg = defaultConfig()
   const engineA = 'aaaa'
@@ -223,6 +279,29 @@ test('deleteModelProfile removes only the target slot, pruning the model when em
 
   // Deleting from an unknown model is a no-op (no throw).
   assert.doesNotThrow(() => deleteModelProfile(cfg, 'gone|q4|1', 'aaaa'))
+})
+
+test('profile helpers never reach Object or Object.prototype through a key like constructor or __proto__', () => {
+  // A probe stands in for a built-in such as Object.entries, which
+  // `delete cfg.modelProfiles["constructor"][engine]` used to remove process-wide.
+  const probe = '__tllmProfileProbe'
+  const objects = [Object, Object.prototype] as unknown as Array<Record<string, unknown>>
+  for (const o of objects) Object.defineProperty(o, probe, { value: 1, configurable: true, writable: true })
+  try {
+    const cfg = defaultConfig()
+    deleteModelProfile(cfg, 'constructor', probe)
+    deleteModelProfile(cfg, '__proto__', probe)
+    for (const o of objects) assert.equal(o[probe], 1)
+    assert.equal(getModelProfile(cfg, 'constructor', probe), undefined)
+    assert.throws(() => setModelProfile(cfg, '__proto__', 'aaaa', flatProfile()))
+    assert.throws(() => setModelProfile(cfg, 'm|q4|1', '__proto__', flatProfile()))
+    // An inherited name that is not reserved becomes an ordinary own entry.
+    setModelProfile(cfg, 'toString', 'aaaa', flatProfile({ ctx: 1024 }))
+    assert.equal(Object.hasOwn(cfg.modelProfiles, 'toString'), true)
+    assert.equal((getModelProfile(cfg, 'toString', 'aaaa') as { ctx: number }).ctx, 1024)
+  } finally {
+    for (const o of objects) delete o[probe]
+  }
 })
 
 test('bug #35 scenario: two engines for one model keep independent profiles; unknown falls back to the last-used one', () => {
@@ -680,4 +759,358 @@ test('migrateModelKey: renaming to the same key is a no-op', () => {
   setModelProfile(cfg, 'm|q4|1', 'e', flatProfile())
   const moved = migrateModelKey(cfg, 'm|q4|1', 'm|q4|1')
   assert.equal(moved, false)
+})
+
+// A UTF-8 BOM (Windows editors, PowerShell 5.1 `Set-Content -Encoding UTF8`) made JSON.parse
+// throw, and load() then treated a valid hand-edited config as corrupt and reset it to defaults
+// — API keys, engines and model dirs gone.
+test('ConfigStore.load: a UTF-8 BOM before the JSON is ignored, not treated as a corrupt file', () => {
+  const path = tmpConfigPath()
+  try {
+    const cfg = { ...defaultConfig(), modelDirs: ['/models/bom-test'] }
+    writeFileSync(path, '\uFEFF' + JSON.stringify(cfg))
+
+    const store = ConfigStore.load(path)
+
+    assert.equal(store.brokenBackup(), '', 'no .broken-* backup may be written')
+    assert.deepEqual(store.snapshot().modelDirs, ['/models/bom-test'])
+  } finally {
+    cleanup(path)
+  }
+})
+
+// PowerShell 5.1's `>` and `Out-File` write UTF-16LE with a BOM. Read as UTF-8 that is not JSON,
+// so load() reset the whole config to defaults and kept a backup decoded as UTF-8, mangling any
+// non-ASCII text in it.
+test('ConfigStore.load: a UTF-16 (LE or BE) config with a BOM is read, not reset to defaults', () => {
+  for (const [label, encode] of [
+    ['UTF-16LE', (t: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(t, 'utf16le')])],
+    ['UTF-16BE', (t: string) => Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(t, 'utf16le').swap16()])],
+  ] as const) {
+    const path = tmpConfigPath()
+    try {
+      const cfg = defaultConfig()
+      cfg.daemon.port = 7123
+      cfg.modelDirs = ['C:\\Modèles\\日本']
+      writeFileSync(path, encode(JSON.stringify(cfg)))
+
+      const store = ConfigStore.load(path)
+
+      assert.equal(store.brokenBackup(), '', `${label}: no .broken-* backup may be written`)
+      assert.equal(store.snapshot().daemon.port, 7123, label)
+      assert.deepEqual(store.snapshot().modelDirs, ['C:\\Modèles\\日本'], label)
+    } finally {
+      cleanup(path)
+    }
+  }
+})
+
+test('ConfigStore.load: the .broken-* backup of an unreadable config is its exact bytes', () => {
+  const path = tmpConfigPath()
+  try {
+    const bytes = Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('{"modelDirs": ["Modèles"', 'utf16le')])
+    writeFileSync(path, bytes)
+
+    const store = ConfigStore.load(path)
+
+    assert.ok(store.brokenBackup(), 'a truncated file is still reset')
+    assert.deepEqual(readFileSync(store.brokenBackup()), bytes)
+  } finally {
+    cleanup(path)
+  }
+})
+
+// What `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+test('configuredDaemonPort: reads the port through a UTF-8 or UTF-16 BOM; shipped default otherwise', () => {
+  const path = tmpConfigPath()
+  try {
+    const json = JSON.stringify({ daemon: { port: 7123 } })
+    writeFileSync(path, '\uFEFF' + json)
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-8 BOM')
+    writeFileSync(path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(json, 'utf16le')]))
+    assert.equal(configuredDaemonPort(path), 7123, 'UTF-16LE BOM')
+    writeFileSync(path, json)
+    assert.equal(configuredDaemonPort(path), 7123)
+    writeFileSync(path, '{ not json')
+    assert.equal(configuredDaemonPort(path), defaultConfig().daemon.port)
+    assert.equal(configuredDaemonPort(join(path, '..', 'absent.json')), defaultConfig().daemon.port)
+  } finally {
+    cleanup(path)
+  }
+})
+
+// migrateLegacyDataDir moves the pre-0.x platform config dir to ~/.turbollm and repoints engine
+// binPaths that named the old dir. It read config.json as UTF-8, so a UTF-16 file (PowerShell
+// 5.1's `>`, which load() reads) failed JSON.parse there and every managed build was left
+// pointing into the folder that had just been moved away.
+test('migrateLegacyDataDir: repoints engine binPaths in a UTF-16 (LE or BE) config too', (t) => {
+  const envKeys = ['HOME', 'USERPROFILE', 'APPDATA', 'XDG_CONFIG_HOME'] as const
+  const saved = envKeys.map((k) => [k, process.env[k]] as const)
+  t.after(() => {
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  })
+  for (const [label, encode] of [
+    ['UTF-16LE', (s: string) => Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(s, 'utf16le')])],
+    ['UTF-16BE', (s: string) => Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(s, 'utf16le').swap16()])],
+  ] as const) {
+    // homedir() follows HOME (USERPROFILE on Windows); the legacy dir follows APPDATA,
+    // ~/Library/Application Support or XDG_CONFIG_HOME, by platform.
+    const home = tmpDir('tllm-legacy-home-')
+    process.env.HOME = home
+    process.env.USERPROFILE = home
+    process.env.APPDATA = join(home, 'AppData', 'Roaming')
+    process.env.XDG_CONFIG_HOME = join(home, '.config')
+    const legacy =
+      process.platform === 'win32'
+        ? join(home, 'AppData', 'Roaming', 'turbollm')
+        : process.platform === 'darwin'
+          ? join(home, 'Library', 'Application Support', 'turbollm')
+          : join(home, '.config', 'turbollm')
+    mkdirSync(legacy, { recursive: true })
+    const cfg = defaultConfig()
+    cfg.engines = [{ binPath: join(legacy, 'engines', 'llama.cpp-b4000', 'llama-server') }] as unknown as Config['engines']
+    writeFileSync(join(legacy, 'config.json'), encode(JSON.stringify(cfg)))
+
+    migrateLegacyDataDir()
+
+    const moved = JSON.parse(decodeConfigText(readFileSync(join(home, '.turbollm', 'config.json')))) as Config
+    assert.equal(moved.engines[0].binPath, join(home, '.turbollm', 'engines', 'llama.cpp-b4000', 'llama-server'), label)
+  }
+})
+
+// Every process that loads the config saves it (load() persists its migration), so
+// `turbollm --stop` and a refused second start write the running daemon's config.json too. With
+// one shared `config.json.tmp`, such a load landing between a daemon save's write and its rename
+// overwrote the daemon's tmp with its own snapshot and renamed it away: the daemon's rename then
+// threw ENOENT and its change never reached disk.
+test("ConfigStore: another process's load during a save leaves that save's tmp file alone", (t) => {
+  const path = tmpConfigPath()
+  const realRename = fs.renameSync
+  const realPid = process.pid
+  const setPid = (pid: number) =>
+    Object.defineProperty(process, 'pid', { value: pid, writable: false, enumerable: true, configurable: true })
+  try {
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    const daemon = ConfigStore.load(path)
+    let interleaved = false
+    t.mock.method(fs, 'renameSync', (from: string, to: string) => {
+      if (!interleaved) {
+        // The daemon's tmp is written, its rename not yet done: `turbollm --stop` loads now.
+        interleaved = true
+        setPid(realPid + 1)
+        try {
+          ConfigStore.load(path)
+        } finally {
+          setPid(realPid)
+        }
+      }
+      return realRename(from, to)
+    })
+    syncBuiltinESMExports()
+
+    daemon.update((c) => {
+      c.modelDirs = ['/models/saved-by-daemon']
+    })
+
+    assert.equal(interleaved, true)
+    assert.deepEqual((JSON.parse(readFileSync(path, 'utf8')) as Config).modelDirs, ['/models/saved-by-daemon'])
+    assert.deepEqual(readdirSync(join(path, '..')).filter((n) => n.endsWith('.tmp')), [], 'no tmp file left behind')
+  } finally {
+    setPid(realPid)
+    t.mock.restoreAll()
+    syncBuiltinESMExports()
+    cleanup(path)
+  }
+})
+
+// A save writes the whole config (the HF and GitHub tokens, tunnel tokens) to its tmp file, then
+// renames it into place. With the per-process name, a process killed between the two left
+// `config.json.<pid>.tmp` behind for good: no later save overwrites another pid's, so each kept a
+// copy of the tokens saved then, after the user rotated or removed them.
+test('ConfigStore.load: removes a tmp file a killed process left, not one a live process may be writing', () => {
+  const path = tmpConfigPath()
+  const dir = join(path, '..')
+  try {
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    const dead = spawnSync(process.execPath, ['-e', '']).pid as number // exited before spawnSync returns
+    const live = process.ppid // the test runner
+    writeFileSync(join(dir, `config.json.${dead}.tmp`), JSON.stringify({ hf: { token: 'hf_rotated_since' } }))
+    writeFileSync(join(dir, `config.json.${live}.tmp`), '{}')
+    writeFileSync(join(dir, 'other.json.123.tmp'), '{}')
+    // Not a name save writes, though Number() reads a pid (one no process can have) out of it.
+    writeFileSync(join(dir, 'config.json.1e9.tmp'), '{}')
+
+    ConfigStore.load(path)
+
+    assert.deepEqual(
+      readdirSync(dir).filter((n) => n.endsWith('.tmp')).sort(),
+      [`config.json.${live}.tmp`, 'other.json.123.tmp', 'config.json.1e9.tmp'].sort(),
+    )
+  } finally {
+    cleanup(path)
+  }
+})
+
+// config.json holds the tunnel, HF and GitHub tokens, the search keys, MCP env values and API keys
+// of MCP servers, and link peer tokens. save() wrote its tmp file with the default mode and renamed
+// it into place, so under the usual umask 022 config.json was 0644 in a 0755 ~/.turbollm (macOS
+// home folders, older Debian/Ubuntu): readable by every other local account, the daemon running or
+// not. A user's chmod 600 was undone by the next save. The .broken-* backup is a full copy too.
+test('ConfigStore: config.json and its .broken-* backup are readable by their owner only', { skip: process.platform === 'win32' && 'no POSIX file modes' }, () => {
+  const path = tmpConfigPath()
+  const mode = (p: string) => statSync(p).mode & 0o777
+  const umask = process.umask(0o022)
+  try {
+    const store = ConfigStore.load(path)
+    assert.equal(mode(path), 0o600, 'a new config.json')
+    store.update((c) => { c.hf.token = 'hf_SECRET' })
+    assert.equal(mode(path), 0o600, 'after a save')
+
+    // An existing install's 0644 file is tightened at its next load, and a chmod back is undone.
+    chmodSync(path, 0o644)
+    const existing = ConfigStore.load(path)
+    assert.equal(mode(path), 0o600, 'an existing 0644 config.json, at the next load')
+    chmodSync(path, 0o644)
+    existing.update((c) => { c.gh.token = 'ghp_SECRET' })
+    assert.equal(mode(path), 0o600, 'at the next save')
+
+    // A tmp file under this process's pid an earlier process left (pid reuse after a kill), one the
+    // load's sweep did not remove: its 0644 mode must not carry over into config.json.
+    const tmp = `${path}.${process.pid}.tmp`
+    writeFileSync(tmp, '{}')
+    chmodSync(tmp, 0o644)
+    existing.update((c) => { c.hf.token = 'hf_SECRET2' })
+    assert.equal(mode(path), 0o600, "a leftover tmp of this pid's")
+
+    // An unparsable file is copied to .broken-<ts>, its tokens included.
+    writeFileSync(path, '{"hf": {"token": "hf_SECRET"')
+    const reset = ConfigStore.load(path)
+    assert.ok(reset.brokenBackup())
+    assert.equal(mode(reset.brokenBackup()), 0o600, 'the .broken-* backup')
+    assert.equal(mode(path), 0o600, 'the reset config.json')
+  } finally {
+    process.umask(umask)
+    cleanup(path)
+  }
+})
+
+// Every load saved config.json, and a save creates the file anew, owned by whoever saves, mode
+// 0600. `sudo turbollm --stop` (a daemon started elevated) with the owner's HOME, as macOS keeps
+// it, therefore left config.json root's and unreadable to its owner, whose next start crashed with
+// an uncaught EACCES. The test runs as one user, so another user's file is a stubbed getuid.
+test("ConfigStore.load: a config.json of another user's is neither rewritten nor chmodded", { skip: process.platform === 'win32' && 'no POSIX owners' }, (t) => {
+  const path = tmpConfigPath()
+  const mode = (p: string) => statSync(p).mode & 0o777
+  try {
+    // Not in the form save() writes (compact, an old file's missing keys): a load would save it.
+    const old = { ...defaultConfig(), modelDirs: ['/models/mine'] } as Partial<Config>
+    delete old.gh
+    writeFileSync(path, JSON.stringify(old))
+    chmodSync(path, 0o644)
+    const owner = statSync(path).uid
+    t.mock.method(process as { getuid(): number }, 'getuid', () => owner + 1) // optional in the types (none on Windows)
+    const bytes = readFileSync(path)
+    const ino = statSync(path).ino
+
+    const store = ConfigStore.load(path)
+    assert.deepEqual(store.snapshot().modelDirs, ['/models/mine'])
+    assert.equal(store.snapshot().gh.token, '', 'normalized in memory')
+    assert.deepEqual(readFileSync(path), bytes, 'config.json is not rewritten')
+    assert.equal(statSync(path).ino, ino, 'nor replaced')
+    assert.equal(statSync(path).uid, owner)
+    assert.equal(mode(path), 0o644, 'nor chmodded')
+
+    // An unparsable one keeps its own bytes too; the backup is a new file of this user's.
+    writeFileSync(path, '{"hf": {"token": "hf_SECRET"')
+    const broken = readFileSync(path)
+    const reset = ConfigStore.load(path)
+    assert.ok(reset.brokenBackup())
+    assert.deepEqual(readFileSync(reset.brokenBackup()), broken)
+    assert.deepEqual(readFileSync(path), broken, 'the broken config.json is not reset on disk')
+    assert.equal(reset.brokenLeftInPlace(), true, 'so the start does not say it was reset')
+
+    t.mock.restoreAll() // this user's own: reset, as before
+    const own = ConfigStore.load(path)
+    assert.equal(own.brokenLeftInPlace(), false)
+    assert.notDeepEqual(readFileSync(path), broken)
+  } finally {
+    t.mock.restoreAll()
+    cleanup(path)
+  }
+})
+
+// load() tightened an existing install's 0644 file by always rewriting it; a load now writes only
+// what a migration or normalization changed, and fixes the mode in place.
+test('ConfigStore.load: a config.json already in saved form is left in place, its mode tightened there', { skip: process.platform === 'win32' && 'no POSIX file modes' }, () => {
+  const path = tmpConfigPath()
+  const umask = process.umask(0o022)
+  try {
+    ConfigStore.load(path).update((c) => { c.modelDirs = ['/models/mine'] })
+    ConfigStore.load(path) // normalizes what the first save wrote (defaultConfig() as it is)
+    const bytes = readFileSync(path)
+    const ino = statSync(path).ino
+    chmodSync(path, 0o644)
+    // A tmp under this process's pid an earlier process left (pid reuse after a kill mid-save):
+    // the load's save removed it, and a load that saves nothing must still not keep its tokens.
+    const leftover = `${path}.${process.pid}.tmp`
+    writeFileSync(leftover, JSON.stringify({ hf: { token: 'hf_rotated_since' } }))
+
+    const store = ConfigStore.load(path)
+    assert.deepEqual(store.snapshot().modelDirs, ['/models/mine'])
+    assert.equal(statSync(path).ino, ino, 'not replaced by a save')
+    assert.deepEqual(readFileSync(path), bytes)
+    assert.equal(statSync(path).mode & 0o777, 0o600, 'tightened in place')
+    assert.equal(existsSync(leftover), false, "this pid's leftover tmp is swept")
+
+    // One a migration or normalization changes is still saved.
+    writeFileSync(path, JSON.stringify(defaultConfig()))
+    ConfigStore.load(path)
+    assert.notEqual(readFileSync(path, 'utf8'), JSON.stringify(defaultConfig()))
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), JSON.parse(JSON.stringify(ConfigStore.load(path).snapshot())))
+  } finally {
+    process.umask(umask)
+    cleanup(path)
+  }
+})
+
+test('configAccessProblem: names the file and whose it is for a permission error, nothing for others', { skip: process.platform === 'win32' && 'no POSIX owners' }, (t) => {
+  const path = tmpConfigPath()
+  try {
+    writeFileSync(path, '{}')
+    const denied = Object.assign(new Error(`EACCES: permission denied, open '${path}'`), { code: 'EACCES' })
+    assert.equal(configAccessProblem(path, Object.assign(new Error('ENOENT'), { code: 'ENOENT' })), undefined)
+    assert.equal(configAccessProblem(path, new SyntaxError('Unexpected token')), undefined)
+
+    // This user's own file and folder: no owner to blame.
+    const own = configAccessProblem(path, denied) ?? ''
+    assert.ok(own.includes(path) && own.includes('EACCES'), own)
+    assert.ok(!own.includes('another user'), own)
+
+    const uid = statSync(path).uid
+    t.mock.method(process as { getuid(): number }, 'getuid', () => uid + 1)
+    const foreign = configAccessProblem(path, denied) ?? ''
+    assert.ok(foreign.includes(`TurboLLM cannot read or write its config file ${path}`), foreign)
+    assert.ok(foreign.includes(`It belongs to another user (uid ${uid}; this is uid ${uid + 1})`), foreign)
+    assert.ok(foreign.includes(`sudo chown "$(id -un)" '${path}'`), foreign)
+
+    // No config.json yet (the save's tmp could not be written): the folder is named.
+    rmSync(path)
+    const folder = configAccessProblem(path, Object.assign(new Error('EPERM'), { code: 'EPERM' })) ?? ''
+    assert.ok(folder.includes('Its folder belongs to another user') && folder.includes(`sudo chown "$(id -un)" '${join(path, '..')}'`), folder)
+
+    // A path with quotes, `$` and a backtick in it pastes into a shell as itself.
+    const odd = join(path, '..', `it's "$HOME" \`x\``, 'config.json')
+    mkdirSync(join(odd, '..'))
+    writeFileSync(odd, '{}')
+    const line = (configAccessProblem(odd, denied) ?? '').split('\n').pop() ?? ''
+    const arg = line.replace(/^ {2}sudo chown "\$\(id -un\)" /, '')
+    assert.notEqual(arg, line, line)
+    assert.equal(spawnSync('sh', ['-c', `printf %s ${arg}`], { encoding: 'utf8' }).stdout, odd)
+  } finally {
+    t.mock.restoreAll()
+    cleanup(path)
+  }
 })

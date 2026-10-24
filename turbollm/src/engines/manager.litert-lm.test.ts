@@ -6,6 +6,7 @@ import { delimiter as pathDelimiter, join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { engineCommand, pyEngineEnv, Manager, type StartOpts } from './manager'
+import { freePort } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 
 const engine = { id: 'lrt', kind: 'litert-lm', binPath: '/venv/bin/python', capabilities: { flags: [], kvTypes: [] } } as unknown as Engine
@@ -124,6 +125,9 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
     model: { key: 'm', name: 'Fake Bundle', quant: 'Q4', ctx: 4096, vision: false },
     modelPath: '/models/fake-bundle.litertlm',
     extraArgs: [],
+    // The fake server binds the port it is handed: pinned clear of the 8081+ walk, which a parallel test file's engine
+    // can be handed too (it then died here with EADDRINUSE, engine_exited instead of model_load_failed).
+    preferredPort: await freePort(),
   } as unknown as StartOpts)
 
   await waitForState(manager, 'error', 30_000)

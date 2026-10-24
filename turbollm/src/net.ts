@@ -1,3 +1,4 @@
+import { isIP } from 'node:net'
 import { networkInterfaces } from 'node:os'
 
 /** Adapter-name patterns for virtual/tunnel NICs (Hyper-V/WSL vEthernet, Docker, VPN
@@ -71,4 +72,27 @@ export function getAdvertisedHost(): { host: string; port: number | null } | nul
     if (port > 0 && port <= 65535) return { host: withPort[1], port }
   }
   return { host: v, port: null }
+}
+
+/** The host and port `--addr` names, the host bare as a bind takes it. `[::1]:6996` and `[::1]` are
+ *  the unambiguous IPv6 forms. An unbracketed IPv6 address is split on its last colon only when
+ *  what follows that colon is a decimal number and what comes before it is an IPv6 address itself
+ *  (`::1:6996`, which bound as ::1 port 6996 before), and is otherwise the whole host (`::1`,
+ *  `fe80::1`, `fd00::abc:def`, `::ffff:127.0.0.1`: a last group with a hex letter or a dot is never
+ *  a port). The split on the last colon alone handed serve() the hostname `[::1]`, which no lookup
+ *  resolves, so the daemon exited at boot, and turned `::1` into the host `:`; a host with no port
+ *  (`0.0.0.0`) lost its last character. No port, or one that is not a number, is 6996; no host is
+ *  127.0.0.1, as before. */
+export function parseListenAddr(addr: string): { host: string; port: number } {
+  const port = (s: string | undefined): number => Number(s) || 6996
+  const bracketed = /^\[([^\]]*)\](?::(.*))?$/.exec(addr)
+  if (bracketed) return { host: bracketed[1] || '127.0.0.1', port: port(bracketed[2]) }
+  const last = addr.lastIndexOf(':')
+  if (last < 0) return { host: addr || '127.0.0.1', port: 6996 }
+  const head = addr.slice(0, last)
+  const tail = addr.slice(last + 1)
+  // Two colons or more: an IPv6 address, with a port only in the `::1:6996` form. `fd00::abc:def`
+  // and `fe80::1:abcd` were split into fd00::abc and fe80::1, another address, on port 6996.
+  if (head.includes(':') && !(/^\d+$/.test(tail) && isIP(head) === 6)) return { host: addr, port: 6996 }
+  return { host: head || '127.0.0.1', port: port(tail) }
 }

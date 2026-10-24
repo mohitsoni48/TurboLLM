@@ -63,7 +63,7 @@ function makeRepo(overrides: Partial<RepoPickerState> = {}): RepoPickerState {
 function Harness({
   repoRoot, repo, repoBranch, onSubmit = () => {}, onImagesChange, onStop,
   mode = AGENT_MODES[0], ctxUsed = 0, ctxMax = 0, live, textareaDisabled, slashCommands,
-  thinkingBudget = -1, loadedName = null, lastPromptTokens, lastGenTokens,
+  thinkingBudget = -1, loadedName = null, lastPromptTokens, lastGenTokens, modelsHidden,
 }: {
   repoRoot?: string
   repo?: RepoPickerState
@@ -81,6 +81,7 @@ function Harness({
   loadedName?: string | null
   lastPromptTokens?: number
   lastGenTokens?: number
+  modelsHidden?: CodeComposerProps['modelsHidden']
 }) {
   const [value, setValue] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -97,6 +98,7 @@ function Harness({
       mode={mode}
       onModeChange={() => {}}
       models={[]}
+      modelsHidden={modelsHidden}
       loadedKey={loadedName ? 'k1' : null}
       loadedName={loadedName}
       modelPending={false}
@@ -470,6 +472,17 @@ describe('CodeComposer steer/queue send affordance (ADR-246)', () => {
     render(<CodeComposer {...steerProps({ live: true, sendDisabled: false, onSubmit })} />)
     fireEvent.keyDown(screen.getByPlaceholderText('Describe a task…'), { key: 'Enter' })
     expect(onSubmit).toHaveBeenCalledWith(undefined)
+  })
+})
+
+// The screens count what they leave out of `models`; the composer hands that count to its picker, whose empty state
+// names it.
+describe('CodeComposer model picker', () => {
+  it("says how many models the selected engine can't run when it has none to offer", async () => {
+    render(<Harness modelsHidden={{ byEngine: 2 }} />)
+    await userEvent.click(screen.getByRole('button', { name: /Load a model/ }))
+    expect(await screen.findByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(/^2 hidden: the selected engine can't run them/)).toBeInTheDocument()
   })
 })
 

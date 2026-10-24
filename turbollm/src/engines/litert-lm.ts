@@ -26,13 +26,15 @@
 // this engine is only reachable when TurboLLM itself runs inside Termux.
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { basename, dirname, join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a uv/pip install or a probe the daemon does not live to see ends with it,
+// instead of running on, parented to init (its timeout is a daemon timer).
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 const LITERT_LM_PYTHON = '3.12'
 
@@ -69,24 +71,26 @@ export async function ensureLitertLmEnv(
     const uv = await ensureUv(root, onProgress)
     const envDir = join(root, 'litert-lm', 'venv')
     const py = venvPython(envDir)
+    const { reinstall } = beginPyEnvInstall(envDir, py)
 
     if (!existsSync(py)) {
       onProgress?.({ phase: 'extracting', pct: -1 })
       await execFileP(uv, ['venv', '--python', LITERT_LM_PYTHON, envDir], { cwd: root, signal })
     }
     onProgress?.({ phase: 'extracting', pct: -1 })
-    // `--reinstall` on the plain install (PR #271 re-review, live-verified on uv 0.12): a bare
-    // `uv pip install litert-lm` answers "Checked 1 package" and installs NOTHING when the
-    // version is already satisfied — so an Install over a half-installed venv (a cancelled
-    // provision leaves one behind) would register an engine whose files are still broken.
-    // --reinstall makes Install mean "a coherent environment": a no-op on a fresh venv, a full
-    // rewrite from the uv cache on a damaged one. The Update path keeps plain -U — the
-    // alreadyLatest short-circuit refuses same-version updates, and a real version bump
-    // rewrites everything anyway.
-    const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['-U'] : ['--reinstall']), 'litert-lm']
+    // `--reinstall` on a plain install over an unfinished environment (PR #271 re-review,
+    // live-verified on uv 0.12): a bare `uv pip install litert-lm` answers "Checked 1 package"
+    // and installs NOTHING when the version is already satisfied — so an Install over a
+    // half-installed venv (a cancelled provision leaves one behind) would register an engine
+    // whose files are still broken. A venv the last install finished carries its marker
+    // (py-env-marker.ts), and is not rewritten again on every Install. The Update path keeps
+    // plain -U — the alreadyLatest short-circuit refuses same-version updates, and a real
+    // version bump rewrites everything anyway.
+    const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '-U', reinstall }), 'litert-lm']
     await execFileP(uv, installArgs, { cwd: root, maxBuffer: 64 * 1024 * 1024, signal })
 
     const version = await probeLitertLm(py, signal)
+    finishPyEnvInstall(envDir)
     return { python: py, version }
   } finally {
     resetLitertLmServeCache()

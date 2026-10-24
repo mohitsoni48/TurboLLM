@@ -34,6 +34,12 @@ test('layaInstallArgs passes --upgrade only for an update', () => {
   assert.ok(!layaInstallArgs('/py', false).includes('--upgrade'))
 })
 
+test('layaInstallArgs passes --reinstall only for a plain install over an environment its last install left unfinished', () => {
+  assert.ok(layaInstallArgs('/py', false, true).includes('--reinstall'))
+  assert.ok(!layaInstallArgs('/py', false, false).includes('--reinstall'))
+  assert.deepEqual(layaInstallArgs('/py', true, true).filter((a) => a.startsWith('--') && a !== '--python' && a !== '--torch-backend=auto'), ['--upgrade'], 'an update keeps --upgrade alone')
+})
+
 test('LAYA_PACKAGE pins the 0.3 line the launcher is written against', () => {
   assert.equal(LAYA_PACKAGE, 'laya[serve]>=0.3.20,<0.4')
 })

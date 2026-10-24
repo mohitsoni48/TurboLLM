@@ -5,7 +5,8 @@
 // runs a shell script as the "binary", so it is POSIX only, as in the zip tests.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
@@ -29,11 +30,16 @@ interface Opts {
   dataDir?: string
   lanBind?: boolean
   busy?: 'download' | 'build'
+  /** The active engine ('e-run'), with a model running on it. */
   runningBinPath?: string
+  /** The engine the loaded model was started on, while another engine (or none) is active. */
+  serving?: { id: string; name: string; binPath: string }
   /** Engine id an extra pool slot is running on (the primary is stopped). */
   poolEngineId?: string
-  engines?: Array<{ id: string; name: string; binPath: string; release?: ReleaseProvenance }>
+  engines?: Array<{ id: string; name: string; binPath: string; release?: ReleaseProvenance; kind?: string; version?: string; sourceRepo?: string }>
   customSources?: Array<{ name: string; binPath: string }>
+  /** What stopping the engine's pool slots does (an update's first step); resolves at once by default. */
+  stopPoolSlots?: () => Promise<void>
 }
 
 interface Harness {
@@ -55,6 +61,7 @@ function harness(o: Opts = {}): Harness {
   const realProvision = new ProvisionState()
   realProvision.onSettled = (ok, trigger) => { settlements.push({ ok, trigger }) }
   const engines = o.engines ?? []
+  const runningEngine = o.runningBinPath ? { id: 'e-run', name: 'Running', binPath: o.runningBinPath, kind: 'llama-server' } : undefined
   const cfg = {
     daemon: { lanBind: o.lanBind ?? false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [], links: [], telemetry: { level: 'off', machineId: 'm' },
@@ -62,7 +69,13 @@ function harness(o: Opts = {}): Harness {
   const d = {
     version: 'test',
     store: { snapshot: () => cfg, dir: () => dataDir },
-    manager: { status: () => ({ state: o.runningBinPath ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }) },
+    manager: {
+      status: () => ({ state: o.runningBinPath || o.serving ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: null }),
+      currentOpts: () => {
+        const engine = o.serving ?? runningEngine
+        return engine ? { engine } : null
+      },
+    },
     provision: {
       get: () => ({ ...realProvision.get(), active: realProvision.get().active || o.busy === 'download' }),
       startCount: () => realProvision.startCount(),
@@ -73,11 +86,12 @@ function harness(o: Opts = {}): Harness {
     },
     build: { isActive: () => o.busy === 'build' },
     modelRouter: {
+      poolEngineIds: () => new Set(o.poolEngineId ? [o.poolEngineId] : []),
       poolSlotsOnEngine: (id: string) => (id === o.poolEngineId ? 1 : 0),
-      stopPoolSlotsOnEngine: async () => {},
+      stopPoolSlotsOnEngine: o.stopPoolSlots ?? (async () => {}),
     },
     registry: {
-      active: () => (o.runningBinPath ? { id: 'e-run', name: 'Running', binPath: o.runningBinPath, kind: 'llama-server' } : undefined),
+      active: () => runningEngine,
       list: () => ({ engines, activeEngineId: '' }),
       get: (id: string) => engines.find((e) => e.id === id),
       customSources: () => o.customSources ?? [],
@@ -355,6 +369,18 @@ test('POST install: 409 engine_in_use when the occupant is the running engine', 
   })
 })
 
+test('POST install: 409 engine_in_use when the loaded model runs on the occupant though it is not the active engine', async () => {
+  const dataDir = tmpDir('tllm-rel-route-')
+  const occupant = { id: 'e1', name: 'Rel', binPath: join(seededDir(dataDir, RELEASE_INSTALL_MARKER), serverBinName), release: PROVENANCE }
+  const h = harness({ dataDir, serving: occupant, engines: [occupant] })
+  await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET }] }, async () => {
+    const res = await postInstall(h)
+    assert.equal(res.status, 409)
+    assert.equal((await errorOf(res)).code, 'engine_in_use')
+  })
+  assert.deepEqual(h.provisionLog, [])
+})
+
 test('DELETE with binPath removes an unclaimed release-marked dir', async () => {
   const h = harness()
   const dir = seedMarkedDir(h, RELEASE_INSTALL_MARKER, PROVENANCE)
@@ -377,6 +403,19 @@ test('DELETE with binPath: 404 without a marker, 409 when an engine claims the d
   assert.equal(res.status, 409)
   assert.equal((await errorOf(res)).code, 'build_dir_taken')
   assert.ok(existsSync(dir))
+})
+
+test('DELETE with binPath: refuses the hidden folder a purge renamed a release install to, marker and all', async () => {
+  const h = harness()
+  // The purge's background delete owns this folder; an rmSync here would race it on the daemon's thread.
+  const trash = join(h.buildDir, `.${SLUG}.purge-${Date.now()}`)
+  mkdirSync(trash, { recursive: true })
+  writeFileSync(join(trash, serverBinName), 'x')
+  writeReleaseMarker(trash, PROVENANCE)
+  const res = await deleteInstall(h, join(trash, serverBinName))
+  assert.equal(res.status, 404)
+  assert.equal((await errorOf(res)).code, 'engine_not_found')
+  assert.ok(existsSync(join(trash, serverBinName)))
 })
 
 test('DELETE without binPath aborts a running job; so does the engine-download cancel route', async () => {
@@ -432,6 +471,37 @@ test('install: 202, running, then ready with the scan-result shape', posixOnly, 
   })
 })
 
+// The install's last cancel check runs before the promote's renames. On Windows a rename can wait out an AV lock on the
+// just-probed exe for seconds; a Cancel (or the dialog's dismissal) landing then stopped nothing, and the finished build
+// stayed on disk, unclaimed, until the GC a day later. Here the cancel lands inside that rename. download.ts imports
+// renameSync by name: syncBuiltinESMExports carries the patch to that binding.
+test('install: a Cancel that lands after the last cancel check still ends cancelled, and the build is discarded', posixOnly, async (t) => {
+  const h = harness()
+  const target = join(h.buildDir, SLUG)
+  const realRenameSync = fs.renameSync
+  const cancels: Array<Response | Promise<Response>> = []
+  const renames = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    realRenameSync(from, to)
+    if (String(to) === target) cancels.push(h.app.request('/api/v1/engines/backends/cancel', { method: 'POST' }))
+  })
+  syncBuiltinESMExports()
+  try {
+    await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET, bytes: scriptZip() }] }, async () => {
+      assert.equal((await postInstall(h)).status, 202)
+      const view = await jobState(h)
+      assert.equal(cancels.length, 1, 'the cancel was sent from inside the promote')
+      assert.deepEqual(await (await cancels[0]!).json(), { ok: true }, 'it reached the job while it was running')
+      assert.equal(view.state, 'error')
+      assert.equal(view.error?.code, 'cancelled')
+    })
+  } finally {
+    renames.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(target), false, 'the finished build is discarded')
+  assert.deepEqual(h.provisionLog.slice(-1), ['done'], 'a quiet cancel, not a failure')
+})
+
 test('N-1: DELETE of the ready result resets the job; DELETE of another path does not', posixOnly, async () => {
   const h = harness()
   await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET, bytes: scriptZip() }] }, async () => {
@@ -445,6 +515,26 @@ test('N-1: DELETE of the ready result resets the job; DELETE of another path doe
     assert.equal((await deleteInstall(h, ready.result!.binPath)).status, 200)
     assert.equal(((await (await getJob(h)).json()) as { state: string }).state, 'idle')
   })
+})
+
+test('install: a repo typed in another case updates the engine in its own folder, not build_dir_taken', posixOnly, async () => {
+  // Installed from the catalog as O/R; the user now types o/r. GitHub ignores the case, a Linux file system does not.
+  const dataDir = tmpDir('tllm-rel-route-')
+  const ownSlug = releaseInstallDirName({ repo: 'O/R', assetKey: ASSET_KEY })
+  const dir = join(dataDir, 'engines', 'build', ownSlug)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, serverBinName), 'x')
+  writeReleaseMarker(dir, { ...PROVENANCE, repo: 'O/R' })
+  const h = harness({ dataDir, engines: [{ id: 'e1', name: 'Rel', binPath: join(dir, serverBinName), release: { ...PROVENANCE, repo: 'O/R' } }] })
+  await withGithub({ tag: 'b1', assets: [{ name: ZIP_ASSET, bytes: scriptZip() }] }, async () => {
+    const res = await postInstall(h, { repo: REPO, tag: 'b1', asset: ZIP_ASSET })
+    assert.equal(res.status, 202, JSON.stringify(await res.clone().json()))
+    const view = (await jobState(h)) as { state: string; updated?: { id: string }; result?: { binPath: string } }
+    assert.equal(view.state, 'updated')
+    assert.equal(view.updated?.id, 'e1')
+    assert.equal(view.result?.binPath, join(dir, serverBinName))
+  })
+  assert.deepEqual(readdirSync(h.buildDir), [ownSlug])
 })
 
 test('POST /engines reads provenance from the on-disk marker and ignores a client-supplied release', async () => {
@@ -518,6 +608,17 @@ test('POST /engines/:id/update: 409 engine_in_use when that engine is running', 
   const res = await postUpdate(h, 'e-run')
   assert.equal(res.status, 409)
   assert.equal((await errorOf(res)).code, 'engine_in_use')
+})
+
+test('POST /engines/:id/update: 409 engine_in_use when the loaded model runs on that engine though it is not the active one', async () => {
+  const dataDir = tmpDir('tllm-rel-route-')
+  const engine = RELEASE_ENGINE(seededDir(dataDir, RELEASE_INSTALL_MARKER))
+  const h = harness({ dataDir, serving: engine, engines: [engine] })
+  // Stubbed GitHub: a regression that accepts the update must not reach the network.
+  const res = await withGithub('missing', async () => postUpdate(h, 'e1'))
+  assert.equal(res.status, 409)
+  assert.match((await errorOf(res)).message, /Stop "Rel"/)
+  assert.deepEqual(h.provisionLog, [])
 })
 
 test('POST /engines/:id/update: 404 engine_not_found, 409 no_update_source', async () => {
@@ -655,14 +756,92 @@ test('POST install: 409 engine_in_use when only an extra pool slot runs on the o
   assert.deepEqual(h.provisionLog, [])
 })
 
-test('POST /engines/:id/update: an extra pool slot on the engine ends the update as a refusal, never a swap', async () => {
+test('POST /engines/:id/update: an extra pool slot on the engine is a 409 refusal, never a swap', async () => {
   const dataDir = tmpDir('tllm-rel-route-')
   const dir = seededDir(dataDir, RELEASE_INSTALL_MARKER)
   const h = harness({ dataDir, poolEngineId: 'e1', engines: [RELEASE_ENGINE(dir)] })
   await withGithub({ tag: 'b9', assets: [{ name: ZIP_ASSET, bytes: Buffer.alloc(64, 7) }] }, async (requests) => {
-    assert.equal((await postUpdate(h, 'e1')).status, 202)
-    await waitUntil(() => settled(h))
-    assert.equal(requests.some((u) => u.startsWith('https://cdn.test/')), false)
+    const res = await postUpdate(h, 'e1')
+    assert.equal(res.status, 409)
+    const e = await errorOf(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /Stop "Rel"/)
+    assert.deepEqual(requests, [])
   })
-  assert.match(h.provisionLog.find((l) => l.startsWith('fail:')) ?? '', /Stop "Rel"/)
+  assert.deepEqual(h.provisionLog, [])
+})
+
+test('POST /engines/:id/update: an extra pool slot on a KoboldCpp engine blocks its update, primary stopped or on another engine', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const kc = { id: 'kc', name: 'KoboldCpp', kind: 'koboldcpp', binPath: join(dir, 'koboldcpp', 'koboldcpp'), version: 'v1.70' }
+  const other = { id: 'other', name: 'llama.cpp', binPath: join(dir, 'other', serverBinName) }
+  let stoppedSlots = 0
+  // Before the fix the update's first step stopped the slot; failing it there keeps a regression off the network.
+  const stopPoolSlots = async () => { stoppedSlots++; throw new Error('stopped by the test') }
+  for (const serving of [undefined, other]) {
+    const h = harness({ poolEngineId: 'kc', serving, stopPoolSlots, engines: [kc, other] })
+    // Stubbed GitHub: a regression that accepts the update must not reach the network.
+    const res = await withGithub('missing', async () => postUpdate(h, 'kc'))
+    assert.equal(res.status, 409, serving ? 'primary on another engine' : 'primary stopped')
+    const e = await errorOf(res)
+    assert.equal(e.code, 'engine_in_use')
+    assert.match(e.message, /Stop "KoboldCpp"/)
+    assert.deepEqual(h.provisionLog, [])
+  }
+  assert.equal(stoppedSlots, 0, 'the pool slot is never stopped')
+})
+
+// The route keeps its "any engine with an automatic update source" contract (ADR-085): every branch it reaches records
+// the user's trigger, ends a Cancel as done(), offers Cancel only when the branch takes the signal, and a kind with no
+// apply branch is refused up front instead of answering 202 and then failing.
+async function cancelProvision(h: Harness): Promise<boolean> {
+  const res = await h.app.request('/api/v1/engines/backends/cancel', { method: 'POST' })
+  return ((await res.json()) as { ok: boolean }).ok
+}
+
+test('POST /engines/:id/update: 409 no_update_source for a source-built engine and for SGLang, before any job', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const h = harness({
+    engines: [
+      { id: 'src', name: 'Built', kind: 'llama-server', binPath: join(dir, 'build', 'mine', serverBinName), sourceRepo: 'https://github.com/ggml-org/llama.cpp' },
+      { id: 'sg', name: 'SGLang', kind: 'sglang', binPath: join(dir, 'sglang', 'python'), version: 'sglang 0.4.0' },
+    ],
+  })
+  for (const id of ['src', 'sg']) {
+    const res = await postUpdate(h, id)
+    assert.equal(res.status, 409, id)
+    assert.equal((await errorOf(res)).code, 'no_update_source', id)
+  }
+  assert.deepEqual(h.provisionLog, [])
+})
+
+test('POST /engines/:id/update: a cancelled KoboldCpp update ends as a quiet user_update cancel, not a failure', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  const h = harness({ engines: [{ id: 'kc', name: 'KoboldCpp', kind: 'koboldcpp', binPath: join(dir, 'koboldcpp', 'koboldcpp'), version: 'v1.70' }] })
+  const hangGithub: Responder = (url, init) =>
+    url.includes('api.github.com')
+      ? new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
+        })
+      : null
+  await withGithub('missing', async () => {
+    assert.equal((await postUpdate(h, 'kc')).status, 202)
+    assert.equal(await cancelProvision(h), true)
+    await waitUntil(() => settled(h))
+  }, hangGithub)
+  assert.deepEqual(h.provisionLog, ['start:koboldcpp:user_update', 'done'])
+  assert.deepEqual(h.settlements, [{ ok: true, trigger: 'user_update' }])
+})
+
+test('POST /engines/:id/update: a pip upgrade records user_update and offers no Cancel it cannot honour', async () => {
+  const dir = tmpDir('tllm-rel-route-')
+  let failStop = (_e: Error) => {}
+  // Hold the update at its first step, then fail it there: the real uv/pip upgrade never runs in a test.
+  const stopPoolSlots = () => new Promise<void>((_resolve, reject) => { failStop = reject })
+  const h = harness({ stopPoolSlots, engines: [{ id: 'vl', name: 'vLLM', kind: 'vllm', binPath: join(dir, 'vllm', 'python'), version: 'vllm 0.6.0' }] })
+  assert.equal((await postUpdate(h, 'vl')).status, 202)
+  assert.equal(await cancelProvision(h), false)
+  failStop(new Error('stopped by the test'))
+  await waitUntil(() => settled(h))
+  assert.equal(h.provisionLog[0], 'start:vllm:user_update')
 })

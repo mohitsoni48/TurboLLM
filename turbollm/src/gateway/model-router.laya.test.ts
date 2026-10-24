@@ -47,6 +47,7 @@ function stoppedPrimary() {
     load: async (opts: StartOpts) => { loads.push(opts); state = 'running' },
     target: () => 'http://laya-slot',
     touch: () => {},
+    currentOpts: () => null,
   } as unknown as Manager
   return { manager, loads }
 }
@@ -87,6 +88,7 @@ test('routeTo: a Laya model with no Laya engine installed is refused with the re
   assert.deepEqual(result, {
     status: 503,
     message: 'This is a Laya model — it runs only on the Laya engine. Install Laya from Engines to load it.',
+    permanent: true,
   })
   assert.deepEqual(loads, [])
 })
@@ -111,6 +113,9 @@ test('a chat model in the primary still takes the chat slot', () => {
 // once its load has succeeded, and a Laya load in flight is tracked on the side.
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
+
+/** What a load an eject cancelled answers. Permanent: a retry would load the model the owner just ejected. */
+const UNLOADED_WHILE_LOADING = { status: 503, message: 'The model was unloaded while it was loading.', permanent: true }
 
 function deferred() {
   let resolve!: () => void
@@ -159,6 +164,8 @@ function gatedSlot(gate: Promise<void>, { failsToStart = false } = {}) {
     },
     target: () => 'http://laya-slot',
     touch: () => {},
+    currentOpts: () => null,
+    restartOpts: () => null,
   } as unknown as Manager
   return { manager, stops: () => stops, loads: () => loads, startedEngines: () => startedEngines }
 }
@@ -173,6 +180,28 @@ function routerWithSlots(gate: Promise<void>, options: { keepN?: number; models?
   })
   return { r, made }
 }
+
+test('loading a Laya model whose old slot its idle watchdog is still stopping keeps that exiting engine under the pool stopper', async () => {
+  const gate = deferred()
+  const { r } = routerWithSlots(gate.promise)
+  let state: Status['state'] = 'stopping' // Manager.watchdogTick -> stop(); a graceful stop, on Windows up to 8 s
+  const stops: Array<boolean | undefined> = []
+  const old = {
+    status: (): Status => ({ state, err: null, port: 0, pid: 0, loadElapsedMs: 0, model: null }),
+    currentOpts: () => null,
+    restartOpts: () => ({ engine: LAYA_ENGINE, model: LAYA_MODEL }),
+    stopAndWait: async (o?: { force?: boolean }) => { stops.push(o?.force); state = 'stopped' },
+  } as unknown as Manager
+  ;(r as unknown as { extraSlots: Map<string, unknown> }).extraSlots.set(LAYA_MODEL.key, { manager: old, modelKey: LAYA_MODEL.key, lastUsedMs: 0 })
+
+  const loading = r.loadExplicit(LAYA_MODEL.key) // trackLayaLoad drops the old slot
+  await tick()
+  assert.equal(r.poolSlotsOnEngine('laya'), 2, 'the exiting engine and the new load')
+  await Promise.all([...r.poolEngineIds()].map((id) => r.stopPoolSlotsOnEngine(id, { force: true })))
+  assert.deepEqual(stops, [true], 'the ComfyUI pool stopper force-kills the exiting engine and waits for it')
+  gate.resolve()
+  await loading
+})
 
 test('a Laya model is alive as "starting" from the moment its load is requested, even while its manager still waits on the gate', async () => {
   const gate = deferred()
@@ -224,7 +253,7 @@ test('ejecting a Laya model before its engine has spawned cancels the load: noth
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].manager.status().state, 'stopped', 'the engine that spawned after the eject is stopped again')
   assert.deepEqual(r.aliveSlots(), [])
   assert.equal(r.loadedModelKeys().has(LAYA_MODEL.key), false)
@@ -238,7 +267,7 @@ test('ejecting a Laya model while its engine is starting stops it', async () => 
   await tick()
   assert.equal(made[0].manager.status().state, 'starting', 'precondition')
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
-  await loading
+  assert.deepEqual(await loading, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].manager.status().state, 'stopped')
   assert.deepEqual(r.aliveSlots(), [])
 })
@@ -255,7 +284,8 @@ test('a chat model in a pool slot is registered only once it has loaded, as befo
   const loadingB = r.route('B')
   await tick()
   assert.equal(r.aliveSlots().some((s) => s.modelKey === 'B'), false, 'nothing can be routed to B before it is loaded')
-  assert.equal(r.loadedModelKeys().has('B'), false)
+  // Yet it is loading: the delete guard and the Models page count it (they used to miss it for the whole load).
+  assert.equal(r.loadedModelKeys().has('B'), true)
   gate.resolve()
   assert.deepEqual(await loadingB, { target: 'http://laya-slot' })
   assert.equal(r.aliveSlots().some((s) => s.modelKey === 'B' && s.state === 'running'), true)
@@ -271,7 +301,7 @@ test('ejecting a Laya model before its engine has spawned aborts the load, so no
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.equal(made[0].startedEngines(), 0, 'the cancelled load never spawned an engine')
 })
 
@@ -319,7 +349,7 @@ test('ejecting a Laya model whose earlier slot died still cancels the load in fl
   assert.equal(r.stopExplicit(LAYA_MODEL.key), true)
   gate.resolve()
   const result = await loading
-  assert.equal('status' in result && result.status, 503)
+  assert.deepEqual(result, UNLOADED_WHILE_LOADING)
   assert.deepEqual(r.aliveSlots(), [])
   assert.equal(made[0].startedEngines(), 0)
 })
@@ -338,4 +368,16 @@ test('a Laya model is never reported twice by aliveSlots', async () => {
   assert.deepEqual(r.aliveSlots().map((s) => s.modelKey), [LAYA_MODEL.key])
   gate.resolve()
   await loading
+})
+
+// GET /api/v1/status's poolModels: a load in flight into a pool slot counts, and a Laya load's slot is that same load.
+test('poolModelCount counts a Laya load in flight once', async () => {
+  const gate = deferred()
+  const { r } = routerWithSlots(gate.promise)
+  const loading = r.loadExplicit(LAYA_MODEL.key)
+  await tick()
+  assert.equal(r.poolModelCount(), 1, 'loading')
+  gate.resolve()
+  assert.deepEqual(await loading, { target: 'http://laya-slot' })
+  assert.equal(r.poolModelCount(), 1, 'loaded')
 })

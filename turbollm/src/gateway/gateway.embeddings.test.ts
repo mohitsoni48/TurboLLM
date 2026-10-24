@@ -8,7 +8,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { registerGateway } from './gateway'
+import { ModelRouter } from './model-router'
 import type { Deps } from '../deps'
+import type { Manager } from '../engines/manager'
+import type { ModelEntry } from '../models/scanner'
 
 const EMBEDDING_KEY = 'qwen3-embedding-0.6b|Q8_0|639150592'
 
@@ -121,4 +124,79 @@ test('POST /v1/embeddings never proxies to a linked machine — Turbo Link is ch
   assert.equal(res!.status, 400)
   const body = await res!.json() as { error: { code: string } }
   assert.equal(body.error.code, 'link_embeddings_unsupported')
+})
+
+// With auto-swap off the router answered every request from the primary, whatever it named. An embedding model loads
+// into a pool slot of its own whenever a chat model holds the primary (a manual Load goes through loadExplicit, as an
+// auto-swap would), so an embeddings request for it reached the chat engine, never started with --embeddings, and got
+// a 501 every time. The real router decides here; its pool slot is seeded directly, as model-router.test.ts does, and
+// nothing is contacted.
+const CHAT_KEY = 'qwen3-8b|Q4_K_M|5000000000'
+const PRIMARY_TARGET = 'http://primary.invalid'
+const EMBEDDING_SLOT_TARGET = 'http://embedding-slot.invalid'
+
+function libraryEntry(key: string, name: string, extra: Partial<ModelEntry> = {}): ModelEntry {
+  return {
+    key, name, path: `/models/${name}.gguf`, format: 'gguf', quant: 'Q4_K_M', nativeCtx: 4096, vision: false,
+    embedding: false, incomplete: false, parseError: null, ...extra,
+  } as unknown as ModelEntry
+}
+
+function runningManager(modelKey: string, target: string): Manager {
+  return {
+    status: () => ({ state: 'running', err: null, port: 0, pid: 0, loadElapsedMs: 0, model: { key: modelKey } }),
+    target: () => target,
+    touch: () => {},
+    currentOpts: () => null,
+    generationStart: () => {},
+    generationEnd: () => {},
+  } as unknown as Manager
+}
+
+function autoSwapOffDeps(models: ModelEntry[], slotKey: string): Deps {
+  const store = { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: false, keepN: 1 } }) }
+  const primary = runningManager(CHAT_KEY, PRIMARY_TARGET)
+  const scanner = { list: () => ({ models, scanning: false, lastScanAt: '' }), get: (k: string) => models.find((m) => m.key === k) }
+  const router = new ModelRouter(store as never, {} as never, primary, scanner as never, undefined)
+  ;(router as unknown as { extraSlots: Map<string, unknown> }).extraSlots = new Map([
+    [slotKey, { manager: runningManager(slotKey, EMBEDDING_SLOT_TARGET), modelKey: slotKey, lastUsedMs: 0 }],
+  ])
+  return { ...fakeDeps({ model: null }), store, scanner, manager: primary, modelRouter: router } as unknown as Deps
+}
+
+async function postEmbeddings(d: Deps, model: string): Promise<{ res: Response; url: string | null }> {
+  const app = new Hono()
+  registerGateway(app, d)
+  let url: string | null = null
+  const realFetch = globalThis.fetch
+  globalThis.fetch = (async (u: unknown) => { url = String(u); return new Response('{}', { status: 200 }) }) as typeof fetch
+  try {
+    const res = await app.request('/v1/embeddings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: 'hello world' }),
+    })
+    return { res, url }
+  } finally {
+    globalThis.fetch = realFetch
+  }
+}
+
+test('POST /v1/embeddings with auto-swap off reaches the embedding model running in its own pool slot', async () => {
+  const models = [libraryEntry(CHAT_KEY, 'Qwen3-8B'), libraryEntry(EMBEDDING_KEY, 'Qwen3-Embedding-0.6B', { embedding: true })]
+
+  const { res, url } = await postEmbeddings(autoSwapOffDeps(models, EMBEDDING_KEY), EMBEDDING_KEY)
+
+  assert.equal(res.status, 200)
+  assert.equal(url, `${EMBEDDING_SLOT_TARGET}/v1/embeddings`, 'the embedding slot answers, not the primary chat engine')
+})
+
+test('POST /v1/embeddings with auto-swap off still refuses a Laya model running in a pool slot, without forwarding it', async () => {
+  const LAYA_KEY = 'laya-decider|Q8_0|1'
+  const models = [libraryEntry(CHAT_KEY, 'Qwen3-8B'), libraryEntry(LAYA_KEY, 'Laya Decider', { laya: {} } as Partial<ModelEntry>)]
+
+  const { res, url } = await postEmbeddings(autoSwapOffDeps(models, LAYA_KEY), LAYA_KEY)
+
+  assert.equal(res.status, 400)
+  assert.equal(url, null, 'nothing is forwarded')
 })

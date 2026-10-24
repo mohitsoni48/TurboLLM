@@ -44,6 +44,50 @@ function isSafeIdent(v: unknown): boolean {
 }
 
 /**
+ * A raw hardware/model string made to pass {@link isSafeIdent}, for the places
+ * that BUILD `bench_result`'s identifier fields. Real names routinely break the
+ * charset — `Intel(R) Core(TM) i7-8700K CPU @ 3.70GHz`, `AMD Ryzen 7 7840HS w/
+ * Radeon 780M Graphics`, lspci's `Navi 48 [Radeon RX 9070/9070 XT]` — and
+ * `validateEvent` then drops the whole event before it is ever queued, so those
+ * machines never contributed a benchmark row. The validator stays exactly as
+ * strict; the value is normalized instead: disallowed runs become one space,
+ * `..` collapses, length is capped. A string that already passes is returned
+ * untouched, so every join key that reached the dataset before keeps matching.
+ */
+export function toSafeIdent(v: string): string {
+  if (isSafeIdent(v)) return v
+  const out = String(v ?? '')
+    .replace(/[^A-Za-z0-9 ._:()+\-]+/g, ' ')
+    .replace(/\.{2,}/g, '.')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+    .slice(0, MAX_IDENT_LEN)
+    .trim()
+  return out || 'unknown'
+}
+
+/**
+ * {@link toSafeIdent} for the identifiers that come from the user's own files and binaries —
+ * a model's name (a GGUF's raw `general.name`, else the file name) and an engine's version (the
+ * probe's `version:` match, else the first line `--version` printed) — not from hardware
+ * introspection. toSafeIdent turns a path's separators into spaces, so a path-shaped value that
+ * isSafeIdent rejects outright reached the dataset as its directory names: a Windows convert run
+ * writes `C:\Users\alice\...\merged-7b` as general.name (gguf-py only refuses more than one
+ * forward slash), and an engine that does not know `--version` prints
+ * `/home/alice/llama/llama-server: unknown option`. Such a value is reported as 'unknown'
+ * instead: a leading `/`, `~` or `\`, a drive (`C:\`, `C:/`), any backslash, or more than one
+ * `/` anywhere. A single `/` is kept, mapped to a space as toSafeIdent does, for the Hugging
+ * Face `org/name` form. The CPU/GPU names stay on plain toSafeIdent: lspci's
+ * `Navi 31 [Radeon RX 7900 XT/7900 XTX/7900M]` has several slashes and is no path.
+ */
+export function toSafeNameIdent(v: string): string {
+  const s = String(v ?? '').trim()
+  const pathShaped =
+    /^[/~\\]/.test(s) || /^[A-Za-z]:[\\/]/.test(s) || s.includes('\\') || s.split('/').length > 2
+  return pathShaped ? 'unknown' : toSafeIdent(v)
+}
+
+/**
  * `app.os`, specifically — NOT a general identifier.
  *
  * `getSysInfo().os` (sysinfo.ts) is always `${process.platform}/${process.arch}`

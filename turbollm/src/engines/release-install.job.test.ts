@@ -9,6 +9,7 @@ import {
   type ReleaseInstallPlan,
   type ReleaseInstallResult,
 } from './release-install'
+import { GithubRateLimitError } from './download'
 import { ProbeError } from './probe'
 import { SwapBlockedError, ZipError } from './zip-install'
 
@@ -118,6 +119,11 @@ test('typed errors map to their vocabulary code', async () => {
   assert.equal((await failureOf(new ZipError('zip_too_large', 'z')))?.code, 'zip_too_large')
   assert.equal((await failureOf(new ZipError('zip_crc_mismatch', 'z')))?.code, 'bad_zip')
   assert.equal((await failureOf(new ReleaseInstallError('invalid_asset', 'x')))?.code, 'invalid_asset')
+})
+
+test('a GitHub rate limit inside the job keeps its own code, so the UI can offer the token hint', async () => {
+  assert.equal((await failureOf(new GithubRateLimitError('o/r')))?.code, 'github_rate_limited')
+  assert.equal(describeReleaseJobFailure(new GithubRateLimitError('o/r')).code, 'github_rate_limited')
 })
 
 test('describeReleaseJobFailure is exported and classifies the same way', () => {

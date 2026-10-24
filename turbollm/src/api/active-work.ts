@@ -2,30 +2,62 @@
 // model asks for confirmation only when something is actively running, and names it — the same
 // "active work, not an open window" rule as the daemon-restart gate.) One classifier,
 // server-side, so the UI can never disagree with what the daemon is actually doing.
+//
+// The Android app's EngineService reads the same answer as "is the daemon busy?" (`items` and
+// `engineGenerating` only): busy keeps the model loaded and the wake lock held after the app's
+// window has gone. So every piece of work the daemon does on the engine is an item, and work that
+// waits on a person (a chat parked on a tool-call approval) is listed apart, in `waiting`, which a
+// load still interrupts.
 import type { Hono } from 'hono'
 import type { Deps } from '../deps'
-import { inFlightChatIds } from '../chat/chat-routes'
+import { afterReplyChatIds, inFlightChatIds, parkedChatIds, parkedEngineTurns } from '../chat/chat-routes'
 
 export interface ActiveWorkItem {
-  kind: 'chat' | 'code' | 'routine'
+  /** `load`: a primary-engine model loading. `tune`: an auto-tune run (its own loads included).
+   *  `skill`: a skill being written (in-chat save_skill, Save as skill, Learn from folder). */
+  kind: 'chat' | 'code' | 'routine' | 'load' | 'tune' | 'skill'
   id: string
   label: string
 }
 
 export interface ActiveWork {
+  /** Work in progress on the engine. */
   items: ActiveWorkItem[]
+  /** Chats parked on a tool-call approval (kind `chat`): they wait on a person, not the engine, so
+   *  they are not in `items`. A load, Stop or the approval wait (chatApprovalWaitMinutes) running
+   *  out still ends them, so what asks what a load would interrupt reads `items` and `waiting`. */
+  waiting: ActiveWorkItem[]
   /** A generation an API client or a Code terminal agent is running through the gateway. It has
    *  no item of its own: the daemon knows a request is in flight, not whose it is. */
   engineGenerating: boolean
 }
 
+/** Where the chats come from (chat-routes.ts). A test seam only — every caller takes the default. */
+export interface ChatSources {
+  /** Chats whose turn holds their in-flight slot (parked ones included). */
+  inFlight: () => string[]
+  /** Those of them parked on a tool-call approval. */
+  parked: () => string[]
+  /** Chats whose finished reply's auto-title or auto-memory call is still pending. */
+  afterReply: () => string[]
+  /** How many of the engine's in-progress generations are parked chat turns. */
+  parkedGenerations: () => number
+}
+
+const CHAT_SOURCES: ChatSources = { inFlight: inFlightChatIds, parked: parkedChatIds, afterReply: afterReplyChatIds, parkedGenerations: parkedEngineTurns }
+
 const UNTITLED = 'Untitled'
 
-/** `chatIds` is a test seam only — every caller takes the default. */
-export function activeWork(d: Deps, chatIds: () => string[] = inFlightChatIds): ActiveWork {
+export function activeWork(d: Deps, sources: Partial<ChatSources> = {}): ActiveWork {
+  const chats = { ...CHAT_SOURCES, ...sources }
+  const parked = new Set(chats.parked())
+  // A chat is listed once: running (a turn, or its title or memory call), else waiting.
+  const running = [...new Set([...chats.inFlight().filter((id) => !parked.has(id)), ...chats.afterReply()])]
+  const waiting = [...parked].filter((id) => !running.includes(id))
   return {
-    items: [...chatItems(d, chatIds()), ...codeItems(d), ...routineItems(d)],
-    engineGenerating: engineIsGenerating(d),
+    items: [...chatItems(d, running), ...codeItems(d), ...routineItems(d), ...loadItems(d), ...tuneItems(d), ...skillItems(d)],
+    waiting: chatItems(d, waiting),
+    engineGenerating: engineIsGenerating(d, chats.parkedGenerations()),
   }
 }
 
@@ -53,10 +85,38 @@ function routineItems(d: Deps): ActiveWorkItem[] {
   return routineIds.map((id) => ({ kind: 'routine', id, label: d.db.getRoutine(id)?.prompt || UNTITLED }))
 }
 
+/** A primary-engine load (a model loading or restarting, a gateway auto-swap, a routine's swap):
+ *  the engine is busy though nothing generates yet. Not while auto-tune runs, whose candidate
+ *  loads are its own item. */
+function loadItems(d: Deps): ActiveWorkItem[] {
+  const st = d.manager.status()
+  if (st.state !== 'starting' || d.bench?.isRunning()) return []
+  return [{ kind: 'load', id: st.model?.key ?? '', label: st.model?.name || st.model?.key || UNTITLED }]
+}
+
+/** An auto-tune run: it loads and benchmarks one candidate after another on the engine. */
+function tuneItems(d: Deps): ActiveWorkItem[] {
+  if (!d.bench?.isRunning()) return []
+  const key = d.bench.status().modelKey ?? ''
+  return [{ kind: 'tune', id: key, label: d.scanner?.get(key)?.name || key || UNTITLED }]
+}
+
+/** A skill being written (agents/skill-jobs.ts, agent-routes.ts's Learn from folder): it calls the
+ *  engine directly, with no generationStart, so engineGenerating does not see it. Learn from folder's
+ *  own label names the host folder (`Learning from <path>`), and this list reaches callers that may
+ *  not see host paths (a remote-access token with models:load), so it is named generically here. */
+function skillItems(d: Deps): ActiveWorkItem[] {
+  return (d.agentTasks?.list() ?? [])
+    .filter((t) => t.status === 'running' && t.kind.startsWith('skill_'))
+    .map((t) => ({ kind: 'skill', id: t.id, label: t.kind === 'skill_from_folder' ? 'Learning skills from a folder' : t.label }))
+}
+
 function conversationTitle(d: Deps, convId: string): string {
   return d.db.getConversation(convId)?.title || UNTITLED
 }
 
-function engineIsGenerating(d: Deps): boolean {
-  return d.manager.status().state === 'running' && (d.manager.sessionStats()?.activeRequests ?? 0) > 0
+/** A local chat turn counts as a generation from its first request to its end, its approval waits
+ *  included; `parked` of them wait on a person (they are in `waiting`), so they do not count here. */
+function engineIsGenerating(d: Deps, parked: number): boolean {
+  return d.manager.status().state === 'running' && (d.manager.sessionStats()?.activeRequests ?? 0) - parked > 0
 }

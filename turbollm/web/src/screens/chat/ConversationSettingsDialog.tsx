@@ -35,6 +35,16 @@ const SAMPLING_FIELDS = [
   { key: 'min_p',       label: 'Min P',       min: 0, max: 1,   step: 0.01, def: 0.05, modelField: 'minP' as const },
 ] as const
 
+/** The fields this dialog edits, as the server has them for `conv`. */
+function convSettings(conv: Conversation) {
+  return {
+    systemPrompt: conv.systemPrompt ?? '',
+    sampling: conv.sampling ?? {},
+    skillIds: conv.skillIds ?? [],
+    preserveThinking: conv.preserveThinking ?? false,
+  }
+}
+
 /** Draft thread settings for a not-yet-created conversation (a blank chat screen with a
  *  model loaded but no first message sent yet). Mirrors ChatScreen's existing
  *  `pendingSkillIds` pattern, extended to the other three thread-settings fields. */
@@ -80,6 +90,11 @@ export function ConversationSettingsDialog({
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, enabled: open, staleTime: 0 })
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
 
+  // The server values the form was last loaded from, so a later change to them can be told
+  // apart from the user's own edits (see the effect after the next one).
+  const loaded = useRef<ReturnType<typeof convSettings> | null>(null)
+  const serverKey = conv ? JSON.stringify(convSettings(conv)) : ''
+
   useEffect(() => {
     if (!open) return
     // The dialog component stays mounted for the lifetime of the chat screen (only
@@ -88,17 +103,40 @@ export function ConversationSettingsDialog({
     // collapsed on every open, not just the first.
     setSkillsOpen(false)
     if (conv) {
-      setSystemPrompt(conv.systemPrompt ?? '')
-      setSampling(conv.sampling ?? {})
-      setSkillIds(conv.skillIds ?? [])
-      setPreserveThinking(conv.preserveThinking ?? false)
+      const s = convSettings(conv)
+      loaded.current = s
+      setSystemPrompt(s.systemPrompt)
+      setSampling(s.sampling)
+      setSkillIds(s.skillIds)
+      setPreserveThinking(s.preserveThinking)
     } else if (draft) {
       setSystemPrompt(draft.systemPrompt ?? '')
       setSampling(draft.sampling ?? {})
       setSkillIds(draft.skillIds ?? [])
       setPreserveThinking(draft.preserveThinking ?? true)
     }
-  }, [open, conv, draft])
+    // Keyed on the conversation's ID, not the object: every refetch (a reply finishing,
+    // auto-title, another device's message) hands over a new object for the same
+    // conversation, and resyncing on that wiped whatever the user was typing here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, conv?.id, draft])
+
+  // ...but the settings themselves can change while the dialog is open: most often the
+  // refetch after a Save, which closes the dialog before it lands, so reopening in that gap
+  // loads the old values and a second Save would write them back. Take the new
+  // value for each field the user hasn't changed since it was loaded; keep their edits.
+  useEffect(() => {
+    const base = loaded.current
+    if (!open || !conv || !base || JSON.stringify(base) === serverKey) return
+    const next = convSettings(conv)
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+    if (systemPrompt === base.systemPrompt) setSystemPrompt(next.systemPrompt)
+    if (same(sampling, base.sampling)) setSampling(next.sampling)
+    if (same(skillIds, base.skillIds)) setSkillIds(next.skillIds)
+    if (preserveThinking === base.preserveThinking) setPreserveThinking(next.preserveThinking)
+    loaded.current = next
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, serverKey])
 
   const toggleSkill = (id: string) =>
     setSkillIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]))

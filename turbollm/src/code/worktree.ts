@@ -10,6 +10,8 @@
 // exact outcome someone ticks the box to avoid, and it failed silently.
 //
 // ── Layout: <repoRoot>/.turbollm/worktrees/<branch> (founder's choice) ──────────────────────
+// (<repoRoot> being the repository's top level: a session started at a subfolder of a repo works
+// in the same subfolder of the worktree; see createSessionWorktree.)
 // Self-contained and always writable when the repo is. The two hazards that come with living
 // inside the repo are handled rather than assumed away, both verified against real git first:
 //   • The directory shows up as `?? .turbollm/` in the BASE repo. Suppressed via
@@ -18,10 +20,11 @@
 //   • A worktree nested in its own repo could in principle contain itself. It cannot here:
 //     `.turbollm/` is untracked, so it is not part of any branch, so a checkout of that branch
 //     never materialises it. Verified empirically, not reasoned about.
-import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { appendFile, readFile, mkdir } from 'node:fs/promises'
-import { join } from 'node:path'
+import { appendFile, readFile, readlink, mkdir, realpath } from 'node:fs/promises'
+import { basename, dirname, join, resolve } from 'node:path'
+import { endTetheredGroup, spawnHeld } from '../util/tether'
+import { NO_AUTO_GC_ARGS } from '../util/git-gc'
 
 /** Where a repo's session worktrees live, relative to the repo root. */
 export const WORKTREES_SUBDIR = join('.turbollm', 'worktrees')
@@ -45,7 +48,14 @@ export interface GitResult {
 /** Run git with an ARGUMENT ARRAY and no shell. Branch names and paths are user-supplied, and this
  *  is the one place they reach a process boundary — no shell means no quoting rules to get wrong
  *  and no metacharacter can act (see util/shell-command.ts for what the shell path has to do
- *  instead). Never throws: a missing git binary comes back as ok:false like any other failure. */
+ *  instead). Never throws: a missing git binary comes back as ok:false like any other failure.
+ *
+ *  Tethered and held as git-actions.ts's calls are (util/tether.ts): SIGTERM and 2 s when the daemon dies,
+ *  so git drops its locks; a helper git leaves running on purpose (the credential cache) held until the
+ *  daemon stops. So it settles at git's exit plus the end of its output, never on 'close', which a held
+ *  lifeline holds back: waiting for 'close', a git call that had succeeded reported "timed out after
+ *  30000ms" whenever a credential cache was running. A timeout ends git's whole group (TERM, the grace,
+ *  KILL) and holds nothing, so a hung credential helper does not stay. No automatic gc (util/git-gc.ts). */
 export function runGit(cwd: string, args: string[], timeoutMs = 30_000): Promise<GitResult> {
   return new Promise<GitResult>((resolve) => {
     let stdout = ''
@@ -53,15 +63,27 @@ export function runGit(cwd: string, args: string[], timeoutMs = 30_000): Promise
     let settled = false
     const done = (r: GitResult) => { if (!settled) { settled = true; resolve(r) } }
     try {
-      const child = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+      const { child, settled: exited } = spawnHeld('git', [...NO_AUTO_GC_ARGS, ...args], { cwd, stdio: ['ignore', 'pipe', 'pipe'] }, {
+        kind: 'git', end: 'term-then-kill', hold: 'daemon',
+      })
       const timer = setTimeout(() => {
         try { child.kill() } catch { /* already gone */ }
+        endTetheredGroup(child)
         done({ ok: false, stdout, stderr: stderr || `git ${args[0]} timed out after ${timeoutMs}ms` })
       }, timeoutMs)
       child.stdout?.on('data', (b: Buffer) => { stdout += b.toString('utf8') })
       child.stderr?.on('data', (b: Buffer) => { stderr += b.toString('utf8') })
-      child.on('error', (e) => { clearTimeout(timer); done({ ok: false, stdout, stderr: (e as Error).message }) })
-      child.on('close', (code) => { clearTimeout(timer); done({ ok: code === 0, stdout, stderr }) })
+      child.on('error', () => { /* a failed spawn rejects `exited` below */ })
+      exited.then(({ code }) => {
+        clearTimeout(timer)
+        // A helper git left running may still hold the pipes: nothing more is read from them.
+        child.stdout?.destroy()
+        child.stderr?.destroy()
+        done({ ok: code === 0, stdout, stderr })
+      }, (e: Error) => {
+        clearTimeout(timer)
+        done({ ok: false, stdout, stderr: e.message })
+      })
     } catch (e) {
       done({ ok: false, stdout: '', stderr: (e as Error).message })
     }
@@ -74,28 +96,59 @@ export async function isGitRepo(root: string): Promise<boolean> {
   return r.ok && r.stdout.trim() === 'true'
 }
 
-/** Turn arbitrary user text into something `git branch` will accept: git refuses spaces, `~^:?*[`,
- *  `..`, a leading/trailing `/` or `.`, and a trailing `.lock`. Falls back to a fixed stem rather
- *  than returning '' so a name made entirely of illegal characters still produces a usable branch.
- *  Pure. */
+/** A branch path part Windows reads as a device: the names Git for Windows' is_valid_win32_path
+ *  (compat/mingw.c) refuses, alone or followed by an extension, plus COM¹-³ and LPT¹-³, which
+ *  Windows reserves too. The sanitizer lower-cases first and lets `$` and `¹²³` through, so the
+ *  lower-case CONIN$/CONOUT$/COM¹ forms are what can reach it. */
+const WINDOWS_RESERVED_PART = /(^|\/)(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(?=[./]|$)/g
+
+/** Turn arbitrary user text into something `git branch` will accept: git refuses spaces, control
+ *  characters, `~^:?*[\`, `..`, `@{`, a leading `-`, a leading/trailing `/` or `.`, a path
+ *  component starting with `.` or ending in `.lock`, and a trailing `.lock`. Falls back to a fixed
+ *  stem rather than returning '' so a name made entirely of illegal characters still produces a
+ *  usable branch.
+ *
+ *  The name must also be one Git for Windows can create, and is made so on every platform, so a
+ *  branch stays usable wherever the repo is checked out. It is both a loose ref file under
+ *  .git/refs/heads/ and the folder .turbollm/worktrees/<branch>, and Git for Windows refuses
+ *  ("Invalid argument") any path part that contains `"<>|` (`:?*\` are stripped anyway), ends in
+ *  `.`, or names a reserved device (WINDOWS_RESERVED_PART). `git check-ref-format` accepts all
+ *  three, so on Windows a session whose task was `Rename "foo" to "bar"`, or whose typed branch was
+ *  `con`, failed with git_failed and never started. Pure. */
 export function sanitizeBranchName(raw: string): string {
   const cleaned = raw
     .trim()
     .toLowerCase()
     .replace(/\s+/g, '-')
-    .replace(/[~^:?*[\]\\]/g, '')
+    // `|` and the quote/angle brackets read as separators in a task (`a | b`, `<Button>`), so they
+    // become a `-` rather than vanishing and gluing two words together.
+    .replace(/["<>|]/g, '-')
+    .replace(/[\x00-\x1f\x7f~^:?*[\]\\]/g, '')
+    .replace(/@\{/g, '-')
     .replace(/\.\.+/g, '-')
+    .replace(/\/\.+/g, '/')
+    // A part ending in `.` (`v2./fix`): git allows it, Git for Windows can't create the folder.
+    // Before the `.lock` strip, so `x.lock./y` can't come out as `x.lock/y`.
+    .replace(/\.+(?=\/)/g, '')
+    .replace(/(?:\.lock)+(?=\/)/g, '')
     .replace(/\/+/g, '/')
-    .replace(/^[/.]+/, '')
-    .replace(/\.lock$/, '')
+    // A leading `-` matters beyond validity: `git worktree add -b` runs `git branch <name>`, which
+    // parses `-fix-the-bug` (a task typed as a markdown bullet) as options and fails.
+    .replace(/^[-/.]+/, '')
     .replace(/-+/g, '-')
     .slice(0, 80)
     // Trailing `-`, `.` and `/` are stripped AFTER the length cap, not before it. Doing it first
     // was a real bug: the cap can land mid-string and re-expose a character git rejects at the end
     // of a ref. Verified against `git check-ref-format` — a 79-character task description followed
     // by a `.` produced `aaa….`, which git refuses ("is not a valid branch name"), so creating the
-    // session failed outright for nothing more than a long description.
-    .replace(/[-./]+$/, '')
+    // session failed outright for nothing more than a long description. A trailing `.lock` is part
+    // of the same run, so stripping one can't re-expose another (`x.lock-` → `x.lock` → `x`).
+    .replace(/(?:\.lock|[-./])+$/, '')
+    // A reserved device name gets a `-` after it (`con` → `con-`, `nul.txt` → `nul-.txt`), which
+    // Windows no longer reads as the device. Last, because both the cap and the trailing strip can
+    // expose one (`console` cut to `con`, `con -` stripped to `con`); so this one case may come
+    // out a few characters over the cap, which only bounds the name's length loosely anyway.
+    .replace(WINDOWS_RESERVED_PART, '$1$2-')
   return cleaned || 'turbollm-session'
 }
 
@@ -103,6 +156,16 @@ export function sanitizeBranchName(raw: string): string {
 async function refExists(repoRoot: string, name: string): Promise<boolean> {
   const r = await runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`])
   return r.ok && r.stdout.trim().length > 0
+}
+
+/** The commit `base` names — a local or remote-tracking branch, a tag, a commit, anything git
+ *  resolves to one — or null. Asked as `<base>^{commit}`, so a tag is peeled to its commit and a
+ *  tree or file name is no base. A leading `-` would reach rev-parse as an option: never a base. */
+async function resolveBaseCommit(repoRoot: string, base: string): Promise<string | null> {
+  if (base.startsWith('-')) return null
+  const r = await runGit(repoRoot, ['rev-parse', '--verify', '--quiet', `${base}^{commit}`])
+  const sha = r.stdout.trim()
+  return r.ok && sha ? sha : null
 }
 
 /** First free branch name at or after `desired`, suffixing `-2`, `-3`, … when taken.
@@ -124,27 +187,36 @@ export async function findFreeBranchName(repoRoot: string, desired: string): Pro
  *  repo untidy, never broken, so it must not abort a session launch. */
 export async function ensureLocalExclude(repoRoot: string): Promise<void> {
   try {
-    const gitDir = await resolveGitDir(repoRoot)
-    if (!gitDir) return
-    const infoDir = join(gitDir, 'info')
-    const excludePath = join(infoDir, 'exclude')
+    const excludePath = await resolveExcludePath(repoRoot)
+    if (!excludePath) return
     let current = ''
     try { current = await readFile(excludePath, 'utf8') } catch { /* absent — created below */ }
     if (current.split(/\r?\n/).some((l) => l.trim() === EXCLUDE_LINE)) return
-    await mkdir(infoDir, { recursive: true })
+    await mkdir(dirname(excludePath), { recursive: true })
     await appendFile(excludePath, `${current.endsWith('\n') || current === '' ? '' : '\n'}${EXCLUDE_LINE}\n`, 'utf8')
   } catch {
     /* best-effort */
   }
 }
 
-/** Absolute path to the repo's .git directory (`git rev-parse --absolute-git-dir`), or null.
- *  Asked of git rather than assumed to be `<root>/.git`: it is a FILE, not a directory, when the
- *  repo is itself a worktree or a submodule. */
-async function resolveGitDir(repoRoot: string): Promise<string | null> {
-  const r = await runGit(repoRoot, ['rev-parse', '--absolute-git-dir'])
-  const p = r.stdout.trim()
-  return r.ok && p ? p : null
+/** Absolute path to the exclude file git actually reads for this repo, or null. Asked of git
+ *  rather than assumed to be `<root>/.git/info/exclude`: .git is a FILE, not a directory, when the
+ *  repo is itself a worktree or a submodule. And for a LINKED worktree (a base folder made with
+ *  `git worktree add`), the repo's own gitdir, which `--absolute-git-dir` returns, is
+ *  `<main>/.git/worktrees/<name>`, where git never reads an info/exclude: it reads the common
+ *  dir's. Writing the line there left `?? .turbollm/` in the base checkout, and the Git dialog's
+ *  commit-all (`git add -A`) then staged the session worktree as an embedded repo (a 160000
+ *  gitlink). `--git-path info/exclude` answers with the file git reads in every layout. It prints
+ *  a path relative to the cwd for a plain repo, hence the resolve; `--path-format=absolute` would
+ *  avoid that but needs git 2.31. That cwd is the PHYSICAL one (git's getcwd), so the path is
+ *  resolved against the base folder's realpath, not the name it was opened by: a base reached
+ *  through a symlink into a repo subfolder (~/web -> ~/code/mono/packages/web) gets
+ *  `../../.git/info/exclude`, which resolved against the symlink's own path would name a file two
+ *  levels above it, outside any repo, instead of mono/.git/info/exclude. */
+async function resolveExcludePath(repoRoot: string): Promise<string | null> {
+  const r = await runGit(repoRoot, ['rev-parse', '--git-path', 'info/exclude'])
+  const p = r.stdout.replace(/\r?\n$/, '')
+  return r.ok && p ? resolve(await realpath(repoRoot), p) : null
 }
 
 /** The directory a session's agent — and every operation on the files it edits — should act in.
@@ -161,21 +233,24 @@ export function agentCwd(run: { repoRoot?: string; worktreePath?: string }): str
 
 export type WorktreeCreation =
   | { ok: true; path: string; branch: string }
-  | { ok: false; code: 'not_a_repo' | 'branch_unavailable' | 'git_failed'; message: string }
+  | { ok: false; code: 'not_a_repo' | 'branch_unavailable' | 'base_unavailable' | 'git_failed'; message: string }
 
 /**
  * Create an isolated worktree for a Code session.
  *
- * `base` is the commit-ish to branch FROM (the composer's "base branch"); when omitted or
- * unresolvable, git's own HEAD is used — branching a session off whatever is checked out is a far
- * better outcome than refusing to start it because a stale base-branch name no longer exists.
+ * `base` is the commit-ish to branch FROM (the composer's "base branch"): any branch, tag or commit
+ * git resolves. Omitted (or blank), the session branches off what is checked out. One that does
+ * not resolve is refused (`base_unavailable`). It used to count only as a local branch name, and
+ * anything else, a tag, a remote-tracking branch, a commit or a name since deleted, was dropped
+ * without a word: the session branched off the current checkout, not the base it was asked for.
  */
 export async function createSessionWorktree(params: {
   repoRoot: string
   branch: string
   base?: string
 }): Promise<WorktreeCreation> {
-  const { repoRoot, base } = params
+  const { repoRoot } = params
+  const base = params.base?.trim()
 
   if (!(await isGitRepo(repoRoot))) {
     return {
@@ -195,13 +270,33 @@ export async function createSessionWorktree(params: {
     }
   }
 
+  // The commit, not the name, goes to `git worktree add`: from a remote-tracking branch git would
+  // also make it the new branch's upstream (branch.autoSetupMerge), and the Git dialog's plain
+  // `git push` of a branch whose upstream has another name is refused under push.default=simple.
+  const baseCommit = base ? await resolveBaseCommit(repoRoot, base) : null
+  if (base && !baseCommit) {
+    return {
+      ok: false,
+      code: 'base_unavailable',
+      message: `Cannot create a worktree: the base "${base}" is not a branch, tag or commit in this repository. Pick another base branch.`,
+    }
+  }
+
   await ensureLocalExclude(repoRoot)
 
-  const path = join(repoRoot, WORKTREES_SUBDIR, branch)
-  // Only pass a base when it actually resolves — `git worktree add -b x <path> nope` is a hard
-  // failure, and a session that won't start is a worse answer than one branched off HEAD.
-  const baseArgs = base && (await refExists(repoRoot, base)) ? [base] : []
-  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, path, ...baseArgs], 120_000)
+  // A session started at a SUBFOLDER of a repo (a monorepo package): `git worktree add` checks out
+  // the whole repository, and the exclude line is anchored at its top level. So the worktree goes
+  // under the repository's top level, and the session works in the same subfolder of it (the
+  // returned path, which agentCwd uses; created if the base commit lacks it).
+  let prefix = (await runGit(repoRoot, ['rev-parse', '--show-prefix'])).stdout.replace(/\r?\n$/, '')
+  let top = repoRoot
+  if (prefix) {
+    const t = (await runGit(repoRoot, ['rev-parse', '--show-toplevel'])).stdout.replace(/\r?\n$/, '')
+    if (t) top = t
+    else prefix = ''
+  }
+  const worktreeTop = join(top, WORKTREES_SUBDIR, branch)
+  const r = await runGit(repoRoot, ['worktree', 'add', '-b', branch, worktreeTop, ...(baseCommit ? [baseCommit] : [])], 120_000)
   if (!r.ok) {
     return {
       ok: false,
@@ -209,6 +304,8 @@ export async function createSessionWorktree(params: {
       message: `Cannot create a worktree: ${(r.stderr || r.stdout).trim().slice(0, 400)}`,
     }
   }
+  const path = join(worktreeTop, ...prefix.split('/').filter(Boolean))
+  if (prefix) await mkdir(path, { recursive: true }).catch(() => { /* the agent then reports the missing folder */ })
   return { ok: true, path, branch }
 }
 
@@ -230,20 +327,75 @@ export async function removeSessionWorktree(repoRoot: string, worktreePath: stri
   // project moved or deleted, an external drive unplugged. Reporting that as an error produced a
   // raw `spawn git ENOENT` on the delete response (git cannot even start when its cwd is missing),
   // which told the user nothing and made a perfectly successful delete look like it had failed.
-  if (!existsSync(worktreePath) || !existsSync(repoRoot)) return { ok: true }
-
-  const r = await runGit(repoRoot, ['worktree', 'remove', worktreePath], 60_000)
-  if (r.ok) return { ok: true }
-
-  const err = (r.stderr || r.stdout).trim()
-  if (/contains modified or untracked files|use --force/i.test(err)) {
-    return {
-      ok: false,
-      code: 'dirty',
-      message:
-        `The worktree at ${worktreePath} still has uncommitted changes, so it was left in place. ` +
-        `Commit or discard them, then remove it with: git worktree remove "${worktreePath}"`,
+  //
+  // A missing base folder is not "nothing to remove", though. A subfolder session's worktree lives
+  // under the repository's TOP level, so it outlives the folder: deleted, renamed, or absent from
+  // the branch now checked out in the base. Returning success then left the worktree registered,
+  // its branch checked out there ("already used by worktree" on any other checkout of it), with no
+  // note to the user. So git runs from the nearest folder above the base that still exists, and
+  // the base's prefix is that folder's plus the missing path below it. When the repository itself
+  // is gone, so is every worktree in it, and the loop below finds nothing left on disk.
+  //
+  // The first missing name can be a link whose target is gone: a base opened through a symlink
+  // (or junction) into a repo subfolder, ~/web -> ~/code/mono/packages/web, after the checkout
+  // dropped packages/web. The folder above the link (~) is in no repository, so git failed there
+  // ("not a git repository") and the worktree stayed registered. The walk goes on from where the
+  // link points instead, the way the base itself was reached.
+  let gitCwd = resolve(repoRoot)
+  let missing: string[] = []
+  for (let hops = 0; ; hops++) {
+    while (!existsSync(gitCwd)) {
+      const up = dirname(gitCwd)
+      if (up === gitCwd) return { ok: true }
+      missing.unshift(basename(gitCwd))
+      gitCwd = up
     }
+    // 40: the kernel's own limit on links followed in one lookup, so a link loop ends here.
+    const link = missing.length > 0 && hops < 40 ? await readlink(join(gitCwd, missing[0])).catch(() => null) : null
+    if (link === null) break
+    // A relative target is relative to the link's PHYSICAL folder, as the kernel resolves it.
+    const from = await realpath(gitCwd).catch(() => gitCwd)
+    gitCwd = resolve(from, link, ...missing.slice(1))
+    missing = []
   }
-  return { ok: false, code: 'git_failed', message: err.slice(0, 400) }
+
+  // A session started at a repo subfolder works in that subfolder of its worktree
+  // (createSessionWorktree), but `git worktree remove` takes the worktree's own top level: the
+  // stored path without that folder's prefix, tried first. The prefix is asked of the BASE repo,
+  // never of the worktree: a broken one (its .git file gone) would answer for the repository around
+  // it, which may itself be a linked worktree that a remove would then delete. A path that only
+  // ends the same way (a subfolder session created before worktrees moved to the top level, whose
+  // branch is named like the folder) is no worktree, which git says, so the stored path is tried
+  // next. Each is tried only if it is still there: the session's folder inside the worktree can be
+  // gone (deleted by the agent) while the worktree is not.
+  const asked = await runGit(gitCwd, ['rev-parse', '--show-prefix'])
+  const prefix = asked.stdout.replace(/\r?\n$/, '')
+  // Outside any repository (rev-parse fails) the missing path is no prefix of anything.
+  const parts = [...prefix.split('/').filter(Boolean), ...(asked.ok ? missing : [])]
+  // `\` separates only on Windows. On POSIX it is a filename character: split on it, the tail of a
+  // session started at <repo>/pkg\web was `web`, never the prefix `pkg\web`, so only the session's
+  // own folder was tried ("is not a working tree") and the worktree stayed registered.
+  const tail = worktreePath.split(process.platform === 'win32' ? /[\\/]+/ : /\/+/).filter(Boolean).slice(-parts.length)
+  const targets = parts.length > 0 && tail.join('/') === parts.join('/')
+    ? [resolve(worktreePath, ...parts.map(() => '..')), worktreePath]
+    : [worktreePath]
+  for (const [i, target] of targets.entries()) {
+    if (!existsSync(target)) continue
+    const r = await runGit(gitCwd, ['worktree', 'remove', target], 60_000)
+    if (r.ok) return { ok: true }
+
+    const err = (r.stderr || r.stdout).trim()
+    if (i < targets.length - 1 && /is not a working tree/i.test(err)) continue
+    if (/contains modified or untracked files|use --force/i.test(err)) {
+      return {
+        ok: false,
+        code: 'dirty',
+        message:
+          `The worktree at ${target} still has uncommitted changes, so it was left in place. ` +
+          `Commit or discard them, then remove it with: git worktree remove "${target}"`,
+      }
+    }
+    return { ok: false, code: 'git_failed', message: err.slice(0, 400) }
+  }
+  return { ok: true } // nothing of it left on disk
 }

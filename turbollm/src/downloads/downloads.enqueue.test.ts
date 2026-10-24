@@ -6,11 +6,17 @@
 //  - a degenerate repo id is rejected rather than silently mis-placed.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, statfsSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
-import { DownloadManager, DownloadError } from './downloads'
+import { DownloadManager, DownloadError, MAX_FOLDER_FILES, setDownloadGetForTests, type DownloadRecord } from './downloads'
+import { Hono } from 'hono'
 import type { HfModelFiles } from '../hf/hf'
+import { registerApi } from '../api/routes'
+import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
+
+// run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
+setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 
 /** Minimal ConfigStore stand-in: only the two members DownloadManager touches. */
 function fakeStore(modelDir: string, stateDir: string) {
@@ -192,6 +198,134 @@ test('enqueue: a per-quant subfolder is preserved under <owner>/<name>/<dir>', a
   }
 })
 
+/** One whole-folder download as the web queues it: a request per file, each carrying every
+ *  file of the folder by where it lands (`<subdir>/<basename>`) and its size. */
+function queueFolder(dm: DownloadManager, subdir: string, names: string[], size: number) {
+  const folder = { files: names.map((n) => ({ path: `${subdir}/${n}`, size })) }
+  return names.map((rfilename) => dm.enqueue({ repo: 'owner/big', rfilename, size, subdir, folder }))
+}
+
+const SHARDS = [1, 2, 3].map((i) => `model-0000${i}-of-00003.safetensors`)
+
+// A whole-folder download (a safetensors repo, a checkpoint folder) is one request per file,
+// each with the folder as its subdir. Checked file by file, three shards of 60% of the free
+// space each passed (each needs 66%) and queued a folder that needs 198% of it: three 18 GB
+// shards on a disk with 30 GB free. Sized from the real free space so the real check runs.
+test('enqueue: a whole-folder download is checked against the free disk as one total, so none of its files queue when the folder does not fit', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const free = st.bavail * st.bsize
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+
+    const tooBig = await Promise.allSettled(queueFolder(dm, 'big', SHARDS, Math.floor(free * 0.6)))
+    for (const r of tooBig) {
+      assert.equal(r.status, 'rejected', 'every file of a folder that does not fit is refused')
+      assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+    }
+    assert.deepEqual(dm.list(), [], 'nothing of the folder is queued')
+
+    const fits = await Promise.all(queueFolder(dm, 'big', SHARDS, Math.floor(free * 0.1)))
+    assert.deepEqual(fits.map((recs) => recs.length), [1, 1, 1], 'a folder that fits queues every file')
+  } finally {
+    restore()
+  }
+})
+
+// Clicked again while some of its files are still downloading (shard 2 of three errored, 1 and 3
+// still writing), the folder was checked as if all of it were still to come, and the missing
+// shard was refused although it fits on its own. Its live files are not fetched again, so, as a
+// split GGUF drops its live shards before totalling, they come off the folder's total.
+test('enqueue: a whole-folder download clicked again checks only what it still has to fetch', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const shard = Math.floor(st.bavail * st.bsize * 0.4)
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'big/ckpt-2' })
+    await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'big/ckpt-2' })
+
+    const again = await Promise.all(queueFolder(dm, 'big/ckpt-2', SHARDS, shard))
+    assert.deepEqual(again.map((recs) => recs.length), [0, 1, 0], 'the missing shard is queued; the live two add nothing')
+  } finally {
+    restore()
+  }
+})
+
+// Only the folder's OWN files come off its total, never whatever is still downloading under its
+// path. A root checkpoint's folder is the repo's own, so every nested checkpoint sits inside it,
+// yet its files are only the root's (checkpoints.ts: non-recursive). Taken off by path, a live
+// nested checkpoint of 60% of the free space let a root one of 120% queue all three files; and
+// a sibling 'ckpt-2' is not inside 'ckpt', though its path starts with it.
+test('enqueue: a whole-folder download takes off only its own live files, not a nested or sibling folder', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const st = statfsSync(modelDir)
+    const free = st.bavail * st.bsize
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const nested = await Promise.all(queueFolder(dm, 'big/checkpoint-500', SHARDS, Math.floor(free * 0.2)))
+    assert.deepEqual(nested.map((recs) => recs.length), [1, 1, 1], 'the nested checkpoint fits and is downloading')
+
+    for (const subdir of ['big', 'big/checkpoint-50']) {
+      const results = await Promise.allSettled(queueFolder(dm, subdir, SHARDS, Math.floor(free * 0.4)))
+      for (const r of results) {
+        assert.equal(r.status, 'rejected', `every file of ${subdir} is refused: checkpoint-500's live files are not its own`)
+        assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+      }
+    }
+    assert.equal(dm.list().length, 3, 'only the nested checkpoint is queued')
+  } finally {
+    restore()
+  }
+})
+
+// The caller chooses the folder's list, and checking it scanned every row for every listed file:
+// one POST /api/v1/downloads of 20000 entries against 2000 errored rows held the daemon's event
+// loop for nearly 3 s, stalling every chat stream and SSE tail, and nothing capped the list.
+test('enqueue: a whole-folder download listing more than MAX_FOLDER_FILES files is refused; one at the cap queues', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const listing = (n: number) => ({ files: Array.from({ length: n }, (_, i) => ({ path: `big/file-${i}.bin`, size: 1 })) })
+    await assert.rejects(
+      dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder: listing(MAX_FOLDER_FILES + 1) }),
+      (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+    )
+    assert.deepEqual(dm.list(), [], 'nothing is queued')
+    const at = await dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder: listing(MAX_FOLDER_FILES) })
+    assert.equal(at.length, 1)
+  } finally {
+    restore()
+  }
+})
+
+// Every listed file walked every row: thousands of rows (errored ones stay until removed, and
+// each enqueue can leave one) times a folder at the cap was ~20M comparisons as macOS, seconds of
+// the event loop for one request. The live dests are now read once. Counted as walks of the row
+// table rather than timed, so a slow or busy machine cannot fail it and a fast one cannot pass it
+// with the per-file walk back; every walk in DownloadManager goes through records.values().
+test('enqueue: a whole-folder download at the cap walks the download rows a few times, not once per listed file', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    const records = (dm as unknown as { records: Map<string, object> }).records
+    let walks = 0
+    const values = records.values.bind(records)
+    records.values = () => { walks++; return values() }
+    const folder = { files: Array.from({ length: MAX_FOLDER_FILES }, (_, i) => ({ path: `big/file-${i}.bin`, size: 1 })) }
+    const out = await dm.enqueue({ repo: 'owner/big', rfilename: 'file-0.bin', size: 1, subdir: 'big', folder })
+    assert.equal(out.length, 1)
+    assert.ok(walks < 16, `enqueue walked the download rows ${walks} times for ${MAX_FOLDER_FILES} listed files`)
+  } finally {
+    restore()
+  }
+})
+
 test('enqueue: an HF resolve URL honours the linked revision (not main) + decodes path', async () => {
   const restore = stubFetch()
   try {
@@ -211,6 +345,26 @@ test('enqueue: an HF resolve URL honours the linked revision (not main) + decode
     // Revision threaded into the download URL; space re-encoded per segment.
     assert.equal(recs[0].url, 'https://huggingface.co/owner/repo/resolve/v2.0/sub%20dir/model.gguf')
     assert.equal(recs[0].dest, join(modelDir, 'owner', 'repo', 'sub dir', 'model.gguf'))
+  } finally {
+    restore()
+  }
+})
+
+test('enqueue: an HF repo download fetches from the commit the expander read its files at', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const commit = '499bc8821c6b12b4e53c5bffcb21ec206f212d81'
+    const expand = async (_repo: string, rfilename: string): Promise<HfModelFiles> => ({
+      dir: '',
+      files: [{ rfilename, size: 10, sha256: 'a', mmproj: false }],
+      commit,
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), expand)
+    const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+    assert.equal(rec.url, `https://huggingface.co/owner/repo/resolve/${commit}/model.gguf`)
+    assert.equal(rec.name, 'model.gguf', 'the row still shows the file name')
+    assert.equal(rec.repo, 'owner/repo')
   } finally {
     restore()
   }
@@ -253,6 +407,248 @@ test('enqueue: a concurrent duplicate (same dest) is not enqueued twice', async 
     restore()
   }
 })
+
+// A file a live row (downloading, queued or paused) already holds queues nothing new, and the
+// request is answered with that row in `held` (the route's `existing`): returning nothing at all
+// left onboarding with no download to follow after a restart had paused its own, and Import from
+// URL closing without a word.
+test('enqueue: a file a live row already holds is answered with that row, a raw URL, a subdir file or an expanded model alike', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand([
+      { rfilename: 'mmproj-F16.gguf', size: 5, sha256: 'p', mmproj: true },
+    ]))
+    const ids = (rows: { id: string }[]) => rows.map((r) => r.id)
+    for (const input of [
+      { url: 'https://mirror.example/raw.gguf' },
+      { repo: 'owner/st', rfilename: 'config.json', subdir: 'st' },
+      { repo: 'owner/repo', rfilename: 'model.gguf' },
+    ]) {
+      const first = await dm.enqueue(input)
+      assert.ok(first.length > 0)
+      dm.pause(first[0].id) // the first row paused (or queued), the rest still downloading
+      const held: DownloadRecord[] = []
+      assert.deepEqual(await dm.enqueue(input, held), [], JSON.stringify(input))
+      assert.deepEqual(ids(held), ids(first), 'every row that holds a requested file comes back')
+      assert.equal(held[0].status, 'paused')
+    }
+    const dests = dm.list().map((r) => r.dest)
+    assert.equal(new Set(dests).size, dests.length, 'still one row per file')
+  } finally {
+    restore()
+  }
+})
+
+// A raw URL lands flat in the model folder, so another URL saving the same file name meets the first one's row: it was
+// answered as that row, and the page resumed the other URL's download, whose model then landed in the library.
+test('enqueue: a raw URL whose file name a live row of another URL holds is refused, holding nothing; the same URL still gets its row', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const [a] = await dm.enqueue({ url: 'http://h1.example/x/ggml-model-q4_0.gguf' })
+    dm.pause(a.id)
+    const held: DownloadRecord[] = []
+    await assert.rejects(dm.enqueue({ url: 'http://h2.example/y/ggml-model-q4_0.gguf' }, held), (e: unknown) => {
+      assert.equal((e as DownloadError).code, 'download_in_progress')
+      assert.equal((e as Error).message, 'Another download is already saving ggml-model-q4_0.gguf in this folder. Discard it in Downloads, or wait for it to finish.')
+      return true
+    })
+    assert.deepEqual(held, [], 'the other URL\'s row is not handed back')
+    assert.equal(dm.list().length, 1, 'nothing queued')
+    assert.equal(dm.list()[0].status, 'paused', 'and the paused row is left as it was')
+
+    const again: DownloadRecord[] = []
+    assert.deepEqual(await dm.enqueue({ url: 'http://h1.example/x/ggml-model-q4_0.gguf' }, again), [])
+    assert.deepEqual(again.map((r) => r.id), [a.id], 'the same URL is answered with its own row')
+  } finally {
+    restore()
+  }
+})
+
+test('POST /downloads answers a file a paused row holds with that row in `existing`, queuing nothing', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const app = new Hono()
+    registerApi(app, { downloads: dm } as unknown as Deps)
+    const post = async () => {
+      const res = await app.request('/api/v1/downloads', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ repo: 'owner/repo', rfilename: 'm.gguf' }),
+      })
+      assert.equal(res.status, 202)
+      return (await res.json()) as { downloads: Array<{ id: string }>; existing: Array<{ id: string; status: string }> }
+    }
+    const first = await post()
+    assert.equal(first.downloads.length, 1)
+    assert.deepEqual(first.existing, [])
+    assert.equal(dm.pause(first.downloads[0].id), true)
+    const again = await post()
+    assert.deepEqual(again.downloads, [])
+    // Its id, name and status only: the rest of the row is a read (see the remote-token test in
+    // server.download-pause.test.ts).
+    assert.deepEqual(again.existing, [{ id: first.downloads[0].id, name: 'm.gguf', status: 'paused' }])
+    assert.equal(dm.list().length, 1)
+  } finally {
+    restore()
+  }
+})
+
+/** Stand in for another platform for one test (restored after it). */
+function asPlatform(t: { after: (fn: () => void) => void }, platform: NodeJS.Platform) {
+  const actual = process.platform
+  Object.defineProperty(process, 'platform', { value: platform })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actual }))
+}
+
+// Hugging Face serves a repo id in any letter case, so a pasted URL in another casing names the
+// same file as a live Discover download. On a case-insensitive file system (Windows, default
+// macOS) the two dests open one .part, so a second row would be a second writer on it.
+const CANONICAL = { repo: 'ggml-org/models', rfilename: 'x.gguf' }
+const OTHER_CASE = { url: 'https://huggingface.co/GGML-ORG/MODELS/resolve/main/x.gguf' }
+
+for (const platform of ['win32', 'darwin'] as const) {
+  test(`enqueue on ${platform}: the same file under another letter case is not a second writer on its .part`, async (t) => {
+    asPlatform(t, platform)
+    const restore = stubFetch()
+    try {
+      const { modelDir, stateDir } = newDirs()
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+      const [a] = await dm.enqueue(CANONICAL)
+      assert.ok(a)
+      assert.deepEqual(await dm.enqueue(OTHER_CASE), [], 'a live row already owns that file')
+      assert.equal(dm.list().length, 1)
+
+      // A stale errored row next to a live one in another case: no second writer on resume.
+      const asAny = dm as unknown as { records: Map<string, { status: string }> }
+      asAny.records.get(a.id)!.status = 'error'
+      const [b] = await dm.enqueue(OTHER_CASE)
+      assert.ok(b, 'an errored row does not block a fresh attempt')
+      assert.notEqual(a.dest, b.dest)
+      assert.equal(a.dest.toLowerCase(), b.dest.toLowerCase())
+      assert.throws(() => dm.resume(a.id), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
+      // Nor may the stale row delete the live row's .part.
+      writeFileSync(`${b.dest}.part`, Buffer.alloc(16, 1))
+      assert.equal(dm.remove(a.id), true)
+      assert.ok(existsSync(`${b.dest}.part`))
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('enqueue on linux: dests that differ only in letter case are different files', async (t) => {
+  asPlatform(t, 'linux')
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    assert.equal((await dm.enqueue(CANONICAL)).length, 1)
+    assert.equal((await dm.enqueue(OTHER_CASE)).length, 1, 'a case-sensitive file system holds both')
+  } finally {
+    restore()
+  }
+})
+
+// Android's shared storage ignores letter case as well: /sdcard, /storage/emulated/0, an SD card
+// under /storage, and the ~/storage links termux-setup-storage makes into them. Seeded as two rows
+// a restart left paused, in two letter cases of one file, since a test cannot create /storage: the
+// second Resume must not become a second writer on the first one's .part.
+const termuxHome = tmpDir('tllm-termux-home-')
+const ANDROID_SHARED: Array<[label: string, root: string]> = [
+  ['/storage/emulated/0', '/storage/emulated/0/models'],
+  ['/sdcard', '/sdcard/models'],
+  ["Termux's ~/storage/shared", join(termuxHome, 'storage', 'shared', 'models')],
+]
+for (const [label, root] of ANDROID_SHARED) {
+  // os.homedir() reads USERPROFILE on Windows, not HOME, and the Termux root is joined with
+  // backslashes there, so only the /storage and /sdcard cases can stand in for Android on it.
+  const skip = process.platform === 'win32' && root.startsWith(termuxHome) && 'os.homedir() ignores HOME on Windows'
+  test(`resume on android: under ${label}, the same file in another letter case is not a second writer on its .part`, { skip }, async (t) => {
+    asPlatform(t, 'android')
+    const home = process.env.HOME
+    process.env.HOME = termuxHome
+    t.after(() => { process.env.HOME = home })
+    const restore = stubFetch()
+    try {
+      const { stateDir } = newDirs()
+      const row = (id: string, repo: string) => ({
+        id, name: 'x.gguf', repo, url: `https://huggingface.co/${repo}/resolve/main/x.gguf`,
+        dest: `${root}/${repo}/x.gguf`, total: 10, createdAt: new Date().toISOString(),
+      })
+      mkdirSync(join(stateDir, 'downloads'), { recursive: true })
+      writeFileSync(
+        join(stateDir, 'downloads', 'manifest.json'),
+        JSON.stringify({ version: 1, entries: [row('a', 'ggml-org/models'), row('b', 'GGML-ORG/MODELS')] }),
+      )
+      const dm = new DownloadManager(fakeStore(root, stateDir), () => {}, () => ({}), echoExpand())
+      assert.equal(dm.resume('a'), true)
+      assert.throws(() => dm.resume('b'), (e: unknown) => (e as DownloadError).code === 'download_in_progress')
+    } finally {
+      restore()
+    }
+  })
+}
+
+test('enqueue on android: in app-private storage (Termux\'s home), two letter cases are two files', async (t) => {
+  asPlatform(t, 'android')
+  const home = process.env.HOME
+  process.env.HOME = termuxHome
+  t.after(() => { process.env.HOME = home })
+  const restore = stubFetch()
+  try {
+    const { stateDir } = newDirs()
+    const modelDir = join(termuxHome, 'models')
+    mkdirSync(modelDir, { recursive: true })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    assert.equal((await dm.enqueue(CANONICAL)).length, 1)
+    assert.equal((await dm.enqueue(OTHER_CASE)).length, 1, 'a case-sensitive file system holds both')
+  } finally {
+    restore()
+  }
+})
+
+// The folder's live files are matched as sameDest matches one file: where the file system ignores
+// letter case (Windows, macOS, Android's shared storage), a live row in another case holds the
+// same file and comes off the total; where it does not (Linux), it is another file.
+for (const [platform, folds] of [['win32', true], ['darwin', true], ['android', true], ['linux', false]] as const) {
+  const skip = process.platform === 'win32' && platform === 'android' && 'os.homedir() ignores HOME on Windows'
+  test(`enqueue on ${platform}: a whole-folder download takes off its live files in another letter case ${folds ? 'as the same files' : 'only when the case matches'}`, { skip }, async (t) => {
+    asPlatform(t, platform)
+    const home = process.env.HOME
+    const termux = tmpDir('tllm-termux-home-')
+    process.env.HOME = termux
+    t.after(() => { process.env.HOME = home })
+    const restore = stubFetch()
+    try {
+      const { modelDir: plain, stateDir } = newDirs()
+      // On Android, in Termux's link into shared storage (a test cannot create /storage).
+      const modelDir = platform === 'android' ? join(termux, 'storage', 'shared', 'models') : plain
+      mkdirSync(modelDir, { recursive: true })
+      const st = statfsSync(modelDir)
+      const shard = Math.floor(st.bavail * st.bsize * 0.4)
+      const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+      await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[0], size: shard, subdir: 'Big/Ckpt-2' })
+      await dm.enqueue({ repo: 'owner/big', rfilename: SHARDS[2], size: shard, subdir: 'Big/Ckpt-2' })
+
+      const again = await Promise.allSettled(queueFolder(dm, 'big/ckpt-2', SHARDS, shard))
+      if (folds) {
+        assert.deepEqual(again.map((r) => r.status === 'fulfilled' && r.value.length), [0, 1, 0], 'the missing shard is queued; the live two add nothing')
+      } else {
+        for (const r of again) {
+          assert.equal(r.status, 'rejected', 'the live two are other files, so the folder needs all three')
+          assert.equal(((r as PromiseRejectedResult).reason as DownloadError).code, 'insufficient_disk')
+        }
+      }
+    } finally {
+      restore()
+    }
+  })
+}
 
 test('enqueue: two quants sharing one mmproj do not double-enqueue the projector', async () => {
   const restore = stubFetch()
@@ -390,6 +786,76 @@ test('enqueue: a non-HF raw URL stays a single flat file', async () => {
     assert.equal(recs.length, 1)
     assert.equal(recs[0].repo, '')
     assert.equal(recs[0].dest, join(modelDir, 'model.Q4_K_M.gguf'))
+  } finally {
+    restore()
+  }
+})
+
+test('run: the HF token goes only to the HF origin — never to a raw-URL import host', async () => {
+  const { modelDir, stateDir } = newDirs()
+  const real = globalThis.fetch
+  const seen: Array<{ url: string; headers: Record<string, string> }> = []
+  globalThis.fetch = (async (url: string, init: { headers: Record<string, string> }) => {
+    seen.push({ url: String(url), headers: { ...init.headers } })
+    return new Response('x', { status: 200 })
+  }) as unknown as typeof fetch
+  try {
+    const auth = () => ({ 'User-Agent': 'TurboLLM/test', Authorization: 'Bearer hf_SECRET' })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, auth, echoExpand())
+    for (const url of ['http://192.168.1.5/model.gguf', 'https://mirror.example/model.gguf', 'http://huggingface.co/x.gguf']) {
+      const [rec] = await dm.enqueue({ url })
+      await waitTerminal(dm, rec.id)
+    }
+    const [hfRec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'model.gguf' })
+    await waitTerminal(dm, hfRec.id)
+
+    const raw = seen.filter((s) => !s.url.startsWith('https://huggingface.co/'))
+    assert.equal(raw.length, 3)
+    for (const s of raw) {
+      assert.equal(s.headers.Authorization, undefined, `no token for ${s.url}`)
+      assert.equal(s.headers['User-Agent'], 'TurboLLM/test', 'other headers are kept')
+    }
+    const hf = seen.find((s) => s.url === 'https://huggingface.co/owner/repo/resolve/main/model.gguf')
+    assert.equal(hf?.headers.Authorization, 'Bearer hf_SECRET', 'an HF download still authenticates (gated repos)')
+  } finally {
+    globalThis.fetch = real
+  }
+})
+
+test('enqueue: a ".." segment in the file path is rejected (decoded resolve URL or raw rfilename)', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    // The expander's fallback (tree 404 / file not in the tree) echoes the caller's own path.
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echoExpand())
+    await assert.rejects(
+      () => dm.enqueue({ url: 'https://huggingface.co/x/y/resolve/main/..%2F..%2F..%2F..%2Fescaped%2Fevil.gguf' }),
+      (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+    )
+    for (const rfilename of ['../../escaped/evil.gguf', 'sub/../../evil.gguf', '..\\..\\evil.gguf']) {
+      await assert.rejects(
+        () => dm.enqueue({ repo: 'owner/repo', rfilename }),
+        (e: unknown) => e instanceof DownloadError && e.code === 'invalid_request',
+        rfilename,
+      )
+    }
+    assert.equal(dm.list().length, 0)
+  } finally {
+    restore()
+  }
+})
+
+test("enqueue: the expander's dir is sanitised, so it can never place files outside the model dir", async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, stateDir } = newDirs()
+    const hostile = async (): Promise<HfModelFiles> => ({
+      dir: '../../escaped',
+      files: [{ rfilename: 'evil.gguf', size: 10, mmproj: false }],
+    })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), hostile)
+    const [rec] = await dm.enqueue({ repo: 'owner/repo', rfilename: 'evil.gguf' })
+    assert.equal(rec.dest, join(modelDir, 'owner', 'repo', 'escaped', 'evil.gguf'))
   } finally {
     restore()
   }

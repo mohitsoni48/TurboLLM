@@ -576,7 +576,56 @@ test('runningRoutineIds lists a routine whose run is executing, not one parked o
   assert.deepEqual(scheduler.runningRoutineIds(), [], 'a finished run is no longer running')
 })
 
+test('runningRoutineIds lists a parked run again while an Approve resumes it, until the resume returns', async () => {
+  // The Approve route resumes the run (the approved call, then the rest of it, on the engine)
+  // while it is still parked; the guard goes only once it has settled (releaseParked).
+  const store = freshStore()
+  const parked = store.createRoutine({ flavor: 'chat', prompt: 'y', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(parked.id, '2020-01-01T00:00:00.000Z')
+  const scheduler = new RoutineScheduler({ store, now: () => new Date('2026-08-01T10:00:00.000Z'), runRoutine: async () => 'needs_approval' })
+  await scheduler.tick()
+  await flush()
+  assert.deepEqual(scheduler.runningRoutineIds(), [], 'parked: waits on the user')
+
+  scheduler.markResuming(parked.id)
+  assert.deepEqual(scheduler.runningRoutineIds(), [parked.id], 'resuming: runs on the engine')
+  scheduler.markResuming(parked.id) // a second answer racing the first
+  scheduler.unmarkResuming(parked.id)
+  assert.deepEqual(scheduler.runningRoutineIds(), [parked.id], 'the other answer still resumes it')
+  scheduler.unmarkResuming(parked.id)
+  assert.deepEqual(scheduler.runningRoutineIds(), [], 'back to parked once every resume returned')
+  scheduler.unmarkResuming(parked.id)
+  assert.deepEqual(scheduler.runningRoutineIds(), [], 'an extra unmark is a no-op')
+})
+
 test('runningRoutineIds is empty when nothing has fired', () => {
   const scheduler = new RoutineScheduler({ store: freshStore(), now: () => new Date(), runRoutine: async () => 'ok' })
   assert.deepEqual(scheduler.runningRoutineIds(), [])
+})
+
+// A fire cut off mid-execution (or resumeRoutineRun's claim on an approval) by a daemon
+// restart stayed 'running' forever — nothing at startup looked at those rows.
+test('start() closes out runs a daemon restart left at running, and leaves parked ones alone', () => {
+  const store = freshStore()
+  const r = store.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  store.confirmRoutine(r.id, new Date(Date.now() + 3_600_000).toISOString())
+  const interrupted = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const parked = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  store.updateRoutineRun(parked.id, { status: 'needs_approval' })
+  const finished = store.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  store.updateRoutineRun(finished.id, { status: 'ok', endedAt: '2026-01-01T00:00:00.000Z' })
+
+  const scheduler = new RoutineScheduler({ store, now: () => new Date(), runRoutine: async () => 'ok', tickIntervalMs: 3_600_000 })
+  try {
+    scheduler.start()
+    const closed = store.getRoutineRun(interrupted.id)!
+    assert.equal(closed.status, 'errored')
+    assert.match(closed.error ?? '', /restarted/)
+    assert.ok(closed.endedAt)
+    assert.equal(store.getRoutineRun(parked.id)!.status, 'needs_approval')
+    assert.equal(store.getRoutineRun(finished.id)!.status, 'ok')
+    assert.equal(store.getRoutineRun(finished.id)!.endedAt, '2026-01-01T00:00:00.000Z')
+  } finally {
+    scheduler.stop()
+  }
 })

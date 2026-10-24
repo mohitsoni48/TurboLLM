@@ -2,7 +2,8 @@
 // model", extracted from routes.ts so that more than one transport can mount it.
 //
 // It has exactly two callers today: the local `/api/v1/engine/start` + `/api/v1/engine/stop`
-// routes (routes.ts), and the Turbo Link façade's `/api/link/v1/models/load` + `/unload`
+// routes (routes.ts; `/api/v1/engine/restart` too, whose reload on another engine is a load
+// here), and the Turbo Link façade's `/api/link/v1/models/load` + `/unload`
 // (link/link-routes.ts). The façade mounts THESE functions behind `requireCapability` rather
 // than reimplementing them, so eviction, the keep-N pool, the ComfyUI guard, the auto-tune
 // kill switch and swap serialization behave identically whether the caller is the local UI or
@@ -10,14 +11,16 @@
 // that once (an admin `probe()` diverging from `LinkManager.probeOnce`).
 import type { Context } from 'hono'
 import { basename } from 'node:path'
+import { isLocalOrAuthenticated } from '../auth'
 import type { Deps } from '../deps'
 import type { ModelInfo, StartOpts } from '../engines/manager'
 import { abortAllInFlightChats } from '../chat/chat-routes'
-import { modelIncompatibility } from '../engines/compat'
+import { manualLoadRefusal } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
 import { getSysInfo } from '../sysinfo/sysinfo'
+import { launchFieldsRefusal, launchKeyRequired, loadsWithNow } from './profile-validate'
 
 type Status = 200 | 202 | 400 | 409 | 500
 
@@ -27,10 +30,12 @@ function err(c: Context, status: Status, code: string, message: string) {
 
 /** What `POST /api/v1/engine/start` accepts.
  *
- *  `modelPath` / `extraArgs` / `modelName` are the transitional pre-A4 fallback and are
- *  LOCAL-ONLY in practice: they name a filesystem path and extra process arguments, which is
- *  precisely what ADR-139 says no remote caller may supply. The Turbo Link façade therefore
- *  constructs this object itself with `modelKey` alone — it never forwards a peer's body. */
+ *  `modelPath` / `extraArgs` / `modelName` are the transitional pre-A4 fallback. `modelPath` and
+ *  `extraArgs` name a filesystem path and extra process arguments, which is precisely what
+ *  ADR-139 says no remote caller may supply, so startEngine refuses them, and launch fields in
+ *  `profileOverrides` (launchFieldsRefusal), to a caller failing isLocalOrAuthenticated. The
+ *  Turbo Link façade constructs this object itself with `modelKey` alone — it never forwards a
+ *  peer's body. */
 export interface EngineStartBody {
   modelKey?: string
   profileOverrides?: Partial<LoadProfile>
@@ -52,6 +57,16 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   // A Laya model loads on the Laya engine whichever engine is active; every other model on the active one.
   const active = entry ? engineForModel(d.registry, entry) : d.registry.active()
   if (!active) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  // A model path or engine flags of the caller's own (ADR-139), refused before anything is
+  // stopped or loaded: the legacy fields whenever they are sent (as PUT /api/v1/engines/:id does
+  // for a source repo), an override's flags and files only when they differ from what the model
+  // loads with on this engine, which the Load dialog sends back with every load.
+  if (b.modelPath !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'modelPath', 'Loading a model by its file path')
+  if (b.extraArgs !== undefined && !isLocalOrAuthenticated(c, d)) return launchKeyRequired(c, 'extraArgs', 'Setting extra command-line flags')
+  if (entry) {
+    const refused = launchFieldsRefusal(c, d, b.profileOverrides, loadsWithNow(d, entry.key, active.id))
+    if (refused) return refused
+  }
   // ComfyUI guard: while ComfyUI is rendering it owns the GPU, so refuse to load a
   // model (it would thrash/OOM VRAM). The guard reloads automatically once idle.
   if (d.comfy?.isBlocked()) return err(c, 409, 'comfyui_busy', 'ComfyUI is rendering — model loading is paused until its queue finishes.')
@@ -61,9 +76,13 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     if (entry.incomplete || entry.parseError) {
       return err(c, 409, 'model_not_loadable', 'This model is incomplete or unreadable.')
     }
-    // Engine and model must be compatible (spec 03 §2b/2c, ADR-434 (g)): format, audio
-    // tower, a Jev model's vLLM requirement and a Laya model's Laya engine — the one shared rule in compat.ts.
-    const inc = modelIncompatibility(active.kind, entry)
+    // A load asked for by hand starts on the selected engine whatever the model's format, audio tower or Jev vLLM
+    // requirement (spec 03 §2b/2c, ADR-434 (g)), and fails with that engine's own error if it cannot load it: only a
+    // Laya model with no Laya engine is refused here (compat.ts manualLoadRefusal). This refused every model the
+    // engine was not expected to run, with advice to activate another engine ("activate the LiteRT-LM engine to load
+    // it" for a .litertlm model under KoboldCpp), a choice that is the user's alone. The Models screen and the pickers
+    // still hide such a model unless the user shows them all.
+    const inc = manualLoadRefusal(active.kind, entry)
     if (inc) return err(c, 409, 'engine_model_mismatch', inc.message)
 
     // Side models — embedding and Laya — get their own pool slot via the router (same coexistence rule
@@ -74,9 +93,13 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     // Skips the kill switch below too: that exists to stop in-flight chats/auto-tune
     // against an engine that's "going away" (chat-routes.ts's abortAllInFlightChats
     // docblock) — the primary engine isn't going away here, so nothing needs aborting.
+    // `manual`: the router starts it on the selected engine as this function starts a chat model, with no
+    // compatibility refusal of its own (LoadExplicitOpts). A refusal or a failed start comes back as a result, not a
+    // rejection, and is logged as one.
     if (entry.embedding || entry.laya) {
       void d.modelRouter
-        .loadExplicit(entry.key, b.profileOverrides)
+        .loadExplicit(entry.key, b.profileOverrides, { manual: true })
+        .then((r) => { if ('status' in r) console.warn(`engine load failed: ${r.message}`) })
         .catch((e) => console.warn(`engine load failed: ${e}`))
       return c.json({ ok: true }, 202)
     }
@@ -106,9 +129,10 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
       .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
       .then(() => d.modelRouter.markPrimaryLoaded())
       .catch((e) => console.warn(`engine load failed: ${e}`))
-    d.store.update((x) => {
-      x.lastLoaded = { modelKey: entry.key, engineId: active.id }
-    })
+    // Recorded through the router: this load may be queued behind the swap lock that release()'s resume of a gateway
+    // load a ComfyUI render paused holds, and that resume must not record its model over this one (see
+    // ModelRouter.recordManualLoad).
+    d.modelRouter.recordManualLoad(entry.key, active.id)
     return c.json({ ok: true }, 202)
   }
 
@@ -134,6 +158,48 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     .withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
     .then(() => d.modelRouter.markPrimaryLoaded())
     .catch((e) => console.warn(`engine load failed: ${e}`))
+  return c.json({ ok: true }, 202)
+}
+
+/** `POST /api/v1/engine/restart`, the Engines card's Restart (shown while the primary runs or after its load failed):
+ *  reload the last load attempted (Manager.restartOpts), on the engine the user selected. Manager.restart() reloads
+ *  those opts engine included, and they outlive a stop and every activation: an install or Enable selects another
+ *  engine without stopping the model or clearing its error, so Restart brought the model back on the engine the user
+ *  had left, while the error banner's Retry (startEngine) loaded the same model on the selected one. On another
+ *  engine it is now loaded there as startEngine loads a chat model (its saved profile for that engine, recorded as
+ *  the model last loaded; never through the router, which can start a second copy of an embedding model in a pool
+ *  slot), and fails with that engine's own error if it cannot run it; with no engine selected it is refused as a Load
+ *  is. On the same engine, Manager.restart() as before. */
+export function restartEngine(c: Context, d: Deps): Response {
+  const o = d.manager.restartOpts()
+  const entry = o ? d.scanner.get(o.model.key) : undefined
+  // A Laya model loads on the Laya engine; every other model on the active one (engineForModel, as startEngine asks).
+  const selected = entry ? engineForModel(d.registry, entry) : d.registry.active()
+  if (o && !selected) return err(c, 409, 'no_active_engine', 'Register and select an engine first.')
+  const opts: StartOpts | null = !o || !selected || selected.id === o.engine.id
+    ? null
+    : entry
+      ? buildStartOpts({ entry, engine: selected, cfg: d.store.snapshot(), sys: getSysInfo(), trigger: 'manual' })
+      // A load by path (the pre-A4 fallback), or a model no longer in the library: the same launch on that engine.
+      : { ...o, engine: selected }
+  // Kill switch: cancel auto-tune + abort chats, wait for the runner to release the engine,
+  // then restart — so the reload doesn't race auto-tune's teardown.
+  d.bench.cancel()
+  abortAllInFlightChats()
+  if (!opts) {
+    void (async () => {
+      await d.bench.waitIdle()
+      await d.manager.restart()
+    })().catch(() => {})
+    return c.json({ ok: true }, 202)
+  }
+  // Under the router's swap lock with the ComfyUI reverse gate, as startEngine's load is (see there).
+  void (async () => {
+    await d.bench.waitIdle()
+    await d.modelRouter.withSwapLock(() => d.manager.load(opts, { beforeStart: () => d.comfy?.freeComfyUIBeforeLoad() ?? Promise.resolve() }))
+    d.modelRouter.markPrimaryLoaded()
+  })().catch((e) => console.warn(`engine load failed: ${e}`))
+  if (entry) d.modelRouter.recordManualLoad(entry.key, opts.engine.id)
   return c.json({ ok: true }, 202)
 }
 

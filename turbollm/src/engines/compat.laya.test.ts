@@ -24,7 +24,7 @@ test('modelIncompatibility: the Laya engine loads nothing but Laya models', () =
   for (const entry of [PLAIN_GGUF, PLAIN_MLX]) {
     const inc = modelIncompatibility('laya', entry)
     assert.equal(inc?.code, 'format')
-    assert.equal(inc?.message, 'The Laya engine runs only Laya models — load this one on another engine.')
+    assert.equal(inc?.message, 'The Laya engine runs only Laya models.')
   }
 })
 
