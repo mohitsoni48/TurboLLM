@@ -17,7 +17,7 @@ import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
-import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
+import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
@@ -649,7 +649,8 @@ export class BenchRunner {
       // rest of the resolved winner: the defaults stored with it were the user's choice from then on, so a
       // later change to Settings > Model Defaults stopped reaching a tuned model's other settings.
       const auto = automaticProfile(entry, sys, defaults)
-      const userSet = mergeUserSet(userSetProfile(saved, auto), userSetProfile(base, auto))
+      const seed = legacySeedProfile(entry, sys, defaults, auto)
+      const userSet = mergeUserSet(userSetProfile(saved, seed), userSetProfile(base, seed))
       const sampling = { ...(userSet.sampling ?? {}), ...(recommended && hasAnySampling(recommended) ? recommended : {}) }
       const toSave: Partial<LoadProfile> = {
         ...userSet,

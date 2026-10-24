@@ -83,7 +83,7 @@ import { detectHardware } from '../engines/hardware'
 import { recommendEngines } from '../engines/recommend'
 import { modelIncompatibility } from '../engines/compat'
 import { ScannerError, type ModelEntry } from '../models/scanner'
-import { automaticProfile, configuredCtx, estimateVram, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
+import { automaticProfile, configuredCtx, estimateVram, legacySeedProfile, type LoadProfile, resolveProfile, userSetProfile } from '../models/profile'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { requestUsage } from '../sysinfo/usage'
 import { HfError, type HfSearchItem, type HfSortOption } from '../hf/hf'
@@ -2847,10 +2847,11 @@ export function registerApi(app: Hono, d: Deps): void {
     // profile that are the user's, and the profile the model loads with when nothing is set, which a
     // preset applied in the dialog is merged onto.
     const autoProfile = automaticProfile(e, sys, snap.modelDefaults)
+    const seed = legacySeedProfile(e, sys, snap.modelDefaults, autoProfile)
     // `gpu` (first GPU) kept for back-compat; `gpus` (full list) drives the multi-GPU
     // split controls (ADR-054).
     return c.json({
-      ...overlayModel(e, d), profile, saved: userSetProfile(saved, autoProfile) ?? {}, autoProfile,
+      ...overlayModel(e, d), profile, saved: userSetProfile(saved, seed) ?? {}, autoProfile,
       vramFit: estimateVram(profile, e, sys), gpu: sys.gpus[0] ?? null, gpus: sys.gpus, cores: sys.cores,
     })
   })
@@ -2893,8 +2894,8 @@ export function registerApi(app: Hono, d: Deps): void {
       if (pinnedId) {
         const pinned = (ownEntry(cfg.modelPresets, key) ?? []).find((x) => x.id === pinnedId)
         const thisEngine = !pinned || pinned.engineId === '' || pinned.engineId === engineId
-        const auto = automaticProfile(e, getSysInfo(), cfg.modelDefaults)
-        const same = !!pinned && profilesEqual(userSetProfile(pinned.profile as Partial<LoadProfile>, auto), userSetProfile(p, auto))
+        const seed = legacySeedProfile(e, getSysInfo(), cfg.modelDefaults)
+        const same = !!pinned && profilesEqual(userSetProfile(pinned.profile as Partial<LoadProfile>, seed), userSetProfile(p, seed))
         if (thisEngine && !same) delete cfg.lastPresetId[key]
       }
     })

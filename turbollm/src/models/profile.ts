@@ -1,7 +1,7 @@
 // LoadProfile: per-model launch parameters, default derivation, VRAM-fit
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
-import { getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
+import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
@@ -618,11 +618,27 @@ export function deriveTensorSplit(p: LoadProfile, m: ModelEntry, sys: SysInfo): 
   return layers
 }
 
+/** What LiteRT-LM uses for max_num_tokens when it is given none (engine_settings.cc: for an empty prompt, 4096 when the
+ *  bundle's LlmMetadata declares no max_num_tokens). */
+export const LITERT_RUNTIME_DEFAULT_CTX = 4096
+
+/** The context a .litertlm runs at when the user set none: Settings > Model Defaults' context when the user changed it
+ *  from the built-in one (a global setting of theirs), else the bundle's own default (LlmMetadata.max_num_tokens, or
+ *  the runtime's 4096 when it declares none), never past the longest it takes. TurboLLM's llama.cpp heuristic
+ *  (min(native, 8192), then the global 8192 materialized in every config) used to decide it for every bundle: 8192 for
+ *  Qwen3-0.6B_dynamic, whose own default is 4096, and 8192 reported for bundles it could not size while the runtime
+ *  clamped to their real limit. `defaults` absent: the bundle's own. */
+export function litertLmAutoCtx(m: Pick<ModelEntry, 'nativeCtx' | 'defaultCtx'>, defaults?: Pick<ModelDefaults, 'ctx'>): number {
+  const limit = m.nativeCtx > 0 ? m.nativeCtx : Infinity
+  if (defaults && defaults.ctx > 0 && defaults.ctx !== BUILTIN_MODEL_DEFAULT_CTX) return Math.min(defaults.ctx, limit)
+  return Math.min((m.defaultCtx ?? 0) > 0 ? m.defaultCtx! : LITERT_RUNTIME_DEFAULT_CTX, limit)
+}
+
 /** Computed defaults for a model (spec 05 §3). NOT saved until the user saves. */
 export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
   const hasGpu = sys.gpus.length > 0
   const base: LoadProfile = {
-    ctx: Math.min(m.nativeCtx || 8192, 8192),
+    ctx: m.format === 'litertlm' ? litertLmAutoCtx(m) : Math.min(m.nativeCtx || 8192, 8192),
     ngl: hasGpu ? 99 : 0,
     nCpuMoe: 0,
     parallel: 1,
@@ -695,11 +711,14 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
 function applyGlobalDefaults(base: LoadProfile, m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults): LoadProfile {
   if (!defaults) return base
   const hasGpu = sys.gpus.length > 0
-  // Honor the global ctx but never exceed the model's native context window.
+  // Honor the global ctx but never exceed the model's native context window. A .litertlm takes it only when the user
+  // changed it (litertLmAutoCtx), and its own default otherwise.
   const nativeCap = m.nativeCtx
   return {
     ...base,
-    ctx: defaults.ctx > 0 ? (nativeCap > 0 ? Math.min(defaults.ctx, nativeCap) : defaults.ctx) : base.ctx,
+    ctx: m.format === 'litertlm'
+      ? litertLmAutoCtx(m, defaults)
+      : defaults.ctx > 0 ? (nativeCap > 0 ? Math.min(defaults.ctx, nativeCap) : defaults.ctx) : base.ctx,
     ngl: hasGpu ? defaults.ngl : 0,
     imageMaxTokens: defaults.imageMaxTokens ?? base.imageMaxTokens,
   }
@@ -773,6 +792,20 @@ function needsTokenize(entry: string): boolean {
  *  overrides onto, and what {@link userSetProfile} tells an earlier build's saved defaults apart by. */
 export function automaticProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults): LoadProfile {
   return applyGlobalDefaults(deriveDefault(m, sys), m, sys, defaults)
+}
+
+/** The profile the model dialog seeded its draft with before it saved only what the user set (the automatic profile of
+ *  b0e8455): what a profile an earlier build saved holds where the user changed nothing, and so what
+ *  {@link userSetProfile} reads such a profile against. The automatic profile itself, but for a .litertlm's context,
+ *  which was the llama.cpp heuristic (min(Model Defaults, the bundle's KV length or `ekv` tag), the length read raw, a
+ *  dynamic export's magic number included) where it is now the bundle's own default: read against the new one, every
+ *  such profile's 8192 would count as the user's choice. */
+export function legacySeedProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults, auto = automaticProfile(m, sys, defaults)): LoadProfile {
+  if (m.format !== 'litertlm') return auto
+  const oldNative = m.ctxDynamic ? m.nativeCtx + 1 : m.nativeCtx
+  const heuristic = Math.min(oldNative || 8192, 8192)
+  const ctx = defaults && defaults.ctx > 0 ? (oldNative > 0 ? Math.min(defaults.ctx, oldNative) : defaults.ctx) : heuristic
+  return { ...auto, ctx }
 }
 
 /** The groups {@link resolveProfile} merges key by key, so a user-set view keeps only their set keys. */
@@ -849,21 +882,22 @@ export function resolveProfile(
   defaults?: ModelDefaults,
 ): LoadProfile {
   const base = automaticProfile(m, sys, defaults)
-  // The marker says how a stored profile is to be read (userSetProfile); it is not a launch setting,
-  // so the resolved profile never carries it.
-  const { userSetOnly: _savedMarker, ...savedFields } = saved ?? {}
+  // A saved profile counts for what the user set in it (userSetProfile): one an earlier build saved whole holds the
+  // defaults of the day, which must not outrank what the model loads with now. The marker says how a stored profile is
+  // to be read; it is not a launch setting, so the resolved profile never carries it. Overrides are a request's own.
+  const savedFields = userSetProfile(saved, legacySeedProfile(m, sys, defaults, base)) ?? {}
   const { userSetOnly: _overrideMarker, ...overrideFields } = overrides ?? {}
   return {
     ...base,
     ...savedFields,
     ...overrideFields,
-    sampling: { ...base.sampling, ...(saved?.sampling ?? {}), ...(overrides?.sampling ?? {}) },
+    sampling: { ...base.sampling, ...(savedFields.sampling ?? {}), ...(overrides?.sampling ?? {}) },
     // gpu is deep-merged like sampling so a partial override (or an old saved profile
     // missing some fields) keeps the rest of the defaults instead of going undefined.
-    gpu: { ...base.gpu, ...(saved?.gpu ?? {}), ...(overrides?.gpu ?? {}) },
+    gpu: { ...base.gpu, ...(savedFields.gpu ?? {}), ...(overrides?.gpu ?? {}) },
     // vllm deep-merged for the same reason — old/partial profiles keep the defaults.
-    vllm: { ...base.vllm, ...(saved?.vllm ?? {}), ...(overrides?.vllm ?? {}) },
-    litertLm: { ...base.litertLm, ...(saved?.litertLm ?? {}), ...(overrides?.litertLm ?? {}) },
+    vllm: { ...base.vllm, ...(savedFields.vllm ?? {}), ...(overrides?.vllm ?? {}) },
+    litertLm: { ...base.litertLm, ...(savedFields.litertLm ?? {}), ...(overrides?.litertLm ?? {}) },
     // useMmproj has no UI control (only mmprojGpu — GPU-vs-CPU placement — is user-facing;
     // see ModelDetailDialog's "Vision encoder on GPU" toggle), so there is no legitimate way
     // for a saved profile or draft override to carry a meaningful `false` here. Forcing it to
@@ -876,7 +910,7 @@ export function resolveProfile(
     // into real argv elements. Doing it here — after the merge, on the one path every
     // load goes through — heals already-saved profiles and hand-edited config.json with
     // no migration, and covers overrides/API callers that never touch the UI.
-    extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? saved?.extraArgs ?? base.extraArgs),
+    extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? savedFields.extraArgs ?? base.extraArgs),
   }
 }
 

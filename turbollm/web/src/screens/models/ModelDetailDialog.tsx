@@ -650,9 +650,11 @@ export function ModelDetailDialog({
                   </Row>
                   <Slider
                     label="Context length"
-                    hint={detail.nativeCtx > 0
-                      ? `This bundle was exported for ${detail.nativeCtx.toLocaleString()} tokens — the slider stops at its baked-in KV-cache size.`
-                      : "Tokens of history (KV-cache length). The filename declares no ekv size, so the slider is generous here — the bundle's own export size still caps it at runtime."}
+                    hint={`${detail.nativeCtx > 0
+                      ? detail.ctxDynamic
+                        ? `This bundle takes up to ${detail.nativeCtx.toLocaleString()} tokens (a dynamic export).`
+                        : `This bundle was exported for ${detail.nativeCtx.toLocaleString()} tokens — the slider stops at its baked-in KV-cache size.`
+                      : "Tokens of history (KV-cache length). The bundle declares no size, so the slider is generous here — the bundle's own export size still caps it at runtime."} Left alone, the bundle's own default applies (${(detail.defaultCtx || 4096).toLocaleString()} tokens), unless Settings > Model Defaults sets another.`}
                     value={draft.ctx}
                     min={512}
                     // 256K when the bundle declares no `ekvNNNN` in its name: a .litertlm's real

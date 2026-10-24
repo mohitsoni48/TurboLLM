@@ -55,10 +55,21 @@ export function litertlmNativeCtxFromName(fileName: string): number {
 // max_num_tokens down to it whatever the engine was asked for (ClampMaxNumTokens in
 // llm_litert_compiled_model_executor.cc), so it is a hard limit.
 // Only global caches count: a sliding-window (local) cache's length is its window, not the context, and LlmMetadata's
-// own max_num_tokens is just the default for a dynamic export, which can grow past it. Neither is used here.
+// own max_num_tokens is a default, which a dynamic export can grow past: neither is the limit (the default is read
+// as the default, below).
 // litert-community/LFM2.5-230M, for one: no `ekv` in its file name, 4096-entry KV caches, and a 15k-token prompt failed
 // with "Input token ids are too long ... 15753 >= 4096" while the slider offered 256k.
+//
+// A length that is a "magic number" (a prime above 10, the runtime's IsMagicNumber in model_info.cc) is not a size: it
+// marks a dynamic dimension the runtime replaces with max_num_tokens, which must be smaller than it
+// (llm_executor_settings.h). Qwen3-0.6B_dynamic's caches say 32771, so it takes up to 32770 tokens, not "exactly 32771".
+//
+// The model's own default context is LlmMetadata.max_num_tokens (field 5): what the runtime uses when it is given none
+// (engine_settings.cc: that value, or 4096 when the bundle declares none, sized for an empty prompt), the static limit
+// above still capping it. TurboLLM used to pass 8192 (min(Model Defaults, the limit)) on every load instead, doubling
+// Qwen3's KV cache and reporting 8192 for bundles it could not size while the runtime clamped to their real limit.
 
+const SECTION_LLM_METADATA = 5
 const SECTION_EXECUTOR_METADATA = 9
 const MAX_HEADER = 1 << 20
 const MAX_PROTO = 1 << 20
@@ -158,9 +169,34 @@ export function executorMetadataMaxSequence(proto: Buffer): number {
   return typed || untyped
 }
 
-/** The hard context limit the bundle declares (see the section comment above), or 0 when the header says nothing or
- *  cannot be read. Reads only the header and the small ExecutorMetadata section, never the weights. */
-export async function litertlmNativeCtxFromFile(path: string): Promise<number> {
+/** The runtime's IsMagicNumber (model_info.cc): a prime above 10 marks a dynamic dimension, not a size. */
+export function isLitertMagicNumber(n: number): boolean {
+  if (!Number.isInteger(n) || n < 11 || n % 2 === 0) return false
+  for (let i = 3; i * i <= n; i += 2) if (n % i === 0) return false
+  return true
+}
+
+/** LlmMetadata.max_num_tokens (field 5): the context the bundle's runtime uses when it is given none. 0 when unset. */
+export function llmMetadataMaxNumTokens(proto: Buffer): number {
+  const f = protoFields(proto).find((x) => x.field === 5 && x.varint !== undefined)
+  return f?.varint ?? 0
+}
+
+/** What the bundle's header says that TurboLLM uses (see the section comment above). */
+export interface LitertlmHeader {
+  /** The longest context it takes: a static export's KV-cache length, a dynamic one's magic number less one; 0 = unknown. */
+  nativeCtx: number
+  /** nativeCtx is a dynamic export's maximum (its KV length is a magic number), not a size its caches hold. */
+  ctxDynamic: boolean
+  /** LlmMetadata.max_num_tokens: the context the runtime uses when given none; 0 when the bundle declares none. */
+  defaultCtx: number
+}
+
+const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0 }
+
+/** Reads only the header and the small LlmMetadata and ExecutorMetadata sections, never the weights. A header this
+ *  reader does not understand gives NO_HEADER: it costs only the slider's precision and the model's own defaults. */
+export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHeader> {
   let fh: Awaited<ReturnType<typeof open>> | null = null
   try {
     fh = await open(path, 'r')
@@ -170,25 +206,40 @@ export async function litertlmNativeCtxFromFile(path: string): Promise<number> {
       return buf.subarray(0, bytesRead)
     }
     const head = await read(0, 32)
-    if (head.length < 32 || head.toString('latin1', 0, 8) !== MAGIC) return 0
+    if (head.length < 32 || head.toString('latin1', 0, 8) !== MAGIC) return NO_HEADER
     const headerEnd = Number(head.readBigUInt64LE(24))
-    if (headerEnd <= 32 || headerEnd > MAX_HEADER) return 0
+    if (headerEnd <= 32 || headerEnd > MAX_HEADER) return NO_HEADER
     const header = await read(32, headerEnd - 32)
     const root = new FbTable(header, header.readUInt32LE(0))
     const sections = root.table(1)?.tables(0) ?? [] // section_metadata.objects
+    const out: LitertlmHeader = { ...NO_HEADER }
     for (const s of sections) {
-      if (s.u8(3) !== SECTION_EXECUTOR_METADATA) continue
+      const type = s.u8(3)
+      if (type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) continue
       const begin = s.u64(1)
       const end = s.u64(2)
       if (end <= begin || end - begin > MAX_PROTO) continue
-      return executorMetadataMaxSequence(await read(begin, end - begin))
+      const proto = await read(begin, end - begin)
+      if (type === SECTION_LLM_METADATA) {
+        out.defaultCtx = llmMetadataMaxNumTokens(proto)
+        continue
+      }
+      const len = executorMetadataMaxSequence(proto)
+      out.ctxDynamic = isLitertMagicNumber(len)
+      out.nativeCtx = out.ctxDynamic ? len - 1 : len
     }
-    return 0
+    return out
   } catch {
-    return 0 // a header this reader does not understand costs only the slider's precision
+    return NO_HEADER
   } finally {
     await fh?.close().catch(() => {})
   }
+}
+
+/** The hard context limit the bundle declares (see the section comment above), or 0 when the header says nothing or
+ *  cannot be read. */
+export async function litertlmNativeCtxFromFile(path: string): Promise<number> {
+  return (await litertlmHeaderFromFile(path)).nativeCtx
 }
 
 function cleanName(fileName: string): string {
@@ -202,10 +253,14 @@ function cleanName(fileName: string): string {
 /** The library entry for a `.litertlm` file. Its format is 'litertlm' (a single file, deleted as a file); compat.ts
  *  gives it to the LiteRT-LM engine and to no other. Vision/audio stay false: the bundle declares them only in the
  *  FlatBuffer header, and claiming a capability the file may lack would put an image button on a text-only model. */
-export function litertlmEntryFor(path: string, dir: string, sizeBytes: number, mtimeMs: number, headerCtx = 0): ModelEntry {
+export function litertlmEntryFor(
+  path: string, dir: string, sizeBytes: number, mtimeMs: number, header: number | Partial<LitertlmHeader> = 0,
+): ModelEntry {
   const fileName = basename(path)
   const name = cleanName(fileName)
   const quant = litertlmQuantFromName(fileName)
+  const h: Partial<LitertlmHeader> = typeof header === 'number' ? { nativeCtx: header } : header
+  const headerCtx = h.nativeCtx ?? 0
   return {
     key: `${name.toLowerCase()}|${quant}|${sizeBytes}`,
     name,
@@ -218,6 +273,8 @@ export function litertlmEntryFor(path: string, dir: string, sizeBytes: number, m
     quant,
     // The header is the bundle's own word; the `ekvNNNN` name tag is the fallback for headers that declare nothing.
     nativeCtx: headerCtx || litertlmNativeCtxFromName(fileName),
+    ...(headerCtx > 0 && h.ctxDynamic ? { ctxDynamic: true } : {}),
+    ...((h.defaultCtx ?? 0) > 0 ? { defaultCtx: h.defaultCtx } : {}),
     blockCount: 0,
     headCountKv: 0,
     headDim: 0,

@@ -4,8 +4,10 @@ import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import {
   hasLitertlmMagic,
+  isLitertMagicNumber,
   isLitertlmFileName,
   litertlmEntryFor,
+  litertlmHeaderFromFile,
   litertlmNativeCtxFromFile,
   litertlmNativeCtxFromName,
   litertlmQuantFromName,
@@ -122,4 +124,38 @@ test('litertlmNativeCtxFromFile: 0 for anything it cannot read', async () => {
 test('litertlmEntryFor: the header limit wins over the name tag, which stays the fallback', () => {
   assert.equal(litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0, 4096).nativeCtx, 4096)
   assert.equal(litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0).nativeCtx, 8192)
+})
+
+// ── the bundle's own default context, and dynamic exports ─────────────────────────────────────
+
+test('litertlmHeaderFromFile: LlmMetadata.max_num_tokens is the bundle\'s own default; a static KV length is its limit', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'LFM2.5-230M_int8.litertlm')
+  writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
+  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096 })
+})
+
+test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 10) is a dynamic export, taking one less', async () => {
+  // Qwen3-0.6B_dynamic_wi4b32_afp32: caches of 32771 (the runtime's IsMagicNumber), LlmMetadata 4096. It read as
+  // "exported for 32,771 tokens", and LFM2.5-VL-450M (4099, a prime too) got max_num_tokens 4099.
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const qwen = join(dir, 'Qwen3-0.6B_dynamic.litertlm')
+  writeFileSync(qwen, fakeBundle(4096, [[1, 32771], [2, 32771]]))
+  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096 })
+  const vl = join(dir, 'LFM2.5-VL-450M_int8.litertlm')
+  writeFileSync(vl, fakeBundle(4096, [[5, 0], [1, 4099], [2, 4099]]))
+  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096 })
+  assert.equal(isLitertMagicNumber(4096), false)
+  assert.equal(isLitertMagicNumber(7), false, 'primes up to 10 are sizes')
+  assert.equal(isLitertMagicNumber(4097), false, '17 * 241')
+})
+
+test('litertlmEntryFor: carries the dynamic flag and the bundle\'s own default context', () => {
+  const e = litertlmEntryFor('/m/q.litertlm', '/m', 10, 0, { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096 })
+  assert.equal(e.nativeCtx, 32770)
+  assert.equal(e.ctxDynamic, true)
+  assert.equal(e.defaultCtx, 4096)
+  const plain = litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0)
+  assert.equal(plain.ctxDynamic, undefined)
+  assert.equal(plain.defaultCtx, undefined)
 })

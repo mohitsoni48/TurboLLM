@@ -4,7 +4,7 @@
 // userSetOnly; what an earlier build saved is read field by field against the automatic profile (userSetProfile).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { automaticProfile, configuredCtx, mergeUserSet, resolveProfile, userSetProfile, type LoadProfile } from './profile'
+import { automaticProfile, configuredCtx, legacySeedProfile, mergeUserSet, resolveProfile, userSetProfile, type LoadProfile } from './profile'
 import { defaultConfig, setModelProfile } from '../config/config'
 import type { ModelEntry } from './scanner'
 import type { SysInfo } from '../sysinfo/sysinfo'
@@ -75,4 +75,34 @@ test('configuredCtx: the context a model saved without one would load with, not 
   setModelProfile(cfg, m.key, 'e1', { ctx: 20000, userSetOnly: true })
   assert.equal(configuredCtx(cfg, m, 'e1', SYS), 20000)
   assert.equal(configuredCtx(cfg, m, '', SYS), undefined)
+})
+
+// ── a .litertlm's context: its own default unless the user set one ─────────────────────────────
+
+const qwen3 = (): ModelEntry => model({
+  key: 'qwen3|?|1', name: 'Qwen3', path: '/models/Qwen3-0.6B_dynamic.litertlm', format: 'litertlm', arch: 'litertlm',
+  nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, blockCount: 0, headCountKv: 0,
+})
+
+test('a .litertlm\'s automatic context is its own default; Settings > Model Defaults applies only once the user changed it', () => {
+  assert.equal(automaticProfile(qwen3(), SYS, DEFAULTS).ctx, 4096)
+  assert.equal(automaticProfile(qwen3(), SYS, { ...DEFAULTS, ctx: 16384 }).ctx, 16384)
+  assert.equal(automaticProfile(qwen3(), SYS, { ...DEFAULTS, ctx: 65536 }).ctx, 32770, 'never past the longest it takes')
+  assert.equal(automaticProfile(model({ format: 'litertlm', nativeCtx: 0 }), SYS, DEFAULTS).ctx, 4096, 'none declared: the runtime\'s 4096')
+  assert.equal(automaticProfile(model(), SYS, DEFAULTS).ctx, 8192, 'a GGUF keeps the Model Defaults context as before')
+})
+
+test('an earlier build\'s whole profile for a .litertlm reads the old automatic 8192 as the default it was, not the user\'s', () => {
+  const m = qwen3()
+  const seed = legacySeedProfile(m, SYS, DEFAULTS)
+  assert.equal(seed.ctx, 8192, 'min(Model Defaults 8192, the raw 32771)')
+  const oldWhole: Partial<LoadProfile> = { ...seed, litertLm: { backend: 'cpu' } }
+  assert.deepEqual(userSetProfile(oldWhole, seed), { litertLm: { backend: 'cpu' } })
+  assert.equal(resolveProfile(m, SYS, oldWhole, undefined, DEFAULTS).ctx, 4096)
+  // LFM2.5-VL's raw 4099 was its automatic context too.
+  const vl = model({ format: 'litertlm', nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096 })
+  assert.equal(legacySeedProfile(vl, SYS, DEFAULTS).ctx, 4099)
+  assert.equal(resolveProfile(vl, SYS, { ...legacySeedProfile(vl, SYS, DEFAULTS) }, undefined, DEFAULTS).ctx, 4096)
+  // A context the user moved is theirs.
+  assert.equal(resolveProfile(m, SYS, { ...seed, ctx: 2048 }, undefined, DEFAULTS).ctx, 2048)
 })

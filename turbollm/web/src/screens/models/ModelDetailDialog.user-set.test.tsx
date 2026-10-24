@@ -184,3 +184,14 @@ describe('ModelDetailDialog: only what the user set is sent and saved', () => {
     expect(benchStart.mock.calls[0][0].base).toEqual({ ctx: 16384, userSetOnly: true })
   })
 })
+
+describe('ModelDetailDialog: a LiteRT-LM bundle\'s context', () => {
+  it('a dynamic export takes up to its maximum, and left alone the bundle\'s own default applies', async () => {
+    // Qwen3-0.6B_dynamic: caches of 32771, a magic number; it read "exported for 32,771 tokens".
+    detail = detailWith({}, { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096 } as Partial<ModelDetail>)
+    await open()
+    expect(screen.getByText(/takes up to 32,770 tokens \(a dynamic export\)/)).toBeTruthy()
+    expect(screen.getByText(/Left alone, the bundle's own default applies \(4,096 tokens\)/)).toBeTruthy()
+    expect(screen.queryByText(/exported for 32,770/)).toBeNull()
+  })
+})

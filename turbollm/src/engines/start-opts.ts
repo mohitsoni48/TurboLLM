@@ -6,13 +6,13 @@
 // The bodies are startEngine's options-building moved as-is (engine-lifecycle.ts:107-153 at 4fa0f7b);
 // only `trigger` became a parameter. Pure: it never reads the store or calls getSysInfo(), so a caller
 // gets StartOpts for exactly the config snapshot and hardware it made its decision with.
-import { type Config, type Engine, getModelProfile } from '../config/config'
+import { BUILTIN_MODEL_DEFAULT_CTX, type Config, type Engine, getModelProfile } from '../config/config'
 import { engineAcceptsFormat, type ModelFormat } from './compat'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import { litertLmProfileToConfig } from './litert-lm'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
-import { type LoadProfile, profileToArgs, resolveProfile, vllmProfileToArgs } from '../models/profile'
+import { type LoadProfile, legacySeedProfile, LITERT_RUNTIME_DEFAULT_CTX, profileToArgs, resolveProfile, userSetProfile, vllmProfileToArgs } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { autoThreadCount, type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 
@@ -108,13 +108,22 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
   // TurboLLM reports and compacts against the real one, not a slider value the bundle never had (a saved 128k on a
   // 4096-token export).
   const profile = entry.nativeCtx > 0 && resolved.ctx > entry.nativeCtx ? { ...resolved, ctx: entry.nativeCtx } : resolved
+  // max_num_tokens only for a context the user set: a request's, the saved profile's own (userSetProfile), or Settings
+  // > Model Defaults' when the user changed it. Without it the runtime applies the bundle's own default, with its own
+  // rules (on a non-Apple GPU a default above 4096 is cut to 4096): it was always written, 8192 or the KV length.
+  const userCtx = overrides?.ctx
+    ?? userSetProfile(saved, legacySeedProfile(entry, sys, cfg.modelDefaults))?.ctx
+    ?? (cfg.modelDefaults.ctx > 0 && cfg.modelDefaults.ctx !== BUILTIN_MODEL_DEFAULT_CTX ? cfg.modelDefaults.ctx : undefined)
+  // The window the runtime opens when it chooses (engine_settings.cc), for what TurboLLM reports and compacts against.
+  const gpuCut = userCtx === undefined && profile.litertLm.backend === 'gpu' && !sys.os.startsWith('darwin') && profile.ctx > LITERT_RUNTIME_DEFAULT_CTX
+  const ctx = gpuCut ? LITERT_RUNTIME_DEFAULT_CTX : profile.ctx
   return {
     engine,
-    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx: profile.ctx, vision: false },
+    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: false },
     modelPath: entry.path,
     extraArgs: profile.extraArgs,
     // Auto threads are pinned only where the CPU is big.LITTLE (perfCores); elsewhere the runtime keeps choosing.
-    litertLmConfig: litertLmProfileToConfig(profile, sys.perfCores ? autoThreadCount(sys) : 0),
+    litertLmConfig: litertLmProfileToConfig({ ...profile, ctx: userCtx === undefined ? 0 : profile.ctx }, sys.perfCores ? autoThreadCount(sys) : 0),
     preferredPort: profile.port,
     profile,
     trigger,

@@ -713,6 +713,10 @@ export type ModelEntry = {
   arch: string
   quant: string
   nativeCtx: number
+  /** LiteRT-LM only: nativeCtx is a dynamic export's maximum, not a size its caches hold (daemon models/litertlm.ts). */
+  ctxDynamic?: boolean
+  /** LiteRT-LM only: the bundle's own default context (LlmMetadata.max_num_tokens); absent when it declares none. */
+  defaultCtx?: number
   blockCount: number
   headCountKv: number
   /** Attention/KV layout the daemon's scanner reads from the GGUF (twins of src/models/scanner.ts's

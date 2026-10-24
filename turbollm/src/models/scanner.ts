@@ -8,7 +8,7 @@ import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
-import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmNativeCtxFromFile } from './litertlm'
+import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile } from './litertlm'
 
 export interface ModelEntry {
   key: string
@@ -21,6 +21,12 @@ export interface ModelEntry {
   arch: string
   quant: string
   nativeCtx: number
+  /** LiteRT-LM only: `nativeCtx` is a dynamic export's maximum (its KV length is a magic number), not a size its
+   *  caches hold (models/litertlm.ts). Absent elsewhere. */
+  ctxDynamic?: boolean
+  /** LiteRT-LM only: the bundle's own default context (LlmMetadata.max_num_tokens), what its runtime uses when TurboLLM
+   *  passes none. Absent when the bundle declares none (the runtime then uses 4096). */
+  defaultCtx?: number
   blockCount: number
   headCountKv: number
   /** Real per-head dimension (GgufMeta.headDim) — 0 when the GGUF doesn't declare
@@ -384,7 +390,7 @@ export class Scanner {
     const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
     const laya = scan.layaDirs.map((dir) => layaEntryFor(dir))
     const litertlm = await Promise.all(scan.litertlms.map(async (f) =>
-      litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmNativeCtxFromFile(f.path))))
+      litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmHeaderFromFile(f.path))))
     this.entries = [...gguf, ...mlx, ...laya, ...litertlm].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
     this.saveCache()

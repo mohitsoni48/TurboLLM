@@ -240,6 +240,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   backend and the server takes the one the bundle declares (`litert-lm serve` and the app's own server read its
   header); CPU and GPU still force one, also a model loaded by path (`POST /api/v1/engine/start {modelPath}`), which
   was always given the CPU. A failed load names the GPU only when you chose it.
+- **A LiteRT-LM model's context is its own unless you set one.** TurboLLM passed `max_num_tokens` on every load, the
+  llama.cpp rule min(8192, the bundle's KV length): 8192 for Qwen3-0.6B_dynamic, whose own default is 4096 (twice its
+  KV cache), and 8192 reported for bundles it could not size. With no context set (on the model's panel, in a request,
+  or a Settings > Model Defaults context you changed from 8192) it now passes none and the runtime uses the bundle's
+  own (`LlmMetadata.max_num_tokens`, 4096 when it declares none), which TurboLLM reads from the header and reports. A
+  bundle whose KV length is a prime above 10 is a dynamic export (the runtime's magic number): it takes up to one token
+  less, the panel says so, and it is no longer read as its exact size (Qwen3-0.6B_dynamic: up to 32,770).
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

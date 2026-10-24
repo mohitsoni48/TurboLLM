@@ -27,6 +27,11 @@ export const VRAM_HEADROOM_DEFAULT_MB = 1024
  *  before. The Settings slider snaps straight from {@link VRAM_HEADROOM_MIN_MB} to this value. */
 export const VRAM_HEADROOM_SPILL_MB = 0
 
+/** Settings > Model Defaults' context out of the box. normalize writes it into every config, so the stored value alone
+ *  cannot say whether the user set it: a LiteRT-LM bundle runs at its own default context unless the user changed it
+ *  (profile.ts litertLmAutoCtx), where llama.cpp models take it as they always have. */
+export const BUILTIN_MODEL_DEFAULT_CTX = 8192
+
 export interface FlagInfo {
   name: string
   kind: 'enum' | 'boolean' | 'valued'
@@ -797,7 +802,7 @@ export function defaultConfig(): Config {
     showAllEngineModels: false,
     hf: { token: '' },
     gh: { token: '' },
-    modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
+    modelDefaults: { ctx: BUILTIN_MODEL_DEFAULT_CTX, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
     gateway: { autoSwap: true, keepN: 1 },
