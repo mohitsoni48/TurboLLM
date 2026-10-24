@@ -177,10 +177,25 @@ export function litertLmSamplingNote(body: Record<string, unknown>): string | un
     'Top P change nothing until Top K is set above 1 (in the thread settings or the model\'s settings).'
 }
 
-/** Every LiteRT-LM request's shaping (thinking, sampling, and what later steps add). Mutates and returns `body`. */
+// ── tool_choice ───────────────────────────────────────────────────────────────────────────
+// Neither LiteRT-LM server applied tool_choice: upstream's `serve` never reads it (its request parser has no such
+// field), and the Android server forwarded the tools whatever it said. So "none" still showed the model every tool and
+// let it call them: the gateway's loop breaker, which answers a terminal agent's sixth identical call with tool_choice
+// "none" so the model has to answer in text, did nothing on LiteRT-LM and the agent looped on. "none" is honoured by
+// sending no tools (the history's calls and results stay), which is what it means. A forced call ("required", a named
+// function) is passed on as it is: `serve` ignores it and the model chooses.
+
+/** tool_choice "none" sends no tools. Mutates `body`. */
+export function shapeLitertLmToolChoice(body: Record<string, unknown>): void {
+  const choice = body.tool_choice
+  if (choice === 'none' || (isRecord(choice) && choice.type === 'none')) delete body.tools
+}
+
+/** Every LiteRT-LM request's shaping (thinking, sampling, tool_choice). Mutates and returns `body`. */
 export function shapeLitertLmRequest<T extends Record<string, unknown>>(body: T): T {
   shapeLitertLmThinking(body)
   shapeLitertLmSampling(body)
+  shapeLitertLmToolChoice(body)
   return body
 }
 

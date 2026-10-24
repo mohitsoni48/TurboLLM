@@ -291,6 +291,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   chat now says so instead of nothing. LiteRT-LM has no Min P: the thread and model settings no longer offer it for a
   LiteRT-LM model, and a Min P still set on a thread or saved on the model is named in the chat as not applied, with
   where to clear it (the thread and model settings show it, with "Clear it").
+- **`tool_choice: "none"` sends a LiteRT-LM model no tools.** `litert-lm serve` reads no tool_choice, and the app's
+  engine did not apply "none", so the model still saw every tool and could call it; the loop breaker that answers a
+  terminal agent's sixth identical call with "none" did nothing there, and the agent looped on.
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

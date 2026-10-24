@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import {
   shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor,
   litertLmRequestSampling, litertLmSamplingNote, rememberLitertLmModel, shapeLitertLmRequest, litertLmIgnoredFieldsNote,
+  shapeLitertLmToolChoice,
 } from './litert-lm-request'
 import { webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL } from '../tools/builtin'
 import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL } from '../routines/routine-tools'
@@ -220,4 +221,21 @@ test('a Min P a chat thread sets is named as the thread\'s, with where to clear 
   // A Min P the thread leaves to the model's saved settings is still the model's.
   rememberLitertLmModel(M, { sampling: { min_p: 0.2 }, native: true })
   assert.match(litertLmIgnoredFieldsNote({ model: M }, { fromThread: true }) ?? '', /without the Min P saved in this model's settings\./)
+})
+
+// ── tool_choice ───────────────────────────────────────────────────────────────────────────────
+
+test('tool_choice "none" sends no tools: `serve` reads no tool_choice', () => {
+  const tools = [{ type: 'function', function: { name: 'read' } }]
+  const none = { tools, tool_choice: 'none' as unknown }
+  shapeLitertLmToolChoice(none)
+  assert.equal('tools' in none, false)
+  const typed: Record<string, unknown> = { tools, tool_choice: { type: 'none' } }
+  shapeLitertLmToolChoice(typed)
+  assert.equal('tools' in typed, false)
+  for (const choice of [undefined, 'auto', 'required', { type: 'function', function: { name: 'read' } }]) {
+    const b: Record<string, unknown> = { tools, tool_choice: choice }
+    shapeLitertLmToolChoice(b)
+    assert.deepEqual(b.tools, tools, String(JSON.stringify(choice)))
+  }
 })
