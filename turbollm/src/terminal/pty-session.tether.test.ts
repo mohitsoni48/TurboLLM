@@ -13,7 +13,7 @@ import { TerminalManager, killTrackedTerminalsSync, reapStaleTerminals } from '.
 import { PTYSession } from './pty-session'
 import { isGone, killRecorded, pidWrittenTo, record, srcUrl, startStandInDaemon, waitGone, writtenTo } from '../test-support/stand-in-daemon'
 import { tmpDir } from '../test-support/tmp'
-import { PTY_WATCH, closeAllLifelines, stopTethered } from '../util/tether'
+import { PTY_WATCH, _setPtyWatch, closeAllLifelines, stopTethered, tetherTerminal } from '../util/tether'
 
 const skip = process.platform === 'win32' ? 'POSIX sessions (Windows terminals are tied by the job sentinel)' : false
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
@@ -60,6 +60,14 @@ async function startJobs(dir: string, shellPid: number, write: (data: string) =>
   return { cli, jobs, watcher }
 }
 
+/** For a failure message: each of `pids` still running, as ps shows it (pid, ppid, pgid, state, command), so a run
+ *  that fails says what was left and where it sat. */
+function described(pids: number[]): string {
+  if (pids.length === 0) return ''
+  const r = spawnSync('ps', ['-o', 'pid=,ppid=,pgid=,stat=,command=', '-p', pids.join(',')], { encoding: 'utf8', timeout: 10_000 })
+  return `; still running: ${String(r.stdout ?? '').trim().split('\n').map((l) => l.trim()).join(' | ')}`
+}
+
 function assertGcEnv(dir: string): void {
   const lines = readFileSync(join(dir, 'gc.env'), 'utf8').trim().split('\n')
   const n = Number(process.env.GIT_CONFIG_COUNT) > 0 ? Number(process.env.GIT_CONFIG_COUNT) : 0 // the shell inherits ours
@@ -83,7 +91,8 @@ process.stdin.on('data', (line: string) => s.write(line))
     record(shell)
     const { cli, jobs, watcher } = await startJobs(dir, shell, (data) => d.child.stdin?.write(data))
     await d.kill('SIGKILL')
-    assert.deepEqual(await waitGone([shell, cli, ...jobs], 3000), [], 'the shell, the CLI and every job are gone within 3 s')
+    const left = await waitGone([shell, cli, ...jobs], 3000)
+    assert.deepEqual(left, [], `the shell, the CLI and every job are gone within 3 s${described(left)}`)
     assert.ok(watcher > 0, 'the terminal had a watcher')
     assert.deepEqual(await waitGone([watcher], 1000), [], 'and the watcher is gone too')
     assertGcEnv(dir)
@@ -104,7 +113,8 @@ test('closing a Code terminal (TerminalManager.kill) ends everything started in 
     await sleep(200)
     assert.deepEqual([cli, ...jobs].filter(isGone), [], 'all four outlive their commands while the terminal is open')
     m.kill(id)
-    assert.deepEqual(await waitGone([shell, cli, ...jobs, watcher], 3000), [], 'the shell, the CLI, every job and the watcher are gone within 3 s')
+    const left = await waitGone([shell, cli, ...jobs, watcher], 3000)
+    assert.deepEqual(left, [], `the shell, the CLI, every job and the watcher are gone within 3 s${described(left)}`)
   } finally {
     if (id) m.kill(id)
     killRecorded()
@@ -122,9 +132,132 @@ test('a Code terminal whose shell exits takes what it left running with it', { s
     const { cli, jobs, watcher } = await startJobs(dir, shell, (data) => m.write(id, data))
     m.write(id, 'exit\n')
     assert.deepEqual(await waitGone([shell], 3000), [], 'the shell exited')
-    assert.deepEqual(await waitGone([cli, ...jobs, watcher], 3000), [], 'the CLI, every job and the watcher went with it')
+    const left = await waitGone([cli, ...jobs, watcher], 3000)
+    assert.deepEqual(left, [], `the CLI, every job and the watcher went with it${described(left)}`)
   } finally {
     if (id) m.kill(id)
+    killRecorded()
+  }
+})
+
+/** The number of getsid(2) for perl's syscall(): xnu's 310 on macOS (PTY_WATCH's own), elsewhere this system's,
+ *  from perl's syscall.ph or the kernel's table; null where perl or the number is missing. `getpid` for a number
+ *  that is not getsid's. */
+function syscallNumber(name: 'getsid' | 'getpid'): number | null {
+  if (process.platform === 'darwin') return name === 'getsid' ? 310 : 20
+  const r = spawnSync('perl', ['-e', `require "syscall.ph"; print &SYS_${name}`], { encoding: 'utf8', timeout: 10_000 })
+  if (r.status === 0 && /^\d+$/.test(r.stdout)) return Number(r.stdout)
+  if (spawnSync('perl', ['-e', '1']).status !== 0) return null
+  const table: Record<string, Record<string, number>> = { x64: { getsid: 124, getpid: 39 }, arm64: { getsid: 156, getpid: 172 } }
+  return table[process.arch]?.[name] ?? null
+}
+const noPerl = skip || (syscallNumber('getsid') === null ? 'needs perl and the getsid syscall number' : false)
+
+/** PTY_WATCH as macOS runs it, here too: its /proc branch never taken, and perl given this system's getsid number
+ *  (or `nr`) for xnu's. Each edit must apply: a PTY_WATCH that changed shape fails here instead of testing nothing. */
+function asOnMacos(nr: number, edits: Array<[string, string]> = []): string {
+  let script = PTY_WATCH
+  for (const [from, to] of [['[ -d /proc/self ]', 'false'], ['"$$" 310 ', `"$$" ${nr} `], ...edits] as Array<[string, string]>) {
+    assert.ok(script.includes(from), `PTY_WATCH still has ${JSON.stringify(from)}`)
+    script = script.replace(from, () => to) // a function: `$$` in a replacement string is one `$`
+  }
+  return script
+}
+
+/** A stand-in terminal for the sweep macOS takes: a session leader, as node-pty's shell is, that starts a job in its
+ *  own group, one in a group of its own and one in a group of its own that ignores the hangup (as `nohup` and job
+ *  control leave them), then exits, as a shell does at `exit`: from then on only the session id ties the last two to
+ *  it. Returns its pid (alive) and, once it has exited, the jobs' pids. */
+function startStandInTerminal(dir: string): { shell: number; exited: Promise<void>; jobs: () => Promise<number[]> } {
+  const own = (file: string, ignoreHup: boolean) =>
+    `perl -e '${ignoreHup ? '$SIG{HUP} = "IGNORE"; ' : ''}setpgrp(0, 0); exec @ARGV' sleep 300 & echo $! > ${file}`
+  const shell = spawn('/bin/sh', ['-c', `sleep 300 & echo $! > g.pid; ${own('j1.pid', false)}; ${own('j2.pid', true)}; exec sleep 1`],
+    { cwd: dir, detached: true, stdio: 'ignore' })
+  record(shell.pid)
+  const exited = new Promise<void>((resolve) => shell.once('exit', () => resolve()))
+  const jobs = async () => {
+    const pids = [await pidWrittenTo(join(dir, 'g.pid')), await pidWrittenTo(join(dir, 'j1.pid')), await pidWrittenTo(join(dir, 'j2.pid'))]
+    record(...pids)
+    return pids
+  }
+  return { shell: shell.pid as number, exited, jobs }
+}
+
+/** A `pkill` as macOS's is (Apple's takes no -s, and refuses it as an illegal option), first on PATH for the
+ *  watcher, so the sweep macOS takes cannot pass here through Linux's pkill -s. */
+function macosPkillFirst(dir: string): () => void {
+  const bin = join(dir, 'bin')
+  mkdirSync(bin)
+  writeFileSync(join(bin, 'pkill'), '#!/bin/sh\necho "pkill: illegal option -- s" >&2\nexit 2\n', { mode: 0o755 })
+  const path = process.env.PATH
+  process.env.PATH = `${bin}:${path ?? ''}`
+  return () => { process.env.PATH = path }
+}
+
+test('on macOS a terminal whose shell has exited still takes its jobs in groups of their own with it, and nothing outside its session', { skip: noPerl }, async () => {
+  const dir = tmpDir('tllm-pty-macsweep-')
+  const restorePath = macosPkillFirst(dir)
+  _setPtyWatch(asOnMacos(syscallNumber('getsid') as number))
+  const outsider = spawn('sleep', ['300'], { stdio: 'ignore' }) // in the test's own session
+  record(outsider.pid)
+  const warned: string[] = []
+  const warn = console.warn
+  console.warn = (...args: unknown[]) => { warned.push(args.join(' ')) }
+  try {
+    const t = startStandInTerminal(dir)
+    const tie = tetherTerminal(t.shell)
+    const watcher = watcherOf(t.shell)
+    record(watcher)
+    assert.ok(watcher > 0, 'the terminal has a watcher')
+    const jobs = await t.jobs()
+    await t.exited
+    await sleep(200)
+    assert.deepEqual(jobs.filter(isGone), [], 'the jobs outlive their shell until the terminal is released')
+    tie.release()
+    const left = await waitGone([...jobs, watcher], 3000)
+    // What the watcher logged goes into the message: console.warn is held here, and a sweep that failed says why there.
+    const logged = warned.filter((l) => l.includes('[tether]'))
+    assert.deepEqual(left, [], `the job in the shell's group, both in groups of their own and the watcher are gone${described(left)}${
+      logged.length > 0 ? `; logged: ${JSON.stringify(logged)}` : ''}`)
+    assert.equal(isGone(outsider.pid as number), false, 'a process outside the terminal\'s session is left alone')
+    assert.deepEqual(warned.filter((l) => l.includes('[tether]')), [], 'nothing was logged')
+  } finally {
+    console.warn = warn
+    _setPtyWatch(null)
+    restorePath()
+    killRecorded()
+  }
+})
+
+test('a terminal\'s watcher that cannot read session ids on macOS says why in the daemon\'s log', { skip: noPerl }, async () => {
+  const cases: Array<{ what: string; script: string; says: string }> = [
+    { what: 'no perl', says: 'no perl to read the session ids with',
+      script: asOnMacos(syscallNumber('getsid') as number, [['P=/usr/bin/perl;', 'P=/nonexistent/perl;'], ['command -v perl)', 'command -v perl-not-installed)']]) },
+    { what: 'a getsid that does not work', says: 'did not give its own session', script: asOnMacos(syscallNumber('getpid') as number) },
+  ]
+  const warned: string[] = []
+  const warn = console.warn
+  console.warn = (...args: unknown[]) => { warned.push(args.join(' ')) }
+  try {
+    for (const c of cases) {
+      const dir = tmpDir('tllm-pty-macsweep-')
+      _setPtyWatch(c.script)
+      const t = startStandInTerminal(dir)
+      const tie = tetherTerminal(t.shell)
+      const watcher = watcherOf(t.shell)
+      record(watcher)
+      const [inGroup, ...ownGroups] = await t.jobs()
+      await t.exited
+      tie.release()
+      assert.deepEqual(await waitGone([inGroup, watcher], 3000), [], `${c.what}: the shell's group still ends, and the watcher exits`)
+      await sleep(100) // its 'exit' event
+      const line = warned.find((l) => l.includes(`[tether] terminal ${t.shell}:`))
+      assert.ok(line?.includes(c.says), `${c.what}: the daemon logged why (${c.says}); got ${JSON.stringify(warned)}`)
+      assert.deepEqual(ownGroups.filter(isGone), [], `${c.what}: and nothing it could not check was killed`)
+    }
+  } finally {
+    console.warn = warn
+    _setPtyWatch(null)
     killRecorded()
   }
 })
@@ -172,7 +305,8 @@ test('the daemon\'s graceful stop (stopTethered) and the restart keeper (closeAl
       const t0 = Date.now()
       if (end === 'stopTethered') await stopTethered(500)
       else closeAllLifelines()
-      assert.deepEqual(await waitGone([shell, cli, ...jobs], 3000), [], `${end}: the shell, the CLI and every job are gone`)
+      const left = await waitGone([shell, cli, ...jobs], 3000)
+      assert.deepEqual(left, [], `${end}: the shell, the CLI and every job are gone${described(left)}`)
       if (end === 'stopTethered') assert.ok(Date.now() - t0 >= 900, 'the graceful stop waited for the terminal\'s sweep')
     }
   } finally {

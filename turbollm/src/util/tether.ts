@@ -1280,17 +1280,41 @@ export function killTetheredSync(): void {
  *  closed, its shell exited, a graceful stop) or dies, it hangs up the shell, which forwards the hangup to its jobs,
  *  then after 1 s kills the shell's group (a launched agent CLI that ignores the hangup) and every process left in
  *  the session: background jobs in their own job-control groups, `nohup` jobs, a `(trap "" HUP; …) &`. Linux and
- *  Termux read the session from /proc/<pid>/stat (field 6), macOS asks pkill. The watcher is detached, a session of
- *  its own, so its sweep never reaches itself. A program that starts a session of its own (`setsid`) escapes the
- *  sweep (Known); git's automatic gc, the common case, runs in the foreground in a terminal (util/git-gc.ts). It
- *  unsets TMOUT first: where /bin/sh is bash (macOS, Fedora), bash's read takes an exported TMOUT for a timeout, and
- *  the terminal was ended TMOUT seconds after it opened. */
+ *  Termux read the session from /proc/<pid>/stat (field 6). macOS has neither /proc nor a pkill or ps that knows
+ *  sessions (Apple's pkill refuses -s as an illegal option, and its ps's sess is always 0), and once the shell has
+ *  exited nothing else ties its jobs to it (xnu clears the session's terminal then, and launchd adopts them): only
+ *  getsid(2) still names their session. So there perl asks it, through syscall() (xnu's getsid is 310), for each
+ *  pid `ps -A` lists, under `env -i` (no PERL5OPT or PERL5LIB); /usr/bin/perl ships with macOS, the PATH's perl is
+ *  the fallback. perl first checks that getsid gives its own session as the watcher's pid (the watcher leads its
+ *  session), so a getsid that does not work is never read as "no member". A watcher that cannot sweep exits 3 (no
+ *  perl) or 4 (getsid failed that check), and the daemon logs it. Before, macOS ran `pkill -s`, which ended
+ *  nothing: every job in a group of its own outlived the terminal and the daemon. The watcher is detached, a
+ *  session of its own, so its sweep never reaches itself. A program that starts a session of its own (`setsid`)
+ *  escapes the sweep (Known); git's automatic gc, the common case, runs in the foreground in a terminal
+ *  (util/git-gc.ts). It unsets TMOUT first: where /bin/sh is bash (macOS, Fedora), bash's read takes an exported
+ *  TMOUT for a timeout, and the terminal was ended TMOUT seconds after it opened. */
 export const PTY_WATCH = 'SID=$1; unset TMOUT; trap "" HUP INT TERM; exec </dev/null >/dev/null 2>&1; ' +
   'while read -r _; do :; done <&3; ' +
   'kill -s HUP "$SID"; sleep 1; kill -s KILL -- -"$SID"; ' +
   'if [ -d /proc/self ]; then for d in /proc/[0-9]*; do read -r s < "$d/stat" || continue; ' +
   'set -- ${s##*) }; [ "$4" = "$SID" ] && kill -s KILL "${d#/proc/}"; done; ' +
-  'else pkill -KILL -s "$SID"; fi'
+  'else P=/usr/bin/perl; [ -x "$P" ] || P=$(command -v perl) || exit 3; ' +
+  "ps -A -o pid= | /usr/bin/env -i \"$P\" -e '($s, $w, $n) = @ARGV; syscall($n + 0, 0) == $w or exit 4; " +
+  "while (<STDIN>) { $p = int; kill 9, $p if $p > 1 && syscall($n + 0, $p) == $s }' \"$SID\" \"$$\" 310 || exit 4; fi"
+
+/** Test-only: run `script` as every terminal's watcher instead of PTY_WATCH (null: PTY_WATCH), to run the branch
+ *  macOS takes on Linux. */
+let ptyWatchOverride: string | null = null
+export function _setPtyWatch(script: string | null): void {
+  ptyWatchOverride = script
+}
+
+/** Why a watcher that exited with `code` could not sweep its terminal's session, or null (it swept, or was killed). */
+function sweepFailure(code: number | null): string | null {
+  if (code === 3) return 'no perl to read the session ids with (macOS: /usr/bin/perl)'
+  if (code === 4) return 'perl\'s getsid, through syscall(), did not give its own session'
+  return null
+}
 
 interface TerminalTie {
   socket: Socket | null
@@ -1342,7 +1366,7 @@ export function tetherTerminal(shellPid: number, spawnWindow?: { startMs: number
   }
   let watcher: ChildProcess
   try {
-    watcher = spawn(nodeShell(), ['-c', PTY_WATCH, 'sh', String(shellPid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })
+    watcher = spawn(nodeShell(), ['-c', ptyWatchOverride ?? PTY_WATCH, 'sh', String(shellPid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })
   } catch (err) {
     console.warn(`[tether] terminal ${shellPid}: no watcher (${(err as Error).message}); what it starts is not tied to the daemon`)
     return { release: noop }
@@ -1353,7 +1377,11 @@ export function tetherTerminal(shellPid: number, spawnWindow?: { startMs: number
     socket,
     released: false,
     gone: new Promise<void>((resolve) => {
-      watcher.once('exit', () => resolve())
+      watcher.once('exit', (code) => {
+        const why = sweepFailure(code)
+        if (why) console.warn(`[tether] terminal ${shellPid}: its watcher could not end what was left in the terminal's session (${why}); jobs started in it outside the shell's group may still be running`)
+        resolve()
+      })
       watcher.once('error', (err) => {
         console.warn(`[tether] terminal ${shellPid}: no watcher (${err.message}); what it starts is not tied to the daemon`)
         resolve()

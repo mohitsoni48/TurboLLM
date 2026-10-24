@@ -247,7 +247,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   after any stop. git's automatic gc inside Code's commands and terminals runs in the foreground (about 0.5 s longer
   for a commit that triggers it).
 - **Closing a Code terminal, or its shell exiting, ends everything started in it**, `nohup` jobs and agent CLIs that
-  ignore the hangup included, and on Windows the programs started from it, GUI ones included.
+  ignore the hangup included, and on Windows the programs started from it, GUI ones included. On macOS TurboLLM
+  finds what a terminal started through the perl macOS ships; without a working one it logs that jobs started there
+  may be left running.
 - **A repository's own pi extensions (`.pi/extensions`) no longer load into TurboLLM.** Opening a repository in Code
   ran that code inside the daemon, with no approval.
 - A TurboLLM started from a terminal can no longer have ssh ask for a key passphrase or a host key in that terminal
