@@ -164,22 +164,20 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const [importError, setImportError] = useState<string | null>(null)
   const [importModelMismatch, setImportModelMismatch] = useState<string | null>(null)
 
-  // Android's on-device models are small enough that the fit-filter (DiscoverTab.tsx)
-  // only surfaces ~4B-and-under repos — unlimited thinking burns a chunk of their
-  // already-tight context/decode budget on reasoning tokens the user didn't ask for, so
-  // the phone build's untouched defaults (below) start from "off" instead. Purely the
-  // starting point: same per-conv/global override path as every other platform, and a
-  // user who's already made an explicit choice is never overridden by this.
+  // Android's untouched chat defaults: the Blank agent (below). Thinking used to start "off" there too, for every
+  // model: TurboLLM's own default, not the model's, which forced thinking off for Qwen3, Gemma 4 and LFM2.5-Thinking
+  // on LiteRT-LM once its thinking control reached the engine. It now starts automatic on every platform (the
+  // model's own default); a user's explicit choice, per conversation or global, is kept as before.
   const sysQ = useSysInfo()
   const isAndroid = isAndroidOs(sysQ.data?.os ?? '')
 
-  // Thinking budget — per-conversation, persisted in localStorage. -1 = unlimited
-  // (reasoning models think freely, today's default), 0 = off (model answers directly,
-  // no reasoning generated), N>0 = a real sampler-enforced token cap (thinking_budget_tokens
-  // — see chat-routes.ts). Supersedes the old on/off-only `tllm.thinkingEnabled.*` toggle
-  // (ADR-042) now that the engine genuinely supports a graduated budget, not just 0/-1.
-  // Reads per-conv key first; falls back to global default; defaults to unlimited (0 on
-  // Android — see comment above).
+  // Thinking budget — per-conversation, persisted in localStorage. -1 = no limit and nothing
+  // sent (the model's own default: reasoning models think freely), 0 = off (model answers
+  // directly, no reasoning generated), N>0 = a real sampler-enforced token cap
+  // (thinking_budget_tokens — see chat-routes.ts). Supersedes the old on/off-only
+  // `tllm.thinkingEnabled.*` toggle (ADR-042) now that the engine genuinely supports a
+  // graduated budget, not just 0/-1. Reads per-conv key first; falls back to global default;
+  // defaults to -1 on every platform (see comment above).
   const readThinkingBudget = (convId: string | null): number => {
     if (convId) {
       const perConv = localStorage.getItem(`tllm.thinkingBudget.${convId}`)
@@ -187,26 +185,13 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     }
     const global = localStorage.getItem('tllm.thinkingBudget.default')
     if (global !== null) return Number(global)
-    return isAndroid ? 0 : -1
+    return -1
   }
   const [thinkingBudget, setThinkingBudgetState] = useState<number>(() => readThinkingBudget(null))
-  const userTouchedThinkingRef = useRef(false)
   const setThinkingBudget = (val: number) => {
-    userTouchedThinkingRef.current = true
     if (activeId) localStorage.setItem(`tllm.thinkingBudget.${activeId}`, String(val))
     setThinkingBudgetState(val)
   }
-  // isAndroid is unknown (false) on first render — useSysInfo() hasn't answered yet — so the
-  // useState initializer above may have already locked in the desktop default (-1) for a split
-  // second before sysinfo resolves. Correct it once, but only for a still-untouched, still-fresh
-  // (no conversation opened yet) chat — never overrides an explicit per-conv/global choice or
-  // anything the user has already touched this session.
-  useEffect(() => {
-    if (!isAndroid || activeId || userTouchedThinkingRef.current) return
-    if (localStorage.getItem('tllm.thinkingBudget.default') !== null) return
-    setThinkingBudgetState((prev) => (prev === -1 ? 0 : prev))
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isAndroid])
 
   // Reasoning effort (Qwen3.8) — same per-conv/global persistence shape as thinkingBudget
   // above, but a DIFFERENT and independent control (see ReasoningEffortSelect.tsx): only
@@ -236,8 +221,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     userTouchedPersonaRef.current = true
     setSelectedPersonaId(id)
   }
-  // Same first-render race as thinkingBudget above: correct a still-untouched, still-fresh
-  // chat once isAndroid is actually known, never overriding an explicit choice.
+  // isAndroid is unknown (false) on first render — useSysInfo() hasn't answered yet — so correct a
+  // still-untouched, still-fresh chat once it is known, never overriding an explicit choice.
   useEffect(() => {
     if (!isAndroid || activeId || userTouchedPersonaRef.current || hasExplicitDefaultAgent()) return
     setSelectedPersonaId((prev) => (prev === 'default' ? 'blank' : prev))
@@ -448,7 +433,14 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     : null
   // Gates ReasoningEffortSelect vs ThinkingBudgetSlider below — `status.model` (LoadedModel)
   // is a slim subset without capability flags, so look the full ModelEntry up by key.
-  const loadedModelSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === loadedChatModel?.key)?.reasoningEffort ?? false
+  const loadedEntry = (modelsQ.data?.models ?? []).find((m) => m.key === loadedChatModel?.key)
+  const loadedModelSupportsReasoningEffort = loadedEntry?.reasoningEffort ?? false
+  // A .litertlm on this machine: the untouched thinking budget is shown as the model's own default (Auto), which is
+  // what it sends (nothing), since such a model may not think by default (ThinkingBudgetSlider).
+  const loadedOnLitertLm = !activeRemoteId && loadedEntry?.format === 'litertlm'
+  // Sent only with the control shown: a level stored for this chat under a model that had the control reached the
+  // next one too, which LiteRT-LM reads as thinking on or off (gateway and chat-routes map it to reasoning_effort).
+  const sentReasoningEffort = loadedModelSupportsReasoningEffort ? reasoningEffort : undefined
   const modelBusy =
     modelActions.load.isPending ||
     modelActions.eject.isPending ||
@@ -1176,7 +1168,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
 
       const textAttachmentNames = textAttachments.map((a) => a.file.name)
       const sendTo = convId
-      const started = await streamFrom(convId, ac, followChatTurn(convId, (accepted) => sendMessage(sendTo, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, accepting(ac, accepted)), ac.signal))
+      const started = await streamFrom(convId, ac, followChatTurn(convId, (accepted) => sendMessage(sendTo, text, ac.signal, images, docContext, textAttachmentNames, thinkingBudget, sentReasoningEffort, activeRemoteId ?? undefined, accepting(ac, accepted)), ac.signal))
       // streamFrom toasts the error itself and never rethrows. An abort is the user (or Eject)
       // stopping it, not a refusal.
       if (!started && !ac.signal.aborted) restoreComposer()
@@ -1233,7 +1225,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     const started = await streamFrom(
       convId,
       ac,
-      followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }, accepting(ac, accepted)), ac.signal),
+      followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, sentReasoningEffort, activeRemoteId ?? undefined, undefined, { messageId: msgId, content }, accepting(ac, accepted)), ac.signal),
       { start: closeEdit, refused: (e) => { refusal = e } },
     )
     // The question's version switcher gained an entry (or, on a stale refusal, changed elsewhere).
@@ -1264,7 +1256,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
     // added a turn since, the daemon refuses it as stale_message instead of replacing a reply
     // this view never showed, and streamFrom shows why and refetches the chat.
     const convId = activeId
-    await streamFrom(convId, ac, followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, reasoningEffort, activeRemoteId ?? undefined, replyId, undefined, accepting(ac, accepted)), ac.signal))
+    await streamFrom(convId, ac, followChatTurn(convId, (accepted) => continueConversation(convId, ac.signal, thinkingBudget, sentReasoningEffort, activeRemoteId ?? undefined, replyId, undefined, accepting(ac, accepted)), ac.signal))
     // The new reply joined the old one's version group, whose switcher list is cached (and a
     // stale refusal means it may have changed elsewhere).
     void qc.invalidateQueries({ queryKey: ['message-variants'] })
@@ -1481,7 +1473,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
           {loadedModelSupportsReasoningEffort ? (
             <ReasoningEffortSelect value={reasoningEffort} onChange={setReasoningEffort} />
           ) : (
-            <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} />
+            <ThinkingBudgetSlider value={thinkingBudget} onChange={setThinkingBudget} automatic={loadedOnLitertLm} />
           )}
           {activeId && selectedAgent && (
             <span

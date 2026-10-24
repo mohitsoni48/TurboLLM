@@ -6,6 +6,7 @@ import type { HardwareProfile } from './hardware'
 import type { HardwareReq } from './catalog'
 import type { GpuVendor } from '../sysinfo/sysinfo'
 import type { ModelEntry } from '../models/scanner'
+import { shapeLitertLmRequest } from './litert-lm-request'
 
 export type ModelFormat = 'gguf' | 'mlx' | 'litertlm'
 
@@ -254,6 +255,17 @@ export function engineModelAlias(engineKind: string, modelPath?: string | null):
  * is configured. Any new caller MUST run clampMaxTokens immediately before this — the ordering
  * test in compat.litert-lm.test.ts locks the shape every route produces.
  */
+/** An outbound chat request shaped for the local engine it goes to: the token cap's key (applyEngineTokenLimit) and,
+ *  for LiteRT-LM, the fields its servers read (litert-lm-request.ts: thinking as a top-level reasoning_effort). The one
+ *  step every path that calls a local engine runs on the finished body: chat (chat-upstream.ts), the gateway's two
+ *  protocols, the ext API, routines, the distiller, the reviewer and built-in Code. Same ordering contract as
+ *  applyEngineTokenLimit (clampMaxTokens first). Mutates and returns `body`. */
+export function shapeForEngine<T extends Record<string, unknown>>(engineKind: string, body: T): T {
+  applyEngineTokenLimit(engineKind, body)
+  if (engineKind === 'litert-lm') shapeLitertLmRequest(body)
+  return body
+}
+
 export function applyEngineTokenLimit<T extends Record<string, unknown>>(engineKind: string, body: T): T {
   if (engineKind !== 'litert-lm' || !('max_tokens' in body)) return body
   const b = body as Record<string, unknown>

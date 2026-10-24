@@ -43,6 +43,8 @@ import type { ReasoningEffort } from '../chat/reasoning-effort'
 import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
 import { resolveCodeUpstream } from './code-upstream'
+import { shapeLitertLmRequest } from '../engines/litert-lm-request'
+import { servingEngineKind } from '../engines/serving'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
 import {
   LOOP_ABORT_AFTER,
@@ -1340,34 +1342,38 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // model's real remaining context, not a number fixed before this turn's prompt existed.
       delete payload.max_tokens
       delete payload.max_completion_tokens
+      // A local LiteRT-LM engine reads thinking as a top-level reasoning_effort (litert-lm-request.ts), which this hook
+      // otherwise never sent: built-in Code's thinking budget and effort never reached a .litertlm.
+      const shaped = (p: Record<string, unknown>): Record<string, unknown> =>
+        !upstream.remote && servingEngineKind(d) === 'litert-lm' ? shapeLitertLmRequest(p) : p
       if (thinkingBudget === 0) {
-        return {
+        return shaped({
           ...payload,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
-        }
+        })
       }
       // Independent of thinkingBudget above (same as chat-routes.ts's runGeneration) — only
       // set when the caller passed a value that survived parseReasoningEffort. 'off' collapses
       // onto the exact same fields as thinkingBudget===0 above (see reasoning-effort.ts).
       if (reasoningEffort === 'off') {
-        return {
+        return shaped({
           ...payload,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
-        }
+        })
       }
       if (reasoningEffort) {
-        return {
+        return shaped({
           ...payload,
           ...(thinkingBudget > 0 ? { thinking_budget_tokens: thinkingBudget } : {}),
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: reasoningEffort },
-        }
+        })
       }
       if (thinkingBudget > 0) {
-        return { ...payload, thinking_budget_tokens: thinkingBudget }
+        return shaped({ ...payload, thinking_budget_tokens: thinkingBudget })
       }
-      return payload // unlimited (default) — still stripped of the stale max_tokens ceiling
+      return shaped(payload) // unlimited (default) — still stripped of the stale max_tokens ceiling
     })
     pi.on('after_provider_response', () => { stopPrefillPoll(); releaseGate() })
 

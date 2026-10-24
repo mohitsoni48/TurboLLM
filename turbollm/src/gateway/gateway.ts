@@ -7,7 +7,8 @@ import { createPatch } from 'diff'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
+import { shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
@@ -347,8 +348,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     // A level (low/medium/xhigh) says how hard to think, not whether: thinking turned off, by the client's own
     // {type:'disabled'} (mapToOpenAI's budget 0 plus enable_thinking false) or by the slider's Off, stays off, and the
     // level is not sent beside it. A level used to replace the client's 'disabled' with thinking on the default budget,
-    // and the web sets one for every terminal session it opens (its default xhigh, the template's own default, until
-    // the user picks another), so Claude Code's off never reached the engine from a terminal opened there.
+    // and the web used to set one for every terminal session it opened (its default xhigh, the template's own default),
+    // so Claude Code's off never reached the engine from a terminal opened there. It now sets one only when the user
+    // chose a level for a model that shows the control (CodeSessionScreen.tsx); the rule stands for that level.
     const thinkingIsOff = thinkingOff || req.thinking?.type === 'disabled'
     if (effortOverride === 'off') {
       oaiBody.thinking_budget_tokens = 0
@@ -376,8 +378,21 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       const localKind = routeResult.engineKind ?? servingEngineKind(d)
       const oaiAlias = engineModelAlias(localKind, routeResult.modelPath ?? d.manager.currentOpts()?.modelPath)
       if (oaiAlias) (oaiBody as Record<string, unknown>).model = oaiAlias
+      // LiteRT-LM reads thinking as a top-level reasoning_effort (shapeForEngine). Claude Code's {type:'adaptive'} (its
+      // default request) leaves thinking to the model: mapToOpenAI's half-of-max_tokens budget, there for llama.cpp's
+      // sampler, would read as thinking on, so it is not sent, and the bundle's template decides. {type:'enabled'} with
+      // no budget is thinking on, without that cap.
+      if (localKind === 'litert-lm' && req.thinking && req.thinking.type !== 'disabled') {
+        const asked = req.thinking.budget_tokens
+        if (!(Number.isFinite(asked) && (asked ?? 0) > 0)) {
+          delete oaiBody.thinking_budget_tokens
+          if (req.thinking.type === 'enabled') {
+            oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: true }
+          }
+        }
+      }
       // mapToOpenAI emits `max_tokens`, which LiteRT-LM ignores (see applyEngineTokenLimit).
-      applyEngineTokenLimit(localKind, oaiBody as Record<string, unknown>)
+      shapeForEngine(localKind, oaiBody as Record<string, unknown>)
     }
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
@@ -1120,6 +1135,12 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // Both shaped for the engine the router actually sent this to: a pool slot's (see RouteResult), else the primary's.
       const localKind = routeResult.engineKind ?? servingEngineKind(d)
       if (parsedBody && !remote) applyEngineTokenLimit(localKind, parsedBody)
+      // LiteRT-LM reads the OpenAI-standard top-level reasoning_effort itself, every OpenAI value being one it takes
+      // (none/minimal/low/medium/high/xhigh): a client's own is kept as it is, not parsed through Qwen3.8's aliases
+      // ('high' → 'xhigh', 'none' → 'off') into chat_template_kwargs, which `serve` never reads, nor did the Android app's
+      // server until it took chat_template_kwargs too. It was always deleted, so an opencode or SDK client's
+      // reasoning_effort, its 'none' included, never reached a .litertlm.
+      const litertLocal = !remote && localKind === 'litert-lm'
       // Rewrite the outbound model id for engines that serve under a fixed alias
       // (mlx-lm / vLLM) or that require the real loaded model path (mlx-vlm).
       // Routing above already used the caller's original id.
@@ -1148,7 +1169,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // yet — a Code-session override, if set, replaces it below — so the two sources are
       // resolved to a single effective value before either ever touches the outbound body.
       let effort: ReturnType<typeof parseReasoningEffort> = undefined
-      if (parsedBody && 'reasoning_effort' in parsedBody) {
+      if (parsedBody && 'reasoning_effort' in parsedBody && !litertLocal) {
         // `parseReasoningEffort` already returns undefined for a non-string (e.g. a
         // LiteLLM-style explicit `null` for an unset optional), so the delete below must not
         // be gated on the value's type too — the key still has to go either way for "always
@@ -1186,16 +1207,28 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
             else delete parsedBody.chat_template_kwargs
           }
           if (override !== 0 && effort === 'off') effort = undefined
+          // LiteRT-LM: the slider's budget or Off wins over the client's own top-level value the same way, so that is
+          // dropped and the server gets what the budget fields say (litert-lm-request.ts: 0 → 'none', N → on).
+          if (litertLocal) delete parsedBody.reasoning_effort
         }
         // Same override mechanism, for reasoning_effort — see session-auth.ts. A deliberate,
         // persistent Code-session override replaces whatever level the client itself sent on
         // this turn (including the plain-client value parsed above), same precedence the
         // thinking-budget override above already has. Not a client's 'off' ('none'): a level
-        // says how hard to think, not whether, and the web sets one for every terminal session
-        // it opens (its default xhigh until the user picks another), so that off never got
-        // through from one. The session's own 'off' still wins over a client's level.
+        // says how hard to think, not whether, and the web used to set one for every terminal
+        // session it opened (its default xhigh), so that off never got through from one; now it
+        // sets only a level the user chose. The session's own 'off' still wins over a client's level.
         const effortOverride = sessionAuth.getReasoningEffortForToken(chatToken)
-        if (effortOverride !== null && (effortOverride === 'off' || effort !== 'off')) effort = effortOverride
+        if (litertLocal) {
+          // The same precedence for LiteRT-LM, in the field it reads: the session's own 'off' wins; a level replaces the
+          // client's level, but neither the client's off nor thinking turned off (the slider's Off, the client's own
+          // enable_thinking false).
+          const own = parsedBody.reasoning_effort
+          const clientOff = typeof own === 'string' && /^(none|off)$/i.test(own)
+          const thinkingOff = (parsedBody.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking === false
+          if (effortOverride === 'off') parsedBody.reasoning_effort = 'none'
+          else if (effortOverride !== null && !clientOff && !thinkingOff) parsedBody.reasoning_effort = effortOverride
+        } else if (effortOverride !== null && (effortOverride === 'off' || effort !== 'off')) effort = effortOverride
       }
       // Applied exactly once, from whichever of the two sources above won, so a client value
       // and a session override that disagree (e.g. client sends 'medium' but the session's own
@@ -1206,8 +1239,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // template value.
       // A level (low/medium/xhigh) says how hard to think, not whether: thinking already off, by the slider's Off above
       // or the client's own enable_thinking false (which a slider's budget above clears), stays off and gets no
-      // level. Its write used to clear that enable_thinking with the rest, and the web sets an effort for every
-      // terminal session it opens (its default xhigh until the user picks another): the slider's Off kept only
+      // level. Its write used to clear that enable_thinking with the rest, and the web set an effort for every
+      // terminal session it opened (its default xhigh, before it set only a level the user chose): the slider's Off kept only
       // thinking_budget_tokens 0, which vLLM, SGLang, MLX and llama.cpp builds without that sampler field ignore, so
       // the model went on thinking.
       const thinkingIsOff = (parsedBody?.chat_template_kwargs as Record<string, unknown> | undefined)?.enable_thinking === false
@@ -1248,6 +1281,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
         parsedBody.stream_options = { include_usage: true }
         injectedUsage = true
       }
+      // The fields LiteRT-LM reads, from the finished body (shapeForEngine's LiteRT-LM half; the token cap ran above).
+      if (parsedBody && litertLocal) shapeLitertLmRequest(parsedBody)
       headers.delete('content-length') // re-serialised body has a new length
       headers.set('content-type', 'application/json') // re-serialised body; never inherited (a client's text/plain)
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''

@@ -335,6 +335,15 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     const global = localStorage.getItem('tllm.reasoningEffort.default')
     return global === 'off' || global === 'low' || global === 'medium' || global === 'xhigh' ? global : DEFAULT_REASONING_EFFORT
   }
+  // The level the user chose (for this session, or as the default), or null when they chose none. A terminal session's
+  // override is this, not readReasoningEffort's fallback: DEFAULT_REASONING_EFFORT ('xhigh') is the select's resting
+  // position since the control was added (f472730), Qwen3.8's template default, so it changed nothing there. Sent as
+  // an override for every terminal session opened, whatever the model, it reached the gateway as a level, which
+  // LiteRT-LM reads as thinking on.
+  const chosenReasoningEffort = (sid: string | null): ReasoningEffort | null => {
+    const stored = (sid ? localStorage.getItem(`tllm.reasoningEffort.${sid}`) : null) ?? localStorage.getItem('tllm.reasoningEffort.default')
+    return stored === 'off' || stored === 'low' || stored === 'medium' || stored === 'xhigh' ? stored : null
+  }
   const [reasoningEffort, setReasoningEffortState] = useState<ReasoningEffort>(() => readReasoningEffort(effectiveSessionId ?? null))
   const updateReasoningEffort = useUpdateCodeSessionReasoningEffort()
   const setReasoningEffort = (val: ReasoningEffort) => {
@@ -351,11 +360,15 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     setReasoningEffortState(readReasoningEffort(effectiveSessionId ?? null))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [effectiveSessionId])
+  // Synced when a terminal session opens, and when the loaded model gains or loses the control: the user's own level
+  // where the model shows the select, no override otherwise (null clears one), so the model's own default applies.
+  const sessionModelKey = activeRemoteId ?? model?.key ?? null
+  const loadedSupportsReasoningEffort = (modelsQ.data?.models ?? []).find((m) => m.key === sessionModelKey)?.reasoningEffort ?? false
   useEffect(() => {
     if (!isTerminalSession || !effectiveSessionId) return
-    updateReasoningEffort.mutate({ id: effectiveSessionId, effort: readReasoningEffort(effectiveSessionId) })
+    updateReasoningEffort.mutate({ id: effectiveSessionId, effort: loadedSupportsReasoningEffort ? chosenReasoningEffort(effectiveSessionId) : null })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isTerminalSession, effectiveSessionId])
+  }, [isTerminalSession, effectiveSessionId, loadedSupportsReasoningEffort])
 
   const [live, setLive] = useState<LiveState | null>(null)
   // The SERVER-side message queue's contents (tasks waiting behind the active run). Driven by
@@ -497,7 +510,7 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
       // new session — the state update from that effect hasn't applied yet, so the closure here
       // would still hold the PREVIOUS session's value. readThinkingBudget is a synchronous
       // localStorage read, immune to that ordering race.
-      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId), undefined, undefined, undefined, readReasoningEffort(effectiveSessionId), activeRemoteId ?? undefined)
+      void startCodeRun(effectiveSessionId, '', readThinkingBudget(effectiveSessionId), undefined, undefined, undefined, loadedSupportsReasoningEffort ? readReasoningEffort(effectiveSessionId) : undefined, activeRemoteId ?? undefined)
         .then(() => { void qc.invalidateQueries({ queryKey: codeKeys.detail(effectiveSessionId) }); clientRef.current?.connect() })
         .catch((e) => { autoStartedRef.current = null; toast.error(e instanceof ApiError ? e.message : 'Could not start the run.') })
     }
@@ -708,7 +721,8 @@ export function CodeSessionScreen({ embedded, sessionIdOverride }: { embedded?: 
     // run. Either way it's owned server-side, so a queued follow-up survives a disconnect. The
     // open stream reflects the result (a new `queue` frame, or the turn going live when it runs).
     try {
-      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind, reasoningEffort, activeRemoteId ?? undefined)
+      // A level only with the control shown (as chat): one stored under another model is not this one's.
+      const res = await startCodeRun(effectiveSessionId, text, thinkingBudget, promptOverride, filesToSend, kind, loadedSupportsReasoningEffort ? reasoningEffort : undefined, activeRemoteId ?? undefined)
       // `steered` reports whether a steer actually injected into the live turn vs. was queued —
       // confirm the real outcome. followUp needs no toast: its queued card already shows inline.
       if (kind === 'steer') toast.success(steerOutcomeMessage(res.steered))

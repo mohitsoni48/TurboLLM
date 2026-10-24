@@ -247,6 +247,18 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   own (`LlmMetadata.max_num_tokens`, 4096 when it declares none), which TurboLLM reads from the header and reports. A
   bundle whose KV length is a prime above 10 is a dynamic export (the runtime's magic number): it takes up to one token
   less, the panel says so, and it is no longer read as its exact size (Qwen3-0.6B_dynamic: up to 32,770).
+- **Thinking settings reach LiteRT-LM models.** LiteRT-LM read thinking only from a top-level `reasoning_effort`
+  (`litert-lm serve` still does), and TurboLLM sent it in llama.cpp's terms, so the chat's thinking control, built-in
+  Code's, a terminal session's, Claude Code's thinking setting and the daemon's own "off" for titles, memory and
+  compaction never reached a `.litertlm`, and an OpenAI client's own `reasoning_effort` was deleted (or rewritten into
+  Qwen3.8's terms) on the way. Off is now sent as `none` and a budget as thinking on (`litert-lm serve` cannot cap it;
+  the Android app's engine takes the budget too); a client's `reasoning_effort` reaches the model as it is; Claude
+  Code's adaptive thinking sends nothing, so the model decides. Untouched, every control is the model's own default: on
+  Android a new chat no longer starts with thinking Off (whatever the engine), and a terminal session gets a
+  reasoning-effort override only once you choose a level for a model that shows that control (it got `xhigh`, the
+  control's resting position, for every model). For a LiteRT-LM model the chat shows the untouched thinking budget as
+  "Auto (model's default)", not "Unlimited": the model may not think by default, and a budget is what turns thinking on
+  there. A reasoning-effort level is sent only while the loaded model shows the control.
 - **A `.litertlm` with a vision or audio encoder is a vision or audio model.** Every bundle was marked text-only; its
   header's encoder sections now set it (LFM2.5-VL, Gemma 3n/4), so it gets the Vision facet and loads as a vision
   model. Images reach it on desktop and Termux (`litert-lm serve` enables the encoders itself).

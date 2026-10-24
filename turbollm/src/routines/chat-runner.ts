@@ -22,7 +22,7 @@ import type { CustomChatAgent } from '../config/config'
 import type { Routine, RoutineRun } from './schema'
 import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { engineModelAlias, shapeForEngine } from '../engines/compat'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
@@ -214,7 +214,7 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     if (baseToolDefs.length && engineKind !== 'litert-lm') reqBody.tools = baseToolDefs
     const cappedMax = clampMaxTokens(undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
-    applyEngineTokenLimit(engineKind, reqBody)
+    shapeForEngine(engineKind, reqBody)
 
     // I3 fix: a genuinely stuck model spends its time INSIDE this fetch, not between rounds —
     // that's the realistic case the Task-2 wall-clock deadline exists to catch. Unwrapped, a

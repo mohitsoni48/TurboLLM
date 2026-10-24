@@ -136,7 +136,8 @@ export function updateCodeSessionThinkingBudget(id: string, tokens: number): Pro
 /** Same live-override mechanism as updateCodeSessionThinkingBudget, for Qwen3.8's independent
  *  reasoning_effort control — only meaningful for a terminal-agent session whose loaded model
  *  supports it (ModelEntry.reasoningEffort). */
-export function updateCodeSessionReasoningEffort(id: string, effort: ReasoningEffort): Promise<{ ok: true; effort: ReasoningEffort | null }> {
+/** `effort` null clears the session's override (the model's own default applies). */
+export function updateCodeSessionReasoningEffort(id: string, effort: ReasoningEffort | null): Promise<{ ok: true; effort: ReasoningEffort | null }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/reasoning-effort`, { method: 'PATCH', json: { effort } })
 }
 

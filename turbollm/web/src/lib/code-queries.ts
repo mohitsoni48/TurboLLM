@@ -133,7 +133,7 @@ export function useUpdateCodeSessionThinkingBudget() {
 /** Same live-override mechanism as useUpdateCodeSessionThinkingBudget, for reasoning_effort. */
 export function useUpdateCodeSessionReasoningEffort() {
   return useMutation({
-    mutationFn: (v: { id: string; effort: ReasoningEffort }) => updateCodeSessionReasoningEffort(v.id, v.effort),
+    mutationFn: (v: { id: string; effort: ReasoningEffort | null }) => updateCodeSessionReasoningEffort(v.id, v.effort),
   })
 }
 
