@@ -144,3 +144,18 @@ test('a vision bundle loads as a vision model', () => {
   const vl = litertlmEntryFor('/models/LFM2.5-VL-450M_int8.litertlm', '/models', 5e8, 0, { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: true, audio: false })
   assert.equal(buildStartOpts({ entry: vl, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).model.vision, true)
 })
+
+test('the sampling the user set for a .litertlm is carried for its requests, and only that; the bundle\'s own too', () => {
+  // LiteRT-LM has no launch flags for sampling (llama.cpp gets --temp etc.), so a model's Sampling settings reached no
+  // LiteRT-LM model. A profile saved now holds only what the user set; an earlier build's whole one, llama.cpp's
+  // 0.8 / 0.95 / 40 / 0.05 beside the one value moved.
+  const e = { ...entry(), sampler: { topK: 20, topP: 0.95, temp: 0.6 } }
+  const mine = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ sampling: { temp: 0.3 }, userSetOnly: true }, e), sys: CPU_ONLY, trigger: 'manual' })
+  assert.deepEqual(mine.litertLmRequest, { sampling: { temperature: 0.3 }, sampler: { topK: 20, topP: 0.95, temp: 0.6 } })
+  const old = withSaved({ ctx: 8192, ngl: 0, sampling: { temp: 0.8, topP: 0.95, topK: 64, minP: 0.05, repeatPenalty: 1, presencePenalty: 0, frequencyPenalty: 0, stop: [] } }, e)
+  assert.deepEqual(buildStartOpts({ entry: e, engine: engine(), cfg: old, sys: CPU_ONLY, trigger: 'manual' }).litertLmRequest?.sampling, { top_k: 64 })
+  // A load's own sampling (the dialog's Load) wins over the saved; nothing set, nothing carried.
+  const load = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ sampling: { temp: 0.3 }, userSetOnly: true }, e), sys: CPU_ONLY, overrides: { sampling: { temp: 0.9, topP: 0.8 } as never, userSetOnly: true }, trigger: 'manual' })
+  assert.deepEqual(load.litertLmRequest?.sampling, { temperature: 0.9, top_p: 0.8 })
+  assert.deepEqual(buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).litertLmRequest, { sampling: {} })
+})

@@ -8,7 +8,7 @@ import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
-import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile } from './litertlm'
+import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile, type LitertlmSampler } from './litertlm'
 
 export interface ModelEntry {
   key: string
@@ -75,6 +75,10 @@ export interface ModelEntry {
    *  llmMetadataToolCalls). false: its chat template never shows the model a request's tools, so TurboLLM sends it
    *  none and says so. Absent elsewhere, and when the header says nothing: the engine decides, as for any model. */
   toolCalls?: boolean
+  /** LiteRT-LM only: the bundle's own sampler (LlmMetadata.sampler_params, models/litertlm.ts llmMetadataSampler), what
+   *  its runtime samples with while a request sets no sampling. Absent when it declares none (on CPU and GPU the
+   *  runtime then decodes greedily: top_k 1). */
+  sampler?: LitertlmSampler
   mmprojPath: string | null
   /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null). Used to size
    *  the vision projector's VRAM contribution instead of a flat guess. */

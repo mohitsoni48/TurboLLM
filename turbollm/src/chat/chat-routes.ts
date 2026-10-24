@@ -31,7 +31,7 @@ import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } fr
 import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats, litertLmTurnErrorMessage } from '../engines/litert-lm'
-import { LITERT_LM_RESEARCH_NOTE, litertLmToolsFor } from '../engines/litert-lm-request'
+import { LITERT_LM_RESEARCH_NOTE, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -1747,6 +1747,9 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       // user is told when it gets none. They were withheld from every LiteRT-LM model (PR #271, before
       // its servers took them), so the thread's tools, MCP and skill tools and the Research persona's
       // web_search never reached LFM2.5, Qwen3 or Gemma 4, whose templates show them to the model.
+      // A temperature or top_p a LiteRT-LM model ignores (no sampler of its own: greedy without a top_k) is said.
+      const samplingNote = localLitert ? litertLmSamplingNote(reqBody) : undefined
+      if (samplingNote) await noteOnce(samplingNote)
       let roundTools = toolDefs
       if (localLitert && toolDefs.length > 0) {
         const pick = litertLmToolsFor(litertModel, toolDefs, iterMessages, upstream.ctxMax)

@@ -10,6 +10,7 @@ import { BUILTIN_MODEL_DEFAULT_CTX, type Config, type Engine, getModelProfile } 
 import { engineAcceptsFormat, type ModelFormat } from './compat'
 import { koboldcppProfileToArgs } from './koboldcpp'
 import { litertLmProfileToConfig } from './litert-lm'
+import { litertLmRequestSampling } from './litert-lm-request'
 import type { StartOpts } from './manager'
 import { mlxSamplingArgs } from './mlx'
 import { type LoadProfile, legacySeedProfile, LITERT_RUNTIME_DEFAULT_CTX, profileToArgs, resolveProfile, userSetProfile, vllmProfileToArgs } from '../models/profile'
@@ -117,6 +118,10 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
   // The window the runtime opens when it chooses (engine_settings.cc), for what TurboLLM reports and compacts against.
   const gpuCut = userCtx === undefined && profile.litertLm.backend === 'gpu' && !sys.os.startsWith('darwin') && profile.ctx > LITERT_RUNTIME_DEFAULT_CTX
   const ctx = gpuCut ? LITERT_RUNTIME_DEFAULT_CTX : profile.ctx
+  // The sampling the user set for this model (its saved profile's own, the load's), which each request carries
+  // (litert-lm-request.ts): LiteRT-LM takes sampling only per request, so llama.cpp's way, launch flags, has no
+  // counterpart, and the model's Sampling settings never reached it. Only what the user set: the rest is the model's.
+  const userSampling = { ...(userSetProfile(saved, legacySeedProfile(entry, sys, cfg.modelDefaults))?.sampling ?? {}), ...(overrides?.sampling ?? {}) }
   return {
     engine,
     // The bundle's own modalities (its header): a vision bundle is a vision model, which it was not before.
@@ -125,6 +130,7 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
     extraArgs: profile.extraArgs,
     // Auto threads are pinned only where the CPU is big.LITTLE (perfCores); elsewhere the runtime keeps choosing.
     litertLmConfig: litertLmProfileToConfig({ ...profile, ctx: userCtx === undefined ? 0 : profile.ctx }, sys.perfCores ? autoThreadCount(sys) : 0),
+    litertLmRequest: { sampling: litertLmRequestSampling(userSampling), ...(entry.sampler ? { sampler: entry.sampler } : {}) },
     preferredPort: profile.port,
     profile,
     trigger,

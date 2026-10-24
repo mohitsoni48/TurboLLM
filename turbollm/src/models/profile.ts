@@ -634,6 +634,25 @@ export function litertLmAutoCtx(m: Pick<ModelEntry, 'nativeCtx' | 'defaultCtx'>,
   return Math.min((m.defaultCtx ?? 0) > 0 ? m.defaultCtx! : LITERT_RUNTIME_DEFAULT_CTX, limit)
 }
 
+/** What LiteRT-LM samples with on CPU and GPU when the bundle declares no sampler of its own and the request sets none
+ *  (engine_settings.cc): TOP_P with top_k 1 (greedy), top_p 0.95, temperature 1.0. */
+export const LITERT_RUNTIME_DEFAULT_SAMPLER = { topK: 1, topP: 0.95, temp: 1.0 } as const
+
+/** A .litertlm's automatic sampling: the bundle's own sampler (LlmMetadata.sampler_params, ModelEntry.sampler), else the
+ *  runtime's default. It is what the model samples with while nothing is set, so it is what the model dialog and the
+ *  thread settings show at rest; TurboLLM's llama.cpp defaults (0.8 / 0.95 / 40) stood there and are not what any
+ *  LiteRT-LM model uses (Qwen3-0.6B's own: 0.6 / 0.95 / 20). A field the bundle leaves out of its sampler is the
+ *  runtime's (top_k 0 when it sets a top_p and no top_k: no top-k limit). The other fields keep defaultSampling(). */
+export function litertLmAutoSampling(m: Pick<ModelEntry, 'sampler'>): Sampling {
+  const own = m.sampler
+  return {
+    ...defaultSampling(),
+    temp: own ? own.temp ?? LITERT_RUNTIME_DEFAULT_SAMPLER.temp : LITERT_RUNTIME_DEFAULT_SAMPLER.temp,
+    topP: own ? own.topP ?? LITERT_RUNTIME_DEFAULT_SAMPLER.topP : LITERT_RUNTIME_DEFAULT_SAMPLER.topP,
+    topK: own ? own.topK ?? 0 : LITERT_RUNTIME_DEFAULT_SAMPLER.topK,
+  }
+}
+
 /** Computed defaults for a model (spec 05 §3). NOT saved until the user saves. */
 export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
   const hasGpu = sys.gpus.length > 0
@@ -675,7 +694,7 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
     speculative: m.nextnLayers > 0 ? 'nextn' : 'off',
     mtpHeadPath: '',
     draftModelPath: '',
-    sampling: defaultSampling(),
+    sampling: m.format === 'litertlm' ? litertLmAutoSampling(m) : defaultSampling(),
     contextOverflow: 'shift',
     nKeep: 0,
     ropeScalingType: 'none',
@@ -798,14 +817,15 @@ export function automaticProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDe
  *  b0e8455): what a profile an earlier build saved holds where the user changed nothing, and so what
  *  {@link userSetProfile} reads such a profile against. The automatic profile itself, but for a .litertlm's context,
  *  which was the llama.cpp heuristic (min(Model Defaults, the bundle's KV length or `ekv` tag), the length read raw, a
- *  dynamic export's magic number included) where it is now the bundle's own default: read against the new one, every
- *  such profile's 8192 would count as the user's choice. */
+ *  dynamic export's magic number included) where it is now the bundle's own default, and its sampling, which was
+ *  llama.cpp's (defaultSampling) where it is now the bundle's: read against the new ones, every such profile's 8192 and
+ *  0.8 / 0.95 / 40 / 0.05 would count as the user's choice. */
 export function legacySeedProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults, auto = automaticProfile(m, sys, defaults)): LoadProfile {
   if (m.format !== 'litertlm') return auto
   const oldNative = m.ctxDynamic ? m.nativeCtx + 1 : m.nativeCtx
   const heuristic = Math.min(oldNative || 8192, 8192)
   const ctx = defaults && defaults.ctx > 0 ? (oldNative > 0 ? Math.min(defaults.ctx, oldNative) : defaults.ctx) : heuristic
-  return { ...auto, ctx }
+  return { ...auto, ctx, sampling: defaultSampling() }
 }
 
 /** The groups {@link resolveProfile} merges key by key, so a user-set view keeps only their set keys. */

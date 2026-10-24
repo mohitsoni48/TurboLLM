@@ -7,6 +7,8 @@ import { test, type TestContext } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { engineCommand, pyEngineEnv, Manager, type StartOpts } from './manager'
 import { litertLmConfigPath } from './litert-lm'
+import { litertLmModelInfo, litertLmSamplingNote, shapeLitertLmRequest } from './litert-lm-request'
+import { fakeLitertlmBundleOf, fakeLlmMetadata } from '../test-support/litertlm-bundle'
 import { freePort } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 
@@ -130,7 +132,12 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
     // The fake server binds the port it is handed: pinned clear of the 8081+ walk, which a parallel test file's engine
     // can be handed too (it then died here with EADDRINUSE, engine_exited instead of model_load_failed).
     preferredPort: port,
+    litertLmRequest: { sampling: { temperature: 0.3 }, sampler: { topK: 20, topP: 0.95, temp: 0.6 } },
   } as unknown as StartOpts)
+  // What each request to the model carries from this load is recorded for the request shaping, by model path.
+  assert.deepEqual(litertLmModelInfo('/models/fake-bundle.litertlm'), {
+    sampling: { temperature: 0.3 }, sampler: { topK: 20, topP: 0.95, temp: 0.6 }, native: false,
+  })
 
   await waitForState(manager, 'error', 30_000)
   // Give the SIGKILLed child's 'close' event a moment to run onTerminated, then pin that it
@@ -145,4 +152,47 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
   // CPU, which a GPU-only bundle cannot run on), and with no backend chosen the hint does not blame one.
   assert.deepEqual(JSON.parse(readFileSync(litertLmConfigPath(dataDir, port), 'utf8')), { default: {} })
   assert.doesNotMatch(st.err?.message ?? '', /GPU|switch the Backend/)
+})
+
+test('a load that carries nothing of the bundle gets its own sampler from its header: by path, or restarted onto LiteRT-LM', { skip: !HAS_PYTHON }, async (t: TestContext) => {
+  // A .litertlm loaded by path (POST /api/v1/engine/start {modelPath}), restarted onto LiteRT-LM from another engine or
+  // resumed as a devModel starts with no litertLmRequest. Its requests carried nothing of the bundle: a thread's
+  // temperature alone went alone, `serve` filled top_k 1 (greedy, so the temperature did nothing), and nothing said
+  // so. Qwen3-0.6B's own sampler: 20 / 0.95 / 0.6.
+  const fakeRoot = tmpDir('turbollm-litert-fakepkgs-')
+  const dataDir = tmpDir('turbollm-litert-header-')
+  const prevPyPath = process.env.PYTHONPATH
+  let manager: Manager | undefined
+  t.after(async () => {
+    await manager?.stopAndWait({ force: true })
+    if (prevPyPath === undefined) delete process.env.PYTHONPATH
+    else process.env.PYTHONPATH = prevPyPath
+    rmSync(fakeRoot, { recursive: true, force: true })
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+  mkdirSync(join(fakeRoot, 'litert_lm'), { recursive: true })
+  writeFileSync(join(fakeRoot, 'litert_lm', '__init__.py'), '')
+  writeFileSync(join(fakeRoot, 'litert_lm', '_ffi.py'), 'def _get_lib():\n    return object()\n')
+  mkdirSync(join(fakeRoot, 'litert_lm_cli'), { recursive: true })
+  writeFileSync(join(fakeRoot, 'litert_lm_cli', '__init__.py'), '')
+  writeFileSync(join(fakeRoot, 'litert_lm_cli', 'main.py'), FAKE_SERVE_PY)
+  process.env.PYTHONPATH = prevPyPath ? [fakeRoot, prevPyPath].join(pathDelimiter) : fakeRoot
+  const modelPath = join(dataDir, 'Qwen3-0.6B.litertlm')
+  writeFileSync(modelPath, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ sampler: { type: 2, k: 20, p: 0.95, temperature: 0.6 } }) }]))
+
+  manager = new Manager(ConfigStore.load(join(dataDir, 'config.json')))
+  await manager.start({
+    engine: {
+      id: 'lrt-header', name: 'LiteRT-LM (fake)', kind: 'litert-lm', binPath: 'python3',
+      version: '', capabilities: { flags: [], kvTypes: [] }, addedAt: '',
+    },
+    model: { key: modelPath, name: 'Qwen3 0.6B', quant: '', ctx: 0, vision: false },
+    modelPath,
+    extraArgs: [],
+    preferredPort: await freePort(),
+  } as unknown as StartOpts)
+  assert.deepEqual(litertLmModelInfo(modelPath), { sampling: {}, sampler: { topK: 20, topP: 0.95, temp: 0.6 }, native: false })
+  const body: Record<string, unknown> = shapeLitertLmRequest({ model: modelPath, messages: [], temperature: 0.9 })
+  assert.deepEqual([body.temperature, body.top_k, body.top_p], [0.9, 20, 0.95])
+  assert.equal(litertLmSamplingNote(body), undefined)
 })

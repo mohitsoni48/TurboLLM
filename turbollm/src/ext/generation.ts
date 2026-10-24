@@ -54,7 +54,7 @@ import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
 import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
-import { litertLmToolsFor } from '../engines/litert-lm-request.js'
+import { litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -302,6 +302,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     else delete reqBody.max_tokens
     shapeForEngine(engineKind, reqBody)
+    const samplingNote = engineKind === 'litert-lm' && iter === 1 ? litertLmSamplingNote(reqBody) : undefined
+    if (samplingNote) console.log(`[ext] ${samplingNote}`)
     if (toolsSupported && engineKind === 'litert-lm') {
       const pick = litertLmToolsFor(litertModel, toolDefs, messages, loadedModel.ctx)
       if (pick.tools.length) reqBody.tools = pick.tools

@@ -5,7 +5,10 @@
 // bundle's template default always decided (Qwen3 thinks by default, Gemma 4 does not).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor } from './litert-lm-request'
+import {
+  shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor,
+  litertLmRequestSampling, litertLmSamplingNote, rememberLitertLmModel, shapeLitertLmRequest,
+} from './litert-lm-request'
 import { webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL } from '../tools/builtin'
 import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL } from '../routines/routine-tools'
 import { LIST_AGENTS_TOOL, CREATE_AGENT_TOOL } from '../chat/chat-agent-tools'
@@ -84,4 +87,54 @@ test('litertLmToolsFor: tools that do not fit in the model\'s context with the c
   assert.equal(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), image, 4096).tools.length, 2)
   const calls = [{ role: 'assistant', content: '', tool_calls: [{ id: 'a', type: 'function', function: { name: 'fetch_url', arguments: 'y'.repeat(12000) } }] }]
   assert.deepEqual(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), calls, 4096).tools, [])
+})
+
+// ── sampling ──────────────────────────────────────────────────────────────────────────────────
+
+const QWEN3 = '/models/Qwen3-0.6B.litertlm'
+const LFM2 = '/models/LFM2.5-230M_int8.litertlm'
+const req = (model: string, fields: Record<string, unknown>) => shapeLitertLmRequest({ model, messages: [], ...fields })
+const sampling = (b: Record<string, unknown>) => Object.fromEntries(['temperature', 'top_p', 'top_k', 'seed'].filter((k) => k in b).map((k) => [k, b[k]]))
+
+test('litertLmRequestSampling: a model\'s saved Sampling in the request fields LiteRT-LM reads', () => {
+  assert.deepEqual(litertLmRequestSampling({ temp: 0.3, topK: 64 }), { temperature: 0.3, top_k: 64 })
+  assert.deepEqual(litertLmRequestSampling({}), {})
+})
+
+test('a request to a LiteRT-LM model carries the sampling the user saved for it, under the request\'s own', () => {
+  // LiteRT-LM takes sampling per request only: the model's Sampling settings reached none of its requests.
+  rememberLitertLmModel(QWEN3, { sampling: { temperature: 0.3, top_k: 64 }, native: false })
+  assert.deepEqual(sampling(req(QWEN3, {})), { temperature: 0.3, top_k: 64 })
+  assert.deepEqual(sampling(req(QWEN3, { temperature: 0.9, top_k: null })), { temperature: 0.9, top_k: 64 }, 'a thread\'s or client\'s value wins; null is unset')
+  assert.deepEqual(sampling(req('/models/other.litertlm', {})), {}, 'a model not loaded here: nothing')
+})
+
+test('a request that sets part of the sampler gets the rest from the bundle\'s own: a temperature alone is no longer greedy', () => {
+  // `serve` fills what a request leaves out with top_k 1, top_p 0.95, temperature 1.0: Qwen3's 20 / 0.95 / 0.6 was gone
+  // and top_k 1 is greedy, so the thread's temperature did nothing.
+  rememberLitertLmModel(QWEN3, { sampling: {}, sampler: { topK: 20, topP: 0.95, temp: 0.6 }, native: false })
+  assert.deepEqual(sampling(req(QWEN3, { temperature: 0.7 })), { temperature: 0.7, top_k: 20, top_p: 0.95 })
+  assert.deepEqual(sampling(req(QWEN3, { seed: 7 })), { seed: 7, top_k: 20, top_p: 0.95, temperature: 0.6 })
+  assert.deepEqual(sampling(req(QWEN3, { top_k: 5 })), { top_k: 5, top_p: 0.95, temperature: 0.6 })
+  // Nothing set: nothing sent, so the runtime samples with the bundle's own as it is.
+  assert.deepEqual(sampling(req(QWEN3, {})), {})
+  // A bundle with none of its own: nothing added (its servers' fill is the runtime's own default).
+  rememberLitertLmModel(LFM2, { sampling: {}, native: false })
+  assert.deepEqual(sampling(req(LFM2, { temperature: 0.7 })), { temperature: 0.7 })
+})
+
+test('a temperature a LiteRT-LM model ignores is said: no sampler of its own and no top_k is greedy on serve', () => {
+  rememberLitertLmModel(LFM2, { sampling: {}, native: false })
+  const note = litertLmSamplingNote({ model: LFM2, temperature: 0.7 })
+  assert.match(note ?? '', /decodes it greedily \(Top K 1\)/)
+  assert.equal(litertLmSamplingNote({ model: LFM2, temperature: 0.7, top_k: 40 }), undefined, 'a top_k is set')
+  assert.equal(litertLmSamplingNote({ model: LFM2 }), undefined, 'nothing set: the model\'s own')
+  assert.equal(litertLmSamplingNote({ model: LFM2, temperature: 0 }), undefined, 'temperature 0 is greedy anyway')
+  rememberLitertLmModel(LFM2, { sampling: { temperature: 0.5 }, native: false })
+  assert.ok(litertLmSamplingNote({ model: LFM2 }), 'the model\'s saved temperature counts')
+  // The Android app's server samples such a request with no top-k limit itself; a bundle with its own sampler is completed.
+  rememberLitertLmModel(LFM2, { sampling: {}, native: true })
+  assert.equal(litertLmSamplingNote({ model: LFM2, temperature: 0.7 }), undefined)
+  rememberLitertLmModel(QWEN3, { sampling: {}, sampler: { topK: 20, topP: 0.95, temp: 0.6 }, native: false })
+  assert.equal(litertLmSamplingNote({ model: QWEN3, temperature: 0.7 }), undefined)
 })

@@ -270,6 +270,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   whose template has no tools, such as Gemma 3 1B or LFM2.5-VL; tools too large for a 4096-token bundle).
   `litert-lm serve` ignores a forced tool choice and the app's server refuses one it cannot honour, so under Research
   a LiteRT-LM model chooses whether to search, and the chat says so.
+- **A LiteRT-LM model's sampling is its own, and yours reaches it.** LiteRT-LM takes sampling only per request, so
+  the Sampling saved on a `.litertlm`'s settings never reached it, and a request that set part of the sampler (a
+  thread's temperature alone) made `litert-lm serve` fill the rest with top_k 1, which is greedy: the temperature did
+  nothing and the model's own sampler (Qwen3-0.6B: top_k 20, top_p 0.95, temperature 0.6) was thrown away. Each
+  request now carries the sampling you set on the model (only what you set) under the thread's or the client's own,
+  and the fields still missing come from the bundle's own sampler, which TurboLLM reads from its header and shows as
+  the model's defaults in the model and thread settings (they showed llama.cpp's 0.8 / 0.95 / 40). For a bundle with
+  no sampler of its own (LFM2.5-230M), `litert-lm serve` stays greedy without a Top K, and the chat says so.
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

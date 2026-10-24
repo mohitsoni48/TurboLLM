@@ -154,8 +154,20 @@ export function fakeLitertlmBundleOf(sections: FakeSection[]): Buffer {
  *  supports_function_calling (12). */
 export function fakeLlmMetadata(fields: {
   maxNumTokens?: number; modelType?: number; template?: string; supportsFunctionCalling?: boolean
+  /** sampler_params (4): SamplerParameters type (1), k (2), p (3, float), temperature (4, float). */
+  sampler?: { type: number; k?: number; p?: number; temperature?: number }
 }): Buffer {
   const out: number[] = []
+  if (fields.sampler) {
+    const f32 = (field: number, v: number) => { const b = Buffer.alloc(4); b.writeFloatLE(v); return [...varint(field * 8 + 5), ...b] }
+    const sp = fields.sampler
+    out.push(...pBytes(4, [
+      ...pVarint(1, sp.type),
+      ...(sp.k !== undefined ? pVarint(2, sp.k) : []),
+      ...(sp.p !== undefined ? f32(3, sp.p) : []),
+      ...(sp.temperature !== undefined ? f32(4, sp.temperature) : []),
+    ]))
+  }
   if (fields.maxNumTokens) out.push(...pVarint(5, fields.maxNumTokens))
   if (fields.modelType !== undefined) out.push(...pBytes(6, pBytes(fields.modelType, [])))
   if (fields.template !== undefined) out.push(...pBytes(7, [...Buffer.from(fields.template, 'utf8')]))

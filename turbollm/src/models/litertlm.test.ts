@@ -8,6 +8,7 @@ import {
   isLitertlmFileName,
   jinjaTemplateTakesTools,
   litertlmEntryFor,
+  llmMetadataSampler,
   litertlmHeaderFromFile,
   litertlmNativeCtxFromFile,
   litertlmNativeCtxFromName,
@@ -133,7 +134,7 @@ test('litertlmHeaderFromFile: LlmMetadata.max_num_tokens is the bundle\'s own de
   const dir = tmpDir('tllm-litertlm-hdr-')
   const p = join(dir, 'LFM2.5-230M_int8.litertlm')
   writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
-  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
+  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
 })
 
 test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 10) is a dynamic export, taking one less', async () => {
@@ -142,10 +143,10 @@ test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 
   const dir = tmpDir('tllm-litertlm-hdr-')
   const qwen = join(dir, 'Qwen3-0.6B_dynamic.litertlm')
   writeFileSync(qwen, fakeBundle(4096, [[1, 32771], [2, 32771]]))
-  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
+  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
   const vl = join(dir, 'LFM2.5-VL-450M_int8.litertlm')
   writeFileSync(vl, fakeBundle(4096, [[5, 0], [1, 4099], [2, 4099]]))
-  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
+  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
   assert.equal(isLitertMagicNumber(4096), false)
   assert.equal(isLitertMagicNumber(7), false, 'primes up to 10 are sizes')
   assert.equal(isLitertMagicNumber(4097), false, '17 * 241')
@@ -179,7 +180,7 @@ test('litertlmHeaderFromFile: vision and audio are the encoder sections the bund
   // A string item that is not model_type, or a section that is not a TFLiteModel, says nothing about modalities.
   const q = join(dir, 'other.litertlm')
   writeFileSync(q, fakeLitertlmBundleOf([{ type: 3, items: { note: 'tf_lite_vision_encoder' } }, { type: 1, items: { model_type: 'tf_lite_audio_encoder_hw' } }]))
-  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null })
+  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null, sampler: null })
 })
 
 // ── tool calling ──────────────────────────────────────────────────────────────────────────────
@@ -239,4 +240,30 @@ test('litertlmEntryFor: carries whether the model calls tools, absent when the h
   assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { toolCalls: false }).toolCalls, false)
   assert.equal('toolCalls' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { toolCalls: null }), false)
   assert.equal('toolCalls' in litertlmEntryFor('/m/d.litertlm', '/m', 10, 0), false)
+})
+
+// ── the bundle's own sampler ──────────────────────────────────────────────────────────────────
+
+test('llmMetadataSampler: the bundle\'s own sampler, as the request fields that reproduce it', () => {
+  // Qwen3-0.6B_dynamic_wi4b32_afp32's sampler_params, byte for byte: TOP_P, k 20, p 0.95, temperature 0.6.
+  const qwen3 = Buffer.concat([Buffer.from([0x22, 14]), Buffer.from('080210141d3333733f259a99193f', 'hex')])
+  assert.deepEqual(llmMetadataSampler(qwen3), { topK: 20, topP: 0.95, temp: 0.6 })
+  assert.deepEqual(llmMetadataSampler(fakeLlmMetadata({ sampler: { type: 2, k: 64, p: 0.95, temperature: 1.0 } })), { topK: 64, topP: 0.95, temp: 1 })
+  // The CPU sampler is TOP_P only: TOP_K is TOP_P with top_p 1, GREEDY is top_k 1; a TOP_P with no k has no top-k limit.
+  assert.deepEqual(llmMetadataSampler(fakeLlmMetadata({ sampler: { type: 1, k: 40, temperature: 0.8 } })), { topK: 40, topP: 1, temp: 0.8 })
+  assert.deepEqual(llmMetadataSampler(fakeLlmMetadata({ sampler: { type: 3 } })), { topK: 1 })
+  assert.deepEqual(llmMetadataSampler(fakeLlmMetadata({ sampler: { type: 2, p: 0.9, temperature: 0.7 } })), { topP: 0.9, temp: 0.7 })
+  // None, or TYPE_UNSPECIFIED (the runtime decides): nothing of its own. LFM2.5-230M and Gemma3-1B declare none.
+  assert.equal(llmMetadataSampler(fakeLlmMetadata({ maxNumTokens: 4096 })), null)
+  assert.equal(llmMetadataSampler(fakeLlmMetadata({ sampler: { type: 0, k: 5 } })), null)
+})
+
+test('litertlmHeaderFromFile and litertlmEntryFor: the entry carries the bundle\'s own sampler', async (t) => {
+  const dir = scratch(t)
+  const p = join(dir, 'qwen3.litertlm')
+  writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096, sampler: { type: 2, k: 20, p: 0.95, temperature: 0.6 } }) }]))
+  const h = await litertlmHeaderFromFile(p)
+  assert.deepEqual(h.sampler, { topK: 20, topP: 0.95, temp: 0.6 })
+  assert.deepEqual(litertlmEntryFor(p, dir, 10, 0, h).sampler, { topK: 20, topP: 0.95, temp: 0.6 })
+  assert.equal('sampler' in litertlmEntryFor(p, dir, 10, 0, { sampler: null }), false)
 })

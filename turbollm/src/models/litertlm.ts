@@ -142,9 +142,10 @@ function sectionStrings(section: FbTable): Map<string, string> {
   return out
 }
 
-type ProtoField = { field: number; varint?: number; bytes?: Buffer }
+type ProtoField = { field: number; varint?: number; bytes?: Buffer; f32?: number }
 
-/** The top-level fields of a protobuf message (varint and length-delimited; fixed-width ones are skipped). */
+/** The top-level fields of a protobuf message: varint, length-delimited and 32-bit (read as a float: the proto's
+ *  `float` fields, SamplerParameters.p and .temperature); 64-bit ones are skipped. */
 export function protoFields(buf: Buffer): ProtoField[] {
   const out: ProtoField[] = []
   let i = 0
@@ -169,8 +170,11 @@ export function protoFields(buf: Buffer): ProtoField[] {
       if (i + len > buf.length) throw new RangeError('truncated field')
       out.push({ field, bytes: buf.subarray(i, i + len) })
       i += len
-    } else if (wire === 5) i += 4
-    else if (wire === 1) i += 8
+    } else if (wire === 5) {
+      if (i + 4 > buf.length) throw new RangeError('truncated field')
+      out.push({ field, f32: buf.readFloatLE(i) })
+      i += 4
+    } else if (wire === 1) i += 8
     else throw new RangeError(`unsupported wire type ${wire}`)
   }
   return out
@@ -237,6 +241,45 @@ export function jinjaTemplateTakesTools(template: string): boolean {
   return false
 }
 
+// ── Sampling ──────────────────────────────────────────────────────────────────────────────
+// A bundle may carry its own sampler (LlmMetadata.sampler_params, field 4: SamplerParameters type 1, k 2, p 3,
+// temperature 4, seed 5): Qwen3-0.6B's is TOP_P with top_k 20, top_p 0.95, temperature 0.6; gemma-4-E2B-it-gpu's top_k
+// 64, top_p 0.95, temperature 1.0. The runtime samples with it while a request sets none of temperature, top_p, top_k
+// or seed; one that sets any gets a sampler of its own, whose other fields upstream's `serve` fills with fixed values
+// (top_k 1, top_p 0.95, temperature 1.0: litert_lm/utils.py _sampler_config_to_params), so a temperature alone threw
+// the model's sampler away and decoded greedily (top_k 1). Without one of its own, the runtime's default on CPU and
+// GPU is that same TOP_P, top_k 1 (engine_settings.cc): greedy.
+
+/** A bundle's own sampler, as the fields of a request that reproduce it on the CPU sampler (TOP_P only,
+ *  sampler_factory.cc): TOP_K is TOP_P with top_p 1, GREEDY is top_k 1. A field the bundle leaves 0 is absent. */
+export interface LitertlmSampler {
+  topK?: number
+  topP?: number
+  temp?: number
+}
+
+/** float32 to the decimal it was written as (0.949999988 is 0.95). */
+const f32 = (v: number | undefined): number | undefined => (v === undefined ? undefined : Number(v.toPrecision(6)))
+
+/** LlmMetadata.sampler_params as {@link LitertlmSampler}; null when the bundle declares none (or TYPE_UNSPECIFIED: the
+ *  runtime decides). */
+export function llmMetadataSampler(proto: Buffer): LitertlmSampler | null {
+  const params = protoFields(proto).find((x) => x.field === 4 && x.bytes !== undefined)?.bytes
+  if (!params) return null
+  const fields = protoFields(params)
+  const type = fields.find((x) => x.field === 1)?.varint ?? 0
+  const k = fields.find((x) => x.field === 2)?.varint ?? 0
+  const p = f32(fields.find((x) => x.field === 3)?.f32)
+  const temp = f32(fields.find((x) => x.field === 4)?.f32)
+  if (type === 3) return { topK: 1 } // GREEDY
+  if (type !== 1 && type !== 2) return null
+  return {
+    ...(k > 0 ? { topK: k } : {}),
+    ...(type === 1 ? { topP: 1 } : p !== undefined && p > 0 ? { topP: p } : {}),
+    ...(temp !== undefined && temp > 0 ? { temp } : {}),
+  }
+}
+
 /** Whether the bundle's model calls tools (see the section comment above). */
 export function llmMetadataToolCalls(proto: Buffer): boolean {
   const fields = protoFields(proto)
@@ -263,9 +306,13 @@ export interface LitertlmHeader {
   audio: boolean
   /** Its model calls tools (llmMetadataToolCalls); null when the bundle has no LlmMetadata to say. */
   toolCalls: boolean | null
+  /** Its own sampler (llmMetadataSampler); null when it declares none. */
+  sampler: LitertlmSampler | null
 }
 
-const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null }
+const NO_HEADER: LitertlmHeader = {
+  nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null, sampler: null,
+}
 
 /** Reads only the header and the small LlmMetadata and ExecutorMetadata sections, never the weights. A header this
  *  reader does not understand gives NO_HEADER: it costs only the slider's precision and the model's own defaults. */
@@ -303,6 +350,7 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
       if (type === SECTION_LLM_METADATA) {
         out.defaultCtx = llmMetadataMaxNumTokens(proto)
         out.toolCalls = llmMetadataToolCalls(proto)
+        out.sampler = llmMetadataSampler(proto)
         continue
       }
       const len = executorMetadataMaxSequence(proto)
@@ -333,8 +381,8 @@ function cleanName(fileName: string): string {
 
 /** The library entry for a `.litertlm` file. Its format is 'litertlm' (a single file, deleted as a file); compat.ts
  *  gives it to the LiteRT-LM engine and to no other. Vision and audio are what its header declares (its encoder
- *  sections, litertlmHeaderFromFile), false when it was not read; tool calling is its LlmMetadata's, absent when the
- *  header says nothing. */
+ *  sections, litertlmHeaderFromFile), false when it was not read; tool calling and the sampler are its LlmMetadata's,
+ *  absent when the header says nothing. */
 export function litertlmEntryFor(
   path: string, dir: string, sizeBytes: number, mtimeMs: number, header: number | Partial<LitertlmHeader> = 0,
 ): ModelEntry {
@@ -366,6 +414,7 @@ export function litertlmEntryFor(
     vision: h.vision === true,
     audio: h.audio === true,
     ...(typeof h.toolCalls === 'boolean' ? { toolCalls: h.toolCalls } : {}),
+    ...(h.sampler ? { sampler: h.sampler } : {}),
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate: true, // the bundle embeds its own template; the runtime applies it

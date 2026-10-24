@@ -14,6 +14,8 @@ import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
+import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
+import { litertlmHeaderFromFile } from '../models/litertlm'
 import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
 import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
@@ -56,6 +58,9 @@ export interface StartOpts {
   /** LiteRT-LM backend/context/threads (litertLmProfileToConfig). Written to a per-port JSON file and passed with
    *  `--config`; only consumed by the litert-lm branch of {@link engineCommand}. */
   litertLmConfig?: LitertLmConfig
+  /** LiteRT-LM: what each request to the model carries from this load (the sampling the user set for it, the bundle's
+   *  own sampler); recorded at start for the request shaping (litert-lm-request.ts). */
+  litertLmRequest?: LitertLmRequestInfo
   /** Per-model pinned port (LoadProfile.port), engine-agnostic. Tried first by
    *  allocPort(); falls back to the normal 8081+ walk if unset or already taken. */
   preferredPort?: number
@@ -407,6 +412,7 @@ export class Manager {
       }
     }
 
+    let litertLmRequest = opts.litertLmRequest
     if (opts.engine.kind === 'litert-lm') {
       // Cached probe (litertLmServeBlockerCached): this runs on EVERY load and auto-resume,
       // and the probe spawns a fresh Python process that dlopens the native library —
@@ -419,6 +425,15 @@ export class Manager {
         this.state = 'error'
         this.errInfo = { code: 'engine_unsupported', message: blocker, exitCode: -1, logTail: [] }
         return
+      }
+      // A load that carries nothing of the bundle (a .litertlm loaded by path, also one restarted onto LiteRT-LM from
+      // another engine, a devModel resumed): its requests get the bundle's own sampler, read from its header here as
+      // the scanner reads a library entry's. Without it a thread's temperature alone went alone, which `serve`
+      // completes with top_k 1 (greedy: the temperature did nothing), and nothing said so. Read before the port is
+      // taken, after which nothing may yield (below).
+      if (!litertLmRequest) {
+        const { sampler } = await litertlmHeaderFromFile(opts.modelPath)
+        litertLmRequest = { sampling: {}, ...(sampler ? { sampler } : {}) }
       }
     }
 
@@ -470,6 +485,8 @@ export class Manager {
       // so the server chooses from the model, as for a profile that sets nothing. It used to write the CPU, which a
       // GPU-only bundle cannot run on.
       writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: {} })
+      // What its requests carry, by model path (litert-lm-request.ts); for a load that carried none, read above.
+      rememberLitertLmModel(opts.modelPath, { ...(litertLmRequest ?? { sampling: {} }), native: isNativeLitertLm(opts.engine.binPath) })
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath, litertConfigPath)

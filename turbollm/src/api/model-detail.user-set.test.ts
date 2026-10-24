@@ -65,3 +65,23 @@ test('GET /models/:key: a profile of only what the user set comes back as it is,
   assert.deepEqual(d.saved, { ctx: 8192 })
   assert.equal('userSetOnly' in d.profile, false)
 })
+
+test('GET /models/:key: a .litertlm\'s resting sampling is its bundle\'s own, which the model and thread dialogs show', async () => {
+  // The dialogs showed llama.cpp's 0.8 / 0.95 / 40 for every LiteRT-LM model, labelled the model's defaults.
+  const litert = { ...M, format: 'litertlm', arch: 'litertlm', path: '/models/q.litertlm', sampler: { topK: 20, topP: 0.95, temp: 0.6 } } as ModelEntry
+  const a = new Hono()
+  const cfg = defaultConfig()
+  registerApi(a, {
+    version: 'test',
+    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    scanner: { get: (k: string) => (k === M.key ? litert : undefined) },
+    registry: { active: () => ({ id: 'e1', kind: 'litert-lm' }), layaEngine: () => undefined },
+    manager: { status: () => ({ state: 'stopped', model: null }) },
+    modelRouter: { loadedModelKeys: () => new Set<string>() },
+    db: { lastGenTpsByModel: () => new Map<string, number>() },
+    downloads: { provenance: () => [] },
+  } as unknown as Deps)
+  const res = await a.request(`/api/v1/models/${encodeURIComponent(M.key)}?engine=e1`)
+  const d = await res.json() as { profile: LoadProfile; autoProfile: LoadProfile }
+  for (const s of [d.profile.sampling, d.autoProfile.sampling]) assert.deepEqual({ temp: s.temp, topP: s.topP, topK: s.topK }, { temp: 0.6, topP: 0.95, topK: 20 })
+})

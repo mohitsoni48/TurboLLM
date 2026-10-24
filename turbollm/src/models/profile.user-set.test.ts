@@ -106,3 +106,26 @@ test('an earlier build\'s whole profile for a .litertlm reads the old automatic 
   // A context the user moved is theirs.
   assert.equal(resolveProfile(m, SYS, { ...seed, ctx: 2048 }, undefined, DEFAULTS).ctx, 2048)
 })
+
+// ── a .litertlm's sampling: its own unless the user set some ─────────────────────────────────
+
+test('a .litertlm\'s automatic sampling is its bundle\'s own sampler, else the runtime\'s default, not llama.cpp\'s', () => {
+  // What the model dialog and the thread settings show at rest: Qwen3-0.6B's own 0.6 / 0.95 / 20, and for a bundle with
+  // none (LFM2.5-230M) what LiteRT-LM samples it with, top_k 1 (greedy). TurboLLM's 0.8 / 0.95 / 40 stood there.
+  const own = automaticProfile({ ...qwen3(), sampler: { topK: 20, topP: 0.95, temp: 0.6 } }, SYS, DEFAULTS).sampling
+  assert.deepEqual({ temp: own.temp, topP: own.topP, topK: own.topK }, { temp: 0.6, topP: 0.95, topK: 20 })
+  const none = automaticProfile(qwen3(), SYS, DEFAULTS).sampling
+  assert.deepEqual({ temp: none.temp, topP: none.topP, topK: none.topK }, { temp: 1, topP: 0.95, topK: 1 })
+  assert.equal(automaticProfile(model(), SYS, DEFAULTS).sampling.temp, 0.8, 'a GGUF keeps llama.cpp\'s')
+})
+
+test('an earlier build\'s whole .litertlm profile holds llama.cpp\'s sampling as the default it was; what the user moved stays', () => {
+  const m = { ...qwen3(), sampler: { topK: 20, topP: 0.95, temp: 0.6 } }
+  const seed = legacySeedProfile(m, SYS, DEFAULTS)
+  assert.equal(seed.sampling.temp, 0.8, 'the old dialog seeded 0.8 / 0.95 / 40 / 0.05')
+  assert.deepEqual(userSetProfile({ ...seed, litertLm: { backend: 'cpu' } }, seed), { litertLm: { backend: 'cpu' } })
+  const resolved = resolveProfile(m, SYS, { ...seed }, undefined, DEFAULTS).sampling
+  assert.deepEqual({ temp: resolved.temp, topP: resolved.topP, topK: resolved.topK }, { temp: 0.6, topP: 0.95, topK: 20 })
+  const moved = resolveProfile(m, SYS, { ...seed, sampling: { ...seed.sampling, temp: 0.3 } }, undefined, DEFAULTS).sampling
+  assert.deepEqual({ temp: moved.temp, topP: moved.topP, topK: moved.topK }, { temp: 0.3, topP: 0.95, topK: 20 })
+})

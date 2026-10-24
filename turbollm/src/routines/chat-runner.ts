@@ -23,7 +23,7 @@ import type { Routine, RoutineRun } from './schema'
 import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias, shapeForEngine } from '../engines/compat'
-import { litertLmToolsFor } from '../engines/litert-lm-request'
+import { litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
@@ -222,6 +222,8 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     const cappedMax = clampMaxTokens(undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     shapeForEngine(engineKind, reqBody)
+    const samplingNote = engineKind === 'litert-lm' && state.iter === 1 ? litertLmSamplingNote(reqBody) : undefined
+    if (samplingNote) console.log(`[routines] run ${run.id}: ${samplingNote}`)
 
     // I3 fix: a genuinely stuck model spends its time INSIDE this fetch, not between rounds —
     // that's the realistic case the Task-2 wall-clock deadline exists to catch. Unwrapped, a
