@@ -113,7 +113,16 @@ test('Stop kills the command\'s background job too', { skip }, async () => {
 // recorded and not sent, and its probe answers "alive", as a process that got the number would. Before, the kill went
 // on with the pid: its probe, the escalation's bare SIGKILL 0.8 s later, and the group kill's bare-pid fallback once
 // the group had ended.
+//
+// The window after the exit is the case's own here: 1 s (POST_EXIT_GRACE_MS), and the Stop or the timeout comes more
+// than that after the exit, so only the job's writing keeps the command waiting until then, as in the daemon. With
+// the daemon's 100 ms, CI's loaded macOS runner let more than 100 ms pass between two of the job's lines (a `sleep
+// 0.02` per line, and perl's 20 ms select alike), the command settled before the Stop or the timeout came, and none
+// of what the case checks ran: Stop found nothing to stop, and the setsid job, its output closed, died of SIGPIPE at
+// its next line. When the command settles early, the message gives the job's longest silence after the exit, the
+// one that ended at the settling included: no line marks its end, as finalize() removes the listeners then.
 const perl = spawnSync('perl', ['-MPOSIX', '-e', '1']).status === 0
+const POST_EXIT_GRACE_MS = 1000
 for (const c of [
   { end: 'abort', job: 'in its group' },
   { end: 'timeout', job: 'in its group' },
@@ -140,21 +149,31 @@ for (const c of [
       return realKill(pid, sig)
     }) as typeof process.kill
     const ac = new AbortController()
+    let exitSeen = false
+    let lastLineAt = 0
+    let longestSilence = 0
+    let settledAt = 0
     try {
-      const ops = createRobustBashOperations({ sessionLabel: session, sessionId: session })
+      const ops = createRobustBashOperations({ sessionLabel: session, sessionId: session, exitStdioGraceMs: POST_EXIT_GRACE_MS })
       let out = ''
       const exec = ops.exec(`echo shell:$$; ${escaped ? loop : `(${loop})`} & echo job:$!; ${escaped ? 'sleep 0.3; ' : ''}exit 0`, tmpDir('tllm-bash-post-exit-'), {
         onData: (b: Buffer) => {
+          const now = Date.now()
+          if (exitSeen) longestSilence = Math.max(longestSilence, now - lastLineAt)
+          lastLineAt = now
+          if (job) return
           out += b.toString()
           shell ||= Number(/shell:(\d+)/.exec(out)?.[1] ?? 0)
           job ||= Number(/job:(\d+)/.exec(out)?.[1] ?? 0)
           if (job) record(job)
         },
         signal: c.end === 'abort' ? ac.signal : undefined,
-        timeout: c.end === 'timeout' ? 1 : undefined,
+        timeout: c.end === 'timeout' ? 3 : undefined,
       })
       let settled = false
-      const outcome = exec.then(() => 'resolved', (e: Error) => e.message).finally(() => { settled = true })
+      const outcome = exec.then(() => 'resolved', (e: Error) => e.message).finally(() => { settled = true; settledAt = Date.now() })
+      const silence = () => `the job's longest silence from the shell's exit until the command settled, as seen here: ${
+        Math.max(longestSilence, (settledAt || Date.now()) - lastLineAt)} ms`
       const deadline = Date.now() + 3000
       while (!(shell && job) && Date.now() < deadline) await sleep(10)
       assert.ok(shell > 0 && job > 0, `the command printed its pids (${JSON.stringify(out.slice(0, 200))})`)
@@ -162,6 +181,7 @@ for (const c of [
         try {
           realKill(shell, 0)
         } catch {
+          exitSeen = true
           break // Node has reaped the shell
         }
         assert.ok(Date.now() < deadline, 'the shell exits')
@@ -169,13 +189,15 @@ for (const c of [
       }
       await sleep(50)
       reaped = true
+      const reapedAt = Date.now()
       if (escaped) {
         while (groupMembers(shell).length > 0 && Date.now() < deadline) await sleep(20)
         assert.deepEqual(groupMembers(shell), [], 'the shell\'s group has ended (its watcher let go)')
       }
-      assert.equal(settled, false, 'the job keeps the command waiting')
+      assert.equal(settled, false, `the job keeps the command waiting (${silence()})`)
       if (c.end === 'abort') {
-        await sleep(300)
+        await sleep(Math.max(0, reapedAt + POST_EXIT_GRACE_MS + 500 - Date.now()))
+        assert.equal(settled, false, `the job's writing keeps the command waiting past the window after the exit (${silence()})`)
         ac.abort()
       }
       if (escaped) {
@@ -183,7 +205,7 @@ for (const c of [
         assert.equal(isGone(job), false, 'nothing reaches a job that left the group')
         realKill(job, 'SIGKILL')
       }
-      assert.equal(await outcome, c.end === 'abort' ? 'aborted' : 'timeout:1')
+      assert.equal(await outcome, c.end === 'abort' ? 'aborted' : 'timeout:3', silence())
       if (!escaped) {
         assert.deepEqual(await waitGone([job], 2000), [], 'the job went with its group')
         await sleep(1200) // the escalation's bare SIGKILL came 0.8 s in

@@ -57,8 +57,9 @@ const EXIT_STDIO_GRACE_MS = 100
  *  returns at once too. */
 export const TIE_GATE = 'IFS= read -t 86400 -r _ 2>/dev/null || IFS= read -r _; exec </dev/null; '
 
-/** Adapted from pi-coding-agent's utils/child-process.js — see module comment above. */
-function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+/** Adapted from pi-coding-agent's utils/child-process.js — see module comment above. `graceMs`: how long the
+ *  output may stay idle once the child has exited (EXIT_STDIO_GRACE_MS, pi's own, unless a test sets another). */
+function waitForChildProcess(child: ChildProcess, graceMs = EXIT_STDIO_GRACE_MS): Promise<number | null> {
   return new Promise((resolve, reject) => {
     let settled = false
     let exited = false
@@ -90,7 +91,7 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
     }
     const armIdleTimer = () => {
       if (postExitTimer) clearTimeout(postExitTimer)
-      postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS)
+      postExitTimer = setTimeout(() => finalize(exitCode), graceMs)
     }
     const onData = () => { if (exited && !settled) armIdleTimer() }
     const onStdoutEnd = () => { stdoutEnded = true; maybeFinalizeAfterExit() }
@@ -241,8 +242,9 @@ async function killProcessTreeVerified(child: ChildProcess, sessionLabel: string
  *  crashed daemon left it running, parented to init, and even a graceful stop never ended it. A command
  *  that left nothing running holds nothing. Stop and the timeout still kill the command's whole group,
  *  also once the shell has exited while a job it left still writes to its output (through the tether,
- *  never the shell's pid). */
-export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string; sessionId?: string }): BashOperations {
+ *  never the shell's pid). `exitStdioGraceMs` is for tests only: a window after the shell's exit longer
+ *  than pi's 100 ms, which a loaded machine's scheduling cannot outlast between two lines of a job. */
+export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string; sessionId?: string; exitStdioGraceMs?: number }): BashOperations {
   const scope = `code-session:${options?.sessionId ?? options?.sessionLabel ?? 'unknown'}`
   return {
     exec: async (command, cwd, { onData, signal, timeout, env }) => {
@@ -297,7 +299,7 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
           if (signal.aborted) onAbort()
           else signal.addEventListener('abort', onAbort, { once: true })
         }
-        const exitCode = await waitForChildProcess(child)
+        const exitCode = await waitForChildProcess(child, options?.exitStdioGraceMs)
         if (signal?.aborted) throw new Error('aborted')
         if (timedOut) throw new Error(`timeout:${timeout}`)
         return { exitCode }

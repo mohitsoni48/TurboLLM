@@ -469,7 +469,11 @@ test('Code bash on Windows: an exported TMOUT starts no command before its tie (
 // Stop can come after the shell has exited, while a job it left still writes to its output and keeps the command
 // waiting. Node has reaped the shell by then, so its pid may name another process: the command's job is ended (the
 // whole tree at once), and the shell's pid gets nothing, no `taskkill /T` and no bare kill. Each signal sent to that pid
-// from its exit on is recorded here and not sent. ($$ and $! are Git Bash's own pids on Windows, so not there.)
+// from its exit on is recorded here and not sent. ($$ and $! are Git Bash's own pids on Windows, so not there.) The
+// window after the exit is the case's own, 1 s, and Stop comes 1.5 s after the exit, so only the job's writing keeps
+// the command waiting until then: with the daemon's 100 ms, CI's loaded macOS runner let more than 100 ms pass between
+// two of the job's lines, the command settled before Stop came, and Stop ended nothing (robust-bash.tether.test.ts's
+// post-exit cases say more). The silence the message gives counts the one that ended at the settling too.
 test('Code bash on Windows: Stop after the shell has exited ends the command\'s job, and sends nothing to the shell\'s pid', { skip: process.platform === 'win32' ? 'POSIX pids from $$ and $!' : gateSkip }, async () => {
   const f = useFakeSentinel({ FAKE_SENTINEL_IDLE: 'held' })
   const realKill = process.kill.bind(process)
@@ -485,11 +489,18 @@ test('Code bash on Windows: Stop after the shell has exited ends the command\'s 
     return realKill(pid, sig)
   }) as typeof process.kill
   const ac = new AbortController()
+  let lastLineAt = 0
+  let longestSilence = 0
+  let settledAt = 0
   try {
-    const ops = createRobustBashOperations({ sessionLabel: 'post-exit', sessionId: 'post-exit' })
+    const ops = createRobustBashOperations({ sessionLabel: 'post-exit', sessionId: 'post-exit', exitStdioGraceMs: 1000 })
     let out = ''
     const exec = ops.exec('echo shell:$$; (while :; do echo tick; sleep 0.02; done) & echo job:$!; exit 0', tmpDir('tllm-gate-post-exit-'), {
       onData: (d: Buffer) => {
+        const now = Date.now()
+        if (reaped) longestSilence = Math.max(longestSilence, now - lastLineAt)
+        lastLineAt = now
+        if (job) return
         out += d.toString()
         shell ||= Number(/shell:(\d+)/.exec(out)?.[1] ?? 0)
         job ||= Number(/job:(\d+)/.exec(out)?.[1] ?? 0)
@@ -497,7 +508,8 @@ test('Code bash on Windows: Stop after the shell has exited ends the command\'s 
       },
       signal: ac.signal,
     })
-    const outcome = exec.then(() => 'resolved', (e: Error) => e.message)
+    let settled = false
+    const outcome = exec.then(() => 'resolved', (e: Error) => e.message).finally(() => { settled = true; settledAt = Date.now() })
     await waitFor(() => shell > 0 && job > 0, 5000, 'the pids')
     await waitFor(() => {
       try {
@@ -508,9 +520,13 @@ test('Code bash on Windows: Stop after the shell has exited ends the command\'s 
       }
     }, 5000, 'the shell\'s exit')
     reaped = true
+    const reapedAt = Date.now()
     await waitFor(() => f.received().some((l) => /^idle \d+ 1000$/.test(l)), 5000, 'the idle')
     await sleep(100)
     assert.equal(f.count('end 1000'), 0, 'held: the job is left')
+    await sleep(Math.max(0, reapedAt + 1500 - Date.now()))
+    const silence = Math.max(longestSilence, (settledAt || Date.now()) - lastLineAt)
+    assert.equal(settled, false, `the job's writing keeps the command waiting past the 1 s after the exit (its longest silence from the exit until the command settled, as seen here: ${silence} ms)`)
     ac.abort()
     await waitFor(() => f.count('end 1000') === 1, 2000, 'the end of the command\'s job')
     realKill(job, 'SIGKILL') // the stand-in only records the end; the real one ends the whole tree, this job with it
