@@ -7,8 +7,11 @@
 // The child process is a fake handed in through installAgent's `_spawn` seam. Each test that starts
 // an install is bounded, so a caller left waiting on a child nobody closes fails the test instead of
 // hanging the file, and cuts that install's own time limit to 5 s so its timer cannot hold the
-// process for 180 s. (The unknown-id test returns before anything is spawned.) The probe test hands
-// agentAvailability a fake `<bin> --version` too.
+// process for 180 s. (The unknown-id test returns before anything is spawned.) Every
+// agentAvailability call gets a fake `<bin> --version` too: the real probe runs each harness's CLI,
+// and pi's is on PATH wherever `npm test` runs (it is this package's dependency, and npm puts
+// node_modules/.bin there). Under load that can outlast the install's 5 s limit, whose timer then
+// ends the install before `installing` is read.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
@@ -30,7 +33,8 @@ function fakeSpawner() {
 }
 
 const tick = () => new Promise((r) => setTimeout(r, 50))
-const installingOf = async (id: string) => (await agentAvailability()).find((a) => a.id === id)?.installing
+const noCli = async () => false
+const installingOf = async (id: string) => (await agentAvailability(Date.now, noCli)).find((a) => a.id === id)?.installing
 
 test('two installs of one agent started together run its install command once and share its result', { timeout: 10_000 }, async () => {
   const { run, children } = fakeSpawner()
