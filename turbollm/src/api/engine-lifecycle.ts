@@ -19,7 +19,8 @@ import { manualLoadRefusal } from '../engines/compat'
 import { engineForModel } from '../engines/registry'
 import { buildStartOpts } from '../engines/start-opts'
 import type { LoadProfile } from '../models/profile'
-import { getSysInfo } from '../sysinfo/sysinfo'
+import { autoThreadCount, getSysInfo } from '../sysinfo/sysinfo'
+import { litertLmProfileToConfig } from '../engines/litert-lm'
 import { launchFieldsRefusal, launchKeyRequired, loadsWithNow } from './profile-validate'
 
 type Status = 200 | 202 | 400 | 409 | 500
@@ -152,6 +153,13 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
   abortAllInFlightChats()
   await d.bench.waitIdle()
   const opts: StartOpts = { engine: active, model: deriveModel(modelPath, name, extra), modelPath, extraArgs: extra }
+  // A .litertlm loaded by path gets what a library entry with nothing set gets (buildStartOpts): no backend and no
+  // context, so the server runs the model on its own, and the performance cores on a big.LITTLE CPU. It got none, and
+  // the Manager wrote the CPU backend for it, which a GPU-only bundle cannot run on.
+  if (active.kind === 'litert-lm') {
+    const sys = getSysInfo()
+    opts.litertLmConfig = litertLmProfileToConfig({ ctx: 0, threads: 0 }, sys.perfCores ? autoThreadCount(sys) : 0)
+  }
   // Same single-chokepoint, fire-and-forget, swap-lock-coordinated load as the
   // resolved-model branch above.
   void d.modelRouter

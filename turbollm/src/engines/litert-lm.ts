@@ -387,10 +387,11 @@ export function litertLmServeBlockerCached(
   return answer
 }
 
-/** The settings TurboLLM drives through LiteRT-LM's `--config` file. Every key is one the 0.17 schema accepts. */
+/** The settings TurboLLM drives through LiteRT-LM's `--config` file. Every key is one the 0.17 schema accepts. A key
+ *  left out is the server's to choose from the model: `backend` the bundle's own (see litertLmProfileToConfig). */
 export interface LitertLmConfig {
   default: {
-    backend: 'cpu' | 'gpu'
+    backend?: 'cpu' | 'gpu'
     max_num_tokens?: number
     cpu_thread_count?: number
   }
@@ -398,21 +399,25 @@ export interface LitertLmConfig {
 
 /**
  * Map a load profile to LiteRT-LM's config. LiteRT-LM has no partial offload, so the profile's `litertLm.backend` picks
- * cpu or gpu outright; `auto` (the default) follows the KoboldCpp convention: `ngl > 0` on a machine with a GPU means
- * the GPU backend and everything else means CPU.
+ * cpu or gpu outright; `auto` (the default) writes no backend, and the server runs the model on its own: upstream's
+ * `serve` (desktop, Termux) reads the bundle's header for it (model_default_backend: a GPU-only "artisan" decoder's GPU,
+ * else the first backend a section's backend_constraint names, else the runtime's CPU), and the Android app's native
+ * server does the same. Auto used to mean the GPU whenever a GPU was detected and the llama.cpp "GPU layers" default
+ * was above 0, so the Android app (which reports its GPU) put every bundle on the GPU, a CPU-only one included, and a
+ * machine without a detected GPU, or with GPU layers set to 0, put a GPU-only bundle on the CPU: none of it was the
+ * model's choice, and every such load failed.
  *   ctx     → max_num_tokens   (the KV-cache length; a bundle exported with a shorter one still caps it)
  *   threads → cpu_thread_count (when set; 0 = `autoThreads` if given — the performance cores on a phone, where the
  *             runtime's own fixed default can land threads on efficiency cores — else the runtime chooses)
  */
 export function litertLmProfileToConfig(
-  p: { ctx: number; ngl: number; threads: number; litertLm?: { backend?: 'auto' | 'cpu' | 'gpu' } },
-  hasGpu: boolean,
+  p: { ctx: number; threads: number; litertLm?: { backend?: 'auto' | 'cpu' | 'gpu' } },
   autoThreads = 0,
 ): LitertLmConfig {
-  // An explicit choice wins over detection: Android/Termux cannot report a GPU, so `auto` would pin it to CPU.
+  // An explicit choice is the user's and reaches the server as it is, also where the model excludes it (the runtime
+  // then refuses it with its own message, which the load failure shows).
   const choice = p.litertLm?.backend ?? 'auto'
-  const backend: 'cpu' | 'gpu' = choice === 'auto' ? (hasGpu && p.ngl > 0 ? 'gpu' : 'cpu') : choice
-  const config: LitertLmConfig = { default: { backend } }
+  const config: LitertLmConfig = { default: choice === 'auto' ? {} : { backend: choice } }
   if (Number.isInteger(p.ctx) && p.ctx > 0) config.default.max_num_tokens = p.ctx
   if (Number.isInteger(p.threads) && p.threads > 0) config.default.cpu_thread_count = p.threads
   else if (Number.isInteger(autoThreads) && autoThreads > 0) config.default.cpu_thread_count = autoThreads
@@ -528,13 +533,19 @@ export function litertLmTurnErrorMessage(reason: string): string {
     'start a new chat, or use a model exported with a longer context.'
 }
 
-/** The user-facing text for a failed warm-up: the runtime's message plus the two causes that account for most of them. */
-export function litertLmLoadFailureMessage(reason: string, backend: 'cpu' | 'gpu'): string {
+/** The user-facing text for a failed warm-up: the runtime's message, verbatim, and a hint. `choice` is the Backend
+ *  the user set ('auto' when they set none, and the server ran the model on its own backend). The GPU is named only
+ *  when the user chose it: under Auto TurboLLM chooses no backend, so "switch to CPU" would blame a choice nobody
+ *  made, and most failures have nothing to do with the GPU (an LFM2.5-230M load that failed in its data processor
+ *  under Auto was told to switch to CPU). */
+export function litertLmLoadFailureMessage(reason: string, choice: 'auto' | 'cpu' | 'gpu'): string {
   // The GPU hint must name a control the LiteRT-LM panel actually offers: "set GPU layers to
   // 0" is llama.cpp advice — the GPU-layers slider is not rendered for LiteRT-LM, whose
   // backend is chosen outright on the model's load panel.
-  const hint = backend === 'gpu'
-    ? 'If this model does not run on your GPU, switch the Backend setting to CPU on the model\'s load panel and load it again.'
-    : 'Check that the file is a complete .litertlm bundle supported by this LiteRT-LM version.'
+  const hint = choice === 'gpu'
+    ? 'You chose the GPU backend: if this model does not run on your GPU, set Backend to Auto (the model\'s own) or CPU on the model\'s load panel and load it again.'
+    : choice === 'cpu' && /backend constraint|requires one of/i.test(reason)
+      ? 'You chose the CPU backend, which this model does not support: set Backend to Auto (the model\'s own) on the model\'s load panel and load it again.'
+      : 'Check that the file is a complete .litertlm bundle supported by this LiteRT-LM version.'
   return `LiteRT-LM could not load this model — ${reason}. ${hint}`
 }

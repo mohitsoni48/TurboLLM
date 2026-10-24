@@ -169,9 +169,9 @@ test('perfCoresFromSpeeds: counts the cores within half the fastest, only on a b
 })
 
 test('litertLmProfileToConfig: auto threads become the performance-core count; an explicit count still wins', () => {
-  assert.equal(litertLmProfileToConfig({ ctx: 0, ngl: 0, threads: 0 }, false, 4).default.cpu_thread_count, 4)
-  assert.equal(litertLmProfileToConfig({ ctx: 0, ngl: 0, threads: 2 }, false, 4).default.cpu_thread_count, 2)
-  assert.equal(litertLmProfileToConfig({ ctx: 0, ngl: 0, threads: 0 }, false).default.cpu_thread_count, undefined)
+  assert.equal(litertLmProfileToConfig({ ctx: 0, threads: 0 }, 4).default.cpu_thread_count, 4)
+  assert.equal(litertLmProfileToConfig({ ctx: 0, threads: 2 }, 4).default.cpu_thread_count, 2)
+  assert.equal(litertLmProfileToConfig({ ctx: 0, threads: 0 }).default.cpu_thread_count, undefined)
 })
 
 test('pyEngineEnv: the native LiteRT-LM server gets a writable cache directory for read-only model folders', () => {

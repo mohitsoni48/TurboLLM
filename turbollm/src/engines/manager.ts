@@ -466,7 +466,10 @@ export class Manager {
     let litertConfigPath: string | undefined
     if (opts.engine.kind === 'litert-lm') {
       litertConfigPath = litertLmConfigPath(this.store.dir(), port)
-      writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: { backend: 'cpu' } })
+      // No config (a load by path built before this one, a restart onto LiteRT-LM of a load by path): nothing is set,
+      // so the server chooses from the model, as for a profile that sets nothing. It used to write the CPU, which a
+      // GPU-only bundle cannot run on.
+      writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: {} })
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath, litertConfigPath)
@@ -865,7 +868,8 @@ export class Manager {
         // request), so the socket is not readiness: load it with a one-token warm-up, which is also where a bad
         // bundle or an unusable GPU surfaces.
         if (kind === 'litert-lm' && this.opts) {
-          const backend = this.opts.litertLmConfig?.default.backend ?? 'cpu'
+          // The user's Backend: the config names one only when the user chose it (litertLmProfileToConfig).
+          const backend = this.opts.litertLmConfig?.default.backend ?? 'auto'
           const res = await warmUpLitertLm(
             port,
             // The `model` field the warm-up must send is exactly what every real request

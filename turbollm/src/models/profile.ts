@@ -46,10 +46,11 @@ export function defaultGpu(): GpuProfile {
 }
 
 /** LiteRT-LM load controls. The runtime has no partial GPU offload, so the one real choice is where the model runs:
- *    auto → GPU when the machine reports one and `ngl` > 0, otherwise CPU (the KoboldCpp convention)
+ *    auto → the model's own: TurboLLM names no backend and the server takes the one the bundle declares (a GPU-only
+ *           "artisan" decoder's GPU, a section's backend_constraint, else the runtime's CPU); see litertLmProfileToConfig
  *    cpu  → always CPU
- *    gpu  → always GPU, even when no GPU was detected. This exists because some platforms (Android/Termux) cannot
- *           report a GPU to us although the runtime can use it; `auto` would silently pin those devices to CPU. */
+ *    gpu  → always GPU, even when no GPU was detected (some platforms, Android/Termux, cannot report one to us
+ *           although the runtime can use it). */
 export interface LitertLmProfile {
   backend: 'auto' | 'cpu' | 'gpu'
 }

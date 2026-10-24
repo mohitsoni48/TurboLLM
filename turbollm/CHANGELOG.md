@@ -232,8 +232,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   remote-access token included), or turning "Require an API key" on for one a keyless device sent over an open LAN,
   now stops it too; before, it ran on. Stop names the reply it stops and frees the chat at once.
 - The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
-  Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
-  Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.
+  Termux's `vulkaninfo`, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the
+  GPU.
+- **LiteRT-LM's Backend "Auto" is the model's own.** Auto meant the GPU whenever a GPU was detected and the llama.cpp
+  GPU-layers default was above 0: the Android app put every `.litertlm` on the GPU, a CPU-only bundle included, and
+  Termux, a desktop without a detected GPU or GPU layers at 0 put a GPU-only bundle on the CPU. Auto now names no
+  backend and the server takes the one the bundle declares (`litert-lm serve` and the app's own server read its
+  header); CPU and GPU still force one, also a model loaded by path (`POST /api/v1/engine/start {modelPath}`), which
+  was always given the CPU. A failed load names the GPU only when you chose it.
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

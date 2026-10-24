@@ -1,11 +1,12 @@
 // LiteRT-LM is a Python engine launched as a module with a --config file; its child env is the shared Python one.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { delimiter as pathDelimiter, join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { engineCommand, pyEngineEnv, Manager, type StartOpts } from './manager'
+import { litertLmConfigPath } from './litert-lm'
 import { freePort } from '../test-support/stand-in-engine'
 import { tmpDir } from '../test-support/tmp'
 
@@ -117,6 +118,7 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
 
   const store = ConfigStore.load(join(dataDir, 'config.json'))
   manager = new Manager(store)
+  const port = await freePort()
   await manager.start({
     engine: {
       id: 'lrt-warm', name: 'LiteRT-LM (fake)', kind: 'litert-lm', binPath: 'python3',
@@ -127,7 +129,7 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
     extraArgs: [],
     // The fake server binds the port it is handed: pinned clear of the 8081+ walk, which a parallel test file's engine
     // can be handed too (it then died here with EADDRINUSE, engine_exited instead of model_load_failed).
-    preferredPort: await freePort(),
+    preferredPort: port,
   } as unknown as StartOpts)
 
   await waitForState(manager, 'error', 30_000)
@@ -139,4 +141,8 @@ test('a failed warm-up keeps its model_load_failed diagnosis through the exit ha
   assert.match(st.err?.message ?? '', /LiteRT-LM could not load this model/)
   assert.match(st.err?.message ?? '', /bad bundle/, 'the runtime message must ride through')
   assert.doesNotMatch(st.err?.message ?? '', /exited unexpectedly/, 'the exit handler must not overwrite the diagnosis')
+  // Started without a LiteRT-LM config (a load by path): nothing is set, so the config names no backend (it named the
+  // CPU, which a GPU-only bundle cannot run on), and with no backend chosen the hint does not blame one.
+  assert.deepEqual(JSON.parse(readFileSync(litertLmConfigPath(dataDir, port), 'utf8')), { default: {} })
+  assert.doesNotMatch(st.err?.message ?? '', /GPU|switch the Backend/)
 })

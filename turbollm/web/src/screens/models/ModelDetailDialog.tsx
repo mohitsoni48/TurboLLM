@@ -640,7 +640,7 @@ export function ModelDetailDialog({
                 <Section>
                   <Row
                     label="Backend"
-                    hint="Auto uses the GPU when one is detected. Choose GPU to force it where the GPU can't be detected (e.g. Android/Termux); choose CPU to avoid GPU compile time and driver issues — and to recover when a model fails to load on the GPU."
+                    hint="Auto runs the model on its own backend, the one its bundle declares (the CPU for most, the GPU for a GPU-only bundle). Choose GPU or CPU to force one: GPU where the model supports it but does not default to it, CPU to avoid GPU compile time and driver issues."
                   >
                     <Segmented
                       value={({ auto: 'Auto', cpu: 'CPU', gpu: 'GPU' } as const)[draft.litertLm?.backend ?? 'auto']}

@@ -485,10 +485,11 @@ function enumVulkanGpus(): GpuInfo[] {
 }
 
 /** The GPU the Android app names for the daemon, or null. The app reads it from a GL context before starting the
- *  daemon (MainActivity.gpuEnv): the packaged-app counterpart of Termux's vulkaninfo, and the signal LiteRT-LM's "auto"
- *  backend needs to pick the GPU. Preferred over running the bundled Vulkan engine with --list-devices: it costs nothing
- *  at boot and works when that engine isn't shipped. Unified memory, so the budget is the same half of RAM the Termux
- *  path assumes. Only the packaged app sets these variables; anywhere else this is null. */
+ *  daemon (MainActivity.gpuEnv): the packaged-app counterpart of Termux's vulkaninfo. LiteRT-LM's "auto" backend no
+ *  longer reads it (it is the model's own: litert-lm.ts litertLmProfileToConfig). Preferred over running the bundled
+ *  Vulkan engine with --list-devices: it costs nothing at boot and works when that engine isn't shipped. Unified
+ *  memory, so the budget is the same half of RAM the Termux path assumes. Only the packaged app sets these variables;
+ *  anywhere else this is null. */
 export function packagedAppGpu(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): GpuInfo | null {
   if (platform !== 'android' || !env.TURBOLLM_ANDROID_NATIVE_LIB_DIR) return null
   const name = env.TURBOLLM_ANDROID_GPU?.trim()

@@ -114,7 +114,7 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
     modelPath: entry.path,
     extraArgs: profile.extraArgs,
     // Auto threads are pinned only where the CPU is big.LITTLE (perfCores); elsewhere the runtime keeps choosing.
-    litertLmConfig: litertLmProfileToConfig(profile, sys.gpus.length > 0, sys.perfCores ? autoThreadCount(sys) : 0),
+    litertLmConfig: litertLmProfileToConfig(profile, sys.perfCores ? autoThreadCount(sys) : 0),
     preferredPort: profile.port,
     profile,
     trigger,

@@ -33,16 +33,15 @@ test('a .litertlm load uses the bundle path, text-only model info and the given 
   assert.ok(opts.profile)
 })
 
-test('without a GPU the config selects the cpu backend whatever the GPU-layers setting', () => {
-  const opts = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, overrides: { ngl: 99 }, trigger: 'resume' })
-  assert.equal(opts.litertLmConfig?.default.backend, 'cpu')
-})
-
-test('with a GPU and GPU layers the config selects the gpu backend; zero layers falls back to cpu', () => {
-  const gpu = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: WITH_GPU, overrides: { ngl: 99 }, trigger: 'manual' })
-  assert.equal(gpu.litertLmConfig?.default.backend, 'gpu')
-  const cpu = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: WITH_GPU, overrides: { ngl: 0 }, trigger: 'manual' })
-  assert.equal(cpu.litertLmConfig?.default.backend, 'cpu')
+test('under Auto the config names no backend, GPU or not, whatever the GPU-layers setting: the model\'s own applies', () => {
+  // It named the GPU when one was detected and GPU layers was above 0, the CPU otherwise: a CPU-only bundle failed on
+  // the Android app (which reports its GPU) and a GPU-only one on Termux or with GPU layers at 0.
+  for (const sys of [CPU_ONLY, WITH_GPU]) {
+    for (const ngl of [0, 99]) {
+      const opts = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys, overrides: { ngl }, trigger: 'manual' })
+      assert.equal(opts.litertLmConfig?.default.backend, undefined, `${sys.gpus.length} GPUs, ngl ${ngl}`)
+    }
+  }
 })
 
 test('ctx and threads from the profile reach the config; ctx also lands on the model info', () => {
@@ -80,4 +79,5 @@ test('a saved litertLm.backend survives the profile merge, and an old profile wi
   assert.equal(saved.litertLmConfig?.default.backend, 'gpu')
   const old = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ ngl: 99 }, e), sys: CPU_ONLY, trigger: 'resume' })
   assert.equal(old.profile?.litertLm.backend, 'auto')
+  assert.equal(old.litertLmConfig?.default.backend, undefined)
 })
