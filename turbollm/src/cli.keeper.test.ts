@@ -339,11 +339,19 @@ test('after a restart, a SIGKILLed keeper still ends its replacement gracefully:
   const d = await boot()
   try {
     const replacement = await restart(d)
+    const killedAt = Date.now()
     process.kill(d.pid, 'SIGKILL')
     // stdin EOF, and, the pty's session leader gone, the kernel's hangup too: whichever comes first runs the graceful
     // shutdown (2 s longer here). The next test has the lifeline alone, with no terminal.
     assert.deepEqual(await waitGone([replacement], SLOW_MS + 8000), [], 'the replacement ended')
-    assert.match(d.out(), /shutting down( \(the keeper ended\))?\r?\n/, 'gracefully')
+    // An end any sooner than the slow shutdown's SLOW_MS was not the graceful one (a crash, a kill).
+    const endedIn = Date.now() - killedAt
+    assert.ok(endedIn >= SLOW_MS - 100, `the replacement ended by its graceful shutdown, ${endedIn} ms after the keeper's SIGKILL`)
+    // On Linux its "shutting down" line still reaches the terminal: a pty's session leader that exits gets its
+    // foreground group a SIGHUP, and nothing more. On macOS no line of the replacement's can after the keeper's death:
+    // xnu revokes a session's terminal when its leader exits (VNOP_REVOKE, REVOKEALL: every open of it goes dead), so
+    // the replacement's writes to it fail. CI's macOS run showed the terminal ending at its "listening" line.
+    if (process.platform !== 'darwin') assert.match(d.out(), /shutting down( \(the keeper ended\))?\r?\n/, 'gracefully')
   } finally {
     killRecorded()
   }
