@@ -247,6 +247,9 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   // The replies this page saw end (their done or error, or its own Stop): a conversation read
   // before the end still names one as running, and the attach effect must not follow it again.
   const finishedReplies = useRef<Set<string>>(new Set())
+  // The daemon's notes this page has shown, by chat: a note about the loaded model (it cannot call tools, a
+  // LiteRT-LM model chooses its own searches) is sent with every turn it applies to, and shown once per chat.
+  const shownNotices = useRef<Set<string>>(new Set())
   // When an attach to a chat's running reply last gave up (its resumes ran out), by chat: it is
   // tried again only once the conversation has been read again after that, so a daemon that
   // cannot be reached is not asked again on every render. An attach says nothing when it fails
@@ -863,6 +866,12 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
         } else if (evt.event === 'delta') {
           const liveTps = pushGenToken(convId)
           updateLive(convId, (l) => ({ ...l, content: l.content + evt.data.delta, timeline: appendTextDelta(l.timeline, evt.data.delta), progress: null, liveGenTps: liveTps, genTokens: l.genTokens + 1 }))
+        } else if (evt.event === 'notice') {
+          const key = `${convId}\n${evt.data.message}`
+          if (!shownNotices.current.has(key)) {
+            shownNotices.current.add(key)
+            toast(evt.data.message)
+          }
         } else if (evt.event === 'tool_call') {
           const tc = evt.data
           const call: LiveToolCall = { id: tc.id, name: tc.name, args: tc.args, status: tc.status, result: tc.result }

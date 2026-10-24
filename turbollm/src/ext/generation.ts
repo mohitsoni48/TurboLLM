@@ -54,6 +54,7 @@ import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
 import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
+import { litertLmToolsFor } from '../engines/litert-lm-request.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -274,10 +275,12 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
 
   // vLLM is strict about a `tools` array defaulting tool_choice to "auto" unless launched with
   // --enable-auto-tool-choice (chat-routes.ts's own BUG note) — same engine-kind gate here.
-  // LiteRT-LM is withheld too, until its server is verified to honor `tools` (PR #271 review).
+  // A LiteRT-LM model gets them when it calls tools and they fit, as in chat (litertLmToolsFor); they
+  // were withheld from every LiteRT-LM model. What it is not sent is logged: this API has no note event.
   const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
-  const toolsSupported =
-    engineKind !== 'vllm' && engineKind !== 'sglang' && engineKind !== 'litert-lm' && toolDefs.length > 0
+  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && toolDefs.length > 0
+  const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(loadedModel.key) : undefined
+  let toolsNoted = false
 
   const messages: WireMessage[] = ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
 
@@ -299,7 +302,11 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     else delete reqBody.max_tokens
     shapeForEngine(engineKind, reqBody)
-    if (toolsSupported) reqBody.tools = toolDefs
+    if (toolsSupported && engineKind === 'litert-lm') {
+      const pick = litertLmToolsFor(litertModel, toolDefs, messages, loadedModel.ctx)
+      if (pick.tools.length) reqBody.tools = pick.tools
+      if (pick.note && !toolsNoted) { toolsNoted = true; console.log(`[ext] ${pick.note}`) }
+    } else if (toolsSupported) reqBody.tools = toolDefs
 
     let res: Response
     try {

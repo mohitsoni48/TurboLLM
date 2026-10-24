@@ -262,6 +262,14 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **A `.litertlm` with a vision or audio encoder is a vision or audio model.** Every bundle was marked text-only; its
   header's encoder sections now set it (LFM2.5-VL, Gemma 3n/4), so it gets the Vision facet and loads as a vision
   model. Images reach it on desktop and Termux (`litert-lm serve` enables the encoders itself).
+- **Tools reach LiteRT-LM models that call tools.** The chat, the extension API and routines sent no tools to any
+  `.litertlm`, so web search, fetch, MCP and skill tools, an agent's tools and the Research persona's searches never
+  reached LFM2.5, Qwen3 or Gemma 4, whose templates show tools to the model. A model gets them now when its bundle says
+  it calls tools (`supports_function_calling`, else its template reads `tools`, else its model type's default
+  template) and they fit in its context with the conversation; otherwise it gets none and the chat says why (a model
+  whose template has no tools, such as Gemma 3 1B or LFM2.5-VL; tools too large for a 4096-token bundle).
+  `litert-lm serve` ignores a forced tool choice and the app's server refuses one it cannot honour, so under Research
+  a LiteRT-LM model chooses whether to search, and the chat says so.
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

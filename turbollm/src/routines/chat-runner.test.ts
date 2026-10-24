@@ -16,17 +16,19 @@ import type { Deps } from '../deps'
 // is already reserved for stubbing the engine's own /v1/chat/completions calls.
 const AGENT = { id: 'agent-1', name: 'Researcher', description: '', systemPrompt: 'You research things.', skillIds: [], tools: ['run_code'] }
 
-function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry; engineKind: string; modelPath: string | null }> = {}): { d: Deps; db: ConversationStore } {
+function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: ToolRegistry; engineKind: string; modelPath: string | null; toolCalls: boolean; ctx: number }> = {}): { d: Deps; db: ConversationStore } {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db,
     store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
     manager: {
-      status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: 8192, vision: false } }),
+      status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: overrides.ctx ?? 8192, vision: false } }),
       target: () => 'http://engine.invalid.local:1',
       currentOpts: () => (overrides.modelPath !== undefined ? { modelPath: overrides.modelPath } : null),
     },
     registry: { active: () => ({ kind: overrides.engineKind ?? 'llama-server' }) },
+    // The library entry of the loaded model 'm': whether a .litertlm calls tools is its header's (models/litertlm.ts).
+    scanner: { get: (key: string) => (key === 'm' && overrides.toolCalls !== undefined ? { key: 'm', toolCalls: overrides.toolCalls } : undefined) },
     // search: {} deliberately left unconfigured (searchConfigured() is false) — web_search is
     // NOT offered here on purpose. A real reviewer caught this in the original suite: every
     // test used web_search as its "allowed" tool while leaving search unconfigured, so
@@ -109,25 +111,39 @@ test("a route to the primary names the primary's model, as with no route", async
   } finally { fetchStub.restore() }
 })
 
-// PR #271 re-review: the tools gating from the first review covered chat-routes and
-// ext/generation only — the routines path still sent `tools` to litert-lm, so an agent with
-// tools allowed (AGENT has run_code, which buildToolDefinitions() offers unconditionally)
-// looked equipped but could never call anything. This is the call-site proof the gate reaches
-// this path too: the SAME agent that gets `tools` on llama.cpp gets none on litert-lm.
-test('runChatRoutine withholds tools from litert-lm — a tool-equipped agent still runs, without the array', async () => {
-  const { d, db } = fakeDeps({ engineKind: 'litert-lm' })
+// Both LiteRT-LM servers take tools now, and a bundle whose template reads them shows them to its
+// model (LFM2.5, Qwen3, Gemma 4). A routine agent's tools (AGENT has run_code, which
+// buildToolDefinitions() offers unconditionally) were withheld from every LiteRT-LM model: they reach
+// one that calls tools, and one whose template cannot show them (Gemma3-1B, LFM2.5-VL) still runs, without.
+test('runChatRoutine sends the agent\'s tools to a LiteRT-LM model that calls tools, and none to one that cannot', async () => {
+  for (const [toolCalls, sent] of [[true, true], [undefined, true], [false, false]] as const) {
+    const { d, db } = fakeDeps({ engineKind: 'litert-lm', ...(toolCalls === undefined ? {} : { toolCalls }) })
+    const r = routine(db)
+    const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+    const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
+    try {
+      const outcome = await runChatRoutine(d, r, run, new AbortController().signal)
+      assert.equal(outcome.status, 'ok', 'the turn itself succeeds either way')
+      const tools = fetchStub.calls[0].tools as Array<{ function: { name: string } }> | undefined
+      if (sent) assert.deepEqual(tools?.map((t) => t.function.name), ['run_code'], `toolCalls ${toolCalls}`)
+      else assert.equal(tools, undefined, 'a model whose template cannot show tools is sent none')
+    } finally { fetchStub.restore() }
+  }
+})
+
+test('runChatRoutine sends a LiteRT-LM model no tools that do not fit in its context', async () => {
+  const { d, db } = fakeDeps({ engineKind: 'litert-lm', toolCalls: true, ctx: 600 })
   const r = routine(db)
   const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
   const fetchStub = stubFetch([{ choices: [{ message: { content: 'All PRs are green.' } }] }])
   try {
-    const outcome = await runChatRoutine(d, r, run, new AbortController().signal)
-    assert.equal(outcome.status, 'ok', 'the turn itself must succeed — tools are withheld, not fatal')
-    assert.equal(fetchStub.calls[0].tools, undefined, 'litert-lm serve has no verified tools support')
+    assert.equal((await runChatRoutine(d, r, run, new AbortController().signal)).status, 'ok')
+    assert.equal(fetchStub.calls[0].tools, undefined)
   } finally { fetchStub.restore() }
 })
 
 // The same agent on an engine that does take tools: proves the litert-lm test above withholds
-// because of the engine kind, not because the registry or agent came up empty.
+// because of the model, not because the registry or agent came up empty.
 test('runChatRoutine still sends tools on llama-server for the same agent', async () => {
   const { d, db } = fakeDeps({ engineKind: 'llama-server' })
   const r = routine(db)

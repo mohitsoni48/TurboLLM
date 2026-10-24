@@ -31,6 +31,7 @@ import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } fr
 import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats, litertLmTurnErrorMessage } from '../engines/litert-lm'
+import { LITERT_LM_RESEARCH_NOTE, litertLmToolsFor } from '../engines/litert-lm-request'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -1679,6 +1680,16 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       ? baseToolDefs.filter((t) => conv.allowedTools!.includes(t.function.name))
       : baseToolDefs
     const toolDefs = skillTools && ctx.isCodeAuthorized ? [...scopedBaseToolDefs, ...skillTools.defs] : scopedBaseToolDefs
+    // This machine's LiteRT-LM engine and the model it serves (a Turbo Link host shapes for its own engine).
+    const localLitert = engineKind === 'litert-lm' && !upstream.remote
+    const litertModel = localLitert ? d.scanner?.get?.(d.manager.status?.().model?.key ?? '') : undefined
+    /** A note for the user about this turn, once per turn: the chat shows it (ChatScreen's 'notice'). */
+    const notes = new Set<string>()
+    const noteOnce = async (message: string): Promise<void> => {
+      if (notes.has(message)) return
+      notes.add(message)
+      await emit({ event: 'notice', data: { message } })
+    }
 
     outerLoop: while (toolIter <= MAX_TOOL_ITER) {
       toolIter++
@@ -1732,24 +1743,32 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       // depends on the loaded model's chat template matching one of mlx-vlm's built-in
       // tool parsers (see the MLX-VLM catalog note) — not a crash risk, just a
       // per-architecture no-op some of the time.
-      // LiteRT-LM is withheld until its server is verified to honor `tools` (PR #271
-      // review): nothing in its CLI/docs shows tool-call support, and silently sending
-      // the array risks agent/Code turns that look like they have tools but never call
-      // them. Harmless either way: the model just answers without tools.
-      const toolsSupported =
-        engineKind !== 'vllm' && engineKind !== 'sglang' && engineKind !== 'litert-lm' && toolDefs.length > 0
-      if (toolsSupported) reqBody.tools = toolDefs
+      // A local LiteRT-LM model gets them when it calls tools and they fit (litertLmToolsFor), and the
+      // user is told when it gets none. They were withheld from every LiteRT-LM model (PR #271, before
+      // its servers took them), so the thread's tools, MCP and skill tools and the Research persona's
+      // web_search never reached LFM2.5, Qwen3 or Gemma 4, whose templates show them to the model.
+      let roundTools = toolDefs
+      if (localLitert && toolDefs.length > 0) {
+        const pick = litertLmToolsFor(litertModel, toolDefs, iterMessages, upstream.ctxMax)
+        roundTools = pick.tools
+        if (pick.note) await noteOnce(pick.note)
+      }
+      const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && roundTools.length > 0
+      if (toolsSupported) reqBody.tools = roundTools
       // Force web_search on the first two iterations when the conversation has a
       // force_web_search policy (e.g. Research persona). This guarantees at least
       // two distinct searches before the model composes its answer. Iteration 3+
       // use "auto" so the model can continue searching or finish as it sees fit.
+      // Not on LiteRT-LM: `serve` ignores tool_choice and the Android server refuses a forced call it
+      // cannot honour, so its model chooses, and the user is told.
       if (
         toolsSupported &&
         conv.toolPolicy === 'force_web_search' &&
         toolIter <= 2 &&
-        toolDefs.some((t) => t.function.name === 'web_search')
+        roundTools.some((t) => t.function.name === 'web_search')
       ) {
-        reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
+        if (localLitert) await noteOnce(LITERT_LM_RESEARCH_NOTE)
+        else reqBody.tool_choice = { type: 'function', function: { name: 'web_search' } }
       }
 
       const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)

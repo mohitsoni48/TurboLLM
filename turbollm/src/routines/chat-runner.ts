@@ -23,6 +23,7 @@ import type { Routine, RoutineRun } from './schema'
 import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias, shapeForEngine } from '../engines/compat'
+import { litertLmToolsFor } from '../engines/litert-lm-request'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
@@ -193,6 +194,10 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
   const modelPath = local?.modelPath ?? d.manager.currentOpts()?.modelPath
   const baseToolDefs = d.tools ? (await d.tools.buildToolDefinitions()).filter((t) => agent.tools.includes(t.function.name)) : []
   const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
+  // The routine's model, for whether a LiteRT-LM one calls tools; its context is known on the primary only.
+  const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(servedKey) : undefined
+  const litertCtx = local?.engineKind ? 0 : ms.model?.ctx ?? 0
+  let toolsNoted = false
 
   while (state.iter < MAX_TOOL_ITER) {
     state.iter++
@@ -206,12 +211,14 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     // would 400 with a clear "Failed to load model" error rather than silently misbehaving —
     // acceptable as a last-resort guard.
     const reqBody: Record<string, unknown> = { model: engineModelAlias(engineKind, modelPath) ?? servedKey, messages: state.messages, stream: false }
-    // Same gate as chat-routes / ext/generation (PR #271 review): litert-lm serve has nothing
-    // showing it honors a `tools` array, so a routine whose agent allows tools runs its turns
-    // without them — like a plain chat on this engine already does — instead of a request that
-    // looks equipped but can never call them. vLLM/SGLang were already ungated on this path
-    // before LiteRT-LM; that stays as-is.
-    if (baseToolDefs.length && engineKind !== 'litert-lm') reqBody.tools = baseToolDefs
+    // The agent's tools. A LiteRT-LM model gets them when it calls tools and they fit, as in chat
+    // (litertLmToolsFor); they were withheld from every LiteRT-LM model, so a routine agent's tools never
+    // ran there. What it is not sent is logged. vLLM/SGLang were already ungated on this path; that stays.
+    if (baseToolDefs.length && engineKind === 'litert-lm') {
+      const pick = litertLmToolsFor(litertModel, baseToolDefs, state.messages, litertCtx)
+      if (pick.tools.length) reqBody.tools = pick.tools
+      if (pick.note && !toolsNoted) { toolsNoted = true; console.log(`[routines] run ${run.id}: ${pick.note}`) }
+    } else if (baseToolDefs.length) reqBody.tools = baseToolDefs
     const cappedMax = clampMaxTokens(undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     shapeForEngine(engineKind, reqBody)

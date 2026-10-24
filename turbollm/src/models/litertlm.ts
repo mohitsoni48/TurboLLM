@@ -1,8 +1,8 @@
 // LiteRT-LM models in the library. A `.litertlm` file is one self-contained bundle (weights, tokenizer, and for
 // multimodal models the vision/audio encoders) that Google's LiteRT-LM runtime loads directly, so the library holds it
 // the way it holds a GGUF: one file, one entry, deleted as a file. Its metadata is a FlatBuffer header listing its
-// sections, which litertlmHeaderFromFile walks for what the entry needs (context, modalities); the rest comes from the
-// file name and the 8-byte magic.
+// sections, which litertlmHeaderFromFile walks for what the entry needs (context, modalities, tool calling); the rest
+// comes from the file name and the 8-byte magic.
 import { open } from 'node:fs/promises'
 import { basename } from 'node:path'
 import type { ModelEntry } from './scanner'
@@ -213,6 +213,42 @@ export function llmMetadataMaxNumTokens(proto: Buffer): number {
   return f?.varint ?? 0
 }
 
+// ── Tool calling ──────────────────────────────────────────────────────────────────────────
+// Both LiteRT-LM servers pass a request's tools to the runtime (upstream's `serve` as tools it does not run itself,
+// the Android server through litert_lm_conversation_config_set_tools), and the bundle's chat template puts them in
+// the prompt: LFM2.5's renders "List of tools: [...]", Qwen3's <tools>, Gemma 4's <|tool>. A template that never reads
+// them (Gemma3-1B's, LFM2.5-VL's) drops them, so the model cannot call what it was never shown. Whether a model calls
+// tools is therefore its own, read here: what LlmMetadata declares (supports_function_calling, field 12, which newer
+// builders require), else whether its template (jinja_prompt_template, field 7) reads `tools`, else the runtime's
+// default template for its model type (field 6; model_type_utils.cc GetDefaultJinjaPromptTemplate renders tools for
+// Gemma 3n and FunctionGemma only).
+
+/** LlmModelType's oneof cases whose default template renders tools: gemma3n (2), function_gemma (3). */
+const DEFAULT_TEMPLATE_TOOL_TYPES = new Set([2, 3])
+
+/** Whether a Jinja chat template reads the `tools` variable in its code ({% if tools %}, {% for tool in tools %},
+ *  {{ tools | tojson }}), not merely the word: the text inside string literals is left out, so LFM2.5's
+ *  "List of tools: [" and Qwen3's "<tools>" do not count, and neither does an attribute (`message.tools`). */
+export function jinjaTemplateTakesTools(template: string): boolean {
+  for (const m of template.matchAll(/\{[{%]([\s\S]*?)[}%]\}/g)) {
+    const code = m[1].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, '""')
+    if (/(?:^|[^\w.])tools\b/.test(code)) return true
+  }
+  return false
+}
+
+/** Whether the bundle's model calls tools (see the section comment above). */
+export function llmMetadataToolCalls(proto: Buffer): boolean {
+  const fields = protoFields(proto)
+  const declared = fields.find((x) => x.field === 12 && x.varint !== undefined)
+  if (declared) return declared.varint !== 0
+  const template = fields.find((x) => x.field === 7 && x.bytes !== undefined)?.bytes
+  if (template) return jinjaTemplateTakesTools(template.toString('utf8'))
+  const type = fields.find((x) => x.field === 6 && x.bytes !== undefined)?.bytes
+  const kind = type ? protoFields(type)[0]?.field : undefined
+  return kind !== undefined && DEFAULT_TEMPLATE_TOOL_TYPES.has(kind)
+}
+
 /** What the bundle's header says that TurboLLM uses (see the section comment above). */
 export interface LitertlmHeader {
   /** The longest context it takes: a static export's KV-cache length, a dynamic one's magic number less one; 0 = unknown. */
@@ -225,9 +261,11 @@ export interface LitertlmHeader {
   vision: boolean
   /** It carries an audio encoder (tf_lite_audio_encoder_hw). */
   audio: boolean
+  /** Its model calls tools (llmMetadataToolCalls); null when the bundle has no LlmMetadata to say. */
+  toolCalls: boolean | null
 }
 
-const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false }
+const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null }
 
 /** Reads only the header and the small LlmMetadata and ExecutorMetadata sections, never the weights. A header this
  *  reader does not understand gives NO_HEADER: it costs only the slider's precision and the model's own defaults. */
@@ -261,8 +299,10 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
       const end = s.u64(2)
       if (end <= begin || end - begin > MAX_PROTO) continue
       const proto = await read(begin, end - begin)
+      if (proto.length !== end - begin) continue // a cut-short file: its sections say nothing (not "no tools")
       if (type === SECTION_LLM_METADATA) {
         out.defaultCtx = llmMetadataMaxNumTokens(proto)
+        out.toolCalls = llmMetadataToolCalls(proto)
         continue
       }
       const len = executorMetadataMaxSequence(proto)
@@ -293,7 +333,8 @@ function cleanName(fileName: string): string {
 
 /** The library entry for a `.litertlm` file. Its format is 'litertlm' (a single file, deleted as a file); compat.ts
  *  gives it to the LiteRT-LM engine and to no other. Vision and audio are what its header declares (its encoder
- *  sections, litertlmHeaderFromFile), false when it was not read. */
+ *  sections, litertlmHeaderFromFile), false when it was not read; tool calling is its LlmMetadata's, absent when the
+ *  header says nothing. */
 export function litertlmEntryFor(
   path: string, dir: string, sizeBytes: number, mtimeMs: number, header: number | Partial<LitertlmHeader> = 0,
 ): ModelEntry {
@@ -324,6 +365,7 @@ export function litertlmEntryFor(
     nextnLayers: 0,
     vision: h.vision === true,
     audio: h.audio === true,
+    ...(typeof h.toolCalls === 'boolean' ? { toolCalls: h.toolCalls } : {}),
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate: true, // the bundle embeds its own template; the runtime applies it

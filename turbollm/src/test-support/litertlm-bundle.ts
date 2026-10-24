@@ -149,7 +149,16 @@ export function fakeLitertlmBundleOf(sections: FakeSection[]): Buffer {
   return file
 }
 
-/** LlmMetadata protobuf bytes (runtime/proto/llm_metadata.proto) with the fields the tests need. */
-export function fakeLlmMetadata(fields: { maxNumTokens?: number }): Buffer {
-  return Buffer.from(fields.maxNumTokens ? pVarint(5, fields.maxNumTokens) : [])
+/** LlmMetadata protobuf bytes (runtime/proto/llm_metadata.proto) with the fields the tests need: max_num_tokens (5),
+ *  llm_model_type (6, its oneof case number with an empty message), jinja_prompt_template (7) and
+ *  supports_function_calling (12). */
+export function fakeLlmMetadata(fields: {
+  maxNumTokens?: number; modelType?: number; template?: string; supportsFunctionCalling?: boolean
+}): Buffer {
+  const out: number[] = []
+  if (fields.maxNumTokens) out.push(...pVarint(5, fields.maxNumTokens))
+  if (fields.modelType !== undefined) out.push(...pBytes(6, pBytes(fields.modelType, [])))
+  if (fields.template !== undefined) out.push(...pBytes(7, [...Buffer.from(fields.template, 'utf8')]))
+  if (fields.supportsFunctionCalling !== undefined) out.push(...pVarint(12, fields.supportsFunctionCalling ? 1 : 0))
+  return Buffer.from(out)
 }

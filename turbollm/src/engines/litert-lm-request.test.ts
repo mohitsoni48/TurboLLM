@@ -5,7 +5,11 @@
 // bundle's template default always decided (Qwen3 thinks by default, Gemma 4 does not).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS } from './litert-lm-request'
+import { shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor } from './litert-lm-request'
+import { webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL } from '../tools/builtin'
+import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL } from '../routines/routine-tools'
+import { LIST_AGENTS_TOOL, CREATE_AGENT_TOOL } from '../chat/chat-agent-tools'
+import { LIST_MODELS_TOOL } from '../models/model-tools'
 
 const shaped = (body: Record<string, unknown>): Record<string, unknown> => {
   const b = structuredClone(body)
@@ -43,4 +47,41 @@ test('the llama.cpp-shaped fields stay: the Android server takes a budget from t
   const b = shaped({ thinking_budget_tokens: 512, chat_template_kwargs: { enable_thinking: true } })
   assert.equal(b.thinking_budget_tokens, 512)
   assert.deepEqual(b.chat_template_kwargs, { enable_thinking: true })
+})
+
+// ── tools ─────────────────────────────────────────────────────────────────────────────────────
+
+const tool = (name: string) => ({ type: 'function' as const, function: { name, description: 'd', parameters: { type: 'object' } } })
+
+test('litertLmToolsFor: a model that calls tools gets them; one whose template cannot show them gets none, with a note', () => {
+  const tools = [tool('web_search'), tool('fetch_url')]
+  const messages = [{ role: 'user', content: 'hi' }]
+  assert.deepEqual(litertLmToolsFor({ toolCalls: true }, tools, messages, 4096), { tools })
+  // Unknown (a model loaded by path, a header that says nothing): the engine decides, as for any model.
+  assert.deepEqual(litertLmToolsFor(undefined, tools, messages, 4096), { tools })
+  assert.deepEqual(litertLmToolsFor({}, tools, messages, 0), { tools })
+  assert.deepEqual(litertLmToolsFor({ toolCalls: false }, tools, messages, 4096), { tools: [], note: LITERT_LM_NO_TOOL_CALLING_NOTE })
+  // No tools, no note.
+  assert.deepEqual(litertLmToolsFor({ toolCalls: false }, [], messages, 4096), { tools: [] })
+})
+
+test('litertLmToolsFor: tools that do not fit in the model\'s context with the conversation are not sent, and the note says so', () => {
+  // TurboLLM's own chat tools take about 3,600 tokens: in a 4096-token bundle (every litert-community one read here)
+  // they leave no room, and the runtime refuses the turn ("Input token ids are too long"), a chat that worked.
+  const own = [webSearchTool(), FETCH_URL_TOOL, RUN_CODE_TOOL, CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL,
+    DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL, LIST_AGENTS_TOOL, CREATE_AGENT_TOOL, LIST_MODELS_TOOL]
+  const messages = [{ role: 'system', content: 'You are a helpful assistant.' }, { role: 'user', content: 'What is new in Rust?' }]
+  const small = litertLmToolsFor({ toolCalls: true }, own, messages, 4096)
+  assert.deepEqual(small.tools, [])
+  assert.match(small.note ?? '', /^The tools \(about [\d,]+ tokens\) do not fit in this model's 4,096-token context/)
+  // The same tools in Qwen3-0.6B_dynamic opened at 16k fit; so do two tools in 4096.
+  assert.equal(litertLmToolsFor({ toolCalls: true }, own, messages, 16384).tools.length, own.length)
+  assert.equal(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), messages, 4096).tools.length, 2)
+  // The conversation counts too, text parts and earlier calls included; an image part's data does not.
+  const long = [{ role: 'user', content: [{ type: 'text', text: 'x'.repeat(12000) }] }]
+  assert.deepEqual(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), long, 4096).tools, [])
+  const image = [{ role: 'user', content: [{ type: 'image_url', image_url: { url: 'data:image/png;base64,' + 'A'.repeat(50000) } }, { type: 'text', text: 'what is this?' }] }]
+  assert.equal(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), image, 4096).tools.length, 2)
+  const calls = [{ role: 'assistant', content: '', tool_calls: [{ id: 'a', type: 'function', function: { name: 'fetch_url', arguments: 'y'.repeat(12000) } }] }]
+  assert.deepEqual(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), calls, 4096).tools, [])
 })

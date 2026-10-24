@@ -183,6 +183,8 @@ export type ChatSseEvent =
   | { event: 'reasoning'; data: { delta: string } }
   | { event: 'delta';     data: { delta: string } }
   | { event: 'tool_call'; data: { id: string; name: string; args: Record<string, unknown>; status: 'pending' | 'done' | 'error' | 'awaiting_approval'; result?: string; diff?: string; patch?: string; firstChangedLine?: number } }
+  /** A note about this turn for the user: e.g. the loaded model cannot call tools, so none were sent. */
+  | { event: 'notice';    data: { message: string } }
   /** `message`: the reply as the daemon saved it (null when it was deleted meanwhile). */
   | { event: 'done';      data: { message?: Message | null } }
   | { event: 'error';     data: { code: string; message: string } }

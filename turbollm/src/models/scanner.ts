@@ -71,6 +71,10 @@ export interface ModelEntry {
    *  tower/encoder, e.g. gemma4's Conformer audio module). GGUF detection isn't
    *  implemented (no observed need yet) — always false there. */
   audio: boolean
+  /** LiteRT-LM only: whether the bundle's model calls tools (its LlmMetadata, models/litertlm.ts
+   *  llmMetadataToolCalls). false: its chat template never shows the model a request's tools, so TurboLLM sends it
+   *  none and says so. Absent elsewhere, and when the header says nothing: the engine decides, as for any model. */
+  toolCalls?: boolean
   mmprojPath: string | null
   /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null). Used to size
    *  the vision projector's VRAM contribution instead of a flat guess. */

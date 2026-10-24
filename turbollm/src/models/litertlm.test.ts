@@ -6,6 +6,7 @@ import {
   hasLitertlmMagic,
   isLitertMagicNumber,
   isLitertlmFileName,
+  jinjaTemplateTakesTools,
   litertlmEntryFor,
   litertlmHeaderFromFile,
   litertlmNativeCtxFromFile,
@@ -13,7 +14,7 @@ import {
   litertlmQuantFromName,
 } from './litertlm'
 import { tmpDir } from '../test-support/tmp'
-import { fakeLitertlmBundle as fakeBundle, fakeLitertlmBundleOf } from '../test-support/litertlm-bundle'
+import { fakeLitertlmBundle as fakeBundle, fakeLitertlmBundleOf, fakeLlmMetadata } from '../test-support/litertlm-bundle'
 
 function scratch(t: TestContext): string {
   const dir = tmpDir('turbollm-litertlm-')
@@ -132,7 +133,7 @@ test('litertlmHeaderFromFile: LlmMetadata.max_num_tokens is the bundle\'s own de
   const dir = tmpDir('tllm-litertlm-hdr-')
   const p = join(dir, 'LFM2.5-230M_int8.litertlm')
   writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
-  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false })
+  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
 })
 
 test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 10) is a dynamic export, taking one less', async () => {
@@ -141,10 +142,10 @@ test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 
   const dir = tmpDir('tllm-litertlm-hdr-')
   const qwen = join(dir, 'Qwen3-0.6B_dynamic.litertlm')
   writeFileSync(qwen, fakeBundle(4096, [[1, 32771], [2, 32771]]))
-  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false })
+  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
   const vl = join(dir, 'LFM2.5-VL-450M_int8.litertlm')
   writeFileSync(vl, fakeBundle(4096, [[5, 0], [1, 4099], [2, 4099]]))
-  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false })
+  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false })
   assert.equal(isLitertMagicNumber(4096), false)
   assert.equal(isLitertMagicNumber(7), false, 'primes up to 10 are sizes')
   assert.equal(isLitertMagicNumber(4097), false, '17 * 241')
@@ -178,5 +179,64 @@ test('litertlmHeaderFromFile: vision and audio are the encoder sections the bund
   // A string item that is not model_type, or a section that is not a TFLiteModel, says nothing about modalities.
   const q = join(dir, 'other.litertlm')
   writeFileSync(q, fakeLitertlmBundleOf([{ type: 3, items: { note: 'tf_lite_vision_encoder' } }, { type: 1, items: { model_type: 'tf_lite_audio_encoder_hw' } }]))
-  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false })
+  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null })
+})
+
+// ── tool calling ──────────────────────────────────────────────────────────────────────────────
+
+// The lines that read `tools` in the templates of litert-community's LFM2.5-230M, Qwen3-0.6B and gemma-4-E2B-it, and
+// what Gemma3-1B-IT's and LFM2.5-VL-450M's (which read none) have instead.
+const LFM2_TOOLS = `{%- if tools -%}
+{%- set ns.system_prompt = ns.system_prompt + ("\\n" if ns.system_prompt else "") + "List of tools: [" -%}
+{%- for tool in tools -%}{%- set ns.system_prompt = ns.system_prompt + (tool | tojson) -%}{%- endfor -%}
+{%- endif -%}`
+const QWEN3_TOOLS = `{%- if tools or messages[0]['role'] == 'system' -%}{%- if tools -%}
+{{- "# Tools\\n\\nYou are provided with function signatures within <tools></tools> XML tags:\\n<tools>" -}}
+{%- for tool in tools -%}{{- '\\n' + tool | tojson -}}{%- endfor -%}{%- endif -%}{%- endif -%}`
+const NO_TOOLS = `{{ bos_token }}{%- for message in messages -%}{{ '<start_of_turn>' + message['role'] + '\\n' }}
+{{ message['content'] | trim }}{{ '<end_of_turn>\\n' }}{%- endfor -%}`
+
+test('jinjaTemplateTakesTools: a template that reads `tools` in its code, not the word in its text', () => {
+  assert.equal(jinjaTemplateTakesTools(LFM2_TOOLS), true)
+  assert.equal(jinjaTemplateTakesTools(QWEN3_TOOLS), true)
+  assert.equal(jinjaTemplateTakesTools('{{- tools | tojson -}}'), true)
+  assert.equal(jinjaTemplateTakesTools(NO_TOOLS), false)
+  // The word in a string literal, in the template's text, or as another name's part or attribute is not the variable.
+  assert.equal(jinjaTemplateTakesTools(`{{- "List of tools: [" -}}{{ '<tools>' }}`), false)
+  assert.equal(jinjaTemplateTakesTools('You may use tools. {{ message.tools }} {{ tools_in_user_message }}'), false)
+})
+
+test('litertlmHeaderFromFile: tool calling is what LlmMetadata declares, else its template, else its model type\'s default template', async (t) => {
+  // A bundle whose template never shows the model the tools (Gemma3-1B-IT, LFM2.5-VL) cannot call them; LFM2.5's,
+  // Qwen3's and Gemma 4's can. A bundle with no template of its own renders the runtime's default for its model type,
+  // which shows tools for FunctionGemma (litert-community's mobile-actions bundle: model type function_gemma, no
+  // template) and Gemma 3n only. supports_function_calling, where declared, is the bundle's own word.
+  const dir = scratch(t)
+  const toolCallsOf = async (name: string, meta: Parameters<typeof fakeLlmMetadata>[0] | null): Promise<boolean | null> => {
+    const p = join(dir, name)
+    writeFileSync(p, fakeLitertlmBundleOf(meta ? [{ type: 5, data: fakeLlmMetadata(meta) }] : [{ type: 3, items: { model_type: 'tf_lite_prefill_decode' } }]))
+    return (await litertlmHeaderFromFile(p)).toolCalls
+  }
+  assert.equal(await toolCallsOf('lfm2.litertlm', { maxNumTokens: 4096, template: LFM2_TOOLS }), true)
+  assert.equal(await toolCallsOf('qwen3.litertlm', { maxNumTokens: 4096, template: QWEN3_TOOLS }), true)
+  assert.equal(await toolCallsOf('gemma3-1b.litertlm', { maxNumTokens: 4096, template: NO_TOOLS }), false)
+  assert.equal(await toolCallsOf('functiongemma.litertlm', { maxNumTokens: 1024, modelType: 3 }), true)
+  assert.equal(await toolCallsOf('gemma3n.litertlm', { modelType: 2 }), true)
+  assert.equal(await toolCallsOf('gemma3.litertlm', { modelType: 4 }), false)
+  assert.equal(await toolCallsOf('untyped.litertlm', { maxNumTokens: 4096 }), false)
+  assert.equal(await toolCallsOf('declared-no.litertlm', { template: LFM2_TOOLS, supportsFunctionCalling: false }), false)
+  assert.equal(await toolCallsOf('declared-yes.litertlm', { template: NO_TOOLS, supportsFunctionCalling: true }), true)
+  assert.equal(await toolCallsOf('no-metadata.litertlm', null), null, 'no LlmMetadata: the header says nothing')
+  // A file cut short before its LlmMetadata says nothing either, rather than "no tools".
+  const whole = fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ template: LFM2_TOOLS }) }])
+  const cut = join(dir, 'cut.litertlm')
+  writeFileSync(cut, whole.subarray(0, whole.length - 8))
+  assert.equal((await litertlmHeaderFromFile(cut)).toolCalls, null)
+})
+
+test('litertlmEntryFor: carries whether the model calls tools, absent when the header says nothing', () => {
+  assert.equal(litertlmEntryFor('/m/a.litertlm', '/m', 10, 0, { toolCalls: true }).toolCalls, true)
+  assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { toolCalls: false }).toolCalls, false)
+  assert.equal('toolCalls' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { toolCalls: null }), false)
+  assert.equal('toolCalls' in litertlmEntryFor('/m/d.litertlm', '/m', 10, 0), false)
 })
