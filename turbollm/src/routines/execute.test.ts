@@ -5,6 +5,8 @@ import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { executeRoutine, resumeRoutineRun, runCliRoutineBranch, runCliInteractiveBranch } from './execute'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
 import { runCliInteractiveRoutine, sweepInteractiveCliRuns, terminalLookupsBySession, type CliInteractiveDeps } from './cli-interactive-runner'
+import { VERSION_PROBE_DEADLINE_MS } from './cli-preflight'
+import type { BoundedRunCommand } from '../cli-launch'
 import { parsePendingToolCall, stallRoutineRun } from './approval'
 import type { Deps } from '../deps'
 import type { Manager } from '../engines/manager'
@@ -570,12 +572,15 @@ test('an interactive kickoff abandoned while its terminal is being started close
 
 // I2 (re-review): the CLI branch skips createRunDeadline() on purpose (gate self-deadlock), which
 // left it with NO wall-clock backstop at all. runCliCodeRoutine's very first await —
-// `deps.isAvailable()` -> cli-preflight -> cli-launch.ts's `realRunCommand` — has no timer and
-// settles only on the child's 'error'/'exit' events, so a wedged `claude --version` (reproduced
-// live by the reviewer) never settles. The stand-in below models exactly that: an orchestrator
-// call that never resolves. Without the Promise.race the run row stays 'running' with no endedAt
-// forever and the scheduler's inFlight guard for this routine never clears, so it silently stops
-// firing. The timeout is injected (25ms) so the bound is proven without a slow test.
+// `deps.isAvailable()` -> cli-preflight -> cli-launch.ts's `realRunCommand` — had no timer and
+// settled only on the child's 'error'/'exit' events, so a wedged `claude --version` (reproduced
+// live) never settled. That probe has a deadline of its own now (isCliAvailable,
+// realRunCommandWithin), at which the run is skipped (the cli_unavailable tests further down); the
+// race still covers any other unbounded await in the orchestrator, which is what the stand-in
+// below models: an orchestrator call that never resolves. Without the Promise.race the run row
+// stays 'running' with no endedAt forever and the scheduler's inFlight guard for this routine
+// never clears, so it silently stops firing. The timeout is injected (25ms) so the bound is proven
+// without a slow test.
 test('a hung claude_cli availability probe still drives the run to a terminal state within the wall-clock bound', async () => {
   const { d, db } = fakeDeps({ loadedKey: 'm' })
   const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', workspacePath: '/repo', codingAgent: 'claude_cli' })
@@ -673,6 +678,80 @@ test('a one-shot CLI run abandoned while the CLI runs kills it and leaves the er
   const finalRun = db.getRoutineRun(run.id)!
   assert.equal(finalRun.status, 'errored', 'must not be overwritten by the abandoned run')
   assert.match(finalRun.error ?? '', /wall-clock limit/)
+})
+
+// A CLI whose `--version` has not answered by VERSION_PROBE_DEADLINE_MS (realRunCommandWithin ends it then) skips the
+// routine's run before the model or the gate is touched. Counted as installed, as the Code agent picker counts it, the
+// run would go on with a CLI that does not answer: swap in its pinned model and hold it until the run's own bound (10
+// minutes one-shot, up to 30 parked for an interactive run). The preflight is execute.ts's own wiring; only the command
+// under it (`_runProbe`) answers 'timeout', as realRunCommandWithin does at the deadline.
+function unansweredProbe(): { runProbe: BoundedRunCommand; probed: Array<[string, string[], number]> } {
+  const probed: Array<[string, string[], number]> = []
+  return { probed, runProbe: async (bin, args, deadlineMs) => { probed.push([bin, args, deadlineMs]); return 'timeout' } }
+}
+
+/** A gate that counts every read and acquire, and is otherwise free. */
+function countingGate(): { gate: GenerationGate; touched: () => number } {
+  let touched = 0
+  const gate = {
+    stats: () => { touched++; return { inFlight: 0, queued: 0, capacity: 1 } },
+    acquire: async () => { touched++; return () => {} },
+  } as unknown as GenerationGate
+  return { gate, touched: () => touched }
+}
+
+test('a one-shot CLI routine whose `claude --version` does not answer is skipped as cli_unavailable, never touching the model or the gate', async (t) => {
+  const warned: string[] = []
+  t.mock.method(console, 'warn', (line: string) => { warned.push(line) })
+  const { gate, touched } = countingGate()
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'small-model', gate })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'claude_cli' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const { runProbe, probed } = unansweredProbe()
+  let spawned = 0
+  const status = await runCliRoutineBranch(d, routine, run, (r, deps) => runCliCodeRoutine(r, {
+    ...deps,
+    // Never the real CLI, whatever the preflight answers.
+    permissionModeChoices: async () => [],
+    runProcess: async () => { spawned++; return { exitCode: 0, timedOut: false, stdout: CLI_OK_STDOUT, stderr: '' } },
+  }), undefined, runProbe)
+  assert.equal(status, 'skipped')
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'skipped')
+  assert.equal(finalRun.skipReason, 'cli_unavailable')
+  assert.ok(finalRun.endedAt)
+  assert.deepEqual(probed, [['claude', ['--version'], VERSION_PROBE_DEADLINE_MS]])
+  assert.deepEqual(loadCalls, [], 'the pinned model is never swapped in')
+  assert.equal(touched(), 0, 'the gate is never read')
+  assert.equal(spawned, 0, 'the CLI never runs')
+  assert.deepEqual(warned, [`[routines] \`claude --version\` did not answer within ${VERSION_PROBE_DEADLINE_MS} ms: it was ended, and the routine skips claude`])
+})
+
+test('an interactive CLI routine whose `opencode --version` does not answer is skipped as cli_unavailable, never touching the model or the gate', async (t) => {
+  const warned: string[] = []
+  t.mock.method(console, 'warn', (line: string) => { warned.push(line) })
+  const { gate, touched } = countingGate()
+  const { d, db, loadCalls } = fakeDeps({ loadedKey: 'small-model', gate })
+  const routine = db.createRoutine({ flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'big-model', workspacePath: '/repo', codingAgent: 'opencode_cli', permissionMode: 'auto' })
+  const run = db.createRoutineRun({ routineId: routine.id, configSnapshot: JSON.stringify(routine) })
+  const { runProbe, probed } = unansweredProbe()
+  let terminals = 0
+  const status = await runCliInteractiveBranch(d, routine, run, (r, rr, deps) => runCliInteractiveRoutine(r, rr, {
+    ...deps,
+    // Never a real terminal, whatever the preflight answers.
+    createTerminal: async () => { terminals++; return { ok: true, terminalId: 't' } },
+    killTerminal: () => {},
+  }), undefined, runProbe)
+  assert.equal(status, 'skipped')
+  const finalRun = db.getRoutineRun(run.id)!
+  assert.equal(finalRun.status, 'skipped')
+  assert.equal(finalRun.skipReason, 'cli_unavailable')
+  assert.ok(finalRun.endedAt)
+  assert.deepEqual(probed, [['opencode', ['--version'], VERSION_PROBE_DEADLINE_MS]], "the routine's own harness is probed")
+  assert.deepEqual(loadCalls, [], 'the pinned model is never swapped in')
+  assert.equal(touched(), 0, 'the gate is never read')
+  assert.equal(terminals, 0, 'no terminal is opened')
+  assert.deepEqual(warned, [`[routines] \`opencode --version\` did not answer within ${VERSION_PROBE_DEADLINE_MS} ms: it was ended, and the routine skips opencode`])
 })
 
 // M1 (re-review): the read-back's `?? 'errored'` only caught a MISSING row, but 'running' is a

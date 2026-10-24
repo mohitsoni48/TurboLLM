@@ -23,8 +23,8 @@ import { runChatRoutine, resumeChatRoutine, type ChatRunOutcome } from './chat-r
 import { runCodeRoutine, resumeCodeRoutine, type CodeRunOutcome } from './code-runner'
 import { parsePendingToolCall } from './approval'
 import { runCliCodeRoutine, type CliRoutineDeps } from './cli-routine'
-import { isCliAvailable, isClaudeCliAvailable } from './cli-preflight'
-import { cliBin } from '../cli-launch'
+import { isCliAvailable, VERSION_PROBE_DEADLINE_MS } from './cli-preflight'
+import { cliBin, realRunCommandWithin, type BoundedRunCommand } from '../cli-launch'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 
 import { realSpawnCliProcess, runClaudeCliProcess } from './cli-process'
@@ -39,6 +39,13 @@ import { createAgentTerminal, getTerminalManager } from '../terminal/terminal-ro
 function terminalHarnessBin(routine: Routine): string {
   if (!isTerminalCodingAgent(routine.codingAgent)) return 'claude'
   return cliBin(TERMINAL_CODE_AGENT[routine.codingAgent]) ?? 'claude'
+}
+
+/** A CLI routine's preflight: `<bin> --version` through `run`. One that has not answered by VERSION_PROBE_DEADLINE_MS
+ *  is ended and skips the run ('cli_unavailable') before it touches the model or the gate (isCliAvailable's
+ *  'unavailable'), where the Code agent picker counts it as installed. */
+function routineCliAvailable(bin: string, run: BoundedRunCommand): Promise<boolean> {
+  return isCliAvailable(bin, run, VERSION_PROBE_DEADLINE_MS, 'unavailable')
 }
 
 type RoutineOutcome = ChatRunOutcome | CodeRunOutcome
@@ -147,13 +154,15 @@ function engineFreeForRoutine(d: Deps): boolean {
  *  without spawning a real `claude` subprocess: the very first thing the real orchestrator does is
  *  probe the installed CLI, so there is no other way to cover the branch deterministically.
  *  `_timeoutMs` is the same kind of seam for the wall-clock race below, so the timeout path can be
- *  proven in milliseconds instead of ten minutes. */
+ *  proven in milliseconds instead of ten minutes, and `_runProbe` for the preflight's `claude --version`, so what the
+ *  run makes of a probe that does not answer is proven without a CLI that hangs for its deadline. */
 export async function runCliRoutineBranch(
   d: Deps,
   routine: Routine,
   run: RoutineRun,
   _runCli: (routine: Routine, deps: CliRoutineDeps) => Promise<void> = runCliCodeRoutine,
   _timeoutMs: number = ROUTINE_RUN_TIMEOUT_MS,
+  _runProbe: BoundedRunCommand = realRunCommandWithin,
 ): Promise<RoutineRunStatus> {
   const abandon = new AbortController()
   const cliDeps: CliRoutineDeps = {
@@ -166,7 +175,7 @@ export async function runCliRoutineBranch(
     now: () => new Date(),
     port: d.bindPort ?? d.store.snapshot().daemon.port, // the port really bound (`--port` wins over config)
     host: d.bindHost, // and the address: `--addr [::1]:6996` answers on no 127.0.0.1
-    isAvailable: () => isClaudeCliAvailable(),
+    isAvailable: () => routineCliAvailable('claude', _runProbe),
     permissionModeChoices: () => claudePermissionModeChoices(),
     runProcess: (args, opts) => runClaudeCliProcess(args, opts, realSpawnCliProcess),
     existingRun: run,
@@ -176,13 +185,15 @@ export async function runCliRoutineBranch(
   // executeRoutine's comment: the self-deadlock fix), which also removed the ONLY wall-clock
   // backstop on this path — and runCliCodeRoutine bounds its own SUBPROCESS
   // (CLI_ROUTINE_TIMEOUT_MS, step 4) but not its pre-spawn probes. `deps.isAvailable()` — its very
-  // first await — bottoms out in cli-launch.ts's `realRunCommand`, which resolves only on the
-  // child's 'error'/'exit' events and has no timer at all: one wedged `claude --version` leaves
+  // first await — bottomed out in cli-launch.ts's `realRunCommand`, which resolves only on the
+  // child's 'error'/'exit' events and has no timer at all: one wedged `claude --version` left
   // this promise unsettled forever, which strands the run row at 'running' with no endedAt AND
   // permanently pins the routine in scheduler.ts's `inFlight` set, so it silently never fires
-  // again. Racing here (rather than only timing out `realRunCommand`) restores the wall-clock
-  // ceiling spec 20 §6 requires for EVERY execution path, and covers any future unbounded await
-  // inside the orchestrator, not just today's probe.
+  // again. The probe has a deadline of its own now (routineCliAvailable: at VERSION_PROBE_DEADLINE_MS
+  // the CLI is ended and the run skipped as 'cli_unavailable', about 10 s in, before the model or
+  // the gate is touched), and racing here as well restores the wall-clock ceiling spec 20 §6
+  // requires for EVERY execution path, and covers any future unbounded await inside the
+  // orchestrator, not just the probe.
   let timer: ReturnType<typeof setTimeout> | undefined
   const TIMED_OUT = Symbol('cli_routine_timeout')
   let raced: unknown
@@ -248,13 +259,15 @@ const ROUTINE_TERMINAL_IDLE_TTL_MS = CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS + 5 * 60
  *  terminal-routes.ts's `createAgentTerminal` (the exact function `POST
  *  /api/v1/code/sessions/:sessionId/terminal` itself calls) so a routine's live terminal is
  *  spawned the SAME way a human's would be, just eagerly and server-side. `_runInteractive` is a
- *  default-parameter seam, same convention as `runCliRoutineBranch`'s `_runCli`. */
+ *  default-parameter seam, same convention as `runCliRoutineBranch`'s `_runCli` (and `_timeoutMs` and `_runProbe` as
+ *  there). */
 export async function runCliInteractiveBranch(
   d: Deps,
   routine: Routine,
   run: RoutineRun,
   _runInteractive: (routine: Routine, run: RoutineRun, deps: CliInteractiveDeps) => Promise<RoutineRunStatus> = runCliInteractiveRoutine,
   _timeoutMs: number = CLI_INTERACTIVE_KICKOFF_TIMEOUT_MS,
+  _runProbe: BoundedRunCommand = realRunCommandWithin,
 ): Promise<RoutineRunStatus> {
   const tm = getTerminalManager(d)
   const kickoff = new AbortController()
@@ -284,8 +297,9 @@ export async function runCliInteractiveBranch(
     now: () => new Date(),
     // Probe the binary THIS routine actually needs — the interactive path now serves every terminal
     // harness, so a hardcoded `claude --version` would report "not installed" for a machine that has
-    // opencode but no claude (and vice versa).
-    isAvailable: () => isCliAvailable(terminalHarnessBin(routine)),
+    // opencode but no claude (and vice versa). One that does not answer skips the run within the
+    // kickoff bound, as on the one-shot path (routineCliAvailable).
+    isAvailable: () => routineCliAvailable(terminalHarnessBin(routine), _runProbe),
     // Nobody may ever open this terminal, so TerminalManager's 5-minute idle reaper would kill it
     // (and its CLI) long before the run's own CLI_INTERACTIVE_ROUTINE_TIMEOUT_MS, which the sweep
     // enforces. Its idle TTL outlasts that bound, so the sweep decides; once the run has ended, the

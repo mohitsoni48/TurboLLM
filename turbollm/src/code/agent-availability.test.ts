@@ -112,3 +112,55 @@ test('a probe still running when an install ends neither answers nor caches what
   const next = (await agentAvailability(Date.now, probe)).find((a) => a.id === 'opencode')
   assert.equal(next?.installed, true, 'and the next request does not get it from the cache')
 })
+
+// Each request used to run a probe round of its own, so the requests that came while one ran (a reload, another tab
+// or device, an Install's refetch; the page's own focus refetches and 2 s polls wait on its request in flight) each
+// started one more `<bin> --version` per harness; with a CLI that never answered, they piled up. They share the
+// running round now.
+test('requests that come while a probe round runs share it: one probe per harness, however many ask', { timeout: 10_000 }, async () => {
+  invalidateAvailabilityCache()
+  const probed: string[] = []
+  let answer!: () => void
+  const answers = new Promise<void>((r) => { answer = r })
+  const probe = async (bin: string) => {
+    probed.push(bin)
+    await answers
+    return bin === 'pi'
+  }
+  const requests = Array.from({ length: 5 }, () => agentAvailability(Date.now, probe))
+  await tick()
+  assert.deepEqual([...probed].sort(), ['claude', 'opencode', 'pi'], `one probe per harness, not one per request: ${probed.join(', ')}`)
+
+  answer()
+  for (const agents of await Promise.all(requests)) {
+    assert.deepEqual(agents.map((a) => [a.id, a.installed]), [['claude', false], ['pi', true], ['opencode', false]])
+  }
+  assert.equal(probed.length, 3, 'and none after it')
+})
+
+test('a request after an install ended gets a round of its own, and the requests from before it share that one', { timeout: 10_000 }, async () => {
+  invalidateAvailabilityCache()
+  const probed: string[] = []
+  let opencodeOnPath = false
+  let holding = true
+  let release!: () => void
+  const released = new Promise<void>((r) => { release = r })
+  const probe = async (bin: string) => {
+    probed.push(bin)
+    if (holding) await released // the round from before the install's end
+    return bin === 'opencode' && opencodeOnPath
+  }
+  const before = agentAvailability(Date.now, probe)
+  await tick()
+
+  opencodeOnPath = true
+  holding = false
+  invalidateAvailabilityCache() // what the install's end does
+  const after = (await agentAvailability(Date.now, probe)).find((a) => a.id === 'opencode')
+  assert.equal(after?.installed, true, 'not the answer of the round that started before the install ended')
+  assert.equal(probed.length, 6, 'a round of its own')
+
+  release()
+  assert.equal((await before).find((a) => a.id === 'opencode')?.installed, true, 'the earlier request does not answer what it saw before the end either')
+  assert.equal(probed.length, 6, 'it took the round of the new generation, not a third one')
+})

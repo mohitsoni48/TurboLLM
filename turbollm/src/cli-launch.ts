@@ -15,13 +15,13 @@
 //     at the gateway (session-auth.ts) instead of racing on one global config file.
 //   - `mcpArgs` points the harness at the daemon's own MCP bridge, for harnesses with a confirmed
 //     flag for it (claude). opencode carries the same bridge inside its inline config instead.
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
-import { spawnTethered } from './util/tether'
+import { killTetheredTree, spawnTethered } from './util/tether'
 import { isQualifiedId } from './link/model-id'
 import { isTextClassifier } from './models/text-classifier'
 import { localDaemonOrigin } from './daemon-pid'
@@ -1056,29 +1056,58 @@ function piArgs(ctx: LaunchContext): string[] {
  *  itself deprecation-warns about this exact hazard). No shell means no metacharacters. */
 export type RunCommand = (bin: string, args: string[]) => Promise<boolean>
 
+/** RunCommand with a deadline: true on exit code 0, false on any other exit or a spawn error, 'timeout' when the
+ *  command had not exited `deadlineMs` after it started. Its whole tree has been ended then (killTetheredTree: its
+ *  process group, under the Android helper its pid, on Windows its job, else `taskkill /T /F`, which takes a `.cmd`
+ *  shim's cmd.exe and the CLI under it), and the answer does not wait for the exit: a program stuck in the kernel (a
+ *  dead network mount) cannot hold the caller either. */
+export type BoundedRunCommand = (bin: string, args: string[], deadlineMs: number) => Promise<boolean | 'timeout'>
+
+/** The command, started as realRunCommand and realRunCommandWithin run it. */
+function startRunCommand(bin: string, args: string[]): ChildProcess {
+  // Resolve first, exactly as realSpawn does, instead of handing `spawn` a bare name.
+  //
+  // A bare `spawn('pi', ['--version'])` FAILS on Windows even when pi is installed: libuv's own
+  // PATHEXT lookup lands on `pi.cmd`, and Node refuses to spawn a `.cmd` without a shell (EINVAL,
+  // a deliberate mitigation). The probe therefore reported "not installed" for every npm-shim CLI
+  // — measured live: the availability endpoint said pi and opencode were missing while both were
+  // on PATH and launchable. `claude` masked this for months by shipping a real `claude.exe`.
+  //
+  // The shell is used ONLY for that shim case, and the command is built by `buildShellCommand`,
+  // which quotes each argument — so this keeps the property the no-shell choice was originally
+  // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
+  // Quoting is what makes that safe, not the absence of a shell.
+  //
+  // Tethered (util/tether.ts): the daemon runs the CLI probes (the Routines preflight and the Code agent picker,
+  // through realRunCommandWithin), and a hung CLI must not outlive it.
+  const resolved = resolveExecutable(bin)
+  return requiresShell(resolved)
+    ? spawnTethered(buildShellCommand(bin, args), null, { shell: true, stdio: 'ignore' }, { kind: 'probe' })
+    : spawnTethered(resolved ?? bin, args, { stdio: 'ignore' }, { kind: 'probe' })
+}
+
+/** No deadline: `turbollm launch hermes` runs its `hermes config set` steps through it, in the user's terminal. */
 export const realRunCommand: RunCommand = (bin, args) =>
   new Promise<boolean>((resolve) => {
-    // Resolve first, exactly as realSpawn does, instead of handing `spawn` a bare name.
-    //
-    // A bare `spawn('pi', ['--version'])` FAILS on Windows even when pi is installed: libuv's own
-    // PATHEXT lookup lands on `pi.cmd`, and Node refuses to spawn a `.cmd` without a shell (EINVAL,
-    // a deliberate mitigation). The probe therefore reported "not installed" for every npm-shim CLI
-    // — measured live: the availability endpoint said pi and opencode were missing while both were
-    // on PATH and launchable. `claude` masked this for months by shipping a real `claude.exe`.
-    //
-    // The shell is used ONLY for that shim case, and the command is built by `buildShellCommand`,
-    // which quotes each argument — so this keeps the property the no-shell choice was originally
-    // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
-    // Quoting is what makes that safe, not the absence of a shell.
-    //
-    // Tethered (util/tether.ts): the daemon runs this (the Routines preflight, prepareHermes), and a hung CLI must not
-    // outlive it.
-    const resolved = resolveExecutable(bin)
-    const child = requiresShell(resolved)
-      ? spawnTethered(buildShellCommand(bin, args), null, { shell: true, stdio: 'ignore' }, { kind: 'probe' })
-      : spawnTethered(resolved ?? bin, args, { stdio: 'ignore' }, { kind: 'probe' })
+    const child = startRunCommand(bin, args)
     child.on('error', () => resolve(false))
     child.on('exit', (code) => resolve(code === 0))
+  })
+
+/** realRunCommand with a deadline, for the daemon's CLI probes (isCliAvailable). realRunCommand resolves only on the
+ *  child's 'error' or 'exit', so one `claude --version` that never returned (reproduced live, routines/execute.test.ts)
+ *  left GET /api/v1/code/agents unanswered for good, and each new request started another probe that stayed until
+ *  the daemon ended. */
+export const realRunCommandWithin: BoundedRunCommand = (bin, args, deadlineMs) =>
+  new Promise<boolean | 'timeout'>((resolve) => {
+    const child = startRunCommand(bin, args)
+    // Not unref'd, as in runWithTimeout: settled or cleared, it never outlives the command.
+    const timer = setTimeout(() => {
+      killTetheredTree(child, 'SIGKILL')
+      resolve('timeout')
+    }, deadlineMs)
+    child.on('error', () => { clearTimeout(timer); resolve(false) })
+    child.on('exit', (code) => { clearTimeout(timer); resolve(code === 0) })
   })
 
 /** hermes — Nous Research's agent CLI. Its config is YAML, not JSON, so rather than

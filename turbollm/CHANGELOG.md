@@ -206,6 +206,12 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - macOS: Code terminals and interactive routine terminals open. Every one failed with "posix_spawnp failed.": the
   helper program node-pty starts them through is installed without permission to run. TurboLLM now gives it that
   before its first terminal, and the desktop app ships it so.
+- The Code agent picker (Settings, onboarding) gets its answer even when an agent CLI hangs. TurboLLM checks each
+  CLI with `<cli> --version`, and one that never answered held the answer for every agent for good: a missing agent
+  was never marked missing or offered Install, an Install's button kept spinning, and each new request left one more
+  check running. A check now gets 10 s, after which TurboLLM ends it and counts the CLI as installed (it was found
+  and started), and requests made while a check runs share it. A routine whose CLI's check does not answer in those
+  10 s is skipped ("Skipped (cli_unavailable)"), without touching the model.
 
 ### Changed
 - **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a

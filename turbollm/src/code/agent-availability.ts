@@ -11,7 +11,10 @@
 // Instead the picker shows it, refuses to SELECT it, and offers to install it.
 //
 // Probing is `<bin> --version` (cli-preflight.ts), the same check the Routines preflight uses, so
-// the picker and a scheduled run can never disagree about whether a harness is usable.
+// the picker and a scheduled run agree on every probe that answers. One that has not answered by
+// VERSION_PROBE_DEADLINE_MS is where they differ, on purpose (isCliAvailable's `onTimeout`): the
+// picker counts that CLI as installed (it was found and started), and a routine skips its run as
+// 'cli_unavailable' before it touches the model or the gate.
 import type { spawn } from 'node:child_process'
 import type { SpawnOptions } from 'node:child_process'
 import { cliSpecInfo } from '../cli-launch'
@@ -44,6 +47,11 @@ type Probed = Omit<AgentAvailability, 'installing'>
 let cache: { at: number; value: Probed[] } | null = null
 // Bumped by every invalidation, so a probe can tell that an install ended while it ran.
 let generation = 0
+// The probe round running now, and the generation it started at. Each request used to run a round of its own, so
+// requests that came while one ran (a reload, another tab or device, an Install's refetch; the page's own focus
+// refetches and 2 s polls wait on its request in flight) each started one more `<bin> --version` per harness: with
+// a CLI whose probe never answered, they piled up.
+let round: { gen: number; probed: Promise<Probed[]> } | null = null
 
 /** Drop the cache — called right after an install so the UI reflects it immediately instead of
  *  waiting out the TTL. */
@@ -52,37 +60,49 @@ export function invalidateAvailabilityCache(): void {
   generation++
 }
 
+/** The running round when no install has ended since it started, else a new one. Its answer is cached when no install
+ *  ended while it ran. */
+function probeRound(now: () => number, probe: (bin: string) => Promise<boolean>): Promise<Probed[]> {
+  if (round && round.gen === generation) return round.probed
+  const gen = generation
+  const probed = Promise.all(
+    TERMINAL_AGENT_IDS.map(async (id): Promise<Probed> => {
+      const spec = cliSpecInfo(id)
+      // An unknown id can't be probed OR installed; report it uninstalled with no command rather
+      // than throwing, so one bad entry can't take down the whole picker.
+      if (!spec) return { id, installed: false, installCommand: '' }
+      return { id, installed: await probe(spec.bin), installCommand: spec.install }
+    }),
+  ).then((value) => {
+    if (gen === generation) cache = { at: now(), value }
+    return value
+  }).finally(() => {
+    if (round?.probed === probed) round = null
+  })
+  round = { gen, probed }
+  return probed
+}
+
 /** `probe` is `isCliAvailable` but for a test, which needs a probe still running when an install
- *  ends. */
+ *  ends. A call that joins a running round gets that round's answers, whichever `probe` it passed. */
 export async function agentAvailability(
   now = () => Date.now(),
-  probe = isCliAvailable,
+  probe: (bin: string) => Promise<boolean> = isCliAvailable,
 ): Promise<AgentAvailability[]> {
-  let probed = cache && now() - cache.at < TTL_MS ? cache.value : null
+  const cached = () => (cache && now() - cache.at < TTL_MS ? cache.value : null)
+  let probed = cached()
   if (!probed) {
-    const probeAll = () => Promise.all(
-      TERMINAL_AGENT_IDS.map(async (id): Promise<Probed> => {
-        const spec = cliSpecInfo(id)
-        // An unknown id can't be probed OR installed; report it uninstalled with no command rather
-        // than throwing, so one bad entry can't take down the whole picker.
-        if (!spec) return { id, installed: false, installCommand: '' }
-        return { id, installed: await probe(spec.bin), installCommand: spec.install }
-      }),
-    )
     // An install that ended while this probe ran (its end invalidates the cache) may have been
     // probed before its CLI existed. That answer used to be cached over the invalidation, and
     // returned with `installing` already false: GET /code/agents said "not installed" for 5 s
     // after the install succeeded, so a page polling for the install's end (useAgentAvailability)
     // stopped on it and kept offering Install, and the page that ran it could get the same answer
     // right after its "installed" toast. Such a probe is run again, and only an answer no install
-    // ended under is cached.
-    let gen = generation
-    probed = await probeAll()
-    if (gen !== generation) {
-      gen = generation
-      probed = await probeAll()
-    }
-    if (gen === generation) cache = { at: now(), value: probed }
+    // ended under is cached. The run again is the round of the new generation, which a request
+    // that came after the install's end may have started already.
+    const gen = generation
+    probed = await probeRound(now, probe)
+    if (gen !== generation) probed = cached() ?? await probeRound(now, probe)
   }
   // Read on every call, never cached: it changes the moment an install starts or ends.
   return probed.map((a) => ({ ...a, installing: installsInFlight.has(a.id) }))
