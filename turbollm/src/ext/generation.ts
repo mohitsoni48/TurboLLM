@@ -54,7 +54,7 @@ import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
 import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
-import { litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
+import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -266,7 +266,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
 
   const engineKind = servingEngineKind(d)
   // BUG-006 (chat-routes.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
-  // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason.
+  // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason; LiteRT-LM keeps llama.cpp's
+  // name, whose window the Android app's server applies as llama.cpp does (chat-routes.ts).
   const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
   const sampling = ctx.chat.sampling ?? {}
   const samplingOverride = mapSampling(sampling, repeatPenaltyKey)
@@ -304,6 +305,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     shapeForEngine(engineKind, reqBody)
     const samplingNote = engineKind === 'litert-lm' && iter === 1 ? litertLmSamplingNote(reqBody) : undefined
     if (samplingNote) console.log(`[ext] ${samplingNote}`)
+    const ignoredNote = engineKind === 'litert-lm' && iter === 1 ? litertLmIgnoredFieldsNote(reqBody) : undefined
+    if (ignoredNote) console.log(`[ext] ${ignoredNote}`)
     if (toolsSupported && engineKind === 'litert-lm') {
       const pick = litertLmToolsFor(litertModel, toolDefs, messages, loadedModel.ctx)
       if (pick.tools.length) reqBody.tools = pick.tools

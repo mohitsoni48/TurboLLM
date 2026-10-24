@@ -7,6 +7,7 @@ import type { ModelEntry } from '../models/scanner'
 import { litertlmEntryFor } from '../models/litertlm'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import { buildStartOpts } from './start-opts'
+import { rememberLitertLmModel, shapeLitertLmRequest } from './litert-lm-request'
 
 const CPU_ONLY: SysInfo = { os: 'win32', cpu: 'test', cores: 8, ramMB: 32768, gpus: [] }
 const WITH_GPU: SysInfo = { ...CPU_ONLY, gpus: [{ name: 'Radeon 780M', vramMb: 4096, vendor: 'amd' }] }
@@ -158,4 +159,18 @@ test('the sampling the user set for a .litertlm is carried for its requests, and
   const load = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ sampling: { temp: 0.3 }, userSetOnly: true }, e), sys: CPU_ONLY, overrides: { sampling: { temp: 0.9, topP: 0.8 } as never, userSetOnly: true }, trigger: 'manual' })
   assert.deepEqual(load.litertLmRequest?.sampling, { temperature: 0.9, top_p: 0.8 })
   assert.deepEqual(buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).litertLmRequest, { sampling: {} })
+})
+
+test('Top K 0 on a GPU the user chose is no top-k limit too: the largest top_k, as on the CPU', () => {
+  // A saved Top K 0 went to `serve` as 0, which it refuses (400 "top_k should be positive"). On a GPU LiteRT-LM 0.18.0
+  // sets no top-k limit of its own either (GpuConfig::max_top_k is only printed), so the GPU gets the largest k too. A
+  // saved Min P is carried, so that it is named as not applied.
+  const e = entry()
+  const saved = { litertLm: { backend: 'gpu' }, sampling: { topK: 0, minP: 0.2 }, userSetOnly: true }
+  const gpu = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved(saved, e), sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(gpu.litertLmConfig?.default.backend, 'gpu')
+  rememberLitertLmModel(gpu.modelPath, { ...gpu.litertLmRequest!, native: false })
+  const body: Record<string, unknown> = shapeLitertLmRequest({ model: gpu.modelPath, messages: [] })
+  assert.equal(body.top_k, 2147483647)
+  assert.equal(body.min_p, 0.2)
 })

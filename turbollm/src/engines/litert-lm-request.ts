@@ -56,20 +56,38 @@ export function shapeLitertLmThinking(body: Record<string, unknown>): void {
 /** What a LiteRT-LM model's requests carry from its load (StartOpts.litertLmRequest). */
 export interface LitertLmRequestInfo {
   /** The sampling the user set for the model, in request fields (litertLmRequestSampling): only what they set. */
-  sampling: Record<string, number>
+  sampling: Record<string, number | string[]>
   /** The bundle's own sampler (ModelEntry.sampler); absent when it declares none. */
   sampler?: LitertlmSampler
 }
 
-/** A model's saved Sampling (LoadProfile.sampling, only the fields the user set) as the request fields LiteRT-LM reads
- *  for it: temperature, top_p, top_k. */
-export function litertLmRequestSampling(s: Partial<Sampling>): Record<string, number> {
-  const out: Record<string, number> = {}
+/** A model's saved Sampling (LoadProfile.sampling, only the fields the user set) as the request fields LiteRT-LM's
+ *  servers read: temperature, top_p, top_k, the penalties and stop; and a Min P above 0 as min_p, which no LiteRT-LM
+ *  applies, so that it is named as not applied (litertLmIgnoredFieldsNote, the gateway's X-Unapplied-Parameters, the
+ *  Android server's own) rather than dropped: the dialogs no longer offer it for LiteRT-LM, but a value saved before
+ *  stays in the profile. The repeat penalty goes as llama.cpp's repeat_penalty, as a thread's does (chat-routes.ts),
+ *  since it is llama.cpp's: the Android server applies that name over llama.cpp's window, the last 64 tokens, and
+ *  repetition_penalty over the whole reply. */
+export function litertLmRequestSampling(s: Partial<Sampling>): Record<string, number | string[]> {
+  const out: Record<string, number | string[]> = {}
   if (typeof s.temp === 'number') out.temperature = s.temp
   if (typeof s.topP === 'number') out.top_p = s.topP
   if (typeof s.topK === 'number') out.top_k = s.topK
+  if (typeof s.minP === 'number' && s.minP > 0) out.min_p = s.minP
+  if (typeof s.repeatPenalty === 'number') out.repeat_penalty = s.repeatPenalty
+  if (typeof s.presencePenalty === 'number') out.presence_penalty = s.presencePenalty
+  if (typeof s.frequencyPenalty === 'number') out.frequency_penalty = s.frequencyPenalty
+  if (Array.isArray(s.stop) && s.stop.length > 0) out.stop = s.stop
   return out
 }
+
+/** "No top-k limit" for `serve`, which refuses a top_k below 1 ("top_k should be positive, but got 0", a 400) where
+ *  TurboLLM's Top K 0 and llama.cpp's convention mean no limit, and the Android app's server takes it so: the largest
+ *  k, which the CPU sampler clamps to the vocabulary (sampling_cpu_util.cc TopKTopPSampling). The same on a GPU: the
+ *  Android server gives a GPU sampler the model's vocabulary, which it reads from the model's logits, and the largest
+ *  k where it cannot, as here, where the vocabulary is not read; LiteRT-LM 0.18.0 sets no top_k limit of its own
+ *  (GpuConfig::max_top_k is read nowhere), and `serve` samples on the CPU where no GPU sampler library is present. */
+const NO_TOP_K_LIMIT = 2147483647
 
 /** The LiteRT-LM models loaded, by model path, with whether their server is the Android app's native one. */
 const loadedModels = new Map<string, LitertLmRequestInfo & { native: boolean }>()
@@ -95,11 +113,52 @@ export function shapeLitertLmSampling(body: Record<string, unknown>): void {
   const info = litertLmModelInfo(body.model)
   if (!info) return
   for (const [k, v] of Object.entries(info.sampling)) if (!isSet(body[k])) body[k] = v
+  // Top K 0 (or below) is no limit: on `serve`, the largest k; the Android server maps it itself.
+  if (!info.native && typeof body.top_k === 'number' && body.top_k <= 0) body.top_k = NO_TOP_K_LIMIT
   if (!info.sampler || !SAMPLER_FIELDS.some((k) => isSet(body[k]))) return
   const own = info.sampler
   if (!isSet(body.top_k) && own.topK !== undefined) body.top_k = own.topK
   if (!isSet(body.top_p) && own.topP !== undefined) body.top_p = own.topP
   if (!isSet(body.temperature) && own.temp !== undefined) body.temperature = own.temp
+}
+
+/** The note for fields a LiteRT-LM server does not apply: min_p on either (LiteRT-LM has no Min P sampling), and on
+ *  upstream's `serve` the stop strings and the penalties too (it reads none of them; the Android app's server cuts the
+ *  reply at a stop string and applies the penalties). A Min P the request leaves to the model's saved settings is named
+ *  as theirs, with where to clear it and that the model must then be reloaded (its load recorded them,
+ *  rememberLitertLmModel, so a Save without reloading still sends it); one the request sets from a chat thread's own
+ *  settings (`fromThread`, the chat's) as the thread's, with where to clear it. Undefined when nothing set is ignored.
+ *  Reads the body as {@link shapeLitertLmSampling} will send it. */
+export function litertLmIgnoredFieldsNote(body: Record<string, unknown>, opts: { fromThread?: boolean } = {}): string | undefined {
+  const info = litertLmModelInfo(body.model)
+  if (!info) return undefined
+  const value = (k: string): unknown => (isSet(body[k]) ? body[k] : info.sampling[k])
+  const ignored: string[] = []
+  const minP = value('min_p')
+  const hasMinP = typeof minP === 'number' && minP > 0
+  // A Min P the request does not set is the one saved on the model, which the chat does not show: say whose it is.
+  // So is one a thread sets, which the thread settings no longer show a slider for on LiteRT-LM (only a Clear).
+  const savedMinP = hasMinP && !isSet(body.min_p)
+  const threadMinP = hasMinP && !savedMinP && opts.fromThread === true
+  if (hasMinP) ignored.push(savedMinP ? 'the Min P saved in this model\'s settings' : threadMinP ? 'this thread\'s Min P' : 'Min P')
+  if (!info.native) {
+    const stop = value('stop')
+    if ((typeof stop === 'string' && stop) || (Array.isArray(stop) && stop.length > 0)) ignored.push('stop strings')
+    const penalty = (k: string, off: number) => typeof value(k) === 'number' && value(k) !== off
+    if (penalty('repetition_penalty', 1) || penalty('repeat_penalty', 1) || penalty('presence_penalty', 0) || penalty('frequency_penalty', 0)) {
+      ignored.push('repetition, presence and frequency penalties')
+    }
+  }
+  if (ignored.length === 0) return undefined
+  const list = ignored.length === 1 ? ignored[0] : `${ignored.slice(0, -1).join(', ')} and ${ignored[ignored.length - 1]}`
+  const clear = savedMinP
+    ? ' Clear that Min P under Models → the model\'s Load settings and reload the model.'
+    : threadMinP ? ' Clear that Min P in Thread settings.' : ''
+  return info.native
+    ? `LiteRT-LM has no Min P: this reply was sampled without ${savedMinP || threadMinP ? ignored[0] : 'it'}.${clear}`
+    : `This LiteRT-LM server (litert-lm serve) does not apply ${list}: this reply was written without ` +
+      `${ignored.length === 1 && hasMinP ? 'it' : 'them'}. The Android app's LiteRT-LM applies stop strings and ` +
+      `penalties; no LiteRT-LM has Min P.${clear}`
 }
 
 /** The note for a temperature or top_p that has no effect: the model has no sampler of its own, so with no top_k the

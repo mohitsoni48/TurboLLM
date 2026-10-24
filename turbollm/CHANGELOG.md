@@ -278,6 +278,15 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   and the fields still missing come from the bundle's own sampler, which TurboLLM reads from its header and shows as
   the model's defaults in the model and thread settings (they showed llama.cpp's 0.8 / 0.95 / 40). For a bundle with
   no sampler of its own (LFM2.5-230M), `litert-lm serve` stays greedy without a Top K, and the chat says so.
+- **LiteRT-LM: Top K 0 is no limit, a model's saved penalties and stop strings are sent, and Min P is gone.** `litert-lm
+  serve` refused Top K 0, the dialogs' "no limit", with a 400 ("top_k should be positive"): it now gets the largest
+  top_k there is, which the CPU sampler clamps to the whole vocabulary (on a GPU the Android app's engine gives the
+  vocabulary itself). A model's saved penalties and stop strings now go with its requests, as a thread's do:
+  `repeat_penalty` (llama.cpp's, which the Android app's engine applies over the last 64 tokens, as llama.cpp does),
+  `presence_penalty`, `frequency_penalty` and `stop`, which that engine applies; `litert-lm serve` ignores them, and the
+  chat now says so instead of nothing. LiteRT-LM has no Min P: the thread and model settings no longer offer it for a
+  LiteRT-LM model, and a Min P still set on a thread or saved on the model is named in the chat as not applied, with
+  where to clear it (the thread and model settings show it, with "Clear it").
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

@@ -31,7 +31,7 @@ import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } fr
 import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats, litertLmTurnErrorMessage } from '../engines/litert-lm'
-import { LITERT_LM_RESEARCH_NOTE, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
+import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -1439,7 +1439,10 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // BUG-006: vLLM and SGLang reject `repeat_penalty` (the llama.cpp name) and require
   // `repetition_penalty` — the OpenAI-spec name. mlx-vlm's request schema (server/schemas.py)
   // only declares `repetition_penalty` too — `repeat_penalty` isn't rejected (the schema
-  // allows extra fields) but is silently ignored, a no-op. Map per engine kind.
+  // allows extra fields) but is silently ignored, a no-op. Map per engine kind. LiteRT-LM keeps
+  // `repeat_penalty`: the Repeat penalty is llama.cpp's, and the Android app's server applies that
+  // name as llama.cpp does, over the last 64 tokens (`repetition_penalty` over the whole reply);
+  // `serve` reads neither, which litertLmIgnoredFieldsNote says.
   const repeatPenaltyKey =
     (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
   const SAMPLING_KEYS: Record<string, string> = {
@@ -1750,6 +1753,10 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       // A temperature or top_p a LiteRT-LM model ignores (no sampler of its own: greedy without a top_k) is said.
       const samplingNote = localLitert ? litertLmSamplingNote(reqBody) : undefined
       if (samplingNote) await noteOnce(samplingNote)
+      // So is a setting the server does not apply (Min P; on `serve`, stop strings and penalties). The request's own
+      // sampling is the thread's (samplingOverride), so a Min P it sets is named as the thread's.
+      const ignoredNote = localLitert ? litertLmIgnoredFieldsNote(reqBody, { fromThread: true }) : undefined
+      if (ignoredNote) await noteOnce(ignoredNote)
       let roundTools = toolDefs
       if (localLitert && toolDefs.length > 0) {
         const pick = litertLmToolsFor(litertModel, toolDefs, iterMessages, upstream.ctxMax)

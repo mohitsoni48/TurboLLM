@@ -439,7 +439,8 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
   const loadedEntry = (modelsQ.data?.models ?? []).find((m) => m.key === loadedChatModel?.key)
   const loadedModelSupportsReasoningEffort = loadedEntry?.reasoningEffort ?? false
   // A .litertlm on this machine: the untouched thinking budget is shown as the model's own default (Auto), which is
-  // what it sends (nothing), since such a model may not think by default (ThinkingBudgetSlider).
+  // what it sends (nothing), since such a model may not think by default (ThinkingBudgetSlider); the thread settings
+  // leave out what LiteRT-LM cannot do (Min P).
   const loadedOnLitertLm = !activeRemoteId && loadedEntry?.format === 'litertlm'
   // Sent only with the control shown: a level stored for this chat under a model that had the control reached the
   // next one too, which LiteRT-LM reads as thinking on or off (gateway and chat-routes map it to reasoning_effort).
@@ -1478,7 +1479,7 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <SlidersHorizontal size={15} />
             </Button>
           )}
-          <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} />
+          <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} litertLm={loadedOnLitertLm} />
           {loadedModelSupportsReasoningEffort ? (
             <ReasoningEffortSelect value={reasoningEffort} onChange={setReasoningEffort} />
           ) : (

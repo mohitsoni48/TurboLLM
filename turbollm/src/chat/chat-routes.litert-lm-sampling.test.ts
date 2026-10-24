@@ -12,7 +12,7 @@ import { registerChatRoutes } from './chat-routes.js'
 import { ConversationStore } from './db.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
-import { rememberLitertLmModel, type LitertLmRequestInfo } from '../engines/litert-lm-request'
+import { litertLmRequestSampling, rememberLitertLmModel, type LitertLmRequestInfo } from '../engines/litert-lm-request'
 
 const MODEL = '/models/Qwen3-0.6B_dynamic.litertlm'
 
@@ -103,4 +103,25 @@ test('a temperature a LiteRT-LM model ignores is said in the chat; a chat that s
   const plain = await turn(h)
   assert.deepEqual(sampling(engine.sent[1]), {})
   assert.equal(plain.some((f) => f.event === 'notice'), false)
+})
+
+test('a thread\'s repeat penalty reaches a LiteRT-LM model as llama.cpp\'s repeat_penalty, and its Min P, which LiteRT-LM has not, is said as the thread\'s', async (t) => {
+  // The Repeat penalty is llama.cpp's, and the Android server applies repeat_penalty as llama.cpp does, over the last 64
+  // tokens (repetition_penalty over the whole reply). The thread settings show no Min P slider for LiteRT-LM: the note
+  // says whose it is and where to clear it.
+  const engine = textEngine(t)
+  const frames = await turn(routes(t, { sampling: {}, sampler: QWEN3_OWN, native: true }), { repeatPenalty: 1.2, minP: 0.05 })
+  assert.equal(engine.sent[0].repeat_penalty, 1.2)
+  assert.equal('repetition_penalty' in engine.sent[0], false)
+  assert.equal(String(frames.find((f) => f.event === 'notice')?.data.message),
+    'LiteRT-LM has no Min P: this reply was sampled without this thread\'s Min P. Clear that Min P in Thread settings.')
+})
+
+test('a Min P the user saved on a LiteRT-LM model is said in an untouched chat, not dropped', async (t) => {
+  // The model dialog no longer offers Min P for LiteRT-LM, but one saved before stays in the profile (the load carries
+  // it, litertLmRequestSampling): it reached nothing and nothing said so, while a thread's Min P was named.
+  const engine = textEngine(t)
+  const frames = await turn(routes(t, { sampling: litertLmRequestSampling({ minP: 0.2 }), sampler: QWEN3_OWN, native: false }))
+  assert.equal(engine.sent[0].min_p, 0.2)
+  assert.match(String(frames.find((f) => f.event === 'notice')?.data.message), /does not apply the Min P saved in this model's settings: this reply was written without it\..* Clear that Min P under Models → the model's Load settings and reload the model\.$/)
 })

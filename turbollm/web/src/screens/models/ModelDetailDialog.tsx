@@ -412,6 +412,14 @@ export function ModelDetailDialog({
     setDraft((d) => (d ? { ...d, sampling: { ...d.sampling, [k]: v } } : d))
     setUserSet((u) => withUserGroupValue(u, 'sampling', k, v))
   }
+  // A Min P the user saved, which a LiteRT-LM model cannot apply (its panel has no Min P slider): shown with a Clear.
+  const savedMinP = typeof userSet.sampling?.minP === 'number' ? userSet.sampling.minP : 0
+  const clearMinP = () => {
+    setUserSet((u) => {
+      const { minP: _dropped, ...sampling } = u.sampling ?? {}
+      return { ...u, sampling }
+    })
+  }
   const setG = <K extends keyof LoadProfile['gpu']>(k: K, v: LoadProfile['gpu'][K]) => {
     setDraft((d) => (d ? { ...d, gpu: { ...(d.gpu ?? defaultGpu()), [k]: v } } : d))
     setUserSet((u) => withUserGroupValue(u, 'gpu', k, v))
@@ -826,8 +834,22 @@ export function ModelDetailDialog({
             <Section>
               <Slider label="Temperature" value={draft.sampling.temp} min={0} max={2} step={0.05} onChange={(v) => setS('temp', v)} fmt={(v) => v.toFixed(2)} />
               <Slider label="Top P" value={draft.sampling.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} fmt={(v) => v.toFixed(2)} />
-              <Slider label="Top K" value={draft.sampling.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', v)} />
-              <Slider label="Min P" value={draft.sampling.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} fmt={(v) => v.toFixed(2)} />
+              <Slider label="Top K" hint={isLitertLm ? '0 = no top-k limit.' : undefined} value={draft.sampling.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', v)} />
+              {/* LiteRT-LM has no Min P sampling: the slider saved a value neither of its servers applies (the Android
+                  server names it as not applied). One saved before stays in the profile and is named in the chat as not
+                  applied until the model is reloaded without it (a load records what its requests carry); it is shown
+                  here, with a way to drop it, rather than hidden with the slider. */}
+              {isLitertLm
+                ? (savedMinP > 0
+                    ? (
+                      <p className="text-[12px] text-faint">
+                        {`LiteRT-LM has no Min P sampling: the Min P saved for this model (${savedMinP.toFixed(2)}) is not applied. `}
+                        <button type="button" className="underline hover:text-ink" onClick={clearMinP}>Clear it</button>
+                        {' and reload the model.'}
+                      </p>
+                    )
+                    : <p className="text-[12px] text-faint">LiteRT-LM has no Min P sampling.</p>)
+                : <Slider label="Min P" value={draft.sampling.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} fmt={(v) => v.toFixed(2)} />}
               {isLlamaCpp && (<>
               <Slider label="Repeat penalty" hint="Penalise tokens that appeared earlier. 1.0 = off." value={draft.sampling.repeatPenalty} min={1} max={2} step={0.05} onChange={(v) => setS('repeatPenalty', v)} fmt={(v) => v.toFixed(2)} />
               <Slider label="Presence penalty" hint="Flat penalty for any token that appeared. 0 = off." value={draft.sampling.presencePenalty} min={0} max={2} step={0.05} onChange={(v) => setS('presencePenalty', v)} fmt={(v) => v.toFixed(2)} />

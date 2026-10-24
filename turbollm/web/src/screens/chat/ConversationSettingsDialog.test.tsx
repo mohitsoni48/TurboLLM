@@ -83,3 +83,52 @@ describe('ConversationSettingsDialog — unsaved edits', () => {
     expect(updateConversation).toHaveBeenLastCalledWith('c1', expect.objectContaining({ systemPrompt: 'Be brief.', preserveThinking: false }))
   })
 })
+
+describe('ConversationSettingsDialog — a LiteRT-LM model', () => {
+  const qc = new QueryClient()
+
+  it('leaves out Min P, which LiteRT-LM has not, and labels Top K 0 as no limit; other models keep it', async () => {
+    // The slider sent a min_p no LiteRT-LM applies.
+    const { unmount } = render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={conv} litertLm modelSampling={{ temp: 0.6, topP: 0.95, topK: 0, minP: 0.05 }} /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    await screen.findByText('Top K')
+    expect(screen.queryByText('Min P')).toBeNull()
+    expect(screen.getByText('off')).toBeTruthy()
+    expect(screen.getByText(/LiteRT-LM has no Min P\. Top K 0 is no top-k limit\./)).toBeTruthy()
+    unmount()
+    render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={conv} /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    expect(await screen.findByText('Min P')).toBeTruthy()
+    expect(screen.queryByText(/LiteRT-LM has no Min P/)).toBeNull()
+  })
+
+  it('shows a Min P the thread already has as not applied, and Clear drops only it', async () => {
+    // Set under another engine, it was hidden with the slider: still sent, and only Reset, which drops every sampling
+    // override, could remove it.
+    vi.mocked(updateConversation).mockClear()
+    const withMinP = { ...conv, sampling: { min_p: 0.1, temperature: 0.9 } } as unknown as Conversation
+    render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={withMinP} litertLm /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    await screen.findByText('Top K')
+    expect(screen.getByText(/LiteRT-LM has no Min P: this thread's Min P \(0\.10\) is not applied\./)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Clear it' }))
+    expect(screen.getByText(/LiteRT-LM has no Min P\. Top K 0 is no top-k limit\./)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(updateConversation).toHaveBeenCalledTimes(1))
+    expect(updateConversation).toHaveBeenLastCalledWith('c1', expect.objectContaining({ sampling: { temperature: 0.9 } }))
+  })
+
+  it("counts a thread's camelCase minP, which an API client may store, and Clear drops it too", async () => {
+    // The chat sends a thread's minP as min_p and names it in its note, which points here.
+    vi.mocked(updateConversation).mockClear()
+    const withMinP = { ...conv, sampling: { minP: 0.05, temperature: 0.9 } } as unknown as Conversation
+    render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={withMinP} litertLm /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    await screen.findByText('Top K')
+    expect(screen.getByText(/LiteRT-LM has no Min P: this thread's Min P \(0\.05\) is not applied\./)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Clear it' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(updateConversation).toHaveBeenCalledTimes(1))
+    expect(updateConversation).toHaveBeenLastCalledWith('c1', expect.objectContaining({ sampling: { temperature: 0.9 } }))
+  })
+})
