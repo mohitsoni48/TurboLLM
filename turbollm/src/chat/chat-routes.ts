@@ -30,14 +30,14 @@ import { buildBenchResultConfig } from '../telemetry/events/perf'
 import { shouldEmitBenchResult, benchRateLimitKey, MIN_GEN_TOKENS_FOR_BENCH } from '../telemetry/runtime/bench-rate-limit'
 import { resolveProfile, type LoadProfile } from '../models/profile'
 import type { ModelInfo } from '../engines/manager'
-import { litertLmPrefillStats, litertLmTurnErrorMessage } from '../engines/litert-lm'
+import { litertLmPrefillStats } from '../engines/litert-lm'
+import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
 import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
 import { callChatUpstream, resolveChatUpstream, type ChatUpstream } from './chat-upstream'
 import { servingEngine, servingEngineKind } from '../engines/serving'
-import { redactLocalPaths } from '../util/redact-paths'
 import { nonStringField } from '../util/string-fields'
 
 /** The per-request code-routine trust decision. Exported ONLY so it can be behaviourally
@@ -1396,23 +1396,8 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
  *  earlier rounds saved) by the same catch. */
 export class EngineStreamError extends Error {}
 
-/** The error message an SSE chunk carries, if it is an error chunk: `{"error": "…"}` or `{"error": {"message": "…"}}`. */
-export function streamChunkError(chunk: Record<string, unknown>): string | null {
-  const err = chunk.error
-  if (typeof err === 'string' && err.trim()) return err.trim()
-  if (err && typeof err === 'object') {
-    const msg = (err as { message?: unknown }).message
-    if (typeof msg === 'string' && msg.trim()) return msg.trim()
-    return JSON.stringify(err)
-  }
-  return null
-}
-
-/** An engine's error text as the chat shows it: the LiteRT-LM context hint where it applies, and local paths
- *  redacted (redactLocalPaths), since it reaches every client of the conversation, a Turbo Link peer's included. */
-export function engineErrorText(d: Pick<Deps, 'manager' | 'store'>, engineKind: string, raw: string): string {
-  return redactLocalPaths(d, engineKind === 'litert-lm' ? litertLmTurnErrorMessage(raw) : raw)
-}
+// The engine's error, read and shown as every path shows it (engines/engine-error.ts).
+export { streamChunkError, engineErrorText } from '../engines/engine-error'
 
 /** The whole generation turn: engine call(s), tool loop, and the ONE write-back that persists
  *  the reply. Exported ONLY so tests can drive it with a sink of their own — the persistence
@@ -1784,19 +1769,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       const res = await callChatUpstream(upstream, reqBody, ac.signal, undefined, d)
 
       if (!res.ok || !res.body) {
-        // The engine's own reason, when its error body has one, says far more than the status code.
-        let reason = ''
-        try {
-          const text = await res.text()
-          let parsed: Record<string, unknown> | null = null
-          try { parsed = JSON.parse(text) as Record<string, unknown> } catch { /* not JSON */ }
-          // `{"error": …}` (OpenAI, llama.cpp, LiteRT-LM), else `{"message": …}` (vLLM) / `{"detail": …}` (FastAPI),
-          // else the raw text.
-          const msg = parsed && typeof parsed === 'object'
-            ? streamChunkError(parsed) ?? (typeof parsed.message === 'string' ? parsed.message : typeof parsed.detail === 'string' ? parsed.detail : null)
-            : null
-          reason = (msg ?? text).trim().slice(0, 500)
-        } catch { /* no body */ }
+        // The engine's own reason, from its body or (LiteRT-LM) its status line, says far more than the status code.
+        let reason = await engineErrorReason(res)
         if (reason) reason = engineErrorText(d, engineKind, reason)
         // Thrown, not returned: the catch below sends it as engine_error, puts back a Regenerate's
         // or a Save & Resend's old turn when this one produced nothing (restoreReplaced), and

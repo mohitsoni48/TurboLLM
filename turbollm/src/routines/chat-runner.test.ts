@@ -20,7 +20,7 @@ function fakeDeps(overrides: Partial<{ customAgents: typeof AGENT[]; tools: Tool
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const d = {
     db,
-    store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: overrides.customAgents ?? [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), dir: () => '/data/turbollm' },
     manager: {
       status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: '', ctx: overrides.ctx ?? 8192, vision: false } }),
       target: () => 'http://engine.invalid.local:1',
@@ -153,6 +153,21 @@ test('runChatRoutine still sends tools on llama-server for the same agent', asyn
     await runChatRoutine(d, r, run, new AbortController().signal)
     assert.ok(Array.isArray(fetchStub.calls[0].tools) && fetchStub.calls[0].tools.length > 0, 'run_code must be offered on llama-server')
   } finally { fetchStub.restore() }
+})
+
+// A refused turn said only "Engine returned 400." in the run's record; LiteRT-LM's servers give their reason in the
+// status line (the Android app's with a JSON body too, `litert-lm serve` with an HTML page), here alone.
+test('a run the engine refuses records the engine\'s reason', async () => {
+  const { d, db } = fakeDeps({ engineKind: 'litert-lm' })
+  const r = routine(db)
+  const run = db.createRoutineRun({ routineId: r.id, configSnapshot: JSON.stringify(r) })
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response(null, { status: 400, statusText: 'Invalid sampler parameters: ValueError: top_p must be between 0 and 1, got 1.5' })) as typeof fetch
+  try {
+    const outcome = await runChatRoutine(d, r, run, new AbortController().signal)
+    assert.equal(outcome.status, 'errored')
+    assert.equal((outcome as { error?: string }).error, 'Engine returned 400: Invalid sampler parameters: ValueError: top_p must be between 0 and 1, got 1.5')
+  } finally { globalThis.fetch = original }
 })
 
 test('a final answer with no tool calls records status ok', async () => {

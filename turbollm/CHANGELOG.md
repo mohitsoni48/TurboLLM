@@ -91,6 +91,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   a close of the app while any of them is on.
 
 ### Fixed
+- **A refused request says why, on LiteRT-LM too and in extension runs and routines.** `litert-lm serve` gives the
+  reason in the HTTP status line ("400 Missing model"), with an HTML error page for a body, which the chat showed
+  instead of the reason. Extension runs and routines reported only the status code for every engine. All three now
+  give the engine's own reason.
 - **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
   a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
   and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set

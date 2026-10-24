@@ -24,6 +24,7 @@ import type { Conversation, Message } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { engineModelAlias, shapeForEngine } from '../engines/compat'
 import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
+import { engineErrorReason, engineErrorText } from '../engines/engine-error'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval'
 import { ToolLoopTracker, LOOP_BREAK_AFTER, LOOP_ABORT_AFTER } from './runaway-guard'
 import { stallRoutineRun, type PendingRoutineToolCall } from './approval'
@@ -235,7 +236,11 @@ async function runChatRoundLoop(d: Deps, run: RoutineRun, agent: CustomChatAgent
     let message: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } | undefined
     try {
       const res = await fetch(`${target}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(reqBody), signal })
-      if (!res.ok) return { status: 'errored', error: `Engine returned ${res.status}.` }
+      if (!res.ok) {
+        // The engine's reason, as the chat gives it: the run recorded only the status code.
+        const reason = await engineErrorReason(res)
+        return { status: 'errored', error: reason ? `Engine returned ${res.status}: ${engineErrorText(d, engineKind, reason)}` : `Engine returned ${res.status}.` }
+      }
       const data = await res.json() as { choices?: Array<{ message?: { content?: string | null; tool_calls?: Array<{ id: string; function: { name: string; arguments: string } }> } }> }
       message = data.choices?.[0]?.message
     } catch (e) {

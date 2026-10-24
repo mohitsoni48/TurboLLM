@@ -55,6 +55,7 @@ import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
 import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
 import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
+import { engineErrorReason, engineErrorText } from '../engines/engine-error.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -328,7 +329,9 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
       return
     }
     if (!res.ok || !res.body) {
-      hooks.onError(`Engine returned ${res.status}`)
+      // The engine's reason, as the chat gives it: it said only the status code.
+      const reason = res.ok ? '' : await engineErrorReason(res)
+      hooks.onError(reason ? `Engine returned ${res.status}: ${engineErrorText(d, engineKind, reason)}` : `Engine returned ${res.status}`)
       return
     }
 
