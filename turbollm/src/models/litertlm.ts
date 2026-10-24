@@ -1,7 +1,8 @@
 // LiteRT-LM models in the library. A `.litertlm` file is one self-contained bundle (weights, tokenizer, and for
 // multimodal models the vision/audio encoders) that Google's LiteRT-LM runtime loads directly, so the library holds it
-// the way it holds a GGUF: one file, one entry, deleted as a file. Unlike a GGUF it carries no header TurboLLM can read
-// cheaply (the metadata is a FlatBuffer), so the entry is built from the file name and the 8-byte magic.
+// the way it holds a GGUF: one file, one entry, deleted as a file. Its metadata is a FlatBuffer header listing its
+// sections, which litertlmHeaderFromFile walks for what the entry needs (context, modalities); the rest comes from the
+// file name and the 8-byte magic.
 import { open } from 'node:fs/promises'
 import { basename } from 'node:path'
 import type { ModelEntry } from './scanner'
@@ -69,8 +70,15 @@ export function litertlmNativeCtxFromName(fileName: string): number {
 // above still capping it. TurboLLM used to pass 8192 (min(Model Defaults, the limit)) on every load instead, doubling
 // Qwen3's KV cache and reporting 8192 for bundles it could not size while the runtime clamped to their real limit.
 
+const SECTION_TFLITE_MODEL = 3
 const SECTION_LLM_METADATA = 5
 const SECTION_EXECUTOR_METADATA = 9
+
+// The model types whose sections make a bundle multimodal: the encoders upstream's `serve` gives a vision or audio
+// backend for (serve/util.py, model.parse_backend with target_model_types VISION_ENCODER / AUDIO_ENCODER_HW). A bundle
+// declares its modalities only in this header, so they are read here: every .litertlm used to be marked text-only.
+const VISION_ENCODER = 'tf_lite_vision_encoder'
+const AUDIO_ENCODER = 'tf_lite_audio_encoder_hw'
 const MAX_HEADER = 1 << 20
 const MAX_PROTO = 1 << 20
 
@@ -109,6 +117,29 @@ class FbTable {
     const o = this.field(i)
     return o ? this.b.readUInt8(this.pos + o) : 0
   }
+  string(i: number): string | null {
+    const o = this.field(i)
+    if (!o) return null
+    let p = this.pos + o
+    p += this.b.readUInt32LE(p)
+    const n = this.b.readUInt32LE(p)
+    return this.b.toString('utf8', p + 4, p + 4 + n)
+  }
+}
+
+/** VData.StringValue, the union type of a KeyValuePair whose value is a string (litertlm_header_schema.fbs). */
+const VDATA_STRING = 9
+
+/** A section's string items (KeyValuePair key → StringValue): a TFLiteModel's `model_type`, `backend_constraint`. */
+function sectionStrings(section: FbTable): Map<string, string> {
+  const out = new Map<string, string>()
+  for (const kv of section.tables(0)) {
+    const key = kv.string(0)
+    if (key === null || kv.u8(1) !== VDATA_STRING) continue
+    const value = kv.table(2)?.string(0)
+    if (value != null) out.set(key, value)
+  }
+  return out
 }
 
 type ProtoField = { field: number; varint?: number; bytes?: Buffer }
@@ -190,9 +221,13 @@ export interface LitertlmHeader {
   ctxDynamic: boolean
   /** LlmMetadata.max_num_tokens: the context the runtime uses when given none; 0 when the bundle declares none. */
   defaultCtx: number
+  /** It carries a vision encoder (a TFLiteModel section of model_type tf_lite_vision_encoder). */
+  vision: boolean
+  /** It carries an audio encoder (tf_lite_audio_encoder_hw). */
+  audio: boolean
 }
 
-const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0 }
+const NO_HEADER: LitertlmHeader = { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false }
 
 /** Reads only the header and the small LlmMetadata and ExecutorMetadata sections, never the weights. A header this
  *  reader does not understand gives NO_HEADER: it costs only the slider's precision and the model's own defaults. */
@@ -215,6 +250,12 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
     const out: LitertlmHeader = { ...NO_HEADER }
     for (const s of sections) {
       const type = s.u8(3)
+      if (type === SECTION_TFLITE_MODEL) {
+        const modelType = sectionStrings(s).get('model_type')?.toLowerCase()
+        if (modelType === VISION_ENCODER) out.vision = true
+        if (modelType === AUDIO_ENCODER) out.audio = true
+        continue
+      }
       if (type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) continue
       const begin = s.u64(1)
       const end = s.u64(2)
@@ -251,8 +292,8 @@ function cleanName(fileName: string): string {
 }
 
 /** The library entry for a `.litertlm` file. Its format is 'litertlm' (a single file, deleted as a file); compat.ts
- *  gives it to the LiteRT-LM engine and to no other. Vision/audio stay false: the bundle declares them only in the
- *  FlatBuffer header, and claiming a capability the file may lack would put an image button on a text-only model. */
+ *  gives it to the LiteRT-LM engine and to no other. Vision and audio are what its header declares (its encoder
+ *  sections, litertlmHeaderFromFile), false when it was not read. */
 export function litertlmEntryFor(
   path: string, dir: string, sizeBytes: number, mtimeMs: number, header: number | Partial<LitertlmHeader> = 0,
 ): ModelEntry {
@@ -281,8 +322,8 @@ export function litertlmEntryFor(
     moe: false,
     expertCount: 0,
     nextnLayers: 0,
-    vision: false,
-    audio: false,
+    vision: h.vision === true,
+    audio: h.audio === true,
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate: true, // the bundle embeds its own template; the runtime applies it

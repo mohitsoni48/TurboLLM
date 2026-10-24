@@ -119,7 +119,8 @@ function buildLitertLmStartOpts({ entry, engine, cfg, sys, overrides, trigger }:
   const ctx = gpuCut ? LITERT_RUNTIME_DEFAULT_CTX : profile.ctx
   return {
     engine,
-    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: false },
+    // The bundle's own modalities (its header): a vision bundle is a vision model, which it was not before.
+    model: { key: entry.key, name: entry.name, quant: entry.quant, ctx, vision: entry.vision },
     modelPath: entry.path,
     extraArgs: profile.extraArgs,
     // Auto threads are pinned only where the CPU is big.LITTLE (perfCores); elsewhere the runtime keeps choosing.

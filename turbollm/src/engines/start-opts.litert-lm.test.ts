@@ -139,3 +139,8 @@ test('on a GPU the user chose, a default above 4096 is reported as the runtime o
   const mac = buildStartOpts({ entry: big, engine: engine(), cfg: defaultConfig(), sys: { ...CPU_ONLY, os: 'darwin/arm64' }, overrides: { litertLm: { backend: 'gpu' } }, trigger: 'manual' })
   assert.equal(mac.model.ctx, 8192)
 })
+
+test('a vision bundle loads as a vision model', () => {
+  const vl = litertlmEntryFor('/models/LFM2.5-VL-450M_int8.litertlm', '/models', 5e8, 0, { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: true, audio: false })
+  assert.equal(buildStartOpts({ entry: vl, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).model.vision, true)
+})

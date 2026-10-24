@@ -247,6 +247,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   own (`LlmMetadata.max_num_tokens`, 4096 when it declares none), which TurboLLM reads from the header and reports. A
   bundle whose KV length is a prime above 10 is a dynamic export (the runtime's magic number): it takes up to one token
   less, the panel says so, and it is no longer read as its exact size (Qwen3-0.6B_dynamic: up to 32,770).
+- **A `.litertlm` with a vision or audio encoder is a vision or audio model.** Every bundle was marked text-only; its
+  header's encoder sections now set it (LFM2.5-VL, Gemma 3n/4), so it gets the Vision facet and loads as a vision
+  model. Images reach it on desktop and Termux (`litert-lm serve` enables the encoders itself).
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

@@ -13,7 +13,7 @@ import {
   litertlmQuantFromName,
 } from './litertlm'
 import { tmpDir } from '../test-support/tmp'
-import { fakeLitertlmBundle as fakeBundle } from '../test-support/litertlm-bundle'
+import { fakeLitertlmBundle as fakeBundle, fakeLitertlmBundleOf } from '../test-support/litertlm-bundle'
 
 function scratch(t: TestContext): string {
   const dir = tmpDir('turbollm-litertlm-')
@@ -132,7 +132,7 @@ test('litertlmHeaderFromFile: LlmMetadata.max_num_tokens is the bundle\'s own de
   const dir = tmpDir('tllm-litertlm-hdr-')
   const p = join(dir, 'LFM2.5-230M_int8.litertlm')
   writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
-  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096 })
+  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false })
 })
 
 test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 10) is a dynamic export, taking one less', async () => {
@@ -141,10 +141,10 @@ test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 
   const dir = tmpDir('tllm-litertlm-hdr-')
   const qwen = join(dir, 'Qwen3-0.6B_dynamic.litertlm')
   writeFileSync(qwen, fakeBundle(4096, [[1, 32771], [2, 32771]]))
-  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096 })
+  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false })
   const vl = join(dir, 'LFM2.5-VL-450M_int8.litertlm')
   writeFileSync(vl, fakeBundle(4096, [[5, 0], [1, 4099], [2, 4099]]))
-  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096 })
+  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false })
   assert.equal(isLitertMagicNumber(4096), false)
   assert.equal(isLitertMagicNumber(7), false, 'primes up to 10 are sizes')
   assert.equal(isLitertMagicNumber(4097), false, '17 * 241')
@@ -158,4 +158,25 @@ test('litertlmEntryFor: carries the dynamic flag and the bundle\'s own default c
   const plain = litertlmEntryFor('/m/x_ekv8192.litertlm', '/m', 10, 0)
   assert.equal(plain.ctxDynamic, undefined)
   assert.equal(plain.defaultCtx, undefined)
+})
+
+test('litertlmHeaderFromFile: vision and audio are the encoder sections the bundle carries', async () => {
+  const dir = tmpDir('tllm-litertlm-hdr-')
+  const p = join(dir, 'vl.litertlm')
+  writeFileSync(p, fakeLitertlmBundleOf([
+    { type: 3, items: { model_type: 'tf_lite_prefill_decode', backend_constraint: 'cpu' } },
+    { type: 3, items: { model_type: 'TF_LITE_VISION_ENCODER' } },
+    { type: 5, data: Buffer.from([0x28, 0x80, 0x20]) }, // LlmMetadata: max_num_tokens 4096
+  ]))
+  const h = await litertlmHeaderFromFile(p)
+  assert.equal(h.vision, true)
+  assert.equal(h.audio, false)
+  assert.equal(h.defaultCtx, 4096)
+  const e = litertlmEntryFor(p, dir, 10, 0, h)
+  assert.equal(e.vision, true)
+  assert.equal(e.audio, false)
+  // A string item that is not model_type, or a section that is not a TFLiteModel, says nothing about modalities.
+  const q = join(dir, 'other.litertlm')
+  writeFileSync(q, fakeLitertlmBundleOf([{ type: 3, items: { note: 'tf_lite_vision_encoder' } }, { type: 1, items: { model_type: 'tf_lite_audio_encoder_hw' } }]))
+  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false })
 })
