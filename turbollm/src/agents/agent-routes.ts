@@ -108,11 +108,15 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
         // Fallback: no SKILL.md found — distill reusable skills from the folder's text files.
         if (taskId) d.agentTasks?.step(taskId, 'No skill files found — distilling from the folder…')
         const { distillSkillsFromFolder } = await import('./distiller')
+        // Files the model could not be asked about (no model loaded, the engine refused the request), and why: said,
+        // not reported as a folder with no skills in it.
+        const failed: Array<{ file: string; error: string }> = []
         const distilled = await distillSkillsFromFolder(d, folder, {
           max: Math.max(0, SKILL_CAP - store.userSkills().length),
           onProgress: (done, total, file) => {
             if (taskId) d.agentTasks?.step(taskId, `Distilling ${done + 1}/${total}: ${file}`)
           },
+          onError: (file, error) => failed.push({ file, error }),
         })
         const added: string[] = []
         for (const s of distilled) {
@@ -124,12 +128,18 @@ export function registerAgentRoutes(app: Hono, d: Deps): void {
           added.push(skillId)
         }
         if (taskId) {
-          d.agentTasks?.done(
-            taskId,
-            added.length > 0
-              ? `Saved ${added.length} skill${added.length === 1 ? '' : 's'}: ${added.join(', ')}`
-              : 'No skills found in that folder.',
-          )
+          const notRead = failed.length > 0
+            ? `${failed.length} file${failed.length === 1 ? '' : 's'} could not be read by the model (${failed[0].file}: ${failed[0].error})`
+            : ''
+          if (added.length === 0 && notRead) d.agentTasks?.fail(taskId, `Could not learn skills from the folder: ${notRead}`)
+          else {
+            d.agentTasks?.done(
+              taskId,
+              (added.length > 0
+                ? `Saved ${added.length} skill${added.length === 1 ? '' : 's'}: ${added.join(', ')}`
+                : 'No skills found in that folder.') + (notRead ? ` ${notRead}.` : ''),
+            )
+          }
         }
       } catch (e) {
         if (taskId) d.agentTasks?.fail(taskId, e instanceof Error ? e.message : 'learn failed')

@@ -95,6 +95,12 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   reason in the HTTP status line ("400 Missing model"), with an HTML error page for a body, which the chat showed
   instead of the reason. Extension runs and routines reported only the status code for every engine. All three now
   give the engine's own reason.
+- **Writing a skill says why it could not, and LiteRT-LM models write theirs their own way.** "Save as skill", the
+  in-chat `save_skill` and learning from a folder reported "No clear reusable skill found" / "No skills found in that
+  folder" when no model was loaded or the engine refused the request (on `litert-lm serve` every request to
+  LFM2.5-230M or gemma-3-270m-it is refused); the task now fails with the reason. A LiteRT-LM model is no longer sent
+  `response_format: json_object`, a JSON grammar from the first token that made LFM2.5 answer `{"name":", "}` instead
+  of the skill: it writes its JSON its own way, as the prompt asks. Other engines still get it.
 - **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
   a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
   and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set

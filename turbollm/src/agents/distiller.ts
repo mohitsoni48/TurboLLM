@@ -3,12 +3,14 @@
 // Turns experience into a reusable skill: a name + description + procedure. Two sources —
 // a successful conversation, or a folder of example files. Uses the Phase-0-validated
 // gateway recipe (disable thinking + json_object + fence-strip + exact model alias) so the
-// JSON is reliable on small local models. Best-effort: returns null on any failure.
+// JSON is reliable on small local models (json_object not on LiteRT-LM: json-completion.ts).
+// Best-effort: null when nothing came out, with the reason when the model could not be asked.
 import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Deps } from '../deps'
-import { engineModelAlias, shapeForEngine } from '../engines/compat'
+import { engineModelAlias } from '../engines/compat'
 import { servingEngineKind } from '../engines/serving'
+import { jsonCompletion } from './json-completion'
 
 const DISTILL_SYSTEM = `You write a single reusable SKILL from the material provided. A skill captures a repeatable approach so it can be applied to similar future tasks.
 
@@ -26,35 +28,32 @@ export interface DistilledSkill {
   name: string | null
   description: string | null
   procedure: string | null
+  /** Why there is no skill when the model could not be asked (no model loaded, the engine's reason for refusing the
+   *  request): not "nothing reusable found". */
+  error?: string
 }
 
 async function distill(d: Deps, material: string): Promise<DistilledSkill> {
   const ms = d.manager.status()
   const target = d.manager.target()
-  if (ms.state !== 'running' || !ms.model || !target) return { name: null, description: null, procedure: null }
+  if (ms.state !== 'running' || !ms.model || !target) return { name: null, description: null, procedure: null, error: 'No model loaded.' }
   const model = engineModelAlias(servingEngineKind(d), d.manager.currentOpts()?.modelPath) ?? ms.model.key
   try {
-    const res = await fetch(`${target}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(shapeForEngine(servingEngineKind(d), {
-        model,
-        messages: [
-          { role: 'system', content: DISTILL_SYSTEM },
-          { role: 'user', content: `Material:\n\n${material.slice(0, 24_000)}\n\nWrite ONE reusable skill as raw JSON — no markdown fences.` },
-        ],
-        temperature: 0.3,
-        max_tokens: 800,
-        thinking_budget_tokens: 0,
-        chat_template_kwargs: { enable_thinking: false },
-        response_format: { type: 'json_object' },
-        stream: false,
-      })),
-      signal: AbortSignal.timeout(90_000),
-    })
-    if (!res.ok) return { name: null, description: null, procedure: null }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
-    let txt = data.choices?.[0]?.message?.content ?? ''
+    const answer = await jsonCompletion(d, target, {
+      model,
+      messages: [
+        { role: 'system', content: DISTILL_SYSTEM },
+        { role: 'user', content: `Material:\n\n${material.slice(0, 24_000)}\n\nWrite ONE reusable skill as raw JSON — no markdown fences.` },
+      ],
+      temperature: 0.3,
+      max_tokens: 800,
+      thinking_budget_tokens: 0,
+      chat_template_kwargs: { enable_thinking: false },
+      response_format: { type: 'json_object' },
+      stream: false,
+    }, 90_000)
+    if ('error' in answer) return { name: null, description: null, procedure: null, error: answer.error }
+    let txt = answer.content
     txt = txt.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```json|```/gi, '').trim()
     const m = txt.match(/\{[\s\S]*\}/)
     if (!m) return { name: null, description: null, procedure: null }
@@ -104,12 +103,18 @@ function collectFolderFiles(folder: string, max: number): { name: string; conten
  * Learn skills from a folder — ONE skill per file (the "point it at a folder" feature).
  * A skills library is typically one file per skill, so we distill each file independently
  * and return every skill that came out clean. Best-effort: files that don't yield a
- * reusable skill are simply skipped. `onProgress` drives the live bg-task step log.
+ * reusable skill are simply skipped. `onProgress` drives the live bg-task step log; `onError`
+ * gets a file the model could not be asked about, and why (the caller says so, rather than that
+ * the folder held no skill).
  */
 export async function distillSkillsFromFolder(
   d: Deps,
   folder: string,
-  opts: { max?: number; onProgress?: (done: number, total: number, file: string) => void } = {},
+  opts: {
+    max?: number
+    onProgress?: (done: number, total: number, file: string) => void
+    onError?: (file: string, error: string) => void
+  } = {},
 ): Promise<DistilledSkill[]> {
   if (!existsSync(folder) || !statSync(folder).isDirectory()) return []
   const max = opts.max ?? 12
@@ -121,6 +126,7 @@ export async function distillSkillsFromFolder(
     const f = files[i]
     opts.onProgress?.(i, files.length, f.name)
     const s = await distill(d, `A reusable approach captured in "${f.name}":\n\n${f.content}`)
+    if (s.error) opts.onError?.(f.name, s.error)
     if (s.name && s.procedure && !seen.has(s.name)) {
       seen.add(s.name)
       out.push(s)

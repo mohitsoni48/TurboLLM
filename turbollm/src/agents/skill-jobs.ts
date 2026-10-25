@@ -31,6 +31,11 @@ export function saveSkillFromConversation(d: Deps, convId: string): string | nul
     try {
       if (taskId) d.agentTasks?.step(taskId, 'Reading the conversation and drafting a skill…')
       const s = await distillFromConversation(d, transcript)
+      // The model could not be asked: say why, rather than that the conversation held no skill.
+      if (s.error) {
+        if (taskId) d.agentTasks?.fail(taskId, `Could not write a skill: ${s.error}`)
+        return
+      }
       if (!s.name || !s.procedure) {
         if (taskId) d.agentTasks?.done(taskId, 'No clear reusable skill found in this conversation.')
         return
