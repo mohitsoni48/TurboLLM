@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import {
   shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor,
   litertLmRequestSampling, litertLmSamplingNote, rememberLitertLmModel, shapeLitertLmRequest, litertLmIgnoredFieldsNote,
-  shapeLitertLmToolChoice, litertLmForcedToolChoiceError,
+  shapeLitertLmToolChoice, litertLmForcedToolChoiceError, litertLmUnappliedParameters,
 } from './litert-lm-request'
 import { webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL } from '../tools/builtin'
 import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL } from '../routines/routine-tools'
@@ -269,4 +269,19 @@ test('a forced tool call is refused on `serve`, in the Android server\'s words; 
     shapeLitertLmToolChoice(b)
     assert.equal(b.tool_choice, type)
   }
+})
+
+test('litertLmUnappliedParameters: what `serve` reads none of, by request name; for the Android server, min_p only in a reply of the gateway\'s own', () => {
+  rememberLitertLmModel('/m/serve.litertlm', { sampling: {}, native: false })
+  rememberLitertLmModel('/m/app.litertlm', { sampling: {}, native: true })
+  const all = { min_p: 0.05, stop: '###', repetition_penalty: 1.1, repeat_penalty: 1.1, presence_penalty: 0.4, frequency_penalty: -0.2 }
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/serve.litertlm', ...all }),
+    ['min_p', 'stop', 'repetition_penalty', 'repeat_penalty', 'presence_penalty', 'frequency_penalty'])
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/serve.litertlm', min_p: 0, stop: [], repetition_penalty: 1, presence_penalty: 0 }), [])
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/app.litertlm', ...all }), [], 'its own header names min_p')
+  // /v1/messages writes its own reply, which that header never reaches: min_p, the one field it does not apply.
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/app.litertlm', ...all }, { ownReply: true }), ['min_p'])
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/app.litertlm', min_p: 0, stop: '###' }, { ownReply: true }), [])
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/unknown.litertlm', ...all }), [])
+  assert.deepEqual(litertLmUnappliedParameters({ model: '/m/unknown.litertlm', ...all }, { ownReply: true }), [])
 })

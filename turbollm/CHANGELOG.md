@@ -306,6 +306,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   (`Invalid tool_choice: this server cannot make the model call a tool ...`); "auto" and "none" are as before. An
   Anthropic client's `tool_choice: {"type": "none"}` is now "none" on every engine: it was sent as a forced call of a
   function with no name.
+- **LiteRT-LM on `litert-lm serve`: the gateway names what it does not apply.** `serve` reads no `min_p`, `stop`
+  (`stop_sequences`) or repetition, presence and frequency penalties, so an API client's own went nowhere and nothing
+  said so. The response now names them in an `X-Unapplied-Parameters` header (the one the Android app's engine names
+  `min_p` in; it applies stop strings and penalties itself), and the daemon log says so once per model and set of
+  fields. On `/v1/messages`, whose reply is the gateway's own, a `min_p` is named for the Android app's engine too.
 - **A LiteRT-LM model's past reasoning goes where its template reads it.** With "Preserve thinking across turns" on
   (a new chat's default), each earlier answer's reasoning was resent folded into its text as `<think>…</think>`, the
   markup Qwen's and DeepSeek's templates parse back out, and most LiteRT-LM bundle templates put in verbatim

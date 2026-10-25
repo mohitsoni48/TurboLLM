@@ -8,7 +8,7 @@ import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
-import { litertLmForcedToolChoiceError, shapeLitertLmRequest } from '../engines/litert-lm-request'
+import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
@@ -396,6 +396,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       // A forced tool call (tool_choice any or a named tool) LiteRT-LM cannot make: refused as its Android server does.
       const forced = localKind === 'litert-lm' ? litertLmForcedToolChoiceError(oaiBody as Record<string, unknown>) : undefined
       if (forced) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: forced } }, 400)
+      // What `serve` does not apply is named, in the Anthropic spelling for stop strings; and a Min P on the Android
+      // app's server too, whose own X-Unapplied-Parameters names it in a reply this route never relays (ownReply).
+      const unapplied = localKind === 'litert-lm'
+        ? unappliedNote(litertLmUnappliedParameters(oaiBody as Record<string, unknown>, { ownReply: true }).map((f) => (f === 'stop' ? 'stop_sequences' : f)), oaiBody.model)
+        : undefined
+      if (unapplied) c.header('X-Unapplied-Parameters', unapplied)
     }
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
@@ -866,6 +872,24 @@ function connectionNamed(headers: Headers): string[] {
   return (headers.get('connection') ?? '').split(',').map((t) => t.trim().toLowerCase()).filter((t) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(t))
 }
 
+/** The models and sets of unapplied request fields logged (unappliedNote), so each is logged once. */
+const unappliedLogged = new Set<string>()
+
+/** The X-Unapplied-Parameters value for request fields a LiteRT-LM model's server does not apply (`litert-lm serve`:
+ *  min_p, stop and the penalties; litertLmUnappliedParameters), logged once per model and set of fields: an API
+ *  client's own went nowhere, and nothing said so. The Android app's server sends the same header for min_p, which
+ *  /v1/messages, writing its own reply, names itself. Undefined when none. */
+function unappliedNote(fields: string[], model: unknown): string | undefined {
+  if (fields.length === 0) return undefined
+  const value = fields.join(', ')
+  const key = `${String(model)}|${value}`
+  if (!unappliedLogged.has(key)) {
+    unappliedLogged.add(key)
+    console.log(`[gateway] LiteRT-LM does not apply ${value} to ${String(model)} (X-Unapplied-Parameters)`)
+  }
+  return value
+}
+
 /** An engine response's headers as relayed to the client: without its hop-by-hop headers. llama-server's
  *  `Connection: close` and `Keep-Alive` described its socket to us, and relayed they closed the client's own
  *  keep-alive connection to the gateway. */
@@ -1126,6 +1150,8 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
   const init: RequestInit & { duplex?: 'half' } = { method: c.req.method, headers, signal: ac.signal }
   /** Set when the gateway itself added `stream_options.include_usage` (below), not the caller. */
   let injectedUsage = false
+  /** Request fields the LiteRT-LM server does not apply, for the response's X-Unapplied-Parameters (unappliedNote). */
+  let unapplied: string | undefined
 
   if (c.req.method !== 'GET' && c.req.method !== 'HEAD') {
     if (isChat) {
@@ -1291,6 +1317,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       if (forced) {
         return c.json({ error: { message: forced, type: 'invalid_request_error', param: 'tool_choice', code: 'unsupported_value' } }, 400)
       }
+      if (parsedBody && litertLocal) unapplied = unappliedNote(litertLmUnappliedParameters(parsedBody), parsedBody.model)
       headers.delete('content-length') // re-serialised body has a new length
       headers.set('content-type', 'application/json') // re-serialised body; never inherited (a client's text/plain)
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
@@ -1387,6 +1414,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       : `${err.message || 'Engine unreachable.'}${cause}`
     finalizeLog({ status: 500, error: { code, message }, durationMs: Date.now() - requestStart })
     return c.json({ error: { message, type: 'api_error', code } }, 500)
+  }
+  if (unapplied && res.ok) {
+    const withNote = new Headers(res.headers)
+    withNote.set('X-Unapplied-Parameters', unapplied)
+    res = new Response(res.body, { status: res.status, statusText: res.statusText, headers: withNote })
   }
 
   // Best-effort session-stats recording (B4) for OpenAI chat completions, fully

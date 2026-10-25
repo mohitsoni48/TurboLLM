@@ -161,6 +161,27 @@ export function litertLmIgnoredFieldsNote(body: Record<string, unknown>, opts: {
       `penalties; no LiteRT-LM has Min P.${clear}`
 }
 
+/** The fields of a request to a model on upstream's `serve` that it does not apply, by their request names: min_p,
+ *  stop and the penalties, none of which `serve` reads, so an API client's own went nowhere and nothing said so. The
+ *  gateway names them in an X-Unapplied-Parameters response header, the one the Android app's server names min_p in
+ *  (it applies stop strings and the penalties itself). Empty for that server, whose own header the gateway relays,
+ *  except min_p where the gateway writes the reply itself (`ownReply`, /v1/messages), so that header never reaches the
+ *  client; and empty for a model TurboLLM did not load. Reads the body as shaped (the model's saved sampling
+ *  included). */
+export function litertLmUnappliedParameters(body: Record<string, unknown>, opts: { ownReply?: boolean } = {}): string[] {
+  const info = litertLmModelInfo(body.model)
+  if (!info || (info.native && opts.ownReply !== true)) return []
+  const out: string[] = []
+  const num = (k: string): number | undefined => (typeof body[k] === 'number' ? body[k] as number : undefined)
+  if ((num('min_p') ?? 0) > 0) out.push('min_p')
+  if (info.native) return out
+  const stop = body.stop
+  if ((typeof stop === 'string' && stop) || (Array.isArray(stop) && stop.length > 0)) out.push('stop')
+  const neutral: Array<[string, number]> = [['repetition_penalty', 1], ['repeat_penalty', 1], ['presence_penalty', 0], ['frequency_penalty', 0]]
+  for (const [k, off] of neutral) if (num(k) !== undefined && num(k) !== off) out.push(k)
+  return out
+}
+
 /** The note for a temperature or top_p that has no effect: the model has no sampler of its own, so with no top_k the
  *  runtime's top_k 1 decides (greedy). Upstream's `serve` only; the Android app's server samples with no top-k limit
  *  there itself. Undefined when it does not apply. Reads the body as {@link shapeLitertLmSampling} will send it. */
