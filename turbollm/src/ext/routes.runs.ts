@@ -292,8 +292,9 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // truncation would mean the model answering from a history the integrator believes it sent.
     // Reuses generation.ts's `loadFullHistory` (pages via cursor until exhausted) and
     // `buildGenerationCtx` (prepends the system prompt, folds prior `reasoning` into `<think>`
-    // blocks) — the SAME assembly the real generation path hands the engine moments later. A
-    // single capped `listMessages(scope, chatId, { limit: 200 })` call would silently return only
+    // blocks; a LiteRT-LM run sends it as `reasoning_content` instead, counted the same here)
+    // — the SAME assembly the real generation path hands the engine moments later. A single
+    // capped `listMessages(scope, chatId, { limit: 200 })` call would silently return only
     // the OLDEST page once a chat passes 200 stored messages (`SqliteChatStore.clampLimit`),
     // letting this check pass a conversation whose true full history overflows the window — see
     // `loadFullHistory`'s own header comment for the exact failure mode this avoids.

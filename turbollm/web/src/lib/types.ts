@@ -747,6 +747,10 @@ export type ModelEntry = {
    *  (low/medium/xhigh) — Qwen3.8's reasoning-depth control. Composers gate the
    *  ReasoningEffortSelect vs ThinkingBudgetSlider choice on this flag. */
   reasoningEffort: boolean
+  /** LiteRT-LM only: whether the bundle's chat template reads the model's past reasoning. false: the model sees none of
+   *  it, so a thread's "Preserve thinking" cannot apply (the thread settings say so). Absent when the bundle does not
+   *  say. */
+  reasoningHistory?: boolean
   /** True when the model is an embedding model (BERT-family or embed filename pattern).
    *  Activates --embeddings at startup so /v1/embeddings is available. */
   embedding: boolean

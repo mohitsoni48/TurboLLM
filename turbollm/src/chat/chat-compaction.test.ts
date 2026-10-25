@@ -233,6 +233,22 @@ test('buildEngineMessages: preserveThinking folds reasoning into an assistant me
   assert.ok(!out.some((o) => typeof o.content === 'string' && o.content.includes('old thoughts')))
 })
 
+test('buildEngineMessages: for LiteRT-LM, past reasoning goes as the message\'s reasoning_content, not <think> text; off, none', () => {
+  // A LiteRT-LM bundle's template mostly puts the content in verbatim (Qwen3-0.6B's, Gemma's), so the fold put every
+  // past turn's reasoning into a 4096-token context; LFM2.5's reads reasoning_content and applies its own
+  // preserve_thinking.
+  const u1 = makeMsg('user', 'q1')
+  const a1 = makeMsg('assistant', 'Paris', { reasoning: 'The capital of France is Paris.' })
+  const u2 = makeMsg('user', 'q2')
+  const out = buildEngineMessages(makeConv({ preserveThinking: true }), [u1, a1, u2], undefined, { reasoningField: true })
+  assert.deepEqual(out[1], { role: 'assistant', content: 'Paris', reasoning_content: 'The capital of France is Paris.' })
+  assert.ok(!out.some((o) => typeof o.content === 'string' && o.content.includes('<think>')))
+  // Preserve thinking off: no reasoning, either way, as before.
+  assert.deepEqual(buildEngineMessages(makeConv({ preserveThinking: false }), [u1, a1, u2], undefined, { reasoningField: true })[1], { role: 'assistant', content: 'Paris' })
+  // Every other engine (and a linked host's) keeps the fold.
+  assert.equal(buildEngineMessages(makeConv({ preserveThinking: true }), [u1, a1, u2])[1].content, '<think>\nThe capital of France is Paris.\n</think>\n\nParis')
+})
+
 // ── pickCompactionCut ────────────────────────────────────────────────────────────────
 
 test('pickCompactionCut: returns null when there are too few messages to bother', () => {

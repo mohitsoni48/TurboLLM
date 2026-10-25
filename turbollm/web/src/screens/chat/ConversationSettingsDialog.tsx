@@ -75,6 +75,7 @@ export function ConversationSettingsDialog({
   draft,
   modelSampling,
   litertLm = false,
+  noPastReasoning = false,
 }: {
   conv: Conversation | undefined
   draft?: ConversationSettingsDraft
@@ -83,6 +84,10 @@ export function ConversationSettingsDialog({
    *  LiteRT-LM applies; the Android server names it as not applied), a Min P the thread already has is shown as not
    *  applied with a Clear, and Top K 0 is labelled as what it is there, no top-k limit. */
   litertLm?: boolean
+  /** The loaded model's chat template shows it none of its past reasoning (a .litertlm whose template reads no
+   *  reasoning_content, which is where the chat sends it to LiteRT-LM): Preserve thinking cannot apply to it, and its
+   *  row says so rather than seeming to work. */
+  noPastReasoning?: boolean
 }) {
   const mut = useConversationMutations()
   const [open, setOpen] = useState(false)
@@ -361,6 +366,11 @@ export function ConversationSettingsDialog({
               <span className="text-[12px] text-muted">
                 Resend the model's past reasoning on later turns, not just its final answers — uses more tokens per request.
               </span>
+              {noPastReasoning && (
+                <span className="mt-1 text-[12px] text-faint">
+                  This model's chat template shows it none of its past reasoning, so this does not apply to it.
+                </span>
+              )}
             </span>
             <Switch checked={preserveThinking} onCheckedChange={(v) => { track('chat', 'toggle_preserve_thinking'); setPreserveThinking(v) }} />
           </div>

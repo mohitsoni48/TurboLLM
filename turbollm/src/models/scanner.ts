@@ -79,6 +79,10 @@ export interface ModelEntry {
    *  its runtime samples with while a request sets no sampling. Absent when it declares none (on CPU and GPU the
    *  runtime then decodes greedily: top_k 1). */
   sampler?: LitertlmSampler
+  /** LiteRT-LM only: whether the bundle's chat template reads a model's past reasoning (a message's
+   *  reasoning_content; models/litertlm.ts llmMetadataReasoningHistory). false: the model sees none of it, so a
+   *  thread's "Preserve thinking" cannot apply, and the thread settings say so. Absent when the header says nothing. */
+  reasoningHistory?: boolean
   mmprojPath: string | null
   /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null). Used to size
    *  the vision projector's VRAM contribution instead of a flat guess. */

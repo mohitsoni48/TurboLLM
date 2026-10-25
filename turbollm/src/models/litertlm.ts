@@ -241,6 +241,36 @@ export function jinjaTemplateTakesTools(template: string): boolean {
   return false
 }
 
+// ── Past reasoning ────────────────────────────────────────────────────────────────────────
+// What a bundle's template does with a model's reasoning on earlier turns is its own. LFM2.5's reads a message's
+// `reasoning_content` (or `thinking`, `reasoning`) and shows it for the turn being answered, and for earlier turns only
+// with its own preserve_thinking; Qwen3-0.6B's, Gemma 3's, Gemma 4's and LFM2.5-VL's read none, so the model sees only
+// its earlier answers (Gemma 4's strips its own thinking channel from them). TurboLLM's chat sends past reasoning in
+// that field to a LiteRT-LM model (chat-compaction.ts buildEngineMessages); whether it can reach the model at all is
+// read here, for the thread settings to say so.
+
+/** The message fields a template reads a model's past reasoning from. */
+const REASONING_FIELDS = 'reasoning_content|reasoning|thinking'
+
+/** Whether a Jinja chat template reads a message's past reasoning in its code: `message.reasoning_content` (or
+ *  `.thinking`, `.reasoning`), or the same as a subscript or a .get(); not the word in its text or a string literal. */
+export function jinjaTemplateReadsReasoning(template: string): boolean {
+  const subscript = new RegExp(`(?:\\[|\\.get\\()\\s*(['"])(?:${REASONING_FIELDS})\\1`)
+  const attribute = new RegExp(`\\.(?:${REASONING_FIELDS})\\b`)
+  for (const m of template.matchAll(/\{[{%]([\s\S]*?)[}%]\}/g)) {
+    if (subscript.test(m[1])) return true
+    if (attribute.test(m[1].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, '""'))) return true
+  }
+  return false
+}
+
+/** Whether the bundle's template reads a model's past reasoning (jinjaTemplateReadsReasoning); null when it carries no
+ *  template of its own (the runtime's default for its model type applies, which this does not judge). */
+export function llmMetadataReasoningHistory(proto: Buffer): boolean | null {
+  const template = protoFields(proto).find((x) => x.field === 7 && x.bytes !== undefined)?.bytes
+  return template ? jinjaTemplateReadsReasoning(template.toString('utf8')) : null
+}
+
 // ── Sampling ──────────────────────────────────────────────────────────────────────────────
 // A bundle may carry its own sampler (LlmMetadata.sampler_params, field 4: SamplerParameters type 1, k 2, p 3,
 // temperature 4, seed 5): Qwen3-0.6B's is TOP_P with top_k 20, top_p 0.95, temperature 0.6; gemma-4-E2B-it-gpu's top_k
@@ -308,10 +338,13 @@ export interface LitertlmHeader {
   toolCalls: boolean | null
   /** Its own sampler (llmMetadataSampler); null when it declares none. */
   sampler: LitertlmSampler | null
+  /** Its template reads a model's past reasoning (llmMetadataReasoningHistory); null when the header does not say. */
+  reasoningHistory: boolean | null
 }
 
 const NO_HEADER: LitertlmHeader = {
   nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null, sampler: null,
+  reasoningHistory: null,
 }
 
 /** Reads only the header and the small LlmMetadata and ExecutorMetadata sections, never the weights. A header this
@@ -351,6 +384,7 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
         out.defaultCtx = llmMetadataMaxNumTokens(proto)
         out.toolCalls = llmMetadataToolCalls(proto)
         out.sampler = llmMetadataSampler(proto)
+        out.reasoningHistory = llmMetadataReasoningHistory(proto)
         continue
       }
       const len = executorMetadataMaxSequence(proto)
@@ -381,8 +415,8 @@ function cleanName(fileName: string): string {
 
 /** The library entry for a `.litertlm` file. Its format is 'litertlm' (a single file, deleted as a file); compat.ts
  *  gives it to the LiteRT-LM engine and to no other. Vision and audio are what its header declares (its encoder
- *  sections, litertlmHeaderFromFile), false when it was not read; tool calling and the sampler are its LlmMetadata's,
- *  absent when the header says nothing. */
+ *  sections, litertlmHeaderFromFile), false when it was not read; tool calling, the sampler and whether its template
+ *  reads past reasoning are its LlmMetadata's, absent when the header says nothing. */
 export function litertlmEntryFor(
   path: string, dir: string, sizeBytes: number, mtimeMs: number, header: number | Partial<LitertlmHeader> = 0,
 ): ModelEntry {
@@ -415,6 +449,7 @@ export function litertlmEntryFor(
     audio: h.audio === true,
     ...(typeof h.toolCalls === 'boolean' ? { toolCalls: h.toolCalls } : {}),
     ...(h.sampler ? { sampler: h.sampler } : {}),
+    ...(typeof h.reasoningHistory === 'boolean' ? { reasoningHistory: h.reasoningHistory } : {}),
     mmprojPath: null,
     mmprojSizeBytes: 0,
     hasChatTemplate: true, // the bundle embeds its own template; the runtime applies it

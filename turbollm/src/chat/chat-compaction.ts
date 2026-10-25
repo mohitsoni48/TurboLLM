@@ -167,12 +167,29 @@ export function userTurnContent(text: string, docContext: string | undefined, im
     : fullContent
 }
 
+/** A message as buildEngineMessages sends it: `reasoning_content` is a past turn's reasoning, for an engine whose
+ *  templates read it there (see `reasoningField`). */
+export type EngineMessage = { role: string; content: unknown; reasoning_content?: string }
+
 /** `answeringUserMessageId` — the user turn this generation answers, when it is already in
  *  `activeMessages` (/continue): it is rebuilt with its images and documents, as POST
- *  /messages sends a new turn. Every other turn is resent as text, as POST /messages does. */
-export function buildEngineMessages(conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string): { role: string; content: unknown }[] {
+ *  /messages sends a new turn. Every other turn is resent as text, as POST /messages does.
+ *
+ *  `reasoningField` (a LiteRT-LM engine): with preserveThinking on, a past turn's reasoning goes in the message's
+ *  `reasoning_content`, the field LiteRT-LM's own conversation history keeps it in, and its template decides what the
+ *  model sees, instead of `<think>` text in its content. The fold is Qwen's and DeepSeek's markup, which a template
+ *  that knows it parses back out; a LiteRT-LM bundle's template mostly puts the content in verbatim (Qwen3-0.6B's,
+ *  Gemma 3's, LFM2.5-VL's; Gemma 4's strips only its own thinking channel), so every past turn's reasoning, which the
+ *  model's own history leaves out, filled its 4096-token context: on the Android app's server (and on `serve` for
+ *  Qwen3-0.6B) a folded block of about 100 tokens of reasoning added about 100 prompt tokens on Qwen3-0.6B,
+ *  gemma-3-270m-it and LFM2.5-VL-450M, and as reasoning_content none. LFM2.5's template reads reasoning_content and
+ *  applies its own preserve_thinking (the chat's preserve_thinking kwarg, which the Android app's server passes to the
+ *  template). */
+export function buildEngineMessages(
+  conv: Conversation, activeMessages: Message[], answeringUserMessageId?: string, opts: { reasoningField?: boolean } = {},
+): EngineMessage[] {
   const { summary, rest } = resolveCompactionCut(conv, activeMessages)
-  const out: { role: string; content: unknown }[] = []
+  const out: EngineMessage[] = []
   // ONE leading system message, with the summary folded in: chat templates that enforce strict
   // role alternation (Gemma 2/3, older Mistral) take only messages[0] as the system prompt and
   // raise on a second `system` turn — every post-compaction turn failed on them. The summary
@@ -183,6 +200,10 @@ export function buildEngineMessages(conv: Conversation, activeMessages: Message[
   ].filter(Boolean).join('\n\n')
   if (system) out.push({ role: 'system', content: system })
   for (const m of rest) {
+    if (opts.reasoningField && conv.preserveThinking && m.role === 'assistant' && m.reasoning?.trim()) {
+      out.push({ role: m.role, content: m.content, reasoning_content: m.reasoning })
+      continue
+    }
     out.push({
       role: m.role,
       content: m.id === answeringUserMessageId

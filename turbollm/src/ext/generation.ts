@@ -73,7 +73,7 @@ const DEFAULT_PAGE_SIZE = 200
  *  1000 pages at the max real page size is 200,000 messages, far beyond any realistic chat. */
 const MAX_PAGES = 1000
 
-interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }
+interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }
 
 interface ToolCallRecord { id: string; name: string; args: Record<string, unknown>; result?: string; error?: string }
 
@@ -125,14 +125,20 @@ export interface GenerationCtx {
  *  the placeholder by id — see `createMakeBody`). Folds a prior assistant turn's `reasoning` back
  *  in as a `<think>` block exactly as chat-routes.ts's own resend logic does — `preserveThinking`
  *  is always on here, matching `ConversationStore.createConversation`'s own default for new chats
- *  (there is no per-chat toggle in the public API). */
-export function buildGenerationCtx(chat: Chat, engineHistory: ChatMessage[]): GenerationCtx {
+ *  (there is no per-chat toggle in the public API). For a LiteRT-LM engine (`engineKind`) it goes in the
+ *  message's `reasoning_content` instead, as the chat sends it there (chat-compaction.ts buildEngineMessages):
+ *  a bundle's template decides what of it the model sees, where the `<think>` text went into most of them verbatim,
+ *  every past turn's reasoning in a 4096-token context. */
+export function buildGenerationCtx(chat: Chat, engineHistory: ChatMessage[], engineKind = ''): GenerationCtx {
   const engineMessages: WireMessage[] = []
   if (chat.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(chat.systemPrompt) })
   for (const m of engineHistory) {
-    const content = (m.role === 'assistant' && m.reasoning?.trim())
-      ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-      : m.content
+    const reasoning = m.role === 'assistant' && m.reasoning?.trim() ? m.reasoning : undefined
+    if (reasoning && engineKind === 'litert-lm') {
+      engineMessages.push({ role: m.role, content: m.content, reasoning_content: reasoning })
+      continue
+    }
+    const content = reasoning ? `<think>\n${reasoning}\n</think>\n\n${m.content}` : m.content
     engineMessages.push({ role: m.role, content })
   }
   return { chat, engineMessages }
@@ -284,7 +290,9 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
   const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(loadedModel.key) : undefined
   let toolsNoted = false
 
-  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
+  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({
+    role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}),
+  }))
 
   let iter = 0
   let finishedCleanly = false
@@ -585,7 +593,7 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       // chat-routes.ts's own `allMsgs = conv.messages.filter(m => m.id !== assistantMsg.id)`).
       const fullHistory = await loadFullHistory(d.chatStore, scope, chatId)
       const engineHistory = fullHistory.filter((m) => m.id !== messageId)
-      const ctx = buildGenerationCtx(chat, engineHistory)
+      const ctx = buildGenerationCtx(chat, engineHistory, servingEngineKind(d))
 
       release = d.gate ? await d.gate.acquire('bg', { signal }) : null
       d.manager.generationStart()

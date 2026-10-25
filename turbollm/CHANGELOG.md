@@ -300,6 +300,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **`tool_choice: "none"` sends a LiteRT-LM model no tools.** `litert-lm serve` reads no tool_choice, and the app's
   engine did not apply "none", so the model still saw every tool and could call it; the loop breaker that answers a
   terminal agent's sixth identical call with "none" did nothing there, and the agent looped on.
+- **A LiteRT-LM model's past reasoning goes where its template reads it.** With "Preserve thinking across turns" on
+  (a new chat's default), each earlier answer's reasoning was resent folded into its text as `<think>…</think>`, the
+  markup Qwen's and DeepSeek's templates parse back out, and most LiteRT-LM bundle templates put in verbatim
+  (Qwen3-0.6B, Gemma 3 and 4, LFM2.5-VL): every past turn's reasoning filled a 4096-token context. The chat and the
+  extension API now send it to a LiteRT-LM model as the message's `reasoning_content`, and the bundle's template decides
+  (LFM2.5's reads it, with its own preserve_thinking); the thread settings say when the loaded model's template shows
+  it none of it, so the switch does not apply. Other engines are unchanged.
 - **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
   Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app

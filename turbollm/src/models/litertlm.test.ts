@@ -6,6 +6,7 @@ import {
   hasLitertlmMagic,
   isLitertMagicNumber,
   isLitertlmFileName,
+  jinjaTemplateReadsReasoning,
   jinjaTemplateTakesTools,
   litertlmEntryFor,
   llmMetadataSampler,
@@ -134,7 +135,7 @@ test('litertlmHeaderFromFile: LlmMetadata.max_num_tokens is the bundle\'s own de
   const dir = tmpDir('tllm-litertlm-hdr-')
   const p = join(dir, 'LFM2.5-230M_int8.litertlm')
   writeFileSync(p, fakeBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
-  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
+  assert.deepEqual(await litertlmHeaderFromFile(p), { nativeCtx: 4096, ctxDynamic: false, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null, reasoningHistory: null })
 })
 
 test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 10) is a dynamic export, taking one less', async () => {
@@ -143,10 +144,10 @@ test('litertlmHeaderFromFile: a KV length that is a magic number (a prime above 
   const dir = tmpDir('tllm-litertlm-hdr-')
   const qwen = join(dir, 'Qwen3-0.6B_dynamic.litertlm')
   writeFileSync(qwen, fakeBundle(4096, [[1, 32771], [2, 32771]]))
-  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
+  assert.deepEqual(await litertlmHeaderFromFile(qwen), { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null, reasoningHistory: null })
   const vl = join(dir, 'LFM2.5-VL-450M_int8.litertlm')
   writeFileSync(vl, fakeBundle(4096, [[5, 0], [1, 4099], [2, 4099]]))
-  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null })
+  assert.deepEqual(await litertlmHeaderFromFile(vl), { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: false, audio: false, toolCalls: false, sampler: null, reasoningHistory: null })
   assert.equal(isLitertMagicNumber(4096), false)
   assert.equal(isLitertMagicNumber(7), false, 'primes up to 10 are sizes')
   assert.equal(isLitertMagicNumber(4097), false, '17 * 241')
@@ -180,7 +181,7 @@ test('litertlmHeaderFromFile: vision and audio are the encoder sections the bund
   // A string item that is not model_type, or a section that is not a TFLiteModel, says nothing about modalities.
   const q = join(dir, 'other.litertlm')
   writeFileSync(q, fakeLitertlmBundleOf([{ type: 3, items: { note: 'tf_lite_vision_encoder' } }, { type: 1, items: { model_type: 'tf_lite_audio_encoder_hw' } }]))
-  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null, sampler: null })
+  assert.deepEqual(await litertlmHeaderFromFile(q), { nativeCtx: 0, ctxDynamic: false, defaultCtx: 0, vision: false, audio: false, toolCalls: null, sampler: null, reasoningHistory: null })
 })
 
 // ── tool calling ──────────────────────────────────────────────────────────────────────────────
@@ -240,6 +241,43 @@ test('litertlmEntryFor: carries whether the model calls tools, absent when the h
   assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { toolCalls: false }).toolCalls, false)
   assert.equal('toolCalls' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { toolCalls: null }), false)
   assert.equal('toolCalls' in litertlmEntryFor('/m/d.litertlm', '/m', 10, 0), false)
+})
+
+// ── past reasoning ────────────────────────────────────────────────────────────────────────────
+
+// The lines of litert-community's LFM2.5-230M template that read a past turn's reasoning; Qwen3-0.6B's assistant
+// branch (its content as it is, no reasoning); Gemma 4's, which strips only its own thinking channel from the content.
+const LFM2_REASONING = `{%- if message.role == "assistant" -%}
+{%- set thinking = message.thinking or message.reasoning or message.reasoning_content -%}
+{%- if thinking and (preserve_thinking or loop.index0 > ns.last_user_index) -%}{{- "<think>" + thinking + "</think>" -}}{%- endif -%}`
+const QWEN3_ASSISTANT = `{%- elif message['role'] == 'assistant' -%}{{- '<|im_start|>' + message['role'] + '\\n' + content -}}`
+const GEMMA4_ASSISTANT = `{%- macro strip_thinking(text) -%}{%- for part in text.split('<channel|>') -%}{%- endfor -%}{%- endmacro -%}
+{{- strip_thinking(message['content']) -}}`
+
+test('jinjaTemplateReadsReasoning: a template that reads a message\'s past reasoning in its code', () => {
+  assert.equal(jinjaTemplateReadsReasoning(LFM2_REASONING), true)
+  assert.equal(jinjaTemplateReadsReasoning("{%- set t = message.get('reasoning_content') -%}"), true)
+  assert.equal(jinjaTemplateReadsReasoning("{{ message['thinking'] }}"), true)
+  assert.equal(jinjaTemplateReadsReasoning(QWEN3_ASSISTANT), false)
+  assert.equal(jinjaTemplateReadsReasoning(GEMMA4_ASSISTANT), false)
+  // The word in the template's text or in a string literal, or a longer name, is not a read.
+  assert.equal(jinjaTemplateReadsReasoning('Think: message.reasoning {{ "message.reasoning_content" }} {{ m.thinking_budget }}'), false)
+})
+
+test('litertlmHeaderFromFile and litertlmEntryFor: whether the bundle\'s template reads past reasoning; nothing said without one', async (t) => {
+  const dir = scratch(t)
+  const of = async (name: string, meta: Parameters<typeof fakeLlmMetadata>[0]): Promise<boolean | null> => {
+    const p = join(dir, name)
+    writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata(meta) }]))
+    return (await litertlmHeaderFromFile(p)).reasoningHistory
+  }
+  assert.equal(await of('lfm2.litertlm', { maxNumTokens: 4096, template: LFM2_REASONING }), true)
+  assert.equal(await of('qwen3.litertlm', { maxNumTokens: 4096, template: QWEN3_ASSISTANT }), false)
+  assert.equal(await of('gemma4.litertlm', { template: GEMMA4_ASSISTANT }), false)
+  assert.equal(await of('functiongemma.litertlm', { maxNumTokens: 1024, modelType: 3 }), null, 'the runtime\'s default template: not judged')
+  assert.equal(litertlmEntryFor('/m/a.litertlm', '/m', 10, 0, { reasoningHistory: false }).reasoningHistory, false)
+  assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { reasoningHistory: true }).reasoningHistory, true)
+  assert.equal('reasoningHistory' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { reasoningHistory: null }), false)
 })
 
 // ── the bundle's own sampler ──────────────────────────────────────────────────────────────────

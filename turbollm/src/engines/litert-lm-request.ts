@@ -216,8 +216,9 @@ export const LITERT_LM_RESEARCH_NOTE =
   'This model decides for itself whether to search: LiteRT-LM cannot force the Research persona\'s web searches.'
 
 /** The text of a message as the template renders it, for a size estimate: text parts only (an image is the
- *  encoder's, sized apart), and the calls an assistant message made. */
-function messageText(m: { role: string; content?: unknown; tool_calls?: unknown }): { role: string; content: string } {
+ *  encoder's, sized apart), the calls an assistant message made, and its past reasoning (reasoning_content, which a
+ *  template may show: counted, so the estimate does not fall short). */
+function messageText(m: { role: string; content?: unknown; tool_calls?: unknown; reasoning_content?: unknown }): { role: string; content: string } {
   let text = ''
   if (typeof m.content === 'string') text = m.content
   else if (Array.isArray(m.content)) {
@@ -227,6 +228,7 @@ function messageText(m: { role: string; content?: unknown; tool_calls?: unknown 
     }
   }
   if (m.tool_calls !== undefined) text += JSON.stringify(m.tool_calls)
+  if (typeof m.reasoning_content === 'string') text += m.reasoning_content
   return { role: m.role, content: text }
 }
 
@@ -241,7 +243,7 @@ function messageText(m: { role: string; content?: unknown; tool_calls?: unknown 
 export function litertLmToolsFor<T>(
   model: { toolCalls?: boolean } | undefined,
   tools: readonly T[],
-  messages: ReadonlyArray<{ role: string; content?: unknown; tool_calls?: unknown }>,
+  messages: ReadonlyArray<{ role: string; content?: unknown; tool_calls?: unknown; reasoning_content?: unknown }>,
   ctx: number,
 ): { tools: T[]; note?: string } {
   if (tools.length === 0) return { tools: [] }

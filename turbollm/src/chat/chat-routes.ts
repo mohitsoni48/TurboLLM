@@ -11,7 +11,7 @@ import { needsExtraPass } from './think-utils'
 import { parseReasoningEffort, type ReasoningEffort } from './reasoning-effort'
 import type { EmitSink } from './emit-sink.js'
 import { chatRuns, type ChatRun, type ChatRunMeta } from './chat-runs.js'
-import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent } from './chat-compaction.js'
+import { buildEngineMessages, maybeAutoCompact, compactConversation, setAsideFrozenCut, userTurnContent, type EngineMessage } from './chat-compaction.js'
 
 import type { ClaimVerdict, ConversationStore, Message, MessageStats, ResearchMeta, ResearchSource, ToolCallRecord } from './db'
 import { checkReply } from '../tools/research-referee.js'
@@ -733,7 +733,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // summary + cut when one is resolvable; a plain passthrough when not).
       // setAsideFrozenCut: a cut left behind on another branch is not this branch's summary.
       const allMsgs = (conv.messages ?? []).filter(m => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, undefined, { reasoningField: reasoningAsField(d, upstream) })
       // Fold any attached document text into the prompt; attach images as multimodal parts.
       engineMessages.push({ role: 'user', content: userTurnContent(content, b.docContext, images) })
 
@@ -851,7 +851,7 @@ export function registerChatRoutes(app: Hono, d: Deps): void {
       // `lastUser` is the turn being answered: it goes out with its images and documents, as
       // POST /messages first sent it — the text alone is not what the user asked about.
       const allMsgs = (conv.messages ?? []).filter((m) => m.id !== assistantMsg.id)
-      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id)
+      const engineMessages = buildEngineMessages(setAsideFrozenCut(db, conv), allMsgs, lastUser.id, { reasoningField: reasoningAsField(d, upstream) })
 
       await runGeneration(d, sink, { convId, conv, engineMessages, assistantMsg, upstream, ac, thinkingBudget: b.thinkingBudget ?? -1, reasoningEffort: parseReasoningEffort(b.reasoningEffort), replacedId: replaced?.role === 'assistant' ? replaced.id : undefined, edited, isCodeAuthorized })
     })
@@ -1262,7 +1262,7 @@ function getShareTarget(defaultPort: number): { host: string; port: number; only
 interface GenerationCtx {
   convId: string
   conv: NonNullable<ReturnType<Deps['db']['getConversation']>>
-  engineMessages: { role: string; content: unknown }[]
+  engineMessages: EngineMessage[]
   assistantMsg: NonNullable<ReturnType<Deps['db']['getLastMessage']>>
   /** Where this turn generates — the local engine, or a linked host (chat-upstream.ts).
    *  `upstream.remote` is the single test for "another machine did the work", which every
@@ -1396,6 +1396,13 @@ export function resilientSink(sink: EmitSink): EmitSink & { clientGone: () => bo
  *  earlier rounds saved) by the same catch. */
 export class EngineStreamError extends Error {}
 
+/** Whether this turn's past reasoning goes to the engine as each message's `reasoning_content` rather than folded into
+ *  its text (buildEngineMessages): this machine's LiteRT-LM engine, whose bundle templates decide what of it the model
+ *  sees. A linked host's engine is not this machine's to judge: it keeps the fold. */
+function reasoningAsField(d: Deps, upstream: ChatUpstream): boolean {
+  return !upstream.remote && servingEngineKind(d) === 'litert-lm'
+}
+
 // The engine's error, read and shown as every path shows it (engines/engine-error.ts).
 export { streamChunkError, engineErrorText } from '../engines/engine-error'
 
@@ -1449,8 +1456,8 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
   // ── Agentic tool loop ──────────────────────────────────────────────────────
   // engineMessages is extended each round with tool results. Start from ctx copy
   // so the original array is never mutated (continue endpoint reuses it).
-  const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }[] =
-    ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
+  const iterMessages: { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }[] =
+    ctx.engineMessages.map((m) => ({ role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}) }))
 
   // Skills enabled for this conversation (the shared SKILL.md library, picked via
   // Thread settings or the '/' picker): inject their instructions into the system

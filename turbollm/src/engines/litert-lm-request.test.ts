@@ -90,6 +90,14 @@ test('litertLmToolsFor: tools that do not fit in the model\'s context with the c
   assert.deepEqual(litertLmToolsFor({ toolCalls: true }, own.slice(1, 3), calls, 4096).tools, [])
 })
 
+test('litertLmToolsFor: a past answer\'s reasoning_content, which a template may show, counts toward the conversation', () => {
+  // The chat sends a LiteRT-LM model its past reasoning there (chat-compaction.ts buildEngineMessages).
+  const two = [webSearchTool(), FETCH_URL_TOOL]
+  const answered = [{ role: 'assistant', content: 'Paris.', reasoning_content: 'z'.repeat(12000) }, { role: 'user', content: 'And Italy?' }]
+  assert.deepEqual(litertLmToolsFor({ toolCalls: true }, two, answered, 4096).tools, [])
+  assert.equal(litertLmToolsFor({ toolCalls: true }, two, [{ role: 'assistant', content: 'Paris.' }, { role: 'user', content: 'And Italy?' }], 4096).tools.length, 2)
+})
+
 // ── sampling ──────────────────────────────────────────────────────────────────────────────────
 
 const QWEN3 = '/models/Qwen3-0.6B.litertlm'

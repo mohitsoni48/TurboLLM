@@ -1479,7 +1479,10 @@ export function ChatScreen({ embedded, convIdOverride }: { embedded?: boolean; c
               <SlidersHorizontal size={15} />
             </Button>
           )}
-          <ConversationSettingsDialog conv={conv} draft={draft} modelSampling={modelSampling} litertLm={loadedOnLitertLm} />
+          <ConversationSettingsDialog
+            conv={conv} draft={draft} modelSampling={modelSampling} litertLm={loadedOnLitertLm}
+            noPastReasoning={loadedOnLitertLm && loadedEntry?.reasoningHistory === false}
+          />
           {loadedModelSupportsReasoningEffort ? (
             <ReasoningEffortSelect value={reasoningEffort} onChange={setReasoningEffort} />
           ) : (

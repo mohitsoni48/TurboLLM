@@ -131,4 +131,18 @@ describe('ConversationSettingsDialog — a LiteRT-LM model', () => {
     await waitFor(() => expect(updateConversation).toHaveBeenCalledTimes(1))
     expect(updateConversation).toHaveBeenLastCalledWith('c1', expect.objectContaining({ sampling: { temperature: 0.9 } }))
   })
+
+  it('says Preserve thinking does not apply to a model whose template shows it none of its past reasoning', async () => {
+    // Qwen3-0.6B's, Gemma's and LFM2.5-VL's templates read no reasoning_content, where the chat sends past reasoning to
+    // LiteRT-LM: the switch would seem to work and change nothing.
+    const { unmount } = render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={conv} litertLm noPastReasoning /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    await screen.findByText('Preserve thinking across turns')
+    expect(screen.getByText(/This model's chat template shows it none of its past reasoning, so this does not apply to it\./)).toBeTruthy()
+    unmount()
+    render(<QueryClientProvider client={qc}><ConversationSettingsDialog conv={conv} litertLm /></QueryClientProvider>)
+    fireEvent.click(screen.getByTitle(/Thread settings/))
+    await screen.findByText('Preserve thinking across turns')
+    expect(screen.queryByText(/none of its past reasoning/)).toBeNull()
+  })
 })
