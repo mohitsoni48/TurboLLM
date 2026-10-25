@@ -37,6 +37,16 @@ test('mapToOpenAI sets return_progress only for streaming requests', () => {
   assert.equal(nonStreamed.return_progress, undefined)
 })
 
+test('mapToOpenAI: tool_choice none is OpenAI\'s none, not a forced call of a function with no name', () => {
+  const tools = [{ name: 'read', input_schema: { type: 'object' } }]
+  const ask = (tool_choice: Record<string, unknown>) =>
+    mapToOpenAI({ messages: [{ role: 'user', content: 'hi' }], max_tokens: 10, tools, tool_choice } as never).tool_choice
+  assert.equal(ask({ type: 'none' }), 'none')
+  assert.equal(ask({ type: 'auto' }), 'auto')
+  assert.equal(ask({ type: 'any' }), 'required')
+  assert.deepEqual(ask({ type: 'tool', name: 'read' }), { type: 'function', function: { name: 'read' } })
+})
+
 // ── mapToOpenAI forwards the extended-thinking budget ───────────────────────
 // Regression coverage for a real bug (found + fully root-caused live 2026-07-23):
 // mapToOpenAI never forwarded any thinking budget to thinking_budget_tokens (the

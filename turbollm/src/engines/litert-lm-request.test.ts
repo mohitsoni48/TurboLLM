@@ -8,7 +8,7 @@ import { test } from 'node:test'
 import {
   shapeLitertLmThinking, LITERT_LM_REASONING_EFFORTS, LITERT_LM_NO_TOOL_CALLING_NOTE, litertLmToolsFor,
   litertLmRequestSampling, litertLmSamplingNote, rememberLitertLmModel, shapeLitertLmRequest, litertLmIgnoredFieldsNote,
-  shapeLitertLmToolChoice,
+  shapeLitertLmToolChoice, litertLmForcedToolChoiceError,
 } from './litert-lm-request'
 import { webSearchTool, FETCH_URL_TOOL, RUN_CODE_TOOL } from '../tools/builtin'
 import { CREATE_ROUTINE_TOOL, LIST_ROUTINES_TOOL, UPDATE_ROUTINE_TOOL, DELETE_ROUTINE_TOOL, RUN_ROUTINE_NOW_TOOL } from '../routines/routine-tools'
@@ -245,5 +245,28 @@ test('tool_choice "none" sends no tools: `serve` reads no tool_choice', () => {
     const b: Record<string, unknown> = { tools, tool_choice: choice }
     shapeLitertLmToolChoice(b)
     assert.deepEqual(b.tools, tools, String(JSON.stringify(choice)))
+  }
+})
+
+test('a forced tool call is refused on `serve`, in the Android server\'s words; that server answers it itself', () => {
+  // LiteRT-LM cannot make a model call a tool: `serve` ignored the force and the model chose, which a client could not
+  // tell from a forced call; the Android app's server answers it with this 400.
+  rememberLitertLmModel('/m/serve.litertlm', { sampling: {}, native: false })
+  rememberLitertLmModel('/m/app.litertlm', { sampling: {}, native: true })
+  const named = { type: 'function', function: { name: 'read' } }
+  assert.equal(litertLmForcedToolChoiceError({ model: '/m/serve.litertlm', tool_choice: 'required' }),
+    'Invalid tool_choice: this server cannot make the model call a tool ("required"); LiteRT-LM can only offer it the ' +
+    'tools, as tool_choice "auto" does')
+  assert.match(litertLmForcedToolChoiceError({ model: '/m/serve.litertlm', tool_choice: named }) ?? '', /\(\{"type":"function","function":\{"name":"read"\}\}\)/)
+  for (const choice of [undefined, null, 'auto', 'none', { type: 'none' }]) {
+    assert.equal(litertLmForcedToolChoiceError({ model: '/m/serve.litertlm', tool_choice: choice }), undefined, JSON.stringify(choice))
+  }
+  assert.equal(litertLmForcedToolChoiceError({ model: '/m/app.litertlm', tool_choice: 'required' }), undefined, 'the Android server says it')
+  assert.equal(litertLmForcedToolChoiceError({ model: '/m/unknown.litertlm', tool_choice: 'required' }), undefined)
+  // A typed none or auto goes as the string: the Android server reads any object as a forced call and refuses it.
+  for (const type of ['none', 'auto']) {
+    const b: Record<string, unknown> = { model: '/m/app.litertlm', tools: [named], tool_choice: { type } }
+    shapeLitertLmToolChoice(b)
+    assert.equal(b.tool_choice, type)
   }
 })

@@ -33,7 +33,7 @@ export interface AnthropicRequest {
   stop_sequences?: string[]
   stream?: boolean
   tools?: Array<{ name: string; description?: string; input_schema: Record<string, unknown> }>
-  tool_choice?: { type: 'auto' | 'any' | 'tool'; name?: string }
+  tool_choice?: { type: 'auto' | 'any' | 'tool' | 'none'; name?: string }
   // 'enabled' with an explicit budget_tokens is the documented shape; 'adaptive' (no
   // budget_tokens, plus a display field) is a real shape confirmed live from Claude
   // Code (2026-07-23) — apart from 'disabled' (the explicit off switch), the type value isn't
@@ -250,13 +250,17 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
       function: { name: t.name, description: t.description, parameters: stripUnsupportedSchemaKeywords(t.input_schema) },
     }))
     const tc = req.tool_choice
+    // {type:'none'} (the client wants text, not a call) is OpenAI's 'none'; it became a forced call of a function with
+    // no name, which an engine that cannot force one (LiteRT-LM) refuses.
     if (tc)
       oai.tool_choice =
         tc.type === 'auto'
           ? 'auto'
-          : tc.type === 'any'
-            ? 'required'
-            : { type: 'function', function: { name: tc.name } }
+          : tc.type === 'none'
+            ? 'none'
+            : tc.type === 'any'
+              ? 'required'
+              : { type: 'function', function: { name: tc.name } }
   }
   // Forward the caller's extended-thinking budget to the field the engine's sampler
   // actually reads (thinking_budget_tokens — mirrors chat-routes.ts's runGeneration).

@@ -183,12 +183,32 @@ export function litertLmSamplingNote(body: Record<string, unknown>): string | un
 // let it call them: the gateway's loop breaker, which answers a terminal agent's sixth identical call with tool_choice
 // "none" so the model has to answer in text, did nothing on LiteRT-LM and the agent looped on. "none" is honoured by
 // sending no tools (the history's calls and results stay), which is what it means. A forced call ("required", a named
-// function) is passed on as it is: `serve` ignores it and the model chooses.
+// function) LiteRT-LM cannot make: the Android app's server refuses it with a 400, and on `serve`, which ignores it,
+// the gateway refuses it the same way (litertLmForcedToolChoiceError) rather than let a reply that may not call it
+// stand for one that must.
 
-/** tool_choice "none" sends no tools. Mutates `body`. */
+/** tool_choice "none" sends no tools. A typed {type: "none"} or {type: "auto"} goes as the string, which the Android
+ *  app's server reads, where any object is a forced call it refuses. Mutates `body`. */
 export function shapeLitertLmToolChoice(body: Record<string, unknown>): void {
   const choice = body.tool_choice
-  if (choice === 'none' || (isRecord(choice) && choice.type === 'none')) delete body.tools
+  if (isRecord(choice) && (choice.type === 'none' || choice.type === 'auto')) body.tool_choice = choice.type
+  if (body.tool_choice === 'none') delete body.tools
+}
+
+/** The 400 for a request that forces a tool call ("required", or a named function): LiteRT-LM 0.18.0 cannot make a
+ *  model call one (its constrained decoding keeps a call well formed, and Gemma's function-call-only mode is set by
+ *  the model file, not per conversation). The Android app's server answers it so itself, in these words; upstream's
+ *  `serve` ignores tool_choice, and the model chose whether to call anything, which the client could not tell from a
+ *  forced call. Undefined when the request forces nothing, or its server is the Android app's, or the model was not
+ *  loaded by TurboLLM (nothing to judge by). Reads the body as shaped. */
+export function litertLmForcedToolChoiceError(body: Record<string, unknown>): string | undefined {
+  const choice = body.tool_choice
+  const forced = choice === 'required' || (isRecord(choice) && choice.type !== 'none' && choice.type !== 'auto')
+  if (!forced) return undefined
+  const info = litertLmModelInfo(body.model)
+  if (!info || info.native) return undefined
+  return `Invalid tool_choice: this server cannot make the model call a tool (${JSON.stringify(choice)}); LiteRT-LM ` +
+    'can only offer it the tools, as tool_choice "auto" does'
 }
 
 /** Every LiteRT-LM request's shaping (thinking, sampling, tool_choice). Mutates and returns `body`. */

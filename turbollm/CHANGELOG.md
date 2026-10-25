@@ -300,6 +300,12 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **`tool_choice: "none"` sends a LiteRT-LM model no tools.** `litert-lm serve` reads no tool_choice, and the app's
   engine did not apply "none", so the model still saw every tool and could call it; the loop breaker that answers a
   terminal agent's sixth identical call with "none" did nothing there, and the agent looped on.
+- **LiteRT-LM: a forced tool call is a 400.** LiteRT-LM cannot make a model call a tool, and `litert-lm serve` ignored
+  `tool_choice: "required"` or a named function: the model answered as it chose, which a client could not tell from a
+  forced call. Through the gateway such a request to `serve` now gets the 400 the Android app's engine gives
+  (`Invalid tool_choice: this server cannot make the model call a tool ...`); "auto" and "none" are as before. An
+  Anthropic client's `tool_choice: {"type": "none"}` is now "none" on every engine: it was sent as a forced call of a
+  function with no name.
 - **A LiteRT-LM model's past reasoning goes where its template reads it.** With "Preserve thinking across turns" on
   (a new chat's default), each earlier answer's reasoning was resent folded into its text as `<think>…</think>`, the
   markup Qwen's and DeepSeek's templates parse back out, and most LiteRT-LM bundle templates put in verbatim

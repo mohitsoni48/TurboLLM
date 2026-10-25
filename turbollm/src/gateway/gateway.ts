@@ -8,7 +8,7 @@ import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
 import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
-import { shapeLitertLmRequest } from '../engines/litert-lm-request'
+import { litertLmForcedToolChoiceError, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
 import { noteLocalActivity } from '../link/host-idle'
@@ -393,6 +393,9 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
       }
       // mapToOpenAI emits `max_tokens`, which LiteRT-LM ignores (see applyEngineTokenLimit).
       shapeForEngine(localKind, oaiBody as Record<string, unknown>)
+      // A forced tool call (tool_choice any or a named tool) LiteRT-LM cannot make: refused as its Android server does.
+      const forced = localKind === 'litert-lm' ? litertLmForcedToolChoiceError(oaiBody as Record<string, unknown>) : undefined
+      if (forced) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: forced } }, 400)
     }
 
     // ── Concurrency: never exceed the engine's own slot count ─────────────────
@@ -1283,6 +1286,11 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       }
       // The fields LiteRT-LM reads, from the finished body (shapeForEngine's LiteRT-LM half; the token cap ran above).
       if (parsedBody && litertLocal) shapeLitertLmRequest(parsedBody)
+      // A forced tool call LiteRT-LM cannot make: refused as its Android server does (litertLmForcedToolChoiceError).
+      const forced = parsedBody && litertLocal ? litertLmForcedToolChoiceError(parsedBody) : undefined
+      if (forced) {
+        return c.json({ error: { message: forced, type: 'invalid_request_error', param: 'tool_choice', code: 'unsupported_value' } }, 400)
+      }
       headers.delete('content-length') // re-serialised body has a new length
       headers.set('content-type', 'application/json') // re-serialised body; never inherited (a client's text/plain)
       init.body = parsedBody ? JSON.stringify(parsedBody) : ''
