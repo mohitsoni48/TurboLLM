@@ -23,6 +23,7 @@ import {
   resetLitertLmServeCache,
   warmUpLitertLm,
   writeLitertLmConfig,
+  LITERT_LM_SERVE_SHIM,
 } from './litert-lm'
 import { tmpDir } from '../test-support/tmp'
 
@@ -52,7 +53,7 @@ test('litertLmPathBlocker: a comma anywhere in the path is refused, a clean path
 test('litertLmServerCommand: runs the CLI as a module with an explicit config, host and port, extra args last', () => {
   assert.deepEqual(litertLmServerCommand('/venv/bin/python', '/data/cfg.json', 8085, '127.0.0.1', ['--verbose']), {
     cmd: '/venv/bin/python',
-    args: ['-m', 'litert_lm_cli.main', 'serve', '--config', '/data/cfg.json', '--host', '127.0.0.1', '--port', '8085', '--verbose'],
+    args: ['-c', LITERT_LM_SERVE_SHIM, 'serve', '--config', '/data/cfg.json', '--host', '127.0.0.1', '--port', '8085', '--verbose'],
   })
   assert.deepEqual(litertLmServerCommand('py', 'c.json', 1, 'h').args.slice(-2), ['--port', '1'])
 })

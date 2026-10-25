@@ -448,9 +448,25 @@ export function writeLitertLmConfig(path: string, config: LitertLmConfig): void 
 }
 
 /**
- * Command + args to launch the LiteRT-LM OpenAI-compatible server. We invoke the CLI as a module (`python -m
- * litert_lm_cli.main`) rather than the venv's console script, the same way SGLang is launched: one path on every OS,
- * no `.exe` shim to locate. `serve` defaults to 0.0.0.0:9379, so host and port are always passed explicitly.
+ * How `litert-lm serve` is started: its CLI module (litert_lm_cli.main, as `python -m` would run it), with Python's
+ * http.server writing each reply's reason phrase on one line. `serve` puts its error in the status line
+ * (send_error(code, "<Exception>: <message>\n")), and an exception's text ends with a newline, which ended the status
+ * line early ("HTTP/1.0 500 RuntimeError: Failed to create conversation\n\r\n"): the daemon's HTTP client (undici, the
+ * global dispatcher server.ts sets) refuses such a reply outright ("fetch failed: Response does not match the HTTP/1.1
+ * protocol (Missing expected CR after response line)"), so a failed load said "fetch failed" instead of the runtime's
+ * message, and so did every refused request (the chat, the gateway, extension runs, routines, the skill writer). The
+ * reason is also made latin-1, which Python's encoder of that line takes strictly. Nothing else of `serve` changes.
+ */
+export const LITERT_LM_SERVE_SHIM =
+  "import http.server as h, runpy; o = h.BaseHTTPRequestHandler.send_response_only; " +
+  "h.BaseHTTPRequestHandler.send_response_only = lambda s, c, m=None: o(s, c, m if m is None else " +
+  "' '.join(str(m).split()).encode('latin-1', 'replace').decode('latin-1')); " +
+  "runpy.run_module('litert_lm_cli.main', run_name='__main__', alter_sys=True)"
+
+/**
+ * Command + args to launch the LiteRT-LM OpenAI-compatible server. We invoke the CLI as a module (litert_lm_cli.main,
+ * through LITERT_LM_SERVE_SHIM) rather than the venv's console script, the same way SGLang is launched: one path on
+ * every OS, no `.exe` shim to locate. `serve` defaults to 0.0.0.0:9379, so host and port are always passed explicitly.
  *
  * `extraArgs` are the user's own `serve` flags (--verbose, --cors-origin, ...) and go last.
  */
@@ -464,7 +480,7 @@ export function litertLmServerCommand(
   const serve = ['serve', '--config', configPath, '--host', host, '--port', String(port), ...extraArgs]
   // The Android app's bundled server takes the CLI's own `serve` arguments, so only the program differs.
   if (isNativeLitertLm(python)) return { cmd: python, args: serve }
-  return { cmd: python, args: ['-m', 'litert_lm_cli.main', ...serve] }
+  return { cmd: python, args: ['-c', LITERT_LM_SERVE_SHIM, ...serve] }
 }
 
 /**

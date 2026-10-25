@@ -6,7 +6,7 @@ import { delimiter as pathDelimiter, join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { engineCommand, pyEngineEnv, Manager, type StartOpts } from './manager'
-import { litertLmConfigPath } from './litert-lm'
+import { LITERT_LM_SERVE_SHIM, litertLmConfigPath } from './litert-lm'
 import { litertLmModelInfo, litertLmSamplingNote, shapeLitertLmRequest } from './litert-lm-request'
 import { fakeLitertlmBundleOf, fakeLlmMetadata } from '../test-support/litertlm-bundle'
 import { freePort } from '../test-support/stand-in-engine'
@@ -18,7 +18,7 @@ test('engineCommand: litert-lm launches the CLI module with the config path, loo
   const opts = { engine, modelPath: '/models/m.litertlm', extraArgs: ['--verbose'] } as unknown as StartOpts
   assert.deepEqual(engineCommand(opts, 8090, undefined, '/data/engines/litert-lm/config-8090.json'), {
     cmd: '/venv/bin/python',
-    args: ['-m', 'litert_lm_cli.main', 'serve', '--config', '/data/engines/litert-lm/config-8090.json', '--host', '127.0.0.1', '--port', '8090', '--verbose'],
+    args: ['-c', LITERT_LM_SERVE_SHIM, 'serve', '--config', '/data/engines/litert-lm/config-8090.json', '--host', '127.0.0.1', '--port', '8090', '--verbose'],
   })
 })
 
@@ -195,4 +195,81 @@ test('a load that carries nothing of the bundle gets its own sampler from its he
   const body: Record<string, unknown> = shapeLitertLmRequest({ model: modelPath, messages: [], temperature: 0.9 })
   assert.deepEqual([body.temperature, body.top_k, body.top_p], [0.9, 20, 0.95])
   assert.equal(litertLmSamplingNote(body), undefined)
+})
+
+// ── `serve`'s error replies, as the daemon's HTTP client reads them ──────────────────────────
+// `serve` answers a failed request with send_error(code, "<Exception>: <message>\n"): the exception's text ends with a
+// newline, which ended the status line early, and the daemon's HTTP client (undici's Agent, the global dispatcher
+// server.ts sets) refused the reply outright ("fetch failed: ... Missing expected CR after response line"). A failed
+// load said "LiteRT-LM could not load this model — fetch failed", and every refused request "fetch failed". `serve` is
+// now started through LITERT_LM_SERVE_SHIM, which writes the reason on one line.
+
+/** A stand-in `litert_lm_cli.main` that refuses a chat request as `serve` does: Python's send_error, HTTP/1.0, the
+ *  exception's text with its newline as the reason, Python's HTML page as the body. */
+const FAKE_SERVE_SEND_ERROR_PY = `
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PORT = int(sys.argv[sys.argv.index('--port') + 1])
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('content-type', 'application/json')
+        self.send_header('content-length', '2')
+        self.end_headers()
+        self.wfile.write(b'{}')
+    def do_POST(self):
+        n = int(self.headers.get('content-length') or 0)
+        if n:
+            self.rfile.read(n)
+        self.send_error(500, 'RuntimeError: Failed to create conversation\\n')
+    def log_message(self, *a):
+        pass
+
+HTTPServer(('127.0.0.1', PORT), H).serve_forever()
+`
+
+test('a failed load\'s reason from `serve`, which ends with a newline, reaches the diagnosis through the daemon\'s HTTP client', { skip: !HAS_PYTHON }, async (t: TestContext) => {
+  const { Agent, getGlobalDispatcher, setGlobalDispatcher } = await import('undici')
+  const fakeRoot = tmpDir('turbollm-litert-fakeserve-')
+  const dataDir = tmpDir('turbollm-litert-senderror-')
+  const prevPyPath = process.env.PYTHONPATH
+  const prevDispatcher = getGlobalDispatcher()
+  let manager: Manager | undefined
+  t.after(async () => {
+    await manager?.stopAndWait({ force: true })
+    setGlobalDispatcher(prevDispatcher)
+    if (prevPyPath === undefined) delete process.env.PYTHONPATH
+    else process.env.PYTHONPATH = prevPyPath
+    rmSync(fakeRoot, { recursive: true, force: true })
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+  // The daemon's own HTTP client, as server.ts sets it.
+  setGlobalDispatcher(new Agent({ keepAliveMaxTimeout: 60_000, connections: 10 }))
+  mkdirSync(join(fakeRoot, 'litert_lm'), { recursive: true })
+  writeFileSync(join(fakeRoot, 'litert_lm', '__init__.py'), '')
+  writeFileSync(join(fakeRoot, 'litert_lm', '_ffi.py'), 'def _get_lib():\n    return object()\n')
+  mkdirSync(join(fakeRoot, 'litert_lm_cli'), { recursive: true })
+  writeFileSync(join(fakeRoot, 'litert_lm_cli', '__init__.py'), '')
+  writeFileSync(join(fakeRoot, 'litert_lm_cli', 'main.py'), FAKE_SERVE_SEND_ERROR_PY)
+  process.env.PYTHONPATH = prevPyPath ? [fakeRoot, prevPyPath].join(pathDelimiter) : fakeRoot
+
+  manager = new Manager(ConfigStore.load(join(dataDir, 'config.json')))
+  await manager.start({
+    engine: {
+      id: 'lrt-senderror', name: 'LiteRT-LM (fake)', kind: 'litert-lm', binPath: 'python3',
+      version: '', capabilities: { flags: [], kvTypes: [] }, addedAt: '',
+    },
+    model: { key: 'm', name: 'Fake LFM2', quant: 'Q8', ctx: 4096, vision: false },
+    modelPath: '/models/fake-lfm2.litertlm',
+    extraArgs: [],
+    preferredPort: await freePort(),
+  } as unknown as StartOpts)
+  await waitForState(manager, 'error', 30_000)
+  await sleep(300)
+  const st = manager.status()
+  assert.equal(st.err?.code, 'model_load_failed', `err was: ${JSON.stringify(st.err)}`)
+  assert.match(st.err?.message ?? '', /RuntimeError: Failed to create conversation/)
+  assert.doesNotMatch(st.err?.message ?? '', /fetch failed/)
 })

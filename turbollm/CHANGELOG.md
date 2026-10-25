@@ -101,6 +101,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   LFM2.5-230M or gemma-3-270m-it is refused); the task now fails with the reason. A LiteRT-LM model is no longer sent
   `response_format: json_object`, a JSON grammar from the first token that made LFM2.5 answer `{"name":", "}` instead
   of the skill: it writes its JSON its own way, as the prompt asks. Other engines still get it.
+- **`litert-lm serve`'s errors can be read.** It puts an error in the HTTP status line, and an exception's text ends
+  with a newline, which broke the reply: TurboLLM's HTTP client refused it, so a model that failed to load said
+  "LiteRT-LM could not load this model — fetch failed", and a refused chat, API, extension, routine or skill request
+  said "fetch failed", never why. TurboLLM now starts `serve` with its reason written on one line (desktop and Termux;
+  the Android app's engine was not affected).
 - **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
   a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
   and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set

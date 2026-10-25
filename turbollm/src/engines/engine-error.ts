@@ -5,7 +5,9 @@
 // 0.", "500 RuntimeError: Failed to create conversation"), with Python's stock HTML error page as the body, which the
 // chat showed in the reason's place. A reason that ends with a newline (every exception's text does) ends the status
 // line early: a strict HTTP client, the daemon's own among them, refuses such a reply ("fetch failed"), and a lenient
-// one reads the page's own headers ("Server: BaseHTTP/0.6 ...") into the body, past which the page is read here.
+// one reads the page's own headers ("Server: BaseHTTP/0.6 ...") into the body, past which the page is read here. The
+// daemon starts `serve` with its reasons written on one line (litert-lm.ts LITERT_LM_SERVE_SHIM); a `serve` started
+// otherwise still answers so.
 import { STATUS_CODES } from 'node:http'
 import type { Deps } from '../deps'
 import { litertLmTurnErrorMessage } from './litert-lm'

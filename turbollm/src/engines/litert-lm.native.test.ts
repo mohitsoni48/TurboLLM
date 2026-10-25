@@ -9,7 +9,7 @@ import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { autoThreadCount, availableMemBytes, packagedAppGpu, perfCoresFromSpeeds } from '../sysinfo/sysinfo'
 import { tmpDir } from '../test-support/tmp'
-import { isNativeLitertLm, LITERT_LM_NATIVE_SERVER, litertLmNativeVersion, litertLmProfileToConfig, litertLmServerCommand } from './litert-lm'
+import { isNativeLitertLm, LITERT_LM_NATIVE_SERVER, LITERT_LM_SERVE_SHIM, litertLmNativeVersion, litertLmProfileToConfig, litertLmServerCommand } from './litert-lm'
 import { pyEngineEnv } from './manager'
 import { engineForModel, Registry } from './registry'
 import { ensureAndroidBundledEngine, ensureAndroidModelsDir } from './seed'
@@ -54,7 +54,7 @@ test('litertLmServerCommand: the native server takes the same serve arguments, w
     args: ['serve', '--config', '/d/config-8081.json', '--host', '127.0.0.1', '--port', '8081', '--verbose'],
   })
   const py = litertLmServerCommand('/venv/bin/python', '/d/config-8081.json', 8081, '127.0.0.1')
-  assert.deepEqual(py.args.slice(0, 3), ['-m', 'litert_lm_cli.main', 'serve'])
+  assert.deepEqual(py.args.slice(0, 3), ['-c', LITERT_LM_SERVE_SHIM, 'serve'])
 })
 
 test('litertLmNativeVersion: reads the runtime version from --version, in the stored pip-style form', async () => {
