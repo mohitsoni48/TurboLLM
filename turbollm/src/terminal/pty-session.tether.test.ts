@@ -5,7 +5,7 @@
 // typing `exit`) left them too. POSIX only: Windows terminals keep today's behaviour until the job sentinel.
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs'
 import type { Socket } from 'node:net'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -337,5 +337,92 @@ test('an exported TMOUT ends no Code terminal where /bin/sh is bash: its watcher
     assert.deepEqual(await waitGone(ties.map((t) => t.shell), 3000), [], 'its release still ends each one')
   } finally {
     killRecorded()
+  }
+})
+
+// The watcher hung up the shell's pid. A shell that exited has been reaped by node-pty by the time the watcher fires
+// (the exit is what releases it), so that pid could name another process by then. Here the watcher is handed the pid
+// of a process outside any terminal, as a shell's reused pid would be: in the test's own group and session, leading
+// neither. It must get no hangup.
+test('a terminal\'s watcher hangs up no process outside its shell\'s group, such as one that got a reaped shell\'s pid', { skip }, async () => {
+  const dir = tmpDir('tllm-pty-hup-')
+  const hup = join(dir, 'hup')
+  const other = spawn(process.execPath, ['-e', `const fs = require('fs'); process.on('SIGHUP', () => fs.writeFileSync(${JSON.stringify(hup)}, 'HUP'));
+fs.writeFileSync(${JSON.stringify(join(dir, 'other.pid'))}, String(process.pid)); setInterval(() => {}, 1000)`], { stdio: 'ignore' })
+  record(other.pid)
+  try {
+    await pidWrittenTo(join(dir, 'other.pid')) // its SIGHUP handler is in place
+    const watcher = spawn('/bin/sh', ['-c', PTY_WATCH, 'sh', String(other.pid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })
+    record(watcher.pid)
+    ;(watcher.stdio[3] as Socket).destroy() // the release
+    assert.deepEqual(await waitGone([watcher.pid as number], 5000), [], 'the watcher fired and finished')
+    assert.equal(existsSync(hup), false, 'the process got no hangup')
+    assert.equal(isGone(other.pid as number), false, 'and runs on')
+  } finally {
+    killRecorded()
+  }
+})
+
+/** How to run `unshare` here, as pid1.test.ts does: as root directly, through `sudo -n`, or not at all. */
+function unshareVia(): string[] | null {
+  if (process.platform !== 'linux') return null
+  const works = (argv: string[]) => spawnSync(argv[0], argv.slice(1), { stdio: 'ignore', timeout: 10_000 }).status === 0
+  const ns = ['unshare', '--pid', '--fork', '--mount-proc', 'true']
+  if (process.getuid?.() === 0 && works(ns)) return []
+  if (works(['sudo', '-n', ...ns])) return ['sudo', '-n']
+  return null
+}
+const nsVia = skip ? null : unshareVia()
+
+/** Run as PID 1 of a pid namespace of its own, where ns_last_pid can be set: a stand-in shell (a session leader, as
+ *  node-pty's is) and its watcher; the shell exits and is reaped, then a new process is given the shell's pid,
+ *  leading a group and session of its own (`leader`, as a job-control job or a daemon does) or not; then the
+ *  release. Prints what that process got. */
+const REUSED_PID = `
+const { spawn } = require('child_process')
+const fs = require('fs')
+const [watch, mode, dir] = process.argv.slice(1)
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+;(async () => {
+  const shell = spawn('/bin/sh', ['-c', 'sleep 0.3'], { detached: true, stdio: 'ignore' })
+  const pid = shell.pid
+  const watcher = spawn('/bin/sh', ['-c', fs.readFileSync(watch, 'utf8'), 'sh', String(pid)], { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] })
+  await new Promise((r) => shell.once('exit', r))
+  await sleep(100)
+  fs.writeFileSync('/proc/sys/kernel/ns_last_pid', String(pid - 1))
+  const other = spawn(process.execPath, ['-e', "process.on('SIGHUP', () => require('fs').writeFileSync(" + JSON.stringify(dir + '/hup') + ", 'HUP')); setInterval(() => {}, 1000)"], { detached: mode === 'leader', stdio: 'ignore' })
+  let endedBy = null
+  other.once('exit', (code, signal) => { endedBy = signal })
+  await sleep(500)
+  const stat = fs.readFileSync('/proc/' + other.pid + '/stat', 'utf8')
+  const pgid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[2])
+  watcher.stdio[3].destroy()
+  await new Promise((r) => watcher.once('exit', r))
+  await sleep(300)
+  console.log(JSON.stringify({ reused: other.pid === pid, leads: pgid === other.pid, hup: fs.existsSync(dir + '/hup'), endedBy }))
+  try { process.kill(other.pid, 'SIGKILL') } catch {}
+  process.exit(0)
+})()
+`
+
+// A shell that exited has been reaped by node-pty by the time its watcher fires, and its pid can be given to a new
+// process, which may lead a group and a session of that id: a job-control job, a daemon. The watcher's hangup to the
+// shell's group, its kill and its session sweep then reached it. Now nothing is signalled once the pid names a process
+// started at another time than the shell.
+test('a terminal\'s watcher signals nothing once its shell\'s pid names another process, one leading its own group too', { skip: skip || (nsVia === null ? 'needs Linux and `unshare --pid --fork --mount-proc` (root, or passwordless sudo)' : false) }, () => {
+  const dir = tmpDir('tllm-pty-reuse-')
+  const watch = join(dir, 'watch.sh')
+  writeFileSync(watch, PTY_WATCH)
+  for (const mode of ['leader', 'not-leader']) {
+    const run = join(dir, mode)
+    mkdirSync(run)
+    const argv = [...(nsVia ?? []), 'unshare', '--pid', '--fork', '--kill-child', '--mount-proc', process.execPath, '-e', REUSED_PID, watch, mode, run]
+    const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 30_000, killSignal: 'SIGKILL' })
+    const line = String(r.stdout ?? '').trim().split('\n').at(-1) ?? ''
+    assert.ok(line.startsWith('{'), `${mode}: the namespace said ${JSON.stringify(r.stdout)} ${JSON.stringify(r.stderr)}`)
+    const got = JSON.parse(line) as { reused: boolean; leads: boolean; hup: boolean; endedBy: string | null }
+    assert.equal(got.reused, true, `${mode}: the new process got the shell's pid`)
+    assert.equal(got.leads, mode === 'leader', mode)
+    assert.deepEqual([got.hup, got.endedBy], [false, null], `${mode}: it got no hangup and was not killed`)
   }
 })
