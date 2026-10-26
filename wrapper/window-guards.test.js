@@ -7,7 +7,7 @@ const { join } = require('node:path')
 const Module = require('node:module')
 const { EventEmitter } = require('node:events')
 
-const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 
 const APP = appOriginFor(6996)
 
@@ -53,6 +53,23 @@ test('launchPortFor: TURBOLLM_PORT, else the port saved in Settings, else 6996',
   assert.equal(launchPortFor(undefined, ''), '6996', 'no config.json yet')
   for (const config of ['{', 'null', '{}', '{"daemon":{}}', '{"daemon":{"port":"7001"}}', '{"daemon":{"port":0}}', '{"daemon":{"port":70000}}', '{"daemon":{"port":7001.5}}']) {
     assert.equal(launchPortFor(undefined, config), '6996', config)
+  }
+})
+
+// The daemon reads a config.json a Windows tool saved with a byte order mark, or as UTF-16; parsed as plain UTF-8 here,
+// its saved port was lost and the app's `--port 6996` won over it.
+test('decodeConfigText: config.json as the daemon decodes it, so its saved port is the launch port in any of its encodings', () => {
+  const json = JSON.stringify({ daemon: { port: 7001 } })
+  const utf16be = Buffer.from(`\uFEFF${json}`, 'utf16le').swap16()
+  for (const [encoding, bytes] of [
+    ['UTF-8', Buffer.from(json)],
+    ['UTF-8 with a BOM', Buffer.from(`\uFEFF${json}`)],
+    ['UTF-16 LE', Buffer.from(`\uFEFF${json}`, 'utf16le')],
+    ['UTF-16 BE', utf16be],
+    ['UTF-16 BE with a stray last byte', Buffer.concat([utf16be, Buffer.from([0x0a])])],
+  ]) {
+    assert.equal(decodeConfigText(bytes), json, encoding)
+    assert.equal(launchPortFor(undefined, decodeConfigText(bytes)), '7001', encoding)
   }
 })
 
@@ -362,6 +379,12 @@ test('main.js: the daemon starts on the port saved in Settings, and the window o
   const pinned = loadMain({ home, env: { TURBOLLM_PORT: '7100' } })
   pinned.ready()
   assert.deepEqual(portArgs(pinned.spawned[0].args), ['--port', '7100', '--addr', '127.0.0.1:7100'])
+
+  // Saved with a byte order mark by a Windows tool: the daemon reads the port, and so does the app.
+  writeFileSync(join(home, '.turbollm', 'config.json'), `\uFEFF${JSON.stringify({ daemon: { port: 7002 } }, null, 2)}`)
+  const bom = loadMain({ home })
+  bom.ready()
+  assert.deepEqual(portArgs(bom.spawned[0].args), ['--port', '7002', '--addr', '127.0.0.1:7002'])
 })
 
 // On macOS a close destroys the window, and the next one loaded the launch port, which nothing listened on after a

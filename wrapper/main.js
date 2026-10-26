@@ -10,7 +10,7 @@ const { execFile, spawn } = require('child_process')
 const http = require('http')
 const { existsSync, readFileSync } = require('fs')
 const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
-const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
   MINIMIZED_NOTICE, TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction,
   probeStatusNotifierHost, quitsWhenAllClosed, trayMenuTemplate, usesTray,
@@ -19,10 +19,10 @@ const {
 // The daemon's data folder, which holds its config.json and its pidfile: ~/.turbollm, as the app passes no --config.
 const DATA_DIR = join(homedir(), '.turbollm')
 
-/** A file of the daemon's data folder, or '' when it cannot be read. */
+/** A file of the daemon's data folder, decoded as the daemon decodes its config.json, or '' when it cannot be read. */
 function readDataFile (name) {
   try {
-    return readFileSync(join(DATA_DIR, name), 'utf8')
+    return decodeConfigText(readFileSync(join(DATA_DIR, name)))
   } catch {
     return ''
   }

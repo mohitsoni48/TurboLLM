@@ -51,8 +51,23 @@ function daemonPortFor (windowUrl, appOrigin, fallbackPort) {
   return String(fallbackPort)
 }
 
+/** config.json's text as the daemon decodes it (turbollm/src/config/config.ts decodeConfigText): UTF-16 by its byte
+ *  order mark, else UTF-8 less a leading one. A Windows tool may save it so (an editor's "UTF-8 with BOM", PowerShell
+ *  5's `Set-Content -Encoding UTF8` or `>`), and the daemon still reads its port: parsed as plain UTF-8 here, the
+ *  saved port was lost and the app's `--port 6996` won over it.
+ *  @param {Buffer} bytes
+ *  @returns {string} */
+function decodeConfigText (bytes) {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le')
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // No 'utf16be' Buffer encoding: swap to LE (swap16 needs an even length; drop a stray byte).
+    return Buffer.from(bytes.subarray(2, bytes.length - (bytes.length % 2))).swap16().toString('utf16le')
+  }
+  return bytes.toString('utf8').replace(/^\uFEFF/, '')
+}
+
 /** The port the app starts its daemon on: TURBOLLM_PORT when it is set, else the port saved in Settings (`daemon.port`
- *  in the daemon's config.json, `configJson`), else 6996. The app passes it as `--port`, which wins over the saved
+ *  in the daemon's config.json, `configJson`, decoded by decodeConfigText), else 6996. The app passes it as `--port`, which wins over the saved
  *  port, so every launch put the daemon back on 6996 while Settings showed the port saved there. */
 function launchPortFor (envPort, configJson) {
   if (envPort) return String(envPort)
@@ -92,4 +107,4 @@ function allowPermission (permission, requestingUrl, appOrigin) {
   return ALLOWED_PERMISSIONS.has(permission) && isAppUrl(requestingUrl, appOrigin)
 }
 
-module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor }
+module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor }
