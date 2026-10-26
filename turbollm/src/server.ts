@@ -270,9 +270,14 @@ const NO_FRAMING_CSP = "frame-ancestors 'none'"
  *  Plain-http images (model cards, markdown in replies) still load: a port-less `http://*` matches
  *  only the scheme's default port, 80, which an Android app cannot bind without root — and Chromium
  *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
+ *  The WebView routes no WebSocket through that block either, and Chromium sends the cookie on a
+ *  WebSocket to `ws://127.0.0.1:<an engine's port>` and on a sendBeacon to another port: connect-src
+ *  takes 'self' (the UI's fetches, its SSE tails and its terminal WebSocket on the same port), https:
+ *  and wss: (an artifact's calls to a web API), and data: and blob: (an artifact's export), but no
+ *  plain http or ws, which is all any other loopback port the app could reach speaks.
  *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
- *  scripts (frame-ancestors is never applied to them), and the UI's own fetches are same-origin. */
-const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; ${NO_FRAMING_CSP}`
+ *  scripts (frame-ancestors is never applied to them). */
+const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; connect-src 'self' https: wss: data: blob:; ${NO_FRAMING_CSP}`
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
  *  `createApp()`, before the server starts accepting connections. NOT folded into

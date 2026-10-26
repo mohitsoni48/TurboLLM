@@ -17,7 +17,7 @@ import { tmpDir } from './test-support/tmp'
 // Host checks, and on the default loopback bind they carry full keyless host trust.
 
 const FRAME_ANCESTORS = "frame-ancestors 'none'"
-const CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; ${FRAME_ANCESTORS}`
+const CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; connect-src 'self' https: wss: data: blob:; ${FRAME_ANCESTORS}`
 
 function spaApp(): Hono {
   const root = tmpDir('spa-csp-')
@@ -53,6 +53,19 @@ test('with TURBOLLM_APP_SECRET set, the UI HTML (direct and SPA fallback) carrie
     // Static assets aren't documents; a CSP there would do nothing for the page.
     const js = await app.request('/app.js')
     assert.equal(js.headers.get('content-security-policy'), null)
+  })
+})
+
+// The WebView's port block sees no WebSocket, and Chromium sent the host-only app cookie on a WebSocket to another
+// loopback port (an engine's) and on a sendBeacon there: connect-src allows the UI's own port, https/wss (an artifact's
+// web API calls) and data:/blob: (an artifact's export), and no plain http or ws source of any port.
+test('with TURBOLLM_APP_SECRET set, connect-src admits the UI\'s own origin and https/wss, never plain http or ws', async () => {
+  await withAppSecret('s3cret', async () => {
+    const res = await spaApp().request('/')
+    const directives = (res.headers.get('content-security-policy') ?? '').split(';').map((d) => d.trim().split(/\s+/))
+    const connect = directives.find(([name]) => name === 'connect-src')?.slice(1)
+    assert.deepEqual(connect, ["'self'", 'https:', 'wss:', 'data:', 'blob:'])
+    for (const source of connect ?? []) assert.doesNotMatch(source, /^(?:\*|https?:\/\/|wss?:\/\/|http:$|ws:$)/, source)
   })
 })
 
