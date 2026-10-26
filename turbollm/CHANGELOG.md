@@ -239,10 +239,12 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - `/v1/messages` (Claude Code and other Anthropic clients) leaves out no user turn. One holding only a PDF `document`
   block, or an empty content array, was dropped, so the model answered the turn before it (and LiteRT-LM refused the
   request), and a PDF beside text went without a word. A document with a text or content source is now sent as text,
-  and an image by URL as its URL. A PDF, URL or file document, or any other block the gateway cannot send, gets a 400
-  `invalid_request_error` naming it when it is in the turn being answered, and reaches the model as a note saying
-  what was there ("[a PDF document was attached here; this local model cannot read it]") in an earlier turn, so the
-  conversation can go on; an empty content array gets the 400 in any turn. `/v1/messages/count_tokens` does the same.
+  and an image by URL as its URL. A PDF, URL or file document, or any other block the gateway cannot send, reaches
+  the model as a note saying what was there ("[a PDF document was attached here; this local model cannot read it]"),
+  so the conversation can go on, and so does a document inside a tool result (a PDF an agent reads with its Read
+  tool); only in the turn being answered, and when that turn holds nothing else, is it a 400 `invalid_request_error`
+  naming it. An empty content array gets the 400 in any turn. An image inside a tool result is still not sent.
+  `/v1/messages/count_tokens` does the same.
 - Extension API: appending a message with `generate: false` to a chat whose run is answering is refused with 409
   `run_active` (retryable), as every other change to that chat is; it landed in the chat beside the run's reply.
 - Desktop app: a port changed in Settings is kept when the app starts again. Every launch put TurboLLM back on 6996

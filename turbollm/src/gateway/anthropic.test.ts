@@ -50,8 +50,8 @@ test('mapToOpenAI: tool_choice none is OpenAI\'s none, not a forced call of a fu
 // ── A user turn's blocks: mapped, refused naming the block, or noted, never left out ──────────────────────────────
 // The mapping dropped every user block it did not know, and a turn holding only those vanished: [user, assistant,
 // user(a PDF document)] reached the engine as [user, assistant], so the model answered the turn before it (and
-// LiteRT-LM refused it as continuing a reply). The turn the reply answers is refused; an earlier one's block goes as a
-// note, since every later request of that conversation carries it again.
+// LiteRT-LM refused it as continuing a reply). The turn the reply answers is refused when it holds nothing else; beside
+// anything sendable, or in an earlier turn, the block goes as a note, since every later request carries it again.
 
 const PDF = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }
 const earlier = [
@@ -78,7 +78,7 @@ test('mapToOpenAI: a document with a text or content source reaches the engine a
     { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/cat.png' } }] })
 })
 
-test('mapToOpenAI: the turn the reply answers is refused when it holds a block it cannot send, naming the block, and an empty turn as Anthropic\'s API refuses it', () => {
+test('mapToOpenAI: the turn the reply answers is refused when it holds only blocks it cannot send, naming the first, and an empty turn as Anthropic\'s API refuses it', () => {
   const refusal = (content: unknown) => {
     try {
       mapToOpenAI({ max_tokens: 64, messages: [...earlier, { role: 'user', content }] } as never)
@@ -88,7 +88,8 @@ test('mapToOpenAI: the turn the reply answers is refused when it holds a block i
     return 'mapped'
   }
   assert.match(refusal([PDF]), /^messages\.2\.content\.0: a `document` block with a base64 source cannot be sent to a local model/)
-  assert.match(refusal([{ type: 'text', text: 'see the file' }, PDF]), /^messages\.2\.content\.1: a `document` block with a base64 source/, 'not dropped beside text either')
+  assert.match(refusal([PDF, { type: 'search_result', source: 'https://example.com', title: 't', content: [] }]), /^messages\.2\.content\.0: a `document` block/, 'the first')
+  assert.match(refusal([{ type: 'document', source: { type: 'content', content: [] } }, PDF]), /^messages\.2\.content\.1: /, 'a document of no content sends nothing either')
   assert.match(refusal([{ type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } }]), /a `document` block with a url source/)
   assert.match(refusal([{ type: 'document', source: { type: 'file', file_id: 'file_1' } }]), /a `document` block with a file source/)
   assert.match(refusal([{ type: 'search_result', source: 'https://example.com', title: 't', content: [] }]), /a `search_result` content block cannot be sent/)
@@ -102,6 +103,39 @@ test('mapToOpenAI: the turn the reply answers is refused when it holds a block i
   // An empty turn is refused wherever it is, as the API refuses it.
   assert.throws(() => mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [] }, ...earlier.slice(1), { role: 'user', content: 'hi' }] } as never),
     /^Error: messages\.0: all messages must have non-empty content/)
+})
+
+// An agent CLI's Read of a PDF returns the PDF as a document beside the Read's tool_result (merged into one user turn),
+// or inside the tool_result. Refused, that turn stayed the last: the client keeps no assistant turn for an API error
+// and adds the next prompt to the turn, so every later prompt got the same 400. Beside anything sendable the block goes
+// as its note, in the turn the reply answers too.
+test('mapToOpenAI: beside a tool_result, text or anything sendable, the answered turn\'s unsendable block goes as its note', () => {
+  const NOTE = '[a PDF document was attached here; this local model cannot read it]'
+  const read = [
+    { role: 'user', content: 'Summarize docs/spec.pdf.' },
+    { role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'docs/spec.pdf' } }] },
+  ]
+  const mapped = (content: unknown) =>
+    (mapToOpenAI({ max_tokens: 64, messages: [...read, { role: 'user', content }] } as never).messages as Array<Record<string, unknown>>).slice(2)
+  const result = { type: 'tool_result', tool_use_id: 'r1', content: 'PDF file read: docs/spec.pdf (1 KB)' }
+  assert.deepEqual(mapped([result, PDF]), [
+    { role: 'tool', tool_call_id: 'r1', content: 'PDF file read: docs/spec.pdf (1 KB)' },
+    { role: 'user', content: NOTE },
+  ])
+  // The next prompt, added to that turn, is answered too.
+  assert.deepEqual(mapped([result, PDF, { type: 'text', text: 'Answer from the file name only.' }]), [
+    { role: 'tool', tool_call_id: 'r1', content: 'PDF file read: docs/spec.pdf (1 KB)' },
+    { role: 'user', content: [{ type: 'text', text: NOTE }, { type: 'text', text: 'Answer from the file name only.' }] },
+  ])
+  assert.deepEqual(mapped([{ type: 'text', text: 'see the file' }, PDF]),
+    [{ role: 'user', content: [{ type: 'text', text: 'see the file' }, { type: 'text', text: NOTE }] }], 'beside text, in its place')
+  // Inside the tool_result: the PDF as its note, a text document as its text, an image left out as before.
+  assert.deepEqual(mapped([{ type: 'tool_result', tool_use_id: 'r1', content: [{ type: 'text', text: 'PDF file read: docs/spec.pdf (1 KB)' }, PDF] }]),
+    [{ role: 'tool', tool_call_id: 'r1', content: `PDF file read: docs/spec.pdf (1 KB)\n${NOTE}` }])
+  assert.deepEqual(mapped([{ type: 'tool_result', tool_use_id: 'r1', content: [
+    { type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'page one' } },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA=' } },
+  ] }]), [{ role: 'tool', tool_call_id: 'r1', content: 'page one' }])
 })
 
 test('mapToOpenAI: an earlier turn\'s block it cannot send goes as a note saying what was there, so the conversation goes on', () => {

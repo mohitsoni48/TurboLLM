@@ -133,8 +133,8 @@ function imagePart(source: { media_type?: string; data?: string }): Record<strin
   return { type: 'image_url', image_url: { url: `data:${source.media_type};base64,${source.data}` } }
 }
 
-/** A block no engine can be given: why (the 400 /v1/messages answers when the turn being answered holds it) and the
- *  note an earlier turn carries in its place, so that the model still sees the turn and what was in it. */
+/** A block no engine can be given: why (the 400 /v1/messages answers when the turn being answered holds nothing else)
+ *  and the note the turn carries in its place otherwise, so that the model still sees the turn and what was in it. */
 type Unsendable = { error: string; note: string }
 const unreadable = (what: string) => `[${what} was attached here; this local model cannot read it]`
 
@@ -188,9 +188,12 @@ function answeredTurn(messages: AnthropicRequest['messages']): number {
 
 /** Why /v1/messages (and count_tokens) must refuse the request's content, as Anthropic's API would or because no
  *  engine can be given it, or null. A user turn whose content array is empty is refused as the API refuses it. A block
- *  userBlockParts cannot map is refused, naming it, only in the turn the reply answers: in an earlier turn it goes as
- *  a note saying what was there, so that a conversation which once held a PDF can go on. Checked before anything
- *  routes or swaps a model. */
+ *  userBlockParts cannot map is refused, naming it, only when it is in the turn the reply answers and that turn holds
+ *  nothing an engine can take: otherwise it goes as a note saying what was there. In an earlier turn a refusal would
+ *  end the conversation, since every later request carries the turn again. Beside a tool_result, text or another
+ *  sendable block it would too: an agent CLI's Read of a PDF puts the PDF beside the Read's tool_result, and such a
+ *  client keeps no assistant turn for an error and adds the next prompt to the refused turn, so it stayed the last
+ *  and was refused again on every prompt after it. Checked before anything routes or swaps a model. */
 export function anthropicContentError(req: AnthropicRequest): string | null {
   if (!Array.isArray(req.messages)) return null
   const answered = answeredTurn(req.messages)
@@ -198,13 +201,36 @@ export function anthropicContentError(req: AnthropicRequest): string | null {
     if (msg?.role !== 'user' || !Array.isArray(msg.content)) continue
     if (msg.content.length === 0) return `messages.${i}: all messages must have non-empty content except for the optional final assistant message`
     if (i !== answered) continue
+    let refusal: string | null = null
+    let sendable = false
     for (const [j, b] of msg.content.entries()) {
-      if (b?.type === 'tool_result') continue
+      if (b?.type === 'tool_result') {
+        sendable = true
+        continue
+      }
       const mapped = userBlockParts(b)
-      if ('error' in mapped) return `messages.${i}.content.${j}: ${mapped.error}`
+      if ('error' in mapped) refusal ??= `messages.${i}.content.${j}: ${mapped.error}`
+      else if (mapped.parts.length > 0) sendable = true
     }
+    if (refusal && !sendable) return refusal
   }
   return null
+}
+
+/** A tool_result's content as its tool message's text: its text blocks, and a document in its text or as the note
+ *  saying what was there (an agent CLI's Read of a PDF returns the PDF there, beside a line of text, and the model,
+ *  told nothing, answered as if it had read it). An image in a tool_result is left out, as before. */
+function toolResultText(content: Array<{ type: string; text?: string }> | undefined): string {
+  const out: string[] = []
+  for (const x of content ?? []) {
+    if (x.type === 'text') out.push(x.text ?? '')
+    else if (x.type === 'document') {
+      const mapped = userBlockParts(x as ABlock)
+      if ('note' in mapped) out.push(mapped.note)
+      else for (const part of mapped.parts) if (part.type === 'text') out.push(part.text as string)
+    }
+  }
+  return out.join('\n')
 }
 
 /** Thrown by mapToOpenAI for content anthropicContentError refuses, for a caller that did not check it first. */
@@ -258,17 +284,11 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
       const parts: unknown[] = []
       for (const b of raw) {
         if (b.type === 'tool_result') {
-          const text =
-            typeof b.content === 'string'
-              ? b.content
-              : ((b.content as Array<{ type: string; text?: string }>) ?? [])
-                  .filter((x) => x.type === 'text')
-                  .map((x) => x.text ?? '')
-                  .join('\n')
+          const text = typeof b.content === 'string' ? b.content : toolResultText(b.content)
           toolResults.push({ role: 'tool', tool_call_id: b.tool_use_id, content: text })
         } else {
           const mapped = userBlockParts(b)
-          // Only an earlier turn's can be unsendable here (anthropicContentError refused the answered turn's).
+          // An unsendable block goes as its note (anthropicContentError refused a turn that would carry nothing else).
           if ('parts' in mapped) parts.push(...mapped.parts)
           else parts.push({ type: 'text', text: mapped.note })
         }

@@ -281,7 +281,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     }
     // A user turn of only blocks the mapping cannot send (a PDF document, an empty content array) vanished from the
     // engine's request, which then ended on the turn before it. The turn the reply answers is refused here when it
-    // holds one, naming the block, before any routing (an earlier turn's goes as a note); an empty turn anywhere too.
+    // holds nothing else, naming the block, before any routing (beside anything sendable, or in an earlier turn, the
+    // block goes as a note); an empty turn anywhere too.
     const contentError = anthropicContentError(req)
     if (contentError) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: contentError } }, 400)
     // Enforce the global "max response tokens" cap on external (Claude Code) traffic.

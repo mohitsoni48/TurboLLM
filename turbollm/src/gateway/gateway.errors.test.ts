@@ -647,7 +647,8 @@ for (const body of ['5', '"hello"', 'true', 'null', '[]', '[{"role":"user","cont
 
 // A user turn of only blocks the mapping did not know (a PDF document, an empty content array) vanished from the
 // engine's request, which then ended on the assistant turn before it. Both routes refuse it, naming the block, when it
-// is the turn the reply answers; in an earlier turn the block goes to the engine as a note saying what was there.
+// is the turn the reply answers; in an earlier turn, or beside anything sendable (an agent CLI's Read of a PDF puts it
+// beside the Read's tool_result), the block goes to the engine as a note saying what was there.
 for (const path of ['/v1/messages', '/v1/messages/count_tokens'] as const) {
   test(`${path}: a user turn of a PDF document is a 400 invalid_request_error naming the block, not a turn left out`, async () => {
     const app = new Hono()
@@ -705,6 +706,51 @@ for (const path of ['/v1/messages', '/v1/messages/count_tokens'] as const) {
       } else {
         assert.ok((JSON.parse(seen[0]) as { content: string }).content.includes(JSON.stringify(note)), seen[0])
         assert.deepEqual(await res.json(), { input_tokens: 3 })
+      }
+    } finally {
+      await engine.close()
+    }
+  })
+
+  // An agent CLI's Read of a PDF: the PDF beside the Read's tool_result in the turn the reply answers. A 400 there was
+  // final, since the client adds its next prompt to that turn; the PDF goes as a note and the agent's turn goes on.
+  test(`${path}: a PDF beside a tool_result in the turn being answered reaches the engine as a note, and the request is answered`, async () => {
+    const seen: string[] = []
+    const engine = await withFakeEngine((req, res) => {
+      let body = ''
+      req.on('data', (d: Buffer) => { body += d.toString() })
+      req.on('end', () => {
+        seen.push(body)
+        res.writeHead(200, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify(req.url === '/tokenize' ? { tokens: [1, 2, 3] } : {
+          id: 'c1', object: 'chat.completion', model: 'm',
+          choices: [{ index: 0, message: { role: 'assistant', content: 'I cannot read that PDF.' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 3, completion_tokens: 6 },
+        }))
+      })
+    })
+    try {
+      const app = new Hono()
+      registerGateway(app, fakeDeps(engine.url))
+      const messages = [
+        { role: 'user', content: 'Summarize docs/spec.pdf.' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'docs/spec.pdf' } }] },
+        { role: 'user', content: [
+          { type: 'tool_result', tool_use_id: 'r1', content: 'PDF file read: docs/spec.pdf (1 KB)' },
+          { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } },
+        ] },
+      ]
+      const res = await app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ model: 'qwen3-8b|Q4|123', max_tokens: 64, stream: false, messages }) })
+      assert.equal(res.status, 200, await res.clone().text())
+      assert.equal(seen.length, 1)
+      const note = '[a PDF document was attached here; this local model cannot read it]'
+      if (path === '/v1/messages') {
+        assert.deepEqual((JSON.parse(seen[0]) as { messages: unknown[] }).messages.slice(2), [
+          { role: 'tool', tool_call_id: 'r1', content: 'PDF file read: docs/spec.pdf (1 KB)' },
+          { role: 'user', content: note },
+        ])
+      } else {
+        assert.ok((JSON.parse(seen[0]) as { content: string }).content.includes(note), seen[0])
       }
     } finally {
       await engine.close()
