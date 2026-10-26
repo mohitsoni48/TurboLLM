@@ -6,14 +6,14 @@
 const { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, session, shell } = require('electron')
 const { join } = require('path')
 const { homedir } = require('os')
-const { spawn } = require('child_process')
+const { execFile, spawn } = require('child_process')
 const http = require('http')
 const { existsSync, readFileSync } = require('fs')
 const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
 const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
-  TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction, quitsWhenAllClosed,
-  trayMenuTemplate, usesTray,
+  MINIMIZED_NOTICE, TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction,
+  probeStatusNotifierHost, quitsWhenAllClosed, trayMenuTemplate, usesTray,
 } = require('./window-lifecycle')
 
 // The daemon's data folder, which holds its config.json and its pidfile: ~/.turbollm, as the app passes no --config.
@@ -284,6 +284,18 @@ let quitting = false
 // its icon with it.
 let tray = null
 let trayNotice = null
+// Linux: whether the desktop shows tray icons at all (window-lifecycle.js probeStatusNotifierHost); until the session
+// bus has said so, a close minimizes the window rather than hide it under an icon that may show nowhere.
+let trayShown = process.platform !== 'linux'
+let trayProbe = null
+// Asks the session bus again, unless it is being asked: at launch, and at each close of the window, so that the next
+// close follows a tray that came or went since (the AppIndicator extension turned on or off).
+function probeTray () {
+  if (process.platform !== 'linux' || trayProbe) return
+  trayProbe = probeStatusNotifierHost({ execFile })
+    .then((shown) => { trayShown = shown }, (err) => console.error('Could not ask the session bus for a tray:', err.message))
+    .then(() => { trayProbe = null })
+}
 
 // The one place a window is opened or brought back: the tray's Open, a click on the tray icon, a
 // second launch, a Dock click and the startup window once the daemon answers.
@@ -312,14 +324,18 @@ function openMainWindow () {
   })
   guardWindow(mainWindow)
   const win = mainWindow
-  // Windows and Linux: a close hides the window into the tray and the daemon keeps running; Quit is
-  // what stops it. During a quit the close goes through (see window-lifecycle.js closeAction).
+  // Windows and Linux: a close hides the window into the tray (minimizes it on a Linux desktop that shows no tray
+  // icon) and the daemon keeps running; Quit is what stops it. During a quit the close goes through (see
+  // window-lifecycle.js closeAction).
   win.on('close', (event) => {
     daemonPort() // the port the window is on, for a window or a daemon started once it is gone
-    if (closeAction({ platform: process.platform, quitting, hasTray: tray !== null }) !== 'hide') return
+    const action = closeAction({ platform: process.platform, quitting, hasTray: tray !== null, trayShown })
+    if (action === 'close') return
     event.preventDefault()
-    win.hide()
-    showTrayNoticeOnce()
+    probeTray()
+    if (action === 'minimize') win.minimize()
+    else win.hide()
+    showTrayNoticeOnce(action === 'minimize' ? MINIMIZED_NOTICE : TRAY_NOTICE)
   })
 
   mainWindow.loadURL(`http://127.0.0.1:${port}`)
@@ -359,13 +375,13 @@ function createTray () {
 // The first time the window goes to the tray, say once that the app is still running and where Quit
 // is: until now closing the window was how the app was quit. A tray balloon on Windows (it needs no
 // Start-menu shortcut registered for the app, as an Electron Notification there does), a desktop
-// notification on Linux.
-function showTrayNoticeOnce () {
+// notification on Linux, which names File > Quit where the desktop shows no tray icon (`notice`).
+function showTrayNoticeOnce (notice) {
   try {
     if (!trayNotice) trayNotice = createTrayNotice(join(app.getPath('userData'), TRAY_NOTICE_FILE))
     if (!trayNotice.take()) return
-    if (process.platform === 'win32') tray.displayBalloon({ title: TRAY_NOTICE.title, content: TRAY_NOTICE.body })
-    else if (Notification.isSupported()) new Notification({ title: TRAY_NOTICE.title, body: TRAY_NOTICE.body }).show()
+    if (process.platform === 'win32') tray.displayBalloon({ title: notice.title, content: notice.body })
+    else if (Notification.isSupported()) new Notification({ title: notice.title, body: notice.body }).show()
   } catch (err) {
     console.error('Could not show the tray notice:', err.message)
   }
@@ -405,6 +421,7 @@ app.whenReady().then(() => {
 
   // From launch, so Quit is in reach while the daemon starts too.
   if (usesTray(process.platform)) createTray()
+  probeTray()
 
   waitForDaemon().then(() => {
     // Refused (onDaemonLost): whatever answers on the port is not this app's daemon.

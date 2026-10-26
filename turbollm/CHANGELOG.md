@@ -336,8 +336,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app
   update is installed then. The first close shows a one-time notice. Launching the app again opens the window; on
   macOS a second launch from a terminal (or `open -n`) after the window was closed now opens one too, where it opened
-  nothing. On a Linux desktop without a tray, launching the app again is the way back, and the window's File menu has
-  Quit.
+  nothing. On a Linux desktop that shows no tray icons (GNOME without the AppIndicator extension), closing the window
+  minimizes it instead, and the notice says to quit from File > Quit.
 - **The text-classification playground's run continues in the daemon** (`POST`, `GET`, `DELETE ?id=` on
   `/api/v1/jev/playground/run`). Closing, reloading or leaving the page no longer stops it, a page that comes back
   shows it running or its answer, and a Cancel button stops it. A second run while one runs is refused and followed.

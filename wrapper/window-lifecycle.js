@@ -11,10 +11,14 @@
 // Exit (Windows) or File > Quit and Ctrl+Q (Linux), or until a logoff or shutdown ends it (main.js before-quit says
 // which of those are a quit). macOS already kept the app running in the Dock with no window open, and still does.
 
-const { dirname } = require('node:path')
+const { statSync } = require('node:fs')
+const { dirname, isAbsolute, join } = require('node:path')
 
 /** The OS notification shown the first time the window is closed into the tray (see createTrayNotice). */
 const TRAY_NOTICE = { title: 'TurboLLM', body: 'TurboLLM is still running. Quit it from the tray icon.' }
+
+/** The same notice on a Linux desktop that shows no tray icon, where a close minimizes the window (closeAction). */
+const MINIMIZED_NOTICE = { title: 'TurboLLM', body: 'TurboLLM is still running, minimized. Quit it from File > Quit.' }
 
 /** The tray icon is the app's icon. build/icon.png is electron-builder's icon source, but the `files` allowlist
  *  keeps wrapper/build out of the packaged app, so electron-builder.config.cjs copies it into the app's resources
@@ -34,17 +38,76 @@ function usesTray (platform) {
  * What closing the main window does.
  * - 'hide': Windows and Linux, with a tray icon. The close is cancelled and the window hidden, so the app, its
  *   daemon and the page itself keep running; the tray or a second launch shows the same window again.
+ * - 'minimize': Linux, with a tray icon no tray shows (`trayShown` false: see probeStatusNotifierHost). Hidden, the
+ *   window could only be found by launching the app again, and the notice pointed at an icon the user cannot see;
+ *   minimized, it stays in the window list and the app and its daemon keep running all the same.
  * - 'close': the window closes. On macOS the app stays in the Dock, as before. During a quit (`quitting`, set in
  *   before-quit) on every platform: a cancelled close cancels the whole quit, so hiding there would turn the tray's
  *   Quit, the app menu's Quit, Ctrl+Q or a logoff into "hide the window" and leave the daemon running. And with no
  *   tray icon (it could not be created) there would be no way back to a hidden window, so it closes and the app
  *   quits as before (quitsWhenAllClosed).
- * @param {{ platform: NodeJS.Platform, quitting: boolean, hasTray: boolean }} state
- * @returns {'hide'|'close'}
+ * @param {{ platform: NodeJS.Platform, quitting: boolean, hasTray: boolean, trayShown?: boolean }} state
+ * @returns {'hide'|'minimize'|'close'}
  */
-function closeAction ({ platform, quitting, hasTray }) {
+function closeAction ({ platform, quitting, hasTray, trayShown = true }) {
   if (quitting || !usesTray(platform) || !hasTray) return 'close'
-  return 'hide'
+  return platform === 'linux' && !trayShown ? 'minimize' : 'hide'
+}
+
+/** The calls that ask the session bus whether a StatusNotifierWatcher runs: what Electron's tray icon registers with
+ *  on Linux (KDE's, the AppIndicator extension's on GNOME). With none, GNOME shows the icon nowhere. GLib's gdbus
+ *  first, which Electron's own GTK needs, else dbus-send. */
+const STATUS_NOTIFIER_PROBES = [
+  ['gdbus', ['call', '--session', '--timeout', '2', '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
+    '--method', 'org.freedesktop.DBus.NameHasOwner', 'org.kde.StatusNotifierWatcher']],
+  ['dbus-send', ['--session', '--print-reply', '--reply-timeout=2000', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+    'org.freedesktop.DBus.NameHasOwner', 'string:org.kde.StatusNotifierWatcher']],
+]
+
+/** Whether `path` is a socket. */
+function isSocket (path) {
+  try {
+    return statSync(path).isSocket()
+  } catch {
+    return false
+  }
+}
+
+/** The session bus the probes ask, as a D-Bus address: DBUS_SESSION_BUS_ADDRESS, else the user's bus socket
+ *  ($XDG_RUNTIME_DIR/bus, where systemd and dbus-broker put it) when it exists, else null. With no address either tool
+ *  autolaunches a bus of its own (`dbus-launch --autolaunch`, with an X display), which no tray registers with and
+ *  which outlives the probe, so the probes then do not run.
+ *  @param {NodeJS.ProcessEnv} env
+ *  @param {(path: string) => boolean} [socketAt]
+ *  @returns {string|null} */
+function sessionBusAddress (env, socketAt = isSocket) {
+  if (env.DBUS_SESSION_BUS_ADDRESS) return env.DBUS_SESSION_BUS_ADDRESS
+  const runtime = env.XDG_RUNTIME_DIR
+  if (!runtime || !isAbsolute(runtime) || !socketAt(join(runtime, 'bus'))) return null
+  // A D-Bus address value escapes every byte but these as %xx.
+  const escaped = Array.from(Buffer.from(join(runtime, 'bus')), (b) =>
+    /[-0-9A-Za-z_/.\\*]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).padStart(2, '0')}`).join('')
+  return `unix:path=${escaped}`
+}
+
+/** Whether a tray icon shows on this Linux desktop: the session bus says a StatusNotifierWatcher has an owner. False
+ *  when it says none has, when there is no session bus to ask (sessionBusAddress), and when neither probe answers
+ *  within `timeoutMs` (no tool): a window minimized under a tray that shows is still at hand, one hidden under none is
+ *  not. Both tools are given the bus's address, so neither looks for one itself.
+ *  @param {{ execFile: typeof import('node:child_process').execFile, timeoutMs?: number, env?: NodeJS.ProcessEnv,
+ *    socketAt?: (path: string) => boolean }} deps
+ *  @returns {Promise<boolean>} */
+async function probeStatusNotifierHost ({ execFile, timeoutMs = 3000, env = process.env, socketAt = isSocket }) {
+  const address = sessionBusAddress(env, socketAt)
+  if (address === null) return false
+  const options = { timeout: timeoutMs, env: { ...env, DBUS_SESSION_BUS_ADDRESS: address } }
+  for (const [command, args] of STATUS_NOTIFIER_PROBES) {
+    const answer = await new Promise((resolve) => {
+      execFile(command, args, options, (err, stdout) => resolve(err ? null : String(stdout)))
+    })
+    if (answer !== null) return /\(true,\)|\bboolean true\b/.test(answer)
+  }
+  return false
 }
 
 /** Whether the app quits once its last window has closed: only on Windows and Linux when there is no tray icon to
@@ -119,13 +182,17 @@ function readShown (file, fs) {
 }
 
 module.exports = {
+  MINIMIZED_NOTICE,
+  STATUS_NOTIFIER_PROBES,
   TRAY_ICON,
   TRAY_NOTICE,
   TRAY_NOTICE_FILE,
   closeAction,
   createTrayNotice,
   openAction,
+  probeStatusNotifierHost,
   quitsWhenAllClosed,
+  sessionBusAddress,
   trayMenuTemplate,
   usesTray,
 }

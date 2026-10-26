@@ -136,10 +136,16 @@ test('main.js does not run electron-updater on macOS (no zip, unsigned: it canno
 // userData: the folder app.getPath('userData') names (the tray notice's file goes there); by default
 // a fresh one, removed after the tests. home: the home folder, whose .turbollm holds the daemon's config.json and
 // pidfile; by default a fresh one. env: TURBOLLM_PORT, when the test sets it (by default it is unset).
+// statusNotifier: what the session bus says on Linux of a StatusNotifierWatcher, the host of tray icons: 'running'
+// (by default), 'none' (GNOME without the AppIndicator extension), or 'no-bus' (no probe answers); setStatusNotifier
+// changes it, and `probes` lists the probes run, with the bus address each was given.
 const userDataDirs = []
+// The session bus main.js's tray probe asks (window-lifecycle.js sessionBusAddress): with none, it runs no probe.
+const SESSION_BUS = 'unix:path=/run/user/1000/bus'
+process.env.DBUS_SESSION_BUS_ADDRESS = SESSION_BUS
 test.after(() => { for (const dir of userDataDirs) rmSync(dir, { recursive: true, force: true }) })
 
-function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratchUserData(), env = {} } = {}) {
+function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratchUserData(), env = {}, statusNotifier = 'running' } = {}) {
   const spawned = []
   const dialogs = []
   const heldHealthz = []
@@ -147,6 +153,7 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratc
   const trays = []
   const notifications = []
   const iconPaths = []
+  const probes = []
   const appHandlers = {}
   let quits = 0
   let windowUrl = ''
@@ -167,6 +174,7 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratc
     isDestroyed () { return this.destroyed }
     on (event, handler) { this.handlers[event] = handler }
     hide () { this.visible = false }
+    minimize () { this.minimized = true }
     show () { this.visible = true }
     focus () { this.focused += 1 }
     isMinimized () { return this.minimized }
@@ -237,6 +245,11 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratc
       spawned.push({ args, child })
       return child
     },
+    execFile (command, _args, options, callback) {
+      probes.push({ command, bus: (options.env || process.env).DBUS_SESSION_BUS_ADDRESS })
+      const answer = { running: '(true,)\n', none: '(false,)\n' }[statusNotifier]
+      setImmediate(() => (answer ? callback(null, answer, '') : callback(new Error('Cannot autolaunch D-Bus without X11 $DISPLAY'), '', '')))
+    },
   }
   const http = {
     get (_url, _opts, onResponse) {
@@ -276,6 +289,8 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratc
     trays: () => trays,
     notifications,
     iconPaths,
+    probes,
+    setStatusNotifier: (answer) => { statusNotifier = answer },
     windowUrl: () => windowUrl,
     setWindowUrl: (url) => { windowUrl = url },
   }
@@ -575,6 +590,56 @@ for (const platform of ['win32', 'linux']) {
     assert.equal(main.allWindows().length, 1, 'never a second window')
   }))
 }
+
+// GNOME without the AppIndicator extension shows no tray icon: a close hid the window where only a second launch
+// found it, and the notice said to quit from a tray icon the user could not see.
+for (const statusNotifier of ['none', 'no-bus']) {
+  test(`main.js: on a Linux desktop that shows no tray icon (${statusNotifier}) a close minimizes the window; the notice names no tray`, () => withPlatform('linux', async () => {
+    const main = loadMain({ statusNotifier })
+    main.ready()
+    await turns()
+    const daemon = main.spawned[0].child
+    const [win] = main.windows()
+    assert.equal(win.close(), 'hidden', 'the close is cancelled')
+    assert.equal(win.minimized, true, 'minimized')
+    assert.equal(win.visible, true, 'not hidden: it stays in the window list')
+    assert.deepEqual(main.notifications, [{ title: 'TurboLLM', body: 'TurboLLM is still running, minimized. Quit it from File > Quit.' }])
+    assert.equal(main.quits(), 0, 'the app keeps running')
+    assert.deepEqual(daemon.signals, [], 'the daemon is not stopped')
+
+    main.emit('second-instance')
+    assert.equal(win.minimized, false, 'launching the app again restores it')
+    assert.equal(main.allWindows().length, 1)
+  }))
+}
+
+// A tray can come or go while the app runs (the AppIndicator extension turned on or off). The launch's answer was
+// kept for good: each close now asks the session bus again, and the next close follows the answer.
+test('main.js: on Linux each close asks the session bus again, so the next close follows a tray that came or went', () => withPlatform('linux', async () => {
+  const main = loadMain({ statusNotifier: 'none' })
+  main.ready()
+  await turns()
+  const [win] = main.windows()
+  assert.deepEqual(main.probes, [{ command: 'gdbus', bus: SESSION_BUS }], 'asked at launch, on the session bus')
+
+  main.setStatusNotifier('running') // the tray comes
+  win.close()
+  assert.equal(win.minimized, true, 'the answer at hand: no tray')
+  await turns()
+  main.emit('second-instance')
+  main.setStatusNotifier('none') // and goes
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [false, false], 'hidden under the tray that came')
+
+  await turns()
+  main.emit('second-instance')
+  assert.equal(win.visible, true)
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [true, true], 'minimized once the tray went')
+  await turns()
+  assert.equal(main.probes.length, 4, 'once at launch and once at each close')
+  assert.equal(main.allWindows().length, 1)
+}))
 
 // A quit closes the windows, and a close that hides the window instead cancels the quit, so Quit
 // would only hide the window and leave the daemon running. Nor may anything open a window while
