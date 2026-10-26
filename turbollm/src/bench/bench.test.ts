@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor } from './bench'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor, cardThatGrew } from './bench'
 import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -400,6 +400,19 @@ test('vramCardFor: where the engine may number the cards otherwise than nvidia-s
   assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: '/home/u/.turbollm/engines/build/ik_llama.cpp-b100/llama-server', sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp', release: { repo: 'ikawrakow/ik_llama.cpp', tag: 'b100', asset: 'x.zip' } as never }, NO_ENV, BUILD_ROOT), undefined)
   // Nor is an `engines/build` folder of another project, outside TurboLLM's data folder.
   assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: '/home/u/src/engines/build/x/llama-server', sourceRepo: 'https://github.com/ggml-org/llama.cpp' }, NO_ENV, BUILD_ROOT), undefined)
+})
+
+// Where the engine may number the cards otherwise than nvidia-smi, a single-GPU load's card is the one it grows.
+test('cardThatGrew: the card a load grew by most, when it stands out; else none', () => {
+  assert.equal(cardThatGrew([13000, 200], [13000, 4500]), 1, 'another program\'s memory on card 0 is not the load\'s')
+  assert.equal(cardThatGrew([300, 1100], [600, 9800]), 1, 'the engine\'s context on the other card is not either')
+  assert.equal(cardThatGrew([300, 1100, 50], [2400, 1100, 50]), 0)
+  assert.equal(cardThatGrew([300, 300], [600, 650]), undefined, 'two contexts: neither stands out')
+  assert.equal(cardThatGrew([300, 300], [500, 300]), undefined, 'under 256 MB: too little to tell')
+  assert.equal(cardThatGrew([300, 300], [4000, 2500]), undefined, 'another program allocating meanwhile: not twice as much')
+  assert.equal(cardThatGrew([9000, 300], [5000, 1500]), 1, 'a card another program freed meanwhile counts as no growth')
+  assert.equal(cardThatGrew([300], [5000]), undefined, 'one card: nothing to pick')
+  assert.equal(cardThatGrew([300, 300], [5000]), undefined, 'readings that do not line up')
 })
 
 test('parseRocmVramUsed: a single-GPU split reads only its own card', () => {
