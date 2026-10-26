@@ -57,8 +57,9 @@ test('with TURBOLLM_APP_SECRET set, the UI HTML (direct and SPA fallback) carrie
 })
 
 // The WebView's port block sees no WebSocket, and Chromium sent the host-only app cookie on a WebSocket to another
-// loopback port (an engine's) and on a sendBeacon there: connect-src allows the UI's own port, https/wss (an artifact's
-// web API calls) and data:/blob: (an artifact's export), and no plain http or ws source of any port.
+// loopback port (an engine's) and on a sendBeacon there: connect-src allows the UI's own port, data: (the page's
+// fetch of an artifact export's data: URL), blob: and https/wss (needed by nothing today; https/wss reach a loopback
+// port only over TLS, which no loopback server completes in the WebView), and no plain http or ws source of any port.
 test('with TURBOLLM_APP_SECRET set, connect-src admits the UI\'s own origin and https/wss, never plain http or ws', async () => {
   await withAppSecret('s3cret', async () => {
     const res = await spaApp().request('/')

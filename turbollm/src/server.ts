@@ -272,9 +272,14 @@ const NO_FRAMING_CSP = "frame-ancestors 'none'"
  *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
  *  The WebView routes no WebSocket through that block either, and Chromium sends the cookie on a
  *  WebSocket to `ws://127.0.0.1:<an engine's port>` and on a sendBeacon to another port: connect-src
- *  takes 'self' (the UI's fetches, its SSE tails and its terminal WebSocket on the same port), https:
- *  and wss: (an artifact's calls to a web API), and data: and blob: (an artifact's export), but no
- *  plain http or ws, which is all any other loopback port the app could reach speaks.
+ *  takes 'self' (the UI's fetches, its SSE tails and its terminal WebSocket on the same port), data:
+ *  (the page's own fetch of an artifact export's data: URL), and blob:, https: and wss:, which
+ *  nothing needs today; but no plain http or ws. https: and wss: reach a loopback port only over
+ *  TLS, which the WebView cannot complete with one: no trusted certificate names 127.0.0.1, and the
+ *  app overrides neither onReceivedSslError nor the network security config (either would make
+ *  them a way to another app's TLS port, such as Syncthing's 127.0.0.1:8384, with the cookie).
+ *  An artifact connects nowhere either way: its srcdoc carries a meta policy of its own,
+ *  `default-src 'none'` (web ArtifactCard buildSrcdoc), and both apply.
  *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
  *  scripts (frame-ancestors is never applied to them). */
 const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; connect-src 'self' https: wss: data: blob:; ${NO_FRAMING_CSP}`
