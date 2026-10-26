@@ -227,6 +227,11 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   check running. A check now gets 10 s, after which TurboLLM ends it and counts the CLI as installed (it was found
   and started), and requests made while a check runs share it. A routine whose CLI's check does not answer in those
   10 s is skipped ("Skipped (cli_unavailable)"), without touching the model.
+- `fetch_url` connects only to addresses it has checked. It looked a host up to check it and the connection looked it
+  up again, so a name answering a public address to the first lookup and 127.0.0.1 to the second (DNS rebinding), or
+  one whose first lookup failed, reached TurboLLM's own API or the local network. Each connection, a redirect's and a
+  search result's date check included, now looks the host up itself and is refused, with the same "blocked" error,
+  when an address is private.
 
 ### Changed
 - **A model's Load settings save only what you changed.** Load, Save, "Remember these settings", Save as… (a preset)
