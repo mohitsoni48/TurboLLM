@@ -239,6 +239,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   `invalid_request_error` naming it when it is in the turn being answered, and reaches the model as a note saying
   what was there ("[a PDF document was attached here; this local model cannot read it]") in an earlier turn, so the
   conversation can go on; an empty content array gets the 400 in any turn. `/v1/messages/count_tokens` does the same.
+- Extension API: appending a message with `generate: false` to a chat whose run is answering is refused with 409
+  `run_active` (retryable), as every other change to that chat is; it landed in the chat beside the run's reply.
 - Desktop app: a port changed in Settings is kept when the app starts again. Every launch put TurboLLM back on 6996
   while Settings showed the saved port; `TURBOLLM_PORT`, when set, still wins. On macOS a window opened again (the
   Dock, a second launch) after a port change opens on the new port, where it showed a connection error.
