@@ -7,7 +7,8 @@
 // with no address bar, so a phishing page looks like TurboLLM, and would grant that page every
 // permission it asks for (camera, microphone, location) without any prompt. So only the app's own
 // pages stay in the app, web links go to the system browser, and permissions are denied unless the
-// UI itself needs them. It also says which port a (re)spawned daemon binds: the one the window is on.
+// UI itself needs them. It also says which port the daemon starts on and a (re)spawned daemon binds and a window
+// opens on: the one the window is on, else the daemon's.
 
 // Everything the web UI asks for: copy buttons (navigator.clipboard.writeText, web/src/lib/clipboard.ts)
 // and routine-finished notifications (web/src/lib/notify-routine.ts). Anything else is denied.
@@ -37,17 +38,41 @@ function isAppUrl (url, appOrigin) {
   }
 }
 
-/** The port a daemon this app spawns must listen on: the port of the app page the window shows, else
- *  the launch port (no window yet, or not on an app page). After a port change in Settings the
- *  window is on the new port (see isAppUrl), and so is the live daemon; the daemon's --port is only
- *  read at boot. A respawn on the launch port would leave the window, and the restart overlay that
- *  polls and reloads the window's own origin, on a port nothing listens on. */
-function daemonPortFor (windowUrl, appOrigin, launchPort) {
+/** The port a daemon this app spawns must listen on, and a window it opens must load: the port of the app page the
+ *  window shows, else `fallbackPort` (no window, or not on an app page; main.js passes the port the daemon recorded,
+ *  else the last one known). After a port change in Settings the window is on the new port (see isAppUrl), and so is
+ *  the live daemon; the daemon's --port is only read at boot. A respawn on the launch port would leave the window,
+ *  and the restart overlay that polls and reloads the window's own origin, on a port nothing listens on. */
+function daemonPortFor (windowUrl, appOrigin, fallbackPort) {
   if (isAppUrl(windowUrl, appOrigin)) {
     const { port } = new URL(windowUrl)
     if (port) return port
   }
-  return String(launchPort)
+  return String(fallbackPort)
+}
+
+/** The port the app starts its daemon on: TURBOLLM_PORT when it is set, else the port saved in Settings (`daemon.port`
+ *  in the daemon's config.json, `configJson`), else 6996. The app passes it as `--port`, which wins over the saved
+ *  port, so every launch put the daemon back on 6996 while Settings showed the port saved there. */
+function launchPortFor (envPort, configJson) {
+  if (envPort) return String(envPort)
+  return portIn(configJson, (config) => config && config.daemon && config.daemon.port) ?? '6996'
+}
+
+/** The port the running daemon is on, from its pidfile (`daemon.pid`: `{ pid, port }`, written at every bind, so
+ *  after a port change in Settings too), when that pidfile is the daemon's with `pid`; else null (no pidfile yet, or
+ *  another daemon's). */
+function recordedPortFor (pidfileJson, pid) {
+  return portIn(pidfileJson, (record) => record && record.pid === pid && record.port)
+}
+
+function portIn (json, pick) {
+  try {
+    const port = pick(JSON.parse(json))
+    return Number.isInteger(port) && port >= 1 && port <= 65535 ? String(port) : null
+  } catch {
+    return null
+  }
 }
 
 /** http(s) only: the one kind of link worth handing to the system browser. Never file:, javascript:
@@ -67,4 +92,4 @@ function allowPermission (permission, requestingUrl, appOrigin) {
   return ALLOWED_PERMISSIONS.has(permission) && isAppUrl(requestingUrl, appOrigin)
 }
 
-module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl }
+module.exports = { ALLOWED_PERMISSIONS, allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor }

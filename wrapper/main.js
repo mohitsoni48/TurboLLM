@@ -5,17 +5,31 @@
 // only quitting the app stops the daemon (window-lifecycle.js).
 const { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, session, shell } = require('electron')
 const { join } = require('path')
+const { homedir } = require('os')
 const { spawn } = require('child_process')
 const http = require('http')
-const { existsSync } = require('fs')
+const { existsSync, readFileSync } = require('fs')
 const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
-const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
   TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction, quitsWhenAllClosed,
   trayMenuTemplate, usesTray,
 } = require('./window-lifecycle')
 
-const PORT = process.env.TURBOLLM_PORT || 6996
+// The daemon's data folder, which holds its config.json and its pidfile: ~/.turbollm, as the app passes no --config.
+const DATA_DIR = join(homedir(), '.turbollm')
+
+/** A file of the daemon's data folder, or '' when it cannot be read. */
+function readDataFile (name) {
+  try {
+    return readFileSync(join(DATA_DIR, name), 'utf8')
+  } catch {
+    return ''
+  }
+}
+
+// TURBOLLM_PORT, else the port saved in Settings, else 6996 (window-guards.js launchPortFor).
+const PORT = launchPortFor(process.env.TURBOLLM_PORT, readDataFile('config.json'))
 const APP_ORIGIN = appOriginFor(PORT)
 
 // ── Locate daemon files ───────────────────────────────────────────────────────
@@ -208,10 +222,16 @@ function stderrOf (child) {
 }
 
 // PORT until a port change in Settings moves the live daemon and then the window (window-guards.js
-// daemonPortFor); from then on the window's port, so a respawn comes back where the window is.
+// daemonPortFor); from then on the window's port, so a respawn comes back where the window is. With no window (macOS
+// after a close) the port the running daemon recorded, else the last one known: a window opened again loaded PORT,
+// which nothing listened on after a port change.
+let knownPort = PORT
 function daemonPort () {
   const url = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : ''
-  return daemonPortFor(url, APP_ORIGIN, PORT)
+  const daemon = supervisor && supervisor.current()
+  const recorded = daemon ? recordedPortFor(readDataFile('daemon.pid'), daemon.pid) : null
+  knownPort = daemonPortFor(url, APP_ORIGIN, recorded ?? knownPort)
+  return knownPort
 }
 
 // Set once the daemon was refused because another TurboLLM holds the data dir, or because it may not read or
@@ -277,6 +297,7 @@ function openMainWindow () {
     return
   }
   if (action !== 'create') return
+  const port = daemonPort()
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -294,13 +315,14 @@ function openMainWindow () {
   // Windows and Linux: a close hides the window into the tray and the daemon keeps running; Quit is
   // what stops it. During a quit the close goes through (see window-lifecycle.js closeAction).
   win.on('close', (event) => {
+    daemonPort() // the port the window is on, for a window or a daemon started once it is gone
     if (closeAction({ platform: process.platform, quitting, hasTray: tray !== null }) !== 'hide') return
     event.preventDefault()
     win.hide()
     showTrayNoticeOnce()
   })
 
-  mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
+  mainWindow.loadURL(`http://127.0.0.1:${port}`)
 
   if (process.env.NODE_ENV === 'development') {
     mainWindow.webContents.openDevTools()

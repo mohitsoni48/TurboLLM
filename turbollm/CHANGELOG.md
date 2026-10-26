@@ -232,6 +232,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   one whose first lookup failed, reached TurboLLM's own API or the local network. Each connection, a redirect's and a
   search result's date check included, now looks the host up itself and is refused, with the same "blocked" error,
   when an address is private.
+- Desktop app: a port changed in Settings is kept when the app starts again. Every launch put TurboLLM back on 6996
+  while Settings showed the saved port; `TURBOLLM_PORT`, when set, still wins. On macOS a window opened again (the
+  Dock, a second launch) after a port change opens on the new port, where it showed a connection error.
 
 ### Changed
 - **A model's Load settings save only what you changed.** Load, Save, "Remember these settings", Save as… (a preset)
