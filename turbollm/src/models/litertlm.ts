@@ -81,6 +81,15 @@ const VISION_ENCODER = 'tf_lite_vision_encoder'
 const AUDIO_ENCODER = 'tf_lite_audio_encoder_hw'
 const MAX_HEADER = 1 << 20
 const MAX_PROTO = 1 << 20
+// A header lists its sections in a FlatBuffer vector, and a vector may name one table any number of times: a crafted
+// header of MAX_HEADER could have one 1 MiB LlmMetadata section read and its template scanned some 260,000 times on
+// every model scan (hours), and a section's items the same way. So each metadata section is read once, and a header
+// that lists more sections than MAX_SECTIONS, or a section more items than MAX_ITEMS, is one this reader does not
+// understand: real bundles carry about ten sections of a few items each.
+const MAX_SECTIONS = 1024
+const MAX_ITEMS = 256
+// An item value longer than this is decoded as no value: no model type is that long.
+const MAX_ITEM_VALUE = 1024
 
 /** One FlatBuffer table over a buffer: just the accessors the header needs. */
 class FbTable {
@@ -96,12 +105,14 @@ class FbTable {
     const p = this.pos + o
     return new FbTable(this.b, p + this.b.readUInt32LE(p))
   }
-  tables(i: number): FbTable[] {
+  /** Field i's tables; a vector of more than `max` throws (the header reader then gives NO_HEADER). */
+  tables(i: number, max: number): FbTable[] {
     const o = this.field(i)
     if (!o) return []
     let p = this.pos + o
     p += this.b.readUInt32LE(p)
     const n = this.b.readUInt32LE(p)
+    if (n > max) throw new RangeError(`a vector of ${n} tables`)
     const out: FbTable[] = []
     for (let k = 0; k < n; k++) {
       const q = p + 4 + 4 * k
@@ -125,21 +136,34 @@ class FbTable {
     const n = this.b.readUInt32LE(p)
     return this.b.toString('utf8', p + 4, p + 4 + n)
   }
+  /** The byte length of field i's string, without decoding it; null when it is absent. */
+  stringBytes(i: number): number | null {
+    const o = this.field(i)
+    if (!o) return null
+    const p = this.pos + o
+    return this.b.readUInt32LE(p + this.b.readUInt32LE(p))
+  }
 }
 
 /** VData.StringValue, the union type of a KeyValuePair whose value is a string (litertlm_header_schema.fbs). */
 const VDATA_STRING = 9
 
-/** A section's string items (KeyValuePair key → StringValue): a TFLiteModel's `model_type`, `backend_constraint`. */
-function sectionStrings(section: FbTable): Map<string, string> {
-  const out = new Map<string, string>()
-  for (const kv of section.tables(0)) {
-    const key = kv.string(0)
-    if (key === null || kv.u8(1) !== VDATA_STRING) continue
-    const value = kv.table(2)?.string(0)
-    if (value != null) out.set(key, value)
+/** A section's string item `key` (KeyValuePair key → StringValue), such as a TFLiteModel's `model_type`; null when it
+ *  has none. */
+function sectionString(section: FbTable, key: string): string | null {
+  // The last item of the key, as a map of the items held it: walked from the end, the first. A key of another length
+  // is not decoded, so each item costs the same whatever its strings' length.
+  const keyBytes = Buffer.byteLength(key)
+  const items = section.tables(0, MAX_ITEMS)
+  for (let k = items.length - 1; k >= 0; k--) {
+    const kv = items[k]
+    if (kv.stringBytes(0) !== keyBytes || kv.string(0) !== key || kv.u8(1) !== VDATA_STRING) continue
+    const value = kv.table(2)
+    const n = value?.stringBytes(0)
+    if (n == null) continue
+    return n > MAX_ITEM_VALUE ? '' : value!.string(0)
   }
-  return out
+  return null
 }
 
 type ProtoField = { field: number; varint?: number; bytes?: Buffer; f32?: number }
@@ -418,22 +442,27 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
     if (headerEnd <= 32 || headerEnd > MAX_HEADER) return NO_HEADER
     const header = await read(32, headerEnd - 32)
     const root = new FbTable(header, header.readUInt32LE(0))
-    const sections = root.table(1)?.tables(0) ?? [] // section_metadata.objects
+    const sections = root.table(1)?.tables(0, MAX_SECTIONS) ?? [] // section_metadata.objects
     const out: LitertlmHeader = { ...NO_HEADER }
-    for (const s of sections) {
+    // Each metadata type comes from one section: the last that reads whole, as when every section was read in order
+    // and each overwrote the one before. Walked from the end that is the first, and the rest are not read at all.
+    const readTypes = new Set<number>()
+    for (let i = sections.length - 1; i >= 0; i--) {
+      const s = sections[i]
       const type = s.u8(3)
       if (type === SECTION_TFLITE_MODEL) {
-        const modelType = sectionStrings(s).get('model_type')?.toLowerCase()
+        const modelType = sectionString(s, 'model_type')?.toLowerCase()
         if (modelType === VISION_ENCODER) out.vision = true
         if (modelType === AUDIO_ENCODER) out.audio = true
         continue
       }
-      if (type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) continue
+      if ((type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) || readTypes.has(type)) continue
       const begin = s.u64(1)
       const end = s.u64(2)
       if (end <= begin || end - begin > MAX_PROTO) continue
       const proto = await read(begin, end - begin)
       if (proto.length !== end - begin) continue // a cut-short file: its sections say nothing (not "no tools")
+      readTypes.add(type)
       if (type === SECTION_LLM_METADATA) {
         out.defaultCtx = llmMetadataMaxNumTokens(proto)
         out.toolCalls = llmMetadataToolCalls(proto)

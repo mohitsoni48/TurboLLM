@@ -341,6 +341,56 @@ for (const [name, template] of Object.entries(HOSTILE_TEMPLATES)) {
   })
 }
 
+// A header lists its sections in a FlatBuffer vector, which may name one table again and again: read each time, one
+// crafted 1 MiB LlmMetadata section had its template scanned some 260,000 times per model scan (hours). Each metadata
+// type is now read from one section, the one the header's last word gives, and a vector past its bound is no header.
+test('litertlmHeaderFromFile reads a section the header lists many times once: a crafted header cannot multiply the template scan', async (t) => {
+  const p = join(scratch(t), 'repeated.litertlm')
+  // The costliest template for the linear scans: a tag of empty string literals, each blanked.
+  writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096, template: hostile("''", '{{ ', ' }}') }) }], 1000))
+  const start = performance.now()
+  const h = await litertlmHeaderFromFile(p)
+  const ms = performance.now() - start
+  assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+  assert.equal(h.defaultCtx, 4096)
+  assert.equal(h.toolCalls, false)
+})
+
+test('litertlmHeaderFromFile: the last metadata section that reads whole is the one, as before', async (t) => {
+  const dir = scratch(t)
+  const bundle = fakeLitertlmBundleOf([
+    { type: 5, data: fakeLlmMetadata({ maxNumTokens: 1024, template: '{{ tools }}' }) },
+    { type: 3, items: { model_type: 'tf_lite_vision_encoder' } },
+    { type: 5, data: fakeLlmMetadata({ maxNumTokens: 2048, template: 'no tags' }) },
+  ])
+  const whole = join(dir, 'whole.litertlm')
+  writeFileSync(whole, bundle)
+  const h = await litertlmHeaderFromFile(whole)
+  assert.deepEqual([h.defaultCtx, h.toolCalls, h.vision], [2048, false, true])
+  // The last section's bytes cut short: the one before it speaks.
+  const cut = join(dir, 'cut.litertlm')
+  writeFileSync(cut, bundle.subarray(0, bundle.length - 1))
+  const c = await litertlmHeaderFromFile(cut)
+  assert.deepEqual([c.defaultCtx, c.toolCalls, c.vision], [1024, true, true])
+})
+
+test('litertlmHeaderFromFile: a header listing more sections, or a section more items, than any bundle carries is no header', async (t) => {
+  const dir = scratch(t)
+  const many = join(dir, 'many.litertlm')
+  writeFileSync(many, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096 }) }], 1025))
+  assert.equal((await litertlmHeaderFromFile(many)).defaultCtx, 0)
+  // model_type and n - 1 other items.
+  const itemsOf = (n: number) => ({ ...Object.fromEntries(Array.from({ length: n - 1 }, (_, i) => [`key_${i}`, 'value'])), model_type: 'tf_lite_vision_encoder' })
+  const wide = join(dir, 'wide.litertlm')
+  writeFileSync(wide, fakeLitertlmBundleOf([{ type: 3, items: itemsOf(257) }]))
+  assert.equal((await litertlmHeaderFromFile(wide)).vision, false)
+  // At the bounds, read as ever.
+  writeFileSync(many, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096 }) }], 1024))
+  assert.equal((await litertlmHeaderFromFile(many)).defaultCtx, 4096)
+  writeFileSync(wide, fakeLitertlmBundleOf([{ type: 3, items: itemsOf(256) }]))
+  assert.equal((await litertlmHeaderFromFile(wide)).vision, true)
+})
+
 // ── the bundle's own sampler ──────────────────────────────────────────────────────────────────
 
 test('llmMetadataSampler: the bundle\'s own sampler, as the request fields that reproduce it', () => {
