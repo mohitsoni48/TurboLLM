@@ -16,6 +16,8 @@ import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB,
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
+import { backendIdFromBinPath } from '../engines/update'
+import { isEngineInBuildDir } from '../engines/build-runner'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
@@ -294,6 +296,11 @@ export class BenchRunner {
 
   private heldPath(): string {
     return join(this.store.dir(), HELD_RESULT_FILE)
+  }
+
+  /** The folder TurboLLM builds engines into (build-runner.ts: `<data dir>/engines/build/<slug>/`). */
+  private buildRoot(): string {
+    return join(this.store.dir(), 'engines', 'build')
   }
 
   /** Write the held result to disk (see `winning`), as the daemon's other state files are written: a temp file of this
@@ -1013,7 +1020,7 @@ export class BenchRunner {
     let spill: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the readings are final
-      vramAbsMb = await readGpuVramMb(sys, profile)
+      vramAbsMb = await readGpuVramMb(sys, profile, active, this.buildRoot())
       spill = spillMb(sharedBefore, await readGpuSharedMb(sys))
     }
     await this.stopEngine()
@@ -1124,7 +1131,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
 
-    const vramBefore = await readGpuVramMb(sys, profile)
+    const vramBefore = await readGpuVramMb(sys, profile, active, this.buildRoot())
     const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
@@ -1162,7 +1169,7 @@ export class BenchRunner {
     }
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
-    const vramAfter = await readGpuVramMb(sys, profile)
+    const vramAfter = await readGpuVramMb(sys, profile, active, this.buildRoot())
     // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
     // see, since the probe never generates and so never allocates the prefill compute buffers.
     const sharedAfter = await readGpuSharedMb(sys)
@@ -2157,10 +2164,42 @@ export interface VramCard {
 /** The card a single-GPU ('none') split runs on, indexed exactly like `gpuBudgetMb` so the
  *  reading and the budget it is judged against describe the SAME card (a summed reading against
  *  one card's budget counted the other cards' desktop/browser/ComfyUI memory as this card's).
- *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool. */
-export function vramCardFor(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): VramCard | undefined {
+ *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool, and where
+ *  the engine may number the cards otherwise (see {@link numbersCardsAsListed}). */
+export function vramCardFor(
+  sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>, engine?: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'>, env: NodeJS.ProcessEnv = process.env,
+  buildRoot?: string,
+): VramCard | undefined {
   if (sys.gpus.length < 2 || p?.gpu?.splitMode !== 'none') return undefined
+  if (!numbersCardsAsListed(sys, engine, env, buildRoot)) return undefined
   return { index: p.gpu.mainGpu >= 0 ? p.gpu.mainGpu : 0, of: sys.gpus.length }
+}
+
+/** The variables that renumber the cards a CUDA or ROCm engine sees, which nvidia-smi and rocm-smi ignore (HIP takes
+ *  GPU_DEVICE_ORDINAL as well). */
+const DEVICE_SELECTION_VARS = ['CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL']
+
+/** Whether the engine's `--main-gpu N` is card N of the readers' lists (nvidia-smi's and rocm-smi's, in PCI bus
+ *  order, as sysinfo's). A CUDA build numbers the fastest card first (CUDA_DEVICE_ORDER's default, FASTEST_FIRST), so
+ *  on a box of two models its card 0 can be the listing's card 1; a Vulkan build numbers them in the Vulkan loader's
+ *  order, which puts the GPU driving the display first (Mesa's device-select layer, Windows' adapter order) even among
+ *  cards of one model; and the variables above renumber them. Card N of the listing was then another card than the
+ *  engine's, and its reading too low, so one card is read only where the two orders are very unlikely to differ: a
+ *  CUDA or ROCm build on cards all of one model (FASTEST_FIRST leaves the order of equal cards unspecified, PCI order
+ *  in practice), with none of those variables set. The build is known by an official install's directory, or as one
+ *  TurboLLM compiled, which is CUDA: inside `buildRoot`, the folder its builds go to (`<data dir>/engines/build`, as
+ *  build-runner.ts places them), and with the source it was built from, not a release install there. A sourceRepo
+ *  alone proves nothing: any engine can be given one (registry.setSource), and an `engines/build` folder of another
+ *  project is not TurboLLM's. */
+function numbersCardsAsListed(
+  sys: SysInfo, engine: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'> | undefined, env: NodeJS.ProcessEnv, buildRoot: string | undefined,
+): boolean {
+  const [first] = sys.gpus
+  if (sys.gpus.some((g) => g.name !== first.name || g.vramMb !== first.vramMb)) return false
+  if (DEVICE_SELECTION_VARS.some((v) => env[v] !== undefined)) return false
+  const builtHere = !!buildRoot && !!engine?.sourceRepo && !engine.release && isEngineInBuildDir(engine.binPath, buildRoot)
+  const backend = backendIdFromBinPath(engine?.binPath ?? '') || (builtHere ? 'cuda' : '')
+  return backend === 'cuda' || backend === 'rocm'
 }
 
 /** Sum of per-card readings — or only `card`'s, when given and the tool listed exactly as many
@@ -2232,8 +2271,10 @@ function readRocmVramMb(card?: VramCard): Promise<number | null> {
  *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
  *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
  *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
-async function readGpuVramMb(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): Promise<number | null> {
-  const card = vramCardFor(sys, p)
+async function readGpuVramMb(
+  sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>, engine?: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'>, buildRoot?: string,
+): Promise<number | null> {
+  const card = vramCardFor(sys, p, engine, process.env, buildRoot)
   const nv = await readNvidiaVramMb(card)
   if (nv !== null) return nv
   if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb(card)

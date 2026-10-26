@@ -98,7 +98,8 @@ test('measure: with parallel slots and no unified KV, the bench prompt fits one 
       target: () => 'http://engine.invalid',
     }
     const registry = { active: () => ({ id: 'llama-cpp', binPath: '', version: 'b1', capabilities: CAPS }) }
-    const bench = new BenchRunner(manager as never, {} as never, {} as never, registry as never, 'test', {} as never)
+    // The store's data folder: the VRAM reading looks for TurboLLM's build folder in it.
+    const bench = new BenchRunner(manager as never, { dir: () => '/home/u/.turbollm' } as never, {} as never, registry as never, 'test', {} as never)
     const r = bench as unknown as RunnerInternals & { prefillProbe: (t: string, messages: { content: string }[]) => Promise<unknown> }
     r.deadline = Date.now() + 60_000
     r.engine = registry.active()
