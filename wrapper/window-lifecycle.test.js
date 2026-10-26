@@ -82,8 +82,9 @@ test('probeStatusNotifierHost: whether the session bus has a StatusNotifierWatch
 // With no DBUS_SESSION_BUS_ADDRESS (a session started without one, an app launched from a bare shell) gdbus and
 // dbus-send look for a bus themselves and, with an X display, autolaunch one (`dbus-launch --autolaunch`): a bus no
 // tray registers with, which outlives the probe. The user's bus socket is given to them when it exists; else neither
-// runs, and the desktop counts as showing no tray.
-test('probeStatusNotifierHost: with no bus address, the user\'s bus socket if it exists, else no tray and no tool run', async (t) => {
+// runs, and the desktop counts as showing no tray. Linux only, as the probe is (main.js asks only there): the test
+// listens on a unix socket path, which Windows refuses (EACCES).
+test('probeStatusNotifierHost: with no bus address, the user\'s bus socket if it exists, else no tray and no tool run', { skip: process.platform === 'win32' && 'unix socket paths; the probe runs on Linux only' }, async (t) => {
   const runtime = mkdtempSync(join(tmpdir(), 'tllm-xdg-'))
   const server = createServer()
   t.after(() => {
