@@ -232,6 +232,13 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   one whose first lookup failed, reached TurboLLM's own API or the local network. Each connection, a redirect's and a
   search result's date check included, now looks the host up itself and is refused, with the same "blocked" error,
   when an address is private.
+- `/v1/messages` (Claude Code and other Anthropic clients) leaves out no user turn. One holding only a PDF `document`
+  block, or an empty content array, was dropped, so the model answered the turn before it (and LiteRT-LM refused the
+  request), and a PDF beside text went without a word. A document with a text or content source is now sent as text,
+  and an image by URL as its URL. A PDF, URL or file document, or any other block the gateway cannot send, gets a 400
+  `invalid_request_error` naming it when it is in the turn being answered, and reaches the model as a note saying
+  what was there ("[a PDF document was attached here; this local model cannot read it]") in an earlier turn, so the
+  conversation can go on; an empty content array gets the 400 in any turn. `/v1/messages/count_tokens` does the same.
 - Desktop app: a port changed in Settings is kept when the app starts again. Every launch put TurboLLM back on 6996
   while Settings showed the saved port; `TURBOLLM_PORT`, when set, still wins. On macOS a window opened again (the
   Dock, a second launch) after a port change opens on the new port, where it showed a connection error.

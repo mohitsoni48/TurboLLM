@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto'
 type ASystem = string | Array<{ type: string; text?: string }>
 type ABlock =
   | { type: 'text'; text: string }
-  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } | { type: 'url'; url: string } | { type: 'file'; file_id: string } }
   | { type: 'tool_use'; id: string; name: string; input: unknown }
   // `is_error` is the client's own verdict on whether the call it was asked to make actually
   // succeeded — set when the tool threw, when its preconditions failed (an `Edit` whose
@@ -17,6 +17,13 @@ type ABlock =
   // ever gets about whether a terminal-agent CLI's edit really landed, which gateway.ts's
   // coding-activity attribution correlates against before crediting anything.
   | { type: 'tool_result'; tool_use_id: string; is_error?: boolean; content: string | Array<{ type: string; text?: string }> }
+  // A document's source: a base64 PDF, a URL of one, a Files API id, plain text, or text and image blocks
+  // ('content'). Only the last two are text an engine can be given.
+  | { type: 'document'; source: ADocumentSource; title?: string; context?: string }
+type ADocumentSource =
+  | { type: 'text'; media_type?: string; data: string }
+  | { type: 'content'; content: string | Array<{ type: string; text?: string; source?: { type: string; media_type?: string; data?: string } }> }
+  | { type: 'base64' | 'url' | 'file'; media_type?: string; data?: string; url?: string; file_id?: string }
 // 'system' is undocumented but real: Claude Code injects hook context (e.g. SessionStart)
 // as a `role:'system'` entry directly into `messages`, not just via the top-level `system`
 // field — mapToOpenAI folds every one of these into a single leading system message (see there).
@@ -121,7 +128,91 @@ function stripSchemaNameMap(map: unknown): unknown {
   return out
 }
 
+/** An image block's part in an OpenAI request. */
+function imagePart(source: { media_type?: string; data?: string }): Record<string, unknown> {
+  return { type: 'image_url', image_url: { url: `data:${source.media_type};base64,${source.data}` } }
+}
+
+/** A block no engine can be given: why (the 400 /v1/messages answers when the turn being answered holds it) and the
+ *  note an earlier turn carries in its place, so that the model still sees the turn and what was in it. */
+type Unsendable = { error: string; note: string }
+const unreadable = (what: string) => `[${what} was attached here; this local model cannot read it]`
+
+/** What a user turn's block (other than a tool_result) becomes in the OpenAI request, or, for one no engine can be
+ *  given, why and the note that stands for it. The mapping dropped every block it did not know (a `document`, a
+ *  `search_result`), and a turn of only those vanished, so the model answered the turn before it, or (LiteRT-LM) the
+ *  request was refused as continuing a reply. A document whose source is text is sent as text; a PDF is not. */
+function userBlockParts(b: ABlock): { parts: Record<string, unknown>[] } | Unsendable {
+  if (b.type === 'text') return { parts: [{ type: 'text', text: b.text }] }
+  if (b.type === 'image') {
+    // A URL is the engine's to fetch (llama-server downloads http(s) images); it was sent as `data:undefined;…`.
+    if (b.source?.type === 'url') return { parts: [{ type: 'image_url', image_url: { url: b.source.url } }] }
+    if (b.source?.type !== 'base64') return { error: `an \`image\` block with a ${typeof b.source?.type === 'string' ? b.source.type : 'missing'} source cannot be sent to a local model: send it base64 or as a URL.`, note: unreadable('an image') }
+    return { parts: [imagePart(b.source)] }
+  }
+  if (b.type === 'document') {
+    const src = b.source as ADocumentSource | undefined
+    const lead = [b.title, b.context].filter((x): x is string => typeof x === 'string' && x.trim() !== '')
+    const asText = (text: string) => ({ type: 'text', text: [...lead, text].join('\n\n') })
+    if (src?.type === 'text' && typeof src.data === 'string') return { parts: [asText(src.data)] }
+    if (src?.type === 'content') {
+      if (typeof src.content === 'string') return { parts: [asText(src.content)] }
+      const parts: Record<string, unknown>[] = []
+      for (const inner of Array.isArray(src.content) ? src.content : []) {
+        if (inner.type === 'text') parts.push({ type: 'text', text: inner.text ?? '' })
+        else if (inner.type === 'image' && inner.source?.type === 'base64') parts.push(imagePart(inner.source))
+        else return { error: `a document's content holds a \`${inner.type}\` block, which this gateway cannot send to a local model (text and base64 image blocks only).`, note: unreadable('a document') }
+      }
+      if (lead.length > 0) parts.unshift({ type: 'text', text: lead.join('\n\n') })
+      return { parts }
+    }
+    const kind = typeof src?.type === 'string' ? src.type : 'missing'
+    const pdf = kind === 'base64' && (src?.media_type ?? 'application/pdf') === 'application/pdf'
+    return {
+      error: `a \`document\` block with a ${kind} source cannot be sent to a local model: this gateway reads documents only as text. Send its text instead, as a text block or a document with a text source.`,
+      note: unreadable(pdf ? 'a PDF document' : 'a document'),
+    }
+  }
+  const type = (b as { type?: unknown }).type
+  return {
+    error: `a \`${type}\` content block cannot be sent to a local model through this gateway (it takes text, image, document and tool_result blocks in a user turn).`,
+    note: `[a ${typeof type === 'string' ? type : 'content'} block was here; this local model cannot read it]`,
+  }
+}
+
+/** The index of the user turn the reply answers: the last one (an assistant prefill may follow it), or -1. */
+function answeredTurn(messages: AnthropicRequest['messages']): number {
+  for (let i = messages.length - 1; i >= 0; i--) if (messages[i]?.role === 'user') return i
+  return -1
+}
+
+/** Why /v1/messages (and count_tokens) must refuse the request's content, as Anthropic's API would or because no
+ *  engine can be given it, or null. A user turn whose content array is empty is refused as the API refuses it. A block
+ *  userBlockParts cannot map is refused, naming it, only in the turn the reply answers: in an earlier turn it goes as
+ *  a note saying what was there, so that a conversation which once held a PDF can go on. Checked before anything
+ *  routes or swaps a model. */
+export function anthropicContentError(req: AnthropicRequest): string | null {
+  if (!Array.isArray(req.messages)) return null
+  const answered = answeredTurn(req.messages)
+  for (const [i, msg] of req.messages.entries()) {
+    if (msg?.role !== 'user' || !Array.isArray(msg.content)) continue
+    if (msg.content.length === 0) return `messages.${i}: all messages must have non-empty content except for the optional final assistant message`
+    if (i !== answered) continue
+    for (const [j, b] of msg.content.entries()) {
+      if (b?.type === 'tool_result') continue
+      const mapped = userBlockParts(b)
+      if ('error' in mapped) return `messages.${i}.content.${j}: ${mapped.error}`
+    }
+  }
+  return null
+}
+
+/** Thrown by mapToOpenAI for content anthropicContentError refuses, for a caller that did not check it first. */
+export class AnthropicContentError extends Error {}
+
 export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
+  const refused = anthropicContentError(req)
+  if (refused) throw new AnthropicContentError(refused)
   const messages: Record<string, unknown>[] = []
 
   // Collect EVERY system-role text into ONE combined message at index 0 — Claude Code sometimes
@@ -175,13 +266,11 @@ export function mapToOpenAI(req: AnthropicRequest): Record<string, unknown> {
                   .map((x) => x.text ?? '')
                   .join('\n')
           toolResults.push({ role: 'tool', tool_call_id: b.tool_use_id, content: text })
-        } else if (b.type === 'text') {
-          parts.push({ type: 'text', text: b.text })
-        } else if (b.type === 'image') {
-          parts.push({
-            type: 'image_url',
-            image_url: { url: `data:${b.source.media_type};base64,${b.source.data}` },
-          })
+        } else {
+          const mapped = userBlockParts(b)
+          // Only an earlier turn's can be unsendable here (anthropicContentError refused the answered turn's).
+          if ('parts' in mapped) parts.push(...mapped.parts)
+          else parts.push({ type: 'text', text: mapped.note })
         }
       }
       // tool results must precede text parts (spec)

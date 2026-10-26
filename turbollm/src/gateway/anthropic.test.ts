@@ -47,6 +47,85 @@ test('mapToOpenAI: tool_choice none is OpenAI\'s none, not a forced call of a fu
   assert.deepEqual(ask({ type: 'tool', name: 'read' }), { type: 'function', function: { name: 'read' } })
 })
 
+// ── A user turn's blocks: mapped, refused naming the block, or noted, never left out ──────────────────────────────
+// The mapping dropped every user block it did not know, and a turn holding only those vanished: [user, assistant,
+// user(a PDF document)] reached the engine as [user, assistant], so the model answered the turn before it (and
+// LiteRT-LM refused it as continuing a reply). The turn the reply answers is refused; an earlier one's block goes as a
+// note, since every later request of that conversation carries it again.
+
+const PDF = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: 'JVBERi0=' } }
+const earlier = [
+  { role: 'user', content: 'Summarize the attached file.' },
+  { role: 'assistant', content: [{ type: 'text', text: 'Please attach it.' }] },
+]
+const lastTurn = (content: unknown) =>
+  (mapToOpenAI({ max_tokens: 64, messages: [...earlier, { role: 'user', content }] } as never).messages as Array<{ role: string; content: unknown }>).at(-1)
+
+test('mapToOpenAI: a document with a text or content source reaches the engine as the user turn\'s text', () => {
+  assert.deepEqual(lastTurn([{ type: 'document', source: { type: 'text', media_type: 'text/plain', data: 'Q3 revenue rose 4%.' }, title: 'report.txt' }]),
+    { role: 'user', content: 'report.txt\n\nQ3 revenue rose 4%.' })
+  assert.deepEqual(lastTurn([{ type: 'document', source: { type: 'content', content: 'plain text' } }]), { role: 'user', content: 'plain text' })
+  assert.deepEqual(lastTurn([
+    { type: 'text', text: 'Compare these.' },
+    { type: 'document', source: { type: 'content', content: [{ type: 'text', text: 'page 1' }, { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAA=' } }] } },
+  ]), { role: 'user', content: [
+    { type: 'text', text: 'Compare these.' },
+    { type: 'text', text: 'page 1' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA=' } },
+  ] })
+  // An image by URL is the engine's to fetch (llama-server downloads it); it went out as `data:undefined;base64,undefined`.
+  assert.deepEqual(lastTurn([{ type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } }]),
+    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/cat.png' } }] })
+})
+
+test('mapToOpenAI: the turn the reply answers is refused when it holds a block it cannot send, naming the block, and an empty turn as Anthropic\'s API refuses it', () => {
+  const refusal = (content: unknown) => {
+    try {
+      mapToOpenAI({ max_tokens: 64, messages: [...earlier, { role: 'user', content }] } as never)
+    } catch (e) {
+      return (e as Error).message
+    }
+    return 'mapped'
+  }
+  assert.match(refusal([PDF]), /^messages\.2\.content\.0: a `document` block with a base64 source cannot be sent to a local model/)
+  assert.match(refusal([{ type: 'text', text: 'see the file' }, PDF]), /^messages\.2\.content\.1: a `document` block with a base64 source/, 'not dropped beside text either')
+  assert.match(refusal([{ type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } }]), /a `document` block with a url source/)
+  assert.match(refusal([{ type: 'document', source: { type: 'file', file_id: 'file_1' } }]), /a `document` block with a file source/)
+  assert.match(refusal([{ type: 'search_result', source: 'https://example.com', title: 't', content: [] }]), /a `search_result` content block cannot be sent/)
+  assert.match(refusal([{ type: 'image', source: { type: 'file', file_id: 'file_2' } }]), /an `image` block with a file source/)
+  assert.equal(refusal([]), 'messages.2: all messages must have non-empty content except for the optional final assistant message')
+  // A turn of tool results alone is no empty turn: they go out as tool messages, as before.
+  assert.equal(refusal([{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }]), 'mapped')
+  // Followed by an assistant prefill, the last user turn is still the one the reply answers.
+  assert.throws(() => mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [PDF] }, { role: 'assistant', content: 'The PDF says' }] } as never),
+    /^Error: messages\.0\.content\.0: a `document` block with a base64 source/)
+  // An empty turn is refused wherever it is, as the API refuses it.
+  assert.throws(() => mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [] }, ...earlier.slice(1), { role: 'user', content: 'hi' }] } as never),
+    /^Error: messages\.0: all messages must have non-empty content/)
+})
+
+test('mapToOpenAI: an earlier turn\'s block it cannot send goes as a note saying what was there, so the conversation goes on', () => {
+  const later = [{ role: 'assistant', content: 'I cannot open that file.' }, { role: 'user', content: 'Then answer from my question.' }]
+  const mapped = (content: unknown) =>
+    (mapToOpenAI({ max_tokens: 64, messages: [earlier[0], earlier[1], { role: 'user', content }, ...later] } as never).messages as Array<{ role: string; content: unknown }>)
+  const NOTE = '[a PDF document was attached here; this local model cannot read it]'
+  assert.deepEqual(mapped([PDF]), [
+    { role: 'user', content: 'Summarize the attached file.' },
+    { role: 'assistant', content: 'Please attach it.' },
+    { role: 'user', content: NOTE },
+    { role: 'assistant', content: 'I cannot open that file.' },
+    { role: 'user', content: 'Then answer from my question.' },
+  ])
+  assert.deepEqual(mapped([{ type: 'text', text: 'Here it is.' }, PDF]).at(2),
+    { role: 'user', content: [{ type: 'text', text: 'Here it is.' }, { type: 'text', text: NOTE }] }, 'beside text, in its place')
+  assert.deepEqual(mapped([{ type: 'document', source: { type: 'url', url: 'https://example.com/a.pdf' } }]).at(2),
+    { role: 'user', content: '[a document was attached here; this local model cannot read it]' })
+  assert.deepEqual(mapped([{ type: 'image', source: { type: 'file', file_id: 'file_2' } }]).at(2),
+    { role: 'user', content: '[an image was attached here; this local model cannot read it]' })
+  assert.deepEqual(mapped([{ type: 'search_result', source: 'https://example.com', title: 't', content: [] }]).at(2),
+    { role: 'user', content: '[a search_result block was here; this local model cannot read it]' })
+})
+
 // ── mapToOpenAI forwards the extended-thinking budget ───────────────────────
 // Regression coverage for a real bug (found + fully root-caused live 2026-07-23):
 // mapToOpenAI never forwarded any thinking budget to thinking_budget_tokens (the
