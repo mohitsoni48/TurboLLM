@@ -3,9 +3,11 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import {
+  blankJinjaStrings,
   hasLitertlmMagic,
   isLitertMagicNumber,
   isLitertlmFileName,
+  jinjaTagCode,
   jinjaTemplateReadsReasoning,
   jinjaTemplateTakesTools,
   litertlmEntryFor,
@@ -279,6 +281,65 @@ test('litertlmHeaderFromFile and litertlmEntryFor: whether the bundle\'s templat
   assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { reasoningHistory: true }).reasoningHistory, true)
   assert.equal('reasoningHistory' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { reasoningHistory: null }), false)
 })
+
+// ── reading a template in linear time ─────────────────────────────────────────────────────────
+//
+// Every scan reads each bundle's template (up to a MiB) for its tools and past reasoning, and both reads used plain
+// regexes that are quadratic on a crafted template. The rewrite must stay linear AND find the tags and string literals
+// those regexes found, in any template.
+
+/** The patterns as they were: the reference for "same tags, same literals". */
+const PLAIN_TAG = /\{[{%]([\s\S]*?)[}%]\}/g
+const PLAIN_STRING = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g
+
+test('jinjaTagCode and blankJinjaStrings: the tags and string literals the plain patterns found, on random templates', () => {
+  // Pieces that open, close and half-open tags and literals, and escape quotes and line ends, in any order (a fixed
+  // seed, so a failure reproduces).
+  const pieces = [
+    '{{', '{%', '}}', '%}', '{', '}', '%', "'", '"', '\\', "\\'", '\\"', '\\\n', '\n', '\r', '\u2028', ' ', 'x',
+    'tools', '.reasoning_content', "['thinking']",
+  ]
+  let seed = 0x7e3a
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  for (let i = 0; i < 5000; i++) {
+    const template = Array.from({ length: Math.floor(random() * 30) }, () => pieces[Math.floor(random() * pieces.length)]).join('')
+    const tags = jinjaTagCode(template)
+    assert.deepEqual(tags, [...template.matchAll(PLAIN_TAG)].map((m) => m[1]), JSON.stringify(template))
+    for (const code of [template, ...tags]) assert.equal(blankJinjaStrings(code), code.replace(PLAIN_STRING, '""'), JSON.stringify(code))
+  }
+})
+
+// Each template is quadratic for one of the old patterns: the old code took from 14 seconds to over a minute per bundle
+// here, the new code a few milliseconds. The bound is far above the latter, so a loaded CI machine can't trip it. A
+// bundle's template can be four times this size, which took the old code minutes.
+const HOSTILE_BOUND_MS = 1_000
+const hostile = (unit: string, before = '', after = '') =>
+  before + unit.repeat(Math.floor((256 * 1024 - before.length - after.length) / unit.length)) + after
+const HOSTILE_TEMPLATES: Record<string, string> = {
+  'expression openers with no closer': hostile('{{'),
+  'statement openers with no closer': hostile('{%'),
+  'both openers': hostile('{{{%'),
+  'a quote that never closes, in a tag': hostile("\\'", "{{ '", ' }}'),
+  'a double quote that never closes, in a tag': hostile('\\"', '{{ "', ' }}'),
+}
+for (const [name, template] of Object.entries(HOSTILE_TEMPLATES)) {
+  test(`litertlmHeaderFromFile stays linear on a crafted template: ${name}`, async (t) => {
+    const p = join(scratch(t), 'crafted.litertlm')
+    writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ template }) }]))
+    const start = performance.now()
+    const h = await litertlmHeaderFromFile(p)
+    const ms = performance.now() - start
+    assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+    // Read, not skipped as too large: both answers come from the template.
+    assert.equal(h.toolCalls, false)
+    assert.equal(h.reasoningHistory, false)
+  })
+}
 
 // ── the bundle's own sampler ──────────────────────────────────────────────────────────────────
 

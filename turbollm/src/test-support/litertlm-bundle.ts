@@ -170,7 +170,10 @@ export function fakeLlmMetadata(fields: {
   }
   if (fields.maxNumTokens) out.push(...pVarint(5, fields.maxNumTokens))
   if (fields.modelType !== undefined) out.push(...pBytes(6, pBytes(fields.modelType, [])))
-  if (fields.template !== undefined) out.push(...pBytes(7, [...Buffer.from(fields.template, 'utf8')]))
-  if (fields.supportsFunctionCalling !== undefined) out.push(...pVarint(12, fields.supportsFunctionCalling ? 1 : 0))
-  return Buffer.from(out)
+  // The template is joined as a Buffer: one of up to a MiB is too many arguments for push().
+  const template = Buffer.from(fields.template ?? '', 'utf8')
+  if (fields.template !== undefined) out.push(...varint(7 * 8 + 2), ...varint(template.length))
+  const tail: number[] = []
+  if (fields.supportsFunctionCalling !== undefined) tail.push(...pVarint(12, fields.supportsFunctionCalling ? 1 : 0))
+  return Buffer.concat([Buffer.from(out), template, Buffer.from(tail)])
 }
