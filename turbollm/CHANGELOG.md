@@ -66,6 +66,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   `items` nor `engineGenerating`. The Android app keeps the model loaded and the phone awake for all of that work
   (before, it could unload the model under a load, an auto-tune, a skill or a reply's title), and lets the phone sleep
   while a reply waits for an approval. Loading a text-classification model names each in its confirmation.
+- `GET /api/v1/activity` also carries `downloads` (the running and queued downloads: `name`, `status`, `received`,
+  `total`, `bytesPerSec`) and `status` (`engine.state`, `model.name`, `poolModels`, `jev.name`, `laya.name` and
+  `serving`, as `GET /api/v1/status` gives them), each only to a caller that may read that route, so the Android app's
+  service can ask one route every 3 s instead of three.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
