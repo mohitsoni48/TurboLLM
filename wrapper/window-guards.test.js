@@ -636,32 +636,52 @@ for (const statusNotifier of ['none', 'no-bus']) {
   }))
 }
 
-// A tray can come or go while the app runs (the AppIndicator extension turned on or off). The launch's answer was
-// kept for good: each close now asks the session bus again, and the next close follows the answer.
-test('main.js: on Linux each close asks the session bus again, so the next close follows a tray that came or went', () => withPlatform('linux', async () => {
-  const main = loadMain({ statusNotifier: 'none' })
+// A tray can go or come back while the app runs (the AppIndicator extension turned off and on): the launch's answer was
+// kept for good, so each close now asks the session bus again, and the next close follows the answer.
+test('main.js: on Linux each close asks the session bus again, so the next close follows a tray that went or came back', () => withPlatform('linux', async () => {
+  const main = loadMain()
   main.ready()
   await turns()
   const [win] = main.windows()
-  assert.deepEqual(main.probes, [{ command: 'gdbus', bus: SESSION_BUS }], 'asked at launch, on the session bus')
+  assert.deepEqual(main.probes, [{ command: 'gdbus', bus: SESSION_BUS }, { command: 'gdbus', bus: SESSION_BUS }],
+    'asked at launch, on the session bus: for the watcher, then for its host')
 
-  main.setStatusNotifier('running') // the tray comes
+  main.setStatusNotifier('none') // the tray goes
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [false, false], 'the answer at hand: a tray')
+  await turns()
+  main.emit('second-instance')
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [true, true], 'minimized once the tray went')
+
+  await turns()
+  main.emit('second-instance')
+  main.setStatusNotifier('running') // and comes back: the app's icon registers with it again
   win.close()
   assert.equal(win.minimized, true, 'the answer at hand: no tray')
   await turns()
   main.emit('second-instance')
-  main.setStatusNotifier('none') // and goes
   win.close()
-  assert.deepEqual([win.minimized, win.visible], [false, false], 'hidden under the tray that came')
-
-  await turns()
-  main.emit('second-instance')
-  assert.equal(win.visible, true)
-  win.close()
-  assert.deepEqual([win.minimized, win.visible], [true, true], 'minimized once the tray went')
-  await turns()
-  assert.equal(main.probes.length, 4, 'once at launch and once at each close')
+  assert.deepEqual([win.minimized, win.visible], [false, false], 'hidden under the tray that came back')
   assert.equal(main.allWindows().length, 1)
+}))
+
+// Electron's tray icon registers with a tray only when it is created, at launch, and again with one that comes back:
+// with none at launch it falls back for good to a GTK status icon, which GNOME shows nowhere. So a tray that first
+// appears later (the AppIndicator extension turned on) shows no icon of the app, and hiding the window there lost it.
+test('main.js: on Linux a tray that first appears after launch shows no icon of the app, so a close still minimizes', () => withPlatform('linux', async () => {
+  const main = loadMain({ statusNotifier: 'none' })
+  main.ready()
+  await turns()
+  const [win] = main.windows()
+  main.setStatusNotifier('running')
+  for (const close of [1, 2, 3]) {
+    win.close()
+    assert.deepEqual([win.minimized, win.visible], [true, true], `close ${close}`)
+    await turns()
+    main.emit('second-instance')
+  }
+  assert.equal(main.probes.length, 7, 'asked at launch (no watcher), and at each close (a watcher, then its host)')
 }))
 
 // A quit closes the windows, and a close that hides the window instead cancels the quit, so Quit

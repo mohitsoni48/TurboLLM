@@ -284,16 +284,26 @@ let quitting = false
 // its icon with it.
 let tray = null
 let trayNotice = null
-// Linux: whether the desktop shows tray icons at all (window-lifecycle.js probeStatusNotifierHost); until the session
-// bus has said so, a close minimizes the window rather than hide it under an icon that may show nowhere.
+// Linux: whether the desktop shows this app's tray icon (window-lifecycle.js probeStatusNotifierHost); until the
+// session bus has said so, a close minimizes the window rather than hide it under an icon that may show nowhere.
 let trayShown = process.platform !== 'linux'
+// The answer at launch, while `new Tray()` asked the bus the same: Electron's icon registers with a tray only then, and
+// again with one that comes back after; with none at launch it falls back for good to a GTK status icon, which those
+// desktops show nowhere. So a tray that first appears later shows no icon of this app: the launch answer is a ceiling.
+let trayAtLaunch = null
 let trayProbe = null
 // Asks the session bus again, unless it is being asked: at launch, and at each close of the window, so that the next
-// close follows a tray that came or went since (the AppIndicator extension turned on or off).
+// close follows a tray that went since (the AppIndicator extension turned off), or came back.
 function probeTray () {
   if (process.platform !== 'linux' || trayProbe) return
   trayProbe = probeStatusNotifierHost({ execFile })
-    .then((shown) => { trayShown = shown }, (err) => console.error('Could not ask the session bus for a tray:', err.message))
+    .then((shown) => {
+      if (trayAtLaunch === null) trayAtLaunch = shown
+      trayShown = trayAtLaunch && shown
+    }, (err) => {
+      if (trayAtLaunch === null) trayAtLaunch = false
+      console.error('Could not ask the session bus for a tray:', err.message)
+    })
     .then(() => { trayProbe = null })
 }
 

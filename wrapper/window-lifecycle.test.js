@@ -47,19 +47,21 @@ test('closeAction: on a Linux desktop that shows no tray icon a close minimizes 
   assert.match(MINIMIZED_NOTICE.body, /still running.*File > Quit/)
 })
 
-/** A stand-in execFile answering each command with `answers[command]` (a string: its stdout; else an error); `calls`
- *  lists the commands run, their timeout and the bus address they were given (in their env, else this process's). */
+/** A stand-in execFile answering each command with `answers[command]` (a string: its stdout; else an error), or, for
+ *  the property read, `answers[`${command} host`]` when given; `calls` lists the commands run (` host` added for the
+ *  property read), their timeout and the bus address they were given (in their env, else this process's). */
 function fakeExecFile (answers) {
   const calls = []
   const execFile = (command, args, options, callback) => {
-    calls.push({ command, timeout: options.timeout, bus: (options.env || process.env).DBUS_SESSION_BUS_ADDRESS })
-    const answer = answers[command]
+    const name = args.some((a) => a.endsWith('IsStatusNotifierHostRegistered')) ? `${command} host` : command
+    calls.push({ command: name, timeout: options.timeout, bus: (options.env || process.env).DBUS_SESSION_BUS_ADDRESS })
+    const answer = name in answers ? answers[name] : answers[command]
     setImmediate(() => (typeof answer === 'string' ? callback(null, answer, '') : callback(answer || new Error('ENOENT'), '', '')))
   }
   return { execFile, calls }
 }
 
-test('probeStatusNotifierHost: whether the session bus has a StatusNotifierWatcher, by gdbus, else dbus-send; no answer is none', async () => {
+test('probeStatusNotifierHost: whether the session bus has a StatusNotifierWatcher with a host registered, by gdbus, else dbus-send; no answer is none', async () => {
   const BUS = 'unix:path=/run/user/1000/bus'
   const probe = async (answers) => {
     const { execFile, calls } = fakeExecFile(answers)
@@ -67,15 +69,24 @@ test('probeStatusNotifierHost: whether the session bus has a StatusNotifierWatch
     for (const call of calls) assert.equal(call.bus, BUS, 'the session\'s own bus')
     return { shown, calls: calls.map(({ command, timeout }) => ({ command, timeout })) }
   }
-  assert.deepEqual(await probe({ gdbus: '(true,)\n' }), { shown: true, calls: [{ command: 'gdbus', timeout: 1000 }] })
+  const both = (command) => [{ command, timeout: 1000 }, { command: `${command} host`, timeout: 1000 }]
+  assert.deepEqual(await probe({ gdbus: '(true,)\n', 'gdbus host': '(<true>,)\n' }), { shown: true, calls: both('gdbus') })
   assert.deepEqual(await probe({ gdbus: '(false,)\n' }), { shown: false, calls: [{ command: 'gdbus', timeout: 1000 }] })
-  const viaDbusSend = await probe({ 'dbus-send': 'method return time=1.2 sender=org.freedesktop.DBus\n   boolean true\n' })
-  assert.deepEqual(viaDbusSend, { shown: true, calls: [{ command: 'gdbus', timeout: 1000 }, { command: 'dbus-send', timeout: 1000 }] })
+  const viaDbusSend = await probe({
+    'dbus-send': 'method return time=1.2 sender=org.freedesktop.DBus\n   boolean true\n',
+    'dbus-send host': 'method return time=1.3 sender=:1.40\n   variant       boolean true\n',
+  })
+  assert.deepEqual(viaDbusSend, { shown: true, calls: [{ command: 'gdbus', timeout: 1000 }, ...both('dbus-send')] })
   assert.equal((await probe({ 'dbus-send': '   boolean false\n' })).shown, false)
   assert.equal((await probe({})).shown, false, 'no bus or no tool: treated as no tray')
-  // Both ask the bus itself whether the watcher's name has an owner.
-  for (const [, args] of STATUS_NOTIFIER_PROBES) {
-    assert.ok(args.some((a) => a.endsWith('NameHasOwner')) && args.some((a) => a.endsWith('org.kde.StatusNotifierWatcher')))
+  // A watcher with no host registered draws no icon: Electron's falls back to a GTK one, shown nowhere.
+  assert.deepEqual(await probe({ gdbus: '(true,)\n', 'gdbus host': '(<false>,)\n' }), { shown: false, calls: both('gdbus') })
+  assert.equal((await probe({ 'dbus-send': '   boolean true\n', 'dbus-send host': '   variant       boolean false\n' })).shown, false)
+  assert.equal((await probe({ gdbus: '(true,)\n', 'gdbus host': new Error('No such property') })).shown, false, 'nor one that cannot say')
+  // Both ask the bus itself whether the watcher's name has an owner, then the watcher whether a host registered.
+  for (const [, [watcher, host]] of STATUS_NOTIFIER_PROBES) {
+    assert.ok(watcher.some((a) => a.endsWith('NameHasOwner')) && watcher.some((a) => a.endsWith('org.kde.StatusNotifierWatcher')))
+    assert.ok(host.some((a) => a.endsWith('Properties.Get')) && host.some((a) => a.endsWith('IsStatusNotifierHostRegistered')))
   }
 })
 
@@ -92,7 +103,7 @@ test('probeStatusNotifierHost: with no bus address, the user\'s bus socket if it
     rmSync(runtime, { recursive: true, force: true })
   })
   const probe = async (env) => {
-    const { execFile, calls } = fakeExecFile({ gdbus: '(true,)\n' })
+    const { execFile, calls } = fakeExecFile({ gdbus: '(true,)\n', 'gdbus host': '(<true>,)\n' })
     return { shown: await probeStatusNotifierHost({ execFile, timeoutMs: 1000, env }), buses: calls.map((c) => c.bus) }
   }
   assert.deepEqual(await probe({ XDG_RUNTIME_DIR: runtime }), { shown: false, buses: [] }, 'no socket: nothing runs')
@@ -103,9 +114,9 @@ test('probeStatusNotifierHost: with no bus address, the user\'s bus socket if it
   assert.deepEqual(await probe({ XDG_RUNTIME_DIR: 'run/user/1000' }), { shown: false, buses: [] }, 'a relative one is none')
 
   await new Promise((resolve) => server.listen(join(runtime, 'bus'), resolve))
-  assert.deepEqual(await probe({ XDG_RUNTIME_DIR: runtime }), { shown: true, buses: [`unix:path=${join(runtime, 'bus')}`] })
+  assert.deepEqual(await probe({ XDG_RUNTIME_DIR: runtime }), { shown: true, buses: Array(2).fill(`unix:path=${join(runtime, 'bus')}`) })
   // An address set is the one used, socket or not.
-  assert.deepEqual(await probe({ XDG_RUNTIME_DIR: runtime, DBUS_SESSION_BUS_ADDRESS: 'unix:abstract=x' }), { shown: true, buses: ['unix:abstract=x'] })
+  assert.deepEqual(await probe({ XDG_RUNTIME_DIR: runtime, DBUS_SESSION_BUS_ADDRESS: 'unix:abstract=x' }), { shown: true, buses: ['unix:abstract=x', 'unix:abstract=x'] })
   assert.equal(sessionBusAddress({ XDG_RUNTIME_DIR: '/run/user/1 000' }, () => true), 'unix:path=/run/user/1%20000/bus', 'escaped as D-Bus addresses are')
 })
 

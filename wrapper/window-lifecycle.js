@@ -54,14 +54,24 @@ function closeAction ({ platform, quitting, hasTray, trayShown = true }) {
   return platform === 'linux' && !trayShown ? 'minimize' : 'hide'
 }
 
-/** The calls that ask the session bus whether a StatusNotifierWatcher runs: what Electron's tray icon registers with
- *  on Linux (KDE's, the AppIndicator extension's on GNOME). With none, GNOME shows the icon nowhere. GLib's gdbus
- *  first, which Electron's own GTK needs, else dbus-send. */
+/** The calls that ask the session bus whether tray icons show, as Electron's tray icon asks when it is created on
+ *  Linux (Chromium's StatusIconLinuxDbus): whether a StatusNotifierWatcher has an owner (KDE's, the AppIndicator
+ *  extension's on GNOME), and then whether a StatusNotifierHost, which draws the icons, has registered with it. With
+ *  either answer no, the icon falls back to a GTK status icon, which GNOME and Wayland show nowhere. Per tool, those
+ *  two calls: GLib's gdbus first, which Electron's own GTK needs, else dbus-send. */
 const STATUS_NOTIFIER_PROBES = [
-  ['gdbus', ['call', '--session', '--timeout', '2', '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
-    '--method', 'org.freedesktop.DBus.NameHasOwner', 'org.kde.StatusNotifierWatcher']],
-  ['dbus-send', ['--session', '--print-reply', '--reply-timeout=2000', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
-    'org.freedesktop.DBus.NameHasOwner', 'string:org.kde.StatusNotifierWatcher']],
+  ['gdbus', [
+    ['call', '--session', '--timeout', '2', '--dest', 'org.freedesktop.DBus', '--object-path', '/org/freedesktop/DBus',
+      '--method', 'org.freedesktop.DBus.NameHasOwner', 'org.kde.StatusNotifierWatcher'],
+    ['call', '--session', '--timeout', '2', '--dest', 'org.kde.StatusNotifierWatcher', '--object-path', '/StatusNotifierWatcher',
+      '--method', 'org.freedesktop.DBus.Properties.Get', 'org.kde.StatusNotifierWatcher', 'IsStatusNotifierHostRegistered'],
+  ]],
+  ['dbus-send', [
+    ['--session', '--print-reply', '--reply-timeout=2000', '--dest=org.freedesktop.DBus', '/org/freedesktop/DBus',
+      'org.freedesktop.DBus.NameHasOwner', 'string:org.kde.StatusNotifierWatcher'],
+    ['--session', '--print-reply', '--reply-timeout=2000', '--dest=org.kde.StatusNotifierWatcher', '/StatusNotifierWatcher',
+      'org.freedesktop.DBus.Properties.Get', 'string:org.kde.StatusNotifierWatcher', 'string:IsStatusNotifierHostRegistered'],
+  ]],
 ]
 
 /** Whether `path` is a socket. */
@@ -90,10 +100,11 @@ function sessionBusAddress (env, socketAt = isSocket) {
   return `unix:path=${escaped}`
 }
 
-/** Whether a tray icon shows on this Linux desktop: the session bus says a StatusNotifierWatcher has an owner. False
- *  when it says none has, when there is no session bus to ask (sessionBusAddress), and when neither probe answers
- *  within `timeoutMs` (no tool): a window minimized under a tray that shows is still at hand, one hidden under none is
- *  not. Both tools are given the bus's address, so neither looks for one itself.
+/** Whether a tray icon shows on this Linux desktop: the session bus says a StatusNotifierWatcher has an owner and a
+ *  StatusNotifierHost registered with it. False when it says either is missing, when the second call fails, when there
+ *  is no session bus to ask (sessionBusAddress), and when neither tool answers the first call within `timeoutMs` (no
+ *  tool): a window minimized under a tray that shows is still at hand, one hidden under none is not. Both tools are
+ *  given the bus's address, so neither looks for one itself.
  *  @param {{ execFile: typeof import('node:child_process').execFile, timeoutMs?: number, env?: NodeJS.ProcessEnv,
  *    socketAt?: (path: string) => boolean }} deps
  *  @returns {Promise<boolean>} */
@@ -101,11 +112,17 @@ async function probeStatusNotifierHost ({ execFile, timeoutMs = 3000, env = proc
   const address = sessionBusAddress(env, socketAt)
   if (address === null) return false
   const options = { timeout: timeoutMs, env: { ...env, DBUS_SESSION_BUS_ADDRESS: address } }
-  for (const [command, args] of STATUS_NOTIFIER_PROBES) {
-    const answer = await new Promise((resolve) => {
-      execFile(command, args, options, (err, stdout) => resolve(err ? null : String(stdout)))
-    })
-    if (answer !== null) return /\(true,\)|\bboolean true\b/.test(answer)
+  const ask = (command, args) => new Promise((resolve) => {
+    execFile(command, args, options, (err, stdout) => resolve(err ? null : String(stdout)))
+  })
+  // gdbus prints a boolean as `(true,)` and a property's variant as `(<true>,)`; dbus-send prints `boolean true`.
+  const yes = (answer) => /\(<?true>?,\)|\bboolean true\b/.test(answer)
+  for (const [command, [watcher, host]] of STATUS_NOTIFIER_PROBES) {
+    const owned = await ask(command, watcher)
+    if (owned === null) continue
+    if (!yes(owned)) return false
+    const registered = await ask(command, host)
+    return registered !== null && yes(registered)
   }
   return false
 }
