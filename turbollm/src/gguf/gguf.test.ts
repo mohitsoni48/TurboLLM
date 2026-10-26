@@ -6,7 +6,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { parseGguf, quantFromName } from './gguf'
+import { ggufCutShort, parseGguf, quantFromName } from './gguf'
+import { ggufFile, ggufVocabOnly } from '../test-support/gguf-file'
 import { tmpDir } from '../test-support/tmp'
 
 const T_UINT32 = 4
@@ -435,4 +436,69 @@ test('quantFromName: anchoring does not break split-file or dot-separated real q
   assert.equal(quantFromName('model-Q4_K_XL-00001-of-00002.gguf'), 'Q4_K_XL')
   assert.equal(quantFromName('model.Q5_K_M.gguf'), 'Q5_K_M')
   assert.equal(quantFromName('model-q4_0.gguf'), 'Q4_0')
+})
+
+/** Writes `bytes` as a .gguf in a fresh temp dir and passes its path to `run`. */
+function withFile(bytes: Buffer, run: (path: string) => void): void {
+  const dir = tmpDir('gguf-test-')
+  try {
+    const path = join(dir, 'model.gguf')
+    writeFileSync(path, bytes)
+    run(path)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+test('dataEnd is where the furthest tensor data ends, after the tensor infos aligned', () => {
+  // F32 [10] = 40 bytes at 0; Q8_0 [64] = 68 bytes at 64 (40 padded to 32): the data ends 132
+  // bytes into the data section. A writer pads after the last tensor too (to 160), and that
+  // padding is not needed, as llama.cpp's own bounds check does not need it.
+  const tensors = [
+    { name: 'a', dims: [10], type: 0 },
+    { name: 'b', dims: [32, 2], type: 8 },
+  ]
+  const bytes = ggufFile(tensors, [['general.architecture', 'llama']])
+  withFile(bytes, (path) => {
+    const meta = parseGguf(path)
+    assert.equal(meta.dataEnd, bytes.length - 160 + 132)
+  })
+  // general.alignment moves the data section's start.
+  const wide = ggufFile(tensors, [['general.alignment', 256]], 256)
+  withFile(wide, (path) => assert.equal(parseGguf(path).dataEnd, wide.length - 512 + 256 + 68))
+})
+
+test('dataEnd is 0 (no verdict) when a tensor has a type the table does not know', () => {
+  const bytes = ggufFile([{ name: 'a', dims: [10], type: 0 }])
+  const typeAt = bytes.indexOf(Buffer.from([0x0a, 0, 0, 0, 0, 0, 0, 0]), 24) + 8 // after dims [10]
+  bytes.writeUInt32LE(999, typeAt)
+  withFile(bytes, (path) => assert.equal(parseGguf(path).dataEnd, 0))
+})
+
+test('ggufCutShort: a file shorter than its tensors, or cut inside its tensor infos, is cut short; a whole one is not', () => {
+  const bytes = ggufFile([{ name: 'token_embd.weight', dims: [4096], type: 0 }], [['general.architecture', 'llama']])
+  withFile(bytes, (path) => assert.equal(ggufCutShort(path, bytes.length), false))
+  const short = bytes.subarray(0, bytes.length - 1000)
+  withFile(short, (path) => assert.equal(ggufCutShort(path, short.length), true))
+  const header = bytes.subarray(0, 60) // inside the tensor info
+  withFile(header, (path) => assert.equal(ggufCutShort(path, header.length), true))
+  // Not a GGUF at all: unreadable, which is no verdict on its length.
+  const html = Buffer.from('<html>not found</html>')
+  withFile(html, (path) => assert.equal(ggufCutShort(path, html.length), false))
+})
+
+test('a GGUF with no tensors (vocab-only) needs only its header: it is not cut short', () => {
+  // convert_hf_to_gguf.py --vocab-only writes the header and the KV pairs and no padding, as
+  // llama.cpp's models/ggml-vocab-*.gguf are. The header end rounded up to the alignment put each
+  // one 3 to 31 bytes past its own end, so it was taken for cut short and listed incomplete, and a
+  // download of one with no length failed.
+  const bytes = ggufVocabOnly([['general.architecture', 'llama'], ['tokenizer.ggml.model', 'gpt2']])
+  assert.notEqual(bytes.length % 32, 0, 'the fixture ends off the alignment, as those files do')
+  withFile(bytes, (path) => {
+    assert.equal(parseGguf(path).dataEnd, bytes.length)
+    assert.equal(ggufCutShort(path, bytes.length), false)
+  })
+  // Cut inside its KV pairs, it is still cut short.
+  const cut = bytes.subarray(0, bytes.length - 3)
+  withFile(cut, (path) => assert.equal(ggufCutShort(path, cut.length), true))
 })

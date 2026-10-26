@@ -7,7 +7,7 @@ import userEvent from '@testing-library/user-event'
 import { ExperimentalSection } from './ExperimentalSection'
 
 const save = { mutate: vi.fn(), isPending: false }
-const settings = { experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false } }
+const settings = { experimental: { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false } }
 
 vi.mock('../../lib/queries', () => ({
   useSettings: () => ({ query: { data: settings }, save }),
@@ -15,7 +15,7 @@ vi.mock('../../lib/queries', () => ({
 
 beforeEach(() => {
   save.mutate.mockClear()
-  settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: false }
+  settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: false, remoteAccess: false }
 })
 
 describe('ExperimentalSection', () => {
@@ -54,8 +54,21 @@ describe('ExperimentalSection', () => {
     expect(save.mutate.mock.calls[0][0]).toEqual({ experimental: { turboLink: true } })
   })
 
+  it('offers Remote access and patches only that one flag when switched on', async () => {
+    // The CHANGELOG (1.13.2) and README send users to Settings → Experimental → Remote access;
+    // without this row the flag (and RemoteAccessSection behind it) was unreachable from the UI.
+    render(<ExperimentalSection />)
+    const row = screen.getByText('Remote access').closest('label')!
+    const box = row.querySelector('input[type="checkbox"]') as HTMLInputElement
+    expect(box.checked).toBe(false)
+
+    await userEvent.click(box)
+    expect(save.mutate).toHaveBeenCalledTimes(1)
+    expect(save.mutate.mock.calls[0][0]).toEqual({ experimental: { remoteAccess: true } })
+  })
+
   it('reflects the flag being already on', () => {
-    settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: true }
+    settings.experimental = { memory: false, cloudDeploy: false, routines: false, turboLink: true, remoteAccess: false }
     render(<ExperimentalSection />)
     const rows = screen.getAllByRole('checkbox') as HTMLInputElement[]
     expect(rows[rows.length - 1].checked).toBe(true)

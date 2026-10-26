@@ -29,13 +29,103 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
   existing LiteRT-LM config, warm-up and request handling apply unchanged; it is not updated from PyPI (it updates
   with the app) and needs no Python preflight.
-- `.litertlm` models load on the LiteRT-LM engine whichever engine is active, the way Laya models go to Laya — no
-  engine switch needed first.
+- `.litertlm` models load on the LiteRT-LM engine once it is the selected engine (Engines). Like every model but a Laya
+  one (a Laya model loads on the Laya engine, which is never the selected engine), they load only on the engine the
+  user selected, and no path starts LiteRT-LM on its own: under another engine they are hidden from the Models screen
+  and the pickers, and a Load asked for anyway is started on the selected engine, whose own error says it could not
+  load the file.
+- **Show models for every engine** (Settings → Models & loading, off by default) lists every model in the Models screen,
+  the model pickers and the gateway's `GET /v1/models` (Claude Code's `/model`), also those the selected engine is not
+  expected to run; with it off, that list leaves them out too, unless one is running. A model shown that way still
+  loads only on the selected engine: its Load starts there and, if that engine cannot load it, fails with the engine's
+  own error. While it is on, the automatic loads (the gateway's auto-swap for Claude Code and other API clients,
+  routines, the boot resume) start such a model on the selected engine too; with it off they refuse it and unload
+  nothing. Nothing switches to another engine or suggests one.
+- **Hide a model** (Models → Library, a model's ⋯ menu → Hide): it leaves the Library list and every model picker until
+  it is unhidden, but for the draft-model select in Load settings (a small draft model is what one hides from the chat
+  pickers); **Show hidden models** under the list shows them again, each marked, with an Unhide. The daemon keeps the
+  choice (`PUT /api/v1/models/:key/hidden`, and `hidden` on each model of `GET /api/v1/models`), so it holds on every
+  page and device. A hidden model keeps its files and settings, stays listed while it is loaded, and still loads when it
+  is named (an API client, a routine pinned to it, `turbollm launch --model`); the gateway's `GET /v1/models` still
+  lists it. A model picker with nothing to show says how many models you hid and links to that switch.
+- `GET /api/v1/conversations/:id` reports `runningReplyId` (the reply whose turn holds the chat, or `null`) and
+  `compacting` (a manual compaction holds it), and each `GET /api/v1/conversations` row reports `running`, so a page
+  or device that did not start the turn can tell what is running.
+- `GET /api/v1/conversations/:id/stream` follows a chat's running reply: its frames from the start, then live, to any
+  page that opens it (`?run=<reply id>&fromSeq=<n>` resumes one it was following). The turn streams carry each frame's
+  seq as `id:` and an SSE keepalive comment every 20 s. `POST /api/v1/chat/stop` takes the `messageId` of the reply to
+  stop and answers `stopped`.
+- **A chat reply waits a set time for its tool-call approvals** (Settings → Tool permissions → Wait for an answer, 30
+  minutes by default, `chatApprovalWaitMinutes` 0-1440 on `PATCH /api/v1/settings`; 0 waits until answered). The time
+  is the reply's, all its calls together: a call set to Ask that gets no answer within what is left of it is not run,
+  reads "No answer within N minutes; the call was not run." and the reply goes on as after a Deny; the reply's later
+  calls set to Ask are then answered the same way at once. Code's ask mode still waits until answered.
+- `GET /api/v1/activity` also lists a model loading (`load`), an auto-tune run (`tune`), a skill being written
+  (`skill`), a routine run an Approve is resuming, and a chat whose finished reply's auto-title or memory call is still
+  pending. A chat whose reply waits for a tool-call approval is listed apart, in `waiting`, and counts in neither
+  `items` nor `engineGenerating`. The Android app keeps the model loaded and the phone awake for all of that work
+  (before, it could unload the model under a load, an auto-tune, a skill or a reply's title), and lets the phone sleep
+  while a reply waits for an approval. Loading a text-classification model names each in its confirmation.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
+- **Pause a download** (Models → Discover → Downloads): Pause on a running or queued download, Pause all and Resume
+  all (`POST /api/v1/downloads/:id/pause`). A paused download keeps what it has downloaded, also across a restart, and
+  Resume continues from there. Cancel all leaves paused downloads alone, and a Cancel that would delete more than
+  50 MB asks first.
+- The Library shows one line while downloads are running, paused or failed ("2 downloads running · 1 paused · 1
+  failed"), with Show, which opens the Downloads panel.
+- `POST /api/v1/downloads` also answers `existing` (the id, name and status of a download already holding a requested
+  file). Asking again for a file whose download is paused (Discover, Import from URL, onboarding) resumes it, and
+  Import from URL and the quant dialog say "Resumed" or "Already downloading". Import from URL of another link that
+  would save the same file name in the folder is refused while that download is running, queued or paused (409
+  `download_in_progress`), instead of resuming the other link's download.
+- `GET /api/v1/code/sessions/:id` reports `compacting`, and each agent of `GET /api/v1/code/agents` reports
+  `installing`.
+- `GET /api/v1/status` reports `poolModels`, the number of models loaded or loading beside the primary (an embedding
+  model's pool slot, a Laya load). The Android app keeps its service while one is; before, with notifications off, it
+  stopped under an embedding model left loaded, or still loading, after the chat model was ejected.
+- `GET /api/v1/status` reports `serving`: `lan` (the daemon listens beyond loopback), `remote` (remote access is up,
+  or starting or reconnecting: a tunnel, or Tailscale Serve or Funnel) and `linkPeers` (how many Turbo Link tokens this
+  machine has minted for other machines, 0 while Turbo Link is off). The Android app keeps the daemon running through
+  a close of the app while any of them is on.
 
 ### Fixed
+- **A refused request says why, on LiteRT-LM too and in extension runs and routines.** `litert-lm serve` gives the
+  reason in the HTTP status line ("400 Missing model"), with an HTML error page for a body, which the chat showed
+  instead of the reason. Extension runs and routines reported only the status code for every engine. All three now
+  give the engine's own reason.
+- **Writing a skill says why it could not, and LiteRT-LM models write theirs their own way.** "Save as skill", the
+  in-chat `save_skill` and learning from a folder reported "No clear reusable skill found" / "No skills found in that
+  folder" when no model was loaded or the engine refused the request (on `litert-lm serve` every request to
+  LFM2.5-230M or gemma-3-270m-it is refused); the task now fails with the reason. A LiteRT-LM model is no longer sent
+  `response_format: json_object`, a JSON grammar from the first token that made LFM2.5 answer `{"name":", "}` instead
+  of the skill: it writes its JSON its own way, as the prompt asks. Other engines still get it.
+- **`litert-lm serve`'s errors can be read.** It puts an error in the HTTP status line, and an exception's text ends
+  with a newline, which broke the reply: TurboLLM's HTTP client refused it, so a model that failed to load said
+  "LiteRT-LM could not load this model — fetch failed", and a refused chat, API, extension, routine or skill request
+  said "fetch failed", never why. TurboLLM now starts `serve` with its reason written on one line (desktop and Termux;
+  the Android app's engine was not affected).
+- **A stopped chat reply is saved as stopped.** With the request log on (the default), and always in the Android app,
+  a Stop mid-reply (or closing the page) saved the reply as finished: no "aborted" mark, and its title, memory facts
+  and bench result were still made from it. A tool call the reply was streaming when Stop came still ran, also one set
+  to Allow. The reply is now saved as stopped, and no tool call starts once a reply is stopped.
+- A chat reply cut off by a daemon restart, a crash or Android closing the app before any of its text was saved now
+  reads "Generation failed or was stopped." instead of "This message is empty." for good.
+- **Android: chats are written to disk about a second after they change**, not every 10 s, so Quit (which ends the
+  app's process) or Android closing the app no longer loses a reply that finished seconds before, or a new chat. A
+  burst of changes is still written once, and at least every 10 s while changes keep coming. `POST
+  /api/v1/daemon/flush` writes the database at once and answers when it is on disk (`flushed: false` on the desktop,
+  whose database is written as it changes); the app calls it before it quits.
+- A chat reply's text is saved every 10 s while it streams, so a daemon crash or kill, or Android closing the app,
+  mid-reply keeps what it had written by then (the reply then reads as stopped, with Stopped under its text) instead
+  of an empty reply. `POST /api/v1/daemon/flush` saves a running reply's text first, so the Android app's Quit keeps
+  all of it.
+- A reload (or Ctrl+R in the desktop app) keeps the chat that was open: the address names it (`/workspace/chat/<id>`)
+  from a new chat's first send and whenever another chat is picked, without adding a Back step per chat.
+- The idle timeout (Settings → Idle timeout) no longer unloads the model while a chat still needs it: during a reply's
+  auto-compaction, a manual compaction, or its title and memory calls just after it. Once the timeout had passed since
+  the model was loaded or an API client last used it, the compaction failed and the title and memory were lost.
 - **LiteRT-LM context limit is read from the bundle.** A `.litertlm` export can size its KV cache statically, and the
   runtime then clamps any larger context to it. The library only knew that size from an `ekvNNNN` tag in the file
   name, so an untagged bundle (e.g. litert-community/LFM2.5-230M, 4096 tokens) offered a 256k slider and a long system
@@ -44,9 +134,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - **Engine errors sent inside a stream reach the chat.** LiteRT-LM (and llama-server once streaming has begun) report a
   failed turn as a `data: {"error": …}` chunk, which the chat skipped, ending the turn as an empty message. The error
   is now shown, a non-OK engine response carries the engine's reason, and a LiteRT-LM context overflow says why.
-- **Requests are shaped for the engine actually serving the model.** A `.litertlm` model runs on LiteRT-LM whichever
-  engine is active, but chat, the gateway, routines, the extension API and the agents shaped requests (model field,
-  token limit) for the active engine. The last-used `.litertlm` model also resumes on LiteRT-LM at boot now.
+- **Requests are shaped for the engine actually serving the model.** A model goes on running on the engine it was
+  loaded on when an engine install or Enable activates another, but chat, the gateway, routines, the extension API and
+  the agents shaped requests (model field, token limit) for the active engine.
 - **RAM usage counts the page cache as available** (MemAvailable, not Node 18's MemFree), which made Linux and
   Android machines look nearly out of memory.
 - **Auto CPU threads use the performance cores on big.LITTLE arm64** (phones, Termux, ARM Linux), where threads on
@@ -54,11 +144,233 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - Android (app and Termux): the CPU name comes from the SoC, the core count includes cores outside the app's cpuset,
   CPU usage falls back to TurboLLM's own processes where /proc/stat is closed to apps, and GPU load is read from the
   kernel where the vendor lets apps read it.
+- **The idle timeout counts from the model's last use** (Settings → Idle timeout). A chat reply, a Code turn and the
+  chat work that holds the model (a compaction, a wait for a tool-call approval, a reply's title or memory call)
+  restart it, as an API request does. It counted from the load, so a model in active chat use was unloaded between two
+  replies once the timeout had passed since it was loaded, and the next send answered "Load a model first.".
+- A chat reply running when the daemon is stopped or restarted (Ctrl+C, `turbollm --stop`, Settings → Restart daemon,
+  an app update, the desktop app's Quit on Linux and macOS) is saved as stopped, with the text it had written, instead
+  of as a finished reply cut short. A call it was waiting to have approved reads "Denied by user.", as after a Stop.
+- **A finished auto-tune result survives an engine stop and a restart.** Eject, loading a model, a restart or a Turbo
+  Link unload no longer throw away a tune that finished unsaved, and the result is kept on disk, so Quit, a daemon
+  restart or the Android app's service stopping keep it too: the results dialog offers it the next time that model's
+  dialog is opened, while the model is still in the library, and Save still writes it. Its Cancel, or a new run,
+  discards it. A run still in flight is cancelled as before.
+- An agent terminal in Code that is still printing with no tab watching it is no longer killed 5 minutes after its
+  last viewer left. It is reaped after 5 minutes without output, and at most 6 hours after the last viewer left. A
+  routine's terminal keeps its own limit.
+- Code: a running /compact shows as "Compacting conversation…" on a reloaded or reopened page or another tab. A turn,
+  /clear, /resume, /revert or another /compact sent meanwhile is refused (409 `compaction_in_progress`) instead of
+  running beside it. While it runs, the idle timeout no longer unloads the model under it, and `GET /api/v1/activity`
+  reports the engine as generating.
+- Code: an agent CLI install (Settings → Code agent → Install) that is still running shows "Installing…" after a
+  reload, and a second Install waits for it instead of starting another `npm install -g`.
+- Downloads: Dismiss all clears only finished and cancelled downloads; it used to delete a failed one's partial file.
+  A paused or failed download's own button is Discard, which deletes its partial file and asks first above 50 MB.
+- Downloads: resuming a file that changed on the server (another ETag, weak or strong, or another Last-Modified)
+  starts it again instead of joining the old file's start to the new file's end.
+- Downloads: a `.gguf` download of unknown length that the server cut short is no longer marked done, and Resume
+  fetches the rest. A GGUF in a model folder that is shorter than its tensors is listed incomplete.
+- Downloads: Hugging Face downloads fetch from the commit the repo was at when they were queued, so a paused download
+  finishes after the repo is updated. A download whose file changed on the server stops with "The file changed on the
+  server since this download started. Download it again from Discover." instead of downloading it all again and
+  failing the checksum.
+- Downloads: a kill while the download list or the provenance record is being saved no longer loses paused downloads
+  or the "Downloaded" marks.
+- Downloads: running out of storage says "Storage is full. Free some space, then Resume." and keeps the partial file.
+  A stalled download stops showing its last speed after 3 s. A download that failed its size or checksum check no
+  longer counts the removed bytes as downloaded. Cancel and Discard no longer leave an empty `.part` behind.
+- Onboarding: the Load step finds its download again after a closed tab or a restart, shows it as paused with Resume,
+  and says when it was cancelled.
+- A model picker with nothing to offer (Chat's, the Code composer's and the terminal toolbar's) says why under "No
+  models found.": "N hidden: the selected engine can't run them — Settings → Models & loading → Show models for every
+  engine.", or with none hidden "Download one in Models → Discover.". It showed only a faint "No models found" heading
+  over an empty list, so a library of models the selected engine cannot run looked like no library at all. An empty
+  model select in the routine form says where to get a model, and an empty draft-model select what a draft must be.
+- The web app keeps working while the browser reports itself offline (Wi-Fi off with TurboLLM on the same machine):
+  sends, replies and polls no longer wait for the browser to come back online.
+- **Nothing TurboLLM starts outlives it.** Engines, their Python workers and the models loaded beside the primary stop
+  the moment TurboLLM stops, by any means, a kill, a crash or an out-of-memory kill included, and an engine killed
+  while it was still loading is no longer left running after the next start. So do a tunnel and the `tailscale` CLI,
+  routine runs of `claude`, agent CLI installs, MCP and language servers (with whatever they started), engine builds,
+  prerequisite and Python engine installs, archive extraction, version and GPU probes, the usage monitor, the export
+  browser (its crash handlers included) and the Code agent's grep and find, even a search over the whole disk. Some
+  of them used to run on forever. On Windows, the children of these programs' own children (a Git Bash command's,
+  an engine's workers, a compiler tree) end with TurboLLM too. On the Android app, engines start through the app's
+  `libtether_exec.so` when the app ships it and a boot self-test has seen it work, so the kernel ends them with the
+  app.
+- git commands get SIGTERM and 2 s when TurboLLM dies in the middle of one, so they drop their locks
+  (`.git/index.lock` no longer blocks the next command). A helper git leaves running on purpose, such as the
+  credential cache, ends with TurboLLM, and TurboLLM's own git runs no automatic gc, so none is left behind.
+- A Settings restart under `npm start` works: the new daemon could not load its TypeScript, and TurboLLM ended.
+- Ctrl+C under `npm start` shuts TurboLLM down gracefully even while it is busy, and Ctrl+Break on Windows does too;
+  both used to end it at once. Ctrl+C during an artifact export no longer cuts the shutdown short.
+- Closing the terminal TurboLLM runs in shuts it down gracefully (replies saved as stopped, engines stopped). It
+  ended within milliseconds instead, its shutdown cut short by the write of "shutting down" to the closed terminal.
+  A TurboLLM whose output pipe or terminal is gone without a hangup (`turbollm | tee log` with `tee` killed) runs on
+  with its output lost, where it exited at its next log line.
+- Desktop app: Quit shuts the daemon down gracefully on Windows (replies saved as stopped, engines stopped), where it
+  was killed outright. If the app crashes or is killed, its daemon shuts down by itself. Opening the app again right
+  after a Quit waits for the previous daemon to finish instead of saying TurboLLM is already running. A TurboLLM
+  started from a terminal inside the desktop app no longer takes itself for the app's own daemon.
+- Python engines: Install redoes an environment only when an earlier install did not finish. LiteRT-LM redid a
+  finished one on every Install, and the others never redid a broken one.
+- Error messages of the commands TurboLLM runs name the real program (`tar`, not a wrapper).
+- Turbo Link's list of machines linked to this one no longer shows remote-access tokens, which are not machines;
+  they stay listed in Developer → API Keys.
+- macOS: Code terminals and interactive routine terminals open. Every one failed with "posix_spawnp failed.": the
+  helper program node-pty starts them through is installed without permission to run. TurboLLM now gives it that
+  before its first terminal, and the desktop app ships it so.
+- The Code agent picker (Settings, onboarding) gets its answer even when an agent CLI hangs. TurboLLM checks each
+  CLI with `<cli> --version`, and one that never answered held the answer for every agent for good: a missing agent
+  was never marked missing or offered Install, an Install's button kept spinning, and each new request left one more
+  check running. A check now gets 10 s, after which TurboLLM ends it and counts the CLI as installed (it was found
+  and started), and requests made while a check runs share it. A routine whose CLI's check does not answer in those
+  10 s is skipped ("Skipped (cli_unavailable)"), without touching the model.
 
 ### Changed
+- **A model's Load settings save only what you changed.** Load, Save, "Remember these settings", Save as… (a preset)
+  and Auto-tune used to send and save the whole panel, so the first save made every default your choice: context 8192,
+  GPU layers 99 and llama.cpp's sampling 0.8 / 0.95 / 40 / 0.05 were stored even when you had changed only the Backend,
+  and a later change to Settings > Model Defaults no longer reached any model saved once. They now send and save only
+  the controls you moved (`userSetOnly` on the stored profile; `GET /api/v1/models/:key` adds `saved` and
+  `autoProfile`), and Auto-tune saves those plus what it tuned (GPU layers / CPU-offloaded experts, the GPU split, the
+  card's sampling and the context it measured at). A profile or preset saved before is read field by field: a field
+  equal to the automatic value counts as not set (the file is not rewritten; move the control to make it yours).
+- **A chat reply runs in the daemon, not in the page.** Closing, reloading or leaving the page, Android's Back or a
+  dropped connection no longer stops a reply, a Regenerate or a Save & Resend, their auto-compaction, their tool calls
+  or a call waiting for approval: the daemon finishes and saves the reply, and gives it its title and memory facts. A
+  page that opens the chat again, on this device or another, shows the reply live with its Stop and any approval card,
+  and after a reload or Back the chat screen reopens the chat whose reply is running. Stop, Eject, deleting the chat,
+  loading, stopping or restarting the engine, turning LAN access off (for a reply another device sent over the LAN)
+  and stopping remote access (for one sent through it) still stop it. Revoking the key a reply was sent with (a
+  remote-access token included), or turning "Require an API key" on for one a keyless device sent over an open LAN,
+  now stops it too; before, it ran on. Stop names the reply it stops and frees the chat at once.
 - The Android app reports its GPU to the daemon (`TURBOLLM_ANDROID_GPU`, read from a GL context), the counterpart of
-  Termux's `vulkaninfo`. LiteRT-LM's default "auto" backend therefore picks the GPU in the app exactly as it does on
-  Termux, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the GPU.
+  Termux's `vulkaninfo`, and GPU detection no longer runs the Vulkan engine at boot when the app has already named the
+  GPU.
+- **LiteRT-LM's Backend "Auto" is the model's own.** Auto meant the GPU whenever a GPU was detected and the llama.cpp
+  GPU-layers default was above 0: the Android app put every `.litertlm` on the GPU, a CPU-only bundle included, and
+  Termux, a desktop without a detected GPU or GPU layers at 0 put a GPU-only bundle on the CPU. Auto now names no
+  backend and the server takes the one the bundle declares (`litert-lm serve` and the app's own server read its
+  header); CPU and GPU still force one, also a model loaded by path (`POST /api/v1/engine/start {modelPath}`), which
+  was always given the CPU. A failed load names the GPU only when you chose it.
+- **A LiteRT-LM model's context is its own unless you set one.** TurboLLM passed `max_num_tokens` on every load, the
+  llama.cpp rule min(8192, the bundle's KV length): 8192 for Qwen3-0.6B_dynamic, whose own default is 4096 (twice its
+  KV cache), and 8192 reported for bundles it could not size. With no context set (on the model's panel, in a request,
+  or a Settings > Model Defaults context you changed from 8192) it now passes none and the runtime uses the bundle's
+  own (`LlmMetadata.max_num_tokens`, 4096 when it declares none), which TurboLLM reads from the header and reports. A
+  bundle whose KV length is a prime above 10 is a dynamic export (the runtime's magic number): it takes up to one token
+  less, the panel says so, and it is no longer read as its exact size (Qwen3-0.6B_dynamic: up to 32,770).
+- **Thinking settings reach LiteRT-LM models.** LiteRT-LM read thinking only from a top-level `reasoning_effort`
+  (`litert-lm serve` still does), and TurboLLM sent it in llama.cpp's terms, so the chat's thinking control, built-in
+  Code's, a terminal session's, Claude Code's thinking setting and the daemon's own "off" for titles, memory and
+  compaction never reached a `.litertlm`, and an OpenAI client's own `reasoning_effort` was deleted (or rewritten into
+  Qwen3.8's terms) on the way. Off is now sent as `none` and a budget as thinking on (`litert-lm serve` cannot cap it;
+  the Android app's engine takes the budget too); a client's `reasoning_effort` reaches the model as it is; Claude
+  Code's adaptive thinking sends nothing, so the model decides. Untouched, every control is the model's own default: on
+  Android a new chat no longer starts with thinking Off (whatever the engine), and a terminal session gets a
+  reasoning-effort override only once you choose a level for a model that shows that control (it got `xhigh`, the
+  control's resting position, for every model). For a LiteRT-LM model the chat shows the untouched thinking budget as
+  "Auto (model's default)", not "Unlimited": the model may not think by default, and a budget is what turns thinking on
+  there. A reasoning-effort level is sent only while the loaded model shows the control.
+- **A `.litertlm` with a vision or audio encoder is a vision or audio model.** Every bundle was marked text-only; its
+  header's encoder sections now set it (LFM2.5-VL, Gemma 3n/4), so it gets the Vision facet and loads as a vision
+  model. Images reach it on desktop and Termux (`litert-lm serve` enables the encoders itself).
+- **Tools reach LiteRT-LM models that call tools.** The chat, the extension API and routines sent no tools to any
+  `.litertlm`, so web search, fetch, MCP and skill tools, an agent's tools and the Research persona's searches never
+  reached LFM2.5, Qwen3 or Gemma 4, whose templates show tools to the model. A model gets them now when its bundle says
+  it calls tools (`supports_function_calling`, else its template reads `tools`, else its model type's default
+  template) and they fit in its context with the conversation; otherwise it gets none and the chat says why (a model
+  whose template has no tools, such as Gemma 3 1B or LFM2.5-VL; tools too large for a 4096-token bundle).
+  `litert-lm serve` ignores a forced tool choice and the app's server refuses one it cannot honour, so under Research
+  a LiteRT-LM model chooses whether to search, and the chat says so.
+- **A LiteRT-LM model's sampling is its own, and yours reaches it.** LiteRT-LM takes sampling only per request, so
+  the Sampling saved on a `.litertlm`'s settings never reached it, and a request that set part of the sampler (a
+  thread's temperature alone) made `litert-lm serve` fill the rest with top_k 1, which is greedy: the temperature did
+  nothing and the model's own sampler (Qwen3-0.6B: top_k 20, top_p 0.95, temperature 0.6) was thrown away. Each
+  request now carries the sampling you set on the model (only what you set) under the thread's or the client's own,
+  and the fields still missing come from the bundle's own sampler, which TurboLLM reads from its header and shows as
+  the model's defaults in the model and thread settings (they showed llama.cpp's 0.8 / 0.95 / 40). For a bundle with
+  no sampler of its own (LFM2.5-230M), `litert-lm serve` stays greedy without a Top K, and the chat says so.
+- **LiteRT-LM: Top K 0 is no limit, a model's saved penalties and stop strings are sent, and Min P is gone.** `litert-lm
+  serve` refused Top K 0, the dialogs' "no limit", with a 400 ("top_k should be positive"): it now gets the largest
+  top_k there is, which the CPU sampler clamps to the whole vocabulary (on a GPU the Android app's engine gives the
+  vocabulary itself). A model's saved penalties and stop strings now go with its requests, as a thread's do:
+  `repeat_penalty` (llama.cpp's, which the Android app's engine applies over the last 64 tokens, as llama.cpp does),
+  `presence_penalty`, `frequency_penalty` and `stop`, which that engine applies; `litert-lm serve` ignores them, and the
+  chat now says so instead of nothing. LiteRT-LM has no Min P: the thread and model settings no longer offer it for a
+  LiteRT-LM model, and a Min P still set on a thread or saved on the model is named in the chat as not applied, with
+  where to clear it (the thread and model settings show it, with "Clear it").
+- **`tool_choice: "none"` sends a LiteRT-LM model no tools.** `litert-lm serve` reads no tool_choice, and the app's
+  engine did not apply "none", so the model still saw every tool and could call it; the loop breaker that answers a
+  terminal agent's sixth identical call with "none" did nothing there, and the agent looped on.
+- **LiteRT-LM: a forced tool call is a 400.** LiteRT-LM cannot make a model call a tool, and `litert-lm serve` ignored
+  `tool_choice: "required"` or a named function: the model answered as it chose, which a client could not tell from a
+  forced call. Through the gateway such a request to `serve` now gets the 400 the Android app's engine gives
+  (`Invalid tool_choice: this server cannot make the model call a tool ...`); "auto" and "none" are as before. An
+  Anthropic client's `tool_choice: {"type": "none"}` is now "none" on every engine: it was sent as a forced call of a
+  function with no name.
+- **LiteRT-LM on `litert-lm serve`: the gateway names what it does not apply.** `serve` reads no `min_p`, `stop`
+  (`stop_sequences`) or repetition, presence and frequency penalties, so an API client's own went nowhere and nothing
+  said so. The response now names them in an `X-Unapplied-Parameters` header (the one the Android app's engine names
+  `min_p` in; it applies stop strings and penalties itself), and the daemon log says so once per model and set of
+  fields. On `/v1/messages`, whose reply is the gateway's own, a `min_p` is named for the Android app's engine too.
+- **A LiteRT-LM model's past reasoning goes where its template reads it.** With "Preserve thinking across turns" on
+  (a new chat's default), each earlier answer's reasoning was resent folded into its text as `<think>…</think>`, the
+  markup Qwen's and DeepSeek's templates parse back out, and most LiteRT-LM bundle templates put in verbatim
+  (Qwen3-0.6B, Gemma 3 and 4, LFM2.5-VL): every past turn's reasoning filled a 4096-token context. The chat and the
+  extension API now send it to a LiteRT-LM model as the message's `reasoning_content`, and the bundle's template decides
+  (LFM2.5's reads it, with its own preserve_thinking); the thread settings say when the loaded model's template shows
+  it none of it, so the switch does not apply. Other engines are unchanged.
+- **Desktop app: closing the window keeps TurboLLM running** on Windows and Linux, with a tray icon (Open TurboLLM,
+  Quit TurboLLM), so replies, Code runs, downloads, builds and auto-tunes go on. Quit in the tray or the app menu
+  (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app
+  update is installed then. The first close shows a one-time notice. Launching the app again opens the window; on
+  macOS a second launch from a terminal (or `open -n`) after the window was closed now opens one too, where it opened
+  nothing. On a Linux desktop without a tray, launching the app again is the way back, and the window's File menu has
+  Quit.
+- **The text-classification playground's run continues in the daemon** (`POST`, `GET`, `DELETE ?id=` on
+  `/api/v1/jev/playground/run`). Closing, reloading or leaving the page no longer stops it, a page that comes back
+  shows it running or its answer, and a Cancel button stops it. A second run while one runs is refused and followed.
+  As for a chat reply, revoking the key a run was started with, requiring a key of the keyless open-LAN device that
+  started it, turning LAN access off or stopping remote access cancels it; the host's runs are not touched.
+  `/v1/systemone` is unchanged.
+- **A GitHub release install** (Add engine → From a GitHub release, or a card's Install prebuilt) continues when the
+  dialog is dismissed, the Engines screen is left or the page is reloaded or closed. Opening it again shows its
+  progress or offers the finished build for Add. Cancel stops it.
+- **A Settings restart started from a terminal stays in that terminal.** Ctrl+C, `docker stop`, `turbollm --stop` or
+  closing the terminal ends TurboLLM gracefully, and the new daemon's output (a fresh `--print-token` included)
+  appears there instead of in `restart.log`, which is no longer written. The first process stays as a small keeper
+  until TurboLLM stops. A restart stops running Code turns, as Stop does, and pauses running downloads, which keep
+  what they have and show as paused, as after any restart. `npm start` runs `node --import tsx src/cli.ts`.
+- **Code: what an agent's bash command starts in the background keeps running** after the command returns, until
+  its Code session is archived or deleted, TurboLLM stops, or for a routine, its run ends; Stop still ends it, and
+  deleting a session ends it before its worktree is removed. Before, a graceful stop never ended it, and it ran on
+  after any stop. git's automatic gc inside Code's commands and terminals runs in the foreground (about 0.5 s longer
+  for a commit that triggers it).
+- **Closing a Code terminal, or its shell exiting, ends everything started in it**, `nohup` jobs and agent CLIs that
+  ignore the hangup included, and on Windows the programs started from it, GUI ones included. On macOS TurboLLM
+  finds what a terminal started through the perl macOS ships; without a working one it logs that jobs started there
+  may be left running.
+- **A repository's own pi extensions (`.pi/extensions`) no longer load into TurboLLM.** Opening a repository in Code
+  ran that code inside the daemon, with no approval.
+- A TurboLLM started from a terminal can no longer have ssh ask for a key passphrase or a host key in that terminal
+  during a git push: ssh uses the desktop's askpass dialog when there is one, otherwise it fails at once instead of
+  waiting 30 s for an answer nobody sees. ssh-agent keys are unaffected.
+- Prerequisite installs (apt, dnf, pacman, zypper, brew) get SIGTERM from TurboLLM, never a kill, as Cancel does;
+  under sudo one may finish its transaction after TurboLLM is gone.
+- Desktop app: on Windows and Linux Quit waits for the daemon to finish, up to 15 s. On macOS Quit never waits, so a
+  logout or shutdown is not cancelled, and the daemon finishes within 15 s after the app.
+- **Docker:** the images, the RunPod one included, start `tini` as PID 1, which reaps what TurboLLM leaves and passes
+  `docker stop` on to it; the RunPod image runs the installed `turbollm` under it rather than `npx turbollm`. TurboLLM
+  warns at boot when nothing reaps its orphaned processes (no init, or a PID 1 such as `tail`).
+- Windows: a program under a TurboLLM tree that asks to break away from its job object stays in TurboLLM's job, and
+  ends with it: it fails to start (access denied) when its own job is TurboLLM's, and from a job nested inside it
+  (Node's own, for what a Node program starts) it leaves only that one. A Code bash command starts a few
+  milliseconds later, once its job exists.
+- The export browser opens no DevTools port, and on Linux it starts no crash handler (on macOS Chrome starts one
+  whatever it is told; it ends with the browser).
 
 ## [1.14.5] - 2026-10-04
 

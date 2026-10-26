@@ -32,11 +32,13 @@ export interface DownloadFailure {
   hostDetail: boolean
 }
 
-export type EnqueueOutcome = { ok: true; downloads: DownloadRecord[] } | DownloadFailure
+/** `existing`: the live rows (downloading, queued or paused) that already held files the request
+ *  names, which got no second row. */
+export type EnqueueOutcome = { ok: true; downloads: DownloadRecord[]; existing: DownloadRecord[] } | DownloadFailure
 
 /** The DownloadError → HTTP status table. One definition, both transports. */
 export function downloadErrorStatus(code: string): DownloadFailureStatus {
-  if (code === 'no_model_dir') return 409
+  if (code === 'no_model_dir' || code === 'download_in_progress') return 409
   if (code === 'hf_unauthorized') return 401
   if (code === 'hf_gated') return 403
   return 400
@@ -69,7 +71,9 @@ export function listDownloads(d: Deps): DownloadRecord[] {
  *  mmproj), so the whole created set comes back. */
 export async function enqueueDownload(d: Deps, input: EnqueueInput): Promise<EnqueueOutcome> {
   try {
-    return { ok: true, downloads: await d.downloads.enqueue(input) }
+    const existing: DownloadRecord[] = []
+    const downloads = await d.downloads.enqueue(input, existing)
+    return { ok: true, downloads, existing }
   } catch (e) {
     return toDownloadFailure(e)
   }

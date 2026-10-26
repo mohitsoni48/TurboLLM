@@ -4,8 +4,9 @@
 //   • cacheEligible: on only when enabled + cachePersist + llama-server + text + parallel 1.
 //   • saveSlot: POSTs …/slots/0?action=save; true on ok, false on !ok / throw / timeout.
 //   • restoreSlot: POSTs …/slots/0?action=restore; deletes the file + true on ok, false else.
+//     A file a save started during the restore rewrote is kept for its own restore.
 import assert from 'node:assert/strict'
-import { existsSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { StartOpts } from './manager'
@@ -152,6 +153,32 @@ test('restoreSlot returns false and keeps the file on a non-ok response', async 
     const ok = await restoreSlot({ http: h.impl, base: 'http://x', dir, filename: file })
     assert.equal(ok, false)
     assert.equal(existsSync(join(dir, file)), true, 'a failed restore leaves the file for the TTL sweep')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// A save of the same file (the next ComfyUI prompt's acquire, same model and launch args) can land while a slow restore
+// is in flight. The restore deleted that new file once it returned, as its own single-use one.
+test('restoreSlot keeps the file when a save of it starts while the restore is in flight', async () => {
+  const dir = tmpDir('slot-restore-')
+  try {
+    const file = 'slot-race.bin'
+    writeFileSync(join(dir, file), 'kv-old')
+    const saveHttp: SlotHttp = async () => {
+      writeFileSync(join(dir, file), 'kv-new') // what llama-server's save does
+      return { ok: true, status: 200 }
+    }
+    const restoreHttp: SlotHttp = async () => {
+      await saveSlot({ http: saveHttp, base: 'http://x', dir, filename: file, capMs: 1000, ttlMs: 60_000, now: Date.now() })
+      return { ok: true, status: 200 }
+    }
+    assert.equal(await restoreSlot({ http: restoreHttp, base: 'http://x', dir, filename: file }), true)
+    assert.equal(readFileSync(join(dir, file), 'utf8'), 'kv-new', "the save's file is left for its own restore")
+
+    // That restore, with no save during it, deletes the file as before.
+    assert.equal(await restoreSlot({ http: fakeHttp({ ok: true }).impl, base: 'http://x', dir, filename: file }), true)
+    assert.equal(existsSync(join(dir, file)), false)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

@@ -26,17 +26,29 @@ export interface BufferedEvent {
 /** A bounded, seq-numbered append log. `since(fromSeq)` is the replay primitive. */
 export class RingBuffer {
   private events: BufferedEvent[] = []
-  private nextSeq = 0
+  private nextSeq: number
 
   /** `cap` is how many recent events are retained for replay. Defaults to BUFFER_CAP so the
-   *  Code path is unchanged; the public API passes its own (spec 27 §6.3). */
-  constructor(private readonly cap: number = BUFFER_CAP) {}
+   *  Code path is unchanged; the public API passes its own (spec 27 §6.3). `startSeq` lets a
+   *  replacement buffer for the same stream continue past the old one's seqs (see
+   *  CodeRunManager's seqFloor) instead of restarting at 0 under a client's cursor. */
+  constructor(private readonly cap: number = BUFFER_CAP, startSeq = 0) {
+    this.nextSeq = startSeq
+  }
 
   push(event: string, data: unknown): BufferedEvent {
     const ev: BufferedEvent = { seq: this.nextSeq++, event, data }
     this.events.push(ev)
     if (this.events.length > this.cap) this.events.shift()
     return ev
+  }
+
+  /** Drop the most recent retained event matching `pred`, if any — for a frame that carries a
+   *  full snapshot superseding the previous one, so only the latest copy is kept for replay. */
+  dropLast(pred: (e: BufferedEvent) => boolean): void {
+    for (let i = this.events.length - 1; i >= 0; i--) {
+      if (pred(this.events[i])) { this.events.splice(i, 1); return }
+    }
   }
 
   /** Every retained event with seq >= fromSeq, in order. */

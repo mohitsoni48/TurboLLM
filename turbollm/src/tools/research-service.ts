@@ -759,7 +759,8 @@ export function dedupeSearchResults(results: SearchResult[]): SearchResult[] {
  * Run a web search via the configured provider — plus, when the question is aggregator-shaped,
  * one concurrent debaited reformulation — then dedupe the merged pool and deterministically
  * score, rank, filter (≥0.4) and cap (top MAX_RESULTS) the results. Returns ResearchResult[].
- * Returns [] if the provider is not configured or the primary search fails.
+ * Returns [] if the provider is not configured; rejects if the primary search fails, so a bad key,
+ * exhausted quota or outage reaches the caller as an error rather than as "found nothing".
  */
 export async function research(
   q: ResearchQuery,
@@ -779,16 +780,14 @@ export async function research(
   // something substantive left after debaiting. Concurrent, so latency is one round-trip either
   // way, and best-effort — a failed reformulation must never cost the user their search.
   const debaited = debaitQuery(q.query)
-  const primaryCall = client.search(q.query, MAX_SEARCH_RESULTS, opts).then(
-    (r) => r,
-    () => null, // null distinguishes "the search failed" from "the search found nothing".
-  )
+  // The primary call is NOT caught: its failure must reject (both callers turn that into an explicit
+  // "could not reach the provider" result), never collapse into an empty, "nothing found" result.
+  const primaryCall = client.search(q.query, MAX_SEARCH_RESULTS, opts)
   const extraCall: Promise<SearchResult[]> = debaited
     ? client.search(debaited, MAX_SEARCH_RESULTS, opts).catch(() => [])
     : Promise.resolve([])
 
   const [primaryRaw, extraRaw] = await Promise.all([primaryCall, extraCall])
-  if (primaryRaw === null) return []
 
   // Dedupe before scoring, so the MAX_RESULTS slots are spent on MAX_RESULTS distinct pages.
   // The primary pool goes first: on a tie the reformulation is the fallback, not the answer.

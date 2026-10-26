@@ -1,6 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { delimiter, dirname, join } from 'node:path'
+import { tmpDir } from '../../test-support/tmp'
 import { NgrokProvider, NGROK_URL_RE, ngrokAssetUrl } from './ngrok'
+import { ensureNgrok, ngrokBinPath } from './ngrok-provision'
 
 const cfg = { authtoken: '2abcDEF', domain: '' }
 
@@ -39,6 +43,73 @@ test('ngrok: the authtoken travels as NGROK_AUTHTOKEN, not argv — readable via
 test('ngrok: parses the assigned URL out of its log line', () => {
   const line = 't=2026-09-10T10:00:00+0000 lvl=info msg="started tunnel" url=https://a1b2-c3d4.ngrok-free.app'
   assert.equal(NGROK_URL_RE.exec(line)?.[0], 'https://a1b2-c3d4.ngrok-free.app')
+})
+
+// ngrok 3.39.11's own log lines (`ngrok http 6997 --log stdout --domain llm.example.com`); the
+// run had no valid authtoken, so the "started tunnel" line is in the same logfmt shape, as ngrok
+// prints it once the session is up.
+const NGROK_STARTUP = [
+  't=2026-10-17T09:25:36+0000 lvl=info msg="no configuration paths supplied"',
+  't=2026-10-17T09:25:36+0000 lvl=info msg="starting web service" obj=web addr=127.0.0.1:4040 allow_hosts=[]',
+  '',
+].join('\n')
+const startedOn = (url: string) =>
+  `t=2026-10-17T09:25:37+0000 lvl=info msg="started tunnel" obj=tunnels name=command_line addr=http://localhost:6997 url=${url}\n`
+
+test('ngrok: with a reserved custom domain, the URL it waits for is that domain', () => {
+  const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  const out = NGROK_STARTUP + startedOn('https://llm.example.com')
+  assert.equal(NGROK_URL_RE.exec(out), null, 'the random-URL pattern never sees it')
+  assert.equal(p.urlPattern().exec(out)?.[0], 'https://llm.example.com')
+  // An ngrok-hosted reserved domain too, and no domain still means a random ngrok URL.
+  const hosted = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.ngrok.app' })
+  assert.equal(hosted.urlPattern().exec(startedOn('https://llm.ngrok.app'))?.[0], 'https://llm.ngrok.app')
+  assert.equal(new NgrokProvider('/tmp/data', cfg).urlPattern(), NGROK_URL_RE)
+})
+
+test('ngrok: a reserved domain entered as a URL is used as its bare host', () => {
+  // ngrok's own `--url` help writes it as https://api.example.com, so a pasted URL is likely.
+  for (const domain of ['https://llm.ngrok.app/', 'HTTP://llm.ngrok.app', 'llm.ngrok.app/']) {
+    const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain })
+    assert.deepEqual(p.argv(6997), ['http', '6997', '--log', 'stdout', '--domain', 'llm.ngrok.app'], domain)
+    assert.equal(p.urlPattern().exec(NGROK_STARTUP + startedOn('https://llm.ngrok.app'))?.[0], 'https://llm.ngrok.app', domain)
+  }
+})
+
+test('ngrok: an error naming the reserved domain, or a different host, is not the tunnel URL', () => {
+  const p = new NgrokProvider('/tmp/data', { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  const refused = [
+    `t=2026-10-17T09:25:37+0000 lvl=eror msg="failed to start tunnel" obj=tunnels.session err="The endpoint 'https://llm.example.com' is already online."`,
+    "ERROR:  The endpoint 'https://llm.example.com' is already online.",
+    '',
+  ].join('\n')
+  assert.equal(p.urlPattern().exec(NGROK_STARTUP + refused), null)
+  assert.equal(p.urlPattern().exec(startedOn('https://llm.example.com.evil.test')), null)
+  assert.equal(p.urlPattern().exec(startedOn('https://xllm.example.com')), null)
+})
+
+test('ngrok: start() with a reserved custom domain resolves with it instead of timing out', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('the stand-in ngrok is a shell script')
+    return
+  }
+  // A stand-in at the cached binary path, so ensureNgrok reuses it: it logs what ngrok does,
+  // then exits a moment later (without the fix, the start failed on that exit, or after 30 s).
+  const dataDir = tmpDir('ngrok-domain-')
+  const binPath = ngrokBinPath(dataDir)
+  mkdirSync(dirname(binPath), { recursive: true })
+  writeFileSync(binPath, [
+    '#!/bin/sh',
+    `printf '%s' '${NGROK_STARTUP + startedOn('https://llm.example.com')}'`,
+    'sleep 1',
+    '',
+  ].join('\n'), { mode: 0o755 })
+  const p = new NgrokProvider(dataDir, { authtoken: '2abcDEF', domain: 'llm.example.com' })
+  try {
+    assert.deepEqual(await p.start(6997), { url: 'https://llm.example.com' })
+  } finally {
+    await p.stop()
+  }
 })
 
 test('ngrok: an unpublished platform/arch has no asset URL', () => {
@@ -84,4 +155,66 @@ test('ngrok: the asset URL matches what the live archive publishes', () => {
     ngrokAssetUrl('linux', 'arm64'),
     'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.tgz',
   )
+})
+
+// --- ensureNgrok: a provision still extracting (stubbed download and tar, real temp dir) ---
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+// A Stop then a Start while the first provision is still extracting. tar writes the archive's
+// `ngrok` straight to its final path, so the binary exists, half-written, before the provision
+// ends: the second call took it as installed and spawned it (ETXTBSY on Linux). It must join the
+// running provision instead. The extraction is a stand-in `tar` first on PATH, invoked as
+// `tar -xzf <archive> -C <dir>`: it writes part of the binary, waits for the test, then the rest.
+test('ensureNgrok: a call while the archive is still being extracted waits for the extraction', async (t) => {
+  if (process.platform === 'win32' || !ngrokAssetUrl()) {
+    t.skip('needs the tar extraction (Linux, macOS)')
+    return
+  }
+  const dataDir = tmpDir('ngrok-provision-')
+  const toolDir = tmpDir('ngrok-fake-tar-')
+  const finish = join(toolDir, 'finish')
+  writeFileSync(join(toolDir, 'tar'), [
+    '#!/bin/sh',
+    'printf "partial" > "$4/ngrok"',
+    `i=0; while [ ! -e '${finish}' ] && [ $i -lt 1000 ]; do sleep 0.02; i=$((i+1)); done`,
+    'printf "complete ngrok" > "$4/ngrok"',
+    '',
+  ].join('\n'), { mode: 0o755 })
+  const realPath = process.env.PATH
+  const realFetch = globalThis.fetch
+  let downloads = 0
+  process.env.PATH = `${toolDir}${delimiter}${realPath ?? ''}`
+  globalThis.fetch = (async () => {
+    downloads++
+    return new Response(new Uint8Array([0x1f, 0x8b, 0x08]), { status: 200 })
+  }) as typeof fetch
+  t.after(() => {
+    if (realPath === undefined) delete process.env.PATH
+    else process.env.PATH = realPath
+    globalThis.fetch = realFetch
+  })
+
+  const binPath = ngrokBinPath(dataDir)
+  const first = ensureNgrok(dataDir)
+  try {
+    for (let waited = 0; !existsSync(binPath); waited += 10) {
+      assert.ok(waited < 10_000, 'the extraction never started')
+      await sleep(10)
+    }
+    let secondSettled = false
+    const second = ensureNgrok(dataDir).finally(() => { secondSettled = true })
+    await sleep(100)
+    assert.equal(secondSettled, false, 'a half-written binary must not be returned as installed')
+    writeFileSync(finish, '')
+    const [a, b] = await Promise.all([first, second])
+    assert.equal(a.binPath, binPath)
+    assert.equal(b.binPath, binPath)
+    assert.equal(readFileSync(binPath, 'utf8'), 'complete ngrok')
+    assert.equal(downloads, 1, 'the second call joined the first provision')
+  } finally {
+    // On a failure too: let the stand-in tar finish and the provision end inside the test.
+    writeFileSync(finish, '')
+    await first.catch(() => {})
+  }
 })

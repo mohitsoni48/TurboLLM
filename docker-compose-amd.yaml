@@ -10,10 +10,11 @@ services:
     volumes:
       # Persists config.json, the chat SQLite DB, downloaded engines/models, and logs
       # across container restarts/rebuilds (this is ~/.turbollm inside the container).
-      # NOTE: the image seeds daemon.lanBind=true in this config.json, so the daemon's
-      # default requireApiKey behavior actually enforces on this exposed port. Don't
-      # flip lanBind back to false while this port is published — that reopens the
-      # port to unauthenticated access.
+      # NOTE: the image seeds daemon.lanBind=true in this config.json to match the
+      # container's 0.0.0.0 bind. Don't flip lanBind back to false while this port is
+      # published: the daemon rebinds to 127.0.0.1 inside the container and the port
+      # stops answering until the container restarts. (Key enforcement on this port
+      # does not depend on lanBind: the image's --addr 0.0.0.0 bind alone turns it on.)
       - turbollm-data:/root/.turbollm
 
     # --- AMD GPU passthrough (ROCm) ---

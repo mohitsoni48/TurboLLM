@@ -3,6 +3,7 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import { TextClassificationModelList } from './TextClassificationModelList'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
@@ -27,10 +28,22 @@ const LAYA = model({ key: 'laya-key', name: 'laya', laya: { checkpoints: ['engli
 
 const LAYA_LOADED: LoadedJev = { key: 'laya-key', name: 'laya', labels: [], checkpoints: ['english'], state: 'running', slot: 'pool' }
 
-function renderList(models: ModelEntry[], { current = null, pendingKey }: { current?: LoadedJev | null; pendingKey?: string } = {}) {
+function renderList(
+  models: ModelEntry[],
+  { current = null, pendingKey, showAllEngineModels }: { current?: LoadedJev | null; pendingKey?: string; showAllEngineModels?: boolean } = {},
+) {
   const onLoad = vi.fn()
   const onEject = vi.fn()
-  render(<TextClassificationModelList models={models} current={current} pendingKey={pendingKey} onLoad={onLoad} onEject={onEject} />)
+  render(
+    <TextClassificationModelList
+      models={models}
+      current={current}
+      pendingKey={pendingKey}
+      showAllEngineModels={showAllEngineModels}
+      onLoad={onLoad}
+      onEject={onEject}
+    />,
+  )
   return { onLoad, onEject }
 }
 
@@ -74,10 +87,58 @@ describe('TextClassificationModelList', () => {
     expect(within(list()).getByText('Needs vLLM (Linux or WSL2)')).toBeInTheDocument()
   })
 
+  // Settings → Models, "Show models for every engine": a model listed for loading loads on the selected engine,
+  // which shows its own error if it cannot; its Load was off. A Laya model never runs there, so with no Laya engine
+  // its Load stays off.
+  it('offers the Load of a model the engine cannot run with "Show models for every engine" on, and still says why', async () => {
+    const jev = { ...JEV, compatibleWithActiveEngine: false, incompatibleReason: 'Needs vLLM (Linux or WSL2)' }
+    const laya = { ...LAYA, compatibleWithActiveEngine: false, incompatibleReason: 'Needs the Laya engine' }
+    const { onLoad } = renderList([jev, laya], { showAllEngineModels: true })
+    expect(within(list()).getByText('Needs vLLM (Linux or WSL2)')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Load laya' })).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Load Qwen NLI' }))
+    expect(onLoad).toHaveBeenCalledWith(jev)
+  })
+
   it('shows the load in flight', () => {
     renderList([JEV, LAYA], { pendingKey: 'laya-key' })
     const loading = screen.getByRole('button', { name: 'Load laya' })
     expect(loading).toBeDisabled()
     expect(loading).toHaveTextContent('Loading…')
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): left out of the playground's list, but for the model loaded here.
+describe('TextClassificationModelList with models hidden by the user', () => {
+  it('leaves a hidden model out and keeps the loaded one, though hidden', () => {
+    renderList([{ ...JEV, hidden: true }, { ...LAYA, hidden: true }], { current: LAYA_LOADED })
+    expect(within(list()).queryByText('Qwen NLI')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Eject laya' })).toBeInTheDocument()
+  })
+
+  it('says no models were found, and how to list the hidden ones, when it hid them all', () => {
+    render(
+      <MemoryRouter>
+        <TextClassificationModelList models={[{ ...JEV, hidden: true }]} current={null} pendingKey={undefined} onLoad={vi.fn()} onEject={vi.fn()} />
+      </MemoryRouter>,
+    )
+    expect(within(list()).getByText('No models found.')).toBeInTheDocument()
+    expect(within(list()).getByText(/^1 hidden by you —/)).toBeInTheDocument()
+    expect(within(list()).getByRole('link', { name: 'Show hidden models' })).toBeInTheDocument()
+  })
+
+  it('counts a hidden model in two folders once', () => {
+    render(
+      <MemoryRouter>
+        <TextClassificationModelList
+          models={[{ ...JEV, hidden: true }, { ...JEV, hidden: true, path: '/more/jev' }]}
+          current={null}
+          pendingKey={undefined}
+          onLoad={vi.fn()}
+          onEject={vi.fn()}
+        />
+      </MemoryRouter>,
+    )
+    expect(within(list()).getByText(/^1 hidden by you —/)).toBeInTheDocument()
   })
 })

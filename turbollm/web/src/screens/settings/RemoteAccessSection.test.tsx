@@ -246,6 +246,163 @@ describe('RemoteAccessSection', () => {
     await waitFor(() => expect(vi.mocked(startRemote)).toHaveBeenCalled())
   })
 
+  it('does not switch the saved provider while a tunnel is live — the row only expands to read', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // A public quick tunnel is up. Saving Tailscale Serve under it would leave the trycloudflare
+    // URL serving while the chip, the daemon's next auto-restart and its Tailscale-identity
+    // trust all read "tailscale-serve" — a public URL accepting forged Tailscale headers.
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'cloudflare-quick',
+      enabled: true,
+      state: { kind: 'connected', url: 'https://x.trycloudflare.com', since: '2026-09-10T00:00:00Z' },
+      url: 'https://x.trycloudflare.com',
+      ingressPort: 6997,
+    })
+    const savesBefore = vi.mocked(apiLib.saveSettings).mock.calls.length
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText('https://x.trycloudflare.com')).toBeTruthy()
+    await userEvent.click(screen.getByRole('radio', { name: /tailscale serve/i }))
+    // Still readable...
+    expect(await screen.findByText(/your devices only/i)).toBeTruthy()
+    expect(screen.getByText(/turn remote access off to switch/i)).toBeTruthy()
+    // ...but nothing saved, and the selection still names what is actually running.
+    expect(vi.mocked(apiLib.saveSettings).mock.calls.length).toBe(savesBefore)
+    expect(screen.getByRole('radio', { name: /cloudflare quick tunnel/i }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('radio', { name: /tailscale serve/i }).getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('a row opened only to read shows its pros/cons and the hint, never its own fields', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({ remoteAccess: { provider: 'tailscale-serve', tailscale: { port: 443 } } } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'tailscale-serve',
+      enabled: true,
+      state: { kind: 'connected', url: 'https://box.tail1234.ts.net', since: '2026-09-10T00:00:00Z' },
+      url: 'https://box.tail1234.ts.net',
+      ingressPort: 6997,
+    })
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText('https://box.tail1234.ts.net')).toBeTruthy()
+    // Funnel shares Serve's port field: rendering it in the read-only row too gave two
+    // id="remote-ts-port" selects, the second label pointing at the first.
+    await userEvent.click(screen.getByRole('radio', { name: /tailscale funnel/i }))
+    expect(screen.getByText(/turn remote access off to switch/i)).toBeTruthy()
+    expect(document.querySelectorAll('#remote-ts-port')).toHaveLength(1)
+    // ...and no other provider's credentials can be typed and saved from a read-only row.
+    await userEvent.click(screen.getByRole('radio', { name: /^ngrok$/i }))
+    expect(screen.getByText(/turn remote access off to switch/i)).toBeTruthy()
+    expect(document.querySelector('#remote-ngrok-token')).toBeNull()
+  })
+
+  it('"I run my own" names the port its tunnel points at, from the daemon, and warns off the main port', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // As under `--port 6997`: settings still say 6997 for the ingress, which is the main port
+    // this boot, and the daemon moved the ingress to 6996. The option must name 6996.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      port: 6996,
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'custom',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+      tunnelTargetPort: 6996,
+      mainPort: 6997,
+    })
+    wrap(<RemoteAccessSection />)
+    const target = await screen.findByText('http://127.0.0.1:6996')
+    expect(target.closest('p')?.textContent).toMatch(/^Point your tunnel at http:\/\/127\.0\.0\.1:6996\. That port listens only while remote access is on/)
+    const warning = screen.getByText(/^Never point it at port 6997, this app's own port:/)
+    expect(warning.textContent).toMatch(/full control and no key/)
+    expect(screen.queryByText(/127\.0\.0\.1:6997/)).toBeNull()
+  })
+
+  it('"I run my own" names no port before the daemon has said which one, and still warns off the main port', async () => {
+    const apiLib = await import('../../lib/api')
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    // The file's default status: no tunnelTargetPort, as before it loads.
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/^Point your tunnel at this machine's remote-access port/)).toBeTruthy()
+    expect(screen.getByText(/^Never point it at this app's own port:/)).toBeTruthy()
+    expect(screen.queryByText(/6997/)).toBeNull()
+  })
+
+  it('"I run my own" says to restart, and names no port to point at, while the daemon names none', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // Settings moved this app's port onto this boot's remote-access port (6997), so the daemon
+    // answers no tunnel port: naming one would name the main listener.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({
+      port: 6997,
+      remoteAccess: { provider: 'custom', ingressPort: 6997, custom: { publicUrl: '' } },
+    } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'custom',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+      tunnelTargetPort: null,
+      mainPort: 6997,
+    })
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/^Restart TurboLLM before you point a tunnel here:/)).toBeTruthy()
+    expect(screen.queryByText(/Point your tunnel at/)).toBeNull()
+    expect(screen.queryByText(/127\.0\.0\.1/)).toBeNull()
+    expect(screen.getByText(/^Never point it at port 6997, this app's own port:/)).toBeTruthy()
+  })
+
+  it('puts the selection back when the daemon refuses a provider change', async () => {
+    const apiLib = await import('../../lib/api')
+    // The daemon refuses a provider change while a tunnel is running (409) — e.g. one started
+    // from another tab since this pane's last status poll. The radio must not keep naming a
+    // provider that was never saved.
+    vi.mocked(apiLib.saveSettings).mockRejectedValueOnce(new ApiError('remote_access_running', 'Turn remote access off before changing its provider.', 409))
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('radio', { name: /^ngrok$/i }))
+    await waitFor(() =>
+      expect(screen.getByRole('radio', { name: /cloudflare quick tunnel/i }).getAttribute('aria-checked')).toBe('true'),
+    )
+    expect(screen.getByRole('radio', { name: /^ngrok$/i }).getAttribute('aria-checked')).toBe('false')
+  })
+
+  it('says what models:load and models:unload do for this token, and that Chat cannot load or eject with it', async () => {
+    wrap(<RemoteAccessSection />)
+    expect(await screen.findByText(/cannot see full engine\/model status detail, change settings, or load or eject a model from Chat.s model picker/i)).toBeTruthy()
+    expect(screen.getByText(/models:load lets a request to the OpenAI-compatible \/v1 API load the model it names/i)).toBeTruthy()
+    expect(screen.getByText(/models:unload has no effect on this token/i)).toBeTruthy()
+  })
+
+  it('reverts a token-permission change when its save fails', async () => {
+    const apiLib = await import('../../lib/api')
+    vi.mocked(apiLib.saveSettings).mockRejectedValueOnce(new ApiError('internal', 'Daemon restarting.', 500))
+    wrap(<RemoteAccessSection />)
+    const load = (await screen.findByText('models:load')).closest('label')!.querySelector('input') as HTMLInputElement
+    expect(load.checked).toBe(false)
+    await userEvent.click(load)
+    // Seeded once and never re-synced, so without a revert the box would stay checked while
+    // the next minted token still gets the old grant.
+    await waitFor(() => expect(load.checked).toBe(false))
+  })
+
+  it('reverts the Tailscale port when its save fails', async () => {
+    const apiLib = await import('../../lib/api')
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({ remoteAccess: { provider: 'tailscale-serve', tailscale: { port: 443 } } } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(apiLib.saveSettings).mockRejectedValueOnce(new ApiError('internal', 'Daemon restarting.', 500))
+    wrap(<RemoteAccessSection />)
+    const port = (await screen.findByLabelText('Port')) as HTMLSelectElement
+    await waitFor(() => expect(port.value).toBe('443'))
+    await userEvent.selectOptions(port, '8443')
+    await waitFor(() => expect(port.value).toBe('443'))
+  })
+
   it('stops remote access from the section', async () => {
     const api = await import('../../lib/remote-api')
     // mockResolvedValueOnce, not mockResolvedValue: this file's vitest config sets no
@@ -263,6 +420,27 @@ describe('RemoteAccessSection', () => {
     wrap(<RemoteAccessSection />)
     await userEvent.click(await screen.findByRole('switch', { name: /remote access/i }))
     await waitFor(() => expect(vi.mocked(stopRemote)).toHaveBeenCalled())
+  })
+
+  it('the token shown once after a start points to Customize → Connect → API keys, not the Developer screen', async () => {
+    const apiLib = await import('../../lib/api')
+    const remoteApi = await import('../../lib/remote-api')
+    // Tailscale Serve both locally and on the server: no exposure confirmation, no provider
+    // save, so the click goes straight to startRemote. All Once: nothing leaks into the last test.
+    vi.mocked(apiLib.getSettings).mockResolvedValueOnce({ remoteAccess: { provider: 'tailscale-serve' } } as Awaited<ReturnType<typeof apiLib.getSettings>>)
+    vi.mocked(remoteApi.getRemoteStatus).mockResolvedValueOnce({
+      provider: 'tailscale-serve',
+      enabled: false,
+      state: { kind: 'off' },
+      url: '',
+      ingressPort: null,
+    })
+    vi.mocked(startRemote).mockResolvedValueOnce({ state: { kind: 'starting' }, token: 'tllm-remote-once' })
+    wrap(<RemoteAccessSection />)
+    await userEvent.click(await screen.findByRole('switch', { name: /remote access/i }))
+    expect(await screen.findByText('tllm-remote-once')).toBeTruthy()
+    expect(screen.getByText(/Manage or revoke it in Customize → Connect → API keys\./)).toBeTruthy()
+    expect(screen.queryByText(/Developer/)).toBeNull()
   })
 
   it('turning on Tailscale Serve does NOT show an internet-exposure confirmation', async () => {

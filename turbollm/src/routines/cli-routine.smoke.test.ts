@@ -66,6 +66,7 @@ test(
       // is never acted on — nothing here can swap a model.
       getEngineIdle: () => true,
       loadExplicit: async () => ({ target: `http://127.0.0.1:${PORT}` }),
+      reloadAfterRender: () => {},
       now: () => new Date(),
       port: PORT,
       isAvailable: () => isClaudeCliAvailable(),

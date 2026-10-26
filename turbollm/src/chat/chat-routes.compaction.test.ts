@@ -91,6 +91,38 @@ test('DELETE /compact: clears a prior compaction and returns the updated convers
   }
 })
 
+// The chat draws its divider, summary, Undo and meter projection from these fields. A cut frozen
+// with a branch the user left is set aside for this branch's turns (setAsideFrozenCut), but GET
+// still reported it: the new branch showed the other branch's summary, and its Undo deleted it.
+test('GET /conversations/:id reports no compaction on a branch that left the cut behind, and reports it again back on that branch', async () => {
+  const { app, store, cleanup } = makeApp()
+  try {
+    const conv = store.createConversation({ title: 'Test' })
+    const u1 = store.addMessage(conv.id, 'user', 'Write me a scraper')
+    const a1 = store.addMessage(conv.id, 'assistant', 'In Python: ...')
+    store.addMessage(conv.id, 'user', 'Add retries')
+    store.addMessage(conv.id, 'assistant', 'Done: ...')
+    store.setConversationCompaction(conv.id, { summary: 'User wants a PYTHON scraper', upToMessageId: a1.id, tokensBefore: 500 })
+    type Shown = { compactionSummary?: string; compactionUpToMessageId?: string; compactionTokensBefore?: number }
+    const get = async () => (await (await app.request(`/api/v1/conversations/${conv.id}`)).json()) as Shown
+    assert.equal((await get()).compactionSummary, 'User wants a PYTHON scraper')
+
+    // Editing the first question freezes the cut (a1) with the branch the user left.
+    const edit = await app.request(`/api/v1/conversations/${conv.id}/messages/${u1.id}`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ content: 'Write me a scraper in Rust' }) })
+    assert.equal(edit.status, 200)
+    const onNewBranch = await get()
+    assert.equal(onNewBranch.compactionSummary, undefined)
+    assert.equal(onNewBranch.compactionUpToMessageId, undefined)
+    assert.equal(onNewBranch.compactionTokensBefore, undefined)
+
+    // The stored compaction is untouched: switching back shows it again.
+    assert.equal((await app.request(`/api/v1/conversations/${conv.id}/messages/${u1.id}/activate`, { method: 'POST' })).status, 200)
+    assert.equal((await get()).compactionSummary, 'User wants a PYTHON scraper')
+  } finally {
+    cleanup()
+  }
+})
+
 test('POST /compact: honors the request body\'s `model`, not the conversation\'s stale bound `modelKey` (opus-review I-A)', async () => {
   const { app, store, cleanup } = makeApp()
   try {

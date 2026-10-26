@@ -26,7 +26,14 @@
  *  funnel and a stale/missing value degrades safely through `resumeAt`'s
  *  existing fallback — so it does not need the tamper-resistance a
  *  server-owned fact would. Profile and completion status are still never
- *  read from or written to `localStorage` anywhere in this file. */
+ *  read from or written to `localStorage` anywhere in this file.
+ *
+ *  The download the Load step follows (`ctx.expectedDownloadId`) is kept the
+ *  same way, under its own key, for the same reason: it is where this tab's
+ *  wizard is, not a funnel fact. Lost on a reopen, the Load step matched any
+ *  download in the list: "Download complete" from an older row while this
+ *  one was still gigabytes short. A row id survives a daemon restart (the
+ *  manifest keeps it); LoadStep stops following one whose row is gone. */
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useReducer, useRef, type ReactNode } from 'react'
 import { deriveSteps, reduce } from '../../screens/onboarding/machine'
@@ -35,6 +42,7 @@ import { useOnboardingState, useSetOnboardingState } from '../onboarding-queries
 import { track } from '../api'
 
 const STEP_ID_STORAGE_KEY = 'tllm.onboarding.currentStepId'
+const DOWNLOAD_ID_STORAGE_KEY = 'tllm.onboarding.expectedDownloadId'
 
 const INITIAL_CTX: StepContext = {
   profile: null,
@@ -81,11 +89,19 @@ function readSavedStepId(): string | null {
   }
 }
 
+function readSavedDownloadId(): string | null {
+  try {
+    return localStorage.getItem(DOWNLOAD_ID_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
 function useOnboardingMachineState(): UseOnboardingMachineResult {
   const [state, dispatch] = useReducer(
     reduce,
     undefined,
-    () => ({ currentId: readSavedStepId(), ctx: INITIAL_CTX }),
+    () => ({ currentId: readSavedStepId(), ctx: { ...INITIAL_CTX, expectedDownloadId: readSavedDownloadId() } }),
   )
   const onboardingQuery = useOnboardingState()
   const setOnboarding = useSetOnboardingState()
@@ -126,6 +142,16 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
     }
   }, [state.currentId])
 
+  // The followed download, kept the same way (see the header).
+  useEffect(() => {
+    try {
+      if (state.ctx.expectedDownloadId) localStorage.setItem(DOWNLOAD_ID_STORAGE_KEY, state.ctx.expectedDownloadId)
+      else localStorage.removeItem(DOWNLOAD_ID_STORAGE_KEY)
+    } catch {
+      // best-effort, as the step id
+    }
+  }, [state.ctx.expectedDownloadId])
+
   const steps = useMemo(() => deriveSteps(state.ctx), [state.ctx])
   const currentStepIndex = useMemo(
     () => steps.findIndex((s) => s.id === state.currentId),
@@ -139,7 +165,10 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
   const patchCtx = useCallback((patch: Partial<StepContext>) => dispatch({ type: 'ctx', patch }), [])
 
   const clearSavedStepId = () => {
-    try { localStorage.removeItem(STEP_ID_STORAGE_KEY) } catch { /* best-effort */ }
+    try {
+      localStorage.removeItem(STEP_ID_STORAGE_KEY)
+      localStorage.removeItem(DOWNLOAD_ID_STORAGE_KEY)
+    } catch { /* best-effort */ }
   }
 
   // Both skip() and completeOnboarding() are awaited by their callers before
@@ -155,8 +184,11 @@ function useOnboardingMachineState(): UseOnboardingMachineResult {
   // resolves only after `onSuccess` has already updated the cache, so
   // awaiting it before navigating closes the race.
   const skip = useCallback(async () => {
-    dispatch({ type: 'skip' })
+    // Persist FIRST: dispatching 'skip' clears currentStep, and OnboardingScreen renders
+    // nothing without one — so a rejected request after the dispatch left a blank page with
+    // no controls. A failure now leaves the user on the step they were on.
     await setOnboarding.mutateAsync({ status: 'skipped' })
+    dispatch({ type: 'skip' })
     clearSavedStepId()
   }, [setOnboarding])
 

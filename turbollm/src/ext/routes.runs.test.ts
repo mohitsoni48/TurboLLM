@@ -10,7 +10,7 @@ import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import { StoreError, type ChatStore } from '../chat/store/chat-store.js'
 import { hashKey } from '../auth.js'
-import { PublicRunManager } from './run-manager.js'
+import { PublicRunManager, type RunRecordStore } from './run-manager.js'
 import { registerExtChatRoutes } from './routes.chats.js'
 import { registerExtRunRoutes, type ExtRouteDeps } from './routes.runs.js'
 import { loadFullHistory } from './generation.js'
@@ -34,6 +34,10 @@ function harness(
   bodyFactory?: () => Promise<{ status: 'complete' | 'aborted' }>,
   ext?: ExtRouteDeps,
   managerStatus?: () => Status,
+  /** When given, the body waits for it before emitting its first frame. */
+  beforeFirstFrame?: Promise<void>,
+  /** When given, the run manager writes its run records there (the daemon passes its DB). */
+  runDb?: RunRecordStore,
 ) {
   const dir = tmpDir('turbollm-ext-runs-')
   const conv = new ConversationStore(dir)
@@ -59,11 +63,12 @@ function harness(
       target: () => 'http://127.0.0.1:9999',
     },
   } as never
-  const runs = new PublicRunManager()
+  const runs = new PublicRunManager(runDb ? { db: runDb } : undefined)
   const app = new Hono()
   registerExtChatRoutes(app, d, ext)
   registerExtRunRoutes(app, d, runs, {
     makeBody: () => async ({ emit }) => {
+      if (beforeFirstFrame) await beforeFirstFrame
       await emit({ event: 'delta', data: { content: 'hello' } })
       await emit({ event: 'delta', data: { content: ' world' } })
       return bodyFactory ? await bodyFactory() : { status: 'complete' as const }
@@ -217,10 +222,122 @@ test('reattaching with ?after replays only later frames', async () => {
       post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
     await runs.settled(started.id)
 
+    const ids = (text: string) => [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]))
     const full = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?owner=u1`, { headers: { Authorization: ACME } })).text()
-    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=2&owner=u1`, { headers: { Authorization: ACME } })).text()
-    assert.ok(full.length > tail.length)
+    assert.deepEqual(ids(full), [1, 2, 3], 'no ?after replays every frame: delta, delta, done')
+    // `after` is the last id the client already HAS (exclusive) — `?after=N` used to resend
+    // frame N, duplicating the last rendered delta on every resume.
+    const tail = await (await app.request(`/api/ext/v1/runs/${started.id}/stream?after=1&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.deepEqual(ids(tail), [2, 3], '?after=1 must not resend frame 1')
     assert.match(tail, /event: done/, 'a late reattach still receives the terminal frame')
+  } finally {
+    cleanup()
+  }
+})
+
+// `after` went through a bare Number(...): 'abc' (NaN) or '1.5' matched no retained frame, so the
+// route answered 409 replay_window_exceeded and told the client to re-read the message and
+// reattach, for a cursor that was never valid in the first place.
+test('?after that is not an integer is a 400 invalid_input, not a 409 replay_window_exceeded', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    const started = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await runs.settled(started.id)
+    for (const after of ['abc', '1.5', 'Infinity', '0x']) {
+      const res = await app.request(`/api/ext/v1/runs/${started.id}/stream?after=${after}&owner=u1`, { headers: { Authorization: ACME } })
+      assert.equal(res.status, 400, `after=${after}`)
+      const body = await res.json() as { error: { type: string; code: string; param?: string } }
+      assert.equal(body.error.type, 'invalid_request')
+      assert.equal(body.error.code, 'invalid_input')
+      assert.equal(body.error.param, 'after')
+    }
+    // An integer cursor, and an empty or absent one (from the first frame), still stream.
+    for (const q of ['after=2&', 'after=&', '']) {
+      const res = await app.request(`/api/ext/v1/runs/${started.id}/stream?${q}owner=u1`, { headers: { Authorization: ACME } })
+      assert.equal(res.status, 200, q)
+      assert.match(await res.text(), /event: done/)
+    }
+  } finally {
+    cleanup()
+  }
+})
+
+// canReplayFrom took a cursor past the run's last frame for "caught up" (nothing retained after
+// it, and not before the buffer's head): a finished run answered 200 with an empty stream, and a
+// live one then sent every frame it emitted, at or below the cursor too, which the client took
+// for frames it already had. Such a cursor names frames the run never sent.
+test('?after past the last frame the run has sent is a 400 invalid_input, for a finished run and a live one', async () => {
+  const ids = (text: string) => [...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1]))
+  const expectPastEnd = async (res: Response, label: string) => {
+    assert.equal(res.status, 400, label)
+    const body = await res.json() as { error: { type: string; code: string; param?: string } }
+    assert.equal(body.error.type, 'invalid_request', label)
+    assert.equal(body.error.code, 'invalid_input', label)
+    assert.equal(body.error.param, 'after', label)
+  }
+
+  // Finished: delta, delta, done (frames 1-3).
+  const done = harness()
+  try {
+    const chatId = await newChat(done.app)
+    const started = await (await done.app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    await done.runs.settled(started.id)
+    for (const after of [4, 99]) {
+      await expectPastEnd(await done.app.request(`/api/ext/v1/runs/${started.id}/stream?after=${after}&owner=u1`, { headers: { Authorization: ACME } }), `finished, after=${after}`)
+    }
+    // The last frame itself is a cursor that is caught up: 200, and nothing more to send.
+    const caughtUp = await done.app.request(`/api/ext/v1/runs/${started.id}/stream?after=3&owner=u1`, { headers: { Authorization: ACME } })
+    assert.equal(caughtUp.status, 200)
+    assert.deepEqual(ids(await caughtUp.text()), [])
+  } finally {
+    done.cleanup()
+  }
+
+  // Live: both deltas (frames 1-2) sent, the done frame (3) held back until released.
+  let release: () => void
+  const gate = new Promise<void>((r) => { release = r })
+  const live = harness(async () => { await gate; return { status: 'complete' as const } })
+  try {
+    const chatId = await newChat(live.app)
+    const started = await (await live.app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string }
+    while ((live.runs.get(started.id)?.eventSeq ?? 0) < 2) await new Promise((r) => setTimeout(r, 5))
+    await expectPastEnd(await live.app.request(`/api/ext/v1/runs/${started.id}/stream?after=5&owner=u1`, { headers: { Authorization: ACME } }), 'live, after=5')
+    // A cursor at the last frame sent still attaches, and gets only the frames after it.
+    const attached = await live.app.request(`/api/ext/v1/runs/${started.id}/stream?after=2&owner=u1`, { headers: { Authorization: ACME } })
+    assert.equal(attached.status, 200)
+    release!()
+    assert.deepEqual(ids(await attached.text()), [3])
+    await live.runs.settled(started.id)
+  } finally {
+    release!()
+    live.cleanup()
+  }
+})
+
+// The 202 body and an early GET /runs/{id} report event_seq 0 before any frame exists. Frames
+// used to be numbered from 0 as well, so a client that attached later with ?after=<that
+// event_seq> (once frame 0 had been sent) lost the run's first frame.
+test('?after=<the event_seq reported before any frame> still gets the first frame', async () => {
+  let start: () => void
+  const firstFrame = new Promise<void>((r) => { start = r })
+  const { app, runs, cleanup } = harness(undefined, undefined, undefined, firstFrame)
+  try {
+    const chatId = await newChat(app)
+    const created = await (await app.request(`/api/ext/v1/chats/${chatId}/messages`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))).json() as { id: string; event_seq: number }
+    const early = await (await app.request(`/api/ext/v1/runs/${created.id}?owner=u1`, { headers: { Authorization: ACME } })).json() as { event_seq: number }
+    assert.equal(created.event_seq, 0)
+    assert.equal(early.event_seq, 0)
+    start!()
+    await runs.settled(created.id)
+
+    const text = await (await app.request(`/api/ext/v1/runs/${created.id}/stream?after=${early.event_seq}&owner=u1`, { headers: { Authorization: ACME } })).text()
+    assert.match(text, /"content":"hello"/, 'the first frame, sent after event_seq 0 was reported, must not be skipped')
+    assert.deepEqual([...text.matchAll(/^id: (\d+)$/gm)].map((m) => Number(m[1])), [1, 2, 3])
   } finally {
     cleanup()
   }
@@ -340,9 +457,8 @@ test('a duplicate Idempotency-Key on the generate path reattaches to the same ru
     const run1 = await first.json() as { id: string }
     await runs.settled(run1.id)
 
-    // Retry with the SAME key but DIFFERENT content — proving this reattaches rather than
-    // starting a fresh generation from the new body.
-    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi again'))
+    // A genuine retry: SAME key, SAME body — reattaches rather than starting a fresh generation.
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages`, genPost('hi'))
     assert.equal(second.status, 202)
     const run2 = await second.json() as { id: string }
     assert.equal(run2.id, run1.id, 'the replay must reattach to the SAME run, not start a new one')
@@ -350,6 +466,40 @@ test('a duplicate Idempotency-Key on the generate path reattaches to the same ru
     const list = await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })
     const page = await list.json() as { data: Array<{ role: string }> }
     assert.deepEqual(page.data.map((m) => m.role), ['user', 'assistant'], 'the replay must not persist a second user/assistant pair')
+  } finally {
+    cleanup()
+  }
+})
+
+// The replay used to ignore the chat id and body, so a key reused for a DIFFERENT message
+// (e.g. an integrator keying sends by turn number, unique per chat but not across chats)
+// answered 202 with the OLD run while the new message was never persisted.
+test('an Idempotency-Key reused for a different chat or different content is refused with 409, not replayed', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatA = await newChat(app)
+    const chatB = await newChat(app)
+    const gen = (chatId: string, content: string) => app.request(`/api/ext/v1/chats/${chatId}/messages`, {
+      method: 'POST',
+      headers: { Authorization: ACME, 'Content-Type': 'application/json', 'Idempotency-Key': 'turn-1' },
+      body: JSON.stringify({ role: 'user', content, owner: 'u1' }),
+    })
+
+    const first = await gen(chatA, 'hello A')
+    assert.equal(first.status, 202)
+    await runs.settled((await first.json() as { id: string }).id)
+
+    const otherChat = await gen(chatB, 'hello B')
+    assert.equal(otherChat.status, 409, 'a different chat under the same key must not be reported as sent')
+    assert.equal((await otherChat.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
+    const msgsB = await (await app.request(`/api/ext/v1/chats/${chatB}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(msgsB.data.length, 0)
+
+    const otherContent = await gen(chatA, 'something else')
+    assert.equal(otherContent.status, 409, 'different content on the same chat under the same key is a different request')
+    assert.equal((await otherContent.json() as { error: { code: string } }).error.code, 'idempotency_key_reused')
+    const msgsA = await (await app.request(`/api/ext/v1/chats/${chatA}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(msgsA.data.length, 2, 'only the first request\'s user/assistant pair exists')
   } finally {
     cleanup()
   }
@@ -406,6 +556,38 @@ test('a stale Idempotency-Key whose run has already been pruned is refused rathe
     })
     assert.equal(replay.status, 409)
     assert.equal((await replay.json() as { error: { code: string } }).error.code, 'idempotency_replay_expired')
+  } finally {
+    cleanup()
+  }
+})
+
+// The generate route never read `role`: it saved every turn as role 'user' and started a run, so
+// a client back-filling an assistant reply (POST /chats/:id/messages with role 'assistant' and
+// generate left at its default) got that reply stored as a user turn and a model answer to it.
+test('a turn that starts a run must be role user: assistant or any other role is a 400 and writes nothing', async () => {
+  const { app, runs, cleanup } = harness()
+  try {
+    const chatId = await newChat(app)
+    for (const path of [`/api/ext/v1/chats/${chatId}/messages/generate`, `/api/ext/v1/chats/${chatId}/messages`]) {
+      for (const role of ['assistant', 'system', 42, null]) {
+        const res = await app.request(path, post(ACME, { role, content: 'an earlier reply', owner: 'u1' }))
+        assert.equal(res.status, 400, `${path} role=${role}`)
+        const body = await res.json() as { error: { type: string; code: string; param?: string } }
+        assert.equal(body.error.code, 'invalid_input')
+        assert.equal(body.error.param, 'role')
+      }
+    }
+    const list = await (await app.request(`/api/ext/v1/chats/${chatId}/messages?owner=u1`, { headers: { Authorization: ACME } })).json() as { data: unknown[] }
+    assert.equal(list.data.length, 0, 'no turn was saved and no run started')
+
+    // An assistant turn is still appended with generate: false, and role 'user' or no role starts a run.
+    const appended = await app.request(`/api/ext/v1/chats/${chatId}/messages`, post(ACME, { role: 'assistant', content: 'an earlier reply', owner: 'u1', generate: false }))
+    assert.equal(appended.status, 201)
+    for (const b of [{ role: 'user', content: 'next' }, { content: 'and next' }]) {
+      const res = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`, post(ACME, { ...b, owner: 'u1' }))
+      assert.equal(res.status, 202)
+      await runs.settled((await res.json() as { id: string }).id)
+    }
   } finally {
     cleanup()
   }
@@ -702,6 +884,43 @@ test('getChat throwing in the generate handler surfaces a JSON error envelope, a
     assert.equal(second.status, 202, 'the failed attempt must not have left the chat permanently blocked')
     const run = await second.json() as { id: string }
     await runs.settled(run.id)
+  } finally {
+    cleanup()
+  }
+})
+
+// runs.start() wrote the run's first record bare, so a write that threw (disk full, DB locked)
+// went out of the generate route as a bare 500 after the user turn was saved, with the chat's
+// reservation and the tenant's concurrency slot never released: every later turn on that chat
+// got 409 generation_in_flight until the daemon restarted.
+test('an ext_runs write that fails on the generate path ends the run as failed and frees the chat for the next turn', async () => {
+  let failing = true
+  const runDb: RunRecordStore = {
+    upsertExtRun: (r) => { if (failing) throw new Error('database or disk is full'); store.db.upsertExtRun(r) },
+    getExtRun: (id) => store.db.getExtRun(id),
+    listExtRuns: (t, o, l) => store.db.listExtRuns(t, o, l),
+    markStreamingExtRunsFailed: (c, m) => store.db.markStreamingExtRunsFailed(c, m),
+  }
+  const store = harness(undefined, undefined, undefined, undefined, runDb)
+  const { app, runs, cleanup } = store
+  try {
+    const chatId = await newChat(app)
+    const first = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi', owner: 'u1' }))
+    assert.equal(first.status, 202)
+    const run = await first.json() as { id: string }
+    await runs.settled(run.id)
+    const seen = await (await app.request(`/api/ext/v1/runs/${run.id}?owner=u1`, { headers: { Authorization: ACME } })).json() as { status: string; error: { type: string } | null }
+    assert.equal(seen.status, 'failed')
+    assert.equal(seen.error?.type, 'storage')
+
+    failing = false
+    const second = await app.request(`/api/ext/v1/chats/${chatId}/messages/generate`,
+      post(ACME, { role: 'user', content: 'hi again', owner: 'u1' }))
+    assert.equal(second.status, 202, 'the failed write must not leave the chat blocked')
+    const next = await second.json() as { id: string }
+    await runs.settled(next.id)
+    assert.equal(runs.get(next.id)?.status, 'complete')
   } finally {
     cleanup()
   }

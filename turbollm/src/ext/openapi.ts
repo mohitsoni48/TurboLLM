@@ -36,7 +36,8 @@ export interface RouteSpec {
   audited?: string
   requestSchema?: string
   responseSchema?: string
-  /** SSE endpoints document `text/event-stream` alongside `application/json` (spec §5.1, §6.3). */
+  /** SSE endpoints document `text/event-stream` alongside `application/json` (spec §5.1, §6.3),
+   *  always under 200: that is what streamSSE answers. */
   sse?: boolean
   /** A second possible success response, for the one route whose response shape depends on
    *  request BODY content rather than just the `Accept` header (which `sse` already covers).
@@ -54,6 +55,17 @@ export interface RouteSpec {
    *  inference function, so the NEXT route that doesn't fit the convention fails loudly (a
    *  missing successStatus falls back to the wrong default) instead of silently drifting again. */
   successStatus?: string
+  /** Query parameters the handler reads, other than `owner` (derived separately — see
+   *  NO_OWNER_PARAM_PATHS). openapi.test.ts scans the route files' `c.req.query(...)` calls and
+   *  fails when a route reads one this list does not name, or names one it never reads. */
+  query?: QueryParam[]
+  /** Optional request headers the handler reads (beyond auth, `Accept` and `X-Request-Id`):
+   *  `Idempotency-Key`. openapi.test.ts checks every handler reading one documents it. */
+  headers?: QueryParam[]
+  /** Error `type`s this route can answer with, each documented at that type's usual status
+   *  (`errorResponses`). `type:status` documents a type a route sends with a different status
+   *  — e.g. `auth:403` (insufficient_scope / tenant_not_supported, auth.ts) next to the plain
+   *  401, or `engine:409` (context_overflow, routes.runs.ts). */
   errors: string[]
 }
 
@@ -61,8 +73,37 @@ export interface RouteSpec {
 // (`app.use(BASE/*, ...)`, registered ahead of every route including ones added later by
 // routes.runs.ts and mount.ts) — spec §5.4 confirms read AND write traffic is rate limited, so
 // `capacity` belongs in the shared read-error set, not just the write one.
-const CHAT_ERRORS = ['auth', 'not_found', 'invalid_request', 'capacity']
+// `auth:403`: every scoped route refuses a key lacking the scope, or resolving to the local
+// tenant, with 403 (auth.ts) — 401 alone undersold it.
+// `internal` (500): extErrorHandler's backstop, and mapStoreError's fallback, can answer any route.
+const CHAT_ERRORS = ['auth', 'auth:403', 'not_found', 'invalid_request', 'capacity', 'internal']
 const WRITE_ERRORS = [...CHAT_ERRORS, 'conflict', 'storage']
+// Routes that call the chat store also surface mapStoreError's 501 `not_supported` (errors.ts) —
+// the answer for every such call when no adapter serves the key's tenant — and its `storage`
+// (an adapter returning malformed data), on reads as much as writes.
+const STORE_READ_ERRORS = [...CHAT_ERRORS, 'unsupported', 'storage']
+const STORE_WRITE_ERRORS = [...WRITE_ERRORS, 'unsupported']
+// Body caps (limits.ts) are `invalid_request` sent as 413 payload_too_large; the context-window
+// refusal is `engine` sent as 409 context_overflow (routes.runs.ts), never the type's 502.
+const BODY_CAP_ERRORS = ['invalid_request:413']
+
+export interface QueryParam {
+  name: string
+  description: string
+  /** Defaults to 'string'. */
+  type?: 'string' | 'integer'
+}
+// The chat store's cursor pagination (sqlite-chat-store.ts's clampLimit) and dto.ts's include=.
+const CURSOR_PARAM: QueryParam = { name: 'cursor', description: "Opaque cursor: the previous page's `next_cursor`. Omit for the first page." }
+const LIMIT_PARAM: QueryParam = { name: 'limit', type: 'integer', description: 'Page size, an integer (any other value gets 400 invalid_input). The built-in store takes 1-200 (larger values are clamped to 200) and defaults to 50; a configured store adapter applies its own bounds.' }
+// idempotency.ts: kept 24 h, in memory only, scoped to tenant + owner + operation.
+const IDEMPOTENCY_KEY = 'Optional client-chosen key that makes a retry safe: a repeat with the same key (and owner) within 24 hours'
+const IDEMPOTENCY_TAIL = 'Keys are held in memory, so a daemon restart forgets them. Reusing a key for a different request is refused with 409 idempotency_key_reused.'
+const IDEMPOTENCY_GENERATE = `${IDEMPOTENCY_KEY} reattaches to the original run instead of appending the message again. ${IDEMPOTENCY_TAIL} Once that run has left memory (about an hour after it ends), a JSON repeat returns its stored record and a streaming repeat is refused with 409 replay_window_exceeded; a run that can no longer be found at all is refused with 409 idempotency_replay_expired.`
+const INCLUDE_PARAM: QueryParam = {
+  name: 'include',
+  description: 'Comma-separated heavy fields to return on each message: reasoning, attachments, tool_calls, usage, metadata. Omitted fields are left out of the response.',
+}
 
 export const EXT_ROUTES: RouteSpec[] = [
   // ── routes.chats.ts ───────────────────────────────────────────────────────────────────────
@@ -71,39 +112,42 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Store capabilities, limits, and model info.',
     // No `requireScope` call, but still behind the blanket extAuth (401) and per-tenant rate
     // limiter (429) middleware routes.chats.ts registers ahead of every route on this surface.
-    responseSchema: 'Capabilities', errors: ['auth', 'capacity'],
+    responseSchema: 'Capabilities', errors: ['auth', 'capacity', 'internal'],
   },
   {
     method: 'GET', path: '/chats',
     summary: 'List chats, cursor-paginated.',
-    scope: 'chats:read', responseSchema: 'ChatPage', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'ChatPage', errors: STORE_READ_ERRORS,
+    query: [CURSOR_PARAM, LIMIT_PARAM, { name: 'q', description: 'Search text. The built-in store matches it as a substring of chat titles (message content is not searched); a configured store adapter applies its own matching. Honoured only when GET /capabilities reports `search: true`.' }],
   },
   {
     method: 'POST', path: '/chats',
     summary: 'Create a chat.',
     scope: 'chats:write', audited: 'chat.create',
-    requestSchema: 'ChatInput', responseSchema: 'Chat', errors: WRITE_ERRORS,
+    requestSchema: 'ChatInput', responseSchema: 'Chat', errors: STORE_WRITE_ERRORS,
+    headers: [{ name: 'Idempotency-Key', description: `${IDEMPOTENCY_KEY} returns the chat it created instead of creating another. ${IDEMPOTENCY_TAIL}` }],
   },
   {
     method: 'GET', path: '/chats/:id',
     summary: 'Fetch one chat.',
-    scope: 'chats:read', responseSchema: 'Chat', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'Chat', errors: STORE_READ_ERRORS,
   },
   {
     method: 'PATCH', path: '/chats/:id',
     summary: 'Update title, system_prompt, sampling, or metadata.',
     scope: 'chats:write', audited: 'chat.update',
-    requestSchema: 'ChatPatch', responseSchema: 'Chat', errors: WRITE_ERRORS,
+    requestSchema: 'ChatPatch', responseSchema: 'Chat', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'DELETE', path: '/chats/:id',
     summary: 'Delete a chat and its messages.',
-    scope: 'chats:write', audited: 'chat.delete', errors: WRITE_ERRORS,
+    scope: 'chats:write', audited: 'chat.delete', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'GET', path: '/chats/:id/messages',
     summary: 'List messages in a chat, cursor-paginated.',
-    scope: 'chats:read', responseSchema: 'MessagePage', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'MessagePage', errors: STORE_READ_ERRORS,
+    query: [CURSOR_PARAM, LIMIT_PARAM, INCLUDE_PARAM],
   },
   {
     method: 'POST', path: '/chats/:id/messages',
@@ -118,30 +162,41 @@ export const EXT_ROUTES: RouteSpec[] = [
     // since it originates in the forwarded route.
     altResponse: {
       status: '202', schema: 'Run', sse: true,
-      description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON) or an SSE stream, per Accept (spec §5.1).',
+      description: 'Default (generate omitted or true): identical to calling POST .../messages/generate directly — the async Run (JSON), or with Accept: text/event-stream an SSE stream answered with 200 (spec §5.1).',
     },
-    errors: [...WRITE_ERRORS, 'engine'],
+    errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
+    // Read only on the generate:false path, which answers with a Message.
+    query: [{ ...INCLUDE_PARAM, description: `generate:false only. ${INCLUDE_PARAM.description}` }],
+    // Read by the forwarded generate route; generate:false ignores it.
+    headers: [{ name: 'Idempotency-Key', description: `generate omitted or true only. ${IDEMPOTENCY_GENERATE}` }],
   },
   {
     method: 'GET', path: '/messages/:id',
     summary: 'Fetch one message.',
-    scope: 'chats:read', responseSchema: 'Message', errors: CHAT_ERRORS,
+    scope: 'chats:read', responseSchema: 'Message', errors: STORE_READ_ERRORS,
+    query: [INCLUDE_PARAM],
   },
   {
     method: 'PATCH', path: '/messages/:id',
     summary: 'Edit message content.',
     scope: 'chats:write', audited: 'message.update',
-    requestSchema: 'MessagePatch', responseSchema: 'Message', errors: WRITE_ERRORS,
+    requestSchema: 'MessagePatch', responseSchema: 'Message', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS],
+    query: [INCLUDE_PARAM],
   },
   {
     method: 'DELETE', path: '/messages/:id',
     summary: 'Delete a message.',
-    scope: 'chats:write', audited: 'message.delete', errors: WRITE_ERRORS,
+    scope: 'chats:write', audited: 'message.delete', errors: STORE_WRITE_ERRORS,
   },
   {
     method: 'GET', path: '/audit',
     summary: "The tenant's own audit trail of mutations.",
     scope: 'chats:read', responseSchema: 'AuditPage', errors: CHAT_ERRORS,
+    query: [
+      { name: 'limit', type: 'integer', description: 'Page size, a positive integer (larger values are clamped to 200). Default 200.' },
+      { name: 'since', description: 'ISO 8601 date or date-time in extended format, e.g. 2026-10-15, 2026-10-15T10:00:00Z or 2026-10-15T12:00:00.250+02:00 (seconds and fraction optional; a date, or a bare YYYY-MM or YYYY, is midnight UTC; a date-time with neither Z nor an offset is read in the daemon\'s local time zone): only rows at or after that instant. A + offset may be sent percent-encoded (%2B) or raw: a raw + decodes to a space, and a space in its place is read as +. Any other form, the basic format (20261015T100000Z) included, is refused with 400 invalid_input.' },
+      { name: 'before', description: 'The `id` of the oldest row a previous page returned: only rows older than it.' },
+    ],
   },
 
   // ── routes.runs.ts ────────────────────────────────────────────────────────────────────────
@@ -150,11 +205,12 @@ export const EXT_ROUTES: RouteSpec[] = [
     summary: 'Start a generation run for a chat (SSE or JSON, per Accept).',
     scope: 'runs:write', audited: 'run.start',
     requestSchema: 'MessageInput', responseSchema: 'Run', sse: true,
-    successStatus: '202', errors: [...WRITE_ERRORS, 'engine'],
+    successStatus: '202', errors: [...STORE_WRITE_ERRORS, ...BODY_CAP_ERRORS, 'engine:409'],
+    headers: [{ name: 'Idempotency-Key', description: IDEMPOTENCY_GENERATE }],
   },
   {
     method: 'GET', path: '/runs',
-    summary: 'List runs for the tenant.',
+    summary: "List the caller's recent runs: the newest 100 stored and any still held in memory, never older ones.",
     scope: 'chats:read', responseSchema: 'RunPage', errors: CHAT_ERRORS,
   },
   {
@@ -164,8 +220,9 @@ export const EXT_ROUTES: RouteSpec[] = [
   },
   {
     method: 'GET', path: '/runs/:id/stream',
-    summary: "Attach or re-attach to a run's SSE event stream.",
+    summary: "Attach or re-attach to a run's SSE event stream. Query `after` is the last event_seq (SSE `id`) already received: only later frames are sent. Omit it (or pass 0) to replay from the first frame.",
     scope: 'chats:read', sse: true, errors: [...CHAT_ERRORS, 'conflict'],
+    query: [{ name: 'after', type: 'integer', description: 'The last event_seq (SSE `id`) already received; only later frames are sent. Omit it (or pass 0) to replay from the first frame. A value that is not an integer, or one past the last frame the run has sent (its current event_seq), gets 400 invalid_input; once the daemon no longer holds the run, every cursor gets 409 replay_window_exceeded.' }],
   },
   {
     method: 'POST', path: '/runs/:id/cancel',
@@ -183,7 +240,7 @@ export const EXT_ROUTES: RouteSpec[] = [
     // today — NOT keyless. (Whether it should eventually be made keyless, so an integrator can
     // read the schema before it has a key, is a real but separate product decision — see this
     // task's report — not something this manifest entry should misrepresent in the meantime.)
-    responseSchema: 'OpenApiDocument', errors: ['auth', 'capacity'],
+    responseSchema: 'OpenApiDocument', errors: ['auth', 'capacity', 'internal'],
   },
 ]
 
@@ -253,7 +310,7 @@ function buildSchemas(): Record<string, JsonSchema> {
       chat_id: { type: 'string' },
       message_id: { type: 'string' },
       status: { type: 'string', enum: ['queued', 'streaming', 'complete', 'failed', 'aborted'] },
-      event_seq: { type: 'integer', description: 'Monotonic event counter — the resume token (spec §6.3).' },
+      event_seq: { type: 'integer', description: 'Seq (SSE `id`) of the latest event; frames are numbered from 1, so 0 means none yet — the resume token (spec §6.3). GET /runs/{id}/stream?after=N sends only frames after N: pass the last SSE `id` you received. Stored only when the status changes, so for a run the daemon no longer holds in memory (about an hour after it ends, or after a restart) it is informational: an ended run reads the seq of its done frame, but a run that was streaming when the daemon stopped reads 0.' },
       error: { type: ['object', 'null'], additionalProperties: true },
       created_at: { type: 'string', format: 'date-time' },
       ended_at: { type: ['string', 'null'], format: 'date-time' },
@@ -354,7 +411,7 @@ function buildSchemas(): Record<string, JsonSchema> {
     type: 'object',
     description: 'At least one of `content` or a non-empty `attachments` array must be present — an attachments-only message with no content is valid and will be persisted as such.',
     properties: {
-      role: { type: 'string', enum: ['user', 'assistant'] },
+      role: { type: 'string', enum: ['user', 'assistant'], description: 'Defaults to user. assistant only with generate: false: a turn that starts a run (POST .../messages/generate, or generate omitted or true) must be user, and any other role gets 400 invalid_input.' },
       content: { type: 'string', description: 'Optional if a non-empty `attachments` array is present — at least one of `content` or `attachments` is required.' },
       reasoning: { type: 'string' },
       attachments: { type: 'array', items: { type: 'string' }, description: 'data: URIs. Max 4 per message (spec §4.1). Optional if `content` is present — at least one of `content` or `attachments` is required.' },
@@ -395,21 +452,33 @@ function buildSchemas(): Record<string, JsonSchema> {
   }
 
   // NOT `pageOf('AuditRow')`: unlike the other List endpoints, GET /audit isn't cursor-paginated
-  // — `AuditLog.list()` (audit.ts) takes only `limit`/`since`, no cursor, and the route
-  // (routes.chats.ts) returns exactly `{ data: [...] }`. `pageOf()`'s `allOf: [Page]` would
+  // — `AuditLog.list()` (audit.ts) takes `limit`/`since`/`before` (a row id), no opaque cursor,
+  // and the route (routes.chats.ts) returns exactly `{ data: [...] }`. `pageOf()`'s `allOf: [Page]` would
   // require `has_more`/`next_cursor`, which this response never has (openapi.test.ts's
   // response-fidelity test catches that mismatch directly).
   const AuditPage: JsonSchema = {
     type: 'object',
-    description: 'A page of audit rows (spec 27 §10). Not cursor-paginated — page backward using `since`.',
+    description: 'A page of audit rows (spec 27 §10), newest first, at most `limit` (default and max 200). No has_more/next_cursor: page backward by passing the `id` of the oldest row received as `before`, until a page holds fewer than `limit` rows. `since` (ISO timestamp, inclusive) bounds how far back to read.',
     properties: { data: { type: 'array', items: { $ref: '#/components/schemas/AuditRow' } } },
+    required: ['data'],
+  }
+
+  // NOT `pageOf('Run')`, for the same reason as AuditPage: GET /runs (routes.runs.ts) returns
+  // exactly `{ data: [...] }` — no cursor, no has_more/next_cursor. "The caller's runs" alone
+  // read as every run the owner has, while PublicRunManager.list() returns the runs this daemon
+  // still holds (server.ts prunes an ended one after an hour) plus ConversationStore.listExtRuns's
+  // newest 100 stored rows, and nothing older.
+  const RunPage: JsonSchema = {
+    type: 'object',
+    description: "The caller's recent runs, not all of them: those this daemon started that are still running or ended within about the last hour, plus the caller's newest 100 stored runs. An older run is not listed and no cursor pages to it, but GET /runs/{id} still reads it by id.",
+    properties: { data: { type: 'array', items: { $ref: '#/components/schemas/Run' } } },
     required: ['data'],
   }
 
   return {
     Chat, Message, Run, Page, Error,
     Capabilities, ChatInput, ChatPatch, MessageInput, MessagePatch,
-    ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage: pageOf('Run'),
+    ChatPage: pageOf('Chat'), MessagePage: pageOf('Message'), RunPage,
     AuditRow, AuditPage,
     OpenApiDocument: { type: 'object', description: 'This document itself.', additionalProperties: true },
   }
@@ -441,15 +510,25 @@ function templatePath(path: string): string {
 const NO_OWNER_PARAM_PATHS = new Set(['/capabilities', '/openapi.json'])
 
 function errorResponses(codes: string[]): Record<string, JsonSchema> {
-  const responses: Record<string, JsonSchema> = {}
   const statusFor: Record<string, number> = {
     auth: 401, not_found: 404, invalid_request: 400, conflict: 409,
-    capacity: 429, engine: 502, storage: 503, unsupported: 501, internal: 500,
+    // `storage` is 500, not errors.ts's defaultStatus 503: its only producer, mapStoreError's
+    // storage_contract_violation, sends it with 500.
+    capacity: 429, engine: 502, storage: 500, unsupported: 501, internal: 500,
   }
-  for (const code of codes) {
-    const status = String(statusFor[code] ?? 500)
+  // Grouped by status: two types can share one (`conflict` and `engine:409`), and the response
+  // must name both rather than the last one overwriting the first.
+  const typesByStatus: Record<string, string[]> = {}
+  for (const entry of codes) {
+    const [type, explicit] = entry.split(':')
+    const status = explicit ?? String(statusFor[type] ?? 500)
+    const types = typesByStatus[status] ?? (typesByStatus[status] = [])
+    if (!types.includes(type)) types.push(type)
+  }
+  const responses: Record<string, JsonSchema> = {}
+  for (const [status, types] of Object.entries(typesByStatus)) {
     responses[status] = {
-      description: `${code} — see the Error schema's \`type\` enum.`,
+      description: `${types.join(', ')} — see the Error schema's \`type\` enum.`,
       content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
     }
   }
@@ -482,15 +561,16 @@ function buildOperation(route: RouteSpec): JsonSchema {
   // reason — Step 5's real-validator pass, not a guess).
   const sseNote = 'Named SSE events: run, delta, reasoning, tool_call, usage, error, done (spec §5.1, §6.3).'
   const sseContent = { 'text/event-stream': { schema: { type: 'string' } } }
+  // Hono's streamSSE always answers 200, whatever status the route's JSON answer has. The dual-
+  // mode routes listed text/event-stream under their JSON answer's 202, which the stream never
+  // sent, so the stream is documented as its own 200 response.
+  const sseResponse = { description: `OK. For Accept: text/event-stream. ${sseNote}`, content: sseContent }
   let successResponse: JsonSchema
   if (route.responseSchema && route.sse) {
-    // Dual-mode: POST .../messages/generate answers JSON (202) or SSE, per Accept (spec §5.1).
+    // Dual-mode: POST .../messages/generate answers JSON (202) or SSE (200), per Accept (spec §5.1).
     successResponse = {
-      description: `OK. For Accept: text/event-stream, ${sseNote}`,
-      content: {
-        'application/json': { schema: { $ref: `#/components/schemas/${route.responseSchema}` } },
-        ...sseContent,
-      },
+      description: 'OK.',
+      content: { 'application/json': { schema: { $ref: `#/components/schemas/${route.responseSchema}` } } },
     }
   } else if (route.sse) {
     // SSE-only: GET .../stream never answers JSON (routes.runs.ts calls streamSSE unconditionally).
@@ -506,6 +586,7 @@ function buildOperation(route: RouteSpec): JsonSchema {
 
   const responses: Record<string, JsonSchema> = {
     [successStatus]: successResponse,
+    ...(route.responseSchema && route.sse ? { '200': sseResponse } : {}),
     ...errorResponses(route.errors),
   }
 
@@ -516,11 +597,9 @@ function buildOperation(route: RouteSpec): JsonSchema {
     const alt = route.altResponse
     responses[alt.status] = {
       description: alt.description,
-      content: {
-        'application/json': { schema: { $ref: `#/components/schemas/${alt.schema}` } },
-        ...(alt.sse ? sseContent : {}),
-      },
+      content: { 'application/json': { schema: { $ref: `#/components/schemas/${alt.schema}` } } },
     }
+    if (alt.sse) responses['200'] = { ...sseResponse, description: `Default (generate omitted or true) with Accept: text/event-stream. ${sseNote}` }
   }
 
   // Path params: real `parameters` entries (release-gate I11), not the non-standard
@@ -531,7 +610,13 @@ function buildOperation(route: RouteSpec): JsonSchema {
   const ownerParam = (!route.requestSchema && !NO_OWNER_PARAM_PATHS.has(route.path))
     ? [{ name: 'owner', in: 'query', required: false, schema: { type: 'string' }, description: "The integrator's end user. Defaults to 'default'." }]
     : []
-  const parameters = [...pathParams, ...ownerParam]
+  const queryParams = (route.query ?? []).map((q) => ({
+    name: q.name, in: 'query', required: false, schema: { type: q.type ?? 'string' }, description: q.description,
+  }))
+  const headerParams = (route.headers ?? []).map((h) => ({
+    name: h.name, in: 'header', required: false, schema: { type: h.type ?? 'string' }, description: h.description,
+  }))
+  const parameters = [...pathParams, ...ownerParam, ...queryParams, ...headerParams]
 
   const operation: JsonSchema = {
     operationId: operationIdFor(route),
@@ -580,7 +665,9 @@ export function buildOpenApiDocument(version: string): {
       license: { name: 'FSL-1.1-ALv2', url: 'https://github.com/mohitsoni48/TurboLLM/blob/main/LICENSE.md' },
     },
     servers: [
-      { url: 'http://127.0.0.1:6996/api/ext/v1', description: 'Default loopback port; configurable per instance.' },
+      // Origin only: every `paths` key already starts with /api/ext/v1, and OpenAPI appends the
+      // path key to the server URL, so a prefix here would double it (/api/ext/v1/api/ext/v1/...).
+      { url: 'http://127.0.0.1:6996', description: 'Default loopback port; configurable per instance.' },
     ],
     components: {
       securitySchemes: {

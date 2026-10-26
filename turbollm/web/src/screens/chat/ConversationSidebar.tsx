@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import { Archive, ArchiveRestore, ChevronDown, ChevronLeft, ChevronRight, Circle, Download, Folder as FolderIcon, FolderInput, FolderPlus, Loader2, MessageSquarePlus, MoreHorizontal, Pencil, Plus, Search, Trash2 } from 'lucide-react'
 import type { Conversation, Folder } from '../../lib/chat-types'
@@ -342,7 +342,11 @@ function RoutinesList({ q }: { q: string }) {
   )
 }
 
-export function ConversationSidebar({
+// Memoized: ChatScreen re-renders on every streamed token, and re-rendering this whole list each
+// time (every row runs its own useConversationMutations — a dozen useMutation hooks) cost tens of
+// ms of main-thread time per token on a long list. ChatScreen passes ref-stable callbacks and a
+// generatingIds Set that only changes when WHICH conversations are generating changes.
+export const ConversationSidebar = memo(function ConversationSidebar({
   activeId,
   onSelect,
   onNew,
@@ -363,8 +367,10 @@ export function ConversationSidebar({
   onToggle?: () => void
   /** True when a generation is streaming in the active conversation. */
   generating?: boolean
-  /** Ids of every conversation currently streaming a generation (including ones the
-   *  user has navigated away from) — drives the spinning in-progress indicator. */
+  /** Ids of every conversation this page is streaming a generation for (including ones
+   *  the user has navigated away from) — drives the spinning in-progress indicator, as
+   *  does a row's own `running` (the daemon's word: a reply another tab or device, or this
+   *  page before a reload, started). */
   generatingIds?: Set<string>
   /** Ids of conversations whose generation finished while the user was elsewhere —
    *  drives the "new result" dot until the user visits that conversation. */
@@ -451,6 +457,14 @@ export function ConversationSidebar({
     const t = setTimeout(() => setDebouncedQ(q), 200)
     return () => clearTimeout(t)
   }, [q])
+
+  // Being memoized, the list no longer re-renders on the parent's every status poll, which is
+  // what used to keep the rows' relative times ("5m ago") moving — so tick once a minute.
+  const [, setMinuteTick] = useState(0)
+  useEffect(() => {
+    const t = setInterval(() => setMinuteTick((n) => n + 1), 60_000)
+    return () => clearInterval(t)
+  }, [])
 
   // Ctrl+K focuses search
   useEffect(() => {
@@ -651,7 +665,7 @@ export function ConversationSidebar({
                     onSelect={onSelect}
                     onDelete={onDelete}
                     onMove={onMove}
-                    generating={generatingIds?.has(conv.id)}
+                    generating={generatingIds?.has(conv.id) || !!conv.running}
                     recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
                   />
                 ))}
@@ -698,7 +712,7 @@ export function ConversationSidebar({
                     onSelect={onSelect}
                     onDelete={onDelete}
                     onMove={onMove}
-                    generating={generatingIds?.has(conv.id)}
+                    generating={generatingIds?.has(conv.id) || !!conv.running}
                     recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
                   />
                 ))}
@@ -791,7 +805,7 @@ export function ConversationSidebar({
       </AlertDialog>
     </div>
   )
-}
+})
 
 /** A single collapsible folder section: header (chevron + name + count + actions
  *  dropdown) plus its member conversations. Rename is done inline, mirroring ConvItem's
@@ -901,7 +915,7 @@ function FolderSection({
                 onSelect={onSelect}
                 onDelete={onDelete}
                 onMove={onMove}
-                generating={generatingIds?.has(conv.id)}
+                generating={generatingIds?.has(conv.id) || !!conv.running}
                 recentlyCompleted={recentlyCompletedIds?.has(conv.id)}
               />
             ))

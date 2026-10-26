@@ -11,7 +11,7 @@ import { readQueue } from '../telemetry/queue'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
-function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>) {
+function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<string, unknown>, deps?: Record<string, unknown>) {
   const cfg: Record<string, unknown> = {
     // Turbo Link ships behind `daemon.experimental.turboLink` (link/gate.ts), off by
     // default. This suite is about the admin routes' OWN behaviour, so it runs with the
@@ -22,6 +22,7 @@ function mkApp(fetchImpl?: typeof fetch, telemetry?: Emitter, daemon?: Record<st
     version: '1.11.2',
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     ...(telemetry ? { telemetry } : {}),
+    ...deps,
   } as unknown as Deps
   const app = new Hono()
   registerLinkAdminRoutes(app, d, { fetchImpl })
@@ -123,6 +124,16 @@ test('mint falls back to auto-detection when the override is unset', async () =>
   assert.ok(baseUrl.startsWith('http://'))
   assert.ok(!baseUrl.includes('llm.example.com'))
   assert.ok(baseUrl.endsWith(':6996'))
+})
+
+test('mint advertises the port really bound, not daemon.port (--port/--addr, Android 7000)', async () => {
+  const baseUrl = await withAdvertisedHost(undefined, async () => {
+    const { app } = mkApp(undefined, undefined, undefined, { bindPort: 7000 })
+    const body = await (await app.request('/api/v1/links/mint',
+      json({ name: 'laptop', capabilities: ['models:use'] }))).json() as { linkString: string }
+    return decodeLinkString(body.linkString)!.baseUrl
+  })
+  assert.match(baseUrl, /:7000$/)
 })
 
 test('mint refuses an unknown capability instead of storing it', async () => {
@@ -264,6 +275,19 @@ test('inbound lists granted keys with their capabilities and last-used, never a 
   assert.ok(body.includes('laptop'))
   assert.ok(body.includes('models:use'))
   assert.ok(!body.includes('hash'))
+})
+
+test('inbound leaves out remote-access tokens: they are not linked machines', async () => {
+  const { app, cfg } = mkApp()
+  await app.request('/api/v1/links/mint', json({ name: 'laptop', capabilities: ['models:use'] }))
+  ;(cfg.apiKeys as unknown[]).push({
+    id: 'remote-key', name: 'remote-2026-10-23T09:00:00.000Z', hash: 'h', prefix: 'tllm_x',
+    createdAt: '2026-10-23T09:00:00.000Z', lastUsedAt: null,
+    grant: { kind: 'remote', capabilities: ['models:use'] },
+  })
+  const res = await app.request('/api/v1/links/inbound')
+  const { inbound } = await res.json() as { inbound: { id: string; name: string }[] }
+  assert.deepEqual(inbound.map((k) => k.name), ['laptop'])
 })
 
 // ── Regression coverage: review findings on `models` validation and the

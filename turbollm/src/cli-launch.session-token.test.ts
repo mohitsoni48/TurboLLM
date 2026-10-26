@@ -198,13 +198,11 @@ test('opencode: none of claude\'s own wiring is applied to a non-Anthropic harne
   // Asserts what WE set, not what the env happens to contain: `inheritedEnv` deliberately passes
   // the daemon's own environment through, so a developer whose shell already exports
   // ANTHROPIC_BASE_URL (measured: this machine does) would fail a blanket prefix check for a
-  // reason that has nothing to do with opencode. The keys below are the ones claudeEnv sets.
-  const { calls, fn } = makeSpawn()
-  const restore = silenceOutput()
-  try {
-    await launchCli('opencode', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
-  } finally { restore() }
-  for (const key of [
+  // reason that has nothing to do with opencode. The keys below are the ones claudeEnv sets, and
+  // they are cleared from this process's environment for the launch: a shell that exports one of
+  // them (CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80, say) passed it into the launch and failed the test
+  // for the same reason.
+  const keys = [
     'ANTHROPIC_AUTH_TOKEN',
     'ANTHROPIC_MODEL',
     'ANTHROPIC_TIMEOUT',
@@ -213,7 +211,21 @@ test('opencode: none of claude\'s own wiring is applied to a non-Anthropic harne
     'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
     'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE',
     'CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS',
-  ]) {
+  ]
+  const saved = new Map(keys.map((k) => [k, process.env[k]]))
+  for (const k of keys) delete process.env[k]
+  const { calls, fn } = makeSpawn()
+  const restore = silenceOutput()
+  try {
+    await launchCli('opencode', 6996, [], fn, undefined, makeFetch(), SESSION_TOKEN, memFs())
+  } finally {
+    restore()
+    for (const [k, v] of saved) {
+      if (v === undefined) delete process.env[k]
+      else process.env[k] = v
+    }
+  }
+  for (const key of keys) {
     assert.equal(calls[0].env[key], undefined, `${key} is claude-only and must not be set for opencode`)
   }
   // And the session token must never be smuggled in under an Anthropic name either.
@@ -548,4 +560,40 @@ test('a SYNC DOES refresh a harness that was previously launched', async () => {
   const models = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm.models
   assert.ok(models.length > 1, 'the refreshed config carries the whole library')
   assert.equal(models.find((m: { id: string }) => m.id === 'mykey').contextWindow, 32768)
+})
+
+// `turbollm --addr [::1]:6996` (the IPv6 form --help gives) binds nothing on 127.0.0.1, and launch
+// dialed http://127.0.0.1:<port> anyway: "Could not reach TurboLLM", so no harness launched, not even
+// from a Code terminal. cli.ts hands launchCli the host the daemon's pidfile records.
+test('a daemon bound to another loopback address alone is dialed and wired there, and its resync keeps that config fresh', async () => {
+  const dialed: string[] = []
+  const inner = makeFetch()
+  const recording = (async (input: string | URL | globalThis.Request, init?: RequestInit) => {
+    dialed.push(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url)
+    return inner(input, init)
+  }) as typeof fetch
+  const fs = memFs()
+  const pi = makeSpawn()
+  const claude = makeSpawn()
+  const unsilence = silenceOutput()
+  try {
+    assert.equal(await launchCli('pi', 6996, [], pi.fn, undefined, recording, undefined, fs, '::1'), 0)
+    assert.equal(await launchCli('claude', 7000, [], claude.fn, undefined, recording, undefined, memFs(), '127.0.0.2'), 0)
+  } finally {
+    unsilence()
+  }
+  assert.ok(dialed.length > 0)
+  for (const url of dialed) assert.match(url, /^http:\/\/(\[::1\]:6996|127\.0\.0\.2:7000)\//, url)
+  const provider = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm
+  assert.equal(provider.baseUrl, 'http://[::1]:6996/v1')
+  assert.equal(claude.calls[0].env.ANTHROPIC_BASE_URL, 'http://127.0.0.2:7000')
+
+  // A model load's resync (cli.ts: the pidfile's host) finds that config wired to this daemon.
+  const { syncHarnessModelConfig } = await import('./cli-launch.js')
+  await syncHarnessModelConfig('pi', {
+    port: 6996, host: '::1', pinnedModel: 'mykey', modelName: 'MyModel', modelCtx: 16384, models: LIBRARY,
+  }, fs)
+  const synced = JSON.parse(fs.files.get(join(HOME, '.pi', 'agent', 'models.json'))!).providers.turbollm
+  assert.equal(synced.baseUrl, 'http://[::1]:6996/v1')
+  assert.equal(synced.models.find((m: { id: string }) => m.id === 'mykey').contextWindow, 16384)
 })

@@ -1,7 +1,7 @@
 // Tests for scoreAsset and pickReleaseAsset (ADR-044).
 // These cover the asset-matching logic for all supported platforms / arches,
 // used by turboquantAssetUrl to pick the right release asset per OS.
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   scoreAsset,
@@ -12,9 +12,16 @@ import {
   isRateLimited,
   availableBackends,
   provisionBackend,
+  provisionTurboquant,
+  renameWithRetry,
+  restoreInterruptedTurboquantUpdate,
 } from './download'
 import type { ReleaseAsset } from './download'
 import { tmpDir } from '../test-support/tmp'
+import { execFileSync } from 'node:child_process'
+import fs, { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
+import { join } from 'node:path'
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -298,6 +305,42 @@ test('provisionBackend: resolves the real asset name from the release when asset
   )
 })
 
+// A Cancel (or a failed extraction) cleans up files extracted moments ago, which Windows AV/the indexer can still hold
+// open. That delete threw EBUSY from the catch, replacing the AbortError: the route then reported "Could not install
+// the cuda engine: EBUSY" instead of a quiet cancel. download.ts imports rmSync by name: syncBuiltinESMExports carries
+// the patch to it.
+function lockRecursiveDeletes(t: TestContext, locked: (p: string) => boolean) {
+  const realRmSync = fs.rmSync
+  const rm = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (locked(String(p)) && existsSync(p)) throw Object.assign(new Error('EBUSY: resource busy or locked, rmdir'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  t.after(() => {
+    rm.mock.restore()
+    syncBuiltinESMExports()
+  })
+  return rm
+}
+
+test('provisionBackend: a Cancel whose cleanup is locked is still an AbortError, not EBUSY', async (t) => {
+  const root = tmpDir('tllm-dl-cancel-')
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+    if (init?.signal?.aborted) throw new DOMException('This operation was aborted', 'AbortError')
+    return new Response('', { status: 500 })
+  }) as typeof fetch
+  const destDir = join(root, 'llama.cpp-b1-cpu')
+  const rm = lockRecursiveDeletes(t, (p) => p === destDir)
+  const ac = new AbortController()
+  ac.abort()
+  const backend = { id: 'cpu' as const, label: 'CPU', assets: ['llama-b1-bin.zip'], downloadBaseUrl: 'https://dl.test' }
+  await assert.rejects(provisionBackend(root, backend, 'b1', undefined, ac.signal), (e: Error) => e.name === 'AbortError')
+  const cleanup = rm.mock.calls.find((c) => String(c.arguments[0]) === destDir)
+  assert.ok((cleanup?.arguments[1] as fs.RmOptions | undefined)?.maxRetries, 'the cleanup retries, as a Windows lock is brief')
+})
+
 test('isRateLimited: only a 403/429 WITH x-ratelimit-remaining 0 counts', () => {
   const mk = (status: number, remaining: string | null) =>
     new Response('', { status, headers: remaining === null ? {} : { 'x-ratelimit-remaining': remaining } })
@@ -308,4 +351,334 @@ test('isRateLimited: only a 403/429 WITH x-ratelimit-remaining 0 counts', () => 
   assert.equal(isRateLimited(mk(403, null)), false)
   assert.equal(isRateLimited(mk(403, '17')), false)
   assert.equal(isRateLimited(mk(404, '0')), false)
+})
+
+// ─── provisionTurboquant: an update stages the new release, then swaps ─────────
+// The update used to rmSync the install dir before even asking GitHub for the release, so being
+// offline, rate-limited or dropped mid-download left the registered engine with no binary.
+const tqAssetName = process.platform === 'darwin' ? 'llama-turboquant-macos-arm64.tar.gz' : 'llama-turboquant-linux-x64-vulkan.tar.gz'
+const tqSkip =
+  (process.platform === 'win32' || !pickReleaseAsset([asset(tqAssetName)], process.platform, process.arch)) &&
+  'TurboQuant publishes no prebuilt for this OS/arch'
+
+test('provisionTurboquant replace: a failed update leaves the working install; a complete one is swapped in', { skip: tqSkip }, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  const tqDir = join(root, 'turboquant')
+  mkdirSync(tqDir)
+  writeFileSync(join(tqDir, 'llama-server'), 'tq old')
+  const src = tmpDir('tllm-tq-src-')
+  writeFileSync(join(src, 'llama-server'), 'tq new')
+  execFileSync('tar', ['-czf', join(src, 'release.tar.gz'), '-C', src, 'llama-server'])
+  const archive = readFileSync(join(src, 'release.tar.gz'))
+  let download = () => new Response(null, { status: 503 })
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return download()
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }))
+  assert.equal(readFileSync(join(tqDir, 'llama-server'), 'utf8'), 'tq old')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+
+  download = () => new Response(archive)
+  const bin = await provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true })
+  assert.equal(bin, join(tqDir, 'llama-server'))
+  assert.equal(readFileSync(bin, 'utf8'), 'tq new')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+
+  // Once the new install is in place the update has succeeded: a lock on the replaced one (Windows AV) must not
+  // report it as failed. download.ts imports rmSync by name: syncBuiltinESMExports carries the patch to it.
+  const parked = join(root, '.turboquant-old')
+  const realRmSync = fs.rmSync
+  const locked = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (String(p) === parked && existsSync(p)) throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.equal(await provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }), bin)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(readFileSync(bin, 'utf8'), 'tq new')
+  assert.ok(existsSync(parked), 'the locked old install is left behind')
+  // The next update removes the leftover first.
+  await provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true })
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+
+  // The staged tree was extracted moments before the swap, and Windows refuses to rename a directory while AV or the
+  // indexer holds a file under it open (EPERM). The lock is brief: the swap retries rather than failing the update.
+  // Only the swap runs as win32 — the lookup and extraction before it must stay this platform's.
+  const stagedDir = join(root, '.turboquant-update', 'turboquant')
+  const realRenameSync = fs.renameSync
+  const actualPlatform = process.platform
+  let refusals = 2
+  const busy = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(from) === stagedDir && refusals-- > 0) {
+      Object.defineProperty(process, 'platform', { value: 'win32' })
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
+    }
+    return realRenameSync(from, to)
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.equal(await provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }), bin)
+  } finally {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    busy.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(busy.mock.calls.filter((c) => String(c.arguments[0]) === stagedDir).length, 3)
+  assert.equal(readFileSync(bin, 'utf8'), 'tq new')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+})
+
+// The new install was swapped in and the old one deleted before anything ran the new binary. `verify` runs with the
+// new install in place and the old one parked: when it throws, the old install goes back.
+test('provisionTurboquant replace: a new install that fails verify is swapped back out for the old one', { skip: tqSkip }, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  const tqDir = join(root, 'turboquant')
+  mkdirSync(tqDir)
+  writeFileSync(join(tqDir, 'llama-server'), 'tq old')
+  const src = tmpDir('tllm-tq-src-')
+  writeFileSync(join(src, 'llama-server'), 'tq new')
+  execFileSync('tar', ['-czf', join(src, 'release.tar.gz'), '-C', src, 'llama-server'])
+  const archive = readFileSync(join(src, 'release.tar.gz'))
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return new Response(archive)
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+  const seen: string[] = []
+  const verify = async (bin: string) => {
+    seen.push(readFileSync(bin, 'utf8'))
+    throw new Error('Could not run the binary (--version and --help both failed).')
+  }
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true, verify }), /Could not run the binary/)
+  assert.deepEqual(seen, ['tq new'], 'verify ran on the new install, in place')
+  assert.equal(readFileSync(join(tqDir, 'llama-server'), 'utf8'), 'tq old')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+})
+
+/** A TurboQuant install of 'tq old' under the returned engines root, and GitHub serving a release of 'tq new'. */
+function tqOldInstallAndNewRelease(t: TestContext): string {
+  const root = tmpDir('tllm-tq-')
+  mkdirSync(join(root, 'turboquant'))
+  writeFileSync(join(root, 'turboquant', 'llama-server'), 'tq old')
+  const src = tmpDir('tllm-tq-src-')
+  writeFileSync(join(src, 'llama-server'), 'tq new')
+  execFileSync('tar', ['-czf', join(src, 'release.tar.gz'), '-C', src, 'llama-server'])
+  const archive = readFileSync(join(src, 'release.tar.gz'))
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return new Response(archive)
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+  return root
+}
+
+/** An update cut off (the daemon exited) while it probed the new build: what that leaves on disk, copied out at that
+ *  moment. The live update goes on and fails. */
+async function tqUpdateCutOffMidProbe(t: TestContext): Promise<string> {
+  const root = tqOldInstallAndNewRelease(t)
+  const exited = join(tmpDir('tllm-tq-exit-'), 'engines')
+  const verify = async () => {
+    fs.cpSync(root, exited, { recursive: true })
+    throw new Error('the daemon exited here')
+  }
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true, verify }))
+  assert.equal(readFileSync(join(exited, 'turboquant', 'llama-server'), 'utf8'), 'tq new', 'cut off with the new build in place')
+  assert.equal(readFileSync(join(exited, '.turboquant-old', 'llama-server'), 'utf8'), 'tq old', 'and the old one parked')
+  return exited
+}
+
+// Nothing put a parked old install back at boot: an update cut off between the swap and the new build's probe passing
+// left the engine on a build that never ran here, with its only working build in a hidden folder.
+test('restoreInterruptedTurboquantUpdate: an update cut off while its new build was probed gets the old one back', { skip: tqSkip }, async (t) => {
+  const root = await tqUpdateCutOffMidProbe(t)
+  restoreInterruptedTurboquantUpdate(root)
+  assert.equal(readFileSync(join(root, 'turboquant', 'llama-server'), 'utf8'), 'tq old')
+  assert.equal(existsSync(join(root, '.turboquant-old')), false)
+  assert.deepEqual(readdirSync(join(root, 'turboquant')), ['llama-server'], 'its mark of a parked working build goes')
+
+  // Cut off between parking the old install and moving the new one in: the old one goes back. (The same release.)
+  const live = tmpDir('tllm-tq-')
+  mkdirSync(join(live, 'turboquant'))
+  writeFileSync(join(live, 'turboquant', 'llama-server'), 'tq old')
+  const between = join(tmpDir('tllm-tq-between-'), 'engines')
+  const realRenameSync = fs.renameSync
+  let cut = false
+  const rename = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    if (!cut && String(to) === join(live, 'turboquant')) {
+      cut = true // the copy as the daemon left it; the live update goes on, swaps the old install back and fails
+      fs.cpSync(live, between, { recursive: true })
+      throw Object.assign(new Error('the daemon exited here'), { code: 'EIO' })
+    }
+    return realRenameSync(from, to)
+  })
+  syncBuiltinESMExports()
+  try {
+    await assert.rejects(provisionTurboquant(live, 'owner/repo', undefined, undefined, { replace: true }), /the daemon exited here/)
+  } finally {
+    rename.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(join(between, 'turboquant')), false, 'cut off with no install in place')
+  restoreInterruptedTurboquantUpdate(between)
+  assert.equal(readFileSync(join(between, 'turboquant', 'llama-server'), 'utf8'), 'tq old')
+  assert.deepEqual(readdirSync(join(between, 'turboquant')), ['llama-server'], 'without its mark')
+  // No parked install: nothing to do.
+  restoreInterruptedTurboquantUpdate(tmpDir('tllm-tq-none-'))
+})
+
+// The next update took the parked old install for a leftover of an earlier update and deleted it, parked the never-
+// probed build in its place, and put THAT back when its own new build failed the probe: the working build was gone.
+test('provisionTurboquant replace: the update after one cut off mid-probe never deletes the kept working build', { skip: tqSkip }, async (t) => {
+  const root = await tqUpdateCutOffMidProbe(t)
+  const verify = async () => { throw new Error('Could not run the binary (--version and --help both failed).') }
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true, verify }), /Could not run the binary/)
+  assert.equal(readFileSync(join(root, 'turboquant', 'llama-server'), 'utf8'), 'tq old')
+  assert.deepEqual(readdirSync(root), ['turboquant'])
+  assert.deepEqual(readdirSync(join(root, 'turboquant')), ['llama-server'])
+})
+
+// An Install never looked at a parked working build. When the boot could not move it back (turboquant/ gone, its
+// entry left on the missing binary), an Install downloaded beside it, and the next start swapped that download out
+// for it.
+test('provisionTurboquant: an Install after a cut-off update the boot could not undo takes the kept build back, and the next boot keeps it', { skip: tqSkip }, async (t) => {
+  const root = await tqUpdateCutOffMidProbe(t)
+  const parked = join(root, '.turboquant-old')
+  const realRenameSync = fs.renameSync
+  const rename = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    if (String(from) === parked) throw Object.assign(new Error('locked'), { code: 'EBUSY' })
+    return realRenameSync(from, to)
+  })
+  syncBuiltinESMExports()
+  try {
+    assert.equal(restoreInterruptedTurboquantUpdate(root), false)
+  } finally {
+    rename.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.equal(existsSync(join(root, 'turboquant')), false, 'the boot moved the unprobed build out, not the old one back')
+  const bin = await provisionTurboquant(root, 'owner/repo')
+  assert.equal(readFileSync(bin, 'utf8'), 'tq old', 'the Install takes the working build back')
+  assert.equal(existsSync(parked), false)
+  assert.equal(restoreInterruptedTurboquantUpdate(root), true)
+  assert.equal(readFileSync(bin, 'utf8'), 'tq old', 'and the next boot leaves what it registered in place')
+  assert.deepEqual(readdirSync(join(root, 'turboquant')), ['llama-server'])
+})
+
+// The other side: once the new build passed, the old install it could not delete is a leftover, kept hidden at boot.
+// Also once a Purge removed turboquant/ beside it: put back, the catalog showed TurboQuant installed again, and an
+// Install took that old binary instead of downloading the latest.
+test('provisionTurboquant replace: an update whose new build passed keeps the old one it could not delete hidden at boot, also after a Purge', { skip: tqSkip }, async (t) => {
+  const root = tqOldInstallAndNewRelease(t)
+  const leftover = join(root, '.turboquant-old')
+  lockRecursiveDeletes(t, (p) => p === leftover)
+  await provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true, verify: async () => {} })
+  assert.equal(readFileSync(join(leftover, 'llama-server'), 'utf8'), 'tq old', 'its delete failed')
+  restoreInterruptedTurboquantUpdate(root)
+  assert.equal(readFileSync(join(root, 'turboquant', 'llama-server'), 'utf8'), 'tq new')
+
+  fs.renameSync(join(root, 'turboquant'), join(root, `.turboquant.purge-${Date.now()}`)) // as DELETE ?purge=1 does
+  restoreInterruptedTurboquantUpdate(root)
+  assert.equal(existsSync(join(root, 'turboquant')), false, 'the purged engine stays uninstalled')
+  const bin = await provisionTurboquant(root, 'owner/repo')
+  assert.equal(readFileSync(bin, 'utf8'), 'tq new', 'and its Install downloads the latest')
+})
+
+test('provisionTurboquant replace: a failed download whose stage cleanup is locked reports the download error', { skip: tqSkip }, async (t) => {
+  const root = tmpDir('tllm-tq-')
+  mkdirSync(join(root, 'turboquant'))
+  writeFileSync(join(root, 'turboquant', 'llama-server'), 'tq old')
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    const u = url instanceof Request ? url.url : String(url)
+    if (!u.includes('api.github.com')) return new Response(null, { status: 503 })
+    const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
+    return new Response(JSON.stringify([{ tag_name: `turboquant-${osTag}-b2`, assets: [{ name: tqAssetName, browser_download_url: `https://dl.test/${tqAssetName}` }] }]))
+  }) as typeof fetch
+  // Both deletes on the way out: the staged install dir (the inner provision's catch) and the stage root (the finally).
+  const stageRoot = join(root, '.turboquant-update')
+  lockRecursiveDeletes(t, (p) => p === stageRoot || p === join(stageRoot, 'turboquant'))
+  await assert.rejects(provisionTurboquant(root, 'owner/repo', undefined, undefined, { replace: true }), /HTTP 503/)
+  assert.equal(readFileSync(join(root, 'turboquant', 'llama-server'), 'utf8'), 'tq old')
+})
+
+// ─── renameWithRetry: Windows briefly refuses to rename what AV/the indexer holds open ─────────
+
+/** Make the next renames fail with `codes` (in order, then succeed) while `process.platform` reads `platform`.
+ *  renameWithRetry imports renameSync by name: syncBuiltinESMExports carries the patched function to that binding. */
+function refuseRenames(t: TestContext, platform: NodeJS.Platform, codes: string[]) {
+  const realRenameSync = fs.renameSync
+  const mocked = t.mock.method(fs, 'renameSync', (from: fs.PathLike, to: fs.PathLike) => {
+    const code = codes.shift()
+    if (code) throw Object.assign(new Error(`${code}: rename`), { code })
+    return realRenameSync(from, to)
+  })
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: platform })
+  syncBuiltinESMExports()
+  t.after(() => {
+    Object.defineProperty(process, 'platform', { value: actualPlatform })
+    mocked.mock.restore()
+    syncBuiltinESMExports()
+  })
+  return mocked
+}
+
+test('renameWithRetry: on Windows, a rename refused for a moment (EPERM/EBUSY/EACCES) is retried until it succeeds', async (t) => {
+  const dir = tmpDir('tllm-rename-retry-')
+  mkdirSync(join(dir, 'stage'))
+  writeFileSync(join(dir, 'stage', 'llama-server.exe'), 'new')
+  const renames = refuseRenames(t, 'win32', ['EPERM', 'EBUSY', 'EACCES'])
+
+  await renameWithRetry(join(dir, 'stage'), join(dir, 'final'))
+
+  assert.equal(renames.mock.callCount(), 4)
+  assert.equal(readFileSync(join(dir, 'final', 'llama-server.exe'), 'utf8'), 'new')
+  assert.deepEqual(readdirSync(dir), ['final'])
+})
+
+test('renameWithRetry: a lock that outlasts the retries, or any other error, still throws', async (t) => {
+  const dir = tmpDir('tllm-rename-giveup-')
+  mkdirSync(join(dir, 'stage'))
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  // Six refusals and then a rename that would work: a seventh attempt would succeed and fail this test.
+  const always = refuseRenames(t, 'win32', Array(6).fill('EPERM'))
+  const outcome = renameWithRetry(join(dir, 'stage'), join(dir, 'final')).then(() => 'renamed', (e) => (e as NodeJS.ErrnoException).code)
+  for (let i = 0; i < 10; i++) {
+    t.mock.timers.tick(5_000)
+    await new Promise((resolve) => setImmediate(resolve))
+  }
+  assert.equal(await outcome, 'EPERM')
+  assert.equal(always.mock.callCount(), 6, 'gives up after ~3 s of backoff, not forever')
+
+  // Not a lock: thrown at once, no waiting (the timers are still mocked, so a wait would hang here).
+  await assert.rejects(renameWithRetry(join(dir, 'missing'), join(dir, 'final')), { code: 'ENOENT' })
+  assert.deepEqual(readdirSync(dir), ['stage'])
+})
+
+test('renameWithRetry: off Windows an EPERM is a real permission error and is thrown at once', async (t) => {
+  const dir = tmpDir('tllm-rename-posix-')
+  mkdirSync(join(dir, 'stage'))
+  const renames = refuseRenames(t, 'linux', ['EPERM'])
+
+  await assert.rejects(renameWithRetry(join(dir, 'stage'), join(dir, 'final')), { code: 'EPERM' })
+  assert.equal(renames.mock.callCount(), 1)
+  assert.deepEqual(readdirSync(dir), ['stage'])
 })

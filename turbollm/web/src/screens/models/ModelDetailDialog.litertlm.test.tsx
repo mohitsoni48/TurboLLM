@@ -41,12 +41,15 @@ const LITERT_ENGINES = { engines: [{ id: 'e1', name: 'LiteRT-LM', kind: 'litert-
 // that rebuilds its fixtures on every render loops forever (see ModelDetailDialog.eject.test.tsx).
 // `flags: []` would mean "unprobed, allow everything", so the "without" engine lists an unrelated flag.
 const FIXED_DETAIL = detail()
+// The same model with a Min P the user saved before LiteRT-LM's panel dropped the slider.
+const FIXED_DETAIL_MIN_P = { ...detail(), saved: { sampling: { minP: 0.2 }, userSetOnly: true } } as unknown as ModelDetail
+let detailState = FIXED_DETAIL
 const FIXED_PRESETS = { presets: [], pinnedId: null }
 let enginesState = LITERT_ENGINES
 
 vi.mock('../../lib/queries', () => ({
   useEngines: () => ({ data: enginesState }),
-  useModelDetail: () => ({ data: FIXED_DETAIL }),
+  useModelDetail: () => ({ data: detailState }),
   useModelActions: () => ({
     load: { mutate: vi.fn(), isPending: false, error: null },
     eject: { mutate: vi.fn(), isPending: false },
@@ -75,6 +78,7 @@ vi.mock('../../lib/api', async (importOriginal) => ({
 beforeEach(() => {
   saveMutate.mockClear()
   enginesState = LITERT_ENGINES
+  detailState = FIXED_DETAIL
 })
 
 async function openDialog() {
@@ -113,5 +117,28 @@ describe('ModelDetailDialog: LiteRT-LM load panel', () => {
     await userEvent.click(screen.getByRole('button', { name: 'GPU' }))
     await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
     expect(savedProfile().litertLm?.backend).toBe('gpu')
+  })
+})
+
+describe('ModelDetailDialog: LiteRT-LM sampling', () => {
+  it('leaves out Min P, which LiteRT-LM has not, and says Top K 0 is no limit', async () => {
+    await openDialog()
+    expect(screen.getByText('Top K')).toBeTruthy()
+    expect(screen.getByText('0 = no top-k limit.')).toBeTruthy()
+    expect(screen.queryByText('Min P')).toBeNull()
+    expect(screen.getByText('LiteRT-LM has no Min P sampling.')).toBeTruthy()
+  })
+
+  it('shows a Min P saved before as not applied, and Clear drops it from what is saved', async () => {
+    // Hidden with the slider, it stayed in the profile, invisible, and only Reset removed it.
+    detailState = FIXED_DETAIL_MIN_P
+    await openDialog()
+    // A load records what its requests carry, so a Save alone still sends it until the model is reloaded.
+    expect(screen.getByText(/the Min P saved for this model \(0\.20\) is not applied/).textContent)
+      .toMatch(/is not applied\. Clear it and reload the model\.$/)
+    await userEvent.click(screen.getByRole('button', { name: 'Clear it' }))
+    expect(screen.getByText('LiteRT-LM has no Min P sampling.')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: /^save$/i }))
+    expect(savedProfile().sampling?.minP).toBeUndefined()
   })
 })

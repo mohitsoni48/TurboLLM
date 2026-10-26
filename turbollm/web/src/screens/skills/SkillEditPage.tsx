@@ -13,13 +13,16 @@ interface SkillForm {
   name: string
   description: string
   instructions: string
-  tools: string[]
+  /** Raw text as typed — split into names only on save. Re-deriving the controlled value from a
+   *  split array on every keystroke swallowed each typed separator ("web_search fetch_url"
+   *  became "web_searchfetch_url"). */
+  tools: string
 }
 
-const emptyForm = (): SkillForm => ({ id: '', name: '', description: '', instructions: '', tools: [] })
+const emptyForm = (): SkillForm => ({ id: '', name: '', description: '', instructions: '', tools: '' })
 
 function toForm(s: Skill): SkillForm {
-  return { id: s.id, name: s.name, description: s.description, instructions: s.instructions, tools: s.tools }
+  return { id: s.id, name: s.name, description: s.description, instructions: s.instructions, tools: s.tools.join(' ') }
 }
 
 // Derive a kebab-case id from a name (used to prefill the id for new skills).
@@ -58,6 +61,12 @@ export function SkillEditPage() {
     if (!form.name.trim()) { toast.error('Name is required.'); return }
     if (!id || !/^[a-z0-9-]+$/.test(id)) { toast.error('ID must be kebab-case (a-z, 0-9, -).'); return }
     if (!form.instructions.trim()) { toast.error('Instructions are required.'); return }
+    // The save route is create-or-update (it overwrites <id>/SKILL.md), so a NEW skill whose id —
+    // auto-slugged from the name — is already taken would silently replace that skill.
+    if (isNew && (skillsQ.data ?? (await skillsQ.refetch()).data ?? []).some((s) => s.id === id)) {
+      toast.error(`A skill with the ID "${id}" already exists — pick another ID.`)
+      return
+    }
     setSaving(true)
     try {
       await saveSkill({
@@ -65,7 +74,7 @@ export function SkillEditPage() {
         name: form.name.trim(),
         description: form.description.trim(),
         instructions: form.instructions,
-        tools: form.tools,
+        tools: form.tools.split(/[\s,]+/).filter(Boolean),
       })
       void qc.invalidateQueries({ queryKey: skillKeys.list() })
       toast.success(isNew ? 'Skill created.' : 'Skill saved.')
@@ -165,9 +174,9 @@ export function SkillEditPage() {
         <input
           className="rounded-md border border-border bg-bg px-3 py-1.5 font-mono text-[12px] text-ink outline-none focus:border-accent placeholder:text-faint disabled:opacity-60"
           placeholder="web_search fetch_url"
-          value={form.tools.join(' ')}
+          value={form.tools}
           disabled={readOnly}
-          onChange={(e) => setForm((f) => ({ ...f, tools: e.target.value.split(/[\s,]+/).filter(Boolean) }))}
+          onChange={(e) => setForm((f) => ({ ...f, tools: e.target.value }))}
         />
       </div>
 

@@ -25,3 +25,22 @@ test('since() past the retained window returns only what survives', () => {
   assert.equal(b.since(4).length, 1)
   assert.equal(b.since(99).length, 0)
 })
+
+test('startSeq continues a replacement buffer past the old one instead of restarting at 0', () => {
+  const b = new RingBuffer(undefined, 900)
+  assert.equal(b.head(), 900)
+  assert.equal(b.push('delta', {}).seq, 900)
+  assert.deepEqual(b.since(900).map((e) => e.seq), [900], 'a client cursor from the old buffer still replays it')
+})
+
+test('dropLast removes only the most recent matching event; since() is unaffected by the gap', () => {
+  const b = new RingBuffer()
+  b.push('tool_progress', { id: 'a', partial: '1' })
+  b.push('delta', {})
+  b.push('tool_progress', { id: 'a', partial: '12' })
+  b.dropLast((e) => e.event === 'tool_progress')
+  assert.deepEqual(b.since(0).map((e) => e.seq), [0, 1])
+  b.dropLast((e) => e.event === 'nope')
+  assert.equal(b.since(0).length, 2, 'no match drops nothing')
+  assert.equal(b.head(), 3, 'seq numbering never goes back')
+})

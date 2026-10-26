@@ -9,6 +9,7 @@
 
 import { defineEvent, f } from '../core/define'
 import { FAIL_REASONS, OUTCOMES } from '../core/enums'
+import { toSafeIdent, toSafeNameIdent } from '../core/validate'
 import type { PayloadOf } from '../core/types'
 import type { LoadProfile } from '../../models/profile'
 import type { ModelEntry } from '../../models/scanner'
@@ -67,8 +68,10 @@ export const modelDownloaded = defineEvent({
 /** Who initiated a load. `gateway_switch` and `resume`/`manual` all funnel
  *  through `Manager.onLoadSettled` (cli.ts); `autotune` is reported directly
  *  by `bench.ts`, since an auto-tune sweep calls `Manager.start()` — a
- *  separate entry point from `.load()` that `onLoadSettled` never fires for
- *  (see cli.ts's own comment on this exact gap for `model_first_load`). */
+ *  separate entry point from `.load()` that fires `onLoadSettled` only when
+ *  its caller asks (`report`: the ComfyUI guard's reload of a load a render
+ *  stopped while it started), never for a sweep's probes (see cli.ts's own
+ *  comment on this exact gap for `model_first_load`). */
 export const MODEL_LOAD_TRIGGERS = ['manual', 'autotune', 'gateway_switch', 'resume'] as const
 
 /** Structured `LoadError.code` values this product's own code emits (grep
@@ -190,17 +193,23 @@ export function buildModelLoadConfig(
   vram: VramFit,
 ): Pick<PayloadOf<NonNullable<(typeof modelLoad)['payload']>>, 'model' | 'engine' | 'params' | 'fit'> {
   const gpuCount = profile.gpu.tensorSplit.length > 0 ? profile.gpu.tensorSplit.length : 1
+  // Identifier fields go through toSafeIdent, as bench_result's do: a GGUF's general.name
+  // ('Mistral-7B-Instruct [v0.3]', 'meta-llama/Llama-3.1-8B') or the scanner's '?' quant
+  // fallback fails isSafeIdent, and validateEvent then drops the whole event before it is
+  // queued. Already-valid values come back untouched, so existing join keys keep matching. The
+  // name uses toSafeNameIdent: a path-shaped general.name is sent as 'unknown', not as its
+  // directory names.
   return {
     model: {
-      name: entry.name,
-      quant: entry.quant,
-      arch: entry.arch,
+      name: toSafeNameIdent(entry.name),
+      quant: toSafeIdent(entry.quant),
+      arch: toSafeIdent(entry.arch),
       sizeBytes: entry.sizeBytes,
       moe: entry.moe,
       nativeCtx: entry.nativeCtx,
     },
     engine: {
-      kind: engine.kind,
+      kind: toSafeIdent(engine.kind),
       isCustom: Boolean(engine.sourceRepo),
     },
     params: {

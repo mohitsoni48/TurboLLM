@@ -1,13 +1,18 @@
 // The explicit `subdir` is now built from HUGGING-FACE-provided directory names (the checkpoint
 // picker, ADR-434 (h)) and was joined into the model folder unsanitised. It gets the same
-// segment filter the per-repo subfolder has always had, so no `..` can walk out of the library.
+// segment filter the per-repo subfolder has always had, so no `..` can walk out of the library,
+// and a folder link inside the library cannot carry a download out of it either.
 // Temp directories only; fetch is frozen, so nothing is downloaded and no port is touched.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
-import { DownloadManager, DownloadError } from './downloads'
+import { DownloadManager, DownloadError, setDownloadGetForTests } from './downloads'
+import { toDownloadFailure } from '../api/download-lifecycle'
 import { tmpDir } from '../test-support/tmp'
+
+// run() requests through node:http unless pointed elsewhere; these tests' doubles stub globalThis.fetch.
+setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 
 function fakeStore(modelDir: string, stateDir: string) {
   return {
@@ -142,6 +147,81 @@ test('a non-HF URL import with a climbing subdir also stays inside the model fol
     const [rec] = await dm.enqueue({ url: 'https://example.invalid/files/config.json', subdir: '../escape' })
 
     assert.equal(rec.dest, join(modelDir, 'escape', 'config.json'))
+  } finally {
+    restore()
+  }
+})
+
+test('a folder link inside the model folder cannot carry a download out of it; a link that stays inside still works', async () => {
+  const restore = stubFetch()
+  try {
+    const root = tmpDir('tllm-dl-link-')
+    const modelDir = join(root, 'models')
+    const stateDir = join(root, 'state')
+    const outside = join(root, 'outside')
+    for (const d of [modelDir, stateDir, outside, join(modelDir, 'real')]) mkdirSync(d, { recursive: true })
+    // 'junction': a folder link Windows makes without admin rights; elsewhere the type is ignored.
+    symlinkSync(outside, join(modelDir, 'ext'), 'junction')
+    symlinkSync(outside, join(modelDir, 'evil'), 'junction')
+    symlinkSync(join(modelDir, 'real'), join(modelDir, 'alias'), 'junction')
+    const echo = async (_repo: string, rfilename: string) => ({ dir: '', files: [{ rfilename, size: 10, mmproj: false }] })
+    const plain = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    const expanding = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}), echo)
+
+    const refused = (e: unknown) =>
+      e instanceof DownloadError && e.code === 'invalid_request' && e.message === 'The download folder leads out of the model folder through a link.'
+    // An HF repo file with a subdir (the whole-folder dialog's shape), a raw URL with a subdir,
+    // and a repo whose own subfolder (<owner> = evil) is the link, with and without the expander.
+    await assert.rejects(() => plain.enqueue({ repo: 'evil/repo', rfilename: 'payload.sh', subdir: 'ext/deeper' }), refused)
+    await assert.rejects(() => plain.enqueue({ url: 'https://example.invalid/x/authorized_keys', subdir: 'ext' }), refused)
+    await assert.rejects(() => plain.enqueue({ repo: 'evil/repo', rfilename: 'model.gguf' }), refused)
+    await assert.rejects(() => expanding.enqueue({ repo: 'evil/repo', rfilename: 'model.gguf' }), refused)
+    assert.deepEqual(readdirSync(outside), [], 'no folder or file is made out there')
+    assert.equal(plain.list().length + expanding.list().length, 0)
+
+    // A link to another folder inside the model folder is still inside.
+    const [inside] = await plain.enqueue({ repo: 'owner/repo', rfilename: 'config.json', subdir: 'alias/sub' })
+    assert.equal(inside.dest, join(modelDir, 'alias', 'sub', 'config.json'))
+    assert.ok(existsSync(join(modelDir, 'real', 'sub')))
+
+    // A model folder that is itself a link (models reached through ~/models -> /mnt/disk) works.
+    const linked = join(root, 'linked-models')
+    symlinkSync(modelDir, linked, 'junction')
+    const viaLink = new DownloadManager(fakeStore(linked, stateDir), () => {}, () => ({}), echo)
+    const [rec] = await viaLink.enqueue({ repo: 'owner/other', rfilename: 'model.gguf' })
+    assert.equal(rec.dest, join(linked, 'owner', 'other', 'model.gguf'))
+  } finally {
+    restore()
+  }
+})
+
+// A folder that cannot be resolved at all is not a link out of the model folder: it is still
+// refused, but with the fs error, as enqueue reports any other fs failure (500 internal, the
+// message kept off the Turbo Link facade), not as an escape the owner then looks for in vain.
+// ENAMETOOLONG stands in for an lstat refused with EACCES (which a test run as root never gets)
+// or a primary folder on a Windows drive that is gone.
+test('a download folder that cannot be resolved is refused with its fs error, not as a link out of the model folder', {
+  skip: process.platform === 'win32' && 'Windows may report a too-long name as ENOENT, not ENAMETOOLONG',
+}, async () => {
+  const restore = stubFetch()
+  try {
+    const root = tmpDir('tllm-dl-unresolved-')
+    const modelDir = join(root, 'models')
+    const stateDir = join(root, 'state')
+    for (const d of [modelDir, stateDir]) mkdirSync(d, { recursive: true })
+    const dm = new DownloadManager(fakeStore(modelDir, stateDir), () => {}, () => ({}))
+    let thrown: unknown
+    await assert.rejects(() => dm.enqueue({ repo: 'owner/repo', rfilename: 'config.json', subdir: 'x'.repeat(300) }), (e) => {
+      thrown = e
+      return true
+    })
+    assert.ok(!(thrown instanceof DownloadError), 'not a caller-actionable refusal')
+    assert.match((thrown as Error).message, /^The download folder could not be checked: ENAMETOOLONG: /)
+    assert.doesNotMatch((thrown as Error).message, /through a link/)
+    const failure = toDownloadFailure(thrown)
+    assert.deepEqual([failure.status, failure.code, failure.hostDetail], [500, 'internal', true])
+    assert.deepEqual(readdirSync(modelDir), [], 'nothing is made')
+    assert.equal(dm.list().length, 0)
   } finally {
     restore()
   }

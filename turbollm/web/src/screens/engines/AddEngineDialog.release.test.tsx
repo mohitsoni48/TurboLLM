@@ -15,6 +15,7 @@ import {
   listReleaseAssets,
   startReleaseInstall,
   track,
+  uploadEngineZip,
 } from '../../lib/api'
 import type { CatalogEngine, EngineScanResult, ReleaseAssetListing } from '../../lib/types'
 
@@ -28,6 +29,7 @@ vi.mock('../../lib/api', async (importOriginal) => ({
   startReleaseInstall: vi.fn(),
   getReleaseInstall: vi.fn(),
   getEngineCatalog: vi.fn(),
+  uploadEngineZip: vi.fn(),
 }))
 
 const ASSET = 'llama-prism-prism-b10770-bin-win-cpu-x64.zip'
@@ -63,7 +65,11 @@ beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(listReleaseAssets).mockResolvedValue(LISTING)
   vi.mocked(startReleaseInstall).mockResolvedValue({ accepted: true })
+  // The release panel reads the daemon's job once when it opens (an install it may pick up): no
+  // job there the first time, then `ready` for the install a test starts, unless it says otherwise.
+  vi.mocked(getReleaseInstall).mockReset()
   vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: FOUND })
+  vi.mocked(getReleaseInstall).mockResolvedValueOnce({ state: 'idle' })
   vi.mocked(addEngine).mockResolvedValue({ ...FOUND, id: 'e1', name: 'Prism (b10770)', warning: null } as Awaited<ReturnType<typeof addEngine>>)
   vi.mocked(getEngineCatalog).mockResolvedValue({
     engines: [
@@ -155,14 +161,226 @@ describe('AddEngineDialog: GitHub release source', () => {
     expect(within(dialog).queryByRole('button', { name: /Choose folder/ })).toBeNull()
   })
 
-  it('dismissing while an install is running aborts it', async () => {
+  // The install is the daemon's job: dismissing the dialog (Escape, outside click, its X, Android Back) stops
+  // nothing, as a reload or a closed page never did. Only the panel's Cancel does. It used to abort the install on
+  // dismissal, and the dialog opened again neither showed one still running nor offered one that had finished.
+  const PLAN = { repo: LISTING.repo, tag: LISTING.tag, asset: ASSET }
+  async function installThenDismiss() {
+    const dialog = await openDialog()
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    await userEvent.click(await within(dialog).findByRole('button', { name: 'Prism' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Find builds' }))
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await within(dialog).findByText(/Downloading/)
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  }
+  async function reopenReleaseSource() {
+    const dialog = await openDialog()
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    return dialog
+  }
+
+  it('dismissing while an install runs leaves it running, and the release source opened again shows it', async () => {
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running', plan: PLAN })
+    wrap(<AddEngineDialog />)
+    await installThenDismiss()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    const dialog = await reopenReleaseSource()
+    expect(await within(dialog).findByText(/Downloading/)).toBeTruthy()
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+  })
+
+  it('an install that finished after the dialog was dismissed is offered when it opens again, and Add registers it', async () => {
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running', plan: PLAN })
+    wrap(<AddEngineDialog />)
+    await installThenDismiss()
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', plan: PLAN, result: FOUND })
+    await new Promise((r) => setTimeout(r, 50))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    const dialog = await reopenReleaseSource()
+    await userEvent.click(await within(dialog).findByRole('button', { name: 'Add it' }))
+    expect(await screen.findByText('Confirm engine')).toBeTruthy()
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add engine' }))
+    await waitFor(() => expect(vi.mocked(addEngine).mock.calls[0]?.[0]).toEqual({ name: 'Prism (b10770)', binPath: FOUND.binPath }))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+})
+
+describe('AddEngineDialog: release installs supersede an unconfirmed install', () => {
+  const VULKAN: EngineScanResult = { ...FOUND, binPath: '/e/build/prism-vulkan/llama-server', suggestedName: 'Prism Vulkan (b10770)' }
+  const ZIP: EngineScanResult = { ...FOUND, binPath: '/e/build/zip-myfork/llama-server', suggestedName: 'myfork (b4242)' }
+
+  async function installToConfirm(dialog: HTMLElement) {
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await within(dialog).findByText('Confirm engine')
+  }
+  async function backToRelease(dialog: HTMLElement) {
+    await userEvent.click(within(dialog).getByRole('button', { name: /Back/ }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+  }
+
+  it('a second release install discards the first unconfirmed one; Add keeps the second', async () => {
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: VULKAN })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add engine' }))
+    await waitFor(() => expect(vi.mocked(addEngine).mock.calls[0]?.[0]).toEqual({
+      name: VULKAN.suggestedName,
+      binPath: VULKAN.binPath,
+    }))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+    expect(discardReleaseInstall).not.toHaveBeenCalledWith(VULKAN.binPath)
+  })
+
+  it('re-installing into the same dir discards nothing early, and that dir once on dismiss', async () => {
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FOUND.binPath))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+  })
+
+  // Windows/macOS fold case: the repo typed in another case is the same physical folder, which
+  // the reinstall replaced in place — discarding the old spelling would delete the new build.
+  it('re-installing into the same dir spelled in another case discards nothing early', async () => {
+    const UPPER: EngineScanResult = { ...FOUND, binPath: 'C:\\e\\build\\PrismML-Eng-llama.cpp-x\\llama-server.exe' }
+    const LOWER: EngineScanResult = { ...FOUND, binPath: 'C:\\e\\build\\prismml-eng-llama.cpp-x\\llama-server.exe' }
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: UPPER })
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: LOWER })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(LOWER.binPath))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+  })
+
+  it('a newer build that renamed the binary inside the same dir discards nothing early', async () => {
+    const RENAMED: EngineScanResult = { ...FOUND, binPath: '/e/build/prism/llama-server-prism' }
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await installToConfirm(dialog)
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: RENAMED })
+    await backToRelease(dialog)
+    await installToConfirm(dialog)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+
+  // A finished install offered on opening (nobody added it: its dialog was dismissed, or its page
+  // reloaded, while it ran) is passed over for another install. The daemon's job then holds the new
+  // one, so the offered build was left on disk with nothing able to reach it, until the GC.
+  const OTHER: EngineScanResult = { ...FOUND, binPath: '/e/build/other-repo/llama-server', suggestedName: 'Other (b1)' }
+  const OTHER_READY = { state: 'ready' as const, plan: { repo: 'other/repo', tag: 'b1', asset: 'other.zip' }, result: OTHER }
+  async function passOverTheOffer(dialog: HTMLElement) {
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    await within(dialog).findByText('Other (b1) finished installing and has not been added yet.')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Prism' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Find builds' }))
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+  }
+
+  it('a build offered on opening and passed over for another install is discarded once that one lands in another folder', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'ready', result: FOUND })
+    vi.mocked(getReleaseInstall).mockResolvedValueOnce(OTHER_READY)
+    wrap(<AddEngineDialog />)
+    const dialog = await openDialog()
+    await passOverTheOffer(dialog)
+    await within(dialog).findByText('Confirm engine')
+
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(OTHER.binPath))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Add engine' }))
+    await waitFor(() => expect(vi.mocked(addEngine).mock.calls[0]?.[0]).toEqual({ name: FOUND.suggestedName, binPath: FOUND.binPath }))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1)
+  })
+
+  it('a build offered on opening and passed over is discarded when the dialog is dismissed, and the new install runs on', async () => {
+    vi.mocked(getReleaseInstall).mockReset()
+    vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running', plan: { repo: LISTING.repo, tag: LISTING.tag, asset: ASSET } })
+    vi.mocked(getReleaseInstall).mockResolvedValueOnce(OTHER_READY)
+    wrap(<AddEngineDialog />)
+    const dialog = await openDialog()
+    await passOverTheOffer(dialog)
+    await within(dialog).findByText(/Downloading/)
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(OTHER.binPath))
+    expect(discardReleaseInstall).toHaveBeenCalledTimes(1) // no abort (a call with no binPath)
+  })
+
+  it('an unconfirmed zip upload superseded by a release install is removed through the zip route', async () => {
+    vi.mocked(uploadEngineZip).mockResolvedValue(ZIP)
+    wrap(<AddEngineDialog />)
+    const dialog = await openDialog()
+    userEvent.upload(dialog.querySelector('input[type="file"]') as HTMLInputElement, new File([new Uint8Array([1])], 'myfork.zip'))
+    await within(dialog).findByText('Confirm engine')
+    await userEvent.click(within(dialog).getByRole('button', { name: /Back/ }))
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    await userEvent.click(await within(dialog).findByRole('button', { name: 'Prism' }))
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Find builds' }))
+    await installToConfirm(dialog)
+
+    await waitFor(() => expect(deleteEngineZipInstall).toHaveBeenCalledWith(ZIP.binPath))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+  })
+})
+
+describe('AddEngineDialog: dismissed before the install was accepted', () => {
+  it('a start that answers after the dismissal leaves the install running, and the release source shows it', async () => {
+    let accept!: (v: { accepted: true }) => void
+    vi.mocked(startReleaseInstall).mockReturnValue(new Promise((res) => { accept = res }))
     vi.mocked(getReleaseInstall).mockResolvedValue({ state: 'running' })
     wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
     const dialog = await screen.findByRole('dialog')
     await within(dialog).findByText(ASSET)
     await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
-    await within(dialog).findByText(/Downloading/)
+    await waitFor(() => expect(startReleaseInstall).toHaveBeenCalledTimes(1))
     await userEvent.keyboard('{Escape}')
-    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith())
+    await within(dialog).findByRole('button', { name: /From a GitHub release/ })
+
+    accept({ accepted: true })
+    await new Promise((r) => setTimeout(r, 20))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+    await userEvent.click(within(dialog).getByRole('button', { name: /From a GitHub release/ }))
+    expect(await within(dialog).findByText(/Downloading/)).toBeTruthy()
+  })
+
+  it('a start that fails after the dismissal sends no abort', async () => {
+    let refuse!: (e: unknown) => void
+    vi.mocked(startReleaseInstall).mockReturnValue(new Promise((_res, rej) => { refuse = rej }))
+    wrap(<AddEngineDialog defaultReleaseRepo="PrismML-Eng/llama.cpp" open onOpenChange={() => {}} trigger={null} />)
+    const dialog = await screen.findByRole('dialog')
+    await within(dialog).findByText(ASSET)
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Install' }))
+    await waitFor(() => expect(startReleaseInstall).toHaveBeenCalledTimes(1))
+    await userEvent.keyboard('{Escape}')
+    await within(dialog).findByRole('button', { name: /From a GitHub release/ })
+
+    refuse(new Error('busy'))
+    await new Promise((r) => setTimeout(r, 20))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
   })
 })

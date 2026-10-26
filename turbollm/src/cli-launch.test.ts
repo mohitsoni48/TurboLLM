@@ -111,7 +111,7 @@ test('--model naming a Jev model refuses with a clear reason and loads nothing',
   const spawn = makeSpawn()
   const daemon = fakeDaemon()
 
-  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'jev-fake-v2', daemon.fetch))
+  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'jev-fake-v2', daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 1)
   assert.equal(stderr, `'jev fake v2' is a text classification model — coding agents need a chat model.\n`)
@@ -122,7 +122,7 @@ test('--model naming a Jev model refuses with a clear reason and loads nothing',
 test('--model naming a Jev model by NAME is refused too', async () => {
   const daemon = fakeDaemon()
 
-  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], makeSpawn().fn, 'jev fake v2', daemon.fetch))
+  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], makeSpawn().fn, 'jev fake v2', daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 1)
   assert.match(stderr, /is a text classification model/)
@@ -133,7 +133,7 @@ test('--model naming a Laya model is refused the same way and loads nothing', as
   const spawn = makeSpawn()
   const daemon = fakeDaemon()
 
-  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], spawn.fn, LAYA.key, daemon.fetch))
+  const { code, stderr } = await captured(() => launchCli('claude', 6996, [], spawn.fn, LAYA.key, daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 1)
   assert.equal(stderr, `'laya' is a text classification model — coding agents need a chat model.\n`)
@@ -145,7 +145,7 @@ test('auto-load skips a Laya model even when it was the last one loaded', async 
   const spawn = makeSpawn()
   const daemon = fakeDaemon(LAYA.key)
 
-  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch))
+  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 0)
   assert.deepEqual(daemon.loads, ['qwen3-8b'], 'the chat model is loaded, never the Laya one')
@@ -156,7 +156,7 @@ test('auto-load skips a Jev model even when it was the last one loaded', async (
   const spawn = makeSpawn()
   const daemon = fakeDaemon('jev-fake-v2')
 
-  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch))
+  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, undefined, daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 0)
   assert.deepEqual(daemon.loads, ['qwen3-8b'], 'the chat model is loaded, never the Jev one')
@@ -214,7 +214,7 @@ test('--model naming a chat model is unaffected', async () => {
   const spawn = makeSpawn()
   const daemon = fakeDaemon()
 
-  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'qwen3-8b', daemon.fetch))
+  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'qwen3-8b', daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 0)
   assert.deepEqual(daemon.loads, ['qwen3-8b'])
@@ -284,7 +284,7 @@ test('--model naming the loaded Jev model still never launches when the library 
   const spawn = makeSpawn()
   const daemon = fakeDaemon(undefined, 'jev-fake-v2', { jev: JEV_STATUS, libraryFails: true })
 
-  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'jev-fake-v2', daemon.fetch))
+  const { code } = await captured(() => launchCli('claude', 6996, [], spawn.fn, 'jev-fake-v2', daemon.fetch, undefined, memFs()))
 
   assert.equal(code, 1)
   assert.deepEqual(daemon.loads, [], 'nothing may be loaded')

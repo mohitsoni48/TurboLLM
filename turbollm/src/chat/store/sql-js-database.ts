@@ -1,12 +1,13 @@
 // WASM SQLite (sql.js) backend for Android — see sqlite-adapter.ts's header for the full
 // design (why this exists, why openSqlDb has to stay synchronous). Real differences from
 // node:sqlite's DatabaseSync, all consciously accepted for this target:
-//   • In-memory only; flushed to `path` periodically and on close() via db.export(). A
-//     non-graceful kill (routine on Android — the OS can kill an app any time) loses writes
-//     since the last flush, not since the last close — periodic flush (below) bounds that
-//     window instead of only flushing at a clean shutdown, which chat data on Android can't
-//     assume ever happens. Each flush replaces the file atomically (temp + rename), so a
-//     kill mid-flush costs that interval's writes, never the whole file.
+//   • In-memory only; flushed to `path` soon after writes and on close() via db.export(). A
+//     non-graceful kill (routine on Android — the OS can kill an app any time, and the app's
+//     Quit kills its own process) loses writes since the last flush, not since the last close —
+//     flushing soon after writes (below) bounds that window instead of only flushing at a clean
+//     shutdown, which chat data on Android can't assume ever happens. Each flush replaces the
+//     file atomically (temp + rename), so a kill mid-flush costs the writes since the previous
+//     flush, never the whole file. flush() also writes on request (POST /api/v1/daemon/flush).
 //   • No WAL journal mode / busy_timeout — meaningless for an in-process, single-connection,
 //     single-threaded WASM database; both PRAGMAs are stripped out of exec() as no-ops so
 //     ConversationStore's migrate() doesn't need an Android-specific branch of its own.
@@ -16,7 +17,17 @@ import { dirname } from 'node:path'
 import initSqlJs, { type Database as SqlJsDb, type SqlJsStatic } from 'sql.js'
 import type { SqlDb, SqlStatement, SqlValue } from './sqlite-adapter.js'
 
-const FLUSH_INTERVAL_MS = 10_000
+/** A flush runs this long after the last write, so a burst of writes (a reply's rows, a chat's
+ *  import) is exported once, not once per statement. It used to run only every 10 s: Quit (which
+ *  kills the process) or a system kill lost a reply that had finished seconds before, or a new
+ *  chat. An export rewrites the whole database (a few ms to tens of ms on a phone, more for a
+ *  large one), so a flush per statement is not an option either. */
+const FLUSH_SETTLE_MS = 1_000
+/** While writes keep coming (a debounce alone would wait for them to stop), the oldest write not
+ *  yet on disk is flushed after at most this long. */
+const FLUSH_MAX_WAIT_MS = 10_000
+/** Flushes are at least this far apart, and a failed one is retried after FLUSH_MAX_WAIT_MS. */
+const FLUSH_MIN_GAP_MS = 1_000
 
 let sqlJsModule: SqlJsStatic | null = null
 let sqlJsInitPromise: Promise<SqlJsStatic> | null = null
@@ -75,22 +86,76 @@ function fsyncDirectory(path: string): void {
 }
 
 class SqlJsAdapter implements SqlDb {
-  private readonly flushTimer: ReturnType<typeof setInterval>
+  /** The pending flush, armed by the first write after a flush (or by a failed one). One timer,
+   *  not one per write: when it fires early (writes kept coming) it re-arms for when it is due. */
+  private flushTimer: ReturnType<typeof setTimeout> | null = null
   private closed = false
   // Set by anything that may have written; cleared only by a successful flush, so an idle
-  // daemon doesn't rewrite the whole file every interval and a failed flush is retried.
+  // daemon doesn't rewrite the whole file and a failed flush is retried.
   private dirty = false
+  /** When the oldest write not yet on disk was made (FLUSH_MAX_WAIT_MS counts from it). */
+  private dirtySince = 0
+  /** When the last write was made (FLUSH_SETTLE_MS counts from it). */
+  private lastWriteAt = 0
+  /** When the last flush ran, written or failed (FLUSH_MIN_GAP_MS counts from it). */
+  private lastFlushAt = -Infinity
 
-  constructor(private readonly db: SqlJsDb, private readonly path: string) {
-    this.flushTimer = setInterval(() => this.flush(), FLUSH_INTERVAL_MS)
+  constructor(private readonly db: SqlJsDb, private readonly path: string) {}
+
+  private markDirty(): void {
+    const now = Date.now()
+    this.lastWriteAt = now
+    if (!this.dirty) {
+      this.dirty = true
+      this.dirtySince = now
+    }
+    if (!this.flushTimer && !this.closed) this.armFlush(now + FLUSH_SETTLE_MS)
+  }
+
+  private armFlush(at: number): void {
+    // Never more than FLUSH_MAX_WAIT_MS ahead, whatever the clock did (onFlushTimer).
+    const delay = Math.min(FLUSH_MAX_WAIT_MS, Math.max(0, at - Date.now()))
+    // unref'd: a pending flush never keeps the process alive; close() flushes what is left.
+    this.flushTimer = setTimeout(() => this.onFlushTimer(), delay)
     this.flushTimer.unref?.()
+  }
+
+  private onFlushTimer(): void {
+    this.flushTimer = null
+    if (this.closed || !this.dirty) return
+    const now = Date.now()
+    // The times above are the wall clock's, which a manual time change or a network time
+    // correction can set back. One later than now means it was: waiting for it would hold every
+    // flush back as long as the clock went back (set back an hour, nothing written for an hour).
+    // Such a flush runs at once instead. Timers run on a clock that is never set back, so this
+    // one has waited what it was armed for.
+    if (this.lastFlushAt > now || this.lastWriteAt > now || this.dirtySince > now) {
+      this.flush()
+      return
+    }
+    const due = Math.max(
+      this.lastFlushAt + FLUSH_MIN_GAP_MS,
+      Math.min(this.lastWriteAt + FLUSH_SETTLE_MS, this.dirtySince + FLUSH_MAX_WAIT_MS),
+    )
+    if (due > now) {
+      this.armFlush(due)
+      return
+    }
+    this.flush()
   }
 
   /** Writes the snapshot to a sibling temp file, fsyncs it, then renames it over `path`, so
    *  a kill mid-write leaves the previous snapshot intact instead of a truncated file (which
-   *  would fail to load and lose every conversation, not just the last interval's writes). */
-  private flush(): void {
-    if (this.closed || !this.dirty) return
+   *  would fail to load and lose every conversation, not just the writes since the last flush).
+   *  Returns whether everything written so far is on disk (true too when nothing was pending).
+   *  Also called on request (ConversationStore.flush, POST /api/v1/daemon/flush). */
+  flush(): boolean {
+    if (this.closed || !this.dirty) return true
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer)
+      this.flushTimer = null
+    }
+    this.lastFlushAt = Date.now()
     const tmp = `${this.path}.tmp`
     try {
       const bytes = this.exportPreservingForeignKeys()
@@ -106,9 +171,14 @@ class SqlJsAdapter implements SqlDb {
       // directory entry it created is only durable once the directory itself is synced.
       fsyncDirectory(this.path)
       this.dirty = false
+      return true
     } catch {
       // Best-effort — the in-memory DB stays usable even if a flush fails (e.g. disk full);
-      // `dirty` stays set so the next interval retries.
+      // `dirty` stays set and the flush is retried after FLUSH_MAX_WAIT_MS (counted afresh, so
+      // a failing disk is not rewritten every second while writes keep coming).
+      this.dirtySince = this.lastFlushAt
+      if (!this.closed) this.armFlush(this.lastFlushAt + FLUSH_MAX_WAIT_MS)
+      return false
     }
   }
 
@@ -134,12 +204,12 @@ class SqlJsAdapter implements SqlDb {
     const rest = sql.replace(/\bpragma\s+(?:journal_mode|busy_timeout)\b[^;]*;?/gi, '').trim()
     if (!rest) return
     this.db.exec(rest)
-    this.dirty = true
+    this.markDirty()
   }
 
   prepare(sql: string): SqlStatement {
     const db = this.db
-    const markDirty = () => { this.dirty = true }
+    const markDirty = () => this.markDirty()
     // get()/all() are reads everywhere today, but a statement that isn't a plain SELECT
     // (e.g. a future INSERT … RETURNING) must still be flushed.
     const mayWrite = !/^\s*select\b/i.test(sql)
@@ -188,9 +258,10 @@ class SqlJsAdapter implements SqlDb {
 
   close(): void {
     if (this.closed) return
-    clearInterval(this.flushTimer)
     this.flush() // before `closed` is set — flush() is a no-op once it is
     this.closed = true
+    if (this.flushTimer) clearTimeout(this.flushTimer) // a failed flush's retry
+    this.flushTimer = null
     this.db.close()
   }
 }
@@ -198,8 +269,8 @@ class SqlJsAdapter implements SqlDb {
 /** Opens (or creates) a sql.js-backed database at `path`. Synchronous — requires preload()
  *  to have already resolved (cli.ts's Android startup sequence guarantees this before any
  *  ConversationStore gets constructed). Loads any existing bytes at `path` as the starting
- *  state; the file is otherwise just a periodic/close-time snapshot, not continuously
- *  written the way node:sqlite's file is. */
+ *  state; the file is otherwise a snapshot written soon after writes and at close, not
+ *  continuously written the way node:sqlite's file is. */
 export function openSqlJsDatabaseSync(path: string): SqlDb {
   if (!sqlJsModule) {
     throw new Error(

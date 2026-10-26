@@ -8,9 +8,14 @@ import userEvent from '@testing-library/user-event'
 import { ImportUrlDialog } from './ImportUrlDialog'
 
 const enqueue = vi.fn()
+const toastSuccess = vi.hoisted(() => vi.fn())
+const toastInfo = vi.hoisted(() => vi.fn())
 
 vi.mock('../../lib/queries', () => ({
   useDownloadMutations: () => ({ enqueue: { mutate: enqueue, isPending: false, error: null, reset: () => {} } }),
+}))
+vi.mock('../../components/ui/sonner', () => ({
+  toast: { success: (m: string) => toastSuccess(m), info: (m: string) => toastInfo(m) },
 }))
 vi.mock('../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/api')>()),
@@ -26,7 +31,9 @@ function renderDialog() {
 const input = () => screen.getByPlaceholderText(/huggingface\.co\/owner\/repo/)
 
 beforeEach(() => {
-  enqueue.mockClear()
+  enqueue.mockReset()
+  toastSuccess.mockClear()
+  toastInfo.mockClear()
 })
 
 describe('ImportUrlDialog — single-file model formats', () => {
@@ -106,5 +113,40 @@ describe('ImportUrlDialog — single-file model formats', () => {
     ).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Import' })).toBeDisabled()
     expect(enqueue).not.toHaveBeenCalled()
+  })
+})
+
+// A URL already in the download list queues nothing new. The dialog used to close without a
+// word; it now says what happened (the enqueue mutation has resumed a paused row by then).
+describe('ImportUrlDialog — a URL already in the download list', () => {
+  const URL_ = 'https://example.com/files/model.Q4_K_M.gguf'
+  const row = { id: 'dl-1', name: 'model.Q4_K_M.gguf', status: 'queued' }
+  async function importIt(result: unknown) {
+    enqueue.mockImplementation((_input: unknown, opts?: { onSuccess?: (out: unknown) => void }) => opts?.onSuccess?.(result))
+    const onClose = vi.fn()
+    const user = userEvent.setup()
+    render(<ImportUrlDialog open onClose={onClose} onOpenRepo={vi.fn()} />)
+    await user.type(input(), URL_)
+    await user.click(screen.getByRole('button', { name: 'Import' }))
+    return onClose
+  }
+
+  it('says "Resumed" when it was a paused download', async () => {
+    const onClose = await importIt({ downloads: [], existing: [row], resumed: [row] })
+    expect(onClose).toHaveBeenCalled()
+    expect(toastSuccess).toHaveBeenCalledWith('Resumed model.Q4_K_M.gguf')
+    expect(toastInfo).not.toHaveBeenCalled()
+  })
+
+  it('says "Already downloading" when it is still downloading', async () => {
+    await importIt({ downloads: [], existing: [{ ...row, status: 'downloading' }], resumed: [] })
+    expect(toastInfo).toHaveBeenCalledWith('Already downloading model.Q4_K_M.gguf')
+    expect(toastSuccess).not.toHaveBeenCalled()
+  })
+
+  it('says nothing extra for a new download, which shows in the Downloads panel', async () => {
+    await importIt({ downloads: [row], existing: [], resumed: [] })
+    expect(toastSuccess).not.toHaveBeenCalled()
+    expect(toastInfo).not.toHaveBeenCalled()
   })
 })

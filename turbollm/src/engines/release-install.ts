@@ -7,7 +7,7 @@ import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync
 import { basename, join } from 'node:path'
 import { asDirName } from './build-runner'
 import { driverMaxCuda } from './cuda-provision'
-import { downloadFile, extractArchive, stripMacOsQuarantine, type ProvisionProgress, type ReleaseAsset } from './download'
+import { downloadFile, extractArchive, GithubRateLimitError, stripMacOsQuarantine, type ProvisionProgress, type ReleaseAsset } from './download'
 import { probe, ProbeError, type ProbeResult } from './probe'
 import {
   assetKey,
@@ -177,8 +177,15 @@ export async function installReleaseAsset(
       provenance,
     }
   } finally {
-    rmSync(workDirs.stage, { recursive: true, force: true })
-    rmSync(workDirs.tmp, { recursive: true, force: true }) // no-op once renamed into place
+    // Best effort, with retries: AV/the indexer can still hold the fresh or just-probed files, and a throw here would
+    // fail an install that already swapped in (or mask the real error). gcAbandonedZipInstalls sweeps leftovers.
+    for (const dir of [workDirs.stage, workDirs.tmp]) {
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }) // .tmp: no-op once renamed into place
+      } catch {
+        /* best effort */
+      }
+    }
   }
 }
 
@@ -225,7 +232,8 @@ async function downloadAndExtractParts(parts: AssetParts, dirs: WorkDirs, opts: 
     await downloadFile(asset.url, archive, report, opts.signal, refusingOversizeBodies(opts.fetchImpl ?? fetch))
     report({ phase: 'extracting', pct: -1 })
     await extractArchive(archive, dirs.raw)
-    rmSync(archive, { force: true })
+    // Frees the disk before the next part; a lock is harmless, the archive is inside the stage the finally removes.
+    try { rmSync(archive, { force: true }) } catch { /* best effort */ }
     throwIfCancelled(opts.signal)
   }
 }
@@ -322,6 +330,8 @@ export function describeReleaseJobFailure(e: unknown): { code: string; message: 
 function jobErrorCode(e: unknown): string {
   if (e instanceof Error && e.name === 'AbortError') return 'cancelled'
   if (e instanceof SwapBlockedError) return 'engine_in_use'
+  // The job re-reads the release from GitHub, so it can hit the quota the route's own lookup just spent.
+  if (e instanceof GithubRateLimitError) return 'github_rate_limited'
   if (e instanceof ProbeError) return e.code.startsWith('probe_') ? e.code : 'probe_failed'
   if (e instanceof ZipError) return e.code === 'zip_too_large' ? 'zip_too_large' : 'bad_zip'
   const code = (e as { code?: unknown } | null)?.code

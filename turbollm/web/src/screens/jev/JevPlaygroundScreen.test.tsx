@@ -1,5 +1,7 @@
 // The Workspace's only surface while a Jev model is loaded (ADR-434 (b), (c), (i)(1), ADR-439):
-// the System One request as two JSON editors, with the answers beside them.
+// the System One request as two JSON editors, with the answers beside them. A run is a daemon job
+// (src/api/systemone-job.ts) that the screen starts and follows; `daemon` below keeps it as that
+// module does, and its engine call is `h.systemone`, so each test still says what the engine answers.
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
@@ -12,10 +14,14 @@ import { SYSTEMONE_EXAMPLES } from './systemone-examples'
 import { ApiError } from '../../lib/api'
 import { queryKeys } from '../../lib/queries'
 import type { ModelEntry, Status } from '../../lib/types'
-import type { SystemOneResponse } from '../../lib/systemone-types'
+import type { PlaygroundRun } from '../../lib/jev-api'
+import type { SystemOneRequest, SystemOneResponse } from '../../lib/systemone-types'
 
 const h = vi.hoisted(() => ({
   systemone: vi.fn(),
+  start: vi.fn(),
+  get: vi.fn(),
+  cancel: vi.fn(),
   track: vi.fn(),
   stopEngine: vi.fn(),
   requestLoad: vi.fn(),
@@ -34,11 +40,14 @@ vi.mock('../../lib/queries', async (importOriginal) => ({
   useModels: () => ({ data: state.models ? { models: state.models, scanning: state.scanning } : undefined }),
   useSettings: () => ({ query: { data: { experimental: { routines: false } } } }),
   useSysInfo: () => ({ data: { os: 'linux/x64' }, isError: false }),
+  useShowAllEngineModels: () => false,
 }))
 vi.mock('../../lib/useIsDesktop', () => ({ useIsDesktop: () => state.desktop }))
 vi.mock('../../lib/jev-api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/jev-api')>()),
-  systemone: (...a: unknown[]) => h.systemone(...a),
+  startPlaygroundRun: (...a: unknown[]) => h.start(...a),
+  getPlaygroundRun: () => h.get(),
+  cancelPlaygroundRun: (...a: unknown[]) => h.cancel(...a),
 }))
 vi.mock('../../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad: h.requestLoad, isPending: false, pendingKey: undefined }),
@@ -103,6 +112,34 @@ function jevModel(over: Partial<ModelEntry> = {}): ModelEntry {
     jev: { ...JEV_INFO, labels: [...JEV_INFO.labels] },
     ...over,
   } as ModelEntry
+}
+
+const RUN_IN_PROGRESS = 'A text classification run is already in progress. Wait for it, or cancel it first.'
+
+/** The daemon's one playground run, kept as src/api/systemone-job.ts keeps it: a POST starts it with the engine's
+ *  answer `h.systemone(request)`, GET reads it, DELETE cancels the run it names. */
+let daemon: { view: PlaygroundRun; seq: number } = { view: { state: 'idle' }, seq: 0 }
+
+function daemonStart(request: SystemOneRequest): Promise<PlaygroundRun> {
+  if (daemon.view.state === 'running') return Promise.reject(new ApiError('run_in_progress', RUN_IN_PROGRESS, 409))
+  const id = `run-${++daemon.seq}`
+  daemon.view = { state: 'running', id, request, startedAt: new Date().toISOString() }
+  const settle = (outcome: Partial<PlaygroundRun>) => {
+    if (daemon.view.id !== id || daemon.view.state !== 'running') return
+    daemon.view = { ...daemon.view, ...outcome, finishedAt: new Date().toISOString() }
+  }
+  Promise.resolve(h.systemone(request)).then(
+    (response: SystemOneResponse) => settle({ state: 'done', response }),
+    (e: unknown) => settle({ state: 'error', error: { code: e instanceof ApiError ? e.code : 'internal', message: e instanceof Error ? e.message : String(e) } }),
+  )
+  return Promise.resolve(daemon.view)
+}
+
+function daemonCancel(id: string): Promise<PlaygroundRun> {
+  if (daemon.view.state === 'running' && daemon.view.id === id) {
+    daemon.view = { ...daemon.view, state: 'cancelled', finishedAt: new Date().toISOString() }
+  }
+  return Promise.resolve(daemon.view)
 }
 
 /** The real query cache: an eject has to refresh what the playground reads. */
@@ -182,6 +219,10 @@ function fakeStorage(initial: Record<string, string> = {}) {
 beforeEach(() => {
   for (const spy of Object.values(h)) spy.mockReset()
   h.systemone.mockResolvedValue(RESPONSE)
+  daemon = { view: { state: 'idle' }, seq: 0 }
+  h.start.mockImplementation(daemonStart)
+  h.get.mockImplementation(() => Promise.resolve(daemon.view))
+  h.cancel.mockImplementation(daemonCancel)
   state.status = status()
   state.models = [jevModel()]
   state.scanning = false
@@ -215,6 +256,28 @@ describe('JevPlaygroundScreen', () => {
     renderScreen()
     expect(screen.getByText('qwen3.5 4b nli v2 · running')).toBeInTheDocument()
     expect(screen.getByLabelText('state')).toBeInTheDocument()
+  })
+
+  // The header named the active engine beside the model's state. An engine install or Enable activates another engine
+  // without stopping the model, so it read as the selected engine running a model another engine ran.
+  it('names the engine running a model in the primary, not the active one', () => {
+    state.status = status({
+      engine: { id: 'llama', name: 'llama.cpp b6000', kind: 'llama-server', state: 'running', servingId: 'vllm', servingKind: 'vllm', servingName: 'vLLM 0.29' },
+    })
+    renderScreen()
+    expect(screen.getByText('qwen3.5 4b nli v2 · vLLM 0.29 · running')).toBeInTheDocument()
+    expect(screen.queryByText(/llama\.cpp/)).toBeNull()
+  })
+
+  // A pool slot keeps the engine that loaded it, which the status does not name: the active one may not be it.
+  it('names no engine for a model in a pool slot', () => {
+    state.status = status({
+      engine: { id: 'llama', name: 'llama.cpp b6000', kind: 'llama-server', state: 'running', servingId: '', servingKind: '', servingName: '' },
+      jev: { key: KEY, name: 'qwen3.5 4b nli v2', labels: ['contradiction', 'entailment', 'neutral'], state: 'running', slot: 'pool' },
+    })
+    renderScreen()
+    expect(screen.getByText('qwen3.5 4b nli v2 · running')).toBeInTheDocument()
+    expect(screen.queryByText(/llama\.cpp/)).toBeNull()
   })
 
   it('shows Loading… while the model is starting', () => {
@@ -460,8 +523,8 @@ describe('JevPlaygroundScreen running the request', () => {
   it.each([
     ['an Error', new Error('boom'), 'boom'],
     ['something that is not an Error', 'nope', 'The request failed.'],
-  ])('shows a failure that is %s as one readable line', async (_kind, rejection, shown) => {
-    h.systemone.mockRejectedValue(rejection)
+  ])('shows a failure to start the run that is %s as one readable line', async (_kind, rejection, shown) => {
+    h.start.mockRejectedValue(rejection)
     renderScreen()
     await userEvent.click(runButton())
 
@@ -505,14 +568,130 @@ describe('JevPlaygroundScreen running the request', () => {
     expect(hint.tagName).toBe('SPAN')
   })
 
-  it('has no Cancel button, idle or mid-run', async () => {
-    slowRun()
+  it('offers Cancel only while a run is in flight', async () => {
+    const settle = slowRun()
     renderScreen()
     expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull()
 
     await userEvent.click(runButton())
-    await waitFor(() => expect(h.systemone).toHaveBeenCalledTimes(1))
+    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeInTheDocument()
+
+    await settle()
+    await screen.findByText('0.945')
     expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull()
+  })
+})
+
+// The run used to be the page's own /v1/systemone call, which a closed, reloaded or left screen threw away along with
+// its answer. It is the daemon's now: the screen starts it, follows it, and finds it again when it comes back.
+describe('JevPlaygroundScreen and the daemon\'s run', () => {
+  const ROUTING = exampleNamed('routing')
+
+  it('opens on a run still going: shows it running, with Cancel, and its answer once it ends', async () => {
+    const settle = slowRun()
+    await daemonStart(requestOf(ROUTING)) // started by a page that has since gone
+    renderScreen()
+
+    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Running…' })).toBeDisabled()
+    expect(screen.getByLabelText('state')).toHaveValue(ROUTING.stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(ROUTING.questionsText)
+    expect(h.start).not.toHaveBeenCalled()
+
+    await settle()
+    expect(await screen.findByText('0.945')).toBeInTheDocument()
+    expect(runButton()).toHaveTextContent('Run')
+  })
+
+  it('opens on a finished run: its answers, and the request it answered as curl and in the editors', async () => {
+    await daemonStart(requestOf(ROUTING))
+    await tick()
+    expect(daemon.view.state).toBe('done')
+    const { container } = renderScreen()
+
+    expect(await screen.findByText('0.945')).toBeInTheDocument()
+    expect(screen.getByLabelText('state')).toHaveValue(ROUTING.stateText)
+    expect(screen.getByLabelText('questions')).toHaveValue(ROUTING.questionsText)
+    await userEvent.click(screen.getByRole('button', { name: 'curl' }))
+    expect(container.querySelector('pre')?.textContent).toContain(JSON.stringify(requestOf(ROUTING)).replaceAll("'", "'\\''"))
+    expect(h.start).not.toHaveBeenCalled()
+  })
+
+  it('never overwrites what the user typed with the request of a run it finds', async () => {
+    window.localStorage.setItem(DRAFT_KEY, JSON.stringify({ stateText: 'Typed by hand.', questionsText: '{"typed": 1}' }))
+    await daemonStart(requestOf(ROUTING))
+    await tick()
+    const { container } = renderScreen()
+
+    expect(await screen.findByText('0.945')).toBeInTheDocument()
+    expect(screen.getByLabelText('state')).toHaveValue('Typed by hand.')
+    expect(screen.getByLabelText('questions')).toHaveValue('{"typed": 1}')
+    await userEvent.click(screen.getByRole('button', { name: 'curl' }))
+    expect(container.querySelector('pre')?.textContent).toContain(ROUTING.stateText)
+  })
+
+  it('leaving the screen mid-run does not cancel the run, and stops the watching; coming back shows its answer', async () => {
+    const settle = slowRun()
+    const first = renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByRole('button', { name: 'Cancel' })
+
+    first.unmount()
+    const looks = h.get.mock.calls.length
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 700)) })
+    expect(h.cancel).not.toHaveBeenCalled()
+    expect(daemon.view.state).toBe('running')
+    expect(h.get.mock.calls.length).toBe(looks)
+
+    await settle()
+    expect(daemon.view.state).toBe('done')
+    renderScreen()
+    expect(await screen.findByText('0.945')).toBeInTheDocument()
+  })
+
+  it('Cancel cancels the run it follows, and the answers already shown stay', async () => {
+    renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByText('0.945')
+
+    slowRun()
+    await userEvent.click(runButton())
+    await userEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+
+    expect(h.cancel).toHaveBeenCalledWith('run-2')
+    await waitFor(() => expect(runButton()).toHaveTextContent('Run'))
+    expect(daemon.view.state).toBe('cancelled')
+    expect(screen.queryByRole('button', { name: /cancel/i })).toBeNull()
+    expect(screen.getByText('0.945').closest('[aria-busy]')).toHaveAttribute('aria-busy', 'false')
+    expect(within(screen.getByRole('region', { name: 'Response' })).getByRole('status').textContent).toBe('The run was cancelled.')
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('says so when another tab\'s run holds the daemon, follows that run, and offers Run again once it ends', async () => {
+    renderScreen()
+    await tick()
+    const settle = slowRun()
+    await daemonStart(requestOf(ROUTING)) // another tab
+
+    await userEvent.click(runButton())
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(RUN_IN_PROGRESS)
+    expect(await screen.findByRole('button', { name: 'Cancel' })).toBeInTheDocument()
+    expect(h.systemone).toHaveBeenCalledTimes(1)
+    await settle()
+    await waitFor(() => expect(runButton()).toBeEnabled())
+  })
+
+  it('says so when the daemon no longer has the run it follows (it restarted)', async () => {
+    slowRun()
+    renderScreen()
+    await userEvent.click(runButton())
+    await screen.findByRole('button', { name: 'Cancel' })
+
+    daemon.view = { state: 'idle' }
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('The server no longer has this run.')
+    expect(runButton()).toBeEnabled()
   })
 })
 
@@ -930,7 +1109,8 @@ describe('JevPlaygroundScreen remembering the draft', () => {
     renderScreen()
 
     fireEvent.click(runButton())
-    await act(async () => {})
+    // The screen's first look at the daemon's run, 100 ms after it started.
+    await act(async () => { await vi.advanceTimersByTimeAsync(100) })
     expect(screen.getByText('0.945')).toBeInTheDocument()
     fireEvent.change(picker(), { target: { value: 'routing' } })
     advance(400)

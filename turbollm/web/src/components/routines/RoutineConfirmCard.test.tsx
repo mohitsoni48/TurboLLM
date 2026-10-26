@@ -90,6 +90,16 @@ describe('RoutineConfirmCard — create mode', () => {
     expect(confirmMutate).toHaveBeenCalledWith('r1', expect.anything())
   })
 
+  it('names what a code routine with no stored permission mode actually runs as, not a blank', () => {
+    // create_routine may persist no permissionMode; the daemon runs that as 'auto' for in-app pi
+    // (code-runner.ts) and as the one-shot `claude -p` for claude_cli (execute.ts).
+    const { unmount } = renderCreate({ flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined })
+    expect(screen.getByText('Permission mode:').parentElement!.textContent).toBe('Permission mode: Not set: Auto — runs tools without asking')
+    unmount()
+    renderCreate({ flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: undefined })
+    expect(screen.getByText('Permission mode:').parentElement!.textContent).toMatch(/^Permission mode: Not set: One-shot claude -p/)
+  })
+
   it('Confirm is disabled when a flavor-required field is missing (spec 20 §3 / 21 §3)', () => {
     renderCreate({ agentId: undefined })
     expect(screen.getByRole('button', { name: /Confirm/ })).toBeDisabled()
@@ -154,6 +164,44 @@ describe('RoutineConfirmCard — update mode', () => {
     expect(screen.getByText('Agent', { selector: 'span.font-medium' })).toBeInTheDocument()
     expect(screen.getByText('− agent-1')).toBeInTheDocument()
     expect(screen.getByText('+ agent-2')).toBeInTheDocument()
+  })
+
+  it('keeps an unset permission mode unset on Confirm, and diffs a picked one against what actually ran', async () => {
+    const user = userEvent.setup()
+    const original = pendingChatRoutine({ status: 'active', flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined })
+    const draft: RoutineDraft = { flavor: 'code', prompt: 'New prompt', scheduleRule: original.scheduleRule, modelKey: 'model-a', workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined }
+    const { unmount } = renderUpdate(original, draft)
+    expect(screen.queryByText('Permission mode', { selector: 'span.font-medium' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /Confirm/ }))
+    expect(updateMutate.mock.calls[0][0].patch.permissionMode).toBeUndefined()
+    unmount()
+    renderUpdate(original, { ...draft, permissionMode: 'ask' })
+    expect(screen.getByText('− Not set: Auto — runs tools without asking')).toBeInTheDocument()
+    expect(screen.getByText('+ ask')).toBeInTheDocument()
+  })
+
+  // With no stored mode, what runs depends on the coding agent (unsetPermissionModeLabel), so a
+  // switch from claude_cli (asks are refused) to pi (Auto) widens what the routine may do. The
+  // diff compared the stored mode, unset on both sides, and listed only the coding agent.
+  it('a coding-agent switch that changes what an unset permission mode runs as shows the permission change too', () => {
+    const original = pendingChatRoutine({ status: 'active', flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'claude_cli', permissionMode: undefined })
+    const draft: RoutineDraft = { flavor: 'code', prompt: original.prompt, scheduleRule: original.scheduleRule, modelKey: 'model-a', workspacePath: '/repo', codingAgent: 'pi', permissionMode: undefined }
+    renderUpdate(original, draft)
+    expect(screen.getByText('Coding agent', { selector: 'span.font-medium' })).toBeInTheDocument()
+    expect(screen.getByText('Permission mode', { selector: 'span.font-medium' })).toBeInTheDocument()
+    expect(screen.getByText("− Not set: One-shot claude -p with Claude's default permissions — anything it would ask about is refused")).toBeInTheDocument()
+    expect(screen.getByText('+ Not set: Auto — runs tools without asking')).toBeInTheDocument()
+  })
+
+  it('a coding-agent switch with a stored permission mode, or one that runs the same, adds no permission row', () => {
+    const original = pendingChatRoutine({ status: 'active', flavor: 'code', agentId: undefined, workspacePath: '/repo', codingAgent: 'opencode_cli', permissionMode: undefined })
+    const draft: RoutineDraft = { flavor: 'code', prompt: original.prompt, scheduleRule: original.scheduleRule, modelKey: 'model-a', workspacePath: '/repo', codingAgent: 'pi_cli', permissionMode: undefined }
+    const { unmount } = renderUpdate(original, draft)
+    expect(screen.getByText('Coding agent', { selector: 'span.font-medium' })).toBeInTheDocument()
+    expect(screen.queryByText('Permission mode', { selector: 'span.font-medium' })).not.toBeInTheDocument()
+    unmount()
+    renderUpdate({ ...original, permissionMode: 'ask' }, { ...draft, codingAgent: 'pi', permissionMode: 'ask' })
+    expect(screen.queryByText('Permission mode', { selector: 'span.font-medium' })).not.toBeInTheDocument()
   })
 
   it('Save changes inside an update-mode inline edit persists nothing — only Confirm writes', async () => {

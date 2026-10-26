@@ -7,15 +7,18 @@
 // The fit helpers this file owns are exercised here too — `CheckpointPicker` renders one dot
 // per row with exactly these, so they are shared rather than reimplemented.
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { HfRepoContent, fileFit } from './HfRepoDialog'
+import { ApiError } from '../../lib/api'
 import type { HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
 
 const enqueue = vi.fn()
 const requestLoad = vi.fn()
 const toastSuccess = vi.fn()
+const toastError = vi.fn()
+const onClose = vi.fn()
 
 function file(name: string, sizeBytes: number, sha256: string): HfRepoFile {
   return { name, quant: '', sizeBytes, parts: 1, mmproj: false, safetensors: true, sha256, url: `u/${name}` }
@@ -65,7 +68,7 @@ vi.mock('../../lib/queries', () => ({
   useHfRepo: () => ({ data: state.detail }),
   useSysInfo: () => ({ data: { gpus: [{ vramMb: 16000 }] } }),
   useStatus: () => ({ data: { engine: { kind: 'vllm' } } }),
-  useDownloadMutations: () => ({ enqueue: { mutate: enqueue, isPending: false, error: null } }),
+  useDownloadMutations: () => ({ enqueue: { mutate: enqueue, mutateAsync: enqueue, isPending: false, error: null } }),
   useModelActions: () => ({ load: { mutate: vi.fn(), isPending: false } }),
   useSettings: () => ({ query: { data: { hfTokenSet: true } } }),
 }))
@@ -78,7 +81,7 @@ vi.mock('../../lib/model-loader', () => ({
 }))
 // Wrapped rather than passed directly: a `vi.mock` factory is hoisted above the `const`.
 vi.mock('../../components/ui/sonner', () => ({
-  toast: { success: (m: string) => toastSuccess(m), error: () => {} },
+  toast: { success: (m: string) => toastSuccess(m), error: (m: string) => toastError(m) },
 }))
 vi.mock('../../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/api')>()),
@@ -90,7 +93,7 @@ function renderContent(detail: HfRepoDetail) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   return render(
     <QueryClientProvider client={qc}>
-      <HfRepoContent repo="AlexWortega/openjev" onClose={vi.fn()} />
+      <HfRepoContent repo="AlexWortega/openjev" onClose={onClose} />
     </QueryClientProvider>,
   )
 }
@@ -98,10 +101,17 @@ function renderContent(detail: HfRepoDetail) {
 /** What actually got queued, as the download route sees it. */
 const queued = () => enqueue.mock.calls.map((c) => c[0])
 
+/** The `folder` every request of one whole-folder download carries: each of its files by
+ *  where its own request puts it (`<subdir>/<basename>`) and its size. */
+const folderOf = (...files: [string, number][]) => ({ files: files.map(([path, size]) => ({ path, size })) })
+const ROOT_FOLDER = folderOf(['openjev/config.json', 1e6], ['openjev/model.safetensors', 1e9])
+
 beforeEach(() => {
-  enqueue.mockClear()
+  enqueue.mockReset()
   requestLoad.mockClear()
   toastSuccess.mockClear()
+  toastError.mockClear()
+  onClose.mockClear()
 })
 
 describe('fileFit', () => {
@@ -139,17 +149,18 @@ describe('HfRepoDialog — a repo with exactly one checkpoint', () => {
     renderContent(repoDetail({ checkpoints: [ROOT_CHECKPOINT] }))
     await userEvent.click(await screen.findByRole('button', { name: /download model/i }))
     expect(queued()).toEqual([
-      { repo: 'AlexWortega/openjev', rfilename: 'config.json', size: 1e6, sha256: 'sha-cfg', subdir: 'openjev' },
-      { repo: 'AlexWortega/openjev', rfilename: 'model.safetensors', size: 1e9, sha256: 'sha-root', subdir: 'openjev' },
+      { repo: 'AlexWortega/openjev', rfilename: 'config.json', size: 1e6, sha256: 'sha-cfg', subdir: 'openjev', folder: ROOT_FOLDER },
+      { repo: 'AlexWortega/openjev', rfilename: 'model.safetensors', size: 1e9, sha256: 'sha-root', subdir: 'openjev', folder: ROOT_FOLDER },
     ])
   })
 
   it('in a subfolder, downloads THAT folder into its own subdir', async () => {
     renderContent(repoDetail({ files: [], checkpoints: [checkpoint()] }))
     await userEvent.click(await screen.findByRole('button', { name: /download model/i }))
+    const folder = folderOf(['openjev/qwen3.5-4b-nli-v2/config.json', 1e6], ['openjev/qwen3.5-4b-nli-v2/model.safetensors', 9e9])
     expect(queued()).toEqual([
-      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v2/config.json', size: 1e6, sha256: 'sha-v2-cfg', subdir: 'openjev/qwen3.5-4b-nli-v2' },
-      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v2/model.safetensors', size: 9e9, sha256: 'sha-v2', subdir: 'openjev/qwen3.5-4b-nli-v2' },
+      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v2/config.json', size: 1e6, sha256: 'sha-v2-cfg', subdir: 'openjev/qwen3.5-4b-nli-v2', folder },
+      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v2/model.safetensors', size: 9e9, sha256: 'sha-v2', subdir: 'openjev/qwen3.5-4b-nli-v2', folder },
     ])
     expect(toastSuccess).toHaveBeenCalledWith('Queued 2 files for openjev/qwen3.5-4b-nli-v2')
   })
@@ -229,7 +240,19 @@ describe('HfRepoDialog — a repo with several checkpoints', () => {
     renderContent(repoDetail({ files: [], checkpoints: [checkpoint(), V1, BIG] }))
     await userEvent.click((await screen.findAllByRole('button', { name: 'Download' }))[1])
     expect(queued()).toEqual([
-      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v1/model.safetensors', size: 4e9, sha256: 'sha-v1', subdir: 'openjev/qwen3.5-4b-nli-v1' },
+      { repo: 'AlexWortega/openjev', rfilename: 'qwen3.5-4b-nli-v1/model.safetensors', size: 4e9, sha256: 'sha-v1', subdir: 'openjev/qwen3.5-4b-nli-v1', folder: folderOf(['openjev/qwen3.5-4b-nli-v1/model.safetensors', 4e9]) },
+    ])
+  })
+
+  it('sends a root row\'s folder as the root\'s own files only, never a nested checkpoint\'s', async () => {
+    // The root checkpoint's folder is the repo's own, which every nested checkpoint's sits in:
+    // the daemon takes off the folder's total only the files listed here that are still
+    // downloading, so a nested checkpoint in flight never makes room for the root one.
+    renderContent(repoDetail({ files: [...ROOT_FILES, ...V2_FILES], checkpoints: [ROOT_CHECKPOINT, checkpoint()] }))
+    await userEvent.click((await screen.findAllByRole('button', { name: 'Download' }))[0])
+    expect(queued().map((q) => [q.rfilename, q.folder])).toEqual([
+      ['config.json', ROOT_FOLDER],
+      ['model.safetensors', ROOT_FOLDER],
     ])
   })
 
@@ -251,5 +274,56 @@ describe('HfRepoDialog — a repo with several checkpoints', () => {
     renderContent(repoDetail({ files: [], checkpoints: [plain, V1, BIG] }))
     await userEvent.click(await screen.findByRole('button', { name: 'Load' }))
     expect(requestLoad.mock.calls[0][0].jev).toBeNull()
+  })
+})
+
+describe('HfRepoDialog — a whole-folder download the daemon refuses', () => {
+  it('says so, and keeps the panel open, instead of reporting every file queued', async () => {
+    // The daemon checks disk space per file: the small files queue, the big shard does not.
+    enqueue.mockImplementation((input: { rfilename: string }) =>
+      input.rfilename === 'model.safetensors'
+        ? Promise.reject(new ApiError('insufficient_disk', 'Not enough free disk space for model.safetensors.', 507))
+        : Promise.resolve({}),
+    )
+    renderContent(repoDetail({ checkpoints: undefined }))
+    await userEvent.click(await screen.findByRole('button', { name: /download model/i }))
+    await waitFor(() => expect(toastError).toHaveBeenCalledTimes(1))
+    expect(toastError.mock.calls[0][0]).toBe(
+      '1 of 2 files could not be queued for openjev: Not enough free disk space for model.safetensors.',
+    )
+    expect(toastSuccess).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('checks the free disk against the folder\'s total, so three 18 GB shards on 30 GB free queue none', async () => {
+    // The daemon's check (downloads.ts assertDisk): free must cover 1.1 × what it is asked
+    // about, here the total of the folder's files when the request carries them (nothing of it
+    // is downloading yet), else the file's own size.
+    const free = 30e9
+    enqueue.mockImplementation((input: { size: number; folder?: { files: { size: number }[] } }) =>
+      Math.max(input.size, (input.folder?.files ?? []).reduce((s, f) => s + f.size, 0)) * 1.1 > free
+        ? Promise.reject(new ApiError('insufficient_disk', 'Not enough free disk space: need ~59.4 GB, only 30.0 GB free.', 400))
+        : Promise.resolve({}),
+    )
+    const shards = [1, 2, 3].map((i) => file(`model-0000${i}-of-00003.safetensors`, 18e9, `sha-${i}`))
+    renderContent(repoDetail({ files: shards, checkpoints: undefined }))
+    await userEvent.click(await screen.findByRole('button', { name: /download model/i }))
+    await waitFor(() => expect(toastError).toHaveBeenCalledTimes(1))
+    expect(toastError.mock.calls[0][0]).toBe(
+      '3 of 3 files could not be queued for openjev: Not enough free disk space: need ~59.4 GB, only 30.0 GB free.',
+    )
+    const folder = folderOf(...shards.map((f): [string, number] => [`openjev/${f.name}`, 18e9]))
+    expect(queued().map((q) => q.folder)).toEqual([folder, folder, folder])
+    expect(toastSuccess).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('reports success and closes only once every file is queued', async () => {
+    enqueue.mockResolvedValue({})
+    renderContent(repoDetail({ checkpoints: undefined }))
+    await userEvent.click(await screen.findByRole('button', { name: /download model/i }))
+    await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
+    expect(toastSuccess).toHaveBeenCalledWith('Queued 2 files for openjev')
+    expect(toastError).not.toHaveBeenCalled()
   })
 })

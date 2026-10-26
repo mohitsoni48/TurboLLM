@@ -16,10 +16,14 @@ export interface ProvisionStatus {
   part: number // 1-based current archive (multi-asset backends like CUDA)
   parts: number // total archives for this backend
   error: string | null
+  /** When this run began (epoch ms), kept on its failure; 0 when idle. It identifies the run: the web banner keys a
+   *  dismissed failure to it, since a retry can fail the same way between two of its 2 s status polls, which then
+   *  never see it running. */
+  startedAt: number
 }
 
 export class ProvisionState {
-  private s: ProvisionStatus = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
+  private s: ProvisionStatus = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null, startedAt: 0 }
 
   get(): ProvisionStatus {
     return { ...this.s }
@@ -46,7 +50,7 @@ export class ProvisionState {
   start(backend: string, trigger: ProvisionTrigger = 'user_install'): void {
     this.starts++
     this.trigger = trigger
-    this.s = { active: true, phase: 'downloading', backend, pct: 0, part: 1, parts: 1, error: null }
+    this.s = { active: true, phase: 'downloading', backend, pct: 0, part: 1, parts: 1, error: null, startedAt: Date.now() }
   }
 
   progress(phase: 'downloading' | 'extracting', pct: number, part = 1, parts = 1): void {
@@ -66,13 +70,13 @@ export class ProvisionState {
 
   done(): void {
     const trigger = this.trigger
-    this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null }
+    this.s = { active: false, phase: 'idle', backend: '', pct: 0, part: 1, parts: 1, error: null, startedAt: 0 }
     this.settle(true, trigger)
   }
 
   fail(error: string): void {
     const trigger = this.trigger
-    this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error }
+    this.s = { active: false, phase: 'error', backend: this.s.backend, pct: 0, part: 1, parts: 1, error, startedAt: this.s.startedAt }
     this.settle(false, trigger, classifyProvisionFailure(error))
   }
 

@@ -9,9 +9,9 @@ import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ModelsScreen } from './ModelsScreen'
-import type { JevInfo, ModelEntry } from '../lib/types'
+import type { DownloadRecord, JevInfo, ModelEntry } from '../lib/types'
 
-const state: { models: ModelEntry[]; status: unknown; sys?: unknown } = { models: [], status: undefined }
+const state: { models: ModelEntry[]; status: unknown; sys?: unknown; showAll?: boolean; downloads?: Partial<DownloadRecord>[] } = { models: [], status: undefined }
 const requestLoad = vi.fn()
 
 vi.mock('../lib/queries', () => ({
@@ -28,6 +28,8 @@ vi.mock('../lib/queries', () => ({
   }),
   useStatus: () => ({ data: state.status ?? { engine: { state: 'stopped' }, model: null } }),
   useSysInfo: () => ({ data: state.sys }),
+  useShowAllEngineModels: () => state.showAll ?? false,
+  useDownloads: () => ({ data: state.downloads ? { downloads: state.downloads } : undefined }),
 }))
 vi.mock('../lib/model-loader', () => ({
   useModelLoader: () => ({ requestLoad, isPending: false, pendingKey: undefined }),
@@ -94,7 +96,9 @@ function renderScreen() {
 beforeEach(() => {
   state.status = undefined
   state.sys = undefined
+  state.showAll = undefined
   state.models = [entry()]
+  state.downloads = undefined
   requestLoad.mockClear()
 })
 
@@ -187,16 +191,54 @@ describe('ModelsScreen — Jev models', () => {
     expect(screen.getByText('Mistral MLX')).toBeTruthy()
   })
 
-  // No churn for other models: `incompatibleReason` is the short chip label, so serving it as
-  // the tooltip would drop the actionable half of the sentence.
-  it('keeps the full "switch to" tooltip for a model that is not a Jev model', async () => {
-    state.models = [entry({ key: 'mlx-1', name: 'Mistral MLX', format: 'mlx', compatibleWithActiveEngine: false, incompatibleReason: 'needs MLX or vLLM' })]
+  // Settings → Models' "Show models for every engine": the screen opens with every model on it, a .litertlm bundle
+  // under llama.cpp included. That row says why the selected engine may not run it, and its Load starts it there
+  // all the same (the daemon does not refuse it, and the engine's error shows if it fails): its Load was off.
+  it('lists every model with "Show models for every engine" on, and a row the engine cannot run still says why', async () => {
+    state.showAll = true
+    const bundle = entry({ key: 'litert-1', name: 'Gemma 3n', format: 'litertlm', path: '/models/gemma.litertlm', compatibleWithActiveEngine: false, incompatibleReason: 'needs LiteRT-LM' })
+    state.models = [entry(), bundle]
     renderScreen()
 
+    expect(screen.getByText("Showing all models. 1 can't load on the active engine.")).toBeTruthy()
+    expect(screen.getByText('Gemma 3n')).toBeTruthy()
+    expect(screen.getByText('needs LiteRT-LM')).toBeTruthy()
+    const loads = screen.getAllByRole('button', { name: 'Load' }) as HTMLButtonElement[]
+    expect(loads.map((b) => b.disabled)).toEqual([false, false])
+    await userEvent.click(loads[1])
+    expect(requestLoad).toHaveBeenCalledWith(bundle)
+
+    // The banner's own toggle still hides them for this visit.
+    await userEvent.click(screen.getByRole('button', { name: 'Show compatible only' }))
+    expect(screen.queryByText('Gemma 3n')).toBeNull()
+  })
+
+  // "Show all" reveals them the same way; a Laya model, which never runs on the selected engine, still has no Load
+  // with no Laya engine installed.
+  it('offers the Load of a row "Show all" reveals, but not of a Laya model with no Laya engine', async () => {
+    state.models = [
+      entry({ key: 'mlx-1', name: 'Mistral MLX', format: 'mlx', compatibleWithActiveEngine: false, incompatibleReason: 'needs MLX or vLLM' }),
+      layaEntry({ compatibleWithActiveEngine: false, incompatibleReason: 'Needs the Laya engine' }),
+    ]
+    renderScreen()
     await userEvent.click(screen.getByRole('button', { name: 'Show all' }))
 
-    expect(screen.getByRole('button', { name: 'Load' }).getAttribute('title'))
-      .toBe("The active engine can't load this model — switch to MLX or vLLM")
+    const loads = screen.getAllByRole('button', { name: 'Load' }) as HTMLButtonElement[]
+    expect(loads.map((b) => [b.disabled, b.getAttribute('title')])).toEqual([
+      [false, "The selected engine isn't expected to load this model. Load starts it there anyway, and shows the engine's error if it fails."],
+      [true, 'Install the Laya engine (Engines) to load this model.'],
+    ])
+  })
+
+  it('hides a .litertlm bundle the selected engine cannot run by default', () => {
+    state.models = [
+      entry(),
+      entry({ key: 'litert-1', name: 'Gemma 3n', format: 'litertlm', path: '/models/gemma.litertlm', compatibleWithActiveEngine: false, incompatibleReason: 'needs LiteRT-LM' }),
+    ]
+    renderScreen()
+
+    expect(screen.getByText("1 model is hidden — the active engine can't load it.")).toBeTruthy()
+    expect(screen.queryByText('Gemma 3n')).toBeNull()
   })
 
   it('gives a Jev model the daemon\'s own reason instead', () => {
@@ -262,5 +304,52 @@ describe('ModelsScreen — inside the Android app', () => {
   it('shows no import control outside the app', () => {
     renderScreen()
     expect(screen.queryByRole('button', { name: /Import model file/ })).toBeNull()
+  })
+})
+
+// Models opens on the Library, and download progress shows only under Discover: after reopening
+// the app, a download a restart had left paused was out of sight. The Library says so in one line,
+// only while a download is running, queued, paused or errored, and "Show" opens Discover.
+describe('ModelsScreen — the Library says when downloads are waiting', () => {
+  const dl = (id: string, status: DownloadRecord['status']) => ({ id, name: `${id}.gguf`, status, received: 0, total: 100 })
+  const notice = () => screen.queryByRole('button', { name: 'Show downloads' })
+
+  it('counts running (with queued), paused and failed downloads in one line', () => {
+    state.downloads = [dl('a', 'downloading'), dl('b', 'queued'), dl('c', 'paused'), dl('d', 'error'), dl('e', 'done')]
+    renderScreen()
+    expect(screen.getByText('2 downloads running · 1 paused · 1 failed')).toBeTruthy()
+    expect(notice()).toBeTruthy()
+  })
+
+  it('names the first count it shows: one paused download alone', () => {
+    state.downloads = [dl('c', 'paused'), dl('e', 'cancelled')]
+    renderScreen()
+    expect(screen.getByText('1 download paused')).toBeTruthy()
+  })
+
+  it('shows nothing while every download is done or cancelled, or there are none', () => {
+    state.downloads = [dl('e', 'done'), dl('f', 'cancelled')]
+    const { unmount } = renderScreen()
+    expect(notice()).toBeNull()
+    unmount()
+    state.downloads = undefined
+    renderScreen()
+    expect(notice()).toBeNull()
+  })
+
+  it('"Show" opens Discover, where the Downloads panel is', async () => {
+    state.downloads = [dl('c', 'paused')]
+    renderScreen()
+    expect(screen.getByText(/GGUF models discovered in your folders/)).toBeTruthy()
+    await userEvent.click(notice()!)
+    expect(screen.getByText(/Find and download GGUF models from Hugging Face/)).toBeTruthy()
+    expect(notice()).toBeNull()
+  })
+
+  it('shows on an empty library too', () => {
+    state.models = []
+    state.downloads = [dl('a', 'downloading')]
+    renderScreen()
+    expect(screen.getByText('1 download running')).toBeTruthy()
   })
 })

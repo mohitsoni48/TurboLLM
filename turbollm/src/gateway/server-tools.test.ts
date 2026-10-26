@@ -246,6 +246,20 @@ test('serverToolSseEvents: text blocks are also emitted as deltas', () => {
   assert.ok(deltas[0].delta.text.includes('Hono is a small, simple web framework.'))
 })
 
+test('serverToolSseEvents: a text block starts empty, so a start-then-append client gets the digest once', () => {
+  // The official SDK's MessageStream keeps the start block's text and appends each text_delta to it; with the
+  // digest in both, an SDK client read "…results…results…". The real API always starts a text block empty.
+  const blocks = buildWebSearchBlocks('hono', [result()])
+  const events = [...serverToolSseEvents('local', blocks)].map((e) => JSON.parse(e.data))
+  const assembled = new Map<number, string>()
+  for (const e of events) {
+    if (e.type === 'content_block_start' && e.content_block.type === 'text') assembled.set(e.index, e.content_block.text)
+    if (e.type === 'content_block_delta' && e.delta.type === 'text_delta') assembled.set(e.index, assembled.get(e.index) + e.delta.text)
+  }
+  const digest = (blocks.find((b) => (b as { type: string }).type === 'text') as { text: string }).text
+  assert.deepEqual([...assembled.values()], [digest])
+})
+
 test('serverToolSseEvents: emits a well-formed, balanced Anthropic event sequence', () => {
   const blocks = buildWebSearchBlocks('hono', [result()])
   const events = [...serverToolSseEvents('local', blocks)]

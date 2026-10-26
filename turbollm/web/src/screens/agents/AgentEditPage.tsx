@@ -150,8 +150,13 @@ export function AgentEditPage() {
   const [deleteConfirm, setDeleteConfirm] = useState(false)
   const [formTab, setFormTab] = useState<'skills' | 'tools'>('skills')
 
+  // Both lists must have LOADED (not merely one of them be non-empty): hydration runs once, so
+  // whichever query resolved second would otherwise be captured as [] — a built-in saved that
+  // way persists `tools: []`, i.e. an agent with no tools at all.
+  const listsLoaded = skillsQ.isSuccess && toolsQ.isSuccess
+
   // New agent: default the checklists to "everything checked" once the lists load.
-  if (isNew && !hydrated && (skills.length || tools.length)) {
+  if (isNew && !hydrated && listsLoaded) {
     setForm((f) => ({ ...f, skillIds: skills.map((s) => s.id), tools: tools.map((t) => t.name) }))
     setHydrated(true)
   }
@@ -162,7 +167,7 @@ export function AgentEditPage() {
   }
   // Built-in agent: hydrate from its saved override (if any), else the hardcoded
   // default with every skill/tool checked (same "all checked" convention as new).
-  if (isBuiltin && !hydrated && builtinBase && overridesQ.isSuccess && (skills.length || tools.length)) {
+  if (isBuiltin && !hydrated && builtinBase && overridesQ.isSuccess && listsLoaded) {
     setForm({
       name: override?.name ?? builtinBase.name,
       description: override?.description ?? builtinBase.description,

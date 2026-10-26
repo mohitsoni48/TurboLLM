@@ -74,6 +74,26 @@ test('background agent run blocks every tool when agentAllowedTools is omitted (
   assert.match(result, /Blocked.*background agent/)
 })
 
+test('the background-run block names where Tool permissions really are (Settings → Tools & safety), not the Developer screen', async () => {
+  // The web UI's nav has had no Developer screen for a while: the per-tool Ask/Allow/Deny list
+  // is under Settings → Tools & safety. The model relays this text, so a stale path misleads.
+  const { result } = await executeToolCallWithApproval({
+    tools: fakeTools(),
+    sink: () => {},
+    convId: 'c1',
+    id: 't3b',
+    name: 'web_search',
+    args: {},
+    globalPolicies: {},
+    convOverrides: {},
+    signal: new AbortController().signal,
+    interactive: false,
+  })
+
+  assert.match(result, /set it to Allow in Settings → Tools & safety → Tool permissions\./)
+  assert.doesNotMatch(result, /Developer/)
+})
+
 test('explicit global "deny" wins even if the tool is in agentAllowedTools', async () => {
   const { result } = await executeToolCallWithApproval({
     tools: fakeTools(),
@@ -158,4 +178,47 @@ test('an "allow"-policy tool still executes for a background run with no agentAl
 
   assert.strictEqual(error, undefined)
   assert.strictEqual(result, '42')
+})
+
+// ── A chat's Ask waits a set time for its answer (Settings → Tool permissions → "Wait for an answer") ──
+
+const askBase = {
+  convId: 'c-wait',
+  name: 'run_code',
+  args: { code: '6*7' },
+  globalPolicies: { run_code: 'ask' as const },
+  convOverrides: {},
+  interactive: true,
+}
+
+test('an Ask nobody answers within approvalWaitMinutes is not run, and is answered so the turn goes on', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let ran = 0
+  const tools = { executeTool: async () => { ran++; return '42' } } as unknown as ToolRegistry
+  const { sink, events } = collectSink()
+  const outcome = executeToolCallWithApproval({ ...askBase, tools, sink, id: 'w1', signal: new AbortController().signal, approvalWaitMinutes: 2 })
+  await new Promise((r) => setImmediate(r))
+  assert.deepEqual(events.map((e) => (e.data as { status: string }).status), ['awaiting_approval'])
+  t.mock.timers.tick(2 * 60_000)
+  const { result, error } = await outcome
+  assert.equal(result, 'No answer within 2 minutes; the call was not run.')
+  assert.equal(error, undefined)
+  assert.equal(ran, 0, 'the call never ran')
+  assert.deepEqual(events.at(-1), { event: 'tool_call', data: { id: 'w1', name: 'run_code', args: { code: '6*7' }, status: 'done', result } })
+})
+
+test('a one-minute wait says 1 minute, not 1 minutes', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const outcome = executeToolCallWithApproval({ ...askBase, tools: fakeTools(), sink: () => {}, id: 'w2', signal: new AbortController().signal, approvalWaitMinutes: 1 })
+  await new Promise((r) => setImmediate(r))
+  t.mock.timers.tick(60_000)
+  assert.equal((await outcome).result, 'No answer within 1 minute; the call was not run.')
+})
+
+test('a Stop while an Ask waits within its limit stays a deny by the user', async () => {
+  const ac = new AbortController()
+  const outcome = executeToolCallWithApproval({ ...askBase, tools: fakeTools(), sink: () => {}, id: 'w3', signal: ac.signal, approvalWaitMinutes: 30 })
+  await new Promise((r) => setImmediate(r))
+  ac.abort()
+  assert.equal((await outcome).result, 'Denied by user.')
 })

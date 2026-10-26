@@ -56,3 +56,10 @@ test('remoteAccess: an unknown provider falls back to cloudflare-quick', () => {
   assert.equal(normalizeProvider('not-a-provider'), 'cloudflare-quick')
   assert.equal(normalizeProvider('tailscale-serve'), 'tailscale-serve')
 })
+
+test('remoteAccess: lastUrlProvider survives a reload; an unknown one is dropped', () => {
+  // auth.ts falls back to lastUrl as Serve's name only when this says Serve saved it.
+  assert.equal(loadRaw({ remoteAccess: { lastUrl: 'https://box.ts.net', lastUrlProvider: 'tailscale-serve' } }).remoteAccess.lastUrlProvider, 'tailscale-serve')
+  assert.equal(loadRaw({ remoteAccess: { lastUrlProvider: 'not-a-provider' } }).remoteAccess.lastUrlProvider, undefined)
+  assert.equal(loadRaw({ remoteAccess: { lastUrl: 'https://x.test' } }).remoteAccess.lastUrlProvider, undefined)
+})

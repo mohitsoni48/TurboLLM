@@ -31,8 +31,9 @@ export interface ShellRunResult {
 
 /** Run one user-typed shell command in `repoRoot`. Never throws for a non-zero exit or a timeout —
  *  those are normal outcomes reported in the result; it only rejects if the shell itself can't be
- *  spawned (e.g. the cwd vanished). `sessionLabel` is threaded to robust-bash purely for its
- *  kill-escalation warning logs. */
+ *  spawned (e.g. the cwd vanished). `sessionLabel` is the Code session's id: robust-bash's
+ *  kill-escalation warning logs name it, and what the command leaves running in the background is held
+ *  in that session's scope (released when the session is archived or deleted). */
 export async function runShellCommand(
   command: string,
   repoRoot: string,
@@ -41,7 +42,7 @@ export async function runShellCommand(
 ): Promise<ShellRunResult> {
   const maxOutput = opts?.maxOutput ?? SHELL_MAX_OUTPUT
   const timeoutSec = opts?.timeoutSec ?? SHELL_TIMEOUT_SEC
-  const ops = createRobustBashOperations({ sessionLabel })
+  const ops = createRobustBashOperations({ sessionLabel, sessionId: sessionLabel })
 
   let output = ''
   let truncated = false

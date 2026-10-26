@@ -119,6 +119,11 @@ export function sweepExpired(dir: string, ttlMs: number, now: number): void {
   }
 }
 
+/** How many saves of each cache file (by its full path) this process has started. A save names the same file as the
+ *  one before it whenever the model and its launch args are the same, so restoreSlot deletes the file it restored only
+ *  when no save of it has started since the restore began (see there). */
+const savesStarted = new Map<string, number>()
+
 /** Save the running model's slot-0 KV cache to disk before the ComfyUI-forced unload.
  *  Capped by `capMs` (see {@link SAVE_CAP_MS}) — if the server doesn't finish the write in
  *  time we abort so VRAM frees immediately. Fully fail-safe: a timeout, an HTTP 501
@@ -134,6 +139,9 @@ export async function saveSlot(p: {
   now: number
 }): Promise<boolean> {
   sweepExpired(p.dir, p.ttlMs, p.now)
+  const file = join(p.dir, p.filename)
+  // Noted before the request: the server may write the file before its answer reaches us.
+  savesStarted.set(file, (savesStarted.get(file) ?? 0) + 1)
   try {
     console.log(`[slot-cache] saving the prompt cache before ComfyUI takes the GPU (cap ${p.capMs}ms).`)
     const res = await p.http(`${p.base}/slots/0?action=save`, {
@@ -157,8 +165,14 @@ export async function saveSlot(p: {
 /** Restore a previously-saved slot-0 KV cache after the model reloads, skipping the
  *  re-prefill. On success the file is deleted (it's single-use — the live cache is now
  *  back in VRAM) and we return true; any failure (mismatch HTTP error, server down) is
- *  swallowed and returns false so the reload is otherwise unaffected. */
+ *  swallowed and returns false so the reload is otherwise unaffected.
+ *  Not deleted when a save of the same file started while the restore ran: the next ComfyUI prompt's acquire saves
+ *  the reloaded engine's cache under the same name, for its own release to restore, and can do so while a slow restore
+ *  is still in flight (the release route answers before the reload). Deleting it then left that release nothing to
+ *  restore. */
 export async function restoreSlot(p: { http: SlotHttp; base: string; dir: string; filename: string }): Promise<boolean> {
+  const file = join(p.dir, p.filename)
+  const saves = savesStarted.get(file) ?? 0
   try {
     console.log('[slot-cache] restoring the prompt cache after the ComfyUI reload (skipping the re-prefill).')
     const res = await p.http(`${p.base}/slots/0?action=restore`, {
@@ -172,7 +186,7 @@ export async function restoreSlot(p: { http: SlotHttp; base: string; dir: string
       return false
     }
     try {
-      rmSync(join(p.dir, p.filename), { force: true })
+      if ((savesStarted.get(file) ?? 0) === saves) rmSync(file, { force: true })
     } catch {
       /* best-effort cleanup; a leftover file is pruned by the TTL sweep anyway */
     }

@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref, type RefObject } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type Ref, type RefObject } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import ReactMarkdown from 'react-markdown'
+import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import { CheckCircle2, ChevronDown, ChevronLeft, ChevronRight, FileText, HelpCircle, Loader2, Pencil, RefreshCw, Trash2, XCircle } from 'lucide-react'
@@ -12,7 +12,8 @@ import { CopyButton } from '../../components/ui/copy-button'
 import { ArtifactCard, isArtifactLang } from '../../components/ArtifactCard'
 import { isRoutineConfirmTool, isSupersededUpdatePreview, RoutineConfirmToolCard } from '../../components/routines/RoutineConfirmToolCard'
 import { friendlyName } from '../../lib/tool-explain'
-import { track } from '../../lib/api'
+import { ApiError, track } from '../../lib/api'
+import { toast } from '../../components/ui/sonner'
 import { saveThinkingBlockHeight, useThinkingBlockHeight } from '../../lib/thinking-block-size'
 
 // ── Thinking block ────────────────────────────────────────────────────────────
@@ -85,7 +86,8 @@ function useFollowStreamingText(block: RefObject<HTMLElement | null>, following:
 
 // ── Stats row ─────────────────────────────────────────────────────────────────
 
-function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
+/** `errorShown`: the bubble shows the error card ("Generation failed or was stopped.") in place of its content. */
+function StatsRow({ stats, errorShown }: { stats: Partial<MessageStats>; errorShown: boolean }) {
   const parts: string[] = []
   if (stats.tps)          parts.push(`${stats.tps.toFixed(1)} tok/s`)
   if (stats.promptTps)    parts.push(`${stats.promptTps.toFixed(0)} tok/s prefill`)
@@ -97,7 +99,10 @@ function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
   }
   if (stats.totalMs)      parts.push(`${(stats.totalMs / 1000).toFixed(1)}s total`)
 
-  if (!parts.length) return null
+  // A reply cut off by a daemon kill after one of its partial saves is reconciled to exactly `{"aborted":true}` with
+  // its text kept (db.ts abortUnfinishedReplies): no numbers to list, so the row showed nothing and the reply read as
+  // finished. It shows the stopped mark alone, unless the error card above already says it was stopped.
+  if (!parts.length && !(stats.aborted && !errorShown)) return null
 
   const tooltip = [
     stats.model       ? `Model: ${stats.model}` : '',
@@ -110,7 +115,7 @@ function StatsRow({ stats }: { stats: Partial<MessageStats> }) {
   return (
     <div className="mt-2 text-[11px] text-faint" title={tooltip}>
       {parts.join(' · ')}
-      {stats.aborted && <span className="ml-2" style={{ color: 'var(--warn)' }}>· aborted</span>}
+      {stats.aborted && <span className={parts.length ? 'ml-2' : ''} style={{ color: 'var(--warn)' }}>{parts.length ? '· aborted' : 'Stopped'}</span>}
     </div>
   )
 }
@@ -137,62 +142,67 @@ function childrenToString(node: ReactNode): string {
 // a second markdown pipeline — Code mode's commentary is genuinely the same kind
 // of content chat's is, just presented in a different frame around it.
 export const Markdown = memo(function Markdown({ children, streaming }: { children: string; streaming?: boolean }) {
+  // Built once per `streaming` value, not per render: react-markdown uses these as element
+  // TYPES, so a fresh map on every streamed token made React unmount and remount every code
+  // block, link and table (resetting a sideways-scrolled code line, a selection, the copy
+  // button's state) instead of reconciling them.
+  const components = useMemo<Components>(() => ({
+    a: ({ children, href }) => (
+      // Styling comes entirely from the unlayered .prose-tllm a rules (index.css);
+      // this override exists only to force new-tab + noopener on every link.
+      <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
+    ),
+    code: ({ className, children, ...props }) => {
+      // A fenced block without a language tag has no className — detect it by
+      // checking for a trailing newline, which react-markdown always appends to
+      // block code. Inline code never contains newlines in practice.
+      const hasLang = !!className?.includes('language-')
+      const isBlock = hasLang || (typeof children === 'string' && children.includes('\n'))
+      if (!isBlock) return <code className="rounded bg-panel-2 px-1 py-0.5 font-mono text-[0.88em]" {...props}>{children}</code>
+      // rehypeHighlight rewrites the class to "hljs language-html", so a plain
+      // `.replace('language-','')` leaves "hljs html" and breaks artifact detection.
+      // Pull just the language token out of whatever classes are present.
+      const lang = className?.match(/language-(\S+)/)?.[1] ?? ''
+      const artifactType = isArtifactLang(lang)
+      if (artifactType) {
+        // While the message is still streaming, the artifact code is partial and
+        // re-parsed every token — rendering the live iframe makes it flicker. Show
+        // a calm placeholder; the real preview mounts once when generation finishes.
+        if (streaming) {
+          return (
+            <div className="my-2 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
+              <Loader2 size={12} className="animate-spin" />
+              Generating artifact…
+            </div>
+          )
+        }
+        return <ArtifactCard lang={lang} code={childrenToString(children).replace(/\n$/, '')} />
+      }
+      return (
+        <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
+          <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
+            <span>{lang}</span>
+            <CopyButton text={childrenToString(children)} size={12} screen="chat" />
+          </div>
+          <div className="overflow-x-auto overscroll-x-contain" onScroll={e => e.stopPropagation()}>
+            <code className={`${className ?? ''} block p-3 font-mono text-[13px] leading-relaxed whitespace-pre`} {...props}>{children}</code>
+          </div>
+        </div>
+      )
+    },
+    pre: ({ children }) => <>{children}</>,
+    // Borders/padding/font-size/weight for table cells come from the unlayered
+    // .prose-tllm table/th/td rules (index.css) — only what prose doesn't set
+    // stays here: the scroll wrapper, full width, header tint, left-aligned th
+    // (UA default centers th). td needs no override at all anymore.
+    table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full text-[13px]">{children}</table></div>,
+    th: ({ children }) => <th className="bg-panel-2 text-left">{children}</th>,
+  }), [streaming])
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
-      components={{
-        a: ({ children, href }) => (
-          // Styling comes entirely from the unlayered .prose-tllm a rules (index.css);
-          // this override exists only to force new-tab + noopener on every link.
-          <a href={href} target="_blank" rel="noopener noreferrer">{children}</a>
-        ),
-        code: ({ className, children, ...props }) => {
-          // A fenced block without a language tag has no className — detect it by
-          // checking for a trailing newline, which react-markdown always appends to
-          // block code. Inline code never contains newlines in practice.
-          const hasLang = !!className?.includes('language-')
-          const isBlock = hasLang || (typeof children === 'string' && children.includes('\n'))
-          if (!isBlock) return <code className="rounded bg-panel-2 px-1 py-0.5 font-mono text-[0.88em]" {...props}>{children}</code>
-          // rehypeHighlight rewrites the class to "hljs language-html", so a plain
-          // `.replace('language-','')` leaves "hljs html" and breaks artifact detection.
-          // Pull just the language token out of whatever classes are present.
-          const lang = className?.match(/language-(\S+)/)?.[1] ?? ''
-          const artifactType = isArtifactLang(lang)
-          if (artifactType) {
-            // While the message is still streaming, the artifact code is partial and
-            // re-parsed every token — rendering the live iframe makes it flicker. Show
-            // a calm placeholder; the real preview mounts once when generation finishes.
-            if (streaming) {
-              return (
-                <div className="my-2 flex items-center gap-2 rounded-lg border border-border bg-panel-2 px-3 py-2 text-[12px] text-muted">
-                  <Loader2 size={12} className="animate-spin" />
-                  Generating artifact…
-                </div>
-              )
-            }
-            return <ArtifactCard lang={lang} code={childrenToString(children).replace(/\n$/, '')} />
-          }
-          return (
-            <div className="relative my-2 overflow-hidden rounded-md border border-border bg-[var(--code-bg)]">
-              <div className="flex items-center justify-between border-b border-border bg-panel-2 px-3 py-1 font-mono text-[12px] text-muted">
-                <span>{lang}</span>
-                <CopyButton text={childrenToString(children)} size={12} screen="chat" />
-              </div>
-              <div className="overflow-x-auto overscroll-x-contain" onScroll={e => e.stopPropagation()}>
-                <code className={`${className ?? ''} block p-3 font-mono text-[13px] leading-relaxed whitespace-pre`} {...props}>{children}</code>
-              </div>
-            </div>
-          )
-        },
-        pre: ({ children }) => <>{children}</>,
-        // Borders/padding/font-size/weight for table cells come from the unlayered
-        // .prose-tllm table/th/td rules (index.css) — only what prose doesn't set
-        // stays here: the scroll wrapper, full width, header tint, left-aligned th
-        // (UA default centers th). td needs no override at all anymore.
-        table: ({ children }) => <div className="overflow-x-auto my-2"><table className="w-full text-[13px]">{children}</table></div>,
-        th: ({ children }) => <th className="bg-panel-2 text-left">{children}</th>,
-      }}
+      components={components}
     >
       {children}
     </ReactMarkdown>
@@ -670,7 +680,7 @@ function EditTextarea({
  *   - `daemonGenerating` — /api/v1/status reports a `liveGeneration`. That is the DAEMON's view of
  *     the world and it survives reloads, which is precisely what the local state cannot do.
  *   - `isLast` — only the newest bubble can be the one being written into (ChatScreen passes
- *     `isLast={i === arr.length - 1 && !live}`).
+ *     `isLast={i === arr.length - 1 && !live && !compactingHere}`).
  *   - the row is an UNFINALIZED placeholder — finalization always writes `totalMs`
  *     (chat-routes.ts's stats object sets it unconditionally), so its ABSENCE is the durable
  *     marker for "nothing has finalized this message yet". This is the condition that keeps a
@@ -700,6 +710,7 @@ export function MessageBubble({
   onEditCancel,
   showThinking = true,
   daemonGenerating = false,
+  compacting = false,
 }: {
   message: Message
   /** Needed for the chat-branching variant switcher (GitHub #52); optional so read-only
@@ -717,9 +728,20 @@ export function MessageBubble({
   /** GitHub #177: the DAEMON reports a generation in flight (`/api/v1/status` → `liveGeneration`).
    *  Defaults to false so every other caller (read-only share view, tests) is unchanged. */
   daemonGenerating?: boolean
+  /** A manual Compact of this chat is running: the daemon refuses a version switch and an edit's
+   *  Save until it ends (409 compaction_in_progress), so the switcher's arrows and Save are
+   *  disabled rather than left to toast that refusal. */
+  compacting?: boolean
 }) {
   const [editDraft, setEditDraft] = useState(message.content)
   const isEditing = editingId === message.id
+  // Every edit starts from the message itself. beginEdit (the pencil) resets the draft, but the
+  // composer's ArrowUp opens an edit by setting editingId directly — without this it reopened
+  // whatever was typed into an earlier, cancelled edit, ready to be sent by "Save & Resend".
+  useLayoutEffect(() => {
+    if (isEditing) setEditDraft(message.content)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isEditing])
 
   // ── Edit-box sizing: the box IS the bubble ──────────────────────────────────────
   //
@@ -846,7 +868,7 @@ export function MessageBubble({
               />
               <div className="mt-1.5 flex gap-1.5 justify-end">
                 <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
-                <Button size="sm" onClick={() => { track('chat', 'save_edited_message'); onEditSave(editDraft) }}>Save & Resend</Button>
+                <Button size="sm" disabled={compacting} onClick={() => { track('chat', 'save_edited_message'); onEditSave(editDraft) }}>Save & Resend</Button>
               </div>
             </div>
           ) : (
@@ -871,7 +893,7 @@ export function MessageBubble({
           )}
           {!isEditing && (
             <div className="flex items-center gap-0.5">
-              {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+              {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} disabled={compacting} />}
               <div className="hover-actions flex items-center gap-0.5">
                 <CopyButton text={message.content} className="rounded p-1 hover:bg-panel-2" screen="chat" />
                 {onEdit && <ActionBtn icon={<Pencil size={12} />}  label="Edit"   onClick={() => { track('chat', 'open_edit_message'); beginEdit() }} />}
@@ -940,7 +962,7 @@ export function MessageBubble({
             <Button size="sm" variant="ghost" onClick={() => { track('chat', 'cancel_edit_message'); onEditCancel() }}>Cancel</Button>
             {/* GitHub #52: unlike a user-message edit, this only fixes the reply's own
                 text in place — it doesn't resend or trigger a new generation. */}
-            <Button size="sm" onClick={() => { track('chat', 'save_edited_reply'); onEditSave(editDraft) }}>Save</Button>
+            <Button size="sm" disabled={compacting} onClick={() => { track('chat', 'save_edited_reply'); onEditSave(editDraft) }}>Save</Button>
           </div>
         </div>
       ) : hasError ? (
@@ -973,13 +995,13 @@ export function MessageBubble({
       {/* F-021: sources panel */}
       {rm && <SourcesPanel meta={rm} />}
       <div className="flex items-center gap-1.5">
-        <StatsRow stats={message.stats} />
+        <StatsRow stats={message.stats} errorShown={hasError && !isEditing} />
         {/* GitHub #52: only ever set by an explicit in-place edit, never by generation. */}
         {message.edited && <span className="text-[11px] text-faint">· Edited</span>}
       </div>
       {!isEditing && (
         <div className="mt-1 flex items-center gap-0.5">
-          {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} />}
+          {convId && message.variantGroup && <VariantSwitcher convId={convId} message={message} disabled={compacting} />}
           <div className="hover-actions flex items-center gap-0.5">
             {/* GitHub #52 (v1.7.5 fix was incomplete): Copy/Edit make no sense on a message
                 with no content to copy or edit — hasError already replaces the content area
@@ -1002,7 +1024,7 @@ export function MessageBubble({
 
 // ── Chat branching (GitHub #52): ‹ 2/3 › switcher for regenerated sibling replies ──
 
-function VariantSwitcher({ convId, message }: { convId: string; message: Message }) {
+function VariantSwitcher({ convId, message, disabled }: { convId: string; message: Message; disabled: boolean }) {
   const qc = useQueryClient()
   const group = message.variantGroup!
   const variantsQ = useQuery({
@@ -1022,6 +1044,12 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       await activateVariant(convId, targetId)
       await qc.invalidateQueries({ queryKey: ['message-variants', group] })
       await qc.invalidateQueries({ queryKey: ['conversation', convId] })
+    } catch (e) {
+      // Refused, e.g. 409 stale_message: this group left the shown branch (switched in another
+      // tab or device). Say why and catch the view up now rather than on the next poll.
+      toast.error(e instanceof ApiError ? e.message : 'Could not switch version.')
+      void qc.invalidateQueries({ queryKey: ['message-variants'] })
+      void qc.invalidateQueries({ queryKey: ['conversation', convId] })
     } finally {
       setSwitching(false)
     }
@@ -1031,7 +1059,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
     <div className="flex items-center gap-0.5 text-[11px] text-faint">
       <button
         type="button"
-        disabled={switching || index <= 0}
+        disabled={disabled || switching || index <= 0}
         onClick={() => { track('chat', 'switch_message_variant'); go(variants[index - 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Previous version"
@@ -1041,7 +1069,7 @@ function VariantSwitcher({ convId, message }: { convId: string; message: Message
       <span className="tabular-nums">{index + 1}/{variants.length}</span>
       <button
         type="button"
-        disabled={switching || index >= variants.length - 1}
+        disabled={disabled || switching || index >= variants.length - 1}
         onClick={() => { track('chat', 'switch_message_variant'); go(variants[index + 1].id) }}
         className="grid h-5 w-5 place-items-center rounded hover:bg-panel-2 disabled:pointer-events-none disabled:opacity-30"
         title="Next version"

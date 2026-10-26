@@ -18,6 +18,8 @@ import { Type, Unsafe, type TSchema } from 'typebox'
 import {
   createAgentSession,
   createBashTool,
+  createEditToolDefinition,
+  createWriteToolDefinition,
   DefaultResourceLoader,
   ModelRegistry,
   AuthStorage,
@@ -29,9 +31,11 @@ import {
   type ToolCallEventResult,
   type ToolResultEvent,
   type AgentSessionEvent,
+  type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
 import { estimateTokens, calculateContextTokens } from '@earendil-works/pi-coding-agent'
 import { createRobustBashOperations } from './robust-bash'
+import { searchToolsFor } from './search-tools'
 import type { TextContent, ToolCall as PiToolCall, Usage } from '@earendil-works/pi-ai'
 import type { Deps } from '../deps'
 import type { Message as DbMessage } from '../chat/db'
@@ -39,6 +43,8 @@ import type { ReasoningEffort } from '../chat/reasoning-effort'
 import { SkillStore, type Skill } from '../agents/skills'
 import { isContainedFromRoot } from './containment'
 import { resolveCodeUpstream } from './code-upstream'
+import { shapeLitertLmRequest } from '../engines/litert-lm-request'
+import { servingEngineKind } from '../engines/serving'
 import { buildAppendPrompt, toolsForMode, type CodeMode } from './persona'
 import {
   LOOP_ABORT_AFTER,
@@ -73,6 +79,15 @@ const ZERO_USAGE: Usage = {
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 }
 
+/** The tool calls the session's OWN model made in this message — all history replay feeds back
+ *  to it. A delegate_task/invoke_skill sub-agent's calls are stored on the same message (shown in
+ *  the transcript, revertable) but tagged `subagent` by code-run-manager.ts; replaying them would
+ *  hand the parent model the sub-agent's whole step-by-step work — exactly what delegate_task
+ *  exists to keep out of its context — as calls it never made. */
+function ownToolCalls(m: DbMessage): DbMessage['toolCalls'] {
+  return m.toolCalls.filter((tc) => !tc.subagent)
+}
+
 /** Replay this conversation's prior turns into a FRESH SessionManager as real pi session
  *  entries — not a flattened text blob — before the new turn is prompted.
  *
@@ -94,7 +109,7 @@ const ZERO_USAGE: Usage = {
  *  the index (into `messages`) of the DB message it came from — compactCodeSession uses this
  *  to translate pi's post-compaction `firstKeptEntryId` back into "which DB message is the new
  *  cut point," since a fresh SessionManager has no entries of its own to already know this. */
-function seedPriorHistory(
+export function seedPriorHistory(
   sessionManager: SessionManager,
   messages: DbMessage[],
   modelId: string,
@@ -107,15 +122,16 @@ function seedPriorHistory(
       return
     }
     // m.role === 'assistant'
+    const toolCalls = ownToolCalls(m)
     const content: (TextContent | PiToolCall)[] = []
     if (m.content.trim()) content.push({ type: 'text', text: m.content })
-    for (const tc of m.toolCalls) content.push({ type: 'toolCall', id: tc.id, name: tc.name, arguments: tc.args })
+    for (const tc of toolCalls) content.push({ type: 'toolCall', id: tc.id, name: tc.name, arguments: tc.args })
     if (content.length === 0) return // an empty/aborted turn — nothing worth replaying
     onEntry?.(sessionManager.appendMessage({
       role: 'assistant', content, api: 'openai-completions', provider: 'local', model: modelId,
       usage: ZERO_USAGE, stopReason: 'stop', timestamp,
     }), msgIndex)
-    for (const tc of m.toolCalls) {
+    for (const tc of toolCalls) {
       onEntry?.(sessionManager.appendMessage({
         role: 'toolResult', toolCallId: tc.id, toolName: tc.name,
         content: [{ type: 'text', text: tc.result ?? tc.error ?? '' }], isError: !!tc.error, timestamp,
@@ -128,12 +144,13 @@ function seedPriorHistory(
  *  own qualification logic exactly (one entry per user message; one assistant entry + one
  *  toolResult entry per tool call for a non-empty assistant turn; nothing for an empty/aborted
  *  one) — the expected count to verify seeding actually took effect against. */
-function countReplayEntries(messages: DbMessage[]): number {
+export function countReplayEntries(messages: DbMessage[]): number {
   let n = 0
   for (const m of messages) {
     if (m.role === 'user') { n++; continue }
-    if (!m.content.trim() && m.toolCalls.length === 0) continue
-    n += 1 + m.toolCalls.length
+    const toolCalls = ownToolCalls(m)
+    if (!m.content.trim() && toolCalls.length === 0) continue
+    n += 1 + toolCalls.length
   }
   return n
 }
@@ -148,7 +165,7 @@ function renderHistoryFallbackText(summaryText: string | null, messages: DbMessa
   for (const m of messages) {
     if (m.role === 'user') { parts.push(`User: ${m.content}`); continue }
     if (m.content.trim()) parts.push(`Assistant: ${m.content}`)
-    for (const tc of m.toolCalls) {
+    for (const tc of ownToolCalls(m)) {
       parts.push(`Assistant used tool ${tc.name}(${JSON.stringify(tc.args)}) → ${(tc.result ?? tc.error ?? '').slice(0, 500)}`)
     }
   }
@@ -187,6 +204,15 @@ export function resolveEffectiveHistory(d: Deps, convId: string, sessionId: stri
   const compactionIdx = all.findIndex((m) => m.id === run.compactionUpToMessageId)
   const rest = compactionIdx === -1 ? all : all.slice(compactionIdx + 1)
   return { summaryText: `${COMPACTION_PREFIX}${run.compactionSummary}${COMPACTION_SUFFIX}`, messages: rest }
+}
+
+/** One turn's prior history: resolveEffectiveHistory minus the messages that aren't history for
+ *  it (RunCodeParams.excludeFromHistory — its own user message and placeholder, and the follow-ups
+ *  still queued behind it), in DB order. */
+export function priorHistoryForTurn(d: Deps, convId: string, sessionId: string, excludeFromHistory: string[]): { summaryText: string | null; priorMessages: DbMessage[] } {
+  const { summaryText, messages } = resolveEffectiveHistory(d, convId, sessionId)
+  const excluded = new Set(excludeFromHistory)
+  return { summaryText, priorMessages: messages.filter((m) => !excluded.has(m.id)) }
 }
 
 // pi's own auto-compaction defaults (reserveTokens: 16384, keepRecentTokens: 20000 — 36384 total)
@@ -245,7 +271,7 @@ export function nearOverflowReserveTokens(contextWindow: number): number {
  *  (see keepRecentTokensFor below), not to reproduce pi's count exactly. */
 export function estimateMessageTokensRough(m: DbMessage): number {
   let chars = m.content.length
-  for (const tc of m.toolCalls) {
+  for (const tc of ownToolCalls(m)) {
     chars += tc.name.length + JSON.stringify(tc.args).length // the assistant's own toolCall block
     chars += (tc.result ?? tc.error ?? '').length // the separate toolResult entry
   }
@@ -309,6 +335,12 @@ export interface RunCodeParams {
   reasoningEffort: ReasoningEffort | undefined
   /** The user's task text (first prompt of the run). */
   task: string
+  /** DB message ids that are NOT prior history for this turn: its own user message and assistant
+   *  placeholder, plus any follow-ups still queued behind it. Their rows already exist (a user
+   *  message is stored when it is POSTed, the placeholder when its turn starts), so with two queued
+   *  follow-ups the DB reads u1 a1 u2 u3 a2 a3 — cutting at the last user message would replay u2
+   *  for u2's own turn and drop a2 from u3's. code-run-manager.ts knows the queue; pass it here. */
+  excludeFromHistory: string[]
   /** Turbo Link (ADR-376): the qualified `<machine>/<model>` id the Code picker selected,
    *  or absent for "this machine's loaded model" — every pre-Turbo-Link caller. Resolved by
    *  `resolveCodeUpstream`, which treats a non-matching id (including a local key carrying
@@ -378,6 +410,19 @@ export function foldTurnUsage(
 // read-only and never gated. bash has no path argument, so containment can't confine it —
 // the mode system is its only guard (ask = approval, plan = not in toolset, auto = unconfined).
 export const MUTATING_TOOLS = new Set(['edit', 'write', 'bash'])
+// The routine tool calls that act on one of the owner's routines with no person in the loop, so
+// ASK mode asks for them as it does for edit/write/bash: run_routine_now fires a confirmed routine
+// (a paused one too), and update_routine/delete_routine with `confirm: true` apply the change or
+// the delete. That flag is an argument the MODEL passes, not a human step: without this an
+// ask-mode session (a prompt-injected README is enough) rewrote a confirmed code routine's
+// prompt, workspacePath and permissionMode 'auto' and fired it, running bash/edit/write
+// unattended in the same session that asks before a single bash. Their previews (no `confirm:
+// true`) and list_routines change nothing and stay free; create_routine always lands in
+// pending_confirmation, which only a person arms. `input` is the validated args pi hands the tool.
+function routineActionNeedsApproval(toolName: string, input: Record<string, unknown>): boolean {
+  if (toolName === 'run_routine_now') return true
+  return (toolName === 'update_routine' || toolName === 'delete_routine') && input.confirm === true
+}
 // Tools whose path argument routes through the containment gate below (plan §3b) — not all of
 // them are actually BLOCKED by it, see WRITE_PATH_TOOLS. bash is deliberately absent — it takes
 // `command`, not `path` (see risk flag 1).
@@ -389,6 +434,24 @@ export const PATH_TOOLS = new Set(['read', 'edit', 'write', 'grep', 'find', 'ls'
 // docs while investigating is a normal, safe read. containment.ts's isContainedFromRoot is only
 // actually enforced (as a block) for entries in this set — see the shared PATH_TOOLS gate below.
 export const WRITE_PATH_TOOLS = new Set(['edit', 'write'])
+
+/** pi's own edit and write tools (the built-ins, made the same way), but run one at a time with the
+ *  other calls of the same reply. pi prepares a reply's calls in turn (each one's tool_call hook:
+ *  containment, the ask-mode approval wait, the re-check after it) and, in its default parallel
+ *  mode, runs none until all are prepared. So with two writes in one reply the first ran only after
+ *  the second one's approval wait, which can last minutes, and its re-check no longer held: a folder
+ *  swapped for a link out of the repo meanwhile took the approved write out of it. One sequential
+ *  tool makes pi run its whole batch in order, each call right after its own hook. Registered as
+ *  customTools, which replace the built-ins of the same name and obey the same allowlist (plan mode
+ *  still has neither). */
+function sequentialWriteTools(repoRoot: string): ToolDefinition[] {
+  // Widened to the plain ToolDefinition customTools takes (their typed render callbacks don't fit
+  // its `unknown` args).
+  return [
+    { ...createEditToolDefinition(repoRoot), executionMode: 'sequential' },
+    { ...createWriteToolDefinition(repoRoot), executionMode: 'sequential' },
+  ] as ToolDefinition[]
+}
 
 // ── Consecutive identical tool-call loop breaker (founder-reported) ────────────
 // The rules themselves now live in ./agent-loop-rules — they are pure string/counter logic, and
@@ -497,6 +560,17 @@ export function codeEventToFrame(ev: AgentSessionEvent, turnCounter: { index: nu
 // expiry the sub-session is aborted and whatever it produced so far is returned as an explicit
 // "did not finish" result, never a silent hang. A parent Stop aborts it immediately too (sooner).
 export const DELEGATE_SUBAGENT_TIMEOUT_MS = 5 * 60_000
+
+/** The mode an invoke_skill / delegate_task sub-agent runs in, from the turn's START mode and the
+ *  conversation's mode as the DB says now. A live switch applies to the next sub-agent, except that
+ *  'plan' is fixed for the whole run either way: a switch TO plan keeps the start mode (the run's
+ *  own toolset can't change mid-run, so this keeps an ask run's mutations gated), and a PLAN run's
+ *  sub-agents always stay in plan — that is what lets plan mode offer these tools at all
+ *  (persona.ts's PLAN_MODE_EXTENSION_TOOLS) without a sub-agent writing on its behalf. */
+export function subAgentMode(runMode: CodeMode, dbMode: CodeMode): CodeMode {
+  if (runMode === 'plan') return 'plan'
+  return dbMode === 'plan' ? runMode : dbMode
+}
 
 /** Validate the `task` argument the model passes to delegate_task. Pure/exported so the tool's
  *  input contract is unit-testable without a live pi session or a loaded model. */
@@ -655,14 +729,14 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   const authStorage = AuthStorage.inMemory()
   const modelRegistry = ModelRegistry.inMemory(authStorage)
   // Seed prior turns (see seedPriorHistory's own comment), respecting any existing manual
-  // /compact — everything up to but NOT including the current turn's user message.
+  // /compact — everything except the current turn and the turns queued behind it.
   // code-run-manager.ts's pump() has already appended both `task`'s own user message AND an
-  // empty assistant placeholder for THIS turn by the time we get here, so the current turn is
-  // excluded by cutting at the last user message, not by seq. Computed BEFORE settingsManager
-  // below (moved up from its original spot) since keepRecentTokensFor needs priorMessages.
-  const { summaryText, messages: effectiveMessages } = resolveEffectiveHistory(d, convId, sessionId)
-  const lastUserIdx = effectiveMessages.findLastIndex((m) => m.role === 'user')
-  const priorMessages = lastUserIdx > 0 ? effectiveMessages.slice(0, lastUserIdx) : []
+  // empty assistant placeholder for THIS turn by the time we get here, and queued follow-ups'
+  // user messages may sit before that placeholder — so the current turn is excluded by id
+  // (params.excludeFromHistory), not by cutting at the last user message. Computed BEFORE
+  // settingsManager below (moved up from its original spot) since keepRecentTokensFor needs
+  // priorMessages.
+  const { summaryText, priorMessages } = priorHistoryForTurn(d, convId, sessionId, params.excludeFromHistory)
   // Auto-compaction settings scaled to THIS model's real ctx (see compactionSettingsFor) — pi's
   // own hosted-model-sized defaults would otherwise make auto-compaction self-defeating here.
   // keepRecentTokens further guarded by keepRecentTokensFor — see its doc comment for the real
@@ -769,6 +843,11 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     return client
   }
 
+  // A delegate_task/invoke_skill sub-agent's tool frames go through the parent's sink so the UI
+  // shows them, tagged `subagent` so code-run-manager.ts can keep them out of the parent model's
+  // replayed history (see ownToolCalls).
+  const subagentSink: CodeSseSink = (ev) => sink({ event: ev.event, data: { ...(ev.data as Record<string, unknown>), subagent: true } })
+
   /** Runs one skill as a REAL, contained agentic sub-session — a separate pi session (its own
    *  history, not seeded with the outer conversation) but with the SAME mode-based tool access
    *  and safety boundary as the outer session: `auto`/`ask` get the default read/bash/edit/write
@@ -810,6 +889,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const skillExtension = (pi: ExtensionAPI): void => {
       pi.on('before_provider_request', async (event) => {
         releaseSkillGate()
+        // A Stop that landed before pi had an active run was a no-op abort (see the main session's
+        // identical check) — honor it now that one exists.
+        if (signal.aborted) { void skillSession.abort(); return }
         // Stays 'bg' — this is background sub-work, not the turn the user is watching — but takes
         // the same queue ceiling, so a long holder ahead of it isn't reported as a failure.
         // Not on a remote turn: the gate serializes THIS machine's single engine slot, and a
@@ -833,7 +915,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const toolName = event.toolName
         const toolCallId = event.toolCallId
         const input = event.input as Record<string, unknown>
-        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
+        await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
 
         // Only WRITE_PATH_TOOLS members (edit/write) are actually confined to repoRoot — same
         // loosened boundary as the outer session's own hook (2026-07-25).
@@ -843,22 +925,28 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           if (p !== undefined && typeof p === 'string') {
             if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(p, repoRoot)) {
               const reason = 'path is outside the allowed repo root'
-              await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+              await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
               return { block: true, reason }
             }
           } else if (pathRequired) {
             const reason = `${toolName}: a valid path is required`
-            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
         }
 
         if (skillMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
-          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
+          await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal, toolName)
           if (decision === 'deny') {
             const reason = 'denied by user'
-            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+          // Containment again after the wait, as in the outer session's hook (see there).
+          if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+            const reason = 'path is outside the allowed repo root'
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
         }
@@ -876,7 +964,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           data.patch = event.details.patch
           data.firstChangedLine = event.details.firstChangedLine
         }
-        await sink({ event: 'tool_call', data })
+        await subagentSink({ event: 'tool_call', data })
       })
     }
 
@@ -900,6 +988,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
+      // pi otherwise loads a repository's own extensions (every `<repo>/.pi/extensions/*.js`; the in-memory
+      // settings count the project as trusted) and those under agentDir into THIS process: opening a repo in Code
+      // ran its code inside the daemon, with no approval, outside every tie and guard (an extension's spawn had
+      // ppid 1 once the daemon died). Only the inline extensionFactories above still load. Same at all 5 loaders
+      // in this file; raw-spawn-guard.test.ts requires it at every `new DefaultResourceLoader(` in src.
+      noExtensions: true,
     })
     await skillResourceLoader.reload()
 
@@ -908,7 +1002,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // Same verified-kill bash tool the main session uses (see its own registration above for the
     // full root-cause writeup) — a skill sub-session runs real bash calls too and deserves the
     // same reliable Stop behavior, not just the outer session.
-    const skillBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:skill:${skill.id}` }) })
+    const skillBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:skill:${skill.id}`, sessionId }) })
     const { session: skillSession } = await createAgentSession({
       cwd: repoRoot,
       agentDir: skillAgentDir,
@@ -920,18 +1014,24 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Same ctx-scaled auto-compaction settings as the outer session (compactionSettingsFor) —
       // a skill sub-session shares the same model/contextWindow, so the same defaults apply.
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [skillBash],
+      customTools: [skillBash, ...searchToolsFor(repoRoot, skillTools), ...sequentialWriteTools(repoRoot)],
       ...(skillTools ? { tools: skillTools } : {}),
     })
 
+    // The parent's Stop aborts the skill, the same way delegate_task's sub-agent is wired — pi
+    // awaits this tool's execute, so without it the parent turn can't settle until the skill
+    // finishes on its own. (A Stop before the skill's run exists is caught by the hook above.)
+    const onParentAbort = () => { void skillSession.abort() }
+    signal.addEventListener('abort', onParentAbort, { once: true })
     try {
-      await skillSession.prompt(task)
+      if (!signal.aborted) await skillSession.prompt(task)
+      const finalText = skillSession.getLastAssistantText() ?? ''
+      return finalText.trim() || '(the skill produced no output)'
     } finally {
+      signal.removeEventListener('abort', onParentAbort)
       releaseSkillGate()
+      skillSession.dispose()
     }
-    const finalText = skillSession.getLastAssistantText() ?? ''
-    skillSession.dispose()
-    return finalText.trim() || '(the skill produced no output)'
   }
 
   /** Runs one free-form DELEGATED sub-task as a REAL, contained agentic sub-session (delegate_task
@@ -991,6 +1091,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     const subExtension = (pi: ExtensionAPI): void => {
       pi.on('before_provider_request', async (event) => {
         releaseSubGate()
+        // A Stop / timeout that landed before pi had an active run was a no-op abort (see the main
+        // session's identical check) — honor it now that one exists.
+        if (subAc.signal.aborted) { void subSession.abort(); return }
         // 'bg' priority + subAc.signal: foreground Chat preempts, and a parent Stop / timeout gives
         // up a queued wait instead of hanging (see gate.ts). The parent isn't holding the gate here
         // (it released before executing this tool), so this acquire can't deadlock against it.
@@ -1011,7 +1114,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const toolName = event.toolName
         const toolCallId = event.toolCallId
         const input = event.input as Record<string, unknown>
-        await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
+        await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'pending' } })
 
         // Only WRITE_PATH_TOOLS members (edit/write) are actually confined to repoRoot — same
         // loosened boundary as the outer session's own hook (2026-07-25).
@@ -1021,22 +1124,28 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           if (p !== undefined && typeof p === 'string') {
             if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(p, repoRoot)) {
               const reason = 'path is outside the allowed repo root'
-              await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+              await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
               return { block: true, reason }
             }
           } else if (pathRequired) {
             const reason = `${toolName}: a valid path is required`
-            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
         }
 
         if (subMode === 'ask' && MUTATING_TOOLS.has(toolName)) {
-          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal)
+          await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
+          const decision = await waitForToolApproval(`${convId}:${toolCallId}`, subAc.signal, toolName)
           if (decision === 'deny') {
             const reason = 'denied by user'
-            await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+            return { block: true, reason }
+          }
+          // Containment again after the wait, as in the outer session's hook (see there).
+          if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+            const reason = 'path is outside the allowed repo root'
+            await subagentSink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
             return { block: true, reason }
           }
         }
@@ -1054,7 +1163,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           data.patch = event.details.patch
           data.firstChangedLine = event.details.firstChangedLine
         }
-        await sink({ event: 'tool_call', data })
+        await subagentSink({ event: 'tool_call', data })
       })
     }
 
@@ -1066,23 +1175,28 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       extensionFactories: [{ name: 'turbollm-delegate', factory: subExtension }],
       // The normal mode persona (no skill catalog — a delegated sub-agent can't invoke skills),
       // plus the delegation preamble that frames it as a focused, summary-returning worker.
+      // Without the guidance for tools only the parent has (web_search/fetch_url, install_lsp,
+      // update_todos — see createAgentSession below): passing the parent's `!!d.tools` told the
+      // sub-agent to call web_search and fetch_url whenever the web tools were registered.
       appendSystemPrompt: [...buildAppendPrompt(subMode, [], {
         repoRoot,
         globalDir: d.store.dir(),
         projectCandidates: d.store.snapshot().code.agentsMdProjectCandidates,
         globalCandidates: d.store.snapshot().code.agentsMdGlobalCandidates,
-      }, !!d.tools), DELEGATED_SUBAGENT_PREAMBLE],
+      }, false, false), DELEGATED_SUBAGENT_PREAMBLE],
       noSkills: true,
       // Disables pi's own native AGENTS.md/CLAUDE.md loader — see the skill sub-session's
       // identical construction above for the full double-injection writeup.
       noContextFiles: true,
       noPromptTemplates: true,
       noThemes: true,
+      // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+      noExtensions: true,
     })
     await subResourceLoader.reload()
 
     const subTools = toolsForMode(subMode)
-    const subBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:delegate` }) })
+    const subBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: `${sessionId}:delegate`, sessionId }) })
     const { session: subSession } = await createAgentSession({
       cwd: repoRoot,
       agentDir: subAgentDir,
@@ -1092,7 +1206,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       resourceLoader: subResourceLoader,
       sessionManager: SessionManager.inMemory(repoRoot),
       settingsManager: SettingsManager.inMemory({ compaction: compactionSettingsFor(contextWindow) }),
-      customTools: [subBash],
+      customTools: [subBash, ...searchToolsFor(repoRoot, subTools), ...sequentialWriteTools(repoRoot)],
       ...(subTools ? { tools: subTools } : {}),
       // No invoke_skill / delegate_task / web / mcp / lsp tools registered → depth-1, bounded set.
     })
@@ -1187,6 +1301,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // outgoing payload (pi-coding-agent's BeforeProviderRequestEventResult contract).
     pi.on('before_provider_request', async (event) => {
       releaseGate() // defensive: never hold two
+      // A Stop / "Send now" that lands while pi has no active run (during prompt()'s own pre-flight,
+      // or between the runs of a steered/compaction continuation) reaches session.abort() as a
+      // no-op — pi's Agent.abort() only aborts an EXISTING run, and the next run gets a fresh
+      // controller. The turn's AbortController can't fire twice, so later Stops do nothing either.
+      // Every run's first step is this request, so honor the stop here (and skip the gate, whose
+      // idle fast path would grant even an aborted signal): the request then fails as aborted.
+      if (signal.aborted) { void session.abort(); return }
       // `signal` is this turn's own abort signal (Stop / connection drop) — passed through so a
       // stuck queue wait can actually be given up on. A genuinely stuck/leaked gate now rejects
       // (see gate.ts's own comment for the incident this fixed) rather than hanging the whole
@@ -1221,34 +1342,38 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // model's real remaining context, not a number fixed before this turn's prompt existed.
       delete payload.max_tokens
       delete payload.max_completion_tokens
+      // A local LiteRT-LM engine reads thinking as a top-level reasoning_effort (litert-lm-request.ts), which this hook
+      // otherwise never sent: built-in Code's thinking budget and effort never reached a .litertlm.
+      const shaped = (p: Record<string, unknown>): Record<string, unknown> =>
+        !upstream.remote && servingEngineKind(d) === 'litert-lm' ? shapeLitertLmRequest(p) : p
       if (thinkingBudget === 0) {
-        return {
+        return shaped({
           ...payload,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
-        }
+        })
       }
       // Independent of thinkingBudget above (same as chat-routes.ts's runGeneration) — only
       // set when the caller passed a value that survived parseReasoningEffort. 'off' collapses
       // onto the exact same fields as thinkingBudget===0 above (see reasoning-effort.ts).
       if (reasoningEffort === 'off') {
-        return {
+        return shaped({
           ...payload,
           thinking_budget_tokens: 0,
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), enable_thinking: false },
-        }
+        })
       }
       if (reasoningEffort) {
-        return {
+        return shaped({
           ...payload,
           ...(thinkingBudget > 0 ? { thinking_budget_tokens: thinkingBudget } : {}),
           chat_template_kwargs: { ...(payload.chat_template_kwargs as Record<string, unknown> ?? {}), reasoning_effort: reasoningEffort },
-        }
+        })
       }
       if (thinkingBudget > 0) {
-        return { ...payload, thinking_budget_tokens: thinkingBudget }
+        return shaped({ ...payload, thinking_budget_tokens: thinkingBudget })
       }
-      return payload // unlimited (default) — still stripped of the stale max_tokens ceiling
+      return shaped(payload) // unlimited (default) — still stripped of the stale max_tokens ceiling
     })
     pi.on('after_provider_response', () => { stopPrefillPoll(); releaseGate() })
 
@@ -1329,7 +1454,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // 2. Mode-based approval.
       //    auto  → containment only, no approval await (built above).
       //    plan  → mutating tools aren't in the toolset at all, so nothing reaches here to gate.
-      //    ask   → write/edit/bash get an approval gate; reads pass straight through.
+      //    ask   → write/edit/bash, MCP tools and the routine actions (routineActionNeedsApproval)
+      //            get an approval gate; reads pass straight through.
       //
       // Re-read the mode FRESH from the DB on every tool_call (a cheap single-row
       // read) instead of using the closed-over `mode` param, so a mid-run switch
@@ -1351,11 +1477,22 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // gate as edit/write/bash — see mcpToolDefs' own comment for why they're treated as
       // mutating despite not being in the hardcoded MUTATING_TOOLS set (their names are dynamic,
       // resolved per-run from whatever MCP servers are currently connected).
-      if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName))) {
+      if (liveMode === 'ask' && (MUTATING_TOOLS.has(toolName) || mcpToolNames.has(toolName) || routineActionNeedsApproval(toolName, input))) {
         await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'awaiting_approval' } })
-        const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal)
+        // With the tool's name, which the approve route (chat-routes.ts) checks as well as the
+        // toolName its caller sends: an MCP call approved as "bash" is still an MCP call.
+        const decision = await waitForToolApproval(`${convId}:${toolCallId}`, signal, toolName)
         if (decision === 'deny') {
           const reason = 'denied by user'
+          await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
+          return { block: true, reason }
+        }
+        // Containment (step 1) again, now that the user has answered. It ran before the wait, which
+        // can last minutes: a folder on the path replaced meanwhile by a link to somewhere outside
+        // the repo (by a bash the user approved, or any other local writer) would otherwise take the
+        // approved edit/write out of it.
+        if (WRITE_PATH_TOOLS.has(toolName) && !isContainedFromRoot(input.path as string | undefined, repoRoot)) {
+          const reason = 'path is outside the allowed repo root'
           await sink({ event: 'tool_call', data: { id: toolCallId, name: toolName, args: input, status: 'error', result: reason } })
           return { block: true, reason }
         }
@@ -1511,9 +1648,8 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         // Live mode — mirrors the outer tool_call hook's own resolution just above (re-read
         // fresh from the DB so a mid-run mode switch applies to the NEXT invoke_skill call too,
         // same plan-mode exception: plan's toolset is fixed at session-creation time, so a
-        // mid-run switch to/from plan only takes effect on the skill's next invocation).
-        const dbMode = (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode
-        const liveMode: CodeMode = dbMode === 'plan' ? mode : dbMode
+        // switch to/from plan only takes effect on the next run — see subAgentMode).
+        const liveMode = subAgentMode(mode, (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode)
         try {
           const text = await runSkillSubSession(liveMode, skill, params.task)
           return { content: [{ type: 'text', text }], details: {} }
@@ -1547,8 +1683,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
         const valid = validateDelegateTask(params.task)
         if (!valid.ok) return { content: [{ type: 'text', text: valid.message }], details: {} }
         // Live mode — same fresh-from-DB resolution and plan-mode exception as invoke_skill above.
-        const dbMode = (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode
-        const liveMode: CodeMode = dbMode === 'plan' ? mode : dbMode
+        const liveMode = subAgentMode(mode, (d.db.getConversation(convId)?.agentMode ?? mode) as CodeMode)
         try {
           const text = await runDelegatedSubSession(liveMode, valid.task)
           return { content: [{ type: 'text', text }], details: {} }
@@ -1637,8 +1772,9 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     // the EXACT SAME implementation chat's own tools use (ToolRegistry.executeTool) — same
     // provider config, same SSRF checks — not a second, divergent implementation. Neither is a
     // path-taking or mutating tool (not in PATH_TOOLS/MUTATING_TOOLS above), so they're never
-    // containment-checked or ask-mode-gated, in every mode including plan — researching before
-    // touching files is exactly what plan mode is for.
+    // containment-checked or ask-mode-gated. Plan mode offers web_search but not fetch_url: an
+    // unapproved GET to any URL plus an unconfined `read` is a zero-click way out for a host file
+    // (see persona.ts's PLAN_MODE_EXTENSION_TOOLS).
     if (d.tools) {
       const tools = d.tools
       pi.registerTool({
@@ -1690,7 +1826,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
           'and return the result. Useful for calculations, data transformation, and quick logic checks.',
         promptSnippet: 'run_code(code) - execute a sandboxed JS snippet and return the result',
         parameters: Type.Object({
-          code: Type.String({ description: 'JavaScript code to execute. The last expression is the return value.' }),
+          code: Type.String({ description: 'JavaScript code to execute, run as a function body: use a `return` statement for the result (e.g. `return 21 * 2`) — a bare last expression is discarded. console.log output is also captured.' }),
         }),
         async execute(toolCallId, params) {
           const text = await tools.executeTool({ id: toolCallId, name: 'run_code', args: params })
@@ -1701,10 +1837,13 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
       // Routine tools (Phase 4) — the SAME shared executor chat's ToolRegistry uses
       // (tools.executeTool), not a second implementation. Registered unconditionally like
       // web_search/fetch_url/run_code above: none of these touch the filesystem or this session's
-      // containment root, so plan mode's read-only guarantee over the workspace is unaffected, and
-      // update_routine/delete_routine's own `confirm: true` two-phase gate (routine-tools.ts)
-      // already stands in for Code's ask-mode approval. They're likewise NOT added to
-      // MUTATING_TOOLS for that reason.
+      // containment root. update_routine/delete_routine's `confirm: true` two-phase step
+      // (routine-tools.ts) is NOT a human approval: the model supplies `confirm` itself, and
+      // run_routine_now has no second step at all. So in ask mode the tool_call hook asks for
+      // run_routine_now, and for update_routine/delete_routine with confirm: true, through the
+      // same waitForToolApproval as edit/write/bash (routineActionNeedsApproval); their previews
+      // and list_routines stay free. Plan mode's allowlist (toolsForMode) keeps only
+      // list_routines — the others create, change, or start routines.
       //
       // Every call passes isCodeAuthorized = true (executeTool's 2nd arg, which FAILS CLOSED to
       // false — omitting it would leave a Code session unable to author or trigger a code-flavor
@@ -1880,12 +2019,16 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await resourceLoader.reload()
 
   // Plan mode's real safety mechanism (plan §3c): mutating tools are simply not in the toolset,
-  // so there is nothing for the tool_call hook to block. auto/ask use pi's default tool set
-  // (read/bash/edit/write) — toolsForMode returns undefined so `tools` is omitted below.
+  // so there is nothing for the tool_call hook to block. The allowlist covers the extension tools
+  // registered above too — only the read-only ones are on it (persona.ts's
+  // PLAN_MODE_EXTENSION_TOOLS). auto/ask use pi's default tool set (read/bash/edit/write) plus
+  // every registered tool — toolsForMode returns undefined so `tools` is omitted below.
   const tools = toolsForMode(mode)
 
   // Stop-button reliability (founder-reported gap, 2026-07-17): a customTool with the same name
@@ -1898,7 +2041,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // live, repeated, timed testing): pi's own bash tool already wires abort correctly, but its
   // Windows kill (taskkill /F /T against a Git-Bash-rooted process tree) intermittently fails to
   // actually kill the spawned process — this swaps in a verified, escalating kill instead.
-  const robustBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: sessionId }) })
+  const robustBash = createBashTool(repoRoot, { operations: createRobustBashOperations({ sessionLabel: sessionId, sessionId }) })
 
   const { session } = await createAgentSession({
     cwd: repoRoot,
@@ -1909,7 +2052,7 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
     resourceLoader,
     sessionManager,
     settingsManager,
-    customTools: [robustBash],
+    customTools: [robustBash, ...searchToolsFor(repoRoot, tools), ...sequentialWriteTools(repoRoot)],
     ...(tools ? { tools } : {}),
   })
 
@@ -1958,8 +2101,12 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   // and the one accumulating assistant message captures it all. Guarded on isStreaming: if the
   // turn has already settled by the time a steer lands (a race — it just finished), return false
   // so the manager falls back to follow-up/queue instead of dropping it into a dead session.
+  // Guarded on `aborted` too: a stopped run (the user's Stop, or this run's own loop breaker and
+  // near-overflow stop, which abort pi directly and never fire the manager's signal) is still
+  // streaming while it winds down, and pi would drain the steer into a round whose model request
+  // is already aborted — stored, never answered. Declined, it runs as the next turn instead.
   const steerHandle: SteerHandle = async (text) => {
-    if (!session.isStreaming) return false
+    if (aborted || !session.isStreaming) return false
     await session.steer(text)
     return true
   }
@@ -1969,8 +2116,10 @@ export async function runCodeSession(params: RunCodeParams): Promise<RunCodeResu
   turnStartedAt = Date.now()
   try {
     // Not-streaming prompt: resolves after the whole agentic loop settles (mirrors pi's own
-    // print mode), including any steered continuation folded in via steerHandle above.
-    await session.prompt(task)
+    // print mode), including any steered continuation folded in via steerHandle above. Skipped
+    // when a Stop already landed during the setup above (onAbort's session.abort() had no run to
+    // abort then — see the before_provider_request hook).
+    if (!signal.aborted) await session.prompt(task)
   } finally {
     params.onSteerable?.(null)
     stopPrefillPoll() // belt-and-suspenders: never leak the /slots timer past the turn (incl. abort)
@@ -2129,6 +2278,8 @@ export async function compactCodeSession(params: CompactCodeParams): Promise<Com
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await compactResourceLoader.reload()
 
@@ -2286,6 +2437,8 @@ export async function lookbackPreCompactionHistory(params: LookbackParams): Prom
     noContextFiles: true,
     noPromptTemplates: true,
     noThemes: true,
+    // No repository or agentDir extensions in the daemon: see the skill sub-session's loader above.
+    noExtensions: true,
   })
   await lookbackResourceLoader.reload()
 

@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { getAdvertisedHost, getLanIp } from './net'
+import { getAdvertisedHost, getLanIp, parseListenAddr } from './net'
 
 // TURBOLLM_ADVERTISED_HOST exists for the one case auto-detection provably cannot solve:
 // TurboLLM running INSIDE a Docker container, where the only non-internal IPv4 interface
@@ -73,4 +73,35 @@ test('getLanIp stays pure — the override never leaks into it', () => {
   const without = withAdvertisedHost(undefined, getLanIp)
   assert.equal(withOverride, without)
   assert.notEqual(withOverride, '203.0.113.7')
+})
+
+// --addr was split on its last colon: `[::1]:6996` bound the hostname `[::1]` (no lookup resolves
+// it: the daemon exited), `::1` became the host `:` with port 1, and `0.0.0.0` (no port) bound
+// `0.0.0.`. The host comes back bare, as serve() binds it.
+test('parseListenAddr: IPv6 with or without brackets, a host without a port, and the old forms', () => {
+  const cases: [string, string, number][] = [
+    ['127.0.0.1:6996', '127.0.0.1', 6996],
+    ['0.0.0.0:7000', '0.0.0.0', 7000],
+    ['localhost:7000', 'localhost', 7000],
+    [':7000', '127.0.0.1', 7000],
+    ['0.0.0.0', '0.0.0.0', 6996],
+    ['127.0.0.1:junk', '127.0.0.1', 6996],
+    ['[::1]:7000', '::1', 7000],
+    ['[::1]', '::1', 6996],
+    ['[::]:7000', '::', 7000],
+    ['[]:7000', '127.0.0.1', 7000],
+    ['::1:7000', '::1', 7000], // what bound as ::1 port 7000 before still does
+    ['::1', '::1', 6996],
+    ['::', '::', 6996],
+    ['fe80::1', 'fe80::1', 6996],
+    ['2001:db8::1', '2001:db8::1', 6996],
+    // A last group with a hex letter or a dot is part of the address, never a port: these became
+    // fd00::abc, fe80::1 and ::ffff, other addresses, on 6996.
+    ['fd00::abc:def', 'fd00::abc:def', 6996],
+    ['fe80::1:abcd', 'fe80::1:abcd', 6996],
+    ['::ffff:127.0.0.1', '::ffff:127.0.0.1', 6996],
+    ['::ffff:127.0.0.1:7000', '::ffff:127.0.0.1', 7000],
+    ['[fd00::abc:def]:7000', 'fd00::abc:def', 7000],
+  ]
+  for (const [addr, host, port] of cases) assert.deepEqual(parseListenAddr(addr), { host, port }, addr)
 })

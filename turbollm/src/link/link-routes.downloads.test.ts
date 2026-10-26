@@ -240,6 +240,22 @@ test('a body that is not JSON at all is a 400, not a 500', async () => {
   assert.deepEqual(h.enqueued, [])
 })
 
+// A body of null threw at the first field read: a bare 500 from Hono's default handler.
+test('a JSON body that is not an object is the malformed-request 400, not a 500', async () => {
+  const h = mkDeps([key('tllm-a', ['downloads:write'])], [])
+  const a = app(h.d)
+  for (const body of ['null', '5', '"Qwen/Qwen3-35B-GGUF"', '[]']) {
+    const res = await a.request('/api/link/v1/downloads', {
+      method: 'POST',
+      headers: { 'X-TurboLLM-Auth': 'tllm-a', 'content-type': 'application/json' },
+      body,
+    })
+    assert.equal(res.status, 400, `${body}: ${await res.clone().text()}`)
+    assert.equal((await res.json() as { error: { code: string } }).error.code, 'invalid_request')
+  }
+  assert.deepEqual(h.enqueued, [])
+})
+
 test('a DownloadError from the host surfaces with its own code and status', async () => {
   const h = mkDeps(
     [key('tllm-a', ['downloads:write'])], [],

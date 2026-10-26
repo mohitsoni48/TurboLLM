@@ -159,6 +159,25 @@ test('handleIngest: a rate-limited caller is turned away', async () => {
   assert.equal(stored, false)
 })
 
+test('handleIngest: quarantine-bound events are counted for the rate limiter, and a limited caller quarantines nothing', async () => {
+  // Each quarantined row is a D1 write. Uncounted, a batch of 500 junk events cost the IP tier 1.
+  const charged: { accepted: number; quarantined: number }[] = []
+  let quarantineCalled = false
+  const res = await handleIngest(
+    post([validEvent(), validEvent({ prompt: 'x' }), validEvent({ prompt: 'y' }), validEvent({ prompt: 'z' })]),
+    deps({
+      rateLimit: async (_req, events, quarantined) => {
+        charged.push({ accepted: events.length, quarantined })
+        return false
+      },
+      quarantine: async () => void (quarantineCalled = true),
+    }),
+  )
+  assert.deepEqual(charged, [{ accepted: 1, quarantined: 3 }])
+  assert.equal(res.status, 429)
+  assert.equal(quarantineCalled, false)
+})
+
 test('handleIngest: the consent ping is accepted despite carrying no machineId', async () => {
   const stored: unknown[][] = []
   const res = await handleIngest(

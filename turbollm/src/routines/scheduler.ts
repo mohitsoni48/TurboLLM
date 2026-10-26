@@ -71,11 +71,18 @@ export class RoutineScheduler {
    *  release the guard for the exact run that parked it — see `RoutineSchedulerDeps.runRoutine`'s
    *  doc comment for the double-fire regression this closes. */
   private parked = new Map<string, string>()
+  /** routineId -> how many Approve calls are resuming its parked run right now
+   *  (routine-routes.ts, around resumeRoutineRun). A resumed run runs the approved call and the
+   *  rest of the run on the engine while it is still `parked` (the guard goes only once it has
+   *  settled), so runningRoutineIds counts it again meanwhile. A count: a second answer can race
+   *  the first, and the first to finish must not drop the other's mark. */
+  private resuming = new Map<string, number>()
 
   constructor(private deps: RoutineSchedulerDeps) {}
 
   start(): void {
     if (this.timer) return
+    this.reconcileInterruptedRuns()
     this.reconcileParkedRuns()
     this.reconcileMissedRuns()
     this.timer = setInterval(() => void this.tick(), this.deps.tickIntervalMs ?? DEFAULT_TICK_INTERVAL_MS)
@@ -87,9 +94,38 @@ export class RoutineScheduler {
   }
 
   /** Routines whose run is executing right now: `inFlight` minus runs parked awaiting an
-   *  approval, which wait on the user, not the engine (ADR-434 (i)(3)'s active-work probe). */
+   *  approval, which wait on the user, not the engine (ADR-434 (i)(3)'s active-work probe), plus
+   *  parked runs an Approve is resuming (markResuming), which run on the engine again. */
   runningRoutineIds(): string[] {
-    return [...this.inFlight].filter((routineId) => !this.parked.has(routineId))
+    const executing = [...this.inFlight].filter((routineId) => !this.parked.has(routineId))
+    return [...new Set([...executing, ...this.resuming.keys()])]
+  }
+
+  /** Called by the Approve route as it resumes `routineId`'s parked run; unmarkResuming
+   *  once that call has returned or thrown. Until then the run is listed as running. */
+  markResuming(routineId: string): void {
+    this.resuming.set(routineId, (this.resuming.get(routineId) ?? 0) + 1)
+  }
+
+  unmarkResuming(routineId: string): void {
+    const left = (this.resuming.get(routineId) ?? 1) - 1
+    if (left > 0) this.resuming.set(routineId, left)
+    else this.resuming.delete(routineId)
+  }
+
+  /** Runs first at start(): a row still 'running' in the DB was cut off by a daemon restart or
+   *  quit — a fire mid-execution, or resumeRoutineRun's claim on an approval — and nothing will
+   *  ever finish it, so it would show "running" forever. Closed as 'errored', the same way
+   *  sweepInteractiveCliRuns closes a parked interactive run whose terminal the restart killed.
+   *  Never re-executed: an approved action may already have run before the restart. Skips a
+   *  routine already in `inFlight` for the same reason reconcileParkedRuns does (N1, below) —
+   *  a no-op at a genuine cold start. */
+  private reconcileInterruptedRuns(): void {
+    const endedAt = this.deps.now().toISOString()
+    for (const run of this.deps.store.listRunningRoutineRuns()) {
+      if (this.inFlight.has(run.routineId)) continue
+      this.deps.store.updateRoutineRun(run.id, { status: 'errored', error: 'Interrupted: the daemon restarted before this run finished.', endedAt })
+    }
   }
 
   /** Runs once at start(), BEFORE reconcileMissedRuns(): the parked guard (`inFlight`/`parked`)

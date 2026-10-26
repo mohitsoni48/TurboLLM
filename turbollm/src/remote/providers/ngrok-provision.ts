@@ -22,6 +22,7 @@
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { downloadFile, extractArchive, findFile, type ProvisionProgress } from '../../engines/download'
+import { provisionOnce } from '../../tunnel/provision'
 
 const EQUINOX_BASE = 'https://bin.equinox.io/c/bNyj1mQVY4c'
 
@@ -61,16 +62,32 @@ export interface NgrokRuntime {
 /**
  * Provision ngrok: cache-check first (a prior successful provision is reused as-is), then
  * resolve the asset URL for this OS/arch, download it, extract it, locate the binary inside,
- * and (POSIX) mark it executable — the same pipeline as ensureCloudflared.
+ * and (POSIX) mark it executable — the same pipeline as ensureCloudflared. Concurrent
+ * first-time calls share one download (provisionOnce): two would share the archive path, and
+ * one's cleanup below would delete the other's extracted binary.
  */
 export async function ensureNgrok(
   dataDir: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
 ): Promise<NgrokRuntime> {
-  const dir = ngrokDir(dataDir)
   const binPath = ngrokBinPath(dataDir)
-  if (existsSync(binPath)) return { binPath } // cache-check first, same as ensureCloudflared
+  // The cache check runs inside provisionOnce, never ahead of it: the archive is extracted
+  // straight into ngrokDir (tar, or Expand-Archive on Windows), so binPath exists while a
+  // provision is still writing it. Checked ahead, a Stop then Start in that window got the
+  // half-written binary back at once, and its spawn failed (ETXTBSY on Linux). Checked here,
+  // that call joins the running provision and gets the binary once it is complete.
+  return provisionOnce(binPath, async () =>
+    existsSync(binPath) ? { binPath } : provisionNgrok(dataDir, onProgress, signal),
+  )
+}
+
+async function provisionNgrok(
+  dataDir: string,
+  onProgress?: (p: ProvisionProgress) => void,
+  signal?: AbortSignal,
+): Promise<NgrokRuntime> {
+  const dir = ngrokDir(dataDir)
 
   const url = ngrokAssetUrl()
   if (!url) throw new Error(`ngrok publishes no build for ${process.platform}/${process.arch}`)

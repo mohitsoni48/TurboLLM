@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  BUNDLED_ENGINE_TITLES,
   customSourceIsLive,
   customSourceKey,
   engineGroupKey,
@@ -53,6 +54,26 @@ test('groupLabel reads Laya engines as "Laya", same as any other pip engine grou
   const laya = eng({ id: 'ly', kind: 'laya' })
   const groups = groupEngines([laya])
   assert.equal(groups[0].label, 'Laya')
+})
+
+// The Android app's own engines are user-added groups, whose label was the registered name: the selector read
+// "litert-lm-android", and the selector is where an engine is picked.
+test('groupLabel reads the Android app\'s own engines by name, not by their registered names', () => {
+  const groups = groupEngines([
+    eng({ id: 'a1', name: 'llama-server-android', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server.so' }),
+    eng({ id: 'a2', name: 'llama-server-android-vulkan', kind: 'llama-server', binPath: '/data/app/lib/arm64/libllama_server_vk.so' }),
+    eng({ id: 'a3', name: 'litert-lm-android', kind: 'litert-lm', binPath: '/data/app/lib/arm64/liblitertlm_server.so' }),
+  ])
+  assert.deepEqual(groups.map((g) => g.label), ['llama.cpp (CPU)', 'llama.cpp (Vulkan GPU)', 'LiteRT-LM'])
+  // Any other user-added engine still reads as its own name.
+  assert.equal(groupEngines([userFork])[0].label, 'My Fork')
+})
+
+test('BUNDLED_ENGINE_TITLES knows only the Android app\'s engines, not names Object.prototype holds', () => {
+  for (const name of ['constructor', 'toString', 'hasOwnProperty', '__proto__']) {
+    assert.equal(BUNDLED_ENGINE_TITLES[name], undefined, name)
+  }
+  assert.equal(BUNDLED_ENGINE_TITLES['litert-lm-android']?.label, 'LiteRT-LM')
 })
 
 test('engineGroupKey detects TurboQuant by path', () => {
@@ -151,6 +172,20 @@ test('customSourceKey: matches the backend registry.ts test vectors byte-for-byt
     customSourceKey({ binPath: 'x', sourceRepo: 'r', sourceBranch: 'main', sourceCommit: 'abc' }),
   )
   assert.equal(customSourceKey({ binPath: '/opt/my-server' }), '/opt/my-server')
+})
+
+test('customSourceKey: a repo URL ending ".git/" keys like the daemon (slashes stripped before ".git")', () => {
+  // Exact daemon output (registry.ts customSourceKey → build-runner.ts normRepoUrl) for this input;
+  // the web used to strip ".git" first and produce "ikawrakow/ik_llama.cpp.git#main#", so "Forget"
+  // on an engine built from such a URL silently matched nothing.
+  assert.equal(
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp.git/', sourceBranch: 'main' }),
+    'ikawrakow/ik_llama.cpp#main#',
+  )
+  assert.equal(
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/user/fork.git//', sourceBranch: '' }),
+    customSourceKey({ binPath: 'x', sourceRepo: 'https://github.com/user/fork', sourceBranch: '' }),
+  )
 })
 
 test('customSourceIsLive: true when a live engine shares the same identity, false otherwise', () => {

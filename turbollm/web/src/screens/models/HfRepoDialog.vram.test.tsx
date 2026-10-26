@@ -126,3 +126,31 @@ describe('HfRepoContent — multi-GPU VRAM', () => {
     expect(screen.getByText(`${fitsLabel} (20.0 GB total · 32 GB VRAM)`)).toBeInTheDocument()
   })
 })
+
+describe('HfRepoContent — a quant the user picked', () => {
+  it('survives the repo detail refreshing (the verifying poll settling)', async () => {
+    const user = userEvent.setup()
+    state.detail = { ...state.detail, verifying: true }
+    const view = renderContent()
+    await user.click(screen.getByRole('button', { name: /Q4_K_M/ }))
+    await user.click(screen.getByRole('menuitem', { name: /Q2_K/ }))
+    // A fresh detail object: verification finished and flipped one badge.
+    state.detail = {
+      ...state.detail,
+      verifying: false,
+      files: state.detail.files.map((f) => (f.quant === 'Q8_0' ? { ...f, downloaded: true, localKey: 'k' } : f)),
+    }
+    view.rerender(<HfRepoContent repo="owner/model" onClose={vi.fn()} />)
+    expect(screen.getByRole('button', { name: /Q2_K/ })).toBeInTheDocument()
+  })
+
+  it('does not carry over to a different repo', async () => {
+    const user = userEvent.setup()
+    const view = renderContent()
+    await user.click(screen.getByRole('button', { name: /Q4_K_M/ }))
+    await user.click(screen.getByRole('menuitem', { name: /Q2_K/ }))
+    state.detail = { ...state.detail, repo: 'owner/other' }
+    view.rerender(<HfRepoContent repo="owner/other" onClose={vi.fn()} />)
+    expect(screen.getByRole('button', { name: /Q4_K_M/ })).toBeInTheDocument()
+  })
+})

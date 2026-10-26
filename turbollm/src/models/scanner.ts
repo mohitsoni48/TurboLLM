@@ -8,7 +8,7 @@ import { GgufError, type GgufMeta, parseGguf, quantFromName } from '../gguf/gguf
 import { CoalescedRunner } from '../util/coalesced-runner'
 import { detectJev, type JevInfo } from './jev'
 import { isLayaModelDir, layaEntryFor, type LayaInfo } from './laya'
-import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmNativeCtxFromFile } from './litertlm'
+import { hasLitertlmMagic, isLitertlmFileName, litertlmEntryFor, litertlmHeaderFromFile, type LitertlmSampler } from './litertlm'
 
 export interface ModelEntry {
   key: string
@@ -21,6 +21,12 @@ export interface ModelEntry {
   arch: string
   quant: string
   nativeCtx: number
+  /** LiteRT-LM only: `nativeCtx` is a dynamic export's maximum (its KV length is a magic number), not a size its
+   *  caches hold (models/litertlm.ts). Absent elsewhere. */
+  ctxDynamic?: boolean
+  /** LiteRT-LM only: the bundle's own default context (LlmMetadata.max_num_tokens), what its runtime uses when TurboLLM
+   *  passes none. Absent when the bundle declares none (the runtime then uses 4096). */
+  defaultCtx?: number
   blockCount: number
   headCountKv: number
   /** Real per-head dimension (GgufMeta.headDim) — 0 when the GGUF doesn't declare
@@ -65,6 +71,18 @@ export interface ModelEntry {
    *  tower/encoder, e.g. gemma4's Conformer audio module). GGUF detection isn't
    *  implemented (no observed need yet) — always false there. */
   audio: boolean
+  /** LiteRT-LM only: whether the bundle's model calls tools (its LlmMetadata, models/litertlm.ts
+   *  llmMetadataToolCalls). false: its chat template never shows the model a request's tools, so TurboLLM sends it
+   *  none and says so. Absent elsewhere, and when the header says nothing: the engine decides, as for any model. */
+  toolCalls?: boolean
+  /** LiteRT-LM only: the bundle's own sampler (LlmMetadata.sampler_params, models/litertlm.ts llmMetadataSampler), what
+   *  its runtime samples with while a request sets no sampling. Absent when it declares none (on CPU and GPU the
+   *  runtime then decodes greedily: top_k 1). */
+  sampler?: LitertlmSampler
+  /** LiteRT-LM only: whether the bundle's chat template reads a model's past reasoning (a message's
+   *  reasoning_content; models/litertlm.ts llmMetadataReasoningHistory). false: the model sees none of it, so a
+   *  thread's "Preserve thinking" cannot apply, and the thread settings say so. Absent when the header says nothing. */
+  reasoningHistory?: boolean
   mmprojPath: string | null
   /** On-disk size of the mmproj file, bytes (0 when `mmprojPath` is null). Used to size
    *  the vision projector's VRAM contribution instead of a flat guess. */
@@ -113,7 +131,9 @@ interface CacheRow {
 // 6: reasoningEffort (Qwen3.8's low/medium/xhigh chat-template reasoning-depth control) —
 // a row cached by an older build predates the field and would otherwise replay `false`
 // forever for a model that genuinely supports it.
-const CACHE_VERSION = 6
+// 7: dataEnd (the length a GGUF needs to hold its tensors) — a row cached by an older build
+// predates it, so a file already cut short when it was scanned would keep reading complete.
+const CACHE_VERSION = 7
 
 /** Optional attention-layout metadata the GGUF parser surfaces (ADR-223).
  *
@@ -382,7 +402,7 @@ export class Scanner {
     const mlx = scan.mlxDirs.map((dir) => mlxEntryFor(dir))
     const laya = scan.layaDirs.map((dir) => layaEntryFor(dir))
     const litertlm = await Promise.all(scan.litertlms.map(async (f) =>
-      litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmNativeCtxFromFile(f.path))))
+      litertlmEntryFor(f.path, dirname(f.path), f.size, f.mtime, await litertlmHeaderFromFile(f.path))))
     this.entries = [...gguf, ...mlx, ...laya, ...litertlm].sort((a, b) => a.name.localeCompare(b.name))
     this.lastScanAt = new Date().toISOString()
     this.saveCache()
@@ -433,7 +453,7 @@ export class Scanner {
 
       for (const f of singles) {
         const mmproj = resolveMmproj(f, mmprojFiles)
-        entries.push(await this.entryFor(f.path, f.size, f.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, false))
+        entries.push(await this.entryFor(f.path, f.size, f.size, f.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, false))
         await tick()
       }
       for (const { shards, total } of splits.values()) {
@@ -457,7 +477,7 @@ export class Scanner {
             }
         }
         const mmproj = resolveMmproj(first, mmprojFiles)
-        entries.push(await this.entryFor(first.path, totalSize, first.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, incomplete))
+        entries.push(await this.entryFor(first.path, totalSize, first.size, first.mtime, dir, mmproj?.path ?? null, mmproj?.size ?? 0, incomplete))
         await tick()
       }
     }
@@ -468,6 +488,8 @@ export class Scanner {
   private async entryFor(
     path: string,
     sizeBytes: number,
+    /** The size of `path` itself: `sizeBytes` is a split's total. */
+    fileBytes: number,
     mtimeMs: number,
     dir: string,
     mmprojPath: string | null,
@@ -488,6 +510,13 @@ export class Scanner {
         parseError = e instanceof GgufError ? e.message : (e as Error).message
       }
     }
+
+    // A GGUF whose tensors' data runs past its end is cut short (a download that stopped early
+    // with no length to check it against, a copy that did not finish): flagged like a split with
+    // a missing part, so the Library shows it and nothing tries to load it, where it listed as
+    // complete and failed only at load ("tensor '…' data is not within the file bounds"). Only
+    // the parsed file is checked: for a split, the first shard.
+    const cutShort = !!meta && meta.dataEnd > fileBytes
 
     const fileName = basename(path)
     // Filename wins over the GGUF's own `general.file_type` when it parses (issue: Q2/IQ2 dynamic
@@ -553,7 +582,7 @@ export class Scanner {
       hasChatTemplate: meta?.hasChatTemplate ?? false,
       reasoningEffort: meta?.reasoningEffort ?? false,
       embedding: isEmbeddingModel(arch, fileName),
-      incomplete,
+      incomplete: incomplete || cutShort,
       parseError,
       loaded: false, // overlaid live by the API layer
       hasProfile: false, // overlaid live by the API layer

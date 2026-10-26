@@ -1,6 +1,6 @@
-// Which engine is serving the loaded model. Not the same as `registry.active()` since `.litertlm` models load on the
-// LiteRT-LM engine whichever engine is active (engineForModel): with llama-server active, a LiteRT-LM model is served
-// by LiteRT-LM, and every request has to be shaped for LiteRT-LM (the model path in `model`, max_completion_tokens).
+// Which engine is serving the loaded model. Not always `registry.active()`: an engine install or Enable activates
+// another engine without stopping the model, which goes on running on the engine it was loaded on, and every request
+// has to be shaped for that engine (for LiteRT-LM, the model path in `model` and max_completion_tokens).
 import type { Engine } from '../config/config'
 import type { Deps } from '../deps'
 
@@ -22,7 +22,7 @@ type EngineUseDeps = {
 }
 
 /** True when stopping or replacing `engineId` would pull the engine out from under a loaded model: it is the active
- *  engine, the one the primary model runs on (a .litertlm model on LiteRT-LM while llama.cpp is active), or the
+ *  engine, the one the primary model runs on (an install or Enable that activated another left it running), or the
  *  engine of an extra pool slot. */
 export function engineInUse(d: EngineUseDeps, engineId: string): boolean {
   return d.registry.active()?.id === engineId || d.manager.currentOpts()?.engine.id === engineId ||

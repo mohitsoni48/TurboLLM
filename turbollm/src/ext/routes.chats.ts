@@ -12,7 +12,7 @@ import type { Scope } from '../chat/store/types.js'
 import { extAuth, requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError, requestId as makeRequestId } from './errors.js'
 import { parseInclude, toChatDTO, toMessageDTO } from './dto.js'
-import { IdempotencyStore } from './idempotency.js'
+import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 import {
   TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   MAX_BODY_BYTES, MAX_ATTACHMENTS,
@@ -58,6 +58,43 @@ export interface ExtRouteDeps {
 function hasActiveRun(runs: PublicRunManager | undefined, scope: Scope, chatId: string): boolean {
   if (!runs) return false
   return runs.isChatActive(scope, chatId)
+}
+
+/** ISO 8601 extended format: `YYYY`, `YYYY-MM` or `YYYY-MM-DD`, and after a full date optionally
+ *  `THH:mm[:ss[.fraction]]` with `Z` or `±HH:mm`. `t` and `z` may be lowercase, as RFC 3339 allows.
+ *  The offset's sign may also be a space (group 4): a query string decodes a raw `+` to a space,
+ *  so the documented `since=2026-10-15T12:00:00+02:00`, typed as is into curl or a URL, arrives as
+ *  `...T12:00:00 02:00` and was refused with 400. A space can stand only for that `+` there. */
+const ISO_8601 = /^(\d{4})(?:-(\d{2})(?:-(\d{2})(?:T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|([+ -])\d{2}:\d{2})?)?)?)?$/i
+
+/** GET /audit's `since` as epoch ms, or NaN when it is not in the ISO 8601 extended format above.
+ *  A bare Date.parse also takes V8's legacy formats: `since=1` or `since=foo 1` read as 2001-01-01
+ *  and returned every row from 2001 on instead of the documented 400. The form is checked first,
+ *  and Date.parse then reads it as before (a date-time with neither Z nor an offset in local time),
+ *  upper-cased so a lowercase `t`/`z` takes the standard path too. Date.parse rolls an impossible
+ *  day over ('2026-02-30' is 2 March), so the day is checked as well; setUTCFullYear, unlike
+ *  Date.UTC, keeps years 0-99 as they are. */
+function parseIsoInstant(v: string): number {
+  const m = ISO_8601.exec(v)
+  if (!m) return NaN
+  if (m[3] !== undefined) {
+    const d = new Date(0)
+    d.setUTCFullYear(Number(m[1]), Number(m[2]) - 1, Number(m[3]))
+    if (d.getUTCDate() !== Number(m[3])) return NaN
+  }
+  // The only space the pattern lets through is that offset sign.
+  return Date.parse((m[4] === ' ' ? v.replace(' ', '+') : v).toUpperCase())
+}
+
+/** A list route's `limit`: undefined when absent or empty (the store's default), NaN when it is
+ *  not an integer. It went to the store as a bare Number(...), so `limit=1.5` reached SQLite's
+ *  LIMIT as 2.5 (one row is added to look ahead), which it refuses with a datatype mismatch: a
+ *  bare 500 internal. 'abc' silently became the default page size. The range is left to the store
+ *  (the built-in one clamps to 1-200; an adapter applies its own bounds), as before. */
+function pageLimit(v: string | undefined): number | undefined {
+  if (!v) return undefined
+  const n = Number(v)
+  return Number.isInteger(n) ? n : NaN
 }
 
 /** `ext` is optional so every pre-existing test/caller that constructs this route set without
@@ -143,10 +180,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
   }))
 
   app.get(`${BASE}/chats`, requireScope('chats:read'), async (c) => {
+    const limit = pageLimit(c.req.query('limit'))
+    if (Number.isNaN(limit)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`limit` must be an integer.', { param: 'limit' })
+    }
     try {
       const page = await d.chatStore.listChats(scopeFor(c, c.req.query('owner')), {
         cursor: c.req.query('cursor'),
-        limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        limit,
         q: c.req.query('q'),
       })
       return c.json({ data: page.data.map(toChatDTO), has_more: page.hasMore, next_cursor: page.nextCursor })
@@ -176,6 +217,8 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     // the SAME scope, so they can never disagree about which owner this request is for.
     const scope = scopeFor(c, b.owner)
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+    // The fields createChat receives — what makes a retry "the same request" (idempotency.ts).
+    const fingerprint = idempotencyKey ? requestFingerprint([b.title, b.model, b.system_prompt, b.sampling, b.metadata]) : ''
 
     // Idempotent replay (spec §7.6): a cached key means THIS chat was already created by an
     // earlier attempt of the same request — return that frozen result rather than creating a
@@ -185,13 +228,19 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     // owner reusing the same Idempotency-Key value would replay THIS owner's chat verbatim,
     // private metadata included (live-reproduced in the review this fixes).
     if (idempotencyKey) {
-      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as { id?: string } | null
+      const cached = idempotency.lookup(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey) as { dto: { id?: string }; fingerprint: string } | null
       if (cached) {
+        // Same key, different body: a different request, never a replay of this one.
+        if (cached.fingerprint !== fingerprint) {
+          return extError(c, 'conflict', 'idempotency_key_reused',
+            'This Idempotency-Key was already used for a different request. Use a new Idempotency-Key for a new chat.',
+            { status: 409, retryable: false })
+        }
         // Route has no `:id` param to fall back on (this is POST /chats) — without this, the
         // audit row for a replay would carry a null targetId even though the real chat id is
         // sitting right here in the cached DTO.
-        if (cached.id) c.set('auditTargetId', cached.id)
-        return c.json(cached, 201)
+        if (cached.dto.id) c.set('auditTargetId', cached.dto.id)
+        return c.json(cached.dto, 201)
       }
     }
 
@@ -210,7 +259,7 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
       // concurrent retries still can't both observe a miss (the second's `createChat` may still
       // create a duplicate chat under a true race — see idempotency.ts's own residual-window
       // note — but a SEQUENTIAL retry, the actual reported failure mode, is fully covered).
-      if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, dto)
+      if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { dto, fingerprint })
       return c.json(dto, 201)
     } catch (e) {
       const m = mapStoreError(e)
@@ -274,10 +323,14 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
 
   app.get(`${BASE}/chats/:id/messages`, requireScope('chats:read'), async (c) => {
     const include = parseInclude(c.req.query('include'))
+    const limit = pageLimit(c.req.query('limit'))
+    if (Number.isNaN(limit)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`limit` must be an integer.', { param: 'limit' })
+    }
     try {
       const page = await d.chatStore.listMessages(scopeFor(c, c.req.query('owner')), c.req.param('id'), {
         cursor: c.req.query('cursor'),
-        limit: c.req.query('limit') ? Number(c.req.query('limit')) : undefined,
+        limit,
       })
       return c.json({ data: page.data.map((m) => toMessageDTO(m, include)), has_more: page.hasMore, next_cursor: page.nextCursor })
     } catch (e) {
@@ -399,11 +452,17 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     const fwdHeaders = new Headers(c.req.raw.headers)
     fwdHeaders.set('X-Request-Id', c.get('requestId'))
     fwdHeaders.set(INTERNAL_FORWARD_HEADER, internalForwardToken)
-    const fwdRes = await app.fetch(new Request(new URL(`${BASE}/chats/${c.req.param('id')}/messages/generate`, c.req.url), {
+    // The forward re-enters lanAuth, which judges a request by the socket it arrived on (auth.ts's
+    // isTunneled, isLoopback). With no bindings it has none, and while remote access is up
+    // isTunneled reads that as tunneled (it fails closed), so a backend on this machine or the LAN
+    // got the tunnel's 401 here once a named tunnel required an Access login. `c.env` gives it the
+    // caller's own socket: the forward is judged exactly as this request was. And `:id` arrives
+    // decoded, so it is encoded again: '..%2Fchats%3F' would otherwise forward to POST /chats.
+    const fwdRes = await app.fetch(new Request(new URL(`${BASE}/chats/${encodeURIComponent(c.req.param('id'))}/messages/generate`, c.req.url), {
       method: 'POST',
       headers: fwdHeaders,
       body: JSON.stringify({ ...b, content }),
-    }))
+    }), c.env)
     // N7: the forwarded call is a SEPARATE Hono dispatch with its own Context — the id of the
     // message it actually created (the USER turn, not the assistant placeholder the JSON body's
     // `message_id` field carries) never reaches THIS context on its own. Without this, the
@@ -526,8 +585,19 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
         return extError(c, 'invalid_request', 'invalid_input', '`limit` must be a positive integer.', { param: 'limit' })
       }
     }
+    // Rows store `at` as toISOString() and audit.list compares it as text, so any other ISO form
+    // ('...T10:00:00Z' with no milliseconds, or an offset) would cut at the wrong instant.
+    const sinceParam = c.req.query('since') || undefined
+    let since: string | undefined
+    if (sinceParam !== undefined) {
+      const ms = parseIsoInstant(sinceParam)
+      if (Number.isNaN(ms)) {
+        return extError(c, 'invalid_request', 'invalid_input', '`since` must be an ISO 8601 timestamp.', { param: 'since' })
+      }
+      since = new Date(ms).toISOString()
+    }
     try {
-      const rows = audit.list(scope.tenant, scope.owner, { limit, since: c.req.query('since') })
+      const rows = audit.list(scope.tenant, scope.owner, { limit, since, before: c.req.query('before') || undefined })
       return c.json({ data: rows.map(toAuditDTO) })
     } catch (e) {
       const m = mapStoreError(e)

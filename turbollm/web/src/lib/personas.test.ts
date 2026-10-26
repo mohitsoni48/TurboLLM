@@ -56,6 +56,19 @@ test('the TurboLLM Expert persona names text classification once, then its two r
   assert.match(gateway, /Discover's Text classification category finds both/)
 })
 
+// The in-app assistant explains downloads from this text: Pause keeps a download, a paused one's Discard deletes its
+// partial, and the "all" buttons leave what they should alone. It still said only an interrupted download comes back
+// paused, and that Cancel deletes the partial, with no word of Pause, Discard or Pause all.
+test('the TurboLLM Expert persona says Pause keeps a download across a restart, Discard deletes a paused one\'s partial, and Cancel all leaves paused ones alone', () => {
+  const expert = resolveAgents([], {}).find((a) => a.id === 'expert')
+  assert.ok(expert)
+  const downloads = expert!.systemPrompt.split('**Pause and Resume**')[1]?.split('\n')[0] ?? ''
+  assert.match(downloads, /\*\*Pause\*\* \(or \*\*Pause all\*\*\) stops a download and keeps what it has downloaded, also across a daemon restart/)
+  assert.match(downloads, /\*\*Resume\*\* \(or \*\*Resume all\*\*\) continues from that exact byte/)
+  assert.match(downloads, /A paused or failed download offers \*\*Discard\*\*, which deletes its partial file \(it asks first above 50 MB\)/)
+  assert.match(downloads, /\*\*Cancel all\*\* leaves paused downloads alone, and \*\*Dismiss all\*\* clears only finished and cancelled rows/)
+})
+
 // getDefaultAgentId/getConvAgentId's isAndroid fallback (personas.ts) isn't covered here: both
 // read/write `localStorage`, which this suite's node:test runner (tsx --test, no
 // --localstorage-file) only stubs — setItem/removeItem are undefined, so any test touching them

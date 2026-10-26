@@ -10,7 +10,7 @@ import type { MiddlewareHandler } from 'hono'
 import type { Context } from 'hono'
 import type { Deps } from '../deps.js'
 import type { Scope } from '../chat/store/types.js'
-import { hashKey, isFacadeOnlyKey } from '../auth.js'
+import { hashKey, isFacadeOnlyKey, keyTenant } from '../auth.js'
 import { extError } from './errors.js'
 
 // Hono resolves `c.get`/`c.set` key types against this global map whenever the app instance
@@ -53,7 +53,9 @@ export function resolveTenantFromKey(presented: string, d: Deps): ResolvedKey | 
   for (const record of keys) {
     if (!record.hash || record.hash !== hash) continue
     if (isFacadeOnlyKey(record)) return null
-    return { tenant: record.tenant ?? 'local', scopes: record.scopes ?? ALL_SCOPES }
+    // keyTenant, not a second spelling of the fallback: auth.ts's isExtOnlyKey refuses exactly the
+    // keys this resolves to a non-local tenant on every other surface.
+    return { tenant: keyTenant(record), scopes: record.scopes ?? ALL_SCOPES }
   }
   return null
 }

@@ -31,7 +31,7 @@ RUN npm prune --omit=dev
 
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libvulkan1 libgomp1 \
+      curl ca-certificates libvulkan1 libgomp1 tini \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -45,10 +45,14 @@ COPY --from=build /src/node_modules ./node_modules
 # Create models folder
 RUN mkdir -p /root/.turbollm/models
 # Define the model path
-# lanBind must be true here: the container always binds 0.0.0.0 (see CMD below), and
-# --addr alone does not set this flag (src/cli.ts) — without it, src/auth.ts's
-# bypassesAuth() treats the daemon as loopback-only and skips the API key check even
-# though the port is published to the host/LAN.
+# lanBind is seeded true to match the 0.0.0.0 bind the container always uses (see CMD
+# below), so Settings shows LAN access as on. Turning it off there re-binds the listener in
+# place to 127.0.0.1 (src/cli.ts), and the published port stops answering until the next
+# container start. A port change in Settings keeps 0.0.0.0, whatever lanBind says, but moves
+# the listener, and the page with it, to a port this container does not publish, so that
+# too stops answering until the next start, when CMD's --addr puts it back on 6996. Key
+# enforcement does not depend on lanBind: src/auth.ts's isLanExposed() follows the address
+# actually bound, so --addr 0.0.0.0 alone already requires the API key.
 RUN echo '{ \
       "modelDirs": [ \
         "/root/.turbollm/models" \
@@ -61,8 +65,14 @@ RUN echo '{ \
 
 # Force the GPU backend during the image build.
 # Docker builds cannot detect the host GPU.
+# This seeding run binds loopback: --addr 127.0.0.1, not --port, which would bind the
+# 0.0.0.0 lanBind asks for. On a bind other machines can reach, with requireApiKey on and no
+# key yet, the daemon mints its bootstrap API key; one minted here was printed in the build
+# log and stored in the image's config.json, so every container built from the image
+# accepted it. The container's first start (CMD below, on 0.0.0.0) mints that key instead,
+# into its own ~/.turbollm volume, and prints it.
 ENV TURBOLLM_SEED_BACKEND=vulkan
-RUN (node bin/turbollm.mjs --no-open --port 6996 &) \
+RUN (node bin/turbollm.mjs --no-open --addr 127.0.0.1:6996 &) \
     && for i in $(seq 1 60); do \
       node -e "process.exit((()=>{try{return JSON.parse(require('fs').readFileSync(process.env.HOME+'/.turbollm/config.json','utf8')).engines.length>0}catch{return false}})()?0:1)" && break; \
       sleep 3; \
@@ -72,7 +82,12 @@ RUN (node bin/turbollm.mjs --no-open --port 6996 &) \
 
 EXPOSE 6996/tcp
 
-ENTRYPOINT ["node", "bin/turbollm.mjs"]
+# tini is PID 1: it reaps every orphan TurboLLM leaves (each tethered child's watcher is one) and forwards
+# `docker stop`'s SIGTERM to the daemon, which shuts down gracefully. With node itself as PID 1 every one of them
+# stayed a zombie, and under a pids limit TurboLLM could no longer start a process. -s: tini is a subreaper when
+# it is not PID 1 itself (docker run --init, compose init: true), so either way they are reaped. The daemon warns
+# at boot when nothing reaps them (turbollm/src/util/pid1.ts).
+ENTRYPOINT ["/usr/bin/tini", "-s", "--", "node", "bin/turbollm.mjs"]
 # --addr 0.0.0.0:... required in a container (default bind is loopback-only).
 # --no-open because there's no browser inside the container.
 # --print-token: with the named volume above persisting ~/.turbollm (including apiKeys)

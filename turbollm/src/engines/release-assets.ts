@@ -17,6 +17,7 @@ import {
 } from './download'
 import { parseGitRepo } from './github-repo'
 import type { ReleaseProvenance } from './release-install'
+import { compareBuildTags, parseBuildTag } from './version-compare'
 
 export type AssetOs = 'windows' | 'linux' | 'macos' | 'android'
 export type AssetBackend = 'cuda' | 'rocm' | 'sycl' | 'vulkan' | 'metal' | 'cpu' | 'opencl' | 'other'
@@ -77,21 +78,36 @@ const BACKEND_BY_TOKEN: Record<string, AssetBackend> = {
   cann: 'other',
 }
 
-const CUDA_VERSION = /(?:^|[-_])cuda[-_]?(\d+\.\d+)(?=$|[-_])/
+// Also the older llama.cpp spellings `cuda-cu12.4`, `cudart-...-cu12.4` and `cublas-cu12.2.0`, plus
+// a patch component (`cuda-12.4.1`); only major.minor is kept. Forks also write it undotted, PyTorch
+// style: `cu124` / `cuda-118` is 12.4 / 11.8, two digits of major and one of minor (every CUDA since
+// 10.0). Such a build used to read as `cpu`: no cudart pairing, and ranked below Vulkan on NVIDIA.
+const CUDA_VERSION = /(?:^|[-_])cu(?:da)?[-_]?(?:(\d+)\.(\d+)(?:\.\d+)?|(\d{2})(\d))(?=$|[-_])/
+
+// `cuda12` / `cu12`: a CUDA build, but its minor version is unknown (and `cu92` was 9.2), so it gets no
+// cudaVersion: it ranks as CUDA, and no cudart is paired with it, since one of the wrong minor version
+// could lack what the build was linked against.
+const CUDA_MAJOR_ONLY = /^cu(?:da)?\d{1,2}$/
 
 export function classifyReleaseAsset(asset: ReleaseAsset & { size?: number }): ClassifiedAsset {
   const archive = archiveKindOf(asset.name)
   const stem = stripArchiveExtension(asset.name.toLowerCase())
   const tokens = nameTokens(stem)
   const os = firstMapped(tokens, OS_BY_TOKEN)
+  const cuda = CUDA_VERSION.exec(stem)
+  const cudaVersion = cuda ? `${cuda[1] ?? cuda[3]}.${cuda[2] ?? cuda[4]}` : null
   return {
     name: asset.name,
     url: asset.browser_download_url,
     size: asset.size ?? null,
     os,
     arch: firstMapped(tokens, ARCH_BY_TOKEN),
-    backend: firstMapped(tokens, BACKEND_BY_TOKEN) ?? (os === 'macos' ? 'metal' : 'cpu'),
-    cudaVersion: CUDA_VERSION.exec(stem)?.[1] ?? null,
+    // A CUDA version with no backend token (`cublas-cu12.2.0`, `cuda12.4`, a `cu12.4` cudart, `cu124`, `cuda12`) is a
+    // CUDA build.
+    backend:
+      firstMapped(tokens, BACKEND_BY_TOKEN) ??
+      (cudaVersion || tokens.some((t) => CUDA_MAJOR_ONLY.test(t)) ? 'cuda' : os === 'macos' ? 'metal' : 'cpu'),
+    cudaVersion,
     archive,
     companion: tokens.includes('cudart') ? 'cudart' : null,
   }
@@ -280,11 +296,18 @@ function stripArchiveExtension(lowerName: string): string {
   return lowerName.replace(/\.(zip|tar\.gz|tgz)$/, '')
 }
 
+/** Removes the tag only as a whole run of tokens: as a raw substring, a short tag such as `v4` or `12`
+ *  would cut into `x64` or `cuda-12.4`, and one file name would key differently per release. Any
+ *  character but a letter or digit is a boundary (`-`, `_`, `+`, `~`, a space, the archive extension's
+ *  `.`), except a `.` that joins digits, as in `12.4`. */
 function removeTag(lowerName: string, lowerTag: string): string {
   const bare = lowerTag.replace(/^v/, '')
   const longestFirst = [...new Set([lowerTag, bare, `v${bare}`])].filter(Boolean).sort((a, b) => b.length - a.length)
-  const present = longestFirst.find((form) => lowerName.includes(form))
-  return present === undefined ? lowerName : lowerName.split(present).join('')
+  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const asTokens = (form: string, flags = '') =>
+    new RegExp(`(?<![a-z0-9])(?<!\\d\\.)${escape(form)}(?![a-z0-9])(?!\\.\\d)`, flags)
+  const present = longestFirst.find((form) => asTokens(form).test(lowerName))
+  return present === undefined ? lowerName : lowerName.replace(asTokens(present, 'g'), '')
 }
 
 function stripReleasesSuffix(url: string): string {
@@ -377,9 +400,31 @@ export async function newestMatchingRelease(
 ): Promise<MatchingRelease | null> {
   const listed = (await listReleases(provenance.repo, signal, fetchImpl)) ?? []
   const candidates = listed.filter((r) => isUpdateCandidate(r, provenance))
-  return (
-    findByAssetKey(candidates, provenance.assetKey) ?? findByIdenticalClassification(candidates, provenance.asset)
-  )
+  // Key then classification inside each release. A key-only pass over every candidate would always
+  // stop at the installed release (it is listed, and its own asset has the key), so a newer release
+  // that renamed the asset would never be reached. The first match listed (newest first) is the pick,
+  // and a match listed after it replaces it only with a higher version in a numbering the two share
+  // (see tagNumberings): GitHub lists by creation, so a backport cut after a new major (v1.9.5
+  // published after v2.0.0) came first and v2.0.0 was never offered. Versions are not compared across
+  // numberings: compareBuildTags reads a date or a build number as a major version, so the installed
+  // 20240501, always a candidate itself, outranked every later v1.x. A match in a numbering the pick
+  // does not share, or with no version order, never replaces it, however recently it was published:
+  // an engine on v0.9.0 offered v0.9.9, 20261001 and v1.0.0, listed in that order, gets v1.0.0, not
+  // the later 20261001. The pick does not look at which numberings the repo used before the install:
+  // the listing holds only its last 30 releases, and the installed release would then beat every later
+  // one in a numbering ranked below its own, for good. Nor does it prefer the installed tag's
+  // numbering: nothing tells a backport on the line the repo left (a v1.0.1 cut after the repo moved
+  // to 20261001) from a line that goes on beside another (a fork's b4600 cut after its v0.4.0), so an
+  // engine on 20261001 offered a v1.0.1 published after it takes v1.0.1, as on main.
+  let best: MatchingRelease | null = null
+  for (const release of candidates) {
+    const match =
+      findByAssetKey([release], provenance.assetKey) ?? findByIdenticalClassification([release], provenance.asset)
+    if (!match) continue
+    if (!best) best = match
+    else if (sameNumbering(best.tag, match.tag) && compareBuildTags(best.tag, match.tag) === 'newer') best = match
+  }
+  return best
 }
 
 function toResolved(repo: string, release: GithubRelease, fellBack: boolean): ResolvedRelease {
@@ -401,14 +446,47 @@ function hasCompatibleAsset(release: GithubRelease, host: HostProfile): boolean 
 function isUpdateCandidate(release: GithubRelease, installed: ReleaseProvenance): boolean {
   if (release.draft === true) return false
   if (release.prerelease === true && !installed.prerelease) return false
+  // A backport on an older version line (v1.9.5 published after v2.0.0) is not an update. Tags with
+  // no version order (nightly, a commit SHA), or in different numberings, keep the publish-time rule,
+  // and so does a higher version published before the installed release: a repo that renumbered its
+  // tags downward (20240501 or a build number such as 4500, then v1.0.0) still lists its old releases,
+  // which outrank every v1.x, so an engine on `auto` would be moved to one and never offered a v1.x again.
+  const tag = release.tag_name ?? ''
+  if (sameNumbering(installed.tag, tag) && compareBuildTags(installed.tag, tag) === 'older') return false
   return (release.published_at ?? '') >= installed.publishedAt
 }
 
+// The numberings a tag's version order comes from: a llama.cpp build (b4500), a plain build or date
+// number (4500, 20240501), a dotted calendar version (2024.05.01) or a version (v1.2.3, 0.10.3, v5). A
+// plain number under four digits is both a build number and a major version (5, then a v4.9.1
+// backport). None for a tag with no order: compareBuildTags reads the leading digits of any tag, so a
+// commit SHA such as 9f1e2d3 would otherwise be ordered by them (as 9) at random.
+function tagNumberings(tag: string): string[] {
+  const t = tag.trim()
+  if (parseBuildTag(t) !== null) return ['build']
+  if (/^\d+$/.test(t)) return t.length < 4 ? ['number', 'version'] : ['number']
+  if (/^v?(?:19|20)\d\d\.\d/.test(t)) return ['calendar']
+  return /^v?\d+(?:\.\d+|$)/.test(t) ? ['version'] : []
+}
+
+// Two tags are ordered by version only when they share a numbering. compareBuildTags reads a date, a
+// build number or a year as a major version, so across a renumbering every v1.x compared older than a
+// release tagged 20240501 or 4500: an engine installed from one was refused every later semver
+// release, and was never offered an update again.
+function sameNumbering(a: string, b: string): boolean {
+  const theirs = tagNumberings(b)
+  return tagNumberings(a).some((n) => theirs.includes(n))
+}
+
+// The archive kind is not part of the build: a fork that moves from .zip to .tar.gz (as llama.cpp
+// itself did) ships the same build under the other extension. The installed kind only breaks ties.
 function findByAssetKey(releases: GithubRelease[], key: string): MatchingRelease | null {
   for (const release of releases) {
-    const asset = (release.assets ?? []).find(
-      (a) => archiveKindOf(a.name) !== null && assetKey(a.name, release.tag_name ?? '') === key,
+    const keyOf = (a: ReleaseAsset) => assetKey(a.name, release.tag_name ?? '')
+    const keyed = (release.assets ?? []).filter(
+      (a) => archiveKindOf(a.name) !== null && stripArchiveExtension(keyOf(a)) === stripArchiveExtension(key),
     )
+    const asset = keyed.find((a) => keyOf(a) === key) ?? keyed[0]
     if (asset) return toMatch(release, asset)
   }
   return null
@@ -418,7 +496,9 @@ function findByIdenticalClassification(releases: GithubRelease[], installedAsset
   const wanted = classifyReleaseAsset({ name: installedAssetName, browser_download_url: '' })
   for (const release of releases) {
     const twins = (release.assets ?? []).filter((a) => sameBuildVariant(classifyReleaseAsset(a), wanted))
-    if (twins.length > 0) return twins.length === 1 ? toMatch(release, twins[0]!) : null
+    const sameArchive = twins.filter((a) => archiveKindOf(a.name) === wanted.archive)
+    const pick = sameArchive.length > 0 ? sameArchive : twins
+    if (pick.length > 0) return pick.length === 1 ? toMatch(release, pick[0]!) : null
   }
   return null
 }
@@ -430,8 +510,7 @@ function sameBuildVariant(a: ClassifiedAsset, b: ClassifiedAsset): boolean {
     a.os === b.os &&
     a.arch === b.arch &&
     a.backend === b.backend &&
-    a.cudaVersion === b.cudaVersion &&
-    a.archive === b.archive
+    a.cudaVersion === b.cudaVersion
   )
 }
 

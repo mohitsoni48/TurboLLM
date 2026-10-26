@@ -8,6 +8,7 @@ import type {
 } from './code-types'
 import { ApiError, authHeaders } from './api'
 import { markCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
+import { readSseStream } from './sse'
 import { DEFAULT_REASONING_EFFORT, type ReasoningEffort } from '../components/ReasoningEffortSelect'
 
 async function req<T>(path: string, init?: RequestInit & { json?: unknown }): Promise<T> {
@@ -91,6 +92,10 @@ export interface CodeSessionDetail {
   /** Turns waiting behind the active one (server-side queue) — restores the "Queued" chips
    *  after a reload/reconnect. */
   queued: QueuedTurn[]
+  /** True while a manual /compact runs in the daemon, whichever page started it: the daemon
+   *  refuses a turn, /clear, /resume and another /compact meanwhile (409 compaction_in_progress),
+   *  so a reopened page shows the compaction and holds the composer back. */
+  compacting: boolean
   /** The live turn's current checklist, if the run is active — reflects the daemon's in-memory
    *  state (reset per turn), same reconnect-resilience purpose as `queued`. */
   todos: TodoItem[]
@@ -131,7 +136,8 @@ export function updateCodeSessionThinkingBudget(id: string, tokens: number): Pro
 /** Same live-override mechanism as updateCodeSessionThinkingBudget, for Qwen3.8's independent
  *  reasoning_effort control — only meaningful for a terminal-agent session whose loaded model
  *  supports it (ModelEntry.reasoningEffort). */
-export function updateCodeSessionReasoningEffort(id: string, effort: ReasoningEffort): Promise<{ ok: true; effort: ReasoningEffort | null }> {
+/** `effort` null clears the session's override (the model's own default applies). */
+export function updateCodeSessionReasoningEffort(id: string, effort: ReasoningEffort | null): Promise<{ ok: true; effort: ReasoningEffort | null }> {
   return req(`/api/v1/code/sessions/${encodeURIComponent(id)}/reasoning-effort`, { method: 'PATCH', json: { effort } })
 }
 
@@ -214,7 +220,8 @@ export function steerOutcomeMessage(steered: boolean): string {
  *  0 for a fresh load). The daemon replays buffer.since(fromSeq) then live-tails. Dropping this
  *  connection (abort/navigate) does NOT abort the run — that's the whole point. Each yielded
  *  event carries its `seq` (from the SSE `id:` field) so the caller can reconnect from where it
- *  left off. Same hand-rolled SSE line parser as chat-api.ts, extended to read `id:`. */
+ *  left off. Parsed by the shared `readSseStream` (sse.ts), which reads each message's `id:` from
+ *  its own block — hono writes `id:` AFTER `data:`. */
 export async function* streamCodeSession(
   sessionId: string,
   fromSeq: number,
@@ -233,34 +240,12 @@ export async function* streamCodeSession(
     throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Request failed with status ${res.status}.`, res.status)
   }
 
-  const reader = res.body.getReader()
-  const decoder = new TextDecoder()
-  let buf = ''
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buf += decoder.decode(value, { stream: true })
-      const lines = buf.split('\n')
-      buf = lines.pop() ?? ''
-      let event = ''
-      let seq: number | undefined
-      for (const line of lines) {
-        if (line.startsWith('event: ')) { event = line.slice(7).trim() }
-        else if (line.startsWith('id: ')) { const n = Number.parseInt(line.slice(4).trim(), 10); seq = Number.isFinite(n) ? n : undefined }
-        else if (line.startsWith('data: ')) {
-          const raw = line.slice(6).trim()
-          try {
-            const data = JSON.parse(raw)
-            if (event) yield { event, data, seq } as CodeStreamEvent
-          } catch { /* skip malformed */ }
-          event = ''
-          seq = undefined
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock()
+  for await (const msg of readSseStream(res.body)) {
+    if (!msg.event) continue
+    let data: unknown
+    try { data = JSON.parse(msg.data) } catch { continue /* skip malformed */ }
+    const n = msg.id !== undefined ? Number.parseInt(msg.id, 10) : Number.NaN
+    yield { event: msg.event, data, seq: Number.isFinite(n) ? n : undefined } as CodeStreamEvent
   }
 }
 

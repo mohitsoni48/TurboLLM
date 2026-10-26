@@ -60,8 +60,10 @@ export function JevLoadConfirmHost() {
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Load {target.name}?</AlertDialogTitle>
+          {/* No engine named: the load starts on the selected engine, whichever it is, and a Jev model is offered
+              under any engine once every model is shown. "on vLLM" named an engine that may never run. */}
           <AlertDialogDescription>
-            Loading a text classification model on vLLM stops the running model and interrupts:
+            Loading a text classification model stops the running model and interrupts:
           </AlertDialogDescription>
         </AlertDialogHeader>
         <ul className="text-sm text-muted list-disc pl-5 space-y-1">
@@ -82,14 +84,24 @@ export function JevLoadConfirmHost() {
  *  pretending the list is empty. */
 function interruptedWork(work: ActiveWork | null): string[] {
   if (!work) return [UNKNOWN_WORK]
-  if (work.items.length > 0) return work.items.map(describeItem)
+  // A reply parked on a tool-call approval waits on the user, not the engine, but the load stops
+  // it all the same (the call is denied), so it is named too.
+  const lines = [...work.items.map(describeItem), ...(work.waiting ?? []).map(describeWaiting)]
+  if (lines.length > 0) return lines
   return work.engineGenerating ? [API_GENERATION] : []
 }
 
 function describeItem(item: ActiveWorkItem): string {
   if (item.kind === 'chat') return `a reply in "${item.label}"`
   if (item.kind === 'code') return `a Code turn in "${item.label}"`
+  if (item.kind === 'load') return `the load of "${item.label}"`
+  if (item.kind === 'tune') return `the auto-tune of "${item.label}"`
+  if (item.kind === 'skill') return `a skill being written ("${truncated(item.label)}")`
   return `the routine "${truncated(item.label)}"`
+}
+
+function describeWaiting(item: ActiveWorkItem): string {
+  return `a reply in "${item.label}" waiting for your approval`
 }
 
 /** A routine has no name of its own, so it is labelled with its prompt — which can be a whole

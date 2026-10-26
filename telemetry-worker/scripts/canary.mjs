@@ -163,7 +163,12 @@ function signature(event, payloadJson) {
 
 function queryLanded() {
   const npx = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-  const sql = `SELECT event, payload FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > datetime('now', '-5 minutes')`
+  // received_at is the event's own ISO `ts` (YYYY-MM-DDTHH:MM:SS.sssZ), so the cutoff is an ISO
+  // string too. SQLite's datetime() text ('YYYY-MM-DD HH:MM:SS') sorts below every 'T' row of the
+  // same day, which matched the whole day and let an earlier deploy's rows pass for this one. Taken
+  // from the same clock that stamped the rows.
+  const since = new Date(Date.now() - 5 * 60_000).toISOString()
+  const sql = `SELECT event, payload FROM events WHERE machine_id = '${CANARY_MACHINE_ID}' AND received_at > '${since}'`
   const raw = execSync(`${npx} wrangler d1 execute ${DB_NAME} --remote --json --command "${sql}"`, {
     cwd: join(HERE, '..'),
     encoding: 'utf8',

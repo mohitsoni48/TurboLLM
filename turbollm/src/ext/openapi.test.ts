@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { rmSync } from 'node:fs'
+import { readFileSync, rmSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Hono } from 'hono'
 import { EXT_ROUTES, buildOpenApiDocument } from './openapi.js'
 import { registerExtChatRoutes } from './routes.chats.js'
@@ -8,6 +10,7 @@ import { registerExtRunRoutes } from './routes.runs.js'
 import { PublicRunManager } from './run-manager.js'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
+import { StoreError, type ChatStore } from '../chat/store/chat-store.js'
 import { hashKey } from '../auth.js'
 import { tmpDir } from '../test-support/tmp'
 
@@ -68,6 +71,60 @@ test('POST .../messages/generate documents 202, not the default-inferred 201', (
   assert.ok(!op.responses['201'], 'must not ALSO claim 201 — that is the wrong status for this route')
 })
 
+// streamSSE always answers 200, but the dual-mode routes listed text/event-stream under the JSON
+// answer's 202, so a client generated from the document treated the stream's 200 as undocumented
+// (or expected a 202 that never came). The SSE status comes from the real routes here.
+test('the generate routes document their SSE stream under 200 and only the JSON Run under 202', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  type Responses = Record<string, { content?: Record<string, unknown> }>
+  const dir = tmpDir('turbollm-ext-openapi-sse-status-')
+  const conv = new ConversationStore(dir)
+  try {
+    const key = 'tllm-ext-openapi-sse-status'
+    const d = {
+      db: conv,
+      chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
+      store: { snapshot: () => ({ apiKeys: [{ hash: hashKey(key), tenant: 'acme' }] }) },
+      manager: { status: () => ({ state: 'running', model: { key: 'm', name: 'm', ctx: 0 } }), target: () => 'http://127.0.0.1:9' },
+    } as never
+    const app = new Hono()
+    const runs = new PublicRunManager()
+    registerExtChatRoutes(app, d)
+    registerExtRunRoutes(app, d, runs, { makeBody: () => async () => ({ status: 'complete' as const }) })
+    const chat = await (await app.request('/api/ext/v1/chats', {
+      method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: '{}',
+    })).json() as { id: string }
+    for (const [path, docPath] of [
+      [`/api/ext/v1/chats/${chat.id}/messages/generate`, '/api/ext/v1/chats/{id}/messages/generate'],
+      [`/api/ext/v1/chats/${chat.id}/messages`, '/api/ext/v1/chats/{id}/messages'],
+    ]) {
+      const send = async (accept: string) => {
+        const res = await app.request(path, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', Accept: accept },
+          body: JSON.stringify({ role: 'user', content: 'hi' }),
+        })
+        const status = String(res.status)
+        const type = (res.headers.get('Content-Type') ?? '').split(';')[0]
+        if (type === 'application/json') await runs.settled(((await res.json()) as { id: string }).id)
+        else await res.text()
+        return { status, type }
+      }
+      const responses = (doc.paths[docPath].post as { responses: Responses }).responses
+      for (const accept of ['application/json', 'text/event-stream']) {
+        const { status, type } = await send(accept)
+        assert.equal(type, accept)
+        assert.ok(responses[status]?.content?.[type], `${docPath}: the route answers ${status} ${type}, the document does not list it`)
+      }
+      const listing = (type: string) => Object.keys(responses).filter((st) => responses[st].content?.[type] !== undefined)
+      assert.deepEqual(listing('text/event-stream'), ['200'], `${docPath}: the stream is documented only under 200`)
+      assert.ok(!listing('application/json').includes('200'), `${docPath}: no JSON answer is sent with 200`)
+    }
+  } finally {
+    conv.close(); rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('POST /runs/:id/cancel documents 200, not the default-inferred 201', () => {
   const doc = buildOpenApiDocument('1.0.0')
   const op = doc.paths['/api/ext/v1/runs/{id}/cancel'].post as { responses: Record<string, unknown> }
@@ -89,6 +146,65 @@ test('every route without a request body documents owner as an optional query pa
     assert.ok(owner, `expected an owner query param on ${r.method} ${r.path}`)
     assert.equal(owner!.in, 'query')
     assert.equal(owner!.required, false, "owner defaults to 'default' server-side, so it must not be required")
+  }
+})
+
+// The document used to declare no query parameter but `owner`, so pagination (cursor/limit),
+// search (q), include=, the audit window (limit/since/before) and the stream's resume cursor
+// (after) were invisible to any client generated from it. Hono handlers carry no inspectable
+// schema, so this reads the route files themselves: each `app.<verb>(`${BASE}<path>`` handler's
+// `c.req.query('<name>')` calls (up to the next registration) must be exactly the query
+// parameters documented for that route.
+test('every query parameter a route handler reads is documented on that route, and nothing else', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const here = dirname(fileURLToPath(import.meta.url))
+  const read = new Map<string, Set<string>>()
+  for (const file of ['routes.chats.ts', 'routes.runs.ts']) {
+    const src = readFileSync(join(here, file), 'utf8')
+    const regs = [...src.matchAll(/app\.(get|post|patch|delete)\(`\$\{BASE\}([^`]*)`/g)]
+    regs.forEach((m, i) => {
+      const body = src.slice(m.index, regs[i + 1]?.index ?? src.length)
+      read.set(`${m[1].toUpperCase()} ${m[2]}`, new Set([...body.matchAll(/c\.req\.query\('([^']+)'\)/g)].map((q) => q[1])))
+    })
+  }
+  for (const r of EXT_ROUTES) {
+    if (r.path === '/openapi.json') continue // mount.ts; reads nothing
+    const key = `${r.method} ${r.path}`
+    const handlerReads = read.get(key)
+    assert.ok(handlerReads, `no handler found for ${key}`)
+    const op = doc.paths[`/api/ext/v1${r.path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`][r.method.toLowerCase()] as {
+      parameters?: Array<{ name: string; in: string }>
+    }
+    const documented = (op.parameters ?? []).filter((p) => p.in === 'query').map((p) => p.name).sort()
+    assert.deepEqual(documented, [...handlerReads].sort(), `query parameters of ${key}`)
+  }
+  assert.ok(read.get('GET /chats')?.has('cursor'), 'the scan itself works')
+})
+
+// The document declared no header parameters, so a client generated from it had no way to send
+// Idempotency-Key, the routes' retry-safety mechanism. Every handler that reads it documents it,
+// as does POST .../messages, whose default path forwards its headers to .../generate.
+test('every route that honours Idempotency-Key documents it as an optional header parameter', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const here = dirname(fileURLToPath(import.meta.url))
+  const reading: string[] = []
+  for (const file of ['routes.chats.ts', 'routes.runs.ts']) {
+    const src = readFileSync(join(here, file), 'utf8')
+    const regs = [...src.matchAll(/app\.(get|post|patch|delete)\(`\$\{BASE\}([^`]*)`/g)]
+    regs.forEach((m, i) => {
+      const body = src.slice(m.index, regs[i + 1]?.index ?? src.length)
+      if (body.includes("c.req.header('Idempotency-Key')")) reading.push(`${m[1]} ${m[2]}`)
+    })
+  }
+  assert.deepEqual(reading.sort(), ['post /chats', 'post /chats/:id/messages/generate'], 'the scan itself works')
+  for (const [method, path] of [...reading.map((r) => r.split(' ')), ['post', '/chats/:id/messages']]) {
+    const op = doc.paths[`/api/ext/v1${path.replace(/:([A-Za-z0-9_]+)/g, '{$1}')}`][method] as {
+      parameters?: Array<{ name: string; in: string; required: boolean; description?: string }>
+    }
+    const header = op.parameters?.find((p) => p.in === 'header' && p.name === 'Idempotency-Key')
+    assert.ok(header, `${method} ${path} must document the Idempotency-Key header`)
+    assert.equal(header.required, false)
+    assert.ok(header.description?.includes('idempotency_key_reused'), `${method} ${path}: ${header.description}`)
   }
 })
 
@@ -226,5 +342,182 @@ test('GET /audit response body satisfies every field its own documented schema r
   } finally {
     conv.close()
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// OpenAPI builds a request URL as server URL + path key. Both carried /api/ext/v1, so a
+// client generated from this document called /api/ext/v1/api/ext/v1/... and got 404s.
+test('server URL + path key names each route exactly once under /api/ext/v1', () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  for (const server of doc.servers) {
+    for (const key of Object.keys(doc.paths)) {
+      const url = new URL(server.url.replace(/\/+$/, '') + key)
+      assert.equal(url.pathname.split('/api/ext/v1').length - 1, 1, `${server.url} + ${key} -> ${url.pathname}`)
+      assert.ok(url.pathname.startsWith('/api/ext/v1/'), `${url.pathname} must be served under /api/ext/v1`)
+    }
+  }
+})
+
+const KEY_FULL = 'tllm-ext-openapi-full'
+const KEY_READONLY = 'tllm-ext-openapi-readonly'
+const KEY_LOCAL = 'tllm-ext-openapi-local'
+
+/** A real chat + run route set over a temp store. `adapter: false` leaves the chat store with no
+ *  adapter, which is how every non-local tenant's store call gets 501 not_supported. `wrap`
+ *  stands in for a third-party adapter around the temp store. */
+function statusHarness(opts: { adapter: boolean; wrap?: (s: ChatStore) => ChatStore; runDb?: boolean }) {
+  const dir = tmpDir('turbollm-ext-openapi-status-')
+  const conv = new ConversationStore(dir)
+  const d = {
+    db: conv,
+    chatStore: new ChatStoreRouter(conv.chatStore, opts.adapter ? (opts.wrap?.(conv.chatStore) ?? conv.chatStore) : null),
+    store: { snapshot: () => ({ apiKeys: [
+      { hash: hashKey(KEY_FULL), tenant: 'acme' },
+      { hash: hashKey(KEY_READONLY), tenant: 'acme', scopes: ['chats:read'] },
+      { hash: hashKey(KEY_LOCAL), tenant: 'local' },
+    ] }) },
+    // A 1000-token window, so a long message is refused with context_overflow.
+    manager: {
+      status: () => ({ state: 'running', model: { key: 'm', name: 'm', quant: 'Q4_K_M', ctx: 1000, vision: false } }),
+      target: () => 'http://127.0.0.1:9999',
+    },
+  } as never
+  // `runDb`: run records go to the conversation DB, as the daemon's do.
+  const runs = new PublicRunManager(opts.runDb ? { db: conv } : undefined)
+  const app = new Hono()
+  registerExtChatRoutes(app, d, undefined, runs)
+  registerExtRunRoutes(app, d, runs, { makeBody: () => async () => ({ status: 'complete' as const }) })
+  return { app, db: conv, cleanup: () => { conv.close(); rmSync(dir, { recursive: true, force: true }) } }
+}
+
+// The documented error statuses drifted from what the routes send — 403 (scope / local
+// tenant), 413 (body caps) and 501 (no store adapter) were missing, and context_overflow (type
+// `engine`) is sent as 409, not the documented 502. Each case below drives a REAL route into
+// that error and checks the document lists that status, naming the envelope's `type`.
+test('every error status a route really sends is documented on that route, with its type', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const big = 'x'.repeat(1_048_577)
+  const call = (app: Hono, method: string, path: string, key: string, body?: unknown) => app.request(`/api/ext/v1${path}`, {
+    method,
+    headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  const check = async (res: Response, expected: number, method: string, route: string) => {
+    assert.equal(res.status, expected, `${method} ${route}: expected the route to answer ${expected}`)
+    const type = (await res.json() as { error: { type: string } }).error.type
+    const op = doc.paths[`/api/ext/v1${route}`][method.toLowerCase()] as { responses: Record<string, { description: string }> }
+    const documented = op.responses[String(expected)]
+    assert.ok(documented, `${method} ${route} sends ${expected} but does not document it (has ${Object.keys(op.responses).join(', ')})`)
+    assert.ok(documented.description.includes(type), `${method} ${route} ${expected} must name type "${type}": ${documented.description}`)
+  }
+
+  const full = statusHarness({ adapter: true })
+  try {
+    const chat = await (await call(full.app, 'POST', '/chats', KEY_FULL, { title: 'T', owner: 'u1' })).json() as { id: string }
+    const msg = await (await call(full.app, 'POST', `/chats/${chat.id}/messages`, KEY_FULL, { content: 'hi', owner: 'u1', generate: false })).json() as { id: string }
+
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_READONLY, { content: 'hi', owner: 'u1' }), 403, 'POST', '/chats/{id}/messages/generate')
+    await check(await call(full.app, 'GET', '/runs', KEY_LOCAL), 403, 'GET', '/runs')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'POST', '/chats/{id}/messages/generate')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'POST', '/chats/{id}/messages')
+    await check(await call(full.app, 'PATCH', `/messages/${msg.id}`, KEY_FULL, { content: big, owner: 'u1' }), 413, 'PATCH', '/messages/{id}')
+    await check(await call(full.app, 'POST', `/chats/${chat.id}/messages/generate`, KEY_FULL, { content: 'x'.repeat(8000), owner: 'u1' }), 409, 'POST', '/chats/{id}/messages/generate')
+  } finally {
+    full.cleanup()
+  }
+  const op = doc.paths['/api/ext/v1/chats/{id}/messages/generate'].post as { responses: Record<string, unknown> }
+  assert.ok(!op.responses['502'], 'no HTTP response of this route is ever 502')
+
+  const noAdapter = statusHarness({ adapter: false })
+  try {
+    await check(await call(noAdapter.app, 'GET', '/chats', KEY_FULL), 501, 'GET', '/chats')
+    await check(await call(noAdapter.app, 'POST', '/chats', KEY_FULL, { title: 'T' }), 501, 'POST', '/chats')
+  } finally {
+    noAdapter.cleanup()
+  }
+
+  // An adapter returning malformed data: mapStoreError sends `storage` with 500 (the document
+  // said 503), on reads too (which documented no `storage` at all), and an unexpected throw is
+  // `internal` 500 (which no route documented).
+  const broken = statusHarness({
+    adapter: true,
+    wrap: (s) => new Proxy(s, {
+      get(target, prop, receiver) {
+        if (prop === 'listChats' || prop === 'createChat') return async () => { throw new StoreError('contract_violation', 'malformed row') }
+        if (prop === 'getChat') return async () => { throw new Error('adapter bug') }
+        return Reflect.get(target, prop, receiver)
+      },
+    }),
+  })
+  try {
+    await check(await call(broken.app, 'GET', '/chats', KEY_FULL), 500, 'GET', '/chats')
+    await check(await call(broken.app, 'POST', '/chats', KEY_FULL, { title: 'T', owner: 'u1' }), 500, 'POST', '/chats')
+    await check(await call(broken.app, 'GET', '/chats/c1', KEY_FULL), 500, 'GET', '/chats/{id}')
+  } finally {
+    broken.cleanup()
+  }
+  for (const [path, methods] of Object.entries(doc.paths)) {
+    for (const [method, op] of Object.entries(methods)) {
+      assert.ok((op as { responses: Record<string, unknown> }).responses['500'], `${method} ${path}: the error backstop can answer any route with 500 internal`)
+    }
+  }
+})
+
+// Same drift as GET /audit (above): GET /runs was documented as a cursor page (`pageOf('Run')`,
+// requiring has_more/next_cursor) while the route returns only `{ data }`.
+test('GET /runs response body satisfies every field its own documented schema requires', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const operation = doc.paths['/api/ext/v1/runs'].get as {
+    responses: Record<string, { content?: { 'application/json'?: { schema: { $ref?: string } } } }>
+  }
+  const schemaRef = operation.responses['200']?.content?.['application/json']?.schema
+  assert.ok(schemaRef?.$ref, 'GET /runs has no documented application/json response schema')
+  const schemaName = (schemaRef.$ref as string).replace('#/components/schemas/', '')
+  const required = resolveRequired(doc.components.schemas[schemaName] as JsonSchemaLike, doc.components.schemas as Record<string, JsonSchemaLike>)
+
+  const h = statusHarness({ adapter: true })
+  try {
+    const res = await h.app.request('/api/ext/v1/runs', { headers: { Authorization: `Bearer ${KEY_FULL}` } })
+    assert.equal(res.status, 200)
+    const responseBody = await res.json() as Record<string, unknown>
+    for (const field of required) {
+      assert.ok(field in responseBody, `${schemaName} declares "${field}" required, but the real GET /runs response has no such key (got: ${Object.keys(responseBody).join(', ')}) — schema/route drift`)
+    }
+  } finally {
+    h.cleanup()
+  }
+})
+
+// RunPage said "The caller's runs. Not cursor-paginated." and the summary "List runs for the
+// tenant.", which read as every run the owner has. The route lists the runs the daemon still
+// holds plus the owner's newest 100 stored ones (ConversationStore.listExtRuns's LIMIT), so an
+// integrator walking GET /runs for its history silently missed every older run.
+test('GET /runs documents that it lists the newest 100 stored runs, not all of them, as the route does', async () => {
+  const doc = buildOpenApiDocument('1.0.0')
+  const runPage = doc.components.schemas.RunPage as { description?: string }
+  const summary = (doc.paths['/api/ext/v1/runs'].get as { summary?: string }).summary ?? ''
+  assert.match(runPage.description ?? '', /newest 100 stored runs/)
+  assert.match(runPage.description ?? '', /not all of them/)
+  assert.match(summary, /newest 100 stored/)
+
+  const h = statusHarness({ adapter: true, runDb: true })
+  try {
+    // 105 stored runs of the default owner (the one a request without ?owner= reads), none in
+    // memory: a fresh process after a restart.
+    for (let i = 0; i < 105; i++) {
+      const at = new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString()
+      h.db.upsertExtRun({
+        id: `run_${String(i).padStart(3, '0')}`, chatId: 'c', messageId: 'm', tenant: 'acme', owner: 'default',
+        status: 'complete', eventSeq: 1, error: null, createdAt: at, endedAt: at,
+      })
+    }
+    const auth = { headers: { Authorization: `Bearer ${KEY_FULL}` } }
+    const listed = ((await (await h.app.request('/api/ext/v1/runs', auth)).json()) as { data: Array<{ id: string }> }).data.map((r) => r.id)
+    assert.equal(listed.length, 100)
+    for (let i = 0; i < 5; i++) assert.ok(!listed.includes(`run_00${i}`), `the 5 oldest are not listed (run_00${i})`)
+    // ...and an unlisted run is still read by id, as the description says.
+    assert.equal((await h.app.request('/api/ext/v1/runs/run_000', auth)).status, 200)
+  } finally {
+    h.cleanup()
   }
 })

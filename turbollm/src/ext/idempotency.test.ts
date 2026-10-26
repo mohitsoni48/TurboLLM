@@ -16,7 +16,7 @@
 // live-repro scenario end to end.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { IdempotencyStore } from './idempotency.js'
+import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 
 test('an idempotency key replays the original result instead of re-running', () => {
   const store = new IdempotencyStore()
@@ -58,4 +58,19 @@ test('expired idempotency entries are dropped', () => {
   store.remember('acme', 'u1', 'runs:generate', 'k', { run_id: 'r' })
   store.prune(Date.now() + 10)
   assert.equal(store.lookup('acme', 'u1', 'runs:generate', 'k'), null)
+})
+
+test('requestFingerprint ignores object key order at every depth, but not values or array order', () => {
+  const a = requestFingerprint(['chat_1', 'hi', null, { user: 'u1', tags: { b: 2, a: 1 }, list: [{ y: 1, x: 2 }] }])
+  // The same request from a client that serialized its metadata in another key order: a replay, not a 409.
+  assert.equal(a, requestFingerprint(['chat_1', 'hi', null, { list: [{ x: 2, y: 1 }], tags: { a: 1, b: 2 }, user: 'u1' }]))
+
+  assert.notEqual(a, requestFingerprint(['chat_1', 'hi', null, { user: 'u1', tags: { b: 2, a: 3 }, list: [{ y: 1, x: 2 }] }]))
+  assert.notEqual(
+    requestFingerprint(['c', 'hi', ['data:a', 'data:b'], null]),
+    requestFingerprint(['c', 'hi', ['data:b', 'data:a'], null]),
+    'attachment order is part of the message',
+  )
+  // The positional parts stay positional.
+  assert.notEqual(requestFingerprint(['a', 'b']), requestFingerprint(['b', 'a']))
 })

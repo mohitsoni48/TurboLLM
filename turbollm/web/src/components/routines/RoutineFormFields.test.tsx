@@ -2,20 +2,23 @@ import { useState } from 'react'
 import { fireEvent, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { RoutineFormFields } from './RoutineFormFields'
-import { emptyRoutineDraft, type RoutineDraft } from '../../lib/routine-form'
+import { emptyRoutineDraft, ROUTINE_MAX_INTERVAL_MS, type RoutineDraft } from '../../lib/routine-form'
 import type { ModelEntry } from '../../lib/types'
 
 const MODEL_A: Partial<ModelEntry> = { key: 'model-a', name: 'Model A', quant: 'Q4_0', dir: 'D:\\models\\model-a', path: 'D:\\models\\model-a\\model-a.gguf', compatibleWithActiveEngine: true }
 let mockLibrary: Array<Partial<ModelEntry>> = [MODEL_A]
+/** False while the catalog query has not answered yet (its data is undefined). */
+let mockModelsAnswered = true
 
 vi.mock('../../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../lib/queries')>()
   return {
     ...actual,
     useChatAgents: () => ({ data: [{ id: 'agent-1', name: 'Research Agent', description: '', systemPrompt: '', skillIds: [], tools: [] }] }),
-    useModels: () => ({ data: { models: mockLibrary } }),
+    useModels: () => ({ data: mockModelsAnswered ? { models: mockLibrary } : undefined }),
   }
 })
 
@@ -124,8 +127,8 @@ describe('RoutineFormFields — flavor toggle', () => {
     await user.click(screen.getByRole('button', { name: 'Code' }))
     const next = onChange.mock.calls[0][0] as RoutineDraft
     expect(next.flavor).toBe('code')
-    // Not just "truthy" — the backend resolves an ABSENT permissionMode to 'auto', so the field
-    // must be present, and must be the 'ask' the select is already showing.
+    // Not just "truthy" — the stored value must be explicit, and must be the 'ask' the select
+    // then shows (an ABSENT one runs as 'auto' for the in-app agent).
     expect(Object.prototype.hasOwnProperty.call(next, 'permissionMode')).toBe(true)
     expect(next.permissionMode).toBe('ask')
   })
@@ -158,6 +161,45 @@ describe('RoutineFormFields — flavor toggle', () => {
     expect(next.workspacePath).toBeUndefined()
     expect(next.codingAgent).toBeUndefined()
     expect(next.permissionMode).toBeUndefined()
+  })
+})
+
+// A routine create_routine/REST stored with no permission mode runs as whatever the daemon's
+// default is for its coding agent ('auto' for in-app pi, one-shot `claude -p` for claude_cli) —
+// the select must name that, not show "Ask", and must not store anything the user didn't pick.
+describe('RoutineFormFields — a stored routine with no permission mode', () => {
+  const unset = (codingAgent: RoutineDraft['codingAgent']): RoutineDraft => ({ ...codeWeeklyDraft(), codingAgent, permissionMode: undefined })
+  const modeSelect = () => screen.getByLabelText('Permission mode') as HTMLSelectElement
+  const selectedText = (s: HTMLSelectElement) => s.options[s.selectedIndex].textContent
+
+  it('shows the in-app agent\'s unset mode as the Auto it actually runs, not Ask', () => {
+    renderControlled(unset('pi'), vi.fn(), false, true)
+    expect(modeSelect().value).toBe('')
+    expect(selectedText(modeSelect())).toBe('Not set: Auto — runs tools without asking')
+  })
+
+  it('names the one-shot claude -p path for claude_cli, and Ask for the other terminal agents', () => {
+    const { unmount } = renderControlled(unset('claude_cli'), vi.fn(), false, true)
+    expect(selectedText(modeSelect())).toMatch(/^Not set: One-shot claude -p with Claude's default permissions/)
+    unmount()
+    renderControlled(unset('opencode_cli'), vi.fn(), false, true)
+    expect(selectedText(modeSelect())).toBe('Not set: Ask before each tool call')
+  })
+
+  it('leaves the mode unset when another field is edited, and stores one only when the user picks it', async () => {
+    const user = userEvent.setup()
+    const onChange = vi.fn()
+    renderControlled(unset('pi'), onChange, false, true)
+    fireEvent.change(screen.getByLabelText('Task prompt'), { target: { value: 'Tidy it all' } })
+    expect((onChange.mock.lastCall![0] as RoutineDraft).permissionMode).toBeUndefined()
+    await user.selectOptions(modeSelect(), 'ask')
+    expect((onChange.mock.lastCall![0] as RoutineDraft).permissionMode).toBe('ask')
+  })
+
+  it('offers no "Not set" choice once a mode is stored (PUT cannot clear one)', () => {
+    renderControlled(codeWeeklyDraft(), vi.fn(), false, true)
+    expect(modeSelect().value).toBe('ask')
+    expect(screen.queryByRole('option', { name: /^Not set/ })).not.toBeInTheDocument()
   })
 })
 
@@ -238,6 +280,50 @@ describe('RoutineFormFields — cleared time input', () => {
   })
 })
 
+describe('RoutineFormFields — interval minutes', () => {
+  function IntervalHarness({ onRule }: { onRule: (everyMs: number) => void }) {
+    const [draft, setDraft] = useState<RoutineDraft>({ ...emptyRoutineDraft(), scheduleRule: { kind: 'interval', everyMs: 60 * 60_000 } })
+    return <RoutineFormFields draft={draft} onChange={(d) => { setDraft(d); if (d.scheduleRule.kind === 'interval') onRule(d.scheduleRule.everyMs) }} />
+  }
+
+  it('lets the field be cleared and retyped — clearing no longer snaps to 1 (60 → "30" gave 130)', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    await userEvent.clear(input)
+    expect(input.value).toBe('')
+    await userEvent.type(input, '30')
+    expect(input.value).toBe('30')
+    expect(onRule).toHaveBeenLastCalledWith(30 * 60_000)
+  })
+
+  it('never commits below one minute, and shows the committed value once the field is left', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    await userEvent.clear(input)
+    await userEvent.type(input, '0')
+    expect(onRule).toHaveBeenLastCalledWith(60_000)
+    fireEvent.blur(input)
+    expect(input.value).toBe('1')
+  })
+
+  // The server now refuses an interval over a year with a 400 (validateScheduleRule). The field
+  // committed any number typed, and the server took it: a routine whose next fire passed the year
+  // 9999 then fired on every tick, and one past Date's range could not be confirmed (a 500).
+  it('never commits more than a year, and shows the committed value once the field is left', async () => {
+    const onRule = vi.fn()
+    render(<QueryClientProvider client={new QueryClient()}><IntervalHarness onRule={onRule} /></QueryClientProvider>)
+    const input = screen.getByLabelText('Minutes between runs') as HTMLInputElement
+    expect(input.max).toBe('525600')
+    await userEvent.clear(input)
+    await userEvent.type(input, '600000')
+    expect(onRule).toHaveBeenLastCalledWith(ROUTINE_MAX_INTERVAL_MS)
+    fireEvent.blur(input)
+    expect(input.value).toBe('525600')
+  })
+})
+
 // ADR-434 (f): a Jev model labels text and can never run a routine, so the model picker leaves it
 // out. It stays UNfiltered by engine on purpose: a routine may target a model the active engine
 // can't load right now, because the routine swaps it in when it fires.
@@ -279,5 +365,70 @@ describe('RoutineFormFields — model picker offers chat models only', () => {
     renderControlled({ ...emptyRoutineDraft(), modelKey: 'deleted-model' }, vi.fn())
     expect(screen.getByRole('option', { name: /deleted-model \(not in the current catalog\)/ })).toBeInTheDocument()
     expect(screen.queryByRole('option', { name: /a text classification model/ })).not.toBeInTheDocument()
+  })
+})
+
+// An empty catalog left the select with only its placeholder, a drop-down with nothing in it and no word of why.
+describe('RoutineFormFields — no models', () => {
+  afterEach(() => { mockLibrary = [MODEL_A]; mockModelsAnswered = true })
+
+  it('says no models were found, and where to get one, under an empty model select', () => {
+    mockLibrary = []
+    renderForm()
+    expect(screen.getByLabelText('Model')).toHaveAccessibleDescription('No models found. Download one in Models → Discover.')
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+  })
+
+  it('counts a library of text classification models as no models, since none can run a routine', () => {
+    mockLibrary = [{ ...MODEL_A, laya: { checkpoints: ['english'] } }]
+    renderForm()
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+  })
+
+  it('says nothing while the catalog is still loading, or once it lists a model', () => {
+    mockModelsAnswered = false
+    const { unmount } = renderForm()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+    unmount()
+    mockModelsAnswered = true
+    renderForm()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('Model')).not.toHaveAttribute('aria-describedby')
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): no picker offers it. A routine already pinned to one keeps it: it still runs.
+describe('RoutineFormFields — models hidden by the user', () => {
+  const HIDDEN: Partial<ModelEntry> = { ...MODEL_A, key: 'model-h', name: 'Model H', path: 'D:\\models\\h.gguf', hidden: true, loaded: false }
+
+  afterEach(() => { mockLibrary = [MODEL_A] })
+
+  function renderRouted(draft: RoutineDraft) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    return render(<QueryClientProvider client={qc}><MemoryRouter><RoutineFormFields draft={draft} onChange={vi.fn()} /></MemoryRouter></QueryClientProvider>)
+  }
+
+  it('leaves a hidden model out of the select', () => {
+    mockLibrary = [MODEL_A, HIDDEN]
+    renderForm()
+    expect(screen.getByRole('option', { name: /Model A/ })).toBeInTheDocument()
+    expect(screen.queryByRole('option', { name: /Model H/ })).not.toBeInTheDocument()
+  })
+
+  it('keeps a stored hidden model selected, marked hidden', () => {
+    mockLibrary = [MODEL_A, HIDDEN]
+    renderControlled({ ...emptyRoutineDraft(), modelKey: 'model-h' }, vi.fn())
+    expect((screen.getByLabelText('Model') as HTMLSelectElement).value).toBe('model-h')
+    expect(screen.getByRole('option', { name: /Model H · Q4_0 — .* \(hidden\)/ })).toBeInTheDocument()
+    expect(screen.queryByText(/not in the current catalog/)).not.toBeInTheDocument()
+  })
+
+  it('counts them under an empty select, with the way to list them', () => {
+    mockLibrary = [HIDDEN]
+    renderRouted(emptyRoutineDraft())
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Show hidden models' })).toHaveAttribute('href', '/models?hidden=1')
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
   })
 })

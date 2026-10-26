@@ -23,9 +23,33 @@ export function isArtifactLang(lang: string): string | null {
   return ARTIFACT_LANGS[lang.toLowerCase()] ?? null
 }
 
+/** Put `head` (the CSP meta + helpers) at the very START of a full HTML document — after a
+ *  leading doctype if there is one — never after a regex hit for `<head` inside it. A meta CSP
+ *  only governs what the parser sees after it, so splicing at the author's `<head` let a
+ *  `<script>` placed before `<head>` run unrestricted, and a `<head>` inside a leading comment
+ *  swallowed the meta entirely. Leading meta/style/script go into the implied <head>; the
+ *  author's own later <html>/<head> tags merge into it or are ignored by the parser. The doctype
+ *  may be preceded only by HTML's own whitespace (not JS `\s`, which also takes NBSP, U+2028 and
+ *  VT): any other leading character opens <body>, where a meta CSP is ignored — same rule as the
+ *  daemon's `withArtifactCsp` (src/artifacts/screenshot.ts). U+FEFF (also in `\s`) is a special
+ *  case: a browser decodes srcdoc as UTF-8 and strips a leading one as a BOM, so here it never
+ *  opened <body>; it is still not treated as whitespace, because the daemon's export loads the
+ *  same HTML with page.setContent, which keeps it as a character. The meta then simply goes
+ *  first, and the doctype after it is dropped, which is harmless: srcdoc is always no-quirks. */
+function injectAtDocStart(code: string, head: string): string {
+  const m = /^[\t\n\f\r ]*<!doctype[^>]*>/i.exec(code)
+  return m ? `${m[0]}\n${head}\n${code.slice(m[0].length)}` : `${head}\n${code}`
+}
+
 /** Build a sandboxed srcdoc that reports its NATURAL content size ({w,h}). The card
- *  scales the whole iframe to fit; injects a CSP (blocks external network) and
- *  (HTML only) self-rasterizers for PNG/JPEG and GIF export. */
+ *  scales the whole iframe to fit; injects a CSP (blocks fetch/XHR/subresource loads) and
+ *  (HTML only) self-rasterizers for PNG/JPEG and GIF export. The CSP does NOT stop the frame
+ *  navigating itself (`location = …`, `<meta http-equiv=refresh>`) to any URL — so an HTML
+ *  document built here is only ever mounted on a user action (Interactive, or an export that
+ *  needs the live page), never just because a message rendered. The raw SVG document IS
+ *  mounted on render (it shows until the rasterized preview replaces it), but in a `sandbox=""`
+ *  frame: neither the SVG's own <script> nor the sizer runs there, so it shows unfitted until
+ *  then, and stays that way only when the SVG can't be rasterized even after `wellFormedSvg`. */
 function buildSrcdoc(type: string, code: string): string {
   const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:;">`
   const resizeHtml = `<script>(function(){function r(){var h=Math.max(document.documentElement.scrollHeight,document.body?document.body.scrollHeight:0);var w=Math.max(document.documentElement.scrollWidth,document.body?document.body.scrollWidth:0);parent.postMessage({type:'tllm-size',w:w,h:h},'*')}window.addEventListener('load',r);if(document.readyState!=='loading')r();try{new ResizeObserver(r).observe(document.documentElement)}catch(e){}})()</script>`
@@ -38,7 +62,7 @@ function buildSrcdoc(type: string, code: string): string {
 
   if (type === 'text/html') {
     const head = `${csp}\n${resizeHtml}\n${norm}\n${shot}\n${frame}\n${gif}`
-    if (/<head[\s>]/i.test(code)) return code.replace(/(<head[^>]*>)/i, `$1\n${head}`)
+    if (/<head[\s>]/i.test(code)) return injectAtDocStart(code, head)
     return `<!doctype html><html><head>${head}</head><body>${code}</body></html>`
   }
   if (type === 'image/svg+xml') {
@@ -51,7 +75,7 @@ function buildSrcdoc(type: string, code: string): string {
  *  the content. Renders full-width to measure first; DOM shape is identical in
  *  both states (no reload). */
 function FittedIframe({
-  srcDoc, frameRef, naturalW, naturalH, scale, cap, ready, sandbox = 'allow-scripts',
+  srcDoc, frameRef, naturalW, naturalH, scale, cap, ready, sandbox = 'allow-scripts', onLoad,
 }: {
   srcDoc: string
   frameRef: React.RefObject<HTMLIFrameElement | null>
@@ -63,6 +87,7 @@ function FittedIframe({
   // 'allow-scripts' = interactive (isolated, runs JS). 'allow-same-origin' = static
   // (real browser render, NO scripts — untrusted markup can't execute).
   sandbox?: string
+  onLoad?: () => void
 }) {
   const boxW = ready ? Math.round(naturalW * scale) : undefined
   const boxH = ready ? Math.round(naturalH * scale) : Math.min(naturalH, cap)
@@ -72,6 +97,7 @@ function FittedIframe({
         ref={frameRef}
         srcDoc={srcDoc}
         sandbox={sandbox}
+        onLoad={onLoad}
         title="Artifact"
         className={cn('block border-0', ready ? '' : 'w-full')}
         style={ready
@@ -213,12 +239,31 @@ function captureGif(iframe: HTMLIFrameElement | null): Promise<Blob | null> {
   })
 }
 
-/** Rasterize an SVG string to a PNG data URL (2048px minimum on shortest side).
- *  Returns null on failure. */
-function svgToPreview(svg: string): Promise<string | null> {
+/** An SVG that isn't well-formed XML (no xmlns, a bare `&`, an HTML entity like `&nbsp;`) shows
+ *  inline in an HTML page but fails to load as an <img>, so it could never be rasterized. Parse it
+ *  the way the page does (an inert DOMParser document: nothing runs or loads) and serialize its
+ *  <svg> back as XML, minus its comments (they never render, and one holding `--` is not XML).
+ *  Null when there is no <svg>. */
+function wellFormedSvg(svg: string): string | null {
+  const doc = new DOMParser().parseFromString(svg, 'text/html')
+  const el = doc.querySelector('svg')
+  if (!el) return null
+  const comments = doc.createNodeIterator(el, NodeFilter.SHOW_COMMENT)
+  for (let c = comments.nextNode(); c; c = comments.nextNode()) c.parentNode?.removeChild(c)
+  return new XMLSerializer().serializeToString(el)
+}
+
+/** Rasterize an SVG string to a PNG data URL (2048px minimum on shortest side, but the
+ *  longest side is capped at 4096px). Returns null on failure. A failed load is retried once
+ *  with `wellFormedSvg`; the raw string goes first so a valid SVG renders exactly as written.
+ *  An SVG with a <foreignObject> taints the canvas, so it can't be encoded: Chromium does that
+ *  only for an image loaded from a blob: URL, so it is retried from a data: URL, and where that
+ *  taints too (Safari) the SVG itself is the preview (an <img> runs no script, loads nothing). */
+function svgToPreview(svg: string, retry = true, asData = false): Promise<string | null> {
   return new Promise((resolve) => {
-    const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
+    const url = asData
+      ? 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg)
+      : URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml;charset=utf-8' }))
     const img = new Image()
     img.onload = () => {
       let w = img.naturalWidth, h = img.naturalHeight
@@ -227,7 +272,10 @@ function svgToPreview(svg: string): Promise<string | null> {
         const p = m ? m[1].trim().split(/\s+/).map(Number) : []
         if (p.length === 4) { w = p[2]; h = p[3] } else { w = 800; h = 600 }
       }
-      const scale = Math.max(2, 2048 / Math.min(w, h))
+      // This runs automatically on mount, so bound the canvas: forcing only the SHORT side to
+      // 2048px made a wide `graph LR` (~1500×70) a ~44k×2048 canvas (hundreds of MB, seconds
+      // of synchronous PNG encoding), and past the browser's canvas limits a blank image.
+      const scale = Math.min(Math.max(2, 2048 / Math.min(w, h)), 4096 / Math.max(w, h))
       const canvas = document.createElement('canvas')
       canvas.width = Math.max(1, Math.round(w * scale))
       canvas.height = Math.max(1, Math.round(h * scale))
@@ -237,9 +285,21 @@ function svgToPreview(svg: string): Promise<string | null> {
       ctx.fillRect(0, 0, canvas.width, canvas.height)
       ctx.scale(scale, scale); ctx.drawImage(img, 0, 0, w, h)
       URL.revokeObjectURL(url)
-      resolve(canvas.toDataURL('image/png'))
+      let png: string
+      try {
+        png = canvas.toDataURL('image/png')
+      } catch { // SecurityError: the canvas is tainted (see above).
+        return resolve(asData ? url : svgToPreview(svg, false, true))
+      }
+      // A canvas the browser couldn't allocate encodes as the empty "data:," (truthy) — that's
+      // a failure, not a preview.
+      resolve(png === 'data:,' ? null : png)
     }
-    img.onerror = () => { URL.revokeObjectURL(url); resolve(null) }
+    img.onerror = () => {
+      URL.revokeObjectURL(url)
+      const fixed = retry ? wellFormedSvg(svg) : null
+      resolve(fixed && fixed !== svg ? svgToPreview(fixed, false) : null)
+    }
     img.src = url
   })
 }
@@ -281,7 +341,7 @@ function buildCaptureDoc(code: string): string {
   // this, a `min-height:100vh` page renders taller here than naturalH and the bottom is
   // clipped. Scrollbars are hidden because the box is already sized to the full content.
   const norm = `<style>html,body{margin:0;height:auto!important;min-height:0!important}html{scrollbar-width:none}html::-webkit-scrollbar{width:0;height:0}img,svg,canvas,video{max-width:100%}</style>`
-  if (/<head[\s>]/i.test(code)) return code.replace(/(<head[^>]*>)/i, `$1\n${csp}\n${norm}`)
+  if (/<head[\s>]/i.test(code)) return injectAtDocStart(code, `${csp}\n${norm}`)
   return `<!doctype html><html><head>${csp}${norm}</head><body>${code}</body></html>`
 }
 
@@ -293,6 +353,14 @@ function buildCaptureDoc(code: string): string {
  *  clone is what gets rasterized. */
 const CAPTURE_FREEZE_CSS =
   '*,*::before,*::after{animation-duration:0s!important;animation-delay:0s!important;animation-fill-mode:forwards!important;transition:none!important}'
+
+/** html2canvas loads every <img> src and CSS url() itself, with `new Image()` in the APP's
+ *  window, so the frame's CSP (img-src data: blob:) does not cover those requests. With
+ *  useCORS on, a model-written remote image URL (an attacker's `?d=<data>`, a LAN admin page)
+ *  was fetched on Download PNG/JPEG although the preview blocks it. Off (and allowTaint off,
+ *  its default), html2canvas skips cross-origin images, so no third party is contacted: the
+ *  export loads only data:, blob: and app-origin (relative) image URLs. */
+const H2C_USE_CORS = false
 
 /** Render the HTML in an isolated, same-origin, SCRIPT-DISABLED iframe and rasterize
  *  it with html2canvas. Unlike the foreignObject trick, html2canvas performs real
@@ -345,7 +413,7 @@ async function html2canvasCapture(code: string, vw: number, vh: number): Promise
     const { default: html2canvas } = await import('html2canvas')
     const canvas = await html2canvas(doc.body, {
       width: w, height: realH, windowWidth: w, windowHeight: h,
-      scale, backgroundColor: bg, useCORS: true, logging: false, scrollX: 0, scrollY: 0,
+      scale, backgroundColor: bg, useCORS: H2C_USE_CORS, logging: false, scrollX: 0, scrollY: 0,
       onclone: (cloned: Document) => {
         const s = cloned.createElement('style')
         s.textContent = CAPTURE_FREEZE_CSS
@@ -453,7 +521,7 @@ async function rasterizeStaticFrozen(
     const { default: html2canvas } = await import('html2canvas')
     const canvas = await html2canvas(doc.body, {
       width: dims.w, height: dims.h, windowWidth: dims.w, windowHeight: dims.h,
-      scale, backgroundColor: bg, useCORS: true, logging: false, scrollX: 0, scrollY: 0,
+      scale, backgroundColor: bg, useCORS: H2C_USE_CORS, logging: false, scrollX: 0, scrollY: 0,
       onclone: (cloned: Document) => {
         const s = cloned.createElement('style')
         s.textContent = CAPTURE_FREEZE_CSS
@@ -490,31 +558,6 @@ async function rasterizeStaticFrozen(
     return null
   } finally {
     tagged.forEach((el) => el.removeAttribute('data-h2cpad'))
-  }
-}
-
-/** Post the preview to the vision model for quality verification.
- *  Returns true if OK or if the model doesn't support vision. */
-async function verifyWithVision(dataUrl: string): Promise<boolean> {
-  try {
-    const res = await fetch('/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: [{ role: 'user', content: [
-          { type: 'image_url', image_url: { url: dataUrl } },
-          { type: 'text', text: 'Does this diagram or UI render correctly with no visual errors or garbled content? Reply only "ok" or briefly describe any issue.' },
-        ]}],
-        max_tokens: 30,
-        stream: false,
-      }),
-    })
-    if (!res.ok) return true
-    const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> }
-    const text = (data.choices?.[0]?.message?.content ?? 'ok').toLowerCase().trim()
-    return text.startsWith('ok') || text.length <= 2
-  } catch {
-    return true
   }
 }
 
@@ -590,6 +633,14 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [interactive, setInteractive] = useState(false)
+  // HTML only: the hidden scripted iframe that GIF/canvas export reads from. It runs the model's
+  // JS, and the CSP can't stop that JS navigating the frame to any URL, so it is mounted only
+  // when the user asks for an export that needs it (`liveFrame`), never on render, and unmounted
+  // again once the last export that asked for it is done (`releaseLiveFrame`).
+  const [liveWanted, setLiveWanted] = useState(false)
+  const liveLoad = useRef<{ loaded: boolean; waiters: Array<() => void> }>({ loaded: false, waiters: [] })
+  // Exports still running that took the live frame (the Download menu stays usable while one runs).
+  const liveUsers = useRef(0)
   // Frozen-vh dimensions of the static HTML render: once the static iframe has loaded, the
   // parent rewrites its vh units to px and measures the true full-page size here, so the
   // iframe can be shown at full height (no clip) without the height feeding back into vh.
@@ -669,16 +720,23 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
 
   // Computed here (before capture effects) so the effects can reference it safely.
   const fitReady = naturalW > 0 && availW > 0
+  // The static HTML render measures itself (no scripted sizer runs until a user action), so it
+  // only needs the column width.
+  const hasAvailW = availW > 0
 
   // Clear static preview whenever content or theme changes.
   useEffect(() => {
     setPreviewUrl(null)
     setInteractive(false)
+    setLiveWanted(false)
+    liveLoad.current = { loaded: false, waiters: [] }
     setImgDims(null)
     setStaticDims(null)
   }, [stableCode, theme])
 
-  // Capture Mermaid SVG → static preview image once the SVG is rendered.
+  // Capture Mermaid SVG → static preview image once the SVG is rendered. (No vision-model
+  // "verify then retry" pass: re-rasterizing the same SVG yields the same image, so it could
+  // never change the result, and each check was a real inference on the user's loaded model.)
   useEffect(() => {
     if (type !== 'application/vnd.mermaid' || !mermaid.svg) return
     let cancelled = false
@@ -686,28 +744,25 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     void svgToPreview(svg).then((url) => {
       if (cancelled || !url) return
       setPreviewUrl(url)
-      void verifyWithVision(url).then((ok) => {
-        if (!ok && !cancelled) void svgToPreview(svg).then((u2) => { if (u2 && !cancelled) setPreviewUrl(u2) })
-      })
     })
     return () => { cancelled = true }
   }, [type, mermaid.svg])
 
   // Capture SVG → static preview image (perfect SVG raster). Mermaid has its own
   // capture effect; HTML renders a live browser iframe instead and only rasterizes
-  // (via html2canvas) on download.
+  // (via html2canvas) on download. Needs only the column width, not fitReady: the pre-preview
+  // SVG frame runs no scripts, so its sizer never reports, and svgToPreview sizes from the <img>
+  // (which never runs SVG script). `theme` re-captures after the clear effect above drops the
+  // preview on a theme change (the raster's background is the theme's --bg).
   useEffect(() => {
-    if (type !== 'image/svg+xml' || !fitReady) return
+    if (type !== 'image/svg+xml' || !hasAvailW) return
     let cancelled = false
     void svgToPreview(stableCode).then((url) => {
       if (cancelled || !url) return
       setPreviewUrl(url)
-      void verifyWithVision(url).then((ok) => {
-        if (!ok && !cancelled) void svgToPreview(stableCode).then((u2) => { if (u2 && !cancelled) setPreviewUrl(u2) })
-      })
     })
     return () => { cancelled = true }
-  }, [type, fitReady, stableCode])
+  }, [type, hasAvailW, stableCode, theme])
 
   // Static HTML render: freeze the live iframe's vh→px (at a desktop-proportioned reference
   // viewport) and measure the true full-page size. A LIVE iframe is pixel-perfect (flexbox
@@ -719,14 +774,17 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     // The static iframe is ALWAYS mounted (only its visibility toggles), so it's frozen+
     // measured exactly once per content/theme — toggling to interactive and back never
     // remounts it (a remount would load an UNFROZEN doc and clip the page).
-    if (type !== 'text/html' || staticDims || !fitReady) return
+    if (type !== 'text/html' || staticDims || !hasAvailW) return
     const f = staticRef.current
     if (!f) return
     let cancelled = false
     const refH = captureViewportH(staticMeasureW(availW))
     const measure = () => {
       const doc = f.contentDocument
-      if (!doc || !doc.body) return
+      // Until the srcdoc navigation lands, contentDocument is the initial about:blank — already
+      // readyState 'complete', with a body — and measuring THAT would freeze the card at the
+      // empty frame's size. Only the srcdoc document (URL about:srcdoc) is the artifact.
+      if (!doc || !doc.body || doc.URL !== 'about:srcdoc') return
       try { freezeVh(doc, refH) } catch { /* cross-origin / parse issue: fall back to raw */ }
       requestAnimationFrame(() => requestAnimationFrame(() => {
         if (cancelled || !doc.body) return
@@ -740,7 +798,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     return () => { cancelled = true; f.removeEventListener('load', measure) }
     // availW read at call time; resizing re-runs via staticDims reset, not as a dep.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [type, staticDims, fitReady, stableCode, theme])
+  }, [type, staticDims, hasAvailW, stableCode, theme])
 
   const srcdoc = type !== 'application/vnd.mermaid' ? buildSrcdoc(type, stableCode) : ''
   const mermaidSrcdoc = mermaid.svg ? buildSrcdoc('image/svg+xml', mermaid.svg) : ''
@@ -775,8 +833,35 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
   // Applicable image-format downloads — the underlying html/svg/mermaid is abstracted.
   const formats: Fmt[] = type === 'text/html' ? ['png', 'jpeg', 'gif', 'html'] : ['png', 'jpeg', 'svg']
 
+  /** Mount the hidden scripted HTML iframe (a user action asked for it) and resolve with it once
+   *  its document has loaded — or after a bound, so an export never hangs on it. */
+  function liveFrame(): Promise<HTMLIFrameElement | null> {
+    liveUsers.current++
+    setLiveWanted(true)
+    const l = liveLoad.current
+    if (l.loaded) return Promise.resolve(iframeRef.current)
+    return new Promise((resolve) => {
+      const done = () => resolve(iframeRef.current)
+      l.waiters.push(done)
+      setTimeout(done, 4000)
+    })
+  }
+
+  /** An export that called liveFrame() is done with the frame. Once no other export still needs
+   *  it, unmount it: left mounted, the model's JS kept running unseen in the 0-height frame for
+   *  the rest of the card's life (timers, animation loops, a delayed self-navigation). The load
+   *  state goes with it, so the next export mounts a fresh frame and waits for that one to load
+   *  instead of reading the gone frame as ready. */
+  function releaseLiveFrame() {
+    if (--liveUsers.current > 0) return
+    setLiveWanted(false)
+    liveLoad.current = { loaded: false, waiters: [] }
+  }
+
   async function download(fmt: Fmt) {
     setBusy(true)
+    let tookLive = false
+    const takeLive = () => { tookLive = true; return liveFrame() }
     try {
       if (fmt === 'svg') {
         const svg = type === 'application/vnd.mermaid' ? (mermaid.svg ?? '') : stableCode
@@ -784,10 +869,11 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
       } else if (fmt === 'html') {
         downloadBlob(new Blob([stableCode], { type: 'text/html' }), 'artifact.html')
       } else if (fmt === 'gif') {
-        const blob = await captureGif(iframeRef.current)
+        const live = await takeLive()
+        const blob = await captureGif(live)
         if (blob) downloadBlob(blob, 'artifact.gif')
         else {
-          const png = await htmlIframeToPng(iframeRef.current)
+          const png = await htmlIframeToPng(live)
           if (png) downloadBlob(png, 'artifact.png')
         }
       } else {
@@ -804,7 +890,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
           if (!blob) blob = await rasterizeStaticFrozen(staticRef.current, staticDims, mime)
           if (!blob) {
             const vw = staticMeasureW(availW)
-            const url = await captureHtmlPreview(stableCode, iframeRef.current, vw, captureViewportH(vw))
+            const url = await captureHtmlPreview(stableCode, await takeLive(), vw, captureViewportH(vw))
             const png = url ? await (await fetch(url)).blob() : null
             blob = png ? (fmt === 'jpeg' ? await blobToJpeg(png) : png) : null
           }
@@ -813,6 +899,7 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
         else toast.error('Couldn’t export this artifact as an image — try GIF or HTML.')
       }
     } finally {
+      if (tookLive) releaseLiveFrame()
       setBusy(false)
     }
   }
@@ -843,14 +930,20 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
     //    none` makes it non-interactive. Until measured we render it transparent + a spinner.
     //  · interactive: a REAL viewport — scale 1, full card width, fixed 60vh height, natively
     //    scrollable, scripts on. Fixed height = no collapse / no runaway-expand.
-    // A hidden scripted iframe (iframeRef) powers GIF/canvas + on-demand image downloads.
+    // A hidden scripted iframe (iframeRef) powers GIF/canvas + the last-resort image export. It
+    // is mounted only while one of those exports needs it (`liveFrame`), never on render.
     const measureW = staticMeasureW(availW)
     const refH = captureViewportH(measureW)
     body = (
       <>
-        <div style={{ height: 0, overflow: 'hidden' }} aria-hidden>
-          <FittedIframe frameRef={iframeRef} srcDoc={srcdoc} naturalW={naturalW} naturalH={naturalH} scale={scale} cap={cap} ready={fitReady} />
-        </div>
+        {liveWanted && (
+          <div style={{ height: 0, overflow: 'hidden' }} aria-hidden>
+            <FittedIframe
+              frameRef={iframeRef} srcDoc={srcdoc} naturalW={naturalW} naturalH={naturalH} scale={scale} cap={cap} ready={fitReady}
+              onLoad={() => { const l = liveLoad.current; l.loaded = true; l.waiters.splice(0).forEach((w) => w()) }}
+            />
+          </div>
+        )}
         {/* Static frozen-vh render — ALWAYS mounted (frozen once); only hidden when interactive,
             so toggling back never remounts/unfreezes it. */}
         <div
@@ -910,9 +1003,11 @@ export function ArtifactCard({ lang, code }: ArtifactCardProps) {
       />
     )
   } else {
-    // Mermaid/SVG before the image is ready: live render.
+    // Mermaid/SVG before the image is ready: live render. A raw SVG is model-written and mounts
+    // with no click, so its frame gets no scripts at all (`sandbox=""`): its own <script> can't
+    // run or navigate the frame anywhere. Mermaid's SVG is mermaid's own strict-mode output.
     const doc = type === 'application/vnd.mermaid' ? mermaidSrcdoc : srcdoc
-    body = <FittedIframe frameRef={iframeRef} srcDoc={doc} naturalW={naturalW} naturalH={naturalH} scale={scale} cap={cap} ready={fitReady} />
+    body = <FittedIframe frameRef={iframeRef} srcDoc={doc} naturalW={naturalW} naturalH={naturalH} scale={scale} cap={cap} ready={fitReady} sandbox={type === 'image/svg+xml' ? '' : undefined} />
   }
 
   return (
