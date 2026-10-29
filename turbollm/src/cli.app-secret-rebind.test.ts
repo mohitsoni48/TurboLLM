@@ -39,5 +39,5 @@ test('the boot-time bind retry is unchanged: the app asks for a proof before it 
   // the daemon answers GET /api/v1/app-proof, so a busy port at boot is still retried as before.
   const listen = listenBlock()
   // (The next try's count starts over when a rebind re-pointed the bind meanwhile; see cli.ts.)
-  assert.match(listen, /if \(e\?\.code === 'EADDRINUSE' && attempt < 20\) \{\n {8}if \(attempt === 0\) console\.log\(`  Port \$\{port\} busy \(previous listener releasing\) — retrying…`\)\n(?: {8}\/\/.*\n)* {8}setTimeout\(\(\) => listen\(`\$\{host\}:\$\{port\}` === tried \? attempt \+ 1 : 0\), 500\)/)
+  assert.match(listen, /if \(e\?\.code === 'EADDRINUSE' && attempt < 20\) \{\n {8}if \(attempt === 0\) console\.log\(` {2}Port \$\{port\} busy \(previous listener releasing\) — retrying…`\)\n(?: {8}\/\/.*\n)* {8}setTimeout\(\(\) => listen\(`\$\{host\}:\$\{port\}` === tried \? attempt \+ 1 : 0\), 500\)/)
 })

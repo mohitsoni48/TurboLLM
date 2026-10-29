@@ -145,7 +145,9 @@ export function fakeLitertlmBundleOf(sections: FakeSection[]): Buffer {
   file.writeUInt32LE(1, 8); file.writeUInt32LE(7, 12)
   file.writeBigUInt64LE(BigInt(32 + header.length), 24)
   header.copy(file, 32)
-  sections.forEach((s, i) => s.data?.copy(file, ranges[i][0]))
+  sections.forEach((s, i) => {
+    s.data?.copy(file, ranges[i][0])
+  })
   return file
 }
 

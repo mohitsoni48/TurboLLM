@@ -587,24 +587,24 @@ test('GitHub #221: overrides (unsaved dialog edits) are tokenized too', () => {
 
 test('tokenizeExtraArgs keeps a quoted value containing spaces as one token, quotes stripped', () => {
   assert.deepEqual(
-    tokenizeExtraArgs(['--chat-template-file "C:\my path\t.jinja"']),
-    ['--chat-template-file', 'C:\my path\t.jinja'],
+    tokenizeExtraArgs(['--chat-template-file "C:my path\t.jinja"']),
+    ['--chat-template-file', 'C:my path\t.jinja'],
   )
   assert.deepEqual(tokenizeExtraArgs(["--grammar 'a b c'"]), ['--grammar', 'a b c'])
 })
 
 test('tokenizeExtraArgs is idempotent — a second pass is a no-op', () => {
-  const raw = ['--load-mode dio', '--chat-template-file "C:\my path\t.jinja"', '-dio', '--foo="a b"']
+  const raw = ['--load-mode dio', '--chat-template-file "C:my path\t.jinja"', '-dio', '--foo="a b"']
   const once = tokenizeExtraArgs(raw)
   assert.deepEqual(tokenizeExtraArgs(once), once)
   // Specifically: the unquoted path token must not be chopped in half on reload.
-  assert.ok(once.includes('C:\my path\t.jinja'))
+  assert.ok(once.includes('C:my path\t.jinja'))
 })
 
 test('resolveProfile is idempotent over an already-resolved profile (reload-safe)', () => {
   const m = model()
   const s = sys()
-  const first = resolveProfile(m, s, { extraArgs: ['--chat-template-file "C:\my path\t.jinja"'] })
+  const first = resolveProfile(m, s, { extraArgs: ['--chat-template-file "C:my path\t.jinja"'] })
   const second = resolveProfile(m, s, { extraArgs: first.extraArgs })
   assert.deepEqual(second.extraArgs, first.extraArgs)
 })
@@ -630,8 +630,8 @@ test('tokenizeExtraArgs does not split a bare value entry that contains spaces',
   // The workaround users were told to use: flag and value as separate chips. The value
   // chip is not a flag, so it survives verbatim even with a space in it.
   assert.deepEqual(
-    tokenizeExtraArgs(['--chat-template-file', 'C:\my path\t.jinja']),
-    ['--chat-template-file', 'C:\my path\t.jinja'],
+    tokenizeExtraArgs(['--chat-template-file', 'C:my path\t.jinja']),
+    ['--chat-template-file', 'C:my path\t.jinja'],
   )
 })
 

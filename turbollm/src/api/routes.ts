@@ -3737,7 +3737,7 @@ export function registerApi(app: Hono, d: Deps): void {
         //    Downloaded, while a sibling variant never matches by name alone.
         const listedByPath = f.name !== basename(f.name)
         const pmatch = prov.find((p) => {
-          if (!!p.sha256 && !!f.sha256 && p.sha256 === f.sha256) return true
+          if (p.sha256 && f.sha256 && p.sha256 === f.sha256) return true
           if (p.repo !== repo) return false
           if (!listedByPath) return p.filename === f.name
           return p.filename === basename(f.name) && p.dest.replace(/\\/g, '/').endsWith('/' + f.name)

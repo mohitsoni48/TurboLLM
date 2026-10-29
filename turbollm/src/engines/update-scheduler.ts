@@ -13,7 +13,7 @@ import type { ConfigStore, Engine } from '../config/config'
 import type { Manager } from './manager'
 import { ProbeError } from './probe'
 import type { Registry } from './registry'
-import { UPDATE_CHECK_INTERVAL_MS, UpdateChecker, decideAutoUpdate, normalizeUpdatePolicy } from './update'
+import { UPDATE_CHECK_INTERVAL_MS, type UpdateChecker, decideAutoUpdate, normalizeUpdatePolicy } from './update'
 
 export interface UpdateSchedulerDeps {
   store: ConfigStore

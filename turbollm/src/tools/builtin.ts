@@ -3,7 +3,7 @@
 import { Worker } from 'node:worker_threads'
 import { fetchWithSsrfCheck } from './security.js'
 import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
-import { type SearchConfig } from './search-providers.js'
+import type { SearchConfig } from './search-providers.js'
 import {
   ageInDays, aggregatorPenalty, currentnessMultiplier, freshnessSignal, officialDocsBoost,
   officialSourceBoost, research, type ResearchResult,
@@ -105,7 +105,7 @@ export const RUN_CODE_TOOL = {
 
 // ── Web search — F-021 retrieval service ──────────────────────────────────────
 
-export { type ResearchResult }
+export type { ResearchResult }
 
 /** PURE: today's date as 'YYYY-MM-DD' (UTC), stamped on results so the model can tell how old
  *  a source is instead of guessing from its training cutoff. */

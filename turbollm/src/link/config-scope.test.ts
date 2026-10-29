@@ -386,8 +386,8 @@ test('scrubRemoteConfig drops host paths, secrets and network settings a host sh
   // Built FORWARD from the allowlist, so this holds for fields nobody has thought of yet —
   // which is the whole reason the read surface is a projection rather than a deletion list.
   const out = scrubRemoteConfig({
-    modelDirs: ['D:\models', '/home/dev/models'],
-    primaryModelDir: 'D:\models',
+    modelDirs: ['D:models', '/home/dev/models'],
+    primaryModelDir: 'D:models',
     apiKeys: [{ id: 'k', hash: 'h', value: 'tllm-secret' }],
     links: [{ token: 'tllm-other' }],
     telemetry: { enabled: true },

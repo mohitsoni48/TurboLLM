@@ -1,7 +1,7 @@
 // Engine lifecycle state machine (A2, spec 03 §4): stopped → starting → running
 // → stopping → stopped, plus error. Owns the single running engine process.
 // Ports the verified Go manager to node:child_process.
-import { ChildProcess, execFile, spawnSync } from 'node:child_process'
+import { type ChildProcess, execFile, spawnSync } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'

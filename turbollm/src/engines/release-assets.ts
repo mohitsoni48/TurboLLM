@@ -303,9 +303,9 @@ function stripArchiveExtension(lowerName: string): string {
 function removeTag(lowerName: string, lowerTag: string): string {
   const bare = lowerTag.replace(/^v/, '')
   const longestFirst = [...new Set([lowerTag, bare, `v${bare}`])].filter(Boolean).sort((a, b) => b.length - a.length)
-  const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const asTokens = (form: string, flags = '') =>
-    new RegExp(`(?<![a-z0-9])(?<!\\d\\.)${escape(form)}(?![a-z0-9])(?!\\.\\d)`, flags)
+    new RegExp(`(?<![a-z0-9])(?<!\\d\\.)${escapeRegExp(form)}(?![a-z0-9])(?!\\.\\d)`, flags)
   const present = longestFirst.find((form) => asTokens(form).test(lowerName))
   return present === undefined ? lowerName : lowerName.replace(asTokens(present, 'g'), '')
 }

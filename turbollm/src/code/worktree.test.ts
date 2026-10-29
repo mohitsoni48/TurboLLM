@@ -414,6 +414,7 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
 // (compat/mingw.c) for the characters the sanitizer can let through; on Linux and macOS git
 // accepts every one of these names, so this is asserted on every platform, in pure code.
 function windowsRefusal(name: string): string | null {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: mirrors Git for Windows' own forbidden-character set, control bytes included
   if (/[<>:"|?*\\\x00-\x1f]/.test(name)) return 'a character Windows forbids'
   for (const part of name.split('/')) {
     if (/[. ]$/.test(part)) return `part ${JSON.stringify(part)} ends in a dot or space`

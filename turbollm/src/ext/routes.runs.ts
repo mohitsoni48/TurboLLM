@@ -17,7 +17,7 @@ import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { checkContextFits } from './context-limit.js'
 import { loadFullHistory, buildGenerationCtx } from './generation.js'
-import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
+import type { PublicRunManager, PublicRun, RunBody } from './run-manager.js'
 import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 import {
   TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,

@@ -98,6 +98,7 @@ async function inNamespace(pid1: string[]): Promise<string> {
       child.stdout.destroy()
       child.stderr.destroy()
       child.unref()
+      // biome-ignore lint/correctness/noUnsafeFinally: deliberate — a namespace that outlives its kill is itself the failure this test harness reports, even over a try-block error
       throw new Error(`the namespace (unshare ${unsharePid ?? 'of unknown pid'}) did not end within 10 s of its kill; it printed:\n${out}`)
     }
     if (unsharePid !== undefined) liveUnshares.delete(unsharePid)

@@ -508,9 +508,15 @@ function onProgramExit(e: Entry): void {
     else forgetIfDone(e)
     return
   }
-  if (!e.lifelineOpen) return forgetIfDone(e)
+  if (!e.lifelineOpen) {
+    forgetIfDone(e)
+    return
+  }
   if (e.stopping) return // endGroups closes it once the group is down to the watcher, or at its grace
-  if (e.end === 'term') return quitLifeline(e) // it ended by itself: no SIGTERM for it
+  if (e.end === 'term') {
+    quitLifeline(e) // it ended by itself: no SIGTERM for it
+    return
+  }
   if (e.hold !== undefined && !e.noHold && e.group) {
     e.state = 'deciding'
     const pid = e.child.pid as number
@@ -1133,7 +1139,10 @@ export function killTetheredTree(child: ChildProcess, signal: NodeJS.Signals): v
     return
   }
   const e = byChild.get(child)
-  if (e) return signalGroup(e, signal)
+  if (e) {
+    signalGroup(e, signal)
+    return
+  }
   // Not started here: as child.kill() does, nothing once Node has reaped it (its pid may name another process).
   if (child.exitCode !== null || child.signalCode !== null) return
   try {

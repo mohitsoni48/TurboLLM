@@ -38,7 +38,7 @@ export const MAX_IDENT_LEN = 96
  */
 function isSafeIdent(v: unknown): boolean {
   if (typeof v !== 'string' || v.length === 0 || v.length > MAX_IDENT_LEN) return false
-  if (!/^[A-Za-z0-9 ._:()+\-]+$/.test(v)) return false // no slashes, backslashes, control chars
+  if (!/^[A-Za-z0-9 ._:()+-]+$/.test(v)) return false // no slashes, backslashes, control chars
   if (v.includes('..')) return false // no traversal-shaped values
   return true
 }
@@ -57,7 +57,7 @@ function isSafeIdent(v: unknown): boolean {
 export function toSafeIdent(v: string): string {
   if (isSafeIdent(v)) return v
   const out = String(v ?? '')
-    .replace(/[^A-Za-z0-9 ._:()+\-]+/g, ' ')
+    .replace(/[^A-Za-z0-9 ._:()+-]+/g, ' ')
     .replace(/\.{2,}/g, '.')
     .replace(/ {2,}/g, ' ')
     .trim()
@@ -122,7 +122,7 @@ export function checkFields(obj: unknown, spec: Record<string, FieldSpec>, path:
   // review). `spec` is always our own literal object, so this call can never
   // itself fail on a missing hasOwnProperty.
   for (const key of Object.keys(o)) {
-    if (!Object.prototype.hasOwnProperty.call(spec, key)) return `unknown field: ${path}.${key}`
+    if (!Object.hasOwn(spec, key)) return `unknown field: ${path}.${key}`
   }
 
   for (const [key, field] of Object.entries(spec)) {
