@@ -740,6 +740,8 @@ function applyGlobalDefaults(base: LoadProfile, m: ModelEntry, sys: SysInfo, def
       : defaults.ctx > 0 ? (nativeCap > 0 ? Math.min(defaults.ctx, nativeCap) : defaults.ctx) : base.ctx,
     ngl: hasGpu ? defaults.ngl : 0,
     imageMaxTokens: defaults.imageMaxTokens ?? base.imageMaxTokens,
+    kvTypeK: defaults.kvTypeK || base.kvTypeK,
+    kvTypeV: defaults.kvTypeV || base.kvTypeV,
   }
 }
 

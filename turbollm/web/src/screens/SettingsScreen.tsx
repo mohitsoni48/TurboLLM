@@ -20,6 +20,7 @@ import {
   useTelemetryLog,
   useRegenerateMachineId,
   useAppUpdate,
+  useEngines,
   useSysInfo,
 } from '../lib/queries'
 import { ModelDirs } from './models/ModelDirs'
@@ -160,6 +161,8 @@ function draftsFrom(s: DaemonSettings) {
     defNgl: s.modelDefaults?.ngl ?? 99,
     defImageMax: s.modelDefaults?.imageMaxTokens ?? 0,
     defMaxTokens: s.modelDefaults?.maxTokens ?? 0,
+    defKvK: s.modelDefaults?.kvTypeK ?? '',
+    defKvV: s.modelDefaults?.kvTypeV ?? '',
     telemetry: (s.telemetryLevel ?? 'off') as TelemetryLevel,
     lanBind: s.lanBind ?? false,
     requireApiKey: s.requireApiKey ?? true,
@@ -193,6 +196,8 @@ export function SettingsScreen() {
   const [defNgl, setDefNgl] = useState<number>(99)
   const [defImageMax, setDefImageMax] = useState<number>(0)
   const [defMaxTokens, setDefMaxTokens] = useState<number>(0)
+  const [defKvK, setDefKvK] = useState('')
+  const [defKvV, setDefKvV] = useState('')
   const [telemetry, setTelemetry] = useState<TelemetryLevel>('off')
   const [lanBind, setLanBind] = useState(false)
   const [requireApiKey, setRequireApiKey] = useState(true)
@@ -245,6 +250,8 @@ export function SettingsScreen() {
     setDefNgl(keep('defNgl'))
     setDefImageMax(keep('defImageMax'))
     setDefMaxTokens(keep('defMaxTokens'))
+    setDefKvK(keep('defKvK'))
+    setDefKvV(keep('defKvV'))
     setTelemetry(keep('telemetry'))
     setLanBind(keep('lanBind'))
     setRequireApiKey(keep('requireApiKey'))
@@ -301,6 +308,8 @@ export function SettingsScreen() {
     if (edited('defNgl', defNgl)) md.ngl = clampN(defNgl, 0, 99)
     if (edited('defImageMax', defImageMax)) md.imageMaxTokens = Math.max(0, Math.round(defImageMax))
     if (edited('defMaxTokens', defMaxTokens)) md.maxTokens = Math.max(0, Math.round(defMaxTokens))
+    if (edited('defKvK', defKvK)) md.kvTypeK = defKvK
+    if (edited('defKvV', defKvV)) md.kvTypeV = defKvV
     if (Object.keys(md).length) p.modelDefaults = md
     const cu: NonNullable<DaemonSettingsPatch['comfyui']> = {}
     if (edited('comfyEnabled', comfyEnabled)) cu.enabled = comfyEnabled
@@ -335,7 +344,7 @@ export function SettingsScreen() {
 
   const handleSave = () => {
     const sent: ReturnType<typeof draftsFrom> = {
-      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, showAllEngineModels, defCtx, defNgl, defImageMax, defMaxTokens, telemetry,
+      ttl, vramHeadroom, port, autoTitle, openBrowser, autoLoad, showAllEngineModels, defCtx, defNgl, defImageMax, defMaxTokens, defKvK, defKvV, telemetry,
       lanBind, requireApiKey, comfyEnabled, comfyUrl, comfyReverseGate, gatewayAutoSwap, gatewayKeepN,
     }
     save.mutate(settingsPayload(), {
@@ -389,6 +398,8 @@ export function SettingsScreen() {
       defNgl !== (settings.modelDefaults?.ngl ?? 99) ||
       defImageMax !== (settings.modelDefaults?.imageMaxTokens ?? 0) ||
       defMaxTokens !== (settings.modelDefaults?.maxTokens ?? 0) ||
+      defKvK !== (settings.modelDefaults?.kvTypeK ?? '') ||
+      defKvV !== (settings.modelDefaults?.kvTypeV ?? '') ||
       telemetry !== (settings.telemetryLevel ?? 'off') ||
       lanBind !== (settings.lanBind ?? false) ||
       requireApiKey !== (settings.requireApiKey ?? true) ||
@@ -717,6 +728,8 @@ export function SettingsScreen() {
                       />
                     </div>
                   </div>
+
+                  <KvTypeDefaults k={defKvK} v={defKvV} setK={setDefKvK} setV={setDefKvV} />
 
                   <div className="flex items-center justify-between border-t border-border py-2">
                     <div>
@@ -1844,5 +1857,45 @@ function HelpSection() {
         </a>
       </div>
     </section>
+  )
+}
+
+/** Model defaults' K and V cache types (GitHub #288). Offers what the selected engine lists, as the
+ *  model dialog does; '' is automatic. A stored type that engine does not list stays selectable so
+ *  opening Settings never changes it, and a model loading on such an engine runs at f16. */
+function KvTypeDefaults({ k, v, setK, setV }: { k: string; v: string; setK: (t: string) => void; setV: (t: string) => void }) {
+  const enginesQ = useEngines()
+  const active = enginesQ.data?.engines.find((e) => e.id === enginesQ.data?.activeEngineId)
+  const listed = active?.capabilities.kvTypes ?? []
+  const options = (cur: string) => [...new Set(['', ...listed, ...(cur ? [cur] : [])])]
+  const picker = (label: string, value: string, onChange: (t: string) => void) => (
+    <select
+      aria-label={label}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      className="rounded-md border border-border bg-bg px-2 py-1 text-[13px] text-ink outline-none"
+    >
+      {options(value).map((t) => (
+        <option key={t} value={t}>
+          {t === '' ? 'Automatic' : listed.includes(t) ? t : `${t} (not on this engine)`}
+        </option>
+      ))}
+    </select>
+  )
+  return (
+    <div className="flex items-center justify-between border-t border-border py-2">
+      <div>
+        <div className="text-[14px] font-medium text-ink">KV cache type</div>
+        <div className="text-[12px] text-muted">
+          K and V cache types for llama.cpp engines. q8_0 roughly halves KV memory, q4_0 quarters it. Automatic is f16 (q4_0 on Android).
+        </div>
+      </div>
+      <div className="flex items-center gap-2">
+        <span className="text-[12px] text-muted">K</span>
+        {picker('Default K cache type', k, setK)}
+        <span className="text-[12px] text-muted">V</span>
+        {picker('Default V cache type', v, setV)}
+      </div>
+    </div>
   )
 }

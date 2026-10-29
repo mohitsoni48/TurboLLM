@@ -98,6 +98,17 @@ export function isConfigTheme(v: unknown): boolean {
   return typeof v === 'string' && (CONFIG_THEMES as readonly string[]).includes(v)
 }
 
+/** Settings → Model defaults' K and V cache types (`modelDefaults.kvTypeK` / `kvTypeV`): '' is
+ *  automatic (the per-model heuristic, f16, or q4_0 on Android), anything else a llama.cpp
+ *  `--cache-type-k/-v` name as an engine's probe lists them (f16, q8_0, turbo3, …). A type the
+ *  loading engine does not list is never passed to it (profileToArgs), so this only keeps the
+ *  stored value a plain name. */
+export const KV_TYPE_MESSAGE = 'modelDefaults.kvTypeK and kvTypeV must be a cache type name such as f16 or q8_0, or "" for automatic.'
+
+export function isKvTypeName(v: unknown): v is string {
+  return typeof v === 'string' && (v === '' || /^[a-z0-9_]{1,16}$/.test(v))
+}
+
 /** LOCAL policy: a JSON number only, range-checked and coerced per its `coerce`. Returns the
  *  value to store, or `null` when the caller should answer 400 with `CONFIG_BOUNDS[path].message`.
  *  It took any JSON type through Number() once: null and false became 0 (`ngl` 0 is no GPU

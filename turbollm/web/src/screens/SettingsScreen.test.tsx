@@ -8,7 +8,7 @@ import { toast } from '../components/ui/sonner'
 import { SettingsScreen } from './SettingsScreen'
 
 type SaveCall = { payload: unknown; opts: { onSuccess?: (res: DaemonSettings & { rebind?: unknown }) => void } }
-const state: { settings: DaemonSettings | null; sysInfo: unknown; saveCalls: SaveCall[]; restarts: number } = { settings: null, sysInfo: undefined, saveCalls: [], restarts: 0 }
+const state: { settings: DaemonSettings | null; sysInfo: unknown; engines: unknown; saveCalls: SaveCall[]; restarts: number } = { settings: null, sysInfo: undefined, engines: undefined, saveCalls: [], restarts: 0 }
 const mk = (over: Partial<DaemonSettings> = {}) => ({
   idleTtlMinutes: 60, vramHeadroomMb: 1024, port: 6996, autoGenerateTitles: true, openBrowserOnStart: true,
   autoLoadOnStart: false, modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 }, telemetryLevel: 'off',
@@ -34,6 +34,7 @@ vi.mock('../lib/queries', () => ({
   useTelemetryPreview: () => ({ data: undefined }), useTelemetryLog: () => ({ data: undefined }),
   useRegenerateMachineId: () => mut(), useAppUpdate: () => ({ data: undefined }), useSysInfo: () => ({ data: state.sysInfo }),
   useAppUpdatePolicyMutation: () => mut(), useDismissAppUpdateMutation: () => mut(),
+  useEngines: () => ({ data: state.engines }),
 }))
 // Its live gauges poll hooks this file does not mock; the System tab is only opened for Restart.
 vi.mock('./settings/HardwareSection', () => ({ HardwareSection: () => null }))
@@ -141,6 +142,43 @@ describe('SettingsScreen — Show models for every engine', () => {
     render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
     await openModels()
     expect(toggle().checked).toBe(true)
+  })
+})
+
+// GitHub #288: default K and V cache types beside the other model defaults.
+describe('SettingsScreen — default KV cache type', () => {
+  const openAdvanced = async () => {
+    await userEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: 'Models & loading' }))
+    await userEvent.click(screen.getByRole('button', { name: /Advanced/ }))
+  }
+  const picker = (name: RegExp) => screen.getByRole('combobox', { name }) as HTMLSelectElement
+  const engines = (kvTypes: string[]) => ({ activeEngineId: 'e1', engines: [{ id: 'e1', capabilities: { kvTypes, flags: [] } }] })
+
+  it("offers Automatic and the selected engine's types, and Save sends only the one changed", async () => {
+    state.settings = mk()
+    state.engines = engines(['f16', 'q8_0', 'q4_0'])
+    state.saveCalls = []
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await openAdvanced()
+    const k = picker(/Default K cache type/)
+    expect(k.value).toBe('')
+    expect([...k.options].map((o) => o.textContent)).toEqual(['Automatic', 'f16', 'q8_0', 'q4_0'])
+
+    await userEvent.selectOptions(k, 'q8_0')
+    expect(screen.getByText('Unsaved changes')).toBeTruthy()
+    await userEvent.click(screen.getByRole('button', { name: /Save settings/ }))
+    expect(state.saveCalls.map((c) => c.payload)).toEqual([{ modelDefaults: { kvTypeK: 'q8_0' } }])
+  })
+
+  it('keeps a stored type the selected engine does not list, and says so', async () => {
+    state.settings = mk({ modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0, kvTypeV: 'turbo3' } })
+    state.engines = engines(['f16', 'q8_0'])
+    render(<MemoryRouter><SettingsScreen /></MemoryRouter>)
+    await openAdvanced()
+    const v = picker(/Default V cache type/)
+    expect(v.value).toBe('turbo3')
+    expect(v.selectedOptions[0].textContent).toBe('turbo3 (not on this engine)')
+    expect(screen.queryByText('Unsaved changes')).toBeNull()
   })
 })
 
