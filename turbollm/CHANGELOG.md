@@ -24,6 +24,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 ## [Unreleased]
 
 ### Added
+- **Default KV cache types** (Settings → Models & loading → Advanced, #288). Pick the K and V cache types a model
+  loads with when it has none saved of its own, beside the default context and GPU layers: q8_0 roughly halves KV
+  memory, q4_0 quarters it. Automatic keeps today's choice (f16, q4_0 on Android). The list is the selected engine's;
+  a model loading on an engine without the chosen type runs at f16, as a saved per-model type does.
 - **LiteRT-LM in the standalone Android app.** The app now ships LiteRT-LM built in: a native port of
   `litert-lm serve` over the same `liblitert-lm.so` runtime Termux users run through Python, registered at boot
   as `litert-lm-android` (TurboLLM-Android, `engines/litert-lm-server`). It speaks the `serve` contract, so the
