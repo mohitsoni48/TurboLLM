@@ -1384,7 +1384,10 @@ function parseHfResolveUrl(u: string): { repo: string; rev: string; rfilename: s
   } catch {
     return null
   }
-  if (parsed.hostname !== base.hostname) return null
+  // hf.co is Hugging Face's short domain: it only redirects to huggingface.co, a cross-origin hop
+  // the token is dropped on, so as a raw import a gated file failed. Read as the link it stands for.
+  const shortHf = parsed.hostname === 'hf.co' && base.hostname === 'huggingface.co'
+  if (parsed.hostname !== base.hostname && !shortHf) return null
   const parts = parsed.pathname.split('/').filter(Boolean)
   const ri = parts.indexOf('resolve')
   // Need owner/repo before `resolve`, then a revision, then at least one path segment.
