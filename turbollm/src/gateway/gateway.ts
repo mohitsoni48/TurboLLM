@@ -20,7 +20,7 @@ import { extractParams, summarizeRequest, drainOpenAiSseForLog, requestLogConfig
 import { sessionAuth } from '../code/session-auth'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
 import { classifyHarness } from '../telemetry/classify'
-import { mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
+import { anthropicContentError, mapToOpenAI, mapFromOpenAI, streamToAnthropic, messageStartEvent, pingWhilePending, DEFAULT_PING_INTERVAL_MS, type AnthropicRequest, type StreamToolCall } from './anthropic'
 import { analyzeTurn, applyAgentGuidance } from './agent-guidance'
 import { handleJevRequest, jevEndpointFor } from './jev-endpoints'
 import { isJsonObject, NOT_A_JSON_OBJECT } from './jev-serving'
@@ -279,6 +279,12 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
         400,
       )
     }
+    // A user turn of only blocks the mapping cannot send (a PDF document, an empty content array) vanished from the
+    // engine's request, which then ended on the turn before it. The turn the reply answers is refused here when it
+    // holds nothing else, naming the block, before any routing (beside anything sendable, or in an earlier turn, the
+    // block goes as a note); an empty turn anywhere too.
+    const contentError = anthropicContentError(req)
+    if (contentError) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: contentError } }, 400)
     // Enforce the global "max response tokens" cap on external (Claude Code) traffic.
     const maxLimit = d.store.snapshot().modelDefaults.maxTokens ?? 0
     req.max_tokens = clampMaxTokens(req.max_tokens, maxLimit) ?? req.max_tokens
@@ -810,6 +816,8 @@ export function registerGateway(app: Hono, d: Deps, opts: GatewayOptions = {}): 
     if (!isJsonObject(req)) {
       return c.json({ type: 'error', error: { type: 'invalid_request_error', message: NOT_A_JSON_OBJECT } }, 400)
     }
+    const contentError = anthropicContentError(req)
+    if (contentError) return c.json({ type: 'error', error: { type: 'invalid_request_error', message: contentError } }, 400)
 
     const target = d.manager.target()
     const oaiBody = mapToOpenAI(req)

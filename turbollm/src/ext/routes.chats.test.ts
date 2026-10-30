@@ -1210,6 +1210,33 @@ test('DELETE /messages/:id is refused with 409 run_active while a generation is 
   }
 })
 
+// An append with generate:false was the one chat mutation the guard did not cover: an assistant (or user) message
+// landed in the chat while its run was answering, after the reply's placeholder, so the next turn's history no longer
+// ended on that reply.
+test('POST /chats/:id/messages with generate:false is refused with 409 run_active while a generation is in flight', async () => {
+  const ctx = await startInFlightGeneration()
+  try {
+    for (const role of ['assistant', 'user']) {
+      const res = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}/messages`,
+        json(ACME, { role, content: `${role} appended mid-run`, owner: 'u1', generate: false }))
+      assert.equal(res.status, 409, role)
+      const err = await res.json() as { error: { code: string; retryable?: boolean } }
+      assert.equal(err.error.code, 'run_active', role)
+      assert.equal(err.error.retryable, true, role)
+    }
+    await ctx.settle()
+    const list = await (await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}/messages?owner=u1`, json(ACME))).json() as {
+      data: Array<{ id: string; role: string }>
+    }
+    assert.deepEqual(list.data.map((m) => m.id), [ctx.userMessageId, ctx.assistantMessageId], 'nothing landed beside the run')
+    const after = await ctx.app.request(`/api/ext/v1/chats/${ctx.chatId}/messages`,
+      json(ACME, { role: 'assistant', content: 'appended after the run', owner: 'u1', generate: false }))
+    assert.equal(after.status, 201, 'once the run has ended the append goes through')
+  } finally {
+    ctx.cleanup()
+  }
+})
+
 test('once the run ends, the same mutation that was refused with run_active succeeds', async () => {
   const ctx = await startInFlightGeneration()
   try {

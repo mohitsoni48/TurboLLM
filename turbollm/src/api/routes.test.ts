@@ -233,9 +233,12 @@ test('GET /api/v1/status reports a loaded Jev model as the vLLM text classifier'
 // can never fall behind the SPA fallback (ADR-421).
 test('registerApi registers GET /api/v1/activity', async () => {
   const d = {
-    store: { snapshot: () => ({}) },
+    store: { snapshot: () => ({ apiKeys: [] }) },
     manager: { status: () => ({ state: 'stopped' }), sessionStats: () => ({ activeRequests: 0 }) },
     db: { getConversation: () => null, getAgentRun: () => null, getRoutine: () => null },
+    downloads: { list: () => [] },
+    modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
+    scanner: { get: () => undefined },
   } as unknown as Deps
   const app = new Hono()
   registerApi(app, d)
@@ -243,7 +246,10 @@ test('registerApi registers GET /api/v1/activity', async () => {
   const res = await app.request('/api/v1/activity')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(await res.json(), { items: [], waiting: [], engineGenerating: false })
+  assert.deepEqual(await res.json(), {
+    items: [], waiting: [], engineGenerating: false, downloads: [],
+    status: { engine: { state: 'stopped' }, model: null, poolModels: 0, jev: null, laya: null, serving: { lan: false, remote: false, linkPeers: 0 } },
+  })
 })
 
 // ADR-444: Discover's "Text classification" category is `?category=text-classification` on the same search route.

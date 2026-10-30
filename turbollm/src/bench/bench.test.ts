@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor } from './bench'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor, cardThatGrew } from './bench'
 import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -343,25 +343,76 @@ test('parseRocmVramUsed: malformed JSON → null, never throws', () => {
 // ---- single-GPU split on a multi-GPU box: the VRAM reading must cover the SAME card as the
 // budget (gpuBudgetMb uses one card for splitMode 'none'), not the sum of every card ------------
 
-const TWO_CARDS = { os: 'linux/x64', cpu: 't', cores: 8, ramMB: 32000, gpus: [{ name: 'a', vramMb: 16376, vendor: 'nvidia' as const }, { name: 'b', vramMb: 12288, vendor: 'nvidia' as const }] }
+const TWO_CARDS = { os: 'linux/x64', cpu: 't', cores: 8, ramMB: 32000, gpus: [{ name: 'a', vramMb: 16376, vendor: 'nvidia' as const }, { name: 'a', vramMb: 16376, vendor: 'nvidia' as const }] }
 const SINGLE = (mainGpu: number) => ({ gpu: { splitMode: 'none' as const, tensorSplit: [], mainGpu, tensorParallelSize: 1 } })
+/** An official CUDA build of llama.cpp, as TurboLLM installs it; no device-selection variable set. */
+const CUDA = { binPath: '/home/u/.turbollm/engines/llama.cpp-b6000-cuda/llama-server' }
+const NO_ENV = {}
+/** The folder TurboLLM builds engines into, under its data folder (BenchRunner's buildRoot). */
+const BUILD_ROOT = '/home/u/.turbollm/engines/build'
 
 test('vramCardFor: a single-GPU split reads its main card; a layer split or one-GPU box reads the sum', () => {
-  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1)), { index: 1, of: 2 })
-  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(-1)), { index: 0, of: 2 }) // same default card as gpuBudgetMb
-  assert.equal(vramCardFor(TWO_CARDS, { gpu: { ...SINGLE(0).gpu, splitMode: 'layer' } }), undefined)
-  assert.equal(vramCardFor({ ...TWO_CARDS, gpus: TWO_CARDS.gpus.slice(0, 1) }, SINGLE(0)), undefined)
-  assert.equal(vramCardFor(TWO_CARDS), undefined)
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1), CUDA, NO_ENV), { index: 1, of: 2 })
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(-1), CUDA, NO_ENV), { index: 0, of: 2 }) // same default card as gpuBudgetMb
+  assert.equal(vramCardFor(TWO_CARDS, { gpu: { ...SINGLE(0).gpu, splitMode: 'layer' } }, CUDA, NO_ENV), undefined)
+  assert.equal(vramCardFor({ ...TWO_CARDS, gpus: TWO_CARDS.gpus.slice(0, 1) }, SINGLE(0), CUDA, NO_ENV), undefined)
+  assert.equal(vramCardFor(TWO_CARDS, undefined, CUDA, NO_ENV), undefined)
 })
 
 test('single-GPU split: the other card\'s desktop memory no longer counts against GPU0\'s headroom', () => {
   // 16 GB GPU0 with 13.8 GB used (2.5 GB free, above the 1 GB headroom); GPU1 drives the display.
   const smi = '13800\n1700\n'
-  const card = vramCardFor(TWO_CARDS, SINGLE(0))
+  const card = vramCardFor(TWO_CARDS, SINGLE(0), CUDA, NO_ENV)
   assert.equal(parseNvidiaVramUsed(smi, card), 13800)
   assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: parseNvidiaVramUsed(smi, card), spillMb: null }, 16376, 1024).decision, 'fits')
   // Without a card (layer/row split) it is still the summed pool, as before.
   assert.equal(parseNvidiaVramUsed(smi), 15500)
+})
+
+test('vramCardFor: where the engine may number the cards otherwise than nvidia-smi, the reading is the sum', () => {
+  // nvidia-smi (and so sysinfo) lists an RTX 3060 on PCI bus 01, which drives the display, then an RTX 4090. A CUDA
+  // build numbers the fastest first, so `--main-gpu 0` is the 4090, where the model went: the 3060's 1100 MB was read
+  // as its use, and no load ever looked over the headroom.
+  const mixed = { ...TWO_CARDS, gpus: [{ name: 'NVIDIA GeForce RTX 3060', vramMb: 12288, vendor: 'nvidia' as const }, { name: 'NVIDIA GeForce RTX 4090', vramMb: 24564, vendor: 'nvidia' as const }] }
+  const card = vramCardFor(mixed, SINGLE(0), CUDA, NO_ENV)
+  assert.equal(card, undefined)
+  assert.equal(parseNvidiaVramUsed('1100\n22900\n', card), 24000)
+  // One name with two memory sizes (an RTX 3060 of 8 GB and one of 12 GB) is two models too.
+  assert.equal(vramCardFor({ ...TWO_CARDS, gpus: [{ ...TWO_CARDS.gpus[0], vramMb: 8192 }, TWO_CARDS.gpus[1]] }, SINGLE(0), CUDA, NO_ENV), undefined)
+  // A Vulkan build numbers the cards in the Vulkan loader's order, the display's GPU first, even among cards of one
+  // model; an engine whose build is not known may be one.
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(0), { binPath: '/home/u/.turbollm/engines/llama.cpp-b6000-vulkan/llama-server' }, NO_ENV), undefined)
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(0), { binPath: '/opt/llama/llama-server' }, NO_ENV), undefined)
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(0), undefined, NO_ENV), undefined)
+  // The variables that renumber what the engine sees, which nvidia-smi and rocm-smi ignore.
+  for (const v of ['CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL']) {
+    assert.equal(vramCardFor(TWO_CARDS, SINGLE(0), CUDA, { [v]: '1' }), undefined, v)
+  }
+  // An official ROCm build, and one TurboLLM compiled (with CUDA) in the folder it builds into, read their card.
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: 'C:\\Users\\u\\.turbollm\\engines\\llama.cpp-b6000-rocm\\llama-server.exe' }, NO_ENV), { index: 1, of: 2 })
+  const IK = { binPath: '/home/u/.turbollm/engines/build/ik_llama.cpp/build/bin/llama-server', sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp' }
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1), IK, NO_ENV, BUILD_ROOT), { index: 1, of: 2 })
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: 'C:\\Users\\u\\.turbollm\\engines\\build\\llama.cpp\\build\\bin\\Release\\llama-server.exe', sourceRepo: 'https://github.com/ggml-org/llama.cpp' }, NO_ENV, 'C:\\Users\\u\\.turbollm\\engines\\build'), { index: 1, of: 2 })
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), IK, NO_ENV), undefined, 'with no build folder known, no engine is known as built there')
+  // A source repo alone is not TurboLLM's build: any engine can be given one (PUT /api/v1/engines/:id), so a Vulkan
+  // build added by hand reads the sum, and so does a release install in the build directory (any backend).
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: '/opt/llama-vulkan/llama-server', sourceRepo: 'https://github.com/ggml-org/llama.cpp' }, NO_ENV, BUILD_ROOT), undefined)
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: '/home/u/.turbollm/engines/build/ik_llama.cpp-b100/llama-server', sourceRepo: 'https://github.com/ikawrakow/ik_llama.cpp', release: { repo: 'ikawrakow/ik_llama.cpp', tag: 'b100', asset: 'x.zip' } as never }, NO_ENV, BUILD_ROOT), undefined)
+  // Nor is an `engines/build` folder of another project, outside TurboLLM's data folder.
+  assert.equal(vramCardFor(TWO_CARDS, SINGLE(1), { binPath: '/home/u/src/engines/build/x/llama-server', sourceRepo: 'https://github.com/ggml-org/llama.cpp' }, NO_ENV, BUILD_ROOT), undefined)
+})
+
+// Where the engine may number the cards otherwise than nvidia-smi, a single-GPU load's card is the one it grows.
+test('cardThatGrew: the card a load grew by most, when it stands out; else none', () => {
+  assert.equal(cardThatGrew([13000, 200], [13000, 4500]), 1, 'another program\'s memory on card 0 is not the load\'s')
+  assert.equal(cardThatGrew([300, 1100], [600, 9800]), 1, 'the engine\'s context on the other card is not either')
+  assert.equal(cardThatGrew([300, 1100, 50], [2400, 1100, 50]), 0)
+  assert.equal(cardThatGrew([300, 300], [600, 650]), undefined, 'two contexts: neither stands out')
+  assert.equal(cardThatGrew([300, 300], [500, 300]), undefined, 'under 256 MB: too little to tell')
+  assert.equal(cardThatGrew([300, 300], [4000, 2500]), undefined, 'another program allocating meanwhile: not twice as much')
+  assert.equal(cardThatGrew([9000, 300], [5000, 1500]), 1, 'a card another program freed meanwhile counts as no growth')
+  assert.equal(cardThatGrew([300], [5000]), undefined, 'one card: nothing to pick')
+  assert.equal(cardThatGrew([300, 300], [5000]), undefined, 'readings that do not line up')
 })
 
 test('parseRocmVramUsed: a single-GPU split reads only its own card', () => {

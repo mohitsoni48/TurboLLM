@@ -10,7 +10,12 @@
 // load still interrupts.
 import type { Hono } from 'hono'
 import type { Deps } from '../deps'
+import { mayAlsoRead } from '../auth'
 import { afterReplyChatIds, inFlightChatIds, parkedChatIds, parkedEngineTurns } from '../chat/chat-routes'
+import type { DownloadRecord } from '../downloads/downloads'
+import { jevStatus } from './jev-status'
+import { layaStatus } from './laya-status'
+import { servingStatus, type ServingStatus } from './serving-status'
 
 export interface ActiveWorkItem {
   /** `load`: a primary-engine model loading. `tune`: an auto-tune run (its own loads included).
@@ -61,8 +66,52 @@ export function activeWork(d: Deps, sources: Partial<ChatSources> = {}): ActiveW
   }
 }
 
+/** A download the Android app's poll counts as work (running or queued), with the fields its notification reads, as
+ *  GET /api/v1/downloads gives them. */
+export type LiveDownload = Pick<DownloadRecord, 'name' | 'status' | 'received' | 'total' | 'bytesPerSec'>
+
+/** The fields of GET /api/v1/status the Android app's poll reads, in the same names and shapes: whether a model is
+ *  held (the primary engine's state, `poolModels`, a Jev or Laya model) and its name, and the server features on. */
+export interface PollStatus {
+  engine: { state: string }
+  model: { name: string } | null
+  poolModels: number
+  jev: { name: string } | null
+  laya: { name: string } | null
+  serving: ServingStatus
+}
+
+/** The activity, plus what the Android app's poll read from two more requests every 3 s (each with its own proof
+ *  connection): `downloads`, the running and queued rows of GET /api/v1/downloads, and `status`, its fields of GET
+ *  /api/v1/status. Each only for a caller that route would answer (mayAlsoRead: a remote-access token needs
+ *  downloads:read and config:read for them); absent otherwise, as from a daemon before them, which a client reads as
+ *  "ask that route". */
 export function registerActivityRoutes(app: Hono, d: Deps): void {
-  app.get('/api/v1/activity', (c) => c.json(activeWork(d)))
+  app.get('/api/v1/activity', (c) => c.json({
+    ...activeWork(d),
+    ...(mayAlsoRead(c, d, '/api/v1/downloads') ? { downloads: liveDownloads(d) } : {}),
+    ...(mayAlsoRead(c, d, '/api/v1/status') ? { status: pollStatus(d) } : {}),
+  }))
+}
+
+function liveDownloads(d: Deps): LiveDownload[] {
+  return d.downloads.list()
+    .filter((r) => r.status === 'downloading' || r.status === 'queued')
+    .map(({ name, status, received, total, bytesPerSec }) => ({ name, status, received, total, bytesPerSec }))
+}
+
+function pollStatus(d: Deps): PollStatus {
+  const ms = d.manager.status()
+  const jev = jevStatus(d)
+  const laya = layaStatus(d)
+  return {
+    engine: { state: ms.state },
+    model: ms.model ? { name: ms.model.name } : null,
+    poolModels: d.modelRouter.poolModelCount(),
+    jev: jev ? { name: jev.name } : null,
+    laya: laya ? { name: laya.name } : null,
+    serving: servingStatus(d),
+  }
 }
 
 function chatItems(d: Deps, convIds: string[]): ActiveWorkItem[] {

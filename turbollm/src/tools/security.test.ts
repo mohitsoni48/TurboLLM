@@ -2,10 +2,11 @@
 // handled upstream by the tool-call approval gate (execute-with-approval.ts) —
 // execRunCode itself always executes.
 import assert from 'node:assert/strict'
+import type { LookupOptions } from 'node:dns'
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import { test } from 'node:test'
-import { checkSsrf, isPrivateIp } from './security'
+import { test, type TestContext } from 'node:test'
+import { _setSsrfResolver, checkSsrf, checkedLookup, isPrivateIp } from './security'
 import { execFetchUrl, execRunCode, backfillPublishedDates, FETCH_URL_MAX_CHARS } from './builtin'
 import type { ResearchResult } from './research-service'
 
@@ -161,6 +162,110 @@ test('execFetchUrl follows a raw UTF-8 Location header to the UTF-8 path, as fet
   } finally {
     globalThis.fetch = original
     server.close()
+  }
+})
+
+// ── The connection connects only to addresses that pass the check ───────────────────────────
+//
+// checkSsrf resolved a host and fetch() resolved it again to connect, so a name answering a public address to the
+// check and 127.0.0.1 to the connection (DNS rebinding), or one whose lookup failed at the check, reached loopback.
+// Each case runs a real loopback server, which must receive nothing, and a resolver giving a name its answers in turn.
+
+const BLOCKED = 'Error: fetch_url blocked — private/loopback addresses are not allowed'
+
+/** Resolves each name to its next answer (the last one repeats; an Error is thrown), and lists the names asked. */
+function resolveInTurn(answers: Record<string, Array<string | Error>>): string[] {
+  const asked: string[] = []
+  _setSsrfResolver(async (hostname) => {
+    asked.push(hostname)
+    const list = answers[hostname] ?? []
+    const answer = list.length > 1 ? list.shift() : list[0]
+    if (answer === undefined || answer instanceof Error) throw answer ?? new Error(`getaddrinfo ENOTFOUND ${hostname}`)
+    return [{ address: answer, family: answer.includes(':') ? 6 : 4 }]
+  })
+  return asked
+}
+
+async function loopbackServer(t: TestContext): Promise<{ port: number; requests: string[] }> {
+  const requests: string[] = []
+  const server = createServer((req, res) => {
+    requests.push(req.url ?? '')
+    res.writeHead(200, { 'content-type': 'text/plain' }).end('INTERNAL-SECRET')
+  })
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  t.after(() => {
+    _setSsrfResolver(null)
+    server.close()
+  })
+  return { port: (server.address() as AddressInfo).port, requests }
+}
+
+test('execFetchUrl: a name answering a public address to the check and 127.0.0.1 to the connection is blocked', async (t) => {
+  const { port, requests } = await loopbackServer(t)
+  const asked = resolveInTurn({ 'rebind.invalid': ['203.0.113.7', '127.0.0.1'] })
+  assert.equal(await execFetchUrl({ url: `http://rebind.invalid:${port}/secret` }), BLOCKED)
+  assert.deepEqual(requests, [])
+  assert.deepEqual(asked, ['rebind.invalid', 'rebind.invalid'], 'checked, then resolved again by the connection')
+})
+
+test('execFetchUrl: a name whose lookup fails at the check is still checked when the connection resolves it', async (t) => {
+  const { port, requests } = await loopbackServer(t)
+  resolveInTurn({ 'flaky.invalid': [new Error('getaddrinfo ENOTFOUND flaky.invalid'), '127.0.0.1'] })
+  assert.equal(await execFetchUrl({ url: `http://flaky.invalid:${port}/secret` }), BLOCKED)
+  assert.deepEqual(requests, [])
+})
+
+test('execFetchUrl: an IPv4-mapped IPv6 loopback answer to the connection is blocked', async (t) => {
+  const { port, requests } = await loopbackServer(t)
+  resolveInTurn({ 'mapped.invalid': ['203.0.113.7', '::ffff:127.0.0.1'] })
+  assert.equal(await execFetchUrl({ url: `http://mapped.invalid:${port}/secret` }), BLOCKED)
+  assert.deepEqual(requests, [])
+})
+
+test('execFetchUrl: a redirect hop\'s connection is checked too', async (t) => {
+  const { port, requests } = await loopbackServer(t)
+  resolveInTurn({ 'start.invalid': ['203.0.113.7'], 'hop.invalid': ['203.0.113.8', '127.0.0.1'] })
+  // The first hop answers from a stand-in; the second goes to the real fetch, as fetchWithSsrfCheck asks it to.
+  const original = globalThis.fetch
+  globalThis.fetch = ((input: string | URL | Request, init?: RequestInit) => String(input) === 'http://start.invalid/'
+    ? Promise.resolve(new Response('', { status: 302, headers: { location: `http://hop.invalid:${port}/secret` } }))
+    : original(input, init)) as typeof fetch
+  try {
+    assert.equal(await execFetchUrl({ url: 'http://start.invalid/' }), BLOCKED)
+    assert.deepEqual(requests, [])
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+test('checkedLookup gives a connection the checked addresses in the form it asks for', async (t) => {
+  t.after(() => _setSsrfResolver(null))
+  resolveInTurn({ 'public.invalid': ['203.0.113.7'] })
+  const lookup = (options: LookupOptions) =>
+    new Promise<unknown[]>((resolve) => checkedLookup('public.invalid', options, (...args) => resolve(args)))
+  // Node 20 and later ask for every address (autoSelectFamily), Node 18 (the Android app's) for one.
+  assert.deepEqual(await lookup({ all: true, family: 0 }), [null, [{ address: '203.0.113.7', family: 4 }]])
+  assert.deepEqual(await lookup({ family: 0 }), [null, '203.0.113.7', 4])
+})
+
+// A lookup that finds no address: Node's own fails with ENOTFOUND. checkedLookup read the first address of none, threw
+// in its promise's handler (an unhandled rejection, which ends the daemon) and never answered the connection; asked
+// for every address, it answered an empty list.
+test('checkedLookup answers a lookup that finds no address with ENOTFOUND, as getaddrinfo does', async (t) => {
+  t.after(() => _setSsrfResolver(null))
+  _setSsrfResolver(async () => [])
+  const lookup = (options: LookupOptions) => Promise.race([
+    new Promise<unknown[]>((resolve) => checkedLookup('none.invalid', options, (...args) => resolve(args))),
+    new Promise<string>((resolve) => setTimeout(resolve, 2000, 'no answer within 2 s').unref()),
+  ])
+  for (const options of [{ all: true, family: 0 }, { family: 0 }]) {
+    const answer = await lookup(options)
+    assert.ok(Array.isArray(answer), `${JSON.stringify(options)}: ${answer}`)
+    const [err, address] = answer as [NodeJS.ErrnoException | null, unknown]
+    assert.ok(err instanceof Error, `${JSON.stringify(options)}: answered ${JSON.stringify(answer)}`)
+    assert.equal(err.code, 'ENOTFOUND')
+    assert.equal(err.message, 'getaddrinfo ENOTFOUND none.invalid')
+    assert.equal(address, '')
   }
 })
 

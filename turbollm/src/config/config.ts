@@ -520,6 +520,11 @@ export interface ModelDefaults {
    *  chat and clamped onto external gateway requests so nothing on this machine can
    *  exceed it. */
   maxTokens?: number
+  /** Default K / V cache types (`--cache-type-k/-v`) for a llama.cpp-family model with none saved.
+   *  Absent or '' = automatic (f16, q4_0 on Android). A type the loading engine does not list is
+   *  not passed to it, so the model loads at f16 there. */
+  kvTypeK?: string
+  kvTypeV?: string
 }
 /** TRANSITIONAL (A1/A2): carries the model path + extra args until the
  *  model/profile system (spec 05, A4) replaces it. */

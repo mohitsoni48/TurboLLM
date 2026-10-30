@@ -1,6 +1,10 @@
 // Security hardening for built-in tools.
-// SSRF block: rejects private/loopback destinations before fetch_url executes.
+// SSRF block: rejects private/loopback destinations before fetch_url executes, and again as each of its connections
+// resolves its host (checkedLookup).
+import type { LookupAddress, LookupOptions } from 'node:dns'
 import { lookup } from 'node:dns/promises'
+import type { LookupFunction } from 'node:net'
+import { Agent } from 'undici'
 
 /** RFC-1918, loopback, link-local, CGNAT and IPv6 unique-local CIDR ranges to block. */
 const PRIVATE_RANGES: Array<(ip: string) => boolean> = [
@@ -39,6 +43,19 @@ export function isPrivateIp(ip: string): boolean {
   return PRIVATE_RANGES.some((fn) => fn(ip))
 }
 
+const BLOCKED = 'Error: fetch_url blocked — private/loopback addresses are not allowed'
+
+/** Every address a host name has, as Node's lookup gives them; `options` are the family and hints a connection asks
+ *  for. */
+type Resolve = (hostname: string, options: LookupOptions) => Promise<LookupAddress[]>
+const systemResolve: Resolve = (hostname, options) => lookup(hostname, { ...options, all: true })
+let resolveHost: Resolve = systemResolve
+
+/** For tests: resolve host names with `resolve` instead of the system's resolver (null restores it). */
+export function _setSsrfResolver(resolve: Resolve | null): void {
+  resolveHost = resolve ?? systemResolve
+}
+
 /**
  * Checks whether the given http/https URL targets a private or loopback address.
  * Returns an error string if blocked, or null if the URL is safe to fetch.
@@ -56,26 +73,61 @@ export async function checkSsrf(url: string): Promise<string | null> {
 
   // Block bare hostnames (no dot = likely an internal alias like "localhost", "internal").
   if (!hostname.includes('.')) {
-    return 'Error: fetch_url blocked — private/loopback addresses are not allowed'
+    return BLOCKED
   }
 
   // Resolve the hostname and check every returned address.
   let addresses: string[]
   try {
-    const results = await lookup(hostname, { all: true })
+    const results = await resolveHost(hostname, {})
     addresses = results.map((r) => r.address)
   } catch {
-    // DNS resolution failed — treat as non-private (let the actual fetch fail naturally).
+    // DNS resolution failed: let the fetch fail naturally. If its own lookup succeeds, checkedLookup checks that.
     return null
   }
 
   for (const addr of addresses) {
     if (isPrivateIp(addr)) {
-      return 'Error: fetch_url blocked — private/loopback addresses are not allowed'
+      return BLOCKED
     }
   }
 
   return null
+}
+
+/** checkedLookup's refusal, which fetchWithSsrfCheck answers with checkSsrf's error text. */
+class PrivateAddressError extends Error {}
+
+/**
+ * The lookup of each connection fetchWithSsrfCheck makes, so it connects only to addresses checked here. checkSsrf
+ * resolves the host once and fetch() resolved it again to connect: a name answering a public address to the first
+ * and 127.0.0.1 to the second (DNS rebinding) reached the daemon's own API, and so did a name whose first lookup
+ * failed. An IP literal is connected to without a lookup; checkSsrf has checked it. An answer of no address fails
+ * as Node's own lookup does, with ENOTFOUND. Exported for its tests.
+ */
+export const checkedLookup: LookupFunction = (hostname, options, callback) => {
+  resolveHost(hostname, options).then(
+    (addresses) => {
+      if (addresses.length === 0) callback(Object.assign(new Error(`getaddrinfo ENOTFOUND ${hostname}`), { code: 'ENOTFOUND', hostname }), '')
+      else if (addresses.some((a) => isPrivateIp(a.address))) callback(new PrivateAddressError(BLOCKED), '')
+      else if (options.all) callback(null, addresses)
+      else callback(null, addresses[0].address, addresses[0].family)
+    },
+    (e: NodeJS.ErrnoException) => callback(e, ''),
+  )
+}
+
+/** fetch_url's connections, each resolving its host through checkedLookup (on every redirect hop). An undici Agent,
+ *  which the runtime's fetch takes as it takes server.ts's global one; its types are the package's, not fetch's. */
+const checkedDispatcher = new Agent({ connect: { lookup: checkedLookup } }) as unknown as RequestInit['dispatcher']
+
+/** Whether fetch() failed because checkedLookup refused the address: the error is fetch's "fetch failed", with
+ *  the refusal as its cause. */
+function refusedByLookup(e: unknown): boolean {
+  for (let c = e, depth = 0; c instanceof Error && depth < 4; c = c.cause, depth++) {
+    if (c instanceof PrivateAddressError) return true
+  }
+  return false
 }
 
 /** Redirect hops followed (each one re-checked) before giving up. */
@@ -111,7 +163,13 @@ export async function fetchWithSsrfCheck(url: string, init: RequestInit): Promis
   for (let hop = 0; ; hop++) {
     const blocked = await checkSsrf(current)
     if (blocked) return blocked
-    const resp = await fetch(current, { ...init, redirect: 'manual' })
+    let resp: Response
+    try {
+      resp = await fetch(current, { ...init, redirect: 'manual', dispatcher: checkedDispatcher })
+    } catch (e) {
+      if (refusedByLookup(e)) return BLOCKED
+      throw e
+    }
     const location = resp.status >= 300 && resp.status < 400 ? resp.headers.get('location') : null
     if (!location) return resp
     await resp.body?.cancel().catch(() => {})

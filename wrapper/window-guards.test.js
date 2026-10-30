@@ -1,13 +1,13 @@
 // window-guards.test.js — plain `node --test`, Node built-ins only.
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { existsSync, mkdtempSync, readFileSync, rmSync } = require('node:fs')
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs')
 const { tmpdir } = require('node:os')
 const { join } = require('node:path')
 const Module = require('node:module')
 const { EventEmitter } = require('node:events')
 
-const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 
 const APP = appOriginFor(6996)
 
@@ -41,6 +41,44 @@ test('daemonPortFor: a spawned daemon binds the port of the app page the window 
   assert.equal(daemonPortFor('https://evil.example:7001/', APP, 6996), '6996')
   assert.equal(daemonPortFor('http://localhost:7001/', APP, 6996), '6996')
   assert.equal(daemonPortFor('http://127.0.0.1/', APP, '7002'), '7002', 'no explicit port: keep the launch port')
+})
+
+// The app passes its port as `--port`, which wins over the port saved in Settings: every launch put the daemon back
+// on 6996 while Settings showed the saved port.
+test('launchPortFor: TURBOLLM_PORT, else the port saved in Settings, else 6996', () => {
+  const saved = JSON.stringify({ daemon: { host: '127.0.0.1', port: 7001 } })
+  assert.equal(launchPortFor('7100', saved), '7100', 'an explicit TURBOLLM_PORT wins')
+  assert.equal(launchPortFor(undefined, saved), '7001')
+  assert.equal(launchPortFor('', saved), '7001')
+  assert.equal(launchPortFor(undefined, ''), '6996', 'no config.json yet')
+  for (const config of ['{', 'null', '{}', '{"daemon":{}}', '{"daemon":{"port":"7001"}}', '{"daemon":{"port":0}}', '{"daemon":{"port":70000}}', '{"daemon":{"port":7001.5}}']) {
+    assert.equal(launchPortFor(undefined, config), '6996', config)
+  }
+})
+
+// The daemon reads a config.json a Windows tool saved with a byte order mark, or as UTF-16; parsed as plain UTF-8 here,
+// its saved port was lost and the app's `--port 6996` won over it.
+test('decodeConfigText: config.json as the daemon decodes it, so its saved port is the launch port in any of its encodings', () => {
+  const json = JSON.stringify({ daemon: { port: 7001 } })
+  const utf16be = Buffer.from(`\uFEFF${json}`, 'utf16le').swap16()
+  for (const [encoding, bytes] of [
+    ['UTF-8', Buffer.from(json)],
+    ['UTF-8 with a BOM', Buffer.from(`\uFEFF${json}`)],
+    ['UTF-16 LE', Buffer.from(`\uFEFF${json}`, 'utf16le')],
+    ['UTF-16 BE', utf16be],
+    ['UTF-16 BE with a stray last byte', Buffer.concat([utf16be, Buffer.from([0x0a])])],
+  ]) {
+    assert.equal(decodeConfigText(bytes), json, encoding)
+    assert.equal(launchPortFor(undefined, decodeConfigText(bytes)), '7001', encoding)
+  }
+})
+
+test('recordedPortFor: the port the running daemon recorded in its pidfile, only from its own', () => {
+  assert.equal(recordedPortFor(JSON.stringify({ pid: 42, port: 7001, host: '127.0.0.1' }), 42), '7001')
+  assert.equal(recordedPortFor(JSON.stringify({ pid: 41, port: 7001 }), 42), null, 'another daemon\'s (a CLI one left it)')
+  assert.equal(recordedPortFor('', 42), null, 'none yet')
+  assert.equal(recordedPortFor('{"pid":42', 42), null)
+  assert.equal(recordedPortFor(JSON.stringify({ pid: 42, port: 0 }), 42), null)
 })
 
 test('isWebUrl: only http(s) is handed to the system browser', () => {
@@ -113,11 +151,18 @@ test('main.js does not run electron-updater on macOS (no zip, unsigned: it canno
 // window; 'held': it answers only on answerHealthz(). Dialogs are recorded and answered by the test.
 // main.js reads process.platform when it is called: run a test under another one with withPlatform.
 // userData: the folder app.getPath('userData') names (the tray notice's file goes there); by default
-// a fresh one, removed after the tests.
+// a fresh one, removed after the tests. home: the home folder, whose .turbollm holds the daemon's config.json and
+// pidfile; by default a fresh one. env: TURBOLLM_PORT, when the test sets it (by default it is unset).
+// statusNotifier: what the session bus says on Linux of a StatusNotifierWatcher, the host of tray icons: 'running'
+// (by default), 'none' (GNOME without the AppIndicator extension), or 'no-bus' (no probe answers); setStatusNotifier
+// changes it, and `probes` lists the probes run, with the bus address each was given.
 const userDataDirs = []
+// The session bus main.js's tray probe asks (window-lifecycle.js sessionBusAddress): with none, it runs no probe.
+const SESSION_BUS = 'unix:path=/run/user/1000/bus'
+process.env.DBUS_SESSION_BUS_ADDRESS = SESSION_BUS
 test.after(() => { for (const dir of userDataDirs) rmSync(dir, { recursive: true, force: true }) })
 
-function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
+function loadMain ({ healthz = 'ok', userData = scratchUserData(), home = scratchUserData(), env = {}, statusNotifier = 'running' } = {}) {
   const spawned = []
   const dialogs = []
   const heldHealthz = []
@@ -125,6 +170,7 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
   const trays = []
   const notifications = []
   const iconPaths = []
+  const probes = []
   const appHandlers = {}
   let quits = 0
   let windowUrl = ''
@@ -145,6 +191,7 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
     isDestroyed () { return this.destroyed }
     on (event, handler) { this.handlers[event] = handler }
     hide () { this.visible = false }
+    minimize () { this.minimized = true }
     show () { this.visible = true }
     focus () { this.focused += 1 }
     isMinimized () { return this.minimized }
@@ -210,10 +257,15 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
       // stdin: the daemon's lifeline (daemon-supervisor.js daemonSpawnSpec); `stdinEnded` once Quit ended it.
       const stdin = Object.assign(new EventEmitter(), { end () { child.stdinEnded = true } })
       Object.assign(child, {
-        stdin, stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, signals, stdinEnded: false, kill (signal) { signals.push(signal) },
+        pid: 4000 + spawned.length, stdin, stdout: new EventEmitter(), stderr: new EventEmitter(), exitCode: null, signalCode: null, signals, stdinEnded: false, kill (signal) { signals.push(signal) },
       })
       spawned.push({ args, child })
       return child
+    },
+    execFile (command, _args, options, callback) {
+      probes.push({ command, bus: (options.env || process.env).DBUS_SESSION_BUS_ADDRESS })
+      const answer = { running: '(true,)\n', none: '(false,)\n' }[statusNotifier]
+      setImmediate(() => (answer ? callback(null, answer, '') : callback(new Error('Cannot autolaunch D-Bus without X11 $DISPLAY'), '', '')))
     },
   }
   const http = {
@@ -229,14 +281,18 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
   Module._load = function (request, ...rest) {
     return Object.prototype.hasOwnProperty.call(stubs, request) ? stubs[request] : load.call(this, request, ...rest)
   }
-  const port = process.env.TURBOLLM_PORT
+  const saved = { TURBOLLM_PORT: process.env.TURBOLLM_PORT, HOME: process.env.HOME, USERPROFILE: process.env.USERPROFILE }
   delete process.env.TURBOLLM_PORT
+  Object.assign(process.env, { HOME: home, USERPROFILE: home }, env)
   try {
     delete require.cache[require.resolve('./main')]
     require('./main')
   } finally {
     Module._load = load
-    if (port !== undefined) process.env.TURBOLLM_PORT = port
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
   }
   return {
     spawned,
@@ -250,6 +306,8 @@ function loadMain ({ healthz = 'ok', userData = scratchUserData() } = {}) {
     trays: () => trays,
     notifications,
     iconPaths,
+    probes,
+    setStatusNotifier: (answer) => { statusNotifier = answer },
     windowUrl: () => windowUrl,
     setWindowUrl: (url) => { windowUrl = url },
   }
@@ -305,6 +363,56 @@ test('main.js: a respawn after a requested restart binds the port the window is 
     console.log = log
   }
 })
+
+// The app passed its launch port as `--port`, which wins over the port saved in Settings, so every launch put the
+// daemon back on 6996 while Settings showed the saved port.
+test('main.js: the daemon starts on the port saved in Settings, and the window opens there; TURBOLLM_PORT still wins', async () => {
+  const home = scratchUserData()
+  mkdirSync(join(home, '.turbollm'))
+  writeFileSync(join(home, '.turbollm', 'config.json'), JSON.stringify({ daemon: { port: 7001 } }))
+  const main = loadMain({ home })
+  main.ready()
+  assert.deepEqual(portArgs(main.spawned[0].args), ['--port', '7001', '--addr', '127.0.0.1:7001'])
+  await turns()
+  assert.equal(main.windowUrl(), 'http://127.0.0.1:7001')
+
+  const pinned = loadMain({ home, env: { TURBOLLM_PORT: '7100' } })
+  pinned.ready()
+  assert.deepEqual(portArgs(pinned.spawned[0].args), ['--port', '7100', '--addr', '127.0.0.1:7100'])
+
+  // Saved with a byte order mark by a Windows tool: the daemon reads the port, and so does the app.
+  writeFileSync(join(home, '.turbollm', 'config.json'), `\uFEFF${JSON.stringify({ daemon: { port: 7002 } }, null, 2)}`)
+  const bom = loadMain({ home })
+  bom.ready()
+  assert.deepEqual(portArgs(bom.spawned[0].args), ['--port', '7002', '--addr', '127.0.0.1:7002'])
+})
+
+// On macOS a close destroys the window, and the next one loaded the launch port, which nothing listened on after a
+// port change in Settings: a connection error.
+test('main.js: on macOS a window opened again after a port change opens on the daemon\'s port', () => withPlatform('darwin', async () => {
+  const home = scratchUserData()
+  const main = loadMain({ home })
+  main.ready()
+  await turns()
+  const daemon = main.spawned[0].child
+  main.setWindowUrl('http://127.0.0.1:7001/settings') // the UI followed a port change in Settings
+  assert.equal(main.windows()[0].close(), 'closed')
+  main.emit('activate')
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:7001')
+
+  // A port changed while no window was open (in a browser): the daemon's pidfile says where it is now.
+  assert.equal(main.windows()[0].close(), 'closed')
+  mkdirSync(join(home, '.turbollm'))
+  writeFileSync(join(home, '.turbollm', 'daemon.pid'), JSON.stringify({ pid: daemon.pid, port: 7002 }))
+  main.emit('second-instance')
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:7002')
+
+  // A pidfile another daemon left behind says nothing about this one.
+  assert.equal(main.windows()[0].close(), 'closed')
+  writeFileSync(join(home, '.turbollm', 'daemon.pid'), JSON.stringify({ pid: daemon.pid + 1, port: 7003 }))
+  main.emit('activate')
+  assert.equal(main.windows()[0].url, 'http://127.0.0.1:7002')
+}))
 
 // A CLI daemon already on ~/.turbollm makes the daemon's start guard refuse the app's daemon. The app
 // quit at once, as after a crash: it opened and vanished, and the refusal, which names the running
@@ -505,6 +613,76 @@ for (const platform of ['win32', 'linux']) {
     assert.equal(main.allWindows().length, 1, 'never a second window')
   }))
 }
+
+// GNOME without the AppIndicator extension shows no tray icon: a close hid the window where only a second launch
+// found it, and the notice said to quit from a tray icon the user could not see.
+for (const statusNotifier of ['none', 'no-bus']) {
+  test(`main.js: on a Linux desktop that shows no tray icon (${statusNotifier}) a close minimizes the window; the notice names no tray`, () => withPlatform('linux', async () => {
+    const main = loadMain({ statusNotifier })
+    main.ready()
+    await turns()
+    const daemon = main.spawned[0].child
+    const [win] = main.windows()
+    assert.equal(win.close(), 'hidden', 'the close is cancelled')
+    assert.equal(win.minimized, true, 'minimized')
+    assert.equal(win.visible, true, 'not hidden: it stays in the window list')
+    assert.deepEqual(main.notifications, [{ title: 'TurboLLM', body: 'TurboLLM is still running, minimized. Quit it from File > Quit.' }])
+    assert.equal(main.quits(), 0, 'the app keeps running')
+    assert.deepEqual(daemon.signals, [], 'the daemon is not stopped')
+
+    main.emit('second-instance')
+    assert.equal(win.minimized, false, 'launching the app again restores it')
+    assert.equal(main.allWindows().length, 1)
+  }))
+}
+
+// A tray can go or come back while the app runs (the AppIndicator extension turned off and on): the launch's answer was
+// kept for good, so each close now asks the session bus again, and the next close follows the answer.
+test('main.js: on Linux each close asks the session bus again, so the next close follows a tray that went or came back', () => withPlatform('linux', async () => {
+  const main = loadMain()
+  main.ready()
+  await turns()
+  const [win] = main.windows()
+  assert.deepEqual(main.probes, [{ command: 'gdbus', bus: SESSION_BUS }, { command: 'gdbus', bus: SESSION_BUS }],
+    'asked at launch, on the session bus: for the watcher, then for its host')
+
+  main.setStatusNotifier('none') // the tray goes
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [false, false], 'the answer at hand: a tray')
+  await turns()
+  main.emit('second-instance')
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [true, true], 'minimized once the tray went')
+
+  await turns()
+  main.emit('second-instance')
+  main.setStatusNotifier('running') // and comes back: the app's icon registers with it again
+  win.close()
+  assert.equal(win.minimized, true, 'the answer at hand: no tray')
+  await turns()
+  main.emit('second-instance')
+  win.close()
+  assert.deepEqual([win.minimized, win.visible], [false, false], 'hidden under the tray that came back')
+  assert.equal(main.allWindows().length, 1)
+}))
+
+// Electron's tray icon registers with a tray only when it is created, at launch, and again with one that comes back:
+// with none at launch it falls back for good to a GTK status icon, which GNOME shows nowhere. So a tray that first
+// appears later (the AppIndicator extension turned on) shows no icon of the app, and hiding the window there lost it.
+test('main.js: on Linux a tray that first appears after launch shows no icon of the app, so a close still minimizes', () => withPlatform('linux', async () => {
+  const main = loadMain({ statusNotifier: 'none' })
+  main.ready()
+  await turns()
+  const [win] = main.windows()
+  main.setStatusNotifier('running')
+  for (const close of [1, 2, 3]) {
+    win.close()
+    assert.deepEqual([win.minimized, win.visible], [true, true], `close ${close}`)
+    await turns()
+    main.emit('second-instance')
+  }
+  assert.equal(main.probes.length, 7, 'asked at launch (no watcher), and at each close (a watcher, then its host)')
+}))
 
 // A quit closes the windows, and a close that hides the window instead cancels the quit, so Quit
 // would only hide the window and leave the daemon running. Nor may anything open a window while

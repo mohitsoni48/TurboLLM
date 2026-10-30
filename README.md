@@ -795,7 +795,10 @@ access your GPU directly for accelerated local LLM inference.
 
 ### Getting your API key
 
-The container publishes port 6996 on `0.0.0.0`, so TurboLLM's daemon requires an API key
+The container uses host networking (`network_mode: host`, Linux Docker Engine only — Docker Desktop does not
+support it), so the daemon listens on `0.0.0.0:6996` of the host itself. Requests from the host arrive as
+loopback, which is what lets the in-browser folder picker work; `~/workspace` on the host is mounted at
+`/root/workspace`. Because the port is reachable from the LAN, TurboLLM's daemon requires an API key
 for every request the moment it starts — there is no browser inside the container to log
 in with. Both images launch with **`--print-token`**, which mints a fresh key and prints
 it on every container start (not just the first), so it's always one command away:

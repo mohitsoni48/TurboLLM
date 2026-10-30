@@ -10,7 +10,7 @@ import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
-import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme } from '../config/config-bounds'
+import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, KV_TYPE_MESSAGE, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme, isKvTypeName } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
 import { stripBodies } from '../observability/request-log'
@@ -2966,7 +2966,7 @@ export function registerApi(app: Hono, d: Deps): void {
       lanBind?: boolean
       requireApiKey?: boolean
       telemetryLevel?: string
-      modelDefaults?: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number }
+      modelDefaults?: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number; kvTypeK?: string; kvTypeV?: string }
       hfToken?: string
       comfyui?: { enabled?: boolean; url?: string; reverseGate?: boolean }
       gateway?: { autoSwap?: boolean; keepN?: number }
@@ -3131,7 +3131,7 @@ export function registerApi(app: Hono, d: Deps): void {
     // Global model defaults (spec 05 §3): validate the supplied fields; missing
     // fields keep their current value (partial patch).
     const md = b.modelDefaults
-    const mdUpdates: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number } = {}
+    const mdUpdates: { ctx?: number; ngl?: number; imageMaxTokens?: number; maxTokens?: number; kvTypeK?: string; kvTypeV?: string } = {}
     if (md) {
       // Bounds + messages come from config-bounds.ts, which the Turbo Link config scope
       // reads too. Task 3's review found the remote gate had drifted WIDER than this route
@@ -3143,6 +3143,11 @@ export function registerApi(app: Hono, d: Deps): void {
         const v = coerceBounded(`modelDefaults.${f}`, md[f])
         if (v === null) return err(c, 400, 'invalid_config_value', CONFIG_BOUNDS[`modelDefaults.${f}`].message)
         mdUpdates[f] = v
+      }
+      for (const f of ['kvTypeK', 'kvTypeV'] as const) {
+        if (md[f] === undefined) continue
+        if (!isKvTypeName(md[f])) return err(c, 400, 'invalid_config_value', KV_TYPE_MESSAGE)
+        mdUpdates[f] = md[f]
       }
     }
 

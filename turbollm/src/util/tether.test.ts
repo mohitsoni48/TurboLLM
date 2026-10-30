@@ -766,7 +766,17 @@ setInterval(() => {}, 1e9)
     await sleep(Math.max(0, 1000 - (Date.now() - killedAt)))
     assert.equal(isGone(stubbornPid), false, 'the TERM-ignoring member lives through the grace')
     assert.deepEqual(await waitGone([stubbornPid], 3500), [], 'and is killed after it')
-    assert.deepEqual(groupMembers(child), [])
+    // Right after the group's KILL a member can still be listed for a moment: one killed but not yet run to its exit
+    // (a child just forked, still waiting for a CPU), and on macOS one the KILL missed: xnu's killpg lists the group's
+    // members under its lock, then signals each one it can look up, and a child still being forked is in the group
+    // but cannot be looked up (proc_find refuses it while P_REF_NEW is set) until cloneproc's pinsertchild, after its
+    // address space is copied. So a `sleep 0.1` the stubborn loop was forking then outlives its killed parent and ends
+    // on its own (CI's macOS job saw one member left). So the group gets a bound to empty in; a member the KILL truly
+    // left alive, the watcher included, is still there at it (and is recorded, so the finally ends it).
+    const deadline = Date.now() + 1500
+    while (groupMembers(child).length > 0 && Date.now() < deadline) await sleep(25)
+    record(...groupMembers(child))
+    assert.deepEqual(groupMembers(child), [], 'nothing of the group is left, the watcher included')
   } finally {
     killRecorded(d.pid)
   }

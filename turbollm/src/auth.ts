@@ -831,6 +831,18 @@ export function requiredCapability(method: string, path: string): LinkCapability
   return null
 }
 
+/** Whether the credential of request `c`, already admitted to its own route, may also `GET` `path`: what lanAuth
+ *  would decide for that route. A remote-access token is held to its capabilities there (requiredCapability); every
+ *  other caller lanAuth admits reaches the two routes this serves, GET /api/v1/downloads and /api/v1/status, which
+ *  check nothing more. Not for a route with a check of its own (/api/v1/fs/browse adds isLocalRequest). For a route
+ *  that carries another route's fields (/api/v1/activity), so they reach only a caller that route would answer. */
+export function mayAlsoRead(c: Context, d: Deps, path: string): boolean {
+  const resolved = arrivedOnIngress(c, d) ? resolveKey(c, d) : undefined
+  if (!resolved || grantKind(resolved) !== 'remote') return true
+  const need = requiredCapability('GET', path)
+  return need !== null && hasCapability(resolved, need)
+}
+
 /** Checks a raw candidate key against stored API keys; bumps lastUsedAt best-effort on a
  *  match. The credential-check core shared by every auth surface — HTTP (verifyPresentedKey,
  *  which sources the raw value from headers) and the WebSocket upgrade handler (which sources
