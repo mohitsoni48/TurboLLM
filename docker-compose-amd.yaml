@@ -27,8 +27,10 @@ services:
     group_add:
       - video
       - render
-      - "983" # host 'video' GID to ensure device permissions
-      - "987" # host 'render' GID to ensure device permissions
+    # If the container can't see the GPU (permission denied on /dev/kfd or /dev/dri),
+    # the usual cause is that the host's `render` group GID doesn't match any group
+    # name inside the container. Find the host GID with `getent group render` and
+    # replace the "render" line above with that numeric GID instead (same for `video`).
     environment:
       # Consumer AMD GPUs & APUs (RX 6000/7000/Vega/Ryzen) often need HSA_OVERRIDE_GFX_VERSION
       # to prevent ROCm from throwing "HSA_STATUS_ERROR_INVALID_ISA / unsupported target":
