@@ -279,7 +279,7 @@ export function handOverBackendEngine(
   }
 }
 
-/** TurboQuant fork: re-provision the fork's latest release, swapped in over the install dir
+/** TurboQuant fork: re-provision the fork's newest release for this machine, swapped in over the install dir
  *  only once it is fully on disk (a failed fetch leaves the working install untouched), and
  *  kept only once it probes there (a build that does not run here is swapped back out). */
 async function applyForkUpdate(d: UpdateApplyDeps, engine: Engine, root: string, signal?: AbortSignal): Promise<void> {

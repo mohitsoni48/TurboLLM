@@ -15,6 +15,7 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, getModelProfile, type Engine } from '../config/config'
 import { tmpDir } from '../test-support/tmp'
+import { turboquantReleaseList } from '../test-support/turboquant-release'
 import { availableBackends, installedBackendBuild } from './download'
 import { koboldcppAssetName, koboldcppBinPath } from './koboldcpp'
 import { llamafileBinPath } from './llamafile'
@@ -311,11 +312,9 @@ test('KoboldCpp update: a failed download keeps the binary; an update never acti
 
 /** A TurboQuant release listing for this OS whose one asset is `archive` (a tar.gz holding a llama-server script). */
 function stubTurboquantRelease(t: { after: (fn: () => void) => void }, archive: string): void {
-  const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
-  const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
   stubFetch(t, (url) =>
     url.includes('api.github.com')
-      ? new Response(JSON.stringify([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }]))
+      ? new Response(JSON.stringify(turboquantReleaseList()))
       : new Response(readFileSync(archive)),
   )
 }
@@ -359,7 +358,9 @@ test('a TurboQuant update whose new build fails its probe puts the old build bac
   assert.match(log[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Could not run the binary/)
   assert.equal(readFileSync(bin(root), 'utf8'), OLD_SERVER, 'the old build is back in place')
   assert.equal(d.registry.get('tq')?.version, '100 (old1234)')
-  assert.deepEqual(fs.readdirSync(root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  // build/ is the shared staging parent: it may remain, but empty (no stage left in it).
+  assert.deepEqual(fs.readdirSync(root).filter((n) => n !== 'build'), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  assert.deepEqual(existsSync(join(root, 'build')) ? fs.readdirSync(join(root, 'build')) : [], [], 'no stage is left in build/')
 })
 
 // A release that moves the binary (bin/llama-server instead of llama-server at the archive root) lands at another path,

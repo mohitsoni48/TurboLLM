@@ -11,6 +11,8 @@ import {
   resolveUpdateSource,
   tagFromManagedBinPath,
   tagFromVersionString,
+  turboquantInstalledTag,
+  compareTurboquantTags,
   versionFromPipString,
   parseGitRepo,
   commitFromVersionString,
@@ -179,13 +181,49 @@ test('resolveUpdateSource: a managed llama.cpp build on Android has no update so
   assert.equal(st.error, 'no_source')
 })
 
-test('resolveUpdateSource: turboquant fork → fork repo + tag from version', () => {
+test('resolveUpdateSource: turboquant fork → fork repo + release tag from the probed version', () => {
+  // The probe stores RE_VERSION's capture of `version: b10298-2.0.0 (build 11426, commit cda0f9256)`.
   const src = resolveUpdateSource(
-    eng({ binPath: '/root/engines/turboquant/llama-server', version: 'build b9000' }),
+    eng({ binPath: '/root/engines/turboquant/build/bin/llama-server', version: 'b10298-2.0.0 (build 11426, commit cda0f9256)' }),
   )
   assert.equal(src?.source, 'github-release')
   assert.equal(src?.ref, 'AtomicBot-ai/atomic-llama-cpp-turboquant')
-  assert.equal(src?.installed, 'b9000')
+  assert.equal(src?.installed, 'b10298-2.0.0')
+})
+
+test('turboquantInstalledTag: release tag, else the commit of a pre-tag build, else empty', () => {
+  assert.equal(turboquantInstalledTag('b10298-2.0.0 (build 11426, commit cda0f9256)'), 'b10298-2.0.0')
+  assert.equal(turboquantInstalledTag('1 (519f0c5)'), '519f0c5') // per-platform release era
+  assert.equal(turboquantInstalledTag('unknown'), '')
+})
+
+test('compareTurboquantTags: the fork semver decides first, then the upstream build', () => {
+  assert.equal(compareTurboquantTags('b10269-1.7.0', 'b10298-2.0.0'), 'newer')
+  assert.equal(compareTurboquantTags('b10269-1.5.0', 'b10269-1.7.0'), 'newer') // same build, newer fork release
+  assert.equal(compareTurboquantTags('b10298-2.0.0', 'b10298-2.0.0'), 'equal')
+  assert.equal(compareTurboquantTags('b10298-2.0.0', 'b10269-1.7.0'), 'older')
+  assert.equal(compareTurboquantTags('b10200-2.0.0', 'b10298-2.0.0'), 'newer')
+})
+
+test('compareTurboquantTags: a pre-tag commit build is behind any release; garbage is unknown', () => {
+  assert.equal(compareTurboquantTags('519f0c5', 'b10298-2.0.0'), 'newer')
+  assert.equal(compareTurboquantTags('', 'b10298-2.0.0'), 'unknown')
+  assert.equal(compareTurboquantTags('b10298-2.0.0', 'turboquant-linux-x64-vulkan-519f0c5'), 'unknown')
+})
+
+test('computeUpdateStatus: a pre-tag TurboQuant install is offered the current release', async () => {
+  const e = eng({ binPath: '/root/engines/turboquant/build/bin/llama-server', version: '1 (519f0c5)' })
+  const st = await computeUpdateStatus(e, async () => 'b10298-2.0.0')
+  assert.equal(st.installed, '519f0c5')
+  assert.equal(st.hasUpdate, true)
+  assert.equal(st.comparable, true)
+})
+
+test('computeUpdateStatus: an up-to-date TurboQuant install has no update', async () => {
+  const e = eng({ binPath: '/root/engines/turboquant/build/bin/llama-server', version: 'b10298-2.0.0 (build 11426, commit cda0f9256)' })
+  const st = await computeUpdateStatus(e, async () => 'b10298-2.0.0')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, true)
 })
 
 test('resolveUpdateSource: mlx/vllm → PyPI package + stripped version', () => {
@@ -322,6 +360,22 @@ test('computeUpdateStatus: a non-rate-limit failure still reports offline', asyn
     throw new Error('socket hang up')
   })
   assert.equal(st.error, 'offline')
+})
+
+test('fetchLatest: a TurboQuant release with no build for this machine reports no_release_asset, NOT offline', async (t) => {
+  // Regression: the resolver returned '' when nothing fit, and computeUpdateStatus reported an
+  // empty latest as 'offline' — telling the user their connection was broken when the real
+  // answer was that the fork has no prebuilt for their hardware.
+  const realFetch = globalThis.fetch
+  t.after(() => { globalThis.fetch = realFetch })
+  globalThis.fetch = (async () => new Response('[]', { status: 200 })) as typeof fetch
+
+  const e = eng({ binPath: '/root/engines/turboquant/build/bin/llama-server', version: 'b10298-2.0.0 (build 11426, commit cda0f9256)' })
+  const st = await computeUpdateStatus(e)
+  assert.equal(st.error, 'no_release_asset')
+  assert.equal(st.latest, null)
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.comparable, false)
 })
 
 test('computeUpdateStatus: empty latest treated as offline (no false up-to-date)', async () => {

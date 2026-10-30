@@ -16,7 +16,18 @@
 
 import type { Engine } from '../config/config'
 import { isNativeLitertLm } from './litert-lm'
-import { type BackendId, GithubRateLimitError, latestBuildTagRelease, latestCommitSha, latestReleaseTag } from './download'
+import {
+  type BackendId,
+  GithubRateLimitError,
+  NoReleaseAssetError,
+  compareTurboquantReleaseTags,
+  detectTurboquantHw,
+  fetchTurboquantPlan,
+  latestBuildTagRelease,
+  latestCommitSha,
+  latestReleaseTag,
+  parseTurboquantReleaseTag,
+} from './download'
 import { newestMatchingRelease } from './release-assets'
 import type { ReleaseProvenance } from './release-install'
 
@@ -83,9 +94,10 @@ export interface UpdateStatus {
   checkedAt: string
   /** Set when the check could not complete: 'offline' (network), 'rate_limited' (GitHub's
    *  API quota is spent — the box is online, so saying "offline" would misdirect the user
-   *  into debugging their connection) or 'no_source' (engine has no known update source).
+   *  into debugging their connection), 'no_release_asset' (the upstream release was read fine
+   *  but has no build this machine can run) or 'no_source' (engine has no known update source).
    *  Mutually exclusive with a non-null latest. */
-  error?: 'offline' | 'rate_limited' | 'no_source'
+  error?: 'offline' | 'rate_limited' | 'no_release_asset' | 'no_source'
   /** When latest couldn't be parsed/compared against installed → result was `unknown`.
    *  The UI shows "couldn't compare" rather than a false up-to-date. */
   comparable: boolean
@@ -146,6 +158,32 @@ export function tagFromVersionString(version: string): string {
   return m ? m[0] : ''
 }
 
+/** The installed TurboQuant release from its probed version string. Release builds print
+ *  their tag ("version: b10298-2.0.0 (build 11426, commit cda0f9256)") → `b10298-2.0.0`.
+ *  Builds from the fork's earlier per-platform releases print only a commit ("version: 1
+ *  (519f0c5)") → that short hash, which {@link compareTurboquantTags} treats as older than
+ *  any tagged release. '' when neither is present. */
+export function turboquantInstalledTag(version: string): string {
+  const tag = /\bb\d+-\d+(?:\.\d+)+\b/i.exec(version)
+  if (tag) return tag[0]
+  const sha = /\(([0-9a-f]{7,40})\)/i.exec(version)
+  return sha ? sha[1] : ''
+}
+
+/** Compare TurboQuant release tags (`b<upstream build>-<semver>`), stated from the LATEST's
+ *  perspective like every other comparator here. The ranking itself lives in download.ts's
+ *  {@link compareTurboquantReleaseTags} — the same function the install walks its release
+ *  list with — so the tag the update check offers and the tag an install lands on cannot
+ *  drift apart. An installed commit hash (a pre-tag build, see
+ *  {@link turboquantInstalledTag}) is behind any tagged release. */
+export function compareTurboquantTags(installed: string, latest: string): CompareResult {
+  if (!parseTurboquantReleaseTag(latest)) return 'unknown'
+  if (!parseTurboquantReleaseTag(installed)) {
+    return /^[0-9a-f]{7,40}$/i.test(installed.trim()) ? 'newer' : 'unknown'
+  }
+  const cmp = compareTurboquantReleaseTags(installed, latest)
+  return cmp === 0 ? 'equal' : cmp > 0 ? 'older' : 'newer'
+}
 /** Pull the build's git short hash out of a probed version string (ADR-088): the first
  *  hex token of 7–40 chars (e.g. "1 (0a635dc)" → "0a635dc", "version: x (abcdef1234)" →
  *  "abcdef1234"). Returns '' when none is present. PURE. NOTE: a digits-only build tag
@@ -214,7 +252,7 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
       return { source: 'github-release', ref: OFFICIAL_LLAMA_REPO, installed: tagFromManagedBinPath(engine.binPath) }
     }
     if (isTurboquant(engine.binPath)) {
-      return { source: 'github-release', ref: TURBOQUANT_REPO, installed: tagFromVersionString(engine.version) }
+      return { source: 'github-release', ref: TURBOQUANT_REPO, installed: turboquantInstalledTag(engine.version) }
     }
   }
   // User-added arbitrary binaries: no honest upstream to compare against.
@@ -258,6 +296,16 @@ export async function fetchLatest(src: ResolvedSource, signal?: AbortSignal): Pr
   }
   // Source-built engines (ADR-088): the repo's latest commit sha on the branch.
   if (src.source === 'source') return latestCommitSha(src.ref, src.branch ?? '', signal)
+  // TurboQuant: the same resolver the install/apply uses (newest release with a build for THIS
+  // machine), not `releases/latest` — otherwise the two can disagree and the update repeats.
+  // An empty plan is a REAL answer (no prebuilt for this hardware), not a failed check, so it
+  // throws NoReleaseAssetError rather than returning '' — which would have been reported as if
+  // the machine were offline.
+  if (src.ref === TURBOQUANT_REPO) {
+    const plan = await fetchTurboquantPlan(src.ref, await detectTurboquantHw(), signal)
+    if (!plan.length) throw new NoReleaseAssetError()
+    return plan[0].tag
+  }
   // When the INSTALLED version is a llama.cpp-style build tag, resolve the newest build-tag
   // release rather than GitHub's `releases/latest`. llama.cpp publishes both `b#####` per-build
   // tags and occasional semver releases (`v0.4.0`), and marks the semver one as "latest" — so
@@ -283,10 +331,12 @@ export async function computeUpdateStatus(
   try {
     latest = await fetcher(src, signal)
   } catch (e) {
-    // Distinguish an exhausted GitHub quota from a real network failure. Both mean "couldn't
-    // check", but only one is fixable by the user (add a token), and calling a rate limit
-    // "offline" sends them debugging a connection that is working fine.
-    const error = e instanceof GithubRateLimitError ? 'rate_limited' : 'offline'
+    // Distinguish an exhausted GitHub quota, and a release that simply has no build for this
+    // machine, from a real network failure. All three mean "couldn't check", but only the last
+    // is the user's connection: calling a rate limit (or a missing prebuilt) "offline" sends
+    // them debugging a connection that is working fine.
+    const error =
+      e instanceof GithubRateLimitError ? 'rate_limited' : e instanceof NoReleaseAssetError ? 'no_release_asset' : 'offline'
     return { installed: src.installed, latest: null, hasUpdate: false, checkedAt, error, comparable: false }
   }
   if (!latest) {
@@ -310,7 +360,9 @@ export async function computeUpdateStatus(
       rebuild: true,
     }
   }
-  const cmp = compareVersions(src.source, src.installed, latest)
+  const cmp = src.ref === TURBOQUANT_REPO
+    ? compareTurboquantTags(src.installed, latest)
+    : compareVersions(src.source, src.installed, latest)
   return {
     installed: src.installed,
     latest,

@@ -1061,6 +1061,10 @@ function EngineGallery({
         toast.error(`The update source is limiting requests — wait a moment and check ${e.name} again.`, { id: toastId })
         return
       }
+      if (st.error === 'no_release_asset') {
+        toast.error(`The latest upstream release has no ${e.name} build for this machine.`, { id: toastId })
+        return
+      }
       if (st.error === 'no_source' || !st.comparable) {
         toast.error(`Update status is unavailable for ${e.name}.`, { id: toastId })
         return
@@ -2085,6 +2089,9 @@ function CatalogUpdateStatusLine({ st, repoUrl }: { st: EngineUpdateStatus | und
   }
   if (st.error === 'offline') {
     return <span className="text-[11px] text-muted">Couldn&apos;t check for updates (offline)</span>
+  }
+  if (st.error === 'no_release_asset') {
+    return <span className="text-[11px] text-muted">The latest release has no build for this machine</span>
   }
   if (st.error === 'no_source' || !st.comparable) {
     return <span className="text-[11px] text-muted">Update status unavailable</span>

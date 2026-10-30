@@ -13,6 +13,7 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
 import { tmpDir } from '../test-support/tmp'
+import { turboquantReleaseList } from '../test-support/turboquant-release'
 import { koboldcppAssetName, koboldcppBinPath } from './koboldcpp'
 import { llamafileBinPath } from './llamafile'
 import { Registry } from './registry'
@@ -74,11 +75,9 @@ const CASES: UpdateCase[] = [
       writeExe(join(src, 'llama-server'), '#!/bin/sh\necho "version: 200 (abcdef1)"\n')
       const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
       execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
-      const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
-      const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
       stubFetch(t, (url) =>
         url.includes('api.github.com')
-          ? new Response(JSON.stringify([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }]))
+          ? new Response(JSON.stringify(turboquantReleaseList()))
           : new Response(readFileSync(archive)),
       )
       return { kind: 'llama-server', binPath: bin, version: '100 (old1234)' }

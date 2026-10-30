@@ -79,6 +79,38 @@ function runCaptured(bin: string, arg: string): Promise<{ out: string; err: Erro
   )
 }
 
+/** PURE: the compute-device names in `llama-server --list-devices` output — one
+ *  `  <name>: <description> (<total> MiB, <free> MiB free)` line per device (ggml's
+ *  `common_print_available_devices`), or `[]` for its `  (none)` answer when only the CPU
+ *  backend loaded. `null` when the output has neither shape — an older/unknown format, which
+ *  callers must treat as "cannot tell" rather than as a hard failure. */
+export function parseDeviceNames(out: string): string[] | null {
+  if (/^\s*\(none\)\s*$/m.test(out)) return []
+  const names = [...out.matchAll(/^\s*(\S+):\s.*?\(\d+ MiB, \d+ MiB free\)\s*$/gm)].map((m) => m[1])
+  return names.length ? names : null
+}
+
+/** Ask the binary which compute devices it sees. This is the only way to tell a build whose
+ *  GPU backend actually LOADED from one that silently fell back to the CPU — `--version` and
+ *  `--help` look identical either way. Shares runCaptured's timeout/env handling (including
+ *  the longer macOS first-run budget: Metal JIT-compiles its shaders).
+ *
+ *  Three outcomes: the device names, `[]` when the binary answered with nothing runnable (its
+ *  `(none)` answer, or a crash with no output at all), and `null` when the answer must not be
+ *  judged — an older build whose output format we don't read, a binary that doesn't know the
+ *  flag ("invalid argument: --list-devices"), or a run that hit the timeout. A timeout is
+ *  "cannot tell", never "no device": a first-run antivirus scan can stall a perfectly good
+ *  binary past the budget, and counting that as an answer makes the TurboQuant installer
+ *  discard a working build and download ~500 MB of alternatives. */
+export async function listDevices(bin: string): Promise<string[] | null> {
+  const { out, err } = await runCaptured(bin, '--list-devices')
+  const devices = parseDeviceNames(out)
+  if (devices) return devices
+  if (/invalid argument|unknown argument|unrecognized/i.test(out)) return null
+  if (isTimeout(err)) return null
+  return err || !out.trim() ? [] : null
+}
+
 export async function probe(bin: string): Promise<ProbeResult> {
   if (!existsSync(bin) || statSync(bin).isDirectory()) {
     throw new ProbeError('binary_not_found', 'Binary not found at that path.')

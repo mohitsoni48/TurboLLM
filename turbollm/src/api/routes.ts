@@ -1339,11 +1339,12 @@ export function registerApi(app: Hono, d: Deps): void {
   })
 
   // Provision a catalog fork via GitHub release (ADR-044) — TurboQuant. Downloads
-  // the platform-matching prebuilt llama-server, probes it (it IS llama-server
-  // compatible), and registers it as a kind='llama-server' engine. 202 + progress
-  // via /status. The fork currently ships macOS prebuilts only, so the install is
-  // platform-guarded to where an asset actually exists (matches the OS prefilter).
-  // ?update=1 fetches the latest release and swaps it in only once it is on disk.
+  // the prebuilt llama-server matching this OS/arch/GPU (CUDA on NVIDIA; see download.ts
+  // turboquantCandidates), verifies the backend it promised actually loads (retrying the next
+  // candidate if not), probes it (it IS llama-server compatible), and registers it as a
+  // kind='llama-server' engine. 202 + progress via /status. Hardware with no prebuilt fails
+  // with no_release_asset (→ build from source).
+  // ?update=1 fetches the latest release and swaps it in only once it is on disk and probes.
   app.post('/api/v1/engines/turboquant', (c) => {
     const entry = catalogEngine('turboquant')
     if (!entry?.repo) return err(c, 500, 'internal', 'TurboQuant catalog entry is misconfigured.')
@@ -1368,9 +1369,10 @@ export function registerApi(app: Hono, d: Deps): void {
         // Update: stop what runs on the install, then let provisionTurboquant stage the latest
         // beside it and swap only on success. Deleting the dir first left the engine pointing at
         // nothing whenever the lookup or download failed (offline, GitHub rate limit, no asset).
-        const cur = upgrade ? d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant'))) : undefined
-        if (cur) await stopEngineUsers(d, cur.id)
-        // An update keeps the entry: re-probe it, or it keeps the old build's version and capabilities (flags and KV
+        const cur = d.registry.list().engines.find((e) => isEngineInBuildDir(e.binPath, join(root, 'turboquant')))
+        if (upgrade && cur) await stopEngineUsers(d, cur.id)
+        // An update keeps the entry, and so does an Install that replaced a build this machine can no longer run
+        // (needsTurboquantReprovision): re-probe it, or it keeps the old build's version and capabilities (flags and KV
         // types the new build added stay gated off). It is `cur`, found by the path it ran from: a release that moved
         // the binary within the archive lands elsewhere, where a lookup by the new path found nothing and added a
         // second "TurboQuant" (refused as a taken name). Moved to the new path then (repairBinPath probes it too). For
@@ -1379,11 +1381,9 @@ export function registerApi(app: Hono, d: Deps): void {
         const register = async (bin: string): Promise<Engine> => {
           const kept = cur ?? d.registry.list().engines.find((e) => e.binPath === bin)
           if (!kept) return (await d.registry.add('TurboQuant', bin)).engine
-          if (!upgrade) return kept
           return kept.binPath === bin ? d.registry.reprobe(kept.id) : d.registry.repairBinPath(kept.id, bin)
         }
         let updated: Engine | undefined
-        // Per-platform resolver: Windows build is on HuggingFace, macOS/Linux on GitHub.
         const bin = await provisionTurboquant(
           root, entry.repo!,
           (p) => d.provision.progress(p.phase, p.pct, p.part, p.parts),
@@ -1406,7 +1406,7 @@ export function registerApi(app: Hono, d: Deps): void {
         if ((e as Error)?.name === 'AbortError') return d.provision.done() // user cancelled
         const msg =
           e instanceof Error && e.message === 'no_release_asset'
-            ? 'TurboQuant has no prebuilt binary for this operating system in its latest release.'
+            ? 'TurboQuant has no prebuilt binary for this system. Build llama-server from the fork, then use "Add your own engine".'
             : upgrade
               ? `Could not update TurboQuant — your existing build is unchanged: ${e instanceof Error ? e.message : e}`
               : `Could not install TurboQuant: ${e instanceof Error ? e.message : e}`

@@ -1,7 +1,25 @@
 // Capability-flag extraction from --help output (GitHub #43 regression).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { extractFlags, detectKvTypes, parseEnumList, classifyFlag, extractSpecTypeValues } from './probe'
+import { extractFlags, detectKvTypes, parseEnumList, classifyFlag, extractSpecTypeValues, parseDeviceNames } from './probe'
+
+test('parseDeviceNames: reads ggml device lines, knows its (none) answer, admits what it cannot read', () => {
+  // The shapes come from common_print_available_devices() in llama.cpp's common/arg.cpp.
+  assert.deepEqual(
+    parseDeviceNames('Available devices:\n  CUDA0: NVIDIA GeForce RTX 5090 (32607 MiB, 32000 MiB free)\n'),
+    ['CUDA0'],
+  )
+  assert.deepEqual(
+    parseDeviceNames('Available devices:\n  Vulkan0: AMD Radeon RX 7900 (24560 MiB, 0 MiB free)\n  CPU: AMD Ryzen (0 MiB, 0 MiB free)\n'),
+    ['Vulkan0', 'CPU'],
+  )
+  // Only the CPU backend loaded.
+  assert.deepEqual(parseDeviceNames('Available devices:\n  (none)\n'), [])
+  // A CUDA build whose backend failed to load logs this and lists nothing: it must NOT be
+  // mistaken for a working GPU backend (the silent-CPU-fallback failure this catches).
+  assert.equal(parseDeviceNames('ggml_backend_cuda_init: failed to initialize CUDA: no CUDA-capable device is detected'), null)
+  assert.equal(parseDeviceNames(''), null)
+})
 
 test('captures a normally-documented flag', () => {
   const help = `--cache-type-k TYPE     KV cache data type for K\n--parallel N            number of parallel sequences\n`

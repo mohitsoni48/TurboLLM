@@ -28,7 +28,23 @@ import {
 } from './zip-install'
 import { isInstallMarkerName } from './zip-reader'
 import type { ProbeResult } from './probe'
+import { serverBinName } from './scan'
 import { sourceBuildDirOf } from './build-runner'
+
+/** The binary name `installZipEngine` looks for is THIS host's (`llama-server.exe` on Windows):
+ *  a zip is installed for the machine that is unpacking it, so a fixture meant to install must
+ *  ship the host's name and be asserted at the host's path. Tests that pass an explicit
+ *  `platform` to the pure pickers keep the archive's own name instead. */
+const BIN = serverBinName
+
+/** The library members the installer gathers on THIS platform: `isPlatformLib` keys off the
+ *  extension, so a `.so` in a Windows zip is correctly skipped (and a `.dll` on Linux), and a
+ *  fixture that asserts those files landed has to name them the way the installed platform does.
+ *  The versioned soname / numbered runtime DLL are deliberate — the point is "the runtime beside
+ *  the binary", not a bare basename. */
+const LIBS: [string, string] = process.platform === 'win32'
+  ? ['ggml.dll', 'cudart64_12.dll']
+  : ['libggml.so', 'libcudart.so.12']
 
 function member(name: string, data = `content of ${name}`): ZipMember {
   return { name, data: Buffer.from(data) }
@@ -413,17 +429,17 @@ test('installZipEngine: upload → extract under engines/build/<slug>/ → probe
   const root = tmpDir('tllm-zip-')
   try {
     const buf = buildZipArchive([
-      member('dist/bin/llama-server', 'elf'),
-      member('dist/bin/libggml.so', 'so'),
-      member('runtime/libcudart.so.12', 'cudart'),
+      member(`dist/bin/${BIN}`, 'elf'),
+      member(`dist/bin/${LIBS[0]}`, 'so'),
+      member(`runtime/${LIBS[1]}`, 'cudart'),
     ])
     const res = await installZipEngine(root, 'myfork.zip', buf, { probeFn: STUB_PROBE })
     assert.ok(res.found)
-    assert.equal(res.binPath, join(root, 'build', 'myfork', 'llama-server'))
+    assert.equal(res.binPath, join(root, 'build', 'myfork', BIN))
     assert.equal(res.version, 'b4242 (0deadbe)')
     assert.equal(res.suggestedName, 'myfork (b4242)')
-    assert.equal(existsSync(join(root, 'build', 'myfork', 'libggml.so')), true)
-    assert.equal(existsSync(join(root, 'build', 'myfork', 'libcudart.so.12')), true)
+    assert.equal(existsSync(join(root, 'build', 'myfork', LIBS[0])), true)
+    assert.equal(existsSync(join(root, 'build', 'myfork', LIBS[1])), true)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -432,7 +448,7 @@ test('installZipEngine: upload → extract under engines/build/<slug>/ → probe
 test('installZipEngine: a probe failure removes the whole extraction (no half-installed build)', async () => {
   const root = tmpDir('tllm-zip-')
   try {
-    const buf = buildZipArchive([member('llama-server', 'elf')])
+    const buf = buildZipArchive([member(BIN, 'elf')])
     await assert.rejects(
       installZipEngine(root, 'myfork.zip', buf, { probeFn: async () => { throw new Error('probe_failed: wrong OS') } }),
       /wrong OS/,
@@ -460,7 +476,7 @@ test('installZipEngine: a same-named zip replaces a prior extraction in place (r
     const stale = join(root, 'build', 'myfork', 'stale-file.txt')
     mkdirSync(join(root, 'build', 'myfork'), { recursive: true })
     writeFileSync(stale, 'junk from an earlier extraction')
-    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'elf')]), { probeFn: STUB_PROBE })
+    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'elf')]), { probeFn: STUB_PROBE })
     assert.ok(res.found)
     assert.equal(existsSync(stale), false, 'the clean-start wipe must remove the old extraction')
     assert.equal(existsSync(res.binPath), true)
@@ -474,12 +490,12 @@ test('installZipEngine: the swap is transactional — a FAILED re-upload leaves 
   const root = tmpDir('tllm-zip-')
   try {
     // A working install (as if a previous upload registered it)…
-    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'old-elf')]), { probeFn: STUB_PROBE })
+    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'old-elf')]), { probeFn: STUB_PROBE })
     assert.ok(prior.found)
     // …then a re-upload whose binary fails the probe: the old files must survive, and no
     // temporary dir may linger in the build root.
     await assert.rejects(
-      installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'new-elf')]), {
+      installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'new-elf')]), {
         probeFn: async () => { throw new Error('probe_failed: wrong OS') },
       }),
       /wrong OS/,
@@ -495,10 +511,10 @@ test('installZipEngine: the swap is transactional — a FAILED re-upload leaves 
 test('installZipEngine: blockSwap refuses the swap mid-flight, keeping the prior install', async () => {
   const root = tmpDir('tllm-zip-')
   try {
-    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'old-elf')]), { probeFn: STUB_PROBE })
+    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'old-elf')]), { probeFn: STUB_PROBE })
     assert.ok(prior.found)
     await assert.rejects(
-      installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'new-elf')]), {
+      installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'new-elf')]), {
         probeFn: STUB_PROBE,
         blockSwap: () => 'Stop "My Fork" before replacing its files.',
       }),
@@ -518,10 +534,10 @@ test('installZipEngine: blockSwap refuses the swap mid-flight, keeping the prior
 test('installZipEngine: a failed final rename restores the parked install — never a moment with neither', async () => {
   const root = tmpDir('tllm-zip-')
   try {
-    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'old-elf')]), { probeFn: STUB_PROBE })
+    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'old-elf')]), { probeFn: STUB_PROBE })
     assert.ok(prior.found)
     await assert.rejects(
-      installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'new-elf')]), {
+      installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'new-elf')]), {
         // Runs after extraction, right before the swap: remove the temporary dir so the
         // FINAL rename (tmp → dest) fails the way a Windows EPERM/EBUSY on a just-probed
         // exe would — the swap must put the parked old install back, not lose it.
@@ -550,11 +566,11 @@ test('installZipEngine: a parked dir that cannot be deleted is left for the GC s
   const root = tmpDir('tllm-zip-')
   let hardened: string | null = null
   try {
-    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'old-elf')]), { probeFn: STUB_PROBE })
+    const prior = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'old-elf')]), { probeFn: STUB_PROBE })
     assert.ok(prior.found)
     hardened = dirname(prior.binPath)
     chmodSync(hardened, 0o500) // old install undeletable, still renamable
-    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'new-elf')]), { probeFn: STUB_PROBE })
+    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'new-elf')]), { probeFn: STUB_PROBE })
     assert.ok(res.found, 'the upload itself must succeed — the parked dir is only cleanup')
     assert.equal(readFileSync(res.binPath, 'utf8'), 'new-elf')
     const leftovers = readdirSync(join(root, 'build')).filter((d) => d !== 'myfork')
@@ -578,9 +594,9 @@ test('installZipEngine: a parked dir that cannot be deleted is left for the GC s
 test('installZipEngine: writes the marker and reports the FINAL path with a name derived from it', async () => {
   const root = tmpDir('tllm-zip-')
   try {
-    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member('llama-server', 'elf')]), { probeFn: STUB_PROBE })
+    const res = await installZipEngine(root, 'myfork.zip', buildZipArchive([member(BIN, 'elf')]), { probeFn: STUB_PROBE })
     assert.ok(res.found)
-    assert.equal(res.binPath, join(root, 'build', 'myfork', 'llama-server'))
+    assert.equal(res.binPath, join(root, 'build', 'myfork', BIN))
     assert.equal(existsSync(join(root, 'build', 'myfork', ZIP_BUILD_MARKER)), true)
     assert.equal(res.suggestedName, 'myfork (b4242)', 'the suggested name must come from the final dir, not the temp dir')
     assert.deepEqual(readdirSync(join(root, 'build')), ['myfork'])
