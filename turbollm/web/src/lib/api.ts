@@ -836,6 +836,9 @@ export type ModelDefaults = {
   /** Hard cap on tokens generated per response (0 = unlimited). Applies to in-app
    *  chat and clamps external (Claude Code) requests too. */
   maxTokens?: number
+  /** Default K / V cache types for a model with none saved ('' or absent = automatic). */
+  kvTypeK?: string
+  kvTypeV?: string
 }
 
 /** Telemetry consent level (spec 09 §3): off | anonymous benchmarks | + crash. */
