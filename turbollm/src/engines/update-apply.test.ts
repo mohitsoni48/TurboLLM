@@ -358,7 +358,9 @@ test('a TurboQuant update whose new build fails its probe puts the old build bac
   assert.match(log[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Could not run the binary/)
   assert.equal(readFileSync(bin(root), 'utf8'), OLD_SERVER, 'the old build is back in place')
   assert.equal(d.registry.get('tq')?.version, '100 (old1234)')
-  assert.deepEqual(fs.readdirSync(root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  // build/ is the shared staging parent: it may remain, but empty (no stage left in it).
+  assert.deepEqual(fs.readdirSync(root).filter((n) => n !== 'build'), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  assert.deepEqual(existsSync(join(root, 'build')) ? fs.readdirSync(join(root, 'build')) : [], [], 'no stage is left in build/')
 })
 
 // A release that moves the binary (bin/llama-server instead of llama-server at the archive root) lands at another path,

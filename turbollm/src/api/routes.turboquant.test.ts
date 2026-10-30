@@ -5,7 +5,7 @@
 // scripts (POSIX only).
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { Hono } from 'hono'
@@ -92,7 +92,9 @@ test('?update=1 whose new build fails its probe puts the old build back and keep
   assert.match(settled[0]!, /^fail:Could not update TurboQuant — your existing build is unchanged: Could not run the binary/)
   assert.equal(readFileSync(h.bin, 'utf8'), OLD_SERVER, 'the old build is back in place')
   assert.equal(h.registry.get('tq')?.version, '100 (old1234)')
-  assert.deepEqual(readdirSync(h.root), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  // build/ is the shared staging parent: it may remain, but empty (no stage left in it).
+  assert.deepEqual(readdirSync(h.root).filter((n) => n !== 'build'), ['turboquant'], 'neither the new build nor a parked copy is left behind')
+  assert.deepEqual(existsSync(join(h.root, 'build')) ? readdirSync(join(h.root, 'build')) : [], [], 'no stage is left in build/')
 })
 
 // The route stops what runs on TurboQuant before the download, which takes minutes; a model loaded on it meanwhile had
