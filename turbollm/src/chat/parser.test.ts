@@ -51,7 +51,7 @@ test('think: close tag split across chunks does not emit partial tag as reasonin
 })
 
 test('think: EOS with open think block flushes remaining buf as reasoning', () => {
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${THINK_OPEN}partial`)
   const events = flushState(s2)
   assert.equal(events.length, 1)
@@ -99,7 +99,7 @@ test('skipFinal: exact CHAN_FINAL_SKIP prefix match strips token and enters cont
   const part1 = CHAN_FINAL_SKIP.slice(0, half)
   const part2 = CHAN_FINAL_SKIP.slice(half) + 'answer'
 
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${CHAN_ANALYSIS_OPEN}r${CHAN_CLOSE}${part1}`)
   const { state: s3, events } = feedChunk(s2, part2)
   const all = [...events, ...flushState(s3)]
@@ -134,7 +134,7 @@ test('skipFinal: whitespace prefix + multi-chunk content after CHAN_FINAL_SKIP',
 
 test('skipFinal: no CHAN_FINAL_SKIP present — buf cleared, phase becomes content', () => {
   // When the skip token is not found, buf is cleared and subsequent chunks emit normally.
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${CHAN_ANALYSIS_OPEN}r${CHAN_CLOSE}junk_no_skip_token`)
   assert.equal(s2.phase, 'content')
   assert.equal(s2.buf, '')
@@ -146,7 +146,7 @@ test('skipFinal: no CHAN_FINAL_SKIP present — buf cleared, phase becomes conte
 
 test('skipFinal: partial CHAN_FINAL_SKIP held in buf until complete', () => {
   const partial = CHAN_FINAL_SKIP.slice(0, 15)
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${CHAN_ANALYSIS_OPEN}r${CHAN_CLOSE}`)
   const { state: s3, events: e3 } = feedChunk(s2, partial)
   // Still waiting for more data — no delta emitted yet
@@ -161,7 +161,7 @@ test('skipFinal: partial CHAN_FINAL_SKIP held in buf until complete', () => {
 // ── EOS flush ─────────────────────────────────────────────────────────────
 
 test('EOS flush: reasoning phase flushes remaining buf as reasoning event', () => {
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${THINK_OPEN}incomplete reasoning`)
   const events = flushState(s2)
   // feedChunk emits a safe portion immediately; flushState emits the buffered tail.
@@ -179,7 +179,7 @@ test('EOS flush: reasoning phase flushes remaining buf as reasoning event', () =
 
 test('EOS flush: skipFinal phase flushes remaining buf as delta (truncated stream)', () => {
   // If the stream ends mid-skipFinal, emit whatever's buffered as delta
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${CHAN_ANALYSIS_OPEN}r${CHAN_CLOSE}`)
   assert.equal(s2.phase, 'skipFinal')
   const { state: s3 } = feedChunk(s2, CHAN_FINAL_SKIP.slice(0, 10))
@@ -193,7 +193,7 @@ test('EOS flush: empty buf produces no events', () => {
 })
 
 test('EOS flush: content phase flushes remaining buf as delta', () => {
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, `${THINK_OPEN}r${THINK_CLOSE}`)
   assert.equal(s2.phase, 'content')
   // Feed content too short to flush (≤29 chars retained in lookahead? No — content phase flushes immediately)
@@ -206,7 +206,7 @@ test('EOS flush: content phase flushes remaining buf as delta', () => {
 // ── lookahead buffering ───────────────────────────────────────────────────
 
 test('lookahead: chunk shorter than 29 chars is held in buf, not emitted', () => {
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2, events } = feedChunk(state, 'Hello')  // 5 chars, well below 29
   assert.equal(events.length, 0)
   assert.equal(s2.phase, 'initial')
@@ -214,7 +214,7 @@ test('lookahead: chunk shorter than 29 chars is held in buf, not emitted', () =>
 })
 
 test('lookahead: chunk longer than 29 chars flushes content as delta', () => {
-  let state = initParseState()
+  const state = initParseState()
   // 40 chars with no tag: initial phase flushes 11 safe chars and transitions to content,
   // then the while loop continues and content phase flushes the remaining 29 — total = 40.
   const { state: s2, events } = feedChunk(state, 'A'.repeat(40))
@@ -231,7 +231,7 @@ test('lookahead: accumulated short chunks eventually flush when total exceeds th
 // ── phase transition smoke tests ──────────────────────────────────────────
 
 test('phases: initial → reasoning → content via think block', () => {
-  let state = initParseState()
+  const state = initParseState()
   assert.equal(state.phase, 'initial')
   const { state: s2 } = feedChunk(state, THINK_OPEN)
   assert.equal(s2.phase, 'reasoning')
@@ -241,7 +241,7 @@ test('phases: initial → reasoning → content via think block', () => {
 })
 
 test('phases: initial → reasoning → skipFinal → content via channel block', () => {
-  let state = initParseState()
+  const state = initParseState()
   const { state: s2 } = feedChunk(state, CHAN_ANALYSIS_OPEN)
   assert.equal(s2.phase, 'reasoning')
   assert.equal(s2.isChannel, true)

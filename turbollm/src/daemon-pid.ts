@@ -403,7 +403,10 @@ const defaultHooks: StopHooks = {
       }
       const onResponse = (res: http.IncomingMessage): void => {
         const status = res.statusCode ?? 0
-        if (status < 200 || status > 299 || !String(res.headers.server ?? '').startsWith('TurboLLM/')) return done(false)
+        if (status < 200 || status > 299 || !String(res.headers.server ?? '').startsWith('TurboLLM/')) {
+          done(false)
+          return
+        }
         let text = ''
         res.setEncoding('utf8')
         res.on('data', (chunk: string) => {

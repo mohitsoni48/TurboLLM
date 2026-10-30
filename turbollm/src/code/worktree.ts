@@ -123,6 +123,7 @@ export function sanitizeBranchName(raw: string): string {
     // `|` and the quote/angle brackets read as separators in a task (`a | b`, `<Button>`), so they
     // become a `-` rather than vanishing and gluing two words together.
     .replace(/["<>|]/g, '-')
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: strips control bytes along with the other characters git/filesystems forbid in a ref/branch name
     .replace(/[\x00-\x1f\x7f~^:?*[\]\\]/g, '')
     .replace(/@\{/g, '-')
     .replace(/\.\.+/g, '-')

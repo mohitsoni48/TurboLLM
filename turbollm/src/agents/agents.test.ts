@@ -305,7 +305,7 @@ test('isValidSkillId: rejects traversal / separators / absolute', () => {
   assert.ok(isValidSkillId('my-skill'))
   assert.ok(!isValidSkillId('../config'))
   assert.ok(!isValidSkillId('a/b'))
-  assert.ok(!isValidSkillId('C:\evil'))
+  assert.ok(!isValidSkillId('C:evil'))
   assert.ok(!isValidSkillId(''))
   assert.ok(!isValidSkillId('UPPER'))
   assert.ok(!isValidSkillId('a'.repeat(65)))

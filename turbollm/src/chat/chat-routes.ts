@@ -1686,7 +1686,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
       await emit({ event: 'notice', data: { message } })
     }
 
-    outerLoop: while (toolIter <= MAX_TOOL_ITER) {
+    while (toolIter <= MAX_TOOL_ITER) {
       toolIter++
 
       const reqBody: Record<string, unknown> = {
@@ -2077,7 +2077,7 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
         }
 
         // Continue to next round
-        continue outerLoop
+        continue
       }
 
       // ── F-021: Confidence loop (no tool calls — model gave final answer) ─────
@@ -2104,14 +2104,14 @@ export async function runGeneration(d: Deps, rawEmit: EmitSink, ctx: GenerationC
                 content: `Your confidence is ${conf}. Please search again with a more specific query to improve accuracy, then provide a revised answer with an updated [confidence: X.XX] line.`,
               })
               fullContent = ''
-              continue outerLoop
+              continue
             }
           }
         }
       }
 
       // No tool calls (or tools not available) — done
-      break outerLoop
+      break
     }
 
     // ── BUG-001: Qwen3 empty-reply guard ──────────────────────────────────────

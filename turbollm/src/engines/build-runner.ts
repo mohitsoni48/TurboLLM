@@ -16,7 +16,7 @@
 // custom-path CUDA Toolkit (and a user-provided ninja) are found. Windows or Linux + CUDA only.
 import { execFile, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { basename, delimiter, dirname, join, normalize } from 'node:path'
 import {
@@ -890,7 +890,7 @@ function hasAssemblySources(dir: string): boolean {
   const stack = [dir]
   while (stack.length) {
     const d = stack.pop()!
-    let entries
+    let entries: Dirent[]
     try {
       entries = readdirSync(d, { withFileTypes: true })
     } catch {

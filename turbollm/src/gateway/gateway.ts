@@ -1197,7 +1197,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // invalid, still reach a modern engine unsanitized. Not applied to `chat_template_kwargs`
       // yet — a Code-session override, if set, replaces it below — so the two sources are
       // resolved to a single effective value before either ever touches the outbound body.
-      let effort: ReturnType<typeof parseReasoningEffort> = undefined
+      let effort: ReturnType<typeof parseReasoningEffort> 
       if (parsedBody && 'reasoning_effort' in parsedBody && !litertLocal) {
         // `parseReasoningEffort` already returns undefined for a non-string (e.g. a
         // LiteLLM-style explicit `null` for an unset optional), so the delete below must not

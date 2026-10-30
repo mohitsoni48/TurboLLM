@@ -89,6 +89,7 @@ const MAX_REDIRECTS = 5
  * decoded it, or a latin1 Location) is kept as it is.
  */
 function decodeLocation(location: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: checking for non-ASCII/non-Latin1 bytes is the point of this guard
   if (!/[^\x20-\x7e]/.test(location) || /[^\x00-\xff]/.test(location)) return location
   const bytes = Buffer.from(location, 'latin1')
   const utf8 = bytes.toString('utf8')

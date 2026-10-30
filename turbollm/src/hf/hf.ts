@@ -512,7 +512,6 @@ export class HfClient {
         this.remember(url, { at: now, value: raw })
         return raw
       } catch {
-        continue
       }
     }
     return ''
@@ -814,7 +813,7 @@ function sharedStemPrefix(stems: string[]): string {
   }
   // A prefix that cuts a token in half would leave every label starting mid-word — back
   // it up to the last separator (or nothing) so suffixes always start at a token boundary.
-  if (prefix && stems.some((s) => s.length > prefix.length && !/[-_.\/]/.test(s[prefix.length] ?? ''))) {
+  if (prefix && stems.some((s) => s.length > prefix.length && !/[-_./]/.test(s[prefix.length] ?? ''))) {
     const lastSep = Math.max(prefix.lastIndexOf('-'), prefix.lastIndexOf('_'), prefix.lastIndexOf('.'), prefix.lastIndexOf('/'))
     prefix = lastSep >= 0 ? prefix.slice(0, lastSep + 1) : ''
   }
@@ -834,13 +833,13 @@ function sharedStemPrefix(stems: string[]): string {
  *  a file can shift them (a new bare bundle turns 'GPU' into 'Default') — so nothing may
  *  persist them; downloads and provenance key off `name`, never off the label. */
 function litertlmVariantLabel(prefix: string, stem: string): string {
-  const suffix = stem.length > prefix.length ? stem.slice(prefix.length).replace(/^[-_.\/ ]+/, '') : ''
+  const suffix = stem.length > prefix.length ? stem.slice(prefix.length).replace(/^[-_./ ]+/, '') : ''
   // Acronyms and letter+digit compounds read uppercase whole — 'gpu'/'web' → 'GPU'/'WEB'
   // like quant labels write Q4, FP16, INT4, and SoC ids write MT6989/SM8750 (an 'int4'
   // next to a 'q4' must not read 'Int4' vs 'Q4'); pure words title-case
   // ('Google Tensor G5', 'Mediatek', not 'GOOGLE' or 'mediatek').
   const label = suffix
-    .split(/[-_.\/ ]+/)
+    .split(/[-_./ ]+/)
     .filter(Boolean)
     .map((tok) =>
       tok.length <= 3 || (/[a-z]/i.test(tok) && /\d/.test(tok))

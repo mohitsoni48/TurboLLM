@@ -216,7 +216,7 @@ test('REGRESSION: a selection longer than one command line holds is staged in se
   const trace = join(tmpDir('tllm-git-actions-trace-'), 'trace.log')
   const before = process.env.GIT_TRACE
   process.env.GIT_TRACE = trace
-  let result
+  let result: Awaited<ReturnType<typeof commitGitChanges>>
   try {
     result = await commitGitChanges(dir, 'format', selected)
   } finally {

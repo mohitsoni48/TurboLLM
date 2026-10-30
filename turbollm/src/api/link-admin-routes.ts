@@ -182,7 +182,7 @@ export function registerLinkAdminRoutes(
     // never widen a grant. `d.telemetry` is optional (absent under tests, same
     // convention as tunnel/gate/links), so this must be a no-op when unset.
     if (d.telemetry) {
-      const preset = typeof body?.preset === 'string' && Object.prototype.hasOwnProperty.call(LINK_PRESETS, body.preset)
+      const preset = typeof body?.preset === 'string' && Object.hasOwn(LINK_PRESETS, body.preset)
         ? (body.preset as keyof typeof LINK_PRESETS)
         : undefined
       emit(d.telemetry, linkMinted, { capabilityCount: caps.length, ...(preset ? { preset } : {}) })

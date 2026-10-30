@@ -2,7 +2,7 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine } from '../config/config'
+import { type ConfigStore, type CustomEngineSource, type Engine, type FlagInfo, type UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
