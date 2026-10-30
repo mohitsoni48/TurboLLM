@@ -35,3 +35,13 @@ test('#226: package.json declares no postinstall script (it runs without devDepe
 test('#226: patch-package is wired through `prepare`, so the dev repo still gets patched', () => {
   assert.equal(manifest.scripts?.prepare, 'patch-package')
 })
+
+// `"start": "tsx src/cli.ts"` put tsx's own process between npm and the daemon. tsx relays a signal to its child,
+// waits about 30 ms twice for an acknowledgement over IPC, then SIGKILLs it: measured with a daemon busy 400 ms in
+// every 500 ms, Ctrl+C never ran the graceful shutdown (0 of 3), and engines were left to the reapers. `node
+// --import tsx` runs the daemon itself in npm's process tree, with tsx as a loader only (3 of 3 graceful). Node
+// supports `--import` on every version cli.ts accepts (>= 22.13). A Settings restart's keeper passes execArgv on, so
+// `--import tsx` reaches the replacement (cli.ts becomeKeeper).
+test('`npm start` runs the daemon as node itself, with tsx as a loader: no relaying process to SIGKILL it at Ctrl+C', () => {
+  assert.equal(manifest.scripts?.start, 'node --import tsx src/cli.ts')
+})

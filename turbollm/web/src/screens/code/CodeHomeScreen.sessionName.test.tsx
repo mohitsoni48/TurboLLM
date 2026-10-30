@@ -34,6 +34,7 @@ vi.mock('../../lib/queries', async (importOriginal) => {
     ...actual,
     useStatus: () => ({ data: { engine: { state: 'running' }, model: { key: 'qwen3-8b', name: 'Qwen3 8B' } } }),
     useModels: () => ({ data: { models: [] } }),
+    useShowAllEngineModels: () => false,
     useModelActions: () => ({
       load: { mutate: vi.fn(), isPending: false },
       eject: { mutate: vi.fn(), isPending: false },

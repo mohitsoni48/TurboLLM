@@ -540,6 +540,8 @@ export const UI_ACTIONS = [
   'select_model_quant', 'eject_model', 'load_model', 'open_model_load_settings', 'pin_model',
   'find_model_quants', 'delete_model', 'set_primary_model_dir', 'remove_model_dir',
   'browse_model_dir', 'add_model_dir', 'import_model_file',
+  // Hiding a model by hand, and the Library's "Show hidden models" switch.
+  'hide_model', 'unhide_model', 'toggle_hidden_models',
 
   'switch_customize_tab', 'close_mcp_panel', 'connect_mcp_server', 'add_local_mcp_server',
   'add_manual_mcp_server', 'update_mcp_server', 'cancel_mcp_edit', 'select_builtin_search',
@@ -624,6 +626,8 @@ export const UI_ACTIONS = [
   'commit_code_git', 'push_code_git', 'close_code_git_dialog',
 
   'resume_download', 'cancel_download', 'remove_download',
+  'pause_download', 'pause_all_downloads', 'resume_all_downloads', 'discard_download',
+  'show_downloads_from_library',
 
   'reset_thread_sampling', 'toggle_preserve_thinking', 'save_thread_settings',
 
@@ -656,7 +660,7 @@ export const UI_ACTIONS = [
   'skip_onboarding_payoff', 'skip_onboarding_tune_offer',
   'choose_profile', 'start_model_download', 'use_existing_models', 'open_discover_handoff',
   'pick_different_model', 'accept_autotune', 'decline_autotune', 'finish_onboarding',
-  'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action',
+  'resume_onboarding', 'dismiss_finish_banner', 'take_recovery_action', 'resume_model_download',
 
   // Turbo Link phase 3 (ADR-376): fleet control on the Models screen. `UI_ACTIONS` is a
   // CLOSED enum — `uiAction` validates against it and `POST /api/v1/telemetry/ui` drops an
@@ -686,6 +690,20 @@ export const UI_ACTIONS = [
   'confirm_jev_load', 'cancel_jev_load', 'open_jev_playground_toast',
   // ADR-443: the Workspace sidebar's way into the playground while a Laya model is loaded.
   'open_laya_playground',
+
+  // 35 actions that already had a `track()` call site in web/src but no entry here — the same
+  // CLOSED-enum trap as the batches above, found by scanning every literal `track()` call (that
+  // scan is now ui.test.ts, so a new call site without an entry fails the suite). Turbo Link
+  // settings, Remote Access, the app-update flow, the Monitor/Requests panel, and singles.
+  'set_machine_name', 'mint_link', 'revoke_inbound_link', 'add_link', 'edit_link_url',
+  'ack_link_machine_change', 'remove_link',
+  'select_remote_provider', 'save_remote_cloudflare', 'save_remote_ngrok', 'save_remote_tailscale_port',
+  'save_remote_custom_url', 'save_remote_token_grant', 'start_remote', 'stop_remote', 'stop_remote_from_chip',
+  'open_app_update_from_nav', 'open_app_update_from_settings', 'set_app_update_policy', 'apply_app_update',
+  'switch_monitor_view', 'toggle_request_column', 'toggle_request_log_bodies', 'export_request_log',
+  'clear_request_log', 'open_request_detail',
+  'open_system_from_hw_bar', 'switch_engines_tab', 'check_engine_update', 'save_gh_token',
+  'cancel_all_downloads', 'dismiss_all_downloads', 'set_litert_backend', 'set_model_load_mode', 'set_model_no_mmap',
 ] as const
 
 export const uiAction = defineEvent({

@@ -1,7 +1,7 @@
 // Engine lifecycle state machine (A2, spec 03 §4): stopped → starting → running
 // → stopping → stopped, plus error. Owns the single running engine process.
 // Ports the verified Go manager to node:child_process.
-import { ChildProcess, execFile, spawn, spawnSync } from 'node:child_process'
+import { type ChildProcess, execFile, spawnSync } from 'node:child_process'
 import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createConnection, createServer } from 'node:net'
 import { dirname, join } from 'node:path'
@@ -14,6 +14,10 @@ import { mlxVlmServerCommand } from './mlx-vlm'
 import { koboldcppServerCommand } from './koboldcpp'
 import { llamafileServerCommand } from './llamafile'
 import { slotCacheDir } from './slot-cache'
+import { rememberLitertLmModel, type LitertLmRequestInfo } from './litert-lm-request'
+import { litertlmHeaderFromFile } from '../models/litertlm'
+import { isTetheredGroupLeader, killTetheredTree, spawnTethered } from '../util/tether'
+import { START_TIME_TOLERANCE_MS, processStartTimes } from '../util/process-start-time'
 import { hostUname, vllmModelRunnerEnv, vllmServerCommand, vllmServeBlocker } from './vllm'
 import { sglangServerCommand, sgLangServeBlocker } from './sglang'
 import {
@@ -54,6 +58,9 @@ export interface StartOpts {
   /** LiteRT-LM backend/context/threads (litertLmProfileToConfig). Written to a per-port JSON file and passed with
    *  `--config`; only consumed by the litert-lm branch of {@link engineCommand}. */
   litertLmConfig?: LitertLmConfig
+  /** LiteRT-LM: what each request to the model carries from this load (the sampling the user set for it, the bundle's
+   *  own sampler); recorded at start for the request shaping (litert-lm-request.ts). */
+  litertLmRequest?: LitertLmRequestInfo
   /** Per-model pinned port (LoadProfile.port), engine-agnostic. Tried first by
    *  allocPort(); falls back to the normal 8081+ walk if unset or already taken. */
   preferredPort?: number
@@ -140,6 +147,26 @@ function posNum(v: unknown): number {
   return Number.isFinite(n) && n > 0 ? n : 0
 }
 
+/** Hooks a load or start runs inside the global load gate. `beforeStart` runs first, before the start's own awaits
+ *  (the vLLM/SGLang/LiteRT-LM preflight, the port allocation). `beforeSpawn` runs after the last of them, in the same
+ *  tick as the spawn, so whatever it checks still holds when the engine starts. A throw from either starts nothing and
+ *  rejects the load; a {@link LoadPausedError} is not reported as a failed load. */
+export interface LoadHooks {
+  beforeStart?: () => Promise<void>
+  beforeSpawn?: () => void
+}
+
+/** A hook's refusal that is a pause, not the load failing: the ComfyUI guard's while a render holds the GPU, whose
+ *  release resumes the load. load() keeps it as the engine's error, as any throw (the guard recognises its message
+ *  there), but does not report it to onLoadSettled: telemetry's model_load counted every load a render paused as a
+ *  failed one (load_failed), once per refusal, and the resumed load then reported its own outcome as well. */
+export class LoadPausedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LoadPausedError'
+  }
+}
+
 export class BusyError extends Error {
   constructor() {
     super('engine_already_running')
@@ -183,12 +210,22 @@ export class Manager {
    *  stub. A throwing observer must never break a load. `opts` is the exact
    *  `StartOpts` this attempt was called with (spec 23 §3.3's `model_load`
    *  needs the resolved config) — passed explicitly by the caller rather than
-   *  read off `this.opts`, because `this.opts` is only assigned partway
-   *  through `startInternal()`; an early preflight failure (vLLM/SGLang
-   *  unsupported) returns before reaching that assignment and would otherwise
-   *  report the PREVIOUS load's config for a failure that has nothing to do
-   *  with it. */
+   *  read off `this.opts`, so the report never depends on where `this.opts`
+   *  is assigned: an early preflight failure (vLLM/SGLang unsupported) once
+   *  returned before that assignment and reported the PREVIOUS load's config
+   *  for a failure that had nothing to do with it. */
   onLoadSettled?: (ok: boolean, err: ErrInfo | null, opts: StartOpts) => void
+  /** Whether work the idle watchdog cannot see still needs the loaded model, wired in cli.ts on the primary
+   *  Manager: a chat whose turn holds its slot (generating, compacting, or waiting for a tool-call approval
+   *  within Settings' approval wait), or whose finished reply's auto-title or memory call is still pending
+   *  (chat-routes.ts chatHoldsEngine). The watchdog does not unload while it says so. The generation count
+   *  alone missed the auto-compaction a turn runs before its first request, a manual compaction, and those calls
+   *  after the turn's end, none of which holds a generationStart: once the TTL had passed since the load (or the
+   *  last gateway request) the watchdog unloaded the model under them, the compaction failed, and the reply's
+   *  title and memory were lost. While either holds, each watchdog tick restarts the idle clock, so the timeout
+   *  counts from when the last of that work let go (to within the watchdog's minute). Unset (a pool slot, a test),
+   *  the watchdog reads only the generation count, as before. */
+  holdsEngine?: () => boolean
   private lastCommand: { cmd: string; args: string[] } | null = null
   private lastActivity = 0
   private logPathStr = ''
@@ -197,9 +234,20 @@ export class Manager {
   private generation = 0
   private liveGen: LiveGen | null = null
   private session: SessionAccumulator = freshSession()
+  /** The idle watchdog (watchdogTick), armed only while an engine process is alive. An interval armed for the
+   *  Manager's whole life kept every pool-slot Manager the gateway dropped (and its per-minute config clone) alive
+   *  forever; armed this way, a stopped Manager holds no timer and is collected once nothing references it. */
+  private watchdog: ReturnType<typeof setInterval> | null = null
+  private readonly poolSlot: boolean
+  /** The load() in flight, or a start() that reports (`report`), from its entry into the load gate until it reports.
+   *  A ComfyUI render's stop marks it paused (stopAndWait's `onPausedLoad`): it then reports nothing, as a load the
+   *  guard's hooks refuse does not (LoadPausedError), and the guard reports the reload of it instead. */
+  private reporting: { paused: boolean } | null = null
 
-  constructor(private store: ConfigStore) {
-    setInterval(() => this.watchdogTick(), 60_000).unref()
+  /** `poolSlot`: this Manager runs a gateway pool slot (ModelRouter) beside the primary, often on the same
+   *  engine, so its engine log gets a file of its own (see startInternal). */
+  constructor(private store: ConfigStore, options: { poolSlot?: boolean } = {}) {
+    this.poolSlot = options.poolSlot ?? false
   }
 
   /** Load a model, freeing any currently-loaded one first — the single atomic
@@ -208,19 +256,25 @@ export class Manager {
    *  are one indivisible operation; no other load can interleave. Never throws on a
    *  model that simply fails to load — callers read status() for the running/error
    *  outcome. */
-  async load(opts: StartOpts, hooks?: { beforeStart?: () => Promise<void> }): Promise<void> {
+  async load(opts: StartOpts, hooks?: LoadHooks): Promise<void> {
     // Declared outside the try so the catch block below also reports whichever opts were
     // actually last attempted — a throw from the fallback's own startInternal() must not
     // fall back to reporting the original (mmproj-attached) opts, same defect class this
     // whole fallback mechanism exists to fix.
     let effectiveOpts = opts
     await Manager.runExclusive(async () => {
+      const attempt = { paused: false }
+      this.reporting = attempt
       try {
         if (this.state === 'running' || this.state === 'starting' || this.state === 'stopping') {
           await this.stopAndWait()
         }
+        // Recorded before the hook, which can refuse the load (ComfyUI rendering): restart() then retries
+        // THIS model, not the one just stopped (startInternal records it too, for start()).
+        this.opts = opts
+        this.lastCommand = null
         if (hooks?.beforeStart) await hooks.beforeStart()
-        await this.startInternal(opts)
+        await this.startInternal(opts, undefined, hooks?.beforeSpawn)
         await this.awaitNotStarting()
         // GitHub report (Qwen3.6-35B-A3B): the multimodal projector can fail to load even with
         // the model's own correct, official mmproj — see mmprojFallbackOpts's doc comment. Retry
@@ -245,7 +299,7 @@ export class Manager {
             // Set BEFORE the spawn (not after) so a throw out of startInternal() below is
             // still attributed to the config that actually threw, not the original one.
             effectiveOpts = fallback
-            await this.startInternal(fallback, note)
+            await this.startInternal(fallback, note, hooks?.beforeSpawn)
             await this.awaitNotStarting()
           }
         }
@@ -255,8 +309,9 @@ export class Manager {
         // free. Manager stays telemetry-agnostic: it reports an outcome, and the
         // consumer (wired in cli.ts) decides what that means. Uses effectiveOpts (the
         // fallback's, when one ran and the retry is what actually ended up loaded/failed)
-        // so a successful text-only fallback isn't misreported as a load "with mmproj".
-        this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
+        // so a successful text-only fallback isn't misreported as a load "with mmproj". A load a ComfyUI render
+        // stopped while it started did not fail either: that render's release reloads it, and reports the reload.
+        if (!attempt.paused) this.reportLoad(this.state === 'running', this.errInfo, effectiveOpts)
       } catch (e) {
         // routes.ts fires load() without awaiting and only console.warns the rejection —
         // without this, a failed swap left `state` wherever it last was (often still
@@ -264,8 +319,11 @@ export class Manager {
         // anything went wrong or that a retry could help.
         this.state = 'error'
         this.errInfo = { code: 'load_failed', message: e instanceof Error ? e.message : String(e), exitCode: -1, logTail: [] }
-        this.reportLoad(false, this.errInfo, effectiveOpts)
+        // A load a ComfyUI render paused did not fail: that render's release resumes it, and the resumed load reports.
+        if (!attempt.paused && !(e instanceof LoadPausedError)) this.reportLoad(false, this.errInfo, effectiveOpts)
         throw e
+      } finally {
+        if (this.reporting === attempt) this.reporting = null
       }
     })
   }
@@ -273,11 +331,29 @@ export class Manager {
   /** Start a model assuming nothing is loaded (throws BusyError otherwise). Held by
    *  the global load gate through readiness so concurrent loads can't spin up two
    *  engines at once. Most callers want load() (which stops first); this exists for
-   *  paths that have already ensured the engine is free (bench, ComfyUI reload). */
-  async start(opts: StartOpts): Promise<void> {
+   *  paths that have already ensured the engine is free (bench, ComfyUI reload). `hooks` run inside the gate, as
+   *  load()'s do: a throw from one starts nothing and rejects the start. `report`: report the outcome as load() does
+   *  (the ComfyUI guard's reload of a load a render stopped while it started, which reported nothing); a start that
+   *  is paused, refused by the guard (LoadPausedError) or finds another model loaded (BusyError: that load reports its
+   *  own) reports nothing. */
+  async start(opts: StartOpts, hooks?: LoadHooks, report = false): Promise<void> {
     await Manager.runExclusive(async () => {
-      await this.startInternal(opts)
-      await this.awaitNotStarting()
+      const attempt = report ? { paused: false } : null
+      this.reporting = attempt
+      try {
+        if (hooks?.beforeStart) await hooks.beforeStart()
+        await this.startInternal(opts, undefined, hooks?.beforeSpawn)
+        await this.awaitNotStarting()
+        if (attempt && !attempt.paused) this.reportLoad(this.state === 'running', this.errInfo, opts)
+      } catch (e) {
+        if (attempt && !attempt.paused && !(e instanceof LoadPausedError) && !(e instanceof BusyError)) {
+          const message = e instanceof Error ? e.message : String(e)
+          this.reportLoad(false, { code: 'load_failed', message, exitCode: -1, logTail: [] }, opts)
+        }
+        throw e
+      } finally {
+        if (this.reporting === attempt) this.reporting = null
+      }
     })
   }
 
@@ -303,10 +379,15 @@ export class Manager {
     while (this.state === 'starting' && Date.now() < deadline) await sleep(200)
   }
 
-  private async startInternal(opts: StartOpts, retryNote?: string): Promise<void> {
+  private async startInternal(opts: StartOpts, retryNote?: string, beforeSpawn?: () => void): Promise<void> {
     if (this.state === 'starting' || this.state === 'running' || this.state === 'stopping') {
       throw new BusyError()
     }
+    // From here on this attempt is the engine's model, even when it fails before the spawn (a preflight
+    // return or a throw below): restart() retries it, and launchCommand() shows no argv rather than the
+    // previous model's.
+    this.opts = opts
+    this.lastCommand = null
     if (!opts.engine.binPath) throw new Error('no_active_engine')
     if (!opts.modelPath) throw new Error('no_such_model')
 
@@ -331,6 +412,7 @@ export class Manager {
       }
     }
 
+    let litertLmRequest = opts.litertLmRequest
     if (opts.engine.kind === 'litert-lm') {
       // Cached probe (litertLmServeBlockerCached): this runs on EVERY load and auto-resume,
       // and the probe spawns a fresh Python process that dlopens the native library —
@@ -344,12 +426,31 @@ export class Manager {
         this.errInfo = { code: 'engine_unsupported', message: blocker, exitCode: -1, logTail: [] }
         return
       }
+      // A load that carries nothing of the bundle (a .litertlm loaded by path, also one restarted onto LiteRT-LM from
+      // another engine, a devModel resumed): its requests get the bundle's own sampler, read from its header here as
+      // the scanner reads a library entry's. Without it a thread's temperature alone went alone, which `serve`
+      // completes with top_k 1 (greedy: the temperature did nothing), and nothing said so. Read before the port is
+      // taken, after which nothing may yield (below).
+      if (!litertLmRequest) {
+        const { sampler } = await litertlmHeaderFromFile(opts.modelPath)
+        litertLmRequest = { sampling: {}, ...(sampler ? { sampler } : {}) }
+      }
     }
 
     const port = await allocPort(opts.preferredPort)
-    const logPath = join(this.store.dir(), 'logs', `engine-${opts.engine.id}.log`)
+    // The last await before the spawn: from here to `state = 'starting'` nothing yields, so a check made here (the
+    // ComfyUI guard's, against a render that began during the preflight above) still holds when the engine starts.
+    beforeSpawn?.()
+    // A pool slot often runs on the same engine as the primary, so it logs to a file named by its port (unique
+    // among live engines): sharing the primary's file truncated it and interleaved both engines' output, and every
+    // reader of logPath() (logs route, error banner, mmproj fallback, load-failure checks) saw the other's lines.
+    const logName = this.poolSlot ? `engine-${opts.engine.id}-${port}.log` : `engine-${opts.engine.id}.log`
+    const logPath = join(this.store.dir(), 'logs', logName)
     mkdirSync(dirname(logPath), { recursive: true })
     const logStream = createWriteStream(logPath) // truncates
+    // The log is best-effort: without a listener, a failed write (disk full) is an unhandled 'error' event,
+    // which takes the whole daemon down.
+    logStream.on('error', (e) => console.warn(`[engine] log write failed: ${e.message}`))
     // Header so the raw engine log is self-explanatory. `port` is the engine's OWN
     // loopback port (allocated 8081+), DISTINCT from the TurboLLM app/UI port the
     // user configures — surfacing it here stops the "it says 8081 even though I
@@ -380,37 +481,63 @@ export class Manager {
     let litertConfigPath: string | undefined
     if (opts.engine.kind === 'litert-lm') {
       litertConfigPath = litertLmConfigPath(this.store.dir(), port)
-      writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: { backend: 'cpu' } })
+      // No config (a load by path built before this one, a restart onto LiteRT-LM of a load by path): nothing is set,
+      // so the server chooses from the model, as for a profile that sets nothing. It used to write the CPU, which a
+      // GPU-only bundle cannot run on.
+      writeLitertLmConfig(litertConfigPath, opts.litertLmConfig ?? { default: {} })
+      // What its requests carry, by model path (litert-lm-request.ts); for a load that carried none, read above.
+      rememberLitertLmModel(opts.modelPath, { ...(litertLmRequest ?? { sampling: {} }), native: isNativeLitertLm(opts.engine.binPath) })
     }
 
     const { cmd, args } = engineCommand(opts, port, slotSavePath, litertConfigPath)
-    // The UNWRAPPED command (before the POSIX-llamafile shell-quoting workaround below) is
-    // what a human would actually type in their own terminal — stored for "copy exact launch
-    // command" (GitHub Discord ask). Not logged before now: the file only ever had a port-only
-    // header line, never the real argv.
+    // The command as a human would type it in their own terminal — stored for "copy exact launch command" (GitHub
+    // Discord ask). Not logged before now: the file only ever had a port-only header line, never the real argv.
     this.lastCommand = { cmd, args }
-    const spawned = needsShellWrapper(opts.engine.kind) ? shellWrapped(cmd, args) : { cmd, args }
-    const child = spawn(spawned.cmd, spawned.args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) })
+    // Tethered (util/tether.ts): the engine, and every worker it starts in its process group (vLLM's and SGLang's
+    // Python workers, a pool slot's own), end the moment the daemon does, however it ends. A SIGKILLed, crashed or
+    // out-of-memory-killed daemon used to leave llama-server running, parented to init, holding the model's VRAM and
+    // its port until the next start's reaper found it, and one still loading (no port open yet) not even then. On
+    // POSIX the wrapper is a `/bin/sh` that execs the engine, so a llamafile (an Actually Portable Executable that
+    // execve refuses with ENOEXEC) runs through sh as the old shellWrapped did. Windows spawns it as before, in libuv's
+    // kill-on-close job.
+    const child = spawnTethered(cmd, args, { cwd: dirname(cmd), windowsHide: true, env: pyEngineEnv(opts.engine.kind, this.store.dir(), opts.engine.binPath) }, { kind: 'engine' })
     // end:false — otherwise whichever of stdout/stderr closes first would end the
     // shared log stream and drop the other's output. We close it in onTerminated.
     child.stdout?.pipe(logStream, { end: false })
     child.stderr?.pipe(logStream, { end: false })
+    // pipe() detaches on that error and leaves the engine's output paused: keep draining it, or the engine
+    // blocks for good once its stdout pipe fills.
+    logStream.once('error', () => {
+      child.stdout?.resume()
+      child.stderr?.resume()
+    })
 
     this.state = 'starting'
     this.session = freshSession() // each running session starts with fresh stats (B4)
-    this.opts = opts
     this.port = port
     this.pid = child.pid ?? 0
     // Track the OS process on disk so a daemon that dies WITHOUT running its signal
     // handlers (terminal window closed, killed, crashed) can't leave llama-server
     // orphaned: the next startup reaps it (reapStaleEngines), and the exit handler
-    // kills it synchronously (killTrackedEnginesSync). Cleared in onTerminated.
-    if (this.pid) writeEnginePid(this.store.dir(), this.pid, port)
+    // kills it synchronously (killTrackedEnginesSync). Cleared at the engine's exit, not only at its 'close' (in
+    // onTerminated): a worker left holding its stdout holds 'close' back for as long as it lives, and in that window
+    // the exit handler's kill (taskkill /T on Windows, the bare pid as the fallback on POSIX) named a pid Node had
+    // already reaped, which may name another process by then.
+    if (this.pid) {
+      writeEnginePid(this.store.dir(), this.pid, port, isTetheredGroupLeader(child))
+      const pid = this.pid
+      const dir = this.store.dir()
+      child.once('exit', () => clearEnginePid(dir, pid))
+    }
     this.child = child
     this.startedAt = Date.now()
     this.errInfo = null
     this.lastActivity = Date.now()
     this.logPathStr = logPath
+    if (!this.watchdog) {
+      this.watchdog = setInterval(() => this.watchdogTick(), 60_000)
+      this.watchdog.unref()
+    }
     this.exited = new Promise<void>((res) => {
       this.resolveExited = res
     })
@@ -440,7 +567,16 @@ export class Manager {
     forceKill(child)
   }
 
-  async stopAndWait(opts?: { force?: boolean }): Promise<void> {
+  /** `onPausedLoad`: the ComfyUI guard's stop for a render. A load() still starting, or up and not yet reported, is
+   *  paused, not failed: it reports nothing, and onPausedLoad is called (before the first await), so the guard reports
+   *  the reload of it (start()'s `report`). That load was reported as a failed one, and its reload, a start(), reported
+   *  nothing. */
+  async stopAndWait(opts?: { force?: boolean; onPausedLoad?: () => void }): Promise<void> {
+    const loading = this.reporting
+    if (opts?.onPausedLoad && loading && !loading.paused && (this.state === 'starting' || this.state === 'running')) {
+      loading.paused = true
+      opts.onPausedLoad()
+    }
     const exited = this.exited
     if (this.state === 'running' || this.state === 'starting') {
       // force: SIGKILL immediately rather than the graceful TERM→8s-then-kill path.
@@ -471,23 +607,25 @@ export class Manager {
    *  rejection). Bypasses forceStop()'s running/starting-only guard by calling the
    *  module-level forceKill directly, since by this point state is already 'stopping'. */
   private async waitForExit(exited: Promise<void>): Promise<void> {
-    const result = await Promise.race([exited.then(() => 'exited' as const), sleep(10_000).then(() => 'timeout' as const)])
+    const result = await exitedWithin(exited, 10_000)
     if (result === 'timeout' && this.child) {
       forceKill(this.child)
       // Bounded too: forceKill's taskkill is fire-and-forget (failures swallowed), so an
       // unbounded await here on an unkillable/zombie process would wedge this forever —
       // and since stopAndWait() runs inside the exclusive load gate, that deadlocks every
       // future load(), which is worse than the 'stuck at stopping' bug this replaced.
-      await Promise.race([exited, sleep(5_000)])
+      await exitedWithin(exited, 5_000)
     }
   }
 
-  async restart(): Promise<void> {
+  /** `hooks` as for load(): the ComfyUI guard's reload of a load a render paused refuses it in there when a new
+   *  render has begun. */
+  async restart(hooks?: LoadHooks): Promise<void> {
     const opts = this.opts
     if (!opts?.modelPath) throw new Error('no_such_model')
     // load() stops the current engine (if any) and starts the same opts again, all
     // under the global load gate — so a restart can't race a concurrent swap.
-    await this.load(opts)
+    await this.load(opts, hooks)
   }
 
   /** The exact command last spawned, formatted for copy-paste into a terminal
@@ -512,11 +650,10 @@ export class Manager {
     // engine is in 'error' and `lastCommand` is exactly the argv that just failed — the
     // most useful diagnostic a "show launch command" control could show. Excluding it
     // left that button a documented no-op: the daemon had nothing to show, so toggling it
-    // visibly did nothing. This is still never a STALE command: the two 'error' returns
-    // that happen before a spawn is attempted (the vLLM/SGLang capability preflight,
-    // above) leave `lastCommand` at whatever the previous successful load set it to,
-    // which is a real "last command that ran" — not the made-up one this doc originally
-    // warned about (a different model's command shown as if it were the current one).
+    // visibly did nothing. This is still never a STALE command: an attempt that fails before
+    // a spawn (the vLLM/SGLang/LiteRT-LM preflight, a refused or throwing load) clears
+    // `lastCommand` (startInternal, load), so its error shows no command rather than the
+    // previous model's (a different model's command shown as if it were the current one).
     if (this.state !== 'running' && this.state !== 'starting' && this.state !== 'error') return null
     if (!this.lastCommand) return null
     const args = this.lastCommand.args.filter((a) => a !== '--no-webui')
@@ -579,6 +716,12 @@ export class Manager {
     return (this.state === 'running' || this.state === 'starting') ? this.opts : null
   }
 
+  /** The StartOpts restart() retries: the last load attempted, also one that failed or was refused (status() and
+   *  currentOpts() name no model then). The ComfyUI guard reads it to tell which model its release() loads. */
+  restartOpts(): StartOpts | null {
+    return this.opts
+  }
+
   touch(): void {
     this.lastActivity = Date.now()
   }
@@ -619,12 +762,17 @@ export class Manager {
   logPath(): string {
     return this.logPathStr
   }
+  /** A turn's generation (a chat or Code turn, a gateway or extension request) starts or ends. Both restart the idle
+   *  clock (lastActivity): only a load and a gateway request (touch) did, so the idle timeout counted from the load
+   *  and unloaded a model in active chat use between two replies, once the timeout had passed since it was loaded. */
   generationStart(): void {
     this.generation++
+    this.lastActivity = Date.now()
   }
   generationEnd(): void {
     this.generation = Math.max(0, this.generation - 1)
     if (this.generation === 0) this.liveGen = null
+    this.lastActivity = Date.now()
   }
 
   /** Publish live progress for the in-flight completion (cheap; called per chunk).
@@ -640,6 +788,10 @@ export class Manager {
 
   async shutdown(): Promise<void> {
     const child = this.child
+    // A stop already under way (a Stop, an eject, the idle unload, a restart's teardown: SIGTERM sent) is waited out.
+    // Returning at once let the daemon exit about 1.5 s into that stop's 8 s grace, and the exit handler SIGKILLed the
+    // engine's group before it could exit by itself. gracefulStop's own force kill bounds the wait, waitForExit too.
+    if (child && this.state === 'stopping') return this.waitForExit(this.exited)
     const running = this.state === 'running' || this.state === 'starting'
     if (!child || !running) return
     this.state = 'stopping'
@@ -693,6 +845,8 @@ export class Manager {
     }
     this.child = null
     this.pid = 0
+    if (this.watchdog) clearInterval(this.watchdog)
+    this.watchdog = null
     this.session = freshSession() // session ended — clear stats (B4)
     this.resolveExited?.()
   }
@@ -716,7 +870,7 @@ export class Manager {
       // a fatal load-failure traceback in the log and surface it as an engine error
       // instead. (Checked before probeReady so we win the race.)
       if (kind === 'mlx' || kind === 'rapid-mlx' || kind === 'mlx-vlm' || kind === 'vllm' || kind === 'sglang') {
-        const loadErr = detectPyLoadFailure(readTail(this.logPathStr, 200))
+        const loadErr = detectPyLoadFailure(kind, readTail(this.logPathStr, 200))
         if (loadErr) {
           if (this.child === child && this.state === 'starting') {
             this.state = 'error'
@@ -731,7 +885,8 @@ export class Manager {
         // request), so the socket is not readiness: load it with a one-token warm-up, which is also where a bad
         // bundle or an unusable GPU surfaces.
         if (kind === 'litert-lm' && this.opts) {
-          const backend = this.opts.litertLmConfig?.default.backend ?? 'cpu'
+          // The user's Backend: the config names one only when the user chose it (litertLmProfileToConfig).
+          const backend = this.opts.litertLmConfig?.default.backend ?? 'auto'
           const res = await warmUpLitertLm(
             port,
             // The `model` field the warm-up must send is exactly what every real request
@@ -779,32 +934,17 @@ export class Manager {
   private watchdogTick(): void {
     const ttl = this.store.snapshot().daemon.idleTtlMinutes
     if (ttl <= 0) return
-    const idle = this.state === 'running' && Date.now() - this.lastActivity > ttl * 60_000 && this.generation === 0
-    if (idle) this.stop()
+    // In use: a generation, or work the count cannot see (holdsEngine: a compaction, an approval wait, a reply's title
+    // call). The clock restarts, so the timeout counts from when that work let go, not from the load.
+    if (this.generation > 0 || this.holdsEngine?.()) {
+      this.lastActivity = Date.now()
+      return
+    }
+    if (this.state === 'running' && Date.now() - this.lastActivity > ttl * 60_000) this.stop()
   }
 }
 
 // ---- helpers ---------------------------------------------------------------
-
-/** True when `kind`'s binary needs shell interpretation to run correctly on this platform.
- *  llamafile ships as an "Actually Portable Executable" (Cosmopolitan libc) — a polyglot whose
- *  leading bytes look like a DOS/PE header, which a POSIX shell dispatches to the right native
- *  format for the current OS. Node's `spawn()` calls `execve()` directly (no shell), which fails
- *  with ENOEXEC on macOS/Linux for this format — confirmed live on macOS: the daemon accepted
- *  the start request but the process never spawned, while running the identical binary through
- *  a shell worked immediately. Windows already recognizes the leading MZ/PE header natively, so
- *  no wrapping is needed there. */
-export function needsShellWrapper(kind: string): boolean {
-  return kind === 'llamafile' && process.platform !== 'win32'
-}
-
-/** Wrap cmd+args to run through /bin/sh with no manual argument quoting/escaping needed: `"$0"`
- *  and `"$@"` are populated from spawn's own argv array (never string-concatenated), so a path
- *  or flag containing spaces/special characters passes through unmangled with no shell-injection
- *  risk from argument content. */
-export function shellWrapped(cmd: string, args: string[]): { cmd: string; args: string[] } {
-  return { cmd: '/bin/sh', args: ['-c', 'exec "$0" "$@"', cmd, ...args] }
-}
 
 /** Build the spawn command for an engine, branching on its kind (spec 03 §2b).
  *  `slotSavePath` (F-014) is appended only for llama.cpp; mlx/vllm don't support it. */
@@ -941,8 +1081,9 @@ function withoutLayaApiKey(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
  *  architecture or quantization the installed mlx-lm version doesn't support), that
  *  thread dies but the HTTP server keeps answering /v1/models, so chat requests queue
  *  to a dead thread and hang forever. We catch the crash and return a concise message;
- *  null when no such failure is present. */
-function detectPyLoadFailure(lines: string[]): string | null {
+ *  null when no such failure is present. The message names `kind`'s engine and package:
+ *  readiness runs this for vLLM and SGLang too. */
+export function detectPyLoadFailure(kind: string, lines: string[]): string | null {
   const text = lines.join('\n')
   // Gate on the load path specifically so unrelated tracebacks (e.g. the /v1/models
   // CacheNotFound handler) never false-trigger this.
@@ -955,10 +1096,20 @@ function detectPyLoadFailure(lines: string[]): string | null {
   // The final "SomeError: message" / "SomeException: message" line is the useful detail.
   const errLine = [...lines].reverse().find((l) => /^[A-Za-z_][\w.]*(Error|Exception):/.test(l.trim()))
   const detail = (errLine ? errLine.trim() : 'the model failed to load').slice(0, 200)
+  const [engine, pkg] = PY_ENGINE_NAMES[kind] ?? PY_ENGINE_NAMES.mlx
   return (
-    `MLX could not load this model — ${detail} ` +
-    `This usually means the installed mlx-lm version does not support this model's architecture or quantization.`
+    `${engine} could not load this model — ${detail} ` +
+    `This usually means the installed ${pkg} version does not support this model's architecture or quantization.`
   )
+}
+
+/** Display name and installed package of each engine kind detectPyLoadFailure runs for. */
+const PY_ENGINE_NAMES: Record<string, [engine: string, pkg: string]> = {
+  mlx: ['MLX', 'mlx-lm'],
+  'rapid-mlx': ['Rapid-MLX', 'rapid-mlx'],
+  'mlx-vlm': ['MLX-VLM', 'mlx-vlm'],
+  vllm: ['vLLM', 'vllm'],
+  sglang: ['SGLang', 'sglang'],
 }
 
 function buildArgs(opts: StartOpts, port: number, slotSavePath?: string): string[] {
@@ -1026,18 +1177,38 @@ export async function probeReady(port: number): Promise<boolean> {
 
 async function gracefulStop(child: ChildProcess, exited: Promise<void>): Promise<void> {
   signalTerm(child)
-  const forced = sleep(8000).then(() => 'timeout' as const)
-  const result = await Promise.race([exited.then(() => 'exited' as const), forced])
+  const result = await exitedWithin(exited, 8000)
   if (result === 'timeout') {
     forceKill(child)
     await exited
   }
 }
 
+/** 'exited' once `exited` resolves, or 'timeout' after `ms`. The timer is cleared once the race is decided: a bare
+ *  sleep() left its ref'd timer running after a prompt exit, which held the event loop (a test file, a CLI run) open
+ *  for the rest of it. A prompt exit left two per stopAndWait(): gracefulStop's 8 s grace and waitForExit's 10 s. */
+async function exitedWithin(exited: Promise<void>, ms: number): Promise<'exited' | 'timeout'> {
+  let grace: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      exited.then(() => 'exited' as const),
+      new Promise<'timeout'>((resolve) => { grace = setTimeout(() => resolve('timeout'), ms) }),
+    ])
+  } finally {
+    clearTimeout(grace)
+  }
+}
+
 function signalTerm(child: ChildProcess): void {
   if (!child.pid) return
   if (process.platform === 'win32') {
-    execFile('taskkill', ['/PID', String(child.pid), '/T'], () => {})
+    // Force the tree at once. A plain `taskkill /PID <pid> /T` (no /F) only posts WM_CLOSE to the process's windows,
+    // and the engines are console programs with none (spawned windowsHide with piped stdio), so Windows refuses it
+    // ("This process can only be terminated forcefully (with /F option)") and every Stop, model swap, pool eviction
+    // and update stop sat out the whole 8 s grace in 'stopping', with every load queued behind the gate waiting too,
+    // before forceKill ended it anyway. llama-server, KoboldCpp and llamafile exit cleanly only on a console
+    // Ctrl+C, which taskkill never sends, so there is no gentler request to make from here.
+    forceKill(child)
   } else {
     child.kill('SIGTERM')
   }
@@ -1046,9 +1217,14 @@ function signalTerm(child: ChildProcess): void {
 function forceKill(child: ChildProcess): void {
   if (!child.pid) return
   if (process.platform === 'win32') {
+    // Not once Node has seen the engine exit (a worker holding its stdout keeps 'close', and so the stop, waiting):
+    // libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may name another
+    // process tree by then, as in killTetheredTree (util/tether.ts). An exited root is no tree for taskkill anyway.
+    if (child.exitCode !== null || child.signalCode !== null) return
     execFile('taskkill', ['/PID', String(child.pid), '/F', '/T'], () => {})
   } else {
-    child.kill('SIGKILL')
+    // The engine's whole group (its workers too); the pid alone when it leads none (the Android helper).
+    killTetheredTree(child, 'SIGKILL')
   }
 }
 
@@ -1071,6 +1247,10 @@ interface EnginePidRecord {
   pid: number
   port: number
   owner: number
+  /** When the engine was spawned (epoch ms). Absent in a pidfile written before it was recorded. */
+  startedAt?: number
+  /** The engine leads a process group of its own (util/tether.ts), so a kill takes its workers too. */
+  group: boolean
   file: string
 }
 
@@ -1078,13 +1258,15 @@ function enginePidDir(dataDir: string): string {
   return join(dataDir, 'run')
 }
 
-function writeEnginePid(dataDir: string, pid: number, port: number): void {
+function writeEnginePid(dataDir: string, pid: number, port: number, group: boolean): void {
   try {
     const dir = enginePidDir(dataDir)
     mkdirSync(dir, { recursive: true })
     // owner = this daemon's pid, so another instance can tell "managed by a live daemon"
-    // apart from "true orphan whose daemon is gone".
-    writeFileSync(join(dir, `engine-${pid}.pid`), JSON.stringify({ pid, port, owner: process.pid }))
+    // apart from "true orphan whose daemon is gone". `startedAt` lets the next start's reaper tell this engine apart
+    // from an unrelated process that later got the same pid (util/process-start-time.ts); `group` that it can take
+    // the engine's whole process group.
+    writeFileSync(join(dir, `engine-${pid}.pid`), JSON.stringify({ pid, port, owner: process.pid, startedAt: Date.now(), group }))
   } catch {
     /* best-effort — tracking is a safety net, never block a load on it */
   }
@@ -1124,9 +1306,14 @@ function readEnginePidFiles(dataDir: string): EnginePidRecord[] {
   for (const name of names) {
     const file = join(dir, name)
     try {
-      const { pid, port, owner } = JSON.parse(readFileSync(file, 'utf8')) as { pid?: number; port?: number; owner?: number }
+      const { pid, port, owner, startedAt, group } = JSON.parse(readFileSync(file, 'utf8')) as {
+        pid?: number; port?: number; owner?: number; startedAt?: number; group?: boolean
+      }
       if (typeof pid === 'number' && pid > 0) {
-        out.push({ pid, port: typeof port === 'number' ? port : 0, owner: typeof owner === 'number' ? owner : 0, file })
+        out.push({
+          pid, port: typeof port === 'number' ? port : 0, owner: typeof owner === 'number' ? owner : 0,
+          startedAt: typeof startedAt === 'number' ? startedAt : undefined, group: group === true, file,
+        })
       } else rmSync(file, { force: true })
     } catch {
       try { rmSync(file, { force: true }) } catch { /* best-effort */ }
@@ -1158,15 +1345,29 @@ function portAlive(port: number, timeoutMs = 600): Promise<boolean> {
  *  cleanly. Called once at startup BEFORE anything loads a model. An engine is an orphan
  *  ONLY if its owner daemon is gone — an engine still owned by a live daemon (another
  *  running instance, or the outgoing daemon during a restart overlap) is left untouched.
- *  Among true orphans we still kill only when the recorded engine port is alive, so we
- *  never kill a recycled pid; otherwise just clear the stale file. Returns orphans killed. */
+ *  An orphan is killed only when it is provably the engine that was recorded, so a recycled
+ *  pid is never killed:
+ *   - a pidfile with `startedAt`: when the pid's process started then, whether or not its port
+ *     is open. The port rule alone left an engine killed by its daemon mid-load (no port open
+ *     yet) running, holding its VRAM, until it finished loading and nothing ever reaped it;
+ *     a start time that does not match is not killed;
+ *   - a pidfile from before `startedAt` was recorded, or a live pid whose start time cannot be read (no `ps`, as
+ *     in a slim container image; PowerShell failing on Windows): when the recorded engine port is alive, the rule
+ *     every record had before.
+ *  Either way the stale file is cleared. Returns orphans killed. */
 export async function reapStaleEngines(dataDir: string): Promise<number> {
   let killed = 0
-  for (const { pid, port, owner, file } of readEnginePidFiles(dataDir)) {
-    // Owner still running → a live daemon manages this engine; not ours to reap.
-    if (owner && pidAlive(owner)) continue
-    if (await portAlive(port)) {
-      killPidTree(pid)
+  const orphans = readEnginePidFiles(dataDir).filter(({ owner }) => !(owner && pidAlive(owner)))
+  const started = processStartTimes(orphans.filter((o) => o.startedAt !== undefined && pidAlive(o.pid)).map((o) => o.pid))
+  for (const { pid, port, startedAt, group, file } of orphans) {
+    const actual = startedAt !== undefined ? started.get(pid) : undefined
+    if (startedAt !== undefined && actual !== undefined) {
+      if (Math.abs(actual - startedAt) <= START_TIME_TOLERANCE_MS) {
+        killPidTree(pid, group)
+        killed++
+      }
+    } else if ((startedAt === undefined || pidAlive(pid)) && await portAlive(port)) {
+      killPidTree(pid, startedAt !== undefined && group)
       killed++
     }
     try { rmSync(file, { force: true }) } catch { /* best-effort */ }
@@ -1179,13 +1380,13 @@ export async function reapStaleEngines(dataDir: string): Promise<number> {
  *  startup reap is the real guarantee. Owner-scoped so a daemon exiting during a restart
  *  overlap never kills the incoming daemon's engine. */
 export function killTrackedEnginesSync(dataDir: string): void {
-  for (const { pid, owner, file } of readEnginePidFiles(dataDir)) {
+  for (const { pid, owner, group, file } of readEnginePidFiles(dataDir)) {
     if (owner !== process.pid) continue // not ours — leave another daemon's engine + file alone
     try {
       if (process.platform === 'win32') {
         spawnSync('taskkill', ['/PID', String(pid), '/F', '/T'])
       } else {
-        process.kill(pid, 'SIGKILL')
+        killPosix(pid, group)
       }
     } catch {
       /* process already gone */
@@ -1194,13 +1395,27 @@ export function killTrackedEnginesSync(dataDir: string): void {
   }
 }
 
+/** SIGKILL an engine on POSIX: its whole process group when it leads one (its workers go with it), with the pid
+ *  alone as the fallback. */
+function killPosix(pid: number, group: boolean): void {
+  if (group) {
+    try {
+      process.kill(-pid, 'SIGKILL')
+      return
+    } catch {
+      /* no such group: the pid alone */
+    }
+  }
+  try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+}
+
 /** Kill a process tree by pid (async, fire-and-forget). taskkill /T on Windows takes
- *  the whole tree; SIGKILL on POSIX. */
-function killPidTree(pid: number): void {
+ *  the whole tree; on POSIX the engine's process group when the pidfile says it leads one. */
+function killPidTree(pid: number, group: boolean): void {
   if (process.platform === 'win32') {
     execFile('taskkill', ['/PID', String(pid), '/F', '/T'], () => {})
   } else {
-    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    killPosix(pid, group)
   }
 }
 

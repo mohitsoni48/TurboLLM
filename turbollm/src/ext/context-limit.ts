@@ -13,7 +13,7 @@ const CHARS_PER_TOKEN = 3.5
 
 /** Tokens held back for the reply. A prompt that exactly fills the window leaves no room to
  *  answer, which the engine reports as a far more confusing failure. */
-const REPLY_HEADROOM = 512
+export const REPLY_HEADROOM = 512
 
 export function estimateTokens(messages: Array<{ role: string; content: string }>): number {
   let chars = 0

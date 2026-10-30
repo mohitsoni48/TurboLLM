@@ -11,10 +11,11 @@
 // so `getDiagnostics` opens/updates the document then waits (with a timeout) for that push rather
 // than requesting diagnostics directly — this is how every real LSP client works, there is no
 // synchronous "give me diagnostics now" request in the protocol.
-import { spawn, type ChildProcessWithoutNullStreams, type SpawnOptionsWithStdioTuple } from 'node:child_process'
+import type { ChildProcessWithoutNullStreams, SpawnOptionsWithStdioTuple } from 'node:child_process'
 import { createMessageConnection, StreamMessageReader, StreamMessageWriter, type MessageConnection } from 'vscode-jsonrpc/node'
 import { URI } from 'vscode-uri'
 import type { LspServerSpec } from './lsp-registry'
+import { spawnTethered } from '../util/tether'
 
 // Node's built-in `pathToFileURL` produces `file:///C:/...` on Windows (uppercase drive letter,
 // literal colon) — real LSP servers (built on the same `vscode-uri` conventions VS Code itself
@@ -73,7 +74,8 @@ function resolveFallbackTsserverPath(): Promise<string | null> {
     cachedTsserverPath = new Promise((resolvePromise) => {
       const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
       const script = "process.stdout.write(require.resolve('typescript/lib/tsserver.js'))"
-      const proc = spawn(npxCmd, ['-y', '-p', 'typescript', 'node', '-e', script], npxSpawnOptions())
+      // Tied to the daemon (util/tether.ts), as the server below is: its timeout is a daemon timer.
+      const proc = spawnTethered(npxCmd, ['-y', '-p', 'typescript', 'node', '-e', script], npxSpawnOptions(), { kind: 'lsp' })
       let out = ''
       proc.stdout?.on('data', (d) => { out += String(d) })
       const done = (result: string | null) => { clearTimeout(timer); resolvePromise(result) }
@@ -117,7 +119,10 @@ export class LspClient {
       const fallbackTsserverPath = this.spec.language === 'typescript' ? await resolveFallbackTsserverPath() : null
 
       const npxCmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'
-      const proc = spawn(npxCmd, this.spec.npxArgs, npxSpawnOptions(this.rootDir))
+      // Tied to the daemon (util/tether.ts): npx and the server it runs as its child ended only when dispose() or
+      // the daemon's teardown killed npx, so a daemon that died without one left them running, parented to init,
+      // and a dispose() reached npx alone. Now the group ends with the daemon, and with npx.
+      const proc = spawnTethered(npxCmd, this.spec.npxArgs, npxSpawnOptions(this.rootDir), { kind: 'lsp' }) as ChildProcessWithoutNullStreams
       this.proc = proc
       // A missing `npx` on PATH (or a killed process before it fully starts) fires 'error'
       // asynchronously — without this, a broken environment would just hang initialize forever.
@@ -138,7 +143,7 @@ export class LspClient {
         }))
         this.diagnosticsByUri.set(params.uri, list)
         const waiters = this.waitersByUri.get(params.uri)
-        if (waiters) { waiters.forEach((w) => w()); this.waitersByUri.delete(params.uri) }
+        if (waiters) { for (const w of waiters) w(); this.waitersByUri.delete(params.uri) }
       })
       conn.listen()
 

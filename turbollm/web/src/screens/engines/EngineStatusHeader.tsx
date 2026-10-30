@@ -1,6 +1,6 @@
 import { CircleSlash, RotateCw } from 'lucide-react'
 import type { EngineStats, LiveGeneration, Status } from '../../lib/types'
-import { useEngineMutations, useModelActions } from '../../lib/queries'
+import { servingElsewhere, useEngineMutations, useModelActions } from '../../lib/queries'
 import { ApiError, track } from '../../lib/api'
 import { Button } from '../../components/ui/button'
 import { StateChip } from '../../components/StateChip'
@@ -30,6 +30,9 @@ export function EngineStatusHeader({
   const mut = useEngineMutations()
   const canStop = state === 'running' || state === 'starting'
   const canRestart = state === 'running' || state === 'error'
+  // The model is named with the engine running it when that is not the active one, whose name this card (or the
+  // selector above it) shows: the card used to read as the active engine running a model another engine ran.
+  const elsewhere = servingElsewhere(status)
 
   const onStop = () => {
     track('engines', 'eject_model')
@@ -64,7 +67,10 @@ export function EngineStatusHeader({
           </span>
         )}
         {state === 'running' && status?.model && (
-          <span className="text-[13px] text-muted truncate">{status.model.name}</span>
+          <span className="text-[13px] text-muted truncate">
+            {status.model.name}
+            {elsewhere && <> — on {elsewhere}</>}
+          </span>
         )}
         {/* Compact activity pill for engine traffic without a detailed live row
             (e.g. Claude-CLI / gateway requests). In-app chat shows the richer

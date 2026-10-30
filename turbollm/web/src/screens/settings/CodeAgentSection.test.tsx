@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { describe, expect, it, vi, beforeEach } from 'vitest'
+import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 import { CodeAgentSection } from './CodeAgentSection'
 
 // `node-pty` is an optional native dependency, so a healthy install can have no way to spawn a
@@ -88,5 +88,34 @@ describe('CodeAgentSection — terminal-backend gating', () => {
     statusMock.data = { terminalAvailable: false }
     renderSection()
     expect(screen.getByText(/Needs a terminal, which this install does not have/)).toBeInTheDocument()
+  })
+})
+
+// An agent CLI install runs on in the daemon when the page that started it closes or reloads. The
+// page that comes back used to offer Install again (its "Installing…" was its own request's state
+// only); it now reads the daemon's `installing`.
+describe('CodeAgentSection — an install the daemon is running', () => {
+  const offered = availabilityMock.data.agents.map((a) => ({ ...a }))
+  beforeEach(() => {
+    settingsMock.data = { code: { defaultAgent: 'turbollm' } }
+    statusMock.data = { terminalAvailable: true }
+  })
+  afterEach(() => { availabilityMock.data.agents = offered.map((a) => ({ ...a })) })
+
+  it('shows "Installing…" for it after a reload, with no Install to start a second one', async () => {
+    availabilityMock.data.agents = offered.map((a) => (a.id === 'claude' ? { ...a, installed: false, installing: true } : a))
+    renderSection()
+    const options = await openedOptions()
+    const claude = options.find((t) => t.startsWith('claude'))
+    expect(claude).toContain('Installing…')
+    expect(screen.queryByRole('button', { name: 'Install' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Installing…/ })).toBeDisabled()
+  })
+
+  it('offers Install for a missing agent when nothing is installing it', async () => {
+    availabilityMock.data.agents = offered.map((a) => (a.id === 'claude' ? { ...a, installed: false, installing: false } : a))
+    renderSection()
+    await openedOptions()
+    expect(screen.getByRole('button', { name: 'Install' })).toBeEnabled()
   })
 })

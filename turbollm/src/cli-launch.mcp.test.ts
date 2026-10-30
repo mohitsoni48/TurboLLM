@@ -67,7 +67,7 @@ function makeFetch(): typeof fetch {
 
 test('writeClaudeMcpConfig: writes a turbollm mcpServers entry pointing at the given port', async () => {
   const fs = memFs()
-  const path = await writeClaudeMcpConfig(6996, fs)
+  const path = await writeClaudeMcpConfig(6996, fs, 'linux')
   assert.equal(path, join(HOME, '.turbollm', 'mcp-launch-config.json'))
   assert.deepEqual(fs.mkdirs, [join(HOME, '.turbollm')])
   const written = JSON.parse(fs.files.get(path)!)
@@ -76,7 +76,7 @@ test('writeClaudeMcpConfig: writes a turbollm mcpServers entry pointing at the g
 
 test('writeClaudeMcpConfig: a different port produces a different args array', async () => {
   const fs = memFs()
-  const path = await writeClaudeMcpConfig(9000, fs)
+  const path = await writeClaudeMcpConfig(9000, fs, 'linux')
   const written = JSON.parse(fs.files.get(path)!)
   assert.deepEqual(written.mcpServers.turbollm.args, ['turbollm', 'mcp-server', '--port', '9000'])
 })
@@ -84,9 +84,16 @@ test('writeClaudeMcpConfig: a different port produces a different args array', a
 test('writeClaudeMcpConfig: overwrites a stale config from a previous launch rather than merging', async () => {
   const path = join(HOME, '.turbollm', 'mcp-launch-config.json')
   const fs = memFs({ [path]: JSON.stringify({ mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server', '--port', '1111'] } } }) })
-  await writeClaudeMcpConfig(6996, fs)
+  await writeClaudeMcpConfig(6996, fs, 'linux')
   const written = JSON.parse(fs.files.get(path)!)
   assert.deepEqual(written.mcpServers.turbollm.args, ['turbollm', 'mcp-server', '--port', '6996'])
+})
+
+test('writeClaudeMcpConfig: native Windows runs npx through `cmd /c` (a bare .cmd shim fails to start)', async () => {
+  const fs = memFs()
+  const path = await writeClaudeMcpConfig(6996, fs, 'win32')
+  const written = JSON.parse(fs.files.get(path)!)
+  assert.deepEqual(written, { mcpServers: { turbollm: { command: 'cmd', args: ['/c', 'npx', 'turbollm', 'mcp-server', '--port', '6996'] } } })
 })
 
 // ── launchCli's use of it ────────────────────────────────────────────────────

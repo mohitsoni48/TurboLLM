@@ -19,7 +19,7 @@
 //     apart; a second chat-shaped proxy would have been the fourth.
 //  2. **A remote turn writes nothing into local engine state.** Same rule the gateway's
 //     `localAccounting` flag enforces: this machine did not run the tokens.
-import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { engineModelAlias, shapeForEngine } from '../engines/compat'
 import { linkHeaders, proxyStream, type RemoteTarget } from '../link/link-proxy'
 import type { Deps } from '../deps'
 import { isTextClassifier } from '../models/text-classifier'
@@ -123,12 +123,13 @@ export function resolveChatUpstream(d: Deps, requestedModel?: string): ChatUpstr
   }
 }
 
-/** A copy of `body` shaped for the local engine (LiteRT-LM reads only `max_completion_tokens`), or
- *  `body` itself for a remote turn or a non-object body. Done here, at the one outbound call, so the
- *  main turn, the auto-title, memory extraction and compaction can't drift apart (v1.14.5 review). */
+/** A copy of `body` shaped for the local engine (shapeForEngine: LiteRT-LM reads only `max_completion_tokens`, and
+ *  thinking as a top-level `reasoning_effort`), or `body` itself for a remote turn or a non-object body. Done here, at
+ *  the one outbound call, so the main turn, the auto-title, memory extraction and compaction can't drift apart
+ *  (v1.14.5 review). */
 function shapeForLocalEngine(upstream: ChatUpstream, body: unknown): unknown {
   if (upstream.remote || upstream.engineKind !== 'litert-lm' || !body || typeof body !== 'object' || Array.isArray(body)) return body
-  return applyEngineTokenLimit(upstream.engineKind, { ...(body as Record<string, unknown>) })
+  return shapeForEngine(upstream.engineKind, { ...(body as Record<string, unknown>) })
 }
 
 /** The ONE outbound chat-completions call, local engine or linked host.

@@ -22,7 +22,7 @@ const WATCHED = [
   'engines/update-apply.ts',
 ]
 
-const LEAVES = ['engines/zip-reader.ts', 'engines/github-repo.ts']
+const LEAVES = ['engines/zip-reader.ts', 'engines/github-repo.ts', 'engines/version-compare.ts']
 
 /** Pre-existing cycles through a watched file, each as the sorted member list joined by ' > '.
  *  Add an entry only with a comment saying why it is not this change's to fix. */

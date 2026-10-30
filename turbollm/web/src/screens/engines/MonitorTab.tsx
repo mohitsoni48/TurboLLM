@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { ApiError, track } from '../../lib/api'
-import { activeEngineOf, useEngines, useStatus } from '../../lib/queries'
+import { activeEngineOf, servingElsewhere, useEngines, useStatus } from '../../lib/queries'
 import { InlineError } from '../../components/common'
 import { StateChip } from '../../components/StateChip'
 import { cn } from '../../lib/utils'
@@ -59,7 +59,8 @@ export function MonitorTab() {
         </div>
         {activeEngine && (
           <div className="flex items-center gap-2 text-[12px] text-muted">
-            <span className="truncate">{activeEngine.name}</span>
+            {/* The engine running the model, beside its state: the active one named a model another engine ran. */}
+            <span className="truncate">{servingElsewhere(status) ?? activeEngine.name}</span>
             <StateChip state={engineState} />
           </div>
         )}

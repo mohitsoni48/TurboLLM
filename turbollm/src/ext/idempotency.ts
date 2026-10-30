@@ -29,7 +29,32 @@
 // generation's real run id and streamed content. `owner` is now a mandatory positional
 // component of the key, same as `tenant`/`op` — there is no "caller didn't care about owner"
 // escape hatch, matching every other scope check on this surface.
+//
+// A key reused for a DIFFERENT request (another chat, other content) is refused with
+// 409 `idempotency_key_reused` by the routes, never replayed: replaying would answer "done"
+// for a request that was never executed — e.g. a client keying sends by turn number
+// ("turn-1") across chats got chat A's run back for chat B's message, and chat B's message
+// was silently dropped. Each route stores `requestFingerprint(...)` of what it executed and
+// compares it on a hit.
+import { createHash } from 'node:crypto'
+
 interface Entry { value: unknown; at: number }
+
+/** A stable digest of the request fields that define "the same request" for an op. Callers
+ *  pass a fixed-order array, and objects inside it (metadata, sampling) are hashed with their
+ *  keys sorted at every depth, so the digest never depends on the key order a client sent: a
+ *  retry that rebuilt its metadata object is still the same request, not a 409. */
+export function requestFingerprint(parts: unknown[]): string {
+  return createHash('sha256').update(JSON.stringify(parts, sortedKeys)).digest('hex')
+}
+
+/** `JSON.stringify` replacer: each plain object is re-emitted with its keys sorted (the
+ *  replacer runs again on every nested value). Arrays keep their order; there it is data. */
+function sortedKeys(_key: string, value: unknown): unknown {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return value
+  const obj = value as Record<string, unknown>
+  return Object.fromEntries(Object.keys(obj).sort().map((k) => [k, obj[k]]))
+}
 
 const DEFAULT_TTL_MS = 24 * 60 * 60_000
 

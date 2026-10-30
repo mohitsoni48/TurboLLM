@@ -1,14 +1,15 @@
 // Release provenance marker, install dir naming and the install core (ADR-453). The install
 // tests use a fake fetch serving release JSON and zip bytes; no real network.
-import { test } from 'node:test'
+import { test, type TestContext } from 'node:test'
 import assert from 'node:assert/strict'
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import fs, { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { buildZipArchive } from '../test-support/zip-archive'
 import { MAX_ZIP_BYTES, ZipError } from './zip-install'
 import { serverBinName } from './scan'
-import type { ProbeResult } from './probe'
+import { ProbeError, type ProbeResult } from './probe'
 import type { ProvisionProgress } from './download'
 import {
   RELEASE_INSTALL_MARKER,
@@ -309,4 +310,43 @@ test('a slug option installs into that dir instead of the derived one', async ()
   assert.equal(result.found && result.binPath, join(buildDir(root), 'kept-dir', serverBinName))
   assert.deepEqual(siblings(root), ['kept-dir'])
   assert.equal(readReleaseMarker(join(buildDir(root), 'kept-dir'))?.assetKey, 'llama-bin-win-cuda-13.3-x64.zip')
+})
+
+// Windows AV/the indexer can hold freshly extracted or just-probed files open, so the cleanup of the work dirs can
+// throw EBUSY. That cleanup is best effort: it must neither fail an install that already swapped in nor hide the
+// real error. installReleaseAsset imports rmSync by name: syncBuiltinESMExports carries the patch to that binding.
+function lockingRmSync(t: TestContext, locked: (p: string) => boolean): () => void {
+  const realRmSync = fs.rmSync
+  const patched = t.mock.method(fs, 'rmSync', (p: fs.PathLike, o?: fs.RmOptions) => {
+    if (locked(String(p))) throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${p}'`), { code: 'EBUSY' })
+    return realRmSync(p, o)
+  })
+  syncBuiltinESMExports()
+  return () => {
+    patched.mock.restore()
+    syncBuiltinESMExports()
+  }
+}
+
+test('a locked archive and stage still return the installed build once it swapped in', async (t) => {
+  const root = tmpDir('relinst-')
+  const gh = fakeGithub([{ name: MAIN, bytes: zipOf(serverBinName) }])
+  const restore = lockingRmSync(t, (p) => p.endsWith('.stage') || p.endsWith(MAIN))
+  const result = await installReleaseAsset(root, planFor(MAIN), { probeFn: probeOk, fetchImpl: gh.fetchImpl }).finally(restore)
+  assert.equal(result.found && result.binPath, join(buildDir(root), MAIN_SLUG, serverBinName))
+  assert.equal(readReleaseMarker(join(buildDir(root), MAIN_SLUG))?.tag, 'b1')
+})
+
+test('a locked stage after a failed probe keeps the probe error and still removes the tmp dir', async (t) => {
+  const root = tmpDir('relinst-')
+  const gh = fakeGithub([{ name: MAIN, bytes: zipOf(serverBinName) }])
+  const badProbe = async (): Promise<ProbeResult> => {
+    throw new ProbeError('probe_failed', 'missing ggml-cuda.dll')
+  }
+  const restore = lockingRmSync(t, (p) => p.endsWith('.stage'))
+  await assert.rejects(
+    installReleaseAsset(root, planFor(MAIN), { probeFn: badProbe, fetchImpl: gh.fetchImpl }).finally(restore),
+    (e: unknown) => e instanceof ProbeError && e.code === 'probe_failed',
+  )
+  assert.deepEqual(siblings(root).filter((d) => !d.endsWith('.stage')), [])
 })

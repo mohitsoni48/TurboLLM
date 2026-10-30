@@ -161,6 +161,17 @@ describe('requestLoad — a Jev model while work is running', () => {
     expect(h.loadMutate).not.toHaveBeenCalled()
   })
 
+  it('counts a reply waiting for an approval, which the load would deny', async () => {
+    const waiting: ActiveWork = { items: [], waiting: [{ kind: 'chat', id: 'c2', label: 'Taxes' }], engineGenerating: false }
+    h.getActivity.mockResolvedValue(waiting)
+    const result = loader()
+
+    await act(async () => { result.current.requestLoad(JEV) })
+
+    await waitFor(() => expect(useJevLoadStore.getState().confirm?.work).toEqual(waiting))
+    expect(h.loadMutate).not.toHaveBeenCalled()
+  })
+
   // The Load buttons only go disabled once a mutation starts, and the activity probe is a
   // round trip before that: two clicks inside that window must not swap the question under a
   // user already reaching for "Load anyway", taking the first caller's callbacks with it.

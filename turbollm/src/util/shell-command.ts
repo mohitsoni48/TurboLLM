@@ -78,13 +78,15 @@ export function quotePosixArg(arg: string): string {
 /** Quote one argument for **PowerShell**, which is a different problem from cmd.exe: PowerShell
  *  parses the string first, so `$var`, backticks and `"` are all live in a double-quoted string.
  *  A single-quoted PowerShell string is fully literal — the ONLY character needing an escape is
- *  `'` itself, which is written twice.
+ *  the single quote, which is written twice. PowerShell's tokenizer counts the typographic ones
+ *  (U+2018–U+201B: ‘ ’ ‚ ‛) as single quotes too, so an ordinary "Don’t" pasted from a phone or
+ *  word processor would otherwise end the string and run the rest of the text as script.
  *
  *  Needed because a terminal-agent launch goes through TWO shells: `pty-session.ts` runs
  *  `powershell -Command "<launch command>"`, and that command then re-spawns through cmd.exe. Text
  *  that reaches the CLI as an argument (the session's first message) has to survive both. */
 export function quotePowerShellArg(arg: string): string {
-  return `'${arg.split("'").join("''")}'`
+  return `'${arg.replace(/['\u2018-\u201B]/g, '$&$&')}'`
 }
 
 /** Quote a value for the shell `pty-session.ts` actually spawns — PowerShell on Windows, bash

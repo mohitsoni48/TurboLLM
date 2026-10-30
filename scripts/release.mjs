@@ -28,11 +28,11 @@
 
 import { spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync,
 } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { dirname, join, relative, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -322,22 +322,20 @@ async function phasePreflight(state, flags) {
   //    proves the live pipe accepts every real event name) rather than just
   //    telling a human to go run that command by hand. Without --approved it
   //    still only reports — a Worker deploy is production infra, so the same
-  //    approval bar as merge/publish/announce applies.
+  //    approval bar as merge/publish/announce applies — and a --dry-run only
+  //    says it would deploy, like every other gated side effect. The deploy
+  //    itself waits for every other check below: run here, it shipped
+  //    whatever the tree held (uncommitted Worker code included) from
+  //    whatever branch was checked out, and preflight then failed on the very
+  //    problems that should have stopped it.
   const hashScript = join(REPO, 'telemetry-worker', 'scripts', 'schema-hash.mjs');
+  let redeployWorker = false;
   if (existsSync(hashScript)) {
-    let h = run(process.execPath, [hashScript, 'check']);
+    const h = run(process.execPath, [hashScript, 'check']);
     if (h.code !== 0) {
       if (flags.approved) {
-        step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
-        const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
-        if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
-        note(tailOf(deploy.out, 12));
-        h = run(process.execPath, [hashScript, 'check']);
-        if (h.code !== 0) {
-          problems.push('telemetry Worker deploy ran but the schema hash still does not match — inspect `telemetry-worker/scripts/schema-hash.mjs check` output above by hand before continuing.');
-        } else {
-          note('telemetry Worker redeployed — schema hash now matches (commit the updated deployed.schema.sha256 in this PR)');
-        }
+        redeployWorker = true;
+        note('telemetry schema drifted from the deployed Worker — it is redeployed once every other check passes (--approved)');
       } else {
         problems.push(
           'telemetry schema-hash gate is RED — the telemetry sources changed since the Worker was deployed.\n'
@@ -370,7 +368,24 @@ async function phasePreflight(state, flags) {
     out.push('WARN PR body not checked (no PR resolved)');
   }
 
-  if (problems.length) fail(`preflight found ${problems.length} blocking problem(s):\n\n- ${problems.join('\n\n- ')}`);
+  if (problems.length) {
+    fail(
+      `preflight found ${problems.length} blocking problem(s):\n\n- ${problems.join('\n\n- ')}`
+      + (redeployWorker ? '\n\nThe telemetry Worker was not redeployed: fix the above, then re-run `preflight --approved`.' : ''),
+    );
+  }
+  if (redeployWorker && flags['dry-run']) {
+    note('[dry-run] telemetry schema drifted from the deployed Worker — would redeploy it now (`cd telemetry-worker && npm run deploy`) and re-check the hash');
+  } else if (redeployWorker) {
+    step('telemetry schema drifted from the deployed Worker — redeploying now (--approved)...');
+    const deploy = runNpm(['run', 'deploy'], { cwd: join(REPO, 'telemetry-worker') });
+    if (deploy.code !== 0) fail(`telemetry Worker deploy failed:\n${tailOf(deploy.out, 40)}`);
+    note(tailOf(deploy.out, 12));
+    if (run(process.execPath, [hashScript, 'check']).code !== 0) {
+      fail('telemetry Worker deploy ran but the schema hash still does not match — inspect `telemetry-worker/scripts/schema-hash.mjs check` output above by hand before continuing.');
+    }
+    note('telemetry Worker redeployed — schema hash now matches (commit the updated deployed.schema.sha256 in this PR)');
+  }
   return out.join('\n');
 }
 
@@ -442,6 +457,12 @@ async function phasePrepare(state, flags) {
   const base = state.notes.baseVersion || npmLatest();
   note(`base version from npm: ${base} → releasing ${version}`);
 
+  // A --dry-run writes none of the files below: it used to set the version and regenerate the
+  // README mirror in place, so the preview left the tree holding the release's own edits,
+  // uncommitted. It notes each change instead and adds it to the list a real run would commit.
+  const dryRun = !!flags['dry-run'];
+  const wouldChange = [];
+
   // package.json (+ wrapper in lockstep: the desktop app compares its OWN version
   // against the published release, so a drifted wrapper believes it is ahead)
   for (const p of [daemonPkgPath(), wrapperPkgPath()]) {
@@ -450,6 +471,11 @@ async function phasePrepare(state, flags) {
     const next = raw.replace(/("version"\s*:\s*")[^"]+(")/, `$1${version}$2`);
     if (next === raw && !new RegExp(`"version"\\s*:\\s*"${version.replace(/\./g, '\\.')}"`).test(raw)) {
       fail(`could not rewrite the "version" field in ${p}`);
+    }
+    if (next !== raw && dryRun) {
+      wouldChange.push(relative(REPO, p).replace(/\\/g, '/'));
+      note(`[dry-run] would set ${p.replace(REPO, '.')} → ${version}`);
+      continue;
     }
     if (next !== raw) writeFileSync(p, next);
     note(`${p.replace(REPO, '.')} → ${version}`);
@@ -477,10 +503,15 @@ async function phasePrepare(state, flags) {
   if (existsSync(canonical)) {
     const a = readFileSync(canonical);
     if (!existsSync(mirror) || !readFileSync(mirror).equals(a)) {
-      writeFileSync(mirror, a);
-      note('root README.md regenerated from turbollm/README.md');
+      if (dryRun) {
+        wouldChange.push('README.md');
+        note('[dry-run] would regenerate the root README.md from turbollm/README.md');
+      } else {
+        writeFileSync(mirror, a);
+        note('root README.md regenerated from turbollm/README.md');
+      }
     } else note('root README.md already byte-identical');
-    if (!readFileSync(mirror).equals(readFileSync(canonical))) fail('README mirror still differs after regeneration');
+    if (!dryRun && !readFileSync(mirror).equals(readFileSync(canonical))) fail('README mirror still differs after regeneration');
   }
 
   // web bundle — the persona KB and every UI change get baked into src/webdist here
@@ -494,7 +525,9 @@ async function phasePrepare(state, flags) {
   }
 
   // commit + push — only the release's own paths
-  const { release, unrelated } = splitDirtyPaths();
+  const dirty = splitDirtyPaths();
+  const { unrelated } = dirty;
+  const release = [...new Set([...dirty.release, ...wouldChange])].sort();
   if (unrelated.length) {
     warnLine(`left alone (not this release's to commit): ${unrelated.join(', ')}`);
     out.push(`WARN left alone: ${unrelated.join(', ')}`);
@@ -508,8 +541,14 @@ async function phasePrepare(state, flags) {
     // No Co-Authored-By / AI attribution, ever (CLAUDE.md hard rule 1).
     const subject = `chore(release): v${version}${flags.summary ? ` — ${flags.summary}` : ''}`;
     mustGit('commit', '-m', subject);
+    note(`committed \`${subject}\` (${release.join(', ')})`);
+  }
+  // Every real run pushes, not only the one that just committed: when a push fails after the
+  // commit, the re-run has nothing left to commit, and recording ok without pushing let `verify`
+  // pass on a PR head without the release commit. Pushing an up-to-date branch is a no-op.
+  if (!flags['dry-run']) {
     mustGit('push');
-    note(`committed + pushed \`${subject}\` (${release.join(', ')})`);
+    note('pushed');
   }
 
   return out.join('\n');
@@ -563,6 +602,34 @@ function latestPrRunId(pr) {
   if (!headRef) return null;
   const r = gh('run', 'list', '--branch', headRef, '--limit', '1', '--json', 'databaseId', '-q', '.[0].databaseId');
   return /^\d+$/.test(r.stdout) ? Number(r.stdout) : null;
+}
+
+// The id of `workflowFile`'s run for exactly `sha`, polled until GitHub has created it (a push run
+// appears a few seconds after the push), or null at the deadline. A gh that fails is not "no run
+// yet": a gh too old for `run list --commit` ("unknown flag: --commit"), a lost login or a network
+// error exits non-zero with nothing on stdout, and this loop used to poll that for the whole
+// deadline (5 minutes after a merge) and then report the run as not found. It stops at once.
+export async function waitForCommitRun(workflowFile, sha, timeoutMs, ghRun = gh, pollMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const r = ghRun(
+      'run', 'list', '--workflow', workflowFile, '--commit', sha, '--limit', '1',
+      '--json', 'databaseId', '-q', '.[0].databaseId',
+    );
+    if (/^\d+$/.test(r.stdout)) return Number(r.stdout);
+    if (r.code !== 0) {
+      fail(
+        `\`gh run list --workflow ${workflowFile} --commit ${sha}\` failed (exit ${r.code}), so its run cannot be checked.\n`
+        + (/unknown flag:? --commit/i.test(r.out)
+          ? 'This gh has no `run list --commit`: update gh, then re-run this phase.\n'
+          : 'Fix gh (`gh auth status`), then re-run this phase.\n')
+        + tailOf(r.out, 20),
+      );
+    }
+    if (Date.now() > deadline) return null;
+    step(`waiting for the ${workflowFile} run on ${sha.slice(0, 7)} to start…`);
+    await sleep(pollMs);
+  }
 }
 
 async function waitForRun(runId, timeoutMs) {
@@ -636,13 +703,26 @@ async function phaseMerge(state, flags) {
   out.push(delRemote.code === 0 ? `deleted remote ${branch}` : `remote ${branch}: ${delRemote.out}`);
 
   step('polling the post-merge main run…');
-  const idRes = gh('run', 'list', '--branch', 'main', '--limit', '1', '--json', 'databaseId', '-q', '.[0].databaseId');
-  if (!/^\d+$/.test(idRes.stdout)) {
+  // The ci.yml run for THIS merge commit. The newest main run right after merging is usually the
+  // previous one (GitHub creates the push run a few seconds later) or a scheduled runpod-image.yml
+  // run, and a stale green run would wave a red main through. A gh that fails here is not "no run to
+  // find": read as one, a lost login or a network error skipped the CI check on main and recorded
+  // the merge ok, so it stops the phase as a failing `gh run list` does in waitForCommitRun.
+  const prView = gh('pr', 'view', String(pr), '--json', 'mergeCommit', '-q', '.mergeCommit.oid');
+  if (prView.code !== 0) {
+    fail(
+      `\`gh pr view ${pr} --json mergeCommit\` failed (exit ${prView.code}), so the post-merge run on main cannot be checked.\n`
+      + 'The PR is merged; do not tag or publish until that run is green. Fix gh (`gh auth status`), then re-run this phase.\n'
+      + tailOf(prView.out, 20),
+    );
+  }
+  const mergeSha = prView.stdout;
+  const runId = /^[0-9a-f]{40}$/i.test(mergeSha) ? await waitForCommitRun('ci.yml', mergeSha, 5 * 60_000) : null;
+  if (runId == null) {
     warnLine('could not find the post-merge main run — check it by hand before publishing');
     out.push('WARN post-merge main run not found');
     return out.join('\n');
   }
-  const runId = Number(idRes.stdout);
   let conclusion = await waitForRun(runId, 30 * 60_000);
   if (conclusion !== 'success') {
     const view = gh('run', 'view', String(runId), '--log-failed');
@@ -696,6 +776,35 @@ function resolveNpmToken(opts = {}) {
   );
 }
 
+// Why the local-token fallback may not publish from this checkout, or null when it may. That
+// fallback runs `npm publish` in turbollm/, whose prepublishOnly builds whatever is on disk there
+// (web/ and src/), so it uploaded the working copy: uncommitted edits and untracked files
+// included, at whatever commit HEAD was, while npm-publish.yml builds a fresh checkout of the tag.
+// It may run only when the working copy is the tag: HEAD at the tagged commit, and nothing in
+// turbollm/ that git does not have at it, installed node_modules/ aside. Only turbollm/ counts, as
+// the package's build reads nothing outside it. Ignored files count where the build takes files as
+// they are: bin/, which ships as it is; web/public/, which vite copies verbatim into src/webdist/
+// and the build on into dist/webdist/; and web/.env*, which vite loads into the web build with no
+// import naming them (an .env.production.local with NODE_ENV=development ships React's development
+// build). npm reads no .gitignore above the package, so a file the root .gitignore ignores there
+// (*.zip, *.bin, *.log, *.local, ...) is uploaded or built in too. dist/ and src/webdist/
+// themselves are emptied and rebuilt by that build. A git that fails is a problem, not a pass.
+export function localPublishProblem(tag, gitRun = git) {
+  const head = gitRun('rev-parse', '--verify', 'HEAD^{commit}');
+  const tagged = gitRun('rev-parse', '--verify', '-q', `refs/tags/${tag}^{commit}`);
+  if (head.code !== 0 || tagged.code !== 0) {
+    return `HEAD and the tag ${tag} could not both be resolved.\n${[head.out, tagged.out].filter(Boolean).join('\n')}`.trim();
+  }
+  if (head.stdout !== tagged.stdout) return `HEAD (${head.stdout.slice(0, 7)}) is not the tagged commit ${tag} (${tagged.stdout.slice(0, 7)}).`;
+  const status = gitRun('status', '--porcelain', '--untracked-files=all', '--', 'turbollm');
+  const ignored = gitRun('ls-files', '--others', '--ignored', '--exclude-standard', '--', 'turbollm/bin', 'turbollm/web/public', 'turbollm/web/.env*');
+  if (status.code !== 0 || ignored.code !== 0) return `\`git status\` of turbollm/ failed:\n${status.out}\n${ignored.out}`.trim();
+  const lines = (s) => s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const changed = [...lines(status.stdout), ...lines(ignored.stdout).map((p) => `!! ${p}`)];
+  if (changed.length) return `turbollm/ holds changes that ${tag} does not, and npm publish would upload them:\n${changed.join('\n')}`;
+  return null;
+}
+
 // Publish with a throwaway userconfig so the token never lands in a persistent
 // .npmrc. Always removed in the finally.
 function npmPublishWithToken(token, { dryRun }) {
@@ -739,6 +848,13 @@ async function phasePublish(state, flags) {
   const out = [];
   const note = (s) => { out.push(s); step(s); };
 
+  // Gated before the tag, not at the npm step: creating the GitHub Release is what fires
+  // npm-publish.yml and desktop-release.yml, so a gate checked after it refuses only once CI is
+  // already publishing to npm.
+  if (!flags['dry-run']) {
+    requireApproval(flags, `publishing ${PKG}@${version} (tag ${tag}, GitHub Release, npm via npm-publish.yml / OIDC)`);
+  }
+
   const section = changelogSection(version);
   if (!section) fail(`no \`## [${version}]\` section in turbollm/CHANGELOG.md to use as release notes.`);
 
@@ -754,9 +870,13 @@ async function phasePublish(state, flags) {
     mustGit('tag', tag);
     note(`tagged ${tag}`);
   }
+  // Fatal, and the release below gets --verify-tag: with the tag missing on origin, `gh release
+  // create` makes it itself from the default branch's tip, which is not this commit once main has
+  // moved (another merge during the post-merge CI wait), and npm-publish.yml publishes that tag.
   if (!flags['dry-run']) {
     const push = git('push', 'origin', tag);
-    note(push.code === 0 ? `pushed ${tag}` : `push ${tag}: ${tailOf(push.out, 5)}`);
+    if (push.code !== 0) fail(`could not push tag ${tag} to origin; stopped before the GitHub Release step. Fix the push (\`git push origin ${tag}\`) and re-run publish.\n${tailOf(push.out, 5)}`);
+    note(`pushed ${tag}`);
   }
 
   // GitHub release (idempotent) — publishing it is what triggers desktop-release.yml
@@ -769,7 +889,7 @@ async function phasePublish(state, flags) {
     const notesFile = join(mkdtempSync(join(tmpdir(), 'turbollm-notes-')), 'notes.md');
     writeFileSync(notesFile, `${section.notes}\n`);
     try {
-      mustGh('release', 'create', tag, '--title', tag, '--notes-file', notesFile);
+      mustGh('release', 'create', tag, '--verify-tag', '--title', tag, '--notes-file', notesFile);
     } finally {
       rmSync(dirname(notesFile), { recursive: true, force: true });
     }
@@ -787,29 +907,44 @@ async function phasePublish(state, flags) {
   } else if (flags['dry-run']) {
     note(`[dry-run] would wait for npm-publish.yml on ${tag}, then poll npm view ${PKG} version`);
   } else {
-    requireApproval(flags, `publishing ${PKG}@${version} to npm (via npm-publish.yml / OIDC)`);
-    // A GitHub Release that already existed BEFORE npm-publish.yml was added
-    // (or a rerun) won't have fired the `release: published` event for it —
-    // legacyToken() is the local fallback for that one-off case only.
-    const legacy = resolveNpmToken({ optional: true });
-    if (legacy) {
+    note('waiting for the npm-publish.yml workflow (OIDC trusted publishing)…');
+    const runId = await waitForWorkflowRun('npm-publish.yml', tag, 5 * 60_000);
+    if (runId == null) {
+      // A GitHub Release that already existed BEFORE npm-publish.yml was added
+      // (or a rerun) won't have fired the `release: published` event for it —
+      // the local token is the fallback for that one-off case only. Only once
+      // no run has shown up: with one running, a local publish would race it
+      // for the same version, and one of the two would fail.
+      const legacy = resolveNpmToken({ optional: true });
+      if (!legacy) {
+        fail(
+          `no npm-publish.yml run found for ${tag} after 5 minutes.\n`
+          + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
+          + `  or this release never fired it (one published before npm-publish.yml was added does not).\n`
+          + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
+        );
+      }
+      const notTheTag = localPublishProblem(tag);
+      if (notTheTag) {
+        fail(
+          `no npm-publish.yml run found for ${tag}, and the local-token fallback would not publish ${tag}: ${notTheTag}\n`
+          + `  It publishes this checkout's turbollm/ as it is on disk. Nothing was published to npm.\n`
+          + `  Dispatch the workflow instead (\`gh workflow run npm-publish.yml -f tag=${tag}\`), which builds the tag itself,\n`
+          + `  or check out ${tag} with a clean turbollm/ (\`git checkout ${tag}\`, \`git status -- turbollm\`) and re-run publish.`,
+        );
+      }
       warnLine(`falling back to the local token (${legacy.source}) — npm-publish.yml did not pick up this release, or you're re-running after it was added later`);
       const res = npmPublishWithToken(legacy.token, { dryRun: false });
       note(`npm publish (legacy token path) as ${res.whoami}`);
     } else {
-      note('waiting for the npm-publish.yml workflow (OIDC trusted publishing)…');
-      const runId = await waitForWorkflowRun('npm-publish.yml', tag, 5 * 60_000);
-      if (runId == null) {
-        fail(
-          `no npm-publish.yml run found for ${tag} after 5 minutes.\n`
-          + `  Either it hasn't started yet (check https://github.com/mohitsoni48/TurboLLM/actions/workflows/npm-publish.yml),\n`
-          + `  or the Trusted Publisher isn't configured yet on npmjs.com (package turbollm → Settings → Trusted Publisher → GitHub Actions → this repo + npm-publish.yml).\n`
-          + `  You can also dispatch it manually: \`gh workflow run npm-publish.yml -f tag=${tag}\`.`,
-        );
-      }
       const conclusion = await waitForRun(runId, 10 * 60_000);
       if (conclusion !== 'success') {
-        fail(`npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}`);
+        // The workflow fires on `release: published` whatever npm's settings are, so a missing
+        // Trusted Publisher shows up here, as a failed run, not as a run that never started.
+        fail(
+          `npm-publish.yml run ${runId} did not succeed (${conclusion}) — check https://github.com/mohitsoni48/TurboLLM/actions/runs/${runId}\n`
+          + `  If \`npm publish\` failed on authentication, the Trusted Publisher may not be configured on npmjs.com (package turbollm → Settings → Trusted Publisher → GitHub Actions → this repo + npm-publish.yml).`,
+        );
       }
       note(`npm-publish.yml run ${runId} succeeded`);
     }
@@ -835,33 +970,49 @@ async function phasePublish(state, flags) {
 }
 
 // Finds the most recent run of a given workflow file whose event was `release`
-// (or `workflow_dispatch`, for a manual re-run) and that started after `tag`'s
-// GitHub Release was created — so an unrelated older run for the same workflow
-// file never gets mistaken for this release's run. Returns the run id, or null
-// if none shows up before the timeout (e.g. the Trusted Publisher isn't
-// configured yet, so the workflow never got dispatched to begin with).
-async function waitForWorkflowRun(workflowFile, tag, timeoutMs) {
-  const releaseAt = gh('release', 'view', tag, '--json', 'createdAt', '-q', '.createdAt').stdout;
-  const since = releaseAt ? Date.parse(releaseAt) : 0;
+// for `tag` (or `workflow_dispatch`, for a manual re-run) and that started after
+// `tag`'s GitHub Release was published — so another tag's release run is not
+// mistaken for this one, though a manual dispatch for another tag can be.
+// Published, not created: a release's createdAt is the tagged commit's date, so
+// it never excluded an earlier attempt's failed run for a recreated release.
+// Returns the run id, or null if none shows up before the timeout (e.g. the
+// release was published before npm-publish.yml existed, so it never fired it).
+// A gh that fails is not "no run yet": a lost login, an expired token or a
+// network error exits non-zero, and this loop used to poll that for the whole
+// 5 minutes and return null, which sends publish to the local-token fallback
+// while the workflow may be publishing the same version. It stops at once.
+export async function waitForWorkflowRun(workflowFile, tag, timeoutMs, ghRun = gh, pollMs = 15_000) {
+  const ghFailed = (what, r) => fail(
+    `\`gh ${what}\` failed (exit ${r.code}), so whether ${workflowFile} started for ${tag} cannot be checked.\n`
+    + 'Nothing was published from here: a local publish could race the workflow for the same version.\n'
+    + `Fix gh (\`gh auth status\`), then re-run this phase.\n${tailOf(r.out, 20)}`,
+  );
+  const release = ghRun('release', 'view', tag, '--json', 'publishedAt', '-q', '.publishedAt');
+  // A failed view read as "published at the epoch", and every earlier run for the tag matched.
+  if (release.code !== 0) ghFailed(`release view ${tag}`, release);
+  const since = Date.parse(release.stdout) || 0;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const r = gh(
+    const r = ghRun(
       'run', 'list', '--workflow', workflowFile, '--limit', '5',
-      '--json', 'databaseId,event,createdAt',
+      '--json', 'databaseId,event,createdAt,headBranch',
     );
-    if (r.code === 0) {
-      try {
-        const runs = JSON.parse(r.stdout || '[]');
-        // 60s clock-skew grace on the lower bound only.
-        const match = runs.find((x) =>
-          (x.event === 'release' || x.event === 'workflow_dispatch')
-          && Date.parse(x.createdAt) >= since - 60_000);
-        if (match) return match.databaseId;
-      } catch { /* fall through to retry */ }
-    }
+    if (r.code !== 0) ghFailed(`run list --workflow ${workflowFile}`, r);
+    try {
+      const runs = JSON.parse(r.stdout || '[]');
+      // 60s clock-skew grace on the lower bound only. A `release` run's headBranch is its tag:
+      // for a release older than the workflow, every later release's run is "after" it too, and
+      // taking one of those skipped the token fallback. A dispatched run's headBranch is the
+      // branch it was dispatched from (a tag older than the workflow has no workflow file to
+      // dispatch on), so nothing here ties it to a tag and it matches on time alone.
+      const match = runs.find((x) =>
+        ((x.event === 'release' && x.headBranch === tag) || x.event === 'workflow_dispatch')
+        && Date.parse(x.createdAt) >= since - 60_000);
+      if (match) return match.databaseId;
+    } catch { /* fall through to retry */ }
     if (Date.now() > deadline) return null;
     step(`waiting for ${workflowFile} to start for ${tag}…`);
-    await sleep(15_000);
+    await sleep(pollMs);
   }
 }
 
@@ -1181,7 +1332,10 @@ async function main() {
 export function isCliEntry(moduleUrl, argv1) {
   if (!argv1) return false;
   try {
-    return moduleUrl === pathToFileURL(argv1).href;
+    // Real paths on both sides: Node resolves the main module through symlinks (macOS /tmp →
+    // /private/tmp, a symlinked checkout, a Windows junction) but leaves argv[1] as typed, and a
+    // mismatch here skips main() silently — exit 0, no output.
+    return realpathSync(fileURLToPath(moduleUrl)) === realpathSync(argv1);
   } catch {
     return false;
   }

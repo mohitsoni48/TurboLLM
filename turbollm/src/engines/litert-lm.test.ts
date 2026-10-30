@@ -23,24 +23,23 @@ import {
   resetLitertLmServeCache,
   warmUpLitertLm,
   writeLitertLmConfig,
+  LITERT_LM_SERVE_SHIM,
 } from './litert-lm'
 import { tmpDir } from '../test-support/tmp'
 
-test('litertLmProfileToConfig: GPU layers on a machine with a GPU select the gpu backend', () => {
-  assert.equal(litertLmProfileToConfig({ ctx: 4096, ngl: 99, threads: 0 }, true).default.backend, 'gpu')
-})
-
-test('litertLmProfileToConfig: no GPU, or zero GPU layers, selects the cpu backend', () => {
-  assert.equal(litertLmProfileToConfig({ ctx: 4096, ngl: 99, threads: 0 }, false).default.backend, 'cpu')
-  assert.equal(litertLmProfileToConfig({ ctx: 4096, ngl: 0, threads: 0 }, true).default.backend, 'cpu')
+test('litertLmProfileToConfig: Auto writes no backend, so the server runs the model on its own', () => {
+  // Auto used to be the GPU whenever one was detected and the llama.cpp GPU-layers default was above 0, and the CPU
+  // otherwise: the Android app put a CPU-only bundle on the GPU, and a GPU-only bundle went to the CPU elsewhere.
+  assert.equal('backend' in litertLmProfileToConfig({ ctx: 4096, threads: 0 }).default, false)
+  assert.equal('backend' in litertLmProfileToConfig({ ctx: 4096, threads: 0, litertLm: { backend: 'auto' } }).default, false)
 })
 
 test('litertLmProfileToConfig: ctx becomes max_num_tokens and threads becomes cpu_thread_count only when set', () => {
-  assert.deepEqual(litertLmProfileToConfig({ ctx: 8192, ngl: 0, threads: 6 }, false), {
+  assert.deepEqual(litertLmProfileToConfig({ ctx: 8192, threads: 6, litertLm: { backend: 'cpu' } }), {
     default: { backend: 'cpu', max_num_tokens: 8192, cpu_thread_count: 6 },
   })
-  const auto = litertLmProfileToConfig({ ctx: 0, ngl: 0, threads: 0 }, false)
-  assert.deepEqual(auto, { default: { backend: 'cpu' } })
+  const auto = litertLmProfileToConfig({ ctx: 0, threads: 0 })
+  assert.deepEqual(auto, { default: {} })
   assert.ok(!('cpu_thread_count' in auto.default))
   assert.ok(!('max_num_tokens' in auto.default))
 })
@@ -54,7 +53,7 @@ test('litertLmPathBlocker: a comma anywhere in the path is refused, a clean path
 test('litertLmServerCommand: runs the CLI as a module with an explicit config, host and port, extra args last', () => {
   assert.deepEqual(litertLmServerCommand('/venv/bin/python', '/data/cfg.json', 8085, '127.0.0.1', ['--verbose']), {
     cmd: '/venv/bin/python',
-    args: ['-m', 'litert_lm_cli.main', 'serve', '--config', '/data/cfg.json', '--host', '127.0.0.1', '--port', '8085', '--verbose'],
+    args: ['-c', LITERT_LM_SERVE_SHIM, 'serve', '--config', '/data/cfg.json', '--host', '127.0.0.1', '--port', '8085', '--verbose'],
   })
   assert.deepEqual(litertLmServerCommand('py', 'c.json', 1, 'h').args.slice(-2), ['--port', '1'])
 })
@@ -92,11 +91,24 @@ test('classifyLitertLmBlocker: a supported platform reports a load failure with 
 
 test('litertLmLoadFailureMessage: the GPU hint names the Backend control, which is the one the LiteRT-LM panel actually offers', () => {
   // "Set GPU layers to 0" is llama.cpp advice — that slider is not rendered for LiteRT-LM
-  // (PR #271 review), so the hint must point at the real recovery path: Backend → CPU.
-  assert.match(litertLmLoadFailureMessage('boom', 'gpu'), /Backend setting to CPU/)
+  // (PR #271 review), so the hint must point at the real recovery path: Backend → Auto or CPU.
+  assert.match(litertLmLoadFailureMessage('boom', 'gpu'), /set Backend to Auto \(the model's own\) or CPU/)
   assert.doesNotMatch(litertLmLoadFailureMessage('boom', 'gpu'), /GPU layers/)
   assert.match(litertLmLoadFailureMessage('boom', 'cpu'), /complete \.litertlm bundle/)
   assert.match(litertLmLoadFailureMessage('boom', 'cpu'), /— boom\./)
+})
+
+test('litertLmLoadFailureMessage: the GPU is named only when the user chose it', () => {
+  // An LFM2.5-230M load that failed in its data processor under Auto was told to switch to CPU.
+  const lfm2 = 'RuntimeError: Failed to create conversation: FAILED_PRECONDITION: Constrained decoding is not supported for Lfm2DataProcessor.'
+  const auto = litertLmLoadFailureMessage(lfm2, 'auto')
+  assert.doesNotMatch(auto, /GPU|switch the Backend|CPU/)
+  assert.match(auto, new RegExp(`— ${lfm2.replace(/[.()]/g, '\\$&')}\\.`))
+  assert.match(litertLmLoadFailureMessage(lfm2, 'gpu'), /You chose the GPU backend/)
+  // A CPU the bundle excludes (the runtime's constraint message) points back to the model's own backend.
+  const mismatch = 'INVALID_ARGUMENT: Main backend constraint mismatch. Model requires one of [gpu] but Main backend is CPU'
+  assert.match(litertLmLoadFailureMessage(mismatch, 'cpu'), /You chose the CPU backend, which this model does not support: set Backend to Auto/)
+  assert.doesNotMatch(litertLmLoadFailureMessage(mismatch, 'auto'), /You chose/)
 })
 
 // ── warm-up against a local stand-in for `litert-lm serve` ───────────────────
@@ -406,12 +418,11 @@ test('litertLmPrefillStats: no usage or no TTFT yields nothing rather than a mad
   assert.equal(litertLmPrefillStats(100, Number.NaN), null)
 })
 
-test('litertLmProfileToConfig: an explicit backend overrides GPU detection and layers', () => {
-  const p = (backend: 'auto' | 'cpu' | 'gpu', ngl: number) => ({ ctx: 4096, ngl, threads: 0, litertLm: { backend } })
-  assert.equal(litertLmProfileToConfig(p('gpu', 0), false).default.backend, 'gpu', 'forced GPU with none detected (Android)')
-  assert.equal(litertLmProfileToConfig(p('cpu', 99), true).default.backend, 'cpu', 'forced CPU on a GPU machine')
-  assert.equal(litertLmProfileToConfig(p('auto', 99), true).default.backend, 'gpu')
-  assert.equal(litertLmProfileToConfig(p('auto', 99), false).default.backend, 'cpu')
+test('litertLmProfileToConfig: an explicit backend reaches the server as it is', () => {
+  const p = (backend: 'auto' | 'cpu' | 'gpu') => ({ ctx: 4096, threads: 0, litertLm: { backend } })
+  assert.equal(litertLmProfileToConfig(p('gpu')).default.backend, 'gpu', 'forced GPU, whatever was detected (Android)')
+  assert.equal(litertLmProfileToConfig(p('cpu')).default.backend, 'cpu', 'forced CPU on a GPU machine')
+  assert.equal(litertLmProfileToConfig(p('auto')).default.backend, undefined)
 })
 
 // ── ensureLitertLmEnv itself must be the one to reset the cache (PR #271 follow-up): the

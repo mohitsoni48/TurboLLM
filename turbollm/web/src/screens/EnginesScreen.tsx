@@ -33,6 +33,7 @@ import {
 import { useQueryClient } from '@tanstack/react-query'
 import {
   activeEngineOf,
+  servingElsewhere,
   queryKeys,
   useBackendInstall,
   useBuild,
@@ -48,7 +49,8 @@ import {
   useSysInfo,
   useUpdatePolicyMutation,
 } from '../lib/queries'
-import { ApiError, discardReleaseInstall, getEngineUpdates, track } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, hostKeyAccepted, track } from '../lib/api'
+import { markHostKeyNeeded } from '../lib/auth-signal'
 import { primaryVendorSummary } from '../lib/vram'
 import type {
   CatalogEngine,
@@ -97,12 +99,14 @@ import { BuildGuideDialog } from './engines/BuildGuideDialog'
 import { deleteTargetFor, type DeleteTarget } from '../lib/engine-delete-target'
 import { branchOptions } from '../lib/branch-options'
 import { branchLabel, defaultBuildName } from '../lib/engine-build-name'
+import { engineBuildRunning, isToolInstall } from '../lib/engine-build-run'
 import { enableRequestFor } from '../lib/engine-enable-request'
 import { CustomBuildDialog } from './engines/CustomBuildDialog'
 import { EngineStatusHeader } from './engines/EngineStatusHeader'
 import { EngineLogPanel } from './engines/EngineLogPanel'
 import { LlamaCppBackendRows } from './engines/ManagedEngines'
 import {
+  BUNDLED_ENGINE_TITLES,
   customSourceKey,
   groupEngines,
   memberToActivate,
@@ -157,6 +161,9 @@ function buildContextFor(e: Engine, backends: EngineBackends | undefined): strin
     const active = backends?.backends.find((b) => b.active)
     return active ? `llama.cpp · ${active.label}` : 'llama.cpp'
   }
+  // The Android app's own engines, which read as their registered names ("litert-lm-android") under the selector.
+  const bundled = BUNDLED_ENGINE_TITLES[e.name]
+  if (bundled) return `${bundled.title} · ${bundled.detail}`
   return e.name
 }
 
@@ -625,9 +632,15 @@ function EngineHeaderBar({
   useEffect(() => {
     if (wasBuilding.current && !buildActive && eb) {
       build.refresh()
-      if (eb.phase === 'done' && eb.engine && eb.engine !== 'CUDA Toolkit') {
-        toast.success(`${eb.engine} built and added — it's now your active engine.`)
-      } else if (eb.phase === 'error' && eb.error && eb.engine !== 'CUDA Toolkit') {
+      if (eb.phase === 'done' && eb.engine && !isToolInstall(eb)) {
+        // "Now your active engine" only when it is: a rebuild of an engine the user had not selected, or one the user
+        // switched away from while it compiled, leaves the selection as it was, and the toast said otherwise.
+        toast.success(
+          eb.activated === false ? `${eb.engine} built and added.` : `${eb.engine} built and added — it's now your active engine.`,
+        )
+      } else if (eb.phase === 'error' && eb.error && !(eb.engine === 'CUDA Toolkit' && isToolInstall(eb))) {
+        // Only the CUDA Toolkit download stays quiet here (the build guide shows its error); a failed build the user
+        // named "CUDA Toolkit" has its toast, as any other build does.
         toast.error(eb.error)
       }
     }
@@ -670,8 +683,14 @@ function EngineHeaderBar({
 
   const busy = mut.activate.isPending
   // The active engine's live run-state drives the traffic-light on the selector below
-  // (green running · amber starting · red error · grey stopped).
-  const engineState = status?.engine.state ?? 'stopped'
+  // (green running · amber starting · red error · grey stopped). Only while the loaded model runs on it: one that
+  // another engine runs (an install or Enable activated this one without stopping it) lit the selected engine's light,
+  // so it read as running a model it never loaded. The status card below names the engine that does.
+  const elsewhere = servingElsewhere(status)
+  const engineState = elsewhere ? 'stopped' : (status?.engine.state ?? 'stopped')
+  // And the caption over the selector says "Selected engine" then: "Running now" over the selected engine's name read
+  // as that engine running the model, light off or not.
+  const selectorCaption = elsewhere ? 'Selected engine' : 'Running now'
 
   const activate = (id: string) => {
     if (id === activeEngine?.id) return
@@ -699,7 +718,7 @@ function EngineHeaderBar({
         </div>
 
         <div className="flex flex-col items-start gap-1.5 md:items-end">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-muted">Running now</span>
+          <span className="text-[11px] font-medium uppercase tracking-wide text-muted">{selectorCaption}</span>
           <div className="flex flex-wrap items-center gap-2 md:justify-end">
             <DropdownMenu>
               <DropdownMenuTrigger
@@ -840,8 +859,20 @@ function EngineGallery({
   const engineMut = useEngineMutations()
   const policyMut = useUpdatePolicyMutation()
   const releaseUpdate = useEngineUpdate()
+  const { data: status } = useStatus()
   const qc = useQueryClient()
-  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
+  // A release update (card Update, or a dialog install that refreshed a registered engine) changes
+  // the engine in place and settles long after its 202, so refetch when the provision run ends.
+  const wasProvisioning = useRef(provisioning)
+  useEffect(() => {
+    const settled = wasProvisioning.current && !provisioning
+    wasProvisioning.current = provisioning
+    if (!settled) return
+    void qc.invalidateQueries({ queryKey: queryKeys.engines })
+    void qc.invalidateQueries({ queryKey: queryKeys.engineCatalog })
+  }, [provisioning, qc])
+  // `disabledBuildBinPath`: a Disabled source-built card's delete (see requestDelete).
+  const [deleteTarget, setDeleteTarget] = useState<(DeleteTarget & { disabledBuildBinPath?: string }) | null>(null)
   const customDisabled = registry?.customDisabled ?? []
 
   const catalogById = useMemo(() => {
@@ -889,7 +920,13 @@ function EngineGallery({
     engineMut.remove.isPending ||
     engineMut.disableCustom.isPending ||
     engineMut.purge.isPending ||
+    engineMut.deleteBuild.isPending ||
     releaseUpdate.isPending
+  // A build from source: the daemon refuses an install, Enable, Disable or Delete meanwhile, so
+  // those are disabled. Not part of anyPending, which also closes the cards' menus: a build runs
+  // for many minutes, the daemon still takes a Rename, Re-probe or Auto-update meanwhile, and
+  // Rebuild is how a closed build guide is reopened onto the build's progress and Cancel.
+  const buildRunning = engineBuildRunning(status?.engineBuild)
 
   // ── lifecycle (unchanged behavior; mirrors ManagedEngines.DiscoverEngines) ──
   const installFor = (e: CatalogEngine) => {
@@ -1086,6 +1123,17 @@ function EngineGallery({
   const requestDelete = (e: CatalogEngine) => {
     if (!e.releaseEngineId && e.releaseBinPath) { requestDeleteDisabledRelease(e, e.releaseBinPath); return }
     const registryId = registryEngineId(e)
+    // Disable unregisters an engine, and the purge route only deletes a REGISTERED engine's
+    // files — so a Disabled card has no id to purge. A source-built one is found the way its
+    // Enable finds it (its still-built binary), and DELETE /engines/build removes that folder
+    // without running the binary. Re-registering it first (Enable's request, then a purge) probed
+    // the binary, so a build that no longer starts (a driver change, another arch) failed the
+    // probe and could never be deleted. A Disabled pip/TurboQuant/KoboldCpp/llamafile engine has
+    // no such path (its Enable is a re-install that also activates it); its card disables Delete.
+    if (!registryId && e.sourceBuilt && e.sourceBinPath) {
+      setDeleteTarget({ name: e.name, registryId: '', binPath: e.sourceBinPath, disabledBuildBinPath: e.sourceBinPath })
+      return
+    }
     if (!registryId) { toast.error(`Could not find the installed ${e.name} engine to delete.`); return }
     setDeleteTarget(deleteTargetFor(registryId, registry?.engines ?? [], e.name))
   }
@@ -1126,13 +1174,46 @@ function EngineGallery({
       },
     )
   }
-  // Not routed through the shared delete confirmation dialog (a "remembered but not
-  // registered" source has nothing on disk to warn about) — still a real deletion of the
-  // remembered engine, so it shares `delete_engine` rather than needing its own action.
-  const doForgetCustom = (source: CustomEngineSource) => {
+  // Not routed through the shared delete confirmation dialog: forgetting a "remembered but
+  // not registered" source leaves nothing the user can still reach (a release install's or a
+  // git build's now-unclaimed folder is removed below) — still a real deletion of the remembered
+  // engine, so it shares `delete_engine` rather than needing its own action.
+  const doForgetCustom = async (source: CustomEngineSource) => {
     track('engines', 'delete_engine')
+    // A git build's Remove ends in DELETE /engines/build, which a non-host caller needs a key for
+    // (isLocalOrAuthenticated). The forget before it is open to anyone, and cannot come after the delete: the route
+    // answers 409 build_dir_taken while the remembered source claims the folder. So a keyless Serve identity, Access
+    // JWT or open-LAN peer had the source forgotten and the card gone, then the delete refused: the folder (no marker,
+    // so no GC sweeps it) stayed on disk with nothing left to delete it from. The key is checked first, through the
+    // host gate (api.ts hostKeyAccepted: GET /keys's hostGate is isLocalOrAuthenticated's rule). Refused: nothing is
+    // forgotten, the key prompt opens, and the card stays, to Remove again once the key is in.
+    if (source.sourceRepo && !(await hostKeyAccepted())) {
+      markHostKeyNeeded()
+      toast.error("Deleting an engine's files requires a valid API key.")
+      return
+    }
     engineMut.forgetCustomSource.mutate(customSourceKey(source), {
-      onSuccess: () => toast.success(`${source.name} removed`),
+      onSuccess: () => {
+        // A git build (sourceRepo) goes through the Disabled-build Delete (DELETE /engines/build), as a Disabled
+        // source-built catalog card's Delete does: only the release route was called here, which answers 404 for a
+        // git build, so its engines/build/<slug> folder (often several GB) stayed on disk with no card left to delete
+        // it from. That route answers 404 for a binary outside engines/build (the user's own build, left alone) and
+        // refuses during engine work, so the card disables this Remove then.
+        if (source.sourceRepo) {
+          engineMut.deleteBuild.mutate(source.binPath, {
+            onSuccess: () => toast.success(`${source.name} removed`),
+            onError: (err) => {
+              if (err instanceof ApiError && err.status === 404) toast.success(`${source.name} removed`)
+              else toast.error(`${source.name} removed, but its files could not be deleted: ${err instanceof Error ? err.message : 'unknown error'}`)
+            },
+          })
+          return
+        }
+        toast.success(`${source.name} removed`)
+        // A forgotten release install's dir is now unclaimed: remove it. The route answers 404
+        // for any other dir (zip install) and 409 if something still claims it.
+        void discardReleaseInstall(source.binPath).catch(() => {})
+      },
       onError: (err) => toast.error(err instanceof ApiError ? err.message : `Could not remove ${source.name}.`),
     })
   }
@@ -1163,16 +1244,29 @@ function EngineGallery({
       doDeleteDisabledRelease({ ...deleteTarget, sourceKey: deleteTarget.sourceKey, releaseBinPath: deleteTarget.releaseBinPath })
       return
     }
-    engineMut.purge.mutate(deleteTarget.registryId, {
-      onSuccess: () => {
-        toast.success(`${deleteTarget.name} deleted`)
-        setDeleteTarget(null)
-      },
-      onError: (err) => {
-        setDeleteTarget(null)
-        toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
-      },
-    })
+    const onError = (err: unknown) => {
+      setDeleteTarget(null)
+      toast.error(err instanceof ApiError ? err.message : `Could not delete ${deleteTarget.name}.`)
+    }
+    const purge = (id: string) =>
+      engineMut.purge.mutate(id, {
+        onSuccess: () => {
+          toast.success(`${deleteTarget.name} deleted`)
+          setDeleteTarget(null)
+        },
+        onError,
+      })
+    if (deleteTarget.disabledBuildBinPath) {
+      engineMut.deleteBuild.mutate(deleteTarget.disabledBuildBinPath, {
+        onSuccess: () => {
+          toast.success(`${deleteTarget.name} deleted`)
+          setDeleteTarget(null)
+        },
+        onError,
+      })
+      return
+    }
+    purge(deleteTarget.registryId)
   }
 
   const fits = rec.recommendation.fits
@@ -1227,6 +1321,7 @@ function EngineGallery({
               catalog={catalogById.get(fit.engine.id)}
               isActive={activeCatalogId === fit.engine.id}
               anyPending={anyPending}
+              buildRunning={buildRunning}
               provisioning={provisioning}
               updateStatus={regId ? updates?.updates[regId] : undefined}
               policy={(regId ? updates?.policies[regId] : undefined) ?? 'notify'}
@@ -1261,6 +1356,7 @@ function EngineGallery({
               disabled={false}
               binPathExists
               anyPending={anyPending}
+              buildRunning={buildRunning}
               enabling={false}
               onUpdate={() => updateReleaseEngine(eng.id, eng.name)}
               onDisable={() => doDisableCustom(eng)}
@@ -1278,10 +1374,11 @@ function EngineGallery({
               disabled
               binPathExists={source.binPathExists}
               anyPending={anyPending}
+              buildRunning={buildRunning}
               enabling={enablingKey === customSourceKey(source)}
               onDisable={() => {}}
               onEnable={() => doEnableCustom(source)}
-              onDelete={() => doForgetCustom(source)}
+              onDelete={() => void doForgetCustom(source)}
             />
           ))}
         </div>
@@ -1323,7 +1420,7 @@ function EngineGallery({
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={doDelete} disabled={engineMut.purge.isPending}>
+            <AlertDialogAction onClick={doDelete} disabled={engineMut.purge.isPending || engineMut.deleteBuild.isPending}>
               Delete
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -1342,6 +1439,7 @@ function EngineCard({
   catalog,
   isActive,
   anyPending,
+  buildRunning,
   provisioning,
   updateStatus,
   policy,
@@ -1358,6 +1456,8 @@ function EngineCard({
   catalog: CatalogEngine | undefined
   isActive: boolean
   anyPending: boolean
+  /** A build from source runs: install, Enable, Disable and Delete are refused meanwhile. */
+  buildRunning: boolean
   provisioning: boolean
   updateStatus: EngineUpdateStatus | undefined
   policy: UpdatePolicy
@@ -1626,9 +1726,9 @@ function EngineCard({
                     </DropdownMenuItem>
                   )}
                   {isEnabled ? (
-                    <DropdownMenuItem onSelect={() => onDisable(catalog)}>Disable</DropdownMenuItem>
+                    <DropdownMenuItem disabled={buildRunning} onSelect={() => onDisable(catalog)}>Disable</DropdownMenuItem>
                   ) : (
-                    <DropdownMenuItem onSelect={() => onEnable(catalog)}>Enable</DropdownMenuItem>
+                    <DropdownMenuItem disabled={buildRunning} onSelect={() => onEnable(catalog)}>Enable</DropdownMenuItem>
                   )}
                   {isEnabled && (
                     <>
@@ -1651,9 +1751,17 @@ function EngineCard({
                     </>
                   )}
                   <DropdownMenuSeparator />
-                  <DropdownMenuItem destructive onSelect={() => onDelete(catalog)}>
+                  {/* A Disabled engine has no registry entry to purge; only a source-built one or
+                      a release install can be found again without re-installing it (see
+                      requestDelete). A Disabled release install's Delete stays open during a
+                      build from source: it forgets the source and removes the unclaimed install
+                      (DELETE /engines/release/install), neither of which the daemon refuses then. */}
+                  <DropdownMenuItem destructive disabled={(buildRunning && !releaseDisabled) || (isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled)} onSelect={() => onDelete(catalog)}>
                     Delete
                   </DropdownMenuItem>
+                  {isDisabled && !(sourceBuilt && catalog.sourceBinPath) && !releaseDisabled && (
+                    <p className="px-2 pb-1 text-[11px] text-muted">Enable it first to delete its files.</p>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
               {sourceBuilt && catalog && (
@@ -1697,7 +1805,7 @@ function EngineCard({
           ) : (
             <Button
               size="sm"
-              disabled={anyPending || incompatible || !installFor(catalog)}
+              disabled={anyPending || buildRunning || incompatible || !installFor(catalog)}
               onClick={() => onInstall(catalog)}
               title={incompatible ? fit.incompatibleReason ?? 'Not supported on this hardware' : `Install ${e.name}`}
             >
@@ -1752,6 +1860,7 @@ function CustomEngineCard({
   disabled,
   binPathExists,
   anyPending,
+  buildRunning,
   enabling,
   onUpdate,
   onDisable,
@@ -1773,6 +1882,8 @@ function CustomEngineCard({
   disabled: boolean
   binPathExists: boolean
   anyPending: boolean
+  /** A build from source runs: Enable, Disable and Delete are refused meanwhile. */
+  buildRunning: boolean
   enabling: boolean
   /** Starts the release update; owned by the gallery so `anyPending` sees it. */
   onUpdate?: () => void
@@ -1867,12 +1978,12 @@ function CustomEngineCard({
         )}
         {disabled ? (
           binPathExists && (
-            <Button size="sm" disabled={anyPending || enabling} onClick={onEnable}>
+            <Button size="sm" disabled={anyPending || buildRunning || enabling} onClick={onEnable}>
               {enabling ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Enable
             </Button>
           )
         ) : (
-          <Button variant="outline" size="sm" disabled={anyPending} onClick={onDisable}>
+          <Button variant="outline" size="sm" disabled={anyPending || buildRunning} onClick={onDisable}>
             Disable
           </Button>
         )}
@@ -1911,7 +2022,11 @@ function CustomEngineCard({
             </DropdownMenuContent>
           </DropdownMenu>
         )}
-        <Button variant="outline" size="sm" onClick={onDelete}>
+        {/* A registered engine's Delete is a purge, which the daemon refuses during engine work like
+            Disable; so is a remembered (Disabled) git build's Remove, which deletes its build folder.
+            Any other remembered source's Remove only forgets it (and discards a release install),
+            which the daemon takes then. */}
+        <Button variant="outline" size="sm" disabled={(!disabled || !!sourceRepo) && (anyPending || buildRunning)} onClick={onDelete}>
           {disabled ? 'Remove' : 'Delete'}
         </Button>
       </div>
@@ -2014,7 +2129,8 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
   const { data: status } = useStatus()
   const engines = (list?.engines ?? []).filter((e) => e.kind !== 'laya')
   const running = status?.engine.state === 'running' || status?.engine.state === 'starting'
-  // The engine the loaded model runs on — a .litertlm model runs on LiteRT-LM while llama.cpp stays active.
+  // The engine the loaded model runs on, which need not be the active one (an install or Enable activates another
+  // without stopping the model).
   const servingId = status?.engine.servingId ?? activeEngine?.id
 
   const use = (e: Engine) => {
@@ -2045,13 +2161,6 @@ function BundledEngineGallery({ list, activeEngine }: { list: EnginesList | unde
       </div>
     </section>
   )
-}
-
-/** Display names for the engines the Android app registers itself (turbollm engines/seed.ts). */
-const BUNDLED_ENGINE_TITLES: Record<string, { title: string; detail: string }> = {
-  'llama-server-android': { title: 'llama.cpp', detail: 'CPU' },
-  'llama-server-android-vulkan': { title: 'llama.cpp', detail: 'Vulkan GPU' },
-  'litert-lm-android': { title: 'LiteRT-LM', detail: 'CPU · GPU' },
 }
 
 function BundledEngineCard({
@@ -2130,11 +2239,12 @@ function BundledEngineCard({
 
       <div className="mt-3 flex items-center justify-between gap-2 border-t border-border pt-3">
         <span className="text-[11px] text-muted">
-          {isLitert ? '.litertlm models load on it automatically' : 'Updates with the app'}
+          {isLitert ? 'Runs .litertlm models once it is selected' : 'Updates with the app'}
         </span>
-        {/* No "Use" for LiteRT-LM: .litertlm models reach it on their own, and making it the active engine would send
-            every GGUF model to it, where they cannot load. */}
-        {isLitert ? null : isActive ? (
+        {/* LiteRT-LM is selected here like the others. A model loads only on the engine the user selected, so a
+            .litertlm model reaches LiteRT-LM only once it is; the card offered no "Use" and said those models loaded
+            on it automatically, which left the selector's raw "litert-lm-android" row as the only way to pick it. */}
+        {isActive ? (
           <Button size="sm" variant="outline" disabled>
             In use
           </Button>

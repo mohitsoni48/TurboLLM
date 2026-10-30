@@ -28,13 +28,17 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuTrigger } from './ui/dro
 const MAX_BUDGET = 16_000
 const STEP = 500
 
-function formatBudget(value: number): string {
-  if (value < 0) return 'Unlimited'
+// `automatic` (a model on LiteRT-LM): -1 sends nothing, so the model's own default decides, which for a .litertlm is
+// not always thinking: its template thinks by default (Qwen3) or only when asked (gemma-4-E2B-it), and there only a
+// budget turns it on. "Unlimited" claimed thinking such a bundle never did, at the untouched value every new chat
+// starts at (Android's too, which started at Off).
+function formatBudget(value: number, automatic = false): string {
+  if (value < 0) return automatic ? 'Auto (model\'s default)' : 'Unlimited'
   if (value === 0) return 'Off'
   return `${value.toLocaleString()} tokens`
 }
 
-export function ThinkingBudgetSlider({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+export function ThinkingBudgetSlider({ value, onChange, automatic = false }: { value: number; onChange: (v: number) => void; automatic?: boolean }) {
   const sliderValue = value < 0 ? MAX_BUDGET : Math.min(value, MAX_BUDGET)
   const active = value !== -1
 
@@ -43,7 +47,7 @@ export function ThinkingBudgetSlider({ value, onChange }: { value: number; onCha
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          title={`Thinking: ${formatBudget(value)} — click to adjust`}
+          title={`Thinking: ${formatBudget(value, automatic)} — click to adjust`}
           aria-label="Thinking budget"
           className="grid h-8 w-8 shrink-0 place-items-center rounded-md transition-colors hover:bg-panel-2"
           style={{ color: active ? 'var(--accent)' : 'var(--faint)' }}
@@ -54,7 +58,7 @@ export function ThinkingBudgetSlider({ value, onChange }: { value: number; onCha
       <DropdownMenuContent align="end" className="w-64 p-3">
         <div className="mb-2 flex items-center justify-between text-[12px]">
           <span className="font-medium text-ink">Thinking budget</span>
-          <span className="text-muted">{formatBudget(value)}</span>
+          <span className="text-muted">{formatBudget(value, automatic)}</span>
         </div>
         <input
           type="range"
@@ -72,7 +76,7 @@ export function ThinkingBudgetSlider({ value, onChange }: { value: number; onCha
         />
         <div className="mt-1 flex justify-between text-[10px] text-faint">
           <span>Off</span>
-          <span>Unlimited</span>
+          <span>{automatic ? 'Auto' : 'Unlimited'}</span>
         </div>
       </DropdownMenuContent>
     </DropdownMenu>

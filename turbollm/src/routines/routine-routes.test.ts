@@ -4,6 +4,7 @@ import { Hono } from 'hono'
 import { createHash } from 'node:crypto'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { registerRoutineRoutes, validateCreate, CODE_GATE_MESSAGE, TEXT_CLASSIFIER_ROUTINE_MODEL_MESSAGE } from './routine-routes'
+import { ROUTINE_MAX_INTERVAL_MS } from './schedule'
 import { RoutineScheduler } from './scheduler'
 import { executeRoutine } from './execute'
 import type { Deps } from '../deps'
@@ -275,6 +276,37 @@ test('POST rejects everyMs of 0 or negative (would make the routine permanently 
   }
 })
 
+// A huge everyMs was accepted: next_fire_at = now + everyMs then passed Date's range, so /confirm
+// and /resume threw a RangeError out of toISOString (a 500), and the routine could never be
+// armed. One that stayed in range but passed the year 9999 serialized as '+011533-…', which
+// sorts BEFORE every 4-digit year in listDueRoutines' string comparison: due on every tick.
+test('POST rejects an everyMs longer than a year, and a year still confirms', async () => {
+  const { app, db } = testApp()
+  for (const everyMs of [1e16, 3e14, ROUTINE_MAX_INTERVAL_MS + 1]) {
+    const res = await post(app, { scheduleRule: { kind: 'interval', everyMs } })
+    assert.equal(res.status, 400, `everyMs: ${everyMs}`)
+    assert.equal(await errorCode(res), 'invalid_routine')
+  }
+  const res = await post(app, { scheduleRule: { kind: 'interval', everyMs: ROUTINE_MAX_INTERVAL_MS } })
+  assert.equal(res.status, 201)
+  const { id } = (await res.json()) as { id: string }
+  const confirmed = await app.request(`/api/v1/routines/${id}/confirm`, { method: 'PUT' })
+  assert.equal(confirmed.status, 200)
+  assert.match(((await confirmed.json()) as { nextFireAt: string }).nextFireAt, /^\d{4}-/)
+  assert.equal(db.listDueRoutines(new Date().toISOString()).length, 0, 'not due until a year from now')
+})
+
+test('PUT rejects an everyMs longer than a year instead of persisting it', async () => {
+  const { app, db } = testApp()
+  const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const res = await app.request(`/api/v1/routines/${created.id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ scheduleRule: { kind: 'interval', everyMs: 1e16 } }),
+  })
+  assert.equal(res.status, 400)
+  assert.deepEqual(db.getRoutine(created.id)?.scheduleRule, { kind: 'interval', everyMs: 60_000 })
+})
+
 test('POST rejects a non-numeric everyMs', async () => {
   const { app } = testApp()
   const res = await post(app, { scheduleRule: { kind: 'interval', everyMs: 'soon' } })
@@ -535,7 +567,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
     store: db, now: () => new Date(),
     runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' },
   })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   await scheduler.tick() // fires and parks — inFlight now holds the routine
   await new Promise((resolve) => setImmediate(resolve))
@@ -626,6 +658,61 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
   await scheduler.tick()
   await new Promise((resolve) => setImmediate(resolve))
   assert.equal(db.listRoutineRuns(routine.id).filter((x) => x.skipReason === 'overlap').length, 1, 'still guarded — a retryable failure must not release the parked slot')
+})
+
+// The active-work probe leaves a parked run out (it waits on the user), but an Approve resumes it on
+// the engine: the approved call, then the rest of the run. Android's EngineService reads the probe as
+// "busy", so the run is listed while the Approve resumes it, and not after.
+test('a parked run an Approve is resuming is listed as running until the resume returns', async () => {
+  const db = new ConversationStore(IN_MEMORY_DATA_DIR)
+  const app = new Hono()
+  const routine = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 1000 }, modelKey: 'm', agentId: 'agent-1' })
+  db.confirmRoutine(routine.id, '2020-01-01T00:00:00.000Z')
+  const manager = {
+    status: () => ({ state: 'running', model: { key: 'm' } }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    target: () => 'http://engine.invalid.local:1',
+    currentOpts: () => null,
+  } as unknown as Manager
+  const modelRouter = { loadExplicit: async () => ({ target: 'http://x' }) } as unknown as ModelRouter
+  const AGENT = { id: 'agent-1', name: 'A', description: '', systemPrompt: '', skillIds: [], tools: [] as string[] }
+  let holdGate: Promise<void> = Promise.resolve()
+  const gate = { acquire: async () => { await holdGate; return () => {} } } as unknown as GenerationGate
+  const d = {
+    db, manager, modelRouter, gate,
+    registry: { active: () => ({ kind: 'llama-server' }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+  } as unknown as Deps
+  const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
+  registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
+
+  const originalFetch = globalThis.fetch
+  let stalled = false
+  globalThis.fetch = (async () => {
+    if (!stalled) {
+      stalled = true
+      return new Response(JSON.stringify({ choices: [{ message: { content: null, tool_calls: [{ id: 'c1', function: { name: 'not_allowed_tool', arguments: '{}' } }] } }] }), { status: 200 })
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'All done.' }, finish_reason: 'stop' }] }), { status: 200 })
+  }) as typeof fetch
+  try {
+    await scheduler.tick()
+    await new Promise((resolve) => setImmediate(resolve))
+    const [run] = db.listRoutineRuns(routine.id)
+    assert.equal(run.status, 'needs_approval')
+    assert.deepEqual(scheduler.runningRoutineIds(), [], 'parked: it waits on the user')
+
+    let openGate!: () => void
+    holdGate = new Promise<void>((resolve) => { openGate = resolve })
+    const approving = app.request(`/api/v1/routines/${routine.id}/runs/${run.id}/approve`, { method: 'POST' })
+    await new Promise((resolve) => setImmediate(resolve))
+    assert.deepEqual(scheduler.runningRoutineIds(), [routine.id], 'resuming: it runs on the engine again')
+    openGate()
+    const res = await approving
+    assert.equal(res.status, 200)
+    assert.equal(db.getRoutineRun(run.id)?.status, 'ok')
+    assert.deepEqual(scheduler.runningRoutineIds(), [], 'settled: no longer running')
+  } finally { globalThis.fetch = originalFetch }
 })
 
 // ── I2: run-now/approve/deny must honor the same code-flavor auth gate as create/update ────
@@ -952,7 +1039,7 @@ test('a stale approve on an OLD needs_approval run does not release a DIFFERENT,
 
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' } })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   // A REAL fire happens and genuinely parks — this is the run the scheduler's guard belongs to.
   await scheduler.tick()
@@ -1074,4 +1161,58 @@ test('PUT /api/v1/routines/:id that does not touch modelKey is unaffected', asyn
 test('validateCreate with no predicates behaves exactly as before', () => {
   assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: JEV_KEY } as never), null)
   assert.equal(validateCreate({ ...CHAT_ROUTINE_BODY, modelKey: '   ' } as never), 'modelKey is required.')
+})
+
+// A text field that held a number, an object, an array or a boolean threw where it is trimmed (`.trim is not a function`)
+// or stored (a SQLite bind error), a bare 500 from Hono's default handler; a number in a chat routine's workspacePath,
+// or on POST in a code routine's agentId, was stored as "5.0". On PUT a null threw the same way for the three fields
+// that route reads whenever they are not undefined.
+test('POST /api/v1/routines refuses a text field that is not a string with 400, creating nothing', async () => {
+  const { app, db } = testApp()
+  const post = (body: unknown) => app.request('/api/v1/routines', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  for (const [base, fields] of [
+    [{ ...CHAT_ROUTINE_BODY, modelKey: 'm' }, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+    [CODE_ROUTINE, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+  ] as const) {
+    for (const field of fields) {
+      for (const bad of [5, { text: 'x' }, ['x'], true]) {
+        const res = await post({ ...base, [field]: bad })
+        const what = `${base.flavor} ${field} ${JSON.stringify(bad)}`
+        assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
+        assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: `${field} must be a string.` } }, what)
+      }
+    }
+  }
+  assert.equal(db.listRoutines().length, 0, 'nothing created')
+  assert.equal((await post({ ...CHAT_ROUTINE_BODY, modelKey: 'm' })).status, 201, 'strings still create one')
+})
+
+test('PUT /api/v1/routines/:id refuses a text field that is not a string with 400, changing nothing', async () => {
+  const { app, db } = testApp()
+  const chat = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
+  const code = db.createRoutine({ ...CODE_ROUTINE })
+  const put = (id: string, body: unknown) => app.request(`/api/v1/routines/${id}`, {
+    method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+  })
+  const before = [JSON.stringify(db.getRoutine(chat.id)), JSON.stringify(db.getRoutine(code.id))]
+  for (const routine of [chat, code]) {
+    for (const field of ['prompt', 'scheduleDisplay', 'modelKey', 'workspacePath']) {
+      for (const bad of [5, { text: 'x' }, ['x'], true, ...(field === 'workspacePath' ? [] : [null])]) {
+        const res = await put(routine.id, { [field]: bad })
+        const what = `${routine.flavor} ${field} ${JSON.stringify(bad)}`
+        assert.equal(res.status, 400, `${what}: ${await res.clone().text()}`)
+        assert.deepEqual(await res.json(), { error: { code: 'invalid_routine', message: `${field} must be a string.` } }, what)
+      }
+    }
+  }
+  // A code routine's workspacePath cannot be cleared: a null is refused like a blank one (it threw).
+  const cleared = await put(code.id, { workspacePath: null })
+  assert.equal(cleared.status, 400)
+  assert.equal(((await cleared.json()) as { error: { message: string } }).error.message, 'workspacePath cannot be empty for a code-flavor routine.')
+  assert.deepEqual([JSON.stringify(db.getRoutine(chat.id)), JSON.stringify(db.getRoutine(code.id))], before, 'nothing changed')
+  // Strings still update.
+  assert.equal((await put(chat.id, { prompt: 'new', scheduleDisplay: 'e', modelKey: 'qwen3-coder-32b' })).status, 200)
+  assert.deepEqual([db.getRoutine(chat.id)?.prompt, db.getRoutine(chat.id)?.modelKey], ['new', 'qwen3-coder-32b'])
 })

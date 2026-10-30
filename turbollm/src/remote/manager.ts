@@ -5,11 +5,12 @@
 // child exit it nulled its handle and went silent, which is the direct cause of the
 // "cloudflare sessions end after some time" report this feature exists to answer.
 import type { Hono } from 'hono'
+import { endTunneledTurns } from '../auth'
 import { IngressListener } from './ingress'
 import type { RemoteIngress } from './ingress-types'
 import { backoffDelay, MAX_CONSECUTIVE_FAILURES } from './backoff'
 import { HEALTH_INTERVAL_MS, nextHealthCheck } from './health'
-import type { RemoteProvider, RemoteState } from './types'
+import type { RemoteProvider, RemoteProviderId, RemoteState } from './types'
 
 export interface RemoteAccessOptions {
   app: Hono
@@ -27,7 +28,9 @@ export interface RemoteAccessOptions {
 }
 
 export class RemoteAccessManager implements RemoteIngress {
-  private ingress = new IngressListener()
+  // A chat turn that came through remote access is stopped when the ingress closes (auth.ts holdTurn): it no longer
+  // ends with its connection, which closing the ingress drops.
+  private ingress = new IngressListener(() => { endTunneledTurns() })
   private provider: RemoteProvider | null = null
   private current: RemoteState = { kind: 'off' }
   private failures = 0
@@ -57,6 +60,9 @@ export class RemoteAccessManager implements RemoteIngress {
    *  generation for) — something a generation number alone cannot distinguish. */
   private generation = 0
 
+  /** The disable() still taking the provider and the ingress down, if any — see enable(). */
+  private stopInFlight: Promise<void> | null = null
+
   constructor(private opts: RemoteAccessOptions) {}
 
   state(): RemoteState {
@@ -69,6 +75,18 @@ export class RemoteAccessManager implements RemoteIngress {
 
   ingressPort(): number | undefined {
     return this.ingress.ingressPort()
+  }
+
+  /** See RemoteControl.targetIngressPort. Every enable() binds exactly opts.ingressPort (or
+   *  fails), so that is the port while off; the bound one covers the tests' ephemeral 0. */
+  targetIngressPort(): number {
+    return this.ingress.ingressPort() ?? this.opts.ingressPort
+  }
+
+  /** The provider serving the ingress right now (see RemoteIngress.activeProvider), or
+   *  undefined when the ingress is down. */
+  activeProvider(): RemoteProviderId | undefined {
+    return this.ingress.ingressPort() !== undefined ? this.provider?.id : undefined
   }
 
   /** The ingress listener's underlying http.Server once bound, or null (mirrors
@@ -103,6 +121,17 @@ export class RemoteAccessManager implements RemoteIngress {
    *  mismatch once its timer fires and abandon a perfectly legitimate reconnection attempt,
    *  permanently stranding the manager in `reconnecting` with nothing left to retry it. */
   async enable(): Promise<void> {
+    // A disable() still stopping the provider (a child process gets up to 8 s to exit) leaves
+    // the state it is tearing down in place until it ends. An enable() landing then used to
+    // see that old 'connected', return as a no-op, and let /start answer 'connected' with the
+    // remote token the Stop revoked a moment later, leaving the tunnel off. So wait for the
+    // stop to finish and start afresh after it; a disable() called while this one waits is
+    // the newer request and wins, so this enable() then does nothing.
+    if (this.stopInFlight) {
+      const gen = this.generation
+      await this.stopInFlight
+      if (gen !== this.generation) return
+    }
     if (
       this.current.kind === 'connected' ||
       this.current.kind === 'starting' ||
@@ -135,8 +164,20 @@ export class RemoteAccessManager implements RemoteIngress {
 
     try {
       const port = await this.ingress.start(this.opts.app, this.opts.ingressPort)
+      if (gen !== this.generation) {
+        // Superseded while binding: a disable() that ran before the bind completed found no
+        // listener to stop, so release the one this flow just bound (a newer enable() binds its
+        // own afresh) and never start the provider at all.
+        await this.ingress.stop()
+        return
+      }
       const { url } = await provider.start(port)
-      if (gen !== this.generation) return // superseded while binding ingress / starting the provider
+      if (gen !== this.generation) {
+        // Superseded while the provider was starting: the disable() that bumped the generation
+        // stopped this same instance before it had brought anything up, so undo it here.
+        await this.abandonStaleStart(provider)
+        return
+      }
       this.failures = 0
       this.set({ kind: 'connected', url, since: new Date().toISOString() })
       this.watch(provider, gen)
@@ -164,6 +205,38 @@ export class RemoteAccessManager implements RemoteIngress {
    *  flow already in flight, including a pending restart() sitting in its backoff wait
    *  (ADR-422 final review, Important finding I1). */
   async disable(): Promise<void> {
+    const own = this.takeDown()
+    // What an enable() arriving meanwhile waits for (it never rejects). A disable() called
+    // while another still runs finds the provider already taken and can end first, so it
+    // covers the earlier one too.
+    const inFlight: Promise<void> = Promise.allSettled([this.stopInFlight, own]).then(() => {
+      if (this.stopInFlight === inFlight) this.stopInFlight = null
+    })
+    this.stopInFlight = inFlight
+    await own
+  }
+
+  /** disable(), and every disable() still running from before it: what a shutdown waits for.
+   *  A disable() that finds the provider already taken by an earlier one (a remote-access Stop,
+   *  a provider switch, the flag turned off, a restart's teardown) ends at once, while that
+   *  one's `tailscale serve|funnel … off` still runs. A shutdown that waited for its own only
+   *  then exited, and the 'exit' handler's killTetheredSync killed the `off` mid-call: Serve, or
+   *  the PUBLIC Funnel, stayed on after TurboLLM was gone. disable() itself is unchanged (it
+   *  still ends once its own part is done; an enable() waits for stopInFlight). Bounded by each
+   *  stop's own bound: the CLI's 10 s timeout, a child provider's 8 s grace, the ingress's 3 s. */
+  async disableAll(): Promise<void> {
+    const own = this.disable()
+    const all = this.stopInFlight // every earlier disable() and this one; never rejects
+    try {
+      await own
+    } finally {
+      await all
+    }
+  }
+
+  /** disable()'s body. Its first statements, the generation bump included, run synchronously
+   *  when disable() is called. */
+  private async takeDown(): Promise<void> {
     this.generation++
     clearInterval(this.healthTimer)
     this.healthTimer = undefined
@@ -172,6 +245,31 @@ export class RemoteAccessManager implements RemoteIngress {
     if (provider) await provider.stop()
     await this.ingress.stop()
     this.set({ kind: 'off' })
+  }
+
+  /** Undo a provider start that completed after its flow was superseded (a disable(), maybe
+   *  followed by a fresh enable(), ran while provider.start() was in flight). disable() stopped
+   *  this same instance, but before it had spawned its child or issued its serve — without this
+   *  the tunnel comes up anyway, out of reach of any later disable(): state `off` in front of a
+   *  live public URL. A 'system-state' provider is left alone only while the newer flow's
+   *  provider writes the SAME entry (same id and public port): Tailscale's entry is keyed by the
+   *  public port, not by instance, so this reset would also un-expose that newer connection,
+   *  which owns the entry and resets it itself. Any other pairing is stopped, failing closed: a
+   *  stale `funnel --bg` (it blocks on tailnet-admin approval) landing after the user switched
+   *  to Serve, or to another port, would otherwise leave a public entry nothing owns, or turn
+   *  the newer Serve entry public. When the stale Funnel shares the port, its reset also drops
+   *  the newer Serve entry, which the health loop's restart() re-issues. */
+  private async abandonStaleStart(provider: RemoteProvider): Promise<void> {
+    const live = this.provider
+    if (
+      provider.lifecycle === 'system-state' &&
+      live?.id === provider.id &&
+      provider.publicPort !== undefined &&
+      live.publicPort === provider.publicPort
+    ) {
+      return
+    }
+    await provider.stop().catch(() => {})
   }
 
   /** Watch a child-process provider for an unexpected exit and restart it with backoff. `gen`
@@ -310,11 +408,28 @@ export class RemoteAccessManager implements RemoteIngress {
     if (gen !== this.generation) return
 
     const provider = this.opts.makeProvider()
+    // The replacement is built from the CURRENT config, and Settings saves a Tailscale port
+    // change while connected. A 'system-state' entry outlives its instance and is keyed by the
+    // public port, so if the new instance writes a different entry, reset the old one first:
+    // once `this.provider` moves on, no disable() would ever reset it, leaving the old port
+    // public behind an `off` toggle. Same entry: the new `--bg` simply re-issues it. A disable()
+    // landing during this stop still finds `prev` in `this.provider` and resets it itself.
+    const prev = this.provider
+    if (
+      prev?.lifecycle === 'system-state' &&
+      (prev.id !== provider.id || prev.publicPort !== provider.publicPort)
+    ) {
+      await prev.stop().catch(() => {})
+      if (gen !== this.generation) return
+    }
     this.provider = provider
     try {
       const port = this.ingress.ingressPort() ?? (await this.ingress.start(this.opts.app, this.opts.ingressPort))
       const { url } = await provider.start(port)
-      if (gen !== this.generation) return
+      if (gen !== this.generation) {
+        await this.abandonStaleStart(provider) // a disable() landed mid-start — see enable()
+        return
+      }
       // ADR-422 Phase 3 final review, Important finding I2: start() succeeding is only real
       // evidence of reachability for a 'child-process' provider — spawnAndWait requires the
       // child to print concrete proof (a real URL) before resolving. For 'system-state' and

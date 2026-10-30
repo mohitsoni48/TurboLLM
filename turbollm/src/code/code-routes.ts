@@ -20,6 +20,7 @@
 import type { Context, Hono } from 'hono'
 import { streamSSE } from 'hono/streaming'
 import type { Deps } from '../deps'
+import { holdOpen } from '../auth'
 import type { AgentRun, Message } from '../chat/db'
 import { CodeRunManager, type SteerKind } from './code-run-manager'
 import { parseReasoningEffort } from '../chat/reasoning-effort'
@@ -33,6 +34,8 @@ import { agentAvailability, installAgent } from './agent-availability'
 import { agentsMdPresence } from './persona'
 import type { CodeMode } from './persona'
 import { sessionAuth } from './session-auth'
+import { nonStringField } from '../util/string-fields'
+import { releaseTetherScope } from '../util/tether'
 
 // 503 is Turbo Link's (ADR-376): a linked machine that went offline between the picker
 // listing it and this turn being submitted. Deliberately not 409 — nothing about THIS
@@ -40,6 +43,12 @@ import { sessionAuth } from './session-auth'
 type S = 200 | 201 | 202 | 400 | 404 | 409 | 500 | 503
 function err(c: Context, s: S, code: string, msg: string) { return c.json({ error: { code, message: msg } }, s) }
 async function body<T>(c: Context): Promise<T> { try { return await c.req.json() as T } catch { return {} as T } }
+/** `contextFiles` is stored as the user row's textAttachments, which the chat and Code views
+ *  render as an array of strings (a string or object there crashed them): anything else is
+ *  refused before it is stored. Absent or null is fine. */
+function badContextFiles(v: unknown): boolean {
+  return v != null && !(Array.isArray(v) && v.every((x) => typeof x === 'string'))
+}
 
 const VALID_MODES = new Set<CodeMode>(['auto', 'plan', 'ask'])
 
@@ -152,8 +161,16 @@ function toSidebarRow(run: AgentRun) {
   }
 }
 
-export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager): void {
+/** What a Code session's agent left running in the background (its bash commands' jobs, util/tether.ts holds them in
+ *  the session's scope) ends when the session is archived or deleted. */
+export function releaseCodeSessionProcesses(sessionId: string): Promise<void> {
+  return releaseTetherScope(`code-session:${sessionId}`)
+}
+
+/** `seams` is for the route tests: what the delete route removes the session's worktree with. */
+export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager, seams: { removeSessionWorktree?: typeof removeSessionWorktree } = {}): void {
   const { db } = d
+  const removeWorktree = seams.removeSessionWorktree ?? removeSessionWorktree
 
   // The daemon-owned run registry for this app instance — either the shared instance a caller
   // already constructed (cli.ts, so Routine execution and this UI observe the same sessions), or
@@ -164,12 +181,29 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   const runs = codeRuns ?? new CodeRunManager(d)
   runs.reconcileOnStartup()
 
+  // Sessions whose manual /compact is still running (POST /compact below). That call runs to the
+  // end whatever happens to the page that asked for it, but it was known only to that page's own
+  // state: a page reopened (or another tab) mid-compaction showed no sign of it, and a turn, a
+  // /clear, a /resume, a /revert or a second /compact sent meanwhile was accepted against the
+  // history being summarized. GET /sessions/:id reports it, and those routes answer 409
+  // compaction_in_progress until it settles. A `!` command's output (/exec) is still stored: it
+  // lands after the cut the compaction is computing, and stays as it is.
+  const compacting = new Set<string>()
+  const compactionInProgress = (c: Context) =>
+    err(c, 409, 'compaction_in_progress', 'This session is being compacted. Wait for the compaction to finish.')
+
   // ── create a session ─────────────────────────────────────────────────────────
   app.post('/api/v1/code/sessions', async (c) => {
     const b = await body<{
       repoRoot?: string; repoBranch?: string; modelKey?: string; mode?: string; task?: string; title?: unknown
       useWorktree?: boolean; worktreeBranch?: string; worktreeBase?: string; contextFiles?: string[]
     }>(c)
+    // The base is a name for git to resolve (createSessionWorktree trims it): anything but a string
+    // is refused here, never taken for "no base", which would branch off the current checkout. The
+    // same for the other text fields (nonStringField). `title` is not among them: one that is not
+    // text is ignored (cleanSessionTitle).
+    const notString = nonStringField(b, ['repoRoot', 'task', 'repoBranch', 'modelKey', 'worktreeBranch', 'worktreeBase'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     const repoRoot = (b.repoRoot ?? '').trim()
     const task = (b.task ?? '').trim()
     const chosenTitle = cleanSessionTitle(b.title)
@@ -177,6 +211,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!repoRoot) return err(c, 400, 'invalid_input', 'repoRoot is required.')
     if (!task) return err(c, 400, 'invalid_input', 'A task description is required.')
     if (!VALID_MODES.has(mode)) return err(c, 400, 'invalid_input', 'mode must be one of: auto, plan, ask.')
+    if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
 
     // ── "Use worktree": actually create one (ADR-316) ─────────────────────────────────────
     // Until now these three fields were stored and never read, so the toggle changed nothing and
@@ -251,7 +286,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // machine through. A `fetch(url,{method:'POST'})` with no body sets no Content-Type, making it
     // a CORS-SIMPLE request — no preflight — so any website the user happened to be visiting could
     // fire `npm install -g <pkg>` (and its postinstall scripts) with no interaction. Requiring a
-    // JSON content-type forces a preflight, which the origin allowlist then fails.
+    // JSON content-type forces a preflight, which then fails: /api answers no other origin's
+    // preflight outside /api/v1/sysinfo (server.ts).
     if (!(c.req.header('content-type') ?? '').toLowerCase().includes('application/json')) {
       return err(c, 400, 'unsupported_media_type', 'This endpoint requires Content-Type: application/json.')
     }
@@ -305,6 +341,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       // can be a stale 'running' from a crashed process — reconcileOnStartup fixes those, but
       // this is the authoritative signal the frontend uses to decide whether to reconnect).
       running: runs.isActive(run.id),
+      // A manual /compact still running (see `compacting` above), so a reopened page shows it
+      // and holds the composer back until it settles.
+      compacting: compacting.has(run.id),
       // Tasks waiting behind the active turn — the server-side message queue, so its chips
       // survive a page reload / reconnect.
       queued: runs.queued(run.id),
@@ -463,6 +502,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // never blocked.
     if (archived && runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before archiving this session.')
     db.setAgentRunArchived(id, archived)
+    // An archived session's background jobs end (SIGTERM, then the group kill after 3 s): it is closed, as a
+    // deleted one is, and nothing would ever end them otherwise but TurboLLM's own stop.
+    if (archived) void releaseCodeSessionProcesses(id)
     return c.json({ ok: true, archived })
   })
 
@@ -476,6 +518,10 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop the current run before deleting this session.')
     disposeLspClientsForConv(run.convId)
+    // Its agent's background jobs end first, and are gone before the worktree is removed: one whose cwd is the
+    // worktree stops Windows from removing the directory, and on POSIX it could keep writing into it, so `git
+    // worktree remove` (without --force) refused for its untracked files.
+    await releaseCodeSessionProcesses(id)
 
     // Clean up the session's worktree, but never at the cost of unmerged work. `git worktree
     // remove` (deliberately without --force) refuses while the worktree has modified or untracked
@@ -483,7 +529,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // session. Committed work is safe either way — removing a worktree does not delete its branch.
     let worktreeNote: string | undefined
     if (run.worktreePath && run.repoRoot) {
-      const removed = await removeSessionWorktree(run.repoRoot, run.worktreePath)
+      const removed = await removeWorktree(run.repoRoot, run.worktreePath)
       if (!removed.ok) worktreeNote = removed.message
     }
 
@@ -516,6 +562,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
     const b = await body<{ instructions?: string; model?: string }>(c)
+    const notString = nonStringField(b, ['instructions', 'model'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
     // Same Turbo Link branch as the turn route: a session whose history was generated on a
     // linked machine is compacted BY that machine, so this machine's engine state is not what
     // decides whether compaction can run.
@@ -526,6 +574,19 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       const ms = d.manager.status()
       if (ms.state !== 'running' || !ms.model) return err(c, 409, 'model_not_loaded', 'Load a model first.')
     }
+    // Checked and claimed with no await in between, so two /compact calls racing past the body
+    // read above cannot both start one. A turn is asked about again here: the check at the top ran
+    // before that read, and a turn sent during it was taken (nothing was claimed yet), so this
+    // compaction would have run beside it.
+    if (compacting.has(id)) return compactionInProgress(c)
+    if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before compacting.')
+    compacting.add(id)
+    // A local compaction's summary call goes straight to this machine's engine (code-upstream.ts), and nothing else
+    // held the engine's generation count meanwhile, as a turn does: the idle watchdog could unload the model under it,
+    // and GET /api/v1/activity's engineGenerating (which the Android app reads as busy) said idle. A Turbo Link one
+    // runs on the linked machine.
+    const local = !remoteRoute
+    if (local) d.manager.generationStart()
     try {
       const result = await compactCodeSession({
         d, convId: run.convId, sessionId: id, repoRoot: agentCwd(run),
@@ -538,6 +599,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       if (message === 'nothing_to_compact') return err(c, 400, 'nothing_to_compact', 'Nothing to compact yet — history is already short enough.')
       if (message === 'session_cleared') return err(c, 409, 'session_cleared', 'Resume this session before compacting — compacting a cleared session would lose the hidden history.')
       return err(c, 500, 'compact_failed', message)
+    } finally {
+      compacting.delete(id)
+      if (local) d.manager.generationEnd()
     }
   })
 
@@ -559,6 +623,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before clearing.')
+    if (compacting.has(id)) return compactionInProgress(c)
     if (run.revertedFromMessageId) return err(c, 409, 'session_reverted', 'Resume this session before clearing — it currently has a reverted message pending.')
     const conv = db.getConversation(run.convId, true)
     const lastMsg = (conv?.messages ?? []).at(-1)
@@ -580,6 +645,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const run = db.getAgentRun(id)
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before resuming.')
+    if (compacting.has(id)) return compactionInProgress(c)
     // Undoes whichever of the two independent resumable hidden-states is active (v33) — they're
     // mutually exclusive (see /clear and /revert's own guards), so at most one is ever set.
     if (run.revertedFromMessageId) {
@@ -622,6 +688,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
   app.post('/api/v1/code/sessions/:id/revert', async (c) => {
     const id = c.req.param('id')
     const b = await body<{ messageId?: string; revertFiles?: boolean }>(c)
+    if (nonStringField(b, ['messageId'])) return err(c, 400, 'invalid_input', 'messageId must be a string.')
     const messageId = (b.messageId ?? '').trim()
     if (!messageId) return err(c, 400, 'invalid_input', 'messageId is required.')
 
@@ -629,6 +696,10 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run) return err(c, 404, 'not_found', 'Session not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before reverting.')
+    // Same reason as during a run: a revert now would hide messages the compaction is summarizing,
+    // and its cut (stored when it settles) would then point at a hidden message, so the next turn
+    // would get the summary of the reverted steps back alongside every message still shown.
+    if (compacting.has(id)) return compactionInProgress(c)
     if (run.clearedUpToMessageId) return err(c, 409, 'session_cleared', 'Resume this session before reverting — it currently has cleared messages pending.')
     // A second revert while one is already pending SUPERSEDES it rather than 409ing (founder
     // feedback, 2026-07-24 — the earlier hard stop cost real friction on "revert, try again,
@@ -666,7 +737,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       // real seq-ordered row range regardless of is_active — the same range deactivateMessagesFrom
       // itself operates on below.
       const rangeMessages = db.getMessagesFromIncludingInactive(run.convId, messageId)
-      const result = revertFileEdits(rangeMessages, agentCwd(run))
+      // Stores the edits it undid flagged `reverted`, so a later revert reaching them skips them.
+      const result = revertFileEdits(rangeMessages, agentCwd(run), (msgId, toolCalls) => { db.updateMessage(msgId, { toolCalls }) })
       revertedFiles = result.reverted
       failedFiles = result.failed
     }
@@ -710,6 +782,9 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before committing.')
     const b = await body<{ message?: string; files?: string[] }>(c)
+    if (nonStringField(b, ['message'])) return err(c, 400, 'invalid_input', 'message must be a string.')
+    // Staged one by one: a string was staged character by character, a number threw (500).
+    if (badContextFiles(b.files)) return err(c, 400, 'invalid_input', 'files must be an array of strings.')
     try {
       const result = await commitGitChanges(agentCwd(run), b.message ?? '', b.files)
       return c.json({ ok: true, ...result })
@@ -719,6 +794,7 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
       if (/not a git repository/i.test(message)) return err(c, 400, 'not_a_git_repo', message)
       if (/nothing to commit|nothing staged/i.test(message)) return err(c, 400, 'nothing_to_commit', message)
       if (/outside the repo/i.test(message)) return err(c, 400, 'invalid_input', message)
+      if (/outside this folder are already staged/i.test(message)) return err(c, 409, 'staged_outside_folder', message)
       return err(c, 500, 'git_commit_failed', message)
     }
   })
@@ -765,11 +841,12 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
     if (runs.isActive(id)) return err(c, 409, 'run_active', 'Stop or wait for the current run before running a command.')
     const b = await body<{ command?: string; feedToModel?: boolean }>(c)
+    if (nonStringField(b, ['command'])) return err(c, 400, 'invalid_input', 'command must be a string.')
     const command = (b.command ?? '').trim()
     if (!command) return err(c, 400, 'invalid_input', 'A command is required.')
     const feedToModel = b.feedToModel !== false // default true (the `!` variant); `!!` sends false
 
-    let result
+    let result: Awaited<ReturnType<typeof runShellCommand>>
     try {
       result = await runShellCommand(command, agentCwd(run), id)
     } catch (e) {
@@ -837,6 +914,12 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const conv = db.getConversation(run.convId, true)
     if (!conv) return err(c, 404, 'not_found', 'Session conversation not found.')
     if (!run.repoRoot) return err(c, 400, 'invalid_input', 'Session has no repo root.')
+    // Before anything is stored: a turn queued now would run on the history the compaction is
+    // about to replace, and its message would land past the cut it is computing.
+    if (compacting.has(id)) return compactionInProgress(c)
+    if (badContextFiles(b.contextFiles)) return err(c, 400, 'invalid_input', 'contextFiles must be an array of strings.')
+    const notString = nonStringField(b, ['content', 'promptOverride', 'model'])
+    if (notString) return err(c, 400, 'invalid_input', `${notString} must be a string.`)
 
     // Fail fast with a clear message if there is nothing to run against right now. (A turn
     // that queues while a model is loaded but is then unloaded before it runs fails cleanly
@@ -887,7 +970,11 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     // commits silently did nothing while the repo went dirty. (The site fixed first was /compact —
     // a different one.) Caught by the pre-release review gate, which is why worktrees were cut
     // from v1.9.6 rather than shipped half-wired.
-    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
+    // ownsUserMsg: the row was stored just above for this message alone, so a Stop that drops the
+    // turn from the queue deletes it too (CodeRunManager.stop). A re-run of the last user message
+    // (no content) only points at a row that was already there, and that row is left alone; its
+    // history stops at that row (rerun, see CodeRunManager.pump).
+    const enqueueParams = { convId: run.convId, repoRoot: agentCwd(run), task, userMsgId, ownsUserMsg: Boolean(newContent), rerun: !newContent, thinkingBudget: b.thinkingBudget, reasoningEffort: parseReasoningEffort(b.reasoningEffort), model: requestedModel }
     if (kind === 'steer') {
       const { steered, queued } = await runs.steer(id, enqueueParams)
       return c.json({ ok: true, queued, steered, userMessageId: userMsgId }, 202)
@@ -910,7 +997,8 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
     const fromSeqRaw = Number.parseInt(c.req.query('fromSeq') ?? '', 10)
     const fromSeq = Number.isFinite(fromSeqRaw) && fromSeqRaw >= 0 ? fromSeqRaw : 0
 
-    return streamSSE(c, async (stream) => {
+    // holdOpen: the key that let it in can be revoked while the turn runs (see endStaleStreams).
+    return streamSSE(c, holdOpen(c, async (stream) => {
       const sub = runs.subscribe(id, fromSeq)
       stream.onAbort(() => { sub.close() })
 
@@ -930,6 +1018,6 @@ export function registerCodeRoutes(app: Hono, d: Deps, codeRuns?: CodeRunManager
         // The `id:` field carries the seq so the client can reconnect with ?fromSeq=<last id>.
         await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })
       }
-    })
+    }))
   })
 }

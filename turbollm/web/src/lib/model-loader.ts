@@ -1,8 +1,9 @@
 // The one way the UI loads a local model (ADR-434 (i)(3)).
 //
-// A chat model loads exactly as it always has. A text classification model on vLLM (a Jev model)
-// unloads whatever is running and takes Workspace over, so it asks first — but only when something
-// really is running, the same "active work, not an open window" rule as the daemon-restart gate.
+// A chat model loads exactly as it always has. A Jev text classification model loads into the primary
+// on the selected engine (vLLM, or any engine once every model is shown), unloads whatever is running
+// and takes Workspace over, so it asks first — but only when something really is running, the same
+// "active work, not an open window" rule as the daemon-restart gate.
 // When the daemon cannot be asked, it fails OPEN to the confirmation: "I couldn't check" is not
 // "nothing is running".
 import { useEffect } from 'react'
@@ -155,6 +156,8 @@ async function readActiveWork(): Promise<ActiveWork | null> {
   }
 }
 
+/** Anything a load would interrupt: work in progress, a reply parked on an approval (the load
+ *  denies its call), or an API client's generation. */
 function isBusy(work: ActiveWork): boolean {
-  return work.items.length > 0 || work.engineGenerating
+  return work.items.length > 0 || (work.waiting ?? []).length > 0 || work.engineGenerating
 }

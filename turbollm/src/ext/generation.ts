@@ -30,8 +30,9 @@
 //     `interactive: true` unconditionally — there is no ctx field that reaches it. Every tool
 //     defaults to 'ask' policy unless explicitly configured (tools/tool-policy.ts's own doc
 //     comment), so routing a public run through it would, by default, hang forever on the first
-//     tool call waiting on `waitForToolApproval` (tools/approval-gate.ts has no timeout) — an
-//     approval endpoint no external caller can ever reach.
+//     tool call waiting on `waitForToolApproval` (a chat turn's wait ends only after Settings'
+//     chatApprovalWaitMinutes, and never at 0) — an approval endpoint no external caller can ever
+//     reach.
 //
 // This is exactly the problem routines/chat-runner.ts already solved for a different detached
 // caller (Chat Routines), and its own header comment says as much: "NOT a reuse of
@@ -52,7 +53,9 @@ import type { ChatStore } from '../chat/store/chat-store.js'
 import type { Chat, ChatMessage, Scope } from '../chat/store/types.js'
 import type { RunDeps } from './routes.runs.js'
 import { withCurrentDate } from '../chat/chat-compaction.js'
-import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat.js'
+import { engineModelAlias, shapeForEngine } from '../engines/compat.js'
+import { litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request.js'
+import { engineErrorReason, engineErrorText } from '../engines/engine-error.js'
 import { clampMaxTokens } from '../config/config.js'
 import { executeToolCallWithApproval } from '../tools/execute-with-approval.js'
 import { initParseState, feedChunk, flushState, type ParseState } from '../chat/parser.js'
@@ -70,7 +73,7 @@ const DEFAULT_PAGE_SIZE = 200
  *  1000 pages at the max real page size is 200,000 messages, far beyond any realistic chat. */
 const MAX_PAGES = 1000
 
-interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string }
+interface WireMessage { role: string; content: unknown; tool_calls?: unknown; tool_call_id?: string; reasoning_content?: string }
 
 interface ToolCallRecord { id: string; name: string; args: Record<string, unknown>; result?: string; error?: string }
 
@@ -122,14 +125,20 @@ export interface GenerationCtx {
  *  the placeholder by id — see `createMakeBody`). Folds a prior assistant turn's `reasoning` back
  *  in as a `<think>` block exactly as chat-routes.ts's own resend logic does — `preserveThinking`
  *  is always on here, matching `ConversationStore.createConversation`'s own default for new chats
- *  (there is no per-chat toggle in the public API). */
-export function buildGenerationCtx(chat: Chat, engineHistory: ChatMessage[]): GenerationCtx {
+ *  (there is no per-chat toggle in the public API). For a LiteRT-LM engine (`engineKind`) it goes in the
+ *  message's `reasoning_content` instead, as the chat sends it there (chat-compaction.ts buildEngineMessages):
+ *  a bundle's template decides what of it the model sees, where the `<think>` text went into most of them verbatim,
+ *  every past turn's reasoning in a 4096-token context. */
+export function buildGenerationCtx(chat: Chat, engineHistory: ChatMessage[], engineKind = ''): GenerationCtx {
   const engineMessages: WireMessage[] = []
   if (chat.systemPrompt) engineMessages.push({ role: 'system', content: withCurrentDate(chat.systemPrompt) })
   for (const m of engineHistory) {
-    const content = (m.role === 'assistant' && m.reasoning?.trim())
-      ? `<think>\n${m.reasoning}\n</think>\n\n${m.content}`
-      : m.content
+    const reasoning = m.role === 'assistant' && m.reasoning?.trim() ? m.reasoning : undefined
+    if (reasoning && engineKind === 'litert-lm') {
+      engineMessages.push({ role: m.role, content: m.content, reasoning_content: reasoning })
+      continue
+    }
+    const content = reasoning ? `<think>\n${reasoning}\n</think>\n\n${m.content}` : m.content
     engineMessages.push({ role: m.role, content })
   }
   return { chat, engineMessages }
@@ -264,7 +273,8 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
 
   const engineKind = servingEngineKind(d)
   // BUG-006 (chat-routes.ts): vLLM/SGLang/mlx-vlm require the OpenAI-spec `repetition_penalty`
-  // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason.
+  // name, not llama.cpp's `repeat_penalty`. Same mapping, same reason; LiteRT-LM keeps llama.cpp's
+  // name, whose window the Android app's server applies as llama.cpp does (chat-routes.ts).
   const repeatPenaltyKey = (engineKind === 'vllm' || engineKind === 'sglang' || engineKind === 'mlx-vlm') ? 'repetition_penalty' : 'repeat_penalty'
   const sampling = ctx.chat.sampling ?? {}
   const samplingOverride = mapSampling(sampling, repeatPenaltyKey)
@@ -273,12 +283,16 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
 
   // vLLM is strict about a `tools` array defaulting tool_choice to "auto" unless launched with
   // --enable-auto-tool-choice (chat-routes.ts's own BUG note) — same engine-kind gate here.
-  // LiteRT-LM is withheld too, until its server is verified to honor `tools` (PR #271 review).
+  // A LiteRT-LM model gets them when it calls tools and they fit, as in chat (litertLmToolsFor); they
+  // were withheld from every LiteRT-LM model. What it is not sent is logged: this API has no note event.
   const toolDefs = d.tools ? await d.tools.buildToolDefinitions() : []
-  const toolsSupported =
-    engineKind !== 'vllm' && engineKind !== 'sglang' && engineKind !== 'litert-lm' && toolDefs.length > 0
+  const toolsSupported = engineKind !== 'vllm' && engineKind !== 'sglang' && toolDefs.length > 0
+  const litertModel = engineKind === 'litert-lm' ? d.scanner?.get?.(loadedModel.key) : undefined
+  let toolsNoted = false
 
-  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({ role: m.role, content: m.content }))
+  const messages: WireMessage[] = ctx.engineMessages.map((m) => ({
+    role: m.role, content: m.content, ...(m.reasoning_content ? { reasoning_content: m.reasoning_content } : {}),
+  }))
 
   let iter = 0
   let finishedCleanly = false
@@ -297,8 +311,16 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
     const cappedMax = clampMaxTokens(reqBody.max_tokens as number | undefined, maxLimit)
     if (cappedMax != null) reqBody.max_tokens = cappedMax
     else delete reqBody.max_tokens
-    applyEngineTokenLimit(engineKind, reqBody)
-    if (toolsSupported) reqBody.tools = toolDefs
+    shapeForEngine(engineKind, reqBody)
+    const samplingNote = engineKind === 'litert-lm' && iter === 1 ? litertLmSamplingNote(reqBody) : undefined
+    if (samplingNote) console.log(`[ext] ${samplingNote}`)
+    const ignoredNote = engineKind === 'litert-lm' && iter === 1 ? litertLmIgnoredFieldsNote(reqBody) : undefined
+    if (ignoredNote) console.log(`[ext] ${ignoredNote}`)
+    if (toolsSupported && engineKind === 'litert-lm') {
+      const pick = litertLmToolsFor(litertModel, toolDefs, messages, loadedModel.ctx)
+      if (pick.tools.length) reqBody.tools = pick.tools
+      if (pick.note && !toolsNoted) { toolsNoted = true; console.log(`[ext] ${pick.note}`) }
+    } else if (toolsSupported) reqBody.tools = toolDefs
 
     let res: Response
     try {
@@ -315,7 +337,9 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
       return
     }
     if (!res.ok || !res.body) {
-      hooks.onError(`Engine returned ${res.status}`)
+      // The engine's reason, as the chat gives it: it said only the status code.
+      const reason = res.ok ? '' : await engineErrorReason(res)
+      hooks.onError(reason ? `Engine returned ${res.status}: ${engineErrorText(d, engineKind, reason)}` : `Engine returned ${res.status}`)
       return
     }
 
@@ -453,6 +477,14 @@ async function runGenerationLoop(d: Deps, ctx: GenerationCtx, emit: EmitSink, si
           interactive: false,
           agentAllowedTools: [],
           isCodeAuthorized: false, // no HTTP request to authorize against here (§5.1) — fail closed
+          // A tenant's run may not author, edit or fire a chat routine on an agent that lists one of
+          // the owner's MCP tools, nor create such an agent, as a routine's own unattended run may
+          // not (chat-runner.ts): the routine then runs that MCP tool with no approval. Without it a
+          // tenant whose install had update_routine and run_routine_now on Allow rewrote the
+          // prompt of the owner's MCP routine and fired it, running an MCP tool left on Ask (which
+          // the tenant could not call itself) on the tenant's prompt, then on every later fire.
+          // MCP tools themselves still run under their own policy.
+          refuseMcpAgentsAndRoutines: true,
         })
         hooks.onToolCall({ id: tc.id, name: tc.name, args, result: approved.error ? undefined : approved.result, error: approved.error })
         messages.push({ role: 'tool', content: approved.result, tool_call_id: tc.id })
@@ -561,7 +593,7 @@ export function createMakeBody(d: Deps): RunDeps['makeBody'] {
       // chat-routes.ts's own `allMsgs = conv.messages.filter(m => m.id !== assistantMsg.id)`).
       const fullHistory = await loadFullHistory(d.chatStore, scope, chatId)
       const engineHistory = fullHistory.filter((m) => m.id !== messageId)
-      const ctx = buildGenerationCtx(chat, engineHistory)
+      const ctx = buildGenerationCtx(chat, engineHistory, servingEngineKind(d))
 
       release = d.gate ? await d.gate.acquire('bg', { signal }) : null
       d.manager.generationStart()

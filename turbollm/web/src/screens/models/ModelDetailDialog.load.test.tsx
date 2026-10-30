@@ -179,12 +179,16 @@ describe('ModelDetailDialog — a failed load, reported after the dialog closed'
   })
 })
 
+// The dialog sends and saves only what the user set (user-set-profile.ts): with nothing moved, that is nothing, marked
+// as such, so the model keeps its own and the automatic values.
+const NOTHING_SET = { userSetOnly: true }
+
 describe('ModelDetailDialog — "Remember these settings", then load, after the dialog closed', () => {
-  it('saves the draft, then requests the load with the same overrides', async () => {
+  it('saves what the user set, then requests the load with the same overrides', async () => {
     const onClose = await openDialogFor(CHAT_MODEL)
     await pressLoadAndSeeTheSheetClose()
-    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('chat-1', profile()))
-    expect(api.saveModelProfile).toHaveBeenCalledWith('chat-1', profile(), 'e1')
+    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('chat-1', NOTHING_SET))
+    expect(api.saveModelProfile).toHaveBeenCalledWith('chat-1', NOTHING_SET, 'e1')
     expect(api.saveModelProfile.mock.invocationCallOrder[0]).toBeLessThan(api.loadModel.mock.invocationCallOrder[0])
     expect(onClose).toHaveBeenCalledTimes(1)
   })
@@ -193,13 +197,13 @@ describe('ModelDetailDialog — "Remember these settings", then load, after the 
     api.saveModelProfile.mockRejectedValue(new ApiError('save_failed', 'Disk full', 500))
     await openDialogFor(CHAT_MODEL)
     await pressLoadAndSeeTheSheetClose()
-    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('chat-1', profile()))
+    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('chat-1', NOTHING_SET))
   })
 
   it('requests a Jev load with the same overrides once the save is done', async () => {
     await openDialogFor(JEV_MODEL)
     await pressLoadAndSeeTheSheetClose()
-    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('jev-1', profile()))
+    await waitFor(() => expect(api.loadModel).toHaveBeenCalledWith('jev-1', NOTHING_SET))
     expect(api.saveModelProfile.mock.invocationCallOrder[0]).toBeLessThan(api.loadModel.mock.invocationCallOrder[0])
   })
 })

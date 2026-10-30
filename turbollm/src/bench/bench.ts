@@ -8,20 +8,22 @@
 // profile (tunedBy:'bench'), persists a benchResults row, and — when telemetry is on — queues an
 // anonymized bench_result event. Single active run; additive; fail-safe (a bad candidate is
 // recorded and the sweep continues).
-import { execFile } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { tetheredExecFile } from '../util/tether'
+import { readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB, type BenchResult, type ConfigStore, type ModelPreset } from '../config/config'
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
 import type { Scanner, ModelEntry } from '../models/scanner'
-import { deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, profileToArgs, resolveProfile, type GpuProfile, type LoadProfile } from '../models/profile'
+import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
 import { getSysInfo, unifiedMemoryOnly, type SysInfo } from '../sysinfo/sysinfo'
 import type { HfClient } from '../hf/hf'
 import { inferRepoFromPath } from '../api/path-utils'
 import { enqueue } from '../telemetry/queue'
+import { toSafeIdent, toSafeNameIdent } from '../telemetry/core/validate'
 import { TELEMETRY_SCHEMA_VERSION } from '../telemetry/schema'
 import { classifyBenchFailure } from '../telemetry/classify'
 import { telemetryDisabled } from '../telemetry/disabled'
@@ -155,6 +157,10 @@ const TOTAL_BUDGET_MS = 45 * 60_000
 // during graph capture once the allocation failed). Treat all of these as OOM so the search
 // offloads more and the result reads as a fit problem rather than a mystery crash.
 const OOM_RE = /out of memory|cudaMalloc|failed to allocate|unable to allocate|device not ready|CUDA error/i
+// The run's result when another engine was selected while it ran, or its engine was removed (Disable, Delete), which
+// leaves none selected (Registry.remove). See BenchRunner.startEngine.
+const ENGINE_SWITCHED = 'Auto-tune stopped: another engine was selected during the run. Run it again to tune that engine.'
+const ENGINE_REMOVED = 'Auto-tune stopped: its engine was removed during the run. Select an engine to tune this model again.'
 
 // Auto-tune may also sweep the KV-cache quant — but only ever SELECTS a quality-preserving type:
 // full-precision f16, near-lossless q8_0, and (on TurboQuant forks) turbo4 (≈ q8_0 quality). This
@@ -177,6 +183,22 @@ const KV_BYTES: Record<string, number> = {
   q4_0: 0.5, q4_1: 0.5, iq4_nl: 0.5, turbo4: 0.5, turbo3: 0.375, turbo2: 0.25,
 }
 
+/** A finished run's winner, held for the results dialog's Save/Cancel (BenchRunner.winning). `saved` is what Save
+ *  stores: what the user set and what the tune chose (BenchRunner.run); absent on a result an earlier build held,
+ *  which Save stores whole, as it did. */
+type Winning = { modelKey: string; profile: LoadProfile; saved?: Partial<LoadProfile>; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
+
+/** The held result on disk (BenchRunner.writeHeld): the winner without its scanner entry, which a restore looks up
+ *  again, and what GET /status showed of the finished run. */
+interface HeldResultFile {
+  version: 1
+  winning: Omit<Winning, 'entry'>
+  state: Pick<BenchState, 'modelKey' | 'bestTps' | 'result' | 'candidates'>
+}
+
+/** The held result's file, in the config dir beside config.json. */
+const HELD_RESULT_FILE = 'bench-result.json'
+
 export class BenchError extends Error {
   constructor(
     public code: string,
@@ -190,6 +212,11 @@ export class BenchError extends Error {
 export class BenchRunner {
   private state: BenchState = { running: false }
   private cancelled = false
+  // The engine this run tunes, taken once by start(): every probe launches on it, and its caps and the id the result is
+  // saved under are its own. `engineSwitched`: the run stopped because its engine is no longer the selected one, and
+  // why (ENGINE_SWITCHED or ENGINE_REMOVED, startEngine).
+  private engine: Engine | null = null
+  private engineSwitched: string | null = null
   private deadline = 0
   // Aborts the in-flight measurement request the instant cancel() is called, so a
   // stop/restart/load (kill switches) interrupts auto-tune immediately rather than
@@ -198,10 +225,13 @@ export class BenchRunner {
   private runLog: BenchLogEntry[] = []
   private runLogMeta: { modelKey: string; startedAt: string; sys: SysInfo } | null = null
   private logWinner: BenchLogWinner | null = null
-  // The finished run's winning candidate, held (not persisted) until the user clicks Save.
-  private winning:
-    | { modelKey: string; profile: LoadProfile; cand: BenchCandidate; entry: ModelEntry; sys: SysInfo; engineVersion: string; engineId: string }
-    | null = null
+  // The finished run's winning candidate, held until the user clicks Save or Cancel (or a new run starts). Kept on
+  // disk too (writeHeld), so it outlives the process: the Android app's service stops once nothing is loaded and
+  // nothing runs, and a finished tune leaves the engine stopped, so a result held only in memory was lost with the
+  // process Android then freezes and kills, and with Quit or a daemon restart. `restored`: one read back from disk
+  // whose model the scanner has not listed yet (resolveRestored).
+  private winning: Winning | null = null
+  private restored: HeldResultFile | null = null
 
   constructor(
     private manager: Manager,
@@ -211,7 +241,9 @@ export class BenchRunner {
     private version: string,
     /** Used to fetch the model's HF card for card-derived sampling (ADR-099). */
     private hf: HfClient,
-  ) {}
+  ) {
+    this.restoreHeld()
+  }
 
   /** Journey telemetry (ADR-299 `model_first_load`). Set post-construction in
    *  cli.ts, matching `Manager.onLoadSettled`'s wiring — the Emitter is built
@@ -221,6 +253,7 @@ export class BenchRunner {
 
   /** Live state for GET /status. */
   status(): BenchState {
+    this.resolveRestored()
     return this.state
   }
 
@@ -229,15 +262,98 @@ export class BenchRunner {
     return this.state.running
   }
 
+  /** The engine a running run tunes (the one start() took), or null when none runs. Its model is stopped between two
+   *  probes, so an engine update reads it as idle there: the update routes and the scheduler ask this instead. */
+  tuningEngine(): Engine | null {
+    return this.state.running ? this.engine : null
+  }
+
   /** Cancel the active run: aborts the in-flight measurement immediately, stops after the
    *  current step, leaves the engine stopped, and keeps the partial results gathered so far
-   *  (AC#3). A no-op when nothing is running. */
+   *  (AC#3). A no-op when nothing is running.
+   *
+   *  This is the kill switch every engine stop, model load and restart runs (engine-lifecycle.ts), and a ComfyUI
+   *  render's: it stops running work only. A finished run's unsaved result is NOT dropped here, though it used to be:
+   *  those callers fire with no run left to stop (the Eject, a model load or restart, a Turbo Link unload), so a tune
+   *  that finished while the page was closed was gone before the user saw its results dialog. Save writes config and
+   *  needs no engine. Only the user's own Cancel (POST /bench/cancel: discardResult) and a new run
+   *  (start) discard it. A run cancelled here holds no result: run() re-checks `cancelled` before it takes a winner. */
   cancel(): void {
-    this.winning = null // discard any unsaved result too
-    this.state = { ...this.state, result: undefined } // don't re-show the results dialog
     if (!this.state.running) return
     this.cancelled = true
     this.abort?.abort()
+  }
+
+  /** Drop a finished run's unsaved result (the results dialog's Cancel, through POST /bench/cancel), so the dialog is
+   *  not shown again and Save answers 409 no_bench_result. A no-op when no result is held. */
+  discardResult(): void {
+    this.winning = null
+    this.dropHeld()
+    if (this.state.result) this.state = { ...this.state, result: undefined }
+  }
+
+  private heldPath(): string {
+    return join(this.store.dir(), HELD_RESULT_FILE)
+  }
+
+  /** Write the held result to disk (see `winning`), as the daemon's other state files are written: a temp file of this
+   *  process's own, renamed over the last one, so a kill mid-write leaves the previous file whole. Best-effort: a
+   *  failed write leaves the result held in memory, as before. */
+  private writeHeld(): void {
+    const w = this.winning
+    if (!w) return
+    let tmp = ''
+    try {
+      const { entry: _entry, ...winning } = w
+      const { modelKey, bestTps, result, candidates } = this.state
+      const held: HeldResultFile = { version: 1, winning, state: { modelKey, bestTps, result, candidates } }
+      const path = this.heldPath()
+      tmp = `${path}.${process.pid}.tmp`
+      writeFileSync(tmp, JSON.stringify(held))
+      renameSync(tmp, path)
+    } catch {
+      if (tmp) rmSync(tmp, { force: true })
+    }
+  }
+
+  /** Delete the held result's file (Save, Cancel, a new run, or its model gone). */
+  private dropHeld(): void {
+    this.restored = null
+    try {
+      rmSync(this.heldPath(), { force: true })
+    } catch { /* no config dir: nothing was written */ }
+  }
+
+  /** Read back a held result an earlier process wrote (writeHeld). Its model is looked up again (resolveRestored). */
+  private restoreHeld(): void {
+    try {
+      const held = JSON.parse(readFileSync(this.heldPath(), 'utf8')) as HeldResultFile
+      if (held?.version !== 1 || !held.winning?.modelKey || !held.state?.result) {
+        this.dropHeld()
+        return
+      }
+      this.restored = held
+    } catch {
+      return // none held (or no config dir)
+    }
+    this.resolveRestored()
+  }
+
+  /** A result read back from disk becomes the held one once the scanner lists its model, which Save reports with, as
+   *  after a run. The daemon constructs the runner before its first model scan has finished, so until a scan has
+   *  finished it waits; one that finished without the model drops it (the model was deleted or its folder removed). */
+  private resolveRestored(): void {
+    const r = this.restored
+    if (!r || this.state.running) return
+    const entry = this.scanner.get(r.winning.modelKey)
+    if (entry) {
+      this.restored = null
+      this.winning = { ...r.winning, entry }
+      this.state = { running: false, done: true, ...r.state }
+      return
+    }
+    const scan = this.scanner.list?.()
+    if (scan && !scan.scanning && scan.lastScanAt) this.dropHeld()
   }
 
   /** Report a sweep's conclusion (ADR-299; `model_load` config capture is
@@ -301,14 +417,44 @@ export class BenchRunner {
     await this.manager.stopAndWait({ force: this.cancelled }).catch(() => {})
   }
 
+  /** Every engine start in this file. A cancelled run starts nothing more, checked inside the load gate: a ComfyUI
+   *  render cancels auto-tune (ComfyGuard.acquire), since Manager.start runs no ComfyUI pre-start hook, and a probe
+   *  that was waiting for the gate would otherwise load gigabytes under that render. Callers read the throw as the
+   *  start failing.
+   *
+   *  Every start is on the run's own engine (`opts.engine` is `this.engine`), and only while that engine is still the
+   *  selected one, checked in the same gate. The probes used to look the active engine up again each time, and the
+   *  primary is stopped between two of them, so a switch there (the activate route checked only the primary) sent
+   *  the rest of the run to the newly selected engine: a GGUF launched on vLLM with llama.cpp's flags, or a Vulkan
+   *  build measured, and the winner saved and pinned under the engine the run started on. The activate route now
+   *  refuses a switch during a run; an install or Enable that activates another engine still can make one, and the
+   *  run then stops here as a cancel does, with ENGINE_SWITCHED as its error, rather than load a model on an engine
+   *  the user has just left. A Disable or Delete of the run's engine between two probes leaves no engine selected
+   *  (Registry.remove): the run stops the same way, with ENGINE_REMOVED. */
+  private startEngine(opts: StartOpts): Promise<void> {
+    return this.manager.start(opts, {
+      beforeStart: async () => {
+        if (this.cancelled) throw new Error('Auto-tune was cancelled.')
+        const selected = this.registry.active()
+        if (selected?.id !== opts.engine.id) {
+          this.engineSwitched = selected ? ENGINE_SWITCHED : ENGINE_REMOVED
+          this.cancelled = true
+          throw new Error(this.engineSwitched)
+        }
+      },
+    })
+  }
+
   /** Persist the finished run's winning profile (the user clicked Save). Returns false if there is
    *  nothing to save (no completed run, or it was already saved / discarded). */
   saveResult(): boolean {
+    this.resolveRestored()
     const w = this.winning
     if (!w) return false
-    const record = this.persistBest(w.modelKey, w.profile, w.cand, w.engineId)
+    const record = this.persistBest(w.modelKey, w.saved ?? w.profile, w.cand, w.engineId)
     this.queueTelemetry(record, w.entry, w.sys, this.version, w.engineVersion)
     this.winning = null
+    this.dropHeld()
     this.state = { ...this.state, result: undefined } // consumed — don't re-show the dialog
     return true
   }
@@ -367,8 +513,11 @@ export class BenchRunner {
     if (entry.incomplete || entry.parseError) throw new BenchError('model_not_loadable', 'This model is incomplete or unreadable.')
 
     this.cancelled = false
+    this.engine = active
+    this.engineSwitched = null
     this.abort = new AbortController()
     this.winning = null
+    this.dropHeld()
     this.runLog = []
     this.runLogMeta = null
     this.logWinner = null
@@ -387,7 +536,7 @@ export class BenchRunner {
   private async run(modelKey: string, entry: ModelEntry, base?: Partial<LoadProfile>): Promise<void> {
     const sys = getSysInfo()
     this.runLogMeta = { modelKey, startedAt: new Date().toISOString(), sys }
-    const active = this.registry.active()
+    const active = this.engine
     const caps = active?.capabilities ?? { flags: [], kvTypes: [] }
     // Per-engine profile (issue #35): tune from the profile saved for the active engine
     // (falling back to the '*' migrated profile), so a re-tune builds on this engine's own basis.
@@ -473,14 +622,14 @@ export class BenchRunner {
         await this.stopEngine() // in case the LLM fallback loaded a model
       }
       // A cancel DURING extraction (the LLM fallback can run for minutes) must not resurrect the
-      // results dialog or re-hold a profile the user just discarded: cancel() cleared winning +
-      // result, but couldn't stop this still-running run. Re-check before committing the winner.
+      // results dialog or hold a profile the user (or a kill switch) just cancelled: cancel() only
+      // flags this still-running run, so re-check before committing the winner.
       if (this.cancelled) {
         // A user who backs out of their FIRST sweep before a profile committed is
         // not the same signal as one whose load broke — same reasoning already
         // applied to download outcomes (ADR-299).
         this.reportFirstLoad('cancelled')
-        this.state = { running: false, modelKey, done: true, candidates: results }
+        this.state = { running: false, modelKey, done: true, candidates: results, ...(this.engineSwitched ? { error: this.engineSwitched } : {}) }
         return
       }
       const profile =
@@ -494,7 +643,25 @@ export class BenchRunner {
       // Hold the winner instead of auto-saving — the UI shows a Save/Cancel results dialog and
       // persists via POST /bench/save only when the user clicks Save.
       this.reportFirstLoad('ok', undefined, active ? { profile, entry, engine: active, sys } : undefined)
-      this.winning = { modelKey, profile, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
+      // What Save stores: what the user set (the saved profile's, and the dialog's base, which holds only
+      // that) and what the tune chose: the offload it found, the GPU split it picked, the card's sampling,
+      // and the context it was measured at, since the fit it found holds for that context only. Not the
+      // rest of the resolved winner: the defaults stored with it were the user's choice from then on, so a
+      // later change to Settings > Model Defaults stopped reaching a tuned model's other settings.
+      const auto = automaticProfile(entry, sys, defaults)
+      const seed = legacySeedProfile(entry, sys, defaults, auto)
+      const userSet = mergeUserSet(userSetProfile(saved, seed), userSetProfile(base, seed))
+      const sampling = { ...(userSet.sampling ?? {}), ...(recommended && hasAnySampling(recommended) ? recommended : {}) }
+      const toSave: Partial<LoadProfile> = {
+        ...userSet,
+        ctx: profile.ctx,
+        ngl: profile.ngl,
+        nCpuMoe: profile.nCpuMoe,
+        ...(JSON.stringify(profile.gpu) !== JSON.stringify(auto.gpu) ? { gpu: profile.gpu } : {}),
+        ...(Object.keys(sampling).length > 0 ? { sampling: sampling as LoadProfile['sampling'] } : {}),
+        userSetOnly: true,
+      }
+      this.winning = { modelKey, profile, saved: toSave, cand: best.cand, entry, sys, engineVersion: active?.version ?? '', engineId: active?.id ?? '' }
       this.logWinner = { params: best.cand.params, tps: best.cand.tps ?? 0, prefillTps: best.cand.prefillTps, ttftMs: best.cand.ttftMs ?? 0, vramMb: best.cand.vramMb }
       this.state = {
         running: false,
@@ -520,13 +687,14 @@ export class BenchRunner {
         },
         candidates: results,
       }
+      this.writeHeld()
     } else {
       // No candidate measured successfully — keep the partial results, surface a soft error
       // (every candidate's outcome is visible in `candidates`). When every trial ran out of VRAM,
       // say so with the context size so the fix (lower ctx) is obvious — rather than a vague crash.
       const memoryBound = results.length > 0 && results.every((r) => r.outcome === 'oom')
       const err = this.cancelled
-        ? undefined
+        ? this.engineSwitched ?? undefined
         : memoryBound
           ? `This model doesn't fit on your GPU at ${baseProfile.ctx.toLocaleString()} context — even with maximum CPU offload it ran out of VRAM. Lower the context length and try again.`
           : 'No candidate completed successfully.'
@@ -587,8 +755,11 @@ export class BenchRunner {
     const unified = unifiedMemoryOnly(sys)
 
     if (sys.gpus.length > 0) {
-      // Binary search ngl ∈ [0, blockCount] for the HIGHEST that loads with enough headroom VRAM.
-      const hi0 = entry.blockCount > 0 ? entry.blockCount : 99
+      // Binary search ngl ∈ [0, blockCount + 1] for the HIGHEST that loads with enough headroom VRAM.
+      // +1 because llama.cpp offloads n_layer + 1 layers (the repeating blocks plus the output
+      // layer): `-ngl blockCount` still leaves one of them on the CPU ("offloaded 32/33 layers").
+      // The VRAM estimates clamp ngl to blockCount, so the extra step costs them nothing.
+      const hi0 = entry.blockCount > 0 ? entry.blockCount + 1 : 99
 
       // Spill is measured per probe (see moeSearch and spill.ts) — no calibration phase.
       let lo = 0, hi = hi0
@@ -818,7 +989,7 @@ export class BenchRunner {
     caps: Engine['capabilities'],
   ): Promise<{ outcome: 'ok' | 'timeout' | 'crash' | 'oom'; vramAbsMb: number | null; spillMb: number | null }> {
     const profile = withBalancedSplit(profileIn, entry, sys)
-    const active = this.registry.active()
+    const active = this.engine
     if (!active) return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     const testDeadline = Math.min(Date.now() + READY_TIMEOUT_MS + 5_000, this.deadline)
     const opts: StartOpts = {
@@ -833,7 +1004,7 @@ export class BenchRunner {
     // a dedicated card, far higher with a display attached).
     const sharedBefore = await readGpuSharedMb(sys)
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return { outcome: 'crash', vramAbsMb: null, spillMb: null }
     }
@@ -842,7 +1013,7 @@ export class BenchRunner {
     let spill: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the readings are final
-      vramAbsMb = await readGpuVramMb(sys)
+      vramAbsMb = await readGpuVramMb(sys, profile)
       spill = spillMb(sharedBefore, await readGpuSharedMb(sys))
     }
     await this.stopEngine()
@@ -928,7 +1099,12 @@ export class BenchRunner {
     // Live sub-phase progress so each (possibly multi-minute) trial isn't a silent wait.
     const phase = (p: string) => { this.state = { ...this.state, step: `${stepPrefix} — ${p}` } }
 
-    const active = this.registry.active()
+    // A cancel that landed during the search's last probe ends that loop, but the search still
+    // calls benchAt for the best ngl/nCpuMoe found so far — never start another engine load then.
+    // 'crash' is the same non-ok outcome awaitReady reports for a cancel.
+    if (this.cancelled) return fail('crash')
+
+    const active = this.engine
     if (!active) return fail('crash')
 
     // Per-test cap (PER_TEST_TIMEOUT_MS, 10 min — raised from 3 for deep-ctx trials, ADR-217
@@ -948,11 +1124,11 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
 
-    const vramBefore = await readGpuVramMb(sys)
+    const vramBefore = await readGpuVramMb(sys, profile)
     const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return fail('crash')
     }
@@ -972,8 +1148,8 @@ export class BenchRunner {
     const logPath = this.manager.logPath()
 
     // Bench request sized to this profile's configured ctx (ADR-217 round 2) — see
-    // buildBenchMessages for why depth matters here.
-    const benchMessages = buildBenchMessages(profile.ctx)
+    // buildBenchMessages for why depth matters here — as one request gets it (benchSlotCtx).
+    const benchMessages = buildBenchMessages(benchSlotCtx(profile, caps))
 
     // Prefill gate (doubles as warmup): stream the prompt and fail fast if it's spilling/crawling
     // or the engine faults — so a config that doesn't fit at this ctx is rejected in seconds and the
@@ -986,7 +1162,7 @@ export class BenchRunner {
     }
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
-    const vramAfter = await readGpuVramMb(sys)
+    const vramAfter = await readGpuVramMb(sys, profile)
     // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
     // see, since the probe never generates and so never allocates the prefill compute buffers.
     const sharedAfter = await readGpuSharedMb(sys)
@@ -1264,7 +1440,7 @@ export class BenchRunner {
     sys: SysInfo,
     card: string,
   ): Promise<CardSampling | undefined> {
-    const active = this.registry.active()
+    const active = this.engine
     if (!active) return undefined
     const opts: StartOpts = {
       engine: active,
@@ -1273,7 +1449,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
     try {
-      await this.manager.start(opts)
+      await this.startEngine(opts)
     } catch {
       return undefined
     }
@@ -1321,7 +1497,7 @@ export class BenchRunner {
 
   /** Save the winning profile as the model's saved profile (tunedBy:'bench') and
    *  persist a benchResults row. Both via the same ConfigStore the route uses. */
-  private persistBest(modelKey: string, profile: LoadProfile, cand: BenchCandidate, engineId: string): BenchResult {
+  private persistBest(modelKey: string, profile: Partial<LoadProfile>, cand: BenchCandidate, engineId: string): BenchResult {
     const record: BenchResult = {
       modelKey,
       tps: cand.tps ?? 0,
@@ -1330,7 +1506,7 @@ export class BenchRunner {
       params: cand.params,
       ts: new Date().toISOString(),
     }
-    const tuned: LoadProfile = { ...profile, tunedBy: 'bench' }
+    const tuned: Partial<LoadProfile> = { ...profile, tunedBy: 'bench' }
     this.store.update((cfg) => {
       // Per-engine profile (issue #35): a tune is only valid for the engine it ran on, so
       // persist into that engine's slot only. No active engine (engineId '') → '*' fallback.
@@ -1389,15 +1565,18 @@ export class BenchRunner {
         ts: record.ts,
         machineId,
         app: { version: appVersion, os: sys.os },
+        // Identifier fields go through toSafeIdent — a raw CPU/GPU name with `@`, `/` or `[...]`
+        // fails validation and the whole result is dropped before it is queued. The model name
+        // and engine version use toSafeNameIdent, so a path-shaped one is sent as 'unknown'.
         hw: {
-          cpu: sys.cpu,
+          cpu: toSafeIdent(sys.cpu),
           ramMb: sys.ramMB,
-          gpus: sys.gpus.map((g) => ({ name: g.name, vramMb: g.vramMb })),
+          gpus: sys.gpus.map((g) => ({ name: toSafeIdent(g.name), vramMb: g.vramMb })),
         },
         payload: {
           source: 'autotune',
-          model: { name: entry.name, quant: entry.quant, sizeBytes: entry.sizeBytes, arch: entry.arch, moe: entry.moe },
-          engine: { version: engineVersion },
+          model: { name: toSafeNameIdent(entry.name), quant: toSafeIdent(entry.quant), sizeBytes: entry.sizeBytes, arch: toSafeIdent(entry.arch), moe: entry.moe },
+          engine: { version: toSafeNameIdent(engineVersion) },
           params: record.params,
           result: { tps: record.tps, ttftMs: record.ttftMs, vramMb: record.vramMb, outcome: 'ok' },
         },
@@ -1501,6 +1680,17 @@ export function benchPromptTokens(ctx: number): number {
   return Math.max(256, Math.min(BENCH_MAX_PROMPT_TOKENS, Math.floor(ctx * BENCH_CTX_FRACTION)))
 }
 
+/** The context one bench request gets: the profile's ctx, or one slot's share of it. Without --kv-unified,
+ *  llama.cpp gives each of the `parallel` slots ctx / parallel cells (n_ctx_seq = pad256(n_ctx / n_seq_max),
+ *  llama-context.cpp), and llama-server refuses a prompt longer than its slot. A bench prompt sized from the whole
+ *  ctx then had every candidate's prefill refused with parallel above 1, and auto-tune found nothing. The flag is
+ *  passed as profileToArgs passes it; an engine without it splits the context per slot too. */
+export function benchSlotCtx(p: Pick<LoadProfile, 'ctx' | 'parallel' | 'kvUnified'>, caps: Pick<Engine['capabilities'], 'flags'>): number {
+  const seqs = Math.max(1, p.parallel)
+  const unified = p.kvUnified && (caps.flags.length === 0 || caps.flags.includes('--kv-unified'))
+  return seqs === 1 || unified ? p.ctx : Math.floor(p.ctx / seqs)
+}
+
 /** Deterministic filler topics used to pad the bench prompt out toward the target depth (ADR-217
  *  round 2) — realistic technical prose, not Lorem-ipsum repetition, so the attention pattern isn't
  *  degenerate. Cycled in a fixed order (never random / never Date/Math.random-seeded) so a bench
@@ -1542,7 +1732,12 @@ export function buildBenchMessages(ctx: number): BenchMessage[] {
   for (let round = 0; chars < targetChars; round++) {
     const topic = FILLER_TOPICS[round % FILLER_TOPICS.length]
     const q = `Can you explain ${topic}?`
-    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1)
+    // Clip the last answer to what is left of the target. A whole answer is ~2.8k tokens, so
+    // appending it unclipped overshot a small ctx (2-4k) past the slot's n_ctx, which llama-server
+    // rejects outright — every candidate then failed and auto-tune found nothing.
+    const room = targetChars - chars - q.length
+    if (room <= 0) break
+    const a = fillerAnswer(topic, Math.floor(round / FILLER_TOPICS.length) + 1).slice(0, room)
     messages.push({ role: 'user', content: q }, { role: 'assistant', content: a })
     chars += q.length + a.length
   }
@@ -1952,45 +2147,68 @@ export function kvSpeedAdvisory(tps: number | null, currentKv: string, supported
   return `This result used the "${currentKv}" KV cache type. A different type (e.g. "${smallest}") may run faster, at some output-quality cost — try it manually if you want the extra speed.`
 }
 
-/** Best-effort current NVIDIA VRAM use in MB (sum across GPUs). Null on non-NVIDIA
+/** Which card a VRAM reading should cover — see {@link vramCardFor}. `of` is how many cards
+ *  sysinfo enumerated, so a reader can tell whether its own listing lines up with that index. */
+export interface VramCard {
+  index: number
+  of: number
+}
+
+/** The card a single-GPU ('none') split runs on, indexed exactly like `gpuBudgetMb` so the
+ *  reading and the budget it is judged against describe the SAME card (a summed reading against
+ *  one card's budget counted the other cards' desktop/browser/ComfyUI memory as this card's).
+ *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool. */
+export function vramCardFor(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): VramCard | undefined {
+  if (sys.gpus.length < 2 || p?.gpu?.splitMode !== 'none') return undefined
+  return { index: p.gpu.mainGpu >= 0 ? p.gpu.mainGpu : 0, of: sys.gpus.length }
+}
+
+/** Sum of per-card readings — or only `card`'s, when given and the tool listed exactly as many
+ *  cards as sysinfo did. On a count mismatch the index could name the wrong card, so the sum is
+ *  kept: it over-reads (conservative) where a wrong card could under-read. */
+function sumCards(perCard: number[], card?: VramCard): number {
+  const picked = card && perCard.length === card.of ? [perCard[card.index] ?? 0] : perCard
+  return picked.reduce((a, b) => a + b, 0)
+}
+
+/** Pure parser for `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` (one MB
+ *  figure per GPU, in the same order sysinfo enumerated them from the same tool). Sums every
+ *  GPU, or reads just `card` (see {@link sumCards}). Null when nothing positive was read. */
+export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | null {
+  const perCard = stdout
+    .trim()
+    .split('\n')
+    .map((l) => parseInt(l.trim(), 10))
+    .map((n) => (Number.isFinite(n) ? n : 0))
+  const total = sumCards(perCard, card)
+  return total > 0 ? total : null
+}
+
+// The GPU memory probes below run around every benchmark load, tied to the daemon (util/tether.ts): their timeouts
+// are daemon timers, so a probe hung on a wedged driver outlived a daemon that died meanwhile.
+const probeExecFile = tetheredExecFile({ kind: 'probe' })
+
+/** Best-effort current NVIDIA VRAM use in MB (sum across GPUs, or one `card`). Null on non-NVIDIA
  *  or when nvidia-smi is absent — never throws (spec 09 §1). */
-function readNvidiaVramMb(): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile(
-        'nvidia-smi',
-        ['--query-gpu=memory.used', '--format=csv,noheader,nounits'],
-        { timeout: 8000, windowsHide: true },
-        (err, stdout) => {
-          if (err || !stdout) return resolve(null)
-          const total = stdout
-            .trim()
-            .split('\n')
-            .map((l) => parseInt(l.trim(), 10))
-            .filter((n) => Number.isFinite(n))
-            .reduce((a, b) => a + b, 0)
-          resolve(total > 0 ? total : null)
-        },
-      )
-    } catch {
-      resolve(null)
-    }
-  })
+function readNvidiaVramMb(card?: VramCard): Promise<number | null> {
+  return probeExecFile('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseNvidiaVramUsed(stdout, card) : null), () => null)
 }
 
 /** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
- *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card.
+ *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card,
+ *  or reads just `card` (see {@link sumCards}).
  *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
-export function parseRocmVramUsed(memJson: string): number | null {
+export function parseRocmVramUsed(memJson: string, card?: VramCard): number | null {
   try {
     const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
-    let total = 0
+    const perCard: number[] = []
     for (const fields of Object.values(mem)) {
       const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
       const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
-      total += bytes
+      perCard.push(bytes)
     }
-    const mb = Math.round(total / 1e6)
+    const mb = Math.round(sumCards(perCard, card) / 1e6)
     return mb > 0 ? mb : null
   } catch {
     return null
@@ -2003,27 +2221,22 @@ export function parseRocmVramUsed(memJson: string): number | null {
  *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
  *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
  *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
-function readRocmVramMb(): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
-        resolve(err || !stdout ? null : parseRocmVramUsed(stdout))
-      })
-    } catch {
-      resolve(null)
-    }
-  })
+function readRocmVramMb(card?: VramCard): Promise<number | null> {
+  return probeExecFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseRocmVramUsed(stdout, card) : null), () => null)
 }
 
-/** Best-effort current GPU VRAM use in MB (sum across GPUs), vendor-aware (ADR-217). Tries
+/** Best-effort current GPU VRAM use in MB (sum across GPUs — or, given a single-GPU profile `p`,
+ *  just that profile's card, see {@link vramCardFor}), vendor-aware (ADR-217). Tries
  *  nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`), then
  *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
  *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
  *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
-async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
-  const nv = await readNvidiaVramMb()
+async function readGpuVramMb(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): Promise<number | null> {
+  const card = vramCardFor(sys, p)
+  const nv = await readNvidiaVramMb(card)
   if (nv !== null) return nv
-  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb()
+  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb(card)
   return null
 }
 
@@ -2054,37 +2267,27 @@ let wddmSharedUnsupported = false
 
 function readWddmSharedMb(): Promise<number | null> {
   if (process.platform !== 'win32' || wddmSharedUnsupported) return Promise.resolve(null)
-  return new Promise((resolve) => {
-    try {
-      execFile(
-        'powershell',
-        ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS],
-        { timeout: 10_000, windowsHide: true },
-        (err, stdout) => {
-          if (err) {
-            // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
-            // NOT latch: this runs immediately around a model load, when the machine is under peak
-            // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
-            // is long-lived, so latching on that would silently disable spill detection until
-            // restart — reverting to exactly the fit-only behaviour this release exists to fix.
-            // A missing interpreter (ENOENT) or the script's own `exit 1` (counter unresolvable) are
-            // permanent for this process and worth latching.
-            if (!err.killed) wddmSharedUnsupported = true
-            return resolve(null)
-          }
-          const mb = parseFloat((stdout || '').trim())
-          if (!Number.isFinite(mb) || mb < 0) {
-            wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
-            return resolve(null)
-          }
-          resolve(Math.round(mb))
-        },
-      )
-    } catch {
-      wddmSharedUnsupported = true // could not spawn at all
-      resolve(null)
-    }
-  })
+  return probeExecFile('powershell', ['-NoProfile', '-NonInteractive', '-Command', WDDM_SHARED_PS], { timeout: 10_000, windowsHide: true }).then(
+    ({ stdout }) => {
+      const mb = parseFloat((stdout || '').trim())
+      if (!Number.isFinite(mb) || mb < 0) {
+        wddmSharedUnsupported = true // ran fine but produced nothing parseable → not available here
+        return null
+      }
+      return Math.round(mb)
+    },
+    (err: Error & { killed?: boolean }) => {
+      // ONLY latch on definitive unavailability. A timeout (err.killed) is transient and must
+      // NOT latch: this runs immediately around a model load, when the machine is under peak
+      // I/O and memory pressure and a slow PowerShell start is entirely plausible. The daemon
+      // is long-lived, so latching on that would silently disable spill detection until
+      // restart — reverting to exactly the fit-only behaviour this release exists to fix.
+      // A missing interpreter (ENOENT, or a spawn that could not start at all) or the script's own
+      // `exit 1` (counter unresolvable) are permanent for this process and worth latching.
+      if (!err.killed) wddmSharedUnsupported = true
+      return null
+    },
+  )
 }
 
 /** Pure parser for `rocm-smi --showmeminfo gtt --json`, split out for direct testing. GTT is the
@@ -2110,16 +2313,8 @@ export function parseRocmGttUsed(memJson: string): number | null {
 /** Best-effort AMD host-backed (GTT) memory in MB via rocm-smi. Null when rocm-smi is absent or
  *  unparseable — never throws. */
 function readRocmGttMb(): Promise<number | null> {
-  return new Promise((resolve) => {
-    try {
-      execFile('rocm-smi', ['--showmeminfo', 'gtt', '--json'], { timeout: 8000, windowsHide: true }, (err, stdout) => {
-        if (err || !stdout) return resolve(null)
-        resolve(parseRocmGttUsed(stdout))
-      })
-    } catch {
-      resolve(null)
-    }
-  })
+  return probeExecFile('rocm-smi', ['--showmeminfo', 'gtt', '--json'], { timeout: 8000, windowsHide: true })
+    .then(({ stdout }) => (stdout ? parseRocmGttUsed(stdout) : null), () => null)
 }
 
 /** Host-backed GPU memory in MB, or null where the platform exposes no such accounting.

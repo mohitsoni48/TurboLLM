@@ -1,5 +1,5 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState, type CSSProperties, type ReactNode } from 'react'
+import { useEffect, useId, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   AlertTriangle,
@@ -9,6 +9,8 @@ import {
   ChevronDown,
   CircleSlash,
   Download,
+  Eye,
+  EyeOff,
   FolderPlus,
   Loader2,
   MoreHorizontal,
@@ -23,13 +25,13 @@ import {
 } from 'lucide-react'
 import { ApiError, deleteModel, track } from '../lib/api'
 import { useModelLoader } from '../lib/model-loader'
-import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useStatus, useSysInfo } from '../lib/queries'
+import { queryKeys, useModelActions, useModelDirs, useModelMutations, useModels, useShowAllEngineModels, useStatus, useSysInfo } from '../lib/queries'
 import { importModelFiles } from '../lib/android-app'
 import { useOnboardingState } from '../lib/onboarding-queries'
 import { usePinnedModels } from '../lib/usePinnedModels'
 import { useDocumentScroll } from '../lib/scroll-mode'
 import type { ModelEntry } from '../lib/types'
-import { isChatModel, isSystemOneModel } from '../lib/model-kind'
+import { hiddenByUser, hiddenByUserCount, isChatModel, isSystemOneModel, loadOffered } from '../lib/model-kind'
 import { TextClassificationRuntimeLabel } from '../components/TextClassificationRuntimeLabel'
 import { cn } from '../lib/utils'
 import { useIsDesktop } from '../lib/useIsDesktop'
@@ -37,6 +39,7 @@ import { EmptyState, InlineError, ScreenHeader } from '../components/common'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Skeleton } from '../components/ui/skeleton'
+import { Switch } from '../components/ui/switch'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -80,6 +83,7 @@ import { MachineFilter, MachineNotes, OriginBadge } from '../components/fleet'
 import { RemoteModelRow } from './models/RemoteModelRow'
 import { ModelDetailDialog } from './models/ModelDetailDialog'
 import { DiscoverTab } from './models/DiscoverTab'
+import { LibraryDownloadsNotice } from './models/LibraryDownloadsNotice'
 import { HfRepoDialog } from './models/HfRepoDialog'
 import { FsBrowser } from './engines/FsBrowser'
 
@@ -181,6 +185,10 @@ export function ModelsScreen() {
   // transition, not a URL-driven one.
   const [searchParams] = useSearchParams()
   const [tab, setTab] = useState<Tab>(searchParams.get('tab') === 'discover' ? 'discover' : 'library')
+  // The Library's "Show hidden models" switch: models the user hid by hand (hiddenByUser) are left out until it is on.
+  // This page's own view, like "Show all"; the hidden set itself is the daemon's. A model picker's "Show hidden models"
+  // link (NoModelsHint) opens the Library with it on (`?hidden=1`), read once on mount like `tab`.
+  const [showHidden, setShowHidden] = useState(searchParams.get('hidden') === '1')
   // Issue #178: the Library tab is a plain long list, so the WINDOW should scroll it. Discover
   // is not — ADR-143 made it a resizable list/detail split-pane, deliberately on this same
   // `/models` route, and it needs the bounded full-height shell to size its two panes. Hence the
@@ -188,7 +196,11 @@ export function ModelsScreen() {
   useDocumentScroll(tab === 'library')
   const [filter, setFilter] = useState<Filter>('all')
   const [search, setSearch] = useState('')
-  const [showIncompatible, setShowIncompatible] = useState(false)
+  // "Show all" on the hidden-models banner, else Settings → Models' "Show models for every engine" (off by default).
+  // Either way a listed model still loads only on the selected engine: its Load starts it there, never on another.
+  const showAllEngineModels = useShowAllEngineModels()
+  const [showIncompatibleChoice, setShowIncompatible] = useState<boolean | null>(null)
+  const showIncompatible = showIncompatibleChoice ?? showAllEngineModels
   const [foldersOpen, setFoldersOpen] = useState(false)
   const [openKey, setOpenKey] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState<ModelEntry | null>(null)
@@ -214,25 +226,39 @@ export function ModelsScreen() {
   const models = modelsQ.data?.models ?? []
   const dirs = dirsQ.data?.dirs ?? []
   const primaryDir = dirsQ.data?.primaryDir ?? ''
+  // Hidden by hand comes first: a model the user hid is not one "Show all" can reveal, so the engine banner counts only
+  // what is left (lib/model-kind.ts hiddenByUser).
+  const hiddenByYouCount = hiddenByUserCount(models)
+  // The switch shows only while the user has some model hidden, so it goes off once none is. It stayed on: after the
+  // last hidden model was unhidden it went away still on, and the next Hide left that row listed (marked, with Unhide),
+  // the switch back already on and the toast saying "Show hidden models" lists it. Only once the list has answered:
+  // while it loads nothing counts as hidden, and ?hidden=1 must still list the hidden models when they arrive.
+  const noneHiddenByYou = modelsQ.data !== undefined && hiddenByYouCount === 0
+  useEffect(() => {
+    if (noneHiddenByYou) setShowHidden(false)
+  }, [noneHiddenByYou])
+  const notHiddenByYou = useMemo(() => (showHidden ? models : models.filter((m) => !hiddenByUser(m))), [models, showHidden])
   // Two different questions, so two counts. A Jev model is never hidden by the engine filter
   // (ADR-434 (g)) — it shows as unavailable instead — so it is not one of the models the banner
   // offers to reveal, but it IS one of the models that cannot load once they are all on screen.
-  const hiddenCount = models.filter(hiddenByEngine).length
-  const cannotLoadCount = models.filter((m) => !m.compatibleWithActiveEngine).length
+  const hiddenCount = notHiddenByYou.filter(hiddenByEngine).length
+  const cannotLoadCount = notHiddenByYou.filter((m) => !m.compatibleWithActiveEngine).length
 
-  // Facet-aware filter chips: only offer a facet that at least one model actually has.
+  // Facet-aware filter chips: only offer a facet that at least one model actually has. Counted, like the tab label and
+  // the All chip, over the models the list can show: from every model, they counted the ones hidden by hand, so
+  // "Library (2)" and "All 2" stood over one listed row, and a Vision chip could open to an empty list.
   const facetCounts = useMemo(
     () => ({
-      vision: models.filter((m) => m.vision).length,
-      moe: models.filter((m) => m.moe).length,
-      nextn: models.filter((m) => (m.nextnLayers ?? 0) > 0).length,
-      embedding: models.filter((m) => m.embedding).length,
+      vision: notHiddenByYou.filter((m) => m.vision).length,
+      moe: notHiddenByYou.filter((m) => m.moe).length,
+      nextn: notHiddenByYou.filter((m) => (m.nextnLayers ?? 0) > 0).length,
+      embedding: notHiddenByYou.filter((m) => m.embedding).length,
     }),
-    [models],
+    [notHiddenByYou],
   )
 
   const q = search.trim().toLowerCase()
-  const filtered = models.filter((m) => {
+  const filtered = notHiddenByYou.filter((m) => {
     if (!showIncompatible && hiddenByEngine(m)) return false
     if (q && !m.name.toLowerCase().includes(q)) return false
     if (filter === 'vision') return m.vision
@@ -299,6 +325,20 @@ export function ModelsScreen() {
       onSuccess: () => setRemoteFailures((f) => {
         const n = { ...f }; delete n[`${linkId}:${modelKey}`]; return n
       }),
+    })
+  }
+
+  /** Hide a model by hand, or unhide it. The row leaves the list at once (setHidden updates it in place); a
+   *  loaded model stays until it is ejected, and says so. */
+  const onToggleHidden = (m: ModelEntry) => {
+    const hide = !m.hidden
+    track('models', hide ? 'hide_model' : 'unhide_model')
+    actions.setHidden.mutate({ key: m.key, hidden: hide }, {
+      onSuccess: () => {
+        if (!hide) toast.success(`${m.name} is shown again.`)
+        else toast.success(m.loaded ? `${m.name} is hidden. It stays listed while it's loaded.` : `${m.name} is hidden. "Show hidden models" lists it.`)
+      },
+      onError: (e) => toast.error(e instanceof ApiError ? e.message : `Could not ${hide ? 'hide' : 'unhide'} ${m.name}.`),
     })
   }
 
@@ -374,7 +414,7 @@ export function ModelsScreen() {
               color: tab === t ? 'var(--ink)' : 'var(--muted)',
             }}
           >
-            {t === 'library' ? `Library${models.length ? ` (${models.length})` : ''}` : 'Discover'}
+            {t === 'library' ? `Library${notHiddenByYou.length ? ` (${notHiddenByYou.length})` : ''}` : 'Discover'}
           </button>
         ))}
       </div>
@@ -398,10 +438,15 @@ export function ModelsScreen() {
           filter={filter}
           setFilter={setFilter}
           facetCounts={facetCounts}
+          listedCount={notHiddenByYou.length}
           hiddenCount={hiddenCount}
           cannotLoadCount={cannotLoadCount}
           showIncompatible={showIncompatible}
           setShowIncompatible={setShowIncompatible}
+          hiddenByYouCount={hiddenByYouCount}
+          showHidden={showHidden}
+          setShowHidden={setShowHidden}
+          onToggleHidden={onToggleHidden}
           rescan={() => mut.rescan.mutate()}
           openFolders={() => setFoldersOpen(true)}
           rows={visibleRows}
@@ -419,6 +464,7 @@ export function ModelsScreen() {
           onDiscover={onDiscover}
           isPinned={isPinned}
           togglePinned={togglePinned}
+          onShowDownloads={() => setTab('discover')}
         />
       )}
 
@@ -470,10 +516,15 @@ function LibraryTab({
   filter,
   setFilter,
   facetCounts,
+  listedCount,
   hiddenCount,
   cannotLoadCount,
   showIncompatible,
   setShowIncompatible,
+  hiddenByYouCount,
+  showHidden,
+  setShowHidden,
+  onToggleHidden,
   rescan,
   openFolders,
   rows,
@@ -491,6 +542,7 @@ function LibraryTab({
   onDiscover,
   isPinned,
   togglePinned,
+  onShowDownloads,
 }: {
   modelsQ: ReturnType<typeof useModels>
   actions: ReturnType<typeof useModelActions>
@@ -505,10 +557,17 @@ function LibraryTab({
   filter: Filter
   setFilter: (f: Filter) => void
   facetCounts: { vision: number; moe: number; nextn: number; embedding: number }
+  /** The models the list can show: all of them but those hidden by hand, unless "Show hidden models" is on. */
+  listedCount: number
   hiddenCount: number
   cannotLoadCount: number
   showIncompatible: boolean
   setShowIncompatible: (v: boolean) => void
+  /** Models the user hid by hand (hiddenByUserCount: once per key), whether "Show hidden models" lists them or not. */
+  hiddenByYouCount: number
+  showHidden: boolean
+  setShowHidden: (v: boolean) => void
+  onToggleHidden: (m: ModelEntry) => void
   rescan: () => void
   openFolders: () => void
   rows: FleetRow<LibRow>[]
@@ -526,6 +585,8 @@ function LibraryTab({
   onDiscover: (m: ModelEntry) => void
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
+  /** Opens Discover, whose Downloads panel is at its top. */
+  onShowDownloads: () => void
 }) {
   // Inside the packaged Android app: model files in shared storage cannot be read, so they are imported instead.
   const inAndroidApp = !!useSysInfo().data?.bundledEnginesOnly
@@ -547,6 +608,7 @@ function LibraryTab({
   const trackFilter = (f: Filter) => { track('models', 'filter_models'); setFilter(f) }
   const trackOpenFolders = () => { track('models', 'open_model_folders'); openFolders() }
   const trackRescan = () => { track('models', 'rescan_models'); rescan() }
+  const showHiddenId = useId()
 
   return (
     <>
@@ -567,7 +629,7 @@ function LibraryTab({
         {hasModels && (
           <div className="flex flex-wrap items-center gap-1.5">
             <FilterChip active={filter === 'all'} onClick={() => trackFilter('all')}>
-              All {models.length}
+              All {listedCount}
             </FilterChip>
             {facets.map((f) => (
               <FilterChip key={f.id} active={filter === f.id} onClick={() => trackFilter(f.id)}>
@@ -593,6 +655,9 @@ function LibraryTab({
           </Button>
         </div>
       </div>
+
+      {/* "2 downloads running · 1 paused — Show": the downloads panel is in Discover only. */}
+      <LibraryDownloadsNotice onShow={onShowDownloads} />
 
       {hiddenCount > 0 && (
         <div className="mb-4 flex items-center justify-between gap-3 rounded-[var(--radius)] border border-border bg-panel px-4 py-2.5 text-[12px]">
@@ -664,7 +729,13 @@ function LibraryTab({
           }
         />
       ) : rows.length === 0 ? (
-        <EmptyState icon={<Search size={24} />} message="No models match your search or filter." />
+        <EmptyState
+          icon={<Search size={24} />}
+          // With nothing searched or filtered, an empty list is the user's own hiding, not a search that found nothing.
+          message={!showHidden && hiddenByYouCount > 0 && !search.trim() && filter === 'all' && machineFilter === ALL_MACHINES
+            ? 'All your models are hidden. Turn on "Show hidden models" to list them.'
+            : 'No models match your search or filter.'}
+        />
       ) : (
         <div className="overflow-x-auto">
           <div className={cn('overflow-hidden rounded-xl border border-border bg-panel', isDesktop && 'min-w-[720px]')}>
@@ -702,8 +773,10 @@ function LibraryTab({
                     busy={loadBusy}
                     loadingKey={loadingKey}
                     ejecting={actions.eject.isPending}
+                    showIncompatible={showIncompatible}
                     isPinned={isPinned}
                     togglePinned={togglePinned}
+                    onToggleHidden={onToggleHidden}
                   />
                 )
               }
@@ -730,6 +803,20 @@ function LibraryTab({
           </div>
         </div>
       )}
+
+      {/* Under the list, as the owner sketched it: the models hidden by hand, listed again (each with its Unhide). */}
+      {hiddenByYouCount > 0 && !modelsQ.isLoading && !modelsQ.isError && (
+        <div className="mt-3 flex items-center gap-2">
+          <Switch
+            id={showHiddenId}
+            checked={showHidden}
+            onCheckedChange={(v) => { track('models', 'toggle_hidden_models'); setShowHidden(v) }}
+          />
+          <label htmlFor={showHiddenId} className="cursor-pointer select-none text-[13px] text-muted">
+            Show hidden models ({hiddenByYouCount})
+          </label>
+        </div>
+      )}
     </>
   )
 }
@@ -747,14 +834,19 @@ function useDeleteModel() {
 
 const INSTALL_LAYA_ENGINE_TITLE = 'Install the Laya engine (Engines) to load this model.'
 
-/** Why the Load button is dead. A text classification model needs its own runtime, so "switch to" is the wrong
- *  advice for it. A Jev model takes the daemon's own wording, which names vLLM: `incompatibleReason` is the short
- *  chip label, and serving it here for every model would duplicate the chip beside it and drop the half that says
- *  what to do about it. A Laya model never runs on the active engine at all: its engine is installed beside it. */
-function cannotLoadTitle(m: ModelEntry, needsEngine: string): string {
+/** A row the selected engine is not expected to run, shown by "Show all" or Settings' "Show models for every engine":
+ *  its Load starts it on that engine all the same (lib/model-kind.ts loadOffered). */
+const LOADS_ON_SELECTED_ENGINE_TITLE =
+  "The selected engine isn't expected to load this model. Load starts it there anyway, and shows the engine's error if it fails."
+
+/** Why the Load button is dead: a text classification model the user has not shown every model for (the engine
+ *  filter never hides one, ADR-434 (g)). A Jev model takes the daemon's own wording, which names vLLM:
+ *  `incompatibleReason` is the short chip label. A Laya model never runs on the active engine at all: its engine is
+ *  installed beside it. Any other model the engine cannot run is hidden until shown, and then offers its Load. */
+function cannotLoadTitle(m: ModelEntry): string {
   if (m.laya) return INSTALL_LAYA_ENGINE_TITLE
   if (m.jev && m.incompatibleReason) return m.incompatibleReason
-  return `The active engine can't load this model — switch to ${needsEngine}`
+  return "The active engine can't load this model."
 }
 
 /** One row per model name. Multiple quants collapse into a single row with a quant
@@ -772,8 +864,10 @@ function ModelRow({
   busy,
   loadingKey,
   ejecting,
+  showIncompatible,
   isPinned,
   togglePinned,
+  onToggleHidden,
 }: {
   group: Group
   /** Which machine this row came from. Always `local` here — the remote half is
@@ -793,8 +887,12 @@ function ModelRow({
   busy: boolean
   loadingKey: string | undefined
   ejecting: boolean
+  /** "Show all" or Settings' "Show models for every engine" is on: a row the engine cannot run offers its Load. */
+  showIncompatible: boolean
   isPinned: (key: string) => boolean
   togglePinned: (key: string) => void
+  /** Hide the model by hand, or unhide it (Config.hiddenModels on the daemon). */
+  onToggleHidden: (m: ModelEntry) => void
 }) {
   const variants = group.variants
   const multi = variants.length > 1
@@ -809,6 +907,9 @@ function ModelRow({
   const pinned = isPinned(m.key)
   const loadable = !m.incomplete && !m.parseError
   const compatible = m.compatibleWithActiveEngine !== false
+  // A row the engine cannot run, once shown, still loads on the selected engine only (the daemon starts it there and
+  // its error shows if it fails). Its Load was off, so a model listed to be loaded could not be.
+  const offered = loadOffered(m, showIncompatible)
   const needsEngine = m.format === 'gguf' ? 'llama.cpp' : m.format === 'litertlm' ? 'LiteRT-LM' : 'MLX or vLLM'
   // GGUF models fall back to llama.cpp's built-in per-architecture chat template when the
   // file has none; MLX-format models have no such fallback (mlx-lm/Rapid-MLX read the
@@ -855,6 +956,21 @@ function ModelRow({
         ))}
         <TextClassificationRuntimeLabel model={m} />
         {m.hasProfile && <CapChip>tuned</CapChip>}
+        {/* Listed by "Show hidden models", or because it is loaded: marked, with its Unhide right here in both layouts
+            (the desktop actions column has no room for another button). */}
+        {m.hidden && (
+          <>
+            <CapChip>hidden</CapChip>
+            <button
+              type="button"
+              onClick={() => onToggleHidden(m)}
+              aria-label={`Unhide ${group.name}`}
+              className="shrink-0 rounded px-1 text-[12px] font-medium text-accent hover:underline"
+            >
+              Unhide
+            </button>
+          </>
+        )}
         {problem && (
           <span
             className="shrink-0 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide"
@@ -898,6 +1014,7 @@ function ModelRow({
             </span>
             <span className="flex-1 font-mono text-[13px] text-ink">{v.quant}</span>
             {v.loaded && <span className="text-[11px]" style={{ color: 'var(--ok)' }}>loaded</span>}
+            {v.hidden && <span className="text-[11px] text-faint">hidden</span>}
             <span className="text-[11px] text-muted">{fmtSize(v.sizeBytes)}</span>
           </DropdownMenuItem>
         ))}
@@ -918,13 +1035,15 @@ function ModelRow({
         <Button
           size="sm"
           onClick={() => { track('models', 'load_model'); onLoad(m) }}
-          disabled={!loadable || !compatible || busy}
+          disabled={!loadable || !offered || busy}
           title={
             !loadable
               ? 'Model is incomplete or unreadable'
-              : !compatible
-                ? cannotLoadTitle(m, needsEngine)
-                : ''
+              : compatible
+                ? ''
+                : offered
+                  ? LOADS_ON_SELECTED_ENGINE_TITLE
+                  : cannotLoadTitle(m)
           }
         >
           {loadingThis ? <Loader2 size={14} className="animate-spin" /> : <Zap size={14} />}
@@ -951,6 +1070,11 @@ function ModelRow({
         <DropdownMenuContent align="end">
           <DropdownMenuItem onSelect={() => { track('models', 'pin_model'); togglePinned(m.key) }}>
             <Star size={14} /> {pinned ? 'Unpin' : 'Pin to top'}
+          </DropdownMenuItem>
+          {/* Leaves the Library list and every model picker but the draft-model select until unhidden; the files and
+              settings stay. */}
+          <DropdownMenuItem onSelect={() => onToggleHidden(m)}>
+            {m.hidden ? <Eye size={14} /> : <EyeOff size={14} />} {m.hidden ? 'Unhide' : 'Hide'}
           </DropdownMenuItem>
           {m.incomplete && (
             <DropdownMenuItem onSelect={() => { track('models', 'find_model_quants'); onDiscover(m) }}>

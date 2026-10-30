@@ -23,8 +23,11 @@ import { latestTagForInstalled } from './update'
 import { parseGitRepo as parseGitRepoFromLeaf } from './github-repo'
 import type { ReleaseProvenance } from './release-install'
 import type { Engine } from '../config/config'
-import { engineIsIdle } from './update-scheduler'
+import { UpdateScheduler, engineIsIdle } from './update-scheduler'
 import type { Manager } from './manager'
+import { ProbeError } from './probe'
+import type { Registry } from './registry'
+import type { ConfigStore } from '../config/config'
 
 // ─── build-tag comparison ────────────────────────────────────────────────────
 
@@ -161,6 +164,19 @@ test('resolveUpdateSource: managed official llama.cpp → ggml-org repo + tag fr
     eng({ binPath: '/root/engines/llama.cpp-b9608-cuda/llama-server', version: 'version: b9608' }),
   )
   assert.deepEqual(src, { source: 'github-release', ref: 'ggml-org/llama.cpp', installed: 'b9608' })
+})
+
+// On Android (Termux) the managed build is TurboLLM's own cross-compile, one pinned file on Hugging Face: upstream's
+// newer tags have no Android asset there, so an update offered against them could only fail with HTTP 404.
+test('resolveUpdateSource: a managed llama.cpp build on Android has no update source', async (t) => {
+  const actualPlatform = process.platform
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => Object.defineProperty(process, 'platform', { value: actualPlatform }))
+  const engine = eng({ binPath: '/data/data/com.termux/files/home/.turbollm/engines/llama.cpp-b9608-cpu/llama-server' })
+  assert.equal(resolveUpdateSource(engine), null)
+  const st = await computeUpdateStatus(engine, async () => 'b10818')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
 })
 
 test('resolveUpdateSource: turboquant fork → fork repo + tag from version', () => {
@@ -364,6 +380,23 @@ test('UpdateChecker: forget drops the cached status of one engine only', async (
   assert.equal(checker.get('b')?.latest, 'b9761')
 })
 
+test('UpdateChecker: forgetChanged drops a status whose engine was updated in place, and keeps the rest', async () => {
+  const kobold = eng({ id: 'k', kind: 'koboldcpp', binPath: '/root/engines/koboldcpp/koboldcpp', version: 'v1.70' })
+  const mlx = eng({ id: 'm', kind: 'mlx', version: 'mlx-lm 0.31.2' })
+  const plain = eng({ id: 'p', binPath: '/opt/custom/llama-server', version: 'b1' })
+  const checker = new UpdateChecker(async (src) => (src.ref === 'mlx-lm' ? '0.32.0' : 'v1.80'))
+  for (const e of [kobold, mlx, plain]) await checker.check(e)
+  assert.equal(checker.get('k')?.hasUpdate, true)
+  // The update re-registered the same id with the new version (addKoboldcpp keeps the id).
+  checker.forgetChanged([{ ...kobold, version: 'v1.80' }, mlx, plain])
+  assert.equal(checker.get('k'), undefined)
+  assert.equal(checker.get('m')?.hasUpdate, true)
+  assert.equal(checker.get('p')?.error, 'no_source')
+  // A pip version string compares by its stripped version, as the check recorded it.
+  checker.forgetChanged([{ ...mlx, version: 'mlx-lm 0.32.0' }])
+  assert.equal(checker.get('m'), undefined)
+})
+
 test('UpdateChecker: offline with no prior success caches the offline state', async () => {
   const e = eng({ kind: 'mlx', version: 'mlx-lm 0.31.2' })
   const checker = new UpdateChecker(async () => {
@@ -393,6 +426,89 @@ test('engineIsIdle: stopped/running-idle are idle; starting/stopping/generating 
   assert.equal(engineIsIdle(managerStub('running', 2)), false) // mid-generation
   assert.equal(engineIsIdle(managerStub('starting')), false)
   assert.equal(engineIsIdle(managerStub('stopping')), false)
+})
+
+// An `auto` engine whose new build fails its probe keeps the old one (the apply path's rollback), so the update stays
+// offered, and every scheduler pass downloaded and probed the same build again, for as long as that version was the
+// latest. A version that failed its probe is skipped until upstream publishes another; any other failure (offline, a
+// rate limit) is retried on the next pass as before.
+test('UpdateScheduler: a version whose auto-update failed its probe is not applied again; a newer one is', async () => {
+  const tq = eng({ id: 'tq', updatePolicy: 'auto' })
+  const other = eng({ id: 'other', updatePolicy: 'auto' })
+  let latest = 'b200'
+  const updates = {
+    prune() {},
+    checkAll: async () => {},
+    get: () => ({ installed: 'b100', latest, hasUpdate: true, checkedAt: '', comparable: true }),
+  } as unknown as UpdateChecker
+  const applied: string[] = []
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => ({ engines: [tq, other], activeEngineId: '' }) } as unknown as Registry,
+    manager: managerStub('stopped'),
+    updates,
+    applyUpdate: async (e) => {
+      applied.push(`${e.id}@${latest}`)
+      if (e.id === 'tq') throw new ProbeError('probe_failed', 'Could not run the binary (--version and --help both failed).')
+      throw new Error('could not query o/r releases: HTTP 503')
+    },
+  })
+  await scheduler.runOnce()
+  await scheduler.runOnce()
+  assert.deepEqual(applied, ['tq@b200', 'other@b200', 'other@b200'], 'the probe failure is not retried; the outage is')
+  latest = 'b300'
+  await scheduler.runOnce()
+  assert.deepEqual(applied.slice(3), ['tq@b300', 'other@b300'])
+})
+
+// Auto-tune stops its model between two probes, which engineIsIdle reads as idle (the manager is stopped there), so an
+// `auto` engine's update was applied mid-run to the very engine being tuned: it stopped the probe it caught and swapped
+// the build under the rest of the run. Only that engine waits; the next check after the run applies it.
+test('UpdateScheduler: the engine auto-tune is running on is not auto-updated until the run ends; another engine is', async () => {
+  const tuned = eng({ id: 'cuda', updatePolicy: 'auto' })
+  const other = eng({ id: 'other', updatePolicy: 'auto' })
+  let tuning: Engine | null = tuned
+  const applied: string[] = []
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => ({ engines: [tuned, other], activeEngineId: 'cuda' }) } as unknown as Registry,
+    manager: managerStub('stopped'), // between two probes
+    updates: {
+      prune() {},
+      checkAll: async () => {},
+      get: () => ({ installed: 'b100', latest: 'b200', hasUpdate: true, checkedAt: '', comparable: true }),
+    } as unknown as UpdateChecker,
+    tuningEngine: () => tuning,
+    applyUpdate: async (e) => { applied.push(e.id) },
+  })
+  await scheduler.runOnce()
+  assert.deepEqual(applied, ['other'], 'the tuned engine is left alone; the other is updated')
+  tuning = null // the run ended
+  await scheduler.runOnce()
+  assert.deepEqual(applied.slice(1), ['cuda', 'other'])
+})
+
+// A restart from a terminal keeps the old process as the keeper of its replacement (cli.ts becomeKeeper). stop() left
+// the first pass, 30 s after start, pending: a restart within those 30 s had the keeper check, and perhaps apply an
+// engine update, from the old process, beside the replacement's own scheduler.
+test('UpdateScheduler: stop() also cancels the first pass, so a scheduler stopped by a restart runs no pass', (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] })
+  let passes = 0
+  const scheduler = new UpdateScheduler({
+    store: {} as ConfigStore,
+    registry: { list: () => { passes++; return { engines: [], activeEngineId: '' } } } as unknown as Registry,
+    manager: managerStub('stopped'),
+    updates: { prune() {}, checkAll: async () => {}, get: () => undefined } as unknown as UpdateChecker,
+    applyUpdate: async () => {},
+  })
+  scheduler.start()
+  scheduler.stop()
+  t.mock.timers.tick(24 * 60 * 60_000)
+  assert.equal(passes, 0, 'no pass after stop()')
+  scheduler.start()
+  t.mock.timers.tick(30_000)
+  assert.equal(passes, 1, 'started again, the first pass runs')
+  scheduler.stop()
 })
 
 // ─── source-built engines (ADR-088): commit-hash update detection ─────────────
@@ -433,6 +549,19 @@ test('resolveUpdateSource: sourceRepo takes precedence → source mode with bran
     }),
   )
   assert.deepEqual(src, { source: 'source', ref: 'owner/repo', branch: 'main', installed: '0a635dc' })
+})
+
+test('resolveUpdateSource: a commit-pinned source build has no update source (never "newer source · rebuild")', async () => {
+  const pinned = eng({
+    binPath: '/root/engines/build/ggml-org-llama.cpp-846e991ec3c7/build/bin/llama-server',
+    version: '1 (846e991)',
+    sourceRepo: 'https://github.com/ggml-org/llama.cpp',
+    sourceCommit: '846e991ec3c7ccec49112ff2c5b00b710e5f551d',
+  })
+  assert.equal(resolveUpdateSource(pinned), null)
+  const st = await computeUpdateStatus(pinned, async () => 'abcdef0123456789abcdef0123456789abcdef01')
+  assert.equal(st.hasUpdate, false)
+  assert.equal(st.error, 'no_source')
 })
 
 test('resolveUpdateSource: sourceRepo with no branch → empty branch (default branch)', () => {

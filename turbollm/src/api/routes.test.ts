@@ -3,12 +3,16 @@
 // The reason comes from the one shared `modelIncompatibility()` rule.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { mkdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { Hono } from 'hono'
 import { registerApi } from './routes'
+import { hashKey } from '../auth'
+import { ComfyGuard } from '../engines/comfy-guard'
 import type { Deps } from '../deps'
 import type { ModelEntry } from '../models/scanner'
 import type { JevInfo } from '../models/jev'
+import { tmpDir } from '../test-support/tmp'
 
 const OPENJEV: JevInfo = {
   labels: ['contradiction', 'entailment', 'neutral'],
@@ -35,10 +39,11 @@ const JEV_MODEL = entry({
   key: JEV_KEY, name: 'qwen3.5 4b nli v2', path: '/models/openjev/qwen3.5-4b-nli-v2', format: 'mlx', jev: OPENJEV,
 })
 const GGUF_MODEL = entry({})
+const LITERT_MODEL = entry({ key: 'gemma-litert', format: 'litertlm', path: 'D:\\models\\gemma.litertlm' } as Partial<ModelEntry>)
 
 type ModelRow = { key: string; compatibleWithActiveEngine: boolean; incompatibleReason: string | null; jev?: JevInfo }
 
-function appWithActiveEngine(engineKind: string | null, models: ModelEntry[]) {
+function appWithActiveEngine(engineKind: string | null, models: ModelEntry[], registry: Record<string, unknown> = {}) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [],
@@ -57,6 +62,7 @@ function appWithActiveEngine(engineKind: string | null, models: ModelEntry[]) {
     db: { lastGenTpsByModel: () => new Map<string, number>() },
     registry: {
       active: () => (engineKind ? { id: 'eng-1', name: engineKind, kind: engineKind, binPath: 'engine' } : undefined),
+      ...registry,
     },
     downloads: { provenance: () => [] },
   } as unknown as Deps
@@ -94,6 +100,19 @@ test('a GGUF model under vLLM needs llama.cpp', async () => {
   assert.deepEqual(compatOf(row), { compatibleWithActiveEngine: false, incompatibleReason: 'needs llama.cpp' })
 })
 
+// A .litertlm model under another engine was listed as loadable (the overlay asked the engine it would have been sent
+// to, the LiteRT-LM one), so the Models screen and every picker showed it while KoboldCpp or llama.cpp was selected.
+test('a .litertlm model under KoboldCpp needs LiteRT-LM, though a LiteRT-LM engine is installed', async () => {
+  const app = appWithActiveEngine('koboldcpp', [LITERT_MODEL], {
+    litertLmEngine: () => ({ id: 'litert-1', name: 'LiteRT-LM', kind: 'litert-lm', binPath: 'engine' }),
+    layaEngine: () => undefined,
+  })
+  const res = await app.request('/api/v1/models')
+  const [row] = ((await res.json()) as { models: ModelRow[] }).models
+
+  assert.deepEqual(compatOf(row), { compatibleWithActiveEngine: false, incompatibleReason: 'needs LiteRT-LM' })
+})
+
 test('with no active engine every model is compatible, with no reason', async () => {
   const rows = await listModels(null, [JEV_MODEL, GGUF_MODEL])
 
@@ -101,6 +120,40 @@ test('with no active engine every model is compatible, with no reason', async ()
     { compatibleWithActiveEngine: true, incompatibleReason: null },
     { compatibleWithActiveEngine: true, incompatibleReason: null },
   ])
+})
+
+test('GET /models takes the config snapshot and registry lookups once per request, not once per model', async () => {
+  // Each snapshot (and each registry lookup, which takes one) is a structuredClone of the whole
+  // config; per row, a large library spent hundreds of ms of event loop on every poll.
+  const count = async (n: number) => {
+    const calls = { snapshot: 0, active: 0, laya: 0 }
+    const cfg = { modelProfiles: {}, benchResults: {}, modelDirs: [] }
+    const models = Array.from({ length: n }, (_, i) =>
+      entry({ key: `m${i}|Q4_K_M|1`, ...(i % 3 === 1 ? { laya: true } : i % 3 === 2 ? { format: 'litertlm' } : {}) } as Partial<ModelEntry>))
+    const d = {
+      version: 'test',
+      store: { snapshot: () => (calls.snapshot++, cfg), dir: () => '/tmp/unused' },
+      scanner: { list: () => ({ models, scanning: false, lastScanAt: '' }) },
+      manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }) },
+      modelRouter: { loadedModelKeys: () => new Set<string>() },
+      db: { lastGenTpsByModel: () => new Map<string, number>() },
+      registry: {
+        active: () => (calls.active++, { id: 'eng-1', name: 'llama', kind: 'llama-server', binPath: 'engine' }),
+        layaEngine: () => (calls.laya++, undefined),
+      },
+      downloads: { provenance: () => [] },
+    } as unknown as Deps
+    const app = new Hono()
+    registerApi(app, d)
+    const res = await app.request('/api/v1/models')
+    assert.equal(res.status, 200)
+    assert.equal(((await res.json()) as { models: unknown[] }).models.length, n)
+    return calls
+  }
+  const one = await count(3)
+  const many = await count(30)
+  assert.deepEqual(many, one)
+  assert.ok(one.snapshot <= 1 && one.active <= 1 && one.laya <= 1, JSON.stringify(one))
 })
 
 // `GET /api/v1/status` carries a local-only `jev` field so Workspace can
@@ -126,6 +179,7 @@ function appWithPrimary(primaryKey: string | null) {
     },
     modelRouter: {
       aliveSlots: () => (primaryKey ? [{ modelKey: primaryKey, state: 'running', primary: true, lastUsedMs: 1 }] : []),
+      poolModelCount: () => 0,
     },
     scanner: { get: (key: string) => library.get(key) },
     registry: { active: () => ({ id: 'eng-1', name: 'vLLM', kind: 'vllm', binPath: 'engine' }) },
@@ -189,15 +243,15 @@ test('registerApi registers GET /api/v1/activity', async () => {
   const res = await app.request('/api/v1/activity')
 
   assert.equal(res.status, 200)
-  assert.deepEqual(await res.json(), { items: [], engineGenerating: false })
+  assert.deepEqual(await res.json(), { items: [], waiting: [], engineGenerating: false })
 })
 
 // ADR-444: Discover's "Text classification" category is `?category=text-classification` on the same search route.
-function appWithHfSearch(hf: Record<string, unknown>) {
+function appWithHfSearch(hf: Record<string, unknown>, registry: Record<string, unknown> = {}) {
   const d = {
     store: { snapshot: () => ({}) },
     hf,
-    registry: { active: () => ({ kind: 'llama-server' }), litertLmEngine: () => undefined },
+    registry: { active: () => ({ kind: 'llama-server' }), ...registry },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
   } as unknown as Deps
   const app = new Hono()
@@ -232,6 +286,20 @@ test('GET /api/v1/hf/search browses the category when no query is typed', async 
 
   assert.equal(res.status, 200)
   assert.deepEqual(calls, [['', 'best-match']])
+})
+
+// Discover searched the LiteRT-LM repos beside the active engine's whenever a LiteRT-LM engine was installed, since a
+// .litertlm model loaded there whatever engine was active. It loads only while LiteRT-LM is selected now, so a bundle
+// found under llama.cpp would be one the selected engine cannot load.
+test('GET /api/v1/hf/search searches only what the active engine runs, a LiteRT-LM engine installed or not', async () => {
+  const calls: unknown[][] = []
+  const hf = { searchModels: async (...args: unknown[]) => (calls.push(args), []) }
+  const app = appWithHfSearch(hf, { litertLmEngine: () => ({ id: 'litert-1', kind: 'litert-lm' }) })
+
+  const res = await app.request('/api/v1/hf/search?q=gemma')
+
+  assert.equal(res.status, 200)
+  assert.deepEqual(calls, [['gemma', 'llama-server', 'best-match']])
 })
 
 test('GET /api/v1/hf/search ignores an unknown category and searches as before', async () => {
@@ -394,8 +462,147 @@ test('provenance fallback: unconditional by name, full-path rows resolve by sha2
   assert.deepEqual(files.map((f) => f.downloaded), [true])
 })
 
-test('interleaveByRepo: alternates two ranked lists and drops a repo both returned', async () => {
-  const { interleaveByRepo } = await import('./routes')
-  const r = (repo: string) => ({ repo })
-  assert.deepEqual(interleaveByRepo([r('a'), r('b'), r('c')], [r('x'), r('a')]).map((x) => x.repo), ['a', 'x', 'b', 'c'])
+// The bench route checks isBlocked() (a render holding the GPU) first; the reverse-gate hook after it also refuses
+// while a render is STARTING (an acquire in flight). That refusal is the same 409, not an unhandled 500.
+test('POST /api/v1/bench answers 409 comfyui_busy when the ComfyUI pre-load hook refuses', async () => {
+  let started = false
+  const d = {
+    store: { snapshot: () => ({}) },
+    comfy: {
+      isBlocked: () => false,
+      freeComfyUIBeforeLoad: async () => { throw new Error('ComfyUI is rendering — model loading is paused until its queue finishes.') },
+    },
+    bench: { start: () => { started = true } },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+
+  const res = await app.request('/api/v1/bench', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ modelKey: 'm' }),
+  })
+
+  assert.equal(res.status, 409)
+  assert.equal(((await res.json()) as { error: { code: string } }).error.code, 'comfyui_busy')
+  assert.equal(started, false)
 })
+
+// Auto-tune stops the primary between its probes, which the activate route read as idle: a switch got through mid-run
+// and the rest of the run loaded the model on the newly selected engine with the old one's llama.cpp flags.
+test('POST /api/v1/engines/:id/activate refuses a switch while auto-tune runs', async () => {
+  let tuning = true
+  const engines = [{ id: 'cuda', name: 'llama.cpp CUDA', kind: 'llama-server' }, { id: 'vllm', name: 'vLLM', kind: 'vllm' }]
+  let activeId = 'cuda'
+  const activated: string[] = []
+  const d = {
+    manager: { status: () => ({ state: 'stopped', err: null, port: 0, pid: 0, model: null }), clearError: () => {} },
+    bench: { isRunning: () => tuning },
+    registry: {
+      active: () => engines.find((e) => e.id === activeId),
+      get: (id: string) => engines.find((e) => e.id === id),
+      activate: (id: string) => { activated.push(id); activeId = id },
+    },
+  } as unknown as Deps
+  const app = new Hono()
+  registerApi(app, d)
+  const activate = (id: string) => app.request(`/api/v1/engines/${id}/activate`, { method: 'POST' })
+
+  const refused = await activate('vllm')
+  assert.equal(refused.status, 409)
+  const body = (await refused.json()) as { error: { code: string; message: string } }
+  assert.equal(body.error.code, 'engine_running')
+  assert.equal(body.error.message, 'Stop auto-tune before switching the active engine.')
+  assert.deepEqual(activated, [])
+  // Picking the engine the run tunes changes nothing, so it is not refused.
+  assert.equal((await activate('cuda')).status, 200)
+  tuning = false
+  assert.equal((await activate('vllm')).status, 200)
+  assert.deepEqual(activated, ['cuda', 'vllm'])
+})
+
+// The gate node (v3+) holds its lock across the release call, and a prompt ComfyUI queues meanwhile waits for that lock
+// on ComfyUI's server thread. The route used to answer only once the LLM had reloaded, so every "Run (Instant)"
+// auto-queue iteration froze ComfyUI for up to the node's 10 s timeout.
+test('POST /api/v1/comfyui/release answers once loads are unblocked, before the model has reloaded', async () => {
+  let state = 'running'
+  let finishLoad = () => {}
+  const loading = new Promise<void>((resolve) => { finishLoad = resolve })
+  const starts: unknown[] = []
+  const manager = {
+    status: () => ({ state, err: null, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    currentOpts: () => (state === 'running' || state === 'starting' ? { engine: { id: 'e' }, model: { key: 'llama-8b' } } : null),
+    target: () => null,
+    stopAndWait: async () => { state = 'stopped' },
+    start: async (opts: unknown, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await hooks?.beforeStart?.()
+      starts.push(opts)
+      state = 'starting'
+      await loading // the model takes a while to load
+      state = 'running'
+    },
+  }
+  // The model's engine is the selected one: release() reloads a model only on the selected engine.
+  const comfyStore = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn', url: '', reverseGate: false, cachePersist: false }, activeEngineId: 'e' }),
+    dir: () => '/tmp',
+  }
+  const comfy = new ComfyGuard(comfyStore as never, manager as never)
+  await comfy.acquire()
+  const app = new Hono()
+  registerApi(app, { store: { snapshot: () => ({}) }, comfy } as unknown as Deps)
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const res = await Promise.race([
+    app.request('/api/v1/comfyui/release', { method: 'POST' }),
+    new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 2000) }),
+  ])
+  clearTimeout(timer)
+  finishLoad()
+
+  assert.ok(res, 'answered while the model was still loading')
+  assert.equal(res.status, 200)
+  assert.equal(comfy.isBlocked(), false, 'loads are unblocked')
+  assert.equal(starts.length, 1, 'the reload is under way')
+  comfy.stop()
+})
+
+// The gate node is installed with TurboLLM's URL baked in, and the ComfyUI process on this machine calls it. The URL was
+// built from the request's Host: installed through remote access (Tailscale Serve, a tunnel) that is the proxy's origin,
+// so the node posted to 127.0.0.1:80 (or :443); on a single-address bind (`--addr 192.168.1.10:…`, daemon.host) it
+// posted to 127.0.0.1, where nothing listens. Each request presents a stored key: install needs one from a caller that
+// is not the host, as it is on a single-address bind (same-machine connections to it count as remote) or a LAN peer.
+const COMFY_KEY = 'tllm-comfyinstallcomfyinstallcomfyinstall01'
+for (const [label, bind, requestUrl, base] of [
+  ['through remote access, the port really bound', { bindHost: '127.0.0.1', bindPort: 6996 }, 'https://box.tailnet.ts.net/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+  ['on a single-address bind, that address', { bindHost: '192.168.1.10', bindPort: 7000 }, 'http://192.168.1.10:7000/api/v1/comfyui/install', 'http://192.168.1.10:7000'],
+  ['on a wildcard bind, loopback', { bindHost: '0.0.0.0', bindPort: 6996 }, 'http://192.168.1.10:6996/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+  ['on an IPv6 loopback bind, that address', { bindHost: '::1', bindPort: 6996 }, 'http://[::1]:6996/api/v1/comfyui/install', 'http://[::1]:6996'],
+  ['with no bind recorded, the configured port', {}, 'http://localhost:5173/api/v1/comfyui/install', 'http://127.0.0.1:6996'],
+] as const) {
+  test(`POST /api/v1/comfyui/install bakes in the daemon's own address, not the request's Host: ${label}`, async () => {
+    const comfyDir = tmpDir('tllm-comfy-install-')
+    mkdirSync(join(comfyDir, 'custom_nodes'))
+    const cfg = {
+      daemon: { port: 6996 },
+      comfyui: { gatePath: '' },
+      apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(COMFY_KEY), prefix: COMFY_KEY.slice(0, 12), createdAt: '', lastUsedAt: null }],
+    }
+    const app = new Hono()
+    registerApi(app, {
+      store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
+      ...bind,
+    } as unknown as Deps)
+
+    const res = await app.request(requestUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': COMFY_KEY },
+      body: JSON.stringify({ path: comfyDir }),
+    })
+
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.equal(((await res.json()) as { base: string }).base, base)
+    const node = readFileSync(join(comfyDir, 'custom_nodes', 'turbollm_gate', '__init__.py'), 'utf8')
+    assert.match(node, new RegExp(`^TURBOLLM_URL = ${JSON.stringify(base).replace(/[.[\]]/g, '\\$&')}$`, 'm'))
+  })
+}

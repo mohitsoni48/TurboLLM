@@ -7,8 +7,10 @@ import { MemoryRouter } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { EnginesScreen } from './EnginesScreen'
+import { queryKeys } from '../lib/queries'
 import { customSourceKey } from '../lib/engine-groups'
-import { discardReleaseInstall, getEngineUpdates, updateEngine } from '../lib/api'
+import { ApiError, discardReleaseInstall, getEngineUpdates, hostKeyAccepted, updateEngine } from '../lib/api'
+import { clearHostKeyNeeded, isHostKeyNeeded } from '../lib/auth-signal'
 import { toast } from '../components/ui/sonner'
 import type { CatalogEngine, CustomEngineSource, Engine, EngineFit, EngineVariant, ReleaseProvenance } from '../lib/types'
 
@@ -16,6 +18,10 @@ const calls: string[] = []
 const purgeMutate = vi.fn()
 const forgetMutate = vi.fn((key: string, opts?: { onSuccess?: () => void }) => {
   calls.push(`forget:${key}`)
+  opts?.onSuccess?.()
+})
+const deleteBuildMutate = vi.fn((binPath: string, opts?: { onSuccess?: () => void; onError?: (err: unknown) => void }) => {
+  calls.push(`deleteBuild:${binPath}`)
   opts?.onSuccess?.()
 })
 
@@ -56,8 +62,8 @@ const DISABLED_SOURCE: CustomEngineSource = {
 
 const state: {
   engines: Engine[]; customDisabled: CustomEngineSource[]; catalog: CatalogEngine[]; fits: EngineFit[]
-  updates: Record<string, unknown>
-} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {} }
+  updates: Record<string, unknown>; provisioning: boolean; building: boolean
+} = { engines: [], customDisabled: [], catalog: [], fits: [], updates: {}, provisioning: false, building: false }
 
 vi.mock('../lib/queries', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/queries')>()
@@ -72,7 +78,11 @@ vi.mock('../lib/queries', async (importOriginal) => {
     }),
     useEngineUpdates: () => ({ data: { updates: state.updates, policies: {} } }),
     useSysInfo: () => ({ data: { os: 'win32/win32', cpu: '', cores: 0, ramMB: 0, gpus: [] } }),
-    useStatus: () => ({ data: undefined }),
+    useStatus: () => ({
+      data: state.provisioning ? { engine: { state: 'stopped' }, engineProvision: { active: true } }
+        : state.building ? { engine: { state: 'stopped' }, engineBuild: { active: true, phase: 'compiling', engine: 'ik_llama.cpp', log: [], error: null } }
+          : undefined,
+    }),
     useBuild: () => ({
       start: { mutate: vi.fn(), isPending: false }, cancel: { mutate: vi.fn() },
       cuda: { mutate: vi.fn() }, installPrereq: { mutate: vi.fn() }, refresh: vi.fn(),
@@ -83,6 +93,7 @@ vi.mock('../lib/queries', async (importOriginal) => {
       const noop = { mutate: vi.fn(), isPending: false }
       return {
         add: noop, rename: noop, remove: noop, disableCustom: noop, activate: noop, reprobe: noop, start: noop, stop: noop, restart: noop,
+        deleteBuild: { mutate: deleteBuildMutate, isPending: false },
         purge: { mutate: purgeMutate, isPending: false },
         forgetCustomSource: { mutate: forgetMutate, isPending: false },
       }
@@ -110,6 +121,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
   updateEngine: vi.fn().mockResolvedValue({ accepted: true }),
   getEngineUpdates: vi.fn(),
   discardReleaseInstall: vi.fn(),
+  hostKeyAccepted: vi.fn(),
 }))
 vi.mock('../components/ui/sonner', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../components/ui/sonner')>()),
@@ -118,11 +130,15 @@ vi.mock('../components/ui/sonner', async (importOriginal) => ({
 
 function renderScreen() {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(
+  // A fresh element per render: re-rendering the identical element would bail out without
+  // re-reading the mocked hooks.
+  const tree = () => (
     <QueryClientProvider client={qc}>
       <MemoryRouter><EnginesScreen /></MemoryRouter>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   )
+  const ui = render(tree())
+  return { ...ui, qc, rerender: () => ui.rerender(tree()) }
 }
 
 const cardOf = async (title: string) =>
@@ -157,11 +173,15 @@ beforeEach(() => {
     calls.push(`discard:${bin}`)
     return { ok: true }
   })
+  vi.mocked(hostKeyAccepted).mockResolvedValue(true)
+  clearHostKeyNeeded()
   state.engines = []
   state.customDisabled = []
   state.catalog = [PRISM_CATALOG]
   state.fits = [fitFor(PRISM_CATALOG)]
   state.updates = {}
+  state.provisioning = false
+  state.building = false
 })
 
 describe('N-1: deleting a disabled release engine from its card', () => {
@@ -208,6 +228,21 @@ describe('N-1: deleting a disabled release engine from its card', () => {
     expect(toast.error).toHaveBeenCalledWith("Could not find Prism's files — refresh the page.")
     expect(screen.queryByRole('alertdialog')).toBeNull()
     expect(toast.error).not.toHaveBeenCalledWith(expect.stringContaining('Could not find the installed'))
+  })
+
+  it('keeps Delete open while a build from source runs, which the daemon lets it through, but not Enable', async () => {
+    // The Delete only forgets the source and removes the unclaimed install, neither refused during a build; the
+    // Enable re-registers it (POST /engines), which is.
+    showDisabledRelease()
+    state.building = true
+    renderScreen()
+    const menu = await openPrismMenu()
+    expect(within(menu).getByRole('menuitem', { name: 'Enable' })).toHaveAttribute('data-disabled')
+    const del = within(menu).getByRole('menuitem', { name: 'Delete' })
+    expect(del).not.toHaveAttribute('data-disabled')
+    await userEvent.click(del)
+    await confirmDelete()
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(DISABLED_SOURCE)}`, `discard:${PRISM_BIN}`]))
   })
 
   it('regression: Delete on an enabled release card still purges releaseEngineId', async () => {
@@ -297,5 +332,148 @@ describe('N-4: "Check for update" on an enabled release card is honest', () => {
     await waitFor(() => expect(updateEngine).toHaveBeenCalledTimes(1))
     expect(vi.mocked(updateEngine).mock.calls[0]?.[0]).toBe('relA')
     expect(getEngineUpdates).not.toHaveBeenCalled()
+  })
+})
+
+describe('Remove on a disabled custom release install (not shown on a catalog card)', () => {
+  const FORK_BIN = '/e/build/someone-fork-win-vulkan/llama-server'
+  const FORK_SOURCE: CustomEngineSource = {
+    name: 'someone/fork Vulkan (b100)', binPath: FORK_BIN, addedAt: '2026-10-09T00:00:00Z', binPathExists: true,
+  }
+
+  it('forgets the source, THEN discards its now-unclaimed release dir', async () => {
+    state.customDisabled = [FORK_SOURCE]
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(FORK_SOURCE)}`, `discard:${FORK_BIN}`]))
+    expect(toast.success).toHaveBeenCalledWith('someone/fork Vulkan (b100) removed')
+    expect(purgeMutate).not.toHaveBeenCalled()
+  })
+
+  it('a refused discard (not a release dir, or still claimed) stays silent', async () => {
+    state.customDisabled = [FORK_SOURCE]
+    vi.mocked(discardReleaseInstall).mockRejectedValue(new ApiError('engine_not_found', 'No unconfirmed release install at that path.', 404))
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(discardReleaseInstall).toHaveBeenCalledWith(FORK_BIN))
+    await new Promise((r) => setTimeout(r, 0))
+    expect(toast.success).toHaveBeenCalledWith('someone/fork Vulkan (b100) removed')
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+})
+
+// A Disabled engine built from a git repo (a custom source with sourceRepo) lives in engines/build/<slug>. Its Remove
+// only forgot the source, and the release install route it then called answers 404 for a git build, so the folder,
+// often several GB, stayed on disk with no card left to delete it from.
+describe('Remove on a disabled custom git build', () => {
+  const GIT_BIN = '/e/build/me-fork-main/build/bin/llama-server'
+  const GIT_SOURCE: CustomEngineSource = {
+    name: 'My fork', binPath: GIT_BIN, sourceRepo: 'https://github.com/me/fork', sourceBranch: 'main',
+    addedAt: '2026-10-09T00:00:00Z', binPathExists: true,
+  }
+
+  it('forgets the source, THEN deletes its build folder through the Disabled-build Delete', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(GIT_SOURCE)}`, `deleteBuild:${GIT_BIN}`]))
+    expect(discardReleaseInstall).not.toHaveBeenCalled()
+    expect(toast.success).toHaveBeenCalledWith('My fork removed')
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  it('a refused delete says the engine was removed but its files remain; a build folder already gone stays silent', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    deleteBuildMutate.mockImplementationOnce((_bin, opts) =>
+      opts?.onError?.(new ApiError('engine_files_locked', 'Some of the build\'s files are still in use — try again in a moment.', 409)))
+    const view = renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(
+      'My fork removed, but its files could not be deleted: Some of the build\'s files are still in use — try again in a moment.',
+    ))
+    expect(toast.success).not.toHaveBeenCalled()
+    view.unmount()
+
+    vi.mocked(toast.error).mockClear()
+    deleteBuildMutate.mockImplementationOnce((_bin, opts) =>
+      opts?.onError?.(new ApiError('engine_not_found', 'No engine build at that path.', 404)))
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(toast.success).toHaveBeenCalledWith('My fork removed'))
+    expect(toast.error).not.toHaveBeenCalled()
+  })
+
+  // The delete needs a key from a non-host caller, the forget before it does not, and the forget cannot follow the
+  // delete (a remembered source claims the folder: 409 build_dir_taken). A keyless Serve identity, Access JWT or
+  // open-LAN peer had the source forgotten, then the delete refused with no key prompt: the card was gone and the
+  // folder, which no GC sweeps, stayed. The host gate is asked first.
+  it('a caller the host gate refuses forgets nothing and gets the key prompt; the card stays to Remove again', async () => {
+    state.customDisabled = [GIT_SOURCE]
+    vi.mocked(hostKeyAccepted).mockResolvedValue(false)
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(isHostKeyNeeded()).toBe(true))
+    expect(calls).toEqual([])
+    expect(forgetMutate).not.toHaveBeenCalled()
+    expect(deleteBuildMutate).not.toHaveBeenCalled()
+    expect(toast.error).toHaveBeenCalledWith("Deleting an engine's files requires a valid API key.")
+    expect(toast.success).not.toHaveBeenCalled()
+
+    // Once the key is entered the same card's Remove goes through.
+    clearHostKeyNeeded()
+    vi.mocked(hostKeyAccepted).mockResolvedValue(true)
+    await userEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(GIT_SOURCE)}`, `deleteBuild:${GIT_BIN}`]))
+    expect(isHostKeyNeeded()).toBe(false)
+  })
+
+  it('a binary of the user\'s own (no source repo, as a release install) is not asked about: its Remove forgets, then tries the release discard, as before', async () => {
+    const OWN: CustomEngineSource = { name: 'My own binary', binPath: '/opt/llama/llama-server', addedAt: '2026-10-09T00:00:00Z', binPathExists: true }
+    state.customDisabled = [OWN]
+    vi.mocked(hostKeyAccepted).mockResolvedValue(false)
+    renderScreen()
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }))
+    await waitFor(() => expect(calls).toEqual([`forget:${customSourceKey(OWN)}`, 'discard:/opt/llama/llama-server']))
+    expect(hostKeyAccepted).not.toHaveBeenCalled()
+    expect(isHostKeyNeeded()).toBe(false)
+  })
+
+  it('is disabled while a build from source runs, which refuses the delete, unlike a Remove that only forgets', async () => {
+    const OTHER: CustomEngineSource = { name: 'My own binary', binPath: '/opt/llama/llama-server', addedAt: '2026-10-09T00:00:00Z', binPathExists: true }
+    state.customDisabled = [GIT_SOURCE, OTHER]
+    state.building = true
+    renderScreen()
+    const [git, other] = await screen.findAllByRole('button', { name: 'Remove' })
+    expect(git).toBeDisabled()
+    expect(other).toBeEnabled()
+  })
+})
+
+describe('a finished provision run refreshes the engine list and catalog', () => {
+  it('provisioning true -> false invalidates engines and engineCatalog (a release update settles after its 202)', async () => {
+    showOwnedRelease()
+    state.provisioning = true
+    const { qc, rerender } = renderScreen()
+    await cardOf('Prism')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    rerender()
+    expect(invalidate).not.toHaveBeenCalled()
+
+    state.provisioning = false
+    rerender()
+    await waitFor(() => {
+      const keys = invalidate.mock.calls.map((c) => c[0]?.queryKey)
+      expect(keys).toEqual(expect.arrayContaining([queryKeys.engines, queryKeys.engineCatalog]))
+    })
+  })
+
+  it('a screen that was never provisioning invalidates nothing on re-render', async () => {
+    showOwnedRelease()
+    const { qc, rerender } = renderScreen()
+    await cardOf('Prism')
+    const invalidate = vi.spyOn(qc, 'invalidateQueries')
+    rerender()
+    await new Promise((r) => setTimeout(r, 0))
+    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: queryKeys.engines })
   })
 })

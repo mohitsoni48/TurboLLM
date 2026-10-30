@@ -6,6 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { type Config, type Engine, defaultConfig } from '../config/config'
+import type { LoadProfile } from '../models/profile'
 import type { ModelEntry } from '../models/scanner'
 import { type SysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { koboldcppProfileToArgs } from './koboldcpp'
@@ -27,11 +28,11 @@ test('a safetensors model-directory load carries the resume trigger it was built
   assert.equal(opts.trigger, 'resume')
 })
 
-test('koboldcpp gets KoboldCpp flags, including --nogpu on a machine with no GPU', () => {
+test('koboldcpp gets KoboldCpp flags, including --usecpu on a machine with no GPU', () => {
   const opts = resumeLoad(ggufModel(), 'koboldcpp')
 
   assert.deepEqual(opts.extraArgs, koboldcppProfileToArgs(opts.profile!, primaryVendor(NO_GPU_MACHINE), false))
-  assert.ok(opts.extraArgs.includes('--nogpu'))
+  assert.ok(opts.extraArgs.includes('--usecpu'))
   assert.ok(!opts.extraArgs.includes('-c'))
 })
 
@@ -69,6 +70,28 @@ test('llama-server keeps the saved pinned port as the preferred port', () => {
   const opts = resumeLoad(ggufModel(), 'llama-server', cfg)
 
   assert.equal(opts.preferredPort, 9200)
+})
+
+// The load dialog's "this load only" (Remember unchecked) sends its draft as overrides. The model-directory
+// path resolved them into `profile` but launched from the saved profile alone, so a draft tensor-parallel
+// size, pinned port or MLX sampling never reached the engine.
+test('model-directory engines launch with the "this load only" overrides over the saved profile', () => {
+  const cfg = configWithSavedProfile({ port: 9200, gpu: { tensorParallelSize: 1 }, sampling: { temp: 0.7, topP: 0.9 } })
+  const overrides = {
+    port: 9300,
+    gpu: { splitMode: 'layer', tensorSplit: [], mainGpu: -1, tensorParallelSize: 2 },
+    sampling: { temp: 0.2 }, // a partial draft, as an API caller may send
+  } as unknown as Partial<LoadProfile>
+  const build = (kind: string) =>
+    buildStartOpts({ entry: safetensorsModel(), engine: testEngine(kind), cfg, sys: NO_GPU_MACHINE, overrides, trigger: 'manual' })
+
+  const vllm = build('vllm')
+  const mlx = build('mlx')
+
+  assert.equal(vllm.tensorParallelSize, 2)
+  assert.equal(vllm.preferredPort, 9300)
+  assert.deepEqual(mlx.extraArgs, ['--temp', '0.2', '--top-p', '0.9'])
+  assert.equal(mlx.preferredPort, 9300)
 })
 
 test('building StartOpts leaves the config snapshot it reads unchanged', () => {
@@ -116,6 +139,27 @@ test('a Jev model on MLX keeps the MLX sampling path, with no Jev flags', () => 
   const opts = resumeLoad(jevModel(), 'mlx')
 
   assert.deepEqual(opts.extraArgs, mlxSamplingArgs(undefined))
+})
+
+// A manual Load starts a model on the selected engine whatever its format (compat.ts manualLoadRefusal). Built for the
+// model's format, the engine got options of another engine: llama.cpp's -c and -ngl on vLLM, the LiteRT-LM --config
+// object under KoboldCpp, so it failed on arguments it does not take instead of on the file it was handed.
+test("a model the engine does not read is launched with that engine's own options", () => {
+  const litertlm = ggufModel({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+  const kobold = resumeLoad(litertlm, 'koboldcpp')
+  assert.deepEqual(kobold.extraArgs, koboldcppProfileToArgs(kobold.profile!, primaryVendor(NO_GPU_MACHINE), false))
+  assert.equal(kobold.litertLmConfig, undefined)
+  assert.equal(kobold.modelPath, litertlm.path)
+
+  const vllm = resumeLoad(ggufModel(), 'vllm')
+  assert.ok(vllm.extraArgs.includes('--max-num-batched-tokens'), vllm.extraArgs.join(' '))
+  assert.ok(!vllm.extraArgs.includes('-c'), vllm.extraArgs.join(' '))
+
+  const llama = resumeLoad(safetensorsModel(), 'llama-server')
+  assert.deepEqual(llama.extraArgs.slice(0, 2), ['-c', String(llama.profile!.ctx)])
+
+  const litert = resumeLoad(ggufModel(), 'litert-lm')
+  assert.ok(litert.litertLmConfig, 'the LiteRT-LM engine reads its options from --config')
 })
 
 function resumeLoad(entry: ModelEntry, kind: string, cfg: Config = defaultConfig()): StartOpts {

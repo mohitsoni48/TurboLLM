@@ -4,16 +4,20 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { execFile, execFileSync } from 'node:child_process'
-import { basename, join, win32 } from 'node:path'
+import { createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
+import { basename, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { promisify } from 'node:util'
+import { tetheredExecFile } from '../util/tether'
 import type { GpuVendor } from '../sysinfo/sysinfo'
+import { quotePowerShellArg } from '../util/shell-command'
 import { extractZipAll } from './zip-reader'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an extraction the daemon does not live to see ends with it. Its errors
+// name the real program (tar, powershell), as execFile's did.
+const execFileP = tetheredExecFile({ kind: 'extract' })
 
 /** Build standard GitHub API headers, injecting a token so authenticated requests
  *  get 5,000 req/hour instead of the 60/hour unauthenticated limit.
@@ -63,7 +67,9 @@ export function githubHeaders(
 export function stripMacOsQuarantine(dir: string): void {
   if (process.platform !== 'darwin') return
   try {
-    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir])
+    // Synchronous on the daemon's event loop, so bounded: a large engine tree on a slow disk held the daemon for as
+    // long as the filesystem took. What xattr prints is not the daemon's to log (execFileSync passes stderr on).
+    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir], { timeout: 30_000, stdio: 'ignore' })
   } catch {
     // xattr exits non-zero when the attribute is absent — not an error
   }
@@ -315,12 +321,22 @@ export interface ProvisionProgress {
   parts?: number // total archives for this backend
 }
 
+/** Why an update must not replace an engine's files right now (a model was started on it during the download), or
+ *  null. Re-run right before the swap; a refusal throws with code `engine_in_use` and leaves the old files. */
+export type SwapGuard = () => string | null
+
+function throwIfSwapBlocked(blockSwap: SwapGuard | undefined): void {
+  const blocked = blockSwap?.()
+  if (blocked) throw Object.assign(new Error(blocked), { code: 'engine_in_use' })
+}
+
 export async function downloadFile(
   url: string,
   dest: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
   fetchImpl: typeof fetch = fetch,
+  opts: { blockSwap?: SwapGuard } = {},
 ): Promise<void> {
   const res = await fetchImpl(url, { redirect: 'follow', signal })
   if (!res.ok || !res.body) throw Object.assign(new Error(`download failed: HTTP ${res.status}`), { code: 'download_failed' })
@@ -338,7 +354,63 @@ export async function downloadFile(
       }
     }
   })
-  await pipeline(body, createWriteStream(dest), { signal })
+  // Stream into a sibling `.part` and rename only once the whole body arrived. Written straight to
+  // `dest`, a dropped connection or a quit left a truncated file there — and KoboldCpp/llamafile
+  // treat an existing binary as installed, so the next Install registered the broken one.
+  const part = `${dest}.part`
+  try {
+    await pipeline(body, createWriteStream(part), { signal })
+    // An update replaces the binary an engine runs from. Its caller stopped the engine before the download, which
+    // takes minutes: a model loaded on it meanwhile would have its executable replaced under it (on Windows the
+    // rename fails after ~3 s with a bare EPERM instead of saying what to do).
+    throwIfSwapBlocked(opts.blockSwap)
+    await renameWithRetry(part, dest)
+  } catch (e) {
+    // Best effort: AV/the indexer can hold the fresh .part on Windows, and a throw here would replace e
+    // (a Cancel's AbortError would become a failure). A leftover .part is truncated by the next download.
+    try {
+      rmSync(part, { force: true })
+    } catch {
+      /* best effort */
+    }
+    throw e
+  }
+}
+
+/** renameSync, retried for ~3 s on Windows. Windows refuses to rename a directory while any file
+ *  under it is open (whatever the share mode, surfaced as EPERM; EACCES/EBUSY likewise), and
+ *  real-time AV and the search indexer open freshly written files for a moment — exactly what a
+ *  just-staged install or download is (graceful-fs retries its win32 renames for the same reason).
+ *  POSIX rename ignores open handles, so elsewhere a failure is real and thrown at once. */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let delay = 100; ; delay *= 2) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (process.platform !== 'win32' || delay > 1600 || (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY')) throw e
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+}
+
+/** The release tag a single-binary engine (KoboldCpp, llamafile) was downloaded as, recorded
+ *  beside it by {@link recordReleaseTag}; '' for an install that predates the record. */
+export function recordedReleaseTag(binPath: string): string {
+  try {
+    return readFileSync(`${binPath}.version`, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
+export function recordReleaseTag(binPath: string, tag: string): void {
+  try {
+    writeFileSync(`${binPath}.version`, `${tag}\n`)
+  } catch {
+    /* best effort — it only labels the version */
+  }
 }
 
 export type ArchiveExtractor =
@@ -366,7 +438,9 @@ export function archiveExtractor(
 
 function zipExtractor(archive: string, destDir: string, platform: NodeJS.Platform): ArchiveExtractor {
   if (platform === 'win32') return { kind: 'powershell' }
-  if (platform === 'darwin') return { kind: 'tar', cmd: 'tar', args: ['-xf', archive, '-C', destDir] }
+  // Pinned like Windows' System32 tar.exe: only bsdtar reads zip, and a GNU tar first on PATH
+  // (Homebrew's gnubin) would fail every .zip. /usr/bin/tar on macOS is always bsdtar.
+  if (platform === 'darwin') return { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', archive, '-C', destDir] }
   return { kind: 'node-zip' }
 }
 
@@ -393,7 +467,7 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   const extractor = archiveExtractor(archive, destDir, process.platform, process.env, existsSync)
   switch (extractor.kind) {
     case 'node-zip':
-      extractZipAll(readFileSync(archive), destDir)
+      await extractZipAll(await readFile(archive), destDir)
       break
     case 'unsupported':
       throw extractionError('unsupported_archive', extractor.reason)
@@ -407,8 +481,12 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   stripMacOsQuarantine(destDir)
 }
 
-function powershellExpandArgs(archive: string, destDir: string): string[] {
-  const ps = `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`
+/** PURE: the `powershell -Command` arguments that run Expand-Archive. The paths go through quotePowerShellArg:
+ *  escaping only the ASCII ' left a typographic one (U+2018-U+201B, which PowerShell also reads as a single quote)
+ *  to end the string early, so a data dir under a profile such as C:\Users\O’Brien failed every .zip extraction
+ *  with "The path '...\O' either does not exist". Exported for its test, which needs no Windows. */
+export function powershellExpandArgs(archive: string, destDir: string): string[] {
+  const ps = `Expand-Archive -LiteralPath ${quotePowerShellArg(archive)} -DestinationPath ${quotePowerShellArg(destDir)} -Force`
   return ['-NoProfile', '-NonInteractive', '-Command', ps]
 }
 
@@ -462,6 +540,21 @@ function isFullyProvisioned(dir: string): boolean {
   // route handlers) — a failed write just means the next call re-derives it the same way.
   try { writeFileSync(join(dir, PROVISION_MARKER), JSON.stringify({ backfilled: true })) } catch { /* re-derived next time */ }
   return true
+}
+
+/** Delete what a failed or cancelled install left (a partial archive, a half-extracted dir, a stage) on the way out
+ *  of a catch or finally. With retries, since on Windows AV/the indexer briefly holds files that were extracted
+ *  moments ago, and never throwing: a throw there replaces the error in flight, so a Cancel's AbortError (a quiet
+ *  cancel) or the extraction's own error was reported as "Could not install …: EBUSY". A leftover archive or stage
+ *  is replaced or cleared by the next install (downloadFile's own .part cleanup works the same way). A leftover
+ *  install dir may not be: provisionBackend takes a markerless non-CUDA dir that holds llama-server for an older
+ *  install, and provisionTurboquant any dir that holds one. That gap is older; the delete that threw left it too. */
+function removeAfterFailure(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
 }
 
 /**
@@ -520,9 +613,10 @@ export async function provisionBackend(
     }
   } catch (e) {
     // Cancelled or failed mid-download: remove partial archives + the half-built
-    // backend dir so it isn't mistaken for an installed backend.
-    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    // backend dir so it isn't mistaken for an installed backend. Best effort, as
+    // removeAfterFailure says: a throw here replaced e, so a Cancel became a failure.
+    for (const tmp of tmpPaths) removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 
@@ -758,17 +852,148 @@ export async function turboquantAssetUrl(
   return null
 }
 
+/** Written into the working TurboQuant install right before an update parks it at .turboquant-old, and removed once
+ *  the new install passed `verify`: while the parked install carries it, the update that parked it never finished and
+ *  it is still the working build. */
+const TURBOQUANT_UPDATE_INCOMPLETE_MARKER = '.turbollm-update-incomplete'
+
+/** Best effort, with retries (Windows AV/indexer locks are brief). A marker left in turboquant/ itself is never read
+ *  (only a parked install's is), and the next park writes it anew. */
+function clearTurboquantUpdateMarker(dir: string): void {
+  try {
+    rmSync(join(dir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), { force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Put the parked TurboQuant install back when an update was cut off (the daemon exited or died) after parking it at
+ *  .turboquant-old and before the new install passed its probe: between the two renames (no install in place), or
+ *  while the new one was probed. Nothing did, so the engine stayed on a build that never ran here, its only working
+ *  build in a hidden folder, and the next update took that folder for a leftover and deleted it. Such a parked
+ *  install still carries TURBOQUANT_UPDATE_INCOMPLETE_MARKER; the unverified install beside it is moved into the
+ *  update's stage, which the next update clears first. A parked install without the marker is a leftover whose
+ *  delete failed after its update passed, left for the next update to delete: also when turboquant/ is gone beside
+ *  it (a Purge renames away only that), where putting it back would show TurboQuant installed again and hand its old
+ *  binary to the next Install instead of a download. A rename that fails leaves everything for the next call. Runs
+ *  at boot and at the start of every update and Install; returns false when the parked install is still the working
+ *  build and could not be put back. */
+export function restoreInterruptedTurboquantUpdate(enginesRoot: string): boolean {
+  const destDir = join(enginesRoot, 'turboquant')
+  const parked = join(enginesRoot, '.turboquant-old')
+  if (!existsSync(join(parked, TURBOQUANT_UPDATE_INCOMPLETE_MARKER))) return true
+  try {
+    if (existsSync(destDir)) {
+      const stageRoot = join(enginesRoot, '.turboquant-update')
+      mkdirSync(stageRoot, { recursive: true })
+      renameSync(destDir, join(stageRoot, `unverified-${Date.now()}`))
+    }
+    renameSync(parked, destDir)
+  } catch {
+    return false
+  }
+  clearTurboquantUpdateMarker(destDir)
+  return true
+}
+
 /** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`,
  *  resolving the right per-platform source (HF on Windows, GitHub elsewhere) via the
  *  download → extract → locate pipeline. Throws `no_release_asset` when this platform
- *  has no prebuilt. */
+ *  has no prebuilt. `replace` (an update) fetches the latest even when an install exists:
+ *  it is extracted into a staging dir and swapped in only once it holds a llama-server,
+ *  so a failed lookup, download or extract leaves the working install untouched.
+ *  `verify` (an update only) runs with the new install in place and the old one still
+ *  parked; when it throws (the caller probes the new binary there and registers it), the
+ *  new install is moved out and the old one put back, so a build that does not run here
+ *  never replaces one that does. An update cut off before verify passed is put back at the
+ *  next start, or by the next update or Install first ({@link restoreInterruptedTurboquantUpdate}).
+ *  `blockSwap` (an update only) re-runs right before the swap. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  opts: { replace?: boolean; verify?: (bin: string) => Promise<void>; blockSwap?: SwapGuard } = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
+  // An update cut off before its new build passed the probe left the working build parked: put it back first. An
+  // update's leftover delete below would take it. An Install (after a boot that could not move it back, turboquant/
+  // gone, its entry left on the missing binary) downloaded beside it, and the next start swapped that download out for
+  // it. When it cannot be put back it is still the only working build, so stop.
+  if (!restoreInterruptedTurboquantUpdate(enginesRoot)) {
+    throw new Error(
+      `An earlier TurboQuant update was cut short and its working build, kept at ${join(enginesRoot, '.turboquant-old')}, ` +
+        'could not be moved back yet. Try again in a moment.',
+    )
+  }
+  if (opts.replace) {
+    // Provision into a staging root exactly as a first install would, then swap the dirs.
+    const stageRoot = join(enginesRoot, '.turboquant-update')
+    const stagedDir = join(stageRoot, 'turboquant')
+    rmSync(stageRoot, { recursive: true, force: true }) // a stale stage from an interrupted update
+    try {
+      const stagedBin = await provisionTurboquant(stageRoot, repo, onProgress, signal)
+      // The download took minutes: a model loaded on the engine meanwhile must not have its files swapped under it.
+      throwIfSwapBlocked(opts.blockSwap)
+      const parked = existsSync(destDir) ? join(enginesRoot, '.turboquant-old') : null
+      if (parked) {
+        // A leftover of an earlier update whose delete below failed. Retries: Windows AV/indexer locks are brief.
+        rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+        // Parked, it stays the working build until the new one passed verify below: marked first, so the next start
+        // (or update) puts it back when the daemon exits or dies before then (restoreInterruptedTurboquantUpdate).
+        writeFileSync(join(destDir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), '')
+        try {
+          await renameWithRetry(destDir, parked)
+        } catch (e) {
+          clearTurboquantUpdateMarker(destDir)
+          throw e
+        }
+      }
+      try {
+        // The staged tree was extracted moments ago: AV/the indexer may still hold its files open.
+        await renameWithRetry(stagedDir, destDir)
+      } catch (e) {
+        if (parked) {
+          await renameWithRetry(parked, destDir)
+          clearTurboquantUpdateMarker(destDir)
+        }
+        throw e
+      }
+      const bin = join(destDir, relative(stagedDir, stagedBin))
+      try {
+        await opts.verify?.(bin)
+      } catch (e) {
+        // The new build does not run here. Deleting the old one first and probing after left the broken binary in
+        // place under the old build's version, so the same update kept being offered and an `auto` engine
+        // downloaded it again on every check. Back to the stage (removed below), and the old install back.
+        try {
+          await renameWithRetry(destDir, stagedDir)
+          if (parked) {
+            await renameWithRetry(parked, destDir)
+            clearTurboquantUpdateMarker(destDir)
+          }
+        } catch {
+          /* the probe error stays the reported cause; a parked old install is still at .turboquant-old, marked */
+        }
+        throw e
+      }
+      // The new install is in place: deleting the old one is best effort, never a failed update (the next one
+      // removes a leftover first). From here a parked old one is a leftover: its marker goes first, so a failed
+      // delete of it is never taken for an update cut short.
+      if (parked) {
+        clearTurboquantUpdateMarker(parked)
+        try {
+          rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+        } catch {
+          /* best effort */
+        }
+      }
+      return bin
+    } finally {
+      // After a failed swap the stage still holds those fresh files, and a throw here would mask the real error.
+      removeAfterFailure(stageRoot)
+    }
+  }
   if (existsSync(destDir)) {
     const found = findServer(destDir)
     if (found) {
@@ -791,8 +1016,8 @@ export async function provisionTurboquant(
     await extractArchive(tmp, destDir)
     rmSync(tmp, { force: true })
   } catch (e) {
-    rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 

@@ -35,6 +35,16 @@ const SAMPLING_FIELDS = [
   { key: 'min_p',       label: 'Min P',       min: 0, max: 1,   step: 0.01, def: 0.05, modelField: 'minP' as const },
 ] as const
 
+/** The fields this dialog edits, as the server has them for `conv`. */
+function convSettings(conv: Conversation) {
+  return {
+    systemPrompt: conv.systemPrompt ?? '',
+    sampling: conv.sampling ?? {},
+    skillIds: conv.skillIds ?? [],
+    preserveThinking: conv.preserveThinking ?? false,
+  }
+}
+
 /** Draft thread settings for a not-yet-created conversation (a blank chat screen with a
  *  model loaded but no first message sent yet). Mirrors ChatScreen's existing
  *  `pendingSkillIds` pattern, extended to the other three thread-settings fields. */
@@ -64,10 +74,20 @@ export function ConversationSettingsDialog({
   conv,
   draft,
   modelSampling,
+  litertLm = false,
+  noPastReasoning = false,
 }: {
   conv: Conversation | undefined
   draft?: ConversationSettingsDraft
   modelSampling?: { temp: number; topP: number; topK: number; minP: number }
+  /** The loaded model runs on LiteRT-LM, which has no Min P sampling: the slider is left out (it sent a value no
+   *  LiteRT-LM applies; the Android server names it as not applied), a Min P the thread already has is shown as not
+   *  applied with a Clear, and Top K 0 is labelled as what it is there, no top-k limit. */
+  litertLm?: boolean
+  /** The loaded model's chat template shows it none of its past reasoning (a .litertlm whose template reads no
+   *  reasoning_content, which is where the chat sends it to LiteRT-LM): Preserve thinking cannot apply to it, and its
+   *  row says so rather than seeming to work. */
+  noPastReasoning?: boolean
 }) {
   const mut = useConversationMutations()
   const [open, setOpen] = useState(false)
@@ -80,6 +100,11 @@ export function ConversationSettingsDialog({
   const skillsQ = useQuery({ queryKey: skillKeys.list(), queryFn: fetchSkills, enabled: open, staleTime: 0 })
   const pickableSkills = (skillsQ.data ?? []).filter((s) => !CHAT_UNSUPPORTED_SKILLS.has(s.id))
 
+  // The server values the form was last loaded from, so a later change to them can be told
+  // apart from the user's own edits (see the effect after the next one).
+  const loaded = useRef<ReturnType<typeof convSettings> | null>(null)
+  const serverKey = conv ? JSON.stringify(convSettings(conv)) : ''
+
   useEffect(() => {
     if (!open) return
     // The dialog component stays mounted for the lifetime of the chat screen (only
@@ -88,17 +113,40 @@ export function ConversationSettingsDialog({
     // collapsed on every open, not just the first.
     setSkillsOpen(false)
     if (conv) {
-      setSystemPrompt(conv.systemPrompt ?? '')
-      setSampling(conv.sampling ?? {})
-      setSkillIds(conv.skillIds ?? [])
-      setPreserveThinking(conv.preserveThinking ?? false)
+      const s = convSettings(conv)
+      loaded.current = s
+      setSystemPrompt(s.systemPrompt)
+      setSampling(s.sampling)
+      setSkillIds(s.skillIds)
+      setPreserveThinking(s.preserveThinking)
     } else if (draft) {
       setSystemPrompt(draft.systemPrompt ?? '')
       setSampling(draft.sampling ?? {})
       setSkillIds(draft.skillIds ?? [])
       setPreserveThinking(draft.preserveThinking ?? true)
     }
-  }, [open, conv, draft])
+    // Keyed on the conversation's ID, not the object: every refetch (a reply finishing,
+    // auto-title, another device's message) hands over a new object for the same
+    // conversation, and resyncing on that wiped whatever the user was typing here.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, conv?.id, draft])
+
+  // ...but the settings themselves can change while the dialog is open: most often the
+  // refetch after a Save, which closes the dialog before it lands, so reopening in that gap
+  // loads the old values and a second Save would write them back. Take the new
+  // value for each field the user hasn't changed since it was loaded; keep their edits.
+  useEffect(() => {
+    const base = loaded.current
+    if (!open || !conv || !base || JSON.stringify(base) === serverKey) return
+    const next = convSettings(conv)
+    const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+    if (systemPrompt === base.systemPrompt) setSystemPrompt(next.systemPrompt)
+    if (same(sampling, base.sampling)) setSampling(next.sampling)
+    if (same(skillIds, base.skillIds)) setSkillIds(next.skillIds)
+    if (preserveThinking === base.preserveThinking) setPreserveThinking(next.preserveThinking)
+    loaded.current = next
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, serverKey])
 
   const toggleSkill = (id: string) =>
     setSkillIds((prev) => (prev.includes(id) ? prev.filter((s) => s !== id) : [...prev, id]))
@@ -119,6 +167,12 @@ export function ConversationSettingsDialog({
     setSampling((prev) => ({ ...prev, [field]: val }))
 
   const resetSampling = () => { track('chat', 'reset_thread_sampling'); setSampling({}) }
+  // A Min P the thread already has (set under another engine, or by an earlier build), which LiteRT-LM cannot apply and
+  // which has no slider here on LiteRT-LM: shown with a Clear that drops only it (Reset drops all of the thread's
+  // sampling). The chat also sends a camelCase minP an API client stored on the thread, so that one counts too.
+  const storedMinP = typeof sampling.min_p === 'number' ? sampling.min_p : sampling.minP
+  const threadMinP = litertLm && typeof storedMinP === 'number' && storedMinP > 0 ? storedMinP : 0
+  const clearMinP = () => setSampling(({ min_p: _dropped, minP: _droppedToo, ...rest }) => rest)
 
   const save = () => {
     track('chat', 'save_thread_settings')
@@ -199,7 +253,7 @@ export function ConversationSettingsDialog({
             </div>
 
             <div className="flex flex-col gap-3.5">
-              {SAMPLING_FIELDS.map((f) => {
+              {SAMPLING_FIELDS.filter((f) => !(litertLm && f.key === 'min_p')).map((f) => {
                 const isSet = f.key in sampling
                 const modelDef = modelSampling?.[f.modelField]
                 const effectiveDef = modelDef ?? f.def
@@ -223,7 +277,7 @@ export function ConversationSettingsDialog({
                       style={{ accentColor: 'var(--accent)' }}
                     />
                     <span className="w-10 shrink-0 text-right font-mono text-[13px] tabular-nums text-ink">
-                      {f.step < 1 ? val.toFixed(2) : String(Math.round(val))}
+                      {litertLm && f.key === 'top_k' && val <= 0 ? 'off' : f.step < 1 ? val.toFixed(2) : String(Math.round(val))}
                     </span>
                   </div>
                 )
@@ -233,6 +287,19 @@ export function ConversationSettingsDialog({
             {!hasOverrides && (
               <p className="mt-2.5 text-[12px] text-faint">
                 Using model defaults · move any slider to override for this thread
+              </p>
+            )}
+            {litertLm && (
+              <p className="mt-1.5 text-[12px] text-faint">
+                {threadMinP > 0
+                  ? (
+                    <>
+                      {`LiteRT-LM has no Min P: this thread's Min P (${threadMinP.toFixed(2)}) is not applied. `}
+                      <button type="button" className="underline hover:text-ink" onClick={clearMinP}>Clear it</button>
+                      {' Top K 0 is no top-k limit.'}
+                    </>
+                  )
+                  : 'LiteRT-LM has no Min P. Top K 0 is no top-k limit.'}
               </p>
             )}
           </div>
@@ -299,6 +366,11 @@ export function ConversationSettingsDialog({
               <span className="text-[12px] text-muted">
                 Resend the model's past reasoning on later turns, not just its final answers — uses more tokens per request.
               </span>
+              {noPastReasoning && (
+                <span className="mt-1 text-[12px] text-faint">
+                  This model's chat template shows it none of its past reasoning, so this does not apply to it.
+                </span>
+              )}
             </span>
             <Switch checked={preserveThinking} onCheckedChange={(v) => { track('chat', 'toggle_preserve_thinking'); setPreserveThinking(v) }} />
           </div>

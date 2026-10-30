@@ -6,8 +6,9 @@
 // The fragile bits the spike surfaced are baked in here (disable thinking, json_object,
 // strip fences, exact model alias) so the loop can't silently degrade to NO_LESSON.
 import type { Deps } from '../deps'
-import { applyEngineTokenLimit, engineModelAlias } from '../engines/compat'
+import { engineModelAlias } from '../engines/compat'
 import { servingEngineKind } from '../engines/serving'
+import { jsonCompletion } from './json-completion'
 
 const REVIEWER_SYSTEM = `You review a COMPLETED, user-approved agent task and extract at most ONE reusable lesson — ONLY if there is concrete evidence of a problem.
 
@@ -25,43 +26,41 @@ Respond with ONLY the JSON object, nothing else.`
 export interface ReviewResult {
   lesson: string | null
   evidence: string | null
+  /** Why there is no lesson when the model could not be asked (no model loaded, the engine's reason for refusing the
+   *  request): not NO_LESSON. */
+  error?: string
 }
 
 /** Run the reviewer over a conversation transcript. Returns the lesson (or null) — does
- *  NOT persist (the caller decides). Best-effort: returns {null,null} on any failure. */
+ *  NOT persist (the caller decides). Best-effort: {null,null} when there is no lesson, with
+ *  `error` when the model could not be asked. */
 export async function reviewConversation(
   d: Deps,
   transcript: { role: string; content: string }[],
 ): Promise<ReviewResult> {
   const ms = d.manager.status()
   const target = d.manager.target()
-  if (ms.state !== 'running' || !ms.model || !target) return { lesson: null, evidence: null }
+  if (ms.state !== 'running' || !ms.model || !target) return { lesson: null, evidence: null, error: 'No model loaded.' }
 
   const convoText = transcript.map((m) => `${m.role.toUpperCase()}: ${m.content}`).join('\n').slice(0, 24_000)
   const model = engineModelAlias(servingEngineKind(d), d.manager.currentOpts()?.modelPath) ?? ms.model.key
 
   try {
-    const res = await fetch(`${target}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(applyEngineTokenLimit(servingEngineKind(d), {
-        model,
-        messages: [
-          { role: 'system', content: REVIEWER_SYSTEM },
-          { role: 'user', content: `Here is the completed task conversation:\n\n${convoText}\n\nExtract a lesson only if there is concrete evidence. Output ONLY the raw JSON object — no markdown fences, no explanation.` },
-        ],
-        temperature: 0.2,
-        max_tokens: 600,
-        thinking_budget_tokens: 0,
-        chat_template_kwargs: { enable_thinking: false },
-        response_format: { type: 'json_object' },
-        stream: false,
-      })),
-      signal: AbortSignal.timeout(90_000),
-    })
-    if (!res.ok) return { lesson: null, evidence: null }
-    const data = (await res.json()) as { choices?: Array<{ message?: { content?: string } }> }
-    let txt = data.choices?.[0]?.message?.content ?? ''
+    const answer = await jsonCompletion(d, target, {
+      model,
+      messages: [
+        { role: 'system', content: REVIEWER_SYSTEM },
+        { role: 'user', content: `Here is the completed task conversation:\n\n${convoText}\n\nExtract a lesson only if there is concrete evidence. Output ONLY the raw JSON object — no markdown fences, no explanation.` },
+      ],
+      temperature: 0.2,
+      max_tokens: 600,
+      thinking_budget_tokens: 0,
+      chat_template_kwargs: { enable_thinking: false },
+      response_format: { type: 'json_object' },
+      stream: false,
+    }, 90_000)
+    if ('error' in answer) return { lesson: null, evidence: null, error: answer.error }
+    let txt = answer.content
     txt = txt.replace(/<think>[\s\S]*?<\/think>/gi, '').replace(/```json|```/gi, '').trim()
     const m = txt.match(/\{[\s\S]*\}/)
     if (!m) return { lesson: null, evidence: null }

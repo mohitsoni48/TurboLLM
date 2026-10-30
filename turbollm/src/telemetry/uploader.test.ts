@@ -5,6 +5,7 @@ import { enqueue, readQueue } from './queue'
 import { flush, type Transport } from './uploader'
 import { readSentLog } from './log'
 import { TELEMETRY_ENV } from './disabled'
+import { TELEMETRY_SCHEMA_VERSION } from './schema'
 import { tmpDir } from '../test-support/tmp'
 
 function tempDir(): string {
@@ -132,6 +133,40 @@ test('flush: consent off DISCARDS anything still queued rather than sending it',
 
     assert.equal(sent.length, 0, 'nothing sent')
     assert.equal(readQueue(dir).length, 0, 'queue purged')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: lowering full → anon withdraws the full-only events queued at full', async () => {
+  // Default is `full`; a user who narrows to "anonymous usage + benchmarks" must not have the
+  // click stream / error fingerprints queued before the change uploaded on the next flush.
+  const dir = tempDir()
+  try {
+    assert.ok(enqueue(dir, validEvent({ schema: TELEMETRY_SCHEMA_VERSION, event: 'ui_action', payload: { screen: 'chat', action: 'manual_compact' } })))
+    assert.ok(enqueue(dir, validEvent({ schema: TELEMETRY_SCHEMA_VERSION, event: 'error', payload: { fingerprint: 'cuda_oom' } })))
+    assert.ok(enqueue(dir, validEvent()))
+    const { transport, sent } = fakeTransport('ok')
+
+    await flush(dir, 'anon', transport)
+
+    assert.deepEqual(sent.map((batch) => batch.map((e) => (e as { event: string }).event)), [['app_first_run']])
+    assert.equal(readQueue(dir).length, 0, 'full-only events purged, not kept for a later full flush')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('flush: at full, full-only events are sent as before', async () => {
+  const dir = tempDir()
+  try {
+    enqueue(dir, validEvent({ schema: TELEMETRY_SCHEMA_VERSION, event: 'ui_action', payload: { screen: 'chat', action: 'manual_compact' } }))
+    enqueue(dir, validEvent())
+    const { transport, sent } = fakeTransport('ok')
+
+    await flush(dir, 'full', transport)
+
+    assert.equal(sent[0].length, 2)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

@@ -18,6 +18,7 @@
 // surfaced honestly rather than as a mysterious absence.
 import { Cloud, Info } from 'lucide-react'
 import { useRemoteEngines } from '../../lib/link-queries'
+import { servingElsewhere } from '../../lib/queries'
 import type { LinkSummary, RemoteStatus } from '../../lib/link-api'
 import { describeRemoteFailure } from '../../lib/remote-failure'
 import { fleetMachines } from '../../lib/fleet'
@@ -113,8 +114,10 @@ function RemoteEngineRow({
             <>
               {/* Engine NAME and state only. `port` and `pid` are on the wire shape but are
                   the host's internals — a fleet list has no use for them, and this feature
-                  has already had several host-detail leaks. */}
-              {engine.name}
+                  has already had several host-detail leaks. The name is the engine running
+                  the host's model when that is not the host's selected one: `name` alone
+                  showed the selected engine running a model another engine ran. */}
+              {servingElsewhere(status) ?? engine.name}
               {' · '}
               {engine.state}
               {model ? ` · ${model.name}${model.quant ? ` (${model.quant})` : ''}` : ''}

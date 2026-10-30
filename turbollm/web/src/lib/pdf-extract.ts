@@ -14,13 +14,21 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
 /** Extracts plain text from a PDF file, page by page, joined with blank lines. */
 export async function extractPdfText(file: File): Promise<string> {
   const buf = await file.arrayBuffer()
-  const doc = await pdfjsLib.getDocument({ data: buf }).promise
-  const pages: string[] = []
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i)
-    const content = await page.getTextContent()
-    const text = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
-    pages.push(text)
+  // Each getDocument() (no shared workerPort) spawns its own pdf.js Web Worker, which only the
+  // loading task's destroy() terminates — without it every attached PDF leaked a worker thread
+  // plus its parsed document. Destroyed on the error path too.
+  const task = pdfjsLib.getDocument({ data: buf })
+  try {
+    const doc = await task.promise
+    const pages: string[] = []
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i)
+      const content = await page.getTextContent()
+      const text = content.items.map((it) => ('str' in it ? it.str : '')).join(' ')
+      pages.push(text)
+    }
+    return pages.join('\n\n')
+  } finally {
+    task.destroy().catch(() => {})
   }
-  return pages.join('\n\n')
 }

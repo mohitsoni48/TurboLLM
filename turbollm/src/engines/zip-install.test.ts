@@ -4,7 +4,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { inflateRawSync } from 'node:zlib'
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import fs, { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
+import { syncBuiltinESMExports } from 'node:module'
 import { dirname, join } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
 import { buildZipArchive, type ZipMember } from '../test-support/zip-archive'
@@ -25,6 +26,7 @@ import {
   zipBuildDirName,
   ZipError,
 } from './zip-install'
+import { isInstallMarkerName } from './zip-reader'
 import type { ProbeResult } from './probe'
 import { sourceBuildDirOf } from './build-runner'
 
@@ -157,6 +159,33 @@ test('pickZipFiles: install-provenance markers in the binary dir are never selec
   assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
 })
 
+test('pickZipFiles: a marker in another letter case is not selected either (on NTFS/APFS it IS the marker file)', () => {
+  const entries = readZipEntries(
+    buildZipArchive([member('llama-server'), member('.TurboLLM-Release-Install', '{}'), member('.TURBOLLM-ZIP-INSTALL'), member('libggml.so')]),
+  )
+  const sel = pickZipFiles(entries, 'linux', 'llama-server')
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
+})
+
+// On NTFS a stream suffix still names the marker file ('::$DATA' is its contents), as does a trailing dot or space.
+test('pickZipFiles: a marker spelled as an NTFS alias is not selected either', () => {
+  const aliases = [
+    '.turbollm-release-install::$DATA',
+    '.TurboLLM-Release-Install:x',
+    '.turbollm-zip-install::$INDEX_ALLOCATION',
+    '.turbollm-release-install. .',
+    '.turbollm-zip-install ',
+  ]
+  const entries = readZipEntries(buildZipArchive([member('llama-server'), ...aliases.map((n) => member(n, '{}')), member('libggml.so')]))
+  const sel = pickZipFiles(entries, 'linux', 'llama-server')
+  assert.ok(sel)
+  assert.deepEqual([...sel.files.keys()].sort(), ['libggml.so', 'llama-server'])
+  // A longer name that only starts with a marker's is an ordinary file.
+  assert.equal(isInstallMarkerName('.turbollm-release-install.bak'), false)
+  assert.equal(isInstallMarkerName('dir/.turbollm-zip-installer'), false)
+})
+
 test('pickZipFiles: multiple binaries → shallowest wins, deterministically', () => {
   const entries = readZipEntries(
     buildZipArchive([member('deep/nested/dir/llama-server'), member('cuda/llama-server'), member('cuda/ggml.so')]),
@@ -234,6 +263,14 @@ test('zipBuildDirName: stem of the zip name, collapsed to one safe path step', (
   assert.equal(zipBuildDirName('..'), 'zip-build') // path-step guard
   assert.equal(zipBuildDirName(''), 'zip-build')
   assert.equal(zipBuildDirName('---.zip'), 'zip-build')
+})
+
+test('zipBuildDirName: never a hidden name, so an install cannot pass for a staging or parked dir', () => {
+  assert.equal(zipBuildDirName('.my-build.stage.zip'), 'my-build.stage')
+  assert.equal(zipBuildDirName('.fork-1234abcd.old.zip'), 'fork-1234abcd.old')
+  assert.equal(zipBuildDirName('.-. fork.zip'), 'fork')
+  assert.equal(zipBuildDirName('.zip'), 'zip-build')
+  assert.equal(zipBuildDirName('....zip'), 'zip-build')
 })
 
 // ── extraction ───────────────────────────────────────────────────────────────
@@ -316,6 +353,26 @@ test('extractZipFiles: symlinked library chains materialize as their target\'s b
     assert.equal(readFileSync(join(dir, 'libggml.so'), 'utf8'), 'real-so-bytes')
     assert.equal(readFileSync(join(dir, 'libggml.so.0'), 'utf8'), 'real-so-bytes')
     assert.equal(readFileSync(join(dir, 'libggml.so.0.0.1'), 'utf8'), 'real-so-bytes')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('extractZipFiles: symlink copies count toward the total uncompressed cap, checked before anything is written', () => {
+  // Each link declares only its link text but is written as a full copy of its target. The
+  // declared size stands in for real bytes: the cap must refuse before any inflate, so the
+  // under-filled member below is never even decompressed.
+  const almost2GiB = 2 * 1024 * 1024 * 1024 - 1
+  const buf = buildZipArchive([
+    { name: 'bin/llama-server', lieSize: almost2GiB },
+    { name: 'bin/libggml.so', data: Buffer.from('llama-server'), symlink: true },
+    { name: 'bin/libllama.so', data: Buffer.from('llama-server'), symlink: true },
+  ])
+  const sel = pickZipFiles(readZipEntries(buf), 'linux')!
+  const dir = tmpDir('tllm-zip-')
+  try {
+    assertZipError(() => extractZipFiles(buf, sel, dir), 'zip_too_large', 'total uncompressed-size cap')
+    assert.deepEqual(readdirSync(dir), [])
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -532,6 +589,21 @@ test('installZipEngine: writes the marker and reports the FINAL path with a name
   }
 })
 
+test('installZipEngine: a zip named like a staging dir installs where the sweep leaves a registered engine alone', async () => {
+  const root = tmpDir('tllm-zip-')
+  try {
+    const res = await installZipEngine(root, '.my-build.stage.zip', buildZipArchive([member('llama-server', 'elf')]), { probeFn: STUB_PROBE })
+    assert.ok(res.found)
+    const dir = dirname(res.binPath)
+    const old = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000)
+    utimesSync(dir, old, old)
+    gcAbandonedZipInstalls(root, [res.binPath])
+    assert.equal(readFileSync(res.binPath, 'utf8'), 'elf', 'the registered engine keeps its files')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('missingCudartWarning: a Windows CUDA build without cudart64_*.dll warns; everything else stays silent', () => {
   const msg = missingCudartWarning(['llama-server.exe', 'ggml.dll', 'ggml-cuda.dll'], 'win32')
   assert.ok(msg)
@@ -668,6 +740,15 @@ test('gcAbandonedZipInstalls: a zip-marked dir is still removed by default', () 
   assert.deepEqual(readdirSync(buildRoot), [])
 })
 
+test('gcAbandonedZipInstalls: a removed install a purge renamed aside is left to the purge\'s own delete', () => {
+  const { enginesRoot, buildRoot } = buildDirs([
+    { name: '.rel.purge-1700000000000', marker: RELEASE_INSTALL_MARKER, ageMs: THIRTY_HOURS },
+    { name: '.zipped.purge-1700000000000', marker: ZIP_BUILD_MARKER, ageMs: THIRTY_HOURS },
+  ])
+  gcAbandonedZipInstalls(enginesRoot, [])
+  assert.deepEqual(readdirSync(buildRoot).sort(), ['.rel.purge-1700000000000', '.zipped.purge-1700000000000'])
+})
+
 test('gcAbandonedZipInstalls: opts.markers restricts which marker counts', () => {
   const { enginesRoot, buildRoot } = buildDirs([
     { name: 'rel', marker: RELEASE_INSTALL_MARKER },
@@ -675,4 +756,57 @@ test('gcAbandonedZipInstalls: opts.markers restricts which marker counts', () =>
   ])
   gcAbandonedZipInstalls(enginesRoot, [], { maxAgeMs: 0, markers: [ZIP_BUILD_MARKER] })
   assert.deepEqual(readdirSync(buildRoot), ['rel'])
+})
+
+// A parked previous install (`.<slug>-<id>.old`) is the only build of its engine when the swap's rename and the move
+// back both failed, or the daemon died between them: build/<slug> is gone, no binPath points into the parked dir, and
+// it is as old as the install it holds. The sweep deleted it after 24 h.
+
+/** A parked install of build/<slug> holding `content`, its marker written `markerAgeMs` ago, the dir itself 30 h old. */
+function parkedInstall(buildRoot: string, name: string, content: string, markerAgeMs: number): void {
+  const dir = join(buildRoot, name)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(join(dir, 'llama-server'), content)
+  writeFileSync(join(dir, ZIP_BUILD_MARKER), 'myfork.zip\n')
+  const markerTime = new Date(Date.now() - markerAgeMs)
+  utimesSync(join(dir, ZIP_BUILD_MARKER), markerTime, markerTime)
+  const dirTime = new Date(Date.now() - THIRTY_HOURS)
+  utimesSync(dir, dirTime, dirTime)
+}
+
+test('gcAbandonedZipInstalls: the parked build of an engine whose build dir is gone is moved back, the newest one', () => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  // An older leftover (its delete failed after an earlier swap) and the build parked by the swap that died.
+  parkedInstall(buildRoot, '.myfork-1111aaaa.old', 'older', 3 * THIRTY_HOURS)
+  parkedInstall(buildRoot, '.myfork-2222bbbb.old', 'newer', 2 * THIRTY_HOURS)
+  gcAbandonedZipInstalls(enginesRoot, [join(buildRoot, 'myfork', 'llama-server')])
+  assert.deepEqual(readdirSync(buildRoot), ['myfork'], 'the newest is back in place and the older leftover swept')
+  assert.equal(readFileSync(join(buildRoot, 'myfork', 'llama-server'), 'utf8'), 'newer')
+})
+
+test('gcAbandonedZipInstalls: a parked build that cannot be moved back yet is kept for the next call, not swept', (t) => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  parkedInstall(buildRoot, '.myfork-2222bbbb.old', 'only-build', THIRTY_HOURS)
+  const claimed = [join(buildRoot, 'myfork', 'llama-server')]
+  const locked = t.mock.method(fs, 'renameSync', () => { throw Object.assign(new Error('EPERM: rename'), { code: 'EPERM' }) })
+  syncBuiltinESMExports()
+  try {
+    gcAbandonedZipInstalls(enginesRoot, claimed)
+  } finally {
+    locked.mock.restore()
+    syncBuiltinESMExports()
+  }
+  assert.deepEqual(readdirSync(buildRoot), ['.myfork-2222bbbb.old'])
+  gcAbandonedZipInstalls(enginesRoot, claimed)
+  assert.equal(readFileSync(join(buildRoot, 'myfork', 'llama-server'), 'utf8'), 'only-build')
+})
+
+test('gcAbandonedZipInstalls: a parked build nothing claims (its engine was purged) is not moved back, and is swept', () => {
+  const { enginesRoot, buildRoot } = buildDirs([])
+  mkdirSync(buildRoot, { recursive: true })
+  parkedInstall(buildRoot, '.gone-2222bbbb.old', 'orphan', THIRTY_HOURS)
+  gcAbandonedZipInstalls(enginesRoot, [])
+  assert.deepEqual(readdirSync(buildRoot), [])
 })

@@ -14,6 +14,9 @@ export interface RemoteTarget {
   baseUrl: string
   token: string
   modelKey: string
+  /** The caller on THIS machine may not load models (auth.ts modelLoadsRefused);
+   *  `linkHeaders` tells the host. */
+  noLoad?: true
 }
 
 /** The host's Turbo Link façade prefix. A peer NEVER talks to the host's public `/v1/*`
@@ -47,6 +50,13 @@ const FORWARDED = ['content-type', 'accept'] as const
  *  so the casing is cosmetic; the point is that there is a single definition to change. */
 export const LINK_AUTH_HEADER = 'X-TurboLLM-Auth'
 
+/** Present on a link request whose caller on the peer may not load models, though the link
+ *  itself may (`RemoteTarget.noLoad`). The host's façade then serves only the model it has
+ *  loaded, decided on its live state (link-routes.ts); the peer's own check reads its catalog,
+ *  which can be a refresh behind. It only ever narrows what the link token allows, so a host
+ *  that predates it simply ignores it and the peer's check still applies. */
+export const LINK_NO_LOAD_HEADER = 'X-TurboLLM-Link-No-Load'
+
 /** Build the outbound header set for a link request.
  *
  *  Two distinct leaks are closed at once:
@@ -54,7 +64,10 @@ export const LINK_AUTH_HEADER = 'X-TurboLLM-Auth'
  *     issued for THIS machine and must never be handed to another one; and
  *   - the LINK token is the peer's secret for the host, and must never appear in anything
  *     the peer's own clients can observe. It is added here and only here. */
-export function linkHeaders(remote: Pick<RemoteTarget, 'token'>, incoming?: Headers): Headers {
+export function linkHeaders(
+  remote: Pick<RemoteTarget, 'token' | 'noLoad'>,
+  incoming?: Headers,
+): Headers {
   const out = new Headers()
   if (incoming) {
     for (const name of FORWARDED) {
@@ -63,6 +76,7 @@ export function linkHeaders(remote: Pick<RemoteTarget, 'token'>, incoming?: Head
     }
   }
   out.set(LINK_AUTH_HEADER, remote.token)
+  if (remote.noLoad) out.set(LINK_NO_LOAD_HEADER, '1')
   return out
 }
 

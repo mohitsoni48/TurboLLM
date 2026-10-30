@@ -12,7 +12,7 @@ const GGUF_KEY = 'qwen3-8b|Q4|123'
 const ENGINE = 'http://engine.local'
 
 const LAYA = { key: LAYA_KEY, name: 'laya', laya: { checkpoints: ['english', 'multilingual'] } } as unknown as ModelEntry
-const GGUF = { key: GGUF_KEY, name: 'Qwen3 8B' } as unknown as ModelEntry
+const GGUF = { key: GGUF_KEY, name: 'Qwen3 8B', format: 'gguf' } as unknown as ModelEntry
 const LIBRARY = [LAYA, GGUF]
 
 function deps(routed: string[] = []): Deps {
@@ -25,6 +25,7 @@ function deps(routed: string[] = []): Deps {
       resolveRemoteTarget: () => undefined,
       resolveLocal: byKeyOrName,
       routeTo: async () => ({ target: ENGINE }),
+      loadedModelKeys: () => new Set([GGUF_KEY]),
     },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
@@ -34,7 +35,7 @@ function deps(routed: string[] = []): Deps {
       generationStart: () => {},
       generationEnd: () => {},
     },
-    registry: { active: () => ({ kind: 'llama-server' }) },
+    registry: { active: () => ({ kind: 'llama-server' }), layaEngine: () => ({ kind: 'laya' }) },
   } as unknown as Deps
 }
 

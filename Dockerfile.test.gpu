@@ -21,7 +21,7 @@
 # header comment for that reasoning.
 FROM nvidia/cuda:12.6.3-runtime-ubuntu22.04
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libvulkan1 libgomp1 \
+      curl ca-certificates libvulkan1 libgomp1 tini \
     && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
@@ -49,4 +49,8 @@ COPY test/fixtures/ /fixtures/
 RUN chmod +x /fixtures/stub-llama-server.mjs
 
 ENV TURBOLLM_TEST=1
+# tini is PID 1, as in the distribution images (see Dockerfile.nvidia): it reaps every
+# orphan the daemon leaves (each tethered child's watcher is one), which node as PID 1
+# left as zombies, and forwards `docker stop`'s SIGTERM. -s: a subreaper under --init.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["node", "/fixtures/entrypoint.mjs"]

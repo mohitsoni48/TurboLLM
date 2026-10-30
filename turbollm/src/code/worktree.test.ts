@@ -7,7 +7,7 @@
 // of test that passes while the feature is broken.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   agentCwd,
@@ -45,6 +45,8 @@ test('sanitizeBranchName: produces something git will actually accept', () => {
   assert.equal(sanitizeBranchName('weird.lock'), 'weird', 'git rejects a .lock suffix')
   assert.equal(sanitizeBranchName('~^:?*[]'), 'turbollm-session', 'all-illegal falls back, never empty')
   assert.equal(sanitizeBranchName(''), 'turbollm-session')
+  // A leading `-` would reach the internal `git branch` as an option (`unknown switch`).
+  assert.equal(sanitizeBranchName('- fix the login bug'), 'fix-the-login-bug')
 })
 
 // ── against real git ─────────────────────────────────────────────────────────
@@ -138,6 +140,53 @@ test('ensureLocalExclude: idempotent — never appends the same line twice', asy
   }
 })
 
+test('REGRESSION: ensureLocalExclude: a base folder that is itself a linked worktree hides .turbollm/ too', async () => {
+  // A linked worktree's own gitdir is <main>/.git/worktrees/<name>, whose info/exclude git never
+  // reads: the line went there, the base checkout listed `?? .turbollm/`, and `git add -A` (the Git
+  // dialog's commit-all) staged the session worktree as an embedded repo.
+  const root = await makeRepo()
+  const linked = join(root, '..', 'linked')
+  try {
+    assert.ok((await runGit(root, ['worktree', 'add', '-q', '-b', 'linked', linked])).ok)
+    const r = await createSessionWorktree({ repoRoot: linked, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.equal(r.path, join(linked, WORKTREES_SUBDIR, 'feat'))
+    assert.equal((await runGit(linked, ['status', '--porcelain'])).stdout.trim(), '', 'no `?? .turbollm/` in the linked base')
+    await runGit(linked, ['add', '-A', '--', '.'])
+    assert.equal((await runGit(linked, ['diff', '--cached', '--name-only'])).stdout.trim(), '', 'commit-all stages no gitlink')
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\/\.turbollm\/$/m, 'written to the common dir')
+  } finally {
+    rmSync(join(root, '..'), { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: ensureLocalExclude: a base folder reached through a symlink into a repo subfolder hides .turbollm/ too', async () => {
+  // <tmp>/home/web -> <tmp>/repo/packages/web. git prints `--git-path info/exclude` relative to its
+  // PHYSICAL cwd (../../.git/info/exclude); resolved against the symlink's own path it named
+  // <tmp>/.git/info/exclude, outside any repo, and the base checkout listed `?? .turbollm/`.
+  const root = await makeRepo()
+  const tmp = join(root, '..')
+  try {
+    mkdirSync(join(root, 'packages', 'web'), { recursive: true })
+    writeFileSync(join(root, 'packages', 'web', 'index.ts'), 'export {}\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'web'])
+    mkdirSync(join(tmp, 'home'))
+    const link = join(tmp, 'home', 'web')
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(join(root, 'packages', 'web'), link, 'junction')
+
+    const r = await createSessionWorktree({ repoRoot: link, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    assert.equal((await runGit(root, ['status', '--porcelain'])).stdout.trim(), '', 'no `?? .turbollm/` in the base checkout')
+    assert.match(readFileSync(join(root, '.git', 'info', 'exclude'), 'utf8'), /^\/\.turbollm\/$/m)
+    assert.ok(!existsSync(join(tmp, '.git')), 'no stray .git/info/exclude above the symlink')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
 test('findFreeBranchName: suffixes past names that already exist', async () => {
   const root = await makeRepo()
   try {
@@ -183,12 +232,51 @@ test('createSessionWorktree: branches off the requested base when it resolves', 
   }
 })
 
-test('createSessionWorktree: an unresolvable base falls back to HEAD instead of failing', async () => {
-  // A session that won't start is a worse answer than one branched off the current checkout.
+// Only a local branch counted as a base: a tag, a remote-tracking branch or a commit was dropped
+// without a word and the session branched off whatever was checked out instead.
+test('REGRESSION: createSessionWorktree branches off a tag, a remote-tracking branch or a commit the base names', async () => {
   const root = await makeRepo()
   try {
-    const r = await createSessionWorktree({ repoRoot: root, branch: 'feature', base: 'no-such-branch' })
-    assert.ok(r.ok, JSON.stringify(r))
+    await runGit(root, ['checkout', '-q', '-b', 'side'])
+    writeFileSync(join(root, 'only-on-side.txt'), 'x\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'side work'])
+    const sha = (await runGit(root, ['rev-parse', 'HEAD'])).stdout.trim()
+    await runGit(root, ['tag', '-a', '-m', 'release', 'v1.0'])
+    // A configured remote, so git would take origin/release for an upstream (see below).
+    await runGit(root, ['remote', 'add', 'origin', tmpDir('twt-remote-')])
+    await runGit(root, ['update-ref', 'refs/remotes/origin/release', sha])
+    await runGit(root, ['checkout', '-q', 'main'])
+    await runGit(root, ['branch', '-D', 'side'])
+
+    for (const [i, base] of ['v1.0', 'origin/release', sha, sha.slice(0, 10)].entries()) {
+      const r = await createSessionWorktree({ repoRoot: root, branch: `feature-${i}`, base })
+      assert.ok(r.ok, `${base}: ${JSON.stringify(r)}`)
+      if (!r.ok) return
+      assert.ok(existsSync(join(r.path, 'only-on-side.txt')), `${base}: branched from it, not from main`)
+      // Branched from the commit, so a remote base is not set as the new branch's upstream: with
+      // push.default=simple a plain `git push` of a branch tracking origin/release is refused.
+      assert.equal((await runGit(r.path, ['rev-parse', '--abbrev-ref', '@{u}'])).ok, false, `${base}: no upstream`)
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('createSessionWorktree: an unresolvable base is refused with a clear message, and nothing is created', async () => {
+  const root = await makeRepo()
+  try {
+    for (const base of ['no-such-branch', '-q', 'README.md']) {
+      const r = await createSessionWorktree({ repoRoot: root, branch: 'feature', base })
+      assert.equal(r.ok, false, base)
+      if (r.ok) return
+      assert.equal(r.code, 'base_unavailable', base)
+      assert.match(r.message, new RegExp(`"${base}"`))
+    }
+    assert.equal((await runGit(root, ['branch', '--list', 'feature'])).stdout.trim(), '', 'no branch made')
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR)), 'no worktree made')
+    // An empty base is no base: the current checkout, as when it is left out.
+    assert.equal((await createSessionWorktree({ repoRoot: root, branch: 'feature', base: '  ' })).ok, true)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
@@ -271,6 +359,18 @@ test('runGit: a failing command resolves rather than throwing', async () => {
 //
 // Asserted against `git check-ref-format` rather than a regex of my own: the authority on what git
 // accepts is git, and a hand-written expectation is exactly what missed this the first time.
+
+/** Tasks and typed branch names that used to come out as names Git for Windows cannot create. */
+const WINDOWS_UNSAFE_TASKS = [
+  'Rename "foo" to "bar"',
+  'Make <Button> accept a | separator',
+  'con', 'NUL', 'aux', 'prn', 'com1', 'LPT9', 'com¹', 'conin$', 'CONOUT$',
+  'con.txt', 'nul.tar.gz', 'turbo/con', 'turbo/aux/fix', 'con/con',
+  'con -', 'con.lock', 'aux.lock/b',
+  'a'.repeat(76) + '/console window',
+  'v2./fix', 'x.lock./y',
+]
+
 test('sanitizeBranchName: output always passes git check-ref-format', async () => {
   const cases = [
     'a'.repeat(79) + '. and then some more words to push past the cap',
@@ -283,6 +383,16 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
     'weird.lock',
     '/leading/and/trailing/',
     'a'.repeat(200),
+    // Each of these used to come out as a name git refuses.
+    '- fix the login bug',
+    '-- refactor',
+    'use @{upstream} config',
+    'docs/.hidden notes',
+    'a.lock/b',
+    'a/x.lock.lock/.b',
+    'tab\there\u0001bell\u007f',
+    // The Windows-safe rewrites (next test) must keep the name valid for git too.
+    ...WINDOWS_UNSAFE_TASKS,
   ]
   const root = await makeRepo()
   try {
@@ -294,6 +404,44 @@ test('sanitizeBranchName: output always passes git check-ref-format', async () =
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
+})
+
+// The branch is a loose ref file under .git/refs/heads/ and the folder .turbollm/worktrees/<branch>,
+// and Git for Windows refuses ("Invalid argument") to create either when a path part holds `"<>|`,
+// ends in `.`, or is a reserved device name. `git check-ref-format` accepts all of these, so the
+// fuzz above could not catch it, and on Windows a session started from such a task (or a typed
+// branch `con`) failed with git_failed. This mirrors Git for Windows' is_valid_win32_path
+// (compat/mingw.c) for the characters the sanitizer can let through; on Linux and macOS git
+// accepts every one of these names, so this is asserted on every platform, in pure code.
+function windowsRefusal(name: string): string | null {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: mirrors Git for Windows' own forbidden-character set, control bytes included
+  if (/[<>:"|?*\\\x00-\x1f]/.test(name)) return 'a character Windows forbids'
+  for (const part of name.split('/')) {
+    if (/[. ]$/.test(part)) return `part ${JSON.stringify(part)} ends in a dot or space`
+    if (/^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(?=[. :]|$)/i.test(part)) {
+      return `part ${JSON.stringify(part)} is a reserved device name`
+    }
+  }
+  return null
+}
+
+test('REGRESSION: sanitizeBranchName: output is a name Git for Windows can create', () => {
+  for (const raw of WINDOWS_UNSAFE_TASKS) {
+    const name = sanitizeBranchName(raw)
+    assert.equal(windowsRefusal(name), null, `${JSON.stringify(name)} (from ${JSON.stringify(raw.slice(0, 40))})`)
+  }
+  // The rewrite keeps the words: a separator becomes `-`, a device name gets a `-` after it.
+  assert.equal(sanitizeBranchName('Rename "foo" to "bar"'), 'rename-foo-to-bar')
+  assert.equal(sanitizeBranchName('Make <Button> accept a | separator'), 'make-button-accept-a-separator')
+  assert.equal(sanitizeBranchName('con'), 'con-')
+  assert.equal(sanitizeBranchName('NUL'), 'nul-')
+  assert.equal(sanitizeBranchName('con.txt'), 'con-.txt')
+  assert.equal(sanitizeBranchName('turbo/con'), 'turbo/con-')
+  assert.equal(sanitizeBranchName('v2./fix'), 'v2/fix')
+  // Not device names: only the whole part (or the part before its extension) is reserved.
+  assert.equal(sanitizeBranchName('console/connect'), 'console/connect')
+  assert.equal(sanitizeBranchName('com10'), 'com10')
+  assert.equal(sanitizeBranchName('icon'), 'icon')
 })
 
 test('sanitizeBranchName: a long name is capped without ending in a separator', () => {
@@ -349,4 +497,168 @@ test('removeSessionWorktree: a DIRTY worktree is still refused — the guard did
       rmSync(root, { recursive: true, force: true })
     }
   })()
+})
+
+test('REGRESSION: a worktree session started at a repo subfolder works in that subfolder of a worktree at the repo top level', async () => {
+  // `git worktree add` checks out the whole repository and the exclude line is anchored at its top
+  // level: placed under the picked subfolder, the agent worked across the whole repo and the base
+  // repo listed `?? packages/web/.turbollm/` (which a commit-all then staged as an embedded repo).
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'packages', 'web')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.ok(existsSync(join(r.path, 'a.ts')), 'the session works in the package folder')
+    assert.equal((await runGit(r.path, ['rev-parse', '--show-prefix'])).stdout.trim(), 'packages/web/')
+    assert.equal((await runGit(r.path, ['rev-parse', '--abbrev-ref', 'HEAD'])).stdout.trim(), 'feat')
+    assert.ok(!existsSync(join(sub, '.turbollm')), 'nothing created inside the base package')
+    assert.equal((await runGit(root, ['status', '--porcelain'])).stdout.trim(), '', 'base repo stays clean')
+
+    const removed = await removeSessionWorktree(sub, r.path)
+    assert.equal(removed.ok, true, JSON.stringify(removed))
+    assert.ok(!existsSync(r.path), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: removing a subfolder session\'s worktree whose folder is gone from it, or one in the old layout', async () => {
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'web')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    const worktreeCount = async () => (await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length
+
+    // The session's folder is gone from the worktree (the agent removed the package): the worktree
+    // itself is still removed, or reported dirty while the removal is uncommitted.
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'drop-web' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    const top = join(root, '.turbollm', 'worktrees', 'drop-web')
+    rmSync(r.path, { recursive: true })
+    const dirty = await removeSessionWorktree(sub, r.path)
+    assert.equal(dirty.ok, false, 'an uncommitted removal is work: left in place')
+    if (!dirty.ok) assert.match(dirty.message, /drop-web" *$/)
+    await runGit(top, ['commit', '-qam', 'remove the package'])
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(top), 'worktree removed')
+    assert.equal(await worktreeCount(), 1)
+
+    // Created before worktrees moved to the top level, on a branch named like the folder: its
+    // stored path ends with the folder's prefix but is itself the worktree.
+    const old = join(sub, '.turbollm', 'worktrees', 'web')
+    assert.ok((await runGit(sub, ['worktree', 'add', '-q', '-b', 'web', old])).ok)
+    assert.deepEqual(await removeSessionWorktree(sub, old), { ok: true })
+    assert.ok(!existsSync(old), 'old-layout worktree removed')
+    assert.equal(await worktreeCount(), 1)
+    assert.deepEqual(await removeSessionWorktree(sub, old), { ok: true }, 'already gone')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: a subfolder session\'s worktree is removed even when its folder is gone from the base checkout', async () => {
+  // The worktree lives under the repository's top level, so it outlives the base subfolder (here:
+  // the base checks out a branch without it). Deleting the session reported success and left the
+  // worktree registered, its branch checked out there and unusable anywhere else.
+  const root = await makeRepo()
+  try {
+    assert.ok((await runGit(root, ['branch', 'old'])).ok, 'a branch without the package')
+    const sub = join(root, 'packages', 'web')
+    mkdirSync(sub, { recursive: true })
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    const worktreeCount = async () => (await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    const top = join(root, WORKTREES_SUBDIR, 'feat')
+    assert.ok((await runGit(root, ['checkout', '-q', 'old'])).ok)
+    assert.ok(!existsSync(sub), 'the base folder is gone')
+
+    // Uncommitted work in it is still refused, not silently kept as "done".
+    writeFileSync(join(r.path, 'a.ts'), 'unmerged work\n')
+    const dirty = await removeSessionWorktree(sub, r.path)
+    assert.equal(dirty.ok, false, JSON.stringify(dirty))
+    if (!dirty.ok) assert.equal(dirty.code, 'dirty')
+    await runGit(r.path, ['checkout', '--', 'a.ts'])
+
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(top), 'worktree removed')
+    assert.equal(await worktreeCount(), 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+// The stored path's tail was compared with the folder's prefix after splitting it on `\` too. On
+// POSIX `\` is a filename character, so a session started at `<repo>/pkg\web` (one folder) had a
+// tail of `web` against the prefix `pkg\web`: only the session's own folder was tried, git said
+// "is not a working tree", and the worktree stayed registered with its branch checked out there.
+test('REGRESSION: on POSIX a subfolder session\'s worktree is removed when the folder name has a backslash', { skip: process.platform === 'win32' }, async () => {
+  const root = await makeRepo()
+  try {
+    const sub = join(root, 'pkg\\web')
+    mkdirSync(sub)
+    writeFileSync(join(sub, 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+
+    const r = await createSessionWorktree({ repoRoot: sub, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.equal(r.path, join(root, WORKTREES_SUBDIR, 'feat', 'pkg\\web'))
+
+    assert.deepEqual(await removeSessionWorktree(sub, r.path), { ok: true })
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR, 'feat')), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('REGRESSION: a worktree is removed when the base was a link into a subfolder the base checkout no longer has', async () => {
+  // <tmp>/home/web -> <tmp>/repo/packages/web, and the base checks out a branch without it: the link
+  // dangles. Walking up from the link's own name stopped at <tmp>/home, in no repository, so
+  // `git worktree remove` failed with "not a git repository" and the worktree stayed registered.
+  const root = await makeRepo()
+  const tmp = join(root, '..')
+  try {
+    assert.ok((await runGit(root, ['branch', 'old'])).ok, 'a branch without the package')
+    mkdirSync(join(root, 'packages', 'web'), { recursive: true })
+    writeFileSync(join(root, 'packages', 'web', 'a.ts'), 'a\n')
+    await runGit(root, ['add', '-A'])
+    await runGit(root, ['commit', '-qm', 'package'])
+    mkdirSync(join(tmp, 'home'))
+    const link = join(tmp, 'home', 'web')
+    // 'junction' so this also runs on Windows without admin rights; ignored elsewhere.
+    symlinkSync(join(root, 'packages', 'web'), link, 'junction')
+
+    const r = await createSessionWorktree({ repoRoot: link, branch: 'feat' })
+    assert.ok(r.ok, JSON.stringify(r))
+    if (!r.ok) return
+    assert.ok((await runGit(root, ['checkout', '-q', 'old'])).ok)
+    assert.ok(!existsSync(link), 'the link dangles')
+
+    assert.deepEqual(await removeSessionWorktree(link, r.path), { ok: true })
+    assert.ok(!existsSync(join(root, WORKTREES_SUBDIR, 'feat')), 'worktree removed')
+    assert.equal((await runGit(root, ['worktree', 'list', '--porcelain'])).stdout.match(/^worktree /gm)?.length, 1)
+    assert.ok((await runGit(root, ['checkout', '-q', 'feat'])).ok, 'its branch is free again')
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
 })

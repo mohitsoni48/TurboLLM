@@ -105,3 +105,25 @@ describe('MessageBubble empty-assistant rendering', () => {
     expect(screen.queryByText('Generating…')).toBeNull()
   })
 })
+
+// A reply cut off by a daemon kill after one of its 10 s partial saves keeps its text, and the restart marks it
+// stopped with exactly `{ aborted: true }` (db.ts abortUnfinishedReplies): no numbers for the stats row to list.
+describe('MessageBubble on a reply cut off with its text kept', () => {
+  it('shows Stopped under its text', () => {
+    renderBubble({ ...placeholder({ aborted: true }), content: 'half of a long answer' })
+    expect(screen.getByText('half of a long answer')).toBeTruthy()
+    expect(screen.getByText('Stopped')).toBeTruthy()
+  })
+
+  it('an empty one shows the error card alone, with no second label', () => {
+    renderBubble(placeholder({ aborted: true }))
+    expect(screen.getByText(/Generation failed or was stopped\./)).toBeTruthy()
+    expect(screen.queryByText('Stopped')).toBeNull()
+  })
+
+  it('one with its stats still says aborted after them', () => {
+    renderBubble({ ...placeholder({ ...FINALIZED, aborted: true }), content: 'a stopped answer' })
+    expect(screen.getByText(/· aborted/)).toBeTruthy()
+    expect(screen.queryByText('Stopped')).toBeNull()
+  })
+})

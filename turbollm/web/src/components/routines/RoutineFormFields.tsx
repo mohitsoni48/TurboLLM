@@ -1,10 +1,11 @@
 import { useId, useState } from 'react'
-import type { RoutineDraft } from '../../lib/routine-form'
+import { ROUTINE_MAX_INTERVAL_MS, unsetPermissionModeLabel, type RoutineDraft } from '../../lib/routine-form'
 import type { CodingAgentChoice } from '../../lib/routine-types'
 import { useChatAgents, useModels } from '../../lib/queries'
 import { FsBrowser } from '../../screens/engines/FsBrowser'
 import { track } from '../../lib/api'
-import { isChatModel } from '../../lib/model-kind'
+import { hiddenByUser, hiddenByUserCount, isChatModel } from '../../lib/model-kind'
+import { NoModelsHint } from '../NoModelsHint'
 
 // Labels say plainly which one runs in-process and which shell out — the distinction that the
 // value names encode with the `_cli` suffix (routine-types.ts).
@@ -23,20 +24,52 @@ const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
 const inputCls = 'w-full rounded-md border border-border bg-bg px-3 py-1.5 text-[13px] text-ink outline-none focus:border-accent placeholder:text-faint'
 const labelCls = 'text-[12px] font-medium text-muted'
 
+const MAX_INTERVAL_MINUTES = ROUTINE_MAX_INTERVAL_MS / 60_000
+
+/** "Every N minutes" with a text draft while focused — the same idea as SettingsScreen's
+ *  NumberField. Rendering the rule's own value on every keystroke snapped an emptied field back
+ *  to "1" under the caret (`Math.max(1, Number(''))`), so selecting "60" and typing "30" gave
+ *  130. Now the field shows what was typed; each finite value commits (clamped to 1 minute up to
+ *  a year, so the rule stays valid: the server answers a longer one with a 400, see
+ *  ROUTINE_MAX_INTERVAL_MS), and an empty field keeps the last committed value. */
+function IntervalMinutesInput({ everyMs, disabled, className, onCommit }: {
+  everyMs: number; disabled?: boolean; className: string; onCommit: (everyMs: number) => void
+}) {
+  const [text, setText] = useState<string | null>(null) // null = not editing: show the rule
+  return (
+    <input
+      disabled={disabled}
+      type="number"
+      min={1}
+      max={MAX_INTERVAL_MINUTES}
+      aria-label="Minutes between runs"
+      className={className}
+      value={text ?? String(Math.round(everyMs / 60_000))}
+      onChange={(e) => {
+        const raw = e.target.value
+        setText(raw)
+        const n = Number(raw)
+        if (raw.trim() !== '' && Number.isFinite(n)) onCommit(Math.min(MAX_INTERVAL_MINUTES, Math.max(1, n)) * 60_000)
+      }}
+      onBlur={() => setText(null)}
+    />
+  )
+}
+
 /** Switching flavor rewrites the draft so it carries ONLY the chosen flavor's fields, and so the
  *  permission mode the form is about to DISPLAY is actually present on the draft.
  *
  *  Two defects live on this one transition:
  *
- *  1. Safety. The permission-mode select renders `draft.permissionMode ?? 'ask'`, i.e. it shows
- *     "Ask before each tool call" as selected before the user has touched it. But
- *     `emptyRoutineDraft()` never sets the field and `isRoutineDraftComplete` does not require
- *     it, so the common path (pick Code, pick a workspace and a coding agent, never touch a
- *     control that already looks set) persists `permissionMode: undefined` — and the backend
- *     resolves that to `'auto'`, not `'ask'` (`src/routines/code-runner.ts`: `routine.permissionMode
- *     ?? 'auto'`). The routine would then edit files and run commands unattended while the UI
- *     that created it displayed the approval gate. Materialising the default here makes the
- *     displayed mode and the executed mode the same value.
+ *  1. Safety. A new code routine starts on an explicit 'ask', which the select then shows as
+ *     chosen. `emptyRoutineDraft()` never sets the field and `isRoutineDraftComplete` does not
+ *     require it, so without this the common path (pick Code, pick a workspace and a coding
+ *     agent) would persist `permissionMode: undefined` — and the backend resolves that to
+ *     `'auto'` for the in-app agent (`src/routines/code-runner.ts`: `routine.permissionMode ??
+ *     'auto'`): a routine that edits files and runs commands unattended that nobody chose.
+ *     Materialising the default here makes the displayed mode and the executed mode the same,
+ *     explicitly stored value. An EXISTING routine with no mode (create_routine/REST) is shown
+ *     as its own "Not set: …" option naming what actually runs, and is left unset.
  *  2. Dirty data. Only spreading `{ ...draft, flavor }` leaves the departing flavor's fields
  *     behind, and `src/routines/routine-routes.ts` validates only the chosen flavor's required
  *     field while persisting `agentId`/`workspacePath`/`codingAgent`/`permissionMode`
@@ -73,7 +106,9 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   const agentsQ = useChatAgents()
   const modelsQ = useModels()
   const catalog = modelsQ.data?.models ?? []
-  const models = catalog.filter(isChatModel)
+  // Not a model the user hid by hand (Models → Library "Hide"), as no picker offers one; the empty state counts them.
+  const models = catalog.filter((m) => isChatModel(m) && !hiddenByUser(m))
+  const hiddenByYou = hiddenByUserCount(catalog.filter(isChatModel))
   const agents = agentsQ.data ?? []
   // A controlled <select> whose value matches no <option> falls back to the first one — here the
   // placeholder — so the field would read as unset while the draft still holds a real value and
@@ -85,8 +120,13 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
   // A routine saved before Jev detection existed can name a model that is now a Jev model: it IS in
   // the catalog, it just cannot run a routine, so it gets its own text rather than "not in the catalog".
   const storedJevModel = storedModel && !isChatModel(storedModel) ? storedModel : null
+  // A routine already pinned to a model the user since hid keeps it, and still runs on it: shown as its own option.
+  const storedHiddenModel = storedModel && isChatModel(storedModel) && hiddenByUser(storedModel) ? storedModel : null
   const orphanModelKey = draft.modelKey && !storedModel ? draft.modelKey : null
   const orphanAgentId = draft.agentId && !agents.some((a) => a.id === draft.agentId) ? draft.agentId : null
+  // Once the catalog has answered, an empty one says so under the select: it offered only its placeholder, an empty
+  // drop-down with no word of where a model comes from. Routines list every engine's models, so the engine hides none.
+  const noModels = modelsQ.data !== undefined && models.length === 0
   // Ids so each <label> actually points at its control — these are plain selects/inputs, not
   // wrapped controls, so without htmlFor a screen reader reads them as unlabelled.
   const uid = useId()
@@ -135,10 +175,22 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
 
       <div className="flex flex-col gap-1.5">
         <label className={labelCls} htmlFor={id('model')}>Model</label>
-        <select id={id('model')} disabled={disabled} className={inputCls} value={draft.modelKey} onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}>
+        <select
+          id={id('model')}
+          disabled={disabled}
+          className={inputCls}
+          value={draft.modelKey}
+          onChange={(e) => onChange({ ...draft, modelKey: e.target.value })}
+          aria-describedby={noModels ? id('model-none') : undefined}
+        >
           <option value="">Choose a model…</option>
           {orphanModelKey && <option value={orphanModelKey}>{orphanModelKey} (not in the current catalog)</option>}
           {storedJevModel && <option value={storedJevModel.key}>{storedJevModel.name} (a text classification model — it can&apos;t run a routine)</option>}
+          {storedHiddenModel && (
+            <option value={storedHiddenModel.key} title={storedHiddenModel.path}>
+              {storedHiddenModel.name} · {storedHiddenModel.quant} — {storedHiddenModel.dir} (hidden)
+            </option>
+          )}
           {/* Quant + dir, not just name: the catalog can hold several entries with the SAME
               display name (different quant, or the same quant re-downloaded to a different
               path) — without this an option like "Qwen3.6-35B-A3B" is ambiguous among 4+ real
@@ -149,6 +201,12 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
             </option>
           ))}
         </select>
+        {noModels && (
+          <div id={id('model-none')} className="text-[12px] text-muted">
+            <div className="text-ink">No models found.</div>
+            <NoModelsHint hidden={{ byEngine: 0, byUser: hiddenByYou }} />
+          </div>
+        )}
       </div>
 
       {draft.flavor === 'chat' ? (
@@ -190,9 +248,13 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
               id={id('permission-mode')}
               disabled={disabled}
               className={inputCls}
-              value={draft.permissionMode ?? 'ask'}
-              onChange={(e) => onChange({ ...draft, permissionMode: e.target.value as RoutineDraft['permissionMode'] })}
+              value={draft.permissionMode ?? ''}
+              onChange={(e) => onChange({ ...draft, permissionMode: (e.target.value || undefined) as RoutineDraft['permissionMode'] })}
             >
+              {/* A stored routine with no mode: name what the daemon actually runs for it (which
+                  depends on the coding agent), and keep it unset unless the user picks a mode.
+                  Only offered while unset — PUT cannot clear a stored mode. */}
+              {draft.permissionMode === undefined && <option value="">Not set: {unsetPermissionModeLabel(draft.codingAgent)}</option>}
               {PERMISSION_MODE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
@@ -219,14 +281,11 @@ export function RoutineFormFields({ draft, onChange, disabled, lockFlavor }: { d
         </select>
 
         {rule.kind === 'interval' ? (
-          <input
+          <IntervalMinutesInput
             disabled={disabled}
-            type="number"
-            min={1}
-            aria-label="Minutes between runs"
             className={inputCls}
-            value={Math.round(rule.everyMs / 60_000)}
-            onChange={(e) => onChange({ ...draft, scheduleRule: { kind: 'interval', everyMs: Math.max(1, Number(e.target.value)) * 60_000 } })}
+            everyMs={rule.everyMs}
+            onCommit={(everyMs) => onChange({ ...draft, scheduleRule: { kind: 'interval', everyMs } })}
           />
         ) : clock ? (
           <div className="flex flex-wrap items-center gap-2">

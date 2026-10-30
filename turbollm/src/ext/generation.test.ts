@@ -12,12 +12,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { rmSync } from 'node:fs'
+import { createServer } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { ConversationStore } from '../chat/db.js'
 import { ChatStoreRouter } from '../chat/store/router.js'
 import {
   loadFullHistory, shouldFlushCheckpoint, FLUSH_INTERVAL_MS, FLUSH_MIN_CHARS,
-  extractChunkUsage, buildUsagePatch, buildEngineRequestBody, mapSampling,
+  extractChunkUsage, buildUsagePatch, buildEngineRequestBody, mapSampling, createMakeBody,
 } from './generation.js'
+import { ToolRegistry, MCP_AGENT_REFUSED_MESSAGE, MCP_ROUTINE_REFUSED_MESSAGE } from '../tools/tool-registry'
+import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
 const SCOPE = { tenant: 'acme', owner: 'u1' }
@@ -223,4 +227,102 @@ test('mapSampling: model, messages, stream, and stream_options are all denyliste
     assert.equal(key in out, false, `${key} must be dropped by mapSampling's own denylist, not left to spread order alone`)
   }
   assert.equal(out.top_k, 40)
+})
+
+// ── a tenant's tool calls and the owner's MCP routines ─────────────────────────────────────────
+
+type ScriptedCall = { id: string; name: string; args: Record<string, unknown> }
+
+/** One tenant run through the real createMakeBody, against a loopback engine whose first reply
+ *  makes `calls(routineId)` and whose second answers "done". The install holds the owner's agent
+ *  listing an MCP tool and a confirmed chat routine on it, behind a real ToolRegistry, with the
+ *  routine and agent tools set to Allow and the MCP tool to `mcpPolicy`. Returns each call's
+ *  result by id, the routine's stored prompt, the agents and what runNow fired. */
+async function tenantRun(calls: (routineId: string) => ScriptedCall[], mcpPolicy: 'allow' | 'ask') {
+  const routines = new ConversationStore(tmpDir('turbollm-ext-gen-routines-'))
+  const routine = routines.createRoutine({ flavor: 'chat', prompt: 'owner prompt', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'owner-mcp-agent' })
+  routines.confirmRoutine(routine.id, '2099-01-01T00:00:00.000Z')
+  const replies = [
+    [
+      { choices: [{ index: 0, delta: { role: 'assistant', tool_calls: calls(routine.id).map((c, index) => ({ index, id: c.id, type: 'function', function: { name: c.name, arguments: JSON.stringify(c.args) } })) }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] },
+    ],
+    [
+      { choices: [{ index: 0, delta: { role: 'assistant', content: 'done' }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    ],
+  ]
+  const engine = createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      for (const c of replies.shift() ?? []) res.write(`data: ${JSON.stringify({ id: 'c', object: 'chat.completion.chunk', created: 0, model: 'm', ...c })}\n\n`)
+      res.end('data: [DONE]\n\n')
+    })
+  })
+  await new Promise<void>((r) => engine.listen(0, '127.0.0.1', r))
+  const { chatStore, cleanup } = harness()
+  try {
+    const agents = [{ id: 'owner-mcp-agent', name: 'Owner', systemPrompt: '', tools: ['mcp__srv_1__run'] }]
+    const agentStore = { snapshot: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
+    const fired: string[] = []
+    const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
+    const tools = new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never, routines, runNow, agentStore as never, undefined, () => true)
+    const toolPolicies = { update_routine: 'allow', run_routine_now: 'allow', create_agent: 'allow', mcp__srv_1__run: mcpPolicy }
+    const d = {
+      chatStore,
+      manager: {
+        status: () => ({ state: 'running', model: { key: 'm', name: 'M', ctx: 8192 } }),
+        target: () => `http://127.0.0.1:${(engine.address() as AddressInfo).port}`,
+        currentOpts: () => undefined,
+        generationStart: () => {},
+        generationEnd: () => {},
+      },
+      registry: { active: () => undefined },
+      store: { snapshot: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }) },
+      tools,
+    } as unknown as Deps
+    const chat = await chatStore.createChat(SCOPE, { title: 'tenant' })
+    await chatStore.addMessage(SCOPE, chat.id, { role: 'user', content: 'go' })
+    const placeholder = await chatStore.addMessage(SCOPE, chat.id, { role: 'assistant', content: '', status: 'streaming' })
+    const results: Record<string, string> = {}
+    const emit = (ev: { event: string; data: unknown }) => {
+      const data = ev.data as { id?: string; result?: string }
+      if (ev.event === 'tool_call' && data.id && data.result !== undefined) results[data.id] = data.result
+    }
+    const body = createMakeBody(d)({ chatId: chat.id, messageId: placeholder.id, scope: SCOPE })
+    assert.deepEqual(await body({ emit, signal: new AbortController().signal }), { status: 'complete' })
+    return { results, prompt: routines.getRoutine(routine.id)?.prompt, agents, fired }
+  } finally {
+    cleanup()
+    routines.close()
+    engine.closeAllConnections()
+    await new Promise<void>((r) => engine.close(() => r()))
+  }
+}
+
+// A chat routine runs its agent's tools with no approval. A tenant's run passed neither refuseMcp
+// nor refuseMcpAgentsAndRoutines, so with update_routine and run_routine_now on Allow it rewrote
+// the owner's MCP routine's prompt and fired it: the MCP tool, left on Ask (which blocks the
+// tenant's own direct call of it), then ran on the tenant's prompt, and on every later fire.
+test('a tenant run cannot rewrite or fire a chat routine whose agent uses an MCP tool, nor create such an agent', async () => {
+  const out = await tenantRun((routineId) => [
+    { id: 'call_mcp', name: 'mcp__srv_1__run', args: {} },
+    { id: 'call_update', name: 'update_routine', args: { routineId, prompt: 'tenant prompt', confirm: true } },
+    { id: 'call_run', name: 'run_routine_now', args: { routineId } },
+    { id: 'call_agent', name: 'create_agent', args: { name: 'Tenant agent', systemPrompt: 'x', tools: ['mcp__srv_1__run'] } },
+  ], 'ask')
+  assert.match(out.results.call_mcp, /^Blocked: this tool requires interactive approval/)
+  assert.equal(out.results.call_update, `Error: ${MCP_ROUTINE_REFUSED_MESSAGE}`)
+  assert.equal(out.results.call_run, `Error: ${MCP_ROUTINE_REFUSED_MESSAGE}`)
+  assert.equal(out.results.call_agent, `Error: ${MCP_AGENT_REFUSED_MESSAGE}`)
+  assert.equal(out.prompt, 'owner prompt')
+  assert.deepEqual(out.fired, [])
+  assert.deepEqual(out.agents.map((a) => a.id), ['owner-mcp-agent'])
+})
+
+test('a tenant run still calls an MCP tool the install set to Allow', async () => {
+  const out = await tenantRun(() => [{ id: 'call_mcp', name: 'mcp__srv_1__run', args: {} }], 'allow')
+  // No server is connected here: reaching the lookup is the point (it was not refused).
+  assert.equal(out.results.call_mcp, 'Error: MCP server "srv-1" not connected.')
 })

@@ -46,6 +46,9 @@ export interface SqlDb {
   exec(sql: string): void
   prepare(sql: string): SqlStatement
   close(): void
+  /** sql.js (Android) only: writes the in-memory database to its file now, and returns whether
+   *  everything written so far is on disk. node:sqlite has none: it writes every change itself. */
+  flush?(): boolean
 }
 
 // Cached from preloadSqlJs()'s one dynamic import — NOT re-resolved via requireSync at call

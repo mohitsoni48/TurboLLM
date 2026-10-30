@@ -11,8 +11,17 @@
 // so it's testable without a live PTY/daemon (mirrors code-session.ts's codeEventToFrame).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { buildTerminalLaunchCommand, canSeedFirstMessage, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS } from './terminal-routes'
+import http from 'node:http'
+import { createRequire } from 'node:module'
+import { spawnSync } from 'node:child_process'
+import type { AddressInfo } from 'node:net'
+import { buildTerminalLaunchCommand, canSeedFirstMessage, firstMessageSeedProblem, normalizeSeededMessage, MAX_SEEDED_MESSAGE_CHARS, MAX_SEEDED_MESSAGE_BYTES_POSIX, createAgentTerminal, getTerminalManager, isTerminalBackendAvailable, registerTerminalWs, closeTerminalSockets, dropStaleTerminalSockets } from './terminal-routes'
+import { TerminalManager } from './terminal-manager'
+import type { Deps } from '../deps'
+import type { AgentRun } from '../chat/db'
+import { tmpDir } from '../test-support/tmp'
 import { quotePtyShellArg } from '../util/shell-command'
+import { hashKey } from '../auth'
 import { enforcesPlanMode, permissionModeArgs } from './agent-modes'
 
 test('buildTerminalLaunchCommand: a genuinely first-ever launch registers this session\'s own id', () => {
@@ -250,10 +259,10 @@ test('the unseedable-character rules apply to EVERY harness, not just claude', (
   // The mangling they guard against happens in the `powershell -Command "…"` wrapper, outside the
   // CLI — so it is identical whichever CLI is inside, including opencode's safer --prompt flag.
   for (const agent of ['claude', 'pi', 'opencode']) {
-    assert.equal(canSeedFirstMessage('rename "foo"', agent), false, `${agent}: a literal quote cannot survive`)
-    assert.equal(canSeedFirstMessage('look in C:\\repo\\', agent), false, `${agent}: a trailing backslash becomes a quote`)
-    assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), agent), false, `${agent}: over the cap`)
-    assert.equal(canSeedFirstMessage('multi\nline task', agent), true, `${agent}: newlines fold to spaces`)
+    assert.equal(canSeedFirstMessage('rename "foo"', agent, 'win32'), false, `${agent}: a literal quote cannot survive`)
+    assert.equal(canSeedFirstMessage('look in C:\\repo\\', agent, 'win32'), false, `${agent}: a trailing backslash becomes a quote`)
+    assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), agent, 'win32'), false, `${agent}: over the cap`)
+    assert.equal(canSeedFirstMessage('multi\nline task', agent, 'win32'), true, `${agent}: newlines fold to spaces`)
   }
 })
 
@@ -261,14 +270,14 @@ test('canSeedFirstMessage: blank and over-long messages are skipped, not truncat
   assert.equal(canSeedFirstMessage('Hi', 'claude'), true)
   assert.equal(canSeedFirstMessage('   ', 'claude'), false, 'whitespace-only is not a message')
   assert.equal(canSeedFirstMessage('', 'claude'), false)
-  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS), 'claude'), true, 'exactly at the cap is fine')
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS), 'claude', 'win32'), true, 'exactly at the cap is fine')
   // Truncating would send a half-instruction the user believes was delivered in full.
-  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), 'claude'), false)
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1), 'claude', 'win32'), false)
 })
 
 test('buildTerminalLaunchCommand: an over-long message is omitted rather than half-sent', () => {
   const long = 'x'.repeat(MAX_SEEDED_MESSAGE_CHARS + 1)
-  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', long)
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', long, 'win32')
   assert.ok(!cmd.includes('xxx'), 'no fragment of the message may leak into the command')
   assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })
@@ -279,19 +288,67 @@ test('buildTerminalLaunchCommand: an over-long message is omitted rather than ha
 // `rename foo to bar` and `look in C:\repo\` arrives as `look in C:\repo"`. Single-quoting stops
 // INJECTION (verified across ten hostile inputs, none escaped) but cannot stop that mangling.
 // Not seeding is the honest outcome — the user retypes, rather than the agent acting on a
-// silently corrupted version of their instruction.
+// silently corrupted version of their instruction. All of that is PowerShell's: elsewhere the
+// command is bash's `-lc` argument (pty-session.ts), whose single quotes keep every character, so
+// the same refusal there left an opencode or pi routine whose prompt quoted a name, or ran past
+// 4000 characters, with an idle CLI that never got its task.
+
+test('outside Windows a first message with double quotes, backslashes and 5,000 characters reaches the CLI as typed', {
+  skip: process.platform === 'win32' && 'runs the launch command through bash',
+}, () => {
+  const BS = '\\'
+  const message = `Rename "foo" to "bar" in C:${BS}repo${BS} (don't touch $HOME, \`ls\` or !1). ${'x'.repeat(5000)} end${BS}`
+  for (const [agent, mode] of [['claude', null], ['pi', null], ['opencode', '--auto']] as const) {
+    const cmd = buildTerminalLaunchCommand(agent, 6996, 'tok', 'sess', false, mode, 'auto', message, 'linux')
+    // pty-session.ts runs `bash -lc '<cmd>; exec bash'`; a `turbollm` function prints the arguments
+    // `turbollm launch` would get, one per NUL.
+    const out = spawnSync('bash', ['-c', `turbollm() { printf '%s\\0' "$@"; }; ${cmd}`], { encoding: 'utf8' })
+    assert.equal(out.status, 0, out.stderr)
+    const argv = out.stdout.split('\0').slice(0, -1)
+    const at = agent === 'opencode' ? argv.indexOf('--prompt') + 1 : 2
+    assert.equal(argv[at], message, `${agent}: the prompt arrives as one argument, byte for byte`)
+    assert.equal(argv.filter((a) => a.includes('Rename')).length, 1, `${agent}: and only once`)
+  }
+})
+
+test('canSeedFirstMessage: outside Windows the cap is 64 KiB of UTF-8 as quoted for bash, and control bytes are still refused', () => {
+  // quotePtyShellArg's own two quotes count.
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX - 2), 'pi', 'linux'), true)
+  assert.equal(canSeedFirstMessage('x'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX - 1), 'pi', 'linux'), false)
+  assert.equal(canSeedFirstMessage('é'.repeat(MAX_SEEDED_MESSAGE_BYTES_POSIX / 2 + 1), 'pi', 'darwin'), false, 'bytes, not characters')
+  assert.equal(canSeedFirstMessage('drop a bell\x07here', 'opencode', 'linux'), false)
+  assert.equal(canSeedFirstMessage('rename "foo"', 'kilo', 'linux'), false, 'a harness with no prompt syntax is still never seeded')
+  assert.match(firstMessageSeedProblem('rename "foo"', 'opencode', 'win32') ?? '', /double quote/)
+  assert.equal(firstMessageSeedProblem('rename "foo"', 'opencode', 'linux'), null)
+})
+
+// Each `'` takes four bytes in the quoted command (`'\''`). Measured on the bare text, 40,000 of them
+// would pass and make a 160 KB `-lc` argument, past Linux's 128 KiB, and bash could not be started.
+test('outside Windows a message of apostrophes is measured as quoted, and the longest one allowed still starts bash', {
+  skip: process.platform === 'win32' && 'runs the launch command through bash',
+}, () => {
+  assert.equal(canSeedFirstMessage("'".repeat(40_000), 'pi', 'linux'), false)
+  assert.match(firstMessageSeedProblem("'".repeat(40_000), 'pi', 'linux') ?? '', /over 64 KiB as the launch command quotes it/)
+  const longest = "'".repeat(Math.floor((MAX_SEEDED_MESSAGE_BYTES_POSIX - 2) / 4))
+  assert.equal(canSeedFirstMessage(longest + "'", 'pi', 'linux'), false)
+  const cmd = buildTerminalLaunchCommand('pi', 6996, 'tok', 'sess', false, null, 'auto', longest, 'linux')
+  const out = spawnSync('bash', ['-c', `turbollm() { printf '%s\\0' "$@"; }; ${cmd}`], { encoding: 'utf8' })
+  assert.equal(out.error, undefined)
+  assert.equal(out.status, 0, out.stderr)
+  assert.equal(out.stdout.split('\0')[2], longest, 'the prompt arrives as one argument, byte for byte')
+})
 
 test('canSeedFirstMessage: refuses a message containing a double quote', () => {
-  assert.equal(canSeedFirstMessage('rename "foo" to "bar"', 'claude'), false)
-  assert.equal(canSeedFirstMessage('rename foo to bar', 'claude'), true)
+  assert.equal(canSeedFirstMessage('rename "foo" to "bar"', 'claude', 'win32'), false)
+  assert.equal(canSeedFirstMessage('rename foo to bar', 'claude', 'win32'), true)
 })
 
 test('canSeedFirstMessage: refuses a message ending in a backslash', () => {
   // A raw template literal cannot END in a backslash (it would escape the closing backtick), so
   // the trailing-backslash case is written with an ordinary escaped string.
   const BS = '\\'
-  assert.equal(canSeedFirstMessage(`look in C:${BS}repo${BS}`, 'claude'), false)
-  assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude'), true, 'an interior backslash is fine')
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo${BS}`, 'claude', 'win32'), false)
+  assert.equal(canSeedFirstMessage(`look in C:${BS}repo`, 'claude', 'win32'), true, 'an interior backslash is fine')
 })
 
 // Founder-reported, 2026-08-07: a fresh Code session's first message silently never reached the
@@ -326,7 +383,7 @@ test('buildTerminalLaunchCommand: a multi-line first message reaches the CLI as 
 })
 
 test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangled onto the line', () => {
-  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'rename "foo"')
+  const cmd = buildTerminalLaunchCommand('claude', 6996, 'tok', 'sess', false, 'acceptEdits', 'auto', 'rename "foo"', 'win32')
   assert.ok(!cmd.includes('rename'), 'no fragment of the message may reach the command line')
   assert.ok(cmd.startsWith('turbollm launch claude --port '), cmd)
 })
@@ -334,4 +391,225 @@ test('buildTerminalLaunchCommand: an unseedable message is omitted, never mangle
 test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', () => {
   // The common case must keep working; only the two genuinely unconveyable classes are refused.
   assert.equal(canSeedFirstMessage("don't break this", 'claude'), true)
+})
+
+// A routine kickoff that execute.ts has already given up on (its row is 'errored' and the
+// scheduler has released the routine) passes an aborted signal — the CLI must never be launched.
+test('createAgentTerminal: an aborted signal never spawns the terminal', async () => {
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
+    db: { getConversation: () => undefined, updateAgentRun: () => {} },
+  } as unknown as Deps
+  const run = { id: 'abort-session', convId: 'c', repoRoot: tmpDir('terminal-routes-abort-repo-'), codeAgent: 'opencode' } as unknown as AgentRun
+  const ac = new AbortController()
+  ac.abort()
+  const result = await createAgentTerminal(d, run, { mode: 'ask', signal: ac.signal })
+  const spawned = getTerminalManager(d).findByCodeSessionId(run.id)
+  if (spawned) getTerminalManager(d).kill(spawned)
+  assert.equal(result.ok, false)
+  // The abort outcome itself, not just "no terminal": without node-pty (an optionalDependency) the
+  // stub manager's create() throws, so an unfixed build also fails with no terminal (501).
+  assert.equal((result as { code?: string }).code, 'aborted')
+  assert.equal(spawned, null)
+})
+
+// Shutdown (cli.ts) drops the HTTP connections with closeAllConnections() and then awaits
+// server.close(). A Code terminal's WebSocket is an upgraded socket, which that leaves open: one
+// open terminal held the close until the 12 s fallback, and `--stop` SIGKILLed the daemon at 10 s.
+test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutdown\'s server.close()', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  // A live terminal without spawning a PTY: the handshake only asks the manager these.
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const d = {
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const client = new WebSocket(`ws://127.0.0.1:${(server.address() as AddressInfo).port}/api/v1/code/terminal/ws?terminalId=t1`)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await new Promise((resolve, reject) => { client.once('open', resolve); client.once('error', reject) })
+    const closed = await new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(false), 2_000)
+      // The shutdown's own sequence.
+      server.closeAllConnections()
+      closeTerminalSockets()
+      server.close(() => resolve(true))
+    })
+    assert.equal(closed, true, 'server.close() completed promptly')
+  } finally {
+    clearTimeout(timer)
+    client.terminate()
+    server.close()
+  }
+})
+
+// The handshake gets no CORS check, and a page on another site that opens ws://127.0.0.1:<port>
+// sends a genuine Host, so loopback trust let any website attach to a live terminal whose id it
+// had (https://turbollm.dev could list them through /api's CORS). Its Origin gives it away.
+test('a terminal WebSocket handshake from another site needs a key; the app\'s own page does not', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const raw = 'tllm-terminalwsoriginterminalwsoriginter1'
+  const cfg = {
+    daemon: { port: 6996 },
+    apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null }],
+  }
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
+  } as unknown as Deps
+  const server = http.createServer((_req, res) => res.end())
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const handshake = (headers: Record<string, string>, query = '') =>
+    new Promise<number | 'open'>((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/code/terminal/ws?terminalId=t1${query}`, { headers })
+      ws.once('open', () => { ws.terminate(); resolve('open') })
+      ws.once('unexpected-response', (_req: unknown, res: { statusCode: number }) => { ws.terminate(); resolve(res.statusCode) })
+      ws.once('error', () => resolve(-1))
+    })
+  try {
+    for (const headers of [
+      { Origin: 'https://turbollm.dev' },
+      { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' },
+      { Origin: 'null' },
+      { Origin: `http://127.0.0.1:${port + 1}` },
+    ] as Record<string, string>[]) {
+      assert.equal(await handshake(headers), 401, JSON.stringify(headers))
+    }
+    // The app's own page (Electron, the browser, the Android WebView), a CLI with no Origin.
+    assert.equal(await handshake({ Origin: `http://127.0.0.1:${port}` }), 'open')
+    assert.equal(await handshake({ Origin: `http://LOCALHOST:${port}`, Host: `localhost:${port}` }), 'open')
+    assert.equal(await handshake({}), 'open')
+    // Another site's page holding a real key still connects, as a LAN client would.
+    assert.equal(await handshake({ Origin: 'https://evil.example' }, `&key=${raw}`), 'open')
+  } finally {
+    server.close()
+  }
+})
+
+// ── An open terminal WebSocket whose way in is gone ─────────────────────────────────────────
+// The key and address checks run only at the handshake, and an upgraded socket is no HTTP
+// connection a listener's closeAllConnections() or close() ends: a LAN peer kept its shell after
+// LAN access was turned off, a remote client after remote access was stopped, and anyone after
+// the key that let them in was revoked.
+
+const STALE_RAW_A = 'tllm-stalesocketsAstalesocketsAstalesock1'
+const STALE_RAW_B = 'tllm-stalesocketsBstalesocketsBstalesock1'
+
+/** A live terminal (no PTY: the handshake only asks the manager these), a real key store and a
+ *  real listener, with `open` connecting a terminal WebSocket to it. */
+async function staleHarness(t: import('node:test').TestContext, opts: { listenHost?: string; ingress?: boolean } = {}) {
+  t.mock.method(TerminalManager.prototype, 'isActive', () => true)
+  t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
+  t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
+  const cfg = {
+    daemon: { port: 6996, lanBind: false },
+    apiKeys: [STALE_RAW_A, STALE_RAW_B].map((raw, i) => ({ id: `k${i}`, name: `key-${i}`, hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null })),
+  }
+  const server = http.createServer((_req, res) => res.end())
+  let ingressPort: number | undefined
+  const d = {
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
+    remote: { ingressPort: () => ingressPort },
+    bindHost: opts.listenHost ?? '127.0.0.1',
+  } as unknown as Deps & { bindHost: string }
+  registerTerminalWs(server, d)
+  await new Promise<void>((resolve) => server.listen(0, opts.listenHost ?? '127.0.0.1', resolve))
+  const port = (server.address() as AddressInfo).port
+  if (opts.ingress) ingressPort = port
+  const WebSocket = createRequire(import.meta.url)('ws')
+  const clients: Array<{ terminate(): void }> = []
+  /** Opens a terminal WebSocket; resolves with a probe for whether it is still open. */
+  const open = async (o: { key?: string; headers?: Record<string, string>; localAddress?: string } = {}) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/api/v1/code/terminal/ws?terminalId=t1${o.key ? `&key=${o.key}` : ''}`, { headers: o.headers ?? {}, localAddress: o.localAddress })
+    clients.push(ws)
+    let closed = false
+    ws.on('close', () => { closed = true })
+    await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject) })
+    return { closed: () => closed }
+  }
+  const settle = async (probe: () => boolean) => {
+    for (let i = 0; i < 100 && !probe(); i++) await new Promise((r) => setTimeout(r, 10))
+  }
+  /** Long enough for a terminate() to reach the client, for a check that nothing was closed. */
+  const pause = () => new Promise((r) => setTimeout(r, 100))
+  return {
+    cfg, d, open, settle, pause,
+    setIngressPort: (p: number | undefined) => { ingressPort = p },
+    cleanup: () => { for (const c of clients) c.terminate(); server.close() },
+  }
+}
+
+// 127.0.0.2 is this machine too, but not one of the loopback addresses the gates trust, so a
+// socket from it is judged exactly like a LAN peer's (Linux routes all of 127/8 to loopback).
+test('dropStaleTerminalSockets: a LAN peer\'s terminal is dropped once LAN access is off; the host\'s own stays', { skip: (!isTerminalBackendAvailable() && 'node-pty not installed') || (process.platform !== 'linux' && '127.0.0.2 is not loopback here') }, async (t) => {
+  const h = await staleHarness(t, { listenHost: '0.0.0.0' })
+  try {
+    h.cfg.daemon.lanBind = true
+    const lan = await h.open({ key: STALE_RAW_A, localAddress: '127.0.0.2' })
+    const host = await h.open()
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(lan.closed() || host.closed(), false, 'LAN access still on: nothing is dropped')
+    // LAN access off: the rebind's new listener is loopback-only.
+    h.cfg.daemon.lanBind = false
+    ;(h.d as { bindHost: string }).bindHost = '127.0.0.1'
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(lan.closed)
+    assert.equal(lan.closed(), true, 'the LAN peer\'s shell is closed')
+    assert.equal(host.closed(), false, 'the host\'s own terminal stays open')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('dropStaleTerminalSockets: a terminal that came over remote access is dropped once the ingress is down', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  const h = await staleHarness(t, { ingress: true })
+  try {
+    // Through the ingress nothing is local, so it needed a key.
+    const remote = await h.open({ key: STALE_RAW_A })
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(remote.closed(), false, 'remote access still up: nothing is dropped')
+    h.setIngressPort(undefined) // Stop: the ingress listener is closed
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(remote.closed)
+    assert.equal(remote.closed(), true)
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('dropStaleTerminalSockets: a terminal let in on a key is dropped once that key is revoked; the others stay', { skip: !isTerminalBackendAvailable() && 'node-pty not installed' }, async (t) => {
+  const h = await staleHarness(t)
+  try {
+    // A handshake from another site's page needs a key even on loopback (isLocalUpgrade).
+    const crossSite = { Origin: 'https://evil.example' }
+    const withA = await h.open({ key: STALE_RAW_A, headers: crossSite })
+    const withB = await h.open({ key: STALE_RAW_B, headers: crossSite })
+    const local = await h.open({ key: STALE_RAW_A }) // local: the key it also sent is not what let it in
+    dropStaleTerminalSockets(h.d)
+    await h.pause()
+    assert.equal(withA.closed() || withB.closed() || local.closed(), false, 'no key revoked: nothing is dropped')
+    h.cfg.apiKeys = h.cfg.apiKeys.filter((k) => k.id !== 'k0')
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(withA.closed)
+    assert.equal(withA.closed(), true, 'the terminal opened with the revoked key is closed')
+    assert.equal(withB.closed(), false)
+    assert.equal(local.closed(), false)
+    // A key turned into a link grant is no key here either (verifyKeyValue refuses it).
+    ;(h.cfg.apiKeys[0] as { grant?: unknown }).grant = { kind: 'link', capabilities: ['models:use'] }
+    assert.ok(dropStaleTerminalSockets(h.d) >= 1)
+    await h.settle(withB.closed)
+    assert.equal(withB.closed(), true)
+  } finally {
+    h.cleanup()
+  }
 })

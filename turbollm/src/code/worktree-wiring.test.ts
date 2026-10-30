@@ -37,7 +37,8 @@ const OPERATIONAL_CALLS = [
  *  the agent edits:
  *   - the sidebar/detail payload (the project is what identifies the session)
  *   - `if (!run.repoRoot)` guards (does this session have a repo at all?)
- *   - `removeSessionWorktree(run.repoRoot, …)` — `git worktree remove` MUST run from the base repo
+ *   - `removeSessionWorktree(run.repoRoot, …)` — `git worktree remove` MUST run from the base repo (called
+ *     as `removeWorktree(…)`, the delete route's seam for its tests)
  *   - the `run.worktreePath && run.repoRoot` guard that precedes it */
 function isLegitimateRepoRootUse(line: string): boolean {
   const t = line.trim()
@@ -46,6 +47,7 @@ function isLegitimateRepoRootUse(line: string): boolean {
     t.startsWith('repoRoot: run.repoRoot ??') ||
     t.startsWith('hasAgentsMd: run.repoRoot') ||
     t.includes('removeSessionWorktree(run.repoRoot') ||
+    t.includes('removeWorktree(run.repoRoot') ||
     t.startsWith('if (run.worktreePath && run.repoRoot)')
   )
 }

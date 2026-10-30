@@ -1,10 +1,11 @@
 // packaging.test.js — the packaged app contains only the `files` allowlist (ADR-442, ADR-433).
 const test = require('node:test')
 const assert = require('node:assert/strict')
-const { readFileSync } = require('node:fs')
+const { existsSync, readFileSync } = require('node:fs')
 const { join, relative, sep } = require('node:path')
 
 const config = require('./electron-builder.config.cjs')
+const { TRAY_ICON } = require('./window-lifecycle')
 
 const LOCAL_REQUIRE = /require\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*\)/g
 const TEST_FILE = /\.test\.js$/
@@ -42,6 +43,18 @@ test('no test file or fixture can be packaged', () => {
 test('the app entry points are packaged', () => {
   assert.ok(config.files.includes('main.js'), 'main.js is the app entry point and must be in files')
   assert.ok(config.files.includes('package.json'), 'package.json names the entry point and must be in files')
+})
+
+// The `files` allowlist keeps wrapper/build out of the app, so the tray icon main.js loads from
+// process.resourcesPath must be copied there by the top-level extraResources (every OS).
+test('the tray icon main.js loads ships in the packaged app', () => {
+  const mainSource = readFileSync(join(__dirname, 'main.js'), 'utf8')
+  const copies = config.extraResources.filter((entry) => entry.to === TRAY_ICON.packaged)
+
+  assert.match(mainSource, /join\(process\.resourcesPath, TRAY_ICON\.packaged\)/, 'the packaged app loads the icon from its resources folder')
+  assert.equal(copies.length, 1, `extraResources must copy the tray icon to ${TRAY_ICON.packaged}`)
+  assert.equal(copies[0].from, join(__dirname, TRAY_ICON.source), 'from the icon a dev run loads')
+  assert.ok(existsSync(copies[0].from), `${TRAY_ICON.source} must exist`)
 })
 
 function relativeRequires (source) {

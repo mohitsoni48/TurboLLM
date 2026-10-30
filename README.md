@@ -342,7 +342,7 @@ there. Entirely local; nothing leaves your machine.
 - **Expose it to other tools over MCP** — `turbollm mcp-server` runs a stdio MCP server so any
   MCP-compatible tool (Claude Desktop, Cursor, Windsurf, Cline, Claude Code, and more) can
   delegate a real coding task to Code, not just chat completions. Setup snippets for any host are
-  in the Developer tab.
+  under Customize → Connect.
 - **Or run Claude Code, `pi` or `opencode` itself, inside Code** — set Settings → Code agent and a session
   opens the real CLI in a full-screen terminal, on your local model, in your project folder. The
   model picker, context ring, thinking-budget slider and stats row stay right where they are: the
@@ -426,13 +426,13 @@ curl http://127.0.0.1:6996/v1/chat/completions \
   `/api/ext/v1`, for building a real chat product instead of the gateway's stateless
   send-full-history-every-call model — persistence, history, message editing, and resumable
   streaming generation are handled for you. Off by default; using it today needs two manual
-  `config.json` edits — a key with an explicit, non-`local` `tenant` field (the local tenant, this
-  install's own desktop UI data, is never reachable through this API), and a configured
-  `chatStore` adapter (the SQLite default only ever serves the `local` tenant). A generated
-  OpenAPI spec, a TypeScript client, and a working Postgres adapter example ship with it. The
-  daemon logs a warning at startup while it's enabled — a remote tenant's generations currently
-  inherit this install's own tool permissions, not an independent trust boundary of their own.
-  [Full guide](https://turbollm.dev/docs/api/external).
+  `config.json` edits — a key with an explicit, non-`local` `tenant` field, which works on this
+  API and nowhere else (the local tenant, this install's own desktop UI data, is never reachable
+  through this API), and a configured `chatStore` adapter (the SQLite default only ever serves
+  the `local` tenant). A generated OpenAPI spec, a TypeScript client, and a working Postgres
+  adapter example ship with it. The daemon logs a warning at startup while it's enabled — a
+  remote tenant's generations currently inherit this install's own tool permissions, not an
+  independent trust boundary of their own. [Full guide](https://turbollm.dev/docs/api/external).
 
 **The gateway loads models for you.** Most local hosts make you load a model first, then call it.
 TurboLLM's gateway reads the `model` field of any incoming request, **fuzzy-matches it to your
@@ -600,8 +600,8 @@ Other coding CLIs work too — `turbollm launch opencode`, `turbollm launch kilo
 be parsed, TurboLLM refuses to overwrite it and prints how to add the provider by hand.
 `turbollm launch hermes` does the equivalent for [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 via its own `hermes config set` command (its config is YAML, so we drive its CLI instead of
-hand-editing that file). The in-app **Developer** screen also shows copy-paste snippets for
-any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
+hand-editing that file). The in-app **Customize → Connect** tab also shows copy-paste snippets
+for any OpenAI- or Anthropic-compatible tool (Open WebUI, Kilo Code, opencode, …).
 
 ---
 
@@ -615,7 +615,13 @@ untouched:
 turbollm --addr 0.0.0.0:6996    # bind all interfaces, then open http://<your-ip>:6996
 ```
 
-Turn on **Require API key** in Settings → Network & sharing when you expose it.
+Other devices need an API key: it is required by default on any address other than loopback.
+On the first such start with no key yet, one is generated and printed once in the startup
+banner; otherwise create one under **Customize → Connect → API keys** on the host machine.
+Paste it when the other device asks. To let any device on your network in without a key, turn on
+**Expose on local network (LAN)** in Settings → Network & sharing, then turn
+**Require an API key** off there. Any website opened in a browser on that network can then use
+it without a key too (through DNS rebinding).
 
 ---
 
@@ -635,7 +641,7 @@ turbollm launch opencode        # wire opencode (or kilo / openclaw) to TurboLLM
 | Flag | Description |
 |------|-------------|
 | `--port <n>` | Listen on a specific port (default: `6996`) |
-| `--addr <host:port>` | Full host:port override, e.g. `0.0.0.0:6996` for LAN sharing |
+| `--addr <host:port>` | Full host:port override, e.g. `0.0.0.0:6996` for LAN sharing; an IPv6 address bracketed, `[::1]:6996` |
 | `--no-open` | Start without opening a browser window |
 | `--config <file>` | Path to a custom config file |
 | `--stop` | Stop a running TurboLLM daemon (reads `~/.turbollm/daemon.pid`) and exit |
@@ -804,7 +810,7 @@ docker compose -f docker-compose-nvidia.yaml logs | grep 'Token:'   # or docker-
 Grab the value after `Token:` and either paste it into the web UI's login prompt, or send
 it yourself as `X-TurboLLM-Auth: <key>` (or `Authorization: Bearer <key>`). Each restart
 mints a new one, so re-run the command above after a restart rather than reusing an old
-value — old keys keep working too and can be revoked from Developer → API Keys once
+value — old keys keep working too and can be revoked from Customize → Connect → API keys once
 you're in.
 
 ---

@@ -15,7 +15,15 @@
 // passes `agent.tools` as `allowedTools`, intersected against the real registry), never a grant of
 // new capability. Creating one has exactly the same risk profile as the model composing a longer
 // system-prompt string in its own reply — it cannot reach the filesystem/shell gate that makes
-// code-flavor routines sensitive.
+// code-flavor routines sensitive. A remote-access token is refused create_agent, though
+// (tool-registry.ts), as it is refused POST /api/v1/chat-agents.
+//
+// The one exception is an MCP server tool. A chat turn whose caller may not act on the host is
+// refused the owner's MCP tools (tool-registry.ts `refuseMcp`), while chat-runner.ts runs every
+// tool an agent lists with no approval: so naming one in an agent would grant that caller, through
+// a chat routine, a tool it cannot reach itself. tool-registry.ts refuses create_agent with an MCP
+// tool to that turn and to a routine's unattended run, as POST /api/v1/chat-agents refuses it to
+// the same callers (listsMcpTool).
 import { randomUUID } from 'node:crypto'
 import type { CustomChatAgent } from '../config/config'
 

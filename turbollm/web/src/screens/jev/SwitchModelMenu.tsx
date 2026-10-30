@@ -6,12 +6,16 @@
 // model picked here has replaced its own.
 import { ApiError, track } from '../../lib/api'
 import type { LoadOptions, LoadTarget } from '../../lib/model-loader'
-import { isSystemOneModel } from '../../lib/model-kind'
+import { hiddenByUser, hiddenByUserCount, isSystemOneModel, loadOffered } from '../../lib/model-kind'
 import { TextClassificationRuntimeLabel } from '../../components/TextClassificationRuntimeLabel'
 import { toast } from '../../components/ui/sonner'
+import { NoModelsHint } from '../../components/NoModelsHint'
 import type { LoadedJev, ModelEntry } from '../../lib/types'
 
-const NOTHING_LOADABLE = 'Nothing else here can load on the active engine. Change it on the Engines screen.'
+// Nothing here suggests another engine: a model loads only on the one the user selected. The setting lists the rest.
+const NOTHING_LOADABLE =
+  'Nothing else here can load on the selected engine. Settings → Models & loading → "Show models for every engine" lists every model.'
+const NOTHING_LOADABLE_SHOWING_ALL = 'Nothing else here can be loaded.'
 
 type SwitchDeps = {
   stopEngine(key: string): Promise<unknown>
@@ -22,17 +26,26 @@ export function SwitchModelMenu({
   current,
   models,
   onPick,
+  showAllEngineModels = false,
 }: {
   current: LoadedJev
   models: ModelEntry[]
   onPick: (m: ModelEntry) => void
+  /** Settings → Models, "Show models for every engine" (useShowAllEngineModels). */
+  showAllEngineModels?: boolean
 }) {
-  const loadable = models.filter((m) => canLoad(m, current))
+  // Not a model the user hid by hand (Models → Library "Hide"), as no picker offers one; with nothing else, they are counted.
+  const offered = models.filter((m) => canLoad(m, current, showAllEngineModels))
+  const loadable = offered.filter((m) => !hiddenByUser(m))
+  const hiddenByYou = hiddenByUserCount(offered)
 
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border p-3">
       {loadable.length === 0 ? (
-        <p className="text-[13px] text-muted">{NOTHING_LOADABLE}</p>
+        <div className="flex flex-col gap-1">
+          <p className="text-[13px] text-muted">{showAllEngineModels ? NOTHING_LOADABLE_SHOWING_ALL : NOTHING_LOADABLE}</p>
+          <NoModelsHint hidden={{ byEngine: 0, byUser: hiddenByYou }} offerDownload={false} />
+        </div>
       ) : (
         <>
           <ModelGroup title="Chat models" models={loadable.filter((m) => !isSystemOneModel(m))} onPick={onPick} />
@@ -116,11 +129,13 @@ function ModelGroup({ title, models, onPick }: { title: string; models: ModelEnt
   )
 }
 
-function canLoad(m: ModelEntry, current: LoadedJev): boolean {
-  return canLoadNow(m) && m.key !== current.key
+function canLoad(m: ModelEntry, current: LoadedJev, showAllEngineModels: boolean): boolean {
+  return canLoadNow(m, showAllEngineModels) && m.key !== current.key
 }
 
-/** Only models that would really load right now — an offer that 400s is worse than no offer. */
-export function canLoadNow(m: ModelEntry): boolean {
-  return !m.incomplete && !m.parseError && m.compatibleWithActiveEngine && !m.embedding
+/** Only models that would really load right now — an offer that 400s is worse than no offer. With Settings' "Show
+ *  models for every engine" on, also one the selected engine is not expected to run: like every model picker's, its
+ *  load starts on the selected engine and shows that engine's error if it fails (lib/model-kind.ts loadOffered). */
+export function canLoadNow(m: ModelEntry, showAllEngineModels = false): boolean {
+  return !m.incomplete && !m.parseError && loadOffered(m, showAllEngineModels) && !m.embedding
 }

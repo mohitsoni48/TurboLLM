@@ -3,9 +3,11 @@
 // this codebase's own testing discipline for exactly this class of timing/process-lifecycle bug
 // (see the module's own header for the live, timed testing that found the original bug).
 import assert from 'node:assert/strict'
+import { spawn, spawnSync } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { join } from 'node:path'
-import { createRobustBashOperations } from './robust-bash'
+import { createRobustBashOperations, TIE_GATE } from './robust-bash'
 import { tmpDir } from '../test-support/tmp'
 
 function tmp(): string {
@@ -74,4 +76,51 @@ test('exec: a timeout kills the real process the same way an abort does', async 
   )
   const elapsedMs = Date.now() - start
   assert.ok(elapsedMs < 10_000, `expected timeout-triggered kill to resolve in well under 10s, took ${elapsedMs}ms`)
+})
+
+/** Runs TIE_GATE and a command after it under `shell`, with TMOUT=1 exported, and writes the gate's line 1.5 s in. */
+async function runGate(shell: string, extra: NodeJS.ProcessEnv, command: string) {
+  const child = spawn(shell, ['-c', `${TIE_GATE}${command}`], { env: { ...process.env, ...extra, TMOUT: '1' }, stdio: ['pipe', 'pipe', 'pipe'] })
+  const t0 = Date.now()
+  let startedAt = 0
+  let out = ''
+  let err = ''
+  child.stdout.on('data', (d: Buffer) => { if (!startedAt) startedAt = Date.now(); out += d.toString() })
+  child.stderr.on('data', (d: Buffer) => { err += d.toString() })
+  const line = setTimeout(() => child.stdin.end('\n'), 1500)
+  const [code] = await new Promise<[number | null]>((resolve) => child.once('close', (c) => resolve([c])))
+  clearTimeout(line)
+  return { code, waited: startedAt - t0, out, err }
+}
+
+// On Windows a Code bash command waits behind TIE_GATE until its job exists (exec above). bash's read takes an exported
+// TMOUT for a timeout, so the plain `read` let the command start TMOUT seconds in, before its line, untied. A
+// `TMOUT= read` would not do where TMOUT is readonly (here through BASH_ENV, which a `bash -c` reads): the
+// assignment fails and the read still times out. Git Bash is bash, so it runs here under the first bash on PATH: on a
+// Mac that can be /bin/bash, 3.2, whose timed-out read returns 1, as at EOF.
+const gateSkip = process.platform === 'win32' ? 'the host bash; on Windows win-job-sentinel.test.ts runs the gate in Git Bash'
+  : spawnSync('sh', ['-c', 'command -v bash']).status === 0 ? false : 'needs bash'
+test('TIE_GATE: bash runs the command only once its line comes, past an exported TMOUT and a readonly one; the command keeps TMOUT, and /dev/null as its stdin', { skip: gateSkip }, async () => {
+  const dir = tmp()
+  const bashEnv = join(dir, 'bash-env')
+  writeFileSync(bashEnv, 'readonly TMOUT\n')
+  for (const [what, extra] of [['exported', {}], ['readonly too', { BASH_ENV: bashEnv }]] as const) {
+    const { code, waited, out, err } = await runGate('bash', extra, `echo started; printf '%s\\n' "$TMOUT"; read -r x && echo "stdin: $x" || echo stdin-empty`)
+    assert.equal(code, 0, `${what}: ${err}`)
+    assert.ok(waited >= 1400, `${what}: the command waited for its line past TMOUT=1 (it started after ${waited} ms)`)
+    assert.deepEqual(out.trim().split('\n'), ['started', '1', 'stdin-empty'], `${what}: it keeps TMOUT, and /dev/null as its stdin`)
+    assert.equal(err, '', `${what}: nothing on stderr`)
+  }
+})
+
+// A Code shellPath can name a shell whose read has no -t (dash; Debian's and Ubuntu's /bin/sh, macOS's /bin/dash):
+// with the gate's `read -t` alone, its "Illegal option -t" went into the command's output and the command started at
+// once, untied. The plain read after it waits for the line.
+const dashSkip = process.platform === 'win32' ? 'a POSIX dash' : spawnSync('sh', ['-c', 'command -v dash']).status === 0 ? false : 'needs dash'
+test('TIE_GATE: a shell whose read has no -t (dash) runs the command only once its line comes, and puts nothing on stderr', { skip: dashSkip }, async () => {
+  const { code, waited, out, err } = await runGate('dash', {}, 'echo started; read -r x && echo "stdin: $x" || echo stdin-empty')
+  assert.equal(code, 0, err)
+  assert.ok(waited >= 1400, `the command waited for its line (it started after ${waited} ms)`)
+  assert.deepEqual(out.trim().split('\n'), ['started', 'stdin-empty'], 'it keeps /dev/null as its stdin')
+  assert.equal(err, '', 'nothing on stderr')
 })

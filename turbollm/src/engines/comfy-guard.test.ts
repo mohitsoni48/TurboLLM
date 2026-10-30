@@ -5,10 +5,13 @@
 //   • disabled → acquire/release are no-ops and loads are never blocked.
 //   • the lease backstop auto-releases (reloads) if release never arrives.
 import assert from 'node:assert/strict'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { ComfyGuard } from './comfy-guard'
 import type { FetchImpl } from './comfy-guard'
 import type { StartOpts, Status } from './manager'
+import { tmpDir } from '../test-support/tmp'
 
 /** Records the reverse-gate `POST {url}/free` calls so tests can assert on them, and
  *  returns a scripted response. `throws` simulates an unreachable/timed-out ComfyUI. */
@@ -35,6 +38,7 @@ function fakeManager(initial: { state: Status['state']; opts: StartOpts | null }
       status: () => ({ state, err: null, port: 0, pid: 0, model: opts?.model ?? null, loadElapsedMs: 0 }) as Status,
       target: () => (state === 'running' ? 'http://127.0.0.1:0' : null),
       currentOpts: () => ((state === 'running' || state === 'starting') ? opts : null),
+      restartOpts: () => opts,
       stopAndWait: async (o?: { force?: boolean }) => {
         calls.stops++
         if (o?.force) calls.forceStops++
@@ -52,7 +56,8 @@ function fakeManager(initial: { state: Status['state']; opts: StartOpts | null }
 }
 
 /** ConfigStore double returning a fixed comfyui config snapshot. `url`/`reverseGate`
- *  default off so the existing forward-gate tests are unaffected by the reverse gate. */
+ *  default off so the existing forward-gate tests are unaffected by the reverse gate. The selected engine is OPTS'
+ *  one, as it is while one of its models runs: release() reloads a model only on the selected engine. */
 function fakeStore(comfyui: {
   enabled: boolean
   gatePath: string
@@ -62,7 +67,7 @@ function fakeStore(comfyui: {
 }) {
   const full = { url: '', reverseGate: false, cachePersist: false, ...comfyui }
   return {
-    snapshot: () => ({ comfyui: full }),
+    snapshot: () => ({ comfyui: full, activeEngineId: 'e' }),
     // slot-cache helpers ask the store for the data dir to compute the slot-cache path.
     dir: () => '/tmp/turbollm-test',
   } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
@@ -89,6 +94,115 @@ test('acquire force-unloads the running model + blocks; release reloads exactly 
   assert.equal(calls.starts[0].model.key, 'llama-8b', 'reloads the exact model it unloaded')
   assert.equal(g.isBlocked(), false, 'loads unblocked after release')
   assert.equal(g.snapshot().suspendedModelKey, null, 'capture cleared')
+})
+
+// A model loads only on the engine the user selected. A render leaves the primary stopped, so the Engines screen lets
+// the user select another engine meanwhile; release() then brought the model back on the engine they had left.
+test('release does not reload the model on an engine the user left during the render', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+
+  await g.acquire()
+  activeEngineId = 'other'
+  await g.release()
+
+  assert.equal(calls.starts.length, 0, 'not started on the engine the user left')
+  assert.equal(g.isBlocked(), false)
+
+  // Still selected, it is reloaded as before.
+  const again = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  activeEngineId = 'e'
+  const g2 = new ComfyGuard(store, again.mgr as never)
+  await g2.acquire()
+  await g2.release()
+  assert.equal(again.calls.starts.length, 1)
+})
+
+// A Disable or Delete of the selected engine during the render leaves no engine selected (Registry.remove), and every
+// load but a Laya model's (never on the primary) then refuses until the user picks one. An empty selection read as
+// "reload": a model on an engine still registered came back with no engine selected, and modelKeyLoadedOnRelease
+// named it.
+test('release does not reload the model once the user removed the selected engine during the render', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+
+  await g.acquire()
+  activeEngineId = ''
+  assert.equal(g.modelKeyLoadedOnRelease(), null)
+  await g.release()
+
+  assert.equal(calls.starts.length, 0, 'nothing loads with no engine selected')
+  assert.equal(g.isBlocked(), false)
+})
+
+// The same for a load the render paused, after an engine install or Enable activated another engine (they do not
+// clear the paused load's refusal, as Engines' own switch does): it is not resumed there, and its refusal, which
+// says loading resumes when the queue finishes, is cleared.
+test('release does not resume a paused load on an engine that is no longer the selected one', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  let activeEngineId = 'e'
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+  await g.acquire()
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let paused = true
+  let restarts = 0
+  const stopped = mgr.status
+  Object.assign(mgr, {
+    status: () => (paused
+      ? { state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }
+      : stopped()),
+    restartOpts: () => OPTS('picked'),
+    restart: async () => { restarts++ },
+    clearError: () => { paused = false },
+  })
+  activeEngineId = 'other'
+
+  await g.release()
+
+  assert.equal(restarts, 0, 'not resumed on the engine the user left')
+  assert.equal(calls.starts.length, 0)
+  assert.equal(paused, false, "the paused load's refusal is cleared")
+})
+
+// modelKeyLoadedOnRelease is release()'s decision told in advance: it went on naming the model on the engine the user
+// left, so the gateway told a caller that may not load models it comes back after the render, and a routine's refused
+// restore of it had its swap's lastLoaded record undone for a reload that never happens.
+test('modelKeyLoadedOnRelease names no model once the user selects another engine during the render', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  let activeEngineId = 'e' // OPTS' engine
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: false }, activeEngineId }),
+    dir: () => '/tmp/turbollm-test',
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never)
+  await g.acquire()
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a', 'the model the render unloaded, its engine still selected')
+  activeEngineId = 'other'
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the model the render unloaded, on the engine the user left')
+
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restartOpts: () => OPTS('b'),
+    restart: async () => {},
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the load the render paused, on the engine the user left')
+  activeEngineId = 'e'
+  assert.equal(g.modelKeyLoadedOnRelease(), 'b', 'the load the render paused, its engine selected again')
 })
 
 test('acquire with nothing loaded still blocks; release has nothing to reload', async () => {
@@ -122,6 +236,37 @@ test('disabled guard is fully inert (never blocks, never touches the engine)', a
   await g.acquire()
   assert.equal(calls.stops, 0, 'disabled acquire must not stop the engine')
   assert.equal(g.isBlocked(), false, 'disabled guard never blocks loads')
+})
+
+// Auto-tune starts its probes with Manager.start, which runs no pre-start hook: a render used to kill the running probe,
+// keep that probe's opts as the model to reload, and let the sweep start its next probes under the render. release()
+// then loaded the probe configuration as the user's model, although nothing had been loaded before the run.
+test('acquire during auto-tune cancels the run, and keeps no probe as the model to reload', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('probe-ngl17') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+  let running = true
+  let cancels = 0
+  g.setAutoTune({ isRunning: () => running, cancel: () => { cancels++; running = false } })
+
+  await g.acquire()
+  assert.equal(cancels, 1, 'auto-tune cancelled')
+  assert.equal(calls.forceStops, 1, 'the probe is killed for the render')
+  assert.equal(g.snapshot().suspendedModelKey, null, 'a probe is not the model to reload')
+
+  await g.release()
+  assert.deepEqual(calls.starts, [], 'release loads no probe configuration')
+})
+
+test('acquire with no auto-tune running cancels nothing and still keeps the model to reload', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/turbollm_gate' }), mgr as never)
+  let cancels = 0
+  g.setAutoTune({ isRunning: () => false, cancel: () => { cancels++ } })
+
+  await g.acquire()
+  assert.equal(cancels, 0)
+  assert.equal(g.snapshot().suspendedModelKey, 'llama-8b')
+  await g.release()
 })
 
 test('lease backstop auto-reloads if release never arrives', async () => {
@@ -183,8 +328,231 @@ test('reverse gate does NOT fire while holding the GPU for ComfyUI (render in fl
     mgr as never, undefined, f.impl,
   )
   await g.acquire() // ComfyUI now holds the GPU (held === true)
-  await g.freeComfyUIBeforeLoad()
+  // The hook runs inside the load gate right before the spawn: a load that got this far is refused.
+  await assert.rejects(g.freeComfyUIBeforeLoad(), /ComfyUI is rendering/)
   assert.equal(f.calls.length, 0, 'never interrupt an in-flight render via the reverse gate')
+})
+
+// A load that is already past the routes' isBlocked() check (waiting for the load gate, or in its
+// /free call) must not spawn once a render has acquired the GPU in the meantime.
+test('a load whose /free call is in flight when ComfyUI acquires is refused', async () => {
+  const { mgr } = fakeManager({ state: 'stopped', opts: null })
+  let answer!: () => void
+  const slowFree: FetchImpl = () => new Promise((r) => { answer = () => r({ ok: true, status: 200 }) })
+  const g = new ComfyGuard(
+    fakeStore({ enabled: true, gatePath: '/cn/g', url: 'http://127.0.0.1:8188', reverseGate: true }),
+    mgr as never, undefined, slowFree,
+  )
+  const hook = g.freeComfyUIBeforeLoad()
+
+  await g.acquire()
+  answer()
+
+  await assert.rejects(hook, /ComfyUI is rendering/)
+})
+
+test('acquire during a model swap force-stops the model that is still stopping', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopping', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+
+  await g.acquire()
+
+  assert.equal(calls.forceStops, 1, 'the graceful stop (up to 8 s) is cut short')
+  assert.equal(g.isBlocked(), true)
+})
+
+test('release resumes a load the guard refused mid-render, over the model the render displaced, without its cache', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // suspends A and saves its KV cache
+  // A swap to B, queued behind the render, reaches its start: the hook refuses it and Manager.load stores
+  // the refusal as the engine's error (restart() would retry B, the opts it recorded before the hook).
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let restarts = 0
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restart: async () => { restarts++ },
+  })
+
+  await g.release()
+
+  assert.equal(restarts, 1, 'the refused load is retried')
+  assert.equal(calls.starts.length, 0, 'A, which the user had already swapped away from, is not reloaded')
+  assert.equal(f.calls.filter((c) => c.url.includes('action=restore')).length, 0, "A's KV cache is not restored into B")
+  assert.equal(g.isBlocked(), false)
+})
+
+// The release route answers before the reload (the gate node waits for it holding its lock), so the next prompt's
+// acquire can land while the reload still waits for the load gate, with nothing running yet for acquire() to suspend.
+// That reload used to start with no pre-start check: the LLM loaded under the new render, and nothing reloaded it after.
+test('an acquire while the reload waits for the load gate: nothing starts under the render, and its release reloads the model', async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const start = mgr.start
+  let openGate = () => {}
+  // Manager.start's shape: wait for the load gate, run beforeStart inside it, then spawn.
+  Object.assign(mgr, {
+    start: async (o: StartOpts, hooks?: { beforeStart?: () => Promise<void> }) => {
+      await new Promise<void>((resolve) => { openGate = resolve })
+      await hooks?.beforeStart?.()
+      await start(o)
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+
+  const reload = g.release()
+  await g.acquire() // the next prompt
+  openGate()
+  await reload
+
+  assert.equal(calls.starts.length, 0, 'nothing loads under the new render')
+  assert.equal(g.isBlocked(), true)
+  assert.equal(g.snapshot().suspendedModelKey, 'llama-8b', 'still the model to reload')
+  assert.equal(g.modelKeyLoadedOnRelease(), 'llama-8b')
+
+  const second = g.release()
+  openGate()
+  await second
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['llama-8b'], 'reloaded once that render ends')
+})
+
+// The gateway answers a caller that may not load models from this: it must name the model release() loads.
+test('modelKeyLoadedOnRelease names what release() loads: the paused load over the unloaded model, none outside a render', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'no render')
+  await g.acquire()
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a', 'the model the render unloaded')
+
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  Object.assign(mgr, {
+    status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+    restartOpts: () => OPTS('b'),
+    restart: async () => {},
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), 'b', 'the load the render paused wins')
+
+  await g.release()
+  assert.equal(g.modelKeyLoadedOnRelease(), null, 'the render is over')
+})
+
+// A routine's restore refused mid-render (routines/model-swap.ts): release() reloads the user's model the routine
+// displaced, not the routine's own, which the render unloaded. The user's own choice still wins.
+test("reloadOnReleaseInstead: release reloads the routine's displaced model, without the routine model's cache", async () => {
+  const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('routine') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // suspends the routine's model and saves its KV cache
+  assert.equal(f.calls.filter((c) => c.url.includes('action=save')).length, 1)
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  assert.equal(g.modelKeyLoadedOnRelease(), 'user')
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+  assert.equal(f.calls.filter((c) => c.url.includes('action=restore')).length, 0, "the routine model's KV cache is not restored into the user's")
+})
+
+test('reloadOnReleaseInstead: a render that unloaded nothing reloads the displaced model too', async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+})
+
+test('reloadOnReleaseInstead leaves another model the render unloaded, a load it paused, and a time with no render alone', async () => {
+  {
+    const { mgr } = fakeManager({ state: 'running', opts: OPTS('other') })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.snapshot().suspendedModelKey, null, 'no render: nothing recorded')
+    await g.acquire()
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.modelKeyLoadedOnRelease(), 'other', 'the model the render unloaded is not the routine one')
+  }
+  {
+    const { mgr } = fakeManager({ state: 'running', opts: OPTS('routine') })
+    const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+    await g.acquire()
+    const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+    Object.assign(mgr, {
+      status: () => ({ state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }),
+      restartOpts: () => OPTS('picked'),
+      restart: async () => {},
+    })
+    assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), false)
+    assert.equal(g.modelKeyLoadedOnRelease(), 'picked', 'the load the render paused wins')
+    assert.equal(g.snapshot().suspendedModelKey, 'routine')
+  }
+})
+
+// A render whose acquire landed after the routine's swap had stopped the user's model refuses the routine's load, and
+// release() resumes a paused load. That load is the routine's own, for a routine that never ran: it gives way.
+test("reloadOnReleaseInstead drops the routine's own load the render paused, and reloads the displaced model", async () => {
+  const { mgr, calls } = fakeManager({ state: 'stopped', opts: null })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  await g.acquire()
+  const refusal = await g.freeComfyUIBeforeLoad().then(() => null, (e: Error) => e.message)
+  let paused = true
+  const stopped = mgr.status
+  Object.assign(mgr, {
+    status: () => (paused
+      ? { state: 'error', err: { code: 'load_failed', message: refusal, exitCode: -1, logTail: [] }, port: 0, pid: 0, model: null, loadElapsedMs: 0 }
+      : stopped()),
+    restartOpts: () => OPTS('routine'),
+    restart: async () => { calls.starts.push(OPTS('routine')) },
+    clearError: () => { paused = false },
+  })
+  assert.equal(g.modelKeyLoadedOnRelease(), 'routine')
+
+  assert.equal(g.reloadOnReleaseInstead('routine', OPTS('user')), true)
+
+  assert.equal(g.modelKeyLoadedOnRelease(), 'user')
+  await g.release()
+  assert.deepEqual(calls.starts.map((o) => o.model.key), ['user'])
+})
+
+// Not only once the GPU is held: while acquire is still freeing VRAM, release() will already reload the model.
+test('modelKeyLoadedOnRelease already names the unloaded model while acquire is still stopping it', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  let finishStop = () => {}
+  Object.assign(mgr, {
+    stopAndWait: async () => {
+      Object.assign(mgr, { currentOpts: () => null })
+      await new Promise<void>((resolve) => { finishStop = resolve })
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+
+  const acq = g.acquire()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(g.isBlocked(), false, 'the GPU is not held yet')
+  assert.equal(g.modelKeyLoadedOnRelease(), 'a')
+
+  finishStop()
+  await acq
+  await g.release()
+})
+
+test('acquire also stops the gateway pool slots, before it reports the GPU free', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('m') })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g' }), mgr as never)
+  const events: string[] = []
+  g.setPoolStopper(async () => {
+    await new Promise((r) => setTimeout(r, 20))
+    events.push('pool slots stopped')
+  })
+
+  await g.acquire()
+  events.push('acquire returned')
+
+  assert.deepEqual(events, ['pool slots stopped', 'acquire returned'])
+  assert.equal(g.isBlocked(), true)
 })
 
 test('reverse gate HTTP failure is non-fatal (load proceeds)', async () => {
@@ -257,6 +625,117 @@ test('cachePersist off → neither save nor restore is attempted', async () => {
   assert.equal(calls.starts.length, 1)
 })
 
+// The next prompt's acquire can also land while the reload is restoring the cache. That acquire saves the cache of the
+// engine it stops, for its own release to restore; the reload used to clear it once its restore returned, so the model
+// came back after that render without it.
+test('cachePersist: an acquire landing during the reload\'s restore keeps the cache it saved for its own release', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const slotCalls: string[] = []
+  let finishRestore = () => {}
+  const http: FetchImpl = async (url) => {
+    slotCalls.push(url)
+    // The first restore stays in flight until the next prompt has acquired.
+    if (slotCalls.filter((u) => u.includes('action=restore')).length === 1 && url.includes('action=restore')) {
+      await new Promise<void>((resolve) => { finishRestore = resolve })
+    }
+    return { ok: true, status: 200 }
+  }
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, http)
+  await g.acquire()
+
+  const reload = g.release()
+  while (!slotCalls.some((u) => u.includes('action=restore'))) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt: the reloaded engine is up, so its cache is saved again
+  finishRestore()
+  await reload
+  await g.release()
+
+  assert.deepEqual(slotCalls.map((u) => /action=(\w+)/.exec(u)?.[1]), ['save', 'restore', 'save', 'restore'])
+})
+
+// The same race with the cache file itself, written and read as llama-server does: the next prompt's save lands while
+// the reload's restore is still in flight and writes the file under the same name (same model, same launch args).
+// The restore then deleted that file as its own single-use one once it returned, so that render's release had none to
+// restore and the model came back without its cache after all.
+test("cachePersist: the reload's restore keeps the file a save made during it wrote, for the next release", async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const dataDir = tmpDir('comfy-slot-race-')
+  const cacheDir = join(dataDir, 'slot-cache')
+  mkdirSync(cacheDir, { recursive: true })
+  const restored: string[] = []
+  let saved = 0
+  let restoring = 0
+  let finishRestore = () => {}
+  const http: FetchImpl = async (url, init) => {
+    const file = join(cacheDir, (JSON.parse(String(init?.body ?? '{}')) as { filename?: string }).filename ?? '')
+    if (url.includes('action=save')) {
+      writeFileSync(file, `kv-${++saved}`)
+    } else if (url.includes('action=restore')) {
+      // llama-server reads the file into the slot and answers; a file it cannot open is a 400.
+      if (!existsSync(file)) {
+        restored.push('missing')
+        return { ok: false, status: 400 }
+      }
+      restored.push(readFileSync(file, 'utf8'))
+      // The first restore is slow: it answers only once the next prompt's save has written its file.
+      if (++restoring === 1) await new Promise<void>((resolve) => { finishRestore = resolve })
+    }
+    return { ok: true, status: 200 }
+  }
+  const store = {
+    snapshot: () => ({ comfyui: { enabled: true, gatePath: '/cn/g', url: '', reverseGate: false, cachePersist: true }, activeEngineId: 'e' }),
+    dir: () => dataDir,
+  } as unknown as ConstructorParameters<typeof ComfyGuard>[0]
+  const g = new ComfyGuard(store, mgr as never, undefined, http)
+  await g.acquire() // saves kv-1
+
+  const reload = g.release()
+  while (restoring === 0) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt: saves kv-2 under the same name while kv-1's restore is in flight
+  finishRestore()
+  await reload
+  await g.release()
+
+  assert.deepEqual(restored, ['kv-1', 'kv-2'], "the next release restores the cache the next prompt's save wrote")
+})
+
+// More often the next prompt's acquire catches the reload still starting (the release route answers at once, so an
+// auto-queued prompt lands within milliseconds). That acquire has no running engine to save a cache from, and the
+// reload then skips its restore: the cache saved on the way in was dropped, so the model came back without it.
+test('cachePersist: an acquire that catches the reload still starting keeps the unrestored cache for its own release', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
+  const f = fakeFetch({ ok: true })
+  const { status, currentOpts, stopAndWait, start } = mgr
+  let starting: StartOpts | null = null
+  let leftStarting = () => {}
+  // The reload's start, as Manager.start behaves when an acquire stops the engine it spawned: 'starting' until then,
+  // and it resolves once the engine has left 'starting'. Later starts come up at once.
+  Object.assign(mgr, {
+    start: async (o: StartOpts) => {
+      Object.assign(mgr, { start })
+      starting = o
+      await new Promise<void>((resolve) => { leftStarting = resolve })
+    },
+    status: () => (starting ? { ...status(), state: 'starting' as const } : status()),
+    currentOpts: () => starting ?? currentOpts(),
+    stopAndWait: async (o?: { force?: boolean }) => {
+      if (!starting) return stopAndWait(o)
+      starting = null
+      leftStarting()
+    },
+  })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire()
+
+  const reload = g.release()
+  while (!starting) await new Promise((r) => setImmediate(r))
+  await g.acquire() // the next prompt
+  await reload
+  await g.release()
+
+  assert.deepEqual(f.calls.map((c) => /action=(\w+)/.exec(c.url)?.[1]), ['save', 'restore'])
+})
+
 test('cachePersist: a failed save means release skips the restore', async () => {
   const { mgr, calls } = fakeManager({ state: 'running', opts: OPTS('llama-8b') })
   // Save POST throws (timeout / hit the cap) → cachedFile stays null.
@@ -273,4 +752,29 @@ test('cachePersist: a failed save means release skips the restore', async () => 
   await g.release()
   assert.equal(calls.starts.length, 1, 'still reloads the model')
   assert.equal(restores(f.calls).length, 0, 'no restore — nothing was saved this cycle')
+})
+
+// The reload's start can end with the model not running: the user ejected it while it loaded, or a swap took the
+// primary. The readiness poll then waited (up to 130 s) for any 'running' state and restored the saved cache into
+// whatever model was running by then, such as one the user loaded next.
+test('cachePersist: the saved cache is restored only into the model it was saved from', async () => {
+  const { mgr } = fakeManager({ state: 'running', opts: OPTS('a') })
+  const f = fakeFetch({ ok: true })
+  const g = new ComfyGuard(fakeStore({ enabled: true, gatePath: '/cn/g', cachePersist: true }), mgr as never, undefined, f.impl)
+  await g.acquire() // saves A's cache
+  assert.equal(saves(f.calls).length, 1)
+  let running: StartOpts | null = null
+  Object.assign(mgr, {
+    start: async () => {}, // A was ejected while it loaded
+    status: () => ({ state: running ? 'running' : 'stopped', err: null, port: 0, pid: 0, model: running?.model ?? null, loadElapsedMs: 0 }),
+    currentOpts: () => running,
+    target: () => (running ? 'http://127.0.0.1:0' : null),
+  })
+
+  const reload = g.release()
+  await new Promise((r) => setTimeout(r, 100))
+  running = OPTS('b') // the user loads B meanwhile
+  await reload
+
+  assert.equal(restores(f.calls).length, 0, "A's cache is not restored into B")
 })

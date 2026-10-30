@@ -1,7 +1,7 @@
 // ADR-434 (f): a Jev model labels premise/hypothesis pairs and can never chat, so every list
 // that says "pick a model to talk to" must leave it out. One predicate, so no picker can drift.
 import { describe, expect, it } from 'vitest'
-import { isChatModel, isSystemOneModel, textClassificationRuntime, textClassificationRuntimeLabel } from './model-kind'
+import { chatModelsForPicker, hiddenByUser, isChatModel, isSystemOneModel, loadOffered, textClassificationRuntime, textClassificationRuntimeLabel } from './model-kind'
 import type { JevInfo, ModelEntry } from './types'
 
 const JEV_INFO: JevInfo = {
@@ -77,5 +77,89 @@ describe('textClassificationRuntimeLabel', () => {
 describe('isChatModel with a Laya model', () => {
   it('leaves a Laya decision model out: it answers /v1/systemone and can never chat', () => {
     expect(isChatModel(model({ key: 'laya', laya: { checkpoints: ['english'] } }))).toBe(false)
+  })
+})
+
+// A model shown for loading loads on the selected engine, which shows its own error if it cannot (the daemon no longer
+// refuses it up front); only a Laya model, which never runs on the selected engine, keeps its Load off with no Laya
+// engine installed.
+describe('loadOffered', () => {
+  it('offers a model the engine runs, and one it does not once every model is shown', () => {
+    expect(loadOffered({ compatibleWithActiveEngine: true }, false)).toBe(true)
+    expect(loadOffered({ compatibleWithActiveEngine: false }, false)).toBe(false)
+    expect(loadOffered({ compatibleWithActiveEngine: false }, true)).toBe(true)
+  })
+
+  it('never offers a Laya model with no Laya engine', () => {
+    expect(loadOffered({ compatibleWithActiveEngine: false, laya: { checkpoints: ['english'] } }, true)).toBe(false)
+    expect(loadOffered({ compatibleWithActiveEngine: true, laya: { checkpoints: ['english'] } }, false)).toBe(true)
+  })
+})
+
+// The pickers handed ModelLoadMenu only what they kept, so a library of models the selected engine cannot run opened a
+// picker reading "No models found" with no word of them. Its empty state counts them from here.
+describe('chatModelsForPicker', () => {
+  const gguf = model({ key: 'qwen3-8b', compatibleWithActiveEngine: true })
+  const bundle = model({ key: 'gemma-3n', compatibleWithActiveEngine: false })
+  const jev = model({ key: 'nli', compatibleWithActiveEngine: false, jev: JEV_INFO })
+
+  it('lists the chat models the selected engine runs and counts the ones it leaves out for the engine', () => {
+    const { listed, hidden } = chatModelsForPicker([gguf, bundle, jev], false)
+    expect(listed.map((m) => m.key)).toEqual(['qwen3-8b'])
+    expect(hidden).toEqual({ byEngine: 1, byUser: 0 })
+  })
+
+  it('counts a model in two folders once, as the picker lists it once', () => {
+    expect(chatModelsForPicker([bundle, { ...bundle }], false).hidden).toEqual({ byEngine: 1, byUser: 0 })
+  })
+
+  it('leaves nothing out for the engine with "Show models for every engine" on', () => {
+    const { listed, hidden } = chatModelsForPicker([gguf, bundle, jev], true)
+    expect(listed.map((m) => m.key)).toEqual(['qwen3-8b', 'gemma-3n'])
+    expect(hidden).toEqual({ byEngine: 0, byUser: 0 })
+  })
+
+  it('counts no unfinished download or unreadable file, which the picker never lists', () => {
+    const partial = model({ key: 'gemma-3n-e2b', compatibleWithActiveEngine: false, incomplete: true, parseError: null })
+    const unreadable = model({ key: 'broken', compatibleWithActiveEngine: false, incomplete: false, parseError: 'bad magic' })
+    expect(chatModelsForPicker([gguf, partial, unreadable], false).hidden).toEqual({ byEngine: 0, byUser: 0 })
+  })
+})
+
+// Hidden by hand (Models → Library "Hide"): out of the Library list and every picker, unless it is loaded.
+describe('hiddenByUser', () => {
+  it('hides a model the user hid, but never the one loaded, and reads a missing flag as shown', () => {
+    expect(hiddenByUser({ hidden: true, loaded: false })).toBe(true)
+    expect(hiddenByUser({ hidden: true, loaded: true })).toBe(false)
+    expect(hiddenByUser({ hidden: false, loaded: false })).toBe(false)
+    expect(hiddenByUser({ loaded: false })).toBe(false)
+  })
+})
+
+describe('chatModelsForPicker with models hidden by hand', () => {
+  const shown = model({ key: 'qwen3-8b', compatibleWithActiveEngine: true, loaded: false })
+  const hidden = model({ key: 'gemma-270m', compatibleWithActiveEngine: true, loaded: false, hidden: true })
+  const hiddenWrongEngine = model({ key: 'gemma-3n', compatibleWithActiveEngine: false, loaded: false, hidden: true })
+
+  it('leaves them out and counts them as hidden by the user, whatever the engine', () => {
+    const { listed, hidden: counts } = chatModelsForPicker([shown, hidden, hiddenWrongEngine], false)
+    expect(listed.map((m) => m.key)).toEqual(['qwen3-8b'])
+    expect(counts).toEqual({ byEngine: 0, byUser: 2 })
+  })
+
+  it('still leaves them out with "Show models for every engine" on', () => {
+    expect(chatModelsForPicker([shown, hidden, hiddenWrongEngine], true).listed.map((m) => m.key)).toEqual(['qwen3-8b'])
+  })
+
+  it('counts no hidden unfinished download, which unhiding would not list either', () => {
+    const partial = { ...hidden, key: 'gemma-3n-e2b', incomplete: true, parseError: null }
+    expect(chatModelsForPicker([shown, partial], false).hidden).toEqual({ byEngine: 0, byUser: 0 })
+  })
+
+  it('lists a hidden model that is loaded', () => {
+    const loaded = { ...hidden, loaded: true }
+    const { listed, hidden: counts } = chatModelsForPicker([loaded], false)
+    expect(listed.map((m) => m.key)).toEqual(['gemma-270m'])
+    expect(counts).toEqual({ byEngine: 0, byUser: 0 })
   })
 })

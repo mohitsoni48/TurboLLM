@@ -21,9 +21,15 @@ if (major < 22 || (major === 22 && minor < 13)) {
   process.exit(1)
 }
 
+// Adding a listener does not replace Node's own warning printer (itself a 'warning'
+// listener), so a filter alongside it hides nothing and doubles every other warning. Take
+// Node's printer(s) off and call them from the filter instead — every other warning keeps
+// Node's exact output and flags (--no-warnings installs none, so nothing prints).
+const nodeWarningPrinters = process.listeners('warning')
+process.removeAllListeners('warning')
 process.on('warning', (w) => {
   if (w.name === 'ExperimentalWarning' && /SQLite/i.test(w.message)) return
-  process.stderr.write(`${w.stack ?? `${w.name}: ${w.message}`}\n`)
+  for (const print of nodeWarningPrinters) print(w)
 })
 
 await import('../dist/cli.js')

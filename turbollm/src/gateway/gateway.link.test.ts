@@ -7,8 +7,17 @@
 // in isolation is precisely how this path would ship broken.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { createHash } from 'node:crypto'
+import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { gatewayV1Handler, registerGateway } from './gateway'
+import { ModelRouter } from './model-router'
+import { lanAuth, provisionRemoteApiKey } from '../auth'
+import { defaultConfig, type ApiKey } from '../config/config'
+import { registerLinkApi } from '../link/link-routes'
+import { registerChatRoutes } from '../chat/chat-routes'
+import { ConversationStore } from '../chat/db'
+import { tmpDir } from '../test-support/tmp'
 import type { Deps } from '../deps'
 
 const REMOTE = { linkId: 'lnk1', baseUrl: 'https://rig.trycloudflare.com', token: 'tllm-hostsecret', modelKey: 'Qwen3' }
@@ -376,3 +385,285 @@ test("the SAME engine error is still spelled out in full on the local mount", as
   // Same machine, same user — the diagnostic is theirs to read.
   assert.ok((await res.text()).includes(enginePath))
 })
+
+test("a host reply fetch already decompressed is not relayed with the host's content-encoding", async () => {
+  // fetch decodes a gzip/br body (Cloudflare's edge compresses JSON for a client that accepts it) but keeps the
+  // header. Relayed as-is, the peer's client tried to gunzip plain JSON: "incorrect header check".
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const body = JSON.stringify({ choices: [{ message: { content: 'hi' } }] })
+  const f = captureFetch(async () => new Response(body, {
+    status: 200,
+    headers: { 'content-type': 'application/json', 'content-encoding': 'gzip', 'content-length': '57' },
+  }))
+  let res: Response
+  try {
+    res = await app.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'Rig/Qwen3', messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.equal(res.headers.get('content-encoding'), null)
+  assert.equal(res.headers.get('content-length'), null)
+  assert.equal(await res.text(), body)
+})
+
+test("a remote stream drops the usage chunk only this machine asked the host for", async () => {
+  // The peer injects `stream_options.include_usage` (the host then honours it as the caller's own), so the
+  // `choices: []` chunk has to come off on THIS side — the tee that filters a local stream never runs for a remote one.
+  const app = new Hono()
+  registerGateway(app, fakeDeps())
+  const f = captureFetch(async () => new Response(
+    'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n' +
+    'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":1}}\n\n' +
+    'data: [DONE]\n\n',
+    { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  ))
+  let res: Response
+  try {
+    res = await app.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'Rig/Qwen3', stream: true, messages: [{ role: 'user', content: 'hi' }] }),
+    })
+  } finally {
+    f.restore()
+  }
+  assert.deepEqual(JSON.parse(f.calls[0].body).stream_options, { include_usage: true })
+  assert.equal(await res.text(), 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n')
+})
+
+// ── A remote-access token without models:load must not load a model on a LINKED machine either ──────────────────
+// Locally the router answers such a caller "not loaded" instead of auto-swapping (auth.ts modelLoadsRefused). A
+// qualified `<machine>/<model>` id used to return the linked target before that check, and the request then left with
+// THIS daemon's link token: a link granted models:load had the host swap models for a caller that may load none.
+// Composed for real: lanAuth (which marks the request), the gateway, and the ModelRouter with a catalog stub.
+
+const INGRESS_PORT = 6997
+
+function linkedRouterDeps(advertised: { key: string; loaded: boolean }) {
+  const cfg = defaultConfig()
+  const link = {
+    id: 'lnk1', name: 'rig', baseUrl: 'https://rig.trycloudflare.com', token: 'tllm-hostsecret', machineId: 'm1',
+    grantedCapabilities: ['models:use', 'models:load'], linkApiVersion: 1, status: 'online', lastSeenAt: null, lastError: null,
+  }
+  const remoteModel = { key: advertised.key, name: advertised.key, quant: null, nativeCtx: 8192, vision: false, loaded: advertised.loaded }
+  const catalog = {
+    linkByName: (n: string) => (n.toLowerCase() === 'rig' ? link : undefined),
+    modelOn: (id: string, key: string) => (id === link.id && key === remoteModel.key ? remoteModel : undefined),
+  }
+  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  const manager = fakeDeps().manager
+  const scanner = { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined }
+  const router = new ModelRouter(store as never, {} as never, manager as never, scanner as never, undefined, catalog as never)
+  return {
+    ...fakeDeps(),
+    store,
+    scanner,
+    modelRouter: router,
+    remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider },
+  } as unknown as Deps
+}
+
+async function tunneledChat(d: Deps, token: string, path: '/v1/chat/completions' | '/v1/messages'): Promise<{ res: Response; calls: Captured[] }> {
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerGateway(app, d)
+  const f = captureFetch(async () => jsonCompletion())
+  try {
+    const res = await app.request(`http://local.test${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': token },
+      body: JSON.stringify({ model: 'rig/big-model', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+    }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+    return { res, calls: f.calls }
+  } finally {
+    f.restore()
+  }
+}
+
+for (const path of ['/v1/chat/completions', '/v1/messages'] as const) {
+  test(`${path}: a models:use-only remote token cannot make a linked machine load a model`, async () => {
+    const d = linkedRouterDeps({ key: 'big-model', loaded: false })
+    const token = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] })
+    const { res, calls } = await tunneledChat(d, token, path)
+    assert.equal(res.status, 503)
+    assert.match(await res.text(), /may not load models/)
+    assert.equal(calls.length, 0, 'nothing may go out to the linked machine')
+    // Permanent for this caller: a retry would be refused the same way.
+    assert.equal(res.headers.get('x-should-retry'), 'false')
+  })
+
+  test(`${path}: the same token still uses a model already loaded on the linked machine`, async () => {
+    const d = linkedRouterDeps({ key: 'big-model', loaded: true })
+    const token = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] })
+    const { res, calls } = await tunneledChat(d, token, path)
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].headers.get('X-TurboLLM-Auth'), 'tllm-hostsecret')
+    // ...marked, so the host serves it only while it is still loaded there (see the composed test below).
+    assert.equal(calls[0].headers.get('X-TurboLLM-Link-No-Load'), '1')
+  })
+
+  test(`${path}: a remote token WITH models:load still reaches a linked model that is not loaded`, async () => {
+    const d = linkedRouterDeps({ key: 'big-model', loaded: false })
+    const token = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use', 'models:load'] })
+    const { res, calls } = await tunneledChat(d, token, path)
+    assert.equal(res.status, 200, await res.clone().text())
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].headers.get('X-TurboLLM-Link-No-Load'), null)
+  })
+}
+
+// The peer's check reads its catalog, which refreshes every 15 s; the host acts on its live state. In between, a
+// models:use token's next request switched back a host whose owner had just switched models, and in-app chat repeats
+// the request for every tool round of a turn. The peer now marks the request (link-proxy.ts LINK_NO_LOAD_HEADER) and
+// the host's façade refuses it on its live state. Composed for real on both sides: the peer's lanAuth, gateway and
+// router, and the host's façade (link-routes.ts), joined by a fetch that hands the peer's request to the host.
+test('a models:use token cannot switch a linked machine back to the model its catalog last saw loaded', async () => {
+  const d = linkedRouterDeps({ key: 'big-model', loaded: true }) // the peer's last refresh
+  const token = provisionRemoteApiKey(d, { kind: 'remote', capabilities: ['models:use'] })
+  const hostLoaded = 'other-model' // the host's owner has switched since
+  const hostRouted: string[] = []
+  const linkKey: ApiKey = {
+    id: 'k1', name: 'peer', hash: createHash('sha256').update('tllm-hostsecret').digest('hex'), prefix: 'tllm-hostsec',
+    createdAt: 'c', lastUsedAt: null, grant: { capabilities: ['models:use', 'models:load'] },
+  }
+  const hostCfg = {
+    apiKeys: [linkKey], links: [], gateway: { autoSwap: true }, modelDefaults: { maxTokens: 0 },
+    daemon: { lanBind: true, requireApiKey: true, machineId: 'host-1', experimental: { turboLink: true } },
+  }
+  const hostDeps = {
+    version: '1.14.7',
+    store: { snapshot: () => hostCfg, update: (fn: (c: never) => void) => fn(hostCfg as never) },
+    scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
+    db: { recordApiUsage: () => {} },
+    registry: { active: () => ({ kind: 'llama.cpp' }) },
+    modelRouter: {
+      targetEntry: () => undefined,
+      route: async (m: string) => { hostRouted.push(m); return { target: 'http://host-engine.local' } },
+      resolveRemoteTarget: () => undefined,
+    },
+    manager: {
+      status: () => ({ state: 'running', model: { key: hostLoaded } }),
+      target: () => 'http://host-engine.local',
+      currentOpts: () => ({ modelPath: '' }),
+      sessionStats: () => ({ activeRequests: 0 }),
+      generationStart: () => {},
+      generationEnd: () => {},
+      recordCompletion: () => {},
+    },
+  } as unknown as Deps
+  const host = new Hono()
+  registerLinkApi(host, hostDeps)
+  const peer = new Hono()
+  peer.use('*', lanAuth(d))
+  registerGateway(peer, d)
+  const original = globalThis.fetch
+  let hostCalls = 0
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = String(input)
+    if (url.startsWith('https://rig.trycloudflare.com/')) {
+      hostCalls++
+      return host.request(url.slice('https://rig.trycloudflare.com'.length), { method: init?.method, headers: init?.headers, body: init?.body })
+    }
+    return jsonCompletion() // the host's own engine
+  }) as typeof fetch
+  try {
+    const res = await peer.request('http://local.test/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': token },
+      body: JSON.stringify({ model: 'rig/big-model', messages: [{ role: 'user', content: 'hi' }] }),
+    }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+    assert.equal(res.status, 503)
+    // The answer the peer gives itself when its catalog is current: final, and typed the same way.
+    assert.equal(res.headers.get('x-should-retry'), 'false')
+    const error = ((await res.json()) as { error?: { type?: string; code?: string; message?: string } }).error
+    assert.equal(error?.type, 'model_not_loaded')
+    assert.equal(error?.code, 'model_not_loaded')
+    assert.match(error?.message ?? '', /not loaded on this machine/, 'the host refused it, on its live state')
+    assert.equal(hostCalls, 1)
+    assert.deepEqual(hostRouted, [], "the host never reached its auto-swap: the owner's model stays")
+  } finally {
+    globalThis.fetch = original
+  }
+})
+
+// A refusal the host marks final (x-should-retry: false: a permanent route refusal such as a failed engine start, or
+// the no-load refusal above) must reach a /v1/messages client as it reaches a /v1/chat/completions one. Claude Code
+// retries a 5xx up to 10 times otherwise, and on a link granted models:load each retry runs the failing load again.
+test("the host's x-should-retry: false reaches the client on /v1/messages, as on /v1/chat/completions", async () => {
+  const d = fakeDeps()
+  const app = new Hono()
+  // /v1/messages reads a failed reply through redactLocalPaths, which asks the store for the data dir.
+  registerGateway(app, { ...d, store: { ...d.store, dir: () => '/data' } } as unknown as Deps)
+  const f = captureFetch(async () => new Response(
+    JSON.stringify({ error: { message: 'Engine start failed: boom', type: 'model_not_loaded', code: 'model_not_loaded' } }),
+    { status: 503, headers: { 'content-type': 'application/json', 'x-should-retry': 'false' } },
+  ))
+  try {
+    for (const path of ['/v1/chat/completions', '/v1/messages']) {
+      const res = await app.request(`http://local.test${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model: 'Rig/Qwen3', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+      })
+      assert.equal(res.status, 503, path)
+      assert.equal(res.headers.get('x-should-retry'), 'false', path)
+    }
+  } finally {
+    f.restore()
+  }
+  assert.deepEqual(f.calls.map((cap) => cap.url), Array(2).fill('https://rig.trycloudflare.com/api/link/v1/chat/completions'))
+})
+
+// The same check covers in-app chat: /api/v1/conversations/* is models:use for a remote token, and the turn resolves
+// its remote target through the same router. Every request of the turn is built from that target, so the marker
+// travels on all of them.
+for (const loaded of [false, true]) {
+  test(`in-app chat: a models:use remote token and a linked model that is ${loaded ? '' : 'not '}loaded`, async () => {
+    const d = linkedRouterDeps({ key: 'big-model', loaded })
+    const dir = tmpDir('tllm-gw-link-chat-')
+    const db = new ConversationStore(dir)
+    const cfg = d.store.snapshot() as unknown as Record<string, unknown>
+    cfg.daemon = { ...(cfg.daemon as object), autoGenerateTitles: false, experimental: { memory: false }, autoMemoryEnabled: false }
+    const chatDeps = {
+      ...d,
+      db,
+      remoteCatalog: { modelOn: () => ({ key: 'big-model', name: 'Big', quant: null, nativeCtx: 8192, vision: false, loaded }) },
+    } as unknown as Deps
+    const token = provisionRemoteApiKey(chatDeps, { kind: 'remote', capabilities: ['models:use'] })
+    const app = new Hono()
+    app.use('*', lanAuth(chatDeps))
+    registerChatRoutes(app, chatDeps)
+    const f = captureFetch(async () => new Response('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n', {
+      status: 200, headers: { 'content-type': 'text/event-stream' },
+    }))
+    try {
+      const conv = db.createConversation()
+      const res = await app.request(`http://local.test/api/v1/conversations/${conv.id}/messages`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'X-TurboLLM-Auth': token },
+        body: JSON.stringify({ content: 'hi', model: 'rig/big-model' }),
+      }, { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+      const text = await res.text()
+      if (!loaded) {
+        assert.equal(res.status, 503, text)
+        assert.match(text, /remote_unavailable/)
+        assert.match(text, /may not load models/)
+        assert.equal(f.calls.length, 0, 'nothing may go out to the linked machine')
+      } else {
+        assert.equal(res.status, 200, text)
+        assert.ok(f.calls.length >= 1)
+        for (const call of f.calls) assert.equal(call.headers.get('X-TurboLLM-Link-No-Load'), '1', call.url)
+      }
+    } finally {
+      f.restore()
+      db.close()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+}

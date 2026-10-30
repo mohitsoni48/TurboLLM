@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ChevronRight, ShieldCheck } from 'lucide-react'
 import { useSettings } from '../../lib/queries'
 import { ApiError, track, type ToolPolicy } from '../../lib/api'
@@ -9,6 +9,11 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../../compo
 import { Switch } from '../../components/ui/switch'
 import { toast } from '../../components/ui/sonner'
 import { cn } from '../../lib/utils'
+
+/** chatApprovalWaitMinutes's bounds and default, as the daemon's config-bounds.ts has them. */
+const WAIT_MIN = 0
+const WAIT_MAX = 1440
+const WAIT_DEFAULT = 30
 
 const POLICY_OPTIONS: { value: ToolPolicy; label: string }[] = [
   { value: 'ask', label: 'Ask' },
@@ -25,6 +30,11 @@ export function ToolPermissionsSection() {
   const tools = toolsQ.data ?? []
   const policies = settingsQ.data?.toolPolicies ?? {}
   const autoAllowAll = settingsQ.data?.autoAllowAll ?? false
+  const savedWait = settingsQ.data?.chatApprovalWaitMinutes ?? WAIT_DEFAULT
+  // The field's text while it is edited; saved on blur or Enter, and put back to the saved value
+  // whenever that changes (a save here, or one from another tab once the settings are read again).
+  const [waitText, setWaitText] = useState(String(savedWait))
+  useEffect(() => { setWaitText(String(savedWait)) }, [savedWait])
 
   const setPolicy = (name: string, value: ToolPolicy) => {
     track('settings', 'set_tool_policy')
@@ -39,6 +49,23 @@ export function ToolPermissionsSection() {
     save.mutate(
       { autoAllowAll: value },
       { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not update tool permission.') },
+    )
+  }
+
+  const commitWait = () => {
+    const n = Number(waitText)
+    if (waitText.trim() === '' || !Number.isFinite(n)) { setWaitText(String(savedWait)); return }
+    const value = Math.max(WAIT_MIN, Math.min(WAIT_MAX, Math.round(n)))
+    setWaitText(String(value))
+    if (value === savedWait) return
+    save.mutate(
+      { chatApprovalWaitMinutes: value },
+      {
+        onError: (e) => {
+          setWaitText(String(savedWait))
+          toast.error(e instanceof ApiError ? e.message : 'Could not update the approval wait.')
+        },
+      },
     )
   }
 
@@ -63,6 +90,33 @@ export function ToolPermissionsSection() {
             </div>
           </div>
           <Switch checked={autoAllowAll} onCheckedChange={setAutoAllowAll} disabled={save.isPending} />
+        </div>
+
+        <div className="mb-3 flex items-center justify-between gap-3 rounded-md border border-border px-3 py-2.5">
+          <label htmlFor="chat-approval-wait" className="min-w-0">
+            <div className="text-[13px] font-medium text-ink">Wait for an answer</div>
+            <div className="text-[11px] text-faint">
+              Minutes a chat reply waits for your answers to its tools set to Ask, all its calls together. Past
+              that, they are not run and the reply goes on. 0 waits until you answer.
+            </div>
+          </label>
+          <div className="flex shrink-0 items-center gap-2">
+            <input
+              id="chat-approval-wait"
+              type="number"
+              inputMode="numeric"
+              min={WAIT_MIN}
+              max={WAIT_MAX}
+              step={1}
+              value={waitText}
+              onChange={(e) => setWaitText(e.target.value)}
+              onBlur={commitWait}
+              onKeyDown={(e) => { if (e.key === 'Enter') e.currentTarget.blur() }}
+              disabled={save.isPending}
+              className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none disabled:opacity-60"
+            />
+            <span className="text-[12px] text-muted">min</span>
+          </div>
         </div>
 
         {toolsQ.isLoading && <p className="text-[13px] text-faint">Loading tools…</p>}

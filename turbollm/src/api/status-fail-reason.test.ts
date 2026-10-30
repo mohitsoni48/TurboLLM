@@ -12,9 +12,15 @@ import { tmpDir } from '../test-support/tmp'
 
 type ErrLike = { code: string; message: string; exitCode: number; logTail: string[] }
 
+/** The load that failed, as Manager.restartOpts() names it, and the library entry for its model. */
+type FailedLoad = {
+  opts: { engine: { id: string; name: string; kind: string }; model: { key: string; name: string } }
+  entry?: Record<string, unknown>
+}
+
 // Double mirrors link-routes.status.test.ts's — the status route reads more of
 // Manager/registry than this feature touches, and a thinner stub 500s.
-function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
+function appWithEngineError(dataDir: string, err: ErrLike | undefined, failed?: FailedLoad) {
   const cfg: Record<string, unknown> = {
     daemon: { lanBind: false, requireApiKey: false, port: 6996, machineId: 'm', machineName: 'test' },
     apiKeys: [],
@@ -27,6 +33,7 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
     store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dataDir },
     manager: {
       currentOpts: () => null,
+      restartOpts: () => failed?.opts ?? null,
       status: () => ({
         state: err ? 'error' : 'running',
         err: err ?? null,
@@ -42,7 +49,8 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
     registry: {
       active: () => ({ id: 'eng-1', name: 'llama.cpp', kind: 'llama.cpp', binPath: '/opt/turbollm/engines/llama-server' }),
     },
-    modelRouter: { aliveSlots: () => [] },
+    modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
+    scanner: { get: (key: string) => (failed?.entry && key === failed.opts.model.key ? failed.entry : undefined) },
     bench: { status: () => ({ state: 'idle' }) },
     downloads: { activeCount: () => 0 },
     provision: { get: () => undefined },
@@ -53,11 +61,13 @@ function appWithEngineError(dataDir: string, err: ErrLike | undefined) {
   return app
 }
 
-async function statusEngine(err: ErrLike | undefined) {
+async function statusEngine(err: ErrLike | undefined, failed?: FailedLoad) {
   const dir = tmpDir('tl-status-')
   try {
-    const res = await appWithEngineError(dir, err).request('/api/v1/status')
-    const body = (await res.json()) as { engine?: { error?: { failReason?: string } } }
+    const res = await appWithEngineError(dir, err, failed).request('/api/v1/status')
+    const body = (await res.json()) as {
+      engine?: { error?: { failReason?: string; engineName?: string; modelName?: string; expectedToLoad?: boolean } }
+    }
     return body.engine
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -128,4 +138,48 @@ test('classifying preserves the original message, exitCode and logTail', async (
   assert.equal(err.message, 'out of memory')
   assert.equal(err.exitCode, -1)
   assert.deepEqual(err.logTail, ['line one', 'line two'])
+})
+
+// The banner said only "Model load failed: <the engine's message>", whichever engine and model failed, and offered
+// remedies that suit an engine's own model (re-download it, try another engine) for a model the engine cannot run at
+// all: one "Show models for every engine" lists loads only on the selected engine and fails there.
+const ARCH_FAILURE: ErrLike = {
+  code: 'engine_exited',
+  message: 'The engine process exited unexpectedly.',
+  exitCode: 1,
+  logTail: ["llama_model_load: error loading model: error loading model architecture: unknown model architecture: 'ggmlc'"],
+}
+const LLAMA = { id: 'llama-1', name: 'llama.cpp (b6000)', kind: 'llama-server' }
+
+test('status names the engine and the model of a failed load', async () => {
+  const engine = await statusEngine(ARCH_FAILURE, {
+    opts: { engine: LLAMA, model: { key: 'qwen3-35b', name: 'Qwen3 35B' } },
+    entry: { key: 'qwen3-35b', format: 'gguf', arch: 'qwen3', audio: false },
+  })
+  assert.deepEqual(
+    { engineName: engine?.error?.engineName, modelName: engine?.error?.modelName, expectedToLoad: engine?.error?.expectedToLoad },
+    { engineName: 'llama.cpp (b6000)', modelName: 'Qwen3 35B', expectedToLoad: true },
+  )
+})
+
+test('status says the engine was not expected to load a model it cannot run', async () => {
+  const ggmlc = await statusEngine(ARCH_FAILURE, {
+    opts: { engine: LLAMA, model: { key: 'laya-gguf', name: 'laya GGUF' } },
+    entry: { key: 'laya-gguf', format: 'gguf', arch: 'ggmlc', audio: false },
+  })
+  const litertlm = await statusEngine(ARCH_FAILURE, {
+    opts: { engine: LLAMA, model: { key: 'gemma-3n', name: 'Gemma 3n' } },
+    entry: { key: 'gemma-3n', format: 'litertlm', audio: false },
+  })
+  assert.deepEqual([ggmlc?.error?.expectedToLoad, litertlm?.error?.expectedToLoad], [false, false])
+})
+
+test('a failed load whose model left the library, or with no load recorded, names what it can', async () => {
+  const gone = await statusEngine(ARCH_FAILURE, { opts: { engine: LLAMA, model: { key: 'gone', name: 'Gone' } } })
+  const none = await statusEngine(ARCH_FAILURE)
+  assert.deepEqual(
+    [gone?.error?.engineName, gone?.error?.modelName, gone?.error?.expectedToLoad],
+    ['llama.cpp (b6000)', 'Gone', true],
+  )
+  assert.deepEqual([none?.error?.engineName, none?.error?.modelName, none?.error?.expectedToLoad], ['', '', true])
 })

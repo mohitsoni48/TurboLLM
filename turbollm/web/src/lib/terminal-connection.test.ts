@@ -3,8 +3,8 @@
 // auth-signal.ts on a 401 — invisible on loopback (codeAuth waives the key requirement there)
 // but a hard failure from any genuinely non-local client (LAN/mobile), where codeAuth always
 // requires a key (auth.ts). Mirrors code-api.test.ts's localStorage/fetch stubbing.
-import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { renderHook } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { act, renderHook } from '@testing-library/react'
 import { createTerminalForSession, killTerminalForSession, useTerminalConnection } from './terminal-connection'
 import { setAuthToken } from './api'
 import { isCodeAuthNeeded, clearCodeAuthNeeded } from './auth-signal'
@@ -163,5 +163,159 @@ describe('useTerminalConnection: onMessage race', () => {
     created!.onmessage?.({ data: 'third' })
 
     expect(onMessage.mock.calls.map((c) => c[0])).toEqual(['first', 'second', 'third'])
+  })
+})
+
+// ── useTerminalConnection: auto-reconnect ──
+// Regressions: the reconnect wrapper was installed only on the FIRST socket and the reconnect
+// timer ref was never cleared, so a terminal survived exactly one drop per mount; and a reconnect
+// whose handshake took >2 s got a second socket opened alongside it (overwriting wsRef, never
+// closed — PTY output arrived twice and unmount closed only one).
+class ReconnectWs {
+  static readonly CONNECTING = 0
+  static readonly OPEN = 1
+  static readonly CLOSING = 2
+  static readonly CLOSED = 3
+  static all: ReconnectWs[] = []
+  readyState = ReconnectWs.CONNECTING
+  onopen: (() => void) | null = null
+  onmessage: ((ev: { data: string }) => void) | null = null
+  onclose: ((ev: { code: number; reason: string }) => void) | null = null
+  onerror: (() => void) | null = null
+  send = vi.fn()
+  constructor(public url: string) { ReconnectWs.all.push(this) }
+  open(): void { this.readyState = ReconnectWs.OPEN; this.onopen?.() }
+  /** The network drops (or a handshake fails): an abnormal close. */
+  drop(): void { this.readyState = ReconnectWs.CLOSED; this.onclose?.({ code: 1006, reason: '' }) }
+  /** Like a browser: closing a socket that never finished its handshake reports 1006, not the code passed. */
+  close(code = 1005): void {
+    const reported = this.readyState === ReconnectWs.CONNECTING ? 1006 : code
+    this.readyState = ReconnectWs.CLOSED
+    this.onclose?.({ code: reported, reason: '' })
+  }
+}
+
+describe('useTerminalConnection: auto-reconnect', () => {
+  beforeEach(() => {
+    ReconnectWs.all = []
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', ReconnectWs)
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const advance = (ms: number) => act(() => { vi.advanceTimersByTime(ms) })
+  const unclosed = () => ReconnectWs.all.filter((w) => w.readyState !== ReconnectWs.CLOSED)
+
+  it('reconnects after every unexpected drop, not just the first one per mount', () => {
+    const { result } = renderHook(() => useTerminalConnection('t1'))
+    act(() => ReconnectWs.all[0].open())
+    for (let drop = 1; drop <= 3; drop++) {
+      act(() => ReconnectWs.all[drop - 1].drop())
+      advance(600)
+      expect(ReconnectWs.all).toHaveLength(drop + 1)
+      act(() => ReconnectWs.all[drop].open())
+      expect(result.current.state).toBe('connected')
+    }
+  })
+
+  it('never opens a second socket while a slow reconnect handshake is still in flight', () => {
+    const { unmount } = renderHook(() => useTerminalConnection('t1'))
+    act(() => ReconnectWs.all[0].open())
+    act(() => ReconnectWs.all[0].drop())
+    advance(600) // reconnect #1 created, still CONNECTING
+    advance(6000) // the old code opened another socket every 2 s here
+    expect(ReconnectWs.all).toHaveLength(2)
+    act(() => ReconnectWs.all[1].open())
+    advance(10_000)
+    expect(ReconnectWs.all).toHaveLength(2)
+    unmount()
+    expect(unclosed()).toHaveLength(0)
+  })
+
+  it('still gives up after 5 failed attempts', () => {
+    const { result } = renderHook(() => useTerminalConnection('t1'))
+    act(() => ReconnectWs.all[0].open())
+    act(() => ReconnectWs.all[0].drop())
+    for (let i = 0; i < 10; i++) {
+      advance(2000)
+      const last = ReconnectWs.all[ReconnectWs.all.length - 1]
+      if (last.readyState === ReconnectWs.CONNECTING) act(() => last.drop())
+    }
+    expect(ReconnectWs.all).toHaveLength(1 + 5)
+    expect(result.current.state).toBe('disconnected')
+  })
+
+  it('does not resurrect a socket the caller disconnected mid-handshake', () => {
+    const { unmount } = renderHook(() => useTerminalConnection('t1'))
+    act(() => ReconnectWs.all[0].open())
+    act(() => ReconnectWs.all[0].drop())
+    advance(600) // reconnect #1 CONNECTING
+    unmount() // its close reports 1006
+    advance(30_000)
+    expect(ReconnectWs.all).toHaveLength(2)
+    expect(unclosed()).toHaveLength(0)
+  })
+})
+
+// ── useTerminalConnection: a socket the client closes itself ──
+// Closing a socket whose handshake has not finished makes a browser fire `error` and then `close`
+// 1006 on it, later, as tasks: not the 1000 the client passed. disconnect() (a session switch,
+// TerminalView unmounting) left the handlers on, so TerminalView toasted "Terminal connection
+// error." and "Terminal connection closed: 1006" for a close nobody but the client made, and the
+// late events set the hook's state to error/disconnected over the next socket's "connected".
+class LateEventsWs extends ReconnectWs {
+  static late: LateEventsWs[] = []
+  constructor(url: string) { super(url); LateEventsWs.late.push(this) }
+  /** Like a browser: close() only queues the events; `deliver()` dispatches them. */
+  override close(): void { this.readyState = ReconnectWs.CLOSING }
+  deliver(): void {
+    this.readyState = ReconnectWs.CLOSED
+    this.onerror?.()
+    this.onclose?.({ code: 1006, reason: '' })
+  }
+}
+
+describe('useTerminalConnection: a socket the client closes itself', () => {
+  beforeEach(() => {
+    LateEventsWs.late = []
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', LateEventsWs)
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('closed mid-handshake, it reports no error or close, and leaves the next socket connected', () => {
+    const onError = vi.fn()
+    const onClose = vi.fn()
+    const { result, rerender, unmount } = renderHook(
+      ({ id }) => useTerminalConnection(id, { onError, onClose }),
+      { initialProps: { id: 't1' } },
+    )
+    rerender({ id: 't2' }) // a session switch while t1's handshake is in flight
+    act(() => LateEventsWs.late[1].open())
+    act(() => LateEventsWs.late[0].deliver())
+    expect(onError).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+    expect(result.current.state).toBe('connected')
+    act(() => { vi.advanceTimersByTime(30_000) })
+    expect(LateEventsWs.late).toHaveLength(2)
+
+    unmount()
+    act(() => LateEventsWs.late[1].deliver())
+    expect(onError).not.toHaveBeenCalled()
+    expect(onClose).not.toHaveBeenCalled()
+  })
+
+  it('a drop the client did not cause still reports its close and reconnects', () => {
+    const onClose = vi.fn()
+    renderHook(() => useTerminalConnection('t1', { onClose }))
+    act(() => LateEventsWs.late[0].open())
+    act(() => LateEventsWs.late[0].deliver())
+    expect(onClose).toHaveBeenCalledWith(1006, '')
+    act(() => { vi.advanceTimersByTime(600) })
+    expect(LateEventsWs.late).toHaveLength(2)
   })
 })

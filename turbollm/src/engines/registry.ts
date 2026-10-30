@@ -2,11 +2,12 @@
 // enforced by the API layer using the Manager's live state.
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { ConfigStore, CustomEngineSource, Engine, FlagInfo, UpdatePolicy, ValueError, findEngine, firstActivatableEngine } from '../config/config'
+import { type ConfigStore, type CustomEngineSource, type Engine, type FlagInfo, type UpdatePolicy, ValueError, findEngine } from '../config/config'
 import { probe, type ProbeResult } from './probe'
 import type { ReleaseProvenance } from './release-install'
 import { normRepoUrl, sameRepo } from './build-runner'
 import type { ModelEntry } from '../models/scanner'
+import { modelIncompatibility, type Incompatibility } from './compat'
 
 /** Auto-provisioned official builds live under `<dataDir>/engines/llama.cpp-…/`.
  *  User forks are arbitrary paths and are never auto-removed. */
@@ -69,10 +70,17 @@ export class Registry {
     return c.activeEngineId ? findEngine(c.engines, c.activeEngineId) : undefined
   }
 
+  /** Probe and register a llama-server build; the first one registered while no engine is selected becomes the
+   *  selected one (a first install, Add, Enable, a first build, the rebuild of the selected engine). Not with
+   *  `fillEmptySelection: false`, which a llama.cpp update passes for the new build it registers under a new id: that
+   *  build takes the selection only from the build it replaces (keepActiveAfterUpdate), and with none selected the
+   *  auto-update of a build merely installed made it the selected engine, which the next automatic load then ran on.
+   *  A source rebuild of an engine that was not the selected one passes it too (POST /api/v1/build/run). */
   async add(
     name: string,
     binPath: string,
     source?: { sourceRepo?: string; sourceBranch?: string; sourceCommit?: string; sourcePatchUrl?: string; release?: ReleaseProvenance },
+    opts: { fillEmptySelection?: boolean } = {},
   ): Promise<AddResult> {
     const finalName = name.trim() || 'llama-server'
     this.assertNameFree(finalName, source)
@@ -102,7 +110,7 @@ export class Registry {
       const holder = this.nameHolder(c.engines, finalName)
       if (holder) throw new NameTakenError(holder, source)
       c.engines.push(eng)
-      if (!c.activeEngineId) c.activeEngineId = eng.id
+      if (!c.activeEngineId && opts.fillEmptySelection !== false) c.activeEngineId = eng.id
     })
     return { engine: eng, warning: pr.version === 'unknown' ? 'no_version' : undefined }
   }
@@ -138,8 +146,12 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        // Only a new registration fills an empty selection (a first install). Re-registering the entry in place is an
+        // update (applyPipUpdate, the install route's ?update=1), which leaves the selection as it is: with none
+        // selected (the selected engine was Disabled or Deleted), the auto-update of an engine merely installed made
+        // it the selected one, and the next automatic load ran on it.
+        if (!c.activeEngineId) c.activeEngineId = eng.id
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -165,8 +177,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -191,8 +203,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -217,8 +229,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -242,8 +254,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -276,11 +288,6 @@ export class Registry {
   /** The engine every Laya model loads on, whichever engine is active; undefined until Laya is installed. */
   layaEngine(): Engine | undefined {
     return this.store.snapshot().engines.find((e) => e.kind === 'laya')
-  }
-
-  /** The LiteRT-LM engine a .litertlm model loads on when the active engine is another kind (engineForModel). */
-  litertLmEngine(): Engine | undefined {
-    return this.store.snapshot().engines.find((e) => e.kind === 'litert-lm')
   }
 
   /** Register a KoboldCpp engine (kind='koboldcpp'). binPath is the single KoboldCpp
@@ -325,8 +332,8 @@ export class Registry {
         eng.id = existing.id
       } else {
         c.engines.push(eng)
+        if (!c.activeEngineId) c.activeEngineId = eng.id // a new registration only (see addMlx)
       }
-      if (!c.activeEngineId) c.activeEngineId = eng.id
     })
     return eng
   }
@@ -381,12 +388,30 @@ export class Registry {
     return out!
   }
 
+  /** Unregister an engine (Disable, Delete, a purge, an update's hand-over). Removing the selected engine leaves no
+   *  engine selected: it used to select the first other engine that can be active, without asking, and every automatic
+   *  load after it (the boot resume, a gateway auto-swap, a routine, an Engines Start) then ran on an engine the user
+   *  never picked. Every load but a Laya model's (on the Laya engine, which is never the selected one) now refuses, as
+   *  with no engine registered ("Register and select an engine first.", the gateway's "No active engine."), until the
+   *  user picks one in Engines, whose selector reads "No engine active". */
   remove(id: string): void {
     this.store.update((c) => {
       const i = c.engines.findIndex((e) => e.id === id)
       if (i < 0) throw new NotFoundError()
       c.engines.splice(i, 1)
-      if (c.activeEngineId === id) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
+      if (c.activeEngineId === id) c.activeEngineId = ''
+    })
+  }
+
+  /** Put back an entry {@link remove} took out, as it was (id, name, update policy) and at the `index` it had in the
+   *  list (the UI's order, and firstActivatableEngine's), and make it the active engine again when it was. A rebuild
+   *  removes the engine it replaces to register the new build under its name; when the new binary then fails its
+   *  probe, the build it replaced goes back on disk and so does its registration. */
+  reinstate(engine: Engine, active: boolean, index?: number): void {
+    this.store.update((c) => {
+      const at = index !== undefined && index >= 0 ? Math.min(index, c.engines.length) : c.engines.length
+      if (!findEngine(c.engines, engine.id)) c.engines.splice(at, 0, structuredClone(engine))
+      if (active) c.activeEngineId = engine.id
     })
   }
 
@@ -596,17 +621,40 @@ export function isStaleCapabilities(flags: string[], flagInfo: FlagInfo[] | unde
 /** The engine that loads `entry`: the Laya engine for a Laya model, the active engine for every other one. A
  *  Laya model with no Laya engine installed gets the active engine, whose compat check refuses it with the reason
  *  (compat.ts NEEDS_LAYA). Free-standing, and asking for the Laya engine only for a Laya model, so every caller's
- *  registry needs nothing beyond active() for every other model. */
-export function engineForModel(
-  registry: Pick<Registry, 'active' | 'layaEngine' | 'litertLmEngine'>,
-  entry: Pick<ModelEntry, 'laya'> & Partial<Pick<ModelEntry, 'format'>>,
-): Engine | undefined {
+ *  registry needs nothing beyond active() for every other model.
+ *  A .litertlm model gets the active engine too, as every other format does: a model loads only on the engine the
+ *  user selected. It used to go to the registered LiteRT-LM engine whenever another kind was active, so a Load, an
+ *  Engines Start, a gateway auto-swap, a routine's swap or restore and the boot resume all started LiteRT-LM on their
+ *  own while the user had KoboldCpp or llama.cpp selected, and the Models screen listed the model as loadable there.
+ *  Now a load the user asks for by hand starts it on the active engine, which fails with its own error, and an
+ *  automatic one is refused by the active engine's compat check (compat.ts manualLoadRefusal, modelIncompatibility),
+ *  unless Settings shows every engine's models: then it is started there too (model-router.ts loadRefusal). */
+export function engineForModel(registry: Pick<Registry, 'active' | 'layaEngine'>, entry: Pick<ModelEntry, 'laya'>): Engine | undefined {
   if (entry.laya) return registry.layaEngine() || registry.active()
-  // A .litertlm bundle runs on LiteRT-LM and nothing else (compat.engineAcceptsFormat), so when the active engine is
-  // another kind it would only ever fail with engine_model_mismatch. Route it to the registered LiteRT-LM engine the
-  // way a Laya model goes to Laya. This is what makes the Android app's bundled engine usable without first switching
-  // engines by hand: the app activates its llama.cpp engine, and every .litertlm model still has a home.
-  const active = registry.active()
-  if (entry.format === 'litertlm' && active?.kind !== 'litert-lm') return registry.litertLmEngine() || active
-  return active
+  return registry.active()
+}
+
+/** A predicate giving why a list of models to load leaves a model out, or null when it lists it: the rule the Models
+ *  screen and the pickers follow (web model-kind.ts listedForLoading), for a list whose reader has neither the model's
+ *  compatibility field nor the Settings. A model the engine it loads on (engineForModel) is not expected to run
+ *  (modelIncompatibility, as /api/v1/models marks it) is left out unless Settings shows every engine's models
+ *  (`showAllEngineModels`); with no engine selected none is. The Turbo Link façade's list and load (link-routes.ts
+ *  hiddenFromPeer) and the gateway's GET /v1/models use it.
+ *  Built once per list, not per model: every registry lookup is a snapshot, a structuredClone of the whole config, and
+ *  a linked peer polls its list every 15 s. The lookups are lazy and memoized, as overlayShared's are for the host's own
+ *  /api/v1/models (routes.ts). */
+export function unlistedForLoading(
+  showAllEngineModels: boolean,
+  registry: Pick<Registry, 'active' | 'layaEngine'>,
+): (e: Parameters<typeof modelIncompatibility>[1]) => Incompatibility | null {
+  if (showAllEngineModels) return () => null
+  const once = <T>(f: () => T): (() => T) => {
+    let v: { r: T } | undefined
+    return () => (v ??= { r: f() }).r
+  }
+  const memo = { active: once(() => registry.active()), layaEngine: once(() => registry.layaEngine()) }
+  return (e) => {
+    const engine = engineForModel(memo, e)
+    return engine ? modelIncompatibility(engine.kind, e) : null
+  }
 }

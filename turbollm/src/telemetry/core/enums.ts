@@ -8,8 +8,11 @@
  */
 
 /** Product surfaces we count discovery/usage for. Closed set by construction —
- *  a repo name or a chat title can never be expressed as one of these. */
-export const FEATURES = ['chat', 'code', 'research', 'artifacts', 'mcp', 'agents', 'autotune', 'skills', 'image'] as const
+ *  a repo name or a chat title can never be expressed as one of these. Every value
+ *  `featureForPath` (feature-map.ts) can return must be listed here: `link` (Turbo
+ *  Link) was mapped but missing, so its first-use claim was spent on an event the
+ *  validator then rejected (feature-map.test.ts now checks the two agree). */
+export const FEATURES = ['chat', 'code', 'research', 'artifacts', 'mcp', 'agents', 'autotune', 'skills', 'image', 'link'] as const
 
 /** How a step or a load ended. */
 export const OUTCOMES = ['ok', 'fail', 'cancelled'] as const
