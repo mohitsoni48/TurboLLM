@@ -48,6 +48,39 @@ jobs:
         run: npm test
         working-directory: turbollm
 
+  # Windows parity. The engine installers take a different branch on Windows (PowerShell
+  # Expand-Archive instead of tar, `llama-server.exe`, a separate CUDA runtime pack), and until
+  # this job existed none of that had ever been executed by CI — the win32-only tests were
+  # simply skipped on the ubuntu runner, which is how a Windows-only regression reached review.
+  # Its first runs found 23 failing tests in modules that had never run there: zip-install's
+  # host-vs-archive binary naming and POSIX library names in a Windows fixture, the LiteRT-LM
+  # `#!` fixture Windows cannot execute, and a shell-refused argv path. Those are fixed, so this
+  # job gates like every other one now (no continue-on-error).
+  test-windows:
+    name: Typecheck & Unit tests (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: turbollm/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: turbollm
+
+      - name: Typecheck
+        run: npm run typecheck
+        working-directory: turbollm
+
+      - name: Unit tests
+        run: npm test
+        working-directory: turbollm
+
   web:
     name: Web build & unit tests
     runs-on: ubuntu-latest
