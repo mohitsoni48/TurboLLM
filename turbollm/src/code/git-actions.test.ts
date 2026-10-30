@@ -175,8 +175,12 @@ test('commitGitChanges: default (no files given) stages and commits everything',
 // The staged list was read with execFile's default 1 MiB stdout buffer and any failure taken for
 // an empty list: committing a new folder of generated files (a build output, a vendored tree)
 // answered "Nothing staged" with every file staged, and no commit made.
-test('REGRESSION: committing everything works when the staged file list is over 1 MiB', { timeout: 120_000 }, async () => {
+// 14,000 files is slow on a Windows CI runner (every file is scanned, and with Git for Windows' default autocrlf each
+// one also prints a line-ending warning), so this repo converts nothing and the test gets headroom: what it pins is the
+// size of the list, not the speed of the runner.
+test('REGRESSION: committing everything works when the staged file list is over 1 MiB', { timeout: 300_000 }, async () => {
   const dir = initRepo()
+  gitSync(['config', 'core.autocrlf', 'false'], dir)
   mkdirSync(join(dir, 'gen'))
   // 14000 lines of `gen/<80 characters>` is about 1.19 MB. Many short names rather than fewer long
   // ones: the full path stays well under Windows' 260-character limit, past which `git add` fails
