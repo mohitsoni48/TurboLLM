@@ -41,7 +41,8 @@ RUN apt-get update && \
         libdrm2 \
         libx11-6 \
         libxext6 \
-        libegl1 \n        tini && \
+        libegl1 \
+        tini && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
