@@ -91,6 +91,9 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   a close of the app while any of them is on.
 
 ### Fixed
+- **An `hf.co` model link downloads like a `huggingface.co` one.** A resolve link on Hugging Face's short domain was a
+  raw import: it went to hf.co, which redirects to huggingface.co, and the token is dropped on that hop, so a gated
+  model failed. It now takes the repo download path (subfolder, split shards, mmproj) from huggingface.co.
 - **A refused request says why, on LiteRT-LM too and in extension runs and routines.** `litert-lm serve` gives the
   reason in the HTTP status line ("400 Missing model"), with an HTML error page for a body, which the chat showed
   instead of the reason. Extension runs and routines reported only the status code for every engine. All three now

@@ -123,6 +123,35 @@ test('an HF resolve URL to a .litertlm bundle takes the repo download path, not 
   }
 })
 
+test('an hf.co short link downloads from huggingface.co, so a gated file gets the token', async () => {
+  const restore = stubFetch()
+  try {
+    const { modelDir, dm } = newManager()
+    const [rec] = await dm.enqueue({
+      url: 'https://hf.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-gpu.litertlm',
+    })
+
+    assert.equal(rec.repo, 'litert-community/gemma-4-E2B-it-litert-lm')
+    assert.equal(rec.url, 'https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-gpu.litertlm')
+    assert.equal(rec.dest, join(modelDir, 'litert-community', 'gemma-4-E2B-it-litert-lm', 'gemma-4-E2B-it-gpu.litertlm'))
+  } finally {
+    restore()
+  }
+})
+
+test('a look-alike of hf.co stays a raw import', async () => {
+  const restore = stubFetch()
+  try {
+    const { dm } = newManager()
+    const [rec] = await dm.enqueue({ url: 'https://hf.co.evil.example/owner/repo/resolve/main/m.gguf' })
+
+    assert.equal(rec.repo, '')
+    assert.equal(rec.url, 'https://hf.co.evil.example/owner/repo/resolve/main/m.gguf')
+  } finally {
+    restore()
+  }
+})
+
 test('a non-model file extension is still rejected for both a raw URL and a repo file', async () => {
   const restore = stubFetch()
   try {
