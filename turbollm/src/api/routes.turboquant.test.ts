@@ -14,6 +14,7 @@ import type { Deps } from '../deps'
 import { ConfigStore } from '../config/config'
 import { Registry } from '../engines/registry'
 import { tmpDir } from '../test-support/tmp'
+import { turboquantReleaseList } from '../test-support/turboquant-release'
 
 const NEW_SERVER = '#!/bin/sh\necho "version: 200 (abcdef1)"\necho "  --cache-type-k TYPE"\n'
 
@@ -40,13 +41,11 @@ function harness(t: { after: (fn: () => void) => void }, newServer: string, newP
   writeExe(join(src, newPath), newServer)
   const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
   execFileSync('tar', ['-czf', archive, '-C', src, newPath.split('/')[0]!])
-  const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
-  const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
   const realFetch = globalThis.fetch
   t.after(() => { globalThis.fetch = realFetch })
   globalThis.fetch = (async (input: string | URL | Request) =>
     String(input).includes('api.github.com')
-      ? new Response(JSON.stringify([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }]))
+      ? new Response(JSON.stringify(turboquantReleaseList()))
       : new Response(readFileSync(archive))) as typeof fetch
 
   const settled: string[] = []

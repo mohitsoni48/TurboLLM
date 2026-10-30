@@ -23,6 +23,7 @@ import { Registry } from '../engines/registry'
 import type { Deps } from '../deps'
 import { registerApi } from './routes'
 import { tmpDir } from '../test-support/tmp'
+import { turboquantReleaseList } from '../test-support/turboquant-release'
 
 const backend = availableBackends()[0]!
 const posixOnly = (process.platform === 'win32' || !backend) && 'uses shell-script engine binaries and a llama.cpp backend for this OS'
@@ -340,9 +341,7 @@ function switchCases(t: { after: (fn: () => void) => void }): SwitchCase[] {
         exe(join(src, 'llama-server'), WORKING_SERVER)
         const archive = join(tmpDir('tllm-tq-'), 'tq.tar.gz')
         execFileSync('tar', ['-czf', archive, '-C', src, 'llama-server'])
-        const osTag = process.platform === 'darwin' ? 'macos' : 'linux'
-        const asset = `llama-b200-bin-${osTag}-${process.arch === 'arm64' ? 'arm64' : 'x64'}.tar.gz`
-        serve([{ tag_name: `b200-${osTag}`, assets: [{ name: asset, browser_download_url: `https://cdn.test/${asset}` }] }], () => new Response(readFileSync(archive)))
+        serve(turboquantReleaseList(), () => new Response(readFileSync(archive)))
       },
     })
   }
