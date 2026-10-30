@@ -7,6 +7,7 @@ import type { ModelEntry } from '../models/scanner'
 import { litertlmEntryFor } from '../models/litertlm'
 import type { SysInfo } from '../sysinfo/sysinfo'
 import { buildStartOpts } from './start-opts'
+import { rememberLitertLmModel, shapeLitertLmRequest } from './litert-lm-request'
 
 const CPU_ONLY: SysInfo = { os: 'win32', cpu: 'test', cores: 8, ramMB: 32768, gpus: [] }
 const WITH_GPU: SysInfo = { ...CPU_ONLY, gpus: [{ name: 'Radeon 780M', vramMb: 4096, vendor: 'amd' }] }
@@ -33,16 +34,15 @@ test('a .litertlm load uses the bundle path, text-only model info and the given 
   assert.ok(opts.profile)
 })
 
-test('without a GPU the config selects the cpu backend whatever the GPU-layers setting', () => {
-  const opts = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, overrides: { ngl: 99 }, trigger: 'resume' })
-  assert.equal(opts.litertLmConfig?.default.backend, 'cpu')
-})
-
-test('with a GPU and GPU layers the config selects the gpu backend; zero layers falls back to cpu', () => {
-  const gpu = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: WITH_GPU, overrides: { ngl: 99 }, trigger: 'manual' })
-  assert.equal(gpu.litertLmConfig?.default.backend, 'gpu')
-  const cpu = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: WITH_GPU, overrides: { ngl: 0 }, trigger: 'manual' })
-  assert.equal(cpu.litertLmConfig?.default.backend, 'cpu')
+test('under Auto the config names no backend, GPU or not, whatever the GPU-layers setting: the model\'s own applies', () => {
+  // It named the GPU when one was detected and GPU layers was above 0, the CPU otherwise: a CPU-only bundle failed on
+  // the Android app (which reports its GPU) and a GPU-only one on Termux or with GPU layers at 0.
+  for (const sys of [CPU_ONLY, WITH_GPU]) {
+    for (const ngl of [0, 99]) {
+      const opts = buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys, overrides: { ngl }, trigger: 'manual' })
+      assert.equal(opts.litertLmConfig?.default.backend, undefined, `${sys.gpus.length} GPUs, ngl ${ngl}`)
+    }
+  }
 })
 
 test('ctx and threads from the profile reach the config; ctx also lands on the model info', () => {
@@ -80,4 +80,97 @@ test('a saved litertLm.backend survives the profile merge, and an old profile wi
   assert.equal(saved.litertLmConfig?.default.backend, 'gpu')
   const old = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ ngl: 99 }, e), sys: CPU_ONLY, trigger: 'resume' })
   assert.equal(old.profile?.litertLm.backend, 'auto')
+  assert.equal(old.litertLmConfig?.default.backend, undefined)
+})
+
+// ── context: the bundle's own unless the user set one ─────────────────────────────────────────
+// Qwen3-0.6B_dynamic's header: a dynamic export taking up to 32770 tokens, LlmMetadata.max_num_tokens 4096. TurboLLM
+// wrote max_num_tokens 8192 on every load (min(Model Defaults, the limit)), doubling its KV cache, and reported 8192.
+const qwen3 = (): ModelEntry => litertlmEntryFor('/models/Qwen3-0.6B_dynamic.litertlm', '/models', 600_000_000, 0, { nativeCtx: 32770, ctxDynamic: true, defaultCtx: 4096 })
+
+test('with no context set, no max_num_tokens is written and the bundle\'s own default is reported', () => {
+  const opts = buildStartOpts({ entry: qwen3(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' })
+  assert.equal(opts.litertLmConfig?.default.max_num_tokens, undefined)
+  assert.equal(opts.model.ctx, 4096)
+  assert.equal(opts.profile?.ctx, 4096)
+  // A bundle that declares no default: the runtime's 4096, not 8192.
+  const bare = litertlmEntryFor('/models/gemma-4-E2B-it.litertlm', '/models', 2e9, 0)
+  const b = buildStartOpts({ entry: bare, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' })
+  assert.equal(b.litertLmConfig?.default.max_num_tokens, undefined)
+  assert.equal(b.model.ctx, 4096)
+})
+
+test('a context the user saved is written, a request\'s too, and a Model Defaults context the user changed', () => {
+  const e = qwen3()
+  const saved = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ ctx: 6000, userSetOnly: true }, e), sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(saved.litertLmConfig?.default.max_num_tokens, 6000)
+  assert.equal(saved.model.ctx, 6000)
+  const asked = buildStartOpts({ entry: e, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, overrides: { ctx: 16384 }, trigger: 'manual' })
+  assert.equal(asked.litertLmConfig?.default.max_num_tokens, 16384)
+  const cfg = defaultConfig()
+  cfg.modelDefaults.ctx = 16384
+  const global = buildStartOpts({ entry: e, engine: engine(), cfg, sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(global.litertLmConfig?.default.max_num_tokens, 16384)
+  assert.equal(global.model.ctx, 16384)
+  // Model Defaults' built-in 8192 is in every config, set or not: it is not the user's.
+  assert.equal(buildStartOpts({ entry: e, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'resume' }).litertLmConfig?.default.max_num_tokens, undefined)
+})
+
+test('an earlier build\'s whole profile with the automatic 8192 of the day writes no context; a context the user moved stays', () => {
+  const e = qwen3()
+  // What the old dialog saved for a Backend change: min(Model Defaults 8192, the raw 32771) and the rest.
+  const old = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ ctx: 8192, ngl: 99, threads: 0, litertLm: { backend: 'cpu' } }, e), sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(old.litertLmConfig?.default.max_num_tokens, undefined)
+  assert.equal(old.litertLmConfig?.default.backend, 'cpu')
+  assert.equal(old.model.ctx, 4096)
+  const moved = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ ctx: 2048, ngl: 99, threads: 0 }, e), sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(moved.litertLmConfig?.default.max_num_tokens, 2048)
+})
+
+test('a user context past a dynamic export\'s maximum is cut to it, below its magic number', () => {
+  const opts = buildStartOpts({ entry: qwen3(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, overrides: { ctx: 65536 }, trigger: 'manual' })
+  assert.equal(opts.litertLmConfig?.default.max_num_tokens, 32770)
+})
+
+test('on a GPU the user chose, a default above 4096 is reported as the runtime opens it: 4096 (not on Apple)', () => {
+  const big = litertlmEntryFor('/models/big.litertlm', '/models', 1e9, 0, { nativeCtx: 0, ctxDynamic: false, defaultCtx: 8192 })
+  const gpu = buildStartOpts({ entry: big, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, overrides: { litertLm: { backend: 'gpu' } }, trigger: 'manual' })
+  assert.equal(gpu.model.ctx, 4096)
+  assert.equal(gpu.litertLmConfig?.default.max_num_tokens, undefined)
+  const mac = buildStartOpts({ entry: big, engine: engine(), cfg: defaultConfig(), sys: { ...CPU_ONLY, os: 'darwin/arm64' }, overrides: { litertLm: { backend: 'gpu' } }, trigger: 'manual' })
+  assert.equal(mac.model.ctx, 8192)
+})
+
+test('a vision bundle loads as a vision model', () => {
+  const vl = litertlmEntryFor('/models/LFM2.5-VL-450M_int8.litertlm', '/models', 5e8, 0, { nativeCtx: 4098, ctxDynamic: true, defaultCtx: 4096, vision: true, audio: false })
+  assert.equal(buildStartOpts({ entry: vl, engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).model.vision, true)
+})
+
+test('the sampling the user set for a .litertlm is carried for its requests, and only that; the bundle\'s own too', () => {
+  // LiteRT-LM has no launch flags for sampling (llama.cpp gets --temp etc.), so a model's Sampling settings reached no
+  // LiteRT-LM model. A profile saved now holds only what the user set; an earlier build's whole one, llama.cpp's
+  // 0.8 / 0.95 / 40 / 0.05 beside the one value moved.
+  const e = { ...entry(), sampler: { topK: 20, topP: 0.95, temp: 0.6 } }
+  const mine = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ sampling: { temp: 0.3 }, userSetOnly: true }, e), sys: CPU_ONLY, trigger: 'manual' })
+  assert.deepEqual(mine.litertLmRequest, { sampling: { temperature: 0.3 }, sampler: { topK: 20, topP: 0.95, temp: 0.6 } })
+  const old = withSaved({ ctx: 8192, ngl: 0, sampling: { temp: 0.8, topP: 0.95, topK: 64, minP: 0.05, repeatPenalty: 1, presencePenalty: 0, frequencyPenalty: 0, stop: [] } }, e)
+  assert.deepEqual(buildStartOpts({ entry: e, engine: engine(), cfg: old, sys: CPU_ONLY, trigger: 'manual' }).litertLmRequest?.sampling, { top_k: 64 })
+  // A load's own sampling (the dialog's Load) wins over the saved; nothing set, nothing carried.
+  const load = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved({ sampling: { temp: 0.3 }, userSetOnly: true }, e), sys: CPU_ONLY, overrides: { sampling: { temp: 0.9, topP: 0.8 } as never, userSetOnly: true }, trigger: 'manual' })
+  assert.deepEqual(load.litertLmRequest?.sampling, { temperature: 0.9, top_p: 0.8 })
+  assert.deepEqual(buildStartOpts({ entry: entry(), engine: engine(), cfg: defaultConfig(), sys: CPU_ONLY, trigger: 'manual' }).litertLmRequest, { sampling: {} })
+})
+
+test('Top K 0 on a GPU the user chose is no top-k limit too: the largest top_k, as on the CPU', () => {
+  // A saved Top K 0 went to `serve` as 0, which it refuses (400 "top_k should be positive"). On a GPU LiteRT-LM 0.18.0
+  // sets no top-k limit of its own either (GpuConfig::max_top_k is only printed), so the GPU gets the largest k too. A
+  // saved Min P is carried, so that it is named as not applied.
+  const e = entry()
+  const saved = { litertLm: { backend: 'gpu' }, sampling: { topK: 0, minP: 0.2 }, userSetOnly: true }
+  const gpu = buildStartOpts({ entry: e, engine: engine(), cfg: withSaved(saved, e), sys: CPU_ONLY, trigger: 'resume' })
+  assert.equal(gpu.litertLmConfig?.default.backend, 'gpu')
+  rememberLitertLmModel(gpu.modelPath, { ...gpu.litertLmRequest!, native: false })
+  const body: Record<string, unknown> = shapeLitertLmRequest({ model: gpu.modelPath, messages: [] })
+  assert.equal(body.top_k, 2147483647)
+  assert.equal(body.min_p, 0.2)
 })

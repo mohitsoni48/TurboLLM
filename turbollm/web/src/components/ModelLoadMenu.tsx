@@ -1,13 +1,15 @@
 import { useEffect, useId, useRef, useState } from 'react'
-import type { KeyboardEvent, RefObject } from 'react'
+import type { KeyboardEvent, MouseEvent, RefObject } from 'react'
 import { AlertTriangle, Check, ChevronDown, CircleSlash, Cloud, Cpu, Loader2, Search, SlidersHorizontal, Star } from 'lucide-react'
 import { filterModelGroups, moveActiveIndex, resolveActiveIndex } from '../lib/model-picker-filter'
 import type { ModelEntry } from '../lib/types'
 import type { LinkRecord } from '../lib/link-api'
 import { groupModelChoices, isFlat, type ModelChoice, type RemoteModelRow } from '../lib/remote-models'
 import { usePinnedModels } from '../lib/usePinnedModels'
+import type { PickerHidden } from '../lib/model-kind'
 import { track } from '../lib/api'
 import { toast } from './ui/sonner'
+import { NoModelsHint, type HintLinkProps } from './NoModelsHint'
 import { cn } from '../lib/utils'
 import {
   DropdownMenu,
@@ -18,8 +20,10 @@ import {
 
 /** Key of the Eject row in the keyboard highlight; NUL cannot occur in a model key or remote id. */
 const EJECT_KEY = '\u0000eject'
+/** Key of the empty state's "Show hidden models" link (NoModelsHint) in the keyboard highlight. */
+const SHOW_HIDDEN_KEY = '\u0000show-hidden'
 
-type PickTarget = ModelChoice | typeof EJECT_KEY
+type PickTarget = ModelChoice | typeof EJECT_KEY | typeof SHOW_HIDDEN_KEY
 
 const ROW_CLASS =
   'flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-[13px] outline-none data-[active]:bg-panel-2'
@@ -45,6 +49,7 @@ export function ModelLoadMenu({
   blockedReason,
   links,
   remoteModels,
+  hidden,
 }: {
   models: ModelEntry[]
   loadedKey?: string | null
@@ -66,6 +71,9 @@ export function ModelLoadMenu({
    *  `grantedCapabilities`, never from a local guess about what a link "probably" allows. */
   links?: LinkRecord[]
   remoteModels?: RemoteModelRow[]
+  /** The models the caller left out of `models` (lib/model-kind.ts chatModelsForPicker), which the empty state counts
+   *  and says how to list. */
+  hidden?: PickerHidden
 }) {
   const { isPinned } = usePinnedModels()
   const [open, setOpen] = useState(false)
@@ -75,11 +83,16 @@ export function ModelLoadMenu({
   const [activeKey, setActiveKey] = useState<string | null>(null)
   const handoffRef = useRef(false)
   const inputRef = useRef<HTMLInputElement>(null)
+  const showHiddenRef = useRef<HTMLAnchorElement>(null)
   const idPrefix = useId()
   // Pinned models float to the top (same convention as the library list in ModelsScreen),
   // stable otherwise so unpinned order is unaffected.
+  // One row per key: the same GGUF in two model folders gets one key, and both rows would load
+  // that same key. Two rows sharing it break the key-tracked highlight (ArrowDown from the first
+  // resolves back onto it, so it sticks there) and share a DOM id and a React key.
+  const seenKeys = new Set<string>()
   const loadable = models
-    .filter((m) => !m.incomplete && !m.parseError)
+    .filter((m) => !m.incomplete && !m.parseError && !seenKeys.has(m.key) && !!seenKeys.add(m.key))
     .map((m, i) => ({ m, i }))
     .sort((a, b) => {
       const p = Number(isPinned(b.m.key)) - Number(isPinned(a.m.key))
@@ -91,18 +104,34 @@ export function ModelLoadMenu({
   // All of the "which group, what does the user read, is this row pickable and why not"
   // logic lives in the PURE helper (lib/remote-models.ts) and is unit-tested there; this
   // component only renders what it returns.
-  const repoByKey = new Map(loadable.flatMap((m) => (m.sourceRepo ? [[m.key, m.sourceRepo] as const] : [])))
-  const groups = groupModelChoices({ local: loadable, links: links ?? [], remote: remoteModels ?? [] })
+  // From every loadable copy, not only the one row kept per key: the kept copy may sit in a flat
+  // folder with no repo while its twin has one, and searching that repo must still find the row.
+  const repoByKey = new Map(
+    models.flatMap((m) => (!m.incomplete && !m.parseError && m.sourceRepo ? [[m.key, m.sourceRepo] as const] : [])),
+  )
+  // One row per (link, key), for the same reason as `loadable`: a host with the GGUF in two
+  // folders lists both copies. Link names are unique, so this is one row per choice id.
+  const seenRemote = new Set<string>()
+  const remote = (remoteModels ?? []).filter((r) => {
+    const id = `${r.linkId}\u0000${r.model.key}`
+    return !seenRemote.has(id) && !!seenRemote.add(id)
+  })
+  const groups = groupModelChoices({ local: loadable, links: links ?? [], remote })
   const flat = isFlat(groups)
   const total = groups.reduce((n, g) => n + g.choices.length, 0)
   const searching = query.trim() !== ''
   const { groups: shown, choices } = filterModelGroups(groups, query, repoByKey)
   const nothingMatches = searching && shown.length === 0
-  const targets: PickTarget[] = loadedKey ? [...choices, EJECT_KEY] : choices
+  // The empty state's "Show hidden models" link, while it shows (no local model listed, some hidden by the user), is a
+  // target like the rows: focus stays in the search box and a Radix menu cancels Tab, so the keyboard could reach it
+  // no other way. It comes first, where it renders: the local group leads.
+  const hintLinked = (hidden?.byUser ?? 0) > 0 && shown.some((g) => g.kind === 'local' && g.choices.length === 0)
+  const targets: PickTarget[] = [...(hintLinked ? [SHOW_HIDDEN_KEY] as const : []), ...choices, ...(loadedKey ? [EJECT_KEY] as const : [])]
   const targetKeys = targets.map(keyOfTarget)
-  const disabledKeys = new Set(choices.filter((c) => c.disabled).map((c) => c.id))
-  const activeIndex = resolveActiveIndex(activeKey, targetKeys, choices.length, searching, disabledKeys)
-  const activeDescendantId = activeIndex < 0 ? undefined : domIdOfTarget(idPrefix, activeIndex, choices.length)
+  // The link loads nothing, so it is never the default highlight: only where the user arrows or hovers.
+  const disabledKeys = new Set([SHOW_HIDDEN_KEY, ...choices.filter((c) => c.disabled).map((c) => c.id)])
+  const activeIndex = resolveActiveIndex(activeKey, targetKeys, targets.length - (loadedKey ? 1 : 0), searching, disabledKeys)
+  const activeDescendantId = activeIndex < 0 ? undefined : domIdOfTarget(idPrefix, targetKeys[activeIndex], activeIndex)
 
   useEffect(() => {
     if (activeDescendantId) document.getElementById(activeDescendantId)?.scrollIntoView({ block: 'nearest' })
@@ -139,6 +168,12 @@ export function ModelLoadMenu({
 
   function pick(target: PickTarget | undefined, { alt }: { alt: boolean }) {
     if (target === undefined) return
+    if (target === SHOW_HIDDEN_KEY) {
+      // Clicks the link itself, so Enter goes where a click goes (the Library, "Show hidden models" on); its onClick
+      // closes the menu.
+      showHiddenRef.current?.click()
+      return
+    }
     if (target === EJECT_KEY) {
       track(screen, 'eject_model')
       onEject()
@@ -174,6 +209,15 @@ export function ModelLoadMenu({
     return () => { if (activeKey !== key) setActiveKey(key) }
   }
 
+  const hintLinkProps: HintLinkProps = {
+    id: showHiddenId(idPrefix),
+    ref: showHiddenRef,
+    'data-active': targetKeys[activeIndex] === SHOW_HIDDEN_KEY ? '' : undefined,
+    onMouseMove: highlightOnMouseMove(SHOW_HIDDEN_KEY),
+    onMouseDown: keepFocusInBox,
+    onClick: () => setOpenAndReset(false),
+  }
+
   function renderChoice(choice: ModelChoice) {
     const active = choice.id === loadedKey
     const pinned = !choice.remote && isPinned(choice.id)
@@ -184,6 +228,7 @@ export function ModelLoadMenu({
         id={optionId(idPrefix, index)}
         data-active={index === activeIndex ? '' : undefined}
         onMouseMove={highlightOnMouseMove(choice.id)}
+        onMouseDown={keepFocusInBox}
         role="menuitem"
         tabIndex={-1}
         aria-disabled={choice.disabled || undefined}
@@ -274,9 +319,14 @@ export function ModelLoadMenu({
           {nothingMatches && <div className={SECTION_LABEL_CLASS}>No matching models</div>}
           {flat ? (
             <>
-              {!nothingMatches && (
-                <div className={SECTION_LABEL_CLASS}>{total ? 'Load a model' : 'No models found'}</div>
-              )}
+              {!nothingMatches && (total ? (
+                <div className={SECTION_LABEL_CLASS}>Load a model</div>
+              ) : (
+                <div className="px-2 py-1.5">
+                  <div className="text-[13px] text-ink">No models found.</div>
+                  <NoModelsHint hidden={hidden} className="mt-1" linkProps={hintLinkProps} />
+                </div>
+              ))}
               {(shown[0]?.choices ?? []).map(renderChoice)}
             </>
           ) : (
@@ -298,7 +348,10 @@ export function ModelLoadMenu({
                   </div>
                 )}
                 {g.kind === 'local' && g.choices.length === 0 && (
-                  <div className="px-2 pb-1.5 text-[11px] text-faint">No local models found.</div>
+                  <div className="px-2 pb-1.5">
+                    <div className="text-[11px] text-faint">No local models found.</div>
+                    <NoModelsHint hidden={hidden} offerDownload={false} className="mt-0.5 text-[11px]" linkProps={hintLinkProps} />
+                  </div>
                 )}
                 {g.choices.map(renderChoice)}
               </div>
@@ -313,6 +366,7 @@ export function ModelLoadMenu({
                 id={ejectId(idPrefix)}
                 data-active={targetKeys[activeIndex] === EJECT_KEY ? '' : undefined}
                 onMouseMove={highlightOnMouseMove(EJECT_KEY)}
+                onMouseDown={keepFocusInBox}
                 className={ROW_CLASS}
                 style={{ color: 'var(--err)' }}
                 onClick={() => pick(EJECT_KEY, { alt: false })}
@@ -372,7 +426,7 @@ function PickerSearch({
 }
 
 function keyOfTarget(target: PickTarget): string {
-  return target === EJECT_KEY ? EJECT_KEY : target.id
+  return typeof target === 'string' ? target : target.id
 }
 
 function optionId(idPrefix: string, index: number): string {
@@ -383,12 +437,26 @@ function ejectId(idPrefix: string): string {
   return `${idPrefix}-eject`
 }
 
+function showHiddenId(idPrefix: string): string {
+  return `${idPrefix}-show-hidden`
+}
+
 function listIdOf(idPrefix: string): string {
   return `${idPrefix}-list`
 }
 
-function domIdOfTarget(idPrefix: string, index: number, choiceCount: number): string {
-  return index < choiceCount ? optionId(idPrefix, index) : ejectId(idPrefix)
+function domIdOfTarget(idPrefix: string, key: string, index: number): string {
+  if (key === EJECT_KEY) return ejectId(idPrefix)
+  if (key === SHOW_HIDDEN_KEY) return showHiddenId(idPrefix)
+  return optionId(idPrefix, index)
+}
+
+/** Pressing a row must not move focus from the search box onto the (tabIndex -1) row: a disabled
+ *  row keeps the menu open after its click, and with focus on the row the next keys would feed
+ *  Radix type-ahead instead of the box. The click still fires. Not a refocus in pick(): on a touch
+ *  device that would raise the soft keyboard the picker deliberately avoids. */
+function keepFocusInBox(e: MouseEvent) {
+  if (e.button === 0) e.preventDefault() // the primary button only: a middle-click autoscroll still starts
 }
 
 /** Radix type-ahead hijacks every plain character typed inside the menu, so those keys must not

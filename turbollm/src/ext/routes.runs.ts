@@ -17,8 +17,8 @@ import { requireScope, scopeFor } from './auth.js'
 import { extError, mapStoreError } from './errors.js'
 import { checkContextFits } from './context-limit.js'
 import { loadFullHistory, buildGenerationCtx } from './generation.js'
-import { PublicRunManager, type PublicRun, type RunBody } from './run-manager.js'
-import { IdempotencyStore } from './idempotency.js'
+import type { PublicRunManager, PublicRun, RunBody } from './run-manager.js'
+import { IdempotencyStore, requestFingerprint } from './idempotency.js'
 import {
   TenantLimiter, DEFAULT_MAX_IN_FLIGHT_PER_TENANT, DEFAULT_REQUESTS_PER_MINUTE_PER_TENANT,
   MAX_BODY_BYTES, MAX_ATTACHMENTS,
@@ -47,7 +47,12 @@ export interface ExtRouteDeps {
  *  already-created run, not a frozen response body — the true "result" of a generation is live
  *  and possibly still streaming, so a replay reconnects to the same run rather than replaying a
  *  stale snapshot (see the replay branch in the route below). */
-interface GenerateReplay { runId: string; userMessageId: string; messageId: string }
+interface GenerateReplay {
+  runId: string; userMessageId: string; messageId: string
+  /** `requestFingerprint` of the chat id + message body this key was first used for — a hit
+   *  for a different chat or body is refused rather than replayed (see idempotency.ts). */
+  fingerprint: string
+}
 
 function toRunDTO(r: PublicRun): Record<string, unknown> {
   return {
@@ -59,7 +64,7 @@ function toRunDTO(r: PublicRun): Record<string, unknown> {
 /** Emits the same `run` frame + live/replayed event stream a fresh SSE request gets, or the same
  *  202 JSON envelope — shared by both the just-created path and the idempotent-replay path so
  *  a retry that reattaches is indistinguishable on the wire from a client that reconnected on
- *  its own via GET .../stream. `fromSeq` lets a replay attempt a full-history replay (seq 0);
+ *  its own via GET .../stream. `fromSeq` 0 asks for a full-history replay (frames start at 1);
  *  `runs.canReplayFrom` is checked first so a replay that has aged out of the ring buffer fails
  *  with the same documented `replay_window_exceeded` conflict the dedicated reconnect endpoint
  *  already uses, instead of silently starting mid-stream or hanging. */
@@ -116,7 +121,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
   app.post(`${BASE}/chats/:id/messages/generate`, auditMiddleware(audit, 'run.start'), requireScope('runs:write'), async (c) => {
     const chatId = c.req.param('id')
     const b = await c.req.json().catch(() => ({})) as {
-      role?: 'user'; content?: string; owner?: string
+      role?: unknown; content?: string; owner?: string
       attachments?: string[]; metadata?: Record<string, unknown>
     }
     // Runtime shape guard (round-3 review finding, "N5/N6's byte-size checks crash..."): the
@@ -140,10 +145,23 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     if (b.owner !== undefined && typeof b.owner !== 'string') {
       return extError(c, 'invalid_request', 'invalid_input', '`owner` must be a string.', { param: 'owner' })
     }
+    // The turn is saved as role 'user' below whatever `role` says, so an assistant reply sent
+    // here (or to POST /chats/:id/messages with generate left at its default) was stored as a
+    // user turn and answered by a new run. Only a user turn starts a run; an assistant turn is
+    // appended with generate: false.
+    if (b.role !== undefined && b.role !== 'user') {
+      return extError(c, 'invalid_request', 'invalid_input',
+        "`role` must be 'user' for a turn that starts a run. Append an assistant turn with POST /chats/{id}/messages and generate: false.",
+        { param: 'role' })
+    }
     const scope = scopeFor(c, b.owner)
     const content = (b.content ?? '').trim()
     const attachments = b.attachments
     const idempotencyKey = c.req.header('Idempotency-Key')?.trim() || undefined
+    // Everything that makes this "the same request" for a replay: the target chat and the
+    // message body as it would be persisted. `role` is not included — anything but 'user' is
+    // refused above, so this route always persists a user turn.
+    const fingerprint = idempotencyKey ? requestFingerprint([chatId, content, attachments ?? null, b.metadata ?? null]) : ''
 
     // Idempotent replay (spec §7.6), checked before ANY validation/persistence/limiter charge —
     // a cached key means a run for this exact request already exists, so we reattach to THAT
@@ -169,6 +187,13 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
           // prevent, so an aged-out replay is refused rather than risked.
           return extError(c, 'conflict', 'idempotency_replay_expired',
             'The original run for this Idempotency-Key is no longer available to replay. If you intend to send a new message, retry with a new Idempotency-Key.',
+            { status: 409, retryable: false })
+        }
+        // Same key, different chat or body: a different request, not a retry of this one.
+        // Replaying would report this message as sent while it is never persisted.
+        if (cached.fingerprint !== fingerprint) {
+          return extError(c, 'conflict', 'idempotency_key_reused',
+            'This Idempotency-Key was already used for a different request (another chat or different message content). Use a new Idempotency-Key for a new message.',
             { status: 409, retryable: false })
         }
         // The real run id — this route's own `:id` param names the CHAT, not the run, and a
@@ -267,8 +292,9 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // truncation would mean the model answering from a history the integrator believes it sent.
     // Reuses generation.ts's `loadFullHistory` (pages via cursor until exhausted) and
     // `buildGenerationCtx` (prepends the system prompt, folds prior `reasoning` into `<think>`
-    // blocks) — the SAME assembly the real generation path hands the engine moments later. A
-    // single capped `listMessages(scope, chatId, { limit: 200 })` call would silently return only
+    // blocks; a LiteRT-LM run sends it as `reasoning_content` instead, counted the same here)
+    // — the SAME assembly the real generation path hands the engine moments later. A single
+    // capped `listMessages(scope, chatId, { limit: 200 })` call would silently return only
     // the OLDEST page once a chat passes 200 stored messages (`SqliteChatStore.clampLimit`),
     // letting this check pass a conversation whose true full history overflows the window — see
     // `loadFullHistory`'s own header comment for the exact failure mode this avoids.
@@ -330,7 +356,7 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     // already returned a live `PublicRun` at this line; the injected body's own first engine
     // fetch is still at least one microtask away. A retry that lands anywhere after this line
     // finds this entry and reattaches via the branch above instead of starting a second run.
-    if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId } satisfies GenerateReplay)
+    if (idempotencyKey) idempotency.remember(scope.tenant, scope.owner, IDEMPOTENCY_OP, idempotencyKey, { runId: run.id, userMessageId: userMsgId, messageId: assistantMsgId, fingerprint } satisfies GenerateReplay)
     // The chat reservation from before the first `await` above stays held — no "upgrade" step is
     // needed: `runs.reserveChat`/`isChatActive` (run-manager.ts) don't care whether a real
     // `PublicRun` exists yet, only that the chat is reserved, and it already is.
@@ -367,13 +393,31 @@ export function registerExtRunRoutes(app: Hono, d: Deps, runs: PublicRunManager,
     const scope = scopeFor(c, c.req.query('owner'))
     const run = runs.get(c.req.param('id'))
     if (!run || run.tenant !== scope.tenant || run.owner !== scope.owner) return extError(c, 'not_found', 'not_found', 'Not found.')
-    const after = c.req.query('after') ? Number(c.req.query('after')) : 0
-    if (!runs.canReplayFrom(run.id, after)) {
+    // `after` is EXCLUSIVE: it is the last SSE `id` (event_seq) the client already has, so the
+    // replay starts at the next frame. Frames are numbered from 1, so absent or 0 (the event_seq
+    // of a run with no frame yet) ⇒ replay from the first frame (run-manager.ts FIRST_EVENT_SEQ).
+    const afterParam = c.req.query('after')
+    const after = afterParam ? Number(afterParam) : undefined
+    // A bare Number(...) let 'abc' (NaN) or '1.5' through, which matches no retained frame: the
+    // client got 409 replay_window_exceeded and was told to re-read the message and reattach,
+    // for a cursor that was never valid. Event seqs are integers.
+    if (after !== undefined && !Number.isInteger(after)) {
+      return extError(c, 'invalid_request', 'invalid_input', '`after` must be an integer event_seq.', { param: 'after' })
+    }
+    const from = after !== undefined ? after + 1 : 0
+    // A cursor past the run's last frame names frames it never sent (run-manager.ts isPastEnd):
+    // it used to get 200, an empty stream from a finished run and, from a live one, frames at or
+    // below the cursor. Checked here, before the stream opens; the run only moves forward after.
+    if (runs.isPastEnd(run.id, from)) {
+      return extError(c, 'invalid_request', 'invalid_input',
+        `\`after\` is past the last frame this run has sent (event_seq ${run.eventSeq}).`, { param: 'after' })
+    }
+    if (!runs.canReplayFrom(run.id, from)) {
       return extError(c, 'conflict', 'replay_window_exceeded',
         'That cursor has aged out of the replay buffer. Re-read the message, then attach at the run current event_seq.')
     }
     return streamSSE(c, async (stream) => {
-      const sub = runs.subscribe(run.id, after)
+      const sub = runs.subscribe(run.id, from)
       stream.onAbort(() => { sub.close() })
       for await (const ev of sub) {
         await stream.writeSSE({ id: String(ev.seq), event: ev.event, data: JSON.stringify(ev.data) })

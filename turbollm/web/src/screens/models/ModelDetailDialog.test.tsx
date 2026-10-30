@@ -111,13 +111,14 @@ beforeEach(() => {
 })
 
 describe('ModelDetailDialog — loading through the shared loader', () => {
-  it('loads a Jev model through the loader, jev field and all, with the draft overrides', async () => {
+  it('loads a Jev model through the loader, jev field and all, with the overrides the user set', async () => {
     renderDialog(VERIFIED)
     await userEvent.click(await screen.findByRole('button', { name: /load model/i }))
     expect(requestLoad).toHaveBeenCalledTimes(1)
     const [target, opts] = requestLoad.mock.calls[0]
     expect(target).toEqual(expect.objectContaining({ key: 'jev-1', name: 'qwen3.5-4b-nli-v2', jev: jev() }))
-    expect(opts.overrides).toEqual(profile())
+    // Nothing was moved, so nothing is sent but the marker (user-set-profile.ts).
+    expect(opts.overrides).toEqual({ userSetOnly: true })
   })
 
   it('loads a plain model through the same loader, with nothing to confirm', async () => {

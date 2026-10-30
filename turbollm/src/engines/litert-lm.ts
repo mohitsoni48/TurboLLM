@@ -26,13 +26,15 @@
 // this engine is only reachable when TurboLLM itself runs inside Termux.
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { basename, dirname, join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a uv/pip install or a probe the daemon does not live to see ends with it,
+// instead of running on, parented to init (its timeout is a daemon timer).
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 const LITERT_LM_PYTHON = '3.12'
 
@@ -69,24 +71,26 @@ export async function ensureLitertLmEnv(
     const uv = await ensureUv(root, onProgress)
     const envDir = join(root, 'litert-lm', 'venv')
     const py = venvPython(envDir)
+    const { reinstall } = beginPyEnvInstall(envDir, py)
 
     if (!existsSync(py)) {
       onProgress?.({ phase: 'extracting', pct: -1 })
       await execFileP(uv, ['venv', '--python', LITERT_LM_PYTHON, envDir], { cwd: root, signal })
     }
     onProgress?.({ phase: 'extracting', pct: -1 })
-    // `--reinstall` on the plain install (PR #271 re-review, live-verified on uv 0.12): a bare
-    // `uv pip install litert-lm` answers "Checked 1 package" and installs NOTHING when the
-    // version is already satisfied — so an Install over a half-installed venv (a cancelled
-    // provision leaves one behind) would register an engine whose files are still broken.
-    // --reinstall makes Install mean "a coherent environment": a no-op on a fresh venv, a full
-    // rewrite from the uv cache on a damaged one. The Update path keeps plain -U — the
-    // alreadyLatest short-circuit refuses same-version updates, and a real version bump
-    // rewrites everything anyway.
-    const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['-U'] : ['--reinstall']), 'litert-lm']
+    // `--reinstall` on a plain install over an unfinished environment (PR #271 re-review,
+    // live-verified on uv 0.12): a bare `uv pip install litert-lm` answers "Checked 1 package"
+    // and installs NOTHING when the version is already satisfied — so an Install over a
+    // half-installed venv (a cancelled provision leaves one behind) would register an engine
+    // whose files are still broken. A venv the last install finished carries its marker
+    // (py-env-marker.ts), and is not rewritten again on every Install. The Update path keeps
+    // plain -U — the alreadyLatest short-circuit refuses same-version updates, and a real
+    // version bump rewrites everything anyway.
+    const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '-U', reinstall }), 'litert-lm']
     await execFileP(uv, installArgs, { cwd: root, maxBuffer: 64 * 1024 * 1024, signal })
 
     const version = await probeLitertLm(py, signal)
+    finishPyEnvInstall(envDir)
     return { python: py, version }
   } finally {
     resetLitertLmServeCache()
@@ -383,10 +387,11 @@ export function litertLmServeBlockerCached(
   return answer
 }
 
-/** The settings TurboLLM drives through LiteRT-LM's `--config` file. Every key is one the 0.17 schema accepts. */
+/** The settings TurboLLM drives through LiteRT-LM's `--config` file. Every key is one the 0.17 schema accepts. A key
+ *  left out is the server's to choose from the model: `backend` the bundle's own (see litertLmProfileToConfig). */
 export interface LitertLmConfig {
   default: {
-    backend: 'cpu' | 'gpu'
+    backend?: 'cpu' | 'gpu'
     max_num_tokens?: number
     cpu_thread_count?: number
   }
@@ -394,21 +399,25 @@ export interface LitertLmConfig {
 
 /**
  * Map a load profile to LiteRT-LM's config. LiteRT-LM has no partial offload, so the profile's `litertLm.backend` picks
- * cpu or gpu outright; `auto` (the default) follows the KoboldCpp convention: `ngl > 0` on a machine with a GPU means
- * the GPU backend and everything else means CPU.
+ * cpu or gpu outright; `auto` (the default) writes no backend, and the server runs the model on its own: upstream's
+ * `serve` (desktop, Termux) reads the bundle's header for it (model_default_backend: a GPU-only "artisan" decoder's GPU,
+ * else the first backend a section's backend_constraint names, else the runtime's CPU), and the Android app's native
+ * server does the same. Auto used to mean the GPU whenever a GPU was detected and the llama.cpp "GPU layers" default
+ * was above 0, so the Android app (which reports its GPU) put every bundle on the GPU, a CPU-only one included, and a
+ * machine without a detected GPU, or with GPU layers set to 0, put a GPU-only bundle on the CPU: none of it was the
+ * model's choice, and every such load failed.
  *   ctx     → max_num_tokens   (the KV-cache length; a bundle exported with a shorter one still caps it)
  *   threads → cpu_thread_count (when set; 0 = `autoThreads` if given — the performance cores on a phone, where the
  *             runtime's own fixed default can land threads on efficiency cores — else the runtime chooses)
  */
 export function litertLmProfileToConfig(
-  p: { ctx: number; ngl: number; threads: number; litertLm?: { backend?: 'auto' | 'cpu' | 'gpu' } },
-  hasGpu: boolean,
+  p: { ctx: number; threads: number; litertLm?: { backend?: 'auto' | 'cpu' | 'gpu' } },
   autoThreads = 0,
 ): LitertLmConfig {
-  // An explicit choice wins over detection: Android/Termux cannot report a GPU, so `auto` would pin it to CPU.
+  // An explicit choice is the user's and reaches the server as it is, also where the model excludes it (the runtime
+  // then refuses it with its own message, which the load failure shows).
   const choice = p.litertLm?.backend ?? 'auto'
-  const backend: 'cpu' | 'gpu' = choice === 'auto' ? (hasGpu && p.ngl > 0 ? 'gpu' : 'cpu') : choice
-  const config: LitertLmConfig = { default: { backend } }
+  const config: LitertLmConfig = { default: choice === 'auto' ? {} : { backend: choice } }
   if (Number.isInteger(p.ctx) && p.ctx > 0) config.default.max_num_tokens = p.ctx
   if (Number.isInteger(p.threads) && p.threads > 0) config.default.cpu_thread_count = p.threads
   else if (Number.isInteger(autoThreads) && autoThreads > 0) config.default.cpu_thread_count = autoThreads
@@ -439,9 +448,25 @@ export function writeLitertLmConfig(path: string, config: LitertLmConfig): void 
 }
 
 /**
- * Command + args to launch the LiteRT-LM OpenAI-compatible server. We invoke the CLI as a module (`python -m
- * litert_lm_cli.main`) rather than the venv's console script, the same way SGLang is launched: one path on every OS,
- * no `.exe` shim to locate. `serve` defaults to 0.0.0.0:9379, so host and port are always passed explicitly.
+ * How `litert-lm serve` is started: its CLI module (litert_lm_cli.main, as `python -m` would run it), with Python's
+ * http.server writing each reply's reason phrase on one line. `serve` puts its error in the status line
+ * (send_error(code, "<Exception>: <message>\n")), and an exception's text ends with a newline, which ended the status
+ * line early ("HTTP/1.0 500 RuntimeError: Failed to create conversation\n\r\n"): the daemon's HTTP client (undici, the
+ * global dispatcher server.ts sets) refuses such a reply outright ("fetch failed: Response does not match the HTTP/1.1
+ * protocol (Missing expected CR after response line)"), so a failed load said "fetch failed" instead of the runtime's
+ * message, and so did every refused request (the chat, the gateway, extension runs, routines, the skill writer). The
+ * reason is also made latin-1, which Python's encoder of that line takes strictly. Nothing else of `serve` changes.
+ */
+export const LITERT_LM_SERVE_SHIM =
+  "import http.server as h, runpy; o = h.BaseHTTPRequestHandler.send_response_only; " +
+  "h.BaseHTTPRequestHandler.send_response_only = lambda s, c, m=None: o(s, c, m if m is None else " +
+  "' '.join(str(m).split()).encode('latin-1', 'replace').decode('latin-1')); " +
+  "runpy.run_module('litert_lm_cli.main', run_name='__main__', alter_sys=True)"
+
+/**
+ * Command + args to launch the LiteRT-LM OpenAI-compatible server. We invoke the CLI as a module (litert_lm_cli.main,
+ * through LITERT_LM_SERVE_SHIM) rather than the venv's console script, the same way SGLang is launched: one path on
+ * every OS, no `.exe` shim to locate. `serve` defaults to 0.0.0.0:9379, so host and port are always passed explicitly.
  *
  * `extraArgs` are the user's own `serve` flags (--verbose, --cors-origin, ...) and go last.
  */
@@ -455,7 +480,7 @@ export function litertLmServerCommand(
   const serve = ['serve', '--config', configPath, '--host', host, '--port', String(port), ...extraArgs]
   // The Android app's bundled server takes the CLI's own `serve` arguments, so only the program differs.
   if (isNativeLitertLm(python)) return { cmd: python, args: serve }
-  return { cmd: python, args: ['-m', 'litert_lm_cli.main', ...serve] }
+  return { cmd: python, args: ['-c', LITERT_LM_SERVE_SHIM, ...serve] }
 }
 
 /**
@@ -534,13 +559,19 @@ export function litertLmTurnErrorMessage(reason: string): string {
     'start a new chat, or use a model exported with a longer context.'
 }
 
-/** The user-facing text for a failed warm-up: the runtime's message plus the two causes that account for most of them. */
-export function litertLmLoadFailureMessage(reason: string, backend: 'cpu' | 'gpu'): string {
+/** The user-facing text for a failed warm-up: the runtime's message, verbatim, and a hint. `choice` is the Backend
+ *  the user set ('auto' when they set none, and the server ran the model on its own backend). The GPU is named only
+ *  when the user chose it: under Auto TurboLLM chooses no backend, so "switch to CPU" would blame a choice nobody
+ *  made, and most failures have nothing to do with the GPU (an LFM2.5-230M load that failed in its data processor
+ *  under Auto was told to switch to CPU). */
+export function litertLmLoadFailureMessage(reason: string, choice: 'auto' | 'cpu' | 'gpu'): string {
   // The GPU hint must name a control the LiteRT-LM panel actually offers: "set GPU layers to
   // 0" is llama.cpp advice — the GPU-layers slider is not rendered for LiteRT-LM, whose
   // backend is chosen outright on the model's load panel.
-  const hint = backend === 'gpu'
-    ? 'If this model does not run on your GPU, switch the Backend setting to CPU on the model\'s load panel and load it again.'
-    : 'Check that the file is a complete .litertlm bundle supported by this LiteRT-LM version.'
+  const hint = choice === 'gpu'
+    ? 'You chose the GPU backend: if this model does not run on your GPU, set Backend to Auto (the model\'s own) or CPU on the model\'s load panel and load it again.'
+    : choice === 'cpu' && /backend constraint|requires one of/i.test(reason)
+      ? 'You chose the CPU backend, which this model does not support: set Backend to Auto (the model\'s own) on the model\'s load panel and load it again.'
+      : 'Check that the file is a complete .litertlm bundle supported by this LiteRT-LM version.'
   return `LiteRT-LM could not load this model — ${reason}. ${hint}`
 }

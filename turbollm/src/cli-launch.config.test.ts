@@ -108,6 +108,19 @@ test('prepareOpencode: a commented config NOT yet pointed at us fails without to
   assert.equal(fs.files.get(opencodePath), original, 'must not rewrite a commented file even on failure')
 })
 
+test('prepareOpencode: both by-hand failures point at Customize → Connect → Connect an app, not the Developer screen', async () => {
+  // The web UI's nav has had no Developer screen for a while (/developer only redirects), and
+  // the setup snippets sit under the "Connect an app" heading of Customize's Connect tab.
+  const corrupt = await prepareOpencode(BASE, TOKEN, 'k', 'M', memFs({ [opencodePath]: '{ not json' }))
+  const commented = await prepareOpencode(BASE, TOKEN, 'k', 'M', memFs({ [opencodePath]: '{\n  // mine\n  "provider": {}\n}' }))
+  for (const res of [corrupt, commented]) {
+    assert.equal(res.ok, false)
+    const { message } = res as { message: string }
+    assert.match(message, /see TurboLLM UI → Customize → Connect → Connect an app\)/)
+    assert.doesNotMatch(message, /Developer|Connect a tool/)
+  }
+})
+
 // ── kilo (verified against the live @kilocode/cli install) ────────────────────────
 
 test('prepareKilo: writes opencode-shaped provider + a default model string', async () => {

@@ -1,6 +1,6 @@
 import type { Hono, MiddlewareHandler } from 'hono'
 import { randomUUID } from 'node:crypto'
-import { generateApiKey, hostGate } from '../auth'
+import { generateApiKey, grantKind, hostGate, isLanExposed } from '../auth'
 import { getAdvertisedHost, getLanIp } from '../net'
 import type { Context } from 'hono'
 import type { Deps } from '../deps'
@@ -97,10 +97,11 @@ export function registerLinkAdminRoutes(
     // clear that bar — the owner, at the keyboard — and it is the one that actually decides
     // the mint, since hostGate lets a local caller straight through in this posture.
     //
-    // With `lanBind` off there is no open LAN to close (a tunneled request always enforces
-    // regardless of requireApiKey, see bypassesAuth), so this never fires there.
+    // With the listener loopback-only there is no open LAN to close (a tunneled request always
+    // enforces regardless of requireApiKey, see bypassesAuth), so this never fires there.
+    // isLanExposed, not `lanBind`: a non-loopback --addr/daemon.host is just as open.
     const daemon = d.store.snapshot().daemon
-    if (daemon.lanBind && daemon.requireApiKey !== true) {
+    if (isLanExposed(d) && daemon.requireApiKey !== true) {
       return c.json(
         {
           error: {
@@ -169,7 +170,8 @@ export function registerLinkAdminRoutes(
     })
 
     const cfg = d.store.snapshot()
-    const port = (cfg.daemon as { port?: number }).port ?? 6996
+    // The port really bound (see GET /network's lanUrl): --port/--addr can differ from daemon.port.
+    const port = d.bindPort ?? (cfg.daemon as { port?: number }).port ?? 6996
     const tunnelUrl = d.remote?.url() ?? null
     const baseUrl = tunnelUrl ?? lanBaseUrl(port)
 
@@ -180,7 +182,7 @@ export function registerLinkAdminRoutes(
     // never widen a grant. `d.telemetry` is optional (absent under tests, same
     // convention as tunnel/gate/links), so this must be a no-op when unset.
     if (d.telemetry) {
-      const preset = typeof body?.preset === 'string' && Object.prototype.hasOwnProperty.call(LINK_PRESETS, body.preset)
+      const preset = typeof body?.preset === 'string' && Object.hasOwn(LINK_PRESETS, body.preset)
         ? (body.preset as keyof typeof LINK_PRESETS)
         : undefined
       emit(d.telemetry, linkMinted, { capabilityCount: caps.length, ...(preset ? { preset } : {}) })
@@ -194,11 +196,13 @@ export function registerLinkAdminRoutes(
     return c.json({ keyId, linkString: encodeLinkString(baseUrl, full) })
   })
 
-  // ── Host side: who is linked to me.
+  // ── Host side: who is linked to me. Link grants only: a remote-access token (ADR-422)
+  //    carries a grant too, but it is the owner's own URL, not a machine; Developer → API
+  //    Keys lists it.
   app.get('/api/v1/links/inbound', (c) => {
     const denied = gate(c, VIEW)
     if (denied) return denied
-    const keys = d.store.snapshot().apiKeys.filter((k) => k.grant)
+    const keys = d.store.snapshot().apiKeys.filter((k) => grantKind(k) === 'link')
     return c.json({
       inbound: keys.map((k) => ({
         id: k.id,
@@ -718,7 +722,7 @@ function remoteFailure(c: Context, rec: LinkRecord, probe: LinkProbe): Response 
   )
 }
 
-/** Base URL for the minted link string, at the port the daemon is configured on.
+/** Base URL for the minted link string, at the port the daemon is bound to.
  *
  *  Prefers the operator's `TURBOLLM_ADVERTISED_HOST` override (see net.ts) over LAN
  *  auto-detection: inside a Docker container the auto-detected address is the

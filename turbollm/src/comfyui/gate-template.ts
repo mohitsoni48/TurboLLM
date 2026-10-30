@@ -7,14 +7,19 @@
 // Contract with the daemon (see chat ../engines/comfy-guard.ts):
 //   • rising edge (idle → first job enqueued): blocking POST {base}/api/v1/comfyui/acquire
 //     BEFORE the job is enqueued, so TurboLLM frees VRAM before ComfyUI executes.
+//   • a prompt finished with more still queued (task_done): POST acquire again. While TurboLLM
+//     holds the GPU that only refreshes its crash-recovery lease, which otherwise ran out LEASE
+//     minutes after a long queue's FIRST prompt and reloaded the LLM mid-render (v4).
 //   • queue drained (last task_done): POST {base}/api/v1/comfyui/release → reload.
 
 /** Version stamp written into the node so the installer can detect/upgrade it. */
-export const GATE_VERSION = 2
+export const GATE_VERSION = 4
 
 /** Render the Python source for the gate node, with TurboLLM's base URL baked in.
- *  `baseUrl` is TurboLLM's own origin (e.g. http://127.0.0.1:6996), reachable from
- *  the ComfyUI process (same machine → loopback, so no API key is needed). */
+ *  `baseUrl` is the daemon's own address (e.g. http://127.0.0.1:6996), reachable from
+ *  the ComfyUI process on the same machine: the address the daemon is bound to when that
+ *  is one address, else 127.0.0.1 (see the install route). A loopback address needs no
+ *  API key; a LAN one needs requireApiKey off, since the node sends no key. */
 export function gateNodeSource(baseUrl: string): string {
   const base = baseUrl.replace(/\/+$/, '')
   // Embed as a JSON string literal so any quotes/backslashes are escaped for Python
@@ -46,6 +51,11 @@ LOG_PREFIX = "[turbollm_gate]"
 _lock = threading.Lock()
 _busy = False  # True between the rising edge and the queue draining
 
+# TurboLLM runs on this machine, so its calls never go through a proxy. urlopen would use any the
+# environment sets (HTTP_PROXY, or the system settings on Windows and macOS) unless NO_PROXY lists
+# the host, and a proxy cannot reach this machine's loopback: every acquire and release failed.
+_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def _log(msg: str) -> None:
     print(f"{LOG_PREFIX} {msg}", flush=True)
@@ -56,7 +66,7 @@ def _post(path: str, timeout: float) -> bool:
     req = urllib.request.Request(url, data=b"{}", method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _opener.open(req, timeout=timeout) as resp:
             resp.read()
         return True
     except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
@@ -110,33 +120,35 @@ def _install_hooks() -> None:
     def put(self, item, *args, **kwargs):
         global _busy
         # Acquire BEFORE enqueuing so the worker can't start executing until TurboLLM
-        # has freed the GPU. Only on the rising edge (idle -> busy).
+        # has freed the GPU. Only on the rising edge (idle -> busy). The lock is held
+        # through the acquire and the enqueue, and task_done holds it through its
+        # release: a put racing a draining queue waits for that release to reach
+        # TurboLLM, then acquires again. Otherwise TurboLLM, still holding the GPU,
+        # answers the acquire at once and the late release reloads its model mid-render.
         with _lock:
             if not _busy:
                 _busy = True
-                acquire = True
-            else:
-                acquire = False
-        if acquire:
-            _acquire_blocking()
-        return orig_put(self, item, *args, **kwargs)
+                _acquire_blocking()
+            return orig_put(self, item, *args, **kwargs)
 
     def task_done(self, *args, **kwargs):
         global _busy
         result = orig_task_done(self, *args, **kwargs)
-        try:
-            remaining = self.get_tasks_remaining()
-        except Exception:  # noqa: BLE001
-            remaining = 0
-        if remaining <= 0:
-            do_release = False
-            with _lock:
-                if _busy:
-                    _busy = False
-                    do_release = True
-            if do_release:
+        with _lock:
+            try:
+                remaining = self.get_tasks_remaining()
+            except Exception:  # noqa: BLE001
+                remaining = 0
+            if remaining <= 0 and _busy:
+                _busy = False
                 _free_self()
                 _release()
+            elif _busy:
+                # More prompts to run: acquire again. While TurboLLM holds the GPU this only
+                # refreshes its crash-recovery lease, which must otherwise outlast the whole
+                # queue (it reloads the LLM when it runs out). If TurboLLM no longer holds it
+                # (it restarted, or the lease ran out), it frees VRAM before the next prompt.
+                _acquire_blocking()
         return result
 
     PromptQueue.put = put

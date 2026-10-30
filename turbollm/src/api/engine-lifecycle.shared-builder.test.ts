@@ -1,5 +1,6 @@
 // Source-level guard (D10, run 2026-09-13-autoload-last-model): startEngine must build its StartOpts
-// through the shared buildStartOpts (src/engines/start-opts.ts), never inline.
+// through the shared buildStartOpts (src/engines/start-opts.ts), never inline, and so must restartEngine
+// when it reloads the model on the engine the user has selected since.
 //
 // Why a source scan and not a behavioural test: D10 exists because a second copy of this builder, the
 // boot resume's, drifted from startEngine's. KoboldCpp got llama-server flags, vLLM lost --max-model-len
@@ -24,8 +25,8 @@ const INLINE_BUILDER_CALLS = [
   'getModelProfile(',
 ]
 
-test('engine-lifecycle.ts calls the shared buildStartOpts exactly once', () => {
-  assert.equal(occurrences(ENGINE_LIFECYCLE, 'buildStartOpts('), 1)
+test('engine-lifecycle.ts calls the shared buildStartOpts exactly twice: startEngine and restartEngine', () => {
+  assert.equal(occurrences(ENGINE_LIFECYCLE, 'buildStartOpts('), 2)
 })
 
 test('engine-lifecycle.ts resolves no profile and builds no engine args of its own', () => {

@@ -6,7 +6,7 @@ import { toast } from '../ui/sonner'
 import { describeRoutineError } from '../../lib/routine-api'
 import { useRoutineMutations } from '../../lib/routine-queries'
 import { RoutineFormFields } from './RoutineFormFields'
-import { describeScheduleRule, isRoutineDraftComplete, routineToDraft, type RoutineDraft } from '../../lib/routine-form'
+import { describeScheduleRule, isRoutineDraftComplete, routineToDraft, unsetPermissionModeLabel, type RoutineDraft } from '../../lib/routine-form'
 import type { Routine, RoutineInput } from '../../lib/routine-types'
 
 type Props =
@@ -60,18 +60,31 @@ function draftToPatch(d: RoutineDraft, scheduleDisplay: string): Partial<Routine
   }
 }
 
+/** create_routine/REST may store no mode, and that is not "no permissions": name what the
+ *  daemon actually runs for it (routine-form.ts's `unsetPermissionModeLabel`), not a blank. */
+function permissionModeText(r: Routine): string {
+  return r.permissionMode ?? `Not set: ${unsetPermissionModeLabel(r.codingAgent)}`
+}
+
 /** Old→new diff for an update_routine confirm card — spec 20 §3 item 4. Plain field list
- *  (short discrete values), not a text diff. */
+ *  (short discrete values), not a text diff.
+ *
+ *  A code routine's permission mode is compared as what runs (permissionModeText), not as stored:
+ *  with no stored mode that depends on the coding agent, so switching claude_cli (asks refused)
+ *  to pi (Auto) changes what the routine may do while the stored mode stays unset on both sides,
+ *  and the card listed only "Coding agent" for it. */
 function RoutineUpdateDiff({ previous, next }: { previous: Routine; next: Routine }) {
-  const changed = FIELD_LABELS.filter((f) => previous[f.key] !== next[f.key])
+  const value = (r: Routine, key: DiffKey) => (key === 'permissionMode' && r.flavor === 'code' ? permissionModeText(r) : r[key])
+  const changed = FIELD_LABELS.filter((f) => value(previous, f.key) !== value(next, f.key))
   if (changed.length === 0) return <p className="text-[12px] text-faint">No fields changed.</p>
+  const show = (r: Routine, key: DiffKey) => value(r, key) ?? '(none)'
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-border bg-panel-2 p-2.5 text-[12px]">
       {changed.map((f) => (
         <div key={f.key} className="flex flex-col gap-0.5">
           <span className="font-medium text-muted">{f.label}</span>
-          <span style={{ color: 'var(--err)' }}>− {previous[f.key] ?? '(none)'}</span>
-          <span style={{ color: 'var(--ok)' }}>+ {next[f.key] ?? '(none)'}</span>
+          <span style={{ color: 'var(--err)' }}>− {show(previous, f.key)}</span>
+          <span style={{ color: 'var(--ok)' }}>+ {show(next, f.key)}</span>
         </div>
       ))}
     </div>
@@ -254,7 +267,7 @@ export function RoutineConfirmCard(props: Props) {
             <>
               <p><span className="text-muted">Workspace:</span> {effective.workspacePath}</p>
               <p><span className="text-muted">Coding agent:</span> {effective.codingAgent}</p>
-              <p><span className="text-muted">Permission mode:</span> {effective.permissionMode}</p>
+              <p><span className="text-muted">Permission mode:</span> {permissionModeText(effective)}</p>
             </>
           )}
           {props.mode === 'update' && <RoutineUpdateDiff previous={props.original} next={effective} />}

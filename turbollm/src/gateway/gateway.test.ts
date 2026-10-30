@@ -132,8 +132,11 @@ function jevGatewayDeps(routed: string[] = []): Deps {
       resolveRemoteTarget: () => undefined,
       resolveLocal: byKeyOrName,
       routeTo: async () => ({ target: ENGINE }),
+      loadedModelKeys: () => new Set([JEV_KEY]),
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    // Settings shows every engine's models, so GET /v1/models lists the GGUF under vLLM too: these tests are about how
+    // a row is marked, not about which models the selected engine runs (gateway.models.test.ts).
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true }, showAllEngineModels: true }) },
     manager: {
       status: () => ({ state: 'running', model: { key: JEV_KEY, name: 'qwen3.5 4b nli v2' } }),
       target: () => ENGINE,

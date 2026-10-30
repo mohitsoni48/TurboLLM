@@ -113,8 +113,9 @@ export function runRoutineNow(id: string): Promise<{ ok: true }> {
  *  when the response is written. Refetch {@link listRoutineRuns} for the new state. Throws
  *  ApiError 'not_found' (404), 'internal_error' (500), a 409 carrying resumeRoutineRun's own
  *  code ('not_stalled' / 'gate_timeout' / 'model_busy' / 'model_unavailable' /
- *  'corrupt_pending_call'), or 'unauthorized' (401) for a code-flavor routine from a non-host
- *  device without a key (routine-routes.ts's codeGateBlocks). */
+ *  'corrupt_pending_call', or 'no_pending_call' for a terminal routine's run, which it closes),
+ *  or 'unauthorized' (401) for a code-flavor routine from a non-host device without a key
+ *  (routine-routes.ts's codeGateBlocks). */
 export function approveRoutineRun(routineId: string, runId: string): Promise<{ ok: true }> {
   return req(`/api/v1/routines/${encodeURIComponent(routineId)}/runs/${encodeURIComponent(runId)}/approve`, { method: 'POST' })
 }

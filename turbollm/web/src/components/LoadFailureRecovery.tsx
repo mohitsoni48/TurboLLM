@@ -18,7 +18,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Button } from './ui/button'
-import { recoveryFor, type RecoveryAction, type RecoveryActionId } from '../screens/onboarding/recovery'
+import { recoveryFor, recoveryForUnexpectedModel, type RecoveryAction, type RecoveryActionId } from '../screens/onboarding/recovery'
 import type { LoadFailure } from '../lib/types'
 import { trackRecovery } from '../lib/api'
 
@@ -53,6 +53,10 @@ export interface LoadFailureRecoveryProps {
    *  stay separable in the data. */
   onRetry?: () => Promise<boolean>
   onShowLaunchCommand?: () => void
+  /** False when the engine was not expected to load the model (EngineError.expectedToLoad): the remedies of the
+   *  failure's class (re-download the model, an engine update) do not apply, so only a different model and a retry are
+   *  offered, and the row says why. */
+  expectedToLoad?: boolean
 }
 
 export function LoadFailureRecovery({
@@ -60,10 +64,11 @@ export function LoadFailureRecovery({
   launchCommand,
   onRetry,
   onShowLaunchCommand,
+  expectedToLoad = true,
 }: LoadFailureRecoveryProps) {
   const navigate = useNavigate()
   const [busy, setBusy] = useState<RecoveryActionId | null>(null)
-  const actions = recoveryFor(failure)
+  const actions = expectedToLoad ? recoveryFor(failure) : recoveryForUnexpectedModel()
 
   async function run(action: RecoveryAction) {
     if (busy) return
@@ -132,10 +137,14 @@ export function LoadFailureRecovery({
           {busy === action.id ? 'Working…' : action.label}
         </Button>
       ))}
-      {failure === 'other' && launchCommand && (
-        <span className="text-[12px] text-muted">
-          No specific cause detected — the launch command usually shows why.
-        </span>
+      {expectedToLoad ? (
+        failure === 'other' && launchCommand && (
+          <span className="text-[12px] text-muted">
+            No specific cause detected — the launch command usually shows why.
+          </span>
+        )
+      ) : (
+        <span className="text-[12px] text-muted">The selected engine isn&apos;t expected to load this model.</span>
       )}
     </div>
   )

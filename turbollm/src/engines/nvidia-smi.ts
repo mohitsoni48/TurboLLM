@@ -5,10 +5,11 @@
 // A leaf module on purpose. cuda-provision.ts imports download.ts (downloadFile /
 // extractArchive), so hosting these in cuda-provision.ts would close a cycle the moment
 // download.ts needed them — the shape import-cycles.test.ts exists to catch.
-import { execFile } from 'node:child_process'
-import { promisify } from 'node:util'
+import { tetheredExecFile } from '../util/tether'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a probe's timeout is a daemon timer, so one the daemon does not live to see
+// ended only by itself.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 /** PURE: the driver's max CUDA version from `nvidia-smi`'s header, or null. Older drivers
  *  print "CUDA Version: 13.0"; 600-series drivers print "CUDA UMD Version: 13.4". */

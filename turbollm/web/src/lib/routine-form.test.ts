@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { describeScheduleRule, emptyRoutineDraft, isRoutineDraftComplete, routineToDraft } from './routine-form'
+import { describeScheduleRule, emptyRoutineDraft, isRoutineDraftComplete, routineToDraft, ROUTINE_MAX_INTERVAL_MS } from './routine-form'
 import type { Routine } from './routine-types'
 
 describe('describeScheduleRule', () => {
@@ -58,6 +58,16 @@ describe('isRoutineDraftComplete', () => {
     const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }
     expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: Infinity } })).toBe(false)
     expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: NaN } })).toBe(false)
+  })
+  // validateScheduleRule refuses an everyMs over a year with a 400 (src/routines/schedule.ts's
+  // ROUTINE_MAX_INTERVAL_MS), so a gate that let one through would enable a submit the server
+  // answers with that 400.
+  it('an interval longer than a year is incomplete — validateScheduleRule rejects it with a 400', () => {
+    const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }
+    expect(ROUTINE_MAX_INTERVAL_MS).toBe(31_536_000_000)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: ROUTINE_MAX_INTERVAL_MS } })).toBe(true)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: ROUTINE_MAX_INTERVAL_MS + 1 } })).toBe(false)
+    expect(isRoutineDraftComplete({ ...d, scheduleRule: { kind: 'interval', everyMs: 1e16 } })).toBe(false)
   })
   it('an out-of-range or non-integer hour/minute is incomplete on daily and weekly rules', () => {
     const d = { ...emptyRoutineDraft(), prompt: 'x', modelKey: 'm', agentId: 'a' }

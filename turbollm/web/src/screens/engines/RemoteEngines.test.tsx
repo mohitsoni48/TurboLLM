@@ -99,6 +99,29 @@ describe('RemoteEngines', () => {
     expect(screen.getByText(/Qwen3-35B/)).toBeTruthy()
   })
 
+  // The row named the host's selected engine (`name`), so a model another engine ran there (an install or Enable on
+  // the host activates an engine without stopping the model) read as running on the selected one.
+  it('names the engine running the host\'s model when it is not the host\'s selected one', () => {
+    renderWith([online], {
+      l1: {
+        engine: { id: 'kobold', name: 'KoboldCpp', kind: 'koboldcpp', state: 'running', port: 8080, pid: 1, servingId: 'litert', servingKind: 'litert-lm', servingName: 'LiteRT-LM' },
+        model: { key: 'k', name: 'Gemma 3n', quant: 'INT4', ctx: 4096, vision: false },
+      },
+    })
+    expect(screen.getByText('LiteRT-LM · running · Gemma 3n (INT4)')).toBeTruthy()
+    expect(screen.queryByText(/KoboldCpp/)).toBeNull()
+  })
+
+  it('names the host\'s engine when it runs the model itself', () => {
+    renderWith([online], {
+      l1: {
+        engine: { id: 'kobold', name: 'KoboldCpp', kind: 'koboldcpp', state: 'running', port: 8080, pid: 1, servingId: 'kobold', servingKind: 'koboldcpp', servingName: 'KoboldCpp' },
+        model: { key: 'k', name: 'Gemma 3', quant: 'Q4_K_M', ctx: 4096, vision: false },
+      },
+    })
+    expect(screen.getByText('KoboldCpp · running · Gemma 3 (Q4_K_M)')).toBeTruthy()
+  })
+
   it('explains an unreachable machine instead of spinning forever', () => {
     // `LinkClient` never throws by contract and the routes honour it, so an offline machine
     // must DEGRADE — a reason on screen, not a spinner that never resolves.

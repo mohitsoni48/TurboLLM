@@ -27,6 +27,7 @@ import { DownloadTargetMenu } from '../../components/fleet'
 import { describeRemoteFailure } from '../../lib/remote-failure'
 import type { FitVerdict, HfCheckpoint, HfRepoDetail, HfRepoFile } from '../../lib/types'
 import { downloadSubdir } from '../../lib/download-subdir'
+import { sayIfAlreadyListed } from '../../lib/download-listed'
 import { gpuBudgetMb } from '../../lib/vram'
 import { Badge } from '../../components/ui/badge'
 import { Button } from '../../components/ui/button'
@@ -151,11 +152,22 @@ export function HfRepoContent({
   // picked (e.g. once starting a download flips the badges). `lastRepo` tracks which repo
   // the current selection belongs to; it is updated for every repo, GGUF ones included, so
   // returning to a bundle repo after a GGUF one still resets.
+  //
+  // The same fresh-reference problem applies to a GGUF quant the user picked: `userPicked`
+  // keeps it (while it's still listed) instead of snapping back to the auto-pick when the
+  // verifying poll settles or the repo refetches. Until the user picks, the auto-pick keeps
+  // re-running — e.g. once the GPU's VRAM is known.
   const lastRepo = useRef<string | null>(null)
+  const userPicked = useRef(false)
+  const pickQuant = (name: string) => {
+    userPicked.current = true
+    setSelected(name)
+  }
   useEffect(() => {
     if (!detail) return
     const repoChanged = lastRepo.current !== detail.repo
     lastRepo.current = detail.repo
+    if (repoChanged) userPicked.current = false
     const ggufs = detail.files.filter((f) => !f.mmproj)
     if (ggufs.length === 0) return
     if (isLitertlm) {
@@ -171,7 +183,7 @@ export function HfRepoContent({
       const bK = /q\d_k/i.test(b.quant) ? 0 : 1
       return aK - bK
     })[0]
-    setSelected(best.name)
+    setSelected((cur) => (userPicked.current && ggufs.some((f) => f.name === cur) ? cur : best.name))
   }, [detail, vramMb, isLitertlm])
 
   // Quant options sorted by size (smallest → largest) so the listing reads in a
@@ -237,7 +249,12 @@ export function HfRepoContent({
         // it open while browsing" per this file's own convention above) — closing here
         // used to kick the user out of DiscoverTab's permanent detail pane on every
         // download, and out of the Sheet before they could pick another quant to queue.
-        onSuccess: () => { toast.success(`Downloading ${selectedFile.name}`) },
+        // A quant already in the download list queued nothing new: say so (a paused one has
+        // just been resumed by the mutation) rather than "Downloading" as if it had started.
+        onSuccess: (out) => {
+          if (out.downloads.length === 0 && out.existing.length > 0) sayIfAlreadyListed(out)
+          else toast.success(`Downloading ${selectedFile.name}`)
+        },
       },
     )
   }
@@ -248,10 +265,35 @@ export function HfRepoContent({
    *  encoder/tokenizer/multilingual layout) keeps that structure instead of every file
    *  flattening to `<repoName>/<basename>` and colliding. `toastLabel` is what the user reads —
    *  `repoName` for a whole-repo download, or the picked checkpoint's own folder. */
-  const queueInto = (repoName: string, files: HfRepoFile[], toastLabel: string) => {
+  const queueInto = async (repoName: string, files: HfRepoFile[], toastLabel: string) => {
     if (!detail) return
-    for (const f of files) {
-      dlMut.enqueue.mutate({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir: downloadSubdir(repoName, f.name) })
+    // Wait for every request to settle: the daemon refuses files one by one (insufficient_disk
+    // on the big shards only, no_model_dir on all of them), and neither body renders the
+    // mutation's error — reporting success up front hid every refusal behind a closed panel
+    // and left an incomplete model folder. `mutateAsync`, because `mutate()`'s own callbacks
+    // only fire for the last of several concurrent calls.
+    //
+    // Every request carries the whole folder (`folder`), each file by where its own request puts
+    // it and its size: the daemon checked free disk against each file's own size, so three 18 GB
+    // shards on a disk with 30 GB free were all queued, with "Queued 3 files", for a folder that
+    // could never finish. Checked against the total of its files not already downloading, as a
+    // split GGUF's shards are, a folder that does not fit has none of its files queued and every
+    // request comes back insufficient_disk. By file, not by the folder's path: a root
+    // checkpoint's own files sit next to every nested checkpoint's folder.
+    const placed = files.map((f) => ({ f, subdir: downloadSubdir(repoName, f.name) }))
+    const folder = { files: placed.map(({ f, subdir }) => ({ path: `${subdir}/${f.name.slice(f.name.lastIndexOf('/') + 1)}`, size: f.sizeBytes })) }
+    const results = await Promise.allSettled(
+      placed.map(({ f, subdir }) =>
+        dlMut.enqueue.mutateAsync({ repo: detail.repo, rfilename: f.name, size: f.sizeBytes, sha256: f.sha256, subdir, folder }),
+      ),
+    )
+    const failed = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+    if (failed.length > 0) {
+      const reason: unknown = failed[0].reason
+      toast.error(
+        `${failed.length} of ${files.length} files could not be queued for ${toastLabel}: ${reason instanceof Error ? reason.message : String(reason)}`,
+      )
+      return
     }
     toast.success(`Queued ${files.length} files for ${toastLabel}`)
     onClose()
@@ -261,7 +303,7 @@ export function HfRepoContent({
   const onDownloadSafetensors = () => {
     if (!detail?.safetensors || !detail.files.length) return
     const repoName = detail.repo.split('/').pop() ?? detail.repo
-    queueInto(repoName, detail.files, repoName)
+    void queueInto(repoName, detail.files, repoName)
   }
 
   /** One checkpoint folder lands in its own subdirectory; a root checkpoint keeps today's
@@ -269,7 +311,7 @@ export function HfRepoContent({
   const onDownloadCheckpoint = (cp: HfCheckpoint) => {
     if (!detail) return
     const repoName = detail.repo.split('/').pop() ?? detail.repo
-    queueInto(repoName, cp.files, cp.dir ? `${repoName}/${cp.dir}` : repoName)
+    void queueInto(repoName, cp.files, cp.dir ? `${repoName}/${cp.dir}` : repoName)
   }
 
   const onLoad = () => {
@@ -359,7 +401,7 @@ export function HfRepoContent({
                 <span className="text-[11px] font-normal text-faint">· checking your library…</span>
               )}
             </label>
-            <QuantDropdown files={ggufFiles} selected={selected} onSelect={setSelected} vramMb={vramMb} />
+            <QuantDropdown files={ggufFiles} selected={selected} onSelect={pickQuant} vramMb={vramMb} />
           </div>
 
           {/* VRAM verdict line — a GGUF signal only: it estimates from the file size, and a

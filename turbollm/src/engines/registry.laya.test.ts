@@ -1,6 +1,7 @@
 // The Laya engine serves only Laya models, which load on it whatever engine is active — so registering it must
 // never make it the active engine, or every chat model would stop loading.
 import assert from 'node:assert/strict'
+import { readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { ConfigStore, type Engine } from '../config/config'
@@ -87,7 +88,7 @@ test('activate refuses the Laya engine and leaves the active engine as it was', 
 })
 
 // The Opus review of v1.14.1: two fallbacks made the first engine active without going through activate(), so the
-// Laya engine could become active by removing the engine before it.
+// Laya engine could become active by removing the engine before it. Removing the active engine now selects none.
 test('removing the active engine never makes the Laya engine active', () => {
   const store = ConfigStore.load(join(tmpDir('tllm-laya-registry-'), 'config.json'))
   const llama: Engine = {
@@ -104,7 +105,8 @@ test('removing the active engine never makes the Laya engine active', () => {
   store.update((c) => { c.engines.push(other) })
   assert.deepEqual(reg.list().engines.map((e) => e.kind), ['llama-server', 'laya', 'llama-server'])
   reg.remove(llama.id)
-  assert.equal(reg.list().activeEngineId, other.id, 'the next engine that can be active, not the Laya one')
+  assert.equal(reg.list().activeEngineId, '', 'no engine is selected: neither the Laya one nor the next one')
+  reg.activate(other.id)
   reg.remove(other.id)
   assert.equal(reg.list().activeEngineId, '', 'with only the Laya engine left there is no active engine')
   assert.equal(reg.layaEngine()?.id, laya.id)
@@ -121,5 +123,10 @@ test('a config whose active engine id is empty does not load with the Laya engin
     ] as Engine[]
     c.activeEngineId = ''
   })
+  assert.equal(ConfigStore.load(path).snapshot().activeEngineId, '', 'an empty selection stays empty')
+  // A file with no selection on record starts on the first engine that can be active, not the Laya one.
+  const raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>
+  delete raw.activeEngineId
+  writeFileSync(path, JSON.stringify(raw))
   assert.equal(ConfigStore.load(path).snapshot().activeEngineId, 'llama')
 })

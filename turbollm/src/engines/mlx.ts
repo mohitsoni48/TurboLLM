@@ -7,12 +7,13 @@
 // Runtime is macOS-only (mlx-lm needs Apple Metal). The uv *bootstrap* is
 // cross-platform and independently testable; `ensureMlxEnv` guards on darwin.
 import { existsSync, mkdirSync, rmSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { downloadFile, extractArchive, findFile, type ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 // Pinned uv release (astral-sh/uv). Bump deliberately.
 export const UV_VERSION = '0.11.21'
@@ -92,6 +93,8 @@ export async function ensureMlxEnv(root: string, onProgress?: (p: ProvisionProgr
     } catch { /* treat as incompatible — will recreate */ }
     if (!compatible) rmSync(envDir, { recursive: true, force: true })
   }
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
@@ -110,13 +113,14 @@ export async function ensureMlxEnv(root: string, onProgress?: (p: ProvisionProgr
   // Install (or no-op if already satisfied) mlx-lm into the venv.
   // `--upgrade` forces an upgrade to the latest release when requested.
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['--upgrade'] : []), 'mlx-lm']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '--upgrade', reinstall }), 'mlx-lm']
   await execFileP(uv, installArgs, {
     cwd: root,
     maxBuffer: 16 * 1024 * 1024,
   })
 
   const version = await probeMlx(py)
+  finishPyEnvInstall(envDir)
   return { python: py, version }
 }
 

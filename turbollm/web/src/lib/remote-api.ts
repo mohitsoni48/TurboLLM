@@ -27,6 +27,15 @@ export interface RemoteStatus {
   state: RemoteState
   url: string
   ingressPort: number | null
+  /** The loopback port the ingress listens on whenever remote access is on, known while off
+   *  too: the one a self-run tunnel ("I run my own") must point at. Not settings'
+   *  `remoteAccess.ingressPort`, which `--port` can leave naming the main port. Null when the
+   *  daemon has no remote access, or while the main listener holds it (Settings moved this app's
+   *  port onto it; a restart gives remote access another); optional only so the many status
+   *  fixtures can leave it out. */
+  tunnelTargetPort?: number | null
+  /** The port the main listener is really bound to, which a tunnel must never point at. */
+  mainPort?: number | null
 }
 
 /** Is this provider reachable by anyone on the internet?

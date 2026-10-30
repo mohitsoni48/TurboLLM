@@ -215,7 +215,7 @@ test('provisionTurboquant: installs the CUDA build for an NVIDIA box and records
   })
   const calls = fakeGithub(t, RELEASES, archive)
 
-  const bin = await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, hw({}))
+  const bin = await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, { hw: hw({}) })
   assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server'))
   assert.ok(calls.includes('https://dl.example/b10298-2.0.0/llama-turboquant-linux-x64-cuda-13.3.tar.gz'))
   const marker = JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8'))
@@ -225,7 +225,7 @@ test('provisionTurboquant: installs the CUDA build for an NVIDIA box and records
 
   // Second call: fast path, no network.
   calls.length = 0
-  assert.equal(await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, hw({})), bin)
+  assert.equal(await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, { hw: hw({}) }), bin)
   assert.deepEqual(calls, [])
 })
 
@@ -242,7 +242,7 @@ test('provisionTurboquant: a marker-less CUDA install missing its runtime is rei
   })
   const calls = fakeGithub(t, RELEASES, archive)
 
-  await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, hw({}))
+  await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, { hw: hw({}) })
   assert.ok(calls.some((u) => u.includes('/releases?')), 'resolved and downloaded again')
   assert.ok(existsSync(join(binDir, 'libcudart.so.13')))
 })
@@ -254,7 +254,7 @@ test('provisionTurboquant: a marker-less legacy Vulkan install is kept (and back
   writeFileSync(join(binDir, 'llama-server'), '')
   const calls = fakeGithub(t, RELEASES, Buffer.alloc(0))
 
-  assert.equal(await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, hw({})), join(binDir, 'llama-server'))
+  assert.equal(await provisionTurboquant(root, 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined, { hw: hw({}) }), join(binDir, 'llama-server'))
   assert.deepEqual(calls, [])
   assert.ok(existsSync(join(root, 'turboquant', '.turbollm-provisioned')))
 })
@@ -263,7 +263,7 @@ test('provisionTurboquant: no matching build → no_release_asset', async (t) =>
   fakeGithub(t, RELEASES, Buffer.alloc(0))
   await assert.rejects(
     provisionTurboquant(tmpDir('tllm-tq-'), 'AtomicBot-ai/atomic-llama-cpp-turboquant', undefined, undefined,
-      hw({ platform: 'darwin', arch: 'x64', vendor: 'amd' })),
+      { hw: hw({ platform: 'darwin', arch: 'x64', vendor: 'amd' }) }),
     /no_release_asset/,
   )
 })
@@ -280,7 +280,7 @@ test('provisionTurboquant: a failed release lookup leaves the existing install a
   t.after(() => { globalThis.fetch = realFetch })
   globalThis.fetch = (async () => { throw new Error('getaddrinfo ENOTFOUND') }) as typeof fetch
 
-  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, hw({})), /ENOTFOUND/)
+  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) }), /ENOTFOUND/)
   assert.ok(existsSync(join(binDir, 'llama-server')), 'the interrupted install survived the failed lookup')
 })
 
@@ -291,12 +291,12 @@ test('provisionTurboquant: the update path re-installs over a complete install i
     'build/bin/libcudart.so.13': '',
   })
   const calls = fakeGithub(t, RELEASES, archive)
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) })
 
   calls.length = 0
-  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, hw({})), bin, 'without force it is a no-op')
+  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) }), bin, 'without replace it is a no-op')
   assert.deepEqual([...calls], [])
-  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, hw({}), true), bin, 'forced re-install')
+  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}), replace: true }), bin, 'forced re-install')
   assert.ok(calls.some((u) => u.endsWith('llama-turboquant-linux-x64-cuda-13.3.tar.gz')), 'so the newest release is fetched again')
 })
 
@@ -310,7 +310,7 @@ test('provisionTurboquant: a forced update whose release lookup fails keeps the 
   t.after(() => { globalThis.fetch = realFetch })
   globalThis.fetch = (async () => { throw new Error('getaddrinfo ENOTFOUND') }) as typeof fetch
 
-  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, hw({}), true), /ENOTFOUND/)
+  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}), replace: true }), /ENOTFOUND/)
   assert.ok(existsSync(join(binDir, 'llama-server')), 'the update failed, but the old build is still installed')
 })
 
@@ -321,20 +321,20 @@ test('provisionTurboquant: a forced update that fails on EVERY candidate keeps t
     'build/bin/libcudart.so.13': '',
   })
   fakeGithub(t, RELEASES, archive)
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) })
   const marker = readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')
 
   // Every candidate now serves bytes that are not an archive, so each one fails after the
   // download — the shape a truncated release, a bad mirror or a checksum mismatch takes.
   fakeGithub(t, RELEASES, Buffer.from('not an archive at all'))
   await assert.rejects(
-    provisionTurboquant(root, REPO, undefined, undefined, hw({}), true),
+    provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}), replace: true }),
     /no TurboQuant build for this machine worked/,
   )
   assert.ok(existsSync(bin), 'the registry still points here — the failed update must not have deleted it')
   assert.equal(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8'), marker, 'and the old marker is intact')
   assert.deepEqual(readdirSync(join(root, 'build')).filter((d) => d.startsWith('.turboquant-')), [], 'no staging dir is left behind')
-  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, hw({})), bin, 'the intact install is still the fast path')
+  assert.equal(await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) }), bin, 'the intact install is still the fast path')
 })
 
 for (const [how, script] of [
@@ -349,7 +349,7 @@ for (const [how, script] of [
     })
     const calls = fakeGithub(t, RELEASES, (u) => (u.includes('cuda-13.3') ? broken : works))
 
-    const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+    const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) })
     assert.ok(calls.some((u) => u.endsWith('llama-turboquant-linux-x64-cuda-13.3.tar.gz')), 'tried the preferred build first')
     assert.ok(calls.some((u) => u.endsWith('llama-turboquant-linux-x64-cuda-12.4.tar.gz')), 'fell through to the next candidate')
     assert.ok(!calls.some((u) => u.includes('vulkan')), 'and stopped at the first build that works')
@@ -368,7 +368,7 @@ test('provisionTurboquant: a single-candidate machine keeps its build even when 
   })
   fakeGithub(t, RELEASES, archive)
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'darwin', arch: 'arm64', vendor: 'apple' }))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ platform: 'darwin', arch: 'arm64', vendor: 'apple' }) })
   assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server'))
 })
 
@@ -381,7 +381,7 @@ test('provisionTurboquant: a machine whose every GPU build is dead ends on the C
   })
   const calls = fakeGithub(t, RELEASES, archive)
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({}))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({}) })
   for (const name of ['linux-x64-cuda-13.3', 'linux-x64-cuda-12.4', 'linux-x64-vulkan', 'linux-x64-cpu']) {
     assert.ok(calls.some((u) => u.endsWith(`llama-turboquant-${name}.tar.gz`)), `tried ${name}`)
   }
@@ -410,7 +410,7 @@ test('provisionTurboquant: replaces a build this machine can no longer run', uni
     'build/bin/llama-server': fakeServer('Available devices:', '  Vulkan0: Fake GPU (100 MiB, 90 MiB free)'),
   }))
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ vendor: 'amd', driverCuda: null }))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ vendor: 'amd', driverCuda: null }) })
   assert.ok(calls.some((u) => u.includes('linux-x64-vulkan.tar.gz')), 'a CUDA install on an AMD box is replaced')
   assert.equal(JSON.parse(readFileSync(join(root, 'turboquant', '.turbollm-provisioned'), 'utf8')).variant, 'linux-x64-vulkan')
   assert.equal(bin, join(binDir, 'llama-server'))
@@ -430,7 +430,7 @@ test('provisionTurboquant: the Windows CUDA 13.3 runtime pack is resolved from i
   }
   const calls = fakeGithub(t, RELEASES, (u) => (u.includes('cudart') ? pack : main), [asset])
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32' }))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ platform: 'win32' }) })
   // URL (and digest) come from the API for the pack's pinned tag — not from a hand-built path
   // hanging off LLAMA_BUILD, whose next bump would have 404'd this with nothing to catch it.
   assert.ok(calls.some((u) => u.includes('/releases/tags/b9608')), 'the pack is resolved from its pinned tag')
@@ -453,7 +453,7 @@ test('provisionTurboquant: a release asset whose published sha256 does not match
     }],
   }], archive)
 
-  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, hw({ driverCuda: '12.2' })), /checksum_failed/)
+  await assert.rejects(provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ driverCuda: '12.2' }) }), /checksum_failed/)
 })
 
 // ─── release ordering ────────────────────────────────────────────────────────
@@ -573,7 +573,7 @@ test('provisionTurboquant: extracts a real Windows .zip and finds llama-server.e
   })
   fakeGithub(t, RELEASES, zip)
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32', driverCuda: '12.2' }))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ platform: 'win32', driverCuda: '12.2' }) })
   assert.equal(bin, join(root, 'turboquant', 'build', 'bin', 'llama-server.exe'))
   assert.ok(existsSync(join(root, 'turboquant', 'build', 'bin', 'ggml-vulkan.dll')))
   assert.equal(
@@ -597,7 +597,7 @@ test('provisionTurboquant: a Windows build whose backend never loads falls throu
   }
   const calls = fakeGithub(t, RELEASES, zip, [pack])
 
-  const bin = await provisionTurboquant(root, REPO, undefined, undefined, hw({ platform: 'win32' }))
+  const bin = await provisionTurboquant(root, REPO, undefined, undefined, { hw: hw({ platform: 'win32' }) })
   assert.ok(calls.includes(pack.browser_download_url), 'the separate CUDA runtime pack was fetched')
   for (const name of ['windows-x64-cuda-13.3', 'windows-x64-cuda-12.4', 'windows-x64-vulkan', 'windows-x64-cpu']) {
     assert.ok(calls.some((u) => u.endsWith(`llama-turboquant-${name}.zip`)), `tried ${name}`)

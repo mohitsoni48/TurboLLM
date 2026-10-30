@@ -85,6 +85,10 @@ export function RemoteAccessSection() {
   const [tokenCaps, setTokenCaps] = useState<Set<LinkCapability>>(new Set(LINK_PRESETS.inference))
   const [revealedToken, setRevealedToken] = useState<string | null>(null)
 
+  // A provider row expanded only to READ its pros/cons while remote access is on —
+  // see selectProvider: the saved provider never changes under a live tunnel.
+  const [viewing, setViewing] = useState<RemoteProviderId | null>(null)
+
   useEffect(() => {
     const ra = settingsQ.data?.remoteAccess
     if (!ra || seeded) return
@@ -111,7 +115,18 @@ export function RemoteAccessSection() {
   }
 
   const selectProvider = (p: RemoteProviderId) => {
+    // Never switch the saved provider under a live tunnel. The running tunnel keeps serving
+    // its own URL, but the chip, the daemon's next auto-restart and its Tailscale-identity
+    // trust all read the SAVED provider — so a switch could publish the box with no
+    // ExposureConfirmDialog, or trust Tailscale headers arriving over a public URL. While on,
+    // a click only expands the row so it can still be read; switching needs a stop first.
+    if (isOn) {
+      setViewing(p === provider ? null : p)
+      return
+    }
+    setViewing(null)
     if (p === provider) return
+    const prev = provider
     setProvider(p)
     setPreflight(null)
     track('settings', 'select_remote_provider')
@@ -124,7 +139,13 @@ export function RemoteAccessSection() {
         // has to tolerate. Refetching status the moment the save actually lands closes that
         // window down to a single round trip instead of leaving it open for the full 6s.
         onSuccess: () => void statusQ.refetch(),
-        onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the provider.'),
+        // A refused save (e.g. the daemon's 409 for a tunnel that started after the last
+        // status poll) must not leave the radio naming a provider that was never saved.
+        onError: (e) => {
+          setProvider((cur) => (cur === p ? prev : cur))
+          void statusQ.refetch()
+          toast.error(e instanceof ApiError ? e.message : 'Could not save the provider.')
+        },
       },
     )
     // Preflighting happens in the effect below, keyed on `provider` — not here — so a
@@ -166,11 +187,19 @@ export function RemoteAccessSection() {
   }
 
   const saveTailscalePort = (port: number) => {
+    const prev = tsPort
     setTsPort(port)
     track('settings', 'save_remote_tailscale_port')
     save.mutate(
       { remoteAccess: { tailscale: { port } } },
-      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the Tailscale port.') },
+      {
+        // The drafts above are seeded once and never re-synced, so a failed save has to put
+        // the old value back itself — else the screen shows a port the next tunnel won't use.
+        onError: (e) => {
+          setTsPort((cur) => (cur === port ? prev : cur))
+          toast.error(e instanceof ApiError ? e.message : 'Could not save the Tailscale port.')
+        },
+      },
     )
   }
 
@@ -192,11 +221,20 @@ export function RemoteAccessSection() {
     // back to models:use server-side anyway, so an empty picker would silently diverge from
     // what the next token actually gets.
     const caps = next.size ? Array.from(next) : (['models:use'] as LinkCapability[])
-    setTokenCaps(new Set(caps))
+    const prev = tokenCaps
+    const applied = new Set(caps)
+    setTokenCaps(applied)
     track('settings', 'save_remote_token_grant')
     save.mutate(
       { remoteAccess: { tokenGrant: { capabilities: caps } } },
-      { onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save the token permissions.') },
+      {
+        // Same as saveTailscalePort: revert on failure, or the checkboxes would show a grant
+        // the next minted token won't get. Only if no later toggle has replaced this one.
+        onError: (e) => {
+          setTokenCaps((cur) => (cur === applied ? prev : cur))
+          toast.error(e instanceof ApiError ? e.message : 'Could not save the token permissions.')
+        },
+      },
     )
   }
 
@@ -349,7 +387,7 @@ export function RemoteAccessSection() {
               <CopyButton text={revealedToken} screen="settings" />
             </div>
             <p className="mt-2 text-[11px] text-faint">
-              Shown once — it cannot be recovered. Manage or revoke it in Developer → API Keys.
+              Shown once — it cannot be recovered. Manage or revoke it in Customize → Connect → API keys.
             </p>
           </div>
         )}
@@ -365,6 +403,9 @@ export function RemoteAccessSection() {
           {PROVIDER_IDS.map((id) => {
             const card = PROVIDER_CARDS[id]
             const selected = provider === id
+            // Gated on isOn too: once the tunnel stops, a row opened only to read collapses
+            // and a click on it selects it normally.
+            const viewedOnly = isOn && !selected && viewing === id
             const checking = preflightingFor === id
             const reason =
               preflight?.provider === id && (preflight.state.kind === 'unavailable' || preflight.state.kind === 'needs-setup')
@@ -400,8 +441,11 @@ export function RemoteAccessSection() {
                   </span>
                 </button>
 
-                {selected && (
+                {(selected || viewedOnly) && (
                   <div className="border-t border-border px-3 pb-3 pt-2.5">
+                    {viewedOnly && (
+                      <div className="mb-2 text-[12px] text-faint">Turn remote access off to switch to this provider.</div>
+                    )}
                     <div className="grid grid-cols-1 gap-x-4 gap-y-2 sm:grid-cols-2">
                       <div>
                         <div className="text-[11px] font-semibold" style={{ color: 'var(--ok)' }}>Pros</div>
@@ -427,13 +471,17 @@ export function RemoteAccessSection() {
                       </div>
                     </div>
 
-                    {checking && !reason && (
+                    {/* A row opened only to read (viewedOnly) shows its pros/cons and the hint and
+                        nothing else: no preflight result, and no provider fields — those would
+                        duplicate the selected row's element ids and save a provider that isn't the
+                        one in use. */}
+                    {selected && checking && !reason && (
                       <div className="mt-3 flex items-center gap-1.5 text-[12px] text-faint">
                         <Loader2 size={12} className="animate-spin" /> Checking…
                       </div>
                     )}
 
-                    {reason && (
+                    {selected && reason && (
                       <div
                         className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-md border p-2"
                         style={{ borderColor: 'color-mix(in srgb, var(--err) 40%, var(--border))', background: 'color-mix(in srgb, var(--err) 8%, transparent)' }}
@@ -448,7 +496,7 @@ export function RemoteAccessSection() {
                       </div>
                     )}
 
-                    {id === 'cloudflare-named' && (
+                    {selected && id === 'cloudflare-named' && (
                       <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
                         <label className="text-[12px] text-muted" htmlFor="remote-cf-token">Tunnel token</label>
                         <input
@@ -476,7 +524,7 @@ export function RemoteAccessSection() {
                       </div>
                     )}
 
-                    {id === 'ngrok' && (
+                    {selected && id === 'ngrok' && (
                       <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
                         <label className="text-[12px] text-muted" htmlFor="remote-ngrok-token">Authtoken</label>
                         <input
@@ -504,7 +552,7 @@ export function RemoteAccessSection() {
                       </div>
                     )}
 
-                    {(id === 'tailscale-serve' || id === 'tailscale-funnel') && (
+                    {selected && (id === 'tailscale-serve' || id === 'tailscale-funnel') && (
                       <div className="mt-3 flex items-center gap-2 border-t border-border pt-3">
                         <label className="text-[12px] text-muted" htmlFor="remote-ts-port">Port</label>
                         <select
@@ -518,8 +566,45 @@ export function RemoteAccessSection() {
                       </div>
                     )}
 
-                    {id === 'custom' && (
+                    {selected && id === 'custom' && (
                       <div className="mt-3 flex flex-col gap-2 border-t border-border pt-3">
+                        {/* This option used to ask only for the URL and never say where the tunnel
+                            goes. The obvious guess, the port this page is open on, is the main
+                            listener, where a tunnel or proxy that rewrites Host to 127.0.0.1 gets
+                            loopback trust: every visitor is the owner at this machine, no key. The
+                            ports come from the daemon's status, not settings: settings'
+                            remoteAccess.ingressPort is not the bound one under --port (6997 there
+                            is the main port, the ingress moved to 6996). The daemon answers null
+                            for it while this app's own port was moved onto the remote-access one
+                            in Settings (that port is fixed until a restart), where naming it would
+                            name the main port. */}
+                        <p className="text-[12px] text-muted">
+                          {status?.tunnelTargetPort === null ? (
+                            <>
+                              Restart TurboLLM before you point a tunnel here: this app's own port was moved onto the one
+                              remote access uses, and remote access gets another, named here, only after a restart.
+                            </>
+                          ) : (
+                            <>
+                              Point your tunnel at{' '}
+                              {status?.tunnelTargetPort ? (
+                                <span className="font-mono text-ink">http://127.0.0.1:{status.tunnelTargetPort}</span>
+                              ) : (
+                                "this machine's remote-access port (shown here once its status loads)"
+                              )}
+                              . That port listens only while remote access is on, and everything arriving there is
+                              treated as coming from the internet.
+                            </>
+                          )}
+                        </p>
+                        <p className="flex gap-1.5 text-[12px]" style={{ color: 'var(--warn)' }}>
+                          <AlertTriangle size={13} className="mt-px shrink-0" />
+                          <span>
+                            Never point it at {status?.mainPort ? `port ${status.mainPort}, this app's own port` : "this app's own port"}:
+                            a tunnel or proxy that rewrites the Host header (nginx does by default) makes every visitor
+                            look like you at this machine, with full control and no key.
+                          </span>
+                        </p>
                         <label className="text-[12px] text-muted" htmlFor="remote-custom-url">Public URL</label>
                         <input
                           id="remote-custom-url"
@@ -549,8 +634,17 @@ export function RemoteAccessSection() {
             What the access token minted the next time you turn this on is allowed to do.
           </p>
           <p className="text-[11px] text-faint">
-            A scoped token can chat and manage conversations; it cannot see full engine/model
-            status detail or change settings.
+            A scoped token can chat with the model loaded here and manage conversations; it cannot
+            see full engine/model status detail, change settings, or load or eject a model from
+            Chat's model picker.
+          </p>
+          {/* What the two load capabilities really do for this token (auth.ts requiredCapability,
+              which maps neither /api/v1/engine/start nor /stop): offering them under the old copy
+              alone read as "this token may load models from the web UI", which nothing allows. */}
+          <p className="text-[11px] text-faint">
+            models:load lets a request to the OpenAI-compatible /v1 API load the model it names in
+            place of the loaded one, and lets the token change a model's saved load settings.
+            models:unload has no effect on this token.
           </p>
           <div className="mt-1 flex flex-col gap-1">
             {REMOTE_TOKEN_CAPABILITIES.map((cap) => (

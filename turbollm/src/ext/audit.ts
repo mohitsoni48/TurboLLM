@@ -76,17 +76,32 @@ export class AuditLog {
   // this was the one exception (final-review security recheck, live-reproduced as a real
   // cross-owner leak — same class as C1/N1 — chaining with the caller-supplied-owner design
   // into full cross-owner chat/message content disclosure via harvested owner ids + chat ids).
-  list(tenant: string, owner: string, opts: { limit?: number; since?: string }): AuditRow[] {
+  list(tenant: string, owner: string, opts: { limit?: number; since?: string; before?: string }): AuditRow[] {
     // Release-gate I3: this was the one list endpoint on the surface with no clampLimit
     // equivalent (sqlite-chat-store.ts's clampLimit is what every other list route goes
     // through) — an invalid limit (NaN from `Number('abc')` at the route layer) bound straight
     // into the SQL LIMIT clause and made node:sqlite throw, and a valid-but-huge limit was
     // honored outright, contradicting the max_page_size:200 GET /capabilities advertises.
     const limit = Number.isFinite(opts.limit) && (opts.limit as number) >= 1 ? Math.min(opts.limit as number, 200) : 200
+    // `before` is the id of the oldest row a previous page returned. With only `since` (a lower
+    // bound) and newest-first order, every request returned the same newest rows, so anything
+    // past the first page was unreachable. Resuming strictly below that row's (at, id) — not
+    // just its `at` — keeps rows that share its millisecond from being skipped or repeated.
+    // Looked up within this tenant+owner only; an unknown id (or one pruned, along with
+    // everything older) yields an empty page.
+    let cursor: { at: string; id: string } | null = null
+    if (opts.before !== undefined) {
+      const row = this.db.handle.prepare(
+        `SELECT at, id FROM ext_audit WHERE id = $id AND tenant = $t AND owner = $o`,
+      ).get({ $id: opts.before, $t: tenant, $o: owner }) as unknown as { at: string; id: string } | undefined
+      if (!row) return []
+      cursor = { at: row.at, id: row.id }
+    }
     const rows = this.db.handle.prepare(
       `SELECT * FROM ext_audit WHERE tenant = $t AND owner = $o AND ($since IS NULL OR at >= $since)
-       ORDER BY at DESC LIMIT $l`,
-    ).all({ $t: tenant, $o: owner, $since: opts.since ?? null, $l: limit }) as unknown as Array<{
+       AND ($bat IS NULL OR at < $bat OR (at = $bat AND id < $bid))
+       ORDER BY at DESC, id DESC LIMIT $l`,
+    ).all({ $t: tenant, $o: owner, $since: opts.since ?? null, $bat: cursor?.at ?? null, $bid: cursor?.id ?? null, $l: limit }) as unknown as Array<{
       id: string; tenant: string; owner: string; action: string; target_id: string | null
       request_id: string; status: number; key_prefix: string; at: string
     }>

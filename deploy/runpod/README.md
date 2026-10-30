@@ -26,9 +26,12 @@ same flag; RunPod is the first concrete recipe).
 3. **Pre-bakes** the recommended engine at image-build time (starts the daemon
    briefly, waits for it to self-seed, stops it) so a per-hour-billed pod doesn't eat
    a download on its first request.
-4. On container start: `npx turbollm --tunnel --no-open` — binds loopback-only,
+4. On container start: `turbollm --tunnel --no-open` — binds loopback-only,
    spawns a cloudflared quick tunnel, and prints the public URL + a required access
    token to the container logs.
+5. `tini` is the container's PID 1 and runs TurboLLM under it: it reaps the orphaned
+   processes TurboLLM leaves (with `npx` as PID 1 each stayed a zombie, about one a
+   second on a GPU pod while the UI is open) and passes `docker stop` on to it.
 
 ## Why `--tunnel` instead of RunPod's own HTTP proxy
 

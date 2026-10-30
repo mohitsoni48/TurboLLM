@@ -8,11 +8,12 @@
 // compiler installed in a conda env or a custom location isn't found. {@link buildEnv}
 // prepends user-configured dirs to PATH for BOTH the probe below and the real build, so
 // pointing at e.g. a conda env's bin makes `nvcc` resolve.
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
 import { delimiter, join } from 'node:path'
-import { promisify } from 'node:util'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): a probe's timeout is a daemon timer, so one the daemon does not live to see
+// ended only by itself.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 /** Build a child-process env with `toolchainDirs` prepended to PATH. Empty/blank dirs are
  *  dropped. PATH is matched case-insensitively (Windows uses `Path`); we write back to the

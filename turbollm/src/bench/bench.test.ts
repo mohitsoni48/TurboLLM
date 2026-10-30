@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, buildBenchMessages } from './bench'
+import { pickKvQuants, betterBySpeed, ttfMs, TTF_OUTPUT_TOKENS, probeVerdict, spillImproves, kvSpeedAdvisory, parseRocmVramUsed, parseRocmGttUsed, benchPromptTokens, benchSlotCtx, buildBenchMessages, parseNvidiaVramUsed, vramCardFor } from './bench'
 import { SPILL_TOLERANCE_MB } from './spill'
 
 // ---- pickKvQuants: quality-preserving KV sweep, base-first ------------------
@@ -340,6 +340,46 @@ test('parseRocmVramUsed: malformed JSON → null, never throws', () => {
   assert.equal(parseRocmVramUsed(''), null)
 })
 
+// ---- single-GPU split on a multi-GPU box: the VRAM reading must cover the SAME card as the
+// budget (gpuBudgetMb uses one card for splitMode 'none'), not the sum of every card ------------
+
+const TWO_CARDS = { os: 'linux/x64', cpu: 't', cores: 8, ramMB: 32000, gpus: [{ name: 'a', vramMb: 16376, vendor: 'nvidia' as const }, { name: 'b', vramMb: 12288, vendor: 'nvidia' as const }] }
+const SINGLE = (mainGpu: number) => ({ gpu: { splitMode: 'none' as const, tensorSplit: [], mainGpu, tensorParallelSize: 1 } })
+
+test('vramCardFor: a single-GPU split reads its main card; a layer split or one-GPU box reads the sum', () => {
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(1)), { index: 1, of: 2 })
+  assert.deepEqual(vramCardFor(TWO_CARDS, SINGLE(-1)), { index: 0, of: 2 }) // same default card as gpuBudgetMb
+  assert.equal(vramCardFor(TWO_CARDS, { gpu: { ...SINGLE(0).gpu, splitMode: 'layer' } }), undefined)
+  assert.equal(vramCardFor({ ...TWO_CARDS, gpus: TWO_CARDS.gpus.slice(0, 1) }, SINGLE(0)), undefined)
+  assert.equal(vramCardFor(TWO_CARDS), undefined)
+})
+
+test('single-GPU split: the other card\'s desktop memory no longer counts against GPU0\'s headroom', () => {
+  // 16 GB GPU0 with 13.8 GB used (2.5 GB free, above the 1 GB headroom); GPU1 drives the display.
+  const smi = '13800\n1700\n'
+  const card = vramCardFor(TWO_CARDS, SINGLE(0))
+  assert.equal(parseNvidiaVramUsed(smi, card), 13800)
+  assert.equal(probeVerdict({ outcome: 'ok', vramAbsMb: parseNvidiaVramUsed(smi, card), spillMb: null }, 16376, 1024).decision, 'fits')
+  // Without a card (layer/row split) it is still the summed pool, as before.
+  assert.equal(parseNvidiaVramUsed(smi), 15500)
+})
+
+test('parseRocmVramUsed: a single-GPU split reads only its own card', () => {
+  const memJson = JSON.stringify({
+    card0: { 'VRAM Total Used Memory (B)': '1000000000' },
+    card1: { 'VRAM Total Used Memory (B)': '2000000000' },
+  })
+  assert.equal(parseRocmVramUsed(memJson, { index: 1, of: 2 }), 2000)
+  assert.equal(parseRocmVramUsed(memJson), 3000)
+})
+
+test('per-card VRAM: a listing that does not line up with sysinfo falls back to the (conservative) sum', () => {
+  // e.g. lspci enumerated an iGPU that rocm-smi does not list — index 0 could name the wrong card.
+  assert.equal(parseNvidiaVramUsed('5000\n', { index: 0, of: 2 }), 5000)
+  assert.equal(parseNvidiaVramUsed('5000\n700\n900\n', { index: 1, of: 2 }), 6600)
+  assert.equal(parseNvidiaVramUsed('[N/A]\n'), null)
+})
+
 // ---- parseRocmGttUsed: AMD's host-backed memory, the ROCm counterpart of the WDDM shared counter
 
 test('parseRocmGttUsed: sums host-backed GTT across cards', () => {
@@ -386,6 +426,17 @@ test('benchPromptTokens: floors small ctx at 256', () => {
   assert.equal(benchPromptTokens(0), 256)
 })
 
+test('benchSlotCtx: one slot gets ctx / parallel without a unified KV cache, the whole ctx with one', () => {
+  const all = { flags: [] as string[] } // flags not probed: every flag is assumed, as profileToArgs does
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 1, kvUnified: false }, all), 32768)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, all), 32768)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: false }, all), 8192)
+  assert.equal(benchSlotCtx({ ctx: 10000, parallel: 3, kvUnified: false }, all), 3333)
+  // An engine without --kv-unified is never passed it, so its slots split the context too.
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, { flags: ['--parallel'] }), 8192)
+  assert.equal(benchSlotCtx({ ctx: 32768, parallel: 4, kvUnified: true }, { flags: ['--parallel', '--kv-unified'] }), 32768)
+})
+
 test('buildBenchMessages: small ctx needs no filler — system + the fixed question only', () => {
   const messages = buildBenchMessages(256) // benchPromptTokens(256) floors to 256 tokens ≈ 1024 chars, under the system prompt's own length
   assert.equal(messages[0].role, 'system')
@@ -408,4 +459,15 @@ test('buildBenchMessages: large ctx pads with filler user/assistant pairs to rea
 
 test('buildBenchMessages: deterministic — same ctx always produces the identical message list', () => {
   assert.deepEqual(buildBenchMessages(50_000), buildBenchMessages(50_000))
+})
+
+test('buildBenchMessages: never overshoots its target, so a 2k/4k-ctx model\'s prompt fits its window', () => {
+  // One whole filler answer is ~2.8k tokens; appended unclipped, the prompt for a 2048-ctx model
+  // came to ~3.7k tokens and llama-server rejected every candidate as exceeding the context.
+  const totalChars = (msgs: { content: string }[]) => msgs.reduce((n, m) => n + m.content.length, 0)
+  for (const ctx of [2_048, 4_096, 8_192, 32_768]) {
+    const estTokens = Math.ceil(totalChars(buildBenchMessages(ctx)) / 4) // the builder's own 4 chars/token
+    // +64: the fixed final question (~33 tokens), which the filler target does not count.
+    assert.ok(estTokens <= benchPromptTokens(ctx) + 64, `ctx ${ctx}: ~${estTokens} tokens vs target ${benchPromptTokens(ctx)}`)
+  }
 })

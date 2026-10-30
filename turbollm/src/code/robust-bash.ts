@@ -40,11 +40,26 @@ import { constants } from 'node:fs'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { getShellConfig } from '@earendil-works/pi-coding-agent'
 import type { BashOperations } from '@earendil-works/pi-coding-agent'
+import { killTetheredTree, spawnHeld, tetherPlatform } from '../util/tether'
+import { withForegroundGitGc } from '../util/git-gc'
 
 const EXIT_STDIO_GRACE_MS = 100
 
-/** Adapted from pi-coding-agent's utils/child-process.js — see module comment above. */
-function waitForChildProcess(child: ChildProcess): Promise<number | null> {
+/** Windows: what a command waits behind until its job exists (see exec below). Exported for its test. bash's `read`
+ *  takes an exported TMOUT for its timeout when it is given no -t (CIS hardening sets TMOUT=900), and a plain `read`
+ *  then let the command start TMOUT seconds in, untied. So the gate's read has a -t of a day, which keeps TMOUT out of
+ *  it in every bash (3.2, macOS's, on), TMOUT readonly or not, and is never reached: the line is written within 2 s of
+ *  the spawn (TIE_WAIT_MS in util/tether.ts), and the daemon's death gives the read EOF. Reading again after a timeout
+ *  would not do under bash 3.2, whose timed-out read returns 1, as at EOF; nor would `TMOUT= read` where TMOUT is
+ *  readonly (a BASH_ENV can make it so): the assignment fails and the read still times out. The command keeps TMOUT.
+ *  A shellPath set to a shell whose read has no -t (dash) gets the plain read after it, which waits there (dash's read
+ *  takes no TMOUT); its "Illegal option -t" goes to /dev/null, not into the command's output. At EOF the plain read
+ *  returns at once too. */
+export const TIE_GATE = 'IFS= read -t 86400 -r _ 2>/dev/null || IFS= read -r _; exec </dev/null; '
+
+/** Adapted from pi-coding-agent's utils/child-process.js — see module comment above. `graceMs`: how long the
+ *  output may stay idle once the child has exited (EXIT_STDIO_GRACE_MS, pi's own, unless a test sets another). */
+function waitForChildProcess(child: ChildProcess, graceMs = EXIT_STDIO_GRACE_MS): Promise<number | null> {
   return new Promise((resolve, reject) => {
     let settled = false
     let exited = false
@@ -76,7 +91,7 @@ function waitForChildProcess(child: ChildProcess): Promise<number | null> {
     }
     const armIdleTimer = () => {
       if (postExitTimer) clearTimeout(postExitTimer)
-      postExitTimer = setTimeout(() => finalize(exitCode), EXIT_STDIO_GRACE_MS)
+      postExitTimer = setTimeout(() => finalize(exitCode), graceMs)
     }
     const onData = () => { if (exited && !settled) armIdleTimer() }
     const onStdoutEnd = () => { stdoutEnded = true; maybeFinalizeAfterExit() }
@@ -166,18 +181,40 @@ const VERIFY_GRACE_MS = 800
 const VERIFY_POLL_MS = 100
 const FINAL_VERIFY_MS = 1500
 
-/** Kill `pid`'s whole process tree and VERIFY it actually died instead of firing-and-trusting —
+/** Whether Node has seen `child` exit. From then on its pid may name another process: Node has
+ *  reaped it (on Windows, libuv has closed the handle that kept the number from being reused). */
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null
+}
+
+/** Kill the command's whole process tree and VERIFY it actually died instead of firing-and-trusting —
  *  see the module comment for why: pi's own equivalent (killProcessTree) is correct in mechanism
  *  but intermittently ineffective against a Git-Bash-rooted tree on Windows. Escalates to a
- *  WMI-based descendant kill only when the fast path doesn't verify within `VERIFY_GRACE_MS`. */
-async function killProcessTreeVerified(pid: number, sessionLabel: string): Promise<void> {
+ *  WMI-based descendant kill only when the fast path doesn't verify within `VERIFY_GRACE_MS`.
+ *
+ *  Stop or the timeout can come after the shell itself has exited: a job it left that still writes
+ *  to its output keeps the command waiting (waitForChildProcess), for as long as it writes at least
+ *  every EXIT_STDIO_GRACE_MS. Node has reaped the shell by then, so its pid may name another process:
+ *  a `taskkill /F /T /PID` of it, the group kill's bare-pid fallback or the escalation would end that
+ *  one, or its tree. Then the tether's own force path (killTetheredTree, util/tether.ts) ends what it
+ *  can without the pid: the command's group while its watcher still pins the group id, or on Windows
+ *  the command's job, where it has one. The same holds for the verification: a shell Node has seen
+ *  exit is dead, whatever a reused pid answers. */
+async function killProcessTreeVerified(child: ChildProcess, sessionLabel: string): Promise<void> {
+  const pid = child.pid
+  if (!pid) return
+  if (hasExited(child)) {
+    killTetheredTree(child, 'SIGKILL')
+    return
+  }
   killProcessTreeFast(pid)
+  const gone = () => hasExited(child) || !isAlive(pid)
   const deadline = Date.now() + VERIFY_GRACE_MS
   while (Date.now() < deadline) {
-    if (!isAlive(pid)) return
+    if (gone()) return
     await sleep(VERIFY_POLL_MS)
   }
-  if (!isAlive(pid)) return
+  if (gone()) return
   console.warn(`[code-session:${sessionLabel}] bash process ${pid} still alive ${VERIFY_GRACE_MS}ms after abort — escalating to WMI-based descendant kill`)
   if (process.platform === 'win32') {
     const killed = await killDescendantsViaWmi(pid)
@@ -186,7 +223,7 @@ async function killProcessTreeVerified(pid: number, sessionLabel: string): Promi
     try { process.kill(pid, 'SIGKILL') } catch { /* already dead */ }
   }
   await sleep(FINAL_VERIFY_MS)
-  if (isAlive(pid)) {
+  if (!gone()) {
     console.warn(`[code-session:${sessionLabel}] bash process ${pid} SURVIVED the WMI escalation — giving up, it may still be running orphaned`)
   }
 }
@@ -195,8 +232,20 @@ async function killProcessTreeVerified(pid: number, sessionLabel: string): Promi
  *  escalating kill on abort/timeout instead of a fire-and-forget one. Everything else (shell
  *  resolution, spawn shape, streaming, stdio wiring, exit-vs-close draining) matches pi's own
  *  implementation — only the kill path changes. `sessionLabel` is purely for the warning logs
- *  above (a Code session id), so a recurrence is traceable to which session hit it. */
-export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string }): BashOperations {
+ *  above (a Code session id), so a recurrence is traceable to which session hit it.
+ *
+ *  Each command is tethered to the daemon (util/tether.ts) and held in the Code session's scope
+ *  (`code-session:<sessionId>`; a skill or delegate sub-session passes its parent's id, and without one
+ *  the label is the scope): what a command leaves running in the background (`npm run dev &`, a `nohup`
+ *  server) keeps running after the command returns, until the session is archived or deleted, a
+ *  routine's run ends, or the daemon stops, however it stops. Before, it was cut loose: a SIGKILLed or
+ *  crashed daemon left it running, parented to init, and even a graceful stop never ended it. A command
+ *  that left nothing running holds nothing. Stop and the timeout still kill the command's whole group,
+ *  also once the shell has exited while a job it left still writes to its output (through the tether,
+ *  never the shell's pid). `exitStdioGraceMs` is for tests only: a window after the shell's exit longer
+ *  than pi's 100 ms, which a loaded machine's scheduling cannot outlast between two lines of a job. */
+export function createRobustBashOperations(options?: { shellPath?: string; sessionLabel: string; sessionId?: string; exitStdioGraceMs?: number }): BashOperations {
+  const scope = `code-session:${options?.sessionId ?? options?.sessionLabel ?? 'unknown'}`
   return {
     exec: async (command, cwd, { onData, signal, timeout, env }) => {
       if (signal?.aborted) throw new Error('aborted')
@@ -207,31 +256,41 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
         throw new Error(`Working directory does not exist: ${cwd}\nCannot execute bash commands.`)
       }
       const commandFromStdin = shellConfig.commandTransport === 'stdin'
-      const child = spawn(
+      // Windows: the command starts only once its tie exists. The job sentinel puts the shell in a job of its own
+      // (util/tether.ts), but a command that returns within milliseconds (`nohup srv &`, `cmd //c start srv`) could
+      // leave srv running, born outside that job, before the tie was made. So the shell first waits for one line on
+      // a stdin pipe, which is written once the sentinel has answered for it (or after 2 s; at once without a
+      // sentinel), whatever TMOUT says (TIE_GATE), and then gives the command /dev/null as its stdin, as before. A
+      // shell that takes its command on stdin (WSL's bash) simply gets the command then.
+      const gate = tetherPlatform() === 'win32'
+      // The command leads a process group of its own (the tether makes it one, as `detached` did), which is what
+      // killProcessTreeVerified's group kill needs. git's automatic gc runs in the foreground, inside that group:
+      // daemonized (setsid), it escaped the tie (util/git-gc.ts).
+      const { child, tied } = spawnHeld(
         shellConfig.shell,
-        commandFromStdin ? shellConfig.args : [...shellConfig.args, command],
+        commandFromStdin ? shellConfig.args : [...shellConfig.args, gate ? `${TIE_GATE}${command}` : command],
         {
           cwd,
-          detached: process.platform !== 'win32',
-          env: env ?? process.env,
-          stdio: [commandFromStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+          env: withForegroundGitGc(env ?? process.env),
+          stdio: [commandFromStdin || gate ? 'pipe' : 'ignore', 'pipe', 'pipe'],
           windowsHide: true,
         },
+        { kind: 'code-bash', hold: scope },
       )
-      if (commandFromStdin) {
-        child.stdin?.on('error', () => { /* best-effort */ })
-        child.stdin?.end(command)
-      }
+      if (commandFromStdin || gate) child.stdin?.on('error', () => { /* best-effort */ })
+      if (commandFromStdin && gate) void tied.then(() => child.stdin?.end(command))
+      else if (commandFromStdin) child.stdin?.end(command)
+      else if (gate) void tied.then(() => child.stdin?.end('\n'))
 
       let timedOut = false
       let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-      const onAbort = () => { if (child.pid) void killProcessTreeVerified(child.pid, options?.sessionLabel ?? 'unknown') }
+      const onAbort = () => { void killProcessTreeVerified(child, options?.sessionLabel ?? 'unknown') }
 
       try {
         if (timeout !== undefined && timeout > 0) {
           timeoutHandle = setTimeout(() => {
             timedOut = true
-            if (child.pid) void killProcessTreeVerified(child.pid, options?.sessionLabel ?? 'unknown')
+            void killProcessTreeVerified(child, options?.sessionLabel ?? 'unknown')
           }, timeout * 1000)
         }
         child.stdout?.on('data', onData)
@@ -240,7 +299,7 @@ export function createRobustBashOperations(options?: { shellPath?: string; sessi
           if (signal.aborted) onAbort()
           else signal.addEventListener('abort', onAbort, { once: true })
         }
-        const exitCode = await waitForChildProcess(child)
+        const exitCode = await waitForChildProcess(child, options?.exitStdioGraceMs)
         if (signal?.aborted) throw new Error('aborted')
         if (timedOut) throw new Error(`timeout:${timeout}`)
         return { exitCode }

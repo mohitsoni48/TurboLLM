@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom'
 import { ModelLoadMenu } from './ModelLoadMenu'
 import { Dialog, DialogContent, DialogTitle } from './ui/dialog'
 import type { LinkRecord } from '../lib/link-api'
@@ -224,7 +225,7 @@ describe('search box', () => {
   it('is shown even with no models', async () => {
     await openMenu({ models: [] })
     expect(searchBox()).toBeInTheDocument()
-    expect(screen.getByText('No models found')).toBeInTheDocument()
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
   })
 
   it('never appears for a blocked picker', async () => {
@@ -306,6 +307,20 @@ describe('search box', () => {
     expect(searchBox()).toHaveFocus()
     await user.unhover(screen.getByText('Eject model'))
     expect(searchBox()).toHaveFocus()
+  })
+
+  it('keeps focus in the box after a click on a disabled row, so typing still searches', async () => {
+    const { onLoad } = await openMenu({
+      links: [link({ id: 'l1', name: 'workstation' })],
+      remoteModels: [remoteRow(false)],
+    })
+    await userEvent.click(screen.getByTitle(/not loaded on workstation/i))
+    expect(toastInfo).toHaveBeenCalledWith(expect.stringMatching(/not loaded on workstation/i))
+    expect(searchBox()).toHaveFocus()
+    await userEvent.keyboard('gem')
+    expect(searchBox()).toHaveValue('gem')
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(GEMMA)
   })
 })
 
@@ -534,23 +549,44 @@ describe('list changes under an open menu', () => {
     return { ...harness, ...view }
   }
 
-  it('falls back to the first remaining match, never Eject, when the highlighted remote row vanishes', async () => {
+  // A refresh that removes the row the user chose leaves NO highlight: sliding to the first match
+  // would make the next Enter load a model the user never highlighted (here, the local twin of
+  // the remote row that went offline).
+  it('highlights nothing, and Enter does nothing, when the highlighted remote row vanishes', async () => {
     const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown', 'ArrowDown'])
     expect(activeRows()).toEqual([rowOf('Qwen3 35B', 1)])
     rerender(element({ remoteModels: [] }))
-    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+    expect(activeRows()).toEqual([])
+    expect(searchBox()).not.toHaveAttribute('aria-activedescendant')
     await userEvent.keyboard('{Enter}')
-    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onEject).not.toHaveBeenCalled()
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+  })
+
+  it('highlights nothing, and Enter does nothing, when the highlighted local row is removed', async () => {
+    const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown'])
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    const withoutQwen8 = LOCAL.filter((m) => m.key !== QWEN8)
+    rerender(element({ models: withoutQwen8 }))
+    expect(activeRows()).toEqual([])
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).not.toHaveBeenCalled()
     expect(onEject).not.toHaveBeenCalled()
   })
 
-  it('falls back to the first remaining match when the highlighted local row is removed', async () => {
-    const { onEject, rerender, element } = await openAt(['ArrowDown'])
-    const withoutQwen8 = LOCAL.filter((m) => m.key !== QWEN8)
-    rerender(element({ models: withoutQwen8 }))
-    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+  it('never turns a highlighted Eject into a load when the model unloads under the menu', async () => {
+    const { onLoad, onEject, rerender, element } = await openAt(['ArrowDown', 'ArrowDown', 'ArrowDown'])
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    rerender(element({ loadedKey: null, loadedName: null }))
+    expect(screen.queryByText('Eject model')).not.toBeInTheDocument()
+    expect(activeRows()).toEqual([])
     await userEvent.keyboard('{Enter}')
+    expect(onLoad).not.toHaveBeenCalled()
     expect(onEject).not.toHaveBeenCalled()
+    // Arrowing picks up again from the top.
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
   })
 
   it('highlights nothing, and Enter does nothing, when the list shrinks to zero', async () => {
@@ -603,6 +639,177 @@ describe('one highlight for mouse and keyboard', () => {
     await openMenu({ loadedKey: GEMMA, loadedName: 'Gemma 27B' })
     await userEvent.hover(screen.getByText('Eject model'))
     expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    expect(searchBox()).toHaveFocus()
+  })
+})
+
+describe('duplicate model keys', () => {
+  // The same GGUF in two model folders: the scanner gives both copies one key.
+  const twin = { ...LOCAL[1], path: '/elsewhere/Qwen3-35B-Q4_K_M.gguf' } as ModelEntry
+  const withTwin = [LOCAL[0], LOCAL[1], twin, LOCAL[2]]
+
+  it('shows one row per key, and ArrowDown walks past it to the rows below and Eject', async () => {
+    const { onLoad, onEject } = await openMenu({ models: withTwin, loadedKey: GEMMA, loadedName: 'Gemma 27B' })
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    await userEvent.keyboard('{ArrowDown}{ArrowDown}{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{Enter}')
+    expect(onEject).toHaveBeenCalledTimes(1)
+    expect(onLoad).not.toHaveBeenCalled()
+  })
+
+  it('loads the shared key from the one row', async () => {
+    const { onLoad } = await openMenu({ models: withTwin })
+    await userEvent.keyboard('35b{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+  })
+
+  it("finds the one row by the twin's source repo when the kept copy has none", async () => {
+    // The kept (first) copy sits in a flat folder, so it has no repo; the LM Studio twin has one.
+    const flat = { ...LOCAL[1], sourceRepo: null } as ModelEntry
+    const lms = { ...twin, sourceRepo: 'unsloth/Qwen3-35B-GGUF' } as ModelEntry
+    const { onLoad } = await openMenu({ models: [LOCAL[0], flat, lms, LOCAL[2]] })
+    await userEvent.keyboard('unsloth')
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    expect(screen.queryByText('Gemma 27B')).not.toBeInTheDocument()
+    await userEvent.keyboard('{Enter}')
+    expect(onLoad).toHaveBeenCalledWith(QWEN35)
+  })
+
+  it('shows one row when a link advertises the same key twice, and ArrowDown walks past it', async () => {
+    // The HOST has the GGUF in two folders: its /models route lists both copies under one key.
+    const below = { ...remoteRow(true), model: { ...remoteRow(true).model, key: 'qwen3-8b', name: 'Qwen3 8B' } }
+    const { onLoad, onEject } = await openMenu({
+      models: [LOCAL[0]],
+      loadedKey: GEMMA,
+      loadedName: 'Gemma 27B',
+      links: onlineLink(),
+      remoteModels: [remoteRow(true), remoteRow(true), below],
+    })
+    expect(screen.getAllByText('Qwen3 35B')).toHaveLength(1)
+    await userEvent.keyboard('{ArrowDown}{ArrowDown}{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 8B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{Enter}')
+    expect(onEject).toHaveBeenCalledTimes(1)
+    expect(onLoad).not.toHaveBeenCalled()
+  })
+})
+
+// With nothing to offer the picker showed only a faint "No models found" heading over an empty list: a library of
+// models the selected engine cannot run looked like no library, with no word of the setting that lists them.
+describe('empty state', () => {
+  const ENGINE_HINT = /hidden: the selected engine can't run (it|them) — Settings → Models & loading → Show models for every engine\./
+
+  it('says where to get a model when the library has none', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 0 } })
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText('Download one in Models → Discover.')).toBeInTheDocument()
+  })
+
+  it('counts the models the selected engine cannot run and names the setting that lists them', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 2 } })
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(ENGINE_HINT)).toHaveTextContent(/^2 hidden: the selected engine can't run them/)
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+  })
+
+  it('counts them under "No local models found." when linked machines fill the list, and offers no download', async () => {
+    await openMenu({ models: [], hidden: { byEngine: 1 }, links: onlineLink(), remoteModels: [remoteRow(false)] })
+    expect(screen.getByText('No local models found.')).toBeInTheDocument()
+    expect(screen.getByText(ENGINE_HINT)).toHaveTextContent(/^1 hidden: the selected engine can't run it/)
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+  })
+
+  it('says nothing of hidden models while some are listed', async () => {
+    await openMenu({ hidden: { byEngine: 3 } })
+    expect(screen.queryByText(ENGINE_HINT)).not.toBeInTheDocument()
+    expect(screen.queryByText('No models found.')).not.toBeInTheDocument()
+  })
+})
+
+// Models hidden by hand (Models → Library "Hide"): the empty picker counts them and links to the Library's switch.
+describe('empty state with models hidden by the user', () => {
+  function Where() {
+    const { pathname, search } = useLocation()
+    return <div data-testid="where">{pathname + search}</div>
+  }
+
+  function renderInRouter(props: Partial<MenuProps>) {
+    render(
+      <MemoryRouter initialEntries={['/workspace/chat']}>
+        <Routes>
+          <Route path="/workspace/chat" element={menu(props).element()} />
+          <Route path="/models" element={<Where />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+  const showHiddenLink = () => screen.getByRole('link', { name: 'Show hidden models' })
+
+  it('counts them and links to the Library with "Show hidden models" on', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 1, byUser: 2 } })
+    await userEvent.click(trigger())
+    expect(screen.getByText('No models found.')).toBeInTheDocument()
+    expect(screen.getByText(/^2 hidden by you —/)).toBeInTheDocument()
+    expect(screen.getByText(/^1 hidden: the selected engine can't run it/)).toBeInTheDocument()
+    expect(screen.queryByText('Download one in Models → Discover.')).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('link', { name: 'Show hidden models' }))
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+  })
+
+  // Focus stays in the search box and a Radix menu cancels Tab, so only the picker's own highlight can reach the link.
+  it('lets the keyboard reach the link: ArrowDown highlights it, and Enter opens the Library with the switch on', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 0, byUser: 1 } })
+    await userEvent.click(trigger())
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+    expect(activeRows()).toEqual([])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    expect(searchBox()).toHaveAttribute('aria-activedescendant', showHiddenLink().id)
+    expect(searchBox()).toHaveFocus()
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('reaches the link first, where it shows above the linked machines\' models, then the models and Eject', async () => {
+    const { onLoad, onEject } = menu()
+    renderInRouter({
+      models: [],
+      hidden: { byEngine: 0, byUser: 1 },
+      links: onlineLink(),
+      remoteModels: [remoteRow(true)],
+      loadedKey: GEMMA,
+      loadedName: 'Gemma 27B',
+      onLoad,
+      onEject,
+    })
+    await userEvent.click(trigger())
+    expect(screen.getByText('No local models found.')).toBeInTheDocument()
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([rowOf('Qwen3 35B')])
+    await userEvent.keyboard('{ArrowDown}')
+    expect(activeRows()).toEqual([screen.getByText('Eject model')])
+    await userEvent.keyboard('{ArrowUp}{ArrowUp}')
+    expect(activeRows()).toEqual([showHiddenLink()])
+    await userEvent.keyboard('{Enter}')
+    expect(screen.getByTestId('where')).toHaveTextContent('/models?hidden=1')
+    expect(onLoad).not.toHaveBeenCalled()
+    expect(onEject).not.toHaveBeenCalled()
+  })
+
+  it('highlights the link on hover, while focus stays in the box', async () => {
+    renderInRouter({ models: [], hidden: { byEngine: 0, byUser: 1 } })
+    await userEvent.click(trigger())
+    await userEvent.hover(showHiddenLink())
+    expect(activeRows()).toEqual([showHiddenLink()])
     expect(searchBox()).toHaveFocus()
   })
 })

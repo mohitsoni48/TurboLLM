@@ -23,6 +23,7 @@ import {
   LINK_JEV_UNSUPPORTED,
   MAX_JEV_INPUT_CHARS,
   MAX_JEV_INPUTS,
+  NOT_A_JSON_OBJECT,
   refusalFor,
   resolveJevModel,
   routeToJevModel,
@@ -206,7 +207,6 @@ async function serveJevRequest<Input extends { model: string }, Body extends obj
   }
 }
 
-const NOT_A_JSON_OBJECT = 'Request body must be a JSON object.'
 const MODEL_REQUIRED = 'model is required.'
 // A function, not a constant: MAX_JEV_INPUTS lives in a module that imports gateway.ts, which imports this
 // one, so it is not yet initialised when this module loads first.

@@ -35,7 +35,7 @@
 #     (separate) missing shared libraries the binary also needs.
 FROM node:22-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      curl ca-certificates libvulkan1 libgomp1 \
+      curl ca-certificates libvulkan1 libgomp1 tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -61,4 +61,8 @@ COPY test/fixtures/ /fixtures/
 RUN chmod +x /fixtures/stub-llama-server.mjs
 
 ENV TURBOLLM_TEST=1
+# tini is PID 1, as in the distribution images (see Dockerfile.nvidia): it reaps every
+# orphan the daemon leaves (each tethered child's watcher is one), which node as PID 1
+# left as zombies, and forwards `docker stop`'s SIGTERM. -s: a subreaper under --init.
+ENTRYPOINT ["/usr/bin/tini", "-s", "--"]
 CMD ["node", "/fixtures/entrypoint.mjs"]

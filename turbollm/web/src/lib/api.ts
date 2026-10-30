@@ -8,6 +8,7 @@ import type {
   ChatMessage,
   DownloadRecord,
   DownloadsList,
+  HeldDownload,
   Engine,
   EngineBackends,
   EngineCatalog,
@@ -29,7 +30,7 @@ import type {
   HfSearchRows,
   HfSortOption,
   HfTokenTest,
-  LoadProfile,
+  UserSetProfile,
   ModelDetail,
   ModelDirs,
   ModelPreset,
@@ -40,6 +41,7 @@ import type {
   TokenUsageStats,
   TokenUsageRange,
 } from './types'
+import { markHostKeyNeeded } from './auth-signal'
 
 const AUTH_KEY = 'tllm.authToken'
 
@@ -73,12 +75,33 @@ export function getAuthToken(): string | null {
   return localStorage.getItem(AUTH_KEY)
 }
 
+const authTokenListeners = new Set<() => void>()
+
 /** Persist (or clear) the API key this client sends as X-TurboLLM-Auth. Needed for
  *  LAN access, where the daemon requires a key for non-loopback requests (spec 06 §5). */
 export function setAuthToken(token: string): void {
   const t = token.trim()
   if (t) localStorage.setItem(AUTH_KEY, t)
   else localStorage.removeItem(AUTH_KEY)
+  authTokenListeners.forEach((l) => l())
+}
+
+/** Runs `listener` after each setAuthToken, which is how the key prompt stores a key, and when
+ *  another tab of this origin sets or clears the stored key. A live tail refused 401/403 for want
+ *  of a key waits on it to reopen with the new one (sse.ts subscribeSse): nothing else would tell
+ *  it the prompt was answered. The key is in localStorage, which every tab of the origin shares,
+ *  but setAuthToken in another tab runs only that tab's listeners: a tail here woke only on a key
+ *  stored in its own tab, so one pasted into the other tab's prompt left it dead while the rest
+ *  of this page, which reads the key afresh per request, went on with it. The browser tells the
+ *  other tabs with a 'storage' event (key null for a clear()). Returns the unsubscribe. */
+export function subscribeAuthToken(listener: () => void): () => void {
+  authTokenListeners.add(listener)
+  const onStorage = (e: StorageEvent) => { if (e.key === AUTH_KEY || e.key === null) listener() }
+  window.addEventListener('storage', onStorage)
+  return () => {
+    authTokenListeners.delete(listener)
+    window.removeEventListener('storage', onStorage)
+  }
 }
 
 async function request<T>(
@@ -107,6 +130,8 @@ async function request<T>(
     const rescued = init?.rescue?.(res.status, data)
     if (rescued !== undefined) return rescued
     const env = data as { error?: { code?: string; message?: string } } | undefined
+    // A host-only setting refused for want of a valid key: ask for one (auth-signal.ts).
+    if (res.status === 403 && env?.error?.code === 'api_key_required') markHostKeyNeeded()
     throw new ApiError(
       env?.error?.code ?? 'http_error',
       env?.error?.message ?? `Request failed with status ${res.status}.`,
@@ -172,7 +197,14 @@ export function getHwStats(): Promise<HwUsage> {
 /** Whether each terminal-agent CLI is actually installed on this machine, and the command that
  *  installs it. Label/description deliberately are NOT here — those live in code-types.ts's
  *  CODE_AGENTS so that copy has exactly one owner. */
-export type AgentAvailability = { id: string; installed: boolean; installCommand: string }
+export type AgentAvailability = {
+  id: string
+  installed: boolean
+  installCommand: string
+  /** An install of it is running in the daemon, whichever page started it: the install goes on
+   *  when that page closes or reloads, and a second Install joins it rather than starting another. */
+  installing: boolean
+}
 
 export function getAgentAvailability(): Promise<{ agents: AgentAvailability[] }> {
   return request<{ agents: AgentAvailability[] }>('/api/v1/code/agents')
@@ -495,6 +527,15 @@ export function purgeEngine(id: string): Promise<{ ok: true }> {
   })
 }
 
+/** Delete a DISABLED source build's folder (engines/build/<slug>, no registered engine) without
+ *  running its binary, so a build that no longer starts can still be deleted. The daemon refuses
+ *  a folder any engine or remembered source still points into. */
+export function deleteEngineBuild(binPath: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/engines/build?binPath=${encodeURIComponent(binPath)}`, {
+    method: 'DELETE',
+  })
+}
+
 /** Enable an installed llama.cpp backend without re-downloading (register + activate). */
 export function enableBackend(id: string): Promise<{ ok: true; engineId: string }> {
   return request<{ ok: true; engineId: string }>(
@@ -591,7 +632,7 @@ export function getEngineLogs(tail = 200): Promise<EngineLogs> {
   return request<EngineLogs>(`/api/v1/engine/logs?tail=${tail}`)
 }
 
-/** URL for the SSE live log tail (consumed via EventSource). */
+/** URL for the SSE live log tail (consumed via sse.ts's subscribeSse — not EventSource, which can't send the key). */
 export const engineLogStreamUrl = '/api/v1/engine/logs/stream'
 
 // ── Developer request log (issue #211 follow-up) ─────────────────────────────
@@ -624,7 +665,7 @@ export function clearRequests(): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/requests', { method: 'DELETE' })
 }
 
-/** URL for the SSE live entry stream (consumed via EventSource), same convention as
+/** URL for the SSE live entry stream (consumed via sse.ts's subscribeSse), same convention as
  *  {@link engineLogStreamUrl}. */
 export const requestsStreamUrl = '/api/v1/requests/stream'
 
@@ -693,6 +734,15 @@ export function deleteModel(key: string): Promise<{ ok: true; deleted: string[] 
   })
 }
 
+/** Hide a model by hand, or unhide it (Models → Library). The daemon keeps the flag per model key, for every page and
+ *  device; GET /models then marks the model `hidden`. 404 `no_such_model` for a key the library no longer has. */
+export function setModelHidden(key: string, hidden: boolean): Promise<{ key: string; hidden: boolean }> {
+  return request<{ key: string; hidden: boolean }>(`/api/v1/models/${encodeURIComponent(key)}/hidden`, {
+    method: 'PUT',
+    json: { hidden },
+  })
+}
+
 // ── Load profiles + load flow (A4, spec 05) ──────────────────────────────────
 // Profiles are per-engine (issue #35): pass the installed engine's id so reads/writes
 // hit that engine's slot. Omitting engineId on read lets the server fall back to the
@@ -702,8 +752,8 @@ export function getModelDetail(key: string, engineId?: string): Promise<ModelDet
   return request<ModelDetail>(`/api/v1/models/${encodeURIComponent(key)}${q}`)
 }
 
-export function saveModelProfile(key: string, profile: LoadProfile, engineId: string): Promise<LoadProfile> {
-  return request<LoadProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile?engine=${encodeURIComponent(engineId)}`, {
+export function saveModelProfile(key: string, profile: UserSetProfile, engineId: string): Promise<UserSetProfile> {
+  return request<UserSetProfile>(`/api/v1/models/${encodeURIComponent(key)}/profile?engine=${encodeURIComponent(engineId)}`, {
     method: 'PUT',
     json: profile,
   })
@@ -727,7 +777,7 @@ export function fetchModelPresets(modelKey: string): Promise<{ presets: ModelPre
 /** Create a preset from the current draft. 400 `too_many_presets` at the per-model cap. */
 export function createModelPreset(
   modelKey: string,
-  preset: { name: string; engineId?: string; profile: Partial<LoadProfile> },
+  preset: { name: string; engineId?: string; profile: UserSetProfile },
 ): Promise<ModelPreset> {
   return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets`, { method: 'POST', json: preset })
 }
@@ -736,7 +786,7 @@ export function createModelPreset(
 export function updateModelPreset(
   modelKey: string,
   id: string,
-  patch: { name?: string; engineId?: string; profile?: Partial<LoadProfile> },
+  patch: { name?: string; engineId?: string; profile?: UserSetProfile },
 ): Promise<ModelPreset> {
   return request<ModelPreset>(`/api/v1/models/${encodeURIComponent(modelKey)}/presets/${id}`, { method: 'PUT', json: patch })
 }
@@ -751,7 +801,7 @@ export function applyModelPreset(modelKey: string, id: string): Promise<ModelPre
 }
 
 /** Load a model by key, optionally with one-off profile overrides (spec 05 §7). */
-export function loadModel(modelKey: string, profileOverrides?: Partial<LoadProfile>): Promise<{ ok: true }> {
+export function loadModel(modelKey: string, profileOverrides?: UserSetProfile): Promise<{ ok: true }> {
   return request<{ ok: true }>('/api/v1/engine/start', {
     method: 'POST',
     json: { modelKey, profileOverrides },
@@ -761,7 +811,7 @@ export function loadModel(modelKey: string, profileOverrides?: Partial<LoadProfi
 // ── Auto-benchmark + auto-tune (spec 09 §1) ──────────────────────────────────
 /** Start an auto-tune sweep for a model. 202; progress polls /status `bench`. Throws
  *  ApiError 409 when a run or the engine is busy (caller stops the engine first). */
-export function startBench(modelKey: string, base?: Partial<LoadProfile>): Promise<{ accepted: true }> {
+export function startBench(modelKey: string, base?: UserSetProfile): Promise<{ accepted: true }> {
   return request<{ accepted: true }>('/api/v1/bench', { method: 'POST', json: { modelKey, base } })
 }
 
@@ -820,16 +870,25 @@ export function uninstallComfyGate(): Promise<{ ok: boolean }> {
   return request('/api/v1/comfyui/uninstall', { method: 'POST', json: {} })
 }
 
+/** What the daemon sends for every MCP stdio env value (routes.ts's MCP_ENV_MASK, same string):
+ *  env holds the servers' credentials, so its values are write-only. Sent back unchanged in a
+ *  PUT, a masked value keeps the stored one. */
+export const MCP_ENV_MASK = '••••••••'
+
 export type McpServer = {
   id: string
   name: string
   transport: 'stdio' | 'sse'
   command?: string
   args?: string[]
+  /** stdio only. Read back with each value as MCP_ENV_MASK, never the value itself. */
   env?: Record<string, string>
   url?: string
-  /** sse only — Bearer token for Authorization header (ADR-124) */
+  /** sse only — Bearer token for Authorization header (ADR-124). Write-only: sent on add/edit,
+   *  never returned ('' on edit removes it). */
   apiKey?: string
+  /** Read-only, from the settings payload: whether a Bearer key is stored. */
+  apiKeySet?: boolean
   enabled: boolean
 }
 
@@ -847,6 +906,9 @@ export type DaemonSettings = {
   autoMemoryEnabled: boolean
   openBrowserOnStart: boolean
   autoLoadOnStart: boolean
+  /** Settings → Models, "Show models for every engine": list every model, not only those the selected engine can run
+   *  (they still load only on it, and fail with its error if it cannot). Off by default; absent from older daemons. */
+  showAllEngineModels?: boolean
   /** VRAM to keep free during auto-tune's offload search, MB (300–2048, default 1024) — OR 0, an
    *  explicit opt-in letting the MoE hill-climb spill past all headroom for more t/s. A later
    *  desktop / ComfyUI VRAM grab can't tip a config tuned with less headroom into a sysmem spill. */
@@ -899,6 +961,10 @@ export type DaemonSettings = {
    *  call that would show an "awaiting approval" prompt runs immediately instead.
    *  Only silences a resolved 'ask' — an explicit 'deny' is still honored. */
   autoAllowAll: boolean
+  /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
+   *  together, in whole minutes (0-1440, default 30); past it they are not run and the reply goes
+   *  on. 0 waits until answered. Optional: a daemon from before the setting does not send it. */
+  chatApprovalWaitMinutes?: number
   /** Cloud Launch deploy-link settings (ADR-153). The RunPod Template ID the user
    *  published themselves — not a secret, just an id, echoed back as-is. */
   cloudDeploy: { runpodTemplateId: string }
@@ -944,8 +1010,12 @@ export type SearchProvider = 'tavily' | 'kagi' | 'searxng'
  *  `hfToken` (spec 10 §4) that sets/clears the stored Hugging Face token. `comfyui`
  *  is patchable per-field (only `enabled` is set here; `gatePath` is owned by the
  *  install endpoints). */
-export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess'>> & {
+export type DaemonSettingsPatch = Partial<Omit<DaemonSettings, 'comfyui' | 'tavilyKeySet' | 'search' | 'mcp' | 'experimental' | 'code' | 'requestLog' | 'remoteAccess' | 'modelDefaults' | 'gateway'>> & {
   comfyui?: Partial<ComfyUiSettings>
+  /** Patchable per-field, same reason as `experimental`: routes.ts keeps every member this patch
+   *  leaves out, and Settings' Save sends only the members edited on the page. */
+  modelDefaults?: Partial<ModelDefaults>
+  gateway?: Partial<DaemonSettings['gateway']>
   /** Patchable per-field — the backend applies each key independently (api/routes.ts), so a
    *  patch touching only one flag must not be forced to also supply the other. */
   experimental?: Partial<DaemonSettings['experimental']>
@@ -1121,14 +1191,85 @@ export interface ConnectInfo { cli: string; title: string; steps: ConnectStep[] 
 export function getApiKeys(): Promise<ApiKeysList> {
   return request<ApiKeysList>('/api/v1/keys')
 }
+/** Whether the daemon's host gate (auth.ts hostGate) takes the key this browser now sends: GET
+ *  /api/v1/keys is behind that gate and changes nothing, and answers 403 to a missing, wrong or
+ *  revoked key or a remote-access token (401 with requireApiKey on or through a tunnel).
+ *  EnginesScreen asks it before a git build's Remove, and App.tsx before closing the prompt a
+ *  host-only setting raised once a key judged by /status is stored. Any other failure, a dropped
+ *  connection or no answer in time say, says nothing about the key, so it counts as accepted, as
+ *  before the check. */
+export async function hostKeyAccepted(): Promise<boolean> {
+  return (await keyCheck('/api/v1/keys', authHeaders(), hostGateVerdict)) !== 'refused'
+}
+/** What a check said about a key pasted into the key prompt (App.tsx useKeyPrompt), which replaces
+ *  the stored one only when 'accepted'. 'unchecked' is no answer about the key at all: a dropped
+ *  connection, or a tunnel's or proxy's 5xx while the daemon restarts. The stored key can be a
+ *  remote-access token, shown once and never again, so that must not count as taken: a typo
+ *  pasted while the daemon was restarting replaced it as surely as one the daemon refused. No
+ *  answer within KEY_CHECK_TIMEOUT_MS is 'unchecked' too. */
+export type KeyCheck = 'accepted' | 'refused' | 'unchecked'
+/** `key` checked at the host gate (see hostKeyAccepted), which is also Code's gate (auth.ts
+ *  codeAuth): for a key pasted into the prompt a host-only change or Code raised (auth-signal.ts).
+ *  Only a 2xx takes it. */
+export function hostKeyCheck(key: string): Promise<KeyCheck> {
+  return keyCheck('/api/v1/keys', { 'X-TurboLLM-Auth': key }, hostGateVerdict)
+}
+/** `key` checked by lanAuth through GET /api/v1/status, for a key pasted into the prompt a 401
+ *  from /status raised: only a 401 refuses it. A 403 is a remote-access token without config:read,
+ *  a key that works for everything it was given (connection-state.ts's scopedTokenLimited), so it
+ *  takes the key as a 2xx does. */
+export function statusKeyCheck(key: string): Promise<KeyCheck> {
+  return keyCheck('/api/v1/status', { 'X-TurboLLM-Auth': key }, (status) =>
+    status === 401 ? 'refused' : (status >= 200 && status < 300) || status === 403 ? 'accepted' : 'unchecked')
+}
+function hostGateVerdict(status: number): KeyCheck {
+  return status === 401 || status === 403 ? 'refused' : status >= 200 && status < 300 ? 'accepted' : 'unchecked'
+}
+/** How long a key check waits for an answer before it gives up, as 'unchecked'. */
+export const KEY_CHECK_TIMEOUT_MS = 10_000
+/** GET `path` with `auth` and what `verdict` makes of the answer. A plain fetch, not request(): a
+ *  check's refusal must not raise the auth signals (auth-signal.ts) the prompt it answers is built
+ *  on, and the stored key must not be touched. A dropped connection is 'unchecked', and so is no
+ *  answer within KEY_CHECK_TIMEOUT_MS. */
+async function keyCheck(path: string, auth: Record<string, string>, verdict: (status: number) => KeyCheck): Promise<KeyCheck> {
+  const headers = { Accept: 'application/json', ...auth }
+  // A key with a character no request header can carry (a curly quote or a zero-width space
+  // pasted along with it) made fetch throw before anything was sent, which read as a dropped
+  // connection: the prompt said to try again in a moment, which never helped. No key has such a
+  // character, so it is refused, without a request.
+  try {
+    new Headers(headers)
+  } catch {
+    return 'refused'
+  }
+  // A check with no answer at all (a tunnel holding the connection open) kept AuthGate's Connect
+  // disabled, with no hint, for as long as it was out, and the prompt a 401 from /status opens has
+  // no "Not now": nothing on it could be clicked. So it gives up, and says no more than a dropped
+  // connection does.
+  const abort = new AbortController()
+  const timer = setTimeout(() => abort.abort(), KEY_CHECK_TIMEOUT_MS)
+  try {
+    const res = await fetch(path, { headers, signal: abort.signal })
+    return verdict(res.status)
+  } catch {
+    return 'unchecked'
+  } finally {
+    clearTimeout(timer)
+  }
+}
 export function createApiKey(name: string): Promise<ApiKeyCreated> {
   return request<ApiKeyCreated>('/api/v1/keys', { method: 'POST', json: { name } })
 }
 export function deleteApiKey(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/keys/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }
-export function getConnect(cli: string): Promise<ConnectInfo> {
-  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}`)
+/** The daemon refuses this GET without `X-TurboLLM-UI` (auth.ts lanAuth): it can replace a CLI
+ *  key, and a page on another site cannot add a custom header without a CORS preflight.
+ *  `mint: false` is a fetch the user did not click for: a LAN-bound daemon then answers 409
+ *  `lan_bound` instead of minting a new `cli-<name>` key (which revokes the previous one). */
+export function getConnect(cli: string, opts: { mint?: boolean } = {}): Promise<ConnectInfo> {
+  const query = opts.mint === false ? '?mint=0' : ''
+  return request<ConnectInfo>(`/api/v1/connect/${encodeURIComponent(cli)}${query}`, { headers: { 'X-TurboLLM-UI': '1' } })
 }
 
 // ── System info (spec 05 §6) ─────────────────────────────────────────────────
@@ -1182,7 +1323,9 @@ export function listDownloads(): Promise<DownloadsList> {
 
 /** Enqueue a download: an HF repo file {repo, rfilename} OR a raw {url}. A single HF
  *  request can fan out into several files (split shards + a shared mmproj projector), so
- *  the response carries every record created. */
+ *  the response carries every record created. `existing`: the rows already downloading,
+ *  queued or paused that hold files the request names (they get no second row), by id, name
+ *  and status; absent from a daemon older than it. */
 export function enqueueDownload(input: {
   repo?: string
   rfilename?: string
@@ -1190,12 +1333,17 @@ export function enqueueDownload(input: {
   size?: number
   sha256?: string
   subdir?: string
+  /** With `subdir`: the whole folder download this file is one of, every file of it by where
+   *  its own request puts it (`<subdir>/<basename>`) and its size. The daemon checks free disk
+   *  for each file against the total of those not already downloading, so a folder that does
+   *  not fit has none of its files queued. */
+  folder?: { files: { path: string; size: number }[] }
   /** Onboarding-only (spec 25 §5.4 / ADR-338 Decision 6): drop the shared mmproj vision
    *  projector a blessed catalog GGUF would otherwise expand into — "never pull mmproj-*.gguf
    *  — pure added download before first token." Discover's own manual picks never set this. */
   excludeMmproj?: boolean
-}): Promise<{ downloads: DownloadRecord[] }> {
-  return request<{ downloads: DownloadRecord[] }>('/api/v1/downloads', { method: 'POST', json: input })
+}): Promise<{ downloads: DownloadRecord[]; existing?: HeldDownload[] }> {
+  return request<{ downloads: DownloadRecord[]; existing?: HeldDownload[] }>('/api/v1/downloads', { method: 'POST', json: input })
 }
 
 export function cancelDownload(id: string): Promise<{ ok: true }> {
@@ -1207,6 +1355,14 @@ export function cancelDownload(id: string): Promise<{ ok: true }> {
 
 export function removeDownload(id: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+/** Stop a downloading or queued download but keep its partial file, for {@link resumeDownload}. */
+export function pauseDownload(id: string): Promise<{ ok: true }> {
+  return request<{ ok: true }>(`/api/v1/downloads/${encodeURIComponent(id)}/pause`, {
+    method: 'POST',
+    json: {},
+  })
 }
 
 export function resumeDownload(id: string): Promise<{ ok: true }> {
@@ -1246,28 +1402,39 @@ export async function getDebugSnapshot(convId: string): Promise<string> {
 
 // ── F-024: export / import chat ───────────────────────────────────────────────
 
-/** Trigger a browser download of the chat as a .turbollm-chat.json file. */
-export function downloadChatExport(convId: string): void {
-  // Build a hidden anchor with auth header isn't possible; use a form or direct href.
-  // Since the auth token may be needed, fetch the blob and trigger download via object URL.
-  const headers: Record<string, string> = { Accept: 'application/json', ...authHeaders() }
-  fetch(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, { headers })
-    .then(async (res) => {
-      if (!res.ok) throw new Error(`Export failed with status ${res.status}`)
-      const cd = res.headers.get('Content-Disposition') ?? ''
-      const nameMatch = cd.match(/filename="([^"]+)"/)
-      const filename = nameMatch ? nameMatch[1] : 'chat.turbollm-chat.json'
-      const blob = await res.blob()
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = filename
-      document.body.appendChild(a)
-      a.click()
-      document.body.removeChild(a)
-      URL.revokeObjectURL(url)
-    })
-    .catch(() => { /* silently ignore — caller shows error via toast */ })
+/** Fetch `path` with the API key and save the response as a browser download (Blob + a temporary
+ *  `<a download>`, named from the daemon's Content-Disposition). A plain `<a href>` can't send
+ *  X-TurboLLM-Auth, so over LAN/remote access it would save the daemon's 401 JSON instead of the
+ *  file. Rejects with an `ApiError` on a non-OK response, so the caller can toast it. */
+async function downloadWithAuth(path: string, fallbackName: string): Promise<void> {
+  const res = await fetch(path, { headers: { Accept: 'application/json', ...authHeaders() } })
+  if (!res.ok) {
+    const env = safeJson(await res.text().catch(() => '')) as { error?: { code?: string; message?: string } } | undefined
+    throw new ApiError(env?.error?.code ?? 'http_error', env?.error?.message ?? `Download failed with status ${res.status}.`, res.status)
+  }
+  const cd = res.headers.get('Content-Disposition') ?? ''
+  const nameMatch = cd.match(/filename="([^"]+)"/)
+  const filename = nameMatch ? nameMatch[1] : fallbackName
+  const blob = await res.blob()
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  URL.revokeObjectURL(url)
+}
+
+/** Trigger a browser download of the chat as a .turbollm-chat.json file. Rejects when the export
+ *  fails (401 on LAN without a key, deleted chat, network error) so the caller can tell the user. */
+export function downloadChatExport(convId: string): Promise<void> {
+  return downloadWithAuth(`/api/v1/conversations/${encodeURIComponent(convId)}/export?format=export`, 'chat.turbollm-chat.json')
+}
+
+/** Download the last auto-tune run's log (GET /api/v1/bench/log). Rejects like {@link downloadChatExport}. */
+export function downloadBenchLog(): Promise<void> {
+  return downloadWithAuth('/api/v1/bench/log', 'autotune-log.json')
 }
 
 /** Import a chat from a parsed JSON object. Returns the new conversation id. */

@@ -118,3 +118,12 @@ test('a balanced split lets a lower offload fit where the default split overflow
   const balanced = estimateVramPerGpu({ ...p, gpu: { ...p.gpu, splitMode: 'layer', tensorSplit: ts } }, q8, T4x2)
   assert.notEqual(balanced.verdict, 'overflow')
 })
+
+test('a non-unified KV cache projects the same per-card total as a unified one (ctx cells in total)', () => {
+  // llama.cpp gives each of the `parallel` streams ctx/parallel cells; counting `parallel` full
+  // contexts put 4x the KV cache on the cards with 4 slots and made the offload search back off.
+  const dense = model({ sizeBytes: 8_000_000_000, moe: false, arch: 'llama', blockCount: 32, headDim: 128 })
+  const unified = prof(dense, { ctx: 32768, parallel: 4, kvUnified: true })
+  const split = estimateVramPerGpu({ ...unified, kvUnified: false }, dense, T4x2)
+  assert.deepEqual(split.estMb, estimateVramPerGpu(unified, dense, T4x2).estMb)
+})

@@ -4,21 +4,25 @@
 // the app-data engines dir. No bundling, no system paths, dependency-free
 // (Node fetch; PowerShell Expand-Archive / tar for extraction). The user can
 // override the backend; we fall back GPU → Vulkan → CPU if a build won't run.
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { execFile, execFileSync } from 'node:child_process'
+import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { basename, dirname, join, win32 } from 'node:path'
+import { basename, dirname, join, relative, win32 } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { promisify } from 'node:util'
+import { tetheredExecFile } from '../util/tether'
 import { getSysInfo, primaryVendor, type GpuVendor } from '../sysinfo/sysinfo'
+import { quotePowerShellArg } from '../util/shell-command'
 // nvidia-smi and probe are leaf modules (the former imports only node builtins, the latter
 // only config), so importing them keeps this module free of an import cycle.
 import { driverMaxCuda, nvidiaComputeCaps } from './nvidia-smi'
 import { listDevices } from './probe'
 import { extractZipAll } from './zip-reader'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an extraction the daemon does not live to see ends with it. Its errors
+// name the real program (tar, powershell), as execFile's did.
+const execFileP = tetheredExecFile({ kind: 'extract' })
 
 /** Build standard GitHub API headers, injecting a token so authenticated requests
  *  get 5,000 req/hour instead of the 60/hour unauthenticated limit.
@@ -68,7 +72,9 @@ export function githubHeaders(
 export function stripMacOsQuarantine(dir: string): void {
   if (process.platform !== 'darwin') return
   try {
-    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir])
+    // Synchronous on the daemon's event loop, so bounded: a large engine tree on a slow disk held the daemon for as
+    // long as the filesystem took. What xattr prints is not the daemon's to log (execFileSync passes stderr on).
+    execFileSync('xattr', ['-r', '-d', 'com.apple.quarantine', dir], { timeout: 30_000, stdio: 'ignore' })
   } catch {
     // xattr exits non-zero when the attribute is absent — not an error
   }
@@ -328,15 +334,25 @@ export interface ProvisionProgress {
   parts?: number // total archives for this backend
 }
 
+/** Why an update must not replace an engine's files right now (a model was started on it during the download), or
+ *  null. Re-run right before the swap; a refusal throws with code `engine_in_use` and leaves the old files. */
+export type SwapGuard = () => string | null
+
+function throwIfSwapBlocked(blockSwap: SwapGuard | undefined): void {
+  const blocked = blockSwap?.()
+  if (blocked) throw Object.assign(new Error(blocked), { code: 'engine_in_use' })
+}
+
 export async function downloadFile(
   url: string,
   dest: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
   fetchImpl: typeof fetch = fetch,
-  /** The expected archive hash, verified as the body streams in; a mismatch deletes the file. */
-  expectedSha256?: string,
+  /** `expectedSha256`: the archive hash, verified as the body streams in; a mismatch deletes the download. */
+  opts: { blockSwap?: SwapGuard; expectedSha256?: string } = {},
 ): Promise<void> {
+  const { expectedSha256 } = opts
   const res = await fetchImpl(url, { redirect: 'follow', signal })
   if (!res.ok || !res.body) throw Object.assign(new Error(`download failed: HTTP ${res.status}`), { code: 'download_failed' })
   const total = Number(res.headers.get('content-length') ?? 0)
@@ -355,12 +371,67 @@ export async function downloadFile(
       }
     }
   })
-  await pipeline(body, createWriteStream(dest), { signal })
-  // Integrity, when the release publishes GitHub's own `sha256:` asset digest: a 530 MB engine
-  // archive is far too large to trust to a truncated-but-2xx response.
-  if (expectedSha256 && hash && hash.digest('hex') !== expectedSha256.toLowerCase()) {
-    rmSync(dest, { force: true })
-    throw new Error('checksum_failed: the downloaded archive did not match the published sha256')
+  // Stream into a sibling `.part` and rename only once the whole body arrived. Written straight to
+  // `dest`, a dropped connection or a quit left a truncated file there — and KoboldCpp/llamafile
+  // treat an existing binary as installed, so the next Install registered the broken one.
+  const part = `${dest}.part`
+  try {
+    await pipeline(body, createWriteStream(part), { signal })
+    // Integrity, when the release publishes GitHub's own `sha256:` asset digest: a 530 MB engine
+    // archive is far too large to trust to a truncated-but-2xx response.
+    if (hash && hash.digest('hex') !== expectedSha256?.toLowerCase()) {
+      throw new Error('checksum_failed: the downloaded archive did not match the published sha256')
+    }
+    // An update replaces the binary an engine runs from. Its caller stopped the engine before the download, which
+    // takes minutes: a model loaded on it meanwhile would have its executable replaced under it (on Windows the
+    // rename fails after ~3 s with a bare EPERM instead of saying what to do).
+    throwIfSwapBlocked(opts.blockSwap)
+    await renameWithRetry(part, dest)
+  } catch (e) {
+    // Best effort: AV/the indexer can hold the fresh .part on Windows, and a throw here would replace e
+    // (a Cancel's AbortError would become a failure). A leftover .part is truncated by the next download.
+    try {
+      rmSync(part, { force: true })
+    } catch {
+      /* best effort */
+    }
+    throw e
+  }
+}
+
+/** renameSync, retried for ~3 s on Windows. Windows refuses to rename a directory while any file
+ *  under it is open (whatever the share mode, surfaced as EPERM; EACCES/EBUSY likewise), and
+ *  real-time AV and the search indexer open freshly written files for a moment — exactly what a
+ *  just-staged install or download is (graceful-fs retries its win32 renames for the same reason).
+ *  POSIX rename ignores open handles, so elsewhere a failure is real and thrown at once. */
+export async function renameWithRetry(from: string, to: string): Promise<void> {
+  for (let delay = 100; ; delay *= 2) {
+    try {
+      renameSync(from, to)
+      return
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code
+      if (process.platform !== 'win32' || delay > 1600 || (code !== 'EPERM' && code !== 'EACCES' && code !== 'EBUSY')) throw e
+    }
+    await new Promise((resolve) => setTimeout(resolve, delay))
+  }
+}
+
+/** The release tag a single-binary engine (KoboldCpp, llamafile) was downloaded as, recorded
+ *  beside it by {@link recordReleaseTag}; '' for an install that predates the record. */
+export function recordedReleaseTag(binPath: string): string {
+  try {
+    return readFileSync(`${binPath}.version`, 'utf8').trim()
+  } catch {
+    return ''
+  }
+}
+
+export function recordReleaseTag(binPath: string, tag: string): void {
+  try {
+    writeFileSync(`${binPath}.version`, `${tag}\n`)
+  } catch {
+    /* best effort — it only labels the version */
   }
 }
 
@@ -389,7 +460,9 @@ export function archiveExtractor(
 
 function zipExtractor(archive: string, destDir: string, platform: NodeJS.Platform): ArchiveExtractor {
   if (platform === 'win32') return { kind: 'powershell' }
-  if (platform === 'darwin') return { kind: 'tar', cmd: 'tar', args: ['-xf', archive, '-C', destDir] }
+  // Pinned like Windows' System32 tar.exe: only bsdtar reads zip, and a GNU tar first on PATH
+  // (Homebrew's gnubin) would fail every .zip. /usr/bin/tar on macOS is always bsdtar.
+  if (platform === 'darwin') return { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', archive, '-C', destDir] }
   return { kind: 'node-zip' }
 }
 
@@ -416,7 +489,7 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   const extractor = archiveExtractor(archive, destDir, process.platform, process.env, existsSync)
   switch (extractor.kind) {
     case 'node-zip':
-      extractZipAll(readFileSync(archive), destDir)
+      await extractZipAll(await readFile(archive), destDir)
       break
     case 'unsupported':
       throw extractionError('unsupported_archive', extractor.reason)
@@ -430,8 +503,12 @@ export async function extractArchive(archive: string, destDir: string): Promise<
   stripMacOsQuarantine(destDir)
 }
 
-function powershellExpandArgs(archive: string, destDir: string): string[] {
-  const ps = `Expand-Archive -LiteralPath '${archive.replace(/'/g, "''")}' -DestinationPath '${destDir.replace(/'/g, "''")}' -Force`
+/** PURE: the `powershell -Command` arguments that run Expand-Archive. The paths go through quotePowerShellArg:
+ *  escaping only the ASCII ' left a typographic one (U+2018-U+201B, which PowerShell also reads as a single quote)
+ *  to end the string early, so a data dir under a profile such as C:\Users\O’Brien failed every .zip extraction
+ *  with "The path '...\O' either does not exist". Exported for its test, which needs no Windows. */
+export function powershellExpandArgs(archive: string, destDir: string): string[] {
+  const ps = `Expand-Archive -LiteralPath ${quotePowerShellArg(archive)} -DestinationPath ${quotePowerShellArg(destDir)} -Force`
   return ['-NoProfile', '-NonInteractive', '-Command', ps]
 }
 
@@ -485,6 +562,21 @@ function isFullyProvisioned(dir: string): boolean {
   // route handlers) — a failed write just means the next call re-derives it the same way.
   try { writeFileSync(join(dir, PROVISION_MARKER), JSON.stringify({ backfilled: true })) } catch { /* re-derived next time */ }
   return true
+}
+
+/** Delete what a failed or cancelled install left (a partial archive, a half-extracted dir, a stage) on the way out
+ *  of a catch or finally. With retries, since on Windows AV/the indexer briefly holds files that were extracted
+ *  moments ago, and never throwing: a throw there replaces the error in flight, so a Cancel's AbortError (a quiet
+ *  cancel) or the extraction's own error was reported as "Could not install …: EBUSY". A leftover archive or stage
+ *  is replaced or cleared by the next install (downloadFile's own .part cleanup works the same way). A leftover
+ *  install dir may not be: provisionBackend takes a markerless non-CUDA dir that holds llama-server for an older
+ *  install, and provisionTurboquant any dir that holds one. That gap is older; the delete that threw left it too. */
+function removeAfterFailure(path: string): void {
+  try {
+    rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
 }
 
 /**
@@ -543,9 +635,10 @@ export async function provisionBackend(
     }
   } catch (e) {
     // Cancelled or failed mid-download: remove partial archives + the half-built
-    // backend dir so it isn't mistaken for an installed backend.
-    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    // backend dir so it isn't mistaken for an installed backend. Best effort, as
+    // removeAfterFailure says: a throw here replaced e, so a Cancel became a failure.
+    for (const tmp of tmpPaths) removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 
@@ -1122,6 +1215,53 @@ async function runtimePackArchive(packName: string, signal?: AbortSignal): Promi
   return { name: asset.name, url: asset.browser_download_url, sha256: sha256Of(asset.digest ?? undefined) }
 }
 
+/** Written into the working TurboQuant install right before an update parks it at .turboquant-old, and removed once
+ *  the new install passed `verify`: while the parked install carries it, the update that parked it never finished and
+ *  it is still the working build. */
+const TURBOQUANT_UPDATE_INCOMPLETE_MARKER = '.turbollm-update-incomplete'
+
+/** Where an interrupted update's never-verified build is moved, beside the engines' dirs; the next provision clears it. */
+const TURBOQUANT_UNVERIFIED_ROOT = '.turboquant-update'
+
+/** Best effort, with retries (Windows AV/indexer locks are brief). A marker left in turboquant/ itself is never read
+ *  (only a parked install's is), and the next park writes it anew. */
+function clearTurboquantUpdateMarker(dir: string): void {
+  try {
+    rmSync(join(dir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), { force: true, maxRetries: 5, retryDelay: 100 })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** Put the parked TurboQuant install back when an update was cut off (the daemon exited or died) after parking it at
+ *  .turboquant-old and before the new install passed its probe: between the two renames (no install in place), or
+ *  while the new one was probed. Nothing did, so the engine stayed on a build that never ran here, its only working
+ *  build in a hidden folder, and the next update took that folder for a leftover and deleted it. Such a parked
+ *  install still carries TURBOQUANT_UPDATE_INCOMPLETE_MARKER; the unverified install beside it is moved into the
+ *  update's stage, which the next update or Install clears first. A parked install without the marker is a leftover whose
+ *  delete failed after its update passed, left for the next update to delete: also when turboquant/ is gone beside
+ *  it (a Purge renames away only that), where putting it back would show TurboQuant installed again and hand its old
+ *  binary to the next Install instead of a download. A rename that fails leaves everything for the next call. Runs
+ *  at boot and at the start of every update and Install; returns false when the parked install is still the working
+ *  build and could not be put back. */
+export function restoreInterruptedTurboquantUpdate(enginesRoot: string): boolean {
+  const destDir = join(enginesRoot, 'turboquant')
+  const parked = join(enginesRoot, '.turboquant-old')
+  if (!existsSync(join(parked, TURBOQUANT_UPDATE_INCOMPLETE_MARKER))) return true
+  try {
+    if (existsSync(destDir)) {
+      const stageRoot = join(enginesRoot, TURBOQUANT_UNVERIFIED_ROOT)
+      mkdirSync(stageRoot, { recursive: true })
+      renameSync(destDir, join(stageRoot, `unverified-${Date.now()}`))
+    }
+    renameSync(parked, destDir)
+  } catch {
+    return false
+  }
+  clearTurboquantUpdateMarker(destDir)
+  return true
+}
+
 /** Download + extract ONE planned variant into `destDir` and return its server binary. The
  *  provision marker is written only once every archive is in place, so an install interrupted
  *  between the binary and its runtime pack is never mistaken for a complete one. */
@@ -1151,7 +1291,7 @@ async function installTurboquantVariant(
       const tmp = join(enginesRoot, archive.name)
       tmpPaths.push(tmp)
       onProgress?.({ phase: 'downloading', pct: 0, part, parts })
-      await downloadFile(archive.url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal, fetch, archive.sha256)
+      await downloadFile(archive.url, tmp, (p) => onProgress?.({ ...p, part, parts }), signal, fetch, { expectedSha256: archive.sha256 })
       onProgress?.({ phase: 'extracting', pct: -1, part, parts })
       // The runtime pack's DLLs sit at its root; Windows only searches the exe's own dir.
       const bin = i === 0 ? null : findServer(destDir)
@@ -1159,8 +1299,9 @@ async function installTurboquantVariant(
       rmSync(tmp, { force: true })
     }
   } catch (e) {
-    for (const tmp of tmpPaths) rmSync(tmp, { force: true })
-    rmSync(destDir, { recursive: true, force: true })
+    // Best effort, as removeAfterFailure says: a throw here would replace e (a Cancel would become a failure).
+    for (const tmp of tmpPaths) removeAfterFailure(tmp)
+    removeAfterFailure(destDir)
     throw e
   }
 
@@ -1176,27 +1317,16 @@ async function installTurboquantVariant(
   )
   return bin
 }
-
-/** Swap a fully-installed staging dir in as the live install: park the old dir, rename the new
- *  one in, then delete the old — never a moment where neither exists, and the parked dir is
- *  renamed back if the swap itself fails (on Windows a just-probed .exe can stay locked by
- *  antivirus for a moment: EPERM/EBUSY). Mirrors zip-install's promoteProbedInstall. */
-function promoteTurboquantStaging(enginesRoot: string, stageDir: string, destDir: string): void {
-  const parked = existsSync(destDir) ? join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.old`) : null
-  if (parked) renameSync(destDir, parked)
-  try {
-    renameSync(stageDir, destDir)
-  } catch (e) {
-    if (parked) renameSync(parked, destDir)
-    throw e
-  }
-  if (parked) {
-    try {
-      rmSync(parked, { recursive: true, force: true })
-    } catch {
-      /* best effort — the new install is already in place */
-    }
-  }
+export interface TurboquantProvisionOptions {
+  /** An update: install the newest build even though a working one is in place. */
+  replace?: boolean
+  /** Runs on the new build once it is in place (the caller probes and registers it there); a throw swaps it back
+   *  out, and the build it replaced back in. */
+  verify?: (bin: string) => Promise<void>
+  /** Re-run right before the swap: a model may have been started on the engine during the download. */
+  blockSwap?: SwapGuard
+  /** The machine to pick a build for; detected when omitted. */
+  hw?: TurboquantHw
 }
 
 /** Provision TurboQuant's prebuilt `llama-server` into `<enginesRoot>/turboquant/`: resolve the
@@ -1209,72 +1339,203 @@ function promoteTurboquantStaging(enginesRoot: string, stageDir: string, destDir
  *  try is better off with a build that runs (ggml falls back to the CPU) than with no engine
  *  at all. Throws `no_release_asset` when no prebuilt fits at all.
  *
- *  `force` re-installs even though a complete install is already there — what the update path
- *  wants, having already decided the installed tag is behind. It still resolves before deleting
- *  anything, and every candidate is built and checked in a staging dir that is only swapped in
- *  once it passed, so a failed forced update leaves the old build exactly where it was. */
+ *  An install already in place is returned as-is unless `replace` (an update) is set or this
+ *  machine can no longer run it ({@link needsTurboquantReprovision}). Either way the release is
+ *  resolved before anything is removed, and every candidate is built and checked in a staging
+ *  dir, so a failed lookup, download or extract leaves the working install untouched.
+ *
+ *  A working install is replaced by the update protocol: it is parked at .turboquant-old (marked
+ *  as the working build), the staged one moved in, and `verify` run there; when `verify` throws,
+ *  the new install is moved out and the old one put back, so a build that does not run here never
+ *  replaces one that does. An update cut off before verify passed is put back at the next start,
+ *  or by the next update or Install first ({@link restoreInterruptedTurboquantUpdate}). With no
+ *  working install (none, or a dir an interrupted install left) the staged one simply takes its
+ *  place. `blockSwap` re-runs right before either swap. */
 export async function provisionTurboquant(
   enginesRoot: string,
   repo: string,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
-  hw?: TurboquantHw,
-  force = false,
+  opts: TurboquantProvisionOptions = {},
 ): Promise<string> {
   const destDir = join(enginesRoot, 'turboquant')
-  const hardware = hw ?? (await detectTurboquantHw())
-  const existing = installedTurboquant(destDir)
-  if (existing && !force && !needsTurboquantReprovision(readTurboquantMarker(destDir), turboquantCandidates(hardware), hardware)) {
+  putBackInterruptedTurboquantUpdate(enginesRoot)
+  const hw = opts.hw ?? (await detectTurboquantHw())
+  const working = installedTurboquant(destDir)
+  if (working && !opts.replace && !needsTurboquantReprovision(readTurboquantMarker(destDir), turboquantCandidates(hw), hw)) {
     // Strip quarantine even on the fast-path: a previous failed probe leaves the
     // directory intact with the quarantine attribute still set.
     stripMacOsQuarantine(destDir)
-    return existing
+    return working
   }
   // Resolve BEFORE removing anything: a lookup that fails (offline, rate-limited) must not
   // destroy an install that is sitting there working.
-  const plan = await fetchTurboquantPlan(repo, hardware, signal)
+  const plan = await fetchTurboquantPlan(repo, hw, signal)
   if (!plan.length) throw new NoReleaseAssetError()
-  // Each candidate is downloaded, extracted and backend-checked in a hidden staging sibling
-  // (the probe runs against the staging path), and only the winner is swapped in — so a
-  // download, checksum, extraction or backend failure on EVERY candidate leaves the working
-  // install untouched. The install dir used to be removed up front and again per failure,
-  // which is how a failed forced update took the engine away with it, leaving the registry
-  // pointing at a binary that no longer existed.
-  // Staged under build/ in the `.stage` convention release-install and zip-install use: same
-  // naming, same volume (so the final rename is atomic), and gcAbandonedZipInstalls sweeps one
-  // a hard kill left behind — age alone decides, since a staging dir never holds a registered
-  // binary.
-  const stageDir = join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.stage`)
-  let lastError: unknown = null
+  const staged = await stageFirstWorkingTurboquantBuild(enginesRoot, plan, onProgress, signal)
   try {
-    for (const [i, resolved] of plan.entries()) {
-      try {
-        rmSync(stageDir, { recursive: true, force: true })
-        const stagedBin = await installTurboquantVariant(enginesRoot, stageDir, resolved, onProgress, signal)
-        if (!(await backendLoads(stagedBin, resolved.variant))) {
-          const backend = turboquantBackend(resolved.variant.name)
-          // Not the last candidate: fall through to the next one. The last one is kept — the
-          // CPU-family variants pass this check by definition, so what lands here is a GPU
-          // build on a machine with no fallback left.
-          if (i < plan.length - 1) {
-            throw new Error(`the ${resolved.variant.name} build did not load its ${backend} backend`)
-          }
-          console.warn(`[turboquant] ${resolved.variant.name} is the last build available for this machine and its ${backend} backend did not come up — keeping it (ggml will fall back to the CPU)`)
-        }
-        promoteTurboquantStaging(enginesRoot, stageDir, destDir)
-        const bin = findServer(destDir)
-        if (!bin) throw new Error('llama-server vanished from the TurboQuant install dir after the swap')
-        return bin
-      } catch (e) {
-        if ((e as Error)?.name === 'AbortError') throw e
-        lastError = e
-      }
-    }
-    throw new Error(
-      `no TurboQuant build for this machine worked (tried ${plan.map((p) => p.variant.name).join(', ')}): ` +
-        `${lastError instanceof Error ? lastError.message : String(lastError)}`,
-    )
+    // The download took minutes: a model loaded on the engine meanwhile must not have its files swapped under it.
+    throwIfSwapBlocked(opts.blockSwap)
+    const swapIn = working && (opts.replace || opts.verify) ? replaceWorkingTurboquant : takeOverTurboquantDir
+    return await swapIn(enginesRoot, staged, opts.verify)
   } finally {
-    rmSync(stageDir, { recursive: true, force: true }) // a no-op once it was renamed into place
+    // A no-op once the stage was moved into place. After a failed swap it still holds the fresh files, and a throw
+    // here would mask the real error.
+    removeAfterFailure(staged.dir)
   }
+}
+
+/** An update cut off before its new build passed the probe left the working build parked: put it back first. An
+ *  update's leftover delete would take it. An Install (after a boot that could not move it back, turboquant/ gone, its
+ *  entry left on the missing binary) downloaded beside it, and the next start swapped that download out for it. When
+ *  it cannot be put back it is still the only working build, so stop. */
+function putBackInterruptedTurboquantUpdate(enginesRoot: string): void {
+  if (!restoreInterruptedTurboquantUpdate(enginesRoot)) {
+    throw new Error(
+      `An earlier TurboQuant update was cut short and its working build, kept at ${join(enginesRoot, '.turboquant-old')}, ` +
+        'could not be moved back yet. Try again in a moment.',
+    )
+  }
+  removeAfterFailure(join(enginesRoot, TURBOQUANT_UNVERIFIED_ROOT))
+}
+
+/** A TurboQuant build installed into a staging dir: the dir, and its server binary inside it. */
+interface StagedTurboquant {
+  dir: string
+  bin: string
+}
+
+/** Install the plan's candidates in order, each into its own staging dir, until one loads its backend (or is the last
+ *  one left), and return it. Staged under build/ in the `.stage` convention release-install and zip-install use: same
+ *  naming, same volume (so the final rename is atomic), and gcAbandonedZipInstalls sweeps one a hard kill left behind
+ *  — age alone decides, since a staging dir never holds a registered binary. */
+async function stageFirstWorkingTurboquantBuild(
+  enginesRoot: string,
+  plan: TurboquantResolution[],
+  onProgress?: (p: ProvisionProgress) => void,
+  signal?: AbortSignal,
+): Promise<StagedTurboquant> {
+  let lastError: unknown = null
+  for (const [i, resolved] of plan.entries()) {
+    const dir = join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.stage`)
+    try {
+      const bin = await installTurboquantVariant(enginesRoot, dir, resolved, onProgress, signal)
+      await requireBackendUnlessLast(bin, resolved.variant, i === plan.length - 1)
+      return { dir, bin }
+    } catch (e) {
+      removeAfterFailure(dir)
+      if ((e as Error)?.name === 'AbortError') throw e
+      lastError = e
+    }
+  }
+  throw new Error(
+    `no TurboQuant build for this machine worked (tried ${plan.map((p) => p.variant.name).join(', ')}): ` +
+      `${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  )
+}
+
+/** Throw when a staged build's backend did not come up, so the plan falls through to the next candidate. The last one
+ *  is kept: the CPU-family variants pass this check by definition, so what lands here is a GPU build on a machine with
+ *  no fallback left. */
+async function requireBackendUnlessLast(bin: string, variant: TurboquantVariant, isLast: boolean): Promise<void> {
+  if (await backendLoads(bin, variant)) return
+  const backend = turboquantBackend(variant.name)
+  if (!isLast) throw new Error(`the ${variant.name} build did not load its ${backend} backend`)
+  console.warn(`[turboquant] ${variant.name} is the last build available for this machine and its ${backend} backend did not come up — keeping it (ggml will fall back to the CPU)`)
+}
+
+/** The update protocol: park the working install at .turboquant-old (marked, so an interruption puts it back), move
+ *  the staged build in and verify it there; a build that fails verify is moved out and the parked one put back. */
+async function replaceWorkingTurboquant(
+  enginesRoot: string,
+  staged: StagedTurboquant,
+  verify?: (bin: string) => Promise<void>,
+): Promise<string> {
+  const destDir = join(enginesRoot, 'turboquant')
+  const parked = join(enginesRoot, '.turboquant-old')
+  await parkWorkingTurboquant(destDir, parked)
+  try {
+    // The staged tree was extracted moments ago: AV/the indexer may still hold its files open.
+    await renameWithRetry(staged.dir, destDir)
+  } catch (e) {
+    await putParkedTurboquantBack(parked, destDir)
+    throw e
+  }
+  const bin = join(destDir, relative(staged.dir, staged.bin))
+  try {
+    await verify?.(bin)
+  } catch (e) {
+    await rollBackTurboquantSwap(staged.dir, destDir, parked)
+    throw e
+  }
+  discardParkedTurboquant(parked)
+  return bin
+}
+
+/** Parked, the working install stays the working build until the new one passed verify: marked first, so the next
+ *  start (or update) puts it back when the daemon exits or dies before then (restoreInterruptedTurboquantUpdate). */
+async function parkWorkingTurboquant(destDir: string, parked: string): Promise<void> {
+  // A leftover of an earlier update whose delete failed. Retries: Windows AV/indexer locks are brief.
+  rmSync(parked, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  writeFileSync(join(destDir, TURBOQUANT_UPDATE_INCOMPLETE_MARKER), '')
+  try {
+    await renameWithRetry(destDir, parked)
+  } catch (e) {
+    clearTurboquantUpdateMarker(destDir)
+    throw e
+  }
+}
+
+async function putParkedTurboquantBack(parked: string, destDir: string): Promise<void> {
+  await renameWithRetry(parked, destDir)
+  clearTurboquantUpdateMarker(destDir)
+}
+
+/** The new build does not run here. Deleting the old one first and probing after left the broken binary in place under
+ *  the old build's version, so the same update kept being offered and an `auto` engine downloaded it again on every
+ *  check. Back to the stage (removed by the caller), and the old install back. */
+async function rollBackTurboquantSwap(stageDir: string, destDir: string, parked: string): Promise<void> {
+  try {
+    await renameWithRetry(destDir, stageDir)
+    await putParkedTurboquantBack(parked, destDir)
+  } catch {
+    /* the probe error stays the reported cause; a parked old install is still at .turboquant-old, marked */
+  }
+}
+
+/** The new install is in place: deleting the old one is best effort, never a failed update (the next one removes a
+ *  leftover first). From here a parked old one is a leftover: its marker goes first, so a failed delete of it is never
+ *  taken for an update cut short. */
+function discardParkedTurboquant(parked: string): void {
+  clearTurboquantUpdateMarker(parked)
+  removeAfterFailure(parked)
+}
+
+/** With no working install to protect, the staged build takes turboquant/'s place: whatever an interrupted install
+ *  left there (or a build this machine can no longer run, when no `verify` asked for the update protocol) is parked
+ *  under build/, renamed back if the swap itself fails, and deleted once it succeeded. A build that then fails
+ *  `verify` is moved back out, so the next Install downloads again instead of taking it. */
+async function takeOverTurboquantDir(
+  enginesRoot: string,
+  staged: StagedTurboquant,
+  verify?: (bin: string) => Promise<void>,
+): Promise<string> {
+  const destDir = join(enginesRoot, 'turboquant')
+  const parked = existsSync(destDir) ? join(enginesRoot, 'build', `.turboquant-${randomUUID().slice(0, 8)}.old`) : null
+  if (parked) await renameWithRetry(destDir, parked)
+  try {
+    await renameWithRetry(staged.dir, destDir)
+  } catch (e) {
+    if (parked) await renameWithRetry(parked, destDir)
+    throw e
+  }
+  if (parked) removeAfterFailure(parked)
+  const bin = join(destDir, relative(staged.dir, staged.bin))
+  try {
+    await verify?.(bin)
+  } catch (e) {
+    await renameWithRetry(destDir, staged.dir).catch(() => { /* the probe error stays the reported cause */ })
+    throw e
+  }
+  return bin
 }

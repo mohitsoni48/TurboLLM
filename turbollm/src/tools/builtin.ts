@@ -1,9 +1,9 @@
 // Built-in tool definitions and execution (v0.7.0).
 // Tools: web_search (Tavily), fetch_url, run_code (Node vm sandbox, isolated in a worker thread).
 import { Worker } from 'node:worker_threads'
-import { checkSsrf } from './security.js'
+import { fetchWithSsrfCheck } from './security.js'
 import { RUN_CODE_TIMEOUT_MS } from './run-code-sandbox.js'
-import { type SearchConfig } from './search-providers.js'
+import type { SearchConfig } from './search-providers.js'
 import {
   ageInDays, aggregatorPenalty, currentnessMultiplier, freshnessSignal, officialDocsBoost,
   officialSourceBoost, research, type ResearchResult,
@@ -96,7 +96,7 @@ export const RUN_CODE_TOOL = {
     parameters: {
       type: 'object',
       properties: {
-        code: { type: 'string', description: 'JavaScript code to execute. The last expression is the return value.' },
+        code: { type: 'string', description: 'JavaScript code to execute, run as a function body: use a `return` statement for the result (e.g. `return 21 * 2`) — a bare last expression is discarded. console.log output is also captured.' },
       },
       required: ['code'],
     },
@@ -105,7 +105,7 @@ export const RUN_CODE_TOOL = {
 
 // ── Web search — F-021 retrieval service ──────────────────────────────────────
 
-export { type ResearchResult }
+export type { ResearchResult }
 
 /** PURE: today's date as 'YYYY-MM-DD' (UTC), stamped on results so the model can tell how old
  *  a source is instead of guessing from its training cutoff. */
@@ -236,13 +236,15 @@ export async function backfillPublishedDates(results: ResearchResult[]): Promise
 
   await Promise.allSettled(
     missing.map(async (r) => {
-      if (await checkSsrf(r.url)) return // same guard as fetch_url; never probe internal hosts
       let resp: Response
       try {
-        resp = await fetch(r.url, {
+        // Same guard as fetch_url, on every redirect hop; never probe internal hosts.
+        const fetched = await fetchWithSsrfCheck(r.url, {
           headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
           signal: AbortSignal.timeout(DATE_PROBE_TIMEOUT_MS),
         })
+        if (typeof fetched === 'string') return
+        resp = fetched
       } catch {
         return
       }
@@ -396,6 +398,39 @@ const DATE_META_KEYS = new Set([
 ])
 
 /**
+ * The page cut after its last `>`. A tag pattern (`<meta\s[^>]*>`, `<[^>]+>`) can only match before
+ * that point, but run on the whole page it is quadratic: at each `<` with no `>` anywhere after it,
+ * it scans to the end of the page before giving up, so a crafted page of `<meta `s or `<`s blocked
+ * the event loop (about 80 minutes for one 2 MiB fetch_url page, seconds per search result in the
+ * date backfill). On the cut page every start finds its `>`, so the same patterns find the same
+ * matches in linear time.
+ */
+function upToLastTag(html: string): string {
+  return html.slice(0, html.lastIndexOf('>') + 1)
+}
+
+/**
+ * The bodies of the page's JSON-LD `<script>` blocks, in page order: exactly what
+ * /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi captures, without
+ * that pattern's quadratic backtracking (over every `type=` in a tag, and to the end of the page
+ * for a `</script>` that never comes).
+ */
+function* jsonLdBlocks(html: string): Generator<string> {
+  const page = upToLastTag(html)
+  const open = /<script[^>]*>/gi
+  const close = /<\/script>/gi
+  for (let tag = open.exec(page); tag; tag = open.exec(page)) {
+    if (!/type=["']application\/ld\+json["']/i.test(tag[0])) continue
+    close.lastIndex = open.lastIndex
+    const end = close.exec(page)
+    // No `</script>` after this tag means none after any later tag either.
+    if (!end) return
+    yield page.slice(open.lastIndex, end.index)
+    open.lastIndex = close.lastIndex
+  }
+}
+
+/**
  * PURE: best-effort publication date from raw HTML, in priority order:
  * JSON-LD `datePublished` → publication-date `<meta>` → `<time datetime>`.
  * Returns 'YYYY-MM-DD' or undefined.
@@ -407,20 +442,21 @@ const DATE_META_KEYS = new Set([
 export function extractPublishedDate(html: string): string | undefined {
   // Matched by regex rather than JSON.parse — the page is untrusted and we only ever want a
   // date-shaped substring out of it, never a parsed object graph.
-  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    const iso = normalizeIsoDate(/"datePublished"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+  for (const block of jsonLdBlocks(html)) {
+    const iso = normalizeIsoDate(/"datePublished"\s*:\s*"([^"]{1,64})"/i.exec(block)?.[1])
     if (iso) return iso
   }
 
+  const tags = upToLastTag(html)
   // Attribute order varies across sites, so match the whole tag and pick the pieces out of it.
-  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+  for (const tag of tags.matchAll(/<meta\s[^>]*>/gi)) {
     const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
     if (!key || !DATE_META_KEYS.has(key.trim().toLowerCase())) continue
     const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
     if (iso) return iso
   }
 
-  for (const tag of html.matchAll(/<time\s[^>]*>/gi)) {
+  for (const tag of tags.matchAll(/<time\s[^>]*>/gi)) {
     const iso = normalizeIsoDate(/\bdatetime\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
     if (iso) return iso
   }
@@ -442,11 +478,11 @@ const MODIFIED_META_KEYS = new Set(['article:modified_time', 'og:updated_time', 
  * set exists to fix, just inverted. Both dates are reported so the model can judge.
  */
 export function extractModifiedDate(html: string): string | undefined {
-  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
-    const iso = normalizeIsoDate(/"dateModified"\s*:\s*"([^"]{1,64})"/i.exec(block[1])?.[1])
+  for (const block of jsonLdBlocks(html)) {
+    const iso = normalizeIsoDate(/"dateModified"\s*:\s*"([^"]{1,64})"/i.exec(block)?.[1])
     if (iso) return iso
   }
-  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+  for (const tag of upToLastTag(html).matchAll(/<meta\s[^>]*>/gi)) {
     const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
     if (!key || !MODIFIED_META_KEYS.has(key.trim().toLowerCase())) continue
     const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
@@ -471,6 +507,13 @@ export function extractModifiedDate(html: string): string | undefined {
  */
 export const FETCH_URL_MAX_CHARS = 20_000
 
+/** Raw bytes fetch_url reads before it stops. Far above FETCH_URL_MAX_CHARS because the tool
+ *  returns TEXT: an HTML page's scripts, styles and markup are stripped first, and on a heavy page
+ *  they can fill most of the first megabyte before the content starts. Still a hard bound, so an
+ *  enormous or endless body cannot balloon the daemon's memory (a phone's, on Android); a page cut
+ *  here gets the truncation marker below like any other over-long page. */
+const FETCH_URL_MAX_BYTES = 2 * 1024 * 1024
+
 /** Appended when a page is cut, so the model knows it is looking at a PREFIX and can decide
  *  to fetch a more specific URL rather than concluding the page did not contain the answer.
  *  Static text: no page content reaches it, so it cannot be spoofed into a different field. */
@@ -483,21 +526,41 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   if (!url) return 'Error: url is required.'
   if (!/^https?:\/\//i.test(url)) return 'Error: URL must start with http:// or https://'
 
-  const ssrfErr = await checkSsrf(url)
-  if (ssrfErr) return ssrfErr
-
   let resp: Response
   try {
-    resp = await fetch(url, {
+    const fetched = await fetchWithSsrfCheck(url, {
       headers: { 'User-Agent': 'TurboLLM/0.7 (tool-fetch)' },
       signal: AbortSignal.timeout(15_000),
     })
+    if (typeof fetched === 'string') return fetched
+    resp = fetched
   } catch (e) {
     return `Error: could not fetch URL — ${(e as Error).message}`
   }
 
   const contentType = resp.headers.get('content-type') ?? ''
-  const text = await resp.text().catch(() => '')
+  // Streamed up to FETCH_URL_MAX_BYTES instead of resp.text(), which would buffer a huge or
+  // endless body whole before any of it is cut.
+  let text = ''
+  let cut = false
+  if (resp.body) {
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let read = 0
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        read += value.byteLength
+        text += decoder.decode(value, { stream: true })
+        if (read >= FETCH_URL_MAX_BYTES) { cut = true; break }
+      }
+      text += decoder.decode()
+    } catch {
+      text = ''
+    }
+    await reader.cancel().catch(() => {})
+  }
   let content: string
   let published: string | undefined
   let modified: string | undefined
@@ -505,11 +568,16 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   if (contentType.includes('text/html')) {
     published = extractPublishedDate(text)
     modified = extractModifiedDate(text)
-    // Strip HTML tags and collapse whitespace
-    content = text
-      .replace(/<script[\s\S]*?<\/script>/gi, '')
-      .replace(/<style[\s\S]*?<\/style>/gi, '')
-      .replace(/<[^>]+>/g, ' ')
+    // Strip HTML tags and collapse whitespace, in linear time and with the output the plain
+    // patterns gave. `<script[\s\S]*?<\/script>` rescanned to the end of the page from every
+    // unclosed `<script` (quadratic), so the scan now runs to the end once and puts that unclosed
+    // tail back unchanged, as the plain pattern never removed it. `<[^>]+>`: see upToLastTag.
+    const keepUnclosed = (match: string, close: string) => (close ? '' : match)
+    const code = text
+      .replace(/<script[\s\S]*?(<\/script>|$)/gi, keepUnclosed)
+      .replace(/<style[\s\S]*?(<\/style>|$)/gi, keepUnclosed)
+    const tagsEnd = upToLastTag(code).length
+    content = (code.slice(0, tagsEnd).replace(/<[^>]+>/g, ' ') + code.slice(tagsEnd))
       .replace(/&nbsp;/g, ' ')
       .replace(/&amp;/g, '&')
       .replace(/&lt;/g, '<')
@@ -532,7 +600,7 @@ export async function execFetchUrl(args: Record<string, unknown>): Promise<strin
   // Reserve room for the marker so a truncated page still fits under the ceiling — the old
   // code sliced to the full budget and THEN appended, overshooting by the marker's length.
   const budget = FETCH_URL_MAX_CHARS - header.length - 1 - FETCH_URL_TRUNCATION_MARKER.length
-  if (content.length > budget) content = content.slice(0, budget) + FETCH_URL_TRUNCATION_MARKER
+  if (content.length > budget || cut) content = content.slice(0, budget) + FETCH_URL_TRUNCATION_MARKER
   return `${header}\n${content || '(empty response)'}`
 }
 

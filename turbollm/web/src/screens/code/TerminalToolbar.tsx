@@ -29,6 +29,7 @@ import { ThinkingBudgetSlider } from '../../components/ThinkingBudgetSlider'
 import { ReasoningEffortSelect, type ReasoningEffort } from '../../components/ReasoningEffortSelect'
 import { CodeStatsFooter } from './CodeStatsFooter'
 import type { ModelEntry } from '../../lib/types'
+import type { PickerHidden } from '../../lib/model-kind'
 import type { LinkRecord } from '../../lib/link-api'
 import type { RemoteModelRow } from '../../lib/remote-models'
 
@@ -42,6 +43,8 @@ export interface TerminalToolbarProps {
    *  exactly as it did before Turbo Link existed. */
   links?: LinkRecord[]
   remoteModels?: RemoteModelRow[]
+  /** The models left out of `models`, for ModelLoadMenu's empty state (lib/model-kind.ts chatModelsForPicker). */
+  modelsHidden?: PickerHidden
   loadedKey: string | null
   loadedName: string | null
   modelPending: boolean
@@ -69,7 +72,7 @@ export interface TerminalToolbarProps {
 }
 
 export function TerminalToolbar({
-  agent, models, links, remoteModels, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
+  agent, models, links, remoteModels, modelsHidden, loadedKey, loadedName, modelPending, ejecting, onLoadModel, onEjectModel, onModelSettings,
   ctxUsed, ctxMax, thinkingBudget, onThinkingBudgetChange, reasoningEffort, onReasoningEffortChange,
   lastPromptTokens, lastGenTokens, lastPromptTps, lastGenTps,
 }: TerminalToolbarProps) {
@@ -95,6 +98,7 @@ export function TerminalToolbar({
           models={models}
           links={links}
           remoteModels={remoteModels}
+          hidden={modelsHidden}
           loadedKey={loadedKey}
           loadedName={loadedName}
           pending={modelPending}

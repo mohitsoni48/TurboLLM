@@ -6,7 +6,7 @@
 // NOT persisted: a reload must not resurrect a dialog about work that finished, a toast for a
 // load this browser never fired, or a spinner for a load that is long over.
 import { create } from 'zustand'
-import type { ActiveWork, LoadProfile } from '../lib/types'
+import type { ActiveWork, UserSetProfile } from '../lib/types'
 
 /** The model a load site asked for — its own `jev` field, not a flag the caller has to
  *  remember, is what decides whether the activity probe runs. Structural, so a
@@ -22,7 +22,7 @@ export type LoadTarget = {
 /** What a load site asks for beyond the model itself. Carried through the confirmation, so a
  *  confirmed load behaves exactly like one that was never interrupted (ADR-434 (i)(3)). */
 export type LoadOptions = {
-  overrides?: Partial<LoadProfile>
+  overrides?: UserSetProfile
   onError?: (e: unknown) => void
   onSuccess?: () => void
 }

@@ -5,6 +5,9 @@
 // Jev load confirmation will track is listed here BEFORE those call sites exist (ADR-333/334).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { dirname, join, relative } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { SCREENS, UI_ACTIONS } from './ui'
 
 const JEV_PLAYGROUND_ACTIONS = [
@@ -47,4 +50,30 @@ test('the screens these actions are tracked on already exist', () => {
 
 test('the Laya playground link is a recognised UI action (ADR-443)', () => {
   assert.ok((UI_ACTIONS as readonly string[]).includes('open_laya_playground'))
+})
+
+test('every literal track(screen, action) call in web/src is a recognised screen and action', () => {
+  // The enum-vs-call-site drift above was only ever caught by hand (three times). This scans every
+  // literal `track('<screen>', '<action>')` call in the web app, so a new call site without an
+  // entry here fails the suite instead of silently recording nothing.
+  const root = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'web', 'src')
+  const walk = (dir: string, out: string[] = []): string[] => {
+    for (const name of readdirSync(dir)) {
+      const p = join(dir, name)
+      if (statSync(p).isDirectory()) walk(p, out)
+      else if (/\.(tsx?|jsx?)$/.test(name) && !/\.test\./.test(name)) out.push(p)
+    }
+    return out
+  }
+  const bad: string[] = []
+  let calls = 0
+  for (const file of walk(root)) {
+    for (const m of readFileSync(file, 'utf8').matchAll(/\btrack\(\s*(['"`])([^'"`]+)\1\s*,\s*(['"`])([^'"`]+)\3/g)) {
+      calls++
+      if (!(SCREENS as readonly string[]).includes(m[2])) bad.push(`${relative(root, file)}: screen ${m[2]}`)
+      if (!(UI_ACTIONS as readonly string[]).includes(m[4])) bad.push(`${relative(root, file)}: action ${m[4]}`)
+    }
+  }
+  assert.ok(calls > 100, `expected to find the web app's track() calls, found ${calls}`)
+  assert.deepEqual(bad, [])
 })

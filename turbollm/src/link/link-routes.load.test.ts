@@ -38,12 +38,16 @@ interface Harness {
   finishLoad: () => void
   /** Mutable counter so callers observe stops made after the harness was built. */
   stops: { n: number }
+  /** bench.cancel() calls: the kill switch a load into the primary runs first. */
+  benchCancels: { n: number }
+  /** The host's config, as the store's snapshot() hands it out. */
+  cfg: Record<string, unknown>
 }
 
 function mkDeps(
   keys: ApiKey[],
   models: ModelEntry[],
-  opts?: { blockLoad?: boolean; comfyBlocked?: boolean; noEngine?: boolean },
+  opts?: { blockLoad?: boolean; comfyBlocked?: boolean; noEngine?: boolean; engineKind?: string },
 ): Harness {
   const cfg: Record<string, unknown> = {
     apiKeys: keys,
@@ -54,6 +58,7 @@ function mkDeps(
   const loads: string[] = []
   let release: () => void = () => {}
   const stops = { n: 0 }
+  const benchCancels = { n: 0 }
 
   const manager = {
     status: () => ({ state: 'idle', model: null }),
@@ -74,7 +79,7 @@ function mkDeps(
   const registry = {
     active: () => opts?.noEngine
       ? undefined
-      : { id: 'eng-1', kind: 'llama.cpp', name: 'llama.cpp', binPath: 'llama-server', capabilities: { flags: [] } },
+      : { id: 'eng-1', kind: opts?.engineKind ?? 'llama.cpp', name: 'llama.cpp', binPath: 'llama-server', capabilities: { flags: [] } },
   }
   // The REAL router, so `withSwapLock` under test is the production swap chain, not a
   // test-local re-implementation of one.
@@ -84,11 +89,11 @@ function mkDeps(
   const d = {
     version: '1.11.2',
     store, scanner, manager, registry, modelRouter,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { cancel: () => { benchCancels.n += 1 }, waitIdle: () => Promise.resolve() },
     comfy: opts?.comfyBlocked ? { isBlocked: () => true } : undefined,
   } as unknown as Deps
 
-  return { d, loads, finishLoad: () => release(), stops }
+  return { d, loads, finishLoad: () => release(), stops, benchCancels, cfg }
 }
 
 function app(d: Deps) {
@@ -179,6 +184,23 @@ test('a missing modelKey is 400 — it never falls through to the host lastLoade
   assert.deepEqual(h.loads, [])
 })
 
+// A body of null threw at the first field read: a bare 500 from Hono's default handler.
+test('a JSON body that is not an object is the missing-modelKey 400, not a 500', async () => {
+  const h = mkDeps([key('tllm-a', ['models:load'])], [entry({ key: 'qwen3-35b' })])
+  const a = app(h.d)
+  for (const body of ['null', '5', '"qwen3-35b"', '["qwen3-35b"]']) {
+    const res = await a.request('/api/link/v1/models/load', {
+      method: 'POST',
+      headers: { 'X-TurboLLM-Auth': 'tllm-a', 'content-type': 'application/json' },
+      body,
+    })
+    assert.equal(res.status, 400, `${body}: ${await res.clone().text()}`)
+    assert.deepEqual(await res.json(), { error: { code: 'invalid_input', message: 'modelKey is required.' } })
+  }
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(h.loads, [])
+})
+
 test('a second load while one is in flight serializes through the existing swap chain', async () => {
   const h = mkDeps(
     [key('tllm-a', ['models:load'])],
@@ -202,6 +224,42 @@ test('the ComfyUI guard applies to a remote caller exactly as it does locally', 
   assert.equal(res.status, 409)
   const body = await res.json() as { error: { code: string } }
   assert.equal(body.error.code, 'comfyui_busy')
+})
+
+// A model the host's selected engine cannot run is hidden on the host (its Models screen and pickers) unless the
+// host's owner shows every engine's models; a peer has no such setting. The façade listed such a model to the peer, and
+// its Load went to startEngine as a manual load, which starts on the selected engine whatever the model: it cancelled
+// the host's auto-tune, aborted its chats, stopped its model and recorded the model as last loaded, for a start that
+// then failed (a .litertlm bundle on llama.cpp, a GGUF on vLLM).
+test('a load of a model the host\'s selected engine cannot run is 409 and leaves the host as it was', async () => {
+  const bundle = entry({ key: 'gemma-3n|litertlm|1', name: 'Gemma 3n', format: 'litertlm', path: 'D:\\models\\gemma-3n.litertlm' })
+  const safetensors = entry({ key: 'qwen3-8b-hf', format: 'mlx', path: 'D:\\models\\qwen3-8b-hf' })
+  const cases: Array<[string, ModelEntry, string]> = [
+    // The reason names the host's engine and what it cannot run, and no engine the peer could not switch to anyway.
+    ['llama-server', bundle, "llama.cpp can't run this .litertlm model."],
+    ['vllm', entry({ key: 'qwen3-8b' }), "vLLM can't run this GGUF model."],
+  ]
+  for (const [engineKind, model, message] of cases) {
+    const h = mkDeps([key('tllm-a', ['models:use', 'models:load'])], [entry({ key: 'qwen3-8b' }), bundle, safetensors], { engineKind })
+    h.cfg.lastLoaded = { modelKey: engineKind === 'vllm' ? safetensors.key : 'qwen3-8b', engineId: 'eng-1' }
+    const lastLoaded = h.cfg.lastLoaded
+    const res = await post(app(h.d), '/api/link/v1/models/load', 'tllm-a', { modelKey: model.key })
+    assert.equal(res.status, 409, engineKind)
+    assert.deepEqual(await res.json(), { error: { code: 'engine_model_mismatch', message } })
+    await new Promise((r) => setTimeout(r, 10))
+    assert.deepEqual([h.loads, h.benchCancels.n, h.cfg.lastLoaded], [[], 0, lastLoaded], engineKind)
+  }
+})
+
+test('with every engine\'s models shown on the host, a peer\'s load of one its engine cannot run is started there', async () => {
+  const bundle = entry({ key: 'gemma-3n|litertlm|1', name: 'Gemma 3n', format: 'litertlm', path: 'D:\\models\\gemma-3n.litertlm' })
+  const h = mkDeps([key('tllm-a', ['models:use', 'models:load'])], [entry({ key: 'qwen3-8b' }), bundle], { engineKind: 'llama-server' })
+  h.cfg.showAllEngineModels = true
+  const res = await post(app(h.d), '/api/link/v1/models/load', 'tllm-a', { modelKey: bundle.key })
+  assert.equal(res.status, 202)
+  await new Promise((r) => setTimeout(r, 10))
+  assert.deepEqual(h.loads, [bundle.key])
+  assert.deepEqual(h.cfg.lastLoaded, { modelKey: bundle.key, engineId: 'eng-1' })
 })
 
 test('no host filesystem detail crosses the façade on any load outcome', async () => {

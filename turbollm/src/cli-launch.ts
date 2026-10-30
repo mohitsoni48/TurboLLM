@@ -15,20 +15,23 @@
 //     at the gateway (session-auth.ts) instead of racing on one global config file.
 //   - `mcpArgs` points the harness at the daemon's own MCP bridge, for harnesses with a confirmed
 //     flag for it (claude). opencode carries the same bridge inside its inline config instead.
-import { spawn } from 'node:child_process'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { homedir } from 'node:os'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { join, dirname } from 'node:path'
 import { buildShellCommand } from './util/shell-command'
 import { requiresShell, resolveExecutable } from './util/resolve-executable'
+import { killTetheredTree, spawnTethered } from './util/tether'
 import { isQualifiedId } from './link/model-id'
 import { isTextClassifier } from './models/text-classifier'
+import { localDaemonOrigin } from './daemon-pid'
 
 /** Everything a harness might need to wire itself to this daemon, resolved once per launch and
  *  handed to every per-harness hook on {@link CliSpec}. Exists so adding a harness is a data entry
  *  rather than another `if (target === 'x')` branch in launchCli. */
 export interface LaunchContext {
-  /** `http://127.0.0.1:<port>` — the gateway origin. */
+  /** `http://127.0.0.1:<port>` — the gateway origin (on a daemon bound to another loopback
+   *  address alone, such as `--addr [::1]:6996`, that address: localDaemonOrigin). */
   base: string
   port: number
   /** The token this launch should present. **Session-scoped** for an embedded-terminal launch
@@ -47,7 +50,8 @@ export interface LaunchContext {
   /** The WHOLE model library, not just the loaded model.
    *
    *  Why it must be the whole library: claude gets a real model picker for free — the gateway
-   *  advertises every model on `/v1/models` and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` tells
+   *  advertises the library on `/v1/models` (a model the selected engine can't run only while it runs
+   *  or Settings shows every engine's models) and `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY` tells
    *  Claude Code to read it. Config-file harnesses have no such discovery channel: they can only see
    *  what we WRITE into their config. Writing only the loaded model (as this did originally) left
    *  `/model` in pi showing a single entry — founder-reported as "I can't see turbollm models" — while
@@ -321,6 +325,9 @@ export interface ModelEntry {
    *  at 163328 advertised the wrong window until it happened to be the loaded one. Undefined when
    *  the model has no saved profile, where nativeCtx is the honest remaining answer. */
   configuredCtx?: number
+  /** false when the selected engine cannot run this model (`/api/v1/models`, modelIncompatibility): the Models
+   *  screen hides it unless every engine's models are shown. Absent from a daemon that predates the field. */
+  compatibleWithActiveEngine?: boolean
 }
 
 /** The context window to advertise for one model, best-known first:
@@ -374,10 +381,11 @@ const realSpawn: SpawnLike = (cmd, args, opts) => {
   // Residual shim path (`claude.cmd` from a global npm install), which cannot avoid cmd.exe.
   // The `\"` weakness above is NOT reachable through it in the daemon-driven flow: the only
   // argument here carrying arbitrary user prose is a Code session's seeded first message, and
-  // `canSeedFirstMessage` (terminal-routes.ts) refuses any message containing a double quote
-  // before it is ever put on a command line. Every other argument is one of our own flags, drawn
-  // from a fixed safe character set. A hand-run `turbollm launch claude "…"` can still pass a
-  // quote through, but that is the user's own shell invocation, not a privilege boundary.
+  // `canSeedFirstMessage` (terminal-routes.ts) refuses on Windows, the only platform this path
+  // runs on, any message containing a double quote before it is ever put on a command line.
+  // Every other argument is one of our own flags, drawn from a fixed safe character set. A
+  // hand-run `turbollm launch claude "…"` can still pass a quote through, but that is the user's
+  // own shell invocation, not a privilege boundary.
   return spawn(buildShellCommand(cmd, args), opts)
 }
 
@@ -537,11 +545,16 @@ const realFs: ConfigFs = {
  *  Regenerated on every launch rather than written once: content is fully determined by `port`,
  *  cheap to overwrite, and a stale port left over from a previous daemon would otherwise point
  *  the CLI at a server that no longer exists. */
-export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs): Promise<string> {
+export async function writeClaudeMcpConfig(port: number, fs: ConfigFs = realFs, platform: NodeJS.Platform = process.platform): Promise<string> {
   const dir = join(fs.home, '.turbollm')
   await fs.mkdir(dir)
   const path = join(dir, 'mcp-launch-config.json')
-  const config = { mcpServers: { turbollm: { command: 'npx', args: ['turbollm', 'mcp-server', '--port', String(port)] } } }
+  const npxArgs = ['turbollm', 'mcp-server', '--port', String(port)]
+  // npx is a `.cmd` shim on native Windows, which claude can't spawn as a bare command (the
+  // server dies with "Connection closed") — run it through `cmd /c`, the wrapper Claude Code's
+  // own docs prescribe and the same one tools/mcp-client.ts uses for its stdio servers.
+  const server = platform === 'win32' ? { command: 'cmd', args: ['/c', 'npx', ...npxArgs] } : { command: 'npx', args: npxArgs }
+  const config = { mcpServers: { turbollm: server } }
   await fs.writeFile(path, JSON.stringify(config, null, 2))
   return path
 }
@@ -635,7 +648,7 @@ function commentedConfigError(path: string, label: string): PrepareResult {
       `Found an existing ${label} config at ${path} that uses comments and isn't yet ` +
       `pointed at TurboLLM — auto-merging would delete your comments when rewriting the file, ` +
       `so this is left to you.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 
@@ -649,13 +662,13 @@ function asObject(v: unknown): Record<string, unknown> | null {
 }
 
 /** Standard "can't safely touch your config" failure — points at the same info the
- *  web UI's Connect screen shows (Developer → Connect a tool). */
+ *  web UI's Connect tab shows (Customize → Connect → Connect an app). */
 function corruptConfigError(path: string, label: string): PrepareResult {
   return {
     ok: false,
     message:
       `Found an existing ${label} config at ${path} that doesn't parse as JSON — not overwriting it.\n` +
-      `Add the "turbollm" provider by hand (see the Connect screen: TurboLLM UI → Developer → Connect a tool), then run this again.`,
+      `Add the "turbollm" provider by hand (see TurboLLM UI → Customize → Connect → Connect an app), then run this again.`,
   }
 }
 
@@ -1043,26 +1056,58 @@ function piArgs(ctx: LaunchContext): string[] {
  *  itself deprecation-warns about this exact hazard). No shell means no metacharacters. */
 export type RunCommand = (bin: string, args: string[]) => Promise<boolean>
 
+/** RunCommand with a deadline: true on exit code 0, false on any other exit or a spawn error, 'timeout' when the
+ *  command had not exited `deadlineMs` after it started. Its whole tree has been ended then (killTetheredTree: its
+ *  process group, under the Android helper its pid, on Windows its job, else `taskkill /T /F`, which takes a `.cmd`
+ *  shim's cmd.exe and the CLI under it), and the answer does not wait for the exit: a program stuck in the kernel (a
+ *  dead network mount) cannot hold the caller either. */
+export type BoundedRunCommand = (bin: string, args: string[], deadlineMs: number) => Promise<boolean | 'timeout'>
+
+/** The command, started as realRunCommand and realRunCommandWithin run it. */
+function startRunCommand(bin: string, args: string[]): ChildProcess {
+  // Resolve first, exactly as realSpawn does, instead of handing `spawn` a bare name.
+  //
+  // A bare `spawn('pi', ['--version'])` FAILS on Windows even when pi is installed: libuv's own
+  // PATHEXT lookup lands on `pi.cmd`, and Node refuses to spawn a `.cmd` without a shell (EINVAL,
+  // a deliberate mitigation). The probe therefore reported "not installed" for every npm-shim CLI
+  // — measured live: the availability endpoint said pi and opencode were missing while both were
+  // on PATH and launchable. `claude` masked this for months by shipping a real `claude.exe`.
+  //
+  // The shell is used ONLY for that shim case, and the command is built by `buildShellCommand`,
+  // which quotes each argument — so this keeps the property the no-shell choice was originally
+  // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
+  // Quoting is what makes that safe, not the absence of a shell.
+  //
+  // Tethered (util/tether.ts): the daemon runs the CLI probes (the Routines preflight and the Code agent picker,
+  // through realRunCommandWithin), and a hung CLI must not outlive it.
+  const resolved = resolveExecutable(bin)
+  return requiresShell(resolved)
+    ? spawnTethered(buildShellCommand(bin, args), null, { shell: true, stdio: 'ignore' }, { kind: 'probe' })
+    : spawnTethered(resolved ?? bin, args, { stdio: 'ignore' }, { kind: 'probe' })
+}
+
+/** No deadline: `turbollm launch hermes` runs its `hermes config set` steps through it, in the user's terminal. */
 export const realRunCommand: RunCommand = (bin, args) =>
   new Promise<boolean>((resolve) => {
-    // Resolve first, exactly as realSpawn does, instead of handing `spawn` a bare name.
-    //
-    // A bare `spawn('pi', ['--version'])` FAILS on Windows even when pi is installed: libuv's own
-    // PATHEXT lookup lands on `pi.cmd`, and Node refuses to spawn a `.cmd` without a shell (EINVAL,
-    // a deliberate mitigation). The probe therefore reported "not installed" for every npm-shim CLI
-    // — measured live: the availability endpoint said pi and opencode were missing while both were
-    // on PATH and launchable. `claude` masked this for months by shipping a real `claude.exe`.
-    //
-    // The shell is used ONLY for that shim case, and the command is built by `buildShellCommand`,
-    // which quotes each argument — so this keeps the property the no-shell choice was originally
-    // protecting: our own model keys contain `|`, which cmd.exe would otherwise read as a pipe.
-    // Quoting is what makes that safe, not the absence of a shell.
-    const resolved = resolveExecutable(bin)
-    const child = requiresShell(resolved)
-      ? spawn(buildShellCommand(bin, args), { shell: true, stdio: 'ignore' })
-      : spawn(resolved ?? bin, args, { stdio: 'ignore' })
+    const child = startRunCommand(bin, args)
     child.on('error', () => resolve(false))
     child.on('exit', (code) => resolve(code === 0))
+  })
+
+/** realRunCommand with a deadline, for the daemon's CLI probes (isCliAvailable). realRunCommand resolves only on the
+ *  child's 'error' or 'exit', so one `claude --version` that never returned (reproduced live, routines/execute.test.ts)
+ *  left GET /api/v1/code/agents unanswered for good, and each new request started another probe that stayed until
+ *  the daemon ended. */
+export const realRunCommandWithin: BoundedRunCommand = (bin, args, deadlineMs) =>
+  new Promise<boolean | 'timeout'>((resolve) => {
+    const child = startRunCommand(bin, args)
+    // Not unref'd, as in runWithTimeout: settled or cleared, it never outlives the command.
+    const timer = setTimeout(() => {
+      killTetheredTree(child, 'SIGKILL')
+      resolve('timeout')
+    }, deadlineMs)
+    child.on('error', () => { clearTimeout(timer); resolve(false) })
+    child.on('exit', (code) => { clearTimeout(timer); resolve(code === 0) })
   })
 
 /** hermes — Nous Research's agent CLI. Its config is YAML, not JSON, so rather than
@@ -1091,8 +1136,16 @@ export async function prepareHermes(base: string, _apiKey: string, modelKey: str
   return { ok: true }
 }
 
+/** A load the daemon refused before starting it: POST /api/v1/engine/start's typed error (`{error: {code, message}}`),
+ *  or its bare status when the body carries none. */
+interface LoadRefused {
+  refused: { code: string; message: string }
+}
+
 /**
  * POST /api/v1/engine/start with a modelKey, then wait for it to become the running model.
+ * A refusal (409 no_active_engine with no engine selected, comfyui_busy, …) comes back as the daemon worded it: read as
+ * a load that never finished, it was reported as "did not finish loading within 180 s" at once, never the reason.
  *
  * `_fetch` is injectable for tests.
  */
@@ -1101,7 +1154,7 @@ async function loadAndWait(
   modelKey: string,
   timeoutMs = 180_000,
   _fetch: typeof fetch = fetch,
-): Promise<boolean> {
+): Promise<boolean | LoadRefused> {
   // POST the load request (fire-and-forget on the daemon side — returns 202).
   const loadRes = await _fetch(`${base}/api/v1/engine/start`, {
     method: 'POST',
@@ -1109,8 +1162,20 @@ async function loadAndWait(
     body: JSON.stringify({ modelKey }),
     signal: AbortSignal.timeout(5000),
   })
-  if (!loadRes.ok) return false
+  if (!loadRes.ok) {
+    const body = (await loadRes.json().catch(() => null)) as { error?: { code?: unknown; message?: unknown } } | null
+    const code = typeof body?.error?.code === 'string' ? body.error.code : ''
+    const message = typeof body?.error?.message === 'string' ? body.error.message : `HTTP ${loadRes.status}.`
+    return { refused: { code, message } }
+  }
   return waitForRunning(base, modelKey, timeoutMs, _fetch)
+}
+
+/** What the launcher prints for a refused load: the daemon's own reason, and with no engine selected, where to pick
+ *  one (an engine the launcher never picks for the user). */
+function refusedLoadMessage(base: string, { refused }: LoadRefused): string {
+  const next = refused.code === 'no_active_engine' ? `Open ${base} → Engines and select an engine, then run this again.\n` : ''
+  return `TurboLLM refused the load: ${refused.message}\n${next}`
 }
 
 /**
@@ -1156,19 +1221,21 @@ function isLoadingKey(status: DaemonStatus | null, key: string): boolean {
 /** Bring `key` to the running model, whichever way it gets there: wait for a load already in
  *  flight (ADR-425 D-G2, AC11), or start one ourselves. Prints exactly one banner. On success,
  *  returns the refreshed status — or the caller's own `status`, when the final poll had nothing
- *  newer to report. On failure, returns null; the caller prints its own message and exits. */
+ *  newer to report. On failure, returns null (a timeout or an engine error: the caller prints its own message and
+ *  exits), or the daemon's refusal of the load, which the caller prints instead (refusedLoadMessage). */
 async function awaitModelRunning(
   base: string,
   key: string,
   status: DaemonStatus | null,
   loadingBanner: string,
   _fetch: typeof fetch,
-): Promise<{ status: DaemonStatus | null } | null> {
+): Promise<{ status: DaemonStatus | null } | LoadRefused | null> {
   const waiting = isLoadingKey(status, key)
   process.stdout.write(waiting ? `▸ Waiting for model "${key}" to finish loading…\n` : loadingBanner)
   const ready = waiting
     ? await waitForRunning(base, key, 180_000, _fetch)
     : await loadAndWait(base, key, 180_000, _fetch)
+  if (typeof ready === 'object') return ready
   if (!ready) return null
   return { status: (await fetchStatus(base, _fetch)) ?? status }
 }
@@ -1269,8 +1336,8 @@ export const CONFIG_FILE_HARNESSES: readonly string[] =
  *  Deliberately a read of the REAL config path per harness. hermes always answers false: its config
  *  is YAML written by shelling out to `hermes config set`, so there is nothing cheap to read and a
  *  probe would mean spawning a process on every model load. It is refreshed at launch instead. */
-async function isAlreadyWired(target: string, port: number, fs: ConfigFs): Promise<boolean> {
-  const base = `http://127.0.0.1:${port}`
+async function isAlreadyWired(target: string, port: number, fs: ConfigFs, host?: string): Promise<boolean> {
+  const base = localDaemonOrigin(host, port)
   const paths: Record<string, string> = {
     opencode: join(fs.home, '.config', 'opencode', 'opencode.json'),
     kilo: join(fs.home, '.config', 'kilo', 'kilo.jsonc'),
@@ -1307,7 +1374,7 @@ async function isAlreadyWired(target: string, port: number, fs: ConfigFs): Promi
  *  `opencode`, which is why it is not skipped. */
 export async function syncHarnessModelConfig(
   target: string,
-  opts: { port: number; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
+  opts: { port: number; host?: string; pinnedModel: string; modelName: string; modelCtx?: number; models: ModelEntry[] },
   fs: ConfigFs = realFs,
 ): Promise<PrepareResult> {
   const spec = Object.hasOwn(SUPPORTED, target) ? SUPPORTED[target] : undefined
@@ -1322,8 +1389,9 @@ export async function syncHarnessModelConfig(
   // "Already wired" is a fact on disk: the harness's own config carries a `turbollm` provider,
   // which only a previous `turbollm launch` puts there. A harness the user has never launched is
   // left completely untouched, and starts being synced the moment they do launch it once.
-  if (!(await isAlreadyWired(target, opts.port, fs))) return { ok: true }
-  const base = `http://127.0.0.1:${opts.port}`
+  // `host`: the address the daemon bound, as `turbollm launch` wired it (localDaemonOrigin).
+  if (!(await isAlreadyWired(target, opts.port, fs, opts.host))) return { ok: true }
+  const base = localDaemonOrigin(opts.host, opts.port)
   return await spec.prepareConfig(
     {
       base,
@@ -1346,6 +1414,10 @@ export async function syncHarnessModelConfig(
 /** Launch `target` CLI wired to the TurboLLM gateway on 127.0.0.1:<port>. Returns
  *  the child's exit code (or a non-zero code on a setup failure). Pure launcher —
  *  it never starts the daemon itself.
+ *
+ *  `host` — the address the daemon bound, from its pidfile (cli.ts): on a bind to another loopback
+ *  address alone (`--addr [::1]:6996`) the gateway is dialed and wired there instead, since nothing
+ *  answers on 127.0.0.1 (localDaemonOrigin).
  *
  *  `modelKey` — when provided, resolve + load that model before launching.
  *  `_spawn` is an optional injection point used by unit tests to capture the env
@@ -1411,6 +1483,7 @@ export async function launchCli(
   _fetch: typeof fetch = fetch,
   authToken?: string,
   _mcpFs: ConfigFs = realFs,
+  host?: string,
 ): Promise<number> {
   const spec = SUPPORTED[target]
   if (!target || !spec) {
@@ -1419,7 +1492,7 @@ export async function launchCli(
     return 1
   }
 
-  const base = `http://127.0.0.1:${port}`
+  const base = localDaemonOrigin(host, port)
 
   // Confirm the daemon is up before anything else.
   let status: DaemonStatus | null
@@ -1496,6 +1569,10 @@ export async function launchCli(
       // Fall through to launch.
     } else {
       const outcome = await awaitModelRunning(base, resolvedKey, status, `▸ Loading model "${resolvedKey}"…\n`, _fetch)
+      if (outcome && 'refused' in outcome) {
+        process.stderr.write(refusedLoadMessage(base, outcome))
+        return 1
+      }
       if (!outcome) {
         process.stderr.write(
           `Model did not finish loading within 180 s. ` +
@@ -1527,12 +1604,30 @@ export async function launchCli(
       )
       return 1
     }
+    // Only a model the selected engine runs. This pick is automatic, like the daemon's boot resume, which skips a
+    // model the engine cannot run, but it goes through POST /api/v1/engine/start, a manual load that starts on the
+    // selected engine whatever the model: a last-used (or first-listed) .litertlm bundle under llama.cpp was
+    // started there, failed, and stayed last loaded, so every later launch, and every Code terminal, failed the
+    // same way while a GGUF in the library would have loaded. Whether the Models screen shows every engine's
+    // models does not matter here: that is for a Load the user picks.
+    const loadable = models.filter((m) => m.compatibleWithActiveEngine !== false)
+    if (loadable.length === 0) {
+      process.stderr.write(
+        `TurboLLM is running, but no model is loaded and no model in the library runs on the selected engine.\n` +
+          `Open ${base} → Models → add or load a model, then run this again.\n`,
+      )
+      return 1
+    }
     // Prefer the true last-used model (exposed on /status as lastLoaded) when it's still
     // in the library; otherwise fall back to the first model in the list, which matches
     // the order the UI presents models.
     const lastKey = status?.lastLoaded?.modelKey
-    const autoKey = lastKey && models.some((m) => m.key === lastKey) ? lastKey : models[0].key
+    const autoKey = lastKey && loadable.some((m) => m.key === lastKey) ? lastKey : loadable[0].key
     const outcome = await awaitModelRunning(base, autoKey, status, `▸ Auto-loading model "${autoKey}"…\n`, _fetch)
+    if (outcome && 'refused' in outcome) {
+      process.stderr.write(refusedLoadMessage(base, outcome))
+      return 1
+    }
     if (!outcome) {
       process.stderr.write(
         `Model did not finish loading within 180 s. ` +

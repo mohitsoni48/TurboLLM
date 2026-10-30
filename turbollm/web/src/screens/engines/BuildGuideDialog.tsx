@@ -142,6 +142,14 @@ export function BuildGuideDialog({
   // see as an error since engineBuild.phase never becomes 'error'. Without this, the mutation's
   // own rejection was silently dropped and the dialog was stuck showing "Preparing" forever.
   const [mutationError, setMutationError] = useState<string | null>(null)
+  // engineBuild is ONE global record that keeps the previous run's terminal state (done/error)
+  // until the server handles our POST, so right after a click it still describes the LAST run —
+  // read as ours, it re-probed/cleared the intent before an install had even started. A terminal
+  // phase only counts once this run was seen active, or (a run that settled between two polls
+  // never shows active) once a status fetched after the server accepted the request arrives.
+  const [sawActive, setSawActive] = useState(false)
+  const [acceptedAt, setAcceptedAt] = useState(0)
+  const thisRun = sawActive || (acceptedAt > 0 && statusQ.dataUpdatedAt > acceptedAt)
 
   // Build-environment editor draft (null until edited → show the saved dirs).
   const savedDirs = settings.query.data?.build.toolchainDirs ?? []
@@ -167,7 +175,12 @@ export function BuildGuideDialog({
   // ✓ and the build enables (and hide the progress); a finished build → pull the new engine
   // into the lists. A CUDA *error* stays visible so the user sees why it failed.
   useEffect(() => {
-    if (!intent || !engineBuild || engineBuild.active) return
+    if (!intent || !engineBuild) return
+    if (engineBuild.active) {
+      setSawActive(true)
+      return
+    }
+    if (!thisRun) return
     if (engineBuild.phase === 'done') {
       if (intent === 'cuda' || intent === 'install') {
         void prereqsQ.refetch()
@@ -180,7 +193,7 @@ export function BuildGuideDialog({
       build.refresh()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [intent, engineBuild?.active, engineBuild?.phase])
+  }, [intent, thisRun, engineBuild?.active, engineBuild?.phase])
 
   // Auto-scroll the log to the newest line.
   const logRef = useRef<HTMLPreElement>(null)
@@ -199,19 +212,25 @@ export function BuildGuideDialog({
     setIntent(null)
     setMutationError(e instanceof Error ? e.message : String(e))
   }
+  // The server starts the run before answering, so any status fetched after this moment is ours.
+  const onAccepted = () => setAcceptedAt(Date.now())
 
   const startBuild = () => {
     setMutationError(null)
+    setSawActive(false)
+    setAcceptedAt(0)
     setIntent('build')
     // commit/patchUrl/patchSha256 are only defined for a catalog entry that pins them (e.g.
     // solar-open2); undefined for every other entry, so their request shape is unchanged.
-    build.start.mutate({ repoUrl, branch, commit, patchUrl, patchSha256, name: engineName }, { onError: onMutationError })
+    build.start.mutate({ repoUrl, branch, commit, patchUrl, patchSha256, name: engineName }, { onSuccess: onAccepted, onError: onMutationError })
   }
 
   const downloadCuda = () => {
     setMutationError(null)
+    setSawActive(false)
+    setAcceptedAt(0)
     setIntent('cuda')
-    build.cuda.mutate(undefined, { onError: onMutationError })
+    build.cuda.mutate(undefined, { onSuccess: onAccepted, onError: onMutationError })
   }
 
   // Install a missing prereq ON THE DAEMON MACHINE with its own package manager. This is the
@@ -219,8 +238,10 @@ export function BuildGuideDialog({
   // opens a website in whatever browser is showing this UI, which may not be the host at all.
   const installPrereq = (tool: 'git' | 'cmake' | 'cuda' | 'gcc') => {
     setMutationError(null)
+    setSawActive(false)
+    setAcceptedAt(0)
     setIntent('install')
-    build.installPrereq.mutate(tool, { onError: onMutationError })
+    build.installPrereq.mutate(tool, { onSuccess: onAccepted, onError: onMutationError })
   }
 
   const actionLabel = mode === 'rebuild' ? 'Rebuild now' : 'Build it for me'
@@ -365,7 +386,7 @@ export function BuildGuideDialog({
             </div>
 
             {/* Live build progress (ADR-100) */}
-            {showProgress && engineBuild && (
+            {showProgress && engineBuild && (engineBuild.active || thisRun) && (
               <BuildProgress
                 build={engineBuild}
                 kind={intent === 'cuda' ? 'cuda' : intent === 'install' ? 'install' : 'build'}

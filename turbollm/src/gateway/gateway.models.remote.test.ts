@@ -16,8 +16,8 @@ import type { LinkRecord, RemoteModel } from '../link/types'
 import type { Deps } from '../deps'
 
 const LIBRARY = [
-  { key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B' },
-  { key: 'llama-3-70b|Q5|456', name: 'Llama 3 70B' },
+  { key: 'qwen3-8b|Q4|123', name: 'Qwen3 8B', format: 'gguf' },
+  { key: 'llama-3-70b|Q5|456', name: 'Llama 3 70B', format: 'gguf' },
 ]
 
 function link(over: Partial<LinkRecord>): LinkRecord {
@@ -60,7 +60,7 @@ async function catalogFor(links: LinkRecord[], byBaseUrl: Record<string, RemoteM
 function fakeDeps(remoteCatalog?: RemoteCatalog, autoSwap = true): Deps {
   return {
     scanner: { list: () => ({ models: LIBRARY, scanning: false, lastScanAt: '' }) },
-    modelRouter: { route: async () => ({ target: 'http://engine.local' }) },
+    modelRouter: { route: async () => ({ target: 'http://engine.local' }), loadedModelKeys: () => new Set<string>() },
     store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap } }) },
     manager: { status: () => ({ state: 'stopped', model: null }), target: () => 'http://engine.local' },
     registry: { active: () => ({ kind: 'llama.cpp' }) },

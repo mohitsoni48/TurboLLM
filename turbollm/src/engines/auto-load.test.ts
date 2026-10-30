@@ -164,6 +164,19 @@ test('a Jev last model on a non-vLLM engine skips because it needs vLLM', () => 
   }))
 })
 
+// With Settings → "Show models for every engine" on, a model is always started on the selected engine, and fails there
+// if that engine cannot load it: the boot resume skipped it as engine-incompatible (or loaded devModel in its place).
+test('with "Show models for every engine" on, a GGUF last model on vLLM plans a load onto vLLM', () => {
+  const vllm = engineOfKind('vllm', 'vLLM')
+  const lastModel = entry()
+  const { plan } = planFor({
+    cfg: resumableConfig({ showAllEngineModels: true, devModel: DEV_MODEL }), engine: vllm,
+    findModel: recordingLibrary(lastModel).findModel,
+  })
+
+  assert.deepEqual(plan, { kind: 'load-model', entry: lastModel, engine: vllm })
+})
+
 test('a loadable GGUF last model on llama-server plans a load onto the active engine', () => {
   const lastModel = entry()
   const { plan } = planFor({ engine: LLAMA_SERVER, findModel: recordingLibrary(lastModel).findModel })
@@ -457,6 +470,23 @@ for (const { reason, options, line } of SKIP_CASES) {
     assert.deepEqual(record.loadExplicitCalls, [])
   })
 }
+
+// A model resumes only on the engine the user selected: a last-used .litertlm model resumed on the registered LiteRT-LM
+// engine whenever another kind was active, so the boot started LiteRT-LM on its own under llama.cpp.
+test('runAutoLoad: a last-used .litertlm model under llama.cpp prints the engine skip line, LiteRT-LM installed', async () => {
+  const bundle = entry({ format: 'litertlm', path: 'D:\\models\\gemma.litertlm' })
+  const { deps, record } = mkRunDeps({ findModel: recordingLibrary(bundle).findModel })
+  Object.assign(deps.registry, { litertLmEngine: () => engineOfKind('litert-lm', 'LiteRT-LM') })
+
+  const plan = await runAutoLoad(deps)
+
+  assert.equal(plan.kind, 'skip')
+  assert.deepEqual(record.logs, [
+    'auto-load skipped: engine "llama.cpp" (llama-server) can\'t load last model "gemma 4 e4b|Q6_K|6217256480" (format litertlm)',
+  ])
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(record.loadExplicitCalls, [])
+})
 
 test('runAutoLoad AC6: auto-load off is silent and loads nothing', async () => {
   const { deps, record } = mkRunDeps({ data: resumableConfig({ autoLoadOnStart: false }) })

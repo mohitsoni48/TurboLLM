@@ -43,11 +43,14 @@ export interface ModelStatusView {
     state: string
     port: number | null
     pid: number | null
-    /** Id of the engine the loaded model runs on ('' when none); differs from `id` for a .litertlm model served by
-     *  LiteRT-LM while another engine is active. */
+    /** Id of the engine the loaded model runs on ('' when none). `id`, `name` and `kind` above are the active (selected)
+     *  engine's; this differs from `id` when an engine install or Enable activated another engine without stopping the
+     *  model. A screen that names the engine running the model reads these, never `name`. */
     servingId: string
     /** Kind of that engine ('' when none), for clients that shape requests by the serving engine. */
     servingKind: string
+    /** Name of that engine ('' when none). */
+    servingName: string
     /** How many generations the engine can serve at once. Omitted — not defaulted to 1 —
      *  when the engine advertises no slot count, exactly as the local route does. */
     parallelSlots?: number
@@ -72,6 +75,7 @@ export interface ModelStatusView {
 export function buildModelStatus(d: Deps): ModelStatusView {
   const ms = d.manager.status()
   const active = d.registry.active()
+  const serving = d.manager.currentOpts()?.engine
   const engine: ModelStatusView['engine'] = {
     id: active?.id ?? '',
     name: active?.name ?? '',
@@ -79,10 +83,13 @@ export function buildModelStatus(d: Deps): ModelStatusView {
     state: ms.state,
     port: ms.port,
     pid: ms.pid,
-    // The engine the loaded model runs on, which is not always the active one: a .litertlm model runs on LiteRT-LM
-    // whatever is active. '' when nothing is loaded. The UI's "Running" badge follows this, not `id`.
-    servingId: d.manager.currentOpts()?.engine.id ?? '',
-    servingKind: d.manager.currentOpts()?.engine.kind ?? '',
+    // The engine the loaded model runs on, which is not always the active one (an engine install or Enable activates
+    // another without stopping the model). '' when nothing is loaded. The UI's "Running" badge and every screen that
+    // names the engine running the model follow this, not `id`/`name`: those named the active engine, so a model
+    // another engine ran was shown as running on the selected one.
+    servingId: serving?.id ?? '',
+    servingKind: serving?.kind ?? '',
+    servingName: serving?.name ?? '',
   }
   // NO `engine.error` here — see the interface doc. `ErrInfo.logTail` is the engine's raw
   // stderr and routinely contains absolute host paths. `state` already carries 'error'.

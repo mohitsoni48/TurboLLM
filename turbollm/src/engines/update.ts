@@ -36,66 +36,14 @@ import { parseGitRepo } from './github-repo'
 
 // ─── Layer 1a: version/tag comparison (pure) ─────────────────────────────────
 
-/** The outcome of comparing INSTALLED vs LATEST, stated from the latest's perspective:
- *  `newer` = upstream/latest is ahead of installed (i.e. an update is available),
- *  `older` = installed is ahead of latest, `equal` = same version. `unknown` when the
- *  two can't be meaningfully compared (different/unparseable formats) — the honest
- *  "I can't tell" (we never guess across formats). */
-export type CompareResult = 'older' | 'equal' | 'newer' | 'unknown'
-
-/** Parse a llama.cpp-style build tag (`b9608`, `B9761`) into its integer build
- *  number, or null when it isn't that shape. Tolerates surrounding whitespace and a
- *  leading `v` (some forks tag `vb1234`-style); anything else → null (→ unknown). */
-export function parseBuildTag(tag: string): number | null {
-  const m = /^v?b(\d+)$/i.exec(tag.trim())
-  if (!m) return null
-  const n = Number(m[1])
-  return Number.isInteger(n) ? n : null
-}
-
-/** Compare two GitHub release tags. Prefers llama.cpp build-tag (`b<number>`) ordering;
- *  when EITHER side isn't that shape it falls back to semver/PEP440-ish ordering
- *  ({@link comparePipVersions}) so forks that tag releases `v1.115.2` (KoboldCpp) or
- *  `0.10.3` (llamafile) still compare correctly. `unknown` only when neither scheme can
- *  parse both sides — the honest "I can't tell" (we never guess across formats). */
-export function compareBuildTags(installed: string, latest: string): CompareResult {
-  const a = parseBuildTag(installed)
-  const b = parseBuildTag(latest)
-  if (a !== null && b !== null) return a === b ? 'equal' : a < b ? 'newer' : 'older'
-  // Not both b<number> tags → try semver-style ordering (KoboldCpp/llamafile/etc.).
-  return comparePipVersions(installed, latest)
-}
-
-/** Parse a PEP440-ish / semver-ish version into numeric release segments. We keep
- *  this deliberately simple (documented limit): we read the leading dotted-integer
- *  release (e.g. `1.2.3` from `1.2.3rc1+cu124`) and ignore pre-release/build/local
- *  suffixes. That's enough to answer "is a newer stable out?" for vLLM/MLX, which is
- *  all the update check needs; it is NOT a full PEP440 ordering (rc/post/dev are not
- *  ranked). Strips a leading `v`. Returns null when no leading number is present. */
-export function parsePipVersion(version: string): number[] | null {
-  const m = /^v?(\d+(?:\.\d+)*)/.exec(version.trim())
-  if (!m) return null
-  const parts = m[1].split('.').map((s) => Number(s))
-  if (parts.some((n) => !Number.isInteger(n))) return null
-  return parts
-}
-
-/** Compare two pip-style versions by their numeric release segments (missing trailing
- *  segments count as 0, so `0.11` == `0.11.0`). `unknown` when either side can't be
- *  parsed. Pre-release/build suffixes are ignored (see {@link parsePipVersion}). */
-export function comparePipVersions(installed: string, latest: string): CompareResult {
-  const a = parsePipVersion(installed)
-  const b = parsePipVersion(latest)
-  if (a === null || b === null) return 'unknown'
-  const len = Math.max(a.length, b.length)
-  for (let i = 0; i < len; i++) {
-    const x = a[i] ?? 0
-    const y = b[i] ?? 0
-    if (x < y) return 'newer'
-    if (x > y) return 'older'
-  }
-  return 'equal'
-}
+export {
+  type CompareResult,
+  compareBuildTags,
+  comparePipVersions,
+  parseBuildTag,
+  parsePipVersion,
+} from './version-compare'
+import { type CompareResult, compareBuildTags, comparePipVersions, parseBuildTag } from './version-compare'
 
 /** Which comparison applies to an engine source. llama.cpp + forks compare build
  *  tags; pip engines compare PEP440-ish versions; source-built engines (ADR-088)
@@ -166,6 +114,7 @@ export interface UpdateStatus {
  *
  *  - kind 'llama-server' whose binPath is an official managed build → GitHub `ggml-org/
  *    llama.cpp`, installed tag parsed from the tag-keyed dir name (`llama.cpp-{tag}-{id}`).
+ *    None on Android, whose build is TurboLLM's own pinned one.
  *  - kind 'llama-server' under engines/turboquant/ → the fork's GitHub repo; installed
  *    tag parsed from the probed version string.
  *  - kind 'mlx' / 'rapid-mlx' / 'mlx-vlm' / 'vllm' / 'litert-lm' → PyPI `mlx-lm` / `rapid-mlx` /
@@ -267,6 +216,10 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   // parseable GitHub source repo, compare its built commit hash against the repo's
   // latest commit (notify-only "rebuild" — we can't recompile).
   if (engine.sourceRepo) {
+    // A commit-pinned build (a catalog pin like Solar Open 2, a user's A/B snapshot) is a fixed
+    // snapshot with no "newer source": compared to the branch tip it showed "rebuild" forever,
+    // and no rebuild of the same commit could clear it.
+    if (engine.sourceCommit?.trim()) return null
     const ref = parseGitRepo(engine.sourceRepo)
     if (ref) {
       return {
@@ -292,6 +245,10 @@ export function resolveUpdateSource(engine: Engine): ResolvedSource | null {
   if (engine.kind === 'llamafile') return { source: 'github-release', ref: LLAMAFILE_REPO, installed: engine.version }
   if (engine.kind === 'llama-server') {
     if (isManagedLlama(engine.binPath)) {
+      // On Android (Termux) this build is TurboLLM's own cross-compile, one pinned file on Hugging Face (see
+      // availableBackends), not a ggml-org release: upstream's newer tags have no Android asset there, so comparing
+      // against them offered an update whose download always failed with HTTP 404.
+      if (process.platform === 'android') return null
       return { source: 'github-release', ref: OFFICIAL_LLAMA_REPO, installed: tagFromManagedBinPath(engine.binPath) }
     }
     if (isTurboquant(engine.binPath)) {
@@ -473,6 +430,17 @@ export class UpdateChecker {
   prune(liveIds: Set<string>): void {
     for (const id of [...this.cache.keys()]) {
       if (!liveIds.has(id)) this.cache.delete(id)
+    }
+  }
+
+  /** Drop the cached status of an engine whose installed version changed since it was checked. An update that
+   *  keeps the engine id (KoboldCpp, llamafile, TurboQuant, the pip engines, here or through ?update=1) would
+   *  otherwise keep offering the update it just applied until the next check. */
+  forgetChanged(engines: Engine[]): void {
+    for (const e of engines) {
+      const cached = this.cache.get(e.id)
+      // The same `installed` computeUpdateStatus records: the source's, or the bare version when there is none.
+      if (cached && cached.installed !== (resolveUpdateSource(e)?.installed ?? (e.version || ''))) this.cache.delete(e.id)
     }
   }
 }

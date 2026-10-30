@@ -3,12 +3,13 @@
 // so no locking is needed. Unknown JSON fields ride along on `data` and are
 // preserved across round-trips for free.
 import { randomUUID } from 'node:crypto'
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import type { LinkGrant, LinkRecord } from '../link/types'
 import type { ChatStoreConfig } from '../chat/store/load-adapter.js'
 import type { ReleaseProvenance } from '../engines/release-install'
+import { CHAT_APPROVAL_WAIT_MINUTES } from './config-bounds'
 
 export const SCHEMA_VERSION = 4
 
@@ -25,6 +26,11 @@ export const VRAM_HEADROOM_DEFAULT_MB = 1024
  *  safety margin, so it's gated on this exact value — anything in 1–299 is invalid, same as
  *  before. The Settings slider snaps straight from {@link VRAM_HEADROOM_MIN_MB} to this value. */
 export const VRAM_HEADROOM_SPILL_MB = 0
+
+/** Settings > Model Defaults' context out of the box. normalize writes it into every config, so the stored value alone
+ *  cannot say whether the user set it: a LiteRT-LM bundle runs at its own default context unless the user changed it
+ *  (profile.ts litertLmAutoCtx), where llama.cpp models take it as they always have. */
+export const BUILTIN_MODEL_DEFAULT_CTX = 8192
 
 export interface FlagInfo {
   name: string
@@ -248,13 +254,20 @@ export interface ToolsConfig {
   search?: SearchConfig
   /** Global per-tool approval policy (tool-call approval gate). Every tool defaults
    *  to 'ask' unless explicitly set here to 'allow' or 'deny'. A per-conversation
-   *  override (Conversation.toolOverrides) takes precedence over this map. */
+   *  override (Conversation.toolOverrides) takes precedence over this map, except a
+   *  'deny' here, which no chat override lifts; see resolveToolPolicy. */
   toolPolicies?: Record<string, 'ask' | 'allow' | 'deny'>
   /** Master toggle (Settings → Tool permissions), default OFF: when true, every tool
    *  call that would otherwise show an "awaiting approval" prompt runs immediately
    *  instead. Only silences a resolved 'ask' — an explicit 'deny' (global or
    *  per-conversation) is still honored; see resolveToolPolicy. */
   autoAllowAll?: boolean
+  /** How long a chat reply waits for the answers to its tool calls set to Ask, all its calls
+   *  together, in whole minutes (Settings → Tool permissions; CHAT_APPROVAL_WAIT_MINUTES's bounds,
+   *  default 30). Past it the call still waiting, and every later one of the reply, is not run and
+   *  the turn goes on as after a deny. 0 waits until answered. Chat turns only: Code's ask mode
+   *  waits until answered. normalize always sets it. */
+  chatApprovalWaitMinutes?: number
 }
 
 /** One MCP server the daemon manages as a tool provider (v0.7.0). */
@@ -409,6 +422,9 @@ export interface RemoteAccessConfig {
   tokenGrant: { capabilities: string[]; models?: string[] }
   /** Last known public URL, shown immediately after a daemon restart, stale until probed. */
   lastUrl: string
+  /** The provider that was serving lastUrl (absent in configs saved before it was recorded).
+   *  auth.ts trusts lastUrl as Serve's name only when Serve saved it. */
+  lastUrlProvider?: RemoteProviderId
 }
 
 /** Coerce anything unrecognized to the zero-setup default rather than leaving a broken id
@@ -549,6 +565,12 @@ export interface Config {
   /** Custom (non-catalog) engine identities, kept across Disable — see {@link CustomEngineSource}. */
   customEngineSources: CustomEngineSource[]
   activeEngineId: string
+  /** The first-run seed (engines/seed.ts seedDefaultEngines) has run: it installed and selected the default llama.cpp
+   *  build, or the config had an engine (or a custom engine's identity) when it was loaded. The seed runs only while
+   *  this is false: a start that found no engine registered seeded again, so a user who had removed every engine got
+   *  the default build registered and selected without choosing it (and downloaded when its folder was gone). A seed
+   *  that fails (offline) leaves it false, so the next start tries again. */
+  defaultEngineSeeded: boolean
   modelDirs: string[]
   /** The folder downloads/imports land in (spec 01 §3, ADR-035). When '' or not in
    *  modelDirs, the FIRST entry in modelDirs is the effective default. */
@@ -571,6 +593,16 @@ export interface Config {
   /** Pinned preset per model (ADR-353 D4): modelKey → preset id. Cleared by a manual profile
    *  save, a profile reset, and deleting the pinned preset. */
   lastPresetId: Record<string, string>
+  /** Models the user hid by hand (Models → Library, a model's "Hide"), by the model key modelProfiles and modelPresets
+   *  use, oldest first. Kept here, not in the browser, so the choice holds on every page and device. The web UI leaves
+   *  a hidden model out of the Library list (until its "Show hidden models" switch is on) and out of every model picker
+   *  but ModelDetailDialog's draft-model select (a small draft is what one hides from the chat pickers), unless it is
+   *  loaded. Nothing else changes: it keeps its files and settings, and it still loads when it is named (an API client,
+   *  a routine or preset pinned to it, `turbollm launch --model`); the gateway's /v1/models and the Turbo Link listing
+   *  still list it. Separate from the automatic hiding of models the selected engine cannot run (showAllEngineModels).
+   *  A key no scanned model has is ignored. Bounded: PUT /api/v1/models/:key/hidden adds only a scanned model's key,
+   *  deleting a model through TurboLLM drops its key, and normalize keeps the newest {@link HIDDEN_MODELS_CAP}. */
+  hiddenModels: string[]
   /** Persisted auto-tune results keyed by modelKey (spec 09 §1, 01 §4). Additive;
    *  absent in old configs → normalize seeds {}. Never throws on load. */
   benchResults: Record<string, BenchResult>
@@ -597,6 +629,13 @@ export interface Config {
    *  rather than failing every request. */
   selectedRemoteModel: string
   autoLoadOnStart: boolean
+  /** Settings → Models, "Show models for every engine" (off by default): the Models screen and the model pickers list
+   *  every model, not only those the selected engine can run. A model listed that way still loads only on the selected
+   *  engine (registry.engineForModel): a Load starts it there, and if the engine cannot load it the load fails with the
+   *  engine's own error (compat.ts manualLoadRefusal). While it is on, the automatic loads (the gateway's auto-swap, a
+   *  routine's swap and restore, the boot resume, ComfyUI's reload) start such a model there too, where with it off
+   *  they refuse it. Nothing switches engines or suggests another. */
+  showAllEngineModels: boolean
   hf: HF
   gh: GitHub
   modelDefaults: ModelDefaults
@@ -705,11 +744,13 @@ export function migrateLegacyDataDir(): void {
   }
   // Engine binPaths are absolute and may point into the old data dir (managed
   // llama.cpp builds live under <dataDir>/engines/…). Repoint them at the new
-  // location so they don't dangle after the move.
+  // location so they don't dangle after the move. Decoded as load() decodes it: read as UTF-8, a
+  // UTF-16 file (PowerShell 5.1's `>`) failed the parse here and kept every old binPath, though
+  // load() then read the same file fine.
   try {
     const cfgPath = join(next, 'config.json')
     if (!existsSync(cfgPath)) return
-    const cfg = JSON.parse(readFileSync(cfgPath, 'utf8')) as { engines?: { binPath?: string }[] }
+    const cfg = JSON.parse(decodeConfigText(readFileSync(cfgPath))) as { engines?: { binPath?: string }[] }
     let changed = false
     for (const e of cfg.engines ?? []) {
       if (typeof e.binPath === 'string' && e.binPath.startsWith(prev)) {
@@ -746,24 +787,27 @@ export function defaultConfig(): Config {
     engines: [],
     customEngineSources: [],
     activeEngineId: '',
+    defaultEngineSeeded: false,
     modelDirs: [],
     primaryModelDir: '',
     modelProfiles: {},
     modelPresets: {},
     lastPresetId: {},
+    hiddenModels: [],
     benchResults: {},
     vramHeadroomMb: VRAM_HEADROOM_DEFAULT_MB,
     lastLoaded: { modelKey: '', engineId: '' },
     selectedRemoteModel: '',
     autoLoadOnStart: false,
+    showAllEngineModels: false,
     hf: { token: '' },
     gh: { token: '' },
-    modelDefaults: { ctx: 8192, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
+    modelDefaults: { ctx: BUILTIN_MODEL_DEFAULT_CTX, ngl: 99, imageMaxTokens: 0, maxTokens: 0 },
     featuredOverrideUrl: '',
     comfyui: { enabled: false, gatePath: '', url: '', reverseGate: false, cachePersist: false },
     gateway: { autoSwap: true, keepN: 1 },
     requestLog: { enabled: true, captureBodies: false, maxEntries: 500 },
-    tools: {},
+    tools: { chatApprovalWaitMinutes: CHAT_APPROVAL_WAIT_MINUTES.default },
     mcp: { servers: [] },
     agents: { agents: [] },
     customAgents: [],
@@ -786,35 +830,175 @@ export function defaultConfig(): Config {
   }
 }
 
+/** config.json's text, in whatever encoding a Windows tool saved it. PowerShell 5.1's `>` and
+ *  `Out-File` write UTF-16LE with a BOM (FF FE); `Set-Content -Encoding UTF8` and many editors
+ *  put a UTF-8 BOM first. JSON.parse rejects each of these as read, so load() reset the whole
+ *  config to defaults (API keys, engines, model dirs). A UTF-16BE BOM (FE FF) is decoded too. */
+export function decodeConfigText(bytes: Buffer): string {
+  if (bytes[0] === 0xff && bytes[1] === 0xfe) return bytes.subarray(2).toString('utf16le')
+  if (bytes[0] === 0xfe && bytes[1] === 0xff) {
+    // No 'utf16be' Buffer encoding: swap to LE (swap16 needs an even length; drop a stray byte).
+    return Buffer.from(bytes.subarray(2, bytes.length - (bytes.length % 2))).swap16().toString('utf16le')
+  }
+  return bytes.toString('utf8').replace(/^\uFEFF/, '')
+}
+
+/** The daemon's configured port from config.json, falling back to the shipped default — what
+ *  `turbollm launch` and `turbollm mcp-server` dial when no pidfile names a running daemon.
+ *  Best-effort — a missing/invalid config yields the shipped default. Keeps the literal default
+ *  in ONE place (defaultConfig) rather than hardcoded. Decoded like load() does, so a BOM a
+ *  Windows tool added does not read as "invalid" and silently put the shipped port in its place. */
+export function configuredDaemonPort(configPath: string): number {
+  try {
+    const cfg = JSON.parse(decodeConfigText(readFileSync(configPath))) as { daemon?: { port?: number } }
+    if (typeof cfg.daemon?.port === 'number' && cfg.daemon.port > 0) return cfg.daemon.port
+  } catch { /* missing or invalid config — use the shipped default below */ }
+  return defaultConfig().daemon.port
+}
+
+/** The mode config.json, its save tmp and its .broken-* backup are created with: read and write
+ *  for the owner only. The file holds the tunnel, HF and GitHub tokens, the search keys, MCP env
+ *  values and API keys, and link peer tokens; written with the default mode it was 0644 under the
+ *  usual umask 022, and in a 0755 ~/.turbollm (macOS home folders, older Debian/Ubuntu, many
+ *  servers) every other local account could read them, the daemon running or not. Windows keeps
+ *  only the write bit of a mode, so the file stays writable there and the profile's ACLs protect
+ *  it as before. */
+const CONFIG_FILE_MODE = 0o600
+
+/** Whether the file `st` describes belongs to another user than the one running this process.
+ *  Windows has no uid to compare (process.getuid is undefined there): never. */
+function ownedByAnotherUser(st: { uid: number }): boolean {
+  const uid = process.getuid?.()
+  return uid !== undefined && st.uid !== uid
+}
+
+/** The message a start prints, instead of crashing, when it may not read or write config.json
+ *  (EACCES or EPERM from ConfigStore.load); undefined for any other error. A `sudo turbollm …` run
+ *  with the owner's HOME (macOS keeps it) leaves files there that are root's: before load() stopped
+ *  rewriting a file of another user's, `sudo turbollm --stop` replaced config.json with one root
+ *  owned, mode 0600, and the owner's next start died with an uncaught EACCES on the read. So it
+ *  says whose the file (or its folder) is and how to give it back. */
+export function configAccessProblem(path: string, e: unknown): string | undefined {
+  const code = (e as NodeJS.ErrnoException | undefined)?.code
+  if (code !== 'EACCES' && code !== 'EPERM') return undefined
+  const uid = process.getuid?.()
+  let hint = 'Check that this user may read and write it and its folder.'
+  for (const [what, p] of [['It', path], ['Its folder', dirname(path)]] as const) {
+    let owner: number
+    try {
+      owner = statSync(p).uid
+    } catch {
+      continue
+    }
+    if (uid !== undefined && owner !== uid) {
+      // Single-quoted for the shell, so a path with a `"`, `$` or backtick in it pastes as itself.
+      const quoted = `'${p.replace(/'/g, `'\\''`)}'`
+      hint =
+        `${what} belongs to another user (uid ${owner}; this is uid ${uid}), as after running turbollm with sudo. ` +
+        `Give it back to this user with:\n  sudo chown "$(id -un)" ${quoted}`
+      break
+    }
+  }
+  return `TurboLLM cannot read or write its config file ${path} (${(e as Error).message}).\n${hint}`
+}
+
+/** Remove the `<config>.<pid>.tmp` files (see ConfigStore.save) whose process is gone. A save
+ *  writes the whole config, the HF and GitHub tokens and tunnel tokens included, to its tmp and
+ *  then renames it into place; a process killed in between left it, and no later save overwrites
+ *  another pid's, so each kept a copy of those tokens for good, after the user rotated or removed
+ *  them. Run by every load (each daemon start, a refused one too). A live pid's is left: that
+ *  process may be between its write and its rename (EPERM counts as live). Best-effort — never
+ *  throws. */
+function sweepDeadSaveTmps(configPath: string): void {
+  const dir = dirname(configPath)
+  const prefix = `${basename(configPath)}.`
+  let names: string[]
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return // no data dir yet
+  }
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith('.tmp')) continue
+    const middle = name.slice(prefix.length, -'.tmp'.length)
+    // No pid (an older version's shared `config.json.tmp`, which a daemon of that version may be
+    // writing), or anything but the decimal pid save writes (Number() would read `0x1F` or `1e3`
+    // as one): not ours to judge.
+    if (!/^[1-9]\d*$/.test(middle)) continue
+    const pid = Number(middle)
+    // Our own pid's is a leftover too, of an earlier process that had this pid (killed between its
+    // write and its rename): a save of ours runs in one synchronous call, so none is under way
+    // now. It was left for our first save to remove, and a load that has nothing to save (a config
+    // already in saved form) left it, tokens and all, until the first update().
+    if (pid !== process.pid) {
+      try {
+        process.kill(pid, 0)
+        continue
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EPERM') continue
+      }
+    }
+    try { rmSync(join(dir, name), { force: true }) } catch { /* best-effort */ }
+  }
+}
+
 export class ConfigStore {
+  /** Set by stopSaving() (the restart keeper): config.json belongs to another process from then on. */
+  private saving = true
+
   private constructor(
     private data: Config,
     private filePath: string,
     private brokenPath = '',
+    private brokenKept = false,
   ) {}
 
   static load(path: string): ConfigStore {
+    sweepDeadSaveTmps(path)
     if (!existsSync(path)) {
       const store = new ConfigStore(defaultConfig(), path)
       store.save()
       return store
     }
     let raw: Record<string, unknown>
-    const text = readFileSync(path, 'utf8')
+    // Decoded first: a BOM (UTF-8 or UTF-16, see decodeConfigText) would otherwise send a valid
+    // hand-edited config to the reset below.
+    const bytes = readFileSync(path)
+    const text = decodeConfigText(bytes)
+    // A file of another user's is never rewritten or chmodded by a load. A save creates
+    // config.json anew, owned by whoever saves, mode 0600: run as root (`sudo turbollm …` with the
+    // owner's HOME, as macOS keeps it), every load did that, and the owner's next start could not
+    // read its own config (an uncaught EACCES). The data stays in memory for this process.
+    const st = statSync(path)
+    const foreign = ownedByAnotherUser(st)
     try {
       raw = JSON.parse(text) as Record<string, unknown>
     } catch {
       const backup = `${path}.broken-${Math.floor(Date.now() / 1000)}`
-      writeFileSync(backup, text)
-      const store = new ConfigStore(defaultConfig(), path, backup)
-      store.save()
+      // The file's own bytes: a decoded copy of a file in another encoding mangles its non-ASCII text.
+      // Owner-only like config.json: it is a full copy, tokens included.
+      writeFileSync(backup, bytes, { mode: CONFIG_FILE_MODE })
+      // Another user's is left as it is by the load (see above): this process runs on the defaults,
+      // and says so (brokenLeftInPlace) rather than that the file was reset. Its first update() (a
+      // start's first telemetry event mints a machineId) still saves them over it, as the reset
+      // did.
+      const store = new ConfigStore(defaultConfig(), path, backup, foreign)
+      if (!foreign) store.save()
       return store
     }
     const version = typeof raw.version === 'number' ? raw.version : 0
     const cfg = version < SCHEMA_VERSION ? migrate(raw, version) : (raw as unknown as Config)
     normalize(cfg)
     const store = new ConfigStore(cfg, path)
-    store.save() // persist migration/normalization
+    if (foreign) return store
+    // An existing install's 0644 file (written before CONFIG_FILE_MODE) is tightened in place, not
+    // by a rewrite. Best-effort: a read-only mount still starts.
+    if (process.platform !== 'win32' && (st.mode & 0o777) !== CONFIG_FILE_MODE) {
+      try { chmodSync(path, CONFIG_FILE_MODE) } catch { /* best-effort */ }
+    }
+    // Persist migration/normalization, when they changed anything: a config already in the form
+    // save() writes is left as it is.
+    if (JSON.stringify(cfg, null, 2) !== text) store.save()
     return store
   }
 
@@ -828,7 +1012,15 @@ export class ConfigStore {
     fn(work)
     validate(work)
     this.data = work
-    this.save()
+    if (this.saving) this.save()
+  }
+
+  /** For the restart keeper (cli.ts becomeKeeper): from now on update() changes this process's copy only, and never
+   *  writes config.json. The keeper is the old process, its copy as it stood at the restart, and its replacement owns
+   *  the file: work of the old process still in flight there (a Turbo Link probe's heartbeat, an install that ends)
+   *  wrote that stale copy over the replacement's config, undoing what the user had changed since. */
+  stopSaving(): void {
+    this.saving = false
   }
 
   dir(): string {
@@ -840,12 +1032,35 @@ export class ConfigStore {
   brokenBackup(): string {
     return this.brokenPath
   }
+  /** An unparsable config.json of another user's: backed up (brokenBackup) but not reset on disk,
+   *  as a load never writes one; this process runs on the defaults, and its first update() writes
+   *  them over the file. */
+  brokenLeftInPlace(): boolean {
+    return this.brokenKept
+  }
 
   private save(): void {
     mkdirSync(dirname(this.filePath), { recursive: true })
-    const tmp = `${this.filePath}.tmp`
-    writeFileSync(tmp, JSON.stringify(this.data, null, 2))
-    renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    // A tmp file of this process's own. A process that loads the config can save it (load()
+    // persists its migration), so a refused second start can write the RUNNING daemon's
+    // config.json too; with one shared `config.json.tmp`, a Settings save interleaving with that
+    // had its tmp overwritten with the other process's older snapshot (which then became
+    // config.json), or found it already renamed away and threw ENOENT.
+    const tmp = `${this.filePath}.${process.pid}.tmp`
+    // Owner-only (CONFIG_FILE_MODE): the rename keeps the tmp's mode, so config.json is 0600 after
+    // every save (load() tightens an existing install's 0644 file in place). A mode applies only
+    // to a file the write creates, so one left under this pid (pid reuse after a kill, one the
+    // load's best-effort sweep did not remove) is removed first rather than written through with
+    // its old mode.
+    rmSync(tmp, { force: true })
+    writeFileSync(tmp, JSON.stringify(this.data, null, 2), { mode: CONFIG_FILE_MODE })
+    try {
+      renameSync(tmp, this.filePath) // libuv MoveFileEx replaces on Windows
+    } catch (e) {
+      // Per-process names are never overwritten by a later save: don't leave this one behind.
+      try { rmSync(tmp, { force: true }) } catch { /* best-effort */ }
+      throw e
+    }
   }
 }
 
@@ -885,6 +1100,9 @@ function migrate(raw: Record<string, unknown>, from: number): Config {
       ;(cfg as unknown as Record<string, unknown>)[k] = v
     }
   }
+  // A file with no selection on record (and no pre-v1 engine, selected above) is one normalize() starts on the first
+  // engine: defaultConfig's '' would read as a selection the user cleared.
+  if (typeof raw.activeEngineId !== 'string' && !old?.binPath) delete (cfg as Partial<Config>).activeEngineId
   // v3→v4 (ADR-299, revised by the ADR-299-Decision-4 supersession on 2026-08-01): every
   // pre-existing config already has telemetry.level stored as 'off', because
   // normalizeTelemetryLevel() has coerced any missing/legacy value to 'off' since
@@ -947,6 +1165,9 @@ function normalize(c: Config): void {
   c.links ??= []
   c.engines ??= []
   c.customEngineSources ??= []
+  // A config from before the key, or one that gained an engine since the seed was recorded, has had engines set up:
+  // once the user removes them all, the next start must not install and select the default build for them.
+  c.defaultEngineSeeded = c.defaultEngineSeeded === true || c.engines.length > 0 || c.customEngineSources.length > 0
   c.modelDirs ??= []
   // Primary model dir (spec 01 §3, ADR-035): absent in old files → '' (effective
   // default falls back to the first modelDir). Never throw on an old config.
@@ -1019,6 +1240,7 @@ function normalize(c: Config): void {
       ? c.vramHeadroomMb
       : VRAM_HEADROOM_DEFAULT_MB
   c.autoLoadOnStart ??= false
+  c.showAllEngineModels = c.showAllEngineModels === true
   c.featuredOverrideUrl ??= ''
   // ComfyUI coordination (absent in pre-comfyui configs → defaults; never throw on an
   // old file). Reseat only the known fields so the retired url/pollSeconds keys from
@@ -1086,6 +1308,13 @@ function normalize(c: Config): void {
   }
   c.tools.toolPolicies = toolPolicies
   c.tools.autoAllowAll = tl.autoAllowAll === true
+  // Absent in configs written before the setting, or hand-edited out of range: the default (30
+  // minutes), never a throw on load. A fraction is floored, as the minutes it stands for.
+  const wait = tl.chatApprovalWaitMinutes
+  c.tools.chatApprovalWaitMinutes =
+    typeof wait === 'number' && Number.isFinite(wait) && wait >= CHAT_APPROVAL_WAIT_MINUTES.min && wait <= CHAT_APPROVAL_WAIT_MINUTES.max
+      ? Math.floor(wait)
+      : CHAT_APPROVAL_WAIT_MINUTES.default
   // MCP host (v0.7.0): absent in pre-v0.7.0 configs → empty server list.
   const mc = (c.mcp ?? {}) as Partial<McpConfig>
   c.mcp = {
@@ -1179,6 +1408,11 @@ function normalize(c: Config): void {
     cleanedPins[modelKey] = pin
   }
   c.lastPresetId = cleanedPins
+  // Hidden models: absent in older configs → []. Non-empty strings only, each once, the newest HIDDEN_MODELS_CAP kept,
+  // so a hand-edited list cannot carry junk or grow without bound.
+  c.hiddenModels = Array.isArray(c.hiddenModels)
+    ? [...new Set(c.hiddenModels.filter((k): k is string => typeof k === 'string' && k !== ''))].slice(-HIDDEN_MODELS_CAP)
+    : []
   // Built-in agent overrides (Customize → Agents "Edit" + Reset): absent in
   // pre-feature configs → {}. Filter to well-shaped entries.
   const rawOverrides = (c.builtinAgentOverrides ?? {}) as Record<string, unknown>
@@ -1255,6 +1489,7 @@ function normalize(c: Config): void {
         : undefined,
     },
     lastUrl: str(ra.lastUrl),
+    lastUrlProvider: (REMOTE_PROVIDERS as readonly string[]).includes(ra.lastUrlProvider as string) ? ra.lastUrlProvider : undefined,
   }
   // App auto-update settings (spec 29 B.4): absent in pre-this-feature configs → the
   // 'notify' default. The policy string is NOT validated here — `normalizeUpdatePolicy`
@@ -1304,8 +1539,12 @@ function normalize(c: Config): void {
     // → 'notify' (the safe default — surface updates, never silently auto-apply).
     e.updatePolicy = e.updatePolicy === 'off' || e.updatePolicy === 'auto' ? e.updatePolicy : 'notify'
   }
+  // A selected engine that is gone leaves none selected, as Registry.remove does, and an empty selection stays empty:
+  // filling it with the first engine on every load selected one the user never picked. Only a file with no selection
+  // on record at all (hand-written, or from before the key) starts on the first engine that can be active. A first run
+  // starts with '' and selects the first engine it installs (Registry.add fills an empty selection).
   if (c.activeEngineId && !c.engines.some((e) => e.id === c.activeEngineId)) c.activeEngineId = ''
-  if (!c.activeEngineId) c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
+  if (typeof c.activeEngineId !== 'string') c.activeEngineId = firstActivatableEngine(c.engines)?.id ?? ''
   // A primary that no longer exists in modelDirs (folder removed/renamed) falls
   // back to the effective default (first dir) — reset rather than throw.
   if (c.primaryModelDir && !c.modelDirs.includes(c.primaryModelDir)) c.primaryModelDir = ''
@@ -1384,6 +1623,23 @@ function validate(c: Config): void {
 /** Preset cap is PER MODEL — at most this many in any one modelKey's array. (customAgents is a
  *  flat list so its cap is global; modelPresets is a Record<string, ModelPreset[]>.) */
 export const MODEL_PRESET_CAP = 50
+
+/** At most this many hidden model keys (Config.hiddenModels); past it the oldest is dropped, and that model shows again.
+ *  Far above any library, so only a list no library could fill reaches it. */
+export const HIDDEN_MODELS_CAP = 2000
+
+/** Hide `modelKey` by hand, or unhide it (Config.hiddenModels). Hiding a hidden model, or unhiding a shown one, changes
+ *  nothing; a newly hidden key goes last, so the cap drops the oldest. */
+export function setModelHidden(cfg: Config, modelKey: string, hidden: boolean): void {
+  const keys = cfg.hiddenModels ?? []
+  if (hidden === keys.includes(modelKey)) return
+  cfg.hiddenModels = hidden ? [...keys, modelKey].slice(-HIDDEN_MODELS_CAP) : keys.filter((k) => k !== modelKey)
+}
+
+/** Whether the user hid `modelKey` by hand (Config.hiddenModels). */
+export function isModelHidden(cfg: Pick<Config, 'hiddenModels'>, modelKey: string): boolean {
+  return (cfg.hiddenModels ?? []).includes(modelKey)
+}
 
 function validateModelPresets(c: Config): void {
   for (const [modelKey, presets] of Object.entries(c.modelPresets)) {
@@ -1552,23 +1808,19 @@ export const ANY_ENGINE = '*'
  *  the simplest fallback that doesn't require identifying any engine specially). Returns
  *  undefined if the model has no saved profile on any engine. The single read seam every
  *  caller routes through instead of indexing `cfg.modelProfiles[key]` directly. */
-/** The context window a model would ACTUALLY be loaded with, from its saved profile/preset for
- *  `engineId` — as opposed to its `nativeCtx`, which is only the ceiling its metadata allows.
- *  Undefined when it has no profile for that engine.
- *
- *  Lives here, beside `getModelProfile`, because TWO consumers need the identical answer and they
- *  drifted the first time it was written in only one of them: the models API overlay (for the UI and
- *  for `turbollm launch`, which reads models over HTTP) and the daemon's post-load harness-config
- *  sync (which reads raw scanner entries and so saw no such field). The sync then overwrote the
- *  launcher's correct value with `nativeCtx` on every load — measured live: pi advertised 131072 for
- *  `gpt-oss-120b` while its profile configures 32256. One function, one answer.
- *
- *  A harness that believes a 4x-too-large window does not merely display a wrong number: it fills
- *  the context past what the engine actually allocated and the turn dies on a hard engine error. */
-export function resolveConfiguredCtx(cfg: Config, modelKey: string, engineId: string): number | undefined {
-  if (!engineId) return undefined
-  const profile = getModelProfile(cfg, modelKey, engineId) as { ctx?: number } | undefined
-  return typeof profile?.ctx === 'number' && profile.ctx > 0 ? profile.ctx : undefined
+/** `map[key]` for an OWN entry only. The per-model config maps (`modelProfiles`, `modelPresets`,
+ *  `lastPresetId`, a model's per-engine slots) are plain objects indexed by request input — a
+ *  path's model key, `?engine=` — and a key like `constructor` or `__proto__` would otherwise
+ *  resolve to the Object constructor or Object.prototype, so a later write or `delete` through it
+ *  changes those for the whole process (one request could delete `Object.entries`). */
+export function ownEntry<T>(map: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return map !== undefined && Object.hasOwn(map, key) ? map[key] : undefined
+}
+
+/** Keys no per-model config map may be written under: assigning `__proto__` swaps the map's
+ *  prototype instead of adding an entry, and the other two only ever name built-ins. */
+export function isUnsafeMapKey(key: string): boolean {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype'
 }
 
 export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
@@ -1577,15 +1829,15 @@ export function getModelProfile(cfg: Config, modelKey: string, engineId: string)
   // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —
   // auto-tune seeds its search from this function and needs "this engine's own" profile.
   // A pin pointing at a deleted preset, or at a preset for another engine, falls straight
-  // through to the logic below. `?? {}` guards hand-built Configs that skip normalize().
-  const pinnedId = (cfg.lastPresetId ?? {})[modelKey]
+  // through to the logic below. `ownEntry` also guards hand-built Configs that skip normalize().
+  const pinnedId = ownEntry(cfg.lastPresetId, modelKey)
   if (pinnedId) {
-    const pinned = (cfg.modelPresets ?? {})[modelKey]?.find((p) => p.id === pinnedId)
+    const pinned = ownEntry(cfg.modelPresets, modelKey)?.find((p) => p.id === pinnedId)
     if (pinned && (pinned.engineId === '' || pinned.engineId === engineId)) return pinned.profile
   }
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return undefined
-  const exact = byEngine[engineId]
+  const exact = ownEntry(byEngine, engineId)
   if (exact) return exact.profile
   // `>=` (not `>`): object key insertion order matches save order, so on an exact
   // millisecond tie (two rapid-fire saves) the later-inserted entry — the truly more
@@ -1602,11 +1854,12 @@ export function getModelProfile(cfg: Config, modelKey: string, engineId: string)
  *  engines. Creates the per-model map if absent; never touches other engines' profiles
  *  for the same model. */
 export function setModelProfile(cfg: Config, modelKey: string, engineId: string, profile: unknown): void {
-  ;(cfg.modelProfiles[modelKey] ??= {})[engineId] = { profile, updatedAt: new Date().toISOString() }
+  if (isUnsafeMapKey(modelKey) || isUnsafeMapKey(engineId)) throw new ValueError('modelProfiles', 'invalid model key or engine id.')
+  ;(ownEntry(cfg.modelProfiles, modelKey) ?? (cfg.modelProfiles[modelKey] = {}))[engineId] = { profile, updatedAt: new Date().toISOString() }
 }
 
 /** Move every piece of state keyed on `oldKey` to `newKey` — profiles, presets, the preset pin,
- *  the bench result, and `lastLoaded` — and returns whether anything actually moved.
+ *  the bench result, the hand-hidden flag, and `lastLoaded` — and returns whether anything actually moved.
  *
  *  Exists for one reason: `modelKey` embeds the scanner's derived quant label
  *  (`name|quant|sizeBytes`), so fixing how that label is derived changes the key for any model
@@ -1642,6 +1895,13 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
     delete cfg.benchResults[oldKey]
     moved = true
   }
+  // A model hidden by hand stays hidden under its corrected key.
+  if (isModelHidden(cfg, oldKey)) {
+    cfg.hiddenModels = isModelHidden(cfg, newKey)
+      ? cfg.hiddenModels.filter((k) => k !== oldKey)
+      : cfg.hiddenModels.map((k) => (k === oldKey ? newKey : k))
+    moved = true
+  }
   if (cfg.lastLoaded.modelKey === oldKey) {
     cfg.lastLoaded = { ...cfg.lastLoaded, modelKey: newKey }
     moved = true
@@ -1649,10 +1909,30 @@ export function migrateModelKey(cfg: Config, oldKey: string, newKey: string): bo
   return moved
 }
 
+/** Move what is saved under engine `oldId` to `newId`: each model's profile there, the presets tuned on it, and the
+ *  last-loaded record. For an engine whose update registers the new build under a new id (an official llama.cpp
+ *  backend's, in its own tag-keyed folder) and unregisters the old one: those stayed under the old id, so the next load
+ *  on the updated backend ran untuned defaults (auto-tune's result included), a preset pinned for it stopped applying,
+ *  and the startup resume named an engine that no longer exists. As in migrateModelKey, a model `newId` already has a
+ *  profile for keeps it. */
+export function migrateEngineId(cfg: Config, oldId: string, newId: string): void {
+  if (oldId === newId || isUnsafeMapKey(newId)) return
+  for (const byEngine of Object.values(cfg.modelProfiles)) {
+    const entry = ownEntry(byEngine, oldId)
+    if (!entry) continue
+    if (!ownEntry(byEngine, newId)) byEngine[newId] = entry
+    delete byEngine[oldId]
+  }
+  for (const presets of Object.values(cfg.modelPresets)) {
+    for (const p of presets) if (p.engineId === oldId) p.engineId = newId
+  }
+  if (cfg.lastLoaded.engineId === oldId) cfg.lastLoaded = { ...cfg.lastLoaded, engineId: newId }
+}
+
 /** Delete a model's saved profile for one engine only (issue #35). Prunes the per-model
  *  map when its last slot is removed so `hasProfile`-style emptiness checks stay accurate. */
 export function deleteModelProfile(cfg: Config, modelKey: string, engineId: string): void {
-  const byEngine = cfg.modelProfiles[modelKey]
+  const byEngine = ownEntry(cfg.modelProfiles, modelKey)
   if (!byEngine) return
   delete byEngine[engineId]
   if (Object.keys(byEngine).length === 0) delete cfg.modelProfiles[modelKey]

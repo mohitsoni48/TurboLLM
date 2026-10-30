@@ -151,3 +151,20 @@ test('a GGUF repo has no checkpoints key at all', async () => {
   assert.equal('checkpoints' in detail, false)
   assert.equal(detail.safetensors, undefined)
 })
+
+test('the response cache is bounded: old entries are evicted, recent ones kept', async () => {
+  const real = globalThis.fetch
+  globalThis.fetch = (async () => json([])) as unknown as typeof fetch
+  try {
+    const hf = new HfClient(() => '', '0.0.0-test')
+    // 'vllm' has no library filter, so each search is exactly one cached listing request.
+    for (let i = 0; i < 450; i++) await hf.searchModels(`query-${i}`, 'vllm')
+    const cache = (hf as unknown as { cache: Map<string, unknown> }).cache
+    assert.equal(cache.size, 200)
+    const keys = [...cache.keys()]
+    assert.ok(keys.some((k) => k.includes('search=query-449&')), 'the newest entry is kept')
+    assert.ok(!keys.some((k) => k.includes('search=query-0&')), 'the oldest entry is evicted')
+  } finally {
+    globalThis.fetch = real
+  }
+})

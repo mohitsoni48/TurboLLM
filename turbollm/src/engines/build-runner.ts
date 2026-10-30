@@ -14,11 +14,11 @@
 //
 // The toolchain PATH override (build-prereqs.ts `buildEnv`) is applied so a conda-env /
 // custom-path CUDA Toolkit (and a user-provided ninja) are found. Windows or Linux + CUDA only.
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawnSync, type ChildProcessByStdio } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
-import { delimiter, dirname, join, normalize } from 'node:path'
-import { promisify } from 'node:util'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, symlinkSync, writeFileSync, type Dirent } from 'node:fs'
+import { rm } from 'node:fs/promises'
+import { basename, delimiter, dirname, join, normalize } from 'node:path'
 import {
   buildEnv,
   checkBuildPrereqs,
@@ -32,8 +32,11 @@ import {
 } from './build-prereqs'
 import { resolveServerBinary } from './scan'
 import type { BuildPhase } from './build-state'
+import type { Readable } from 'node:stream'
+import { spawnTethered, tetheredExecFile } from '../util/tether'
 
-const execFileP = promisify(execFile)
+// The ldconfig and vswhere probes, tied to the daemon (util/tether.ts): their timeouts are daemon timers.
+const execFileP = tetheredExecFile({ kind: 'probe' })
 
 /** Locate libcuda.so's directory when it lives OUTSIDE the CUDA Toolkit's own search path —
  *  the common shape on an NVIDIA-container-runtime GPU box (Kaggle, RunPod, generic
@@ -56,8 +59,8 @@ const execFileP = promisify(execFile)
  *  cover — the driver is mounted under a completely separate `/usr/local/nvidia/` prefix, the
  *  standard nvidia-container-runtime convention. Best-effort either way: a missing `ldconfig`,
  *  an empty cache, or no match just means the build proceeds without the override, exactly like
- *  before this existed — never blocks a build that would otherwise have worked. */
-async function findLibcudaDir(signal: AbortSignal): Promise<string | null> {
+ *  before this existed — never blocks a build that would otherwise have worked. Exported for its tether test. */
+export async function findLibcudaDir(signal: AbortSignal): Promise<string | null> {
   try {
     const { stdout } = await execFileP('ldconfig', ['-p'], {
       timeout: 5000,
@@ -385,6 +388,8 @@ export interface BuildOutput {
   buildRoot: string
   /** The repo's default branch, resolved best-effort from the remote; undefined when unknown. */
   defaultBranch?: string
+  /** Where the build this one replaced was parked (see {@link runBuild}); the caller deletes it. */
+  prevBuildRoot?: string
 }
 
 /** PURE: a filesystem-safe directory slug for a repo+branch, so a rebuild of the same
@@ -661,13 +666,17 @@ function cudaSoSourceDirs(env: NodeJS.ProcessEnv): string[] {
  *  equivalent of {@link copyCudaRuntimeDlls}). The binary still needs `LD_LIBRARY_PATH`
  *  pointed at its own directory to find them at runtime (the loader doesn't search the
  *  executable's directory by default, unlike Windows) — the engine launcher does this. */
-function copyCudaRuntimeLibs(env: NodeJS.ProcessEnv, destDir: string, log: (l: string) => void): number {
+export function copyCudaRuntimeLibs(env: NodeJS.ProcessEnv, destDir: string, log: (l: string) => void): number {
   const sources = cudaSoSourceDirs(env)
   if (sources.length === 0) {
     log('Note: could not find the CUDA toolkit shared libraries to bundle — the engine may need LD_LIBRARY_PATH set to run.')
     return 0
   }
   const seen = new Set<string>()
+  // CUDA ships each library once plus `.so` / `.so.MAJOR` symlinks to it, and copyFileSync follows
+  // links — copying them wrote every ~0.5 GB library up to three times. A link to a sibling is
+  // recreated as the same relative link once its target is bundled (falling back to a copy).
+  const links: Array<{ name: string; target: string; src: string }> = []
   let copied = 0
   for (const dir of sources) {
     let names: string[]
@@ -680,12 +689,43 @@ function copyCudaRuntimeLibs(env: NodeJS.ProcessEnv, destDir: string, log: (l: s
       if (seen.has(name)) continue
       if (!CUDA_RUNTIME_SO_PREFIXES.some((p) => name.startsWith(p))) continue
       try {
-        copyFileSync(join(dir, name), join(destDir, name))
+        const src = join(dir, name)
+        const target = lstatSync(src).isSymbolicLink() ? readlinkSync(src) : ''
+        if (target && basename(target) === target) {
+          links.push({ name, target, src })
+          seen.add(name)
+          continue
+        }
+        copyFileSync(src, join(destDir, name))
         seen.add(name)
         copied++
       } catch {
         /* skip a locked/unreadable lib — best effort */
       }
+    }
+  }
+  // A link to a link (libcublas.so → .so.12 → .so.12.x.y) resolves on a later pass.
+  let pending = links
+  for (let progress = true; progress && pending.length > 0; ) {
+    progress = false
+    pending = pending.filter(({ name, target }) => {
+      if (!existsSync(join(destDir, target))) return true
+      try {
+        symlinkSync(target, join(destDir, name))
+      } catch {
+        return true
+      }
+      copied++
+      progress = true
+      return false
+    })
+  }
+  for (const { name, src } of pending) {
+    try {
+      copyFileSync(src, join(destDir, name))
+      copied++
+    } catch {
+      /* skip a locked/unreadable lib — best effort */
     }
   }
   if (copied > 0) log(`Bundled ${copied} CUDA runtime librar${copied === 1 ? 'y' : 'ies'} next to the binary so the engine is self-contained.`)
@@ -710,6 +750,14 @@ async function findVcvarsall(): Promise<string | null> {
   }
 }
 
+/** Windows: MSBuild, should a step run it (CMake does not with the Ninja and NMake generators used here, but a
+ *  project's own build scripts may), keeps its worker nodes running after the build for a later one to reuse. They
+ *  are grandchildren, which libuv's job lets break away, so they outlived the step and the daemon.
+ *  MSBUILDDISABLENODEREUSE=1 makes them end with their build. Exported for its test. */
+export function buildNodeReuseEnv(platform: NodeJS.Platform): { MSBUILDDISABLENODEREUSE?: string } {
+  return platform === 'win32' ? { MSBUILDDISABLENODEREUSE: '1' } : {}
+}
+
 /** The Windows command interpreter to spawn for our vcvars `.bat` steps. Windows always sets
  *  `ComSpec` to the full path of cmd.exe (e.g. `C:\Windows\System32\cmd.exe`), which is the
  *  portable, drive-agnostic way to reach it (Windows may not be on C:). Spawning the bare string
@@ -721,20 +769,88 @@ function winComSpec(): string {
 
 /** Run one child process, streaming combined stdout+stderr line-by-line to `onLine` and
  *  resolving with the full stdout text. Rejects with a clear message on a non-zero exit or
- *  spawn error; aborting `signal` kills the child (Node throws AbortError, name preserved). */
-function runStep(
+ *  spawn error; aborting `signal` kills the child and everything under it (on Linux/macOS with `killTree: false`,
+ *  only the child, with SIGTERM) and rejects with an AbortError. The daemon's exit kills the same tree (on
+ *  Linux/macOS with `killTree: false`, nothing). On Windows neither sends a kill once the child has exited.
+ *  Exported for tests. */
+export function runStep(
   cmd: string,
   args: string[],
-  opts: { cwd?: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLine: (line: string) => void },
+  opts: {
+    cwd?: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLine: (line: string) => void
+    /** false (Linux/macOS): the step stays in the daemon's process group and aborting sends SIGTERM to the direct
+     *  child only, as spawn's own `signal` does. For the package manager runPrereqInstall runs: dnf/zypper (librpm)
+     *  and brew stop their transaction at a safe point on SIGTERM, while a SIGKILL of the group mid-install can
+     *  leave a half-installed package every later install trips over. */
+    killTree?: boolean
+  },
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    const child = spawn(cmd, args, {
+    // spawn's `signal` terminates only the direct child, while the compile under it keeps going (and writing into
+    // these pipes and the build tree) long after "Build cancelled.": on Windows the vcvars steps' child is cmd.exe,
+    // with cmake → ninja → cl/nvcc under it; elsewhere cmake, with ninja and its compiler jobs. Kill the whole tree
+    // instead, and settle only once that is done so cleanup doesn't race the dying compilers: taskkill /T on
+    // Windows, as manager.ts does for engines; elsewhere the step runs in a process group of its own (detached),
+    // which kill(-pid) ends at once.
+    const isWindows = process.platform === 'win32'
+    const killGroupOnAbort = !isWindows && opts.killTree !== false
+    const aborted = () => Object.assign(new Error('The operation was aborted'), { name: 'AbortError', code: 'ABORT_ERR' })
+    if (opts.signal.aborted) return reject(aborted())
+    // Tied to the daemon (util/tether.ts), so a step the daemon does not live to see ends with it: a build step's
+    // whole group is killed (cmake, ninja and every compiler job), however the daemon dies; before, only the 'exit'
+    // handler below did that, and a SIGKILLed or crashed daemon left the compile running, parented to init. A
+    // package manager's step (killTree false) gets 'term' mode: SIGTERM to the program alone, never a kill, and
+    // it stays in the daemon's process group (sudo -n keeps the terminal's ticket).
+    const child = spawnTethered(cmd, args, {
       cwd: opts.cwd,
       env: opts.env,
-      signal: opts.signal,
+      detached: killGroupOnAbort,
+      // A step that opts out of the group kill keeps spawn's own abort: SIGTERM to the direct child, then AbortError.
+      signal: isWindows || killGroupOnAbort ? undefined : opts.signal,
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
-    })
+    }, opts.killTree === false ? { kind: 'install', end: 'term' } : { kind: 'build' }) as ChildProcessByStdio<null, Readable, Readable>
+    const killGroup = () => {
+      try {
+        process.kill(-child.pid!, 'SIGKILL')
+      } catch {
+        /* the group is already gone */
+      }
+    }
+    // Windows: no taskkill once Node has seen the step exit (something it left still holds its pipes, so 'close', and
+    // the step, wait): libuv has closed the process handle that kept the pid from being reused, so `/PID <pid> /T` may
+    // name another process tree by then, as in manager.ts's forceKill. An exited root is no tree for taskkill anyway;
+    // with the job sentinel, what it left was ended with its job at that exit (util/tether.ts).
+    const exited = () => child.exitCode !== null || child.signalCode !== null
+    const onAbort = () => {
+      if (!child.pid) return reject(aborted())
+      if (killGroupOnAbort) {
+        killGroup()
+        return reject(aborted())
+      }
+      if (exited()) return reject(aborted())
+      execFile('taskkill', ['/PID', String(child.pid), '/T', '/F'], () => reject(aborted()))
+    }
+    if (isWindows || killGroupOnAbort) opts.signal.addEventListener('abort', onAbort, { once: true })
+    // The daemon's exit (Settings Restart, Ctrl+C, a crash that reaches 'exit') ends the step's whole tree too. In a
+    // group of its own the step no longer gets the Ctrl+C of the daemon's terminal. On Windows the exit ended only
+    // the direct child: the job object Node puts its children in kills them when the daemon exits but lets their own
+    // children break away, so cmd.exe died while cmake → ninja → cl/nvcc kept compiling, and later dropped a
+    // llama-server.exe nothing had probed into the directory the engine runs from. An exit handler cannot wait for
+    // an async kill, so taskkill runs synchronously there.
+    const killTreeSync = () => {
+      if (exited()) return // as onAbort
+      try {
+        spawnSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true })
+      } catch {
+        /* the tree is already gone */
+      }
+    }
+    const killOnExit = child.pid === undefined ? null : killGroupOnAbort ? killGroup : isWindows ? killTreeSync : null
+    if (killOnExit) process.once('exit', killOnExit)
     let stdout = ''
     let outBuf = ''
     let errBuf = ''
@@ -753,11 +869,14 @@ function runStep(
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (c: string) => pump(c, false))
     child.stderr.on('data', (c: string) => pump(c, true))
-    child.on('error', (e) => reject(e)) // includes AbortError when signal fires
+    child.on('error', (e) => reject(e))
     child.on('close', (code) => {
+      opts.signal.removeEventListener('abort', onAbort)
+      if (killOnExit) process.removeListener('exit', killOnExit)
       if (outBuf) opts.onLine(outBuf.replace(/\r$/, ''))
       if (errBuf) opts.onLine(errBuf.replace(/\r$/, ''))
-      if (code === 0) resolve(stdout)
+      if (opts.signal.aborted) reject(aborted())
+      else if (code === 0) resolve(stdout)
       else reject(new Error(`${cmd} exited with code ${code}`))
     })
   })
@@ -771,7 +890,7 @@ function hasAssemblySources(dir: string): boolean {
   const stack = [dir]
   while (stack.length) {
     const d = stack.pop()!
-    let entries
+    let entries: Dirent[]
     try {
       entries = readdirSync(d, { withFileTypes: true })
     } catch {
@@ -893,7 +1012,8 @@ export async function runPrereqInstall(
   const env = { ...buildEnv(req.toolchainDirs), DEBIAN_FRONTEND: 'noninteractive' }
   for (const [cmd, ...args] of tool.installCommands!) {
     hooks.log(`$ ${[cmd, ...args].join(' ')}`)
-    await runStep(cmd, args, { env, signal, onLine: hooks.log })
+    // killTree false: Cancel asks the package manager to stop (SIGTERM) rather than SIGKILLing it mid-transaction.
+    await runStep(cmd, args, { env, signal, onLine: hooks.log, killTree: false })
   }
 
   // Re-probe rather than trusting a zero exit code: a manager can "succeed" while leaving the
@@ -911,15 +1031,193 @@ export async function runPrereqInstall(
 }
 
 /** Run the full clone → configure → compile → locate flow. Throws on any failure (the
- *  caller surfaces it via BuildState.fail); on success returns the built binary + commit. */
+ *  caller surfaces it via BuildState.fail); on success returns the built binary + commit.
+ *
+ *  A rebuild of the same source lands in the very directory the registered engine runs from, so
+ *  the previous build is PARKED beside it instead of deleted. A failed or cancelled build (an
+ *  unreachable remote, an upstream tip that no longer compiles) drops its partial tree and puts
+ *  the previous build back, so the user still has a working engine; a successful one returns the
+ *  parked dir as `prevBuildRoot` for the caller to delete (discardParkedBuild) once the new build is registered. */
 export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: AbortSignal): Promise<BuildOutput> {
+  const dirs: { buildRoot?: string; prevBuildRoot?: string } = {}
+  try {
+    return await buildFromSource(req, hooks, signal, dirs)
+  } catch (e) {
+    if (dirs.buildRoot) await restorePreviousBuild(dirs.buildRoot, dirs.prevBuildRoot, hooks.log)
+    throw e
+  }
+}
+
+/** Written into a build directory as the build starts, and removed (markBuildComplete) only once the built
+ *  llama-server has passed its probe and is registered: by the build route, or by a later Enable of a build whose own
+ *  registration failed. While it is there the tree is not a finished build, whatever it holds: boot recovery
+ *  (restoreInterruptedBuilds) and the next build's sweep took any llama-server in it for one, so a binary a daemon
+ *  exit cut short mid-link, or one a compile that outlived the daemon wrote later, stayed in place of the parked
+ *  previous build. The marker marks the unfinished tree rather than the finished one, so a build made before it
+ *  existed still counts as finished. It sits at the build directory's top, beside the `_tllm_*.bat` steps, where
+ *  nothing the compile writes can remove it. */
+export const BUILD_INCOMPLETE_MARKER = '.turbollm-build-incomplete'
+
+/** The build in `buildRoot` passed its probe: from now on boot recovery and the next build's sweep keep it. Best
+ *  effort: a marker left behind only makes a parked build beside it go back at the next start. */
+export function markBuildComplete(buildRoot: string): void {
+  try {
+    rmSync(join(buildRoot, BUILD_INCOMPLETE_MARKER), { force: true })
+  } catch {
+    /* best effort */
+  }
+}
+
+/** A finished build: a server binary, and no BUILD_INCOMPLETE_MARKER. */
+function isFinishedBuild(root: string): boolean {
+  if (existsSync(join(root, BUILD_INCOMPLETE_MARKER))) return false
+  return (resolveServerBinary(join(root, 'build')) ?? resolveServerBinary(root)) !== null
+}
+
+/** Remove a failed build's partial tree and move the parked previous build (if any) back. On Windows the tree can
+ *  stay locked for a moment (TerminateProcess of a cancelled compiler tree is asynchronous, and Defender scans the
+ *  fresh objects), so the delete retries — asynchronously, not to freeze the daemon meanwhile. A tree still locked
+ *  after that is moved aside instead when it can be (a lock that defeats the delete — an open handle or a cwd inside
+ *  the tree — often blocks the rename too), so the previous build can still go back; the next build of this directory
+ *  sweeps the moved-aside tree (sweepParkedBuilds). If the rename fails as well, the log says where the previous
+ *  build is: it is kept until a build of this directory succeeds, and the next one puts it back first. The build
+ *  route calls it too, for a build that compiled but whose binary could not be registered (its probe failed). False
+ *  when a parked build could not be moved back, so the route does not report it as kept. */
+export async function restorePreviousBuild(buildRoot: string, prevBuildRoot: string | undefined, log: (l: string) => void): Promise<boolean> {
+  try {
+    try {
+      await rm(buildRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
+    } catch (e) {
+      if (!prevBuildRoot) throw e
+      renameSync(buildRoot, join(dirname(buildRoot), `.${basename(buildRoot)}-${Date.now()}.failed`))
+    }
+    if (prevBuildRoot) renameSync(prevBuildRoot, buildRoot)
+  } catch (e) {
+    if (!prevBuildRoot) return true
+    log(couldNotPutBackMessage(e, prevBuildRoot, buildRoot))
+    return false
+  }
+  return true
+}
+
+function couldNotPutBackMessage(e: unknown, parked: string, buildRoot: string): string {
+  return `Could not put the previous build back (${e instanceof Error ? e.message : String(e)}) — it is kept at ${parked} until a build of this engine succeeds; move it back to ${buildRoot} to use it now.`
+}
+
+/** The discardParkedBuild deletes still running. The next build waits for them before its sweep, so it never deletes
+ *  a tree another delete is working through, nor puts one back as the last working copy. */
+const parkedBuildDeletes = new Set<Promise<void>>()
+
+/** Delete the build a successful rebuild replaced (runBuild's `prevBuildRoot`), off the event loop. The route did it
+ *  with a recursive rmSync, which held the daemon's only thread for as long as a multi-GB CUDA build tree took to
+ *  delete (seconds with Windows Defender scanning): every request, status poll and token stream stalled meanwhile.
+ *  It retries, as a Windows lock on just-replaced files is brief; whatever still stays is swept by the next build of
+ *  that directory. Never rejects. */
+export function discardParkedBuild(prevBuildRoot: string): Promise<void> {
+  const deleting: Promise<void> = rm(prevBuildRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
+    .catch(() => {
+      /* best effort */
+    })
+    .finally(() => parkedBuildDeletes.delete(deleting))
+  parkedBuildDeletes.add(deleting)
+  return deleting
+}
+
+/** Delete what earlier runs left beside `buildRoot`: a parked previous build that was never deleted (the daemon died
+ *  mid-build, or the delete after a successful one failed) and failed trees restorePreviousBuild moved aside. Only
+ *  this directory's own `.<name>-<ms>.prev` / `.failed` siblings: another build's name can start with this one's.
+ *  Best effort — whatever stays locked is tried again by the next build. The deletes run off the event loop (each tree
+ *  is a whole build, often several GB, see discardParkedBuild) and the returned promise settles once all have ended;
+ *  the put-back below is synchronous and done by the time this returns.
+ *
+ *  When `buildRoot` holds no finished build (isFinishedBuild: the daemon died mid-build, or restorePreviousBuild
+ *  could not move the parked build back), the newest finished parked build is the only working copy: it is put back
+ *  first (the partial tree moved aside and swept with the rest), or kept if that fails — never swept. `sweep: false`
+ *  only puts it back and deletes nothing (restoreInterruptedBuilds). */
+function sweepParkedBuilds(buildRoot: string, log: (l: string) => void, opts: { sweep?: boolean } = {}): Promise<void> {
+  const parent = dirname(buildRoot)
+  const prefix = `.${basename(buildRoot)}-`
+  let names: string[]
+  try {
+    names = readdirSync(parent)
+  } catch {
+    return Promise.resolve()
+  }
+  const parked = names.filter((name) => name.startsWith(prefix) && /^\d+\.(prev|failed)$/.test(name.slice(prefix.length)))
+  if (!isFinishedBuild(buildRoot)) {
+    const msOf = (name: string) => parseInt(name.slice(prefix.length), 10)
+    const lastGood = parked
+      .filter((name) => name.endsWith('.prev'))
+      .sort((a, b) => msOf(b) - msOf(a))
+      .find((name) => isFinishedBuild(join(parent, name)))
+    if (lastGood) {
+      parked.splice(parked.indexOf(lastGood), 1)
+      try {
+        if (existsSync(buildRoot)) {
+          const aside = `${prefix}${Date.now()}.failed`
+          renameSync(buildRoot, join(parent, aside))
+          parked.push(aside)
+        }
+        renameSync(join(parent, lastGood), buildRoot)
+        log(`Put back the previous build an earlier run left at ${join(parent, lastGood)}.`)
+      } catch (e) {
+        log(couldNotPutBackMessage(e, join(parent, lastGood), buildRoot))
+      }
+    }
+  }
+  if (opts.sweep === false) return Promise.resolve()
+  const deletes = parked.map((name) =>
+    rm(join(parent, name), { recursive: true, force: true }).catch(() => {
+      /* best effort */
+    }),
+  )
+  return Promise.all(deletes).then(() => undefined)
+}
+
+/** At boot: put the previous build back for every registered (or remembered) source build whose directory holds no
+ *  finished build (no server binary, or BUILD_INCOMPLETE_MARKER still there) while a `.<name>-<ms>.prev` beside it
+ *  does. A daemon that exits mid-rebuild kills the compile, but runBuild's restorePreviousBuild never runs, so the
+ *  engine pointed at a missing binary until the next build of that same directory put it back (sweepParkedBuilds),
+ *  which a SIGKILL or crash mid-build left the same way. Only puts back: the partial tree is moved aside, and it and
+ *  other leftovers are swept by that directory's next build, so a multi-GB delete does not hold up startup. A
+ *  directory nothing claims is left to its next build too, unless it still carries BUILD_INCOMPLETE_MARKER: such a
+ *  tree is never a working build, and a finished `.prev` beside it is the build a rebuild parked and never got to put
+ *  back or discard. A catalog repo's build records no custom source, and the build route unregisters the engine it
+ *  replaces before it probes the new binary, so a daemon exit during that probe left nothing claiming the directory:
+ *  the working build stayed hidden and the catalog card offered the unprobed tree in its place. */
+export function restoreInterruptedBuilds(enginesRoot: string, claimedBinPaths: string[], log: (l: string) => void): void {
+  const buildDir = join(enginesRoot, 'build')
+  let names: string[]
+  try {
+    names = readdirSync(buildDir)
+  } catch {
+    return
+  }
+  const roots = new Set<string>()
+  for (const name of names) {
+    const m = /^\.(.+)-\d+\.prev$/.exec(name)
+    if (m) roots.add(join(buildDir, m[1]))
+  }
+  for (const buildRoot of roots) {
+    const claimed = claimedBinPaths.some((p) => isEngineInBuildDir(p, buildRoot))
+    // Puts back synchronously; with sweep false nothing is deleted, so there is nothing to wait for.
+    if (claimed || existsSync(join(buildRoot, BUILD_INCOMPLETE_MARKER))) void sweepParkedBuilds(buildRoot, log, { sweep: false })
+  }
+}
+
+async function buildFromSource(
+  req: BuildRequest,
+  hooks: BuildHooks,
+  signal: AbortSignal,
+  dirs: { buildRoot?: string; prevBuildRoot?: string },
+): Promise<BuildOutput> {
   const isWindows = process.platform === 'win32'
   const isMac = process.platform === 'darwin'
   const isAndroid = process.platform === 'android'
   // Force git to FAIL fast instead of blocking on an interactive credential prompt (a
   // private/typo'd URL would otherwise hang the build with stdin ignored). GCM_INTERACTIVE
   // disables the Git Credential Manager GUI on Windows.
-  const env = { ...buildEnv(req.toolchainDirs), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
+  const env = { ...buildEnv(req.toolchainDirs), GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never', ...buildNodeReuseEnv(process.platform) }
 
   // Fail fast with actionable guidance if the toolchain isn't usable, rather than a deep
   // cryptic cmake error. CUDA is required on Windows/Linux (-DGGML_CUDA=ON); macOS builds
@@ -959,9 +1257,22 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   const buildRoot = join(req.enginesRoot, 'build', buildDirName(req.repoUrl, req.branch, req.commit))
   const srcDir = join(buildRoot, 'src')
   const buildSubdir = join(buildRoot, 'build')
-  // Start clean so a rebuild never mixes old + new objects.
-  rmSync(buildRoot, { recursive: true, force: true })
+  // Start clean so a rebuild never mixes old + new objects — by parking the previous build (see
+  // runBuild), not deleting it. A hidden sibling name, like zip-install's parked dirs. The sweep
+  // waits for the delete of a build an earlier rebuild replaced, which may still be running.
+  if (parkedBuildDeletes.size > 0) {
+    hooks.log('Waiting for the delete of a replaced build to finish…')
+    await Promise.all(parkedBuildDeletes)
+  }
+  await sweepParkedBuilds(buildRoot, hooks.log)
+  const prevBuildRoot = existsSync(buildRoot) ? join(dirname(buildRoot), `.${basename(buildRoot)}-${Date.now()}.prev`) : undefined
+  if (prevBuildRoot) renameSync(buildRoot, prevBuildRoot)
+  dirs.buildRoot = buildRoot
+  dirs.prevBuildRoot = prevBuildRoot
   mkdirSync(buildRoot, { recursive: true })
+  // Unfinished until the route has probed and registered the binary (markBuildComplete): a daemon exit from here on
+  // leaves a tree that boot recovery must not take for the working build.
+  writeFileSync(join(buildRoot, BUILD_INCOMPLETE_MARKER), '')
 
   // 1) Shallow clone — a branch tip, or (when `req.commit` is set) an exact historical SHA.
   hooks.phase('cloning')
@@ -1148,5 +1459,5 @@ export async function runBuild(req: BuildRequest, hooks: BuildHooks, signal: Abo
   // neither has anything to bundle.
   if (isWindows) copyCudaRuntimeDlls(env, dirname(binPath), hooks.log)
   else if (!isMac && !isAndroid) copyCudaRuntimeLibs(env, dirname(binPath), hooks.log)
-  return { binPath, commit, buildRoot, defaultBranch }
+  return { binPath, commit, buildRoot, defaultBranch, prevBuildRoot }
 }

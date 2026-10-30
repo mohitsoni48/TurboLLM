@@ -57,8 +57,9 @@ export interface Conversation {
    *  compactionUpToMessageId when a future turn is built. Undefined = never compacted.
    *  Never cleared automatically by edit/branch/delete — only an explicit undo or a new
    *  compaction overwrites these three fields. See chat-compaction.ts's
-   *  resolveCompactionCut for how a stranded cut (message deactivated or deleted) is
-   *  handled: the summary is never silently dropped. */
+   *  resolveCompactionCut and setAsideFrozenCut for how a stranded cut is handled: a deleted
+   *  cut keeps its summary; a deactivated one (frozen on a branch the user left) is set aside
+   *  while that branch is inactive. */
   compactionSummary?: string
   /** The message id everything ACTIVE at/before this is now covered by compactionSummary. */
   compactionUpToMessageId?: string
@@ -446,6 +447,13 @@ export interface ToolCallRecord {
   diff?: string
   patch?: string
   firstChangedLine?: number
+  /** Code mode only: made by a delegate_task/invoke_skill sub-agent, not the session's own model
+   *  — shown and revertable like any call, but never replayed into the parent model's history. */
+  subagent?: boolean
+  /** Code mode only, 'edit' calls: a revert-to-message with revertFiles already reverse-applied
+   *  this call's patch on disk (revert.ts). A later revert reaching the call again (one further
+   *  back, or one after /resume) skips it rather than reversing it a second time. */
+  reverted?: boolean
 }
 
 /** Code, item 6 (2026-07-13): an ordered text/tool-call timeline for an assistant message, in
@@ -494,6 +502,10 @@ export interface Message {
   reasoning: string
   attachments: string[]
   textAttachments: string[]
+  /** v52: the attached documents' TEXT as the user turn first sent it (`textAttachments` holds only
+   *  their names). Kept so a regenerate or edit-and-resend can send the turn again with its
+   *  documents. Absent when the turn attached none, and on rows written before v52. */
+  docContext?: string
   /** Tool calls made by this assistant turn (v0.7.0). */
   toolCalls: ToolCallRecord[]
   /** Code, item 6 — ordered text/tool-call interleave. Absent on messages persisted before this
@@ -521,7 +533,7 @@ interface ConvRow { id: string; title: string; system_prompt: string; model_key:
 interface AgentRunRow { id: string; conv_id: string; title: string; status: string; allowed_tools: string; agent_id: string | null; error: string | null; created_at: string; updated_at: string; started_at: string | null; ended_at: string | null; archived_at: string | null; completion: string | null; repo_root: string | null; repo_branch: string | null; use_worktree: number | null; worktree_branch: string | null; worktree_base: string | null; worktree_path: string | null; lines_added: number | null; lines_removed: number | null; compaction_summary: string | null; compaction_upto_message_id: string | null; compaction_tokens_before: number | null; cleared_upto_message_id: string | null; reverted_from_message_id: string | null; title_auto_synced: number | null; code_agent: string | null; terminal_launched_once: number | null }
 interface FolderRow { id: string; name: string; sort_order: number; created_at: string; updated_at: string }
 interface ExtRunRow { id: string; chat_id: string; message_id: string; tenant: string; owner: string; status: string; event_seq: number; error: string | null; created_at: string; ended_at: string | null }
-interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number }
+interface MsgRow  { id: string; conv_id: string; seq: number; role: 'user' | 'assistant'; content: string; reasoning: string; attachments: string; text_attachments: string | null; tool_calls: string | null; timeline: string | null; stats: string; model_key: string | null; research_meta: string | null; created_at: string; variant_group: string | null; is_active: number; branch_of: string | null; edited: number; doc_context: string | null }
 
 // Named-param objects need an explicit cast to Record<string, SqlValue>
 type P = Record<string, SqlValue>
@@ -641,6 +653,7 @@ function rowToMsg(r: MsgRow): Message {
   const msg: Message = { id: r.id, convId: r.conv_id, seq: r.seq, role: r.role, content: r.content, reasoning: r.reasoning, attachments: safeJson(r.attachments) as string[], textAttachments: r.text_attachments ? safeJson(r.text_attachments) as string[] : [], toolCalls: r.tool_calls ? safeJson(r.tool_calls) as ToolCallRecord[] : [], stats: safeJson(r.stats) as Partial<MessageStats>, createdAt: r.created_at, variantGroup: r.variant_group, isActive: r.is_active !== 0, branchOf: r.branch_of, edited: r.edited === 1 }
   if (r.research_meta) msg.researchMeta = safeJson(r.research_meta) as ResearchMeta
   if (r.timeline) msg.timeline = safeJson(r.timeline) as MessageTimelineBlock[]
+  if (r.doc_context) msg.docContext = r.doc_context
   return msg
 }
 
@@ -1311,6 +1324,13 @@ export class ConversationStore {
       if (!this.hasColumn('conversations', 'compaction_applied_at')) this.db.exec(`ALTER TABLE conversations ADD COLUMN compaction_applied_at TEXT;`)
       this.db.exec(`PRAGMA user_version = 51;`)
     }
+    // v52: a user turn's attached-document text (Message.docContext). It used to exist only in
+    // the request that first sent the turn, so a regenerate or edit-and-resend sent the turn
+    // again without its documents. Nullable, no default: most turns attach nothing.
+    if (v < 52) {
+      if (!this.hasColumn('messages', 'doc_context')) this.db.exec(`ALTER TABLE messages ADD COLUMN doc_context TEXT;`)
+      this.db.exec(`PRAGMA user_version = 52;`)
+    }
   }
 
   listConversations(q?: string, kind: 'chat' | 'agent' | 'all' = 'all'): Conversation[] {
@@ -1431,7 +1451,7 @@ export class ConversationStore {
       .all({ $cid: convId, $seq: from.seq } as P) as unknown as MsgRow[]).map(rowToMsg)
   }
 
-  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
+  addMessage(convId: string, role: 'user' | 'assistant', content: string, extra?: Partial<Pick<Message, 'reasoning' | 'attachments' | 'textAttachments' | 'docContext' | 'toolCalls' | 'stats' | 'variantGroup'>>): Message {
     const id = randomUUID()
     const now = new Date().toISOString()
     const row = this.db.prepare(`SELECT COALESCE(MAX(seq),0) AS ms FROM messages WHERE conv_id = $id`).get({ $id: convId } as P) as unknown as { ms: number }
@@ -1440,8 +1460,8 @@ export class ConversationStore {
     const modelKey = role === 'assistant' ? this.conversationModelKey(convId) : null
     const textAttachments = extra?.textAttachments?.length ? JSON.stringify(extra.textAttachments) : null
     const toolCalls = extra?.toolCalls?.length ? JSON.stringify(extra.toolCalls) : null
-    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,tool_calls,stats,model_key,created_at,variant_group,is_active) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$tc,$stats,$mk,$now,$vg,1)`)
-      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now, $vg: extra?.variantGroup ?? null } as P)
+    this.db.prepare(`INSERT INTO messages (id,conv_id,seq,role,content,reasoning,attachments,text_attachments,doc_context,tool_calls,stats,model_key,created_at,variant_group,is_active) VALUES ($id,$cid,$seq,$role,$content,$reasoning,$attachments,$ta,$dc,$tc,$stats,$mk,$now,$vg,1)`)
+      .run({ $id: id, $cid: convId, $seq: row.ms + 1, $role: role, $content: content, $reasoning: extra?.reasoning ?? '', $attachments: JSON.stringify(extra?.attachments ?? []), $ta: textAttachments, $dc: extra?.docContext || null, $tc: toolCalls, $stats: JSON.stringify(extra?.stats ?? {}), $mk: modelKey, $now: now, $vg: extra?.variantGroup ?? null } as P)
     this.touchConversation(convId)
     return this.getMessage(id)!
   }
@@ -1473,6 +1493,24 @@ export class ConversationStore {
 
   deleteMessage(id: string): boolean {
     return ((this.db.prepare(`DELETE FROM messages WHERE id = $id`).run({ $id: id } as P) as unknown) as Changes).changes > 0
+  }
+
+  /** On daemon startup: a chat reply still with its turn's placeholder stats (`{"aborted":false}`, the exact stats
+   *  only the two chat turn routes insert, and which only the save at the end of the turn replaces) belongs to a turn
+   *  of a previous process, which died before that save. It stayed that way for good, shown as "This message is
+   *  empty." (or, with the text the turn saved while it streamed, as a finished reply) with nothing to say why, so it
+   *  is marked stopped, its text kept. A placeholder edited by hand since keeps its text and stats: the two message
+   *  edits, the only writers of `edited` (this app's PUT route and the External Chat API's PATCH, through
+   *  sqlite-chat-store over this table), set it and leave stats alone, while the turn's saves as it streams never
+   *  set it, so `edited` is what tells the two apart now that an unfinished reply can have text. Code sessions
+   *  (kind 'code') are Code's own: its run reconcile marks them, and a finished Code turn can carry those same
+   *  stats. Returns how many replies were marked. */
+  abortUnfinishedReplies(): number {
+    return ((this.db.prepare(
+      `UPDATE messages SET stats = '{"aborted":true}'
+        WHERE role = 'assistant' AND stats = '{"aborted":false}' AND edited = 0
+          AND conv_id IN (SELECT id FROM conversations WHERE kind <> 'code')`,
+    ).run() as unknown) as Changes).changes
   }
 
   /** Most-recent assistant gen t/s per model (spec 04 §5 `lastTps`). For each
@@ -1962,7 +2000,7 @@ export class ConversationStore {
     const byGroup = new Map<string, { protocol: ApiUsageSource; harness: string; requests: number; promptTokens: number; genTokens: number; models: Set<string> }>()
     for (const r of rows) {
       const harness = r.harness ?? 'unknown'
-      const key = `${r.source} ${harness}`
+      const key = `${r.source}\x00${harness}`
       const t = byGroup.get(key) ?? { protocol: r.source, harness, requests: 0, promptTokens: 0, genTokens: 0, models: new Set<string>() }
       t.requests++
       t.promptTokens += r.prompt_tokens
@@ -2133,9 +2171,11 @@ export class ConversationStore {
   }
 
   /** Chat branching (GitHub #52): deactivate a message instead of deleting it, and
-   *  establish its variant_group (its own id) if this is its first regeneration. */
+   *  establish its variant_group (its own id) if this is its first regeneration. Also drops
+   *  any branch_of tag: only freezeTail's rows may carry one, and a row restored before
+   *  restoreTail cleared tags still has its old one (see restoreTail). */
   deactivateMessage(id: string): void {
-    this.db.prepare(`UPDATE messages SET is_active = 0, variant_group = COALESCE(variant_group, id) WHERE id = $id`).run({ $id: id } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 0, branch_of = NULL, variant_group = COALESCE(variant_group, id) WHERE id = $id`).run({ $id: id } as P)
   }
 
   /** All siblings sharing a variant_group (active + inactive), oldest first — the full
@@ -2145,11 +2185,12 @@ export class ConversationStore {
   }
 
   /** Switches which sibling in a variant group is the active/shown one. No-op (returns
-   *  false) if targetId isn't actually a member of that group. */
+   *  false) if targetId isn't actually a member of that group. The sibling it turns off
+   *  loses any branch_of tag, as in deactivateMessage. */
   setActiveVariant(variantGroup: string, targetId: string): boolean {
     const target = this.getMessage(targetId)
     if (!target || target.variantGroup !== variantGroup) return false
-    this.db.prepare(`UPDATE messages SET is_active = 0 WHERE variant_group = $vg`).run({ $vg: variantGroup } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 0, branch_of = NULL WHERE variant_group = $vg AND is_active = 1`).run({ $vg: variantGroup } as P)
     this.db.prepare(`UPDATE messages SET is_active = 1 WHERE id = $id`).run({ $id: targetId } as P)
     return true
   }
@@ -2164,9 +2205,35 @@ export class ConversationStore {
   }
 
   /** Chat branching: reactivate every message previously frozen under `anchorId` — the
-   *  inverse of freezeTail, used when switching back to that message version. */
+   *  inverse of freezeTail, used when switching back to that message version. The tag is
+   *  cleared as the rows come back: an active row must not carry one, or a reply regenerated
+   *  away inside this tail later would still read as "frozen under anchorId" and come back
+   *  next to its replacement. freezeTail re-tags whatever is active when the
+   *  user switches away again. */
   restoreTail(anchorId: string): void {
-    this.db.prepare(`UPDATE messages SET is_active = 1 WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
+    this.db.prepare(`UPDATE messages SET is_active = 1, branch_of = NULL WHERE branch_of = $anchor`).run({ $anchor: anchorId } as P)
+  }
+
+  /** Runs `fn` as one transaction: every statement it makes lands, or (when it throws) none do.
+   *  For the branch operations that take several statements (an edit's freezeTail +
+   *  deactivateMessage + addMessage, a version switch's freezeTail + restoreTail +
+   *  setActiveVariant): a statement that failed partway (disk full, an I/O error) left a group
+   *  with no active member, or a frozen tail with nothing shown in its place. `fn` must be
+   *  synchronous, so nothing else on this connection can run inside it; sql.js (Android) takes
+   *  BEGIN/COMMIT/ROLLBACK like node:sqlite, and its periodic flush is a timer, which cannot fire
+   *  in the middle either. */
+  transaction<T>(fn: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const out = fn()
+      this.db.exec('COMMIT')
+      return out
+    } catch (e) {
+      // SQLite has already rolled back after some errors (SQLITE_FULL, SQLITE_IOERR); a second
+      // ROLLBACK would then throw and hide the error that failed the operation.
+      try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ }
+      throw e
+    }
   }
 
   // ── Folder methods (v10 migration) ────────────────────────────────────────
@@ -2232,16 +2299,23 @@ export class ConversationStore {
     return r ? rowToExtRun(r) : null
   }
 
-  listExtRuns(tenant: string, limit = 100): ExtRunRecord[] {
-    return (this.db.prepare(`SELECT * FROM ext_runs WHERE tenant = $t ORDER BY created_at DESC LIMIT $l`)
-      .all({ $t: tenant, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
+  /** `owner` filters in SQL, before the LIMIT: filtering the tenant's newest `limit` rows
+   *  afterwards dropped an owner's runs whenever other owners had `limit` newer ones. */
+  listExtRuns(tenant: string, owner?: string, limit = 100): ExtRunRecord[] {
+    return (this.db.prepare(`SELECT * FROM ext_runs WHERE tenant = $t AND ($o IS NULL OR owner = $o) ORDER BY created_at DESC LIMIT $l`)
+      .all({ $t: tenant, $o: owner ?? null, $l: limit } as P) as unknown as ExtRunRow[]).map(rowToExtRun)
   }
 
-  /** Close out runs left mid-stream by a previous process (spec 27 §6.4). */
+  /** Close out runs left mid-stream by a previous process (spec 27 §6.4). A row left with a
+   *  terminal status but no ended_at (the run's final write, the one that sets it, failed) gets
+   *  one as well, its status kept: a row with no ended_at reads as a running run, so it refused
+   *  every turn on its chat, and a restart did not clear it. Returns the rows marked failed. */
   markStreamingExtRunsFailed(code: string, message: string): number {
     const err = JSON.stringify({ type: 'engine', code, message })
+    const now = new Date().toISOString()
     const r = this.db.prepare(`UPDATE ext_runs SET status='failed', error=$e, ended_at=$now WHERE status IN ('queued','streaming')`)
-      .run({ $e: err, $now: new Date().toISOString() } as P) as unknown as Changes
+      .run({ $e: err, $now: now } as P) as unknown as Changes
+    this.db.prepare(`UPDATE ext_runs SET ended_at=$now WHERE ended_at IS NULL`).run({ $now: now } as P)
     return r.changes
   }
 
@@ -2409,6 +2483,16 @@ export class ConversationStore {
   listParkedRoutineRuns(): RoutineRun[] {
     const rows = this.db.prepare(
       `SELECT * FROM routine_runs WHERE status = 'needs_approval'`,
+    ).all() as unknown as RoutineRunRow[]
+    return rows.map(rowToRoutineRun)
+  }
+
+  /** Every run row still at 'running', across all routines — read once by
+   *  `RoutineScheduler.start()` to close out runs a daemon restart cut off. Unindexed scan, for
+   *  the same reason as listParkedRoutineRuns above. */
+  listRunningRoutineRuns(): RoutineRun[] {
+    const rows = this.db.prepare(
+      `SELECT * FROM routine_runs WHERE status = 'running'`,
     ).all() as unknown as RoutineRunRow[]
     return rows.map(rowToRoutineRun)
   }
@@ -2688,6 +2772,12 @@ export class ConversationStore {
   pruneAgentSkills(agentId: string): void {
     this.db.prepare(`DELETE FROM agent_skills WHERE agent_id = $a`).run({ $a: agentId } as P)
   }
+
+  /** Writes the database to disk now, where the backend holds it in memory (sql.js, Android:
+   *  POST /api/v1/daemon/flush, before the app's Quit kills the process or its service stops).
+   *  true: everything written so far is on disk; false: the write failed (it is retried); null:
+   *  nothing to do, as node:sqlite writes every change to the file itself. */
+  flush(): boolean | null { return this.db.flush ? this.db.flush() : null }
 
   close(): void { this.db.close() }
 }

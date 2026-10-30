@@ -17,13 +17,24 @@
 
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { ChildProcess, spawn } from 'node:child_process'
+import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpDir } from './test-support/tmp'
 import {
   INSTALL_METHODS,
   checkApplyBlockers,
   classifyInstall,
   classifyUpdateFailure,
+  detectInstall,
+  npmGlobalRoot,
   progressFromResult,
+  realPathOr,
+  resetNpmRootCache,
+  helperPath,
+  spawnUpdateHelper,
   AppUpdateProgressState,
+  UPDATE_LOG_FILE,
   type InstallSignals,
 } from './app-update-apply'
 import { APP_INSTALL_METHODS } from './telemetry/events/app-update'
@@ -33,10 +44,12 @@ import { APP_INSTALL_METHODS } from './telemetry/events/app-update'
 function signals(over: Partial<InstallSignals> = {}): InstallSignals {
   return {
     platform: 'linux',
+    androidApp: false,
     entry: '/opt/somewhere/turbollm/bin/turbollm.mjs',
     desktopEnv: false,
     inContainer: false,
     npmGlobalRoot: null,
+    globalInstallWritable: true,
     sourceCheckout: false,
     ...over,
   }
@@ -52,6 +65,24 @@ test('classifyInstall: a global npm install offers the self-update', () => {
   assert.equal(info.method, 'npm_global')
   assert.equal(info.canSelfUpdate, true)
   assert.equal(info.command, 'npm i -g turbollm@latest')
+})
+
+// A root-owned prefix (`sudo npm i -g turbollm`: Node from apt or NodeSource, the nodejs.org pkg on
+// macOS): "Update & restart" stopped the daemon, the helper's `npm install -g` failed with EACCES,
+// and the old version came back detached, the dialog reading only "npm exited with code 243".
+test('classifyInstall: a global install this user cannot write offers the sudo command, not the self-update', () => {
+  const info = classifyInstall(
+    signals({
+      entry: '/usr/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/usr/lib/node_modules',
+      globalInstallWritable: false,
+    }),
+  )
+  assert.equal(info.method, 'npm_global')
+  assert.equal(info.canSelfUpdate, false)
+  assert.equal(info.command, 'sudo npm i -g turbollm@latest')
+  assert.match(info.note, /cannot write/)
+  assert.match(info.note, /sudo npm i -g turbollm@latest/)
 })
 
 test('classifyInstall: global detection is case-insensitive and separator-agnostic on Windows', () => {
@@ -103,6 +134,17 @@ test('classifyInstall: the desktop env var alone is enough (wrapper-set, path-in
   assert.equal(info.method, 'electron')
 })
 
+test('classifyInstall: macOS desktop users are told to download the .dmg, not that updates are automatic', () => {
+  // The wrapper skips electron-updater on macOS: the unsigned dmg-only build cannot be installed by it.
+  const mac = classifyInstall(signals({ platform: 'darwin', desktopEnv: true }))
+  assert.equal(mac.method, 'electron')
+  assert.match(mac.note, /\.dmg/)
+  assert.doesNotMatch(mac.note, /in the background/)
+
+  const win = classifyInstall(signals({ platform: 'win32', desktopEnv: true }))
+  assert.match(win.note, /in the background/)
+})
+
 test('classifyInstall: a container refuses and shows a rebuild command', () => {
   const info = classifyInstall(signals({ inContainer: true }))
   assert.equal(info.method, 'docker')
@@ -115,6 +157,7 @@ test('classifyInstall: Android refuses and beats every other signal', () => {
   const info = classifyInstall(
     signals({
       platform: 'android',
+      androidApp: true,
       inContainer: true,
       entry: '/data/data/dev.turbollm/files/node_modules/turbollm/bin/turbollm.mjs',
       npmGlobalRoot: '/data/data/dev.turbollm/files/node_modules',
@@ -122,6 +165,37 @@ test('classifyInstall: Android refuses and beats every other signal', () => {
   )
   assert.equal(info.method, 'android')
   assert.equal(info.canSelfUpdate, false)
+})
+
+// Termux's Node reports platform 'android' as the packaged app's does, and every 'android' was
+// taken for the Play Store app: no self-update, and a note pointing at a store Termux users do
+// not install TurboLLM from. There TurboLLM is an ordinary npm install that can update itself.
+test('classifyInstall: Termux (android, not the packaged app) is an npm install that updates itself', () => {
+  const info = classifyInstall(
+    signals({
+      platform: 'android',
+      entry: '/data/data/com.termux/files/usr/lib/node_modules/turbollm/bin/turbollm.mjs',
+      npmGlobalRoot: '/data/data/com.termux/files/usr/lib/node_modules',
+    }),
+  )
+  assert.equal(info.method, 'npm_global')
+  assert.equal(info.canSelfUpdate, true)
+  assert.equal(info.command, 'npm i -g turbollm@latest')
+})
+
+test('detectInstall: the packaged app is told from Termux by its TURBOLLM_ANDROID_NATIVE_LIB_DIR', async (t) => {
+  const platform = process.platform
+  const libDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  Object.defineProperty(process, 'platform', { value: 'android' })
+  t.after(() => {
+    Object.defineProperty(process, 'platform', { value: platform })
+    if (libDir === undefined) delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+    else process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = libDir
+  })
+  process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR = '/data/app/dev.turbollm/lib/arm64'
+  assert.equal((await detectInstall()).method, 'android', 'the packaged app')
+  delete process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
+  assert.notEqual((await detectInstall()).method, 'android', 'Termux')
 })
 
 test('classifyInstall: a source checkout refuses and says to pull', () => {
@@ -147,7 +221,7 @@ test('every install method is covered by INSTALL_METHODS', () => {
     classifyInstall(signals({ entry: '/a/_npx/b/c' })).method,
     classifyInstall(signals({ desktopEnv: true })).method,
     classifyInstall(signals({ inContainer: true })).method,
-    classifyInstall(signals({ platform: 'android' })).method,
+    classifyInstall(signals({ platform: 'android', androidApp: true })).method,
     classifyInstall(signals({ sourceCheckout: true })).method,
     classifyInstall(signals()).method,
   ])
@@ -248,4 +322,226 @@ test('AppUpdateProgressState: only the in-flight states count as running', () =>
   // The target survives a transition that does not restate it — the dialog reads it after
   // the restart to confirm which version it landed on.
   assert.equal(s.get().target, '1.12.8')
+})
+
+test('realPathOr: a global install run through its <prefix>/bin symlink classifies as npm_global', { skip: process.platform === 'win32' ? 'symlinks need privileges on Windows (where npm runs the package path directly anyway)' : false }, () => {
+  // The real layout: <prefix>/bin/turbollm -> ../lib/node_modules/turbollm/bin/turbollm.mjs.
+  // argv[1] is the LINK, which is not under `npm root -g` — the bug was classifying it as-is.
+  const prefix = tmpDir('tllm-global-')
+  {
+    const pkgBin = join(prefix, 'lib', 'node_modules', 'turbollm', 'bin')
+    mkdirSync(pkgBin, { recursive: true })
+    writeFileSync(join(pkgBin, 'turbollm.mjs'), '')
+    mkdirSync(join(prefix, 'bin'))
+    const link = join(prefix, 'bin', 'turbollm')
+    symlinkSync(join('..', 'lib', 'node_modules', 'turbollm', 'bin', 'turbollm.mjs'), link)
+    const root = join(prefix, 'lib', 'node_modules')
+    assert.equal(classifyInstall(signals({ entry: link, npmGlobalRoot: root })).method, 'unknown')
+    // Both sides resolved (detectInstall does this): a tmpdir behind a symlink (macOS /var →
+    // /private/var) is the "prefix behind a symlink" case too.
+    assert.equal(classifyInstall(signals({ entry: realPathOr(link), npmGlobalRoot: realPathOr(root) })).method, 'npm_global')
+    // A path that can't be resolved is returned unchanged rather than throwing.
+    assert.equal(realPathOr(join(prefix, 'missing')), join(prefix, 'missing'))
+  }
+})
+
+test('detectInstall: a global install through a <prefix>/bin link whose folders this user cannot write is not offered the self-update', async (t) => {
+  if (process.platform === 'win32') return t.skip('the writability check is for macOS and Linux')
+  // The real layout, under a prefix `npm root -g` reports (npm_config_prefix).
+  const prefix = tmpDir('tllm-global-ro-')
+  const root = join(prefix, 'lib', 'node_modules')
+  const pkgBin = join(root, 'turbollm', 'bin')
+  mkdirSync(pkgBin, { recursive: true })
+  writeFileSync(join(pkgBin, 'turbollm.mjs'), '')
+  const bin = join(prefix, 'bin')
+  mkdirSync(bin)
+  const link = join(bin, 'turbollm')
+  symlinkSync(join('..', 'lib', 'node_modules', 'turbollm', 'bin', 'turbollm.mjs'), link)
+  chmodSync(root, 0o555)
+  let readOnly = true
+  try { accessSync(root, fsConstants.W_OK); readOnly = false } catch { /* what this test needs */ }
+  if (!readOnly) {
+    chmodSync(root, 0o755)
+    return t.skip('this user can write a 0555 folder (root with CAP_DAC_OVERRIDE)')
+  }
+  const argv1 = process.argv[1]
+  const envPrefix = process.env.npm_config_prefix
+  t.after(() => {
+    process.argv[1] = argv1
+    if (envPrefix === undefined) delete process.env.npm_config_prefix
+    else process.env.npm_config_prefix = envPrefix
+    resetNpmRootCache()
+    chmodSync(root, 0o755)
+    chmodSync(bin, 0o755)
+  })
+  process.argv[1] = link
+  process.env.npm_config_prefix = prefix
+  resetNpmRootCache()
+
+  const ro = await detectInstall()
+  assert.equal(ro.method, 'npm_global')
+  assert.equal(ro.canSelfUpdate, false, 'the global node_modules folder is not writable')
+  assert.equal(ro.command, 'sudo npm i -g turbollm@latest')
+
+  // The bin folder the link sits in, which `npm i -g` rewrites the link in, counts too.
+  chmodSync(root, 0o755)
+  chmodSync(bin, 0o555)
+  assert.equal((await detectInstall()).canSelfUpdate, false, 'the bin folder is not writable')
+
+  chmodSync(bin, 0o755)
+  const rw = await detectInstall()
+  assert.equal(rw.method, 'npm_global')
+  assert.equal(rw.canSelfUpdate, true, 'both writable')
+  assert.equal(rw.command, 'npm i -g turbollm@latest')
+})
+
+/** What Node's own `spawn(command, { shell: true })` would run on Windows (normalizeSpawnArguments), on any OS:
+ *  process.platform is faked for the one synchronous call, and ChildProcess#spawn, which receives the normalized
+ *  options, is stubbed so that nothing runs. */
+function nodeWindowsShellLine(command: string, comspec: string | undefined): { file: string; args: string[]; verbatim: boolean } {
+  type Normalized = { file: string; args: string[]; windowsVerbatimArguments?: boolean }
+  const proto = ChildProcess.prototype as unknown as { spawn: (o: Normalized) => number }
+  const realSpawn = proto.spawn
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!
+  const saved = process.env.comspec
+  let seen: { file: string; args: string[]; verbatim: boolean } | undefined
+  proto.spawn = (o) => {
+    seen = { file: o.file, args: o.args.slice(1), verbatim: o.windowsVerbatimArguments === true }
+    return 0
+  }
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' })
+  if (comspec === undefined) delete process.env.comspec
+  else process.env.comspec = comspec
+  try {
+    spawn(command, { shell: true })
+  } finally {
+    Object.defineProperty(process, 'platform', platform)
+    proto.spawn = realSpawn
+    if (saved === undefined) delete process.env.comspec
+    else process.env.comspec = saved
+  }
+  assert.ok(seen, 'Node normalized the spawn')
+  return seen
+}
+
+// npmGlobalRoot runs through tetheredExecFile, which takes no `shell`, so on Windows it builds cmd.exe's line itself.
+// That line broke once already (the CVE-2024-27980 EINVAL that read every global install as `unknown`), and no CI job
+// runs this file on Windows, so the line is held to the one Node's own `shell: true` builds.
+test('npmGlobalRoot on Windows runs `npm root -g` as Node\'s own shell: true does (%ComSpec% /d /s /c, verbatim), and reads its output as before', async (t) => {
+  t.after(() => resetNpmRootCache())
+  const printed = 'C:\\Users\\owner\\AppData\\Roaming\\npm\\node_modules'
+  for (const comSpec of ['C:\\WINDOWS\\system32\\cmd.exe', undefined, 'C:\\tools\\tcc.exe']) {
+    const calls: { file: string; args: string[]; verbatim: boolean }[] = []
+    resetNpmRootCache()
+    const root = await npmGlobalRoot({
+      platform: 'win32',
+      env: comSpec === undefined ? {} : { ComSpec: comSpec },
+      exec: async (file, args, options) => {
+        calls.push({ file, args: [...args], verbatim: options.windowsVerbatimArguments === true })
+        return { stdout: `${printed}\r\n` }
+      },
+    })
+    assert.equal(root, printed, 'trimmed, its CRLF too')
+    assert.deepEqual(calls, [nodeWindowsShellLine('npm root -g', comSpec)], `ComSpec ${comSpec ?? 'unset'}`)
+  }
+  assert.deepEqual(nodeWindowsShellLine('npm root -g', undefined), { file: 'cmd.exe', args: ['/d', '/s', '/c', '"npm root -g"'], verbatim: true })
+
+  resetNpmRootCache()
+  assert.equal(await npmGlobalRoot({ platform: 'win32', env: {}, exec: async () => ({ stdout: '\r\n' }) }), null, 'nothing printed')
+  resetNpmRootCache()
+  const einval = Object.assign(new Error('spawn EINVAL'), { code: 'EINVAL' })
+  assert.equal(await npmGlobalRoot({ platform: 'win32', env: {}, exec: async () => { throw einval } }), null, 'a failed run')
+  resetNpmRootCache()
+  const posix: string[][] = []
+  await npmGlobalRoot({ platform: 'linux', env: {}, exec: async (file, args, options) => {
+    posix.push([file, ...args, String(options.windowsVerbatimArguments)])
+    return { stdout: '/usr/lib/node_modules\n' }
+  } })
+  assert.deepEqual(posix, [['npm', 'root', '-g', 'false']], 'elsewhere npm itself, no shell')
+})
+
+test('npmGlobalRoot reads the global folder from a real `npm root -g` (on Windows through cmd.exe)', async (t) => {
+  // npm prints <prefix>\node_modules on Windows and <prefix>/lib/node_modules elsewhere, for the prefix
+  // npm_config_prefix names. On Windows this runs the cmd.exe line above for real.
+  const prefix = tmpDir('tllm-npm-root-')
+  const expected = process.platform === 'win32' ? join(prefix, 'node_modules') : join(prefix, 'lib', 'node_modules')
+  mkdirSync(expected, { recursive: true })
+  const envPrefix = process.env.npm_config_prefix
+  t.after(() => {
+    if (envPrefix === undefined) delete process.env.npm_config_prefix
+    else process.env.npm_config_prefix = envPrefix
+    resetNpmRootCache()
+  })
+  process.env.npm_config_prefix = prefix
+  resetNpmRootCache()
+  const root = await npmGlobalRoot()
+  assert.ok(root, 'npm answered')
+  assert.equal(realPathOr(root), realPathOr(expected))
+})
+
+// The relaunched daemon's stdout goes to update.log, and one started with --print-token or
+// --tunnel prints a fresh API key there. Opened with the default mode (0644 under umask 022), it
+// was readable by every other local account in a 0755 ~/.turbollm, as config.json was.
+test('spawnUpdateHelper: update.log, where the relaunched daemon prints its key, is owner-only', { skip: process.platform === 'win32' ? 'Windows keeps only the write bit of a mode' : false }, async () => {
+  // A pid that has already exited, so the helper goes straight on (no install for 'source').
+  const gone = spawn(process.execPath, ['-e', ''])
+  await new Promise((r) => gone.once('exit', r))
+  const prevUmask = process.umask(0o022)
+  try {
+    for (const existing of [false, true]) {
+      const dataDir = tmpDir('tllm-update-log-')
+      const log = join(dataDir, UPDATE_LOG_FILE)
+      if (existing) writeFileSync(log, 'an older update\n', { mode: 0o644 })
+      const launched = spawnUpdateHelper({
+        dataDir, method: 'source', from: '1.0.0', to: '1.0.1',
+        run: { pid: gone.pid!, execPath: process.execPath, argv: ['-e', "console.log('  Token:   tllm-relaunched')"], cwd: dataDir, version: '1.0.0', startedAt: '' },
+      })
+      assert.equal(launched, true)
+      // Already owner-only as the helper starts: one opened for reading meanwhile, while it was
+      // 0644, could read the key the relaunched daemon later appends.
+      assert.equal(statSync(log).mode & 0o777, 0o600, 'owner-only from the helper spawn on')
+      for (let i = 0; i < 300 && !(existsSync(log) && readFileSync(log, 'utf8').includes('tllm-relaunched')); i++) await new Promise((r) => setTimeout(r, 20))
+      const text = readFileSync(log, 'utf8')
+      assert.match(text, /Token: {3}tllm-relaunched/, 'the relaunched daemon wrote to update.log')
+      assert.match(text, /update helper starting/, "and so did the helper")
+      if (existing) assert.ok(text.startsWith('an older update\n'), 'an existing log is appended to')
+      assert.equal(statSync(log).mode & 0o777, 0o600, existing ? 'an existing 0644 log is made owner-only' : 'a new log is created owner-only')
+    }
+    // The helper's own relaunch opens update.log too (update-helper.mjs): run on its own, with its
+    // output elsewhere, it creates the log the relaunched daemon writes to, owner-only as well.
+    const dataDir = tmpDir('tllm-update-log-')
+    const log = join(dataDir, UPDATE_LOG_FILE)
+    const payload = JSON.stringify({ pid: gone.pid, dataDir, method: 'source', from: '1.0.0', to: '1.0.1', execPath: process.execPath, argv: ['-e', "console.log('  Token:   tllm-relaunched')"], cwd: dataDir })
+    const helper = spawn(process.execPath, [helperPath(), payload], { stdio: 'ignore' })
+    await new Promise((r) => helper.once('exit', r))
+    for (let i = 0; i < 300 && !(existsSync(log) && readFileSync(log, 'utf8').includes('tllm-relaunched')); i++) await new Promise((r) => setTimeout(r, 20))
+    assert.match(readFileSync(log, 'utf8'), /Token: {3}tllm-relaunched/)
+    assert.equal(statSync(log).mode & 0o777, 0o600, "the helper's relaunch creates it owner-only")
+  } finally {
+    process.umask(prevUmask)
+  }
+})
+
+// After a Settings restart from a terminal this daemon runs under its restart keeper (cli.ts becomeKeeper), the old
+// process, which keeps the package's files open until it exits with this one: the helper must wait for it as well.
+test('spawnUpdateHelper: the helper also waits for the restart keeper this daemon runs under', async () => {
+  const gone = spawn(process.execPath, ['-e', ''])
+  await new Promise((r) => gone.once('exit', r))
+  const keeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 1500)'], { stdio: 'ignore' })
+  let keeperGoneAt = 0
+  keeper.once('exit', () => { keeperGoneAt = Date.now() })
+  const dataDir = tmpDir('tllm-update-keeper-')
+  const marker = join(dataDir, 'relaunched')
+  try {
+    const launched = spawnUpdateHelper({
+      dataDir, method: 'source', from: '1.0.0', to: '1.0.1', keeperPid: keeper.pid!,
+      run: { pid: gone.pid!, execPath: process.execPath, argv: ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, String(Date.now()))`], cwd: dataDir, version: '1.0.0', startedAt: '' },
+    })
+    assert.equal(launched, true)
+    for (let i = 0; i < 500 && !(existsSync(marker) && readFileSync(marker, 'utf8') !== ''); i++) await new Promise((r) => setTimeout(r, 20))
+    assert.ok(keeperGoneAt > 0, 'the keeper had exited when the daemon was relaunched')
+    assert.ok(Number(readFileSync(marker, 'utf8')) >= keeperGoneAt, 'the relaunch came after the keeper was gone')
+  } finally {
+    keeper.kill('SIGKILL')
+  }
 })

@@ -61,14 +61,16 @@ vi.mock('../../lib/api', async (importOriginal) => {
   }
 })
 
-// jsdom has no EventSource. Neither `useEngineLog` nor `useRequestLog` need more than the
-// constructor + addEventListener/close/onerror — nothing here fires a real frame.
-class FakeEventSource {
-  onerror: (() => void) | null = null
-  addEventListener() {}
-  close() {}
-}
-vi.stubGlobal('EventSource', FakeEventSource)
+// `useEngineLog` / `useRequestLog` tail their streams through `subscribeSse` (an authenticated
+// fetch, retried every 3 s). Stub it so nothing here opens a real request — nothing here needs
+// a live frame. It reports the stream as open, since `useRequestLog` loads its history then.
+vi.mock('../../lib/sse', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../lib/sse')>()),
+  subscribeSse: (_url: string, _onMessage: unknown, opts?: { onOpen?: () => void }) => {
+    opts?.onOpen?.()
+    return () => {}
+  },
+}))
 
 function engine(over: Partial<Engine> = {}): Engine {
   return {
@@ -124,6 +126,19 @@ describe('MonitorTab', () => {
     // The Requests panel must NOT have mounted (and so must not have fetched) while "Engine
     // log" is the active view.
     expect(state.getRequestsCalls).toBe(0)
+  })
+
+  // The header named the active engine beside the primary's state, so a model another engine ran (an install or Enable
+  // activates an engine without stopping it) read as running on the selected one.
+  it('names the engine running the model when it is not the active one', async () => {
+    state.enginesList = { engines: [engine()], activeEngineId: 'e1', customDisabled: [] }
+    state.status = {
+      engine: { id: 'e1', name: 'llama.cpp', state: 'running', servingId: 'lit', servingKind: 'litert-lm', servingName: 'LiteRT-LM' },
+    } as unknown as Status
+    await renderTab()
+
+    expect(screen.getByText('LiteRT-LM')).toBeInTheDocument()
+    expect(screen.queryByText('llama.cpp')).not.toBeInTheDocument()
   })
 
   it('tracks the auto-scroll toggle on the monitor screen, not engines', async () => {

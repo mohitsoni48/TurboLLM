@@ -786,6 +786,28 @@ test('handleJevRequest step 9: the router cannot produce a target → 503 model_
   assert.equal(harness.engineCalls.length, 0)
 })
 
+// The gateway's chat endpoints tell clients not to retry a permanent route refusal (a retry of a load that just failed
+// evicts what is loaded and runs it again); the three Jev endpoints answer the same refusals, so they say the same.
+test('handleJevRequest step 9: a permanent route refusal says x-should-retry: false on every Jev endpoint; one that clears by itself does not', async () => {
+  const failed = 'Engine start failed: out of memory'
+  const bodies: Array<[string, unknown]> = [
+    ['/v1/classify', classifyBody()],
+    ['/v1/rerank', rerankBody()],
+    ['/v1/systemone', { state: 's', model: MODEL_KEY, questions: { q: { type: 'noul', instructions: 'Q?' } } }],
+  ]
+  for (const [path, body] of bodies) {
+    const permanent = jevHarness({ route: { status: 503, message: failed, permanent: true } })
+    const res = await postJson(permanent.app, path, body)
+    assert.equal(res.headers.get('x-should-retry'), 'false', path)
+    await assertRefused(res, { status: 503, code: 'model_not_loaded', type: 'api_error', message: failed })
+
+    const clears = jevHarness({ route: { status: 503, message: 'ComfyUI is rendering — model swap paused until its queue finishes.' } })
+    const retryable = await postJson(clears.app, path, body)
+    assert.equal(retryable.status, 503, path)
+    assert.equal(retryable.headers.get('x-should-retry'), null, path)
+  }
+})
+
 test('handleJevRequest step 10: an engine refusal passes through as its JevHttpError', async () => {
   const harness = jevHarness({ reply: jsonReply({ error: { message: 'bad' } }, 422) })
   await assertRefused(await postJson(harness.app, '/v1/classify', classifyBody()), {

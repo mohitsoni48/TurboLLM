@@ -5,7 +5,7 @@ import { test, type TestContext } from 'node:test'
 import { defaultConfig, type Config, type ConfigStore } from '../config/config'
 import { Scanner } from './scanner'
 import { tmpDir } from '../test-support/tmp'
-import { fakeLitertlmBundle } from '../test-support/litertlm-bundle'
+import { fakeLitertlmBundle, fakeLitertlmBundleOf } from '../test-support/litertlm-bundle'
 
 function scannerOver(t: TestContext): { library: string; scanner: Scanner } {
   const root = tmpDir('turbollm-litertlm-scan-')
@@ -57,4 +57,27 @@ test('a bundle\'s header KV-cache length becomes the entry\'s nativeCtx, with no
   writeFileSync(join(library, 'LFM2.5-230M_int8.litertlm'), fakeLitertlmBundle(4096, [[5, 0], [1, 4096], [2, 4096]]))
   await scanner.rescan()
   assert.equal(scanner.list().models[0].nativeCtx, 4096)
+})
+
+// A bundle declares its modalities only in its header: LFM2.5-VL-450M carries tf_lite_vision_encoder and
+// tf_lite_vision_adapter sections, gemma-4-E2B-it a vision encoder and an audio encoder too. Every .litertlm was marked
+// text-only, so a vision bundle had no Vision facet or image capability.
+test('a bundle\'s vision and audio encoder sections make its entry a vision and an audio model', async (t) => {
+  const { library, scanner } = scannerOver(t)
+  writeFileSync(join(library, 'LFM2.5-VL-450M_int8.litertlm'), fakeLitertlmBundleOf([
+    { type: 3, items: { model_type: 'tf_lite_prefill_decode' } },
+    { type: 3, items: { model_type: 'tf_lite_vision_encoder' } },
+    { type: 3, items: { model_type: 'tf_lite_vision_adapter' } },
+  ]))
+  writeFileSync(join(library, 'gemma-4-E2B-it.litertlm'), fakeLitertlmBundleOf([
+    { type: 3, items: { model_type: 'tf_lite_audio_encoder_hw', backend_constraint: 'cpu' } },
+    { type: 3, items: { model_type: 'tf_lite_vision_encoder', prefer_activation_type: 'fp16' } },
+    { type: 3, items: { model_type: 'tf_lite_prefill_decode' } },
+  ]))
+  writeFileSync(join(library, 'LFM2.5-230M_int8.litertlm'), fakeLitertlmBundleOf([{ type: 3, items: { model_type: 'tf_lite_prefill_decode' } }]))
+  await scanner.rescan()
+  const by = (n: string) => scanner.list().models.find((m) => m.path.endsWith(n))!
+  assert.deepEqual([by('LFM2.5-VL-450M_int8.litertlm').vision, by('LFM2.5-VL-450M_int8.litertlm').audio], [true, false])
+  assert.deepEqual([by('gemma-4-E2B-it.litertlm').vision, by('gemma-4-E2B-it.litertlm').audio], [true, true])
+  assert.deepEqual([by('LFM2.5-230M_int8.litertlm').vision, by('LFM2.5-230M_int8.litertlm').audio], [false, false])
 })

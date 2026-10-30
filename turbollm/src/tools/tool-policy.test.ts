@@ -28,5 +28,11 @@ test('resolveToolPolicy: autoAllowAll is a no-op when the resolved policy is alr
 })
 
 test('resolveToolPolicy: per-conversation override still wins over the global policy, autoAllowAll off', () => {
-  assert.equal(resolveToolPolicy('run_code', { run_code: 'deny' }, { run_code: 'allow' }), 'allow')
+  assert.equal(resolveToolPolicy('run_code', { run_code: 'ask' }, { run_code: 'allow' }), 'allow')
+  assert.equal(resolveToolPolicy('run_code', { run_code: 'allow' }, { run_code: 'deny' }), 'deny')
+})
+
+test('resolveToolPolicy: a global "deny" wins over "Allow for this chat"', () => {
+  assert.equal(resolveToolPolicy('run_code', { run_code: 'deny' }, { run_code: 'allow' }), 'deny')
+  assert.equal(resolveToolPolicy('run_code', { run_code: 'deny' }, { run_code: 'allow' }, true), 'deny')
 })

@@ -9,7 +9,18 @@ import { ensureCloudflared } from '../../tunnel/provision'
 import { ChildTunnel } from '../child-process'
 import type { PreflightState, RemoteProvider } from '../types'
 
-export const QUICK_URL_RE = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/
+/** The tunnel's own URL, as cloudflared prints it inside its "Your quick Tunnel has been
+ *  created!" box (`INF |  https://<random-words>.trycloudflare.com    |`). Not just any
+ *  trycloudflare.com URL in the output: cloudflared asks for a tunnel by POSTing to
+ *  https://api.trycloudflare.com/tunnel, and offline or behind a firewall it prints that URL
+ *  and exits (`failed to request quick Tunnel: Post "https://api.trycloudflare.com/tunnel":
+ *  dial tcp: lookup api.trycloudflare.com ...`). Taking that for the tunnel URL showed
+ *  'connected', and every exit then "reconnected" within a second, which reset the give-up
+ *  count, so the manager never reached 'failed'. So the host is never `api`, the URL must end
+ *  at whitespace (not run on into a path or a closing quote), and a line carrying ERR, error or
+ *  failed before it never counts. */
+export const QUICK_URL_RE =
+  /(?<!\b(?:ERR|error|failed)\b[^\n]*)https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com(?=\s)/i
 
 export class CloudflareQuickProvider implements RemoteProvider {
   readonly id = 'cloudflare-quick' as const

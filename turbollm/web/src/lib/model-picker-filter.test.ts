@@ -140,12 +140,13 @@ describe('resolveActiveIndex', () => {
   it.each([
     ['follows the row', 'b', ['a', 'b', 'E'], 2, true, 1],
     ['follows a row that moved', 'b', ['b', 'a', 'E'], 2, true, 0],
-    ['vanished row with query -> first match', 'x', ['a', 'b', 'E'], 2, true, 0],
+    // A refresh removed the row the user chose: no highlight, so a stray Enter does nothing.
+    ['vanished row with query -> none', 'x', ['a', 'b', 'E'], 2, true, -1],
     ['vanished row, blank query -> none', 'x', ['a', 'b', 'E'], 2, false, -1],
     ['shrunk to zero never lands on Eject', 'x', ['E'], 0, true, -1],
     ['stays on Eject when the user moved there', 'E', ['a', 'E'], 1, true, 1],
     ['Eject as the only target when user moved there', 'E', ['E'], 0, true, 0],
-    ['Eject gone -> first match', 'E', ['a', 'b'], 2, true, 0],
+    ['Eject gone -> none, never a load', 'E', ['a', 'b'], 2, true, -1],
     ['no key, query -> first match', null, ['a', 'E'], 1, true, 0],
     ['no key, blank -> none', null, ['a', 'E'], 1, false, -1],
     ['no key, nothing visible -> none', null, [], 0, true, -1],
@@ -158,7 +159,7 @@ describe('resolveActiveIndex', () => {
       ['default skips a disabled first match', null, ['a', 'b', 'c', 'E'], 3, ['a'], 1],
       ['default skips several disabled matches', null, ['a', 'b', 'c', 'E'], 3, ['a', 'b'], 2],
       ['every match disabled -> no default, never Eject', null, ['a', 'b', 'E'], 2, ['a', 'b'], -1],
-      ['vanished row falls back to the first pickable', 'x', ['a', 'b', 'E'], 2, ['a'], 1],
+      ['vanished row -> none, even with a pickable row left', 'x', ['a', 'b', 'E'], 2, ['a'], -1],
       ['an explicit key on a disabled row is respected', 'a', ['a', 'b', 'E'], 2, ['a'], 0],
     ] as const)('%s', (_label, activeKey, targetKeys, choiceCount, disabled, expected) => {
       expect(resolveActiveIndex(activeKey, [...targetKeys], choiceCount, true, new Set(disabled))).toBe(expected)

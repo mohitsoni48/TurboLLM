@@ -7,7 +7,7 @@ import { writeFileSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
 import { join, win32 } from 'node:path'
 import { tmpDir } from '../test-support/tmp'
-import { archiveExtractor, extractArchive } from './download'
+import { archiveExtractor, extractArchive, powershellExpandArgs } from './download'
 
 const DEST = 'dest-dir'
 const everythingExists = () => true
@@ -19,7 +19,8 @@ const plan = (archive: string, platform: NodeJS.Platform, env: { SystemRoot?: st
 
 test('archiveExtractor: .zip per platform', () => {
   assert.deepEqual(plan('a.zip', 'win32'), { kind: 'powershell' })
-  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: 'tar', args: ['-xf', 'a.zip', '-C', DEST] })
+  // Pinned: only bsdtar reads zip, and a GNU tar first on PATH (Homebrew gnubin) cannot.
+  assert.deepEqual(plan('a.zip', 'darwin'), { kind: 'tar', cmd: '/usr/bin/tar', args: ['-xf', 'a.zip', '-C', DEST] })
   assert.deepEqual(plan('a.zip', 'linux'), { kind: 'node-zip' })
   assert.deepEqual(plan('a.zip', 'android'), { kind: 'node-zip' })
 })
@@ -82,6 +83,19 @@ test('existing callers keep their extractor', () => {
   }
 })
 
+// PowerShell reads U+2018-U+201B as single quotes too, so each must be doubled inside the '...' literal like the ASCII
+// one; escaping only ' let a profile folder such as O’Brien end the -LiteralPath string at the ’.
+test('powershellExpandArgs: every kind of single quote in a path is doubled, so the path stays one literal', () => {
+  const archive = String.raw`C:\Users\O’Brien\.turbollm\engines\llama.zip`
+  const dest = String.raw`C:\Users\‘Kai’ ‚x‛ it's\.turbollm\engines\llama.cpp-b1-cuda`
+  const args = powershellExpandArgs(archive, dest)
+  assert.deepEqual(args.slice(0, 3), ['-NoProfile', '-NonInteractive', '-Command'])
+  assert.equal(
+    args[3],
+    String.raw`Expand-Archive -LiteralPath 'C:\Users\O’’Brien\.turbollm\engines\llama.zip' -DestinationPath 'C:\Users\‘‘Kai’’ ‚‚x‛‛ it''s\.turbollm\engines\llama.cpp-b1-cuda' -Force`,
+  )
+})
+
 test('extractArchive: a corrupt archive fails with code extract_failed naming the file', async () => {
   const dir = tmpDir('extract-')
   const archive = join(dir, 'x.tar.gz')
@@ -91,6 +105,24 @@ test('extractArchive: a corrupt archive fails with code extract_failed naming th
     assert.equal(err.code, 'extract_failed')
     assert.match(err.message, /x\.tar\.gz/)
     assert.ok(err.cause, 'keeps the original error as cause')
+    return true
+  })
+})
+
+// The extraction runs through util/tether.ts's tetheredExecFile: its error still names the real tool, never the
+// /bin/sh wrapper, and carries the tool's own stderr, which is what the user reads in the install's failure.
+test('extractArchive: a failed extraction names tar, not a wrapper, and carries tar\'s own words', async (t) => {
+  if (process.platform === 'win32') return t.skip('the system tar.exe path; POSIX tar here')
+  const dir = tmpDir('extract-tar-')
+  const archive = join(dir, 'y.tar.gz')
+  writeFileSync(archive, randomBytes(64))
+  await assert.rejects(extractArchive(archive, dir), (e: unknown) => {
+    const err = e as Error & { cause?: Error & { cmd?: string; stderr?: string } }
+    assert.match(err.message, /^Could not extract y\.tar\.gz: Command failed: tar -xzf /)
+    assert.ok(!/\/bin\/sh|sh -c/.test(err.message), err.message)
+    assert.equal(err.cause?.cmd, `tar -xzf ${archive} -C ${dir}`)
+    assert.ok(err.cause?.stderr?.trim(), 'tar said why')
+    assert.ok(err.message.includes(err.cause!.stderr!.trim().split('\n')[0]), 'and the message carries it')
     return true
   })
 })

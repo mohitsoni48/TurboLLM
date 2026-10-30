@@ -50,7 +50,10 @@ const MAP: Record<AnyFailure, RecoveryAction[]> = {
   oom: [a('lower-quant-retry', 'Choose a smaller quant', true), a('smaller-quant', 'Choose a smaller model')],
   no_engine: [a('back-to-engine', 'Set up an engine', true)],
   bad_gguf: [a('redownload', 'Re-download the model', true), a('hf-search', 'Choose a different model')],
-  unsupported_arch: [a('alt-engine', 'Try an engine that supports it', true), a('hf-search', 'Choose a different model')],
+  // No other engine is suggested: a model loads only on the engine the user selected (the primary was "Try an engine
+  // that supports it", which opened Engines to pick one). An unknown architecture on an old llama.cpp build is fixed by
+  // updating that engine, so that is offered, on the Engines screen.
+  unsupported_arch: [a('hf-search', 'Choose a different model', true), a('back-to-engine', 'Check for an engine update')],
   timeout: [a('retry', 'Retry', true), a('smaller-quant', 'Choose a smaller model')],
   cancelled: [a('resume', 'Resume', true)],
   other: [a('show-launch-command', 'Show launch command and diagnostics', true), a('retry', 'Retry')],
@@ -58,4 +61,12 @@ const MAP: Record<AnyFailure, RecoveryAction[]> = {
 
 export function recoveryFor(failure: AnyFailure): RecoveryAction[] {
   return MAP[failure]
+}
+
+/** A failed load of a model the engine is not expected to load (EngineError.expectedToLoad false): a model "Show
+ *  models for every engine" lists starts on the selected engine and fails with that engine's error, whatever it
+ *  classifies as. A .litertlm file on llama.cpp reads as bad_gguf, but the file is fine and re-downloading it changes
+ *  nothing; and no engine advice applies, since nothing may suggest another engine. */
+export function recoveryForUnexpectedModel(): RecoveryAction[] {
+  return [a('hf-search', 'Choose a different model', true), a('retry', 'Retry')]
 }

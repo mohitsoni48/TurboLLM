@@ -20,13 +20,14 @@
 // `<bootstrapped uv binary> pip install --python <root>/mlx-vlm/venv/bin/python torch
 // torchvision` — see catalog.ts's mlx-vlm `note` for the user-facing version of this.
 import { existsSync, rmSync } from 'node:fs'
-import { execFile } from 'node:child_process'
+import { tetheredExecFile } from '../util/tether'
+import { beginPyEnvInstall, finishPyEnvInstall, pyInstallFlags } from './py-env-marker'
 import { join } from 'node:path'
-import { promisify } from 'node:util'
 import { ensureUv } from './mlx'
 import type { ProvisionProgress } from './download'
 
-const execFileP = promisify(execFile)
+// Tied to the daemon (util/tether.ts): an install or probe the daemon does not live to see ends with it.
+const execFileP = tetheredExecFile({ kind: 'provision' })
 
 export interface MlxVlmRuntime {
   /** venv python interpreter path */
@@ -71,6 +72,8 @@ export async function ensureMlxVlmEnv(
     } catch { /* treat as incompatible — will recreate */ }
     if (!compatible) rmSync(envDir, { recursive: true, force: true })
   }
+  // An earlier install that did not finish left no marker: this one redoes the environment (py-env-marker.ts).
+  const { reinstall } = beginPyEnvInstall(envDir, py)
 
   if (!existsSync(py)) {
     onProgress?.({ phase: 'extracting', pct: -1 })
@@ -80,10 +83,11 @@ export async function ensureMlxVlmEnv(
   }
 
   onProgress?.({ phase: 'extracting', pct: -1 })
-  const installArgs = ['pip', 'install', '--python', py, ...(upgrade ? ['--upgrade'] : []), 'mlx-vlm']
+  const installArgs = ['pip', 'install', '--python', py, ...pyInstallFlags({ upgrade, upgradeFlag: '--upgrade', reinstall }), 'mlx-vlm']
   await execFileP(uv, installArgs, { cwd: root, maxBuffer: 16 * 1024 * 1024 })
 
   const version = await probeMlxVlm(py)
+  finishPyEnvInstall(envDir)
   return { python: py, version }
 }
 

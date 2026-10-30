@@ -24,14 +24,15 @@ module.exports = {
   },
   // Allowlist, not default include-everything: wrapper/dist (build output) and
   // wrapper/build (icon source, build-time only) must NOT end up inside the
-  // packaged app.
+  // packaged app. The one file of wrapper/build the app reads at run time, the
+  // icon its tray shows, is copied out by extraResources below.
   //
   // node_modules IS shipped now: `electron-updater` is a real runtime
   // dependency of main.js (auto-update), so it has to exist inside the asar.
   // electron-builder resolves the *production* dependency tree itself, so the
   // devDependencies (electron, electron-builder) are still excluded — only the
   // ~16 packages under `electron-updater` come along.
-  files: ['main.js', 'daemon-supervisor.js', 'package.json', 'node_modules/**/*'],
+  files: ['main.js', 'daemon-supervisor.js', 'window-guards.js', 'window-lifecycle.js', 'package.json', 'node_modules/**/*'],
   // Emit latest.yml / latest-linux.yml / latest-mac.yml + .blockmap files
   // alongside the installers. Without a publish provider electron-builder
   // generates no update manifests at all, and electron-updater cannot work.
@@ -44,6 +45,9 @@ module.exports = {
     { from: join(TURBOLLM_ROOT, 'node_modules'), to: 'daemon/node_modules' },
     { from: join(TURBOLLM_ROOT, 'package.json'), to: 'daemon/package.json' },
     { from: process.execPath, to: nodeBinaryName },
+    // The tray icon (Windows, Linux; shipped on macOS too, which shows none):
+    // main.js loads it from process.resourcesPath (window-lifecycle.js TRAY_ICON).
+    { from: join(__dirname, 'build', 'icon.png'), to: 'tray-icon.png' },
   ],
   win: {
     target: [{ target: 'nsis', arch: ['x64'] }],

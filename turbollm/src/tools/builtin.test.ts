@@ -1,6 +1,31 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { execRunCode, resolveSearchQuery } from './builtin'
+import {
+  backfillPublishedDates, execFetchUrl, execRunCode, execWebSearch, extractModifiedDate, extractPublishedDate,
+  normalizeIsoDate, resolveSearchQuery, RUN_CODE_TOOL,
+} from './builtin'
+import type { ResearchResult } from './research-service'
+
+// A provider failure (bad key, quota, outage) used to reach the model as "No results found.",
+// which it read as a real, empty search and answered from memory.
+test('execWebSearch: a provider failure is an explicit error, not "No results found."', async () => {
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response('invalid api key', { status: 401 })) as typeof fetch
+  try {
+    const out = await execWebSearch({ query: 'python' }, { provider: 'tavily', tavilyApiKey: 'expired' })
+    assert.match(out, /^Error: could not reach the tavily search provider — Tavily returned 401/)
+  } finally { globalThis.fetch = original }
+})
+
+// The schema used to promise "the last expression is the return value", but the code runs as
+// a function body — a model following it got "(no output)" for every calculation.
+test('run_code schema describes what the sandbox actually returns', async () => {
+  const desc = RUN_CODE_TOOL.function.parameters.properties.code.description
+  assert.doesNotMatch(desc, /last expression is the return value/)
+  assert.match(desc, /`return`/)
+  assert.equal(await execRunCode({ code: 'const x = 21; x * 2' }), '(no output)')
+  assert.equal(await execRunCode({ code: 'return 21 * 2' }), '42')
+})
 
 // ── resolveSearchQuery ────────────────────────────────────────────────────────
 // Regression: a model emitting `queries: [...]` instead of the schema's `query` used to
@@ -282,4 +307,148 @@ test('more concurrent calls than the worker cap all resolve correctly, none drop
   const n = 10
   const results = await Promise.all(Array.from({ length: n }, (_, i) => execRunCode({ code: `return ${i}` })))
   assert.deepEqual(results, Array.from({ length: n }, (_, i) => String(i)))
+})
+
+// ── fetch_url's HTML stripping and the date extractors ───────────────────────────────────────
+//
+// Both used plain regexes that are quadratic on a crafted page: a 2 MiB fetch_url page of `<`s
+// blocked the daemon's event loop for about 80 minutes, and the date backfill ran the same
+// extractor on every search result, with no approval. The rewrite must stay linear AND give the
+// output those regexes gave, on any page.
+
+/** The regexes as they were: the reference for "same output". */
+function plainStrip(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+const PUBLISHED_KEYS = ['article:published_time', 'og:article:published_time', 'og:published_time', 'datepublished', 'date', 'dc.date', 'dc.date.issued', 'pubdate', 'publish-date']
+const MODIFIED_KEYS = ['article:modified_time', 'og:updated_time', 'datemodified', 'last-modified', 'dc.date.modified']
+function plainDate(html: string, jsonKey: string, metaKeys: string[], withTime: boolean): string | undefined {
+  for (const block of html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    const iso = normalizeIsoDate(new RegExp(`"${jsonKey}"\\s*:\\s*"([^"]{1,64})"`, 'i').exec(block[1])?.[1])
+    if (iso) return iso
+  }
+  for (const tag of html.matchAll(/<meta\s[^>]*>/gi)) {
+    const key = /\b(?:property|name|itemprop)\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1]
+    if (!key || !metaKeys.includes(key.trim().toLowerCase())) continue
+    const iso = normalizeIsoDate(/\bcontent\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
+    if (iso) return iso
+  }
+  if (withTime) {
+    for (const tag of html.matchAll(/<time\s[^>]*>/gi)) {
+      const iso = normalizeIsoDate(/\bdatetime\s*=\s*["']([^"']{1,64})["']/i.exec(tag[0])?.[1])
+      if (iso) return iso
+    }
+  }
+  return undefined
+}
+
+/** fetch_url's text for an HTML page (the line after the date header), and how long it took. */
+async function fetchHtml(html: string): Promise<{ text: string; ms: number }> {
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response(html, { headers: { 'content-type': 'text/html' } })) as typeof fetch
+  try {
+    const start = performance.now()
+    // An IP literal: the SSRF check passes it without a DNS lookup.
+    const result = await execFetchUrl({ url: 'http://203.0.113.7/' })
+    return { text: result.slice(result.indexOf('\n') + 1), ms: performance.now() - start }
+  } finally {
+    globalThis.fetch = original
+  }
+}
+
+const NORMAL_PAGE = `<!doctype html><html><head><title>Qwen &amp; friends</title>
+<meta charset="utf-8"><meta property="article:published_time" content="2024-11-29T10:00:00Z">
+<meta name="article:modified_time" content="2025-07-19">
+<script type="application/ld+json">{"@type":"Article","datePublished":"2024-11-28","dateModified":"2025-07-18"}</script>
+<style>body { color: red }</style><script>var a = 1 < 2 && "</div>";</script>
+<!--[if lt IE 9]><script src="old.js"></script><![endif]--></head>
+<body><!-- <div class="old">hidden</div> --><p>Hello&nbsp;<b>world</b> &lt;3, a < b</p>
+<time datetime="2024-11-30">Nov 30</time><SCRIPT>tail()</SCRIPT></body></html>`
+
+test('fetch_url and the date extractors: a normal page reads exactly as the plain regexes read it', async () => {
+  assert.equal((await fetchHtml(NORMAL_PAGE)).text, plainStrip(NORMAL_PAGE))
+  // Quirks included: the comment's text leaks, and the bare `<` eats up to the next `>`.
+  assert.equal(plainStrip(NORMAL_PAGE), 'Qwen & friends hidden --> Hello world <3, a Nov 30')
+  assert.equal(extractPublishedDate(NORMAL_PAGE), '2024-11-28')
+  assert.equal(extractModifiedDate(NORMAL_PAGE), '2025-07-18')
+  const noJsonLd = NORMAL_PAGE.replace(/application\/ld\+json/, 'text/plain')
+  assert.equal(extractPublishedDate(noJsonLd), '2024-11-29')
+  assert.equal(extractModifiedDate(noJsonLd), '2025-07-19')
+  assert.equal(extractPublishedDate(noJsonLd.replace(/<meta property[^>]*>/, '')), '2024-11-30')
+})
+
+test('fetch_url and the date extractors: same output as the plain regexes on random tag soup', async () => {
+  // Pieces that open, close, half-open and nest every pattern involved, in any order (a fixed
+  // seed, so a failure reproduces).
+  const pieces = [
+    '<script>', '<SCRIPT type="application/ld+json">', "<script type='application/ld+json' async>", '</script>', '</Script>',
+    '<script', '<style>', '<style', '</style>', '<meta ', '<meta\n', '<META ', '<time ', '<time datetime="2025-03-04">',
+    '<', '>', '<>', ' ', '\n', 'text', '&amp;', '&nbsp;', '&lt;b&gt;', '"', "'", '<!-- ', ' -->', '<b>', '</b>',
+    '"datePublished": "2024-01-02"', '"dateModified":"2025-06-07"', 'type="application/ld+json"',
+    'property="article:published_time"', 'name="article:modified_time"', 'itemprop="datePublished"',
+    'content="2023-05-06"', 'datetime="2022-08-09"',
+  ]
+  let seed = 0x5eed
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  for (let i = 0; i < 1500; i++) {
+    const html = Array.from({ length: Math.floor(random() * 30) }, () => pieces[Math.floor(random() * pieces.length)]).join('')
+    assert.equal(extractPublishedDate(html), plainDate(html, 'datePublished', PUBLISHED_KEYS, true), html)
+    assert.equal(extractModifiedDate(html), plainDate(html, 'dateModified', MODIFIED_KEYS, false), html)
+    assert.equal((await fetchHtml(html)).text, plainStrip(html) || '(empty response)', html)
+  }
+})
+
+// Each page is quadratic for one of the old patterns: the old code took from 4 seconds to over a
+// minute per page here, the new code a few milliseconds. The bound is far above the latter, so a
+// loaded CI machine can't trip it.
+const HOSTILE_BOUND_MS = 1_000
+const hostile = (unit: string, size = 256 * 1024) => unit.repeat(Math.ceil(size / unit.length))
+const HOSTILE_PAGES: Record<string, string> = {
+  'unclosed <script': hostile('<script'),
+  'unclosed <style': hostile('<style'),
+  'bare <': hostile('<'),
+  'unclosed <meta': hostile('<meta '),
+  'unclosed <time': hostile('<time '),
+  'unclosed JSON-LD blocks': hostile("<script type='application/ld+json'>", 1024 * 1024),
+  'JSON-LD tag full of type=': `<script ${hostile("type='application/ld+json' ")}>`,
+}
+for (const [name, page] of Object.entries(HOSTILE_PAGES)) {
+  test(`fetch_url stays linear on a hostile page: ${name}`, async () => {
+    const { ms } = await fetchHtml(page)
+    assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+  })
+}
+
+test('the search-result date backfill stays linear on a hostile result page', async () => {
+  // The backfill reads up to 96 KB of every result missing a date and runs the date extractor on
+  // it. On this page the old extractor backtracked over every `type=` from every `<script`: about
+  // 5 s for 32 KB, and over 2 minutes for 96 KB.
+  const page = hostile("<script type='application/ld+json' type='application/ld+json' ", 32_000)
+  const original = globalThis.fetch
+  globalThis.fetch = (async () => new Response(page, { headers: { 'content-type': 'text/html' } })) as typeof fetch
+  try {
+    const results = [{ title: 't', url: 'http://203.0.113.7/post', passage: '' }] as unknown as ResearchResult[]
+    const start = performance.now()
+    await backfillPublishedDates(results)
+    const ms = performance.now() - start
+    assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+    assert.equal(results[0].publishedDate, undefined)
+  } finally {
+    globalThis.fetch = original
+  }
 })

@@ -1,12 +1,14 @@
-﻿import { useEffect, useMemo, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+﻿import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
 import { ChevronDown, ExternalLink, Gauge, MoreHorizontal, RotateCcw, Save, X, Zap } from 'lucide-react'
-import { ApiError, track } from '../../lib/api'
+import { ApiError, downloadBenchLog, track } from '../../lib/api'
 import { useModelLoader } from '../../lib/model-loader'
 import { useBenchActions, useBenchState, useEngines, useModelActions, useModelDetail, useModelPresetMutations, useModelPresets, useModels, useStatus } from '../../lib/queries'
-import type { CardSampling, LoadProfile, ModelPreset, SysGpu } from '../../lib/types'
+import type { CardSampling, LoadProfile, ModelPreset, SysGpu, UserSetProfile } from '../../lib/types'
+import { userSetPayload, userSetView, withUserGroupValue, withUserSet, withUserValue } from '../../lib/user-set-profile'
 import { Input } from '../../components/ui/input'
 import { defaultGpu, defaultLitertLm, defaultVllm } from '../../lib/types'
 import { loadModeFor } from '../../lib/load-mode'
+import { isChatModel } from '../../lib/model-kind'
 import { estimateVram, gpuBudgetMb } from '../../lib/vram'
 import { tokenizeExtraArgs } from '../../lib/argv'
 import { Button } from '../../components/ui/button'
@@ -31,36 +33,19 @@ import { toast } from '../../components/ui/sonner'
  *  `/^[a-z][a-z0-9_-]*$/` (`parseEnumList`, probe.ts), and the space here can't appear in one. */
 const ENGINE_DEFAULT_OPTION = 'engine default'
 
-/** Deep-merges a preset's stored profile onto the current draft. The nested merge is
- *  load-bearing: a preset saved by an older build may be missing fields inside sampling/gpu/vllm,
- *  and a shallow spread would replace a whole nested object — leaving controls that read
- *  draft.sampling.frequencyPenalty facing undefined and white-screening the dialog. */
-function mergePresetIntoDraft(draft: LoadProfile, profile: Partial<LoadProfile> | undefined): LoadProfile {
-  const over = profile ?? {}
-  return {
-    ...draft,
-    ...over,
-    sampling: { ...draft.sampling, ...(over.sampling ?? {}) },
-    gpu: { ...draft.gpu, ...(over.gpu ?? {}) },
-    vllm: { ...draft.vllm, ...(over.vllm ?? {}) },
-    // Same deep-merge as vllm: a preset saved before this field existed (or created from a
-    // partial profile) must not wipe the LiteRT-LM backend choice back to undefined.
-    litertLm: { ...(draft.litertLm ?? defaultLitertLm()), ...(over.litertLm ?? {}) },
-  }
-}
-
 // ── Presets panel (ADR-353) ───────────────────────────────────────────────────
 // Named load configs per model. Selecting a preset pins it (POST /apply) and merges it
 // into the draft — it does NOT load; the Load button stays the only thing that loads.
 function PresetsPanel({
   modelKey,
-  draft,
+  userSet,
   onApplyPreset,
   activeEngineId,
 }: {
   modelKey: string
-  draft: LoadProfile
-  onApplyPreset: (profile: Partial<LoadProfile>) => void
+  /** What the user set in the dialog: all a new preset captures (user-set-profile.ts). */
+  userSet: UserSetProfile
+  onApplyPreset: (profile: UserSetProfile) => void
   activeEngineId?: string
 }) {
   const presetsQ = useModelPresets(modelKey)
@@ -94,14 +79,19 @@ function PresetsPanel({
     setOpen(false)
     setMenuId(null)
     track('models', 'apply_model_preset')
+    // The preset reaches the draft and the dropdown only once the pin is accepted. The daemon
+    // refuses the pin to a caller without a key when the preset's flags or files are not what the
+    // model loads with now (preset-routes.ts, launchFieldsRefusal). Merged up front, with only the
+    // selection undone on the refusal, the draft kept the preset's flags under a dropdown reading
+    // "No preset applied", and the next Save and Load sent them and were refused again, for flags
+    // the user never typed. A refusal changes no pin, so the selection, which mirrors it, stays.
     m.apply.mutate(p.id, {
-      onError: (e) => {
-        setSelectedId(null)
-        toast.error(e instanceof ApiError ? e.message : 'Could not apply preset.')
+      onSuccess: () => {
+        setSelectedId(p.id)
+        onApplyPreset(p.profile)
       },
+      onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not apply preset.'),
     })
-    setSelectedId(p.id)
-    onApplyPreset(p.profile)
   }
 
   const openSaveAs = () => {
@@ -122,7 +112,7 @@ function PresetsPanel({
     if (nameDialog.mode === 'save') {
       track('models', 'create_model_preset')
       m.create.mutate(
-        { name, engineId: activeEngineId ?? '', profile: draft },
+        { name, engineId: activeEngineId ?? '', profile: userSetPayload(userSet) },
         {
           // A just-saved preset IS the panel's current settings, so it becomes the active one —
           // selected in the dropdown AND pinned server-side. Without the pin this desyncs: the
@@ -298,6 +288,9 @@ export function ModelDetailDialog({
   const benchState = useBenchState()
   const [pendingBenchKey, setPendingBenchKey] = useState<string | null>(null)
   const [draft, setDraft] = useState<LoadProfile | null>(null)
+  // What the user set: the saved profile's own fields, then every control moved here. The draft shows
+  // the full profile; Load, Save, Save as… and Auto-tune send only this (user-set-profile.ts).
+  const [userSet, setUserSet] = useState<UserSetProfile>({})
   const [advanced, setAdvanced] = useState(false)
   const [remember, setRemember] = useState(true)
 
@@ -305,7 +298,9 @@ export function ModelDetailDialog({
   const statusQ = useStatus()
   const modelsQ = useModels()
   useEffect(() => {
-    if (detail) setDraft(structuredClone(detail.profile))
+    if (!detail) return
+    setDraft(structuredClone(detail.profile))
+    setUserSet(structuredClone(detail.saved ?? {}))
   }, [detail])
 
   // While the panel is open, mark <html> so the app shell pads to the right by the
@@ -342,7 +337,7 @@ export function ModelDetailDialog({
     // the eject, before the model could possibly have actually stopped.
     const stillLoaded = modelsQ.data?.models.find((m) => m.key === pendingBenchKey)?.loaded ?? true
     if (!stillLoaded) {
-      bench.start.mutate({ key: pendingBenchKey, base: draft ?? undefined })
+      bench.start.mutate({ key: pendingBenchKey, base: userSetPayload(userSet) })
       setPendingBenchKey(null)
     }
   }, [pendingBenchKey, modelsQ.data, bench.start])
@@ -408,17 +403,47 @@ export function ModelDetailDialog({
     return estimateVram(draft, detail, gpuBudgetMb(detail.gpus ?? [], draft.gpu))
   }, [detail, draft])
 
-  const set = <K extends keyof LoadProfile>(k: K, v: LoadProfile[K]) =>
+  // Every control writes the draft (what the dialog shows) and the user's own choice (what it sends).
+  const set = <K extends keyof LoadProfile>(k: K, v: LoadProfile[K]) => {
     setDraft((d) => (d ? { ...d, [k]: v } : d))
-  const setS = <K extends keyof LoadProfile['sampling']>(k: K, v: number) =>
+    setUserSet((u) => withUserValue(u, k, v))
+  }
+  const setS = <K extends keyof LoadProfile['sampling']>(k: K, v: LoadProfile['sampling'][K]) => {
     setDraft((d) => (d ? { ...d, sampling: { ...d.sampling, [k]: v } } : d))
-  const setG = <K extends keyof LoadProfile['gpu']>(k: K, v: LoadProfile['gpu'][K]) =>
+    setUserSet((u) => withUserGroupValue(u, 'sampling', k, v))
+  }
+  // A Min P the user saved, which a LiteRT-LM model cannot apply (its panel has no Min P slider): shown with a Clear.
+  const savedMinP = typeof userSet.sampling?.minP === 'number' ? userSet.sampling.minP : 0
+  const clearMinP = () => {
+    setUserSet((u) => {
+      const { minP: _dropped, ...sampling } = u.sampling ?? {}
+      return { ...u, sampling }
+    })
+  }
+  const setG = <K extends keyof LoadProfile['gpu']>(k: K, v: LoadProfile['gpu'][K]) => {
     setDraft((d) => (d ? { ...d, gpu: { ...(d.gpu ?? defaultGpu()), [k]: v } } : d))
-  const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) =>
+    setUserSet((u) => withUserGroupValue(u, 'gpu', k, v))
+  }
+  const setV = <K extends keyof LoadProfile['vllm']>(k: K, v: LoadProfile['vllm'][K]) => {
     setDraft((d) => (d ? { ...d, vllm: { ...(d.vllm ?? defaultVllm()), [k]: v } } : d))
+    setUserSet((u) => withUserGroupValue(u, 'vllm', k, v))
+  }
 
-  const setL = <K extends keyof NonNullable<LoadProfile['litertLm']>>(k: K, v: NonNullable<LoadProfile['litertLm']>[K]) =>
+  const setL = <K extends keyof NonNullable<LoadProfile['litertLm']>>(k: K, v: NonNullable<LoadProfile['litertLm']>[K]) => {
     setDraft((d) => (d ? { ...d, litertLm: { ...(d.litertLm ?? defaultLitertLm()), [k]: v } } : d))
+    setUserSet((u) => withUserGroupValue(u, 'litertLm', k, v))
+  }
+
+  // A preset is a whole configuration: what it set over the automatic profile, not over whatever the
+  // dialog held, and only what it set becomes the user's (an earlier build stored presets whole, the
+  // defaults of the day included: userSetView reads those as the daemon does).
+  const applyPreset = (profile: UserSetProfile) => {
+    if (!detail) return
+    const auto = detail.autoProfile ?? detail.profile
+    const u = userSetView(profile, auto)
+    setUserSet(u)
+    setDraft(withUserSet(structuredClone(auto), u))
+  }
 
   const loadError = failureOf(loader.loadError, detail?.key)
 
@@ -454,7 +479,7 @@ export function ModelDetailDialog({
       setPendingBenchKey(detail.key)
       actions.eject.mutate(detail.key)
     } else {
-      bench.start.mutate({ key: detail.key, base: draft ?? undefined })
+      bench.start.mutate({ key: detail.key, base: userSetPayload(userSet) })
     }
   }
 
@@ -471,10 +496,9 @@ export function ModelDetailDialog({
         // (cancel included), clobbering unsaved local edits before the user had even decided
         // Save vs. Cancel — that effect is deleted; a real save is the only thing that should
         // ever trigger a refetch, and the existing hook-level invalidation already does that.
+        // Fetched with the API key, not a plain <a href> — that would save a 401 over LAN/remote.
         if (downloadLog) {
-          const a = document.createElement('a')
-          a.href = '/api/v1/bench/log'
-          a.click()
+          downloadBenchLog().catch((e) => toast.error(e instanceof ApiError ? e.message : 'Could not download the run log.'))
         }
       },
       onError: (e) => toast.error(e instanceof ApiError ? e.message : 'Could not save tuned settings.'),
@@ -520,8 +544,8 @@ export function ModelDetailDialog({
           <div className="flex flex-col gap-4">
             <PresetsPanel
               modelKey={detail.key}
-              draft={draft}
-              onApplyPreset={(profile) => setDraft((d) => (d ? mergePresetIntoDraft(d, profile) : d))}
+              userSet={userSet}
+              onApplyPreset={applyPreset}
               activeEngineId={activeEngine?.id}
             />
 
@@ -624,7 +648,7 @@ export function ModelDetailDialog({
                 <Section>
                   <Row
                     label="Backend"
-                    hint="Auto uses the GPU when one is detected. Choose GPU to force it where the GPU can't be detected (e.g. Android/Termux); choose CPU to avoid GPU compile time and driver issues — and to recover when a model fails to load on the GPU."
+                    hint="Auto runs the model on its own backend, the one its bundle declares (the CPU for most, the GPU for a GPU-only bundle). Choose GPU or CPU to force one: GPU where the model supports it but does not default to it, CPU to avoid GPU compile time and driver issues."
                   >
                     <Segmented
                       value={({ auto: 'Auto', cpu: 'CPU', gpu: 'GPU' } as const)[draft.litertLm?.backend ?? 'auto']}
@@ -634,9 +658,11 @@ export function ModelDetailDialog({
                   </Row>
                   <Slider
                     label="Context length"
-                    hint={detail.nativeCtx > 0
-                      ? `This bundle was exported for ${detail.nativeCtx.toLocaleString()} tokens — the slider stops at its baked-in KV-cache size.`
-                      : "Tokens of history (KV-cache length). The filename declares no ekv size, so the slider is generous here — the bundle's own export size still caps it at runtime."}
+                    hint={`${detail.nativeCtx > 0
+                      ? detail.ctxDynamic
+                        ? `This bundle takes up to ${detail.nativeCtx.toLocaleString()} tokens (a dynamic export).`
+                        : `This bundle was exported for ${detail.nativeCtx.toLocaleString()} tokens — the slider stops at its baked-in KV-cache size.`
+                      : "Tokens of history (KV-cache length). The bundle declares no size, so the slider is generous here — the bundle's own export size still caps it at runtime."} Left alone, the bundle's own default applies (${(detail.defaultCtx || 4096).toLocaleString()} tokens), unless Settings > Model Defaults sets another.`}
                     value={draft.ctx}
                     min={512}
                     // 256K when the bundle declares no `ekvNNNN` in its name: a .litertlm's real
@@ -696,8 +722,12 @@ export function ModelDetailDialog({
                       llama.cpp's own -fit aborts entirely if -ngl is explicit, so "Auto-fit MoE CPU
                       offload" only actually engages -fit when -ngl is omitted too. Hide the slider
                       whenever that's the active fit mode so it can't look like a live control. */}
+                  {/* llama.cpp offloads blockCount + 1 layers — the blocks plus the output layer
+                      ("offloaded 33/33 layers" for 32 blocks): -ngl blockCount still leaves the
+                      output layer on the CPU, so only blockCount + 1 is "All" (auto-tune searches
+                      up to it too). A larger saved value (the default 99) still reads "All". */}
                   {(detail.moe ? !draft.nCpuMoeFit : !draft.nglFit) && (
-                    <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount : 99) ? 'All' : String(v))} />
+                    <Slider label="GPU layers" hint={detail.blockCount > 0 ? `${detail.blockCount + 1} total layers.` : 'All layers on GPU = max performance.'} value={draft.ngl} min={0} max={detail.blockCount > 0 ? detail.blockCount + 1 : 99} step={1} onChange={(v) => set('ngl', v)} fmt={(v) => (v >= (detail.blockCount > 0 ? detail.blockCount + 1 : 99) ? 'All' : String(v))} />
                   )}
                 </>
               )}
@@ -804,8 +834,22 @@ export function ModelDetailDialog({
             <Section>
               <Slider label="Temperature" value={draft.sampling.temp} min={0} max={2} step={0.05} onChange={(v) => setS('temp', v)} fmt={(v) => v.toFixed(2)} />
               <Slider label="Top P" value={draft.sampling.topP} min={0} max={1} step={0.01} onChange={(v) => setS('topP', v)} fmt={(v) => v.toFixed(2)} />
-              <Slider label="Top K" value={draft.sampling.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', v)} />
-              <Slider label="Min P" value={draft.sampling.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} fmt={(v) => v.toFixed(2)} />
+              <Slider label="Top K" hint={isLitertLm ? '0 = no top-k limit.' : undefined} value={draft.sampling.topK} min={0} max={200} step={1} onChange={(v) => setS('topK', v)} />
+              {/* LiteRT-LM has no Min P sampling: the slider saved a value neither of its servers applies (the Android
+                  server names it as not applied). One saved before stays in the profile and is named in the chat as not
+                  applied until the model is reloaded without it (a load records what its requests carry); it is shown
+                  here, with a way to drop it, rather than hidden with the slider. */}
+              {isLitertLm
+                ? (savedMinP > 0
+                    ? (
+                      <p className="text-[12px] text-faint">
+                        {`LiteRT-LM has no Min P sampling: the Min P saved for this model (${savedMinP.toFixed(2)}) is not applied. `}
+                        <button type="button" className="underline hover:text-ink" onClick={clearMinP}>Clear it</button>
+                        {' and reload the model.'}
+                      </p>
+                    )
+                    : <p className="text-[12px] text-faint">LiteRT-LM has no Min P sampling.</p>)
+                : <Slider label="Min P" value={draft.sampling.minP} min={0} max={1} step={0.01} onChange={(v) => setS('minP', v)} fmt={(v) => v.toFixed(2)} />}
               {isLlamaCpp && (<>
               <Slider label="Repeat penalty" hint="Penalise tokens that appeared earlier. 1.0 = off." value={draft.sampling.repeatPenalty} min={1} max={2} step={0.05} onChange={(v) => setS('repeatPenalty', v)} fmt={(v) => v.toFixed(2)} />
               <Slider label="Presence penalty" hint="Flat penalty for any token that appeared. 0 = off." value={draft.sampling.presencePenalty} min={0} max={2} step={0.05} onChange={(v) => setS('presencePenalty', v)} fmt={(v) => v.toFixed(2)} />
@@ -815,7 +859,7 @@ export function ModelDetailDialog({
               </Row>
               <ChipListInput
                 value={draft.sampling.stop}
-                onChange={(v) => setDraft((d) => d ? { ...d, sampling: { ...d.sampling, stop: v } } : d)}
+                onChange={(v) => setS('stop', v)}
                 emptyPlaceholder="Type a stop string, press Enter"
               />
               </>)}
@@ -987,9 +1031,11 @@ export function ModelDetailDialog({
                   // at once raced the profile write against the reload. The loader
                   // reports a refusal itself — otherwise a bad param silently stops
                   // the engine and the model "never loads again" with no feedback.
-                  const fireLoad = () => loader.requestLoad(detail, { overrides: draft })
+                  // Only what the user set: a control left alone keeps the model's own or the automatic value.
+                  const chosen = userSetPayload(userSet)
+                  const fireLoad = () => loader.requestLoad(detail, { overrides: chosen })
                   if (remember) {
-                    actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
+                    actions.save.mutate({ key: detail.key, profile: chosen, engineId: activeEngine?.id ?? '*' }, { onSuccess: fireLoad, onError: fireLoad })
                   } else {
                     fireLoad()
                   }
@@ -1000,7 +1046,7 @@ export function ModelDetailDialog({
                 <Zap size={14} />
                 {detail.loaded ? 'Reload' : 'Load model'}
               </Button>
-              <Button variant="outline" onClick={() => { track('models', 'save_model_settings'); actions.save.mutate({ key: detail.key, profile: draft, engineId: activeEngine?.id ?? '*' }) }} disabled={actions.save.isPending} title="Save without reloading">
+              <Button variant="outline" onClick={() => { track('models', 'save_model_settings'); actions.save.mutate({ key: detail.key, profile: userSetPayload(userSet), engineId: activeEngine?.id ?? '*' }) }} disabled={actions.save.isPending} title="Save without reloading">
                 <Save size={14} />
                 Save
               </Button>
@@ -1125,6 +1171,14 @@ function AutoTuneResultDialog({
   onCancel: () => void
 }) {
   const [downloadLog, setDownloadLog] = useState(true)
+  // AlertDialogAction/Cancel compose Radix's Close, so a click on Save ALSO reports the dialog
+  // closing — which meant onCancel, i.e. POST /bench/cancel right behind /bench/save, and the
+  // daemon's cancel drops the result the save needs (409 no_bench_result when it lands first).
+  // Same guard as JevLoadConfirmHost: only a close no button answered (Escape) means Cancel.
+  const answered = useRef(false)
+  useEffect(() => {
+    if (result) answered.current = false
+  }, [result])
   const rec = result?.recommendedSampling
   const s = result?.sampling
   const fromCard = (k: keyof CardSampling) => rec?.[k] != null
@@ -1136,7 +1190,7 @@ function AutoTuneResultDialog({
     { label: 'Min-P', key: 'minP' },
   ]
   return (
-    <AlertDialog open={!!result} onOpenChange={(o) => { if (!o) onCancel() }}>
+    <AlertDialog open={!!result} onOpenChange={(o) => { if (!o && !answered.current) onCancel() }}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>Auto-tune complete</AlertDialogTitle>
@@ -1197,8 +1251,8 @@ function AutoTuneResultDialog({
             <input type="checkbox" checked={downloadLog} onChange={(e) => setDownloadLog(e.target.checked)} className="h-3.5 w-3.5 accent-[var(--accent)]" />
             Download run log
           </label>
-          <AlertDialogCancel onClick={() => { track('models', 'dismiss_autotune_result'); onCancel() }}>Cancel</AlertDialogCancel>
-          <AlertDialogAction onClick={() => { track('models', 'save_autotune_result'); onSave(downloadLog) }}>Save</AlertDialogAction>
+          <AlertDialogCancel onClick={() => { answered.current = true; track('models', 'dismiss_autotune_result'); onCancel() }}>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={() => { answered.current = true; track('models', 'save_autotune_result'); onSave(downloadLog) }}>Save</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -1353,6 +1407,11 @@ function DefaultableNumberInput({ value, placeholder, min, max, step = 1, onChan
   value: number | undefined; placeholder: string; min: number; max: number; step?: number
   onChange: (v: number | undefined) => void
 }) {
+  // The text as typed, while the field is being edited. Clamping into [min, max] on every
+  // keystroke (and writing that back into the field) made a fraction with min > 0 untypable:
+  // the "0" of "0.25" snapped to min (0.01) and the rest was appended to that. A prefix of a
+  // valid value can sit below `min`, so `min` is applied on blur; `max` still applies live.
+  const [text, setText] = useState<string | null>(null)
   return (
     <div className="flex items-center gap-1">
       <input
@@ -1360,11 +1419,17 @@ function DefaultableNumberInput({ value, placeholder, min, max, step = 1, onChan
         min={min}
         max={max}
         step={step}
-        value={value ?? ''}
+        value={text ?? value ?? ''}
         placeholder={placeholder}
         onChange={(e) => {
           const raw = e.target.value
-          onChange(raw === '' ? undefined : Math.max(min, Math.min(max, Number(raw))))
+          setText(raw)
+          if (raw === '') onChange(undefined)
+          else if (Number.isFinite(Number(raw))) onChange(Math.min(max, Number(raw)))
+        }}
+        onBlur={() => {
+          if (text && Number.isFinite(Number(text))) onChange(Math.max(min, Math.min(max, Number(text))))
+          setText(null)
         }}
         className="w-20 rounded-md border border-border bg-bg px-2 py-1 text-right text-[13px] text-ink outline-none placeholder:text-faint"
       />
@@ -1509,12 +1574,27 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
   hint?: string; value: string; onChange: (v: string) => void; sourceRepo?: string | null; excludePath?: string
 }) {
   const modelsQ = useModels()
-  const all = (modelsQ.data?.models ?? []).filter((m) => m.path !== excludePath)
+  // Only what llama.cpp can take as a draft: a GGUF chat model the selected engine runs. The list held every scanned
+  // model, so it offered a .litertlm bundle, an MLX folder or a Jev/Laya model, hidden everywhere else, and llama.cpp
+  // then failed the load on it. Settings' "Show models for every engine" does not reach this list: a draft is passed
+  // to llama.cpp as a file it must read, never loaded as a model of its own.
+  const library = modelsQ.data?.models ?? []
+  const all = library.filter(
+    (m) => m.path !== excludePath && m.format === 'gguf' && m.compatibleWithActiveEngine && !m.embedding && isChatModel(m),
+  )
   const sameRepo = sourceRepo ? all.filter((m) => m.sourceRepo === sourceRepo) : []
   const [showAll, setShowAll] = useState(false)
   const scoped = sameRepo.length > 0 && !showAll
   const models = scoped ? sameRepo : all
   const orphanPath = value && !models.some((m) => m.path === value) ? value : null
+  // A saved draft outside the list says why: one the same-repo scope leaves out reads as the model it is, one still in
+  // the library that cannot be a draft says so, and only one the library no longer has says it is gone.
+  const orphanModel = orphanPath ? library.find((m) => m.path === orphanPath) : undefined
+  const orphanLabel = !orphanModel
+    ? `${orphanPath} (not in the current library)`
+    : all.includes(orphanModel)
+      ? `${orphanModel.name} · ${orphanModel.quant} — ${orphanModel.dir}`
+      : `${orphanPath} (not usable as a draft)`
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center justify-between">
@@ -1531,7 +1611,7 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
         className="w-full rounded-md border border-border bg-bg px-2 py-1 text-[12px] text-ink outline-none"
       >
         <option value="">Choose a model…</option>
-        {orphanPath && <option value={orphanPath}>{orphanPath} (not in the current library)</option>}
+        {orphanPath && <option value={orphanPath} title={orphanPath}>{orphanLabel}</option>}
         {models.map((m) => (
           <option key={m.key} value={m.path} title={m.path}>
             {m.name} · {m.quant} — {m.dir}
@@ -1539,6 +1619,11 @@ function DraftModelSelect({ hint, value, onChange, sourceRepo, excludePath }: {
         ))}
       </select>
       {scoped && <p className="text-[11px] text-faint">From {sourceRepo} — the source repo usually ships the matching draft.</p>}
+      {/* Its placeholder alone read as an empty drop-down. Not the pickers' engine hint: Settings' "Show models for every
+          engine" does not reach this list (above). */}
+      {modelsQ.data !== undefined && all.length === 0 && (
+        <p className="text-[11px] text-faint">No models found. A draft is a GGUF chat model the selected engine runs.</p>
+      )}
     </div>
   )
 }

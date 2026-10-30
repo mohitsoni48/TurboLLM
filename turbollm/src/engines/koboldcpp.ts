@@ -9,19 +9,20 @@
 // with KoboldCpp's OWN flag names (--model/--port/--host/--gpulayers/--contextsize plus
 // a GPU-backend selector). Its /health is llama.cpp's, so the shared probeReady() works.
 //
-// CLI flags verified against the KoboldCpp README + wiki (LostRuins/koboldcpp), v1.115.x:
+// CLI flags checked against koboldcpp.py's argparse parser (LostRuins/koboldcpp v1.115, v1.123.1):
 //   --model <path>        load a GGUF
 //   --port <n>            listen port (default 5001)
 //   --host <addr>         bind address
-//   --gpulayers <n>       layers to offload to GPU VRAM
+//   --gpulayers <n>       layers to offload to GPU VRAM (default -1: autofit, every layer that fits)
 //   --contextsize <n>     context window
-//   --usecuda / --usevulkan / --nogpu   GPU backend selection
+//   --usecuda / --usevulkan / --usecpu   GPU backend selection (one mutually exclusive group)
+// argparse exits 2 on an option it does not know, so a wrong flag name fails every launch.
 // OpenAI-compatible API served at /v1 (the model field is ignored — a single loaded
 // model — so no served-model alias is needed, unlike vLLM).
 import { chmodSync, existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import type { GpuVendor } from '../sysinfo/sysinfo'
-import { downloadFile, latestGithubRelease, type ProvisionProgress, type ReleaseAsset } from './download'
+import { downloadFile, latestGithubRelease, recordedReleaseTag, recordReleaseTag, type ProvisionProgress, type ReleaseAsset, type SwapGuard } from './download'
 
 export const KOBOLDCPP_REPO = 'LostRuins/koboldcpp'
 
@@ -92,14 +93,17 @@ export interface KoboldcppRuntime {
  * Provision KoboldCpp: resolve the latest GitHub release, pick the asset for this
  * OS/arch + GPU class, download the RAW binary into <root>/koboldcpp/, and (POSIX)
  * mark it executable. Returns the binary path + the release tag. `hasNvidia` selects
- * the CUDA build where one exists. When `upgrade` is true the caller has already
- * removed the dir so the latest is re-downloaded.
+ * the CUDA build where one exists. `replace` (an update) re-downloads the latest even
+ * when a binary is present; the download only replaces it once complete, so a failed
+ * fetch or download leaves the working binary in place. `blockSwap` re-runs right before
+ * that replacement (a model started on the engine during the download refuses it).
  */
 export async function ensureKoboldcpp(
   root: string,
   hasNvidia: boolean,
   onProgress?: (p: ProvisionProgress) => void,
   signal?: AbortSignal,
+  opts: { replace?: boolean; blockSwap?: SwapGuard } = {},
 ): Promise<KoboldcppRuntime> {
   const dir = koboldcppDir(root)
   const binPath = koboldcppBinPath(root)
@@ -107,14 +111,16 @@ export async function ensureKoboldcpp(
   const rel = await latestGithubRelease(KOBOLDCPP_REPO, signal)
   const version = rel.tag_name ?? ''
 
-  if (existsSync(binPath)) return { binPath, version }
+  // Already installed: report the release it was downloaded as, not the latest — Disable → Install
+  // re-registers an older binary, and labelling it latest made the update check say "up to date".
+  if (existsSync(binPath) && !opts.replace) return { binPath, version: recordedReleaseTag(binPath) || version }
 
   const asset = pickKoboldcppAsset(rel.assets ?? [], hasNvidia)
   if (!asset) throw new Error('no_release_asset')
 
   mkdirSync(dir, { recursive: true })
   onProgress?.({ phase: 'downloading', pct: 0 })
-  await downloadFile(asset.browser_download_url, binPath, onProgress, signal)
+  await downloadFile(asset.browser_download_url, binPath, onProgress, signal, undefined, { blockSwap: opts.blockSwap })
   // POSIX: the downloaded executable needs the execute bit; Windows ignores chmod.
   if (process.platform !== 'win32') {
     try {
@@ -123,6 +129,7 @@ export async function ensureKoboldcpp(
       /* best-effort — a non-executable file fails loudly at spawn instead */
     }
   }
+  recordReleaseTag(binPath, version)
   return { binPath, version }
 }
 
@@ -130,8 +137,22 @@ export async function ensureKoboldcpp(
  * Command + args to launch KoboldCpp's server for a model. Mirrors mlx/vllm
  * ServerCommand shape. `extraArgs` carries the model's KoboldCpp load flags built by
  * {@link koboldcppProfileToArgs}; the manager injects nothing else for this kind.
- * The GPU-backend flag (--usecuda/--usevulkan/--nogpu) is decided from the detected
+ * The GPU-backend flag (--usecuda/--usevulkan/--usecpu) is decided from the detected
  * vendor and lives in `extraArgs` too (see koboldcppProfileToArgs).
+ *
+ * `--quiet`: without it KoboldCpp prints every request's generation input (`Input: {...}`,
+ * the whole prompt: a Code session's or `turbollm launch` agent's files and tool output,
+ * .env contents included) and every reply (`Output: ...`) to its console, which the manager
+ * writes into the engine log. That log is readable by every caller lanAuth lets in
+ * (GET /api/v1/engine/logs and its stream), keyless open-LAN and Serve callers among them,
+ * the same callers the request log refuses captured bodies to (REQUEST_BODIES_HOST_ONLY).
+ * Quiet mode hides all of KoboldCpp's per-request output: those prints, and also the live
+ * "Processing Prompt (n / m tokens)" and "Generating (n / m tokens)" progress, the EOS and
+ * stop-token notes, the SmartCache slot notes and the tool-call reasoning, so the engine log
+ * no longer shows a generation's progress. The startup lines, load and CUDA errors and each
+ * request's CtxLimit timing line stay; readiness is probed over HTTP and nothing here parses
+ * any of the hidden lines. User `extraArgs` still come last, so a model's own
+ * `--debugmode 1` turns the prints back on.
  */
 export function koboldcppServerCommand(
   binPath: string,
@@ -142,17 +163,24 @@ export function koboldcppServerCommand(
 ): { cmd: string; args: string[] } {
   return {
     cmd: binPath,
-    args: ['--model', model, '--host', host, '--port', String(port), '--skiplauncher', ...extraArgs],
+    args: ['--model', model, '--host', host, '--port', String(port), '--skiplauncher', '--quiet', ...extraArgs],
   }
 }
+
+/** KoboldCpp's backend selectors, one argparse mutually exclusive group: --usecublas and
+ *  --usehipblas are --usecuda's aliases, --noblas is the hidden old spelling of --usecpu, and
+ *  --useclblast is in older releases (v1.100 and earlier). Two of them on one command line exit 2
+ *  ("argument --usecuda: not allowed with argument --usecpu") before anything loads. */
+const KOBOLDCPP_BACKEND_FLAGS = ['--usecuda', '--usecublas', '--usehipblas', '--usevulkan', '--useclblast', '--usecpu', '--noblas']
 
 /** Map a load profile's relevant fields to KoboldCpp CLI flags. KoboldCpp uses its own
  *  flag names, so this is a small, explicit mapping (not the llama-server arg-map):
  *    ctx  → --contextsize
- *    ngl  → --gpulayers   (only when > 0; 0 = CPU, emit nothing)
+ *    ngl  → --gpulayers   (always; 0 = CPU, and 0 whenever --usecpu is ours)
  *  Plus the GPU backend selector from the detected vendor:
- *    nvidia → --usecuda ; any other GPU → --usevulkan ; no GPU → --nogpu
- *  User `extraArgs` pass through last so they can override anything. */
+ *    nvidia → --usecuda ; any other GPU → --usevulkan ; no GPU, or ngl 0 → --usecpu
+ *  User `extraArgs` pass through last so they can override anything; one that names a
+ *  backend replaces ours rather than joining it. */
 export function koboldcppProfileToArgs(
   p: { ctx: number; ngl: number; extraArgs?: string[] },
   vendor: GpuVendor,
@@ -160,12 +188,23 @@ export function koboldcppProfileToArgs(
 ): string[] {
   const a: string[] = []
   if (p.ctx > 0) a.push('--contextsize', String(p.ctx))
-  if (p.ngl > 0) a.push('--gpulayers', String(p.ngl))
   // GPU backend: KoboldCpp's nocuda/portable build still accepts --usevulkan; the CUDA
-  // build accepts --usecuda. We pick by vendor and fall back to Vulkan for any GPU.
-  if (!hasGpu || p.ngl <= 0) a.push('--nogpu')
-  else if (vendor === 'nvidia') a.push('--usecuda')
-  else a.push('--usevulkan')
+  // build accepts --usecuda. We pick by vendor and fall back to Vulkan for any GPU. CPU
+  // is --usecpu: this used to pass --nogpu, which KoboldCpp has never had, so argparse
+  // refused every launch on a machine with no GPU, or with GPU layers 0, before it loaded.
+  // A backend the user named in their extra args is the one they want: adding ours too
+  // would trip the mutually exclusive group, so the model would not start either.
+  const userBackend = p.extraArgs?.some((x) => KOBOLDCPP_BACKEND_FLAGS.some((f) => x === f || x.startsWith(`${f}=`)))
+  const cpu = !userBackend && (!hasGpu || p.ngl <= 0)
+  // --gpulayers defaults to -1 (autofit), not 0, so leaving it out does not mean CPU. --usecpu
+  // sets it to 0 itself except on macOS, where -1, or the profile's layers when no GPU was
+  // detected, would still go to Metal: a CPU launch passes 0.
+  a.push('--gpulayers', String(!cpu && p.ngl > 0 ? p.ngl : 0))
+  if (!userBackend) {
+    if (cpu) a.push('--usecpu')
+    else if (vendor === 'nvidia') a.push('--usecuda')
+    else a.push('--usevulkan')
+  }
   if (p.extraArgs?.length) a.push(...p.extraArgs)
   return a
 }

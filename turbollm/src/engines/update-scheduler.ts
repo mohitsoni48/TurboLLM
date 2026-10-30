@@ -11,8 +11,9 @@
 
 import type { ConfigStore, Engine } from '../config/config'
 import type { Manager } from './manager'
+import { ProbeError } from './probe'
 import type { Registry } from './registry'
-import { UPDATE_CHECK_INTERVAL_MS, UpdateChecker, decideAutoUpdate, normalizeUpdatePolicy } from './update'
+import { UPDATE_CHECK_INTERVAL_MS, type UpdateChecker, decideAutoUpdate, normalizeUpdatePolicy } from './update'
 
 export interface UpdateSchedulerDeps {
   store: ConfigStore
@@ -22,6 +23,10 @@ export interface UpdateSchedulerDeps {
   /** Apply the rollback-safe update for one engine (Layer 2). Provided by the wiring
    *  layer; the scheduler only calls it when decideAutoUpdate() returns true. */
   applyUpdate: (engine: Engine) => Promise<void>
+  /** The engine a running auto-tune tunes, or null (BenchRunner.tuningEngine). Its model is stopped between two probes,
+   *  which engineIsIdle reads as idle, so an auto-update stopped the probe it caught and swapped the build under the
+   *  rest of the run. That engine is skipped while the run lasts, and retried at the next check, as a busy one is. */
+  tuningEngine?: () => Pick<Engine, 'id'> | null
 }
 
 /** Is the engine idle (safe to auto-apply an update)? Idle = not currently generating.
@@ -38,7 +43,15 @@ export function engineIsIdle(manager: Manager): boolean {
 
 export class UpdateScheduler {
   private timer: ReturnType<typeof setInterval> | null = null
+  /** The first pass, 30 s after start. stop() cancels it too: a restart from a terminal keeps the old process as the
+   *  keeper of its replacement (cli.ts becomeKeeper), where a pass still pending ran on, a check and perhaps an engine
+   *  update applied from the old process, beside the replacement's own. */
+  private firstPass: ReturnType<typeof setTimeout> | null = null
   private running = false
+  /** Per engine, the latest version whose auto-update failed its probe: the new build does not run on this machine,
+   *  so applying it again only downloads it again (every check, for good). Skipped until upstream publishes another
+   *  version or the daemon restarts; the user's own Update is never held back by it. */
+  private failedProbe = new Map<string, string>()
 
   constructor(private deps: UpdateSchedulerDeps) {}
 
@@ -47,12 +60,20 @@ export class UpdateScheduler {
   start(): void {
     if (this.timer) return
     // First pass shortly after boot (let the daemon settle / engines seed first).
-    setTimeout(() => void this.runOnce(), 30_000).unref()
+    this.firstPass = setTimeout(() => {
+      this.firstPass = null
+      void this.runOnce()
+    }, 30_000)
+    this.firstPass.unref()
     this.timer = setInterval(() => void this.runOnce(), UPDATE_CHECK_INTERVAL_MS)
     this.timer.unref()
   }
 
   stop(): void {
+    if (this.firstPass) {
+      clearTimeout(this.firstPass)
+      this.firstPass = null
+    }
     if (this.timer) {
       clearInterval(this.timer)
       this.timer = null
@@ -72,13 +93,18 @@ export class UpdateScheduler {
         const policy = normalizeUpdatePolicy(e.updatePolicy)
         const status = this.deps.updates.get(e.id)
         const hasUpdate = !!status?.hasUpdate
-        const idle = engineIsIdle(this.deps.manager)
+        const idle = engineIsIdle(this.deps.manager) && this.deps.tuningEngine?.()?.id !== e.id
         if (decideAutoUpdate({ policy, hasUpdate, idle })) {
+          const latest = status?.latest ?? ''
+          if (this.failedProbe.get(e.id) === latest) continue
           try {
             await this.deps.applyUpdate(e)
-          } catch {
+            this.failedProbe.delete(e.id)
+          } catch (err) {
             // Auto-apply failure: leave the engine as-is (rollback is the apply path's
-            // job). The status stays cached; the next tick or a manual update retries.
+            // job). The status stays cached; the next tick or a manual update retries —
+            // except a build that failed its probe, which would fail it again.
+            if (err instanceof ProbeError) this.failedProbe.set(e.id, latest)
           }
         }
       }

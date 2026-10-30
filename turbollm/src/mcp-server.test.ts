@@ -246,6 +246,32 @@ test('create_routine: invalid args are rejected WITHOUT ever reaching the networ
   assert.equal(called, false, 'validateCreate must short-circuit before any fetch')
 })
 
+// validateCreate trimmed these unchecked: a number, an object or a boolean threw out of the call, a JSON-RPC error with
+// the TypeError's text, or, in a field validateCreate does not trim for that flavor, was posted on to the daemon.
+test('create_routine: a text field that is not a string is a tool error, never posted', async () => {
+  const codeArgs = {
+    ...VALID_ROUTINE_ARGS, flavor: 'code', agentId: undefined, workspacePath: 'D:/repo', codingAgent: 'pi',
+  }
+  for (const [args, fields] of [
+    [VALID_ROUTINE_ARGS, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+    [codeArgs, ['prompt', 'scheduleDisplay', 'modelKey', 'agentId', 'workspacePath']],
+  ] as const) {
+    for (const field of fields) {
+      for (const bad of [5, { text: 'x' }, ['x'], true]) {
+        let called = false
+        const f = (async () => { called = true; return json({ id: 'r1', scheduleDisplay: 'd' }, 201) }) as typeof fetch
+        const res = await handleMcpRequest(toolCallReq('create_routine', { ...args, [field]: bad }), BASE, '1.0.0', f)
+        const what = `${args.flavor} ${field} ${JSON.stringify(bad)}`
+        assert.deepEqual(res, {
+          jsonrpc: '2.0', id: 10,
+          result: { content: [{ type: 'text', text: `Error: ${field} must be a string.` }], isError: true },
+        }, what)
+        assert.equal(called, false, what)
+      }
+    }
+  }
+})
+
 test('create_routine: valid args land pending_confirmation, same message shape as chat/pi\'s create_routine', async () => {
   const created = { id: 'r1', scheduleDisplay: VALID_ROUTINE_ARGS.scheduleDisplay, status: 'pending_confirmation' }
   const f = fakeFetch([() => json(created, 201)])

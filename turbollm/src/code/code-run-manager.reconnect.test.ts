@@ -12,8 +12,11 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { Hono } from 'hono'
 import { ConversationStore, IN_MEMORY_DATA_DIR } from '../chat/db'
 import { CodeRunManager, type BufferedEvent, type CodeSessionRunner } from './code-run-manager'
+import { registerCodeRoutes } from './code-routes'
+import { priorHistoryForTurn } from './code-session'
 import type { Deps } from '../deps'
 import { tmpDir } from '../test-support/tmp'
 
@@ -284,6 +287,66 @@ test('stop() aborts the active run and drops everything queued behind it', async
   assert.equal(store.getAgentRun(sessionId)?.status, 'interrupted', 'aborted run recorded as interrupted')
 })
 
+// POST /messages stores a follow-up's user row before it queues it, and stop() dropped only the
+// queue entry: the row stayed, unanswered, so the next turn replayed it to the model as something
+// the user had said, and the transcript showed it once the stopped turn ended. Driven through the
+// real routes, since it is POST /messages that tells a row stored for the follow-up from a re-run
+// (no content) of a row that was already there, which must stay.
+test('POST /stop also removes the queued follow-ups\' messages: the next turn does not replay them', async () => {
+  const { d, store } = makeDeps()
+  const routeDeps = {
+    ...d,
+    manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+  } as unknown as Deps
+  const histories: Record<string, string[]> = {}
+  const steered: string[] = []
+  let steerable = false
+  const runner = (async (params) => {
+    const { priorMessages } = priorHistoryForTurn(params.d, params.convId, params.sessionId, params.excludeFromHistory)
+    histories[params.task] = priorMessages.map((m) => `${m.role}:${m.content || '(empty)'}`)
+    if (params.task === 'u1') {
+      params.onSteerable?.(async (text: string) => { steered.push(text); return true })
+      steerable = true
+      while (!params.signal.aborted) await delay(5)
+      params.onSteerable?.(null)
+    }
+    if (params.signal.aborted) return { finalText: '', contextUsed: 1, contextMax: 10, aborted: true }
+    params.sink({ event: 'delta', data: { delta: `reply-${params.task}` } })
+    return { finalText: `reply-${params.task}`, contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(routeDeps, { runner })
+  const app = new Hono()
+  registerCodeRoutes(app, routeDeps, mgr)
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId } = makeSession(store, repoRoot, 'u1')
+  const post = async (path: string, body: unknown) => {
+    const res = await app.request(`/api/v1/code/sessions/${sessionId}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.ok(res.ok, `${path}: ${res.status} ${await res.clone().text()}`)
+    return res.json() as Promise<{ queued?: boolean; steered?: boolean }>
+  }
+
+  await post('/messages', {}) // the session's first run: the seeded task u1
+  while (!steerable) await delay(5)
+  // A re-run of the active turn's own message: it must not take that message with it.
+  assert.equal((await post('/messages', {})).queued, true)
+  // A message steered into the live turn, then a re-run of it: it reached the model and stays.
+  assert.equal((await post('/messages', { content: 's1', kind: 'steer' })).steered, true)
+  assert.equal((await post('/messages', {})).queued, true)
+  for (const content of ['u2', 'u3']) assert.equal((await post('/messages', { content })).queued, true)
+  assert.deepEqual(steered, ['s1'])
+
+  await post('/stop', {})
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  const userRows = () => (store.getConversation(convId, true)?.messages ?? []).filter((m) => m.role === 'user').map((m) => m.content)
+  assert.deepEqual(userRows(), ['u1', 's1'], 'the queued follow-ups are gone; the stopped turn\'s own message and the steered one stay')
+
+  await post('/messages', { content: 'u4' })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(histories.u4?.filter((m) => m.startsWith('user:')), ['user:u1', 'user:s1'], 'u2 and u3 are not replayed to the model')
+  assert.deepEqual(userRows(), ['u1', 's1', 'u4'])
+})
+
 // ── an aborted turn's context-usage stats never regress below the last confirmed value ─
 
 test('an aborted turn does not report ctxUsed lower than the last completed turn (context cannot shrink)', async () => {
@@ -494,6 +557,38 @@ test('steer() falls back to the queue (tagged kind:steer) when the live turn is 
   await collect(mgr.subscribe(sessionId, 0), () => false)
 })
 
+// After Stop, pi is still streaming while the stopped turn winds down (a tool being killed), so
+// its handle accepted the steer into a run whose every next model request is aborted: the message
+// was stored and reported steered:true, and never answered.
+test('steer() after Stop does not go into the stopped turn: it runs as the next turn', async () => {
+  const { d, store } = makeDeps()
+  const steerLog: string[] = []
+  const tasks: string[] = []
+  const runner = (async (params) => {
+    tasks.push(params.task)
+    params.onSteerable?.(async (text: string) => { steerLog.push(text); return true }) // still "streaming"
+    while (!params.signal.aborted && tasks.length === 1) await delay(10)
+    await delay(30) // the stopped turn winds down (e.g. its bash tool is being killed)
+    params.onSteerable?.(null)
+    return { finalText: 'ok', contextUsed: 100, contextMax: 8192, aborted: params.signal.aborted }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'first')
+
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'first', userMsgId })
+  await delay(40)
+  assert.equal(mgr.stop(sessionId), true)
+  const u2 = store.addMessage(convId, 'user', 'actually do Y instead')
+  const res = await mgr.steer(sessionId, { convId, repoRoot, task: 'actually do Y instead', userMsgId: u2.id })
+  assert.equal(res.steered, false, 'not injected into the stopped turn')
+  assert.equal(res.queued, true, 'queued behind the turn that is winding down')
+  assert.deepEqual(steerLog, [])
+
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  assert.deepEqual(tasks, ['first', 'actually do Y instead'], 'the steer ran as its own turn')
+})
+
 // ── todo/step checklist live state (ADR-255) ───────────────────────────────────────────
 
 /** A runner that emits one `todos` frame (the update_todos tool's SSE shape) then completes. */
@@ -533,4 +628,209 @@ test('a new turn resets the checklist so a prior turn\'s todos never leak forwar
   mgr.enqueue(sessionId, { convId, repoRoot, task: 'second', userMsgId: u2.id })
   await collect(mgr.subscribe(sessionId, 0), () => false)
   assert.deepEqual(mgr.todos(sessionId), [], 'turn 2 emitted no checklist, so the reset left it empty — no leak from turn 1')
+})
+
+// ── history, seq continuity, replay memory ─────────────────────────────────────────────
+
+test('queued follow-ups: each turn replays the turns before it — not its own message, not a later one', async () => {
+  const { d, store } = makeDeps()
+  const histories: Record<string, string[]> = {}
+  let releaseFirst: (() => void) | undefined
+  // History exactly as runCodeSession computes it, from what the manager passed this turn.
+  const runner = (async (params) => {
+    const { priorMessages } = priorHistoryForTurn(params.d, params.convId, params.sessionId, params.excludeFromHistory)
+    histories[params.task] = priorMessages.map((m) => `${m.role}:${m.content || '(empty)'}`)
+    if (params.task === 'u1') await new Promise<void>((r) => { releaseFirst = r })
+    params.sink({ event: 'delta', data: { delta: `reply-${params.task}` } })
+    return { finalText: `reply-${params.task}`, contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'u1')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'u1', userMsgId })
+  // Two follow-ups typed while turn 1 runs, the way POST /messages stores then queues each one:
+  // the DB ends up u1 a1 u2 u3 a2 a3 (a placeholder is only added when its turn starts).
+  for (const task of ['u2', 'u3']) {
+    const m = store.addMessage(convId, 'user', task)
+    mgr.enqueue(sessionId, { convId, repoRoot, task, userMsgId: m.id })
+  }
+  assert.ok(releaseFirst, 'turn 1 started')
+  releaseFirst()
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+
+  assert.deepEqual(histories.u1, [])
+  assert.deepEqual(histories.u2, ['user:u1', 'assistant:reply-u1'], 'u2 is the prompt, not also replayed history')
+  assert.deepEqual(histories.u3, ['user:u1', 'assistant:reply-u1', 'user:u2', 'assistant:reply-u2'], 'u2\'s reply is part of u3\'s history')
+})
+
+// POST /messages with no content re-runs the last user message, whose row can already have replies
+// after it: its earlier answer, or (queued behind the turn that answers it) that turn's reply once
+// it runs. Only the re-run's own rows were left out of its history, so those replies were replayed
+// after the question was left out, and the question then went as the prompt: the model read its
+// earlier answer before the question it answered.
+test('a re-run of a message (no content) is sent the history before the question, not its earlier answer ahead of it', async () => {
+  const { d, store } = makeDeps()
+  const routeDeps = {
+    ...d,
+    manager: { status: () => ({ state: 'running', model: { key: 'test-model' } }), target: () => ({ host: '127.0.0.1', port: 1 }) },
+    store: { ...d.store, snapshot: () => ({ daemon: { autoGenerateTitles: false }, code: { defaultAgent: 'turbollm' } }) },
+  } as unknown as Deps
+  const turns: Array<{ task: string; history: string[] }> = []
+  let releaseFirst: (() => void) | undefined
+  const runner = (async (params) => {
+    const { priorMessages } = priorHistoryForTurn(params.d, params.convId, params.sessionId, params.excludeFromHistory)
+    turns.push({ task: params.task, history: priorMessages.map((m) => `${m.role}:${m.content || '(empty)'}`) })
+    if (turns.length === 1) await new Promise<void>((r) => { releaseFirst = r })
+    params.sink({ event: 'delta', data: { delta: `reply-${turns.length}` } })
+    return { finalText: `reply-${turns.length}`, contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(routeDeps, { runner })
+  const app = new Hono()
+  registerCodeRoutes(app, routeDeps, mgr)
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId } = makeSession(store, repoRoot, 'u1')
+  const post = async (body: unknown) => {
+    const res = await app.request(`/api/v1/code/sessions/${sessionId}/messages`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    assert.ok(res.ok, `${res.status} ${await res.clone().text()}`)
+  }
+
+  await post({}) // the session's first run: the seeded task u1
+  while (!releaseFirst) await delay(5)
+  await post({ content: 'u2' }) // queued behind turn 1
+  await post({}) // a re-run of u2, queued behind u2's own turn
+  releaseFirst()
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  await post({}) // a re-run of u2 again, now answered twice
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+
+  assert.deepEqual(turns, [
+    { task: 'u1', history: [] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+    { task: 'u2', history: ['user:u1', 'assistant:reply-1'] },
+  ])
+  const stored = (store.getConversation(convId, true)?.messages ?? []).map((m) => `${m.role}:${m.content}`)
+  assert.deepEqual(stored, ['user:u1', 'assistant:reply-1', 'user:u2', 'assistant:reply-2', 'assistant:reply-3', 'assistant:reply-4'], 'each answer is stored after its question')
+})
+
+test('seqs keep rising after an idle session\'s state is dropped, so a reconnect with the client\'s old cursor still replays the new turn', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const { d, store } = makeDeps()
+  let releaseT2: (() => void) | undefined
+  const runner = (async (params) => {
+    for (let i = 0; i < 5; i++) params.sink({ event: 'delta', data: { delta: `${params.task}-${i}` } })
+    if (params.task === 't2') await new Promise<void>((r) => { releaseT2 = r })
+    return { finalText: 'ok', contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 't1')
+
+  // Turn 1, watched to the end. This client keeps lastSeq = last seen seq + 1 across turns, as a
+  // stream client that missed the idle end does (the web client resets its cursor at an idle end
+  // it sees, code-session-client.ts).
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 't1', userMsgId })
+  let lastSeq = 0
+  for await (const ev of mgr.subscribe(sessionId, lastSeq)) lastSeq = Math.max(lastSeq, ev.seq + 1)
+  t.mock.timers.tick(30_000) // IDLE_RETAIN_MS
+  assert.equal((mgr as unknown as { sessions: Map<string, unknown> }).sessions.has(sessionId), false, 'the idle session state was dropped')
+
+  // Turn 2 streams while the client's connection is down, then the client reconnects from its cursor.
+  const u2 = store.addMessage(convId, 'user', 't2')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 't2', userMsgId: u2.id })
+  const sub = mgr.subscribe(sessionId, lastSeq)
+  assert.ok(releaseT2, 'turn 2 started')
+  releaseT2()
+  const deltas: string[] = []
+  for await (const ev of sub) if (ev.event === 'delta') deltas.push((ev.data as { delta: string }).delta)
+  assert.deepEqual(deltas, ['t2-0', 't2-1', 't2-2', 't2-3', 't2-4'])
+})
+
+test('a reconnect whose cursor is past the buffer\'s head (from before a daemon restart) replays the in-flight turn from its start', async () => {
+  // The web client keeps its cursor across a reconnect that succeeds. When the daemon restarted in
+  // between, the new process's seqs start at 0 again, so the old cursor (here 42) sits above
+  // everything the new turn has streamed, and its replay skipped all of it.
+  const { d, store } = makeDeps()
+  let release: (() => void) | undefined
+  const runner = (async (params) => {
+    params.sink({ event: 'delta', data: { delta: 'early-0' } })
+    params.sink({ event: 'delta', data: { delta: 'early-1' } })
+    await new Promise<void>((r) => { release = r })
+    params.sink({ event: 'delta', data: { delta: 'live' } })
+    return { finalText: 'ok', contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner }) // the restarted daemon: a fresh manager
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'after restart')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'after restart', userMsgId })
+  const sub = mgr.subscribe(sessionId, 42)
+  assert.ok(release, 'the turn started')
+  release()
+  const deltas: string[] = []
+  for await (const ev of sub) if (ev.event === 'delta') deltas.push((ev.data as { delta: string }).delta)
+  assert.deepEqual(deltas, ['early-0', 'early-1', 'live'])
+})
+
+test('replay keeps only the latest tool_progress snapshot per tool call; everything else is untouched', async () => {
+  const { d, store } = makeDeps()
+  let release: (() => void) | undefined
+  const runner = (async (params) => {
+    let out = ''
+    for (let i = 0; i < 50; i++) {
+      out += `line ${i}\n`
+      // pi's bash tool re-sends its whole output so far on every update.
+      params.sink({ event: 'tool_progress', data: { id: 'bash-1', name: 'bash', partial: out } })
+      if (i % 10 === 0) params.sink({ event: 'tool_progress', data: { id: 'bash-2', name: 'bash', partial: `other ${i}` } })
+    }
+    params.sink({ event: 'delta', data: { delta: 'after' } })
+    await new Promise<void>((r) => { release = r })
+    return { finalText: 'ok', contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'build')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'build', userMsgId })
+
+  const sub = mgr.subscribe(sessionId, 0) // a client (re)connecting mid-turn
+  assert.ok(release, 'turn started')
+  release()
+  const { events } = await collect(sub, () => false)
+  const progress = events.filter((e) => e.event === 'tool_progress').map((e) => e.data as { id: string; partial: string })
+  assert.deepEqual(progress.map((p) => p.id).sort(), ['bash-1', 'bash-2'], 'one snapshot per call')
+  assert.equal(progress.find((p) => p.id === 'bash-1')!.partial.split('\n').length, 51, 'and it is the latest one')
+  assert.equal(progress.find((p) => p.id === 'bash-2')!.partial, 'other 40')
+  assert.ok(events.some((e) => e.event === 'meta') && events.some((e) => e.event === 'delta'), 'other frames still replay')
+})
+
+test('a sub-agent\'s tool calls are saved on the message tagged `subagent`; the session\'s own are not', async () => {
+  const { d, store } = makeDeps()
+  const runner = (async (params) => {
+    params.sink({ event: 'tool_call', data: { id: 'sub-1', name: 'read', args: { path: 'a' }, status: 'done', result: 'x', subagent: true } })
+    params.sink({ event: 'tool_call', data: { id: 'own-1', name: 'delegate_task', args: { task: 't' }, status: 'done', result: 'summary' } })
+    return { finalText: 'ok', contextUsed: 1, contextMax: 10, aborted: false }
+  }) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'delegate')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'delegate', userMsgId })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  const reply = store.getConversation(convId, true)!.messages!.at(-1)!
+  assert.deepEqual(reply.toolCalls.map((tc) => [tc.id, tc.subagent === true]), [['sub-1', true], ['own-1', false]])
+})
+
+test('an aborted turn that streamed nothing is saved empty, not with pi\'s fallback text (the previous turn\'s reply)', async () => {
+  const { d, store } = makeDeps()
+  // pi's getLastAssistantText() skips an empty aborted message, so a turn stopped before its first
+  // token reports the seeded PREVIOUS reply as its finalText.
+  const runner = (async () => ({ finalText: 'reply to the previous turn', contextUsed: 1, contextMax: 10, aborted: true })) as CodeSessionRunner
+  const mgr = new CodeRunManager(d, { runner })
+  const repoRoot = tmpDir('tllm-code-repo-')
+  const { sessionId, convId, userMsgId } = makeSession(store, repoRoot, 'stopped early')
+  mgr.enqueue(sessionId, { convId, repoRoot, task: 'stopped early', userMsgId })
+  await collect(mgr.subscribe(sessionId, 0), () => false)
+  const reply = store.getConversation(convId, true)!.messages!.at(-1)!
+  assert.equal(reply.role, 'assistant')
+  assert.equal(reply.content, '')
+  assert.deepEqual(reply.timeline ?? [], [])
+  assert.equal(store.getRunDoc(sessionId), '', 'nor written to the session doc')
 })

@@ -1,6 +1,7 @@
 // MCP host/client. Implements stdio (subprocess JSON-RPC) and Streamable HTTP
 // (MCP 2025-03-26) transports. All modern hosted MCPs use Streamable HTTP.
-import { spawn, type ChildProcess } from 'node:child_process'
+import type { ChildProcess } from 'node:child_process'
+import { spawnTethered } from '../util/tether'
 
 // ── MCP protocol types ────────────────────────────────────────────────────
 
@@ -59,6 +60,8 @@ export class StdioMcpClient implements IMcpClient {
   private buf = ''
   private msgId = 0
   private initialized = false
+  /** The handshake (initialize, then `notifications/initialized`) of the process in `proc`. */
+  private handshake: Promise<void> | null = null
 
   constructor(opts: { id: string; name: string; command: string; args?: string[]; env?: Record<string, string> }) {
     this.serverId = opts.id
@@ -68,8 +71,20 @@ export class StdioMcpClient implements IMcpClient {
     this.env = opts.env ?? {}
   }
 
-  async connect(): Promise<void> {
-    if (this.proc) return
+  /** A call made while the server is still starting waits for that same handshake. connect()
+   *  used to return at once whenever a process existed, so a second listTools/callTool during
+   *  the first one's initialize wrote its request before `notifications/initialized`, and a
+   *  server that enforces the order (the Python MCP SDK does) refused it. Only while that process
+   *  is still `proc`: once it is gone (cleanup()), the next call spawns a replacement. */
+  connect(): Promise<void> {
+    if (this.proc && this.handshake) return this.handshake
+    // start() spawns and sets `proc` before its first await, so a call right after this one
+    // already sees both.
+    this.handshake = this.start()
+    return this.handshake
+  }
+
+  private async start(): Promise<void> {
     // npx/uvx are .cmd shims on Windows; Node refuses to spawn .cmd directly (CVE-2024-27980)
     // and won't resolve them via PATHEXT without a shell. Instead of shell:true with a
     // concatenated string (DEP0190 + shell-injection surface from custom commands), run the
@@ -79,13 +94,31 @@ export class StdioMcpClient implements IMcpClient {
     const isWin = process.platform === 'win32'
     const file = isWin ? 'cmd.exe' : this.command
     const args = isWin ? ['/c', this.command, ...this.args] : this.args
-    this.proc = spawn(file, args, {
+    // Tied to the daemon (util/tether.ts): a server that does not exit when its stdin closes, and whatever it
+    // started (an `npx` server's node child, a `uvx` server's Python), ended only when TurboLLM's own teardown
+    // killed it, so a daemon that died without one left them running, parented to init. Now the whole group ends
+    // the moment the daemon does, and cleanup()'s kill below takes the group with the server.
+    const proc = spawnTethered(file, args, {
       env: { ...process.env, ...this.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
+      // stderr is discarded, not piped: nothing reads it, and once an unread pipe fills (~128 KB of
+      // logging — the Python MCP SDK logs every request at INFO) the server blocks on its next
+      // stderr write and every later request times out.
+      stdio: ['pipe', 'pipe', 'ignore'],
+    }, { kind: 'mcp' })
+    this.proc = proc
+    this.buf = ''
 
-    this.proc.stdout?.on('data', (chunk: Buffer) => {
-      this.buf += chunk.toString('utf8')
+    // Every handler below acts only while `proc` is still THE process. After a failed initialize
+    // or a disconnect the old process is killed, not awaited, and the next call lazily spawns a
+    // replacement: the old one's late 'exit'/'error' would otherwise kill that replacement and
+    // fail its pending requests, and its last buffered stdout would splice into the new stream.
+    // Decoded by the stream, not chunk by chunk: a multibyte character split across two pipe
+    // reads (~64 KB each) would otherwise become U+FFFD on both sides, inside a JSON string that
+    // still parses, so a large tool result reached the model silently altered.
+    proc.stdout?.setEncoding('utf8')
+    proc.stdout?.on('data', (chunk: string) => {
+      if (this.proc !== proc) return
+      this.buf += chunk
       const lines = this.buf.split('\n')
       this.buf = lines.pop() ?? ''
       for (const line of lines) {
@@ -104,14 +137,32 @@ export class StdioMcpClient implements IMcpClient {
       }
     })
 
-    this.proc.on('error', () => this.cleanup())
-    this.proc.on('exit', () => this.cleanup())
+    proc.on('error', () => { if (this.proc === proc) this.cleanup() })
+    proc.on('exit', () => { if (this.proc === proc) this.cleanup() })
+    // An 'error' on one of the child's pipes is thrown out of band when nothing listens for it,
+    // and the daemon has no uncaughtException handler, so it exited. The usual one is EPIPE on
+    // stdin: a request written while the server is exiting (it crashed, or was killed) but before
+    // its 'exit' arrives is accepted, since stdin still reads writable on this side, and fails
+    // after. A broken pipe takes no more requests, so it is handled like the exit: the pending
+    // requests fail with "MCP server disconnected" and the next call spawns a fresh server. The
+    // listeners stay on a replaced process, so its late EPIPE is still caught (and ignored).
+    proc.stdin?.on('error', () => { if (this.proc === proc) this.cleanup() })
+    proc.stdout?.on('error', () => { if (this.proc === proc) this.cleanup() })
 
-    await this.sendRequest('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: { tools: {} },
-      clientInfo: { name: 'turbollm', version: '0.7.0' },
-    })
+    try {
+      await this.sendRequest('initialize', {
+        protocolVersion: '2024-11-05',
+        capabilities: { tools: {} },
+        clientInfo: { name: 'turbollm', version: '0.7.0' },
+      })
+    } catch (e) {
+      // A rejected or timed-out initialize (a first-run `npx -y`/`uvx` download easily outlasts
+      // the 30 s timeout) must not leave the child running: the caller drops this client, so
+      // nothing else would ever kill it, and the next sync spawns another. (Unless `proc` is
+      // already gone and cleaned up — then this.proc may be a replacement that is not ours to kill.)
+      if (this.proc === proc) this.cleanup()
+      throw e
+    }
     await this.sendNotification('notifications/initialized', {})
     this.initialized = true
   }
@@ -235,7 +286,7 @@ export class SseMcpClient implements IMcpClient {
     return result.isError ? `Error: ${text}` : (text || '(no output)')
   }
 
-  private async sendRequest(method: string, params: unknown): Promise<unknown> {
+  private async sendRequest(method: string, params: unknown, retried = false): Promise<unknown> {
     const id = ++this.msgId
     const req: JsonRpcRequest = { jsonrpc: '2.0', id, method, params }
     const reqHeaders: Record<string, string> = {
@@ -243,7 +294,8 @@ export class SseMcpClient implements IMcpClient {
       'Accept': 'application/json, text/event-stream',
       ...this.headers,
     }
-    if (this.sessionId) reqHeaders['Mcp-Session-Id'] = this.sessionId
+    const sentSession = this.sessionId
+    if (sentSession) reqHeaders['Mcp-Session-Id'] = sentSession
 
     const resp = await fetch(this.baseUrl, {
       method: 'POST',
@@ -251,6 +303,20 @@ export class SseMcpClient implements IMcpClient {
       body: JSON.stringify(req),
       signal: AbortSignal.timeout(30_000),
     })
+
+    // MCP 2025-03-26: a 404 to a request carrying a session id means the server ended that session
+    // (restart, idle expiry) and the client MUST start a new one. Once per request, so a server
+    // that keeps answering 404 still surfaces as an error below. (An initialize that carried a
+    // stale id is simply resent without one — it IS the new session.)
+    if (resp.status === 404 && sentSession && !retried) {
+      await resp.body?.cancel().catch(() => {})
+      if (this.sessionId === sentSession) {
+        this.sessionId = null
+        this.initialized = false
+      }
+      if (method !== 'initialize') await this.connect()
+      return this.sendRequest(method, params, true)
+    }
 
     if (!resp.ok) {
       const txt = await resp.text().catch(() => '')

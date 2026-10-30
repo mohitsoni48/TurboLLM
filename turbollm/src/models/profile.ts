@@ -1,7 +1,7 @@
 // LoadProfile: per-model launch parameters, default derivation, VRAM-fit
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
-import type { Capabilities, ModelDefaults } from '../config/config'
+import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
@@ -46,10 +46,11 @@ export function defaultGpu(): GpuProfile {
 }
 
 /** LiteRT-LM load controls. The runtime has no partial GPU offload, so the one real choice is where the model runs:
- *    auto → GPU when the machine reports one and `ngl` > 0, otherwise CPU (the KoboldCpp convention)
+ *    auto → the model's own: TurboLLM names no backend and the server takes the one the bundle declares (a GPU-only
+ *           "artisan" decoder's GPU, a section's backend_constraint, else the runtime's CPU); see litertLmProfileToConfig
  *    cpu  → always CPU
- *    gpu  → always GPU, even when no GPU was detected. This exists because some platforms (Android/Termux) cannot
- *           report a GPU to us although the runtime can use it; `auto` would silently pin those devices to CPU. */
+ *    gpu  → always GPU, even when no GPU was detected (some platforms, Android/Termux, cannot report one to us
+ *           although the runtime can use it). */
 export interface LitertLmProfile {
   backend: 'auto' | 'cpu' | 'gpu'
 }
@@ -218,6 +219,12 @@ export interface LoadProfile {
   /** Provenance of a saved profile (spec 05 §3, 09 §1): 'bench' = written by the
    *  auto-tune runner, 'user' = hand-saved. Absent on heuristic/global defaults. */
   tunedBy?: 'bench' | 'user'
+  /** A saved profile or preset that holds only what the user set (the model dialog sends and saves
+   *  only the controls the user changed, auto-tune only those plus what it tuned): every field it
+   *  carries is the user's, whatever its value. Absent on what earlier builds saved, which held the
+   *  dialog's whole draft, the built-in defaults it was seeded with included: see
+   *  {@link userSetProfile} for how those are read. */
+  userSetOnly?: boolean
 }
 
 export type FitVerdict = 'fits' | 'tight' | 'overflow' | 'cpu' | 'unknown'
@@ -304,7 +311,7 @@ function linearLayerCount(m: ModelEntry): number {
  *     KV cache; the rest hold a constant recurrent state — a ~4x over-count.
  *   - sliding-window (Gemma 3/4): most layers cap at a fixed window, and Gemma also uses
  *     a different head dim AND a different KV-head count on sliding vs global layers —
- *     measured up to an ~18x over-count.
+ *     measured up to an ~16x over-count.
  *
  *  Over-counting isn't cosmetic here: it pushes the fit verdict to "tight"/"overflow"
  *  and mis-drives auto-tune's headroom gate for a very popular model family.
@@ -319,9 +326,17 @@ function linearLayerCount(m: ModelEntry): number {
  *  AND feeds auto-tune's headroom gate, so an under-estimate buys a failed load and a
  *  bad tune, while an over-estimate only costs a pessimistic verdict.
  *
+ *  A sliding layer holds more than its window, though: llama.cpp sizes that cache
+ *  `GGML_PAD(min(ctx, n_swa * (unified ? n_seq_max : 1) + n_ubatch), 256)`
+ *  (llama-kv-cache-iswa.cpp) — room for the in-flight ubatch, and for every sequence's window
+ *  when the cache is unified. `swaSeqs` is that sequence factor (the parallel count under a
+ *  unified cache, else 1: a non-unified cache is one stream per sequence, which
+ *  {@link profileKvElems} sizes and multiplies itself) and `ubatch` is --ubatch-size
+ *  (llama.cpp's default 512).
+ *
  *  Pure and exported for unit testing against the measured ground truth in
  *  profile.kv.test.ts. */
-export function kvCacheElems(m: ModelEntry, ctx: number): number {
+export function kvCacheElems(m: ModelEntry, ctx: number, swaSeqs = 1, ubatch = 512): number {
   const blocks = m.blockCount || 1
   const kvHeads = m.headCountKv || 8
   const headDim = m.headDim || HEAD_DIM
@@ -348,18 +363,31 @@ export function kvCacheElems(m: ModelEntry, ctx: number): number {
   // this is the branch essentially every model in the wild takes.
   if (swaPattern === undefined && !hybrid) return 2 * blocks * ctx * kvHeads * headDim
 
+  const swaTokens = Math.ceil(Math.min(ctx, window * swaSeqs + ubatch) / 256) * 256
   let elems = 0
   for (let i = 0; i < blocks; i++) {
     // Linear/SSM layers keep no ctx-scaled cache at all; their constant state is
     // accounted for separately by ssmStateElems so it can't be scaled by ctx.
     if (hybrid && !isFullAttentionLayer(i, interval)) continue
     const sliding = swaPattern?.[i] === true
-    const tokens = sliding ? Math.min(ctx, window) : ctx
+    const tokens = sliding ? swaTokens : ctx
     const heads = perLayerHeads?.[i] || kvHeads
     const dim = sliding ? swaHeadDim : headDim
     elems += 2 * tokens * heads * dim // ×2 for the K and V caches
   }
   return elems
+}
+
+/** Combined K+V cache elements a profile allocates, across all its sequences. A non-unified
+ *  cache (llama.cpp without --kv-unified) is NOT `parallel` full-context caches: llama.cpp gives
+ *  each of the `parallel` streams n_ctx_seq = pad256(ctx / parallel) cells (llama-context.cpp),
+ *  so full-attention layers hold ctx cells in total, as with a unified cache, and only the
+ *  per-stream sliding window is held once per stream. One sequence is one stream either way. */
+export function profileKvElems(m: ModelEntry, p: Pick<LoadProfile, 'ctx' | 'parallel' | 'kvUnified' | 'uBatchSize'>): number {
+  const seqs = Math.max(1, p.parallel)
+  const ubatch = p.uBatchSize || 512
+  if (p.kvUnified || seqs === 1) return kvCacheElems(m, p.ctx, seqs, ubatch)
+  return kvCacheElems(m, Math.ceil(Math.floor(p.ctx / seqs) / 256) * 256, 1, ubatch) * seqs
 }
 
 /** Elements in the CONSTANT recurrent state held by linear/SSM layers — roughly
@@ -410,7 +438,8 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // Attention-layout-aware KV sizing (ADR-223): counts each layer for what it actually
   // caches instead of assuming every layer holds full context. Falls back to exactly the
   // old all-layer formula for any model that doesn't declare its layout — see kvCacheElems.
-  const kvElems = kvCacheElems(m, p.ctx)
+  // Already counts every sequence, unified or not — see profileKvElems.
+  const kvElems = profileKvElems(m, p)
   // The linear/SSM layers' constant recurrent state. Sized at f32 (4 bytes) and NOT scaled by
   // --cache-type-k: llama.cpp keeps recurrent state unquantized, so applying the user's KV quant
   // here would under-count it. f32 rather than f16 is the deliberate, safer reading — this
@@ -426,9 +455,11 @@ export function estimateVram(p: LoadProfile, m: ModelEntry, sys: SysInfo): VramF
   // asymmetric quant (e.g. K=q8_0, V=q4_0) is weighted correctly instead of assuming V
   // matches K's byte width.
   const kvBytesMb = ((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6
+  // The recurrent state is one cell per sequence whether or not the KV cache is unified
+  // (llama.cpp's recurrent_rs_size = max(1, n_seq_max)), so it always scales with parallel.
   const kvMb = p.kvOffload === false
     ? 0
-    : (kvBytesMb + ssmMb) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : kvBytesMb + ssmMb * Math.max(1, p.parallel)
 
   // The mmproj file's on-disk size is a much closer proxy for its real VRAM footprint than
   // a flat guess (already-quantized weights load close to 1:1) — a measured ~15% overhead
@@ -518,11 +549,11 @@ export function estimateVramPerGpu(p: LoadProfile, m: ModelEntry, sys: SysInfo):
 
   // KV rides along with the layer that owns it (llama.cpp allocates it per-layer on that device),
   // so it follows the same distribution as the weights and needs no placement of its own.
-  const kvElems = kvCacheElems(m, p.ctx)
+  const kvElems = profileKvElems(m, p)
   const kvTotalMb = p.kvOffload === false
     ? 0
-    : ((((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
-        + (ssmStateElems(m) * 4) / 1e6) * (p.kvUnified ? 1 : Math.max(1, p.parallel))
+    : (((kvElems / 2) * kvBytesPerElem(p.kvTypeK) + (kvElems / 2) * kvBytesPerElem(p.kvTypeV)) / 1e6)
+      + ((ssmStateElems(m) * 4) / 1e6) * Math.max(1, p.parallel) // per sequence either way, as in estimateVram
   const kvPerLayerMb = kvTotalMb / Math.max(1, residentLayers)
 
   const mmprojMb = p.useMmproj && p.mmprojGpu && m.mmprojPath ? (m.mmprojSizeBytes / 1e6) * 1.15 : 0
@@ -587,11 +618,46 @@ export function deriveTensorSplit(p: LoadProfile, m: ModelEntry, sys: SysInfo): 
   return layers
 }
 
+/** What LiteRT-LM uses for max_num_tokens when it is given none (engine_settings.cc: for an empty prompt, 4096 when the
+ *  bundle's LlmMetadata declares no max_num_tokens). */
+export const LITERT_RUNTIME_DEFAULT_CTX = 4096
+
+/** The context a .litertlm runs at when the user set none: Settings > Model Defaults' context when the user changed it
+ *  from the built-in one (a global setting of theirs), else the bundle's own default (LlmMetadata.max_num_tokens, or
+ *  the runtime's 4096 when it declares none), never past the longest it takes. TurboLLM's llama.cpp heuristic
+ *  (min(native, 8192), then the global 8192 materialized in every config) used to decide it for every bundle: 8192 for
+ *  Qwen3-0.6B_dynamic, whose own default is 4096, and 8192 reported for bundles it could not size while the runtime
+ *  clamped to their real limit. `defaults` absent: the bundle's own. */
+export function litertLmAutoCtx(m: Pick<ModelEntry, 'nativeCtx' | 'defaultCtx'>, defaults?: Pick<ModelDefaults, 'ctx'>): number {
+  const limit = m.nativeCtx > 0 ? m.nativeCtx : Infinity
+  if (defaults && defaults.ctx > 0 && defaults.ctx !== BUILTIN_MODEL_DEFAULT_CTX) return Math.min(defaults.ctx, limit)
+  return Math.min((m.defaultCtx ?? 0) > 0 ? m.defaultCtx! : LITERT_RUNTIME_DEFAULT_CTX, limit)
+}
+
+/** What LiteRT-LM samples with on CPU and GPU when the bundle declares no sampler of its own and the request sets none
+ *  (engine_settings.cc): TOP_P with top_k 1 (greedy), top_p 0.95, temperature 1.0. */
+export const LITERT_RUNTIME_DEFAULT_SAMPLER = { topK: 1, topP: 0.95, temp: 1.0 } as const
+
+/** A .litertlm's automatic sampling: the bundle's own sampler (LlmMetadata.sampler_params, ModelEntry.sampler), else the
+ *  runtime's default. It is what the model samples with while nothing is set, so it is what the model dialog and the
+ *  thread settings show at rest; TurboLLM's llama.cpp defaults (0.8 / 0.95 / 40) stood there and are not what any
+ *  LiteRT-LM model uses (Qwen3-0.6B's own: 0.6 / 0.95 / 20). A field the bundle leaves out of its sampler is the
+ *  runtime's (top_k 0 when it sets a top_p and no top_k: no top-k limit). The other fields keep defaultSampling(). */
+export function litertLmAutoSampling(m: Pick<ModelEntry, 'sampler'>): Sampling {
+  const own = m.sampler
+  return {
+    ...defaultSampling(),
+    temp: own ? own.temp ?? LITERT_RUNTIME_DEFAULT_SAMPLER.temp : LITERT_RUNTIME_DEFAULT_SAMPLER.temp,
+    topP: own ? own.topP ?? LITERT_RUNTIME_DEFAULT_SAMPLER.topP : LITERT_RUNTIME_DEFAULT_SAMPLER.topP,
+    topK: own ? own.topK ?? 0 : LITERT_RUNTIME_DEFAULT_SAMPLER.topK,
+  }
+}
+
 /** Computed defaults for a model (spec 05 §3). NOT saved until the user saves. */
 export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
   const hasGpu = sys.gpus.length > 0
   const base: LoadProfile = {
-    ctx: Math.min(m.nativeCtx || 8192, 8192),
+    ctx: m.format === 'litertlm' ? litertLmAutoCtx(m) : Math.min(m.nativeCtx || 8192, 8192),
     ngl: hasGpu ? 99 : 0,
     nCpuMoe: 0,
     parallel: 1,
@@ -628,7 +694,7 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
     speculative: m.nextnLayers > 0 ? 'nextn' : 'off',
     mtpHeadPath: '',
     draftModelPath: '',
-    sampling: defaultSampling(),
+    sampling: m.format === 'litertlm' ? litertLmAutoSampling(m) : defaultSampling(),
     contextOverflow: 'shift',
     nKeep: 0,
     ropeScalingType: 'none',
@@ -664,11 +730,14 @@ export function deriveDefault(m: ModelEntry, sys: SysInfo): LoadProfile {
 function applyGlobalDefaults(base: LoadProfile, m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults): LoadProfile {
   if (!defaults) return base
   const hasGpu = sys.gpus.length > 0
-  // Honor the global ctx but never exceed the model's native context window.
+  // Honor the global ctx but never exceed the model's native context window. A .litertlm takes it only when the user
+  // changed it (litertLmAutoCtx), and its own default otherwise.
   const nativeCap = m.nativeCtx
   return {
     ...base,
-    ctx: defaults.ctx > 0 ? (nativeCap > 0 ? Math.min(defaults.ctx, nativeCap) : defaults.ctx) : base.ctx,
+    ctx: m.format === 'litertlm'
+      ? litertLmAutoCtx(m, defaults)
+      : defaults.ctx > 0 ? (nativeCap > 0 ? Math.min(defaults.ctx, nativeCap) : defaults.ctx) : base.ctx,
     ngl: hasGpu ? defaults.ngl : 0,
     imageMaxTokens: defaults.imageMaxTokens ?? base.imageMaxTokens,
   }
@@ -737,6 +806,91 @@ function needsTokenize(entry: string): boolean {
   return false
 }
 
+/** The profile a model loads with when the user has set nothing for it: the built-in heuristics with
+ *  the global model defaults over them. What {@link resolveProfile} merges a saved profile and
+ *  overrides onto, and what {@link userSetProfile} tells an earlier build's saved defaults apart by. */
+export function automaticProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults): LoadProfile {
+  return applyGlobalDefaults(deriveDefault(m, sys), m, sys, defaults)
+}
+
+/** The profile the model dialog seeded its draft with before it saved only what the user set (the automatic profile of
+ *  b0e8455): what a profile an earlier build saved holds where the user changed nothing, and so what
+ *  {@link userSetProfile} reads such a profile against. The automatic profile itself, but for a .litertlm's context,
+ *  which was the llama.cpp heuristic (min(Model Defaults, the bundle's KV length or `ekv` tag), the length read raw, a
+ *  dynamic export's magic number included) where it is now the bundle's own default, and its sampling, which was
+ *  llama.cpp's (defaultSampling) where it is now the bundle's: read against the new ones, every such profile's 8192 and
+ *  0.8 / 0.95 / 40 / 0.05 would count as the user's choice. */
+export function legacySeedProfile(m: ModelEntry, sys: SysInfo, defaults?: ModelDefaults, auto = automaticProfile(m, sys, defaults)): LoadProfile {
+  if (m.format !== 'litertlm') return auto
+  const oldNative = m.ctxDynamic ? m.nativeCtx + 1 : m.nativeCtx
+  const heuristic = Math.min(oldNative || 8192, 8192)
+  const ctx = defaults && defaults.ctx > 0 ? (oldNative > 0 ? Math.min(defaults.ctx, oldNative) : defaults.ctx) : heuristic
+  return { ...auto, ctx, sampling: defaultSampling() }
+}
+
+/** The groups {@link resolveProfile} merges key by key, so a user-set view keeps only their set keys. */
+const NESTED_PROFILE_GROUPS = new Set(['sampling', 'gpu', 'vllm', 'litertLm'])
+
+function sameProfileValue(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b)
+}
+
+/** The fields of a saved profile or preset the user set, against `auto` ({@link automaticProfile}).
+ *
+ *  A profile marked {@link LoadProfile.userSetOnly} (what this build's dialog, presets and auto-tune
+ *  save) is the user's in every field it carries, so it is returned as it is. One saved before
+ *  carries the model dialog's whole draft: the dialog was seeded from the resolved profile and every
+ *  Save, and every Load with "Remember these settings" (on by default), stored all of it, so the
+ *  built-in defaults it was seeded with (context 8192, GPU layers 99, the llama.cpp sampling
+ *  0.8/0.95/40/0.05) sit there beside the one control the user moved. Such a profile's fields that
+ *  equal the automatic profile are read as not set: a value equal to the default it was seeded with
+ *  is all but always an untouched default, and treating it as the user's choice would put one fixed
+ *  llama.cpp set over a model's own defaults (a LiteRT-LM bundle's context and sampler) for every
+ *  user who once saved a backend. Nothing is lost by it: the stored file is never rewritten, a field
+ *  read as not set takes the value it equals wherever the automatic one has not changed, every field
+ *  that differs stays the user's, and moving the control again saves it as the user's for good.
+ *  `tunedBy` is provenance, not a setting, and always kept; the marker itself is left out of the view. */
+export function userSetProfile(saved: Partial<LoadProfile> | undefined, auto: LoadProfile): Partial<LoadProfile> | undefined {
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) return undefined
+  const marked = saved.userSetOnly === true
+  const autoFields = auto as unknown as Record<string, unknown>
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(saved)) {
+    if (v === undefined || k === 'userSetOnly') continue
+    if (marked || k === 'tunedBy') {
+      out[k] = v
+      continue
+    }
+    if (NESTED_PROFILE_GROUPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      const autoGroup = (autoFields[k] ?? {}) as Record<string, unknown>
+      const group: Record<string, unknown> = {}
+      for (const [gk, gv] of Object.entries(v as unknown as Record<string, unknown>)) {
+        if (gv !== undefined && !sameProfileValue(gv, autoGroup[gk])) group[gk] = gv
+      }
+      if (Object.keys(group).length > 0) out[k] = group
+      continue
+    }
+    const same = k === 'extraArgs' && Array.isArray(v)
+      ? sameProfileValue(tokenizeExtraArgs(v as string[]), tokenizeExtraArgs(auto.extraArgs))
+      : sameProfileValue(v, autoFields[k])
+    if (!same) out[k] = v
+  }
+  return out as Partial<LoadProfile>
+}
+
+/** `b`'s user-set fields over `a`'s, the nested groups key by key (as {@link resolveProfile} merges them). */
+export function mergeUserSet(a: Partial<LoadProfile> | undefined, b: Partial<LoadProfile> | undefined): Partial<LoadProfile> {
+  const out: Record<string, unknown> = { ...(a ?? {}) }
+  for (const [k, v] of Object.entries(b ?? {})) {
+    if (v === undefined) continue
+    const prev = out[k]
+    out[k] = NESTED_PROFILE_GROUPS.has(k) && prev && typeof prev === 'object' && v && typeof v === 'object'
+      ? { ...(prev as Record<string, unknown>), ...(v as unknown as Record<string, unknown>) }
+      : v
+  }
+  return out as Partial<LoadProfile>
+}
+
 /** Merge heuristics <- global defaults <- saved <- overrides (field-level; sampling
  *  deep-merged). Precedence highest→lowest: per-request overrides > saved per-model
  *  profile > global model defaults > built-in heuristics (spec 05 §3). */
@@ -747,18 +901,23 @@ export function resolveProfile(
   overrides?: Partial<LoadProfile>,
   defaults?: ModelDefaults,
 ): LoadProfile {
-  const base = applyGlobalDefaults(deriveDefault(m, sys), m, sys, defaults)
+  const base = automaticProfile(m, sys, defaults)
+  // A saved profile counts for what the user set in it (userSetProfile): one an earlier build saved whole holds the
+  // defaults of the day, which must not outrank what the model loads with now. The marker says how a stored profile is
+  // to be read; it is not a launch setting, so the resolved profile never carries it. Overrides are a request's own.
+  const savedFields = userSetProfile(saved, legacySeedProfile(m, sys, defaults, base)) ?? {}
+  const { userSetOnly: _overrideMarker, ...overrideFields } = overrides ?? {}
   return {
     ...base,
-    ...(saved ?? {}),
-    ...(overrides ?? {}),
-    sampling: { ...base.sampling, ...(saved?.sampling ?? {}), ...(overrides?.sampling ?? {}) },
+    ...savedFields,
+    ...overrideFields,
+    sampling: { ...base.sampling, ...(savedFields.sampling ?? {}), ...(overrides?.sampling ?? {}) },
     // gpu is deep-merged like sampling so a partial override (or an old saved profile
     // missing some fields) keeps the rest of the defaults instead of going undefined.
-    gpu: { ...base.gpu, ...(saved?.gpu ?? {}), ...(overrides?.gpu ?? {}) },
+    gpu: { ...base.gpu, ...(savedFields.gpu ?? {}), ...(overrides?.gpu ?? {}) },
     // vllm deep-merged for the same reason — old/partial profiles keep the defaults.
-    vllm: { ...base.vllm, ...(saved?.vllm ?? {}), ...(overrides?.vllm ?? {}) },
-    litertLm: { ...base.litertLm, ...(saved?.litertLm ?? {}), ...(overrides?.litertLm ?? {}) },
+    vllm: { ...base.vllm, ...(savedFields.vllm ?? {}), ...(overrides?.vllm ?? {}) },
+    litertLm: { ...base.litertLm, ...(savedFields.litertLm ?? {}), ...(overrides?.litertLm ?? {}) },
     // useMmproj has no UI control (only mmprojGpu — GPU-vs-CPU placement — is user-facing;
     // see ModelDetailDialog's "Vision encoder on GPU" toggle), so there is no legitimate way
     // for a saved profile or draft override to carry a meaningful `false` here. Forcing it to
@@ -771,8 +930,31 @@ export function resolveProfile(
     // into real argv elements. Doing it here — after the merge, on the one path every
     // load goes through — heals already-saved profiles and hand-edited config.json with
     // no migration, and covers overrides/API callers that never touch the UI.
-    extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? saved?.extraArgs ?? base.extraArgs),
+    extraArgs: tokenizeExtraArgs(overrides?.extraArgs ?? savedFields.extraArgs ?? base.extraArgs),
   }
+}
+
+/** The context window model `m` would ACTUALLY be loaded with on `engineId`, from its saved profile or
+ *  pinned preset, as opposed to its `nativeCtx`, which is only the ceiling its metadata allows.
+ *  Undefined when it has no profile for that engine (the caller then shows `nativeCtx`, as before).
+ *
+ *  TWO consumers need the identical answer, and they drifted the first time it was written in only
+ *  one of them: the models API overlay (for the UI and for `turbollm launch`, which reads models over
+ *  HTTP) and the daemon's post-load harness-config sync (which reads raw scanner entries). The sync
+ *  then overwrote the launcher's correct value with `nativeCtx` on every load (measured live: pi
+ *  advertised 131072 for `gpt-oss-120b` while its profile configures 32256), and a harness that
+ *  believes a 4x-too-large window fills the context past what the engine allocated.
+ *
+ *  The resolved context ({@link resolveProfile}), not the stored field: a profile saved from the model
+ *  dialog holds a context only when the user set one (userSetOnly), where an earlier build's held the
+ *  automatic one too, so the stored field alone would advertise the ceiling for every model saved
+ *  without touching Context. */
+export function configuredCtx(cfg: Config, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
+  if (!engineId) return undefined
+  const saved = getModelProfile(cfg, m.key, engineId) as Partial<LoadProfile> | undefined
+  if (!saved || typeof saved !== 'object') return undefined
+  const ctx = resolveProfile(m, sys, saved, undefined, cfg.modelDefaults).ctx
+  return Number.isFinite(ctx) && ctx > 0 ? ctx : undefined
 }
 
 /** GitHub #85 / ADR-324: llama.cpp on ROCm hangs loading large models on AMD unified-memory
@@ -833,7 +1015,19 @@ export function profileToArgs(
   // -fit aborts, and the engine falls through to loading -ngl layers — every expert included —
   // with zero MoE offload, an instant CUDA OOM on a VRAM-constrained card.
   const moeAutoFit = m.moe && p.nCpuMoeFit
-  if (!moeAutoFit && (!p.nglFit || m.moe) && p.ngl > 0) a.push('-ngl', String(p.ngl))
+  // ngl 0 means no layers on the GPU (the slider, Settings' default, auto-tune's verdict): weights
+  // and KV cache stay in RAM. It is not "no GPU at all": llama.cpp still sets up the device (a
+  // compute buffer in VRAM), offloads large-batch work such as prompt processing to it (unless
+  // --no-op-offload), and loads the mmproj there (unless mmproj offload is off). It must be sent
+  // as an explicit `-ngl 0`: current llama.cpp reads an ABSENT -ngl as "auto" and fits the model
+  // onto the GPU anyway. Only where a GPU is detected, though: there a 0 is always a deliberate
+  // choice, since deriveDefault and the global defaults give 99 / the user's own value. With no
+  // detected GPU the 0 is merely deriveDefault's placeholder, and -ngl stays absent so a GPU the
+  // detection missed but the engine can use (Termux without vulkaninfo, a container without
+  // lspci) keeps offloading exactly as it does today.
+  const gpuDetected = (sys?.gpus.length ?? 0) > 0
+  const nglExplicit = !moeAutoFit && (!p.nglFit || m.moe) && (p.ngl > 0 || (p.ngl === 0 && gpuDetected))
+  if (nglExplicit) a.push('-ngl', String(p.ngl))
   // Multi-GPU split (ADR-054). Defaults are no-ops: 'layer' + empty tensorSplit +
   // mainGpu -1 emit nothing, preserving llama.cpp's built-in even split across GPUs.
   const g = p.gpu
@@ -850,7 +1044,7 @@ export function profileToArgs(
   if (has('--parallel')) a.push('--parallel', String(p.parallel))
   if (p.parallel > 1 && p.kvUnified && has('--kv-unified')) a.push('--kv-unified')
   // nCpuMoeFit: omit --n-cpu-moe so -fit's finer-grained MoE offload strategy decides instead.
-  // Outside auto-fit, pass it explicitly whenever -ngl is ALSO explicit (p.ngl > 0 — the same
+  // Outside auto-fit, pass it explicitly whenever -ngl is ALSO explicit (nglExplicit — the same
   // gate as the -ngl push above) — including 0 — found 2026-08-06 from a live BeeLlama.cpp repro:
   // omitting --n-cpu-moe (on the old assumption that "0" and "absent" are equivalent) while -ngl
   // is explicit leaves it ambiguous whether the engine should auto-fit its own placement or use
@@ -858,11 +1052,11 @@ export function profileToArgs(
   // absent, which then aborts on seeing -ngl already pinned ("n_gpu_layers already set by user to
   // N, abort") and falls through to loading every expert on GPU with no real offload — silently
   // spilling to system RAM instead of erroring, so auto-tune's own nCpuMoe=0 search candidate can
-  // look like it fits when it doesn't. Gating on p.ngl > 0 (not unconditional) matters: when ngl
-  // is 0 (a CPU-only box, or a user dragging the still-visible MoE ngl slider to 0) there's no
-  // -ngl on the command line to collide with, so forcing --n-cpu-moe 0 there would needlessly
-  // suppress a fit pass that runs cleanly on its own.
-  if (m.moe && !p.nCpuMoeFit && p.ngl > 0 && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
+  // look like it fits when it doesn't. Gating on nglExplicit (not unconditional) matters: when
+  // -ngl is absent (ngl 0 with no detected GPU) there's no -ngl on the command line to collide
+  // with, so forcing --n-cpu-moe 0 there would needlessly suppress a fit pass that runs cleanly
+  // on its own.
+  if (m.moe && nglExplicit && has('--n-cpu-moe')) a.push('--n-cpu-moe', String(p.nCpuMoe))
   // Emit a non-default KV cache type only when the engine supports the VALUE, not just
   // the --cache-type-k FLAG: e.g. TurboQuant's turbo2/3/4 must NOT leak into a standard
   // llama.cpp / llamafile engine (which has the flag but rejects the value → launch fails).
