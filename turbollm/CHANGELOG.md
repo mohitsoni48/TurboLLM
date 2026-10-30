@@ -239,7 +239,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
 - `/v1/messages` (Claude Code and other Anthropic clients) leaves out no user turn. One holding only a PDF `document`
   block, or an empty content array, was dropped, so the model answered the turn before it (and LiteRT-LM refused the
   request), and a PDF beside text went without a word. A document with a text or content source is now sent as text,
-  and an image by URL as its URL. A PDF, URL or file document, or any other block the gateway cannot send, reaches
+  (an image by URL is refused like a file source: the gateway never hands a caller's URL to the engine to fetch, which
+  would bypass fetch_url's SSRF policy). A PDF, URL or file document, or any other block the gateway cannot send, reaches
   the model as a note saying what was there ("[a PDF document was attached here; this local model cannot read it]"),
   so the conversation can go on, and so does a document inside a tool result (a PDF an agent reads with its Read
   tool); only in the turn being answered, and when that turn holds nothing else, is it a 400 `invalid_request_error`

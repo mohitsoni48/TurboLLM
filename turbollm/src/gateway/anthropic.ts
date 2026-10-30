@@ -143,11 +143,12 @@ const unreadable = (what: string) => `[${what} was attached here; this local mod
  *  `search_result`), and a turn of only those vanished, so the model answered the turn before it, or (LiteRT-LM) the
  *  request was refused as continuing a reply. A document whose source is text is sent as text; a PDF is not. */
 function userBlockParts(b: ABlock): { parts: Record<string, unknown>[] } | Unsendable {
+  if (!b || typeof b !== 'object') return { error: 'a content block must be an object.', note: '[a malformed content block was here; this local model cannot read it]' }
   if (b.type === 'text') return { parts: [{ type: 'text', text: b.text }] }
   if (b.type === 'image') {
-    // A URL is the engine's to fetch (llama-server downloads http(s) images); it was sent as `data:undefined;…`.
-    if (b.source?.type === 'url') return { parts: [{ type: 'image_url', image_url: { url: b.source.url } }] }
-    if (b.source?.type !== 'base64') return { error: `an \`image\` block with a ${typeof b.source?.type === 'string' ? b.source.type : 'missing'} source cannot be sent to a local model: send it base64 or as a URL.`, note: unreadable('an image') }
+    // A URL is not handed on for llama-server to download: that would let any gateway caller make this machine fetch an
+    // address of its choosing, outside fetch_url's SSRF policy. It is refused with the other non-base64 sources.
+    if (b.source?.type !== 'base64') return { error: `an \`image\` block with a ${typeof b.source?.type === 'string' ? b.source.type : 'missing'} source cannot be sent to a local model: send it base64.`, note: unreadable('an image') }
     return { parts: [imagePart(b.source)] }
   }
   if (b.type === 'document') {

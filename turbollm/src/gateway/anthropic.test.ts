@@ -73,9 +73,30 @@ test('mapToOpenAI: a document with a text or content source reaches the engine a
     { type: 'text', text: 'page 1' },
     { type: 'image_url', image_url: { url: 'data:image/png;base64,AAA=' } },
   ] })
-  // An image by URL is the engine's to fetch (llama-server downloads it); it went out as `data:undefined;base64,undefined`.
-  assert.deepEqual(lastTurn([{ type: 'image', source: { type: 'url', url: 'https://example.com/cat.png' } }]),
-    { role: 'user', content: [{ type: 'image_url', image_url: { url: 'https://example.com/cat.png' } }] })
+})
+
+// An image by URL used to go out as `data:undefined;base64,undefined`. Handing the URL on for llama-server to download
+// would let any gateway caller (a remote key, a Turbo Link peer) make this machine fetch an address of its choosing
+// (169.254.169.254, the LAN) outside fetch_url's SSRF policy, so it is refused like a file source: send it base64.
+test('mapToOpenAI: an image by URL is refused, never passed to the engine to fetch', () => {
+  for (const url of ['https://example.com/cat.png', 'http://169.254.169.254/latest/meta-data/', 'http://192.168.1.1/admin.png']) {
+    assert.throws(
+      () => mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [{ type: 'image', source: { type: 'url', url } }] }] } as never),
+      /^Error: messages\.0\.content\.0: an `image` block with a url source cannot be sent to a local model: send it base64/,
+    )
+  }
+  // Beside text the turn still goes, the image as a note, so the engine is given no URL.
+  const sent = mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [{ type: 'text', text: 'What is this?' }, { type: 'image', source: { type: 'url', url: 'http://10.0.0.1/x.png' } }] }] } as never)
+  assert.ok(!JSON.stringify(sent).includes('10.0.0.1'), 'the URL never reaches the engine request')
+})
+
+test('mapToOpenAI: a null or non-object content block is refused as a block, not a TypeError', () => {
+  for (const bad of [null, 7, 'text']) {
+    assert.throws(
+      () => mapToOpenAI({ max_tokens: 64, messages: [{ role: 'user', content: [bad] }] } as never),
+      /^Error: messages\.0\.content\.0: a content block must be an object/,
+    )
+  }
 })
 
 test('mapToOpenAI: the turn the reply answers is refused when it holds only blocks it cannot send, naming the first, and an empty turn as Anthropic\'s API refuses it', () => {
