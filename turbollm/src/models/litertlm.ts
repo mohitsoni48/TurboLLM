@@ -81,6 +81,15 @@ const VISION_ENCODER = 'tf_lite_vision_encoder'
 const AUDIO_ENCODER = 'tf_lite_audio_encoder_hw'
 const MAX_HEADER = 1 << 20
 const MAX_PROTO = 1 << 20
+// A header lists its sections in a FlatBuffer vector, and a vector may name one table any number of times: a crafted
+// header of MAX_HEADER could have one 1 MiB LlmMetadata section read and its template scanned some 260,000 times on
+// every model scan (hours), and a section's items the same way. So each metadata section is read once, and a header
+// that lists more sections than MAX_SECTIONS, or a section more items than MAX_ITEMS, is one this reader does not
+// understand: real bundles carry about ten sections of a few items each.
+const MAX_SECTIONS = 1024
+const MAX_ITEMS = 256
+// An item value longer than this is decoded as no value: no model type is that long.
+const MAX_ITEM_VALUE = 1024
 
 /** One FlatBuffer table over a buffer: just the accessors the header needs. */
 class FbTable {
@@ -96,12 +105,14 @@ class FbTable {
     const p = this.pos + o
     return new FbTable(this.b, p + this.b.readUInt32LE(p))
   }
-  tables(i: number): FbTable[] {
+  /** Field i's tables; a vector of more than `max` throws (the header reader then gives NO_HEADER). */
+  tables(i: number, max: number): FbTable[] {
     const o = this.field(i)
     if (!o) return []
     let p = this.pos + o
     p += this.b.readUInt32LE(p)
     const n = this.b.readUInt32LE(p)
+    if (n > max) throw new RangeError(`a vector of ${n} tables`)
     const out: FbTable[] = []
     for (let k = 0; k < n; k++) {
       const q = p + 4 + 4 * k
@@ -125,21 +136,34 @@ class FbTable {
     const n = this.b.readUInt32LE(p)
     return this.b.toString('utf8', p + 4, p + 4 + n)
   }
+  /** The byte length of field i's string, without decoding it; null when it is absent. */
+  stringBytes(i: number): number | null {
+    const o = this.field(i)
+    if (!o) return null
+    const p = this.pos + o
+    return this.b.readUInt32LE(p + this.b.readUInt32LE(p))
+  }
 }
 
 /** VData.StringValue, the union type of a KeyValuePair whose value is a string (litertlm_header_schema.fbs). */
 const VDATA_STRING = 9
 
-/** A section's string items (KeyValuePair key → StringValue): a TFLiteModel's `model_type`, `backend_constraint`. */
-function sectionStrings(section: FbTable): Map<string, string> {
-  const out = new Map<string, string>()
-  for (const kv of section.tables(0)) {
-    const key = kv.string(0)
-    if (key === null || kv.u8(1) !== VDATA_STRING) continue
-    const value = kv.table(2)?.string(0)
-    if (value != null) out.set(key, value)
+/** A section's string item `key` (KeyValuePair key → StringValue), such as a TFLiteModel's `model_type`; null when it
+ *  has none. */
+function sectionString(section: FbTable, key: string): string | null {
+  // The last item of the key, as a map of the items held it: walked from the end, the first. A key of another length
+  // is not decoded, so each item costs the same whatever its strings' length.
+  const keyBytes = Buffer.byteLength(key)
+  const items = section.tables(0, MAX_ITEMS)
+  for (let k = items.length - 1; k >= 0; k--) {
+    const kv = items[k]
+    if (kv.stringBytes(0) !== keyBytes || kv.string(0) !== key || kv.u8(1) !== VDATA_STRING) continue
+    const value = kv.table(2)
+    const n = value?.stringBytes(0)
+    if (n == null) continue
+    return n > MAX_ITEM_VALUE ? '' : value!.string(0)
   }
-  return out
+  return null
 }
 
 type ProtoField = { field: number; varint?: number; bytes?: Buffer; f32?: number }
@@ -230,13 +254,67 @@ export function llmMetadataMaxNumTokens(proto: Buffer): number {
 /** LlmModelType's oneof cases whose default template renders tools: gemma3n (2), function_gemma (3). */
 const DEFAULT_TEMPLATE_TOOL_TYPES = new Set([2, 3])
 
+// A template comes from the file (up to MAX_PROTO) and is read on every scan, so both scans below run in linear time,
+// with the output the plain patterns gave. `/\{[{%]([\s\S]*?)[}%]\}/g` rescanned to the end from every opener that had
+// no closer after it, and `'(?:[^'\\]|\\.)*'` from every quote that had no closing one: a crafted bundle of `{{`, or
+// of `\'` in a tag, held the daemon for minutes on each scan.
+
+/** The code inside each `{{ }}` and `{% %}` tag, in order: what `/\{[{%]([\s\S]*?)[}%]\}/g` captures. An opener with
+ *  no closer after it ends the scan: no later opener has one either. */
+export function jinjaTagCode(template: string): string[] {
+  const out: string[] = []
+  let from = 0
+  for (;;) {
+    let open = template.indexOf('{', from)
+    while (open >= 0 && template[open + 1] !== '{' && template[open + 1] !== '%') open = template.indexOf('{', open + 1)
+    if (open < 0) return out
+    // The closer is the first `}}` or `%}` starting after the opener, so its `}` is at open + 3 or later.
+    let close = template.indexOf('}', open + 3)
+    while (close >= 0 && template[close - 1] !== '}' && template[close - 1] !== '%') close = template.indexOf('}', close + 1)
+    if (close < 0) return out
+    out.push(template.slice(open + 2, close - 1))
+    from = close + 1
+  }
+}
+
+/** A line terminator, which a backslash cannot escape in the pattern below (its `.` does not match one). */
+const LINE_TERMINATOR = /[\n\r\u2028\u2029]/
+
+/** `code` with each string literal made `""`: what `code.replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, '""')`
+ *  gives. A quote whose literal never closes is kept, and so is every later quote of its kind before the point its
+ *  scan stopped: each is escaped or plain text on that same scan, so its own scan stops there too. */
+export function blankJinjaStrings(code: string): string {
+  let out = ''
+  let copied = 0
+  const unclosedUntil: Record<string, number> = { "'": -1, '"': -1 }
+  for (let q = 0; q < code.length; q++) {
+    const quote = code[q]
+    if ((quote !== "'" && quote !== '"') || q < unclosedUntil[quote]) continue
+    let k = q + 1
+    while (k < code.length && code[k] !== quote) {
+      if (code[k] === '\\') {
+        if (k + 1 >= code.length || LINE_TERMINATOR.test(code[k + 1])) break
+        k++
+      }
+      k++
+    }
+    if (code[k] !== quote) {
+      unclosedUntil[quote] = k
+      continue
+    }
+    out += code.slice(copied, q) + '""'
+    copied = k + 1
+    q = k
+  }
+  return out + code.slice(copied)
+}
+
 /** Whether a Jinja chat template reads the `tools` variable in its code ({% if tools %}, {% for tool in tools %},
  *  {{ tools | tojson }}), not merely the word: the text inside string literals is left out, so LFM2.5's
  *  "List of tools: [" and Qwen3's "<tools>" do not count, and neither does an attribute (`message.tools`). */
 export function jinjaTemplateTakesTools(template: string): boolean {
-  for (const m of template.matchAll(/\{[{%]([\s\S]*?)[}%]\}/g)) {
-    const code = m[1].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, '""')
-    if (/(?:^|[^\w.])tools\b/.test(code)) return true
+  for (const tag of jinjaTagCode(template)) {
+    if (/(?:^|[^\w.])tools\b/.test(blankJinjaStrings(tag))) return true
   }
   return false
 }
@@ -257,9 +335,9 @@ const REASONING_FIELDS = 'reasoning_content|reasoning|thinking'
 export function jinjaTemplateReadsReasoning(template: string): boolean {
   const subscript = new RegExp(`(?:\\[|\\.get\\()\\s*(['"])(?:${REASONING_FIELDS})\\1`)
   const attribute = new RegExp(`\\.(?:${REASONING_FIELDS})\\b`)
-  for (const m of template.matchAll(/\{[{%]([\s\S]*?)[}%]\}/g)) {
-    if (subscript.test(m[1])) return true
-    if (attribute.test(m[1].replace(/'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g, '""'))) return true
+  for (const tag of jinjaTagCode(template)) {
+    if (subscript.test(tag)) return true
+    if (attribute.test(blankJinjaStrings(tag))) return true
   }
   return false
 }
@@ -364,22 +442,27 @@ export async function litertlmHeaderFromFile(path: string): Promise<LitertlmHead
     if (headerEnd <= 32 || headerEnd > MAX_HEADER) return NO_HEADER
     const header = await read(32, headerEnd - 32)
     const root = new FbTable(header, header.readUInt32LE(0))
-    const sections = root.table(1)?.tables(0) ?? [] // section_metadata.objects
+    const sections = root.table(1)?.tables(0, MAX_SECTIONS) ?? [] // section_metadata.objects
     const out: LitertlmHeader = { ...NO_HEADER }
-    for (const s of sections) {
+    // Each metadata type comes from one section: the last that reads whole, as when every section was read in order
+    // and each overwrote the one before. Walked from the end that is the first, and the rest are not read at all.
+    const readTypes = new Set<number>()
+    for (let i = sections.length - 1; i >= 0; i--) {
+      const s = sections[i]
       const type = s.u8(3)
       if (type === SECTION_TFLITE_MODEL) {
-        const modelType = sectionStrings(s).get('model_type')?.toLowerCase()
+        const modelType = sectionString(s, 'model_type')?.toLowerCase()
         if (modelType === VISION_ENCODER) out.vision = true
         if (modelType === AUDIO_ENCODER) out.audio = true
         continue
       }
-      if (type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) continue
+      if ((type !== SECTION_EXECUTOR_METADATA && type !== SECTION_LLM_METADATA) || readTypes.has(type)) continue
       const begin = s.u64(1)
       const end = s.u64(2)
       if (end <= begin || end - begin > MAX_PROTO) continue
       const proto = await read(begin, end - begin)
       if (proto.length !== end - begin) continue // a cut-short file: its sections say nothing (not "no tools")
+      readTypes.add(type)
       if (type === SECTION_LLM_METADATA) {
         out.defaultCtx = llmMetadataMaxNumTokens(proto)
         out.toolCalls = llmMetadataToolCalls(proto)

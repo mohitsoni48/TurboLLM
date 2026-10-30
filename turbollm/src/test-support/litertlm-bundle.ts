@@ -102,13 +102,14 @@ function fbString(s: string): (w: FbWriter) => number {
   }
 }
 
-function fbTables(items: Array<(w: FbWriter) => number>): (w: FbWriter) => number {
+/** A vector of tables; with `repeat`, each table is written once and named that many times in a row. */
+function fbTables(items: Array<(w: FbWriter) => number>, repeat = 1): (w: FbWriter) => number {
   return (w) => {
     w.align(4)
     const p = w.pos
-    w.u32(items.length)
-    const slots = items.map(() => { const at = w.pos; w.u32(0); return at })
-    items.forEach((make, i) => { const c = make(w); w.patchU32(slots[i], c - slots[i]) })
+    w.u32(items.length * repeat)
+    const slots = items.map(() => Array.from({ length: repeat }, () => { const at = w.pos; w.u32(0); return at }))
+    items.forEach((make, i) => { const c = make(w); for (const at of slots[i]) w.patchU32(at, c - at) })
     return p
   }
 }
@@ -117,29 +118,33 @@ function fbTables(items: Array<(w: FbWriter) => number>): (w: FbWriter) => numbe
  *  ExecutorMetadataProto, ...), its string items (a TFLiteModel's model_type, backend_constraint) and its bytes. */
 export interface FakeSection { type: number; items?: Record<string, string>; data?: Buffer }
 
-/** A .litertlm with these sections: the 32-byte prefix, the header FlatBuffer, then each section's bytes. */
-export function fakeLitertlmBundleOf(sections: FakeSection[]): Buffer {
-  const DATA_START = 4096
-  const ranges: Array<[number, number]> = []
-  let at = DATA_START
-  for (const s of sections) { const n = s.data?.length ?? 16; ranges.push([at, at + n]); at += n }
-  const w = new FbWriter()
-  w.u32(0) // root offset, patched below
-  const kv = (key: string, value: string) => (wr: FbWriter) => fbTable(wr, [
-    { id: 0, child: fbString(key) },
-    { id: 1, u8: 9 }, // VData.StringValue
-    { id: 2, child: (w2) => fbTable(w2, [{ id: 0, child: fbString(value) }]) },
-  ])
-  const section = (s: FakeSection, i: number) => (wr: FbWriter) => fbTable(wr, [
-    ...(s.items ? [{ id: 0, child: fbTables(Object.entries(s.items).map(([k, v]) => kv(k, v))) }] : []),
-    { id: 1, u64: ranges[i][0] },
-    { id: 2, u64: ranges[i][1] },
-    { id: 3, u8: s.type },
-  ])
-  const root = fbTable(w, [{ id: 1, child: (wr) => fbTable(wr, [{ id: 0, child: fbTables(sections.map(section)) }]) }])
-  w.patchU32(0, root)
-  const header = Buffer.from(w.b)
-  if (32 + header.length > DATA_START) throw new Error('fake header too large')
+/** A .litertlm with these sections: the 32-byte prefix, the header FlatBuffer, then each section's bytes. `repeat`
+ *  names each section's table that many times in the header's vector, as a crafted header may. */
+export function fakeLitertlmBundleOf(sections: FakeSection[], repeat = 1): Buffer {
+  const build = (dataStart: number) => {
+    const ranges: Array<[number, number]> = []
+    let at = dataStart
+    for (const s of sections) { const n = s.data?.length ?? 16; ranges.push([at, at + n]); at += n }
+    const w = new FbWriter()
+    w.u32(0) // root offset, patched below
+    const kv = (key: string, value: string) => (wr: FbWriter) => fbTable(wr, [
+      { id: 0, child: fbString(key) },
+      { id: 1, u8: 9 }, // VData.StringValue
+      { id: 2, child: (w2) => fbTable(w2, [{ id: 0, child: fbString(value) }]) },
+    ])
+    const section = (s: FakeSection, i: number) => (wr: FbWriter) => fbTable(wr, [
+      ...(s.items ? [{ id: 0, child: fbTables(Object.entries(s.items).map(([k, v]) => kv(k, v))) }] : []),
+      { id: 1, u64: ranges[i][0] },
+      { id: 2, u64: ranges[i][1] },
+      { id: 3, u8: s.type },
+    ])
+    const root = fbTable(w, [{ id: 1, child: (wr) => fbTable(wr, [{ id: 0, child: fbTables(sections.map(section), repeat) }]) }])
+    w.patchU32(0, root)
+    return { ranges, at, header: Buffer.from(w.b) }
+  }
+  // The sections' bytes start at 4096, or past a header too large for that (the header's size does not depend on it).
+  let { ranges, at, header } = build(4096)
+  if (32 + header.length > 4096) ({ ranges, at, header } = build(Math.ceil((32 + header.length) / 4096) * 4096))
   const file = Buffer.alloc(at)
   file.write('LITERTLM', 0, 'latin1')
   file.writeUInt32LE(1, 8); file.writeUInt32LE(7, 12)
@@ -172,7 +177,10 @@ export function fakeLlmMetadata(fields: {
   }
   if (fields.maxNumTokens) out.push(...pVarint(5, fields.maxNumTokens))
   if (fields.modelType !== undefined) out.push(...pBytes(6, pBytes(fields.modelType, [])))
-  if (fields.template !== undefined) out.push(...pBytes(7, [...Buffer.from(fields.template, 'utf8')]))
-  if (fields.supportsFunctionCalling !== undefined) out.push(...pVarint(12, fields.supportsFunctionCalling ? 1 : 0))
-  return Buffer.from(out)
+  // The template is joined as a Buffer: one of up to a MiB is too many arguments for push().
+  const template = Buffer.from(fields.template ?? '', 'utf8')
+  if (fields.template !== undefined) out.push(...varint(7 * 8 + 2), ...varint(template.length))
+  const tail: number[] = []
+  if (fields.supportsFunctionCalling !== undefined) tail.push(...pVarint(12, fields.supportsFunctionCalling ? 1 : 0))
+  return Buffer.concat([Buffer.from(out), template, Buffer.from(tail)])
 }

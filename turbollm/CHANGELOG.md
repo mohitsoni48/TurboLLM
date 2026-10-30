@@ -70,6 +70,10 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   `items` nor `engineGenerating`. The Android app keeps the model loaded and the phone awake for all of that work
   (before, it could unload the model under a load, an auto-tune, a skill or a reply's title), and lets the phone sleep
   while a reply waits for an approval. Loading a text-classification model names each in its confirmation.
+- `GET /api/v1/activity` also carries `downloads` (the running and queued downloads: `name`, `status`, `received`,
+  `total`, `bytesPerSec`) and `status` (`engine.state`, `model.name`, `poolModels`, `jev.name`, `laya.name` and
+  `serving`, as `GET /api/v1/status` gives them), each only to a caller that may read that route, so the Android app's
+  service can ask one route every 3 s instead of three.
 - `.litertlm` downloads: a LiteRT-LM repo (e.g. `litert-community/…`) now lists its bundles in the repo view, a chosen
   bundle downloads as one file, a direct `.litertlm` link imports like a `.gguf` one, and model search is no longer
   limited to GGUF repos while LiteRT-LM is the active engine.
@@ -234,6 +238,26 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   check running. A check now gets 10 s, after which TurboLLM ends it and counts the CLI as installed (it was found
   and started), and requests made while a check runs share it. A routine whose CLI's check does not answer in those
   10 s is skipped ("Skipped (cli_unavailable)"), without touching the model.
+- `fetch_url` connects only to addresses it has checked. It looked a host up to check it and the connection looked it
+  up again, so a name answering a public address to the first lookup and 127.0.0.1 to the second (DNS rebinding), or
+  one whose first lookup failed, reached TurboLLM's own API or the local network. Each connection, a redirect's and a
+  search result's date check included, now looks the host up itself and is refused, with the same "blocked" error,
+  when an address is private.
+- `/v1/messages` (Claude Code and other Anthropic clients) leaves out no user turn. One holding only a PDF `document`
+  block, or an empty content array, was dropped, so the model answered the turn before it (and LiteRT-LM refused the
+  request), and a PDF beside text went without a word. A document with a text or content source is now sent as text,
+  (an image by URL is refused like a file source: the gateway never hands a caller's URL to the engine to fetch, which
+  would bypass fetch_url's SSRF policy). A PDF, URL or file document, or any other block the gateway cannot send, reaches
+  the model as a note saying what was there ("[a PDF document was attached here; this local model cannot read it]"),
+  so the conversation can go on, and so does a document inside a tool result (a PDF an agent reads with its Read
+  tool); only in the turn being answered, and when that turn holds nothing else, is it a 400 `invalid_request_error`
+  naming it. An empty content array gets the 400 in any turn. An image inside a tool result is still not sent.
+  `/v1/messages/count_tokens` does the same.
+- Extension API: appending a message with `generate: false` to a chat whose run is answering is refused with 409
+  `run_active` (retryable), as every other change to that chat is; it landed in the chat beside the run's reply.
+- Desktop app: a port changed in Settings is kept when the app starts again. Every launch put TurboLLM back on 6996
+  while Settings showed the saved port; `TURBOLLM_PORT`, when set, still wins. On macOS a window opened again (the
+  Dock, a second launch) after a port change opens on the new port, where it showed a connection error.
 
 ### Changed
 - **A model's Load settings save only what you changed.** Load, Save, "Remember these settings", Save as… (a preset)
@@ -335,8 +359,8 @@ published version on npm has a matching `vX.Y.Z` tag in git.
   (File > Exit on Windows, File > Quit or Ctrl+Q on Linux, Cmd+Q on macOS) stops it as before, and a downloaded app
   update is installed then. The first close shows a one-time notice. Launching the app again opens the window; on
   macOS a second launch from a terminal (or `open -n`) after the window was closed now opens one too, where it opened
-  nothing. On a Linux desktop without a tray, launching the app again is the way back, and the window's File menu has
-  Quit.
+  nothing. On a Linux desktop that shows no tray icons (GNOME without the AppIndicator extension), closing the window
+  minimizes it instead, and the notice says to quit from File > Quit.
 - **The text-classification playground's run continues in the daemon** (`POST`, `GET`, `DELETE ?id=` on
   `/api/v1/jev/playground/run`). Closing, reloading or leaving the page no longer stops it, a page that comes back
   shows it running or its answer, and a Cancel button stops it. A second run while one runs is refused and followed.

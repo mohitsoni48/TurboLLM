@@ -5,7 +5,7 @@
 // and with a Stop. Also here: a repository's own pi extensions no longer load into the daemon.
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, linkSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, join } from 'node:path'
 import { after, test } from 'node:test'
 import {
@@ -19,6 +19,7 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { createSearchToolDefinitions, findSearchTool, searchToolsFor } from './search-tools'
 import { toolsForMode } from './persona'
+import { renameWithRetry } from '../engines/download'
 import { stopTethered } from '../util/tether'
 import { isGone, killRecorded, pidWrittenTo, record, srcUrl, startStandInDaemon, waitGone } from '../test-support/stand-in-daemon'
 import { tmpGitRepo } from '../test-support/git-repo'
@@ -289,7 +290,7 @@ test('on Windows the lookup searches as libuv\'s spawn does: the cwd first, then
   assert.equal(findSearchTool('rg', win({ Path: '' })), join(dir, 'pi-bin', 'rg.exe'), 'pi\'s managed copy first, as rg.exe')
 })
 
-test('on Windows the lookup finds a program exactly when libuv\'s own spawn does', { skip: process.platform === 'win32' ? false : 'libuv\'s Windows search' }, () => {
+test('on Windows the lookup finds a program exactly when libuv\'s own spawn does', { skip: process.platform === 'win32' ? false : 'libuv\'s Windows search' }, async () => {
   // pi asks by running `<name> --version` (its commandExists): a copy of node.exe answers it. Each layout puts that
   // one program in one place; the lookup and libuv must agree on it, for both PATH values.
   const dir = tmpDir('tllm-search-libuv-')
@@ -312,7 +313,12 @@ test('on Windows the lookup finds a program exactly when libuv\'s own spawn does
       // NeedCurrentDirectoryForExePathW reads the daemon's own environment, so this sets it for the test process.
       if (skipCwd) process.env.NoDefaultCurrentDirectoryInExePath = '1'
       for (const at of layouts) {
-        renameSync(program, at)
+        // The program has just run, and hard-linked it is node.exe itself, which every node process of this job runs.
+        // Windows refuses a rename while another process holds the file open without FILE_SHARE_DELETE (EBUSY; EPERM
+        // or EACCES likewise), as a scanner or any other reader of a just-started program may for a moment (CI's
+        // Windows job saw it once). renameWithRetry waits that out, as the daemon's own installs do; a rename never
+        // allowed still fails here.
+        await renameWithRetry(program, at)
         program = at
         for (const PATH of paths) {
           const env = { ...base, PATH, ...(skipCwd ? { NoDefaultCurrentDirectoryInExePath: '1' } : {}) }

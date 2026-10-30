@@ -1286,9 +1286,19 @@ export function killTetheredSync(): void {
 /** A Code terminal's stand-alone watcher. node-pty forks the shell itself, so the shell cannot be given a lifeline
  *  fd; it is a session leader (node-pty calls setsid), so its pid names its session and its own process group.
  *  The watcher blocks on fd 3, whose other end only the daemon holds. When the daemon closes it (the terminal was
- *  closed, its shell exited, a graceful stop) or dies, it hangs up the shell, which forwards the hangup to its jobs,
- *  then after 1 s kills the shell's group (a launched agent CLI that ignores the hangup) and every process left in
- *  the session: background jobs in their own job-control groups, `nohup` jobs, a `(trap "" HUP; …) &`. Linux and
+ *  closed, its shell exited, a graceful stop) or dies, it hangs up the shell's group: the shell, which forwards the
+ *  hangup to its jobs, while it runs, and its group's other members. After 1 s it kills the shell's group (a
+ *  launched agent CLI that ignores the hangup) and every process left in the session: background jobs in their own
+ *  job-control groups, `nohup` jobs, a `(trap "" HUP; …) &`. A shell that exited has been reaped by node-pty by
+ *  then, so its pid may name another process, one that may lead a group and a session of that id (a job-control job,
+ *  a daemon): so the watcher reads the shell's start time as it starts (field 22 of /proc/<pid>/stat, else ps's
+ *  lstart), and once the pid names a process started at another time it signals nothing, checked before the hangup
+ *  and again before the kill and the sweep. While no process has the pid, what is left of a group and a session of
+ *  that id is taken to be the terminal's (its own jobs). That misses one case (Known): a process that got the pid,
+ *  made a group or a session of it, started others in it and exited before the check, as a daemon's middle fork or a
+ *  pipeline's first command may. Those others get the hangup, the kill and the sweep as the terminal's jobs do; only
+ *  keeping the pid taken until the watcher is done would close it, and it needs the pid reused in the moments
+ *  between the shell's exit and the watcher's kill. Linux and
  *  Termux read the session from /proc/<pid>/stat (field 6). macOS has neither /proc nor a pkill or ps that knows
  *  sessions (Apple's pkill refuses -s as an illegal option, and its ps's sess is always 0), and once the shell has
  *  exited nothing else ties its jobs to it (xnu clears the session's terminal then, and launchd adopts them): only
@@ -1303,8 +1313,10 @@ export function killTetheredSync(): void {
  *  (util/git-gc.ts). It unsets TMOUT first: where /bin/sh is bash (macOS, Fedora), bash's read takes an exported
  *  TMOUT for a timeout, and the terminal was ended TMOUT seconds after it opened. */
 export const PTY_WATCH = 'SID=$1; unset TMOUT; trap "" HUP INT TERM; exec </dev/null >/dev/null 2>&1; ' +
+  'st() { if [ -r "/proc/$SID/stat" ]; then read -r s < "/proc/$SID/stat" && set -- ${s##*) } && echo "${20}"; ' +
+  'else ps -o lstart= -p "$SID" 2>/dev/null; fi; }; ST=$(st); ours() { NOW=$(st); [ -z "$NOW" ] || [ "$NOW" = "$ST" ]; }; ' +
   'while read -r _; do :; done <&3; ' +
-  'kill -s HUP "$SID"; sleep 1; kill -s KILL -- -"$SID"; ' +
+  'ours || exit 0; kill -s HUP -- -"$SID"; sleep 1; ours || exit 0; kill -s KILL -- -"$SID"; ' +
   'if [ -d /proc/self ]; then for d in /proc/[0-9]*; do read -r s < "$d/stat" || continue; ' +
   'set -- ${s##*) }; [ "$4" = "$SID" ] && kill -s KILL "${d#/proc/}"; done; ' +
   'else P=/usr/bin/perl; [ -x "$P" ] || P=$(command -v perl) || exit 3; ' +

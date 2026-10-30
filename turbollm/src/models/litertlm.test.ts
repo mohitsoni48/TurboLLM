@@ -3,9 +3,11 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import {
+  blankJinjaStrings,
   hasLitertlmMagic,
   isLitertMagicNumber,
   isLitertlmFileName,
+  jinjaTagCode,
   jinjaTemplateReadsReasoning,
   jinjaTemplateTakesTools,
   litertlmEntryFor,
@@ -278,6 +280,115 @@ test('litertlmHeaderFromFile and litertlmEntryFor: whether the bundle\'s templat
   assert.equal(litertlmEntryFor('/m/a.litertlm', '/m', 10, 0, { reasoningHistory: false }).reasoningHistory, false)
   assert.equal(litertlmEntryFor('/m/b.litertlm', '/m', 10, 0, { reasoningHistory: true }).reasoningHistory, true)
   assert.equal('reasoningHistory' in litertlmEntryFor('/m/c.litertlm', '/m', 10, 0, { reasoningHistory: null }), false)
+})
+
+// ── reading a template in linear time ─────────────────────────────────────────────────────────
+//
+// Every scan reads each bundle's template (up to a MiB) for its tools and past reasoning, and both reads used plain
+// regexes that are quadratic on a crafted template. The rewrite must stay linear AND find the tags and string literals
+// those regexes found, in any template.
+
+/** The patterns as they were: the reference for "same tags, same literals". */
+const PLAIN_TAG = /\{[{%]([\s\S]*?)[}%]\}/g
+const PLAIN_STRING = /'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*"/g
+
+test('jinjaTagCode and blankJinjaStrings: the tags and string literals the plain patterns found, on random templates', () => {
+  // Pieces that open, close and half-open tags and literals, and escape quotes and line ends, in any order (a fixed
+  // seed, so a failure reproduces).
+  const pieces = [
+    '{{', '{%', '}}', '%}', '{', '}', '%', "'", '"', '\\', "\\'", '\\"', '\\\n', '\n', '\r', '\u2028', ' ', 'x',
+    'tools', '.reasoning_content', "['thinking']",
+  ]
+  let seed = 0x7e3a
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+  for (let i = 0; i < 5000; i++) {
+    const template = Array.from({ length: Math.floor(random() * 30) }, () => pieces[Math.floor(random() * pieces.length)]).join('')
+    const tags = jinjaTagCode(template)
+    assert.deepEqual(tags, [...template.matchAll(PLAIN_TAG)].map((m) => m[1]), JSON.stringify(template))
+    for (const code of [template, ...tags]) assert.equal(blankJinjaStrings(code), code.replace(PLAIN_STRING, '""'), JSON.stringify(code))
+  }
+})
+
+// Each template is quadratic for one of the old patterns: the old code took from 14 seconds to over a minute per bundle
+// here, the new code a few milliseconds. The bound is far above the latter, so a loaded CI machine can't trip it. A
+// bundle's template can be four times this size, which took the old code minutes.
+const HOSTILE_BOUND_MS = 1_000
+const hostile = (unit: string, before = '', after = '') =>
+  before + unit.repeat(Math.floor((256 * 1024 - before.length - after.length) / unit.length)) + after
+const HOSTILE_TEMPLATES: Record<string, string> = {
+  'expression openers with no closer': hostile('{{'),
+  'statement openers with no closer': hostile('{%'),
+  'both openers': hostile('{{{%'),
+  'a quote that never closes, in a tag': hostile("\\'", "{{ '", ' }}'),
+  'a double quote that never closes, in a tag': hostile('\\"', '{{ "', ' }}'),
+}
+for (const [name, template] of Object.entries(HOSTILE_TEMPLATES)) {
+  test(`litertlmHeaderFromFile stays linear on a crafted template: ${name}`, async (t) => {
+    const p = join(scratch(t), 'crafted.litertlm')
+    writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ template }) }]))
+    const start = performance.now()
+    const h = await litertlmHeaderFromFile(p)
+    const ms = performance.now() - start
+    assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+    // Read, not skipped as too large: both answers come from the template.
+    assert.equal(h.toolCalls, false)
+    assert.equal(h.reasoningHistory, false)
+  })
+}
+
+// A header lists its sections in a FlatBuffer vector, which may name one table again and again: read each time, one
+// crafted 1 MiB LlmMetadata section had its template scanned some 260,000 times per model scan (hours). Each metadata
+// type is now read from one section, the one the header's last word gives, and a vector past its bound is no header.
+test('litertlmHeaderFromFile reads a section the header lists many times once: a crafted header cannot multiply the template scan', async (t) => {
+  const p = join(scratch(t), 'repeated.litertlm')
+  // The costliest template for the linear scans: a tag of empty string literals, each blanked.
+  writeFileSync(p, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096, template: hostile("''", '{{ ', ' }}') }) }], 1000))
+  const start = performance.now()
+  const h = await litertlmHeaderFromFile(p)
+  const ms = performance.now() - start
+  assert.ok(ms < HOSTILE_BOUND_MS, `took ${Math.round(ms)} ms`)
+  assert.equal(h.defaultCtx, 4096)
+  assert.equal(h.toolCalls, false)
+})
+
+test('litertlmHeaderFromFile: the last metadata section that reads whole is the one, as before', async (t) => {
+  const dir = scratch(t)
+  const bundle = fakeLitertlmBundleOf([
+    { type: 5, data: fakeLlmMetadata({ maxNumTokens: 1024, template: '{{ tools }}' }) },
+    { type: 3, items: { model_type: 'tf_lite_vision_encoder' } },
+    { type: 5, data: fakeLlmMetadata({ maxNumTokens: 2048, template: 'no tags' }) },
+  ])
+  const whole = join(dir, 'whole.litertlm')
+  writeFileSync(whole, bundle)
+  const h = await litertlmHeaderFromFile(whole)
+  assert.deepEqual([h.defaultCtx, h.toolCalls, h.vision], [2048, false, true])
+  // The last section's bytes cut short: the one before it speaks.
+  const cut = join(dir, 'cut.litertlm')
+  writeFileSync(cut, bundle.subarray(0, bundle.length - 1))
+  const c = await litertlmHeaderFromFile(cut)
+  assert.deepEqual([c.defaultCtx, c.toolCalls, c.vision], [1024, true, true])
+})
+
+test('litertlmHeaderFromFile: a header listing more sections, or a section more items, than any bundle carries is no header', async (t) => {
+  const dir = scratch(t)
+  const many = join(dir, 'many.litertlm')
+  writeFileSync(many, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096 }) }], 1025))
+  assert.equal((await litertlmHeaderFromFile(many)).defaultCtx, 0)
+  // model_type and n - 1 other items.
+  const itemsOf = (n: number) => ({ ...Object.fromEntries(Array.from({ length: n - 1 }, (_, i) => [`key_${i}`, 'value'])), model_type: 'tf_lite_vision_encoder' })
+  const wide = join(dir, 'wide.litertlm')
+  writeFileSync(wide, fakeLitertlmBundleOf([{ type: 3, items: itemsOf(257) }]))
+  assert.equal((await litertlmHeaderFromFile(wide)).vision, false)
+  // At the bounds, read as ever.
+  writeFileSync(many, fakeLitertlmBundleOf([{ type: 5, data: fakeLlmMetadata({ maxNumTokens: 4096 }) }], 1024))
+  assert.equal((await litertlmHeaderFromFile(many)).defaultCtx, 4096)
+  writeFileSync(wide, fakeLitertlmBundleOf([{ type: 3, items: itemsOf(256) }]))
+  assert.equal((await litertlmHeaderFromFile(wide)).vision, true)
 })
 
 // ── the bundle's own sampler ──────────────────────────────────────────────────────────────────

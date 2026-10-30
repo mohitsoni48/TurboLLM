@@ -16,6 +16,8 @@ import { prunePresets, setModelProfile, getModelProfile, VRAM_HEADROOM_SPILL_MB,
 import type { Manager, StartOpts } from '../engines/manager'
 import type { Registry } from '../engines/registry'
 import type { Engine } from '../config/config'
+import { backendIdFromBinPath } from '../engines/update'
+import { isEngineInBuildDir } from '../engines/build-runner'
 import type { Scanner, ModelEntry } from '../models/scanner'
 import { automaticProfile, deriveDefault, deriveTensorSplit, estimateVram, estimateVramPerGpu, gpuBudgetMb, legacySeedProfile, mergeUserSet, profileToArgs, resolveProfile, userSetProfile, type GpuProfile, type LoadProfile } from '../models/profile'
 import { isSpilling, spillFloor, spillMb } from './spill'
@@ -218,6 +220,10 @@ export class BenchRunner {
   private engine: Engine | null = null
   private engineSwitched: string | null = null
   private deadline = 0
+  // For a single-GPU tune where the engine may number the cards otherwise than nvidia-smi (vramCardFor undefined): the
+  // card the engine's loads at a `--main-gpu` were seen to go to in this run (readLoadVram), by binary and main GPU.
+  // Learnt from one load, it holds for the next, a load too small to tell (ngl=0) included.
+  private loadCards = new Map<string, number>()
   // Aborts the in-flight measurement request the instant cancel() is called, so a
   // stop/restart/load (kill switches) interrupts auto-tune immediately rather than
   // waiting out the current candidate's request.
@@ -294,6 +300,62 @@ export class BenchRunner {
 
   private heldPath(): string {
     return join(this.store.dir(), HELD_RESULT_FILE)
+  }
+
+  /** The folder TurboLLM builds engines into (build-runner.ts: `<data dir>/engines/build/<slug>/`). */
+  private buildRoot(): string {
+    return join(this.store.dir(), 'engines', 'build')
+  }
+
+  /** The card a single-GPU ('none') load of `profile` goes to on a box of more than one, into sysinfo's list and the
+   *  readers' alike: card N where the engine numbers the cards as listed (vramCardFor), else the one such loads were
+   *  seen to go to in this run (loadCards). Undefined for a layer/row split, a one-GPU box, or before a load showed it. */
+  private loadCard(sys: SysInfo, profile: LoadProfile, engine: Engine): VramCard | undefined {
+    if (sys.gpus.length < 2 || profile.gpu.splitMode !== 'none') return undefined
+    const listed = vramCardFor(sys, profile, engine, process.env, this.buildRoot())
+    if (listed) return listed
+    const seen = this.loadCards.get(`${engine.binPath}\0${profile.gpu.mainGpu}`)
+    return seen === undefined ? undefined : { index: seen, of: sys.gpus.length }
+  }
+
+  /** What a load of `base` is judged against: gpuBudgetMb, but for a single-GPU split, once the card its loads go to is
+   *  known (loadCard), that card's memory. Where the engine numbers the cards otherwise than sysinfo, that is not card
+   *  N's: its reading against card N's memory counted another card's size as this one's. */
+  private budgetFor(sys: SysInfo, base: LoadProfile): number {
+    const card = this.engine ? this.loadCard(sys, base, this.engine) : undefined
+    return sys.gpus[card?.index ?? -1]?.vramMb ?? gpuBudgetMb(sys, base)
+  }
+
+  /** Each card's VRAM use before a load of `profile`, for readLoadVram to see which card it grows; null when the
+   *  load's card is known already, or for a split that reads the sum anyway. */
+  private async vramBeforeLoad(sys: SysInfo, profile: LoadProfile, engine: Engine): Promise<number[] | null> {
+    if (sys.gpus.length < 2 || profile.gpu.splitMode !== 'none' || this.loadCard(sys, profile, engine)) return null
+    return readGpuVramPerCardMb(sys)
+  }
+
+  /** The VRAM in use with a load of `profile` up, in MB, and the card it is of (an index into sys.gpus, whose memory
+   *  is its budget): the load's card alone when it is known, or when `before` (vramBeforeLoad) shows which card the
+   *  load grew (cardThatGrew; learnt for the rest of the run). Else the sum over the cards: conservative, as it counts
+   *  the other cards' memory as the load's, until a load shows its card. The sum alone counted it on every probe
+   *  wherever the engine might number the cards otherwise, so another program's memory on another card failed every
+   *  single-GPU candidate; and card N alone was another card than the engine's there. */
+  private async readLoadVram(
+    sys: SysInfo, profile: LoadProfile, engine: Engine, before: number[] | null,
+  ): Promise<{ vramAbsMb: number | null; card?: number }> {
+    const after = await readGpuVramPerCardMb(sys)
+    if (after === null) return { vramAbsMb: null }
+    let card = this.loadCard(sys, profile, engine)
+    // Only a single-GPU load has one card to learn: a layer or row split's (measure reads `before` for every split)
+    // grows them all, and its reading is the summed pool it is judged against.
+    if (!card && before !== null && sys.gpus.length > 1 && profile.gpu.splitMode === 'none' && after.length === sys.gpus.length) {
+      const grew = cardThatGrew(before, after)
+      if (grew !== undefined) {
+        this.loadCards.set(`${engine.binPath}\0${profile.gpu.mainGpu}`, grew)
+        card = { index: grew, of: sys.gpus.length }
+      }
+    }
+    const mb = Math.round(sumCards(after, card))
+    return { vramAbsMb: mb > 0 ? mb : null, card: card && after.length === card.of ? card.index : undefined }
   }
 
   /** Write the held result to disk (see `winning`), as the daemon's other state files are written: a temp file of this
@@ -515,6 +577,7 @@ export class BenchRunner {
     this.cancelled = false
     this.engine = active
     this.engineSwitched = null
+    this.loadCards.clear()
     this.abort = new AbortController()
     this.winning = null
     this.dropHeld()
@@ -738,8 +801,9 @@ export class BenchRunner {
     // single-GPU 'none' split (ADR-054). The headroom gate must judge against THIS, not the summed
     // pool — else a 14 GB single-GPU load looks safe against a 30 GB total when it's at one card's
     // edge. Computed unconditionally (0 on a CPU-only box) so the Phase-2 re-check below can reuse
-    // it too (ADR-217) — `overHeadroom` treats a ≤0 budget as "never over".
-    const budgetMb = gpuBudgetMb(sys, base)
+    // it too (ADR-217) — `overHeadroom` treats a ≤0 budget as "never over". Taken again after each
+    // load: a single-GPU split's card can be learnt from one (budgetFor).
+    let budgetMb = this.budgetFor(sys, base)
     // Host memory this config pins regardless of offload, measured from the probes below.
     let spillFloorMb: number | null = null
     // True when budgetMb/vramAbsMb below are a multi-GPU SUM (a layer/row split across >1 card)
@@ -770,6 +834,7 @@ export class BenchRunner {
         const probe = await this.probeVram(entry, sys, { ...base, ngl: mid }, caps)
         this.pushProbe(results, base, 'ngl', mid, probe)
         await this.settleGpu(sys)
+        budgetMb = this.budgetFor(sys, base)
         // Learn this config's fixed host-memory cost from probes that had VRAM to spare, so the
         // near-the-ceiling candidate the search is heading for isn't rejected for it (see spillFloor).
         spillFloorMb = spillFloor(spillFloorMb, probe.spillMb, probe.vramAbsMb, budgetMb, pooled)
@@ -788,6 +853,7 @@ export class BenchRunner {
 
     if (bestNgl === null) return null
     let found = await this.benchAt(entry, sys, { ...base, ngl: bestNgl }, caps, results, `ngl=${bestNgl}`)
+    budgetMb = this.budgetFor(sys, base)
     // Phase 2 (the actual timed run) can allocate more VRAM than Phase 1's load-only probe did
     // (lazy cuBLAS/graph-capture scratch buffers) — re-validate against the REAL post-generation
     // VRAM and back off one layer if it silently blew through the user's headroom (ADR-217).
@@ -834,7 +900,7 @@ export class BenchRunner {
     const derived = deriveDefault(entry, sys)
     const maxN = entry.blockCount > 0 ? entry.blockCount : (derived.nCpuMoe || 0)
     // VRAM budget for THIS split (one card for single-GPU 'none', summed pool otherwise) — see denseSearch.
-    const budgetMb = gpuBudgetMb(sys, base)
+    let budgetMb = this.budgetFor(sys, base)
     // --- SPILL CALIBRATION (ADR-348 follow-up) -------------------------------------------------
     // Absolute VRAM alone cannot tell "fits" from "spilling": once the driver falls back to host
     // memory the reading pins at the card ceiling and stops responding to placement entirely
@@ -887,6 +953,7 @@ export class BenchRunner {
       const probe = await this.probeVram(entry, sys, { ...base, nCpuMoe: mid }, caps)
       this.pushProbe(results, base, 'nCpuMoe', mid, probe)
       await this.settleGpu(sys)
+      budgetMb = this.budgetFor(sys, base)
       // Learn this config's fixed host-memory cost from probes that had VRAM to spare, so the
       // near-the-ceiling candidate the search is heading for isn't rejected for it (see spillFloor).
       spillFloorMb = spillFloor(spillFloorMb, probe.spillMb, probe.vramAbsMb, budgetMb, pooled)
@@ -929,6 +996,7 @@ export class BenchRunner {
       }
       if (n < maxN) this.emit(`nCpuMoe=${n} failed to bench (${results[results.length - 1]?.outcome ?? 'crash'}) — retrying at nCpuMoe=${n + 1}`)
     }
+    budgetMb = this.budgetFor(sys, base)
     // Same Phase-1-vs-Phase-2 VRAM gap as above — back off (more CPU experts, less VRAM) one
     // step if the real measured run blew through headroom (ADR-217).
     // Two ways the real run can invalidate a config the load-only probe accepted: it can exceed the
@@ -1003,6 +1071,7 @@ export class BenchRunner {
     // GPU, and assuming a fixed baseline would be wrong there (measured 157-198 MB across models on
     // a dedicated card, far higher with a display attached).
     const sharedBefore = await readGpuSharedMb(sys)
+    const vramBefore = await this.vramBeforeLoad(sys, profile, active)
     try {
       await this.startEngine(opts)
     } catch {
@@ -1013,7 +1082,7 @@ export class BenchRunner {
     let spill: number | null = null
     if (outcome === 'ok') {
       await sleep(800) // let the allocator settle so the readings are final
-      vramAbsMb = await readGpuVramMb(sys, profile)
+      vramAbsMb = (await this.readLoadVram(sys, profile, active, vramBefore)).vramAbsMb
       spill = spillMb(sharedBefore, await readGpuSharedMb(sys))
     }
     await this.stopEngine()
@@ -1124,7 +1193,7 @@ export class BenchRunner {
       extraArgs: profileToArgs(profile, entry, caps, sys.cores, sys, active.binPath),
     }
 
-    const vramBefore = await readGpuVramMb(sys, profile)
+    const cardsBefore = await readGpuVramPerCardMb(sys)
     const sharedBefore = await readGpuSharedMb(sys)
     phase('loading model…')
     try {
@@ -1162,7 +1231,10 @@ export class BenchRunner {
     }
     phase('measuring t/s…')
     const measured = await this.runChatWatched(target, benchMessages, 128, remaining(), logPath)
-    const vramAfter = await readGpuVramMb(sys, profile)
+    const { vramAbsMb: vramAfter, card } = await this.readLoadVram(sys, profile, active, cardsBefore)
+    // The same card's use before the load (or the same sum), for the load's own share.
+    const before = cardsBefore === null ? 0 : Math.round(sumCards(cardsBefore, card === undefined ? undefined : { index: card, of: sys.gpus.length }))
+    const vramBefore = before > 0 ? before : null
     // Read spill BEFORE stopping the engine — this is the real-run figure the Phase-1 probe cannot
     // see, since the probe never generates and so never allocates the prefill compute buffers.
     const sharedAfter = await readGpuSharedMb(sys)
@@ -2157,10 +2229,44 @@ export interface VramCard {
 /** The card a single-GPU ('none') split runs on, indexed exactly like `gpuBudgetMb` so the
  *  reading and the budget it is judged against describe the SAME card (a summed reading against
  *  one card's budget counted the other cards' desktop/browser/ComfyUI memory as this card's).
- *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool. */
-export function vramCardFor(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): VramCard | undefined {
+ *  Undefined for a layer/row split or a one-GPU box, whose budget is the summed pool, and where
+ *  the engine may number the cards otherwise (see {@link numbersCardsAsListed}): there the bench
+ *  takes the card a load grows as the load's (BenchRunner.readLoadVram, {@link cardThatGrew}). */
+export function vramCardFor(
+  sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>, engine?: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'>, env: NodeJS.ProcessEnv = process.env,
+  buildRoot?: string,
+): VramCard | undefined {
   if (sys.gpus.length < 2 || p?.gpu?.splitMode !== 'none') return undefined
+  if (!numbersCardsAsListed(sys, engine, env, buildRoot)) return undefined
   return { index: p.gpu.mainGpu >= 0 ? p.gpu.mainGpu : 0, of: sys.gpus.length }
+}
+
+/** The variables that renumber the cards a CUDA or ROCm engine sees, which nvidia-smi and rocm-smi ignore (HIP takes
+ *  GPU_DEVICE_ORDINAL as well). */
+const DEVICE_SELECTION_VARS = ['CUDA_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'GPU_DEVICE_ORDINAL']
+
+/** Whether the engine's `--main-gpu N` is card N of the readers' lists (nvidia-smi's and rocm-smi's, in PCI bus
+ *  order, as sysinfo's). A CUDA build numbers the fastest card first (CUDA_DEVICE_ORDER's default, FASTEST_FIRST), so
+ *  on a box of two models its card 0 can be the listing's card 1; a Vulkan build numbers them in the Vulkan loader's
+ *  order, which puts the GPU driving the display first (Mesa's device-select layer, Windows' adapter order) even among
+ *  cards of one model; and the variables above renumber them. Card N of the listing was then another card than the
+ *  engine's, and its reading too low, so card N is read as the engine's only where the two orders are very unlikely
+ *  to differ: a CUDA or ROCm build on cards all of one model (FASTEST_FIRST leaves the order of equal cards
+ *  unspecified, PCI order in practice), with none of those variables set. Elsewhere the card a load grows is taken
+ *  as its own (BenchRunner.readLoadVram). The build is known by an official install's directory, or as one
+ *  TurboLLM compiled, which is CUDA: inside `buildRoot`, the folder its builds go to (`<data dir>/engines/build`, as
+ *  build-runner.ts places them), and with the source it was built from, not a release install there. A sourceRepo
+ *  alone proves nothing: any engine can be given one (registry.setSource), and an `engines/build` folder of another
+ *  project is not TurboLLM's. */
+function numbersCardsAsListed(
+  sys: SysInfo, engine: Pick<Engine, 'binPath' | 'sourceRepo' | 'release'> | undefined, env: NodeJS.ProcessEnv, buildRoot: string | undefined,
+): boolean {
+  const [first] = sys.gpus
+  if (sys.gpus.some((g) => g.name !== first.name || g.vramMb !== first.vramMb)) return false
+  if (DEVICE_SELECTION_VARS.some((v) => env[v] !== undefined)) return false
+  const builtHere = !!buildRoot && !!engine?.sourceRepo && !engine.release && isEngineInBuildDir(engine.binPath, buildRoot)
+  const backend = backendIdFromBinPath(engine?.binPath ?? '') || (builtHere ? 'cuda' : '')
+  return backend === 'cuda' || backend === 'rocm'
 }
 
 /** Sum of per-card readings — or only `card`'s, when given and the tool listed exactly as many
@@ -2171,16 +2277,36 @@ function sumCards(perCard: number[], card?: VramCard): number {
   return picked.reduce((a, b) => a + b, 0)
 }
 
-/** Pure parser for `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits` (one MB
- *  figure per GPU, in the same order sysinfo enumerated them from the same tool). Sums every
- *  GPU, or reads just `card` (see {@link sumCards}). Null when nothing positive was read. */
-export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | null {
-  const perCard = stdout
+/** How much a load must grow one card's VRAM for that card to be taken as the load's ({@link cardThatGrew}): more
+ *  than the context a CUDA or Vulkan engine may open on each card it sees. */
+const LOAD_CARD_MIN_GROWTH_MB = 256
+
+/** The card a single-GPU load went to, from each card's VRAM use before it and with it up (in the readers' order,
+ *  sysinfo's): the one that grew by most, when it grew by at least {@link LOAD_CARD_MIN_GROWTH_MB} and by twice as
+ *  much as any other card (the engine's context on the others, another program allocating meanwhile). Undefined when
+ *  the two do not line up or no card stands out. */
+export function cardThatGrew(before: number[], after: number[]): number | undefined {
+  if (before.length !== after.length || after.length < 2) return undefined
+  const growth = after.map((a, i) => a - before[i])
+  const top = growth.indexOf(Math.max(...growth))
+  const others = Math.max(0, ...growth.filter((_, i) => i !== top))
+  return growth[top] >= LOAD_CARD_MIN_GROWTH_MB && growth[top] >= 2 * others ? top : undefined
+}
+
+/** Pure parser for `nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits`: one MB figure per GPU, in
+ *  the same order sysinfo enumerated them from the same tool (an unreadable one as 0). */
+export function parseNvidiaVramPerCard(stdout: string): number[] {
+  return stdout
     .trim()
     .split('\n')
     .map((l) => parseInt(l.trim(), 10))
     .map((n) => (Number.isFinite(n) ? n : 0))
-  const total = sumCards(perCard, card)
+}
+
+/** The same output summed over every GPU, or just `card`'s (see {@link sumCards}). Null when nothing positive was
+ *  read. */
+export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | null {
+  const total = sumCards(parseNvidiaVramPerCard(stdout), card)
   return total > 0 ? total : null
 }
 
@@ -2188,56 +2314,68 @@ export function parseNvidiaVramUsed(stdout: string, card?: VramCard): number | n
 // are daemon timers, so a probe hung on a wedged driver outlived a daemon that died meanwhile.
 const probeExecFile = tetheredExecFile({ kind: 'probe' })
 
-/** Best-effort current NVIDIA VRAM use in MB (sum across GPUs, or one `card`). Null on non-NVIDIA
- *  or when nvidia-smi is absent — never throws (spec 09 §1). */
-function readNvidiaVramMb(card?: VramCard): Promise<number | null> {
+/** Best-effort current NVIDIA VRAM use in MB, per GPU. Null on non-NVIDIA or when nvidia-smi is
+ *  absent — never throws (spec 09 §1). */
+function readNvidiaVramPerCardMb(): Promise<number[] | null> {
   return probeExecFile('nvidia-smi', ['--query-gpu=memory.used', '--format=csv,noheader,nounits'], { timeout: 8000, windowsHide: true })
-    .then(({ stdout }) => (stdout ? parseNvidiaVramUsed(stdout, card) : null), () => null)
+    .then(({ stdout }) => (stdout ? parseNvidiaVramPerCard(stdout) : null), () => null)
 }
 
 /** Pure parser for `rocm-smi --showmeminfo vram --json` output, split out for direct testing
- *  (mirrors `sysinfo.ts`'s `parseRocmSmi`). Sums "VRAM Total Used Memory (B)" across every card,
- *  or reads just `card` (see {@link sumCards}).
- *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
-export function parseRocmVramUsed(memJson: string, card?: VramCard): number | null {
+ *  (mirrors `sysinfo.ts`'s `parseRocmSmi`): each card's "VRAM Total Used Memory (B)" in MB (a card
+ *  without it as 0). Null on unparseable JSON. */
+export function parseRocmVramPerCard(memJson: string): number[] | null {
   try {
     const mem = JSON.parse(memJson) as Record<string, Record<string, string>>
     const perCard: number[] = []
     for (const fields of Object.values(mem)) {
       const usedKey = Object.keys(fields).find((k) => /VRAM Total Used Memory/i.test(k))
       const bytes = usedKey ? parseInt(String(fields[usedKey]).trim(), 10) || 0 : 0
-      perCard.push(bytes)
+      perCard.push(bytes / 1e6)
     }
-    const mb = Math.round(sumCards(perCard, card) / 1e6)
-    return mb > 0 ? mb : null
+    return perCard
   } catch {
     return null
   }
 }
 
-/** Best-effort current AMD VRAM use in MB (sum across cards) via ROCm's rocm-smi. Null when
+/** The same output summed across every card, or just `card`'s (see {@link sumCards}), in MB.
+ *  Null on unparseable JSON or when no card reports a positive used-memory figure. */
+export function parseRocmVramUsed(memJson: string, card?: VramCard): number | null {
+  const perCard = parseRocmVramPerCard(memJson)
+  const mb = perCard === null ? 0 : Math.round(sumCards(perCard, card))
+  return mb > 0 ? mb : null
+}
+
+/** Best-effort current AMD VRAM use in MB, per card, via ROCm's rocm-smi. Null when
  *  rocm-smi is absent (ROCm not installed) or its output can't be parsed — never throws.
  *  Mirrors `sysinfo.ts`'s `parseRocmSmi` (same `--showmeminfo vram --json` call), reading
  *  "VRAM Total Used Memory (B)" instead of "VRAM Total Memory (B)" (ADR-217: before this, the
- *  headroom gate had zero VRAM protection on AMD — {@link readNvidiaVramMb} silently returned
+ *  headroom gate had zero VRAM protection on AMD — nvidia-smi's reading silently came back
  *  null on every AMD box and {@link overHeadroom} treats unknown VRAM as "never over"). */
-function readRocmVramMb(card?: VramCard): Promise<number | null> {
+function readRocmVramPerCardMb(): Promise<number[] | null> {
   return probeExecFile('rocm-smi', ['--showmeminfo', 'vram', '--json'], { timeout: 8000, windowsHide: true })
-    .then(({ stdout }) => (stdout ? parseRocmVramUsed(stdout, card) : null), () => null)
+    .then(({ stdout }) => (stdout ? parseRocmVramPerCard(stdout) : null), () => null)
 }
 
-/** Best-effort current GPU VRAM use in MB (sum across GPUs — or, given a single-GPU profile `p`,
- *  just that profile's card, see {@link vramCardFor}), vendor-aware (ADR-217). Tries
- *  nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`), then
- *  falls back to rocm-smi only when the box has a known AMD GPU. Null when neither applies
- *  (Intel/Apple/CPU-only, or no live VRAM reader for that vendor) — matches
- *  {@link overHeadroom}'s "unknown VRAM never blocks" contract. Never throws. */
-async function readGpuVramMb(sys: SysInfo, p?: Pick<LoadProfile, 'gpu'>): Promise<number | null> {
-  const card = vramCardFor(sys, p)
-  const nv = await readNvidiaVramMb(card)
-  if (nv !== null) return nv
-  if (sys.gpus.some((g) => g.vendor === 'amd')) return readRocmVramMb(card)
-  return null
+/** Best-effort current GPU VRAM use in MB per card, in sysinfo's order, vendor-aware (ADR-217).
+ *  Tries nvidia-smi first (unconditionally — cheap to attempt, and correct even without `sys`),
+ *  then falls back to rocm-smi only when the box has a known AMD GPU. Null when neither reads a
+ *  positive figure (Intel/Apple/CPU-only, or no live VRAM reader for that vendor). Never throws. */
+async function readGpuVramPerCardMb(sys: SysInfo): Promise<number[] | null> {
+  const nv = await readNvidiaVramPerCardMb()
+  if (nv !== null && nv.some((n) => n > 0)) return nv
+  if (!sys.gpus.some((g) => g.vendor === 'amd')) return null
+  const amd = await readRocmVramPerCardMb()
+  return amd !== null && amd.some((n) => n > 0) ? amd : null
+}
+
+/** Best-effort current GPU VRAM use in MB, summed across GPUs (settleGpu's reading). Null when
+ *  nothing is read. Never throws. */
+async function readGpuVramMb(sys: SysInfo): Promise<number | null> {
+  const perCard = await readGpuVramPerCardMb(sys)
+  const mb = perCard === null ? 0 : Math.round(sumCards(perCard))
+  return mb > 0 ? mb : null
 }
 
 /** Sums host-backed ("shared") GPU memory across every adapter and prints it in MB. Summing rather

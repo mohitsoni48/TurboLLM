@@ -5,17 +5,31 @@
 // only quitting the app stops the daemon (window-lifecycle.js).
 const { app, BrowserWindow, Menu, Notification, Tray, dialog, nativeImage, session, shell } = require('electron')
 const { join } = require('path')
-const { spawn } = require('child_process')
+const { homedir } = require('os')
+const { execFile, spawn } = require('child_process')
 const http = require('http')
-const { existsSync } = require('fs')
+const { existsSync, readFileSync } = require('fs')
 const { createDaemonSupervisor, daemonSpawnSpec, dataDirInUseNotice, configAccessNotice } = require('./daemon-supervisor')
-const { allowPermission, appOriginFor, daemonPortFor, isAppUrl, isWebUrl } = require('./window-guards')
+const { allowPermission, appOriginFor, daemonPortFor, decodeConfigText, isAppUrl, isWebUrl, launchPortFor, recordedPortFor } = require('./window-guards')
 const {
-  TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction, quitsWhenAllClosed,
-  trayMenuTemplate, usesTray,
+  MINIMIZED_NOTICE, TRAY_ICON, TRAY_NOTICE, TRAY_NOTICE_FILE, closeAction, createTrayNotice, openAction,
+  probeStatusNotifierHost, quitsWhenAllClosed, trayMenuTemplate, usesTray,
 } = require('./window-lifecycle')
 
-const PORT = process.env.TURBOLLM_PORT || 6996
+// The daemon's data folder, which holds its config.json and its pidfile: ~/.turbollm, as the app passes no --config.
+const DATA_DIR = join(homedir(), '.turbollm')
+
+/** A file of the daemon's data folder, decoded as the daemon decodes its config.json, or '' when it cannot be read. */
+function readDataFile (name) {
+  try {
+    return decodeConfigText(readFileSync(join(DATA_DIR, name)))
+  } catch {
+    return ''
+  }
+}
+
+// TURBOLLM_PORT, else the port saved in Settings, else 6996 (window-guards.js launchPortFor).
+const PORT = launchPortFor(process.env.TURBOLLM_PORT, readDataFile('config.json'))
 const APP_ORIGIN = appOriginFor(PORT)
 
 // ── Locate daemon files ───────────────────────────────────────────────────────
@@ -208,10 +222,16 @@ function stderrOf (child) {
 }
 
 // PORT until a port change in Settings moves the live daemon and then the window (window-guards.js
-// daemonPortFor); from then on the window's port, so a respawn comes back where the window is.
+// daemonPortFor); from then on the window's port, so a respawn comes back where the window is. With no window (macOS
+// after a close) the port the running daemon recorded, else the last one known: a window opened again loaded PORT,
+// which nothing listened on after a port change.
+let knownPort = PORT
 function daemonPort () {
   const url = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents.getURL() : ''
-  return daemonPortFor(url, APP_ORIGIN, PORT)
+  const daemon = supervisor && supervisor.current()
+  const recorded = daemon ? recordedPortFor(readDataFile('daemon.pid'), daemon.pid) : null
+  knownPort = daemonPortFor(url, APP_ORIGIN, recorded ?? knownPort)
+  return knownPort
 }
 
 // Set once the daemon was refused because another TurboLLM holds the data dir, or because it may not read or
@@ -264,6 +284,28 @@ let quitting = false
 // its icon with it.
 let tray = null
 let trayNotice = null
+// Linux: whether the desktop shows this app's tray icon (window-lifecycle.js probeStatusNotifierHost); until the
+// session bus has said so, a close minimizes the window rather than hide it under an icon that may show nowhere.
+let trayShown = process.platform !== 'linux'
+// The answer at launch, while `new Tray()` asked the bus the same: Electron's icon registers with a tray only then, and
+// again with one that comes back after; with none at launch it falls back for good to a GTK status icon, which those
+// desktops show nowhere. So a tray that first appears later shows no icon of this app: the launch answer is a ceiling.
+let trayAtLaunch = null
+let trayProbe = null
+// Asks the session bus again, unless it is being asked: at launch, and at each close of the window, so that the next
+// close follows a tray that went since (the AppIndicator extension turned off), or came back.
+function probeTray () {
+  if (process.platform !== 'linux' || trayProbe) return
+  trayProbe = probeStatusNotifierHost({ execFile })
+    .then((shown) => {
+      if (trayAtLaunch === null) trayAtLaunch = shown
+      trayShown = trayAtLaunch && shown
+    }, (err) => {
+      if (trayAtLaunch === null) trayAtLaunch = false
+      console.error('Could not ask the session bus for a tray:', err.message)
+    })
+    .then(() => { trayProbe = null })
+}
 
 // The one place a window is opened or brought back: the tray's Open, a click on the tray icon, a
 // second launch, a Dock click and the startup window once the daemon answers.
@@ -277,6 +319,7 @@ function openMainWindow () {
     return
   }
   if (action !== 'create') return
+  const port = daemonPort()
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -291,16 +334,21 @@ function openMainWindow () {
   })
   guardWindow(mainWindow)
   const win = mainWindow
-  // Windows and Linux: a close hides the window into the tray and the daemon keeps running; Quit is
-  // what stops it. During a quit the close goes through (see window-lifecycle.js closeAction).
+  // Windows and Linux: a close hides the window into the tray (minimizes it on a Linux desktop that shows no tray
+  // icon) and the daemon keeps running; Quit is what stops it. During a quit the close goes through (see
+  // window-lifecycle.js closeAction).
   win.on('close', (event) => {
-    if (closeAction({ platform: process.platform, quitting, hasTray: tray !== null }) !== 'hide') return
+    daemonPort() // the port the window is on, for a window or a daemon started once it is gone
+    const action = closeAction({ platform: process.platform, quitting, hasTray: tray !== null, trayShown })
+    if (action === 'close') return
     event.preventDefault()
-    win.hide()
-    showTrayNoticeOnce()
+    probeTray()
+    if (action === 'minimize') win.minimize()
+    else win.hide()
+    showTrayNoticeOnce(action === 'minimize' ? MINIMIZED_NOTICE : TRAY_NOTICE)
   })
 
-  mainWindow.loadURL(`http://127.0.0.1:${PORT}`)
+  mainWindow.loadURL(`http://127.0.0.1:${port}`)
 
   if (process.env.NODE_ENV === 'development') {
     mainWindow.webContents.openDevTools()
@@ -337,13 +385,13 @@ function createTray () {
 // The first time the window goes to the tray, say once that the app is still running and where Quit
 // is: until now closing the window was how the app was quit. A tray balloon on Windows (it needs no
 // Start-menu shortcut registered for the app, as an Electron Notification there does), a desktop
-// notification on Linux.
-function showTrayNoticeOnce () {
+// notification on Linux, which names File > Quit where the desktop shows no tray icon (`notice`).
+function showTrayNoticeOnce (notice) {
   try {
     if (!trayNotice) trayNotice = createTrayNotice(join(app.getPath('userData'), TRAY_NOTICE_FILE))
     if (!trayNotice.take()) return
-    if (process.platform === 'win32') tray.displayBalloon({ title: TRAY_NOTICE.title, content: TRAY_NOTICE.body })
-    else if (Notification.isSupported()) new Notification({ title: TRAY_NOTICE.title, body: TRAY_NOTICE.body }).show()
+    if (process.platform === 'win32') tray.displayBalloon({ title: notice.title, content: notice.body })
+    else if (Notification.isSupported()) new Notification({ title: notice.title, body: notice.body }).show()
   } catch (err) {
     console.error('Could not show the tray notice:', err.message)
   }
@@ -383,6 +431,7 @@ app.whenReady().then(() => {
 
   // From launch, so Quit is in reach while the daemon starts too.
   if (usesTray(process.platform)) createTray()
+  probeTray()
 
   waitForDaemon().then(() => {
     // Refused (onDaemonLost): whatever answers on the port is not this app's daemon.

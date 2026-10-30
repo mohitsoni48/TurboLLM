@@ -8,6 +8,10 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Hono } from 'hono'
 import { activeWork, registerActivityRoutes } from './active-work'
+import { registerApi } from './routes'
+import { lanAuth, provisionRemoteApiKey } from '../auth'
+import { defaultConfig } from '../config/config'
+import type { LinkCapability } from '../link/types'
 import type { Deps } from '../deps'
 
 interface Library {
@@ -45,6 +49,10 @@ function depsWith(library: Library, running: Running = {}, optional = { codeRuns
     },
     scanner: { get: (key: string) => (key === 'gemma-27b|q4|1' ? { key, name: 'Gemma 27B' } : undefined) },
     agentTasks: { list: () => running.agentTasks ?? [] },
+    // What the route adds for the Android app's poll (downloads, status) reads.
+    downloads: { list: () => [] },
+    modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
+    store: { snapshot: () => ({ apiKeys: [], daemon: {} }) },
     ...(optional.codeRuns ? { codeRuns: { activeSessionIds: () => running.codeSessions ?? [] } } : {}),
     ...(optional.routineScheduler ? { routineScheduler: { runningRoutineIds: () => running.routines ?? [] } } : {}),
   } as unknown as Deps
@@ -130,7 +138,116 @@ test('GET /api/v1/activity answers the active work as JSON', async () => {
     items: [{ kind: 'routine', id: 'routine-1', label: 'Morning digest' }],
     waiting: [],
     engineGenerating: true,
+    downloads: [],
+    status: { engine: { state: 'running' }, model: null, poolModels: 0, jev: null, laya: null, serving: { lan: false, remote: false, linkPeers: 0 } },
   })
+})
+
+// ── What the Android app's poll read from two more routes ──────────────────────────────────────────────────────────
+// Every 3 s its EngineService asked GET /api/v1/downloads and GET /api/v1/activity, and GET /api/v1/status when idle,
+// each over a connection of its own plus one for the app's proof: 4 to 6 loopback connections a tick. The activity
+// now carries what it read from the other two, in their names and shapes, to a caller those routes would answer.
+
+const INGRESS_PORT = 6997
+const ROWS = [
+  { id: 'd1', name: 'qwen3-8b-q4.gguf', status: 'downloading', received: 1_000_000, total: 5_000_000, bytesPerSec: 250_000, repo: 'Qwen/Qwen3-8B-GGUF', url: 'https://hf.co/x', dest: '/m/qwen3-8b-q4.gguf', error: null },
+  { id: 'd2', name: 'gemma-2b.gguf', status: 'queued', received: 0, total: 0, bytesPerSec: 0, repo: '', url: 'https://example.com/g', dest: '/m/gemma-2b.gguf', error: null },
+  { id: 'd3', name: 'paused.gguf', status: 'paused', received: 5, total: 10, bytesPerSec: 0, repo: '', url: '', dest: '/m/p', error: null },
+  { id: 'd4', name: 'done.gguf', status: 'done', received: 10, total: 10, bytesPerSec: 0, repo: '', url: '', dest: '/m/d', error: null },
+]
+
+/** The real /api/v1 routes (registerApi: status, downloads and activity together) over doubles of what they read: a
+ *  chat model running in the primary, a Jev model and a Laya model in pool slots, LAN access on. */
+function apiDeps(): Deps {
+  const cfg = defaultConfig()
+  const entries: Record<string, object> = {
+    'jev|q|1': { key: 'jev|q|1', name: 'Sentiment', jev: { labels: ['pos', 'neg'] } },
+    'laya|q|1': { key: 'laya|q|1', name: 'Laya One', laya: { checkpoints: [] } },
+  }
+  return {
+    version: 'test',
+    bindHost: '0.0.0.0',
+    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },
+    manager: {
+      currentOpts: () => null,
+      restartOpts: () => null,
+      status: () => ({ state: 'running', err: null, port: 8081, pid: 1, model: { key: 'qwen|q4|1', name: 'Qwen3 8B', quant: 'Q4', ctx: 4096, vision: false } }),
+      launchCommand: () => undefined,
+      parallelSlots: () => null,
+      sessionStats: () => ({ activeRequests: 0 }),
+      liveGeneration: () => null,
+    },
+    registry: { active: () => ({ id: 'eng-1', name: 'llama.cpp', kind: 'llama.cpp', binPath: '/opt/llama-server' }) },
+    modelRouter: {
+      aliveSlots: () => [
+        { modelKey: 'jev|q|1', state: 'running', primary: false, lastUsedMs: 2 },
+        { modelKey: 'laya|q|1', state: 'running', primary: false, lastUsedMs: 1 },
+      ],
+      poolModelCount: () => 2,
+    },
+    scanner: { get: (key: string) => entries[key] },
+    bench: { isRunning: () => false, status: () => ({ state: 'idle' }) },
+    downloads: { list: () => ROWS, activeCount: () => 2 },
+    provision: { get: () => undefined },
+    build: { get: () => undefined },
+    db: { getConversation: () => null, getAgentRun: () => null, getRoutine: () => null },
+    agentTasks: { list: () => [] },
+    remote: { ingressPort: () => INGRESS_PORT, activeProvider: () => cfg.remoteAccess.provider, state: () => ({ kind: 'off' }), url: () => null },
+  } as unknown as Deps
+}
+
+async function getJson(d: Deps, path: string, token?: string): Promise<Record<string, unknown>> {
+  const app = new Hono()
+  app.use('*', lanAuth(d))
+  registerApi(app, d)
+  const res = token
+    ? await app.request(`http://local.test${path}`, { headers: { 'X-TurboLLM-Auth': token } },
+      { incoming: { socket: { localPort: INGRESS_PORT, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+    : await app.request(`http://127.0.0.1:6996${path}`, {}, { incoming: { socket: { localPort: 6996, remoteAddress: '127.0.0.1', remotePort: 55555, remoteFamily: 'IPv4' } } } as never)
+  assert.equal(res.status, 200, `${path}: ${await res.clone().text()}`)
+  return await res.json() as Record<string, unknown>
+}
+
+test('GET /api/v1/activity carries the live downloads and the status fields the Android app\'s poll reads, as their own routes give them', async () => {
+  const d = apiDeps()
+  const activity = await getJson(d, '/api/v1/activity')
+  const status = await getJson(d, '/api/v1/status')
+  const { downloads } = await getJson(d, '/api/v1/downloads') as { downloads: Array<Record<string, unknown>> }
+
+  // The running and queued rows (the two the poll counts as busy), with the fields its notification reads.
+  const fields = ['name', 'status', 'received', 'total', 'bytesPerSec']
+  const live = downloads.filter((r) => r.status === 'downloading' || r.status === 'queued')
+    .map((r) => Object.fromEntries(fields.map((f) => [f, r[f]])))
+  assert.deepEqual(activity.downloads, live)
+  assert.equal(live.length, 2)
+
+  const pick = (o: unknown, keys: string[]) => (o === null ? null : Object.fromEntries(keys.map((k) => [k, (o as Record<string, unknown>)[k]])))
+  assert.deepEqual(activity.status, {
+    engine: pick(status.engine, ['state']),
+    model: pick(status.model, ['name']),
+    poolModels: status.poolModels,
+    jev: pick(status.jev, ['name']),
+    laya: pick(status.laya, ['name']),
+    serving: status.serving,
+  })
+  assert.deepEqual(activity.status, {
+    engine: { state: 'running' }, model: { name: 'Qwen3 8B' }, poolModels: 2, jev: { name: 'Sentiment' }, laya: { name: 'Laya One' },
+    serving: { lan: true, remote: false, linkPeers: 0 },
+  })
+  // What the activity said before is unchanged.
+  assert.deepEqual([activity.items, activity.waiting, activity.engineGenerating], [[], [], false])
+})
+
+test('GET /api/v1/activity gives a remote-access token the downloads and status only when it may read those routes', async () => {
+  const d = apiDeps()
+  const asToken = async (capabilities: LinkCapability[]) =>
+    getJson(d, '/api/v1/activity', provisionRemoteApiKey(d, { kind: 'remote', capabilities }))
+  const loadOnly = await asToken(['models:use', 'models:load'])
+  assert.deepEqual(Object.keys(loadOnly).sort(), ['engineGenerating', 'items', 'waiting'])
+  assert.deepEqual(Object.keys(await asToken(['models:load', 'downloads:read'])).sort(), ['downloads', 'engineGenerating', 'items', 'waiting'])
+  assert.deepEqual(Object.keys(await asToken(['models:load', 'config:read'])).sort(), ['engineGenerating', 'items', 'status', 'waiting'])
+  assert.deepEqual(Object.keys(await asToken(['models:load', 'downloads:read', 'config:read'])).sort(),
+    ['downloads', 'engineGenerating', 'items', 'status', 'waiting'])
 })
 
 test('a chat parked on a tool-call approval is listed in waiting, not in items', () => {

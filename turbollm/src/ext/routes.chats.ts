@@ -418,6 +418,11 @@ export function registerExtChatRoutes(app: Hono, d: Deps, ext?: ExtRouteDeps, ru
     }
 
     if (b.generate === false) {
+      // Spec §7.2, as for every other chat mutation: an append landed in the chat while its run was answering, after
+      // the reply's placeholder. (The generating path below is refused by the run route's own reservation.)
+      if (hasActiveRun(runs, scopeFor(c, b.owner), c.req.param('id'))) {
+        return extError(c, 'conflict', 'run_active', 'A generation is currently running for this chat.', { retryable: true })
+      }
       try {
         const msg = await d.chatStore.addMessage(scopeFor(c, b.owner), c.req.param('id'), {
           role: b.role ?? 'user', content, reasoning: b.reasoning, attachments, metadata: b.metadata,

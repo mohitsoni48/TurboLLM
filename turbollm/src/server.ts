@@ -270,9 +270,19 @@ const NO_FRAMING_CSP = "frame-ancestors 'none'"
  *  Plain-http images (model cards, markdown in replies) still load: a port-less `http://*` matches
  *  only the scheme's default port, 80, which an Android app cannot bind without root — and Chromium
  *  was checked to still refuse a 302 hop to `http://127.0.0.1:<port>` under this policy.
+ *  The WebView routes no WebSocket through that block either, and Chromium sends the cookie on a
+ *  WebSocket to `ws://127.0.0.1:<an engine's port>` and on a sendBeacon to another port: connect-src
+ *  takes 'self' (the UI's fetches, its SSE tails and its terminal WebSocket on the same port), data:
+ *  (the page's own fetch of an artifact export's data: URL), and blob:, https: and wss:, which
+ *  nothing needs today; but no plain http or ws. https: and wss: reach a loopback port only over
+ *  TLS, which the WebView cannot complete with one: no trusted certificate names 127.0.0.1, and the
+ *  app overrides neither onReceivedSslError nor the network security config (either would make
+ *  them a way to another app's TLS port, such as Syncthing's 127.0.0.1:8384, with the cookie).
+ *  An artifact connects nowhere either way: its srcdoc carries a meta policy of its own,
+ *  `default-src 'none'` (web ArtifactCard buildSrcdoc), and both apply.
  *  Nothing else is restricted: artifact srcdoc iframes inherit this policy and need inline
- *  scripts (frame-ancestors is never applied to them), and the UI's own fetches are same-origin. */
-const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; ${NO_FRAMING_CSP}`
+ *  scripts (frame-ancestors is never applied to them). */
+const APP_SECRET_CSP = `img-src 'self' http://* https: data: blob:; media-src 'self' http://* https: data: blob:; connect-src 'self' https: wss: data: blob:; ${NO_FRAMING_CSP}`
 
 /** Registers the Code/Agents feature's routes, lazily — call once, right after
  *  `createApp()`, before the server starts accepting connections. NOT folded into
