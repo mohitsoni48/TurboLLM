@@ -33,7 +33,7 @@ import type { ModelInfo } from '../engines/manager'
 import { litertLmPrefillStats } from '../engines/litert-lm'
 import { engineErrorReason, engineErrorText, streamChunkError } from '../engines/engine-error'
 import { LITERT_LM_RESEARCH_NOTE, litertLmIgnoredFieldsNote, litertLmSamplingNote, litertLmToolsFor } from '../engines/litert-lm-request'
-import { engineWithholdsTools, engineWithholdsVision } from '../engines/compat'
+import { engineWithholdsTools, engineWithholdsVision, VISION_UNAVAILABLE } from '../engines/compat'
 import { getModelProfile } from '../config/config'
 import { getSysInfo } from '../sysinfo/sysinfo'
 import { noteLocalActivity } from '../link/host-idle'
@@ -339,9 +339,6 @@ const DENIED_TOOL_CHAT_ALLOW_REFUSED = 'This tool is set to Deny in Tool Permiss
 /** A change to an MCP-running chat routine's run conversation, to a caller the routine routes
  *  refuse that routine (see registerChatRoutes's conversationGate). */
 const MCP_ROUTINE_CONVERSATION_REFUSED = 'Changing the conversation of a routine whose agent uses an MCP server tool requires a valid API key from a non-host device.'
-
-/** An image sent to this machine's engine when it reads none (localEngineWithholdsVision, G-2). */
-const VISION_UNAVAILABLE = 'The in-app engine can\'t read images in this version. Switch to the bundled llama.cpp engine in Engines to use images.'
 
 /** Messages as the chat routes return them: without `docContext`, the attached documents' full
  *  text. It is stored so a Regenerate or a Save & Resend can send the turn again with its

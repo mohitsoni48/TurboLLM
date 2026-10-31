@@ -7,7 +7,7 @@ import { createPatch } from 'diff'
 import type { Deps } from '../deps'
 import type { ToolCallRecord } from '../chat/db'
 import { clampMaxTokens } from '../config/config'
-import { applyEngineTokenLimit, engineModelAlias, shapeForEngine } from '../engines/compat'
+import { applyEngineTokenLimit, engineModelAlias, engineWithholdsTools, engineWithholdsVision, shapeForEngine, VISION_UNAVAILABLE } from '../engines/compat'
 import { litertLmForcedToolChoiceError, litertLmUnappliedParameters, shapeLitertLmRequest } from '../engines/litert-lm-request'
 import { unlistedForLoading } from '../engines/registry'
 import { presentedKey } from '../auth'
@@ -883,6 +883,23 @@ function connectionNamed(headers: Headers): string[] {
   return (headers.get('connection') ?? '').split(',').map((t) => t.trim().toLowerCase()).filter((t) => /^[!#$%&'*+.^_`|~0-9a-z-]+$/.test(t))
 }
 
+/** True when any message of an OpenAI chat body holds an `image_url` part. */
+function carriesImage(body: Record<string, unknown>): boolean {
+  const messages = Array.isArray(body.messages) ? body.messages : []
+  return messages.some((m) => Array.isArray(m?.content) && m.content.some(isImagePart))
+}
+
+function isImagePart(part: unknown): boolean {
+  return isJsonObject(part) && part.type === 'image_url'
+}
+
+/** Removes every field that offers the engine tools, the legacy `functions` spelling included. */
+function withholdTools(body: Record<string, unknown>): void {
+  delete body.tools
+  delete body.tool_choice
+  delete body.functions
+}
+
 /** The models and sets of unapplied request fields logged (unappliedNote), so each is logged once. */
 const unappliedLogged = new Set<string>()
 
@@ -1177,6 +1194,13 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // Both shaped for the engine the router actually sent this to: a pool slot's (see RouteResult), else the primary's.
       const localKind = routeResult.engineKind ?? servingEngineKind(d)
       if (parsedBody && !remote) applyEngineTokenLimit(localKind, parsedBody)
+      // A Turbo Link peer chose tools and images by its own engine, not this one (G-5).
+      if (parsedBody && opts.origin === 'link') {
+        if (engineWithholdsVision(localKind) && carriesImage(parsedBody)) {
+          return c.json({ error: { message: VISION_UNAVAILABLE, type: 'invalid_request_error', code: 'vision_unavailable' } }, 400)
+        }
+        if (engineWithholdsTools(localKind)) withholdTools(parsedBody)
+      }
       // LiteRT-LM reads the OpenAI-standard top-level reasoning_effort itself, every OpenAI value being one it takes
       // (none/minimal/low/medium/high/xhigh): a client's own is kept as it is, not parsed through Qwen3.8's aliases
       // ('high' → 'xhigh', 'none' → 'off') into chat_template_kwargs, which `serve` never reads, nor did the Android app's
@@ -1302,7 +1326,7 @@ export async function gatewayV1Handler(c: Context, d: Deps, opts: GatewayV1Optio
       // for the whole session → the engine's reusable prompt prefix is unaffected after turn
       // one); situational nudges go on the trailing user/tool turn, where they cost no prefix
       // reuse and where the model actually acts on them. Same division as the Anthropic path.
-      if (parsedBody && chatGuidance) {
+      if (parsedBody && chatGuidance && declaresTools(parsedBody)) {
         appendSystemRules(parsedBody, chatGuidance.system)
         appendNudges(parsedBody, chatGuidance.nudges)
         // The hard half of the loop breaker: at LOOP_ABORT_AFTER the model physically cannot
