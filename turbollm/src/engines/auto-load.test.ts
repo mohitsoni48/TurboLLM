@@ -28,6 +28,7 @@ import { tmpDir } from '../test-support/tmp'
 const KEY = 'gemma 4 e4b|Q6_K|6217256480'
 const LINKED_MODEL = 'workstation/Qwen3-35B'
 const DEV_MODEL: DevModel = { modelPath: 'D:\\models\\legacy.gguf', extraArgs: ['-c', '4096'], label: 'Legacy' }
+const INTERRUPTED_LOAD_LINE = 'auto-load skipped: the app closed while a model was loading'
 
 function resumableConfig(overrides: Partial<Config> = {}): Config {
   return { ...defaultConfig(), autoLoadOnStart: true, lastLoaded: { modelKey: KEY, engineId: 'eng-1' }, ...overrides }
@@ -106,6 +107,38 @@ test('no active engine skips without consulting the library', () => {
 
   assert.deepEqual(plan, skip({ code: 'no-active-engine' }))
   assert.deepEqual(lookedUp, [])
+})
+
+test('R-6: after an interrupted load, a loadable last model is skipped without consulting the library', () => {
+  const { plan, lookedUp } = planFor({ skipResume: true })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+  assert.deepEqual(lookedUp, [])
+})
+
+test('R-6: an interrupted load also suppresses the devModel fallback', () => {
+  const { plan } = planFor({ skipResume: true, cfg: resumableConfig({ devModel: DEV_MODEL }) })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+})
+
+test('R-6: an interrupted load is reported before ComfyUI and a missing engine', () => {
+  const { plan } = planFor({ skipResume: true, comfyBlocked: true, engine: undefined })
+
+  assert.deepEqual(plan, skip({ code: 'interrupted-load' }))
+})
+
+test('R-6: with auto-load off, an interrupted load still plans nothing', () => {
+  const { plan } = planFor({ skipResume: true, cfg: resumableConfig({ autoLoadOnStart: false }) })
+
+  assert.deepEqual(plan, { kind: 'disabled' })
+})
+
+test('R-6: skipResume false plans the same load as no skipResume at all', () => {
+  const withoutFlag = planFor().plan
+
+  assert.equal(withoutFlag.kind, 'load-model')
+  assert.deepEqual(planFor({ skipResume: false }).plan, withoutFlag)
 })
 
 test('a last model missing from the library skips with its key', () => {
@@ -298,6 +331,11 @@ test('skip line: no active engine', () => {
 
 test('skip line: nothing to load', () => {
   assert.equal(skipLine({ code: 'nothing-to-load' }), 'auto-load skipped: no last-loaded model recorded yet')
+})
+
+test('skip line R-6: the app closed while a model was loading', () => {
+  assert.equal(skipLine({ code: 'interrupted-load' }), INTERRUPTED_LOAD_LINE)
+  assert.match(INTERRUPTED_LOAD_LINE, /^[\x20-\x7E]+$/)
 })
 
 test('skip line AC10: linked model selected', () => {
@@ -499,6 +537,43 @@ test('runAutoLoad AC6: auto-load off is silent and loads nothing', async () => {
   assert.deepEqual(record.loads, [])
   assert.deepEqual(record.loadExplicitCalls, [])
 })
+
+const SKIP_RESUME_ENV = 'TURBOLLM_ANDROID_SDK_SKIP_RESUME'
+
+async function runAutoLoadWithSkipResume(value: string | undefined) {
+  const saved = process.env[SKIP_RESUME_ENV]
+  if (value === undefined) delete process.env[SKIP_RESUME_ENV]
+  else process.env[SKIP_RESUME_ENV] = value
+  try {
+    const { deps, record } = mkRunDeps()
+    const plan = await runAutoLoad(deps)
+    return { plan, record }
+  } finally {
+    if (saved === undefined) delete process.env[SKIP_RESUME_ENV]
+    else process.env[SKIP_RESUME_ENV] = saved
+  }
+}
+
+test('runAutoLoad R-6: TURBOLLM_ANDROID_SDK_SKIP_RESUME=1 prints the interrupted-load line and loads nothing', async () => {
+  const { plan, record } = await runAutoLoadWithSkipResume('1')
+
+  assert.deepEqual(plan, { kind: 'skip', reason: { code: 'interrupted-load' } })
+  assert.deepEqual(record.logs, [INTERRUPTED_LOAD_LINE])
+  assert.deepEqual(record.warns, [])
+  assert.deepEqual(record.loads, [])
+  assert.deepEqual(record.loadExplicitCalls, [])
+  assert.equal(record.updateCalls, 0)
+})
+
+for (const value of [undefined, '0', 'true']) {
+  test(`runAutoLoad R-6: TURBOLLM_ANDROID_SDK_SKIP_RESUME=${value} resumes the last model as before`, async () => {
+    const { plan, record } = await runAutoLoadWithSkipResume(value)
+
+    assert.equal(plan.kind, 'load-model')
+    assert.deepEqual(record.logs, [])
+    assert.equal(record.loads.length, 1)
+  })
+}
 
 test('runAutoLoad: a throw during PLANNING (before any load step) still warns once and never rejects', async () => {
   // architecture.md §3.4 declares runAutoLoad "Never rejects" for the whole function, not just the

@@ -46,6 +46,7 @@ export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
       engine: deps.registry.active(),
       comfyBlocked: deps.comfy.isBlocked(),
       findModel: (key) => deps.scanner.get(key),
+      skipResume: process.env.TURBOLLM_ANDROID_SDK_SKIP_RESUME === '1',
     })
     await carryOut(plan, cfg, deps)
   } catch (e) {
@@ -55,6 +56,7 @@ export async function runAutoLoad(deps: AutoLoadDeps): Promise<AutoLoadPlan> {
 }
 
 export type AutoLoadSkipReason =
+  | { code: 'interrupted-load' }
   | { code: 'comfyui-busy' }
   | { code: 'no-active-engine' }
   | { code: 'nothing-to-load' }
@@ -81,11 +83,15 @@ export interface AutoLoadPlanInput {
   /** `comfy.isBlocked()` */
   comfyBlocked: boolean
   findModel: (key: string) => ModelEntry | undefined
+  /** The previous app process ended during a native model load (Android SDK, risk R1), so this launch must not
+   *  load it again on its own. Per launch: it is never persisted, and `lastLoaded` is kept for the next start. */
+  skipResume?: boolean
 }
 
 export function planAutoLoad(input: AutoLoadPlanInput): AutoLoadPlan {
   const { cfg, engine } = input
   if (!cfg.autoLoadOnStart) return { kind: 'disabled' }
+  if (input.skipResume) return skipBecause({ code: 'interrupted-load' })
   if (input.comfyBlocked) return skipBecause({ code: 'comfyui-busy' })
   if (!engine) return skipBecause({ code: 'no-active-engine' })
   if (isPointedAtLinkedModel(cfg)) {
@@ -180,6 +186,8 @@ function incompatibilityDetail(engine: Engine, entry: ModelEntry, showAll: boole
 
 function whyNothingLoads(reason: AutoLoadSkipReason): string {
   switch (reason.code) {
+    case 'interrupted-load':
+      return 'the app closed while a model was loading'
     case 'comfyui-busy':
       return 'ComfyUI is rendering and holds the GPU; load a model manually once its queue finishes'
     case 'no-active-engine':
