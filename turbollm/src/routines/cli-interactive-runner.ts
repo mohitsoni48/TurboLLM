@@ -54,6 +54,7 @@ import type { GenerationGate } from '../agents/gate'
 import type { Routine, RoutineRun, RoutineRunStatus } from './schema'
 import { isTerminalCodingAgent, TERMINAL_CODE_AGENT } from './schema'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
+import { refusedAsBusy } from './model-swap'
 import { decideModelAction } from './model-conflict'
 import { firstMessageSeedProblem, type CreateAgentTerminalResult } from '../terminal/terminal-routes'
 import type { TerminalManager } from '../terminal/terminal-manager'
@@ -161,6 +162,11 @@ export async function runCliInteractiveRoutine(
   let swap: RouteResult | undefined // the swap's own result, set with previousModel (see restoreModel)
   if (action === 'swap-then-run') {
     const swapResult = await deps.loadExplicit(pinnedModel)
+    // Stopped nothing: no restore, and a skip rather than a failure (refusedAsBusy).
+    if (refusedAsBusy(swapResult)) {
+      finish({ status: 'skipped', skipReason: 'model_busy' })
+      return 'skipped'
+    }
     if ('status' in swapResult) {
       // A load that failed, or a swap a ComfyUI render refused, may already have stopped the
       // user's model (cli-routine.ts's swap explains when): it is restored, or every run of a

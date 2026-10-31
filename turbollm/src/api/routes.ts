@@ -9,7 +9,7 @@ import { basename, dirname, join, resolve } from 'node:path'
 import { GATE_VERSION, gateNodeSource } from '../comfyui/gate-template'
 import { createHash, randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
-import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type Engine, type McpServer } from '../config/config'
+import { ValueError, getModelProfile, setModelProfile, deleteModelProfile, isModelHidden, setModelHidden, isUnsafeMapKey, ownEntry, normalizeProvider, resolveIngressPort, VRAM_HEADROOM_MIN_MB, VRAM_HEADROOM_MAX_MB, VRAM_HEADROOM_SPILL_MB, type ApiKey, type Config, type DeepReadonly, type Engine, type McpServer } from '../config/config'
 import { CHAT_APPROVAL_WAIT_MINUTES, CONFIG_BOUNDS, KV_TYPE_MESSAGE, coerceBounded, isChatApprovalWaitMinutes, isConfigTheme, isKvTypeName } from '../config/config-bounds'
 import type { Deps } from '../deps'
 import { getLanIp } from '../net'
@@ -91,6 +91,7 @@ import { TEXT_CLASSIFICATION_CATEGORY } from '../hf/text-classification-search'
 import type { EnqueueInput } from '../downloads/downloads'
 import { BenchError } from '../bench/bench'
 import { inferRepoFromPath } from './path-utils'
+import { API_TIMEOUT_MS } from '../util/fetch-timeout'
 import { validateLoadProfileFields, profilesEqual, launchFieldsRefusal, loadsWithNow, isUserSetOnly } from './profile-validate'
 import { screenshotArtifact, findChrome } from '../artifacts/screenshot'
 import { readQueue, remove as removeQueued } from '../telemetry/queue'
@@ -249,12 +250,12 @@ export function registerApi(app: Hono, d: Deps): void {
       model: core.model,
       // Last model the user loaded (config-tracked) — lets `turbollm launch` auto-load the
       // true last-used model instead of guessing the first library entry (F-034).
-      lastLoaded: d.store.snapshot().lastLoaded,
+      lastLoaded: d.store.read().lastLoaded,
       // Turbo Link (ADR-382): the linked-machine model this install is pointed at, or '' for
       // local. On /status because every surface reads it here — the web app hydrates its picker
       // from it, and `turbollm launch <cli>` (which has no access to browser state) uses it
       // instead of auto-loading a local model the user did not ask for.
-      selectedRemoteModel: d.store.snapshot().selectedRemoteModel ?? '',
+      selectedRemoteModel: d.store.read().selectedRemoteModel ?? '',
       // The alive Jev model, if any (ADR-434 (i)(1)): Workspace becomes the Jev Playground while
       // one is loaded in any slot. Local-only, like `launchCommand` — not in the shared builder.
       jev: jevStatus(d),
@@ -300,7 +301,7 @@ export function registerApi(app: Hono, d: Deps): void {
       comfyui: (() => {
         const snap = d.comfy?.snapshot() ?? null
         if (!snap) return null
-        const gatePath = d.store.snapshot().comfyui.gatePath
+        const gatePath = d.store.read().comfyui.gatePath
         let installedVersion: number | null = null
         if (gatePath) {
           try {
@@ -311,7 +312,7 @@ export function registerApi(app: Hono, d: Deps): void {
         }
         return { ...snap, installedVersion, currentVersion: GATE_VERSION }
       })(),
-      telemetryLevel: d.store.snapshot().telemetry.level,
+      telemetryLevel: d.store.read().telemetry.level,
       uptimeSec: Math.floor((Date.now() - d.startedAt) / 1000),
       // Cloud Launch tunnel (ADR-045/152): null until --tunnel is active.
       tunnel: tunnelStatusSnapshot(d),
@@ -886,6 +887,7 @@ export function registerApi(app: Hono, d: Deps): void {
       for (let page = 1; page <= 20; page++) {
         const res = await fetch(`https://api.github.com/repos/${repo}/branches?per_page=100&page=${page}`, {
           headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
+          signal: AbortSignal.timeout(API_TIMEOUT_MS),
         })
         if (isRateLimited(res))
           return err(
@@ -906,6 +908,7 @@ export function registerApi(app: Hono, d: Deps): void {
       try {
         const info = await fetch(`https://api.github.com/repos/${repo}`, {
           headers: githubHeaders({}, () => d.store.snapshot().gh?.token ?? ''),
+          signal: AbortSignal.timeout(API_TIMEOUT_MS),
         })
         if (info.ok) {
           const j = await info.json() as { default_branch?: string }
@@ -3973,7 +3976,7 @@ export function registerApi(app: Hono, d: Deps): void {
 /** What {@link overlayModel} reads from the config and the registry, taken once per request by
  *  the list endpoint (every registry lookup is a config snapshot too). The registry lookups are
  *  lazy and memoized: most rows only need `active`. */
-type OverlayShared = { snap: Config; registry: Pick<Registry, 'active' | 'layaEngine'> }
+type OverlayShared = { snap: DeepReadonly<Config>; registry: Pick<Registry, 'active' | 'layaEngine'> }
 
 function overlayShared(d: Deps): OverlayShared {
   const once = <T>(f: () => T): (() => T) => {
@@ -3981,7 +3984,7 @@ function overlayShared(d: Deps): OverlayShared {
     return () => (v ??= { r: f() }).r
   }
   return {
-    snap: d.store.snapshot(),
+    snap: d.store.read(),
     registry: {
       active: once(() => d.registry.active()),
       layaEngine: once(() => d.registry.layaEngine()),
@@ -3998,7 +4001,7 @@ function overlayShared(d: Deps): OverlayShared {
  *  that model is the one currently loaded. */
 function overlayModel(
   e: ModelEntry, d: Deps, lastTpsMap?: Map<string, number>,
-  { snap, registry }: OverlayShared = { snap: d.store.snapshot(), registry: d.registry },
+  { snap, registry }: OverlayShared = { snap: d.store.read(), registry: d.registry },
 ) {
   const ms = d.manager.status()
   const loadedKey = ms.state === 'running' ? ms.model?.key : undefined

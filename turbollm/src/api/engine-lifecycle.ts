@@ -98,6 +98,13 @@ export async function startEngine(c: Context, d: Deps, b: EngineStartBody): Prom
     // compatibility refusal of its own (LoadExplicitOpts). A refusal or a failed start comes back as a result, not a
     // rejection, and is logged as one.
     if (entry.embedding || entry.laya) {
+      // The router loads nothing while an auto-tune runs (its probes would count this model's VRAM as their own), and
+      // that refusal reaches only the log below: the Load did nothing, silently (review L7). A manual Load cancels the
+      // tune, as a chat model's does below; only the tune, since nothing else is going away.
+      if (d.bench.isRunning()) {
+        d.bench.cancel()
+        await d.bench.waitIdle()
+      }
       void d.modelRouter
         .loadExplicit(entry.key, b.profileOverrides, { manual: true })
         .then((r) => { if ('status' in r) console.warn(`engine load failed: ${r.message}`) })

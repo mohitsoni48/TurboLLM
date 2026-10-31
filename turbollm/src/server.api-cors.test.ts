@@ -14,7 +14,7 @@ function mkApp() {
   const cfg = defaultConfig()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => '.' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => '.' },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }) },

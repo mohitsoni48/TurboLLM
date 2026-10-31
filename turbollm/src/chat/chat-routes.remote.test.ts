@@ -56,7 +56,7 @@ function mkApp(opts: { localRunning?: boolean } = {}): {
   }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     gate: { acquire: async () => { ledger.gateAcquires++; return () => {} } },

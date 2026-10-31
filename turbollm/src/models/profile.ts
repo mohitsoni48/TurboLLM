@@ -1,7 +1,7 @@
 // LoadProfile: per-model launch parameters, default derivation, VRAM-fit
 // estimation, and the profile->llama-server arg mapping (spec 05). This
 // productizes the hand-tuned models.json knowledge.
-import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type ModelDefaults } from '../config/config'
+import { BUILTIN_MODEL_DEFAULT_CTX, getModelProfile, type Capabilities, type Config, type DeepReadonly, type ModelDefaults } from '../config/config'
 import { backendIdFromBinPath } from '../engines/update'
 import { autoThreadCount, type SysInfo } from '../sysinfo/sysinfo'
 import { DECODER_EMBED_ARCHS, type ModelEntry } from './scanner'
@@ -951,7 +951,7 @@ export function resolveProfile(
  *  dialog holds a context only when the user set one (userSetOnly), where an earlier build's held the
  *  automatic one too, so the stored field alone would advertise the ceiling for every model saved
  *  without touching Context. */
-export function configuredCtx(cfg: Config, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
+export function configuredCtx(cfg: DeepReadonly<Config>, m: ModelEntry, engineId: string, sys: SysInfo): number | undefined {
   if (!engineId) return undefined
   const saved = getModelProfile(cfg, m.key, engineId) as Partial<LoadProfile> | undefined
   if (!saved || typeof saved !== 'object') return undefined

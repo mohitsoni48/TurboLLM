@@ -122,7 +122,7 @@ test('a reply cut off by a daemon restart reads as stopped once the chat routes 
   try {
     const { chat, cutOff } = seed(store)
     const app = new Hono()
-    registerChatRoutes(app, { db: store, store: { snapshot: () => ({}), dir: () => dir } } as unknown as Deps)
+    registerChatRoutes(app, { db: store, store: { snapshot: () => ({}), read: () => ({}), dir: () => dir } } as unknown as Deps)
     const conv = await (await app.request(`/api/v1/conversations/${chat.id}`)).json() as { messages: Array<{ id: string; stats: { aborted: boolean } }> }
     assert.equal(conv.messages.find((m) => m.id === cutOff.id)!.stats.aborted, true)
   } finally {

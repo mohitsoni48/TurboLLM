@@ -152,6 +152,10 @@ function posNum(v: unknown): number {
  *  tick as the spawn, so whatever it checks still holds when the engine starts. A throw from either starts nothing and
  *  rejects the load; a {@link LoadPausedError} is not reported as a failed load. */
 export interface LoadHooks {
+  /** load() only: the first thing it runs under the global load lock, before it stops the engine. A throw rejects the
+   *  load and leaves the engine exactly as it was (no stop, no 'error'): keep-N eviction re-checks there that its
+   *  victim is still idle, since a request can reach it while the load waits for the lock (review M1). */
+  beforeStop?: () => void
   beforeStart?: () => Promise<void>
   beforeSpawn?: () => void
 }
@@ -263,6 +267,8 @@ export class Manager {
     // whole fallback mechanism exists to fix.
     let effectiveOpts = opts
     await Manager.runExclusive(async () => {
+      // Synchronous, and in the same tick as the stop below, so nothing can start on the engine between the two.
+      hooks?.beforeStop?.()
       const attempt = { paused: false }
       this.reporting = attempt
       try {

@@ -36,7 +36,7 @@ function mkDeps(keys: ApiKey[], opts: { busy?: boolean; loaded?: string | null }
   }
   const d = {
     version: '1.11.2',
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },

@@ -33,7 +33,7 @@ function fakeApp(cfg: Config): Hono {
   const app = new Hono()
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     scanner: { get: (k: string) => (k === KEY ? { key: KEY } : undefined) },
     registry: { active: () => ({ id: ENGINE_A }) },
     manager: { status: () => ({ state: 'stopped', model: null }) },
@@ -165,7 +165,7 @@ test('PUT /profile: a model key containing % or / is used as sent — the path p
     const app = new Hono()
     registerApi(app, {
       version: 'test',
-      store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+      store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
       scanner: { get: (k: string) => (k === key ? { key } : undefined) },
       registry: { active: () => ({ id: ENGINE_A }) },
       manager: { status: () => ({ state: 'stopped', model: null }) },

@@ -43,7 +43,7 @@ async function sentHistory(engineKind: string): Promise<Array<Record<string, unk
       },
       registry: { active: () => ({ id: engineKind, kind: engineKind }) },
       scanner: { get: () => undefined },
-      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }) },
+      store: { snapshot: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }), read: () => ({ tools: { toolPolicies: {}, autoAllowAll: false }, modelDefaults: {} }) },
     } as unknown as Deps
     const chat = await chatStore.createChat(SCOPE, { title: 't' })
     await chatStore.addMessage(SCOPE, chat.id, { role: 'user', content: 'What is the capital of France?' })

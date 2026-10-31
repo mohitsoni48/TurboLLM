@@ -17,7 +17,7 @@ function mkApp() {
     version: 'test',
     // Applies to a copy and commits it only when the function returns, as ConfigStore.update does.
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: typeof cfg) => void) => { const work = structuredClone(cfg); fn(work); Object.assign(cfg, work) },
       dir: () => '.',
     },

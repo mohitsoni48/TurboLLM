@@ -96,7 +96,7 @@ async function captureResumedLoad(parity: ParityCase): Promise<StartOpts> {
 async function driveManualLoad(parity: ParityCase, side: EngineSide): Promise<void> {
   const d = {
     ...side,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
   const app = new Hono()
@@ -136,7 +136,7 @@ function recordingEngineSide(parity: ParityCase) {
   return {
     primaryLoads,
     loadExplicitCalls,
-    store: { snapshot: () => structuredClone(data), update: (fn: (c: Config) => void) => { fn(data) } },
+    store: { snapshot: () => structuredClone(data), read: () => structuredClone(data), update: (fn: (c: Config) => void) => { fn(data) } },
     scanner: { get: (key: string) => (key === parity.entry.key ? parity.entry : undefined) },
     registry: { active: () => parity.engine },
     manager: {

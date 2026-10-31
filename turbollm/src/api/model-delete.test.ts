@@ -12,7 +12,7 @@ for (const [code, status] of [['unsafe_model_delete', 409], ['no_such_model', 40
     const message = 'Real target: /external/model.gguf. Manage it directly at its real location.'
     registerApi(app, {
       // The host's own request (loopback-only bind): the route's key gate reads the config.
-      store: { snapshot: () => defaultConfig() },
+      store: { snapshot: () => defaultConfig(), read: () => defaultConfig() },
       scanner: {
         get: () => ({ key: 'model', path: '/library/model.gguf' }),
         delete: async () => { throw new ScannerError(code, message) },

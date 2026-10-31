@@ -15,7 +15,7 @@ function fakeApp(cfg: Config): Hono {
   const d = {
     version: 'test',
     store: {
-      snapshot: () => cfg,
+      snapshot: () => cfg, read: () => cfg,
       update: (fn: (c: Config) => void) => fn(cfg),
     },
     // The create route guards on model existence, like PUT /models/:key/profile does.

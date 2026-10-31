@@ -264,7 +264,7 @@ async function tenantRun(calls: (routineId: string) => ScriptedCall[], mcpPolicy
   const { chatStore, cleanup } = harness()
   try {
     const agents = [{ id: 'owner-mcp-agent', name: 'Owner', systemPrompt: '', tools: ['mcp__srv_1__run'] }]
-    const agentStore = { snapshot: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
+    const agentStore = { snapshot: () => ({ customAgents: agents }), read: () => ({ customAgents: agents }), update: (fn: (cfg: { customAgents: typeof agents }) => void) => fn({ customAgents: agents }) }
     const fired: string[] = []
     const runNow = async (id: string) => { fired.push(id); return { ok: true as const } }
     const tools = new ToolRegistry({ search: {}, sandbox: {}, mcpServers: [] } as never, routines, runNow, agentStore as never, undefined, () => true)
@@ -279,7 +279,7 @@ async function tenantRun(calls: (routineId: string) => ScriptedCall[], mcpPolicy
         generationEnd: () => {},
       },
       registry: { active: () => undefined },
-      store: { snapshot: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }) },
+      store: { snapshot: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }), read: () => ({ tools: { toolPolicies, autoAllowAll: false }, modelDefaults: {} }) },
       tools,
     } as unknown as Deps
     const chat = await chatStore.createChat(SCOPE, { title: 'tenant' })

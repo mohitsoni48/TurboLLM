@@ -22,7 +22,7 @@ const CHAT_MODEL = {
 
 function store(keepN = 1): ConfigStore {
   return {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
 }
@@ -66,7 +66,7 @@ test('routeTo: a Laya model loads on the Laya engine while llama.cpp is the acti
   const slot = stoppedPrimary()
   const r = new ModelRouter(store(), registry(true), primary.manager, scannerOf(LAYA_MODEL), undefined, undefined, () => slot.manager)
   const result = await r.routeTo(LAYA_MODEL)
-  assert.deepEqual(result, { target: 'http://laya-slot' })
+  assert.deepEqual(result, { target: 'http://laya-slot', manager: slot.manager })
   assert.equal(slot.loads.length, 1)
   assert.equal(slot.loads[0].engine.kind, 'laya')
   assert.equal(slot.loads[0].modelPath, '/models/laya')
@@ -226,7 +226,7 @@ test('two requests for the same Laya model at once start one engine and both get
   const second = r.routeTo(LAYA_MODEL)
   await tick()
   gate.resolve()
-  assert.deepEqual(await Promise.all([first, second]), [{ target: 'http://laya-slot' }, { target: 'http://laya-slot' }])
+  assert.deepEqual(await Promise.all([first, second]), [{ target: 'http://laya-slot', manager: made[0].manager }, { target: 'http://laya-slot', manager: made[0].manager }])
   assert.equal(made.length, 1, 'one manager, so one engine process')
   assert.equal(made[0].loads(), 1)
   assert.equal(made[0].stops(), 0)
@@ -287,7 +287,7 @@ test('a chat model in a pool slot is registered only once it has loaded, as befo
   // Yet it is loading: the delete guard and the Models page count it (they used to miss it for the whole load).
   assert.equal(r.loadedModelKeys().has('B'), true)
   gate.resolve()
-  assert.deepEqual(await loadingB, { target: 'http://laya-slot' })
+  assert.deepEqual(await loadingB, { target: 'http://laya-slot', manager: held.manager })
   assert.equal(r.aliveSlots().some((s) => s.modelKey === 'B' && s.state === 'running'), true)
 })
 
@@ -373,11 +373,11 @@ test('a Laya model is never reported twice by aliveSlots', async () => {
 // GET /api/v1/status's poolModels: a load in flight into a pool slot counts, and a Laya load's slot is that same load.
 test('poolModelCount counts a Laya load in flight once', async () => {
   const gate = deferred()
-  const { r } = routerWithSlots(gate.promise)
+  const { r, made } = routerWithSlots(gate.promise)
   const loading = r.loadExplicit(LAYA_MODEL.key)
   await tick()
   assert.equal(r.poolModelCount(), 1, 'loading')
   gate.resolve()
-  assert.deepEqual(await loading, { target: 'http://laya-slot' })
+  assert.deepEqual(await loading, { target: 'http://laya-slot', manager: made[0].manager })
   assert.equal(r.poolModelCount(), 1, 'loaded')
 })

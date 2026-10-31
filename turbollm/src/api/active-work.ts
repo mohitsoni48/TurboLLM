@@ -165,7 +165,10 @@ function conversationTitle(d: Deps, convId: string): string {
 }
 
 /** A local chat turn counts as a generation from its first request to its end, its approval waits
- *  included; `parked` of them wait on a person (they are in `waiting`), so they do not count here. */
+ *  included; `parked` of them wait on a person (they are in `waiting`), so they do not count here. A keep-N pool
+ *  slot's API traffic is counted on its own Manager, not the primary's (scalability review 1.5), and is read beside
+ *  it; no chat turn runs there, so nothing of it is parked. */
 function engineIsGenerating(d: Deps, parked: number): boolean {
-  return d.manager.status().state === 'running' && (d.manager.sessionStats()?.activeRequests ?? 0) - parked > 0
+  const primary = d.manager.status().state === 'running' && (d.manager.sessionStats()?.activeRequests ?? 0) - parked > 0
+  return primary || (d.modelRouter?.poolGenerating?.() ?? false)
 }

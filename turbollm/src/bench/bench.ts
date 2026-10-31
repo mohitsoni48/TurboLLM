@@ -257,6 +257,16 @@ export class BenchRunner {
    *  construct BenchRunner directly and never exercise `run()`. */
   telemetry?: Emitter
 
+  /** The gateway's keep-N pool (ModelRouter), set in cli.ts once the router is built after this runner. Absent under
+   *  tests that never ask, and then nothing beside the primary is counted. */
+  private pool?: { poolModelCount(): number }
+
+  /** Wire the pool start() checks: a model loaded beside the primary holds VRAM a probe's whole-card reading
+   *  (readLoadVram) counts as its own (scalability review 1.7). */
+  setPool(pool: { poolModelCount(): number }): void {
+    this.pool = pool
+  }
+
   /** Live state for GET /status. */
   status(): BenchState {
     this.resolveRestored()
@@ -550,13 +560,19 @@ export class BenchRunner {
   }
 
   /** Start a run for `modelKey`. Rejects (throws BenchError) when a run is already
-   *  active, the engine is busy, or the model isn't a benchmarkable GGUF. The run
+   *  active, the engine is busy, another model is loaded beside it, or the model isn't a benchmarkable GGUF. The run
    *  itself proceeds in the background; callers get 202 + poll /status. */
   start(modelKey: string, base?: Partial<LoadProfile>): void {
     if (this.state.running) throw new BenchError('bench_running', 'A benchmark is already running.')
     const engineState = this.manager.status().state
     if (engineState === 'running' || engineState === 'starting' || engineState === 'stopping') {
       throw new BenchError('engine_in_use', 'Stop the running model before benchmarking.')
+    }
+    // A keep-N pool slot, an embedding or a Laya model (or one loading into a slot) holds GPU memory nvidia-smi reports
+    // with the probe's, so the tune would save a profile sized for less VRAM than the card has. Refused, not unloaded:
+    // one may be serving a reply, and the user picks what to unload (scalability review 1.7).
+    if ((this.pool?.poolModelCount() ?? 0) > 0) {
+      throw new BenchError('engine_in_use', 'Unload the other loaded models before auto-tuning: the GPU memory they hold would be counted against this model.')
     }
     const active = this.registry.active()
     if (!active) throw new BenchError('no_active_engine', 'Register and select an engine first.')

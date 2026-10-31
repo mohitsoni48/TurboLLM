@@ -52,7 +52,7 @@ function depsWith(library: Library, running: Running = {}, optional = { codeRuns
     // What the route adds for the Android app's poll (downloads, status) reads.
     downloads: { list: () => [] },
     modelRouter: { aliveSlots: () => [], poolModelCount: () => 0 },
-    store: { snapshot: () => ({ apiKeys: [], daemon: {} }) },
+    store: { snapshot: () => ({ apiKeys: [], daemon: {} }), read: () => ({ apiKeys: [], daemon: {} }) },
     ...(optional.codeRuns ? { codeRuns: { activeSessionIds: () => running.codeSessions ?? [] } } : {}),
     ...(optional.routineScheduler ? { routineScheduler: { runningRoutineIds: () => running.routines ?? [] } } : {}),
   } as unknown as Deps
@@ -167,7 +167,7 @@ function apiDeps(): Deps {
   return {
     version: 'test',
     bindHost: '0.0.0.0',
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => '/nonexistent' },
     manager: {
       currentOpts: () => null,
       restartOpts: () => null,
@@ -311,4 +311,12 @@ test('a chat parked on an approval is not an engine generation, though its turn 
 
   const alsoApi = depsWith({ conversations: { 'chat-2': { title: 'Taxes' } } }, { activeRequests: 2 })
   assert.equal(activeWork(alsoApi, sources).engineGenerating, true, 'an API client\'s request beside it still counts')
+})
+
+// A keep-N pool slot's API traffic is counted on its own Manager (scalability review 1.5), not the primary's.
+test('engineGenerating is true while a pool slot generates and the primary is idle', () => {
+  const d = depsWith({}, { activeRequests: 0 })
+  ;(d.modelRouter as unknown as { poolGenerating: () => boolean }).poolGenerating = () => true
+
+  assert.equal(activeWork(d, noChats).engineGenerating, true)
 })

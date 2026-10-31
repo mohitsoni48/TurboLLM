@@ -59,7 +59,7 @@ import { DownloadManager } from './downloads/downloads'
 import { BenchRunner } from './bench/bench'
 import { ModelRouter } from './gateway/model-router'
 import { ToolRegistry } from './tools/tool-registry'
-import { GenerationGate } from './agents/gate'
+import { EngineGates } from './agents/gate'
 import { AgentTaskState } from './agents/task-state'
 import { RequestLog } from './observability/request-log'
 import { launchCli, syncHarnessModelConfig, CONFIG_FILE_HARNESSES } from './cli-launch'
@@ -603,6 +603,10 @@ comfy.setEngineLookup((id) => registry.get(id))
 // That reload loads on the Manager, which records nothing: a gateway load the render refused or killed is recorded as
 // the model last loaded by the router once it runs.
 comfy.setOnReloaded((modelKey, engineId) => modelRouter.reloadedAfterRender(modelKey, engineId))
+// Auto-tune and the pool keep out of each other's way (scalability review 1.7): a tune does not start beside a pool
+// model, whose VRAM its probes would count as their own, and the router loads nothing while a tune runs.
+bench.setPool(modelRouter)
+modelRouter.setAutoTune(bench)
 // Tool registry (v0.7.0): built-in tools + MCP host. Syncs MCP servers from config.
 // Routine tools (Phase 4): `db` structurally satisfies RoutineToolsStore (createRoutine/
 // getRoutine/listRoutines/updateRoutine/deleteRoutine/listRoutineRuns all exist on
@@ -653,10 +657,15 @@ try {
 }
 // `requestRestart` is attached after the server is created (it must close over it).
 const deps: Deps = { store, registry, manager, scanner, hashes, db, chatStore, provision, build, updates, appUpdates, hf, downloads, bench, modelRouter, comfy, remoteCatalog, tools: toolRegistry, version, startedAt }
-// Sized to the RUNNING engine's own slot count, re-read on every admission (a model swap changes
-// it). `Infinity` when the engine advertises no `--parallel` — see Manager.parallelSlots() for why
-// that is not 1.
-deps.gate = new GenerationGate(() => manager.parallelSlots() ?? Infinity)
+// One gate per engine process (scalability review 1.1), each sized to ITS running engine's own slot
+// count, re-read on every admission (a model swap changes it). `Infinity` when the engine advertises
+// no `--parallel` — see Manager.parallelSlots() for why that is not 1. `deps.gate` is the primary's:
+// every in-app caller talks to the primary; the gateway takes the routed engine's through gateFor.
+const engineGates = new EngineGates()
+deps.gate = engineGates.for(manager)
+deps.gateFor = (engine) => engineGates.for(engine)
+// Eviction reads the gates too: a request queued on, or holding, an engine's gate keeps it loaded (review M2).
+modelRouter.setGates(deps.gateFor)
 deps.agentTasks = new AgentTaskState()
 // Developer request log (issue #211 follow-up): sized off config so a raised `maxEntries`
 // (Settings) takes effect on next restart, same as other config-shaped-at-boot values here.
@@ -1108,6 +1117,7 @@ const updateScheduler = new UpdateScheduler({
   manager,
   updates,
   tuningEngine: () => bench.tuningEngine(),
+  poolGenerating: () => modelRouter.poolGenerating(),
   applyUpdate: async (engine) => {
     if (comfy.isBlocked()) return // ComfyUI owns the GPU — don't swap engines under it
     await applyEngineUpdate({ store, registry, manager, provision, updates, modelRouter, workBusy: () => engineWorkBusy(deps) }, engine)

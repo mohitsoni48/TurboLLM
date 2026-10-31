@@ -70,7 +70,7 @@ function bootDaemon(config: Config, args: string[], overrides: Record<string, un
     },
     app: { fetch: () => new Response('ok') },
     deps,
-    store: { snapshot: () => structuredClone(config), dir: () => '' },
+    store: { snapshot: () => structuredClone(config), read: () => structuredClone(config), dir: () => '' },
     argValue: (name: string, fallback: string) => {
       const i = args.indexOf(name)
       return i >= 0 && i + 1 < args.length ? args[i + 1] : fallback
@@ -401,7 +401,7 @@ test('a start while a rebind is between listeners is refused, and the guard is b
   const dir = tmpDir('tllm-rebind-claim-')
   const cfg = config({ port: p })
   const d = bootDaemon(cfg, [], {
-    store: { snapshot: () => structuredClone(cfg), dir: () => dir },
+    store: { snapshot: () => structuredClone(cfg), read: () => structuredClone(cfg), dir: () => dir },
     writePidfile,
     claimDataDir,
     releaseDataDirClaim,
@@ -436,7 +436,7 @@ test("a rebind during the boot's wait for the Tailscale reconcile keeps its clai
   let reconciled!: () => void
   let started = 0
   const d = bootDaemon(cfg, [], {
-    store: { snapshot: () => structuredClone(cfg), dir: () => dir },
+    store: { snapshot: () => structuredClone(cfg), read: () => structuredClone(cfg), dir: () => dir },
     writePidfile,
     claimDataDir,
     releaseDataDirClaim,

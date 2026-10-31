@@ -20,9 +20,9 @@ import type { RequestLogConfig } from '../config/config'
  *  "on") when `requestLog` is absent from the snapshot — a hand-built test `Deps` double that
  *  skips `config.ts`'s `normalize()`, or a config loaded before this field existed and read
  *  before normalize ran. Every capture site goes through this rather than reading
- *  `d.store.snapshot().requestLog` directly, so there is exactly one place this fallback lives. */
+ *  `d.store.read().requestLog` directly, so there is exactly one place this fallback lives. */
 export function requestLogConfig(d: Deps): RequestLogConfig {
-  return d.store.snapshot().requestLog ?? { enabled: false, captureBodies: false, maxEntries: 500 }
+  return d.store.read().requestLog ?? { enabled: false, captureBodies: false, maxEntries: 500 }
 }
 
 /** The exact sampling/generation params LM Studio-style logs show. A WHITELIST, not a dump of

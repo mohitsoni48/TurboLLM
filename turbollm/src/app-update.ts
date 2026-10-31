@@ -9,6 +9,7 @@
 // failure — offline reports a "couldn't check" state instead of a false answer.
 
 import { type CompareResult, comparePipVersions } from './engines/update'
+import { API_TIMEOUT_MS, withTimeout } from './util/fetch-timeout'
 
 /** Compare two app versions (semver `1.0.0` shape). Reuses the engine checker's
  *  numeric dotted-release comparator (pre-release/build suffixes ignored — npm's
@@ -44,10 +45,10 @@ export const APP_PACKAGE = 'turbollm'
 /** Resolve the real latest published version from the npm registry. Hits the cheap
  *  per-package `latest` endpoint (no full metadata download). Throws on network
  *  failure — the caller maps that to an `offline` status, never a fabricated latest. */
-export async function fetchNpmLatest(signal?: AbortSignal): Promise<string> {
+export async function fetchNpmLatest(signal?: AbortSignal, timeoutMs = API_TIMEOUT_MS): Promise<string> {
   const res = await fetch(`https://registry.npmjs.org/${APP_PACKAGE}/latest`, {
     headers: { Accept: 'application/json', 'User-Agent': 'turbollm' },
-    signal,
+    signal: withTimeout(signal, timeoutMs),
   })
   if (!res.ok) throw new Error(`npm query failed: HTTP ${res.status}`)
   const data = (await res.json()) as { version?: string }

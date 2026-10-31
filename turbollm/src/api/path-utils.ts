@@ -2,7 +2,7 @@
  *  Accepts both MLX directory paths (2 segments: owner/repo) and GGUF file
  *  paths (3+ segments: owner/repo/file.gguf). Returns null when the path is
  *  outside every known model directory or has insufficient segments. */
-export function inferRepoFromPath(filePath: string, modelDirs: string[]): string | null {
+export function inferRepoFromPath(filePath: string, modelDirs: readonly string[]): string | null {
   const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
   const fp = norm(filePath)
   const seg = /^[A-Za-z0-9][A-Za-z0-9._-]*$/

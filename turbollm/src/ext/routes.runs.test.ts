@@ -51,6 +51,9 @@ function harness(
     store: { snapshot: () => ({ apiKeys: [
       { hash: hashKey('tllm-ext-acme'), tenant: 'acme' },
       { hash: hashKey('tllm-ext-globex'), tenant: 'globex' },
+    ] }), read: () => ({ apiKeys: [
+      { hash: hashKey('tllm-ext-acme'), tenant: 'acme' },
+      { hash: hashKey('tllm-ext-globex'), tenant: 'globex' },
     ] }) },
     manager: {
       // `ctx: 0` keeps context-limit.ts's "an unknown window is permissive" branch — the
@@ -118,7 +121,7 @@ function harnessWithThrowingStore(method: 'getChat' | 'listMessages', n = Infini
   const d = {
     db: conv,
     chatStore,
-    store: { snapshot: () => ({ apiKeys: [{ hash: hashKey('tllm-ext-acme'), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [{ hash: hashKey('tllm-ext-acme'), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: hashKey('tllm-ext-acme'), tenant: 'acme' }] }) },
     manager: { status: () => ({ state: 'running', model: 'test-model' }), target: () => 'http://127.0.0.1:9999' },
   } as never
   const runs = new PublicRunManager()

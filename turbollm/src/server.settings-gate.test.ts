@@ -36,7 +36,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Confi
   requestLog.finalize(id, { status: 200, responseBody: '{"content":"done"}' })
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: new Proxy({}, { get: () => () => [] }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }) },

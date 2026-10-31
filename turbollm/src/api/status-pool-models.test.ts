@@ -64,7 +64,7 @@ function app(slot?: Manager) {
     modelProfiles: {},
     comfyui: {},
   }
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/nonexistent' } as unknown as ConfigStore
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => '/nonexistent' } as unknown as ConfigStore
   const primary = managerRunning('chat-model')
   const embedding = {
     key: 'bge-m3', name: 'bge-m3', path: '/models/bge-m3.gguf', format: 'gguf', arch: 'bert', quant: 'Q4', nativeCtx: 8192,
@@ -130,6 +130,6 @@ test('GET /api/v1/status counts a model still loading into a pool slot of its ow
   assert.equal(h.primary.status().state, 'stopped')
   assert.equal(await h.poolModels(), 1, 'still loading, nothing else loaded')
   open()
-  assert.deepEqual(await loading, { target: 'http://slot.invalid', engineKind: 'llama-server', modelPath: '/models/bge-m3.gguf', modelName: 'bge-m3' })
+  assert.deepEqual(await loading, { target: 'http://slot.invalid', manager: slot.manager, engineKind: 'llama-server', modelPath: '/models/bge-m3.gguf', modelName: 'bge-m3' })
   assert.equal(await h.poolModels(), 1, 'loaded in its own slot, counted once')
 })

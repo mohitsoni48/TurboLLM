@@ -60,7 +60,7 @@ function memStore(root: string, seed: Partial<Config> = {}): ConfigStore {
   const cfg: Config = { ...defaultConfig(), modelDirs: [root], ...seed }
   return {
     dir: () => root,
-    snapshot: () => cfg,
+    snapshot: () => cfg, read: () => cfg,
     update: (fn: (c: Config) => void) => { fn(cfg) },
   } as unknown as ConfigStore
 }

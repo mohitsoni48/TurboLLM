@@ -40,6 +40,10 @@ function harness(ext?: ExtRouteDeps) {
       { hash: keyHash(ACME), tenant: 'acme' },
       { hash: keyHash(GLOBEX), tenant: 'globex' },
       { hash: keyHash(ACME_READONLY), tenant: 'acme', scopes: ['chats:read'] },
+    ] }), read: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+      { hash: keyHash(GLOBEX), tenant: 'globex' },
+      { hash: keyHash(ACME_READONLY), tenant: 'acme', scopes: ['chats:read'] },
     ] }) },
   } as never
   const app = new Hono()
@@ -60,6 +64,8 @@ function harnessNoAdapter() {
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, null),
     store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+    ] }), read: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
     ] }) },
   } as never
@@ -89,6 +95,9 @@ function harnessWithRuns(bodyFactory?: () => Promise<{ status: 'complete' | 'abo
     db: conv,
     chatStore,
     store: { snapshot: () => ({ apiKeys: [
+      { hash: keyHash(ACME), tenant: 'acme' },
+      { hash: keyHash(GLOBEX), tenant: 'globex' },
+    ] }), read: () => ({ apiKeys: [
       { hash: keyHash(ACME), tenant: 'acme' },
       { hash: keyHash(GLOBEX), tenant: 'globex' },
     ] }) },
@@ -138,7 +147,7 @@ function harnessWithRunsDelayedGetChat(gate: Promise<void>) {
   const d = {
     db: conv,
     chatStore,
-    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
     manager: {
       status: () => ({ state: 'running', model: 'test-model' }),
       target: () => 'http://127.0.0.1:9999',
@@ -1452,7 +1461,7 @@ test('an unhandled throw anywhere on this surface still returns a JSON error env
   const d = {
     db: conv,
     chatStore: new ChatStoreRouter(conv.chatStore, conv.chatStore),
-    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
+    store: { snapshot: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }), read: () => ({ apiKeys: [{ hash: keyHash(ACME), tenant: 'acme' }] }) },
   } as never
   const throwingRuns = { isChatActive: () => { throw new Error('synthetic isChatActive failure') } } as never
   const app = new Hono()

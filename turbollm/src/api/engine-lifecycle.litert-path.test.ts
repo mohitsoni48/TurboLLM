@@ -14,12 +14,12 @@ function deps(engine: Engine): { d: Deps; loads: StartOpts[] } {
   const cfg: Config = defaultConfig()
   const loads: StartOpts[] = []
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     scanner: { get: () => undefined },
     manager: { load: (opts: StartOpts) => { loads.push(opts); return Promise.resolve() } },
     registry: { active: () => engine },
     modelRouter: { withSwapLock: (fn: () => unknown) => Promise.resolve(fn()), markPrimaryLoaded: () => {}, recordManualLoad: () => {} },
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
   return { d, loads }

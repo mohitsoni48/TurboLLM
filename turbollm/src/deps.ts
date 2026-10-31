@@ -57,8 +57,13 @@ export interface Deps {
    *  Optional: only wired in the real `serve()` entrypoint (cli.ts); absent under tests. */
   comfy?: ComfyGuard
   /** Priority-queue mutex serialising engine calls (multiple concurrent generation
-   *  requests). Optional — absent under tests; only wired in cli.ts. */
+   *  requests) on the PRIMARY engine: in-app chat, Code, memory, compaction, extensions and
+   *  routines all talk to the primary. Optional — absent under tests; only wired in cli.ts. */
   gate?: GenerationGate
+  /** The gate of the engine process a gateway request was routed to (scalability review 1.1):
+   *  a keep-N pool slot's own, sized by its own `--parallel`; for the primary, `gate` itself.
+   *  Optional — absent under tests, where the gateway falls back to `gate`; wired in cli.ts. */
+  gateFor?: (engine: Manager) => GenerationGate
   /** Remote access supervisor (ADR-422). Present while the daemon owns a
    *  RemoteAccessManager — always in the real `serve()` entrypoint (cli.ts), absent under
    *  tests that don't exercise it. Its ingress port being bound is what makes a request

@@ -71,7 +71,7 @@ function mkDeps(
     touch: () => {},
   }
 
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
   const scanner = {
     list: () => ({ models, scanning: false, lastScanAt: '' }),
     get: (k: string) => models.find((m) => m.key === k),

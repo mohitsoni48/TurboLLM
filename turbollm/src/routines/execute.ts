@@ -409,7 +409,7 @@ export async function executeRoutine(
     }
     try {
       let ranStatus: RoutineRunStatus = 'errored'
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d) }, routine.modelKey, async (route) => {
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d), holdsGate: !!d.gate }, routine.modelKey, async (route) => {
         const outcome = await dispatchRoutine(d, routine, run, deadline.signal, route)
         ranStatus = finalizeOutcome(d, run.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))
@@ -522,7 +522,7 @@ export async function resumeRoutineRun(d: Deps, run: RoutineRun, decision: 'allo
       return { ok: false, code: 'gate_timeout', message: 'Timed out waiting for the model server.' }
     }
     try {
-      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d) }, routine.modelKey, async (route) => {
+      const swap = await withPinnedModel({ manager: d.manager, modelRouter: d.modelRouter, isAutotuneRunning: () => autotuneRunning(d), holdsGate: !!d.gate }, routine.modelKey, async (route) => {
         const outcome = await dispatchResume(d, routine, current, pending, decision, deadline.signal, route)
         finalizeOutcome(d, current.id, outcome)
       }, pinnedGate(d, routine, () => { release?.(); release = undefined }))

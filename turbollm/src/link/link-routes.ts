@@ -2,7 +2,7 @@ import type { Hono } from 'hono'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import type { Deps } from '../deps'
-import type { ApiKey } from '../config/config'
+import type { ApiKey, DeepReadonly } from '../config/config'
 // A VALUE import, not a type one: `ValueError.field` is the only part of a failed
 // `validate()` that may cross the façade (see the `invalid_config` branch below).
 import { ValueError } from '../config/config'
@@ -38,7 +38,7 @@ import { inferenceServed } from '../telemetry/events/link'
 // plain `Hono` type in this function's signature carries no Variables — so route
 // handlers below see it through this narrowed local alias rather than widening the
 // exported signature (which task 6's interface pins to `Hono`).
-type LinkEnv = { Variables: { linkKey: ApiKey } }
+type LinkEnv = { Variables: { linkKey: DeepReadonly<ApiKey> } }
 
 /** Stable identity for THIS install, minted once and persisted. The peer keeps it so it
  *  can tell "the tunnel URL changed but it's the same box" (normal, every Kaggle session)
@@ -208,8 +208,8 @@ export function registerLinkApi(app: Hono, d: Deps, opts?: { authAlreadyRegister
     const key = c.get('linkKey')
     // A legacy key (no grant) is full-access, so it must report EVERY capability —
     // reporting [] would grey out every control on the peer for an otherwise valid key.
-    const capabilities = key.grant ? key.grant.capabilities : [...LINK_CAPABILITIES]
-    const models = key.grant?.models?.length ? key.grant.models : undefined
+    const capabilities = key.grant ? [...key.grant.capabilities] : [...LINK_CAPABILITIES]
+    const models = key.grant?.models?.length ? [...key.grant.models] : undefined
     const daemon = d.store.snapshot().daemon as { machineName?: string }
     const body: HelloResponse = {
       machineId: machineId(d),

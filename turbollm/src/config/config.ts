@@ -947,6 +947,19 @@ function sweepDeadSaveTmps(configPath: string): void {
   }
 }
 
+export type DeepReadonly<T> = T extends (infer U)[]
+  ? readonly DeepReadonly<U>[]
+  : T extends object ? { readonly [K in keyof T]: DeepReadonly<T[K]> } : T
+
+/** Freezes `value` and everything under it, in place. The config is plain JSON data, so a walk of own values covers it. */
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const v of Object.values(value)) deepFreeze(v)
+  }
+  return value
+}
+
 export class ConfigStore {
   /** Set by stopSaving() (the restart keeper): config.json belongs to another process from then on. */
   private saving = true
@@ -956,7 +969,9 @@ export class ConfigStore {
     private filePath: string,
     private brokenPath = '',
     private brokenKept = false,
-  ) {}
+  ) {
+    deepFreeze(data)
+  }
 
   static load(path: string): ConfigStore {
     sweepDeadSaveTmps(path)
@@ -1007,8 +1022,16 @@ export class ConfigStore {
     return store
   }
 
+  /** A mutable deep copy: for a caller that changes it, or keeps it past the next update(). A reader that only
+   *  looks, above all on a per-request path, uses read(): the clone costs ~2 ms on a library-sized config. */
   snapshot(): Config {
     return structuredClone(this.data)
+  }
+
+  /** The live config, not a copy: the same object until the next update() replaces it. Deep-frozen, so a caller that
+   *  mutates it throws (and cannot corrupt what every other reader sees) instead of silently doing so. */
+  read(): DeepReadonly<Config> {
+    return this.data
   }
 
   /** Mutate the config under one synchronous call, then validate + persist. */
@@ -1016,7 +1039,10 @@ export class ConfigStore {
     const work = structuredClone(this.data)
     fn(work)
     validate(work)
-    this.data = work
+    // A frozen COPY: `fn` may have put in objects its caller still holds and changes (Registry.add*'s engine, a link
+    // record, an API key, an MCP server, a custom agent), which freezing `work` in place froze under them (review L4).
+    // One more clone per write; update() is not on a hot path.
+    this.data = deepFreeze(structuredClone(work))
     if (this.saving) this.save()
   }
 
@@ -1642,7 +1668,7 @@ export function setModelHidden(cfg: Config, modelKey: string, hidden: boolean): 
 }
 
 /** Whether the user hid `modelKey` by hand (Config.hiddenModels). */
-export function isModelHidden(cfg: Pick<Config, 'hiddenModels'>, modelKey: string): boolean {
+export function isModelHidden(cfg: DeepReadonly<Pick<Config, 'hiddenModels'>>, modelKey: string): boolean {
   return (cfg.hiddenModels ?? []).includes(modelKey)
 }
 
@@ -1828,7 +1854,7 @@ export function isUnsafeMapKey(key: string): boolean {
   return key === '__proto__' || key === 'constructor' || key === 'prototype'
 }
 
-export function getModelProfile(cfg: Config, modelKey: string, engineId: string): unknown {
+export function getModelProfile(cfg: DeepReadonly<Config>, modelKey: string, engineId: string): unknown {
   // Pinned preset (ADR-353 D4) outranks the saved per-engine profiles — but ONLY when its
   // engine matches. The engine check is load-bearing: engines keep independent tunes per model
   // (issue #35), so a preset tuned on ONE engine must not shadow another engine's profile —

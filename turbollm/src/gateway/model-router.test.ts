@@ -14,6 +14,7 @@ import { readdirSync, readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 import { ModelRouter } from './model-router'
+import { EngineGates } from '../agents/gate'
 import { Manager, type StartOpts, type Status } from '../engines/manager'
 import { defaultConfig, type Config, type ConfigStore, type Engine } from '../config/config'
 import type { Registry } from '../engines/registry'
@@ -23,8 +24,9 @@ import { getSysInfo } from '../sysinfo/sysinfo'
 import { realEngineSetUp } from '../test-support/stand-in-engine'
 import { modelIncompatibility } from '../engines/compat'
 
-/** A Manager double exposing only status() (all the tested paths read). */
-function fakeManager(state: Status['state'], modelKey: string | null): Manager {
+/** A Manager double exposing only status() (all the tested paths read), plus the in-flight generation count
+ *  keep-N eviction reads (`activeRequests`, default none). */
+function fakeManager(state: Status['state'], modelKey: string | null, activeRequests = 0): Manager {
   const model = modelKey
     ? { key: modelKey, name: modelKey, quant: 'Q4', ctx: 4096, vision: false }
     : null
@@ -33,13 +35,15 @@ function fakeManager(state: Status['state'], modelKey: string | null): Manager {
     // No engine behind it: the pool helpers (and dropSlot) see no process to track.
     currentOpts: () => null,
     restartOpts: () => null,
+    sessionStats: () => ({ activeRequests }),
+    parallelSlots: () => 1, // what an engine's gate is sized from (setGates)
   } as unknown as Manager
 }
 
 /** A ConfigStore double returning a fixed gateway snapshot. */
 function fakeStore(gateway: { keepN: number }): ConfigStore {
   return {
-    snapshot: () => ({ gateway: { autoSwap: true, ...gateway } }),
+    snapshot: () => ({ gateway: { autoSwap: true, ...gateway } }), read: () => ({ gateway: { autoSwap: true, ...gateway } }),
   } as unknown as ConfigStore
 }
 
@@ -186,7 +190,7 @@ test('the ComfyUI pool stopper reaches a pool slot that is still loading, and th
   } as unknown as ConstructorParameters<typeof ModelRouter>[4]
   const entry = fakeEntry('model-b')
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
   const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
@@ -222,7 +226,7 @@ test('the ComfyUI pool stopper reaches a pool slot that is still loading, and th
 // about. `chatSlotCount`/`evictChatLru` are private — reached via the same narrow cast
 // pattern used for extraSlots above rather than driving a real load() in a unit test.
 function privates(r: ModelRouter) {
-  return r as unknown as { chatSlotCount(): number; evictChatLru(): Manager }
+  return r as unknown as { chatSlotCount(): number; evictChatLru(): Manager | undefined }
 }
 
 test('chatSlotCount: a stopping primary still counts as an occupied slot', () => {
@@ -288,6 +292,7 @@ function controllableManager() {
   let concurrentViolation = false
   const manager = {
     status: (): Status => ({ state, err: null, port: 0, pid: 0, model, loadElapsedMs: 0 }),
+    sessionStats: () => ({ activeRequests: 0 }),
     target: () => 'http://127.0.0.1:9999',
     touch: () => {},
     load: (opts: { model: { key: string } }): Promise<void> => {
@@ -310,7 +315,7 @@ function controllableManager() {
 
 function fakeFullStore(): ConfigStore {
   return {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
 }
@@ -378,7 +383,7 @@ test('loadExplicit loads the requested model even when autoSwap is globally disa
   // update() is required — doLoad() calls store.update() to record lastLoaded on success,
   // matching this file's own fakeFullStore() convention above.
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 }, modelProfiles: {} }),
+    snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 }, modelProfiles: {} }), read: () => ({ gateway: { autoSwap: false, keepN: 1 }, modelProfiles: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as import('../config/config').ConfigStore
   // capabilities is required by doLoad's buildOpts -> profileToArgs (reads caps.flags/caps.kvTypes)
@@ -494,7 +499,7 @@ function litertRouter(
   const litert = { id: 'litert-1', kind: 'litert-lm', capabilities: { flags: [] } } as unknown as Engine
   const registry = { active: () => fakeEngine(activeKind), litertLmEngine: () => litert, layaEngine: () => undefined } as unknown as Registry
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {}, showAllEngineModels }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {}, showAllEngineModels }), read: () => ({ gateway: { autoSwap: true, keepN: 1 }, modelProfiles: {}, comfyui: {}, showAllEngineModels }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => { const c = {}; fn(c); updates.push(c) },
   } as unknown as ConfigStore
   return { r: new ModelRouter(store, registry, primary, scanner, comfy), bundle, gguf, laya }
@@ -698,7 +703,7 @@ test('loadExplicit reports 503 for an unknown model key without touching the man
   const scanner = { get: () => undefined, list: () => ({ models: [] }) } as unknown as import('../models/scanner').Scanner
   let loadCalled = false
   const primary = { status: () => ({ state: 'stopped', model: null }), load: async () => { loadCalled = true } } as unknown as import('../engines/manager').Manager
-  const store = { snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 } }) } as unknown as import('../config/config').ConfigStore
+  const store = { snapshot: () => ({ gateway: { autoSwap: false, keepN: 1 } }), read: () => ({ gateway: { autoSwap: false, keepN: 1 } }) } as unknown as import('../config/config').ConfigStore
   const registry = { active: () => ({ id: 'e1', kind: 'llama-cpp' }) } as unknown as import('../engines/registry').Registry
   const { ModelRouter } = await import('./model-router')
   const r = new ModelRouter(store, registry, primary, scanner, undefined)
@@ -758,7 +763,7 @@ function builderEntry(overrides: Partial<ModelEntry>): ModelEntry {
 }
 
 function routerWithConfig(cfg: Config): ModelRouter {
-  const store = { snapshot: () => cfg } as unknown as ConfigStore
+  const store = { snapshot: () => cfg, read: () => cfg } as unknown as ConfigStore
   return new ModelRouter(store, {} as never, fakeManager('stopped', null), {} as never, undefined)
 }
 
@@ -842,7 +847,7 @@ function routingRouter(opts: {
   slots?: PoolSlotShape[]
 }): ModelRouter {
   const cfg = { gateway: { autoSwap: opts.autoSwap ?? true, keepN: 1 }, modelProfiles: {}, comfyui: {}, links: [] }
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as unknown as ConfigStore
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) } as unknown as ConfigStore
   const scanner = {
     list: () => ({ models: opts.models }),
     get: (key: string) => opts.models.find((m) => m.key === key),
@@ -918,7 +923,7 @@ test('routeTo: the entry running in a pool slot gets that slot target', async ()
   const slot = { manager: slotManager('running', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
   const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [slot] })
 
-  assert.deepEqual(await r.routeTo(BETA), { target: BETA_SLOT_TARGET })
+  assert.deepEqual(await r.routeTo(BETA), { target: BETA_SLOT_TARGET, manager: slot.manager })
 })
 
 test('route: a pool slot is described by its OWN engine, so the gateway does not shape the request for the primary', async () => {
@@ -929,7 +934,7 @@ test('route: a pool slot is described by its OWN engine, so the gateway does not
   const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), slots: [{ manager, modelKey: 'beta-key', lastUsedMs: 0 }] })
 
   assert.deepEqual(await r.route('Beta'), {
-    target: BETA_SLOT_TARGET, engineKind: 'litert-lm', modelPath: '/models/beta.litertlm', modelName: 'Beta',
+    target: BETA_SLOT_TARGET, manager, engineKind: 'litert-lm', modelPath: '/models/beta.litertlm', modelName: 'Beta',
   })
   assert.deepEqual(await r.route('Alpha Model'), { target: PRIMARY_TARGET }, 'the primary is left to the gateway, as before')
 })
@@ -959,7 +964,7 @@ test('route: with auto-swap off an embeddings request naming a running pool slot
   const slot = { manager: slotManager('running', 'beta-key', BETA_SLOT_TARGET), modelKey: 'beta-key', lastUsedMs: 0 }
   const r = routingRouter({ models: [ALPHA, BETA], primary: primaryHolding('alpha-key'), autoSwap: false, slots: [slot] })
 
-  assert.deepEqual(await r.route('Beta', { embeddings: true }), { target: BETA_SLOT_TARGET })
+  assert.deepEqual(await r.route('Beta', { embeddings: true }), { target: BETA_SLOT_TARGET, manager: slot.manager })
   assert.equal(r.targetEntry('Beta', { embeddings: true }), BETA)
   assert.deepEqual(await r.route('Beta'), { target: PRIMARY_TARGET }, 'a chat request is answered by the primary, as before')
   assert.equal(r.targetEntry('Beta'), ALPHA)
@@ -1026,6 +1031,7 @@ function slotProcess(key: string, engineId: string) {
     }),
     currentOpts: () => (state === 'running' || state === 'starting' ? opts : null),
     restartOpts: () => opts,
+    sessionStats: () => ({ activeRequests: 0 }),
     stop: () => { if (state === 'running' || state === 'starting') state = 'stopping' },
     stopAndWait: async (o?: { force?: boolean }) => { stops.push(o?.force); state = 'stopped' },
   } as unknown as Manager
@@ -1109,7 +1115,7 @@ function gatedNewSlot(endState: Status['state']) {
 /** keepN 3, model-p in the primary, `slots` registered, new pool slots from `newSlot`, active engine 'eng1'. */
 function poolRouter(slots: PoolSlotShape[], newSlot: () => Manager): ModelRouter {
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN: 3 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
   const entries = slots.map((s) => fakeEntry(s.modelKey))
@@ -1193,7 +1199,7 @@ test('a slot loading over the LRU model it evicted counts on both engines, and f
   }
   const entry = fakeEntry('model-b')
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
   const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
@@ -1232,7 +1238,7 @@ test('a model waiting to load into a new pool slot is loaded for the delete guar
   } as unknown as Manager
   const entry = fakeEntry('model-b')
   const store = {
-    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
+    snapshot: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }), read: () => ({ gateway: { autoSwap: true, keepN: 2 }, modelProfiles: {}, comfyui: {} }),
     update: (fn: (c: { lastLoaded?: unknown }) => void) => fn({}),
   } as unknown as ConfigStore
   const scanner = { list: () => ({ models: [entry] }), get: () => undefined } as unknown as Scanner
@@ -1332,4 +1338,240 @@ test('shutdownPool() stops every pool slot\'s engine and waits for it to exit', 
   assert.equal(after.length, 1)
   const slotPid = before.find((p) => !after.includes(p))!
   assert.throws(() => process.kill(slotPid, 0), 'the slot\'s engine has exited')
+})
+
+// ── keep-N eviction never stops an engine mid-generation (scalability review 1.4) ──────────────
+// evictChatLru ranked only by lastUsedMs — the time a request was ROUTED — so a long generation on the
+// least-recently-routed engine was stopped under its client when another model was requested. A slot with
+// a generation in flight (Manager.sessionStats().activeRequests, counted on the engine that serves it,
+// review 1.5) is skipped; when every candidate is generating nothing is evicted and the load is refused
+// with a retryable 503 (it clears by itself once a reply finishes).
+test('evictChatLru: skips the least-recently-used slot while it is generating, and evicts the idle one', () => {
+  const primary = fakeManager('running', 'llama-8b', 1) // LRU (primaryLastUsed 0), but mid-generation
+  const idleSlot = fakeManager('running', 'qwen-7b')
+  const r = router(primary, fakeStore({ keepN: 2 }), [
+    { manager: idleSlot, modelKey: 'qwen-7b', lastUsedMs: Date.now() },
+  ])
+  assert.equal(privates(r).evictChatLru(), idleSlot)
+})
+
+test('evictChatLru: a busy pool slot is not evicted (and stays registered) when the primary is idle', () => {
+  const primary = fakeManager('running', 'llama-8b')
+  const busySlot = fakeManager('running', 'qwen-7b', 2)
+  const r = router(primary, fakeStore({ keepN: 2 }), [
+    { manager: busySlot, modelKey: 'qwen-7b', lastUsedMs: 0 }, // older than the primary would be
+  ])
+  ;(r as unknown as { primaryLastUsed: number }).primaryLastUsed = Date.now()
+  assert.equal(privates(r).evictChatLru(), primary)
+  assert.equal(r.loadedModelKeys().has('qwen-7b'), true, 'the generating slot keeps its registration')
+})
+
+test('evictChatLru: nothing is evicted when every candidate is generating', () => {
+  const r = router(fakeManager('running', 'llama-8b', 1), fakeStore({ keepN: 2 }), [
+    { manager: fakeManager('running', 'qwen-7b', 1), modelKey: 'qwen-7b', lastUsedMs: 0 },
+  ])
+  assert.equal(privates(r).evictChatLru(), undefined)
+  assert.equal(r.loadedModelKeys().has('qwen-7b'), true)
+})
+
+test('route: a full pool whose engines are all generating answers a retryable 503 and stops nothing', async () => {
+  const entryA = fakeEntry('model-a')
+  const entryB = fakeEntry('model-b')
+  let loads = 0
+  const primary = {
+    status: (): Status => ({ state: 'running', err: null, port: 0, pid: 0, model: { key: 'model-a', name: 'model-a', quant: 'Q4', ctx: 4096, vision: false }, loadElapsedMs: 0 }),
+    sessionStats: () => ({ activeRequests: 1 }),
+    target: () => 'http://primary-engine',
+    touch: () => {},
+    load: async () => { loads++ },
+  } as unknown as Manager
+  const scanner = { list: () => ({ models: [entryA, entryB], scanning: false, lastScanAt: '' }), get: () => undefined } as unknown as Scanner
+  const registry = { active: () => fakeEngine('mlx') } as unknown as Registry
+  const r = new ModelRouter(fakeFullStore(), registry, primary, scanner, undefined)
+
+  const result = await r.route('model-b')
+
+  assert.ok('status' in result, `expected a refusal, got ${JSON.stringify(result)}`)
+  assert.equal(result.status, 503)
+  assert.equal(result.permanent, undefined, 'retryable: it clears once the reply finishes')
+  assert.match(result.message, /generating/)
+  assert.equal(loads, 0, 'the generating engine was never stopped for the new model')
+})
+
+// ── the route names the engine that serves it (scalability review 1.5) ─────────────────────────
+// The gateway counts a request's generation, stats and gate on the engine that runs it. A pool-slot
+// route carries that slot's Manager; a primary route carries none (the gateway reads the primary).
+test('route: a model in a pool slot comes back with that slot\'s own Manager; the primary\'s carries none', async () => {
+  const entryP = fakeEntry('model-p')
+  const entryA = fakeEntry('model-a')
+  const primary = fakeManager('running', 'model-p')
+  Object.assign(primary, { target: () => 'http://primary-engine', touch: () => {} })
+  const slot = fakeManager('running', 'model-a')
+  Object.assign(slot, { target: () => 'http://pool-engine', touch: () => {} })
+  const scanner = { list: () => ({ models: [entryP, entryA], scanning: false, lastScanAt: '' }), get: () => undefined } as unknown as Scanner
+  const r = new ModelRouter(fakeStore({ keepN: 2 }), {} as never, primary, scanner, undefined)
+  ;(r as unknown as { extraSlots: Map<string, PoolSlotShape> }).extraSlots = new Map([['model-a', { manager: slot, modelKey: 'model-a', lastUsedMs: 0 }]])
+
+  const pooled = await r.route('model-a')
+  assert.ok('target' in pooled)
+  assert.equal(pooled.manager, slot)
+  const onPrimary = await r.route('model-p')
+  assert.ok('target' in onPrimary)
+  assert.equal(onPrimary.manager, undefined)
+})
+
+test('poolGenerating: true only while a pool slot (not the primary) has a generation in flight', () => {
+  const idle = router(fakeManager('running', 'llama-8b', 1), STORE, [
+    { manager: fakeManager('running', 'qwen-7b'), modelKey: 'qwen-7b', lastUsedMs: 0 },
+  ])
+  assert.equal(idle.poolGenerating(), false, 'the primary\'s own generation is read off the primary, not here')
+  const busy = router(fakeManager('running', 'llama-8b'), STORE, [
+    { manager: fakeManager('running', 'qwen-7b', 1), modelKey: 'qwen-7b', lastUsedMs: 0 },
+  ])
+  assert.equal(busy.poolGenerating(), true)
+})
+
+// ── a held engine is busy too (scalability review 1.4 follow-up) ───────────────────────────────
+// The primary can need its model with no request in flight: a compaction, a tool-approval wait, a reply's title or
+// memory call (Manager.holdsEngine, chatHoldsEngine). Evicting it then failed that work as surely as a live stream.
+test('evictChatLru: a primary held by chat work with no request in flight is not evicted', () => {
+  const primary = fakeManager('running', 'llama-8b') // LRU (primaryLastUsed 0), no generation
+  Object.assign(primary, { holdsEngine: () => true })
+  const idleSlot = fakeManager('running', 'qwen-7b')
+  const r = router(primary, fakeStore({ keepN: 2 }), [
+    { manager: idleSlot, modelKey: 'qwen-7b', lastUsedMs: Date.now() },
+  ])
+  assert.equal(privates(r).evictChatLru(), idleSlot)
+})
+
+test('evictChatLru: a held primary that is the only engine is not evicted', () => {
+  const primary = fakeManager('running', 'llama-8b')
+  Object.assign(primary, { holdsEngine: () => true })
+  assert.equal(privates(router(primary, fakeStore({ keepN: 1 }))).evictChatLru(), undefined)
+})
+
+// ── no load while auto-tune runs (scalability review 1.7) ─────────────────────────────────────
+// Between two probes the primary reads 'stopped', so a gateway load took it and the next probe's start failed, scored
+// as a crash; one into a pool slot added its VRAM to the probe's reading. Refused, retryable, until the tune ends.
+test('route, routeTo and loadExplicit: a load while auto-tune runs is a retryable 503 and loads nothing', async () => {
+  const { manager, loads } = recordingPrimary()
+  const entry = fakeEntry('model-a')
+  const r = autoSwapRouter('mlx', entry, manager)
+  let tuning = true
+  r.setAutoTune({ isRunning: () => tuning })
+
+  for (const result of [await r.route('model-a'), await r.routeTo(entry), await r.loadExplicit('model-a')]) {
+    assert.ok('status' in result, `expected a refusal, got ${JSON.stringify(result)}`)
+    assert.equal(result.status, 503)
+    assert.equal(result.permanent, undefined, 'retryable: it clears once the tune ends')
+    assert.equal(result.message, "Auto-tune is running, so 'model-a' cannot be loaded until it finishes. Try again when it is done.")
+  }
+  assert.deepEqual(loads, [])
+
+  tuning = false
+  await r.route('model-a')
+  assert.equal(loads.length, 1, 'loads again once the tune has ended')
+})
+
+// ── a request on an engine's gate is busy too (review M2) ─────────────────────────────────────
+// A request holding, or queued on, an engine's gate has not reached generationStart yet, so it was invisible to
+// eviction: the evicted Manager was reused for another model, and its waiters were then released onto a stale target
+// (a dead port, or a different model). The router reads each engine's gate through setGates.
+for (const how of ['holds', 'is queued on'] as const) {
+  test(`evictChatLru: an engine whose gate a request ${how} is not evicted`, async () => {
+    const primary = fakeManager('running', 'llama-8b') // LRU, no generation
+    const idleSlot = fakeManager('running', 'qwen-7b')
+    const r = router(primary, fakeStore({ keepN: 2 }), [
+      { manager: idleSlot, modelKey: 'qwen-7b', lastUsedMs: Date.now() },
+    ])
+    const gates = new EngineGates()
+    r.setGates((m) => gates.for(m as never))
+    const held = await gates.for(primary).acquire('bg')
+    // A waiter exists only behind a full gate, so the queued case has one holder ahead of it.
+    const ac = new AbortController()
+    const waiting = how === 'is queued on' ? gates.for(primary).acquire('bg', { signal: ac.signal }).catch(() => {}) : null
+    try {
+      assert.equal(gates.for(primary).stats().queued, waiting ? 1 : 0)
+      assert.equal(privates(r).evictChatLru(), idleSlot)
+    } finally {
+      ac.abort()
+      await waiting
+      held()
+    }
+  })
+}
+
+test('evictChatLru: an engine whose gate is empty is evicted as before', () => {
+  const primary = fakeManager('running', 'llama-8b')
+  const idleSlot = fakeManager('running', 'qwen-7b')
+  const r = router(primary, fakeStore({ keepN: 2 }), [{ manager: idleSlot, modelKey: 'qwen-7b', lastUsedMs: Date.now() }])
+  const gates = new EngineGates()
+  r.setGates((m) => gates.for(m as never))
+  assert.equal(privates(r).evictChatLru(), primary)
+})
+
+// ── eviction re-checks its victim under the load lock (review M1) ──────────────────────────────
+// doLoad picked an idle victim, then Manager.load waited on the global load lock and stopped it without looking again;
+// a request routed to the still-running victim meanwhile was killed with it. The check runs again in load's
+// beforeStop, under the lock, and refuses with the same retryable 503 as a pool that is busy from the start.
+test('route: a victim that starts generating while the load waits for the lock is not stopped', async () => {
+  const entryA = fakeEntry('model-a')
+  const entryB = fakeEntry('model-b')
+  let active = 0
+  let stopped = false
+  let lockFree!: () => void
+  const lock = new Promise<void>((r) => { lockFree = r })
+  const primary = {
+    status: (): Status => ({ state: 'running', err: null, port: 0, pid: 0, model: { key: 'model-a', name: 'model-a', quant: 'Q4', ctx: 4096, vision: false }, loadElapsedMs: 0 }),
+    sessionStats: () => ({ activeRequests: active }),
+    target: () => 'http://primary-engine',
+    touch: () => {},
+    load: async (_opts: unknown, hooks?: { beforeStop?: () => void }) => {
+      await lock // another load holds the global lock
+      hooks?.beforeStop?.()
+      stopped = true
+    },
+  } as unknown as Manager
+  const scanner = { list: () => ({ models: [entryA, entryB], scanning: false, lastScanAt: '' }), get: () => undefined } as unknown as Scanner
+  const r = new ModelRouter(fakeFullStore(), { active: () => fakeEngine('mlx') } as unknown as Registry, primary, scanner, undefined)
+
+  const pending = r.route('model-b')
+  await new Promise((resolve) => setImmediate(resolve))
+  active = 1 // a request reached the primary while the load waited
+  lockFree()
+  const result = await pending
+
+  assert.ok('status' in result, `expected a refusal, got ${JSON.stringify(result)}`)
+  assert.equal(result.status, 503)
+  assert.equal(result.permanent, undefined, 'retryable: it clears once the reply finishes')
+  assert.match(result.message, /generating/)
+  assert.equal(result.reason, 'busy', 'a routine skips it as a busy engine')
+  assert.equal(stopped, false, 'the engine the request is on was never stopped')
+})
+
+// A routine takes the primary's gate for its swap and restore (routines/execute.ts), so that hold is its own, not a
+// request on the engine: counted, keep-N 1 refused every routine swap as "generating" (LoadExplicitOpts.holdsGate).
+test('loadExplicit: a caller that holds the primary\'s gate itself (holdsGate) can still swap the primary', async () => {
+  const { manager: stopped, loads } = recordingPrimary()
+  const entryA = fakeEntry('model-a')
+  const entryB = fakeEntry('model-b')
+  const primary = Object.assign(stopped, {
+    status: (): Status => ({ state: 'running', err: null, port: 0, pid: 0, model: { key: 'model-a', name: 'model-a', quant: 'Q4', ctx: 4096, vision: false }, loadElapsedMs: 0 }),
+    sessionStats: () => ({ activeRequests: 0 }),
+    parallelSlots: () => 1,
+    load: async (opts: unknown, hooks?: { beforeStop?: () => void }) => { hooks?.beforeStop?.(); loads.push(opts) },
+  })
+  const scanner = { list: () => ({ models: [entryA, entryB], scanning: false, lastScanAt: '' }), get: () => undefined } as unknown as Scanner
+  const r = new ModelRouter(fakeFullStore(), { active: () => fakeEngine('mlx') } as unknown as Registry, primary, scanner, undefined)
+  const gates = new EngineGates()
+  r.setGates((m) => gates.for(m as never))
+  const routineHold = await gates.for(primary).acquire('bg')
+  try {
+    const refused = await r.loadExplicit('model-b')
+    assert.ok('status' in refused && /generating/.test(refused.message), 'a hold the caller does not own is busy')
+    await r.loadExplicit('model-b', undefined, { holdsGate: true })
+    assert.equal(loads.length, 1, 'its own hold does not keep the model it swaps out loaded')
+  } finally {
+    routineHold()
+  }
 })

@@ -3,7 +3,7 @@ import { cors } from 'hono/cors'
 import { existsSync, readFileSync, statSync } from 'node:fs'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join, normalize } from 'node:path'
-import { Agent, setGlobalDispatcher } from 'undici'
+import { setGlobalDispatcher } from 'undici'
 import { registerApi } from './api/routes'
 import { registerLinkAdminRoutes } from './api/link-admin-routes'
 import { registerRemoteApi } from './remote/routes'
@@ -24,11 +24,12 @@ import { createMakeBody } from './ext/generation'
 import { DEFAULT_AUDIT_RETENTION_DAYS } from './ext/audit'
 import { extErrorHandler } from './ext/errors'
 import { daemonTick } from './util/daemon-ticks'
+import { createDaemonDispatcher } from './util/daemon-dispatcher'
 
 // Reuse TCP connections for all engine and HF fetch calls. Without this, Node
 // opens a new connection per request — ~5–20 ms of extra latency every Claude
 // Code turn (it sends back-to-back requests at each agentic step).
-setGlobalDispatcher(new Agent({ keepAliveMaxTimeout: 60_000, connections: 10 }))
+setGlobalDispatcher(createDaemonDispatcher())
 
 const WEB_ROOT = join(dirname(fileURLToPath(import.meta.url)), 'webdist')
 

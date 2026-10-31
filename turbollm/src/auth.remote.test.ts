@@ -16,7 +16,7 @@ const ctxOnWrappedPort = (port: number): Context =>
 const depsWithIngress = (port: number | undefined): Deps => {
   const cfg = defaultConfig()
   return {
-    store: { snapshot: () => cfg, update: () => {}, dir: () => '' },
+    store: { snapshot: () => cfg, read: () => cfg, update: () => {}, dir: () => '' },
     remote: { ingressPort: () => port },
   } as unknown as Deps
 }

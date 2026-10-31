@@ -49,6 +49,9 @@ function testApp(opts: { lanBind?: boolean; hasKey?: boolean; routinesEnabled?: 
       snapshot: () => ({
         daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false, experimental: { routines: opts.routinesEnabled ?? true } },
         apiKeys,
+      }), read: () => ({
+        daemon: { lanBind: opts.lanBind ?? false, requireApiKey: false, experimental: { routines: opts.routinesEnabled ?? true } },
+        apiKeys,
       }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
@@ -464,7 +467,7 @@ test('POST /api/v1/routines/:id/run-now fires immediately via the shared schedul
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
 
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 202)
@@ -477,7 +480,7 @@ test('POST /api/v1/routines/:id/run-now on a pending_confirmation routine return
   const created = db.createRoutine({ flavor: 'chat', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 }, modelKey: 'm', agentId: 'a' })
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 409)
 })
@@ -492,7 +495,7 @@ test('POST /api/v1/routines/:id/run-now refuses to trigger an already-armed rout
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'ok' } })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: false } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: false } } }), read: () => ({ daemon: { experimental: { routines: false } } }) } } as unknown as Deps)
   const res = await app2.request(`/api/v1/routines/${created.id}/run-now`, { method: 'POST' })
   assert.equal(res.status, 403)
   const problem = (await res.json()) as { error: { code: string } }
@@ -513,7 +516,7 @@ test('POST /api/v1/routines/:id/run-now on an unknown routine returns 404', asyn
   const { db } = testApp()
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async () => 'ok' })
   const app2 = new Hono()
-  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
+  registerRoutineRoutes(app2, { db, routineScheduler: scheduler, store: { snapshot: () => ({ daemon: { experimental: { routines: true } } }), read: () => ({ daemon: { experimental: { routines: true } } }) } } as unknown as Deps)
   const res = await app2.request('/api/v1/routines/missing/run-now', { method: 'POST' })
   assert.equal(res.status, 404)
 })
@@ -567,7 +570,7 @@ test('approve releases the scheduler-parked routine once resumeRoutineRun settle
     store: db, now: () => new Date(),
     runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' },
   })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }), read: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   await scheduler.tick() // fires and parks — inFlight now holds the routine
   await new Promise((resolve) => setImmediate(resolve))
@@ -629,7 +632,7 @@ test('approve does NOT release the parked guard on a retryable resume failure (g
   const d = {
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
@@ -681,7 +684,7 @@ test('a parked run an Approve is resuming is listed as running until the resume 
   const d = {
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: (r, run) => executeRoutine(d, r, run) })
   registerRoutineRoutes(app, { ...d, routineScheduler: scheduler } as unknown as Deps)
@@ -728,7 +731,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
   const d = {
     db,
     store: {
-      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
+      snapshot: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }), read: () => ({ daemon: { lanBind: true, requireApiKey: false, experimental: { routines: true } }, apiKeys }),
       update: (fn: (cfg: { apiKeys: typeof apiKeys }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
@@ -746,7 +749,7 @@ test('POST /api/v1/routines/:id/run-now on a code routine from a non-host device
 test('POST /api/v1/routines/:id/run-now on a code routine from the host (loopback-only bind) needs no key (I2)', async () => {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
-  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
+  const d = { db, store: { snapshot: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }), read: () => ({ daemon: { lanBind: false, requireApiKey: false, experimental: { routines: true } }, apiKeys: [] }) } } as unknown as Deps
   const routine = db.createRoutine({
     flavor: 'code', prompt: 'x', scheduleDisplay: 'd', scheduleRule: { kind: 'interval', everyMs: 60_000 },
     modelKey: 'm', workspacePath: 'D:/repo', codingAgent: 'pi',
@@ -907,7 +910,7 @@ test('POST .../runs/:runId/approve returns a shaped 500 (not a raw crash) if res
   const d = {
     db, manager: workingManager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   // Genuinely stall via a real tool-call round so pendingToolCall is parseable.
@@ -961,7 +964,7 @@ test('two concurrent approve calls on the same stalled run: only one executes, a
   const d = {
     db, manager, modelRouter, gate,
     registry: { active: () => ({ kind: 'llama-server' }) },
-    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
+    store: { snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 } }) },
   } as unknown as Deps
 
   const fired: string[] = []
@@ -1039,7 +1042,7 @@ test('a stale approve on an OLD needs_approval run does not release a DIFFERENT,
 
   const fired: string[] = []
   const scheduler = new RoutineScheduler({ store: db, now: () => new Date(), runRoutine: async (r) => { fired.push(r.id); return 'needs_approval' } })
-  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }) } } as unknown as Deps)
+  registerRoutineRoutes(app, { db, routineScheduler: scheduler, store: { snapshot: () => ({ customAgents: [] }), read: () => ({ customAgents: [] }) } } as unknown as Deps)
 
   // A REAL fire happens and genuinely parks — this is the run the scheduler's guard belongs to.
   await scheduler.tick()

@@ -39,7 +39,7 @@ function routes(t: TestContext, kind: string) {
   const engine = { kind, id: kind, capabilities: {} }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => engine },
     manager: {

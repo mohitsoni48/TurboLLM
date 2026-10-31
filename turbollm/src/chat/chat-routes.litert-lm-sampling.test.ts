@@ -42,7 +42,7 @@ function routes(t: TestContext, info: LitertLmRequestInfo & { native: boolean })
   const engine = { kind: 'litert-lm', id: 'lrt', capabilities: {} }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => engine },
     manager: {

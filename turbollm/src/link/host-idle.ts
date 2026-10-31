@@ -71,7 +71,8 @@ export function resetLocalActivity(): void {
 export function hostIdleState(d: Deps): HostIdleState {
   let generating = false
   try {
-    generating = (d.manager.sessionStats().activeRequests ?? 0) > 0
+    // A keep-N pool slot's generation is counted on its own Manager, not the primary's (scalability review 1.5).
+    generating = (d.manager.sessionStats().activeRequests ?? 0) > 0 || (d.modelRouter?.poolGenerating?.() ?? false)
   } catch {
     // A Deps double (or a manager torn down mid-shutdown) with no sessionStats must not
     // 500 the request. Unknown → not generating; the activity ledger still gates.

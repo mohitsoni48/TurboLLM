@@ -26,7 +26,7 @@ function makeApp(): { app: Hono; store: ConversationStore; cleanup: () => void }
   }
   const d = {
     db: store,
-    store: { snapshot: () => cfg, dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, dir: () => dir },
     scanner: { get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     manager: {

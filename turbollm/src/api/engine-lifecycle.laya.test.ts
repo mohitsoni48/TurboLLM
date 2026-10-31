@@ -30,7 +30,7 @@ function mkDeps(models: ModelEntry[], { activeEngine = true, layaInstalled = tru
     target: () => 'http://127.0.0.1:1',
     touch: () => {},
   }
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
   const scanner = { get: (k: string) => models.find((m) => m.key === k) }
   const registry = {
     active: () => (activeEngine ? { id: 'eng-1', kind: 'llama.cpp', name: 'llama.cpp', binPath: 'llama-server', capabilities: { flags: [] } } : undefined),
@@ -47,7 +47,7 @@ function mkDeps(models: ModelEntry[], { activeEngine = true, layaInstalled = tru
   const d = {
     version: '1.12.0',
     store, scanner, manager, registry, modelRouter,
-    bench: { cancel: () => { benchCancelCalls.push(1) }, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => { benchCancelCalls.push(1) }, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
 

@@ -18,7 +18,7 @@ function makeDeps(mutate: (cfg: ReturnType<typeof defaultConfig>) => void = () =
   const cfg = defaultConfig()
   mutate(cfg)
   return {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) },
   } as unknown as Deps
 }
 

@@ -406,7 +406,7 @@ test('a failed host validate() yields the FIELD, never the message that carries 
   const d = {
     version: '1.11.2',
     store: {
-      snapshot: () => real.store.snapshot(),
+      snapshot: () => real.store.snapshot(), read: () => real.store.snapshot(),
       update: () => {
         throw new ValueError('agents', `agent "coder" writeRoots must be within ${hostPath} (v1 invariant)`)
       },

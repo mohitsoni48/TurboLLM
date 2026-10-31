@@ -16,7 +16,7 @@ const skip = process.platform === 'win32' ? 'POSIX held groups (Windows holds th
 function makeApp(seams: Parameters<typeof registerCodeRoutes>[3] = {}) {
   const db = new ConversationStore(IN_MEMORY_DATA_DIR)
   const app = new Hono()
-  const d = { db, version: 'test', store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }) } } as unknown as Deps
+  const d = { db, version: 'test', store: { snapshot: () => ({ code: { defaultAgent: 'turbollm' } }), read: () => ({ code: { defaultAgent: 'turbollm' } }) } } as unknown as Deps
   registerCodeRoutes(app, d, undefined, seams)
   return { app, db }
 }

@@ -222,7 +222,7 @@ function mkDeps(s: LoadScenario) {
       return Promise.resolve()
     },
   }
-  const store = { snapshot: () => s.cfg, update: (fn: (c: Config) => void) => fn(s.cfg) }
+  const store = { snapshot: () => s.cfg, read: () => s.cfg, update: (fn: (c: Config) => void) => fn(s.cfg) }
   const scanner = { get: (k: string) => [s.model].find((m) => m.key === k) }
   const registry = { active: () => s.engine }
   const modelRouter = {
@@ -232,7 +232,7 @@ function mkDeps(s: LoadScenario) {
   }
   const d = {
     store, scanner, manager, registry, modelRouter,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
   return { d, primaryLoadCalls }

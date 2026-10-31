@@ -50,7 +50,7 @@ function depsWith(store: ConversationStore, runner: CodeSessionRunner): Deps {
   const d = {
     db: store,
     manager: { status: () => ({ state: 'running', model: { key: 'm' } }) },
-    store: { snapshot: () => ({ daemon: { autoGenerateTitles: false } }) },
+    store: { snapshot: () => ({ daemon: { autoGenerateTitles: false } }), read: () => ({ daemon: { autoGenerateTitles: false } }) },
   } as unknown as Deps
   d.codeRuns = new CodeRunManager(d, { runner })
   return d

@@ -264,7 +264,7 @@ async function gatedJob(t: { after: (fn: () => unknown) => void }, target: strin
   cfg.daemon.lanBind = true
   cfg.apiKeys.push({ id: 'kA', name: 'a', hash: hashKey(RAW_A), prefix: RAW_A.slice(0, 12), createdAt: '', lastUsedAt: null })
   const app = new Hono()
-  const d = { ...deps(target), store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) } } as unknown as Deps
+  const d = { ...deps(target), store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) } } as unknown as Deps
   const remote = new RemoteAccessManager({ app, ingressPort: 0, makeProvider: () => new FakeProvider(), probe: async () => true })
   ;(d as { remote: unknown }).remote = remote
   app.use('*', lanAuth(d))

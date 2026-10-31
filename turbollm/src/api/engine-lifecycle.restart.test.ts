@@ -37,7 +37,7 @@ async function setUp(t: { after: (fn: () => unknown) => void }) {
   const app = new Hono()
   registerApi(app, {
     version: 'test', store: h.store, registry: h.registry, scanner: h.scanner, manager: h.manager, modelRouter: h.modelRouter,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
   } as unknown as Deps)
   const post = async (path: string, body: unknown = {}) =>
     (await app.request(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })).status

@@ -590,3 +590,22 @@ test('terminalLookupsBySession: agent exit is read off the mapped terminal; no t
   assert.equal(store.getRoutineRun(gone.id)!.status, 'errored')
   assert.match(store.getRoutineRun(gone.id)!.error ?? '', /ended unexpectedly/)
 })
+
+// Review L1: see cli-routine.test.ts — a busy / auto-tune refusal is a busy engine, skipped, and stopped nothing.
+for (const reason of ['busy', 'autotune'] as const) {
+  test(`a swap the router refuses as ${reason} skips as model_busy, never creates a terminal, restores nothing`, async () => {
+    const store = freshStore()
+    const routine = interactiveRoutine(store)
+    const run = schedulerRun(store, routine)
+    const loadCalls: string[] = []
+    const status = await runCliInteractiveRoutine(routine, run, baseDeps({
+      store,
+      getLoadedModelKey: () => 'some-other-model',
+      loadExplicit: async (k) => { loadCalls.push(k); return { status: 503, message: 'refused', reason } },
+      createTerminal: neverCreatesTerminal(),
+    }))
+    assert.equal(status, 'skipped')
+    assert.equal(store.getRoutineRun(run.id)!.skipReason, 'model_busy')
+    assert.deepEqual(loadCalls, ['pinned-model'])
+  })
+}

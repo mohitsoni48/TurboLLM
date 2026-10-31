@@ -23,11 +23,13 @@ function entry(overrides: Partial<ModelEntry>): ModelEntry {
   } as unknown as ModelEntry
 }
 
-function mkDeps(models: ModelEntry[]) {
+function mkDeps(models: ModelEntry[], opts: { tuning?: boolean } = {}) {
   const cfg: Record<string, unknown> = { modelProfiles: {}, lastLoaded: {} }
   const primaryLoadCalls: unknown[] = []
   const loadExplicitCalls: { key: string; overrides: unknown }[] = []
   const benchCancelCalls: number[] = []
+  const events: string[] = []
+  let tuning = opts.tuning ?? false
 
   const manager = {
     status: () => ({ state: 'running', model: { key: 'chat-model' } }),
@@ -35,14 +37,16 @@ function mkDeps(models: ModelEntry[]) {
     target: () => 'http://127.0.0.1:1',
     touch: () => {},
   }
-  const store = { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) }
   const scanner = { get: (k: string) => models.find((m) => m.key === k) }
   const registry = {
     active: () => ({ id: 'eng-1', kind: 'llama.cpp', name: 'llama.cpp', binPath: 'llama-server', capabilities: { flags: [] } }),
+    layaEngine: () => ({ id: 'laya-1', kind: 'laya', name: 'Laya', binPath: 'laya', capabilities: { flags: [] } }),
   }
   const modelRouter = {
     loadExplicit: (key: string, overrides: unknown) => {
       loadExplicitCalls.push({ key, overrides })
+      events.push(tuning ? 'load-while-tuning' : 'load')
       return Promise.resolve({ target: 'http://127.0.0.1:2' })
     },
     withSwapLock: (fn: () => unknown) => Promise.resolve(fn()),
@@ -52,11 +56,15 @@ function mkDeps(models: ModelEntry[]) {
   const d = {
     version: '1.12.0',
     store, scanner, manager, registry, modelRouter,
-    bench: { cancel: () => { benchCancelCalls.push(1) }, waitIdle: () => Promise.resolve() },
+    bench: {
+      isRunning: () => tuning,
+      cancel: () => { benchCancelCalls.push(1); events.push('cancel') },
+      waitIdle: async () => { tuning = false; events.push('idle') },
+    },
     comfy: undefined,
   } as unknown as Deps
 
-  return { d, primaryLoadCalls, loadExplicitCalls, benchCancelCalls }
+  return { d, primaryLoadCalls, loadExplicitCalls, benchCancelCalls, events }
 }
 
 function app(d: Deps) {
@@ -102,3 +110,17 @@ test('loading a regular chat model is unchanged: it still goes straight to the p
   assert.deepEqual(h.loadExplicitCalls, [])
   assert.deepEqual(h.benchCancelCalls, [1], 'the kill switch still applies when the primary engine IS being replaced')
 })
+
+// Review L7: the router refuses every load while an auto-tune runs (its probes would count a pool model's VRAM as their
+// own), so a side model's Load during a tune answered 202 and its refusal reached only console.warn: the Load did
+// nothing, silently. A manual Load cancels the tune first, as a chat model's Load always has (the kill switch above),
+// but still aborts no chat: the primary engine is not going away.
+for (const kind of ['embedding', 'laya'] as const) {
+  test(`loading a${kind === 'laya' ? ' Laya' : 'n embedding'} model during an auto-tune cancels the tune and waits for it before loading`, async () => {
+    const h = mkDeps([entry({ key: 'side', [kind]: true })], { tuning: true })
+    const res = await app(h.d).request('/start', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ modelKey: 'side' }) })
+    assert.equal(res.status, 202)
+    assert.deepEqual(h.events, ['cancel', 'idle', 'load'])
+    assert.deepEqual(h.primaryLoadCalls, [])
+  })
+}

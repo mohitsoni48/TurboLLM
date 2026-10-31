@@ -71,6 +71,7 @@ import { localDaemonOrigin } from '../daemon-pid'
 import { sessionAuth } from '../code/session-auth'
 import { resolveClaudePermissionMode } from '../terminal/agent-modes'
 import type { ModelRouter, RouteResult } from '../gateway/model-router'
+import { refusedAsBusy } from './model-swap'
 
 export interface CliRoutineDeps {
   store: ConversationStore
@@ -192,6 +193,11 @@ export async function runCliCodeRoutine(routine: Routine, deps: CliRoutineDeps):
 
     if (action === 'swap-then-run') {
       const swapResult = await deps.loadExplicit(pinnedModel)
+      // Stopped nothing: no restore, and a skip rather than a failure (refusedAsBusy).
+      if (refusedAsBusy(swapResult)) {
+        finish({ status: 'skipped', skipReason: 'model_busy' })
+        return
+      }
       swap = swapResult
       if ('status' in swapResult) {
         // A load that ran and failed has already stopped the user's model when it took that

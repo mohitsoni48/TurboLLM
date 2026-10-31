@@ -397,7 +397,7 @@ test('canSeedFirstMessage: an apostrophe is still fine — quoting handles it', 
 // scheduler has released the routine) passes an aborted signal — the CLI must never be launched.
 test('createAgentTerminal: an aborted signal never spawns the terminal', async () => {
   const d = {
-    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-abort-') },
     db: { getConversation: () => undefined, updateAgentRun: () => {} },
   } as unknown as Deps
   const run = { id: 'abort-session', convId: 'c', repoRoot: tmpDir('terminal-routes-abort-repo-'), codeAgent: 'opencode' } as unknown as AgentRun
@@ -422,7 +422,7 @@ test('closeTerminalSockets: an open terminal WebSocket no longer holds the shutd
   t.mock.method(TerminalManager.prototype, 'registerWsListener', () => {})
   t.mock.method(TerminalManager.prototype, 'unregisterWsListener', () => {})
   const d = {
-    store: { snapshot: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
+    store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }), dir: () => tmpDir('terminal-routes-ws-close-') },
   } as unknown as Deps
   const server = http.createServer((_req, res) => res.end())
   registerTerminalWs(server, d)
@@ -460,7 +460,7 @@ test('a terminal WebSocket handshake from another site needs a key; the app\'s o
     apiKeys: [{ id: 'k1', name: 'mine', hash: hashKey(raw), prefix: raw.slice(0, 12), createdAt: '', lastUsedAt: null }],
   }
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-origin-') },
   } as unknown as Deps
   const server = http.createServer((_req, res) => res.end())
   registerTerminalWs(server, d)
@@ -516,7 +516,7 @@ async function staleHarness(t: import('node:test').TestContext, opts: { listenHo
   const server = http.createServer((_req, res) => res.end())
   let ingressPort: number | undefined
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg), dir: () => tmpDir('terminal-routes-ws-stale-') },
     remote: { ingressPort: () => ingressPort },
     bindHost: opts.listenHost ?? '127.0.0.1',
   } as unknown as Deps & { bindHost: string }

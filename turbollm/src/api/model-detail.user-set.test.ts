@@ -25,7 +25,7 @@ function app(cfg: Config): Hono {
   const a = new Hono()
   registerApi(a, {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     scanner: { get: (k: string) => (k === M.key ? M : undefined) },
     registry: { active: () => ({ id: 'e1', kind: 'llama-server' }), layaEngine: () => undefined },
     manager: { status: () => ({ state: 'stopped', model: null }) },
@@ -73,7 +73,7 @@ test('GET /models/:key: a .litertlm\'s resting sampling is its bundle\'s own, wh
   const cfg = defaultConfig()
   registerApi(a, {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg) },
     scanner: { get: (k: string) => (k === M.key ? litert : undefined) },
     registry: { active: () => ({ id: 'e1', kind: 'litert-lm' }), layaEngine: () => undefined },
     manager: { status: () => ({ state: 'stopped', model: null }) },

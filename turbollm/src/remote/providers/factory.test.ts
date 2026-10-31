@@ -6,7 +6,7 @@ import { defaultConfig, REMOTE_PROVIDERS } from '../../config/config'
 
 const deps = (): Deps => {
   const cfg = defaultConfig()
-  return { store: { snapshot: () => cfg, dir: () => '/tmp/data' } } as unknown as Deps
+  return { store: { snapshot: () => cfg, read: () => cfg, dir: () => '/tmp/data' } } as unknown as Deps
 }
 
 test('factory: every declared provider id resolves to a provider with that id', () => {

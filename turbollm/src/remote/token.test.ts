@@ -7,7 +7,7 @@ import { defaultConfig } from '../config/config'
 
 const deps = (): Deps => {
   const cfg = defaultConfig()
-  return { store: { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps
+  return { store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) } } as unknown as Deps
 }
 
 test('token: minting stores only a hash and returns the raw value once', () => {

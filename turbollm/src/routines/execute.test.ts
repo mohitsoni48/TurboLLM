@@ -42,7 +42,7 @@ function fakeDeps(opts: { loadedKey: string | null; activeRequests?: number; gat
     db, manager, modelRouter,
     registry: { active: () => ({ kind: 'llama-server' }) },
     store: {
-      snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }),
+      snapshot: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }), read: () => ({ customAgents: [AGENT], tools: { toolPolicies: {} }, modelDefaults: { maxTokens: 0 }, daemon: { port: 6996 } }),
       // Only ever read by TerminalManager's constructor (orphan-safety pidfile dir) when
       // runCliInteractiveBranch's `getTerminalManager(d)` builds the module singleton for the
       // first time in this process — a real tmp dir keeps that harmless in tests that never

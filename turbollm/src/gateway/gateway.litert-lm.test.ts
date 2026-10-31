@@ -26,7 +26,7 @@ function litertDeps(): Deps {
       resolveLocal: byKeyOrName,
       routeTo: async () => ({ target: ENGINE }),
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'running', model: { key: KEY, name: ENTRY.name } }),
       target: () => ENGINE,

@@ -22,7 +22,7 @@ setDownloadGetForTests((url, init) => globalThis.fetch(url, init))
 function fakeStore(modelDir: string, stateDir: string) {
   return {
     dir: () => stateDir,
-    snapshot: () => ({ primaryModelDir: modelDir, modelDirs: [modelDir] }),
+    snapshot: () => ({ primaryModelDir: modelDir, modelDirs: [modelDir] }), read: () => ({ primaryModelDir: modelDir, modelDirs: [modelDir] }),
   } as unknown as ConstructorParameters<typeof DownloadManager>[0]
 }
 

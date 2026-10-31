@@ -409,7 +409,7 @@ function jsonFetch(payload: unknown, status = 200): typeof fetch {
 function fakeDeps(db: ConversationStore, ctxMax = 8192): Deps {
   return {
     db,
-    store: { snapshot: () => ({ requestLog: { enabled: false } }) },
+    store: { snapshot: () => ({ requestLog: { enabled: false } }), read: () => ({ requestLog: { enabled: false } }) },
     gate: undefined,
     modelRouter: { resolveRemoteTarget: () => undefined },
     scanner: { get: () => undefined },
@@ -453,7 +453,7 @@ function noLocalEngineDeps(db: ConversationStore): Deps {
   const boom = (): never => { throw new Error('local engine resolution must not happen when an upstream was passed in') }
   return {
     db,
-    store: { snapshot: () => ({ requestLog: { enabled: false } }) },
+    store: { snapshot: () => ({ requestLog: { enabled: false } }), read: () => ({ requestLog: { enabled: false } }) },
     gate: undefined,
     modelRouter: { resolveRemoteTarget: boom },
     scanner: { get: () => undefined },

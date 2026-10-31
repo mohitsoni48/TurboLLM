@@ -152,3 +152,37 @@ export class GenerationGate {
     return { inFlight: this.inFlight, queued: this.queue.length, capacity: this.capacity() }
   }
 }
+
+/** What a gate is sized from: an engine process's own concurrent-slot count (`Manager.parallelSlots()`), null when it
+ *  advertises none. Structural so this module stays free of the engine layer. */
+interface SlotCounted {
+  parallelSlots(): number | null
+}
+
+/**
+ * One GenerationGate per engine PROCESS (scalability review 1.1). keep-N (ADR-060) runs up to four engines at once —
+ * the primary Manager plus ModelRouter's pool-slot Managers — each its own process with its own `--parallel`. A single
+ * daemon-wide gate sized from the primary serialized a `--parallel 4` pool model behind the primary's traffic, and
+ * with an unbounded primary (vLLM/MLX: Infinity) left a `--parallel 1` pool slot with no gate at all, so subagents
+ * thrashed its one slot's prompt cache: the exact failure ADR-315 caps fan-out to prevent, on the engine it never
+ * looked at. Each gate keeps every GenerationGate rule (fg-before-bg, acquire timeout, abort) and reads ITS engine's
+ * capacity live, so a slot that reloads with a different `--parallel` is re-sized on the next admission.
+ *
+ * Keyed weakly by the engine object: a pool-slot Manager the router drops is collected with its gate, and one the
+ * router reuses for another model (an LRU eviction takes the evicted slot's Manager over) keeps its gate. Eviction
+ * never picks an engine whose gate has a holder or a waiter (ModelRouter.setGates), so a gate a reused Manager keeps
+ * is empty when its process changes model: no request admitted for the old one is released onto the new one.
+ */
+export class EngineGates {
+  private gates = new WeakMap<SlotCounted, GenerationGate>()
+
+  for(engine: SlotCounted): GenerationGate {
+    let gate = this.gates.get(engine)
+    if (!gate) {
+      // `Infinity` when the engine advertises no slot count — see GenerationGate's constructor for why that is not 1.
+      gate = new GenerationGate(() => engine.parallelSlots() ?? Infinity)
+      this.gates.set(engine, gate)
+    }
+    return gate
+  }
+}

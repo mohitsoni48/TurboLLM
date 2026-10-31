@@ -143,7 +143,7 @@ function gateProbe(daemon: { lanBind: boolean; requireApiKey: boolean }, apiKeys
   const app = new Hono()
   const d = {
     store: {
-      snapshot: () => ({ daemon, apiKeys }),
+      snapshot: () => ({ daemon, apiKeys }), read: () => ({ daemon, apiKeys }),
       update: (fn: (cfg: { apiKeys: unknown[] }) => void) => fn({ apiKeys }),
     },
   } as unknown as Deps
@@ -231,7 +231,7 @@ function inFlightHarness(tools?: unknown) {
   const d = {
     db: store,
     // `dir`: an engine's error text is path-redacted against it (engineErrorText).
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },
@@ -1351,7 +1351,7 @@ test('share-url: advertises the port really bound, not daemon.port', async () =>
   const savedAdvertised = process.env.TURBOLLM_ADVERTISED_HOST
   delete process.env.TURBOLLM_ADVERTISED_HOST
   try {
-    const d = { db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
+    const d = { db: store, store: { snapshot: () => ({ daemon: { port: 6996 } }), read: () => ({ daemon: { port: 6996 } }) }, bindPort: 7000 } as unknown as Deps
     const app = new Hono()
     registerChatRoutes(app, d)
     const conv = store.createConversation()

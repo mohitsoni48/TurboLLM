@@ -30,7 +30,7 @@ function mkDeps(mutate: (cfg: Config) => void = () => {}): { d: Deps; cfg: Confi
   const dir = tmpDir('tenant-key-')
   const d = {
     version: 'test',
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: new Proxy({}, { get: () => () => [] }),
     chatStore: {
       capabilities: { search: false },

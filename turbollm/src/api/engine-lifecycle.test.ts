@@ -56,7 +56,7 @@ function mkDeps(engineKind: string, models: ModelEntry[]) {
   }
   const cfg = { modelProfiles: {}, lastLoaded: {} }
   const d = {
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never) },
     scanner: { get: (k: string) => models.find((m) => m.key === k) },
     registry: {
       active: () => ({ id: 'eng-1', kind: engineKind, name: engineKind, binPath: 'x', capabilities: { flags: [] } }),
@@ -64,7 +64,7 @@ function mkDeps(engineKind: string, models: ModelEntry[]) {
     },
     manager,
     modelRouter,
-    bench: { cancel: () => {}, waitIdle: () => Promise.resolve() },
+    bench: { isRunning: () => false, cancel: () => {}, waitIdle: () => Promise.resolve() },
     comfy: undefined,
   } as unknown as Deps
   return { d, loads, primaryLoads, routerLoads }

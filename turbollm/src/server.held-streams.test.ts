@@ -45,7 +45,7 @@ function harness(mutate: (cfg: Config) => void = () => {}) {
   const d = {
     version: 'test',
     // A copy per snapshot, as ConfigStore's: PATCH /settings compares the one before its update.
-    store: { snapshot: () => structuredClone(cfg), update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => structuredClone(cfg), read: () => structuredClone(cfg), update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     db: new Proxy({}, { get: (_t, p) => (p === 'getAgentRun' ? () => ({ id: 's1' }) : () => []) }),
     telemetry: { firstUse: () => {}, useFeature: () => {} },
     manager: { status: () => ({ state: 'stopped', model: null }), logPath: () => logPath },

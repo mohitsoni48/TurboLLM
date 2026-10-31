@@ -92,7 +92,7 @@ function tempDir(): string {
 
 function fakeStore(level: string) {
   const cfg = { telemetry: { level, machineId: '11111111-1111-1111-1111-111111111111' } }
-  return { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  return { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
 }
 
 function makeEmitter(dir: string): Emitter {

@@ -114,7 +114,7 @@ function routes(engineUrl: string, opts: { titles?: boolean; toolPolicy?: 'ask' 
   const remote = opts.remote ? { linkId: 'lnk1', baseUrl: opts.remote.baseUrl, token: 'tllm-hostsecret', modelKey: 'qwen3' } : undefined
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: never) => void) => fn(cfg as never), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: (id: string) => (remote && id === opts.remote!.id ? { target: remote.baseUrl, remote } : undefined) },
@@ -879,7 +879,7 @@ async function gatedRoutes(engineUrl: string, opts: { requireApiKey?: boolean } 
   const app = new Hono()
   const d = {
     db: store,
-    store: { snapshot: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
+    store: { snapshot: () => cfg, read: () => cfg, update: (fn: (c: Config) => void) => fn(cfg), dir: () => dir },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined },
     registry: { active: () => ({ kind: 'llama.cpp', id: 'e1', capabilities: {} }) },
     modelRouter: { resolveRemoteTarget: () => undefined },

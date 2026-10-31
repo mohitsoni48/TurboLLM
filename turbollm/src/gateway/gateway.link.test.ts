@@ -26,7 +26,7 @@ function fakeDeps(): Deps {
   return {
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     modelRouter: { targetEntry: () => undefined, route: async () => ({ target: REMOTE.baseUrl, remote: REMOTE }) },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     manager: {
       status: () => ({ state: 'stopped', model: null }),
       target: () => null,
@@ -243,7 +243,7 @@ function ledgerDeps(over: { remote?: boolean } = {}): { deps: Deps; ledger: Ledg
       route: async () => (remote ? { target: REMOTE.baseUrl, remote } : { target: 'http://127.0.0.1:8081' }),
       resolveRemoteTarget: () => undefined,
     },
-    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
+    store: { snapshot: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }), read: () => ({ modelDefaults: { maxTokens: 0 }, gateway: { autoSwap: true } }) },
     gate: {
       acquire: async () => { ledger.gateAcquires++; return () => {} },
     },
@@ -455,7 +455,7 @@ function linkedRouterDeps(advertised: { key: string; loaded: boolean }) {
     linkByName: (n: string) => (n.toLowerCase() === 'rig' ? link : undefined),
     modelOn: (id: string, key: string) => (id === link.id && key === remoteModel.key ? remoteModel : undefined),
   }
-  const store = { snapshot: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
+  const store = { snapshot: () => cfg, read: () => cfg, update: (fn: (c: typeof cfg) => void) => fn(cfg) }
   const manager = fakeDeps().manager
   const scanner = { list: () => ({ models: [], scanning: false, lastScanAt: '' }), get: () => undefined }
   const router = new ModelRouter(store as never, {} as never, manager as never, scanner as never, undefined, catalog as never)
@@ -538,7 +538,7 @@ test('a models:use token cannot switch a linked machine back to the model its ca
   }
   const hostDeps = {
     version: '1.14.7',
-    store: { snapshot: () => hostCfg, update: (fn: (c: never) => void) => fn(hostCfg as never) },
+    store: { snapshot: () => hostCfg, read: () => hostCfg, update: (fn: (c: never) => void) => fn(hostCfg as never) },
     scanner: { list: () => ({ models: [], scanning: false, lastScanAt: '' }) },
     db: { recordApiUsage: () => {} },
     registry: { active: () => ({ kind: 'llama.cpp' }) },
