@@ -181,7 +181,9 @@ test('a record from before start times were recorded keeps the port rule: no por
   }
 })
 
-test('a record whose start time cannot be read (no `ps`) keeps the port rule: its port is open, so it is reaped', async () => {
+// POSIX only: `ps` is what reads a start time there. Windows reads it another way and kills with taskkill, which is
+// found through PATH: an emptied PATH stops the kill itself, so the orphan would survive for a reason that is not the rule.
+test('a record whose start time cannot be read (no `ps`) keeps the port rule: its port is open, so it is reaped', { skip: process.platform === 'win32' && '`ps` is POSIX-only; the test empties PATH, which also hides taskkill' }, async () => {
   const dir = tmpDir('tllm-reap-')
   const noPs = tmpDir('tllm-reap-nops-') // an empty PATH directory: `ps` cannot be found, as in a slim image
   const eng = await spawnFakeEngine()
