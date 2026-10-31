@@ -16,6 +16,7 @@ import {
   androidEngineProblem,
   assertOrder,
   isCliEntry,
+  magicCloseCommits,
   localPublishProblem,
   splitDirtyPaths,
   splitPreflightDirty,
@@ -702,4 +703,23 @@ test('prepare re-run after a failed push pushes the release commit', POSIX_ONLY,
   } finally {
     cleanup(s.root);
   }
+});
+
+// ── magic-close scan: flags a commit that would close an issue, except ones acknowledged by full SHA ──────────
+// b387a903 quotes the syntax while describing the check (`closes #12`, a PR, so it closed nothing) and sits on main:
+// history cannot be reworded, so a SHA allowlist is the only way past it that does not weaken the scan.
+const entry = (sha, body) => `${sha}\x1f${body}\x1e`;
+
+test('magicCloseCommits: flags Closes/Fixes/Resolves #N in any capitalization, naming the short sha', () => {
+  const log = entry('a'.repeat(40), 'fix(x): y\n\nCloses #5')
+    + entry('b'.repeat(40), 'docs: z\n\nsee (#7), addresses #8')
+    + entry('c'.repeat(40), 'fix: q\n\nresolves #9');
+  assert.deepEqual(magicCloseCommits(log, new Set()), ['aaaaaaaa', 'cccccccc']);
+});
+
+test('magicCloseCommits: a commit acknowledged by its full SHA is skipped, another with the same text is not', () => {
+  const known = 'b'.repeat(40);
+  const log = entry(known, 'quotes `closes #12` while describing the check') + entry('d'.repeat(40), 'closes #12');
+  assert.deepEqual(magicCloseCommits(log, new Set([known])), ['dddddddd']);
+  assert.deepEqual(magicCloseCommits('', new Set()), []);
 });
