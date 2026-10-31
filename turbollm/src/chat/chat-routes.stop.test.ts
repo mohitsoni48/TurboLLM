@@ -14,7 +14,7 @@ import type { AddressInfo } from 'node:net'
 import { rmSync } from 'node:fs'
 import { Hono } from 'hono'
 import { registerChatRoutes } from './chat-routes.js'
-import { ConversationStore } from './db.js'
+import { ConversationStore, IN_MEMORY_DATA_DIR } from './db.js'
 import { RequestLog } from '../observability/request-log.js'
 import type { Deps } from '../deps.js'
 import { tmpDir } from '../test-support/tmp'
@@ -77,7 +77,9 @@ async function standInEngine() {
  *  has it. `run_code` is set to Allow; `executed` lists every tool call that started. */
 function harness(engineUrl: string, opts: { requestLog?: boolean; titles?: boolean } = {}) {
   const dir = tmpDir('tllm-chat-stop-')
-  const store = new ConversationStore(dir)
+  // In memory: an on-disk store cost about a second per test, with multi-second stalls, on a hosted Windows runner, and
+  // nothing here reads the file.
+  const store = new ConversationStore(IN_MEMORY_DATA_DIR)
   const executed: string[] = []
   const cfg = {
     modelDefaults: { maxTokens: 0 },
@@ -157,7 +159,11 @@ function sseFrames(res: Response) {
   }
 }
 
-test('Stop mid-reply with the request log on saves the reply as stopped and gives it no title', { timeout: 20_000 }, async () => {
+// Only a guard against a hang. On a hosted Windows runner, with other test files competing for its few cores and slow
+// disk, two tests in a row have stalled past 20 s; a real hang still fails, a minute on.
+const GUARD_MS = 60_000
+
+test('Stop mid-reply with the request log on saves the reply as stopped and gives it no title', { timeout: GUARD_MS }, async () => {
   const engine = await standInEngine()
   const h = harness(engine.url, { titles: true })
   try {
@@ -185,7 +191,7 @@ test('Stop mid-reply with the request log on saves the reply as stopped and give
   }
 })
 
-test('Stop while the reply streams a tool call: the call does not run, though its tool is set to Allow', { timeout: 20_000 }, async () => {
+test('Stop while the reply streams a tool call: the call does not run, though its tool is set to Allow', { timeout: GUARD_MS }, async () => {
   const engine = await standInEngine()
   const h = harness(engine.url)
   try {
