@@ -39,7 +39,7 @@ import {
 } from './app-update-apply'
 import { applyEngineUpdate } from './engines/update-apply'
 import { engineWorkBusy } from './api/routes'
-import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir } from './engines/seed'
+import { seedDefaultEngines, ensureAndroidBundledEngine, ensureAndroidModelsDir, ensureAndroidSdkEngine } from './engines/seed'
 import { packagedAndroidApp, restoreParkedInstalls } from './engines/zip-install'
 import { restoreInterruptedBuilds } from './engines/build-runner'
 import { runAutoLoad } from './engines/auto-load'
@@ -529,6 +529,7 @@ const enginesDir = join(store.dir(), 'engines')
 // gate so a repaired/first-registered Android engine correctly short-circuits the
 // network-download seed path instead of racing it.
 void ensureAndroidBundledEngine(registry)
+  .then(() => ensureAndroidSdkEngine(registry)) // the app's in-app engine, its default (Option B); no-op elsewhere
   .then(() => seedDefaultEngines(registry, enginesDir, provision, store))
   .then(() => registry.ensureProbed())
 const manager = new Manager(store)

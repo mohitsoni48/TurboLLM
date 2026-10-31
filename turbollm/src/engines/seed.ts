@@ -4,9 +4,9 @@
 // No-ops if any engine is already configured, or once it has seeded (Config.defaultEngineSeeded). Never throws.
 import { existsSync, mkdirSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import type { Registry } from './registry'
-import type { ConfigStore } from '../config/config'
+import type { ConfigStore, Engine } from '../config/config'
 import type { ProvisionState } from './provision-state'
 import { amdApuOnly, getSysInfo, primaryVendor } from '../sysinfo/sysinfo'
 import { LITERT_LM_NATIVE_SERVER, litertLmNativeVersion } from './litert-lm'
@@ -43,6 +43,18 @@ const ANDROID_VULKAN_ENGINE_NAME = 'llama-server-android-vulkan'
  *  model loads on nothing else, see engineForModel). */
 const ANDROID_LITERT_LM_ENGINE_NAME = 'litert-lm-android'
 
+/** The engines the APK may ship in nativeLibraryDir, by the name each is registered under. Only the CPU engine is
+ *  required, and only when the in-app SDK engine is not there to be the default (ensureAndroidBundledEngine). */
+const ANDROID_BUNDLED_ENGINES: { name: string; file: string; kind: 'llama-server' | 'litert-lm' }[] = [
+  { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', kind: 'llama-server' },
+  { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', kind: 'llama-server' },
+  { name: ANDROID_LITERT_LM_ENGINE_NAME, file: LITERT_LM_NATIVE_SERVER, kind: 'litert-lm' },
+]
+
+/** The app's in-app engine (the TurboLLM SDK, kind 'turbollm-sdk'): an HTTP server inside the app process, not a
+ *  binary. The app sets TURBOLLM_ANDROID_SDK_URL when it started it this launch. */
+const ANDROID_SDK_ENGINE_NAME = 'TurboLLM SDK'
+
 /** BUG-01 fix (QA_BUGS.md): on Android, the llama-server binary bundled inside the APK
  *  lives at `<nativeLibraryDir>/libllama_server.so` — the only on-disk location Android's
  *  W^X hardening exempts from execve() (build.gradle.kts's jniLibs comment). Nothing in
@@ -64,17 +76,20 @@ export async function ensureAndroidBundledEngine(registry: Registry): Promise<vo
   const nativeLibDir = process.env.TURBOLLM_ANDROID_NATIVE_LIB_DIR
   if (!nativeLibDir) return
 
-  const bundled: { name: string; file: string; required: boolean; kind: 'llama-server' | 'litert-lm' }[] = [
-    { name: ANDROID_ENGINE_NAME, file: 'libllama_server.so', required: true, kind: 'llama-server' },
-    { name: ANDROID_VULKAN_ENGINE_NAME, file: 'libllama_server_vk.so', required: false, kind: 'llama-server' },
-    { name: ANDROID_LITERT_LM_ENGINE_NAME, file: LITERT_LM_NATIVE_SERVER, required: false, kind: 'litert-lm' },
-  ]
+  // With the SDK engine as the default, the CPU engine is the optional fallback (Option B), so an APK without it is a
+  // build configuration too.
+  const sdkIsDefault = Boolean(process.env.TURBOLLM_ANDROID_SDK_URL)
 
-  for (const { name, file, required, kind } of bundled) {
+  for (const { name, file, kind } of ANDROID_BUNDLED_ENGINES) {
+    const required = name === ANDROID_ENGINE_NAME && !sdkIsDefault
     const binPath = join(nativeLibDir, file)
     // Optional engines are skipped silently when absent: "this APK didn't ship the Vulkan
-    // binary" is a build configuration, not a fault worth a warning on every boot.
-    if (!required && !existsSync(binPath)) continue
+    // binary" is a build configuration, not a fault worth a warning on every boot. A row an
+    // earlier APK registered for one is unregistered instead of offered (ADR-239).
+    if (!required && !existsSync(binPath)) {
+      unregisterUnshippedEngine(registry, name, file)
+      continue
+    }
     try {
       const existing = registry.list().engines.find((e) => e.name === name)
       if (kind === 'litert-lm') {
@@ -106,6 +121,79 @@ export async function ensureAndroidBundledEngine(registry: Registry): Promise<vo
       console.warn(`android: could not register/repair ${name} (${e instanceof Error ? e.message : e})`)
     }
   }
+}
+
+/** G-7 (ADR-239): a bundled engine registered by an earlier APK that this one does not ship (the LiteRT-LM row after an
+ *  upgrade to the default build, the Vulkan row with that build flag off) is unregistered, not offered as working. Only
+ *  the app's own row is: its bundled name on a binary of the bundled file's name, in this install's nativeLibraryDir
+ *  or an earlier one (a reinstall moves it). Never throws, like its caller. */
+function unregisterUnshippedEngine(registry: Registry, name: string, file: string): void {
+  const unshipped = registry.list().engines.find((e) => e.name === name && basename(e.binPath) === file)
+  if (!unshipped) return
+  try {
+    if (registry.active()?.id === unshipped.id) activateAndroidDefault(registry)
+    registry.remove(unshipped.id)
+    console.log(`android: unregistered bundled engine ${name}: this app build does not ship ${file}`)
+  } catch (e) {
+    console.warn(`android: could not unregister ${name} (${e instanceof Error ? e.message : e})`)
+  }
+}
+
+/** The engine an Android start falls back to: the SDK engine when the app started it this launch (it may register
+ *  only after this, and then becomes active as the only choice), else the bundled CPU engine when its file is there. */
+function activateAndroidDefault(registry: Registry): void {
+  const engines = registry.list().engines
+  const fallback = process.env.TURBOLLM_ANDROID_SDK_URL
+    ? engines.find((e) => e.kind === 'turbollm-sdk')
+    : engines.find((e) => e.name === ANDROID_ENGINE_NAME && existsSync(e.binPath))
+  if (fallback) registry.activate(fallback.id)
+}
+
+/** Registers or repairs the app's in-app engine (the TurboLLM SDK) at every start, and makes it the default engine
+ *  (Option B, R-5). Called right after ensureAndroidBundledEngine (cli.ts); a no-op outside the packaged app.
+ *  - Its URL is an ephemeral port that changes every launch, so the one engine of its kind is repaired in place (same
+ *    id, so its per-engine settings survive). Its token is never read or stored here (engine-headers.ts).
+ *  - It is activated when it was registered this start (an upgrading user moves off llama-server once), when no
+ *    engine is active, or when the active one is a bundled engine whose file is gone. Otherwise the user's pick stays.
+ *  - Without the URL (the app could not start the SDK this launch) the SDK engine is kept, and if it is the active one
+ *    the bundled CPU engine takes over when its file is there, so a model can still load.
+ *  Errors are logged, not thrown, like its neighbour's. */
+export function ensureAndroidSdkEngine(registry: Registry, env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.TURBOLLM_ANDROID_NATIVE_LIB_DIR) return
+  try {
+    const baseUrl = env.TURBOLLM_ANDROID_SDK_URL
+    if (baseUrl) registerSdkEngine(registry, baseUrl)
+    else fallBackFromSdkEngine(registry)
+  } catch (e) {
+    console.warn(`android: could not register/repair ${ANDROID_SDK_ENGINE_NAME} (${e instanceof Error ? e.message : e})`)
+  }
+}
+
+function registerSdkEngine(registry: Registry, baseUrl: string): void {
+  const previous = registry.list().engines.find((e) => e.kind === 'turbollm-sdk')
+  const sdk = registry.addTurbollmSdk(ANDROID_SDK_ENGINE_NAME, baseUrl)
+  if (previous?.baseUrl !== baseUrl) {
+    console.log(`android: ${previous ? 'repaired' : 'registered'} ${ANDROID_SDK_ENGINE_NAME} at ${baseUrl}`)
+  }
+  if (!previous || !activeEngineCanRun(registry)) registry.activate(sdk.id)
+}
+
+/** False when no engine is active, or the active one is a bundled engine whose file this APK no longer has. */
+function activeEngineCanRun(registry: Registry): boolean {
+  const active = registry.active()
+  return active !== undefined && !(isBundledEngine(active) && !existsSync(active.binPath))
+}
+
+function isBundledEngine(engine: Engine): boolean {
+  return ANDROID_BUNDLED_ENGINES.some((b) => b.name === engine.name && basename(engine.binPath) === b.file)
+}
+
+function fallBackFromSdkEngine(registry: Registry): void {
+  if (registry.active()?.kind !== 'turbollm-sdk') return
+  const cpu = registry.list().engines.find((e) => e.name === ANDROID_ENGINE_NAME && existsSync(e.binPath))
+  if (!cpu) return
+  registry.activate(cpu.id)
+  console.log(`android: ${ANDROID_SDK_ENGINE_NAME} did not start this launch, so ${ANDROID_ENGINE_NAME} is the active engine`)
 }
 
 /** Installs and selects the default llama.cpp build on a first run only (Config.defaultEngineSeeded). It ran on every
