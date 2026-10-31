@@ -37,10 +37,12 @@ const execFileAsync = tetheredExecFile({ kind: 'git', end: 'term-then-kill', hol
 // Local, read-only/local-mutation ops (status, add, commit) — bounded short since nothing here
 // touches the network.
 const GIT_TIMEOUT_MS = 15_000
-// `git add` is the one local call whose time grows with the tree: staging a new folder of generated files (a build
-// output, a vendored tree) took longer than GIT_TIMEOUT_MS on Windows, where every file is also scanned by antivirus,
-// and the commit failed with "git add timed out" (14,000 files took over 2 minutes on a hosted Windows runner). It is
-// only a backstop against a hung add, so it is generous: failing a user's commit on a slow disk is the worse outcome.
+// The local calls whose time grows with the tree: `git add` of a new folder of generated files (a build output, a
+// vendored tree) took longer than GIT_TIMEOUT_MS on Windows, where every file is also scanned by antivirus, and the
+// commit failed with "git add timed out" (14,000 files took over 2 minutes on a hosted Windows runner); listing what
+// is staged and the commit itself walk the same files, and a pre-commit hook adds to it. It is only a backstop against
+// a hung call, so it is generous: failing a user's commit on a slow disk, with everything left staged, is the worse
+// outcome.
 const GIT_STAGE_TIMEOUT_MS = 600_000
 // Push touches the network — more headroom, but still bounded so a hung credential prompt can't
 // wedge a daemon request forever. GIT_TERMINAL_PROMPT=0 (set on every call below) is the real fix
@@ -306,11 +308,11 @@ export async function commitGitChanges(repoRoot: string, message: string, files?
   // which `git add` silently no-ops on, leaving nothing staged. A failure of this call is its own
   // error, not an empty list: read as one, an output past the buffer answered "Nothing staged"
   // with every file staged.
-  const staged = await git(['diff', '--cached', '--name-only', '--', '.'], repoRoot)
+  const staged = await git(['diff', '--cached', '--name-only', '--', '.'], repoRoot, GIT_STAGE_TIMEOUT_MS)
   const stagedList = staged.split('\n').filter(Boolean)
   if (stagedList.length === 0) throw new GitError('Nothing staged — the selected file(s) have no changes.', '', null)
 
-  await git(['commit', '-m', trimmedMessage], repoRoot)
+  await git(['commit', '-m', trimmedMessage], repoRoot, GIT_STAGE_TIMEOUT_MS)
   const hash = await git(['rev-parse', 'HEAD'], repoRoot)
   return { hash, filesCommitted: stagedList.length }
 }
